@@ -6,7 +6,7 @@
  *  1. The seed turn is filed under a project: the row is CREATED first, then the file uploaded
  *     against it, then the turn posted. A refusal at either of the first two doors ABORTS —
  *     a build never starts against a conversation row the server never created.
- *  2. The user turn is PERSISTED (same call that folds in the project description + the
+ *  2. The user turn is PERSISTED (same call that folds in the application description + the
  *     interview protocol) before the relay reads it.
  *  3. Navigating between two chats never leaks one chat's composer draft into the other.
  *  4. INERTNESS: the preview gets NO app credentials — those arrive server-side at provision.
@@ -46,7 +46,6 @@ vi.mock('../../utils/conversationApi', async (importOriginal) => ({
 // The REAL observe module runs for the reveal test below \u2014 only the transport is replaced, so the
 // assertion is about the beacon that actually goes out, not about a mock being called.
 vi.mock('../../utils/api', async (orig) => ({ ...(await orig()), authFetch: h.authFetch }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // Capture EVERY prop the preview is handed — the isolation assertion is about what it is fed.
 vi.mock('../../components/LivePreview', () => ({ default: (props) => { h.previewProps.push(props); return null } }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))

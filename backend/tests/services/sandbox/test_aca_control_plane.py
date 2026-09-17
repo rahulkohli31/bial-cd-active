@@ -82,7 +82,11 @@ def _control_plane(
     monkeypatch.setattr(
         aca_module,
         "ContainerAppsAPIClient",
-        lambda credential, subscription_id: SimpleNamespace(container_apps=container_apps),
+        # `**kwargs` swallows the constructor's polling interval, which the test below is what
+        # actually pins — a stub that refused it would fail all sixty of these for one reason.
+        lambda credential, subscription_id, **kwargs: SimpleNamespace(
+            container_apps=container_apps
+        ),
     )
     return AcaControlPlane(_config())
 
@@ -165,6 +169,26 @@ def test_is_transient_none_status_is_terminal() -> None:
     err = HttpResponseError(message="no status")
     assert err.status_code is None
     assert is_transient(err) is False
+
+
+def test_the_client_is_built_to_ask_arm_more_often_than_twice_a_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SDK's own default is a 30-second poll, and nothing at a call site shows it. An owner's
+    Restart waits on a revision inside a 180-second budget, so a half-minute spent waiting to be
+    TOLD about an operation ARM already finished is a sixth of that budget, spent on nothing."""
+    built: dict[str, object] = {}
+
+    def _record(credential: object, subscription_id: str, **kwargs: object) -> SimpleNamespace:
+        built.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(aca_module, "DefaultAzureCredential", lambda: SimpleNamespace())
+    monkeypatch.setattr(aca_module, "ContainerAppsAPIClient", _record)
+    AcaControlPlane(_config())
+
+    assert built["polling_interval"] == aca_module.LRO_POLLING_INTERVAL_SECONDS
+    assert aca_module.LRO_POLLING_INTERVAL_SECONDS < 30
 
 
 # --- create_app --------------------------------------------------------------

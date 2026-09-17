@@ -4,7 +4,7 @@ import { Zap, Shield, Cloud } from 'lucide-react'
 import BIALLogo from '../components/BIALLogo'
 import { consumeSignoutReason, SIGNOUT_REASONS, LOGIN_URL, bootstrapSession } from '../utils/auth'
 
-// The shape Navbar's handleLogout hands `navigate('/login', { state })` on a failed
+// The shape `ProfileCluster`'s handleLogout hands `navigate('/login', { state })` on a failed
 // sign-out — the ONLY way for a warning owned by a page that is about to unmount
 // to reach the screen the user actually lands on. `useLocation().state` is typed `any`
 // by react-router, so it is narrowed here rather than trusted.
@@ -133,7 +133,7 @@ export default function LoginPage() {
       setSearchParams(cleaned, { replace: true })
       return
     }
-    // A failed sign-out's warning (see Navbar's handleLogout) arrives as router
+    // A failed sign-out's warning (see `ProfileCluster`'s handleLogout) arrives as router
     // state on THIS navigation, not as a recorded reason to look up — it never touches
     // localStorage, so it takes priority over `consumeSignoutReason()` below rather than
     // racing it.

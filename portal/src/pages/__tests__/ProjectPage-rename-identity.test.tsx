@@ -1,12 +1,16 @@
 /**
- * THE RENAME PENCIL KEEPS THE SAME IDENTITY GUARD `ChatRoute.tsx` ALREADY CARRIES.
+ * THE TOOLBAR'S `⋯` MENU KEEPS THE SAME IDENTITY GUARD `ChatRoute.tsx` ALREADY CARRIES.
  *
  * WHY THIS RENDERS THROUGH THE REAL SHELL, SEPARATELY FROM `ProjectPage.test.tsx`
  *
- * The rename pencil is drawn by `WorkspaceToolbar`, above the Outlet, off `heading.projectName` —
+ * The menu is drawn by `WorkspaceToolbar`, above the Outlet, off `heading.projectName` —
  * `ProjectPage.test.tsx`'s own docblock says so plainly: "a render of this page alone can no
- * longer reach [the rename control] ... covered by `WorkspaceToolbar.test.tsx`". So this suite
- * mounts the real `WorkspaceShell` around the real `ProjectPage`.
+ * longer reach [it] ... covered by `WorkspaceToolbar.test.tsx`". So this suite mounts the real
+ * `WorkspaceShell` around the real `ProjectPage`.
+ *
+ * IT USED TO BE A RENAME PENCIL. Rename retired into Settings › General and the pencil folded
+ * into this menu, which inherited its gate unchanged — so the hazard below is the same hazard,
+ * on a control that now opens four panels instead of one.
  *
  * `ProjectWorkspace` is STUBBED rather than mounted for real. The defect lives entirely in
  * `ProjectPage`'s own `usePublishHeading` call — whether the NAME it publishes agrees with the
@@ -20,9 +24,9 @@
  * own "three branches are one return" note records this). So moving from one project to another
  * re-renders the SAME `ProjectPage` instance with the OLD `project` state still in hand for the
  * whole width of the new fetch. Without a guard, `usePublishHeading` published the stale
- * project's name against the NEW `projectId` throughout that window — the pencil stayed visually
+ * project's name against the NEW `projectId` throughout that window — the control stayed visually
  * enabled, gated on a name belonging to a project no longer on screen, while `ProjectWorkspace`
- * (the only registrar of the actual rename handler) had already unmounted for the load. A press in
+ * (the only registrar of the actual handlers) had already unmounted for the load. A press in
  * that window is a no-op: a live-LOOKING, dead control. `ChatRoute.tsx`'s `projectName` gate
  * already carries the fix
  * for the identical hazard — gate the name on `project.id === projectId`, not on `project` alone.
@@ -53,7 +57,6 @@ vi.mock('../../utils/projectApi', async (importOriginal) => ({
 vi.mock('../../components/workspace/ProjectWorkspace', () => ({
   default: () => <div data-testid="project-workspace-stub" />,
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 
 const makeProject = (over: Partial<Project> = {}): Project => ({
   id: 'pA',
@@ -126,7 +129,7 @@ function renderSwitchable(from: string) {
   )
 }
 
-const pencil = () => screen.queryByRole('button', { name: 'Rename project' })
+const menu = () => screen.queryByTestId('workspace-menu')
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -135,27 +138,27 @@ beforeEach(() => {
 
 afterEach(() => cleanup())
 
-describe('the rename pencil keeps the identity guard `ChatRoute.tsx` already has', () => {
+describe("the toolbar menu keeps the identity guard `ChatRoute.tsx` already has", () => {
   it('★ stays enabled — with the RIGHT name — after navigating between two projects', async () => {
     h.getProject.mockImplementation(async (id: string) =>
       id === 'pA' ? makeProject({ id: 'pA', name: 'Project Alpha' }) : makeProject({ id: 'pB', name: 'Project Bravo' }),
     )
     renderSwitchable('/projects/pA')
 
-    expect(await screen.findByRole('button', { name: 'Rename project' })).toBeTruthy()
+    expect(await screen.findByTestId('workspace-menu')).toBeTruthy()
     // LIVENESS pairing: the surrounding surface actually rendered, not a crash under a boundary.
     expect(screen.getByTestId('project-workspace-stub')).toBeTruthy()
 
     fireEvent.click(screen.getByTestId('switch-pB'))
 
     await waitFor(() => expect(screen.getByTestId('project-workspace-stub')).toBeTruthy())
-    expect(pencil()).toBeTruthy()
+    expect(menu()).toBeTruthy()
   })
 
   it('★ goes quiet rather than dead while the next project is still loading, never a live-LOOKING control bound to the WRONG project', async () => {
     h.getProject.mockResolvedValueOnce(makeProject({ id: 'pA', name: 'Project Alpha' }))
     renderSwitchable('/projects/pA')
-    expect(await screen.findByRole('button', { name: 'Rename project' })).toBeTruthy()
+    expect(await screen.findByTestId('workspace-menu')).toBeTruthy()
 
     // Project B's fetch hangs — the loading window this unit is about.
     let resolveB: (p: Project) => void = () => {}
@@ -168,20 +171,20 @@ describe('the rename pencil keeps the identity guard `ChatRoute.tsx` already has
     fireEvent.click(screen.getByTestId('switch-pB'))
 
     // LIVENESS FIRST: the screen is doing something, not sitting inside a crashed boundary.
-    await screen.findByText('Loading this project…')
-    // The pencil is gone rather than standing over a project that is no longer on screen — a
+    await screen.findByText('Loading this application…')
+    // The menu is gone rather than standing over a project that is no longer on screen — a
     // guard keyed on identity, so a mismatch hides it instead of leaving it enabled against A's
     // name while the address reads B.
-    expect(pencil()).toBeNull()
+    expect(menu()).toBeNull()
 
     resolveB(makeProject({ id: 'pB', name: 'Project Bravo' }))
-    await waitFor(() => expect(pencil()).toBeTruthy())
+    await waitFor(() => expect(menu()).toBeTruthy())
   })
 
-  it('★ the guard keys on IDENTITY, not on render count — an unrelated re-render of the SAME project leaves it enabled', async () => {
+  it('★ the guard keys on IDENTITY, not on render count — an unrelated re-render of the SAME project leaves it offered', async () => {
     h.getProject.mockResolvedValue(makeProject({ id: 'pA', name: 'Project Alpha' }))
     render(<RerenderHarness from="/projects/pA" />)
-    expect(await screen.findByRole('button', { name: 'Rename project' })).toBeTruthy()
+    expect(await screen.findByTestId('workspace-menu')).toBeTruthy()
 
     // A guard implemented as "hide on the render right after a project change, show from the
     // render after that" — a RENDER-COUNT heuristic rather than an identity check — would still
@@ -191,7 +194,7 @@ describe('the rename pencil keeps the identity guard `ChatRoute.tsx` already has
     fireEvent.click(screen.getByTestId('force-rerender'))
     fireEvent.click(screen.getByTestId('force-rerender'))
 
-    expect(pencil()).toBeTruthy()
+    expect(menu()).toBeTruthy()
     // LIVENESS pairing: still the same, correctly loaded project underneath — not an absence
     // that happens to read as "enabled" because the whole surface fell over.
     expect(screen.getByTestId('project-workspace-stub')).toBeTruthy()

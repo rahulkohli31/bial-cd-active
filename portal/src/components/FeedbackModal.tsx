@@ -43,7 +43,7 @@ export default function FeedbackModal({ open, onClose, onSubmitted, triggerRef, 
   }, [open])
 
   // On open: focus the textarea and clear any stale draft/error/busy (the
-  // component stays mounted across opens — Navbar renders it unconditionally —
+  // component stays mounted across opens — `ProfileCluster` renders it unconditionally —
   // so resetting busy here also recovers from a dismiss-mid-submit).
   useEffect(() => {
     if (!open) return

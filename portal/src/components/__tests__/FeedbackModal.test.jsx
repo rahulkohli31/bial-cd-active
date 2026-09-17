@@ -167,7 +167,7 @@ describe('FeedbackModal', () => {
     await click(submitBtn()) // submit starts; busy=true; submitFn still pending
     expect(submitFn).toHaveBeenCalledTimes(1)
 
-    // Parent dismisses the modal mid-flight (e.g. Escape, which Navbar handles).
+    // Parent dismisses the modal mid-flight (e.g. Escape, which `ProfileCluster` handles).
     act(() => {
       root.render(
         <MemoryRouter initialEntries={['/chat']}>

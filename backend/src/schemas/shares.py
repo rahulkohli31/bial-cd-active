@@ -62,21 +62,56 @@ class SharedProjectResponse(CamelModel):
     identity to another (display name only, `marketplace.py`'s own docstring). R5's fuller
     "display name AND email local part" is specific to the colleague PICKER, where an owner
     is choosing among possible strangers with the same name; a recipient is not choosing
-    anyone here, just being told who acted, so the narrower exposure applies."""
+    anyone here, just being told who acted, so the narrower exposure applies.
+
+    `shared_by_user_id` IS THE FILTER'S HANDLE AND THE NAME IS ONLY ITS LABEL. `display_name` is
+    nullable and not unique, so a list filtered by name would collapse two colleagues who share
+    one and hand the recipient the other's applications.
+
+    `project_updated_at` IS THE OWNER'S, not the recipient's, and it is the only date on this row
+    that is not about the share: `shared_at` says when access was granted, and this says when the
+    application behind it last changed."""
 
     project_id: uuid.UUID
     project_name: str
     project_description: str | None
+    project_updated_at: datetime
+    shared_by_user_id: uuid.UUID
     shared_by_display_name: str | None
     shared_at: datetime
 
 
+class SharedProjectSharer(CamelModel):
+    """One option of the "Shared by" filter, with how many of the recipient's rows are that
+    colleague's.
+
+    THE COUNT DESCRIBES THE SEARCH, NOT THE WHOLE LIST — `q` narrows these numbers the same way
+    it narrows `total`, so the filter never offers a colleague with no matching rows behind them.
+    The sharer filter itself is deliberately NOT applied to its own options; see
+    `services/projects/shares.py::list_shared_with_me`."""
+
+    user_id: uuid.UUID
+    display_name: str | None
+    share_count: int
+
+
 class SharedProjectListResponse(CamelModel):
-    """Keyset-paginated (R12's own "separate search/pagination state"), unlike the owner's
-    own numbered-offset project list — see `services/projects/shares.py::list_shared_with_me`
-    for why offset's single-writer justification does not hold for a list every sharer
-    writes into."""
+    """An OFFSET page of the recipient's shared list, with the "Shared by" filter's options
+    alongside it.
+
+    THE COST IS REAL AND IT IS NOT THE OWNER LIST'S COST. `pagination.py` refuses offset because
+    a row written underneath a page walk can duplicate or skip an entry at a boundary, and the
+    owner's project list accepts that only because it is effectively single-writer. This list is
+    not: every colleague who shares or revokes writes into it. What makes it acceptable anyway is
+    argued at `list_shared_with_me`, and `total` is what lets a reader left past the end step
+    back to a page that exists.
+
+    `total` counts AFTER `q` and the sharer filter are applied — it describes the filtered list,
+    never the whole of what the recipient holds."""
 
     items: list[SharedProjectResponse]
-    next_cursor: str | None
-    has_more: bool
+    sharers: list[SharedProjectSharer]
+    page: int
+    page_size: int
+    total: int
+    total_pages: int

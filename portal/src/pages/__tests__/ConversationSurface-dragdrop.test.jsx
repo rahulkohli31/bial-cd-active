@@ -22,7 +22,12 @@ const h = vi.hoisted(() => ({
   notifyUsageChanged: vi.fn(),
 }))
 
-vi.mock('../../utils/usage', () => ({ notifyUsageChanged: h.notifyUsageChanged }))
+// `importOriginal`, not a two-key object: the toolbar's token ring reads this module through
+// `useUsageToday`, so a mock that names only what this suite calls makes an unrelated read throw.
+vi.mock('../../utils/usage', async (importOriginal) => ({
+  ...(await importOriginal()),
+  notifyUsageChanged: h.notifyUsageChanged,
+}))
 vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, getBuild: h.getBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
@@ -31,7 +36,6 @@ vi.mock('../../utils/conversationApi', () => ({
   createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig()),

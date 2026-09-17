@@ -33,7 +33,6 @@ vi.mock('../../utils/buildSessionApi', async (importOriginal) => ({
   giveUpSharedView: h.giveUpSharedView,
   handOverWorkspace: h.handOverWorkspace,
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 
 /** The exact shape `asReclaimBlocked` reads off a thrown error — a real `sandbox_reclaim_
  *  blocked` 409, not a scripted mock of the narrower. */
@@ -70,6 +69,7 @@ function renderAt(projectId = 'p1') {
         <Route path="/shared/:projectId" element={<SharedProjectPage />} />
         <Route path="/projects" element={<div data-testid="projects-page" />} />
         <Route path="/projects/:projectId" element={<div data-testid="owner-workspace" />} />
+        <Route path="/shared-applications" element={<div data-testid="shared-list" />} />
       </Routes>
     </MemoryRouter>,
   )
@@ -126,6 +126,17 @@ it('redirects an owner to their own workspace instead of rendering this view', a
 
   expect(await screen.findByTestId('owner-workspace')).toBeTruthy()
   expect(h.launchSharedPreview).not.toHaveBeenCalled()
+})
+
+it('bounces a recipient off a dead share onto Shared Applications, not the owner list', async () => {
+  // A revoked share and a deleted project are the SAME non-leaking 404 here, and either way
+  // this reader came from the shared list and belongs back on it.
+  h.getProject.mockRejectedValue(new ApiError('gone', 404))
+
+  renderAt()
+
+  expect(await screen.findByTestId('shared-list')).toBeTruthy()
+  expect(screen.queryByTestId('projects-page')).toBeNull()
 })
 
 // --- the hand-over prompt (requirement 24's frontend half) --------------------------------

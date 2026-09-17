@@ -2535,14 +2535,12 @@ describe('LivePreview — the device width it is told to frame at', () => {
     expect(deviceCard(container).style.width).toBe('100%')
   })
 
-  it('frames at 834px for Tablet (iPad Pro 11" preset) and 390px for Mobile (iPhone class)', () => {
-    expect(deviceCard(setup({ device: 'Tablet' }).container).style.width).toBe('834px')
-    cleanup()
+  it('frames at 390px for Mobile (iPhone class)', () => {
     expect(deviceCard(setup({ device: 'Mobile' }).container).style.width).toBe('390px')
   })
 
   it('no per-mode height is imposed on the wrapper — no fixed device aspect ratio', () => {
-    for (const device of ['Desktop', 'Tablet', 'Mobile']) {
+    for (const device of ['Desktop', 'Mobile']) {
       const { container } = setup({ device })
       expect(deviceCard(container).style.height).toBe('')
       cleanup()
@@ -2550,7 +2548,7 @@ describe('LivePreview — the device width it is told to frame at', () => {
   })
 
   it('the card keeps relative + overflow-hidden in every mode — anchors/clips the overlays', () => {
-    for (const device of ['Desktop', 'Tablet', 'Mobile']) {
+    for (const device of ['Desktop', 'Mobile']) {
       const { container } = setup({ device })
       expect(deviceCard(container).className).toMatch(/relative/)
       expect(deviceCard(container).className).toMatch(/overflow-hidden/)

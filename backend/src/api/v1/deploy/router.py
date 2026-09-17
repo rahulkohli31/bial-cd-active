@@ -1,4 +1,4 @@
-"""One-click deploy — the citizen-facing control surface, plus the admin kill-switch.
+"""One-click deploy, its owner-facing production levers, and the admin kill-switch.
 
 WHY THIS EXISTS
 
@@ -49,7 +49,9 @@ from src.api.v1.deploy.schemas import (
     DeployRoutedResponse,
     DeployStartedResponse,
     PublishState,
+    RestartStartedResponse,
     SavedState,
+    TakedownResponse,
     UnpublishResponse,
     compute_publish_state,
 )
@@ -82,6 +84,7 @@ from src.services.deploy.names import published_app_name
 from src.services.deploy.service import (
     FAIL_NO_SNAPSHOT,
     DeployNotPossibleError,
+    LiveRevision,
     VersionRecheck,
     deployment_for_app,
 )
@@ -145,12 +148,57 @@ _SNAPSHOT_MOVED_MSG = (
     "Your app was saved again while this request was being decided, so nothing was "
     "submitted. Try again to publish the version that's saved now."
 )
+_RESTART_NEVER_DEPLOYED = "This app has never been deployed, so there is nothing to restart."
+_RESTART_NOT_LIVE = (
+    "This app isn't running in production right now, so there is nothing to restart. "
+    "Deploy it to publish the version you have saved."
+)
+_RESTART_TAKEN_OFFLINE = (
+    "This app has been taken offline. Publish again to put it back — a restart only "
+    "recycles something that is already running."
+)
+_RESTART_DISABLED = "This app has been disabled by an administrator and cannot be restarted."
+_BUSY_MSG = "Something is already running for this app. Wait for it to finish, then try again."
+_TAKEDOWN_NEVER_DEPLOYED = "This app has never been deployed, so there is nothing to take down."
+_TAKEDOWN_WHILE_DEPLOYING = (
+    "A deploy is running for this app right now. Wait for it to finish before taking the app "
+    "down — otherwise it may publish the app again moments after this removes it."
+)
+_TAKEDOWN_DONE = (
+    "Your app is no longer running in production. Everything it holds — its chats, its data "
+    "and its files — is kept, and Publish again puts it back."
+)
+# Appended, never substituted: a take-down withdraws nothing, and an owner who has a version
+# waiting should not have to discover that by going to look.
+_TAKEDOWN_REVIEW_UNTOUCHED = " The version waiting for an administrator's review is untouched."
+
 # NOT "could not be removed" — see the route. `sweep_published_apps` names the ids that
 # SURVIVED, and a survivor collapses "ARM refused" together with "the delete is still running
 # past our ceiling", whose outcome `await_lro` documents as genuinely unknown. Claiming removal
 # failed would assert something nobody observed; this says only what is true, and points at the
 # retry that settles it either way (`delete_app` is idempotent, so retrying is safe in both).
 _TEARDOWN_UNCONFIRMED = "The takedown could not be confirmed. Retrying is safe and will settle it."
+
+
+async def _owned_app_row(
+    db: AsyncSession, *, project_id: uuid.UUID, user_id: uuid.UUID
+) -> AppRegistry | None:
+    """The caller's OWN registry row for this project, or `None`.
+
+    THE `user_id` PREDICATE LIVES HERE AND NOWHERE ELSE in this file. Four routes make this
+    read and each refuses a missing row differently — a 404, a `nothing_built` state, two
+    unlike 409s — so the answer is returned rather than raised; what must not be spelled four
+    times is the scoping, where a dropped predicate is a cross-user leak rather than a style
+    nit. The whole row, not `deploy_target`'s two-column projection: the ladder reads status,
+    the approval pin, the lineage and the rejection note."""
+    return (
+        await db.execute(
+            sa.select(AppRegistry).where(
+                AppRegistry.project_id == project_id,
+                AppRegistry.user_id == user_id,
+            )
+        )
+    ).scalar_one_or_none()
 
 
 @router.post(
@@ -257,16 +305,7 @@ async def deploy_project(
     # long after the response left. The invariant above covers that case unchanged.
     await owned_project_or_404(db, user.id, project_id)
 
-    # The full registry row, not `deploy_target`'s two-column projection: the ladder
-    # reads status, the approval pin, the lineage and the rejection note.
-    app_row = (
-        await db.execute(
-            sa.select(AppRegistry).where(
-                AppRegistry.project_id == project_id,
-                AppRegistry.user_id == user.id,
-            )
-        )
-    ).scalar_one_or_none()
+    app_row = await _owned_app_row(db, project_id=project_id, user_id=user.id)
     if app_row is None:
         # The SAME code `_shipping_head` raises below for the other "nothing saved"
         # site, and the same string the pipeline itself settles a `Deployment` row with
@@ -964,14 +1003,7 @@ async def latest_deployment(
     # case the row is for. An unconfigured store reads the same as one that raised.
     await owned_project_or_404(db, user.id, project_id)
 
-    app_row = (
-        await db.execute(
-            sa.select(AppRegistry).where(
-                AppRegistry.project_id == project_id,
-                AppRegistry.user_id == user.id,
-            )
-        )
-    ).scalar_one_or_none()
+    app_row = await _owned_app_row(db, project_id=project_id, user_id=user.id)
     if app_row is None:
         # The one `PublishState` member with no app row behind it at all — computed
         # here rather than in `compute_publish_state`, whose signature takes a
@@ -1029,6 +1061,295 @@ async def latest_deployment(
         saved_head=saved.head,
         saved_at=saved.saved_at,
         saved_state=saved.state,
+    )
+
+
+@router.post(
+    "/{project_id}/restart",
+    response_model=RestartStartedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found"),
+        (
+            409,
+            ErrorEnvelope,
+            "Never deployed (`never_deployed`), not currently serving (`not_live`), taken "
+            "offline by its owner (`taken_offline` — publish it again instead), disabled by "
+            "an administrator (`app_disabled`), or already deploying or restarting "
+            "(`deploy_in_flight`)",
+        ),
+        (503, ErrorEnvelope, "Publishing is not configured (`publishing_unavailable`)"),
+    ),
+)
+async def restart_project(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    service: OptionalDeployService,
+) -> RestartStartedResponse:
+    """Recycle the revision this app is ALREADY RUNNING — same version, same address, same
+    data. 202 with the id to poll, because an ARM long-running operation outlives the edge
+    gateway's twenty seconds.
+
+    IT CANNOT RUN A NEWER COMMIT, and that is the point rather than a detail: re-running the
+    deploy path against whatever is saved now would put work no reviewer has seen into
+    production, turning a convenience button into a way around the publish gate. It is also
+    not the control for an app that is OFF — a taken-down app is published again, which goes
+    through that gate."""
+    # THE ORDER IS THE POLICY, and it is the kill-switch's, one lever over: ownership first
+    # (a stranger gets the same non-leaking 404 a missing project does), then the environment
+    # (nothing to recycle where publishing was never configured), then the administrator's
+    # standing decision, then the in-flight guard, then the row that says what is live.
+    await owned_project_or_404(db, user.id, project_id)
+
+    if service is None:
+        raise AppApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE, code="publishing_unavailable"
+        )
+
+    app_row = await _owned_app_row(db, project_id=project_id, user_id=user.id)
+    if app_row is None:
+        raise AppApiError(status.HTTP_409_CONFLICT, _RESTART_NEVER_DEPLOYED, code="never_deployed")
+
+    # The administrator's other lever over the same container. `disable` also severs the
+    # app's database credential, so quietly restarting past it would hand back a container an
+    # administrator decided should not be serving.
+    if app_row.status is AppStatus.DISABLED:
+        raise AppApiError(status.HTTP_409_CONFLICT, _RESTART_DISABLED, code="app_disabled")
+
+    # Check-then-act, narrowing the window rather than closing it — `store.claim` below is the
+    # atomic guard, and this exists so the commonest case gets a sentence that names what is
+    # actually happening instead of the claim's generic one.
+    if await store.in_flight(db, app_id=app_row.id) is not None:
+        raise AppApiError(status.HTTP_409_CONFLICT, _BUSY_MSG, code="deploy_in_flight")
+
+    if await store.latest_for_app(db, app_id=app_row.id) is None:
+        raise AppApiError(status.HTTP_409_CONFLICT, _RESTART_NEVER_DEPLOYED, code="never_deployed")
+
+    # WHAT IS LIVE IS THE LAST ATTEMPT THAT PUBLISHED, NOT THE LAST ATTEMPT. A restart claims a
+    # row of its own, so a restart that fails or times out leaves a `failed` row newer than the
+    # container still serving — and reading the newest row here refused every retry with "this
+    # app isn't running", which is false about a container the lists are simultaneously showing
+    # as live. A restart failure is an ATTEMPT fact; only a publish is a production one.
+    #
+    # A missing digest belongs with the refusals rather than the guesses: without it the
+    # platform cannot name the image that is live, and composing one from a mutable tag is
+    # exactly the "newer bits" this route is written to prevent — which is why the read itself
+    # requires one rather than this branch testing for it afterwards.
+    row = await store.latest_published(db, app_id=app_row.id)
+    if row is None or row.image_digest is None:
+        raise AppApiError(status.HTTP_409_CONFLICT, _RESTART_NOT_LIVE, code="not_live")
+
+    # AND THE TAKEDOWN AXIS IS A COMPARISON, not a field on either end of it. The stamp lands on
+    # whichever row was newest when the owner pressed Take down, and attempts keep arriving after
+    # — so it can settle on a row that is neither the newest nor the published one, and testing
+    # either alone hands back a container its owner removed. Same collapse the lists make.
+    taken_down = await store.latest_takedown(db, app_id=app_row.id)
+    if taken_down is not None and taken_down >= row.id:
+        raise AppApiError(status.HTTP_409_CONFLICT, _RESTART_TAKEN_OFFLINE, code="taken_offline")
+
+    try:
+        started = await service.restart(
+            db,
+            user_id=user.id,
+            app_id=app_row.id,
+            project_id=project_id,
+            live=LiveRevision(image_digest=row.image_digest, head_sha=row.head_sha),
+        )
+    except DeployNotPossibleError as exc:
+        # Lost the race the in-flight check above only narrowed. Nothing was claimed, so
+        # nothing is audited — a refused press is not an action.
+        raise AppApiError(status.HTTP_409_CONFLICT, str(exc), code=exc.code) from None
+
+    await append_audit(
+        db,
+        actor_id=user.id,
+        action="restart",
+        resource_type="app",
+        resource_id=str(app_row.id),
+        detail={
+            "deploymentId": str(started.deployment_id),
+            "recycledFrom": str(row.id),
+            "projectId": str(app_row.project_id),
+            # WHICH VERSION CAME BACK. The rule this route exists to hold is "the commit
+            # already live, and no other", and a trail that does not name the commit cannot
+            # be used to check it after the fact.
+            "headSha": row.head_sha,
+            # Derived, like the kill-switch's: `container_app_name` is written after the
+            # provision returns, so a deploy that died inside that call leaves it NULL over a
+            # container that exists.
+            "containerAppName": published_app_name(app_row.id),
+        },
+    )
+    await db.commit()
+    _log.info(
+        "app_restart_started",
+        app_id=str(app_row.id),
+        deployment_id=str(started.deployment_id),
+        recycled_from=str(row.id),
+    )
+    return RestartStartedResponse(
+        deployment_id=str(started.deployment_id), app_id=str(app_row.id), status="running"
+    )
+
+
+@router.post(
+    "/{project_id}/takedown",
+    response_model=TakedownResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found"),
+        (
+            409,
+            ErrorEnvelope,
+            "Never deployed (`never_deployed`), or a deploy is running for this app "
+            "(`deploy_in_flight` — wait and retry)",
+        ),
+        (
+            503,
+            ErrorEnvelope,
+            "Publishing is not configured (`publishing_unavailable`, terminal), or the "
+            "takedown could not be confirmed (`teardown_unconfirmed` — retrying is safe)",
+        ),
+    ),
+)
+async def take_project_down(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    remover: OptionalPublishedAppRemover,
+) -> TakedownResponse:
+    """Take an owner's own app out of production. The container goes; the app row, its
+    per-project database, its Blob container, its chats and any version waiting for review
+    all stay, and publishing it again brings it back at the same URL.
+
+    NEITHER DELETE NOR THE ADMIN KILL-SWITCH, though it borrows the kill-switch's mechanism:
+    `disable` severs the app's database credential and is for an app that must be stopped,
+    while this keeps the data intact and is for an owner who is done serving it. It moves the
+    deployment's taken-offline axis and NEVER writes `AppStatus` — whether an app is in
+    production is a separate question from Draft / In review / Approved, so nothing here
+    returns to Approved and a version in the queue is not withdrawn.
+
+    IDEMPOTENT: an already-stamped attempt answers 200 and never touches Azure again."""
+    # THE ACCOUNTABILITY ROW IS COMMITTED BEFORE AZURE IS CALLED, for the reason the
+    # kill-switch documents at length: the ARM delete is bounded at five minutes behind an
+    # edge gateway that gives up at twenty seconds, so the failure mode is "this request never
+    # returns" — and a request that never returns cannot audit on its way out. What that row
+    # does NOT claim is that the container is gone; `unpublished_at` claims that, and only
+    # after the sweep comes back clean.
+    await owned_project_or_404(db, user.id, project_id)
+
+    if remover is None:
+        raise AppApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE, code="publishing_unavailable"
+        )
+
+    # No status check anywhere below: a draft, an approved and a pending app all leave
+    # production the same way, because that axis and the app's lifecycle are independent.
+    app_row = await _owned_app_row(db, project_id=project_id, user_id=user.id)
+    if app_row is None:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT, _TAKEDOWN_NEVER_DEPLOYED, code="never_deployed"
+        )
+    message = _TAKEDOWN_DONE
+    if app_row.status is AppStatus.PENDING:
+        message += _TAKEDOWN_REVIEW_UNTOUCHED
+
+    if await store.in_flight(db, app_id=app_row.id) is not None:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT, _TAKEDOWN_WHILE_DEPLOYING, code="deploy_in_flight"
+        )
+
+    row = await store.latest_for_app(db, app_id=app_row.id)
+    if row is None:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT, _TAKEDOWN_NEVER_DEPLOYED, code="never_deployed"
+        )
+
+    if row.unpublished_at is not None:
+        # Already down. No Azure call and no state change, so this branch cannot fail and
+        # does not audit.
+        return TakedownResponse(
+            app_id=str(app_row.id),
+            deployment_id=str(row.id),
+            unpublished_at=row.unpublished_at,
+            message=message,
+        )
+
+    _log.info("app_takedown_requested", app_id=str(app_row.id), deployment_id=str(row.id))
+    await append_audit(
+        db,
+        actor_id=user.id,
+        action="takedown",
+        resource_type="app",
+        resource_id=str(app_row.id),
+        detail={
+            "deploymentId": str(row.id),
+            "projectId": str(app_row.project_id),
+            "containerAppName": published_app_name(app_row.id),
+            "deploymentStatus": row.status.value,
+        },
+    )
+    await db.commit()
+
+    if await sweep_published_apps([app_row.id], client=remover):
+        # UNCONFIRMED, NOT FAILED: the sweep collapses a terminal ARM refusal and a delete
+        # still running past its ceiling into the same survivor entry, so this request only
+        # knows it did not OBSERVE a success. `unpublished_at` stays NULL — marking an app
+        # down that is still serving is the expensive direction of that ambiguity — and a
+        # retry re-attempts an idempotent delete and settles it either way.
+        _log.warning("app_takedown_unconfirmed", app_id=str(app_row.id), deployment_id=str(row.id))
+        await append_audit(
+            db,
+            actor_id=user.id,
+            action="takedown:unconfirmed",
+            resource_type="app",
+            resource_id=str(app_row.id),
+            detail={"deploymentId": str(row.id), "reason": "teardown_unconfirmed"},
+        )
+        await db.commit()
+        raise AppApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            _TEARDOWN_UNCONFIRMED,
+            code="teardown_unconfirmed",
+        )
+
+    now = datetime.now(UTC)
+    if not await store.unpublish(db, row.id, at=now):
+        # Either another caller stamped this row while we were in ARM, or the row is gone —
+        # a concurrent app delete cascades `deployments` away, and the window since the
+        # pre-sweep commit is minutes wide. `db.get(..., populate_existing=True)`, never
+        # `db.refresh(row)`: refresh raises on a vanished row and would surface as a 500 on a
+        # request whose teardown actually succeeded.
+        current = await db.get(Deployment, row.id, populate_existing=True)
+        if current is None:
+            _log.info("app_takedown_app_deleted_mid_flight", app_id=str(app_row.id))
+            raise AppApiError(status.HTTP_404_NOT_FOUND, "Application not found.")
+        # Lost the race; the other caller's timestamp is what is on record, so report that
+        # rather than this call's own unwritten one. Still a 200 — the world is as the owner
+        # asked for it to be, and the repeat-click branch above answers 200 for exactly this
+        # state.
+        settled_at = current.unpublished_at or now
+        await db.commit()
+        return TakedownResponse(
+            app_id=str(app_row.id),
+            deployment_id=str(row.id),
+            unpublished_at=settled_at,
+            message=message,
+        )
+
+    await db.commit()
+    _log.info("app_taken_down", app_id=str(app_row.id), deployment_id=str(row.id))
+    return TakedownResponse(
+        app_id=str(app_row.id),
+        deployment_id=str(row.id),
+        unpublished_at=now,
+        message=message,
     )
 
 

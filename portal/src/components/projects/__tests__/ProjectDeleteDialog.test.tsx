@@ -55,7 +55,7 @@ describe('ProjectDeleteDialog — confirm gating', () => {
 
     expect(await screen.findByText(/all 2 chats/i)).toBeTruthy()
 
-    const confirmBtn = screen.getByRole('button', { name: /delete project/i })
+    const confirmBtn = screen.getByRole('button', { name: /delete application/i })
     const reason = screen.getByLabelText(/why are you deleting/i)
 
     expect(confirmBtn.hasAttribute('disabled')).toBe(true) // nothing written yet
@@ -115,7 +115,7 @@ describe('ProjectDeleteDialog — confirm gating', () => {
     expect(screen.queryByLabelText(/type the project name/i)).toBeNull()
     // Liveness, so the absence above means something.
     expect(screen.getByLabelText(/why are you deleting/i)).toBeTruthy()
-    expect(screen.getByText(/are you sure you want to delete this project/i)).toBeTruthy()
+    expect(screen.getByText(/are you sure you want to delete this application/i)).toBeTruthy()
   })
 
   it('says what happens to the reason, and does not overpromise who reads it', async () => {
@@ -136,7 +136,7 @@ describe('ProjectDeleteDialog — confirm gating', () => {
     h.listProjectConversations.mockResolvedValue([])
     render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
 
-    const confirmBtn = screen.getByRole('button', { name: /delete project/i })
+    const confirmBtn = screen.getByRole('button', { name: /delete application/i })
     const reason = screen.getByLabelText(/why are you deleting/i)
     const words = (n: number) => Array.from({ length: n }, (_, i) => `w${i}`).join(' ')
 
@@ -212,14 +212,14 @@ describe('ProjectDeleteDialog — the count must never overstate certainty', () 
 })
 
 describe('ProjectDeleteDialog — the irreversible warning', () => {
-  const WARNING = /the database and files behind the app are destroyed permanently/i
+  const WARNING = /the database and files behind it are destroyed permanently/i
 
   it('warns about the database on the zero-chat branch, which names nothing else', async () => {
     // The branch that matters most: a project owns its own database from creation, before an app
     // or a single chat, so a project with no chats can still be holding everything ever stored.
     h.listProjectConversations.mockResolvedValue([])
     render(<ProjectDeleteDialog project={project} onClose={vi.fn()} onConfirm={vi.fn()} />)
-    expect(await screen.findByText(/This deletes the project and its app\./i)).toBeTruthy()
+    expect(await screen.findByText(/This deletes the application\./i)).toBeTruthy()
     expect(screen.getByText(WARNING)).toBeTruthy()
   })
 

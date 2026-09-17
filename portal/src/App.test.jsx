@@ -33,7 +33,6 @@ const { page } = vi.hoisted(() => ({
   page: (name) => ({ default: () => <div data-testid={name} /> }),
 }))
 vi.mock('./pages/LoginPage', () => page('login'))
-vi.mock('./pages/HelpPage', () => page('help'))
 vi.mock('./pages/AdminPage', () => page('admin'))
 vi.mock('./pages/ProjectsPage', () => page('projects'))
 // THE TWO WORKSPACE STUBS CARRY LINKS, so the shell's persistence claim is driven the way the
@@ -72,11 +71,13 @@ vi.mock('./pages/ChatRoute', async () => {
     },
   }
 })
-// The shell itself is REAL — it is the subject. Only its navbar is stubbed, because the navbar
-// reads a session and a usage meter this file has neither of, and counting page frames does not
-// need the real one. It renders a marker so "exactly one navbar per address" stays assertable.
-vi.mock('./components/layout/Navbar', () => ({
-  default: () => <div data-testid="navbar" />,
+// The WORKSPACE shell is REAL — it is this file's subject. The navigation shell around it is
+// stubbed, because it reads a session, a usage meter and an admin count this file has none of,
+// and counting page frames does not need the real one. `AppShell.test.tsx` is where its own
+// behaviour is asserted. It renders a marker, and its children, so "exactly one frame per
+// address" stays assertable and every routed page still mounts inside it.
+vi.mock('./components/layout/AppShell', () => ({
+  default: ({ children }) => <div data-testid="app-shell">{children}</div>,
 }))
 
 import App from './App'
@@ -187,15 +188,15 @@ describe('App — the workspace shell is one element across a move inside a proj
     expect(screen.getByTestId('chat-route').textContent).toBe('in-project-b')
   })
 
-  it('renders exactly one navbar and one frame at each address — no second page frame inside the outlet', () => {
-    // The regression this catches is the obvious one: a surface that kept its own root and navbar
-    // after the shell grew them, so the workspace paints two bars and two frames.
+  it('renders exactly one navigation frame and one workspace frame at each address', () => {
+    // The regression this catches is the obvious one: a surface that kept a frame of its own
+    // after the shell grew one, so the workspace paints two.
     renderAt('/projects/p1')
-    expect(screen.getAllByTestId('navbar')).toHaveLength(1)
+    expect(screen.getAllByTestId('app-shell')).toHaveLength(1)
     expect(screen.getAllByTestId('workspace-grid')).toHaveLength(1)
 
     goTo('/chat/abc')
-    expect(screen.getAllByTestId('navbar')).toHaveLength(1)
+    expect(screen.getAllByTestId('app-shell')).toHaveLength(1)
     expect(screen.getAllByTestId('workspace-grid')).toHaveLength(1)
   })
 })
@@ -224,7 +225,7 @@ describe('App — the auth guard sits ABOVE the shell', () => {
 
     expect(wait()).toBeTruthy()
     expect(shell()).toBeNull()
-    expect(screen.queryByTestId('navbar')).toBeNull()
+    expect(screen.queryByTestId('app-shell')).toBeNull()
     expect(screen.queryByTestId(pageId)).toBeNull()
   })
 
@@ -236,7 +237,7 @@ describe('App — the auth guard sits ABOVE the shell', () => {
     await waitFor(() => expect(screen.getByTestId('login')).toBeTruthy())
 
     expect(shell()).toBeNull()
-    expect(screen.queryByTestId('navbar')).toBeNull()
+    expect(screen.queryByTestId('app-shell')).toBeNull()
     expect(screen.queryByTestId('chat-route')).toBeNull()
   })
 })
@@ -259,13 +260,43 @@ describe('the welcome page is gone — its old addresses now land on the project
 describe('App — addresses outside a project get no workspace frame', () => {
   it.each([
     ['/projects', 'projects'],
-    ['/help', 'help'],
+    ['/admin', 'admin'],
   ])('%s renders its page with no shell around it', (path, testId) => {
     // The layout wraps the two addresses INSIDE a project and nothing else. A projects index or a
     // dashboard inside the workspace frame would hold a pane for a project the user has left.
     renderAt(path)
     expect(screen.getByTestId(testId)).toBeTruthy()
     expect(shell()).toBeNull()
+  })
+
+  it('/shared-applications is its own address, with its own page', () => {
+    // Which list is on screen is the ADDRESS rather than a control on the page, so that the
+    // navigation has one entry per list and a pasted link lands every reader on their OWN
+    // shared applications. It is a PAGE of its own now, not the owner list under another
+    // pathname — so the two cannot come to disagree about what a row offers.
+    renderAt('/shared-applications')
+    expect(screen.getByTestId('shared-applications')).toBeTruthy()
+    expect(screen.queryByTestId('projects')).toBeNull()
+    expect(shell()).toBeNull()
+  })
+
+  it('★ /integrations resolves — it was a dialog with two doors and no address', () => {
+    // Nobody could link to it, and neither door was reachable from the other's screen. One
+    // route, outside the workspace frame, like every other list address.
+    renderAt('/integrations')
+    expect(screen.getByTestId('integrations-page')).toBeTruthy()
+    expect(shell()).toBeNull()
+  })
+})
+
+describe('the Help page is gone, and its address with it', () => {
+  it('/help no longer resolves — it falls through to the catch-all', () => {
+    // The five-link removal's last link: not merely "the component is deleted" but "the address
+    // answers nothing". A route left behind rendering an empty element would pass a component
+    // test and still ship a dead entry in the product.
+    renderAt('/help')
+    expect(screen.getByTestId('login')).toBeTruthy()
+    expect(window.location.pathname).toBe('/login')
   })
 })
 

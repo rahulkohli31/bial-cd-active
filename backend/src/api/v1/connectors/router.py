@@ -1,14 +1,14 @@
 """The citizen's connectors: what the registry offers, where they stand, what each project reads.
 
 TWO ROUTERS, TWO MOUNT POINTS, ONE DOMAIN. `router` hangs off `/v1/connectors` and answers for
-the PERSON — the catalogue, their state, asking, withdrawing the ask, and the drill-down list of
-their own projects. `project_router` hangs off `/v1/projects/{project_id}/connectors` and answers
-for the PROJECT — which connectors it reads and over which days. `ConnectorStates` draws the two
-as separate state machines and says why: an administrator answers once, about a person, and after
-that a project only ever answers "switched on here?" and "how far back?".
+the PERSON — the catalogue, their state, asking, and withdrawing the ask. `project_router` hangs
+off `/v1/projects/{project_id}/connectors` and answers for the PROJECT — which connectors it
+reads and over which days. `ConnectorStates` draws the two as separate state machines and says
+why: an administrator answers once, about a person, and after that a project only ever answers
+"switched on here?" and "how far back?".
 
 THE OWNERSHIP CHECK A REVIEWER SHOULD BE ABLE TO MAKE BY READING TOP TO BOTTOM. There is no
-cross-user read among these six routes. Every statement that touches `connector_access_requests`
+cross-user read among these five routes. Every statement that touches `connector_access_requests`
 carries `user_id == user.id` in its WHERE clause, and every statement that touches
 `project_connectors` reaches it through a join on `projects` whose `user_id` predicate is in the
 same clause (that table deliberately carries no `user_id` of its own — `projects` is its
@@ -46,8 +46,7 @@ from src.api.v1.connectors.schemas import (
     AccessRequestBody,
     ConnectorEntry,
     ConnectorListResponse,
-    ConnectorProjectEntry,
-    ConnectorProjectListResponse,
+    ConnectorOnProject,
     ConnectorWindow,
     ConsentLine,
     ProjectConnectorEntry,
@@ -122,27 +121,63 @@ def _known_connector(connector_key: str) -> Connector:
     return CONNECTORS[connector_key]
 
 
-async def _on_project_count(db: DbSession, user_id: uuid.UUID, connector_key: str) -> int:
-    """How many of this person's projects have the connector switched on — `On in 2 projects ›`.
+# HOW MANY OF THEM THE DISCLOSURE WILL ACTUALLY DRAW. Nothing about the switch bounds this:
+# one row per project a person has turned the connector on for, in a response that is otherwise
+# a fixed handful of registry strings. The number on the card is a COUNT rather than this list's
+# length, so the cap shortens the list without ever making the card lie about the total — and a
+# client that receives fewer rows than the count can say so.
+_ON_PROJECTS_CAP: Final = 200
+
+
+async def _on_projects(
+    db: DbSession, user_id: uuid.UUID, connector_key: str
+) -> list[ConnectorOnProject]:
+    """This person's projects with the connector switched on — the Integrations card's
+    disclosure, capped at `_ON_PROJECTS_CAP`. The number on the card is `_on_project_count`.
 
     Scoped through `projects`, which is `project_connectors`' ownership anchor: the `user_id`
-    predicate is on the join target, and dropping it would count every citizen's projects.
+    predicate is on the join target, and dropping it would list every citizen's projects.
 
-    COUNTING `enabled` IS COUNTING EFFECTIVE STATE HERE, and only here. Effective on is
-    `enabled AND the owner is approved` (`core.connectors.resolve_window`), and this
-    number is rendered on the APPROVED row only — the second conjunct is already true for every
-    row it counts. It is not a licence to read `enabled` and call it "on" anywhere else."""
-    counted = await db.scalar(
+    THE FILTER IS `enabled` AND DELIBERATELY NOT EFFECTIVE STATE. Effective on is
+    `enabled AND the owner is approved` (`core.connectors.resolve_window`); folding approval in
+    here would make a withdrawn grant silently empty this list while the projects it named still
+    read the connector's switch as up. The card's `state` is the one place the person-level fact
+    is stated, so the rows stay and say what they are.
+
+    Newest project first — `id` is a UUIDv7 — the order the projects listing uses, so the same
+    projects do not reshuffle between screens."""
+    rows = await db.execute(
+        sa.select(Project.id, Project.name)
+        .join(ProjectConnector, ProjectConnector.project_id == Project.id)
+        .where(
+            Project.user_id == user_id,
+            ProjectConnector.connector_key == connector_key,
+            ProjectConnector.enabled.is_(True),
+        )
+        .order_by(Project.id.desc())
+        .limit(_ON_PROJECTS_CAP)
+    )
+    return [
+        ConnectorOnProject(project_id=project_id, name=name) for project_id, name in rows.all()
+    ]
+
+
+async def _on_project_count(db: DbSession, user_id: uuid.UUID, connector_key: str) -> int:
+    """How many there are, which is NOT the length of the list above once the cap bites.
+
+    Read only where it is sent — an approved person — because it is the only state whose card
+    carries the number."""
+    total = await db.scalar(
         sa.select(sa.func.count())
-        .select_from(ProjectConnector)
-        .join(Project, Project.id == ProjectConnector.project_id)
+        .select_from(Project)
+        .join(ProjectConnector, ProjectConnector.project_id == Project.id)
         .where(
             Project.user_id == user_id,
             ProjectConnector.connector_key == connector_key,
             ProjectConnector.enabled.is_(True),
         )
     )
-    return int(counted or 0)
+    return int(total or 0)
 
 
 def _consent_lines(connector: Connector) -> list[ConsentLine]:
@@ -168,6 +203,9 @@ async def _entry(
     of that rule, correct only for as long as nobody adds a fifth status."""
     access = await current_access(db, user_id=user_id, connector_key=connector_key)
     state = access.state
+    # Read in every state, because it is a fact about the projects rather than about the person
+    # — see `ConnectorEntry.on_projects`. Only the COUNT beside it is state-conditional.
+    on_projects = await _on_projects(db, user_id, connector_key)
     if state is ConnectorPersonState.NEVER_ASKED:
         return ConnectorEntry(
             key=connector_key,
@@ -176,6 +214,7 @@ async def _entry(
             ask_subtitle=connector.ask_subtitle,
             consent_lines_requester=_consent_lines(connector),
             state=state,
+            on_projects=on_projects,
         )
 
     row = access.request
@@ -197,6 +236,7 @@ async def _entry(
         asked_at=asked_at,
         approved_at=row.decided_at if approved else None,
         approved_by_name=access.decided_by_name if approved else None,
+        on_projects=on_projects,
         on_project_count=(
             await _on_project_count(db, user_id, connector_key) if approved else None
         ),
@@ -216,7 +256,12 @@ async def list_connectors(user: CurrentUser, db: DbSession) -> ConnectorListResp
     `askedAt` while you wait, `approvedAt` / `approvedByName` / `onProjectCount` once an
     administrator has said yes, and `decidedAt` / `decidedByName` / `decisionRemarks` if they
     said no. Access is granted to a PERSON, so one answer covers every project you own,
-    including the ones you have not made yet."""
+    including the ones you have not made yet.
+
+    `onProjects` rides this same read rather than a second route — a card and its disclosure are
+    one round trip, and there is no second endpoint to keep in step. It names the projects with
+    the connector switched on, and that is ALL it names: no record counts, no last-read dates,
+    no windows. This read says who may reach the data, never what was read or for how long."""
     return ConnectorListResponse(
         connectors=[
             await _entry(db, user.id, key, connector) for key, connector in CONNECTORS.items()
@@ -342,13 +387,11 @@ async def cancel_access_request(
 
 
 # A SECOND ROUTER IN THE SAME MODULE, and the mount points are why. Everything above hangs off
-# `/v1/connectors` because access belongs to the PERSON. Two of the three routes below hang off
+# `/v1/connectors` because access belongs to the PERSON. The two routes below hang off
 # `/v1/projects/{project_id}/connectors` instead, because the switch and the days belong to the
 # PROJECT (`ConnectorStates`: `Access is yours. The days are the project's.`). One `APIRouter`
 # cannot carry two prefixes, and splitting the file would put one domain's five routes and its
-# shared `_known_connector` in two places. The third — the drill-down list of the caller's own
-# projects — stays on `router`: it is reached from the person's connector row, keys on nothing
-# but `user_id`, and names no project in its path.
+# shared `_known_connector` in two places.
 #
 # THE OWNERSHIP CLAIM EXTENDS UNCHANGED. `project_connectors` carries no `user_id` of its own —
 # `projects` is its ownership anchor — so every statement below reaches it through a join on
@@ -360,20 +403,12 @@ async def cancel_access_request(
 
 project_router = APIRouter(prefix="/projects/{project_id}/connectors", tags=["connectors"])
 
-# How many of the caller's projects one drill-down returns. NOTHING BOUNDS A CITIZEN'S PROJECT
-# COUNT — `projects/router.py` pages its own listing at 25 and no per-user cap exists anywhere in
-# this tree — so "a citizen's project list is short" is an assumption, not a fact. Same cap and
-# same sentinel-row shape as the admin registry listing, and reported rather than hidden:
-# `ConnectorProjectListResponse.truncated` says when it bit. Declared here rather than imported
-# from the admin router, which is a superadmin surface a citizen route should not depend on.
-LISTING_CAP = 200
-
 # The three presets the `DateRange` popover draws, in the board's order. They are the OFFER, not
 # the rule: `_offered_days` filters them against the connector's own retention before any of them
 # reaches a row. See that function for why the filter is not decoration.
 _BOARD_PRESET_DAYS: Final = (7, 14, 30)
 
-_PROJECT_NOT_FOUND = "Project not found."
+_PROJECT_NOT_FOUND = "Application not found."
 _NEEDS_APPROVAL = "You do not have access to {name} yet. Ask for it under Integrations."
 
 # `resolve_window` answers `None` for exactly one input — a missing row — so a `None` beside a row
@@ -604,7 +639,6 @@ async def list_project_connectors(
     # `populate_existing`: this router's upsert is an INSERT, so — unlike an ORM-enabled UPDATE
     # — it does not synchronise the session's identity map. A read that follows a write in the
     # SAME session must take the database's values, never a stale in-session copy of the row.
-    # The drill-down read says the same thing for the same reason.
     rows = (
         await db.execute(
             sa.select(ProjectConnector)
@@ -625,71 +659,6 @@ async def list_project_connectors(
             )
             for key, connector in CONNECTORS.items()
         ]
-    )
-
-
-@router.get(
-    "/{connector_key}/projects",
-    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "No such connector")),
-)
-async def list_connector_projects(
-    connector_key: str, user: CurrentUser, db: DbSession
-) -> ConnectorProjectListResponse:
-    """Every project you own, with this connector's switch and days in each one.
-
-    Newest project first. A project you have never switched this connector on in is present with
-    `enabled: false` and a `null` window — the list is your projects, not your switches, because
-    switching one on is the whole point of opening it.
-
-    Capped at 200 projects. `truncated` is `true` when you own more than that, and the ones past
-    the cap are reachable by narrowing the list rather than by paging.
-
-    Having NO projects is a 200 and an empty list, never a 404 — an administrator can approve
-    somebody before they have made anything, and the grant runs forward from there."""
-    connector = _known_connector(connector_key)
-    # ONE access read for the whole list. Access belongs to the PERSON, so the answer is the same
-    # for every row — reading it per project would be N identical queries and N chances for two
-    # rows in one response to disagree about whether their owner is approved.
-    access = await current_access(db, user_id=user.id, connector_key=connector_key)
-
-    rows = (
-        await db.execute(
-            sa.select(Project.id, Project.name, ProjectConnector)
-            # The connector predicate belongs in the JOIN, not the WHERE: in the WHERE it would
-            # turn this outer join back into an inner one and drop every project the citizen has
-            # not switched this connector on in — which is most of them, and exactly the rows
-            # the panel exists to offer a switch for.
-            .outerjoin(
-                ProjectConnector,
-                sa.and_(
-                    ProjectConnector.project_id == Project.id,
-                    ProjectConnector.connector_key == connector_key,
-                ),
-            )
-            .where(Project.user_id == user.id)
-            # `id` is a UUIDv7, so this is newest-first — the same order and the same expression
-            # the projects listing itself uses, so the panel does not reorder somebody's projects
-            # depending on which screen they opened them from.
-            .order_by(Project.id.desc())
-            # One past the cap: the extra row is never projected, it only answers "is there
-            # more?" without a second COUNT query.
-            .limit(LISTING_CAP + 1)
-            .execution_options(populate_existing=True)
-        )
-    ).all()
-    truncated = len(rows) > LISTING_CAP
-
-    return ConnectorProjectListResponse(
-        projects=[
-            ConnectorProjectEntry(
-                project_id=project_id,
-                name=name,
-                enabled=stored is not None and stored.enabled,
-                window=_resolved(connector, stored, access.request_status)[1],
-            )
-            for project_id, name, stored in rows[:LISTING_CAP]
-        ],
-        truncated=truncated,
     )
 
 

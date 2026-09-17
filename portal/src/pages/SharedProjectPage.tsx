@@ -18,7 +18,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, RefreshCw } from 'lucide-react'
-import Navbar from '../components/layout/Navbar'
 import { BusyGlyph } from '../components/ui/Waiting'
 import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { getProject } from '../utils/projectApi'
@@ -68,8 +67,10 @@ export default function SharedProjectPage(): React.JSX.Element {
   const [step, setStep] = useState<HandoverStep | null>(null)
   const [resolving, setResolving] = useState(false)
 
+  // BACK TO THE LIST THIS READER CAME FROM, which is Shared Applications — a recipient bounced
+  // off a share that no longer exists has no business landing on somebody else's owned list.
   const bounceGone = useCallback(
-    () => navigate('/projects', { replace: true, state: { notice: PROJECT_GONE_NOTICE } }),
+    () => navigate('/shared-applications', { replace: true, state: { notice: PROJECT_GONE_NOTICE } }),
     [navigate],
   )
 
@@ -79,7 +80,7 @@ export default function SharedProjectPage(): React.JSX.Element {
   // 404 the resolver already gives every other reader gives the same answer to both.
   useEffect(() => {
     if (!projectId) {
-      navigate('/projects', { replace: true })
+      navigate('/shared-applications', { replace: true })
       return
     }
     let active = true
@@ -100,7 +101,7 @@ export default function SharedProjectPage(): React.JSX.Element {
           bounceGone()
           return
         }
-        setProjectError(err instanceof Error ? err.message : 'Could not load this project.')
+        setProjectError(err instanceof Error ? err.message : 'Could not load this application.')
       }
     })()
     return () => {
@@ -129,7 +130,7 @@ export default function SharedProjectPage(): React.JSX.Element {
           setBlocked(reclaim)
           return
         }
-        setLaunchError(err instanceof Error ? err.message : 'Could not open this shared project.')
+        setLaunchError(err instanceof Error ? err.message : 'Could not open this shared application.')
       })
       .finally(() => setLaunching(false))
   }, [projectId])
@@ -161,7 +162,7 @@ export default function SharedProjectPage(): React.JSX.Element {
           setBlocked(reclaim)
           return
         }
-        setLaunchError(err instanceof Error ? err.message : 'Could not refresh this shared project.')
+        setLaunchError(err instanceof Error ? err.message : 'Could not refresh this shared application.')
       })
       .finally(() => setRefreshing(false))
   }, [projectId])
@@ -209,23 +210,25 @@ export default function SharedProjectPage(): React.JSX.Element {
   const busy = launching || refreshing
 
   return (
-    <div className="min-h-screen font-manrope flex flex-col bg-bial-bg">
-      <Navbar />
+    <div className="min-h-full font-manrope flex flex-col bg-bial-bg">
 
       <div className="flex items-center gap-3 px-6 py-3 border-b border-bial-border bg-white">
         <button
           type="button"
-          onClick={() => navigate('/projects')}
+          // BACK TO THE LIST THIS CAME FROM. A recipient reaches this page from Shared
+          // Applications and owns nothing on it; sending them to their own list is not "back",
+          // it is being put somewhere else.
+          onClick={() => navigate('/shared-applications')}
           className="flex items-center gap-1 text-sm text-neutral hover:text-primary transition flex-shrink-0"
         >
-          <ArrowLeft size={15} /> Back to projects
+          <ArrowLeft size={15} /> Back to Shared Applications
         </button>
         <h1 className="text-sm font-bold text-tertiary truncate min-w-0">
-          {project?.name || 'Shared project'}
+          {project?.name || 'Shared application'}
         </h1>
         {/* "Can use", never "view only" — Key Decision 3. What this recipient has is not a
-            read-only preview; anything they enter here is saved into the project's real data,
-            exactly as the share panel that granted it says. */}
+            read-only preview; anything they enter here is saved into the project's real data.
+            This is the only surface that says so, so it says it plainly. */}
         <span className="flex-shrink-0 text-[10px] font-bold uppercase tracking-wide text-neutral bg-bial-bg px-2 py-0.5 rounded-full border border-bial-border">
           Can use
         </span>
@@ -255,7 +258,7 @@ export default function SharedProjectPage(): React.JSX.Element {
         {projectError !== null ? (
           <div className="flex-1 flex items-center justify-center p-6">
             <div className="bg-white border border-danger/20 rounded-2xl py-16 px-6 text-center max-w-md">
-              <p className="text-sm font-semibold text-tertiary">Couldn’t load this project</p>
+              <p className="text-sm font-semibold text-tertiary">Couldn’t load this application</p>
               <p className="text-xs text-neutral mt-1">{projectError}</p>
             </div>
           </div>
@@ -285,7 +288,7 @@ export default function SharedProjectPage(): React.JSX.Element {
         ) : preview !== null && preview.ready ? (
           <iframe
             key={`${preview.previewUrl}#${frameNonce}`}
-            title={project?.name || 'Shared project'}
+            title={project?.name || 'Shared application'}
             src={preview.previewUrl}
             className="flex-1 w-full border-0"
           />

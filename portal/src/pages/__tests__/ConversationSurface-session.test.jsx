@@ -67,7 +67,6 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
   fetchPreviewState: (...a) => h.fetchPreviewState(...a),
   relaunchPreview: (...a) => h.relaunchPreview(...a),
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 // `switchMode` is GONE from this list: the route it posted to no longer exists, and a
 // chat's kind can't change after creation, so there is nothing left for a mock to intercept.

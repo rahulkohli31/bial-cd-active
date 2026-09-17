@@ -17,7 +17,7 @@
  * bad app must not blank it for the org. This list is the WHOLE of what Integrations offers and it
  * has one entry today: dropping the only row would render "nothing is connected", which is a
  * different and false statement, and the state is what selects which sentence and which control a
- * row draws. So a row we cannot read is a contract break and throws — the dialog already has an
+ * card draws. So a row we cannot read is a contract break and throws — the page already has an
  * error-and-retry state, and it is the honest one.
  */
 import { ApiError, isRecord, optionalCount, optionalString, readApiError, requiredString } from './apiError'
@@ -41,6 +41,19 @@ export type ConnectorState = 'neverAsked' | 'pending' | 'approved' | 'declined'
 export interface ConsentLine {
   lead: string
   body: string
+}
+
+/**
+ * One application behind the Integrations card's disclosure: a name, and nothing else.
+ *
+ * NO WINDOW, NO RECORD COUNT, NO LAST-READ DATE — the page states who may read the data, never
+ * what was read or for how long. No `enabled` either: every application on this list has the
+ * switch up, which is the list's whole definition, so a field that is always `true` would be a
+ * second and weaker statement of it.
+ */
+export interface ConnectorOnProject {
+  projectId: string
+  name: string
 }
 
 /**
@@ -84,6 +97,17 @@ export interface ConnectorEntry {
    * answers and only one of them belongs on a row with no access.
    */
   onProjectCount: number | null
+  /**
+   * The caller's own applications with this connector switched on — the card's disclosure,
+   * listed rather than counted.
+   *
+   * PRESENT IN EVERY STATE, because it is a fact about the applications and not about the
+   * person: it filters on each application's own switch alone. So a withdrawn grant leaves
+   * those applications listed while the card's access pill is the one place saying the
+   * person-level access is gone — rows disappearing instead would leave the page silently short
+   * for a reason it never gives.
+   */
+  onProjects: readonly ConnectorOnProject[]
   /** `declined` only. */
   decidedAt: string | null
   decidedByName: string | null
@@ -96,16 +120,10 @@ const CONNECTORS_CHANGED = 'bial:connectors-changed'
 /**
  * SAY THAT A CONNECTOR WRITE HAPPENED, so every surface showing that fact can look again.
  *
- * WHY A SIGNAL AND NOT A PROP. `IntegrationsDialog` has TWO doors — the profile menu, which is on
- * every authed screen, and `Manage integrations →` in the workspace rail — and the drill-down
- * inside it can switch the connector on or off for the very project the rail is describing. Only
- * the rail's own door knew to re-read when it closed, so opening the same dialog from the avatar
- * menu left the rail asserting `Reading 30 days of flight data` about a project that had just
- * been switched off, until the citizen navigated away and back.
- *
- * Wiring the second door to the first door's callback would fix that one pair and leave the next
- * mount site to rediscover it. The invalidation belongs to whoever knows a write occurred, which
- * is the dialog — not to whichever component happened to open it.
+ * WHY A SIGNAL AND NOT A PROP. An administrator's decision and a citizen's own ask are written on
+ * different screens from the ones that render the result, and a callback wired between one pair
+ * of them leaves the next mount site to rediscover the problem. The invalidation belongs to
+ * whoever knows a write occurred, not to whichever component happened to be looking.
  *
  * This is the `notifyUsageChanged` / `onUsageChanged` idiom already shipping in `utils/usage.ts`,
  * for the same reason: a bare signal, no payload, best-effort. Listeners re-read from the server
@@ -156,7 +174,7 @@ function readState(value: unknown): ConnectorState {
  * is still legible, but a connector that promises nothing is not a thinner panel — it is a
  * consent box with a heading and no consent under it. Dropping a malformed LINE would be worse
  * still, leaving two of three promises on screen with nothing admitting the third went missing.
- * Both land in the dialog's error-and-retry state, which is honest.
+ * Both land in the page's error-and-retry state, which is honest.
  */
 export function readConsentLines(
   value: unknown,
@@ -171,6 +189,26 @@ export function readConsentLines(
     return {
       lead: requiredString(row.lead, subject, `${field}.lead`),
       body: requiredString(row.body, subject, `${field}.body`),
+    }
+  })
+}
+
+/**
+ * The applications behind the disclosure, or a throw.
+ *
+ * AN ABSENT ARRAY IS A BREAK, NOT AN EMPTY LIST, for the reason the envelope below gives: "no
+ * application has this switched on" is a sentence the page says out loud, and reading it off a
+ * field the server never sent would make that statement on its behalf.
+ */
+function readOnProjects(value: unknown): readonly ConnectorOnProject[] {
+  if (!Array.isArray(value)) {
+    throw new ApiError('The server sent an integrations list we could not read.', 500)
+  }
+  return value.map((entry: unknown) => {
+    const row = isRecord(entry) ? entry : {}
+    return {
+      projectId: readString(row.projectId, 'onProjects.projectId'),
+      name: readString(row.name, 'onProjects.name'),
     }
   })
 }
@@ -193,6 +231,7 @@ function toEntry(value: unknown): ConnectorEntry {
     approvedAt: optionalString(row.approvedAt),
     approvedByName: optionalString(row.approvedByName),
     onProjectCount: optionalCount(row.onProjectCount),
+    onProjects: readOnProjects(row.onProjects),
     decidedAt: optionalString(row.decidedAt),
     decidedByName: optionalString(row.decidedByName),
     decisionRemarks: optionalString(row.decisionRemarks),
@@ -251,7 +290,8 @@ export async function requestConnectorAccess(
 /**
  * Withdraw your own waiting request. Only a request still waiting can be withdrawn — one an
  * administrator has already answered is refused with `409 nothing_pending` rather than silently
- * accepted. Returns the connector in its new state.
+ * accepted, so a press that lost the race says so instead of reporting a success that did
+ * nothing. Returns the connector in its new state.
  */
 export async function cancelConnectorRequest(
   connectorKey: string,
@@ -294,10 +334,9 @@ export interface StoredWindow {
 /**
  * The days one project reads from one connector RIGHT NOW, as `resolve_window` answered.
  *
- * EVERY FIELD IS AN ANSWER, NOT AN INPUT. `start`, `end` and `days` are post-clamp, so the
- * chip and the rail's `Reading N days of flight data` are the same numbers from the same
- * emitter. Nothing in this portal recomputes any of them, and `ConnectorProjectsPanel.test.tsx`
- * feeds a resolved window deliberately inconsistent with its stored pair to prove it.
+ * EVERY FIELD IS AN ANSWER, NOT AN INPUT. `start`, `end` and `days` are post-clamp, so the chip
+ * and the `Reading N days of flight data` sentence beside it are the same numbers from the same
+ * emitter. Nothing in this portal recomputes any of them.
  *
  * `earliestDate` AND `latestDate` ARE WHY THE GRID CAN GREY HONESTLY. A browser in Bangalore and
  * a server in UTC are 5½ hours apart, so a calendar that worked out its own floor would offer a
@@ -321,26 +360,6 @@ export interface ConnectorWindow {
   stored: StoredWindow
 }
 
-/** One of the caller's projects, on the drill-down list behind an approved connector row. */
-export interface ConnectorProjectEntry {
-  projectId: string
-  name: string
-  enabled: boolean
-  /** `null` for a project this connector was never switched on in — there is no window to draw. */
-  window: ConnectorWindow | null
-}
-
-/**
- * Every project the caller owns for one connector, and whether that IS all of them.
- *
- * `truncated` is not decoration: nothing bounds a citizen's project count, the server stops at
- * 200, and a silent prefix would be a list that lies about being the whole list.
- */
-export interface ConnectorProjectList {
-  projects: ConnectorProjectEntry[]
-  truncated: boolean
-}
-
 /**
  * What a citizen picks in the popover — the server's discriminated `WindowChoice`.
  *
@@ -352,8 +371,8 @@ export type WindowChoice =
   | { kind: 'absolute'; start: string; end: string }
 
 /**
- * One registry connector as ONE PROJECT sees it — the rail's DATA row, and the answer every
- * write returns.
+ * One registry connector as ONE APPLICATION sees it — the Settings › Integrations row, and the
+ * answer every write returns.
  *
  * `enabled` IS THE SWITCH POSITION AND `effectivelyOn` IS WHETHER IT READS. Different facts, both
  * shipped: the switch renders `enabled`, and anything meaning "this project can see the data"
@@ -364,7 +383,7 @@ export interface ProjectConnectorEntry {
   key: string
   displayName: string
   /**
-   * What this connector's data is called, lowercase, for the rail's two state sentences. It
+   * What this connector's data is called, lowercase, for the tab's two state sentences. It
    * comes off the wire rather than living in the component for the same reason the ask panel's
    * copy does: a second connector must cost a registry entry and nothing else.
    */
@@ -444,16 +463,6 @@ function toWindow(value: unknown): ConnectorWindow | null {
   }
 }
 
-function toProjectRow(value: unknown): ConnectorProjectEntry {
-  const row = isRecord(value) ? value : {}
-  return {
-    projectId: readString(row.projectId, 'projectId'),
-    name: readString(row.name, 'name'),
-    enabled: readBoolean(row.enabled, 'enabled'),
-    window: toWindow(row.window),
-  }
-}
-
 function toProjectConnector(value: unknown): ProjectConnectorEntry {
   const row = isRecord(value) ? value : {}
   return {
@@ -469,16 +478,11 @@ function toProjectConnector(value: unknown): ProjectConnectorEntry {
 }
 
 /**
- * Every registry connector as ONE project sees it — the read behind the rail's DATA section.
+ * Every registry connector as ONE application sees it — the read behind Settings › Integrations.
  *
- * THE MIRROR IMAGE OF `listConnectorProjects` BELOW, and the pair is the whole of the feature's
- * two axes: this one fixes the project and walks the connectors, that one fixes the connector and
- * walks the projects. Both hand back rows the same `ProjectConnectorRow` renders.
- *
- * IT IS RE-READ, NEVER CACHED. Days resolve against today, an administrator's
- * approval can land between two visits, and this portal has no query cache to invalidate — so
- * the section fetches on every project navigation and again whenever the Integrations dialog
- * closes over it. That guaranteed pre-load moment is why the section owns a skeleton.
+ * IT IS RE-READ, NEVER CACHED. Days resolve against today, an administrator's approval can land
+ * between two visits, and this portal has no query cache to invalidate — so the tab fetches every
+ * time it is chosen. That guaranteed pre-load moment is why the tab owns a skeleton.
  *
  * STRICT, LIKE THE REST OF THIS MODULE: an unreadable row is a contract break and throws, because
  * the state is what selects which sentence and which control a row draws, and a dropped row would
@@ -493,44 +497,13 @@ export async function listProjectConnectors(
     {},
     deps,
   )
-  if (!res.ok) throw await readApiError(res, 'Failed to load this project’s data settings')
+  if (!res.ok) throw await readApiError(res, 'Failed to load this application’s data settings')
   const body: unknown = await res.json()
   const doc = isRecord(body) ? body : {}
   if (!Array.isArray(doc.connectors)) {
     throw new ApiError('The server sent a data list we could not read.', 500)
   }
   return doc.connectors.map(toProjectConnector)
-}
-
-/**
- * Every project you own, with this connector's switch and days in each one — newest first.
- *
- * A project you have never switched this connector on in is still here, with `enabled: false`
- * and a `null` window: the list is your projects, not your switches, because switching one on is
- * the whole reason the panel opens. Having no projects at all is an empty list, not a failure —
- * an administrator can approve somebody before they have made anything.
- */
-export async function listConnectorProjects(
-  connectorKey: string,
-  deps: AuthFetchDeps = {},
-): Promise<ConnectorProjectList> {
-  const res = await authFetch(
-    `/api/connectors/${encodeURIComponent(connectorKey)}/projects`,
-    {},
-    deps,
-  )
-  if (!res.ok) throw await readApiError(res, 'Failed to load your projects')
-  const body: unknown = await res.json()
-  const doc = isRecord(body) ? body : {}
-  if (!Array.isArray(doc.projects)) {
-    throw new ApiError('The server sent a project list we could not read.', 500)
-  }
-  return {
-    projects: doc.projects.map(toProjectRow),
-    // Absent reads as "not truncated": the server defaults it to `false`, and treating a missing
-    // flag as `true` would put a cap notice over a four-project list.
-    truncated: doc.truncated === true,
-  }
 }
 
 /**
@@ -558,6 +531,6 @@ export async function setProjectConnector(
     jsonOpts('PUT', update),
     deps,
   )
-  if (!res.ok) throw await readApiError(res, 'Failed to save this project’s data settings')
+  if (!res.ok) throw await readApiError(res, 'Failed to save this application’s data settings')
   return toProjectConnector(await res.json())
 }

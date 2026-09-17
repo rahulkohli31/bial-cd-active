@@ -27,7 +27,6 @@ const h = vi.hoisted(() => ({
 }))
 
 vi.mock('../../utils/auth', () => ({ getStoredUser: h.getStoredUser }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/appRegistryApi', () => h)
 // Stubbed rather than exercised: they report their failures through their own state, not this
 // channel, and their real modules would pull unrelated data-fetching into this file.

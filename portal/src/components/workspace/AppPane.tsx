@@ -237,28 +237,22 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
           // the wait (see `NoFrame`), because `aria-busy` on a live region tells a reader to hold
           // its announcements until the busy clears — which would silence the very "entering the
           // wait" announcement this region exists to make.
-          className={frameIt ? '' : 'flex min-h-0 flex-1 flex-col px-4 pb-4 pt-3.5'}
+          // THE PANE'S OWN MARGIN IS THE APP'S TO HAVE — a hairline gutter, no more. The card
+          // inside already carries a border and a shadow, so anything wider is the frame drawn
+          // twice at the app's expense.
+          className={frameIt ? '' : 'flex min-h-0 flex-1 flex-col px-2 pb-2 pt-2'}
         >
           {!frameIt && (
             // THE EMPTY PANE IS A NAMED REGION WITH A CARD IN IT, which is what every state but
-            // `running` draws. The label is the tell: it appears on exactly the boards where the
-            // pane holds no app, because a blank half of the screen needs to say what it is for,
-            // and a running application says that itself. Drawn here rather than at the section,
-            // so it comes and goes with the emptiness it explains.
-            <>
-              {/* DECORATIVE, and it has to be now that it is inside the region: the section above
-                  is already labelled "Your app", so this caption is that label a second time, and
-                  a reader would otherwise hear "YOUR APP" announced every time the pane emptied. */}
-              <p
-                aria-hidden="true"
-                className="mb-2.5 text-[11.5px] font-bold tracking-[0.6px] text-neutral"
-              >
-                YOUR APP
-              </p>
-              <div className="flex min-h-0 flex-1 overflow-hidden rounded-xl border border-canvas-rule bg-white shadow-app-card">
-                <NoFrame report={report} takeBack={takeBack} />
-              </div>
-            </>
+            // `running` draws.
+            //
+            // NO CAPTION ABOVE IT, DELIBERATELY: the card already says what the blank half of the
+            // screen is for ("Describe what you want to build."), and a heading repeating that
+            // would answer one question twice at the cost of a row of the app's own height. The
+            // section's accessible label carries the name instead.
+            <div className="flex min-h-0 flex-1 overflow-hidden rounded-xl border border-canvas-rule bg-white shadow-app-card">
+              <NoFrame report={report} takeBack={takeBack} />
+            </div>
           )}
           {/* WHAT A TAKE-BACK THAT WORKED DID TO THE OTHER PROJECT.
 

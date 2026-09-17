@@ -29,7 +29,6 @@ vi.mock('../../../utils/buildSessionApi', async (importOriginal) => ({
   fetchSaveState: api.fetchSaveState,
   handOverWorkspace: api.handOverWorkspace,
 }))
-vi.mock('../../layout/Navbar', () => ({ default: () => <div data-testid="navbar" /> }))
 vi.mock('../../PublishStatusChip', () => ({ default: () => <span data-testid="publish-chip-stub" /> }))
 vi.mock('../../LivePreview', () => ({ default: () => <div data-testid="live-preview" /> }))
 vi.mock('../../projects/ProjectDescriptionEditor', () => ({

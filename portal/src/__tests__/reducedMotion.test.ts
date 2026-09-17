@@ -35,8 +35,10 @@ import { stripComments } from './_stripComments'
 const ROOT = process.cwd()
 const CSS_FILE = 'src/index.css'
 const CONFIG_FILE = 'tailwind.config.js'
+const ENTRY_FILE = 'src/main.tsx'
 const CSS = readFileSync(path.resolve(ROOT, CSS_FILE), 'utf8')
 const CONFIG = readFileSync(path.resolve(ROOT, CONFIG_FILE), 'utf8')
+const ENTRY = readFileSync(path.resolve(ROOT, ENTRY_FILE), 'utf8')
 
 /** The five utilities the block must neutralise. The first two are the app pane;
  *  the last three are every perpetual wait in the product, the bug named above. */
@@ -58,6 +60,13 @@ const REQUIRED_SELECTORS = [
  *  an accommodation. Three copies of a branch is how three copies of one bug happen. The branch
  *  now lives once, in `ui/Waiting.tsx`, and every wait in the portal goes through it. */
 const HOOK_CONSUMERS = ['Waiting'] as const
+
+/** The third mechanism: a root `MotionConfig`, which is the only layer that reaches `motion`'s
+ *  JS-driven animation. `index.css`'s block cannot see it and the hook swaps an element rather
+ *  than a motion, so without this the library would ignore the preference while both docblocks
+ *  claimed full coverage — the exact falsehood this file exists to prevent. `the tree agrees`
+ *  below proves the config is really wired rather than merely written about. */
+const ROOT_MOTION_CONFIG = 'MotionConfig'
 
 // ------------------------------------------------------------------------------------------
 // A very small CSS reader. Comments are stripped first: this stylesheet's prose quotes the very
@@ -142,12 +151,13 @@ function unnamedInDocblock(docblock: string): string[] {
   const required = [
     'usePrefersReducedMotion',
     ...HOOK_CONSUMERS,
+    ROOT_MOTION_CONFIG,
     '.animate-spin',
     '.animate-pulse',
     '.animate-bounce',
   ]
   const missing = required.filter((name) => !docblock.includes(name))
-  if (!/no third/i.test(docblock)) missing.push('the "no third mechanism" statement')
+  if (!/no fourth/i.test(docblock)) missing.push('the "no fourth mechanism" statement')
   return missing
 }
 
@@ -232,6 +242,28 @@ describe('both docblocks name the mechanisms that exist', () => {
     expect(unnamedInDocblock(motionDocblock(text))).toEqual([])
   })
 
+  it('the tree agrees: the root config the docblocks name is really wired', () => {
+    // The docblocks now claim a mechanism that lives in a THIRD file, so claiming it is not the
+    // same as having it. Asserted against the entry module rather than against a render: the
+    // preference is a media query jsdom evaluates for nothing, so a mounted assertion here would
+    // be the empty-page pass this whole file exists to avoid.
+    expect(ENTRY).toContain(ROOT_MOTION_CONFIG)
+    expect(ENTRY).toMatch(/reducedMotion=("user"|\{'user'\}|\{"user"\})/)
+  })
+
+  it('MUTANT — an entry that drops the root config, or asks for the wrong mode, is caught', () => {
+    // `reducedMotion="never"` is the dangerous mutant: it type-checks, renders, and silently
+    // opts the whole product OUT of the preference while both docblocks still promise it.
+    // `replaceAll`, for the reason the docblock mutants below spell out: `main.tsx` names the
+    // mode in its own prose as well as in the JSX, so mutating only the first occurrence leaves
+    // the real one standing and the mutant passes without having mutated anything.
+    const stripped = ENTRY.replaceAll(ROOT_MOTION_CONFIG, 'SomeOtherProvider')
+    expect(stripped).not.toContain(ROOT_MOTION_CONFIG)
+    expect(ENTRY.replaceAll('reducedMotion="user"', 'reducedMotion="never"')).not.toMatch(
+      /reducedMotion=("user"|\{'user'\}|\{"user"\})/,
+    )
+  })
+
   it('the tree agrees: exactly the consumers the docblocks name', () => {
     // This is what keeps the prose true rather than merely well-written. A second consumer, or a
     // renamed one, goes red here and the docblocks get corrected with it — and a SECOND consumer
@@ -247,8 +279,11 @@ describe('both docblocks name the mechanisms that exist', () => {
     // present and the mutant passes for the wrong reason — a mutant that does not mutate proves
     // nothing about the assertion it is meant to be testing.
     expect(unnamedInDocblock(real.replaceAll('Waiting', 'SomeOtherThing'))).toEqual(['Waiting'])
-    expect(unnamedInDocblock(real.replace(/THERE IS NO THIRD/i, 'THERE IS ONE MORE'))).toEqual([
-      'the "no third mechanism" statement',
+    expect(unnamedInDocblock(real.replaceAll(ROOT_MOTION_CONFIG, 'SomeProvider'))).toEqual([
+      ROOT_MOTION_CONFIG,
+    ])
+    expect(unnamedInDocblock(real.replace(/THERE IS NO FOURTH/i, 'THERE IS ONE MORE'))).toEqual([
+      'the "no fourth mechanism" statement',
     ])
   })
 })

@@ -14,7 +14,7 @@
  * consent box with a heading and no promises under it, in front of somebody about to ask.
  */
 import { describe, it, expect, vi } from 'vitest'
-import { listConnectors } from '../connectorApi'
+import { cancelConnectorRequest, listConnectors } from '../connectorApi'
 import { ApiError } from '../apiError'
 
 const deps = (fetchImpl: unknown) =>
@@ -43,6 +43,7 @@ const ENTRY = {
   approvedAt: null,
   approvedByName: null,
   onProjectCount: null,
+  onProjects: [],
   decidedAt: null,
   decidedByName: null,
   decisionRemarks: null,
@@ -61,6 +62,66 @@ describe('the ask panel copy survives the parse intact', () => {
     expect(row.consentLinesRequester).toEqual(CONSENT)
     // The row's own four-word label is a DIFFERENT field, not a truncation of the sentence.
     expect(row.subtitle).toBe('Airport operations')
+  })
+})
+
+describe('withdrawing your own waiting request', () => {
+  it('posts to the cancel route and reads the state the server settled on', async () => {
+    // THE ROUTE IS PINNED HERE BECAUSE NOTHING ELSE PINS IT. Every component test mocks this
+    // function, so a cancel posted at the ask route would withdraw nothing, earn a 409 from a
+    // route that means the opposite, and ship green.
+    const fetchImpl = vi.fn(async () => ok({ ...ENTRY, state: 'neverAsked' }))
+    const row = await cancelConnectorRequest('orbit', deps(fetchImpl))
+
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe('/api/connectors/orbit/cancel')
+    expect(init.method).toBe('POST')
+    // Through the same parse as every other answer: the state is a derivation over the person's
+    // remaining rows, so it is read back rather than assumed.
+    expect(row.state).toBe('neverAsked')
+  })
+})
+
+describe('the applications behind the disclosure', () => {
+  it('carries each one as a name and an id, and nothing else', async () => {
+    const [row] = await listConnectors(
+      deps(
+        vi.fn(async () =>
+          ok({
+            connectors: [
+              {
+                ...ENTRY,
+                onProjects: [
+                  { projectId: 'a1', name: 'Flight Delay Reason Capture', enabled: true, window: null },
+                ],
+              },
+            ],
+          }),
+        ),
+      ),
+    )
+
+    // The wire may carry more; this client keeps only what the page is allowed to state. A
+    // spread here would let a window or a record count reach a surface that must not show one.
+    expect(row.onProjects).toEqual([{ projectId: 'a1', name: 'Flight Delay Reason Capture' }])
+  })
+
+  it('throws when the list is absent — "nothing is switched on" is a statement, not a default', async () => {
+    const { onProjects: _gone, ...noList } = ENTRY
+    await expect(listWith(noList)).rejects.toBeInstanceOf(ApiError)
+  })
+
+  it('throws on an application with no name rather than listing a blank row', async () => {
+    await expect(
+      listWith({ ...ENTRY, onProjects: [{ projectId: 'a1' }] }),
+    ).rejects.toBeInstanceOf(ApiError)
+  })
+
+  it('reads an empty list as an empty list — that one IS an answer', async () => {
+    const [row] = await listConnectors(
+      deps(vi.fn(async () => ok({ connectors: [{ ...ENTRY, onProjects: [] }] }))),
+    )
+    expect(row.onProjects).toEqual([])
   })
 })
 

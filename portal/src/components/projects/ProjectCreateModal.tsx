@@ -10,7 +10,7 @@
  *
  * When the server does reject, we surface the message the thrown `ApiError` carries
  * — which `readApiError` already pulled from whichever of the three envelopes the
- * backend chose — never a synthetic "Failed to create project (422)."
+ * backend chose — never a synthetic "Failed to create the application (422)."
  *
  * TWO SCREENS, ONE FORM (#191 slice 4, R31/R35/R36). Submitting the form does not create
  * a project directly — it first asks the server whether something that does what the
@@ -18,7 +18,7 @@
  * default, day-one case) is the fall-through: it creates immediately, exactly as before
  * this slice. One or more confident matches swap the SAME dialog's content to a second
  * screen instead of unmounting the form, so "Go back" returns to the name/description the
- * citizen already typed rather than to a blank one. "Create project anyway" stays
+ * citizen already typed rather than to a blank one. "Create App anyway" stays
  * available beneath the matches at all times (R36) — this is a courtesy, never a gate.
  */
 import { useState } from 'react'
@@ -200,12 +200,12 @@ export default function ProjectCreateModal({ onClose, onCreated }: ProjectCreate
         <div className="flex items-start justify-between">
           <div>
             <DialogTitle className="text-base font-bold text-tertiary">
-              {screen === 'duplicates' ? 'This might already exist' : 'New project'}
+              {screen === 'duplicates' ? 'This might already exist' : 'Create App'}
             </DialogTitle>
             <p className="text-sm text-neutral mt-0.5">
               {screen === 'duplicates'
                 ? "These published apps sound similar to what you're describing."
-                : 'A project owns one app, its description, and its chats.'}
+                : 'An application owns its screens, its description, and its chats.'}
             </p>
           </div>
           <button
@@ -239,7 +239,7 @@ export default function ProjectCreateModal({ onClose, onCreated }: ProjectCreate
                 onClick={createAnyway}
                 className="flex-1 flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-white font-semibold py-2.5 rounded-xl transition text-sm disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {busy ? <BusyGlyph size={15} /> : null} Create project anyway
+                {busy ? <BusyGlyph size={15} /> : null} Create App anyway
               </button>
               <button
                 type="button"
@@ -340,7 +340,7 @@ export default function ProjectCreateModal({ onClose, onCreated }: ProjectCreate
                 disabled={!canSubmit}
                 className="flex-1 flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-white font-semibold py-2.5 rounded-xl transition text-sm disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {busy ? <BusyGlyph size={15} /> : null} Create project
+                {busy ? <BusyGlyph size={15} /> : null} Create App
               </button>
               <button
                 type="button"

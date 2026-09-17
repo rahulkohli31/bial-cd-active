@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import SecretStr
@@ -26,12 +27,13 @@ from src.db.models.project import Project
 from src.services.build_sessions import SessionManager
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.manager import shr_name_for
+from src.services.projects.shares import revoke_share
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import accessor as storage_accessor
 from src.services.storage import snapshot_key
 from tests.api.v1.projects.conftest import _VALID_DESCRIPTION, DELETE_BODY
 from tests.api.v1.projects.test_projects_crud import _auth
-from tests.factories import UserFactory
+from tests.factories import ProjectFactory, ProjectShareFactory, UserFactory
 from tests.fakes import FakeSandboxClient, FakeStorage
 
 
@@ -593,3 +595,171 @@ async def test_shared_with_me_lists_only_what_was_shared_with_this_caller(
     stranger_view = await client.get("/v1/projects/shared", headers=stranger_headers)
     assert stranger_view.status_code == 200
     assert stranger_view.json()["items"] == []
+
+
+# The wire half of the shared list: the two projection fields, the facet, the numbered-page
+# envelope and the refusals. The query logic itself — search scope, the facet's own predicate,
+# ordering and the offset skew — is pinned directly against the service in
+# `tests/services/projects/test_shares.py`.
+
+
+async def _share_with(db_session, recipient, owner, *, name: str, **project_fields):
+    project = await ProjectFactory.create(db_session, owner.id, name=name, **project_fields)
+    share = await ProjectShareFactory.create(db_session, project.id, recipient.id)
+    return project, share
+
+
+async def test_the_shared_row_carries_the_sharer_id_and_the_owners_updated_date(
+    client, db_session
+) -> None:
+    """★ Both fields are new on this wire and neither is derivable from what was already there.
+    `sharedByUserId` is what the filter matches on — `display_name` is nullable and not unique —
+    and `projectUpdatedAt` is the OWNER's last change, which rides the owner's own project read
+    and has never reached a recipient before."""
+    recipient_headers, recipient = await _auth(db_session)
+    owner = await UserFactory.create(
+        db_session, email="rahul@example.com", display_name="Rahul Kohli"
+    )
+    # An explicit `updated_at` is what makes the two dates DIFFERENT. Both columns default to
+    # `now()`, which in PostgreSQL is the TRANSACTION's timestamp — left to the defaults, a row
+    # wired to the share's date would read identically to one wired to the project's.
+    changed = datetime(2026, 9, 14, 9, 30, tzinfo=UTC)
+    project, share = await _share_with(
+        db_session, recipient, owner, name="Apron Fuel Truck Log", updated_at=changed
+    )
+
+    resp = await client.get("/v1/projects/shared", headers=recipient_headers)
+
+    assert resp.status_code == 200, resp.text
+    row = resp.json()["items"][0]
+    assert row["projectName"] == "Apron Fuel Truck Log"
+    assert row["sharedByUserId"] == str(owner.id)
+    assert row["sharedByDisplayName"] == "Rahul Kohli"
+    assert datetime.fromisoformat(row["projectUpdatedAt"]) == project.updated_at == changed
+    # The grant's own date is a different fact and both travel.
+    assert datetime.fromisoformat(row["sharedAt"]) == share.created_at != changed
+
+
+async def test_the_read_carries_the_shared_by_facet(client, db_session) -> None:
+    recipient_headers, recipient = await _auth(db_session)
+    rahul = await UserFactory.create(
+        db_session, email="rahul@example.com", display_name="Rahul Kohli"
+    )
+    varun = await UserFactory.create(
+        db_session, email="varun@example.com", display_name="Varun Menon"
+    )
+    await _share_with(db_session, recipient, rahul, name="One")
+    await _share_with(db_session, recipient, rahul, name="Two")
+    await _share_with(db_session, recipient, varun, name="Three")
+
+    resp = await client.get("/v1/projects/shared", headers=recipient_headers)
+
+    assert resp.json()["sharers"] == [
+        {"userId": str(rahul.id), "displayName": "Rahul Kohli", "shareCount": 2},
+        {"userId": str(varun.id), "displayName": "Varun Menon", "shareCount": 1},
+    ]
+
+
+async def test_the_shared_by_filter_narrows_the_page_and_its_total(client, db_session) -> None:
+    recipient_headers, recipient = await _auth(db_session)
+    rahul = await UserFactory.create(db_session, email="rahul@example.com")
+    varun = await UserFactory.create(db_session, email="varun@example.com")
+    await _share_with(db_session, recipient, rahul, name="Rahul's")
+    await _share_with(db_session, recipient, varun, name="Varun's")
+
+    resp = await client.get(
+        "/v1/projects/shared", headers=recipient_headers, params={"sharedBy": str(rahul.id)}
+    )
+
+    body = resp.json()
+    assert [item["projectName"] for item in body["items"]] == ["Rahul's"]
+    assert body["total"] == 1
+    assert body["totalPages"] == 1
+
+
+async def test_search_and_sort_reach_the_read(client, db_session) -> None:
+    recipient_headers, recipient = await _auth(db_session)
+    owner = await UserFactory.create(db_session, email="owner@example.com")
+    await _share_with(db_session, recipient, owner, name="Zebra", description="Queue readings.")
+    await _share_with(db_session, recipient, owner, name="apple", description="Queue readings.")
+    await _share_with(db_session, recipient, owner, name="Ignored", description="Fuel uplift.")
+
+    resp = await client.get(
+        "/v1/projects/shared", headers=recipient_headers, params={"q": "queue", "sort": "name"}
+    )
+
+    assert [item["projectName"] for item in resp.json()["items"]] == ["apple", "Zebra"]
+    assert resp.json()["total"] == 2
+
+
+async def test_an_unrecognised_sort_is_refused_in_this_platforms_envelope(
+    client, db_session
+) -> None:
+    """A typo'd `sort` served quietly in the default order looks, to the person using the
+    control, exactly like a control that does not work. The envelope matters too: a native
+    FastAPI refusal would put a second 422 body shape on this one endpoint."""
+    headers, _ = await _auth(db_session)
+
+    resp = await client.get(
+        "/v1/projects/shared", headers=headers, params={"sort": "recentlyShareed"}
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["error"]["message"] == "sort must be one of: recentlyShared, name."
+
+
+async def test_a_malformed_shared_by_is_refused_in_this_platforms_envelope(
+    client, db_session
+) -> None:
+    headers, _ = await _auth(db_session)
+
+    resp = await client.get("/v1/projects/shared", headers=headers, params={"sharedBy": "nobody"})
+
+    assert resp.status_code == 422
+    assert resp.json()["error"]["message"] == "sharedBy must be a colleague id."
+
+
+async def test_a_revoke_under_the_last_page_leaves_a_page_number_to_step_back_to(
+    client, db_session
+) -> None:
+    """★ THE PAGE-SHRINK GUARD'S SERVER HALF. A colleague revoking while the recipient sits on
+    the last page must leave them a real `totalPages` to step back to — an empty `items` beside
+    a stale total, or a 404, is the empty table the guard exists to prevent."""
+    recipient_headers, recipient = await _auth(db_session)
+    owner = await UserFactory.create(db_session, email="owner@example.com")
+    for index in range(3):
+        await _share_with(db_session, recipient, owner, name=f"App {index}")
+    last, _share = await _share_with(db_session, recipient, owner, name="Last")
+
+    before = await client.get(
+        "/v1/projects/shared", headers=recipient_headers, params={"page": 2, "limit": 3}
+    )
+    await revoke_share(db_session, project=last, actor_id=owner.id, colleague_id=recipient.id)
+    await db_session.flush()
+    after = await client.get(
+        "/v1/projects/shared", headers=recipient_headers, params={"page": 2, "limit": 3}
+    )
+
+    assert [item["projectName"] for item in before.json()["items"]] == ["App 0"]
+    assert before.json()["totalPages"] == 2
+    assert after.status_code == 200
+    assert after.json()["items"] == []
+    assert after.json()["total"] == 3
+    assert after.json()["totalPages"] == 1
+
+
+async def test_the_shared_envelope_no_longer_carries_a_keyset_cursor(client, db_session) -> None:
+    """The keyset envelope is GONE, not merely unread: a client still branching on `hasMore`
+    would page forever against a response that never sets it."""
+    recipient_headers, recipient = await _auth(db_session)
+    owner = await UserFactory.create(db_session, email="owner@example.com")
+    await _share_with(db_session, recipient, owner, name="Only")
+
+    body = (await client.get("/v1/projects/shared", headers=recipient_headers)).json()
+
+    assert "nextCursor" not in body
+    assert "hasMore" not in body
+    # Liveness: the envelope really did answer, so the two absences are about its shape rather
+    # than about an empty response.
+    assert [item["projectName"] for item in body["items"]] == ["Only"]
+    assert (body["page"], body["pageSize"], body["total"], body["totalPages"]) == (1, 25, 1, 1)

@@ -2,7 +2,7 @@
  * `DateRange`, as a control: the four options, the month grid and its two disabled ends, the
  * amber note, and the summary that moves with the selection.
  *
- * THE FIXTURE CONNECTOR IS NOT THE REAL ONE, for the reason `IntegrationsDialog.test.tsx` gives:
+ * THE FIXTURE CONNECTOR IS NOT THE REAL ONE, and the reason is the whole point:
  * every string the popover says about a connector comes off the wire, and a component with the
  * real name compiled into it would still pass a suite that asserted the real name. `ORBIT` keeps
  * this suite able to tell the difference — and the same goes for the number in the amber note,

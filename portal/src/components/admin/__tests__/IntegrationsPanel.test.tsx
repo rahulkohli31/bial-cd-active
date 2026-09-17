@@ -42,10 +42,9 @@ vi.mock('../../../utils/adminConnectorApi', () => ({
 }))
 vi.mock('../../../utils/auth', () => ({ getStoredUser: h.getStoredUser }))
 
-// The console's other four panels and its navbar are stubbed for the whole-page tests below:
-// this file is about the Integrations tab, and mounting the app registry (which fetches on
-// mount) would put an unrelated failure on screen beside the thing under test.
-vi.mock('../../layout/Navbar', () => ({ default: () => <nav data-testid="navbar" /> }))
+// The console's other four panels are stubbed for the whole-page tests below: this file is
+// about the Integrations tab, and mounting the app registry (which fetches on mount) would put
+// an unrelated failure on screen beside the thing under test.
 vi.mock('../AppRegistryPanel', () => ({ default: () => <div data-testid="apps-panel" /> }))
 vi.mock('../UsersLimitsPanel', () => ({ default: () => <div data-testid="users-panel" /> }))
 vi.mock('../GlobalLimitsPanel', () => ({ default: () => <div data-testid="limits-panel" /> }))
@@ -296,17 +295,19 @@ describe('the default order is the board’s', () => {
 })
 
 describe('the decided table', () => {
-  it('shows the right pill and project count for an approval, and an em dash for a decline', async () => {
+  it('shows the right pill and application count for an approval, and an em dash for a decline', async () => {
     openPanel()
     const table = await screen.findByTestId('queue-table-decided')
 
     const approved = within(table).getByTestId('queue-row-req-anant')
     expect(within(approved).getByText('Approved')).toBeTruthy()
-    expect(within(approved).getByText('4 projects')).toBeTruthy()
+    expect(within(approved).getByText('4 applications')).toBeTruthy()
 
-    // One project, singular — "1 projects" is the kind of thing that makes a person trust the
-    // rest of an authorization screen slightly less.
-    expect(within(within(table).getByTestId('queue-row-req-meera')).getByText('1 project')).toBeTruthy()
+    // One application, singular — "1 applications" is the kind of thing that makes a person trust
+    // the rest of an authorization screen slightly less.
+    expect(
+      within(within(table).getByTestId('queue-row-req-meera')).getByText('1 application'),
+    ).toBeTruthy()
 
     const declined = within(table).getByTestId('queue-row-req-rakesh')
     expect(within(declined).getByText('Declined')).toBeTruthy()

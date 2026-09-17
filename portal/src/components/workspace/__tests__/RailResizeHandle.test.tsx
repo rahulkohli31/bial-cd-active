@@ -23,7 +23,6 @@ import {
 } from '../workspaceChannel'
 import { RAIL_MAX, RAIL_MIN } from '../railWidth'
 
-vi.mock('../../layout/Navbar', () => ({ default: () => <div data-testid="navbar" /> }))
 vi.mock('../../PublishStatusChip', () => ({ default: () => <span data-testid="publish-chip-stub" /> }))
 vi.mock('../../LivePreview', () => ({ default: () => <div data-testid="live-preview" /> }))
 
@@ -242,7 +241,7 @@ describe('where the handle is NOT', () => {
     // collapsed arm and this goes red.
     render(<Workspace />)
     drag(600)
-    fireEvent.click(screen.getByRole('button', { name: 'Hide details' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Hide the chat' }))
 
     await waitFor(() => expect(widthOf()).toBe('0px'))
     expect(screen.queryByTestId('rail-resize-handle')).toBeNull()
@@ -267,8 +266,8 @@ describe('the app never reloads while any of this happens', () => {
 
     drag(620)
     fireEvent.keyDown(handle(), { key: 'ArrowLeft' })
-    fireEvent.click(screen.getByRole('button', { name: 'Hide details' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Show details' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Hide the chat' }))
+    fireEvent.click(screen.getByTestId('toolbar-collapse'))
 
     expect(frame()).toBe(original)
   })

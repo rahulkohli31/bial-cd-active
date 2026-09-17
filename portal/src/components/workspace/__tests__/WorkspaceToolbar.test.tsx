@@ -17,6 +17,7 @@ import { useState } from 'react'
 import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, Link, useLocation } from 'react-router-dom'
 import WorkspaceShell from '../WorkspaceShell'
+import NavReveal from '../../layout/NavReveal'
 import { rememberProjectsSearch } from '../../../utils/projectsListMemory'
 import { formatStamp } from '../../../utils/publishPresentation'
 import {
@@ -33,13 +34,16 @@ import {
   type WorkspaceHeading,
 } from '../workspaceChannel'
 
-vi.mock('../../layout/Navbar', () => ({ default: () => <div data-testid="navbar" /> }))
 /**
  * The stub lives INSIDE the row (an ordinary child, no memo between them) so its count is the
  * row's own renders — a wrapper around `WorkspaceToolbar` would only see renders its parent
  * causes, missing the ones the row's own cell subscriptions cause.
  */
-const h = vi.hoisted(() => ({ rowRenders: 0 }))
+const h = vi.hoisted(() => ({ rowRenders: 0, usage: vi.fn() }))
+// The token counter's read. It is the NAVIGATION's read too — one hook, so the two surfaces can
+// never disagree about the same day's figures — which is why it is stubbed at the hook rather
+// than at the network.
+vi.mock('../../../hooks/useUsageToday', () => ({ useUsageToday: h.usage }))
 vi.mock('../../PublishStatusChip', () => ({
   default: function PublishStatusChipStub({ projectId }: { projectId: string }) {
     h.rowRenders += 1
@@ -53,6 +57,8 @@ vi.mock('../../../hooks/usePublishState', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../hooks/usePublishState')>()),
   usePublishState: () => ({ deployment: { savedAt: '2026-09-13T14:32:00Z' } }),
 }))
+
+const USAGE = { used: 42_000, limit: 100_000, remaining: 58_000 }
 
 const APP_URL = 'https://app-a.example.azurecontainerapps.io/'
 const SAVED_AT = '2026-09-13T14:32:00Z'
@@ -123,7 +129,7 @@ function Surface({
   // A FRESH OBJECT PER RENDER, which is what the real conversation surface publishes — the pane
   // cell is identity-compared, so this is what makes a keystroke reach the channel at all.
   usePublishPaneView({ ...EMPTY_PANE })
-  usePublishSave(slot, { save: null, discard: null, rename: null, share: null, ...actions })
+  usePublishSave(slot, { save: null, discard: null, settings: null, share: null, ...actions })
   // The row's own `save` slot carries no recovery instant — it is not the row's question — so the
   // reading published here names the flag it does have and no copy it cannot vouch for.
   usePublishSaveState({ dirty: slot.dirty, recoveryAt: null })
@@ -135,10 +141,27 @@ function Where() {
   return <span data-testid="where">{useLocation().pathname}</span>
 }
 
-/** Both addresses under ONE shell, navigated by link exactly as the product navigates them. */
-function Workspace({ entry = '/projects/pA', project, chat }: { entry?: string; project?: SurfaceProps; chat?: SurfaceProps }) {
-  return (
-    <MemoryRouter initialEntries={[entry]}>
+/**
+ * Both addresses under ONE shell, navigated by link exactly as the product navigates them.
+ *
+ * `nav` puts the real `NavReveal` around it, which is what the shell does in the product. Most
+ * tests here are about the row alone and do not need it; the ones about what the row shows WHILE
+ * THE PANEL IS ON SCREEN cannot be written without it — the menu button renders nothing when
+ * there is no reveal to open.
+ */
+function Workspace({
+  entry = '/projects/pA',
+  project,
+  chat,
+  nav = false,
+}: {
+  entry?: string
+  project?: SurfaceProps
+  chat?: SurfaceProps
+  nav?: boolean
+}) {
+  const inside = (
+    <>
       <Where />
       <Routes>
         <Route element={<WorkspaceShell />}>
@@ -163,6 +186,11 @@ function Workspace({ entry = '/projects/pA', project, chat }: { entry?: string; 
         </Route>
         <Route path="/projects" element={<div data-testid="projects-list" />} />
       </Routes>
+    </>
+  )
+  return (
+    <MemoryRouter initialEntries={[entry]}>
+      {nav ? <NavReveal hideable>{inside}</NavReveal> : inside}
     </MemoryRouter>
   )
 }
@@ -174,15 +202,13 @@ beforeEach(() => vi.clearAllMocks())
 afterEach(() => cleanup())
 
 describe('what the row names on each address', () => {
-  it('the project screen: back and the project name, and NOT a second copy of the state', () => {
+  it('the project screen: back, the project name, and the state it is in', () => {
     render(<Workspace />)
 
-    expect(screen.getByRole('button', { name: 'Back to projects' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Back to My Applications' })).toBeTruthy()
     expect(title().textContent).toBe('Visitor Log — Airport Office')
     expect(title().tagName).toBe('H1')
-    // The rail's APP STATUS section already carries this state; a chip beside the title would
-    // repeat it.
-    expect(screen.queryByTestId('publish-chip-stub')).toBeNull()
+    expect(screen.getByTestId('publish-chip-stub').getAttribute('data-project')).toBe('pA')
     expect(screen.queryByTestId('toolbar-chat-kind')).toBeNull()
   })
 
@@ -233,8 +259,8 @@ describe('what the row names on each address', () => {
 
     expect(row()).toBeTruthy()
     expect(row().className).toMatch(/h-\[54px\]/)
-    expect(row().textContent).toContain('Your project')
-    expect(screen.getByRole('button', { name: 'Back to project' })).toBeTruthy()
+    expect(row().textContent).toContain('Your application')
+    expect(screen.getByRole('button', { name: 'Back to the application' })).toBeTruthy()
   })
 
   it('★ a chat still inside its load window is drawn as a CHAT, not as the project screen', () => {
@@ -250,11 +276,11 @@ describe('what the row names on each address', () => {
 
     // On the project screen "Your project" IS the <h1>; on a chat it is the breadcrumb, and the
     // <h1> is the chat's own (empty) slot.
-    expect(row().textContent).toContain('Your project')
+    expect(row().textContent).toContain('Your application')
     expect(title().textContent).toBe('')
     expect(screen.queryByRole('button', { name: /rename/i })).toBeNull()
     // With no project resolved there is none to return to, so back goes to the list.
-    expect(screen.getByRole('button', { name: 'Back to projects' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Back to My Applications' })).toBeTruthy()
     // LIVENESS: the row is drawn at full height throughout, which is the property that stops the
     // layout shifting when the fetch lands.
     expect(row().className).toMatch(/h-\[54px\]/)
@@ -268,7 +294,7 @@ describe('what the row names on each address', () => {
       />,
     )
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to project' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to the application' }))
     expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
   })
 
@@ -277,7 +303,7 @@ describe('what the row names on each address', () => {
     // "never", and in both the row keeps its height, its word and its way out.
     render(<Workspace entry="/chat/c1" chat={{ heading: { ...CHAT_HEADING, projectName: null } }} />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to project' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to the application' }))
     expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
   })
 
@@ -323,23 +349,28 @@ describe('the row is one element across a route change', () => {
 describe('collapsing the rail', () => {
   it('★ leaves the row and everything in it visible', () => {
     render(<Workspace />)
-    fireEvent.click(screen.getByRole('button', { name: 'Hide details' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Hide the chat' }))
 
     const rail = screen.getByTestId('workspace-outlet')
     expect(rail.className).toMatch(/(^|\s)w-0(\s|$)/)
     expect(rail.className).toMatch(/invisible/)
     expect(title().textContent).toBe('Visitor Log — Airport Office')
     expect(screen.getByTestId('publish-chip-stub')).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Show details' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Back to projects' })).toBeTruthy()
+    // ★ TWO WAYS BACK, not one. The toolbar control was the only route out of a collapse, which
+    // made a single control the single point of failure for a state that hides a whole column.
+    // The stub the chat leaves behind carries the second — and it is a SIBLING of the hidden
+    // column rather than inside it, for the same reason the toolbar control is not in the rail.
+    expect(screen.getAllByRole('button', { name: 'Show the chat' })).toHaveLength(2)
+    expect(screen.getByTestId('chat-stub')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Back to My Applications' })).toBeTruthy()
   })
 
   it('★ collapses in BOTH directions, because below the threshold the columns stack', () => {
     // Below the stacking threshold the rail is a flex COLUMN, not a ROW: `w-0 flex-shrink-0`
-    // collapses width but leaves height alone, so "Hide details" left a visible empty band and
+    // collapses width but leaves height alone, so "Hide the chat" left a visible empty band and
     // pushed the app pane off screen. jsdom lays nothing out, so the class is what gets pinned.
     render(<Workspace />)
-    fireEvent.click(screen.getByRole('button', { name: 'Hide details' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Hide the chat' }))
 
     const rail = screen.getByTestId('workspace-outlet')
     expect(rail.className).toMatch(/(^|\s)h-0(\s|$)/)
@@ -350,14 +381,25 @@ describe('collapsing the rail', () => {
 
   it('the toggle points at the rail it hides', () => {
     render(<Workspace />)
-    const toggle = screen.getByRole('button', { name: 'Hide details' })
+    const toggle = screen.getByRole('button', { name: 'Hide the chat' })
     expect(toggle.getAttribute('aria-expanded')).toBe('true')
     expect(toggle.getAttribute('aria-controls')).toBe(screen.getByTestId('workspace-outlet').id)
+
+    // ★ AND SO DOES THE STUB, which is what makes it a real second route rather than a decoration:
+    // it names the same column and reports the same state.
+    fireEvent.click(toggle)
+    const stub = within(screen.getByTestId('chat-stub')).getByRole('button')
+    expect(stub.getAttribute('aria-expanded')).toBe('false')
+    expect(stub.getAttribute('aria-controls')).toBe(screen.getByTestId('workspace-outlet').id)
+    fireEvent.click(stub)
+    expect(screen.getByTestId('workspace-outlet').className).not.toMatch(/invisible/)
   })
 
   it('is absent when there is no pane to give the screen to', () => {
     render(<Workspace project={{ heading: PROJECT_HEADING, paneVisible: false }} />)
-    expect(screen.queryByRole('button', { name: /hide details/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /hide the chat/i })).toBeNull()
+    // The divider goes with it — a separator with one side is just a line.
+    expect(screen.queryByTestId('chat-stub')).toBeNull()
     // Liveness: the row itself is still rendering.
     expect(title().textContent).toBe('Visitor Log — Airport Office')
   })
@@ -384,19 +426,17 @@ describe('the app-scoped controls appear only when there is an app to point at',
   })
 
   it('marks exactly one device pressed, and switches', () => {
-    // Moved from `LivePreview.test.jsx` with the control; the WIDTH half (that Tablet reaches
+    // Moved from `LivePreview.test.jsx` with the control; the WIDTH half (that Mobile reaches
     // 834px) stays there, since the card is the pane's.
     render(<Workspace />)
     const at = (name: string) => screen.getByRole('button', { name }).getAttribute('aria-pressed')
 
     expect(at('Desktop')).toBe('true')
-    expect(at('Tablet')).toBe('false')
     expect(at('Mobile')).toBe('false')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Tablet' }))
-    expect(at('Tablet')).toBe('true')
+    fireEvent.click(screen.getByRole('button', { name: 'Mobile' }))
+    expect(at('Mobile')).toBe('true')
     expect(at('Desktop')).toBe('false')
-    expect(at('Mobile')).toBe('false')
   })
 
   it('★ the chosen width survives a route change from the project screen to a chat', () => {
@@ -421,7 +461,7 @@ describe('the Save control', () => {
   const withSave = (save: Partial<Omit<SaveSlot, 'canSave' | 'canDiscard'>>, onSave: (() => void) | null = null) =>
     render(
       <Workspace
-        project={{ heading: PROJECT_HEADING, save, actions: { save: onSave, rename: null, share: null } }}
+        project={{ heading: PROJECT_HEADING, save, actions: { save: onSave, settings: null, share: null } }}
       />,
     )
 
@@ -557,7 +597,7 @@ describe('the Save control', () => {
         project={{
           heading: PROJECT_HEADING,
           save: { dirty: true, saving: true, error: null },
-          actions: { save: () => {}, rename: null, share: null },
+          actions: { save: () => {}, settings: null, share: null },
         }}
       />,
     )
@@ -677,25 +717,28 @@ describe('the Discard control', () => {
   })
 })
 
-describe('the status chip — where the state is said, and where it would be said twice', () => {
-  // The chip duplicates the rail's APP STATUS section, so it appears only where that section is
-  // NOT: on a chat (no rail section) or over a collapsed rail. On the open project screen it
-  // would be a second rendering of the same fact, which is what this row exists to prevent.
+describe('the status chip — the one place that says what state the application is in', () => {
+  // NOTHING ELSE ON THIS SCREEN SAYS IT. The rail beside the toolbar carries a composer and
+  // nothing else, so a chip gated on anything leaves a citizen unable to tell a draft from
+  // something live without changing the layout first.
 
-  it('★ names the project on a chat, where nothing else says the state', () => {
+  it('★ names the project on a chat', () => {
     render(<Workspace entry="/chat/c1" />)
     expect(screen.getByTestId('publish-chip-stub').getAttribute('data-project')).toBe('pA')
   })
 
-  it('★ comes back when the rail that was carrying it is hidden', () => {
+  it('★ stays put across the one layout change a citizen can make here', () => {
+    // Collapsing the chat is the gesture that used to be REQUIRED to see the state at all. It is
+    // now the gesture that must not change the answer — which is the half a "renders the chip"
+    // test on a single layout cannot see.
     render(<Workspace />)
-    expect(screen.queryByTestId('publish-chip-stub')).toBeNull()
+    expect(screen.getByTestId('publish-chip-stub').getAttribute('data-project')).toBe('pA')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Hide details' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Hide the chat' }))
     expect(screen.getByTestId('publish-chip-stub').getAttribute('data-project')).toBe('pA')
   })
 
-  it('is drawn ONCE where it is drawn at all — one mount, not two that could word a state differently', () => {
+  it('is drawn ONCE — one mount, not two that could word a state differently', () => {
     render(<Workspace entry="/chat/c1" />)
     expect(screen.getAllByTestId('publish-chip-stub')).toHaveLength(1)
   })
@@ -706,85 +749,118 @@ describe('the status chip — where the state is said, and where it would be sai
   })
 })
 
-describe('the back control and the rename', () => {
+describe('the back control, and the menu that replaced two controls', () => {
+  /** The menu is Radix: it opens on POINTERDOWN, never on click. */
+  async function openMenu(): Promise<void> {
+    fireEvent.pointerDown(screen.getByTestId('workspace-menu'))
+    await screen.findByRole('menuitem', { name: 'Settings…' })
+  }
+
   it('goes to the projects list from a project, and to the project from a chat', () => {
     render(<Workspace />)
-    fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
     expect(screen.getByTestId('where').textContent).toBe('/projects')
 
     cleanup()
     render(<Workspace entry="/chat/c1" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Back to project' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to the application' }))
     expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
   })
 
   it('★ asks first when there is unsaved work, rather than discarding it in silence', async () => {
     // One of the two most-used exits out of a workspace, and it used to leave unsaved work behind
-    // without a word. It routes through the same guard the navbar's links do.
+    // without a word. It routes through the same guard the navigation's links do.
     render(<Workspace project={{ heading: PROJECT_HEADING, save: { dirty: true, saving: false, error: null } }} />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
 
     expect(await screen.findByRole('dialog')).toBeTruthy()
     expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
   })
 
-  it('offers rename on the project screen only, and presses the published action', () => {
-    const rename = vi.fn()
-    render(<Workspace project={{ heading: PROJECT_HEADING, actions: { save: null, rename, share: null } }} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Rename project' }))
-    expect(rename).toHaveBeenCalledTimes(1)
-
-    cleanup()
-    // A chat's title is the agent's, not the citizen's.
-    render(<Workspace entry="/chat/c1" />)
-    expect(screen.queryByRole('button', { name: /rename/i })).toBeNull()
+  it.each([
+    ['Settings…', 'settings'],
+    ['Share…', 'share'],
+  ] as const)('presses the published %s action', async (label, key) => {
+    const press = vi.fn()
+    render(
+      <Workspace
+        project={{ heading: PROJECT_HEADING, actions: { save: null, settings: null, share: null, [key]: press } }}
+      />,
+    )
+    await openMenu()
+    fireEvent.click(screen.getByRole('menuitem', { name: label }))
+    expect(press).toHaveBeenCalledTimes(1)
   })
 
-  it('★ no pencil over a project that never loaded, and one the moment it does', () => {
+  it('★ holds Settings and Share and NOTHING ELSE', async () => {
+    // Delete is deliberately not here — it is inside Settings, two steps from any surface. Send
+    // for review is not here either: Settings > Production is its one owner, and a second submit
+    // control is a second place to disagree about whether there is anything to submit.
+    render(<Workspace project={{ heading: PROJECT_HEADING }} />)
+    await openMenu()
+    expect(screen.getAllByRole('menuitem').map((item) => item.textContent)).toEqual([
+      'Settings…',
+      'Share…',
+    ])
+  })
+
+  it('★ the two controls it replaced are gone from the row itself', () => {
+    // Rename retired into Settings > General; Share folded into the menu. Both left bare glyphs
+    // in a row whose own note says nine occupants never fit 360px.
+    render(<Workspace project={{ heading: PROJECT_HEADING }} />)
+    // LIVENESS beside the absence: the row is fully drawn and names the project.
+    expect(row().className).toMatch(/h-\[54px\]/)
+    expect(title().textContent).toBe('Visitor Log — Airport Office')
+    expect(screen.queryByRole('button', { name: /rename/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Share project' })).toBeNull()
+  })
+
+  it('★ no menu over a project that never loaded, and one the moment it does', async () => {
     /* THE MANGLED ADDRESS, in the only shape this row can see it. `projectId` is the ROUTE PARAM,
        so it is still there on a page whose project 422'd at the boundary — which is exactly what
-       the pencil used to be gated on, and why a citizen who followed a truncated link was offered
-       a rename control whose press was a measured no-op (`NO_ACTIONS.rename` is `null`). The NAME
-       is the field that comes from the project's own fetch, so it is the one that means loaded. */
+       the retired rename pencil used to be gated on, and why a citizen who followed a truncated
+       link was offered a control whose press was a measured no-op. The NAME is the field that
+       comes from the project's own fetch, so it is the one that means loaded. */
     render(<Workspace project={{ heading: { ...PROJECT_HEADING, projectName: null } }} />)
 
-    expect(screen.queryByRole('button', { name: /rename/i })).toBeNull()
+    expect(screen.queryByTestId('workspace-menu')).toBeNull()
     // LIVENESS: the row is fully drawn around that absence — full height, a word in the name
     // slot — so this is a control that is gone rather than a tree that failed to render.
     expect(row().className).toMatch(/h-\[54px\]/)
-    expect(title().textContent).toBe('Your project')
+    expect(title().textContent).toBe('Your application')
 
     cleanup()
-    const rename = vi.fn()
-    render(<Workspace project={{ heading: PROJECT_HEADING, actions: { save: null, rename, share: null } }} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Rename project' }))
-    expect(rename).toHaveBeenCalledTimes(1)
+    const settings = vi.fn()
+    render(<Workspace project={{ heading: PROJECT_HEADING, actions: { save: null, settings, share: null } }} />)
+    await openMenu()
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Settings…' }))
+    expect(settings).toHaveBeenCalledTimes(1)
   })
 
-  it('★ the way out is NOT gated by the fact that silences the pencil', () => {
+  it('★ the way out is NOT gated by the fact that silences the menu', () => {
     /* THE MUTANT THIS EXISTS FOR: gate the back control on `heading.projectName !== null` too and
        the dead address becomes a dead end. The row's own docblock is explicit that the control
        survives the load-error branch, and a branch with no way off it is worse than the raw
        validator sentence this unit came to remove. */
     render(<Workspace project={{ heading: { ...PROJECT_HEADING, projectName: null } }} />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
     expect(screen.getByTestId('where').textContent).toBe('/projects')
   })
 
   it('★ the deliberate "Your project" fallback on a chat is untouched', () => {
     /* NOT PART OF THE DEFECT, and deliberately left as it is. A project deleted out from under
        an open chat leaves the breadcrumb with no name, and the row deliberately says "Your project"
-       rather than leaving a gap that shifts the layout when a fetch lands. The pencil gate is
+       rather than leaving a gap that shifts the layout when a fetch lands. The menu gate is
        allowed to read the same `null`; it is not allowed to change what the slot says. */
     render(<Workspace entry="/chat/c1" chat={{ heading: { ...CHAT_HEADING, projectName: null } }} />)
 
-    expect(row().textContent).toContain('Your project')
+    expect(row().textContent).toContain('Your application')
     expect(title().textContent).toBe('Add an out-time column')
-    expect(screen.getByRole('button', { name: 'Back to project' })).toBeTruthy()
-    // Rename is a project-screen control; a chat address never had it, name or no name.
-    expect(screen.queryByRole('button', { name: /rename/i })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Back to the application' })).toBeTruthy()
+    // The menu is about the APPLICATION; a chat address never had it, name or no name.
+    expect(screen.queryByTestId('workspace-menu')).toBeNull()
   })
 })
 
@@ -795,8 +871,8 @@ describe('the back control carries the projects list state back', () => {
      query string itself. Before this it hardcoded a bare `/projects`, so leaving a filtered,
      paged list and pressing Back landed on page one with the search cleared:
      `projectsListMemory.ts`'s own docblock calls this "addressable in one direction and silent
-     in the other". `Navbar` is the one place that remembers what the address bar carried, since
-     `ProjectsPage` mounts its own instance of it — this suite only has to seed that memory. */
+     in the other". This suite seeds that memory directly rather than mounting whatever writes
+     it on `/projects`. */
 
   function WhereFull() {
     return <span data-testid="where-full">{useLocation().pathname + useLocation().search}</span>
@@ -829,7 +905,7 @@ describe('the back control carries the projects list state back', () => {
     // on the destination below would miss.
     expect(screen.getByTestId('surface')).toBeTruthy()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
 
     expect(screen.getByTestId('where-full').textContent).toBe('/projects?page=2&pageSize=20&q=ramp')
   })
@@ -837,7 +913,7 @@ describe('the back control carries the projects list state back', () => {
   it('falls back to the bare list when nothing has been remembered this session', () => {
     renderAt('/projects/pA')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to projects' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
 
     expect(screen.getByTestId('where-full').textContent).toBe('/projects')
   })
@@ -943,29 +1019,29 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     return svg === null ? null : `${svg.getAttribute('width')}×${svg.getAttribute('height')}`
   }
 
-  /** The project screen with an app framed, unsaved work over a saved version, and the rail
-   *  collapsed — the one state in which all ten of the row's occupants are on screen at once. */
+  /** The project screen with an app framed, unsaved work over a saved version, and the chat
+   *  hidden — the one state in which every one of the row's occupants is on screen at once. */
   const everything = () => {
     render(
       <Workspace
         project={{
           heading: PROJECT_HEADING,
           save: { dirty: true, hasSavedVersion: true },
-          actions: { save: () => {}, discard: async () => {}, rename: () => {} },
+          actions: { save: () => {}, discard: async () => {}, settings: () => {} },
         }}
       />,
     )
-    fireEvent.click(screen.getByRole('button', { name: 'Hide details' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Hide the chat' }))
   }
 
-  const back = () => screen.getByRole('button', { name: 'Back to projects' })
-  const pencil = () => screen.getByRole('button', { name: 'Rename project' })
-  const devices = () => ['Desktop', 'Tablet', 'Mobile'].map((name) => screen.getByRole('button', { name }))
+  const back = () => screen.getByRole('button', { name: 'Back to My Applications' })
+  const menu = () => screen.getByTestId('workspace-menu')
+  const devices = () => ['Desktop', 'Mobile'].map((name) => screen.getByRole('button', { name }))
   const reload = () => screen.getByRole('button', { name: 'Reload your app' })
   const newTab = () => screen.getByRole('link', { name: 'Open your app in a new tab' })
   const save = () => screen.getByTestId('save-project')
   const discard = () => screen.getByTestId('discard-changes')
-  const railToggle = () => screen.getByRole('button', { name: 'Show details' })
+  const railToggle = () => screen.getByTestId('toolbar-collapse')
 
   it('★ the row owns a horizontal scroller, so overflow is reachable instead of clipped', () => {
     // THE DEFECT IN ONE LINE. The shell's root is `overflow-hidden` for the rail and the pane, so
@@ -981,21 +1057,26 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     expect(cls(row())).toMatch(/h-\[54px\]/)
   })
 
-  it('★ every occupant is still on the row — nothing was moved into a menu', () => {
-    // The guard on the remedy that was NOT taken. Either a collapsing menu or a scrolling ancestor
-    // would have fixed the clipping; the scroller shipped, so all ten stay put. If an overflow
-    // menu is ever added, this goes red before anyone has to notice the row lost a control.
+  it('★ every occupant the row still owns is on it, and the two that left are named', () => {
+    // THE ROW GOT SHORTER ON PURPOSE. Its own note says nine occupants never fit 360px, and this
+    // is the first change to reduce the count: a third device width, a rename pencil and a share
+    // glyph left; a token ring and one menu arrived. What must not happen is a control quietly
+    // becoming unreachable, so both halves are asserted together — what is here, and what is not.
     everything()
     expect(back()).toBeTruthy()
     expect(title().textContent).toBe('Visitor Log — Airport Office')
     expect(screen.getByTestId('publish-chip-stub')).toBeTruthy()
-    expect(pencil()).toBeTruthy()
-    expect(devices()).toHaveLength(3)
+    expect(devices()).toHaveLength(2)
     expect(reload()).toBeTruthy()
     expect(newTab()).toBeTruthy()
     expect(discard()).toBeTruthy()
     expect(save()).toBeTruthy()
     expect(railToggle()).toBeTruthy()
+    expect(menu()).toBeTruthy()
+
+    expect(screen.queryByRole('button', { name: 'Tablet' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /rename/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Share project' })).toBeNull()
   })
 
   it('★ every pressable control declares the 44px floor below the stacking threshold', () => {
@@ -1003,7 +1084,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     // The floor is `min-h`/`min-w` rather than a bigger glyph — that class declaration is the half
     // jsdom CAN see; `hit areas grow by padding` below is its other half.
     everything()
-    for (const control of [back(), pencil(), ...devices(), reload(), newTab(), railToggle()]) {
+    for (const control of [back(), menu(), ...devices(), reload(), newTab(), railToggle()]) {
       expect(cls(control)).toContain('narrow:min-h-[44px]')
       expect(cls(control)).toContain('narrow:min-w-[44px]')
       // A 44px box with a 15px glyph in its top-left corner is not a 44px target anyone can aim
@@ -1024,7 +1105,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     // easy way to 44×44 and would rebuild the row's visual weight at every width.
     everything()
     expect(glyph(back())).toBe('16×16')
-    expect(glyph(pencil())).toBe('13×13')
+    expect(glyph(menu())).toBe('16×16')
     for (const device of devices()) expect(glyph(device)).toBe('14×14')
     expect(glyph(reload())).toBe('15×15')
     expect(glyph(newTab())).toBe('15×15')
@@ -1038,17 +1119,16 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     // what a 1200px viewport does — and what is left must be the pre-existing class list, with no
     // 44px floor leaking up into the desktop row.
     everything()
-    const desktop = [back(), pencil(), ...devices(), reload(), newTab(), railToggle(), discard(), save()].map(
+    const desktop = [back(), menu(), ...devices(), reload(), newTab(), railToggle(), discard(), save()].map(
       aboveThreshold,
     )
     for (const list of desktop) expect(list).not.toMatch(/min-[hw]-\[44px\]/)
 
     // …and the sizes those controls are actually drawn at up there, named so a silent change to
-    // any of them has to be deliberate: 20×20, 21×21, 28×32, 28×30.
+    // any of them has to be deliberate: 20×20, 28×32, 28×30.
     expect(aboveThreshold(back())).toContain('p-0.5')
-    expect(aboveThreshold(pencil())).toContain('p-1')
     for (const device of devices()) expect(aboveThreshold(device)).toMatch(/\bh-7\b.*\bw-8\b/)
-    expect(aboveThreshold(railToggle())).toMatch(/\bh-7\b.*\bw-\[30px\]/)
+    for (const boxed of [railToggle(), menu()]) expect(aboveThreshold(boxed)).toMatch(/\bh-7\b.*\bw-\[30px\]/)
   })
 
   it('★ the title carries a floor of its own, and still truncates', () => {
@@ -1095,7 +1175,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
         chat={{
           heading: { ...CHAT_HEADING, chatTitle: long },
           save: { dirty: true, saving: false, error: null },
-          actions: { save: () => {}, rename: null, share: null },
+          actions: { save: () => {}, settings: null, share: null },
         }}
       />,
     )
@@ -1103,7 +1183,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     expect(title().textContent).toBe(long)
     expect(cls(title())).toMatch(/\btruncate\b/)
     expect(cls(row())).toMatch(/h-\[54px\]/)
-    expect(screen.getByRole('button', { name: 'Back to project' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Back to the application' })).toBeTruthy()
     expect(save()).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Reload your app' })).toBeTruthy()
   })
@@ -1161,5 +1241,66 @@ describe('the narrow screen is declared, and does not overlap the wide one', () 
     const gutted = CONFIG.replace(/\bnarrow:\s*\{\s*max:\s*'[\d.]+px'\s*\},?/, '')
     expect(screens(gutted).narrowMax).toBeNull()
     expect(screens(gutted).wide).toBe('1100')
+  })
+})
+
+/**
+ * ★ THE TOKEN COUNTER FOLLOWS THE CITIZEN INTO THE WORKSPACE.
+ *
+ * The client requires a counter that never stops being visible, and it lives in the navigation
+ * panel — which is HIDDEN inside an application. So the one screen where tokens are actually
+ * spent was the one screen with no reading on it at all. A compact ring in the right-hand
+ * cluster answers that, off the same hook the panel reads.
+ */
+describe('the token ring in the toolbar', () => {
+  it('★ shows the figures, not just an arc', () => {
+    // The ring is how it reads at a glance; the numbers are the requirement. A ring alone would
+    // satisfy the shape of the ask and none of it.
+    h.usage.mockReturnValue(USAGE)
+    render(<Workspace />)
+    const meter = screen.getByTestId('usage-meter')
+    expect(meter.textContent).toMatch(/42/)
+    expect(meter.textContent).toMatch(/100/)
+  })
+
+  it('★ draws the COMPACT form — the row is already full', () => {
+    // Mutation receipt: drop `compact` and this goes red. The panel's ring carries a border, a
+    // card background and 38px of arc; dropped into a 54px row it is a box inside a box.
+    h.usage.mockReturnValue(USAGE)
+    render(<Workspace />)
+    const meter = screen.getByTestId('usage-meter')
+    expect(meter.className).not.toMatch(/\bborder\b/)
+    expect(meter.querySelector('svg')?.getAttribute('width')).toBe('30')
+  })
+
+  it('★ draws NOTHING when there is no reading, rather than a confident zero', () => {
+    // `null` is signed out, or a read that failed. A 0-of-0 ring would say the budget is spent.
+    h.usage.mockReturnValue(null)
+    render(<Workspace />)
+    // LIVENESS beside the absence: the row is fully drawn around the gap.
+    expect(title().textContent).toBe('Visitor Log — Airport Office')
+    expect(screen.queryByTestId('usage-meter')).toBeNull()
+  })
+
+  it('is on the row itself, where a collapse cannot take it away', () => {
+    h.usage.mockReturnValue(USAGE)
+    render(<Workspace />)
+    fireEvent.click(screen.getByTestId('toolbar-collapse'))
+    expect(row().contains(screen.getByTestId('usage-meter'))).toBe(true)
+  })
+
+  it('★ stands IN for the panel\'s counter rather than joining it', () => {
+    // The requirement is a reading that never stops being visible — ONE reading. Summoning the
+    // navigation puts the panel's own counter on screen, and without this both drew the same two
+    // numbers in one view: not a second opinion, a second chance to disagree.
+    h.usage.mockReturnValue(USAGE)
+    render(<Workspace nav />)
+    expect(row().querySelector('[data-testid="usage-meter"]')).not.toBeNull()
+
+    fireEvent.click(screen.getByTestId('nav-menu-button'))
+    // The reading did not disappear, it MOVED — the panel is what carries it now.
+    expect(screen.getByTestId('nav-panel')).toBeTruthy()
+    expect(row().querySelector('[data-testid="usage-meter"]')).toBeNull()
+    expect(screen.getAllByTestId('usage-meter')).toHaveLength(1)
   })
 })

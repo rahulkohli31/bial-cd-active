@@ -105,9 +105,10 @@ async def test_a_connected_project_gets_the_shipped_block_byte_for_byte() -> Non
 
 
 async def test_the_key_and_the_display_name_both_resolve() -> None:
-    """The prompt shows the citizen's agent `DICE`; the artefact is named by the stored key. A
-    model that reads its instructions passes back the display name, and one that has seen the key
-    somewhere passes that. Matching either is parsing at the boundary, not a policy branch."""
+    """The prompt shows the citizen's agent `Flight Fact Data`; the artefact is named by the
+    stored key. A model that reads its instructions passes back the display name, and one that
+    has seen the key somewhere passes that. Matching either is parsing at the boundary, not a
+    policy branch."""
     for spelling in (
         SYSTEM.key,
         SYSTEM.key.upper(),

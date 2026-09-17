@@ -58,7 +58,6 @@ vi.mock('../../utils/conversationApi', () => ({
   createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/AttachmentChips', () => ({ default: () => null }))
 /** EVERY ADDRESS THE PANE WAS HANDED, IN ORDER. The frame's own `src` can only be sampled between
  *  acts, and the failure this file guards against — the app being unframed for one commit by an

@@ -14,8 +14,11 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
+import { stripComments } from '../../__tests__/_stripComments'
 import {
   ACTION_LABEL,
+  canBeRestarted,
+  formatStamp,
   lookFor,
   presentationFor,
   provenanceRows,
@@ -300,13 +303,11 @@ describe('neither surface holds a second copy of the decision', () => {
    * author, and the two would drift the first time only one of them was edited.
    */
   const read = (rel: string) => readFileSync(path.resolve(__dirname, '..', '..', rel), 'utf8')
-  const stripComments = (text: string) =>
-    text.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
 
   const LABELS = EVERY_STATE.map((state) => presentationFor(state).label)
 
   it('the chip and the panel spell no state label of their own', () => {
-    for (const file of ['components/PublishStatusChip.tsx', 'components/workspace/AppStatusPanel.tsx']) {
+    for (const file of ['components/PublishStatusChip.tsx', 'components/projects/AppStatusPanel.tsx']) {
       const source = stripComments(read(file))
       for (const label of LABELS) {
         expect(source.includes(`'${label}'`), `${file} spells "${label}"`).toBe(false)
@@ -319,5 +320,110 @@ describe('neither surface holds a second copy of the decision', () => {
     // Without this, a scan whose needle never appears passes for ever and protects nothing.
     const bad = stripComments(`const label = 'Nothing built yet'`)
     expect(LABELS.some((label) => bad.includes(`'${label}'`))).toBe(true)
+  })
+})
+
+/**
+ * ★ THE STATE VOCABULARY IS CLOSED, and this is the guard that keeps it that way.
+ *
+ * A UX redesign is allowed to change where a state is drawn and what words surround it. It is not
+ * allowed to change what states the product HAS — that is a change to what the application means,
+ * and it belongs to whoever owns the lifecycle, not to whoever is moving a panel.
+ *
+ * So the count is the guard: thirteen states, no more. Where a failed restart needs explaining,
+ * the Deployment panel's notice explains it rather than the vocabulary naming it.
+ */
+describe('the state vocabulary is the product\'s, not a surface\'s', () => {
+  it('★ answers from the publish state and from nothing else handed alongside it', () => {
+    // NOT `presentationFor.length`: it reads 1 whether a second parameter is absent or merely
+    // defaulted, so an arity check cannot tell the two apart and passes against the mutation it
+    // would be written to catch. Behaviour is the enforceable half — a second input must not
+    // move any answer.
+    const extra = presentationFor as unknown as (s: PublishState, code?: string | null) => unknown
+    for (const state of EVERY_STATE) {
+      for (const code of ['restart_failed', 'restart_not_ready', 'build_failed', null]) {
+        expect(extra(state, code), state).toEqual(presentationFor(state))
+      }
+    }
+  })
+
+  it('★ a first deploy that never came up says what it has always said', () => {
+    const plain = presentationFor('did_not_start')
+    expect(plain.label).toBe("Didn't start")
+    expect(plain.action).toBe('try_again')
+  })
+
+  it('★ no state anywhere in the table answers with a restart-specific label', () => {
+    // The paired liveness: the loop must actually be reading labels, or an empty table would
+    // satisfy the absence check for ever.
+    const labels = EVERY_STATE.map((state) => presentationFor(state).label)
+    expect(labels.length).toBe(EVERY_STATE.length)
+    expect(labels).toContain("Didn't start")
+    expect(labels).not.toContain('Could not restart')
+  })
+})
+
+/**
+ * ★ WHICH STATES HAVE A CONTAINER TO RECYCLE — the precondition Restart and Take down are
+ * offered under, and the routes' own. It lives in this module rather than at the surface because
+ * a component grouping the states itself would be a second author of the answer, which is the
+ * subject of the deploy retirement guard.
+ *
+ * ASSERTED OVER THE WHOLE TABLE, not over samples: the thing that goes wrong with a predicate
+ * like this is the state nobody thought about, and a fourteenth one has to fail here rather than
+ * quietly fall on whichever side the `||` chain happens to put it.
+ */
+describe('the states in which an application can be restarted', () => {
+  const SERVING = ['live_current', 'live_newer_work', 'live_drift_unknown'] as const
+
+  it.each(SERVING)('%s is serving something', (state) => {
+    expect(canBeRestarted(state)).toBe(true)
+  })
+
+  it('★ and every other state in the table is not', () => {
+    const wrong = EVERY_STATE.filter(
+      (state) => canBeRestarted(state) !== (SERVING as readonly string[]).includes(state),
+    )
+    expect(wrong, `disagreed for: ${wrong.join(', ')}`).toEqual([])
+  })
+
+  it('★ a deploy in flight is NOT restartable', () => {
+    // The one that looks live and is not: `starting_up` has no revision to recycle yet, and the
+    // server refuses both operations while a deploy runs. Called out by name because "it is
+    // nearly live" is exactly the reasoning that would add it.
+    expect(canBeRestarted('starting_up')).toBe(false)
+  })
+
+  it('★ nor is an application that WAS live and was taken down', () => {
+    // The other near miss: `taken_offline` has a published address in its history and no
+    // container. Publishing again is its remedy, not restarting.
+    expect(canBeRestarted('taken_offline')).toBe(false)
+  })
+})
+
+describe('a published date reads the same on every machine', () => {
+  // Midday UTC on purpose: every timezone this product is read in lands on the same calendar day,
+  // so the assertions below are about the FORM rather than about where the reader is sitting.
+  const MIDDAY = '2026-09-14T12:00:00Z'
+
+  it('★ is the day-first form this module promises, not the runtime locale’s', () => {
+    // WHAT THIS PREVENTS. Delegating to `Intl` with no locale gave `14 Sep 2026, 07:33` on one
+    // machine and `Sep 14, 2026, 02:03 AM` on another — a month-first US form one click from the
+    // list's day-first columns, in a product for an Indian airport, and neither of them the form
+    // the docblock states.
+    const stamp = formatStamp(MIDDAY)
+    expect(stamp).toMatch(/^\d{1,2} Sep 2026, \d{2}:\d{2}$/)
+    expect(stamp).not.toMatch(/AM|PM/i)
+  })
+
+  it('★ spells September Sep, which is the whole reason the months are not Intl’s', () => {
+    // `Intl` spells it `Sept` in exactly the locales BIAL's browsers are set to — the same trap
+    // the list's own formatter documents avoiding, sprung here instead.
+    expect(formatStamp(MIDDAY)).not.toContain('Sept')
+    expect(formatStamp(MIDDAY)).toContain(' Sep ')
+  })
+
+  it('hands an unreadable instant back unchanged rather than printing the words', () => {
+    expect(formatStamp('not-a-date')).toBe('not-a-date')
   })
 })

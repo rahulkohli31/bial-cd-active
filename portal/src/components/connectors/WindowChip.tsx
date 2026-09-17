@@ -22,7 +22,7 @@ import { Calendar as CalendarIcon } from 'lucide-react'
 import type { ConnectorWindow } from '../../utils/connectorApi'
 import { Button } from '../ui/button'
 import { PopoverTrigger } from '../ui/popover'
-import { MONTHS } from './ConnectorRow'
+import { MONTHS } from './connectorPresentation'
 
 /** One day of milliseconds, for the two places a span is counted. */
 const DAY_MS = 86_400_000
@@ -93,8 +93,8 @@ export interface WindowChipProps {
   window: ConnectorWindow
   /**
    * The whole accessible name, composed by the row so both of its mounts read correctly —
-   * `Days ORBIT reads in Terminal 2 Departures: 1 – 30 Sep` in the drill-down, and the same
-   * sentence about `this project` in the rail.
+   * `Days ORBIT reads in Terminal 2 Departures: 1 – 30 Sep` where a row names its application, and the same
+   * sentence about `this project` in Settings › Integrations.
    */
   accessibleName: string
 }

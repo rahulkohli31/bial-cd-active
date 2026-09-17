@@ -3,11 +3,11 @@
 WHY THIS EXISTS. Connectors are generic by name and specific only by value: the tables are
 `connector_access_requests` and `project_connectors`, the enums are `connector_request_status` and
 `connector_window_kind`, the routes are `/v1/connectors` and `/v1/admin/connector-requests`, and
-the portal ships `IntegrationsDialog` / `ConnectorRow` / `connectorApi.ts`. DICE appears only as a
-value of `connector_key` and as the literals on the one entry below. The checkable form of that
-rule is a word-boundary, case-insensitive search for `dice` across `backend/src/` and
-`portal/src/`: it must hit this file and nothing else. (Use a word boundary — a bare substring
-search also matches `indices` in `portal/src/components/chat/ActivityGroup.tsx`.)
+the portal ships `IntegrationsPage` / `ProjectConnectorRow` / `connectorApi.ts`. DICE appears
+only as a value of `connector_key`; the entry below renders as Flight Fact Data. The checkable
+form of that rule is a word-boundary, case-insensitive search for `dice` across `backend/src/`
+and `portal/src/`: it must hit this file and nothing else. (Use a word boundary — a bare
+substring search also matches `indices` in `portal/src/components/chat/ActivityGroup.tsx`.)
 
 A MODULE CONSTANT, NOT A TABLE. There is exactly one connector. A `connectors`
 table would store display strings the boards own, would need seeding in every environment and every
@@ -42,8 +42,8 @@ specification: `AskAccess` draws `WHAT AN APPROVAL GIVES YOU`
 in the second person for the citizen, and `AdminReview` draws `WHAT APPROVING GIVES THEM` in the
 third person for the administrator — different voice AND different content. The administrator's
 third line is the only one of the six that names the thirty-day cap, and the citizen's first line
-reads `Nothing you build can change DICE data`. Collapsing the two sets would therefore drop a
-promise from the approver's panel and simultaneously ship second-person copy to the approver. Both
+reads `Nothing you build can change Flight Fact Data`. Collapsing the two sets would therefore
+drop a promise from the approver's panel and simultaneously ship second-person copy to it. Both
 panels are consent copy, binding in substance, so they ship as two fields. The literals below are
 byte-exact from the `AskAccess` and `AdminReview` boards.
 
@@ -139,19 +139,19 @@ class Connector:
 _DICE_CONSENT_REQUESTER: Final = (
     ConsentLine(
         lead="Read-only.",
-        body="Nothing you build can change DICE data.",
+        body="Nothing you build can change Flight Fact Data.",
     ),
     ConsentLine(
         lead="One dataset.",
         body=(
             "The Flight Fact Report — flight schedules, gates, stands and status. "
-            "Nothing else in DICE."
+            "Nothing else in Flight Fact Data."
         ),
     ),
     ConsentLine(
-        lead="Every project you own.",
+        lead="Every application you own.",
         body=(
-            "Including ones you have not made yet. You switch it on per project, "
+            "Including ones you have not made yet. You switch it on per application, "
             "and pick the days each one reads."
         ),
     ),
@@ -164,15 +164,17 @@ _DICE_CONSENT_REQUESTER: Final = (
 _DICE_CONSENT_APPROVER: Final = (
     ConsentLine(
         lead="Read access to the Flight Fact Report.",
-        body="and nothing else in DICE.",
+        body="and nothing else in Flight Fact Data.",
     ),
     ConsentLine(
-        lead="Every project they own.",
-        body="including ones they have not made yet. They switch it on per project.",
+        lead="Every application they own.",
+        body="including ones they have not made yet. They switch it on per application.",
     ),
     ConsentLine(
         lead="Up to 30 days of history while they build.",
-        body=("each project picks its own range; a published app reads the dates its users pick."),
+        body=(
+            "each application picks its own range; a published app reads the dates its users pick."
+        ),
     ),
 )
 
@@ -184,12 +186,12 @@ _DICE_CONSENT_APPROVER: Final = (
 CONNECTORS: Final[Mapping[str, Connector]] = MappingProxyType(
     {
         "dice": Connector(
-            display_name="DICE",
+            display_name="Flight Fact Data",
             subtitle="Airport operations",
             data_noun="flight data",
             ask_subtitle=(
-                "DICE is BIAL’s airport operations data. An administrator decides who may "
-                "read it — you are asking once, for yourself."
+                "Flight Fact Data is BIAL’s airport operations data. An administrator "
+                "decides who may read it — you are asking once, for yourself."
             ),
             # DICE's retention, not the platform's rule. See the module docblock.
             max_window_days=30,

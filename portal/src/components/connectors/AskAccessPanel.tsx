@@ -1,14 +1,9 @@
 /**
  * Asking an administrator for access to one connector — the `AskAccess` board, as a BODY of the
- * Integrations dialog rather than a dialog of its own.
+ * Integrations page. The page swaps between its card list and this; there is no second surface to
+ * open, which is why the only way out of here is the back chevron.
  *
- * WHY A PANEL AND NOT A SECOND `Dialog`. `IntegrationsDialog` owns one `<Dialog open>` mount and
- * swaps its body. A second dialog would unmount one Radix dialog and mount another on every
- * forward and back click — a double backdrop fade, and `dialog.tsx`'s `useFocusBackstop()` firing
- * twice — on what the boards draw as one continuous panel. `IntegrationsDialog.test.tsx` pins it
- * by asserting the same DOM node survives the transition.
- *
- * WHAT THIS PANEL DOES NOT OWN. Not the API call, not the busy lock, not the reload: the dialog
+ * WHAT THIS PANEL DOES NOT OWN. Not the API call, not the busy lock, not the reload: the page
  * does all three, hands `busy` down and rejects `onSubmit` on failure. This is a form, an error
  * region and the consent copy.
  *
@@ -25,7 +20,7 @@
  * registry entry plus its board copy — no migration, no route, and nothing to change in here.
  */
 import { useState } from 'react'
-import { ChevronLeft, Check, Loader2, X } from 'lucide-react'
+import { ChevronLeft, Check, Loader2 } from 'lucide-react'
 import type { ConnectorEntry } from '../../utils/connectorApi'
 import {
   countWords,
@@ -34,8 +29,7 @@ import {
   MIN_DELETE_REASON_WORDS,
 } from '../../utils/words'
 import { Textarea } from '../ui/textarea'
-import { DialogTitle } from '../ui/dialog'
-import { ConnectorGlyph } from './ConnectorRow'
+import { ConnectorGlyph } from './connectorPresentation'
 
 /**
  * The box's heading — the panel's own furniture, true of any connector, and the one string here
@@ -59,6 +53,9 @@ const REMARKS_HELPER =
  * owner's decision is "use the rule already shipped for a deletion reason", and a parallel set of
  * aliases would be two names for one number — the drift `words.ts` exists to prevent.
  */
+/** The panel's own subtitle, named so the page can describe its ask body with it. */
+export const ASK_SUBTITLE_ID = 'connector-ask-subtitle'
+
 const RULE_ID = 'connector-remarks-rule'
 const COUNT_ID = 'connector-remarks-count'
 const HELPER_ID = 'connector-remarks-helper'
@@ -71,12 +68,10 @@ export interface AskAccessPanelProps {
    */
   busy: boolean
   /**
-   * The back chevron, and `Cancel`. Both return to the connector list rather than closing the
-   * dialog: abandoning a step inside Integrations leaves you in Integrations, which is where the
-   * citizen was. The header's own X is what closes.
+   * The back chevron, and `Cancel`. Both return to the connector list: abandoning a step inside
+   * Integrations leaves you in Integrations, which is where the citizen was.
    */
   onBack: () => void
-  onClose: () => void
   /**
    * Posts the remarks. REJECTS on failure and the panel renders the server's own message — the
    * duplicate-request 409 says "You have already asked for access to this", which is worth reading
@@ -89,7 +84,6 @@ export default function AskAccessPanel({
   entry,
   busy,
   onBack,
-  onClose,
   onSubmit,
 }: AskAccessPanelProps): React.JSX.Element {
   const [remarks, setRemarks] = useState('')
@@ -125,25 +119,14 @@ export default function AskAccessPanel({
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2.5">
             <ConnectorGlyph size="title" />
-            <DialogTitle className="text-base font-extrabold tracking-[-0.2px] text-primary-900">
+            <h2 className="m-0 text-base font-extrabold tracking-[-0.2px] text-primary-900">
               Ask for access to {entry.displayName}
-            </DialogTitle>
+            </h2>
           </div>
-          <p
-            id="integrations-dialog-subtitle"
-            className="mt-[5px] text-xs leading-[1.6] text-neutral"
-          >
+          <p id={ASK_SUBTITLE_ID} className="mt-[5px] text-xs leading-[1.6] text-neutral">
             {entry.askSubtitle}
           </p>
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close"
-          className="flex-shrink-0 p-0.5 text-neutral transition hover:text-primary-900"
-        >
-          <X size={17} />
-        </button>
       </div>
 
       <form

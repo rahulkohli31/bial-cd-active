@@ -30,5 +30,6 @@ from src.schemas.shares import ColleagueSearchResponse as ColleagueSearchRespons
 from src.schemas.shares import ProjectSharesResponse as ProjectSharesResponse
 from src.schemas.shares import SharedProjectListResponse as SharedProjectListResponse
 from src.schemas.shares import SharedProjectResponse as SharedProjectResponse
+from src.schemas.shares import SharedProjectSharer as SharedProjectSharer
 from src.schemas.shares import ShareRequest as ShareRequest
 from src.schemas.shares import ShareResponse as ShareResponse

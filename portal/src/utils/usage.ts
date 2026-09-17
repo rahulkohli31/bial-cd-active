@@ -1,11 +1,12 @@
 /**
- * Daily-token-usage badge helpers (interim). Isolates the navbar indicator's
- * data fetch and the "usage changed, refetch" signal so the single consumer
- * (Navbar) stays thin and both pieces are testable without a render.
+ * Daily-token-usage badge helpers (interim). Isolates the meter's data fetch and the
+ * "usage changed, refetch" signal so its two consumers — the navigation panel's ring and the
+ * workspace toolbar's compact one, both through `useUsageToday` — stay thin, and so both pieces
+ * are testable without a render.
  *
- * The signal is a window CustomEvent: the Navbar is rendered *inside* each page
- * (no shared React parent holding both the navbar and the chat state), so a
- * lightweight global event is genuinely the lightest cross-component channel.
+ * The signal is a window CustomEvent: the meter and the chat state have no shared React
+ * parent — the meter reads from the navigation panel and a turn completes deep inside the
+ * workspace — so a lightweight global event is genuinely the lightest cross-component channel.
  */
 const USAGE_EVENT = 'bial:usage-refresh'
 
@@ -51,7 +52,7 @@ export async function fetchUsageToday(fetchImpl: typeof fetch = fetch): Promise<
     if (!res.ok) return null
     // UNVALIDATED (unlike projectApi.ts's toProject/toProjectsPage): trusts the
     // server's shape as-is, matching today's behavior exactly. A malformed 200
-    // body still crashes or NaNs in Navbar today, same as before this migration
+    // body still crashes or NaNs in the meter today, same as before this migration
     // — not fixed here. Flagged as a follow-up for Rahul.
     const body: unknown = await res.json()
     return body as UsageToday

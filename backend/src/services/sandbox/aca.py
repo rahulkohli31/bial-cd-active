@@ -129,6 +129,18 @@ def is_transient(exc: HttpResponseError) -> bool:
 _LRO_CEILING_SECONDS: Final = 300.0
 _LRO_POLL_STEP_SECONDS: Final = 5.0
 
+# HOW OFTEN THE SDK ITSELF ASKS ARM. The vendor default is 30 seconds
+# (`azure/mgmt/appcontainers/_configuration.py`), and it is invisible at the call site — so a
+# delete that ARM finished in about a second was not observed as finished for thirty. The two
+# constants above do NOT govern it: `_LRO_POLL_STEP_SECONDS` is how often the worker thread
+# re-checks the poller, and `_LRO_CEILING_SECONDS` bounds the total wait. This is the resolution.
+#
+# It is set at the CONSTRUCTOR, not at a `begin_*`, so a fifth call site cannot quietly inherit 30
+# again. It matters now in a way it did not before: an owner's Restart waits on a revision inside a
+# 180-second readiness budget, and thirty seconds of that spent waiting to be told about an
+# operation already finished is thirty seconds nearer a timeout the citizen reads as a failure.
+LRO_POLLING_INTERVAL_SECONDS: Final = 5
+
 
 def await_lro(poller: Any, *, ceiling: float | None = None) -> Any:
     """Block on an ARM long-running operation, but never past `ceiling`.
@@ -252,7 +264,11 @@ class AcaControlPlane:
     def __init__(self, config: SandboxConfig) -> None:
         self._config = config
         self._credential = DefaultAzureCredential()
-        self._client = ContainerAppsAPIClient(self._credential, config.subscription_id)
+        self._client = ContainerAppsAPIClient(
+            self._credential,
+            config.subscription_id,
+            polling_interval=LRO_POLLING_INTERVAL_SECONDS,
+        )
 
     def _envelope(
         self, env: dict[str, str], tags: dict[str, str], *, identity_resource_id: str | None

@@ -20,7 +20,7 @@ import { isRecord } from '../utils/apiError'
 // bounded-height card that scrolls internally, never a fixed-aspect-ratio clip.
 // THE WIDTH TABLE IS `WorkspaceToolbar`'S — the switcher that picks a width lives in the shell's
 // toolbar row. This component still reads the widths, so it imports the one table rather than
-// keeping a second copy that could disagree about what "Tablet" means.
+// keeping a second copy the two ends could disagree about.
 import { DEVICES, type DeviceName } from './workspace/devices'
 
 // THE REVEAL RESTS ON THE FRAMED DOCUMENT VOUCHING FOR ITSELF, AND ON NOTHING ELSE.
@@ -1268,7 +1268,10 @@ export default function LivePreview({
 
       {/* Main area */}
       <div className="flex-1 flex overflow-hidden relative">
-        <div className="flex-1 bg-[#e8edf2] flex p-4 overflow-auto">
+        {/* THE GUTTER ROUND THE FRAMED APP IS A MAT, NOT A MARGIN: enough to separate the app's
+            own edge from the pane's, and no more. Every pixel here is taken off the one thing on
+            this screen a citizen is actually trying to look at. */}
+        <div className="flex-1 bg-[#e8edf2] flex p-2 overflow-auto">
           {/* NO EMPTY STATE HERE, and it is structurally unreachable rather than merely unused:
               `AppPane` mounts the host only when the address resolver returned a URL. The
               sentence a citizen reads when there is nothing to frame is `AppPane`'s, drawn from

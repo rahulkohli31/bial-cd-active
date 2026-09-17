@@ -256,12 +256,14 @@ export default {
          * `@media (prefers-reduced-motion: reduce)` block in `index.css`, which ALSO suppresses
          * `.animate-spin`, `.animate-pulse` and `.animate-bounce`. That block and
          * `usePrefersReducedMotion()` — defined in `src/components/ui/Waiting.tsx` and consumed
-         * only there, by the `Waiting` primitive every wait in the portal renders through — are
-         * the portal's only two mechanisms; there is no third, and
-         * `src/__tests__/reducedMotion.test.ts` pins that fact so it cannot again be claimed
-         * universal while dozens of other spinners quietly ignore the preference. The hook's
-         * branch was previously copied into three components and every copy was wrong the same
-         * way — it stopped the spin and kept the spinner, which is a picture of a hang.
+         * only there, by the `Waiting` primitive every wait in the portal renders through — and
+         * `MotionConfig reducedMotion="user"` at the root in `src/main.tsx`, which is what
+         * reaches the `motion` library's JS-driven animation, are the portal's only three
+         * mechanisms; there is no fourth, and `src/__tests__/reducedMotion.test.ts` pins that
+         * fact so it cannot again be claimed universal while dozens of other spinners quietly
+         * ignore the preference. The hook's branch was previously copied into three components
+         * and every copy was wrong the same way — it stopped the spin and kept the spinner,
+         * which is a picture of a hang.
          */
         'pane-leave': 'pane-leave 0.24s ease-in forwards',
         'pane-return': 'pane-return 0.24s ease-out',

@@ -5,7 +5,7 @@ import { tableHeadLabelClass } from '../ui/table'
 // The connector glyph and the board's month list, imported rather than re-drawn: the queue's
 // `CONNECTOR` cell is the same teal tile the citizen's own Integrations list draws, and `dayMonth`
 // is the single place `2 Sep` is spelled (see its docblock for why `Intl` cannot produce it).
-import { ConnectorGlyph, dayMonth, dotted } from '../connectors/ConnectorRow'
+import { ConnectorGlyph, dayMonth, dayMonthTime, dotted } from '../connectors/connectorPresentation'
 import type { LimitFields } from '../../utils/admin'
 import type { ConnectorRequestRow, ConnectorRequestStatus } from '../../utils/adminConnectorApi'
 
@@ -310,42 +310,6 @@ function initials(name: string): string {
 }
 
 /**
- * `4 Sep, 09:12` — the `ASKED` column's form, which carries the time of day because a request
- * made twenty minutes ago and one made last Tuesday are a different kind of wait.
- *
- * IT COMPOSES `dayMonth` RATHER THAN RE-SPELLING THE MONTHS. `toLocaleDateString` cannot produce
- * the board's shape at all — en-GB and en-IN abbreviate September as `Sept` under current CLDR
- * and en-US puts the month first — so the list is spelled once, in `ConnectorRow.tsx`, and every
- * connector surface comes back to it. The clock half is local, as it is there: the reader is in
- * Bangalore and the server stamps UTC.
- *
- * WHY THIS IS NOT SIMPLY IMPORTED: `ConnectorRow`'s own `dayMonthTime` is module-private and
- * that file is out of this unit's scope, so the four lines are here and the month list — the
- * part that could actually disagree — is not.
- */
-/**
- * `09:12` — the clock half on its own, local and zero-padded, or `null` for an instant that will
- * not parse.
- *
- * EXPORTED FOR THE ONE SENTENCE THAT SETS IT WITH A WORD RATHER THAN A COMMA: the decide
- * dialog's `Asked on 4 Sep at 09:12.` A third four-line copy of `padStart` would be the drift
- * the docblock above is already about, one level down — the column list is not the only thing
- * two surfaces can disagree on. `dayMonthTime` composes it, so both forms move together.
- */
-export function clockTime(iso: string): string | null {
-  const parsed = new Date(iso)
-  if (Number.isNaN(parsed.getTime())) return null
-  const hh = String(parsed.getHours()).padStart(2, '0')
-  const mm = String(parsed.getMinutes()).padStart(2, '0')
-  return `${hh}:${mm}`
-}
-
-function dayMonthTime(iso: string): string {
-  const clock = clockTime(iso)
-  return clock === null ? iso : `${dayMonth(iso)}, ${clock}`
-}
-
-/**
  * WHO IS ASKING / PERSON — the same two-line cell in both tables, so the email substitution
  * lands identically on either side of a decision.
  *
@@ -496,7 +460,7 @@ export function createConnectorRequestColumns({
           const count = row.original.usingItIn
           return (
             <span className="text-neutral whitespace-nowrap">
-              {count === null ? '—' : `${count} ${count === 1 ? 'project' : 'projects'}`}
+              {count === null ? '—' : `${count} ${count === 1 ? 'application' : 'applications'}`}
             </span>
           )
         },

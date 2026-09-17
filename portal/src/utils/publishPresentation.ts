@@ -11,6 +11,7 @@
  * version ROWS to render.
  */
 import { assertNever } from './assertNever'
+import { MONTHS } from './monthNames'
 import type { ApprovalState, DeploymentView, PublishState } from './deployApi'
 
 /**
@@ -67,11 +68,30 @@ export interface Presentation {
 }
 
 /**
+ * THE FAILURE CODES A RESTART WRITES. `did_not_start` is the state for both a first deploy that
+ * never came up and a restart that did not come back, and those are not the same event to the
+ * person reading them: the first has never had a working version, the second had one a minute
+ * ago. The code is the only thing that tells them apart.
+ */
+export const RESTART_FAILED_CODES: ReadonlySet<string> = new Set([
+  'restart_failed',
+  'restart_not_ready',
+])
+
+/**
  * THE map: one publish state in, one presentation out, ending in `assertNever` so an unlabelled
  * state is a COMPILE error. TWO STATES DELIBERATELY SHARE THE LABEL "Approved" (the difference
  * is on the button/sentence); every other pair differs in words, so the CLOSED chip stays a
  * complete answer — "Live", "Live · newer work saved" and "Live · couldn't check" are three
  * different things, and the last never reads as "nothing of yours is waiting".
+ *
+ * THE STATE VOCABULARY IS NOT THIS REDESIGN'S TO EXTEND: thirteen states, owned by the product's
+ * lifecycle. A redesign may relabel a state or move where it is drawn; adding or removing one
+ * changes what the product MEANS rather than how it is laid out.
+ *
+ * So a failed restart is explained, never named: the Deployment panel carries a notice for it.
+ * That notice covers the application that is STILL SERVING — where a restart left nothing
+ * running, the state word is the only thing said about it.
  */
 export function presentationFor(state: PublishState): Presentation {
   switch (state) {
@@ -226,11 +246,16 @@ export function presentationFor(state: PublishState): Presentation {
       // NO ARTBOARD. Verbatim from the retired Publish card, which had it right: a
       // taken-down app has a working remedy and a switched-off one does not, and
       // collapsing the two into one word would remove that remedy silently.
+      //
+      // THE SENTENCE NAMES NO ACTOR, because there are two. This state is now reachable by the
+      // owner's own take-down as well as by an administrator's, and telling an owner that an
+      // administrator did what they just did themselves is worse than saying nothing about who.
+      // What does not change is the remedy, which is the half that matters.
       return {
         label: 'Taken offline',
         sentence:
-          'An administrator has taken this app offline. Publishing again puts it back ' +
-          'at the same address.',
+          'This app is not running in production. Publishing again puts it back at the ' +
+          'same address.',
         action: 'publish_again',
         version: 'last_published',
       }
@@ -282,17 +307,60 @@ export function presentationFor(state: PublishState): Presentation {
   }
 }
 
-/** `25 Aug 2026, 14:20` — the canvas's form, and the half a citizen recognises. */
+/**
+ * IS THERE A CONTAINER SERVING RIGHT NOW — the precondition the restart and take-down routes
+ * enforce, answered HERE because this module is the one that owns what a publish state means.
+ *
+ * A surface grouping these three states itself would be a second author of the answer, and the
+ * retirement guard's whole subject is client-side predicates that re-decide what the server has
+ * already decided. This one does not re-derive anything: it reads the server's own computed
+ * field, and it exists so exactly one place has to be edited when a fourteenth state arrives.
+ *
+ * `starting_up` IS NOT ONE OF THEM. A deploy in flight has no revision to recycle and the server
+ * refuses both operations while one runs — offering a control in order to have it refused is what
+ * teaches a citizen to distrust the screen.
+ */
+export function canBeRestarted(state: PublishState): boolean {
+  return state === 'live_current' || state === 'live_newer_work' || state === 'live_drift_unknown'
+}
+
+/**
+ * …AND TAKE DOWN IS NOT RESTART'S TWIN, which one shared predicate quietly made it.
+ *
+ * The two are refused on different grounds. A restart needs a revision to recycle, so it is
+ * offered only where the platform can name one. A take-down needs a container to remove, and the
+ * route that does it says so in as many words: it makes no status check at all, because whether an
+ * application is in production is a separate question from Draft / In review / Approved.
+ *
+ * THE STATE THAT SEPARATES THEM IS `in_review`. Submitting a new version for review does not stop
+ * the version already serving — the lifecycle arm simply outranks the deployment row when the
+ * state is named — so an owner with a live application and a version in the queue was shown no way
+ * to take it out of production. The server had gone as far as authoring the sentence for exactly
+ * that case, saying the queued version is untouched; nothing could reach it.
+ *
+ * `switched_off` is deliberately NOT here. That is an administrator's kill-switch, which severs
+ * the application's database as well, and offering an owner a control over a container an
+ * administrator has already stopped is offering a refusal.
+ */
+export function canBeTakenDown(state: PublishState, hasServingRow: boolean): boolean {
+  return canBeRestarted(state) || (state === 'in_review' && hasServingRow)
+}
+
+/**
+ * `25 Aug 2026, 14:20` — the canvas's form, and the half a citizen recognises.
+ *
+ * COMPOSED, NOT DELEGATED, for the two reasons `projectDates.ts` composes its own. `Intl` follows
+ * the RUNTIME's locale, so the same instant rendered `14 Sep 2026, 07:33` on one machine and
+ * `Sep 14, 2026, 02:03 AM` on another — a month-first US form one click away from the list's
+ * day-first columns, in a product for an Indian airport. And `Intl` spells September `Sept` in
+ * exactly the locales BIAL's browsers are set to, which is why the months come from the same
+ * table the list reads. Two forms of one date, neither of them the one this docblock promises.
+ */
 export function formatStamp(iso: string): string {
-  const parsed = new Date(iso)
-  if (Number.isNaN(parsed.getTime())) return iso
-  return parsed.toLocaleString(undefined, {
-    day: 'numeric',
-    month: 'short',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
+  const at = new Date(iso)
+  if (Number.isNaN(at.getTime())) return iso
+  const time = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
+  return `${at.getDate()} ${MONTHS[at.getMonth()]} ${at.getFullYear()}, ${time}`
 }
 
 /** Whether `formatStamp` can render this instant; it hands an unparseable one back unchanged. */

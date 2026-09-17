@@ -871,7 +871,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
   usePublishSave(
     { dirty: saveDirty, saving, error: saveError, discarding, replying: turnRunningHere, hasSavedVersion },
-    { save: handleSave, discard: handleDiscard, rename: null, share: null },
+    { save: handleSave, discard: handleDiscard, settings: null, share: null },
   )
 
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
@@ -1843,7 +1843,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       if (!blocker) return null
       const other = builds.find((b) => b.id === blocker.conversationId)
       const which = other?.title ? `“${other.title}”` : 'another build chat'
-      return `${which} is already building this project. Only one build runs at a time — wait for it to finish, or stop it first.`
+      return `${which} is already building this application. Only one build runs at a time — wait for it to finish, or stop it first.`
     },
     [projectId, builds],
   )
@@ -1893,7 +1893,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // composer swallows without a word; the first press still owns the outcome and the clearing.
     if (sendingRef.current === buildIdRef.current) throw new SendRefusal('', { silent: true })
     // Project-first: a thread REQUIRES a project (no lazy Default — never reintroduce).
-    if (!projectId) throw new SendRefusal('Open a project to start a build.')
+    if (!projectId) throw new SendRefusal('Open an application to start a build.')
     if (attachments.length > 0) {
       const cap = validateConversationAttachmentCap(countAttachments(messages), attachments.length)
       if ('error' in cap) throw new SendRefusal(cap.error)
@@ -1957,7 +1957,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     const { toolCallId, newChatId } = handoff
     if (sendingRef.current === buildIdRef.current) return
     if (!projectId) {
-      setUrgent('Open a project to start a build.')
+      setUrgent('Open an application to start a build.')
       return
     }
     // Non-null: the adopt effect sets buildIdRef.current on mount, before any offer can render.
@@ -1977,7 +1977,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       const session = sessionRef.current
       const sessionLive = isActiveBuildStatus(session.status) && session.sessionId != null
       if (sessionLive && sessionProjectRef.current !== projectId) {
-        setUrgent('You already have a build running in another project. Stop it before starting one here.')
+        setUrgent('You already have a build running in another application. Stop it before starting one here.')
         return
       }
       if (sessionLive) {

@@ -9,8 +9,9 @@
  *
  * THE GRANT IS "CAN USE", NEVER "VIEW ONLY" (R6, Key Decision 3) — a colleague who opens a
  * shared project can interact with the real, running app, and anything they enter is saved
- * into the project's actual data (R7). Both sentences are said here, once, rather than left
- * for the recipient to discover after the fact.
+ * into the project's actual data (R7). This surface no longer says so: the sentence that said
+ * it was removed with the rest of the panel's explanatory copy. The recipient is still told, on
+ * the page they land on (`SharedProjectPage`); the owner granting the access is not.
  */
 import { useEffect, useRef, useState } from 'react'
 import { X } from 'lucide-react'
@@ -29,8 +30,12 @@ import {
 const MIN_QUERY_CHARS = 3
 const DEBOUNCE_MS = 300
 
-export interface SharePanelProps {
+export interface SharePanelBodyProps {
   projectId: string
+}
+
+export interface SharePanelProps extends SharePanelBodyProps {
+  /** Named in the dialog's own title. The body never spells the application's name. */
   projectName: string
   onClose: () => void
 }
@@ -39,7 +44,15 @@ function errorMessage(err: unknown, fallback: string): string {
   return err instanceof Error ? err.message : fallback
 }
 
-export default function SharePanel({ projectId, projectName, onClose }: SharePanelProps): React.JSX.Element {
+/**
+ * EVERYTHING SHARING DOES, with no frame around it — the colleague search, and the list of
+ * people who already have access, with their grants revocable in place.
+ *
+ * IT IS A BODY RATHER THAN A DIALOG because it has two homes: the workspace opens it as a dialog
+ * of its own, and an application's settings mount it as a tab. One body means an owner cannot be
+ * shown two different grant lists depending on which door they came through.
+ */
+export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.Element {
   const [shares, setShares] = useState<ProjectShare[]>([])
   const [sharesLoading, setSharesLoading] = useState(true)
   const [sharesError, setSharesError] = useState<string | null>(null)
@@ -135,7 +148,7 @@ export default function SharePanel({ projectId, projectName, onClose }: SharePan
         loadShares()
         setResults((prev) => prev.filter((c) => c.id !== colleague.id))
       })
-      .catch((err: unknown) => setActionError(errorMessage(err, 'Could not share this project.')))
+      .catch((err: unknown) => setActionError(errorMessage(err, 'Could not share this application.')))
       .finally(() => setSharingId(null))
   }
 
@@ -149,6 +162,124 @@ export default function SharePanel({ projectId, projectName, onClose }: SharePan
   }
 
   return (
+    <>
+      <label className="block">
+        <span className="text-xs font-semibold text-tertiary">Add a colleague</span>
+        <input
+          autoFocus
+          value={query}
+          onChange={(e) => onQueryChange(e.target.value)}
+          placeholder="Search by name or email"
+          className="mt-1.5 w-full border border-bial-border rounded-xl px-3 py-2.5 text-sm text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary"
+        />
+      </label>
+
+      {/* THE ONE REGION FOR ALL FOUR NAMED STATES (R28) — mounted unconditionally so a
+          reader hears each one land, matching the wait-region convention `ProjectsPage`
+          already establishes for this codebase. */}
+      <div role="status" aria-live="polite" data-testid="colleague-search-status" className="mt-2 min-h-[1.125rem]">
+        {searching ? (
+          <p className="text-xs text-neutral flex items-center gap-1.5">
+            <BusyGlyph size={12} /> Searching…
+          </p>
+        ) : searchNotice ? (
+          <p className="text-xs text-neutral">{searchNotice}</p>
+        ) : null}
+      </div>
+
+      {results.length > 0 && (
+        <ul className="mt-1 flex flex-col gap-0.5 max-h-40 overflow-y-auto">
+          {results.map((colleague) => {
+            const alreadyShared = sharedIds.has(colleague.id)
+            const busy = sharingId === colleague.id
+            return (
+              <li
+                key={colleague.id}
+                className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg hover:bg-bial-bg"
+              >
+                <div className="min-w-0">
+                  <p className="text-sm text-tertiary truncate">
+                    {colleague.displayName || colleague.emailLocalPart}
+                  </p>
+                  <p className="text-[11px] text-neutral truncate">{colleague.emailLocalPart}</p>
+                </div>
+                <button
+                  type="button"
+                  aria-disabled={alreadyShared || busy}
+                  onClick={() => {
+                    if (!alreadyShared && !busy) onShare(colleague)
+                  }}
+                  className="flex-shrink-0 text-xs font-semibold text-primary hover:underline aria-disabled:opacity-50 aria-disabled:no-underline aria-disabled:cursor-not-allowed"
+                >
+                  {alreadyShared ? 'Already shared' : busy ? <BusyGlyph size={12} /> : 'Share'}
+                </button>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+
+      {actionError !== null && (
+        <div role="alert" className="mt-3 bg-red-50 border border-red-200 rounded-xl px-3 py-2.5">
+          <p className="text-xs text-red-600">{actionError}</p>
+        </div>
+      )}
+
+      <div className="mt-5">
+        <p className="text-xs font-semibold text-tertiary">Who can use this application</p>
+        {sharesLoading ? (
+          <p className="text-xs text-neutral mt-2 flex items-center gap-1.5">
+            <BusyGlyph size={12} /> Loading…
+          </p>
+        ) : sharesError !== null ? (
+          <p className="text-xs text-danger mt-2">{sharesError}</p>
+        ) : shares.length === 0 ? (
+          <p className="text-xs text-neutral/70 italic mt-2">Not shared with anyone yet.</p>
+        ) : (
+          <ul className="mt-2 flex flex-col gap-0.5 max-h-48 overflow-y-auto">
+            {shares.map((share) => {
+              const busy = revokingId === share.sharedWithUserId
+              return (
+                <li
+                  key={share.id}
+                  className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg hover:bg-bial-bg"
+                >
+                  <div className="min-w-0">
+                    <p className="text-sm text-tertiary truncate">
+                      {share.sharedWithDisplayName || share.sharedWithEmailLocalPart}
+                    </p>
+                    {/* "Can use", never "view only" (R6, Key Decision 3). */}
+                    <p className="text-[11px] text-neutral truncate">Can use</p>
+                  </div>
+                  <button
+                    type="button"
+                    aria-disabled={busy}
+                    onClick={() => {
+                      if (!busy) onRevoke(share)
+                    }}
+                    className="flex-shrink-0 text-xs font-semibold text-neutral hover:text-danger aria-disabled:opacity-50"
+                  >
+                    {busy ? <BusyGlyph size={12} /> : 'Remove'}
+                  </button>
+                </li>
+              )
+            })}
+          </ul>
+        )}
+      </div>
+    </>
+  )
+}
+
+/**
+ * The workspace's own door to sharing: the same body, in a dialog of its own.
+ *
+ * The TITLE names the application and the close control lives here, because both belong to the
+ * frame. Mounted conditionally like every dialog in this portal, which is why `ui/dialog.tsx`
+ * carries a focus backstop — Radix's own restore never runs for a subtree React deletes outright.
+ */
+export default function SharePanel({ projectId, projectName, onClose }: SharePanelProps): React.JSX.Element {
+  return (
     <Dialog
       open
       onOpenChange={(next) => {
@@ -161,16 +292,9 @@ export default function SharePanel({ projectId, projectName, onClose }: SharePan
         className="font-manrope bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 gap-0 border-0"
       >
         <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <DialogTitle className="text-base font-bold text-tertiary truncate">
-              Share &ldquo;{projectName}&rdquo;
-            </DialogTitle>
-            {/* R6 + R7, said once, plainly, before anyone is added. */}
-            <p className="text-xs text-neutral mt-1 leading-relaxed">
-              Anyone you add can open and use this app. Anything they enter is saved into the
-              project&rsquo;s real data.
-            </p>
-          </div>
+          <DialogTitle className="min-w-0 text-base font-bold text-tertiary truncate">
+            Share &ldquo;{projectName}&rdquo;
+          </DialogTitle>
           <button
             type="button"
             onClick={onClose}
@@ -180,110 +304,8 @@ export default function SharePanel({ projectId, projectName, onClose }: SharePan
             <X size={18} />
           </button>
         </div>
-
-        <label className="block mt-5">
-          <span className="text-xs font-semibold text-tertiary">Add a colleague</span>
-          <input
-            autoFocus
-            value={query}
-            onChange={(e) => onQueryChange(e.target.value)}
-            placeholder="Search by name or email"
-            className="mt-1.5 w-full border border-bial-border rounded-xl px-3 py-2.5 text-sm text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary"
-          />
-        </label>
-
-        {/* THE ONE REGION FOR ALL FOUR NAMED STATES (R28) — mounted unconditionally so a
-            reader hears each one land, matching the wait-region convention `ProjectsPage`
-            already establishes for this codebase. */}
-        <div role="status" aria-live="polite" data-testid="colleague-search-status" className="mt-2 min-h-[1.125rem]">
-          {searching ? (
-            <p className="text-xs text-neutral flex items-center gap-1.5">
-              <BusyGlyph size={12} /> Searching…
-            </p>
-          ) : searchNotice ? (
-            <p className="text-xs text-neutral">{searchNotice}</p>
-          ) : null}
-        </div>
-
-        {results.length > 0 && (
-          <ul className="mt-1 flex flex-col gap-0.5 max-h-40 overflow-y-auto">
-            {results.map((colleague) => {
-              const alreadyShared = sharedIds.has(colleague.id)
-              const busy = sharingId === colleague.id
-              return (
-                <li
-                  key={colleague.id}
-                  className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg hover:bg-bial-bg"
-                >
-                  <div className="min-w-0">
-                    <p className="text-sm text-tertiary truncate">
-                      {colleague.displayName || colleague.emailLocalPart}
-                    </p>
-                    <p className="text-[11px] text-neutral truncate">{colleague.emailLocalPart}</p>
-                  </div>
-                  <button
-                    type="button"
-                    aria-disabled={alreadyShared || busy}
-                    onClick={() => {
-                      if (!alreadyShared && !busy) onShare(colleague)
-                    }}
-                    className="flex-shrink-0 text-xs font-semibold text-primary hover:underline aria-disabled:opacity-50 aria-disabled:no-underline aria-disabled:cursor-not-allowed"
-                  >
-                    {alreadyShared ? 'Already shared' : busy ? <BusyGlyph size={12} /> : 'Share'}
-                  </button>
-                </li>
-              )
-            })}
-          </ul>
-        )}
-
-        {actionError !== null && (
-          <div role="alert" className="mt-3 bg-red-50 border border-red-200 rounded-xl px-3 py-2.5">
-            <p className="text-xs text-red-600">{actionError}</p>
-          </div>
-        )}
-
-        <div className="mt-5">
-          <p className="text-xs font-semibold text-tertiary">Who can use this project</p>
-          {sharesLoading ? (
-            <p className="text-xs text-neutral mt-2 flex items-center gap-1.5">
-              <BusyGlyph size={12} /> Loading…
-            </p>
-          ) : sharesError !== null ? (
-            <p className="text-xs text-danger mt-2">{sharesError}</p>
-          ) : shares.length === 0 ? (
-            <p className="text-xs text-neutral/70 italic mt-2">Not shared with anyone yet.</p>
-          ) : (
-            <ul className="mt-2 flex flex-col gap-0.5 max-h-48 overflow-y-auto">
-              {shares.map((share) => {
-                const busy = revokingId === share.sharedWithUserId
-                return (
-                  <li
-                    key={share.id}
-                    className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg hover:bg-bial-bg"
-                  >
-                    <div className="min-w-0">
-                      <p className="text-sm text-tertiary truncate">
-                        {share.sharedWithDisplayName || share.sharedWithEmailLocalPart}
-                      </p>
-                      {/* "Can use", never "view only" (R6, Key Decision 3). */}
-                      <p className="text-[11px] text-neutral truncate">Can use</p>
-                    </div>
-                    <button
-                      type="button"
-                      aria-disabled={busy}
-                      onClick={() => {
-                        if (!busy) onRevoke(share)
-                      }}
-                      className="flex-shrink-0 text-xs font-semibold text-neutral hover:text-danger aria-disabled:opacity-50"
-                    >
-                      {busy ? <BusyGlyph size={12} /> : 'Remove'}
-                    </button>
-                  </li>
-                )
-              })}
-            </ul>
-          )}
+        <div className="mt-1">
+          <SharePanelBody projectId={projectId} />
         </div>
       </DialogContent>
     </Dialog>

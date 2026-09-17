@@ -44,7 +44,6 @@ vi.mock('../../utils/conversationApi', () => ({
   createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({
   default: (props) => {
     seen.push(props.compileState)

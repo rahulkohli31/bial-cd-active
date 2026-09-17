@@ -13,7 +13,6 @@ import { ExternalLink, Search, Store } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type React from 'react'
 
-import Navbar from '../components/layout/Navbar'
 import {
   Pagination,
   PaginationContent,
@@ -238,19 +237,18 @@ export default function MarketplacePage(): React.JSX.Element {
   const showPages = totalPages > 1
 
   return (
-    // Same shell as ProjectsPage: each page renders its own `Navbar` (there is no layout
-    // route), and the gradient ground is the platform's, not this page's.
+    // The gradient ground is the platform's, not this page's — which is why it is painted here
+    // rather than left to `AppShell`, whose own ground every other page sits on.
     <div
-      className="min-h-screen font-manrope flex flex-col"
+      className="min-h-full font-manrope flex flex-col"
       style={{ background: 'linear-gradient(160deg, #ffffff 0%, #f0f9f9 100%)' }}
     >
-      <Navbar />
 
       <main className="flex-1 max-w-5xl mx-auto w-full px-6 py-10 flex flex-col gap-6">
         <header className="flex flex-col gap-2">
           <h1 className="text-2xl font-bold text-tertiary flex items-center gap-2">
             <Store size={22} />
-            Marketplace
+            App Marketplace
           </h1>
           <p className="text-sm text-neutral">
             Every app published across BIAL. Search before you build — someone may have made

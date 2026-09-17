@@ -31,7 +31,6 @@ vi.mock('../../utils/conversationApi', () => ({
   createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 // `switchMode` no longer exists — a chat's kind is fixed at creation. `resolvePlanOptions` stays
 // mocked even though this suite never exercises it: the surface reaches for it whenever a plan

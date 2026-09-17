@@ -59,7 +59,7 @@ describe('ProjectRow — the description', () => {
     // obvious remedy — and this goes red on the first assertion, because the truncation lands
     // in the DOM and a screen reader loses exactly what a sighted reader loses.
     stubClip(true)
-    render(<ProjectRow project={project({ description: LONG })} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project({ description: LONG })} onOpen={vi.fn()} onSettings={vi.fn()} />)
 
     const description = screen.getByText(LONG)
     expect(description.textContent).toBe(LONG)
@@ -73,7 +73,7 @@ describe('ProjectRow — the description', () => {
     // them: the row is alive and the affordance it does have works.
     stubClip(true)
     const onOpen = vi.fn()
-    render(<ProjectRow project={project({ description: LONG })} onOpen={onOpen} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project({ description: LONG })} onOpen={onOpen} onSettings={vi.fn()} />)
 
     const description = screen.getByText(LONG)
     expect(description.className).not.toMatch(/cursor-pointer/)
@@ -91,7 +91,7 @@ describe('ProjectRow — the description', () => {
     // stretched ::after, so it wires `onOpen` back explicitly rather than relying on an
     // overlay jsdom cannot see.
     const onOpen = vi.fn()
-    render(<ProjectRow project={project({ description: LONG })} onOpen={onOpen} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project({ description: LONG })} onOpen={onOpen} onSettings={vi.fn()} />)
 
     fireEvent.click(screen.getByText(LONG))
 
@@ -108,7 +108,7 @@ describe('ProjectRow — the name keeps its tooltip', () => {
       <ProjectRow
         project={project({ name: 'A Very Long Project Name That Has To Clip' })}
         onOpen={vi.fn()}
-        onDelete={vi.fn()}
+        onSettings={vi.fn()}
       />,
     )
 
@@ -120,7 +120,7 @@ describe('ProjectRow — the name keeps its tooltip', () => {
 
   it('opens nothing on a name that already fits', () => {
     stubClip(false)
-    render(<ProjectRow project={project()} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project()} onOpen={vi.fn()} onSettings={vi.fn()} />)
 
     fireEvent.focus(screen.getByRole('button', { name: 'Visitor Log' }))
 
@@ -139,12 +139,12 @@ describe('ProjectRow — the ref never remounts across a clipped transition', ()
     // again.
     stubClip(true)
     const { rerender } = render(
-      <ProjectRow project={project({ name: 'Clipped today' })} onOpen={vi.fn()} onDelete={vi.fn()} />,
+      <ProjectRow project={project({ name: 'Clipped today' })} onOpen={vi.fn()} onSettings={vi.fn()} />,
     )
     const before = screen.getByRole('button', { name: 'Clipped today' })
 
     stubClip(false)
-    rerender(<ProjectRow project={project({ name: 'Fits now' })} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    rerender(<ProjectRow project={project({ name: 'Fits now' })} onOpen={vi.fn()} onSettings={vi.fn()} />)
     const after = screen.getByRole('button', { name: 'Fits now' })
 
     expect(after).toBe(before) // same DOM node, not a fresh mount
@@ -158,7 +158,7 @@ describe('ProjectRow — a project with no description', () => {
     // no `onClick` — a dead strip across the newest, emptiest projects, the ones most likely
     // to be clicked into.
     const onOpen = vi.fn()
-    render(<ProjectRow project={project({ description: null })} onOpen={onOpen} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project({ description: null })} onOpen={onOpen} onSettings={vi.fn()} />)
 
     fireEvent.click(screen.getByText('No description yet'))
 
@@ -167,14 +167,126 @@ describe('ProjectRow — a project with no description', () => {
 })
 
 describe('ProjectRow — no nested interactive elements, still', () => {
-  it('keeps Delete out of the name button, even with the tooltip wrapper added', () => {
+  it('keeps the menu out of the name button, even with the tooltip wrapper added', () => {
     // The tooltip restructuring wraps the name in TooltipProvider/Tooltip/TooltipTrigger —
-    // worth re-confirming the invariant survives the extra nesting.
-    render(<ProjectRow project={project()} onOpen={vi.fn()} onDelete={vi.fn()} />)
+    // worth re-confirming the invariant survives the extra nesting. A browser would forgive a
+    // nested button and jsdom would not notice, so the DOM relationship is what is asserted.
+    render(<ProjectRow project={project()} onOpen={vi.fn()} onSettings={vi.fn()} />)
 
-    const del = screen.getByLabelText('Delete Visitor Log')
+    const menu = screen.getByTestId('app-menu-row')
     const open = screen.getByRole('button', { name: 'Visitor Log' })
-    expect(open.contains(del)).toBe(false)
-    expect(del.contains(open)).toBe(false)
+    expect(open.contains(menu)).toBe(false)
+    expect(menu.contains(open)).toBe(false)
+    expect(menu.parentElement?.closest('button')).toBeNull()
+  })
+
+  it('reaches Settings through the menu, and not by one click on the row', async () => {
+    const onOpen = vi.fn()
+    const onSettings = vi.fn()
+    render(<ProjectRow project={project()} onOpen={onOpen} onSettings={onSettings} />)
+
+    // Nothing destructive has a bare control here: what a row hands out in one press is the
+    // application itself, and everything else is two steps away behind Settings.
+    expect(screen.queryByLabelText('Delete Visitor Log')).toBeNull()
+
+    fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Settings…' }))
+    expect(onSettings).toHaveBeenCalledTimes(1)
+    expect(onOpen).not.toHaveBeenCalled()
+  })
+
+  it('opens the menu by keyboard, without opening the project', async () => {
+    const onOpen = vi.fn()
+    render(<ProjectRow project={project()} onOpen={onOpen} onSettings={vi.fn()} />)
+    const trigger = screen.getByTestId('app-menu-row')
+    trigger.focus()
+    expect(document.activeElement).toBe(trigger)
+    fireEvent.keyDown(trigger, { key: 'Enter' })
+    expect(await screen.findByRole('menuitem', { name: 'Open' })).toBeTruthy()
+    expect(onOpen).not.toHaveBeenCalled()
+  })
+
+})
+
+/**
+ * A LIST ROW IS WHERE AN APPLICATION IS FOUND, NOT WHERE IT IS OPERATED. Restart, Take down and
+ * Delete live in Settings, each on the tab that owns the thing it changes.
+ */
+describe('ProjectRow — the menu is two entries, and stays two', () => {
+  it('★ offers exactly Open and Settings…, even on an application that IS serving', async () => {
+    // SERVING IS THE CASE THAT MATTERS. `isServing` is the one fact about an application that
+    // could make this menu differ at all, so a guard written against a dormant one proves
+    // nothing about the rule it is meant to hold shut.
+    //
+    // The exact list IS the liveness half: a menu that failed to render has no two entries to
+    // enumerate, so the absences underneath cannot be a crash reading as a pass.
+    render(<ProjectRow project={project({ isServing: true })} onOpen={vi.fn()} onSettings={vi.fn()} />)
+    fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
+
+    await screen.findByRole('menuitem', { name: 'Open' })
+    expect(screen.getAllByRole('menuitem').map((item) => item.textContent)).toEqual([
+      'Open',
+      'Settings…',
+    ])
+    expect(screen.queryByTestId('menu-restart')).toBeNull()
+    expect(screen.queryByTestId('menu-takedown')).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: 'Delete' })).toBeNull()
+  })
+})
+
+describe('ProjectRow — the dates', () => {
+  it('renders both dates, each absolute, each in its own column', () => {
+    render(
+      <ProjectRow
+        project={{
+          ...project(),
+          createdAt: '2026-08-12T09:00:00Z',
+          updatedAt: '2026-09-14T09:00:00Z',
+        }}
+        onOpen={vi.fn()}
+        onSettings={vi.fn()}
+      />,
+    )
+    expect(screen.getByText('12 Aug 2026')).toBeTruthy()
+    expect(screen.getByText('14 Sep 2026')).toBeTruthy()
+  })
+
+  it('shows the same date twice for a project created and updated in one minute', () => {
+    // Same value in both columns, and the row keeps its height: the failure this guards is a
+    // column that collapses or wraps when the two strings are identical.
+    const at = '2026-09-14T09:00:00Z'
+    render(
+      <ProjectRow
+        project={{ ...project(), createdAt: at, updatedAt: at }}
+        onOpen={vi.fn()}
+        onSettings={vi.fn()}
+      />,
+    )
+    const both = screen.getAllByText('14 Sep 2026')
+    expect(both).toHaveLength(2)
+    for (const cell of both) expect(cell.className).toMatch(/whitespace-nowrap/)
+  })
+
+  it('★ the status pill is never held narrower than the words inside it', () => {
+    // WHAT THIS PREVENTS: the pill carried the column's fixed 104px itself, and `CHANGES
+    // REQUESTED` needs about 121px at 10px bold uppercase — so seventeen pixels of red text sat
+    // OUTSIDE its own pink background, running to within a few pixels of the `⋯`.
+    //
+    // jsdom has no layout, so the assertion is structural, and that is the stronger form anyway:
+    // the fixed width belongs to the COLUMN and the pill sizes to its own text, which makes the
+    // overflow unreachable rather than merely retuned. Paired with the label itself, because
+    // "has no width class" passes just as well on a pill that rendered nothing.
+    render(
+      <ProjectRow
+        project={project({ appStatus: 'rejected' })}
+        onOpen={vi.fn()}
+        onSettings={vi.fn()}
+      />,
+    )
+    const pill = screen.getByText('Changes requested')
+    expect(pill.className).toMatch(/rounded-full/)
+    expect(pill.className).not.toMatch(/\bw-/)
+    // …and the column that reserves the space is still there, or the row has simply lost its ruler.
+    expect(pill.parentElement?.className).toMatch(/w-\[122px\]/)
   })
 })

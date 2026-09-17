@@ -5,60 +5,45 @@
  * which the keyset envelope doesn't compute — so `page` and `pageSize` are committed
  * state and an effect re-fetches, rather than a hook that appends forward-only.
  *
+ * The summary strip is also this page's ONE filter control: each tile counts a set and then
+ * selects it, and the total tile is how a reader gets back out. See `TILES`.
+ *
  * WHY THIS EXISTS
- * `page`, `pageSize` and `q` live in the URL, not local state — opening a project and
+ * `page`, `pageSize`, `q` and `filter` live in the URL, not local state — opening a project and
  * pressing Back, reloading, or pasting the address to a colleague all land on the same
  * view, which matters more here than on most lists: the canvas gives a citizen no recents
  * list, so this page IS how a project is found again. `view` and `density` stay in
  * `localStorage` instead, on purpose — they are a person's habit rather than a place in a
  * list, and a shared link should not reach into the reader's window and rearrange it.
  *
- * Two empty states differ: zero projects (first run) vs. zero results WITH a search,
- * which quotes `appliedQuery` — never the live `q`, which runs 300ms ahead and would
+ * Two empty states differ: zero projects (first run) vs. zero results with a search or a tile
+ * filter, which quotes `appliedQuery` — never the live `q`, which runs 300ms ahead and would
  * flash a false "no projects" mid-type. The skeleton matches the active view, and a
  * page-2 failure is shown below the rows already on screen, never clears them.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import {
-  Plus,
-  Search,
-  LayoutGrid,
-  List as ListIcon,
-  AlertTriangle,
-  AlertCircle,
-  Info,
-  X,
-  ChevronsLeft,
-  ChevronsRight,
-} from 'lucide-react'
-import Navbar from '../components/layout/Navbar'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { Plus, Search, AlertTriangle, AlertCircle, Info, X } from 'lucide-react'
 import {
   listProjects,
   listProjectCounts,
   deleteProject,
   type Project,
   type ProjectCounts,
+  type ProjectFilter,
 } from '../utils/projectApi'
-import { listSharedWithMe, type SharedProject, type SharedProjectsPage } from '../utils/sharingApi'
 import { ApiError } from '../utils/apiError'
 import ProjectCard from '../components/projects/ProjectCard'
 import ProjectRow from '../components/projects/ProjectRow'
-import SharedProjectCard from '../components/projects/SharedProjectCard'
 import ProjectCreateModal from '../components/projects/ProjectCreateModal'
 import ProjectDeleteDialog from '../components/projects/ProjectDeleteDialog'
-import { useKeysetList } from '../hooks/useKeysetList'
+import AppSettingsDialog from '../components/projects/AppSettingsDialog'
+import { ListPager, ListSkeleton, ViewControls } from '../components/projects/listChrome'
+import { COLUMN, DENSITY_COLS, DEFAULT_PAGE_SIZE, PAGE_SIZES } from '../utils/listView'
+import { useListView } from '../hooks/useListView'
+import { useArrivalNotice } from '../hooks/useArrivalNotice'
 import { Input } from '../components/ui/input'
 import { Skeleton } from '../components/ui/skeleton'
-import { ToggleGroup, ToggleGroupItem } from '../components/ui/toggle-group'
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from '../components/ui/pagination'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 
 /**
@@ -76,53 +61,50 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
  * also why the line is a CONSTANT rather than the server's own message piped through: the moment
  * it is derived from the response, two causes can print two sentences again.
  */
-export const PROJECT_GONE_NOTICE = 'That project is no longer available.'
+export const PROJECT_GONE_NOTICE = 'That application is no longer available.'
 
-type View = 'list' | 'grid'
-type Density = 'S' | 'M' | 'L'
+/**
+ * The three summary tiles, and the filter each one applies.
+ *
+ * EACH TILE COUNTS A SET AND THEN SELECTS IT. `filter` is the value the server's own
+ * `?filter=` takes, named after the count field it sits beside, so a tile cannot come to show a
+ * number its own filter is unable to produce.
+ *
+ * `null` IS THE CLEAR-ALL, not a third filter: everything is the absence of one, which is why
+ * the total tile has no state of its own to get stuck in.
+ *
+ * The strip renders ABOVE the list/grid branch, so the tiles behave identically in both views,
+ * and the filter composes with the search rather than replacing it — there is exactly one
+ * filter state on this page and one thing to clear.
+ */
+const TILES: readonly {
+  label: string
+  hint: string
+  filter: ProjectFilter | null
+  read: (counts: ProjectCounts | null) => number | undefined
+}[] = [
+  {
+    label: 'In production',
+    hint: 'apps live for BIAL staff right now',
+    filter: 'inProduction',
+    read: (counts) => counts?.inProduction,
+  },
+  {
+    label: 'Total applications',
+    hint: 'created since the platform opened',
+    filter: null,
+    read: (counts) => counts?.totalApplications,
+  },
+  {
+    label: 'In review, in progress or deployed',
+    hint: 'moving through the pipeline',
+    filter: 'inPipeline',
+    read: (counts) => counts?.inPipeline,
+  },
+]
 
-/** Remembered per person so the choice survives a reload.
- *  Reads are wrapped because a private window or blocked site data throws on access. */
-const VIEW_KEY = 'bial.projects.view'
-const DENSITY_KEY = 'bial.projects.density'
-
-function readStored<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
-  try {
-    const value = localStorage.getItem(key)
-    return allowed.includes(value as T) ? (value as T) : fallback
-  } catch {
-    return fallback
-  }
-}
-
-function store(key: string, value: string): void {
-  try {
-    localStorage.setItem(key, value)
-  } catch {
-    /* a remembered preference is a convenience, never a requirement */
-  }
-}
-
-/** Grid columns per density. S is denser, L roomier — the mockup's S/M/L control. */
-const DENSITY_COLS: Record<Density, string> = {
-  S: 'grid-cols-1 sm:grid-cols-3 lg:grid-cols-4',
-  M: 'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3',
-  L: 'grid-cols-1 sm:grid-cols-2',
-}
-
-// shadcn's toggle marks its ON state with `bg-accent`, and this theme maps `--accent` to
-// the brand ORANGE (#F5A623) — a solid orange pill in a teal interface. The component is
-// right; its default theme mapping is not for this design, and no unit test can see which
-// colour a class resolves to. Overridden at the call site rather than in `ui/toggle.tsx`,
-// so the vendored component stays upstream-shaped for whoever uses it next.
-const ACTIVE =
-  ' data-[state=on]:bg-primary/10 data-[state=on]:text-primary data-[state=on]:ring-1 data-[state=on]:ring-primary/30'
-
-const PAGE_SIZES = [8, 16, 24, 48] as const
-const DEFAULT_PAGE_SIZE = PAGE_SIZES[0]
-
-/** The three values the URL carries. Everything else about this page is local. */
-type Committed = { page: number; pageSize: number; q: string }
+/** The four values the URL carries. Everything else about this page is local. */
+type Committed = { page: number; pageSize: number; q: string; filter: ProjectFilter | null }
 
 /**
  * READ DEFENSIVELY — a query string is user input, and this one is meant to be pasted around.
@@ -137,10 +119,15 @@ type Committed = { page: number; pageSize: number; q: string }
 function readCommitted(params: URLSearchParams): Committed {
   const asked = Number(params.get('page'))
   const size = Number(params.get('pageSize'))
+  const tile = params.get('filter')
   return {
     page: Number.isInteger(asked) && asked >= 1 ? asked : 1,
     pageSize: (PAGE_SIZES as readonly number[]).includes(size) ? size : DEFAULT_PAGE_SIZE,
     q: params.get('q') ?? '',
+    // Anything but the two tiles that filter is NO filter, which is the total tile — the one
+    // state this page always has a control to leave. A `?filter=banana` the server would refuse
+    // must not leave a reader on an error where their applications should be.
+    filter: tile === 'inProduction' || tile === 'inPipeline' ? tile : null,
   }
 }
 
@@ -166,6 +153,7 @@ function intoParams(prev: URLSearchParams, next: Committed): URLSearchParams {
   put('page', String(next.page), next.page === 1)
   put('pageSize', String(next.pageSize), next.pageSize === DEFAULT_PAGE_SIZE)
   put('q', next.q, next.q === '')
+  put('filter', next.filter ?? '', next.filter === null)
   return params
 }
 
@@ -173,15 +161,19 @@ export default function ProjectsPage(): React.JSX.Element {
   const navigate = useNavigate()
   const [showCreate, setShowCreate] = useState(false)
   const [deleting, setDeleting] = useState<Project | null>(null)
-  const [toast, setToast] = useState<string | null>(null)
+  // THE SETTINGS DIALOG IS AN OVERLAY OVER THIS LIST, not a route. Opening it changes no
+  // address, so a citizen who came from a search and a page is still on that search and that
+  // page when they close it.
+  const [settingsFor, setSettingsFor] = useState<Project | null>(null)
+  /**
+   * WHAT THE STRIP AT THE FOOT SAYS, and whether it is bad news. The tone is carried rather than
+   * assumed, so a failure and a confirmation cannot come to share one voice. `subject` names the
+   * application, because this list can scroll, filter and empty underneath a notice that then
+   * refers to nothing on screen.
+   */
+  const [toast, setToast] = useState<{ text: string; subject: string } | null>(null)
 
-  const [view, setView] = useState<View>(() => readStored(VIEW_KEY, ['list', 'grid'] as const, 'list'))
-  const [density, setDensity] = useState<Density>(() => readStored(DENSITY_KEY, ['S', 'M', 'L'] as const, 'M'))
-  // NOT PERSISTED, NOT IN THE URL — unlike `view`/`density` (a habit) and `page`/`q` (a place
-  // in a list this page is the only way back to), which tab is open is neither: a shared link
-  // to this page is about the citizen's OWN projects either way, and there is nothing here a
-  // colleague would paste around expecting it to land on someone else's "shared with me".
-  const [tab, setTab] = useState<'mine' | 'shared'>('mine')
+  const { view, setView, density, setDensity } = useListView()
 
   // COMMITTED query state — WHAT WAS ASKED FOR, and it lives in the address bar.
   //
@@ -191,7 +183,7 @@ export default function ProjectsPage(): React.JSX.Element {
   // one value — typing, which also resets the page; the rows-per-page control, which does the same
   // — therefore passes both in a single patch.
   const [searchParams, setSearchParams] = useSearchParams()
-  const { page, pageSize, q } = readCommitted(searchParams)
+  const { page, pageSize, q, filter } = readCommitted(searchParams)
   /**
    * `entry` IS THE WHOLE DEBOUNCE QUESTION, ANSWERED AT EVERY CALL SITE.
    *
@@ -220,6 +212,10 @@ export default function ProjectsPage(): React.JSX.Element {
   const [appliedQuery, setAppliedQuery] = useState<string | null>(null)
   const [appliedPage, setAppliedPage] = useState(1)
   const [appliedPageSize, setAppliedPageSize] = useState<number>(PAGE_SIZES[0])
+  // WHICH TILE THE ROWS ANSWER TO. Its own state for the reason `appliedQuery` has one: the
+  // empty states below make a claim about the ACCOUNT, and "Nothing here yet" under a filter
+  // that simply matched nothing is a claim the page has no business making.
+  const [appliedFilter, setAppliedFilter] = useState<ProjectFilter | null>(null)
 
   const [items, setItems] = useState<Project[]>([])
   const [total, setTotal] = useState(0)
@@ -262,53 +258,22 @@ export default function ProjectsPage(): React.JSX.Element {
     return () => clearTimeout(t)
   }, [q])
 
-  // THE ARRIVAL NOTICE, READ ONCE AND THEN SCRUBBED.
-  //
-  // It rides ROUTER STATE, not the query string. A query survives a copy, a bookmark and a share,
-  // and "that project is no longer available" pinned to a shareable `/projects?notice=…` is a
-  // sentence about a bounce the next reader never made. Router state travels only on the one
-  // navigation that set it.
-  //
-  // BUT IT SURVIVES MORE THAN THAT NAVIGATION UNLESS IT IS TAKEN AWAY. React Router keeps this
-  // in `window.history.state`, which the browser restores on RELOAD and replays on BACK — so
-  // without the replace below, refreshing the list re-announces a project the reader dealt with
-  // ten minutes ago, and stepping back onto the list later does it again. Reading the sentence
-  // into component state and then replacing the entry with a stateless one is what makes this a
-  // one-shot. The replace cannot loop: the re-run reads a `notice` that is no longer there.
-  //
-  // WHICH IS ALSO WHY IT NEVER BECOMES A QUERY PARAMETER. The replace above carries
-  // `location.search` through verbatim, so the page, size and query a reader arrived with survive
-  // being told a project is gone — but the reverse must hold too: a `?notice=…` would be copied
-  // forward by `intoParams`, which preserves the parameters it does not own, and would then
-  // outlive the reload it is supposed to be cleared by. Router state is the only channel that
-  // travels on exactly one navigation and nowhere else, so it stays the channel.
-  //
-  // THE TEXT ARRIVES AFTER ITS REGION, which is why this is an effect and not a `useState`
-  // initialiser. A live region inserted together with its text is missed entirely by
-  // several reader-and-browser combinations — `TurnBanner` and `LivePreview` both record it — so
-  // the region below is mounted on every render, empty, and the sentence lands inside it a tick
-  // later. It is its own region rather than a second tenant of `projects-wait`: that one narrates
-  // a wait that is still running, and two unrelated sentences sharing one polite region read as
-  // one announcement.
-  const location = useLocation()
-  const [notice, setNotice] = useState<string | null>(null)
-  useEffect(() => {
-    const carried = (location.state as { notice?: unknown } | null)?.notice
-    if (typeof carried !== 'string' || carried.length === 0) return
-    setNotice(carried)
-    navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
-  }, [location.pathname, location.search, location.state, navigate])
+  // ITS OWN REGION rather than a second tenant of `projects-wait`: that one narrates a wait that
+  // is still running, and two unrelated sentences sharing one polite region read as one
+  // announcement. See the hook for why the sentence rides router state and is scrubbed.
+  const { notice, dismiss: dismissNotice } = useArrivalNotice()
 
   useEffect(() => {
     const id = ++requestId.current
     setLoading(true)
-    listProjects({ page, limit: pageSize, q: debouncedQ || undefined })
+    listProjects({ page, limit: pageSize, q: debouncedQ || undefined, filter: filter ?? undefined })
       .then((res) => {
         if (requestId.current !== id) return
         setItems(res.items)
         setTotal(res.total)
         setTotalPages(res.totalPages)
         setAppliedQuery(debouncedQ)
+        setAppliedFilter(filter)
         setAppliedPage(res.page)
         setAppliedPageSize(res.pageSize)
         setError(null)
@@ -317,13 +282,14 @@ export default function ProjectsPage(): React.JSX.Element {
         if (requestId.current !== id) return
         // The rows already on screen are LEFT INTACT. A later page failing must not blank
         // the list the reader is using; the message goes underneath them instead.
-        setError(caught instanceof Error ? caught : new Error('Could not load your projects.'))
+        setError(caught instanceof Error ? caught : new Error('Could not load your applications.'))
         setAppliedQuery(debouncedQ)
+        setAppliedFilter(filter)
       })
       .finally(() => {
         if (requestId.current === id) setLoading(false)
       })
-  }, [page, pageSize, debouncedQ, reloadNonce])
+  }, [page, pageSize, debouncedQ, filter, reloadNonce])
 
   // The three numbers. A separate route, because the page holds 8 of 12 rows and cannot
   // compute any of them, and because polling the list for three integers would pay for row
@@ -369,41 +335,7 @@ export default function ProjectsPage(): React.JSX.Element {
     if (!loading && totalPages > 0 && page > totalPages) commit({ page: totalPages }, 'replace')
   }, [loading, page, totalPages, commit])
 
-  const chooseView = (next: View): void => {
-    setView(next)
-    store(VIEW_KEY, next)
-  }
-  const chooseDensity = (next: Density): void => {
-    setDensity(next)
-    store(DENSITY_KEY, next)
-  }
-
   const openProject = (id: string): void => navigate(`/projects/${id}`)
-  const openSharedProject = (id: string): void => navigate(`/shared/${id}`)
-
-  // "Shared with me" — keyset-paginated, unlike the offset-paginated "mine" list above, because
-  // `GET /v1/projects/shared` writes into a list every SHARER adds to rather than one this
-  // reader's own total governs; `useKeysetList` never touches `q` here (no search over this
-  // list exists yet), only `items`/`loading`/`error`/`hasMore`/`loadMore`.
-  const shared = useKeysetList<SharedProject, SharedProjectsPage>({
-    fetchPage: ({ cursor, limit }) => listSharedWithMe({ cursor, limit }),
-  })
-  // FETCHED ONCE, ON FIRST VISIT TO THE TAB — `lastPage === null` is "no page has landed yet",
-  // which `loadMore` itself then flips, so this does not re-fire on every render the tab stays
-  // open, and switching back from "mine" and forth does not repeat the request. `error === null`
-  // is what stops a failed first load from retrying itself every render: `loading` flips back to
-  // `false` on failure too, and without this guard that flip alone would re-satisfy the other two
-  // conditions and fire `loadMore` again, forever, against a server that just refused it. A failed
-  // load waits for the Retry button below instead.
-  useEffect(() => {
-    if (tab === 'shared' && shared.lastPage === null && shared.error === null && !shared.loading) {
-      shared.loadMore()
-    }
-    // `shared` is a fresh object every render (`useKeysetList` returns a new literal each call);
-    // depending on it whole would re-run this on every render the tab stays open. The four
-    // properties actually read above are what should gate the effect, and are exactly what's listed.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, shared.lastPage, shared.error, shared.loading, shared.loadMore])
 
   const handleCreated = (project: Project): void => {
     setShowCreate(false)
@@ -437,7 +369,10 @@ export default function ProjectsPage(): React.JSX.Element {
       // The row never left, so this is not "put it back" — it is the totals and the counts
       // strip catching up with whatever the failed attempt did or did not change.
       setReloadNonce((n) => n + 1)
-      setToast(caught instanceof Error ? caught.message : 'Could not delete the project.')
+      setToast({
+        text: caught instanceof Error ? caught.message : 'Could not delete the application.',
+        subject: project.name,
+      })
     } finally {
       setDeletingIds((ids) => {
         const next = new Set(ids)
@@ -455,12 +390,19 @@ export default function ProjectsPage(): React.JSX.Element {
       // one branch.
       setDeleting(null)
       // FOCUS EXPLICITLY, rather than let Radix try, and it still has to be explicit now that
-      // the row survives until the refetch. The Delete button Radix captured is about to be
-      // unmounted by that refetch — a beat AFTER the dialog closes — so a restore onto it
-      // would put the keyboard on a control that is removed a moment later, which lands right
-      // back on the body. The heading is the nearest stable, always-mounted landmark, and it
-      // is unaffected when the row goes.
-      headingRef.current?.focus()
+      // the row survives until the refetch. The control Radix captured is about to be unmounted
+      // by that refetch — a beat AFTER the dialog closes — so a restore onto it would put the
+      // keyboard on a control that is removed a moment later, which lands right back on the
+      // body. The heading is the nearest stable, always-mounted landmark, and it is unaffected
+      // when the row goes.
+      //
+      // NEXT FRAME, NOT THIS ONE, and that is not a nicety. `setDeleting(null)` above does not
+      // unmount the dialog until React commits, so a focus() on this line moves focus OUT of a
+      // focus trap that is still armed — and the trap pulls it straight back in, after which
+      // the dialog unmounts and the keyboard lands on the body. Scheduling here also means
+      // this runs BEFORE `ui/dialog.tsx`'s backstop, which schedules its own frame during
+      // unmount: it then sees focus already placed and correctly does nothing.
+      requestAnimationFrame(() => headingRef.current?.focus())
     }
   }
 
@@ -489,6 +431,10 @@ export default function ProjectsPage(): React.JSX.Element {
   // commit paints. `total` is the server's own last answer, so it still reads 40 in exactly
   // that frame and discriminates the case. Belt and braces on a screen that answers a
   // question about somebody's whole account.
+  //
+  // AND IT IS GATED ON THE TILE FILTER TOO. "Nothing here yet. Create a project" is a claim
+  // about the ACCOUNT; under `?filter=inProduction` the same empty page means only that nothing
+  // is live, and `total` is the filtered total, so it reads 0 with forty applications behind it.
   const showFirstRun =
     settled &&
     !loading &&
@@ -496,21 +442,18 @@ export default function ProjectsPage(): React.JSX.Element {
     error === null &&
     isEmpty &&
     total === 0 &&
-    appliedQuery === ''
+    appliedQuery === '' &&
+    appliedFilter === null
   // Gated on the same flag as the first run, and for the same reason: deleting the last
   // matching row must not claim the search found nothing for the length of the round trip.
   const showNoMatches =
-    settled && !loading && !deleteInFlight && error === null && isEmpty && !!appliedQuery
+    settled &&
+    !loading &&
+    !deleteInFlight &&
+    error === null &&
+    isEmpty &&
+    (!!appliedQuery || appliedFilter !== null)
   const showRows = !isEmpty
-  // A SLIDING WINDOW, not the first five. `Math.min(totalPages, 5)` rendered pages 1-5
-  // whatever page you were on, so from page 6 nothing was marked active and the only way
-  // deeper was clicking Next repeatedly — with the page you were reading not shown at all.
-  const pageWindow = useMemo(() => {
-    const span = Math.min(5, Math.max(totalPages, 1))
-    // Centre on the current page, then clamp so the window never runs past either end.
-    const first = Math.min(Math.max(page - Math.floor(span / 2), 1), Math.max(totalPages - span + 1, 1))
-    return Array.from({ length: span }, (_, i) => first + i)
-  }, [page, totalPages])
 
   // DERIVED FROM WHAT THE ROWS ANSWER, never from what was requested. The footer used to
   // narrate the page that FAILED over the rows that succeeded: 12 projects, page 2 refused,
@@ -522,110 +465,16 @@ export default function ProjectsPage(): React.JSX.Element {
   const lastOnPage = useMemo(() => firstOnPage + items.length - 1, [firstOnPage, items.length])
 
   return (
-    <div className="min-h-screen font-manrope flex flex-col bg-bial-bg">
-      <Navbar />
+    <div className="min-h-full font-manrope flex flex-col bg-bial-bg">
 
       <main className="flex-1 max-w-6xl mx-auto w-full px-6 py-8">
-        <h1 ref={headingRef} tabIndex={-1} className="text-2xl font-extrabold text-tertiary outline-none">Your apps</h1>
+        <h1 ref={headingRef} tabIndex={-1} className="text-2xl font-extrabold text-tertiary outline-none">
+          My Applications
+        </h1>
         <p className="text-sm text-neutral mt-1">
-          Each project is one tool — its app, its description, and its chats.
+          Each application is one tool — its screens, its description, and its chats.
         </p>
 
-        {/* "Shared with me" (#198) is a second list, not a filter on this one — a colleague's
-            project has no page/size/search state of its own to fold into `Committed`, and
-            "mine" keeps every line below untouched by adding a sibling arm instead. */}
-        <ToggleGroup
-          type="single"
-          value={tab}
-          onValueChange={(v) => v && setTab(v as 'mine' | 'shared')}
-          aria-label="Project list"
-          className="mt-4"
-        >
-          <ToggleGroupItem value="mine" className={ACTIVE.trim()}>
-            My projects
-          </ToggleGroupItem>
-          <ToggleGroupItem value="shared" className={ACTIVE.trim()}>
-            Shared with me
-          </ToggleGroupItem>
-        </ToggleGroup>
-
-        {tab === 'shared' ? (
-          <div className="mt-6">
-            {shared.error !== null && shared.items.length === 0 ? (
-              <div
-                data-testid="shared-error"
-                className="bg-white border border-danger/30 rounded-2xl py-16 px-6 text-center"
-              >
-                <AlertTriangle size={22} className="mx-auto text-danger mb-3" />
-                <p className="text-sm font-semibold text-tertiary">Couldn’t load projects shared with you</p>
-                <p className="text-xs text-neutral mt-1 mb-3">The server did not answer. Nothing has been lost.</p>
-                <button onClick={() => shared.refresh()} className="text-xs text-primary font-semibold hover:underline">
-                  Retry
-                </button>
-              </div>
-            ) : shared.lastPage === null ? (
-              <div className={`grid gap-4 ${DENSITY_COLS[density]}`} aria-busy="true">
-                {[0, 1, 2].map((i) => (
-                  <div key={i} className="bg-white border border-bial-border rounded-2xl px-5 py-4">
-                    <Skeleton className="h-4 w-1/2 mb-3" />
-                    <Skeleton className="h-3 w-3/4 mb-2" />
-                    <Skeleton className="h-3 w-1/4" />
-                  </div>
-                ))}
-              </div>
-            ) : shared.items.length === 0 ? (
-              // The plain, message-only empty state `showNoMatches` uses — never `showFirstRun`'s,
-              // which offers "New project": requirement 13 forbids inviting a recipient to create
-              // one from a list that is entirely about what colleagues have shared with them.
-              <div
-                data-testid="shared-empty"
-                className="bg-white border border-bial-border rounded-2xl py-16 px-6 text-center"
-              >
-                <p className="text-sm font-semibold text-tertiary">Nothing shared with you yet</p>
-                <p className="text-xs text-neutral mt-1">
-                  When a colleague shares a project with you, it will show up here.
-                </p>
-              </div>
-            ) : (
-              <>
-                <div className={`grid gap-4 ${DENSITY_COLS[density]}`}>
-                  {shared.items.map((project) => (
-                    <SharedProjectCard
-                      key={project.projectId}
-                      project={project}
-                      onOpen={() => openSharedProject(project.projectId)}
-                    />
-                  ))}
-                </div>
-                {shared.error !== null && (
-                  <p role="alert" className="text-xs text-danger text-center mt-4">
-                    Couldn’t load more.{' '}
-                    <button
-                      type="button"
-                      onClick={() => shared.refresh()}
-                      className="font-semibold text-primary hover:underline"
-                    >
-                      Retry
-                    </button>
-                  </p>
-                )}
-                {shared.hasMore && shared.error === null && (
-                  <div className="flex justify-center mt-5">
-                    <button
-                      type="button"
-                      onClick={() => shared.loadMore()}
-                      aria-disabled={shared.loading}
-                      className="text-xs font-semibold text-primary hover:underline disabled:opacity-50"
-                    >
-                      {shared.loading ? 'Loading…' : 'Load more'}
-                    </button>
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-        ) : (
-        <>
         {/* THE PAGE'S ONE POLITE REGION — permanently mounted, empty when nothing is in flight.
             The skeletons below are the only thing this page used to say while it
             loaded, and `index.css` suppresses `.animate-pulse` for a citizen who asks for less
@@ -639,7 +488,7 @@ export default function ProjectsPage(): React.JSX.Element {
             `sr-only` copy: two elements carrying one sentence is that sentence read twice, which
             `Announcer.tsx` records as having broken three tests. */}
         <div role="status" aria-live="polite" data-testid="projects-wait">
-          {waiting ? <p className="text-sm font-medium text-neutral mt-3">Loading your projects…</p> : null}
+          {waiting ? <p className="text-sm font-medium text-neutral mt-3">Loading your applications…</p> : null}
         </div>
 
         {/* WHY THIS IS NOT THE TOAST AT THE BOTTOM OF THIS FILE. That channel is
@@ -659,7 +508,7 @@ export default function ProjectsPage(): React.JSX.Element {
               <p className="text-sm text-tertiary">{notice}</p>
               <button
                 type="button"
-                onClick={() => setNotice(null)}
+                onClick={dismissNotice}
                 aria-label="Dismiss notice"
                 className="ml-auto text-neutral hover:text-tertiary"
               >
@@ -700,29 +549,52 @@ export default function ProjectsPage(): React.JSX.Element {
           </div>
         ) : (
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-5 mb-6" aria-busy={countsPending}>
-          {[
-            { label: 'In production', value: counts?.inProduction, hint: 'apps live for BIAL staff right now' },
-            { label: 'Total applications', value: counts?.totalApplications, hint: 'created since the platform opened' },
-            { label: 'In review, in progress or deployed', value: counts?.inPipeline, hint: 'moving through the pipeline' },
-          ].map((card) => (
-            <div key={card.label} className="bg-white border border-bial-border rounded-2xl px-5 py-4">
-              <p className="text-xs font-semibold text-neutral">{card.label}</p>
-              <div className="flex items-baseline gap-2 mt-1.5">
-                {card.value === undefined ? (
-                  <Skeleton className="h-7 w-10" />
-                ) : (
-                  <span className="text-2xl font-extrabold text-tertiary tabular-nums">{card.value}</span>
-                )}
-                <span className="text-[11px] text-neutral/80">{card.hint}</span>
-              </div>
-            </div>
-          ))}
+          {TILES.map((tile) => {
+            // THE TOTAL TILE IS THE CLEAR-ALL. "Total applications" selects everything, which is
+            // the same as no filter — so it reads as pressed whenever nothing else is, and
+            // pressing it clears the others rather than adding a fourth state nobody can leave.
+            const pressed = tile.filter === null ? filter === null : filter === tile.filter
+            const value = tile.read(counts)
+            // A tile that can produce no rows is not a control. The one you are STANDING IN
+            // stays live even at zero, because it is also the way back out.
+            const unusable = tile.filter !== null && value === 0 && !pressed
+            return (
+              <button
+                key={tile.label}
+                type="button"
+                aria-pressed={pressed}
+                disabled={unusable}
+                // Pressing the tile you are already in clears it. The total tile lands on the
+                // same answer from either side, which is what makes it the clear-all rather
+                // than a fourth state.
+                onClick={() => commit({ filter: pressed ? null : tile.filter, page: 1 }, 'push')}
+                className={`text-left bg-white border rounded-2xl px-5 py-4 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 disabled:opacity-60 disabled:cursor-not-allowed ${
+                  pressed
+                    ? 'border-primary/40 ring-1 ring-primary/30'
+                    : 'border-bial-border hover:border-primary/40'
+                }`}
+              >
+                <p className="text-xs font-semibold text-neutral">{tile.label}</p>
+                <div className="flex items-baseline gap-2 mt-1.5">
+                  {value === undefined ? (
+                    <Skeleton className="h-7 w-10" />
+                  ) : (
+                    // STILL A NUMBER IN ITS OWN ELEMENT, inside the live region above: the tile
+                    // became a control, and the count still has to read as a count when it
+                    // changes under a delete or a publish.
+                    <span className="text-2xl font-extrabold text-tertiary tabular-nums">{value}</span>
+                  )}
+                  <span className="text-[11px] text-neutral/80">{tile.hint}</span>
+                </div>
+              </button>
+            )
+          })}
         </div>
         )}
         </div>
 
-        {/* ONE controls row: search, density (grid only), view, New project. The
-            New project button lives HERE and nowhere else — adding it to the page
+        {/* ONE controls row: search, density (grid only), view, Create App. The
+            Create App button lives HERE and nowhere else — adding it to the page
             header too would ship two of them. */}
         <div className="flex items-center gap-3 flex-wrap mb-4">
           <div className="relative flex-1 min-w-[220px] max-w-md">
@@ -730,85 +602,33 @@ export default function ProjectsPage(): React.JSX.Element {
             <Input
               value={q}
               onChange={(e) => commit({ q: e.target.value, page: 1 }, 'replace')}
-              placeholder="Search projects…"
-              aria-label="Search projects"
+              placeholder="Search applications…"
+              aria-label="Search applications"
               className="pl-9"
             />
           </div>
 
           <div className="ml-auto flex items-center gap-2">
-            {view === 'grid' && (
-              <ToggleGroup
-                type="single"
-                value={density}
-                onValueChange={(v) => v && chooseDensity(v as Density)}
-                aria-label="Card size"
-              >
-                {(['S', 'M', 'L'] as const).map((d) => (
-                  <ToggleGroupItem
-                    key={d}
-                    value={d}
-                    aria-label={`${d} cards`}
-                    className={`px-2.5${ACTIVE}`}
-                  >
-                    {d}
-                  </ToggleGroupItem>
-                ))}
-              </ToggleGroup>
-            )}
-
-            <ToggleGroup
-              type="single"
-              value={view}
-              onValueChange={(v) => v && chooseView(v as View)}
-              aria-label="View"
-            >
-              <ToggleGroupItem value="list" aria-label="List view" className={ACTIVE.trim()}>
-                <ListIcon size={15} />
-              </ToggleGroupItem>
-              <ToggleGroupItem value="grid" aria-label="Grid view" className={ACTIVE.trim()}>
-                <LayoutGrid size={15} />
-              </ToggleGroupItem>
-            </ToggleGroup>
+            <ViewControls view={view} density={density} onView={setView} onDensity={setDensity} />
 
             <button
               onClick={() => setShowCreate(true)}
               className="flex items-center gap-1.5 px-3.5 py-2 text-sm font-semibold bg-primary text-white rounded-lg hover:bg-primary/90 transition whitespace-nowrap"
             >
-              <Plus size={15} /> New project
+              <Plus size={15} /> Create App
             </button>
           </div>
         </div>
 
         {showSkeleton ? (
-          // Shaped like the view you are in — a card skeleton under a list flashes wrong.
-          view === 'list' ? (
-            <div className="bg-white border border-bial-border rounded-2xl overflow-hidden" aria-busy="true">
-              {[0, 1, 2, 3, 4].map((i) => (
-                <div key={i} className="px-4 py-3.5 border-b border-bial-border last:border-0">
-                  <Skeleton className="h-4 w-48 mb-2" />
-                  <Skeleton className="h-3 w-80" />
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className={`grid gap-4 ${DENSITY_COLS[density]}`} aria-busy="true">
-              {[0, 1, 2, 3, 4, 5].map((i) => (
-                <div key={i} className="bg-white border border-bial-border rounded-2xl px-5 py-4">
-                  <Skeleton className="h-4 w-1/2 mb-3" />
-                  <Skeleton className="h-3 w-3/4 mb-2" />
-                  <Skeleton className="h-3 w-1/4" />
-                </div>
-              ))}
-            </div>
-          )
+          <ListSkeleton view={view} density={density} />
         ) : showFirstPageError ? (
           <div
             data-testid="projects-error"
             className="bg-white border border-danger/30 rounded-2xl py-16 px-6 text-center"
           >
             <AlertTriangle size={22} className="mx-auto text-danger mb-3" />
-            <p className="text-sm font-semibold text-tertiary">Couldn’t load your projects</p>
+            <p className="text-sm font-semibold text-tertiary">Couldn’t load your applications</p>
             <p className="text-xs text-neutral mt-1 mb-3">The server did not answer. Nothing has been lost.</p>
             <button
               onClick={() => setReloadNonce((n) => n + 1)}
@@ -823,14 +643,14 @@ export default function ProjectsPage(): React.JSX.Element {
             className="bg-white border border-bial-border rounded-2xl py-16 px-6 text-center"
           >
             <p className="text-sm font-semibold text-tertiary">Nothing here yet</p>
-            <p className="text-xs text-neutral mt-1 mb-4">Create a project and describe what you need inside it.</p>
+            <p className="text-xs text-neutral mt-1 mb-4">Create an application and describe what you need inside it.</p>
             {/* The SAME dialog the controls row opens — there is exactly one way to make a
                 project. No composer, no chat-kind toggle, no second path. */}
             <button
               onClick={() => setShowCreate(true)}
               className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-semibold bg-primary text-white rounded-lg hover:bg-primary/90 transition"
             >
-              <Plus size={15} /> New project
+              <Plus size={15} /> Create App
             </button>
           </div>
         ) : showNoMatches ? (
@@ -840,13 +660,26 @@ export default function ProjectsPage(): React.JSX.Element {
           >
             <Search size={22} className="mx-auto text-neutral/50 mb-3" />
             <p className="text-sm font-semibold text-tertiary">No matches</p>
-            {/* The query the ROWS answer, not the one still being typed. */}
-            <p className="text-xs text-neutral mt-1">No project matches “{appliedQuery}”. Try a different search.</p>
+            {/* The query the ROWS answer, not the one still being typed. With a tile selected
+                and nothing typed there is no phrase to quote, and quoting an empty one would
+                print `No application matches “”`. */}
+            <p className="text-xs text-neutral mt-1">
+              {appliedQuery
+                ? `No application matches “${appliedQuery}”. Try a different search.`
+                : 'No application matches that filter.'}
+            </p>
+            {/* ONE BUTTON THAT CLEARS WHATEVER IS APPLIED, because clearing only half of a
+                search-and-filter pair lands the reader on this same card again. The label says
+                which half, or both, so the press is never a surprise. */}
             <button
-              onClick={() => commit({ q: '', page: 1 }, 'push')}
+              onClick={() => commit({ q: '', filter: null, page: 1 }, 'push')}
               className="text-xs text-primary font-semibold hover:underline mt-2"
             >
-              Clear the search
+              {appliedQuery && appliedFilter !== null
+                ? 'Clear the search and the filter'
+                : appliedQuery
+                  ? 'Clear the search'
+                  : 'Clear the filter'}
             </button>
           </div>
         ) : null}
@@ -858,21 +691,24 @@ export default function ProjectsPage(): React.JSX.Element {
                 {/* The column header the default list was missing. */}
                 <div className="flex items-center gap-4 px-4 py-2.5 bg-bial-bg/60 border-b border-bial-border text-[10px] font-bold uppercase tracking-wider text-neutral">
                   <span className="flex-1">Application</span>
+                  {/* LEFT-ALIGNED, and the heading sits over its own column at the same fixed
+                      width the cell uses — which is the whole of what makes the dates scan. */}
+                  <span className={`hidden sm:block ${COLUMN.date}`}>Created</span>
                   {/* "Details updated", NOT "Last updated": `updatedAt` moves only when the
                       project ROW is written — a rename or a description edit — and never
                       when the app is built, previewed, published or deployed. Naming it for
                       what it tracks is what stops the column reading as "when the app
                       last changed". */}
-                  <span className="hidden sm:block w-28 text-right">Details updated</span>
-                  <span className="w-[104px] text-right">Status</span>
-                  <span className="w-7" aria-hidden />
+                  <span className={`hidden sm:block ${COLUMN.date}`}>Details updated</span>
+                  <span className={`${COLUMN.status} text-center`}>Status</span>
+                  <span className={COLUMN.menu} aria-hidden />
                 </div>
                 {items.map((project) => (
                   <ProjectRow
                     key={project.id}
                     project={project}
                     onOpen={() => openProject(project.id)}
-                    onDelete={() => setDeleting(project)}
+                    onSettings={() => setSettingsFor(project)}
                   />
                 ))}
               </div>
@@ -883,7 +719,7 @@ export default function ProjectsPage(): React.JSX.Element {
                     key={project.id}
                     project={project}
                     onOpen={() => openProject(project.id)}
-                    onDelete={() => setDeleting(project)}
+                    onSettings={() => setSettingsFor(project)}
                   />
                 ))}
               </div>
@@ -900,7 +736,7 @@ export default function ProjectsPage(): React.JSX.Element {
                 touch. */}
             {error !== null && (
               <p role="alert" className="text-xs text-danger text-center mt-4">
-                Couldn’t load more projects.{' '}
+                Couldn’t load more applications.{' '}
                 <button
                   type="button"
                   onClick={() => setReloadNonce((n) => n + 1)}
@@ -959,67 +795,47 @@ export default function ProjectsPage(): React.JSX.Element {
                   Page {appliedPage} of {Math.max(totalPages, 1)}
                 </span>
 
-                {/* WRAPS rather than overflowing. The number list reached `right: 534px` on a
-                    390px screen with only two pages, which put a horizontal scrollbar on the
-                    landing page and got worse with six. */}
-                <Pagination className="mx-0 w-auto" aria-label="Projects pagination">
-                  <PaginationContent className="flex-wrap justify-end">
-                    {/* Jump-to-first/last were missing; at six pages the difference is four
-                        clicks or one. */}
-                    <PaginationItem>
-                      <PaginationLink
-                        aria-label="First page"
-                        aria-disabled={page <= 1}
-                        onClick={() => page > 1 && commit({ page: 1 }, 'push')}
-                        className={page <= 1 ? 'pointer-events-none opacity-40' : undefined}
-                      >
-                        <ChevronsLeft size={15} />
-                      </PaginationLink>
-                    </PaginationItem>
-                    <PaginationItem>
-                      <PaginationPrevious
-                        aria-disabled={page <= 1}
-                        onClick={() => page > 1 && commit({ page: page - 1 }, 'push')}
-                        className={page <= 1 ? 'pointer-events-none opacity-40' : undefined}
-                      />
-                    </PaginationItem>
-                    {pageWindow.map((n) => (
-                      <PaginationItem key={n}>
-                        <PaginationLink isActive={n === appliedPage} onClick={() => commit({ page: n }, 'push')}>
-                          {n}
-                        </PaginationLink>
-                      </PaginationItem>
-                    ))}
-                    <PaginationItem>
-                      <PaginationNext
-                        aria-disabled={page >= totalPages}
-                        onClick={() => page < totalPages && commit({ page: page + 1 }, 'push')}
-                        className={page >= totalPages ? 'pointer-events-none opacity-40' : undefined}
-                      />
-                    </PaginationItem>
-                    <PaginationItem>
-                      <PaginationLink
-                        aria-label="Last page"
-                        aria-disabled={page >= totalPages}
-                        onClick={() => page < totalPages && commit({ page: totalPages }, 'push')}
-                        className={
-                          page >= totalPages ? 'pointer-events-none opacity-40' : undefined
-                        }
-                      >
-                        <ChevronsRight size={15} />
-                      </PaginationLink>
-                    </PaginationItem>
-                  </PaginationContent>
-                </Pagination>
+                <ListPager
+                  page={page}
+                  activePage={appliedPage}
+                  totalPages={totalPages}
+                  onGo={(next) => commit({ page: next }, 'push')}
+                  label="Applications pagination"
+                />
               </div>
             </div>
           </>
         )}
-        </>
-        )}
       </main>
 
       {showCreate && <ProjectCreateModal onClose={() => setShowCreate(false)} onCreated={handleCreated} />}
+      {settingsFor !== null && (
+        <AppSettingsDialog
+          project={settingsFor}
+          onProjectUpdate={(updated) => {
+            // The list is the source of truth for what a row says, so a rename saved in the
+            // dialog has to reach it — and the dialog itself has to keep showing the stored
+            // values rather than the ones it opened with.
+            //
+            // ONLY WHILE IT IS STILL OPEN. The name commits on blur, so its answer can land after
+            // the dialog has gone — closed by the X, or by Delete handing off to the confirmation
+            // — and writing a project in from `null` re-opens a dialog nobody asked for, or
+            // stacks it over the confirmation being answered.
+            setSettingsFor((open) => (open === null ? null : updated))
+            setReloadNonce((n) => n + 1)
+          }}
+          onClose={() => setSettingsFor(null)}
+          onProductionSettled={() => setReloadNonce((n) => n + 1)}
+          // DELETE HANDS OFF TO THE SAME CONFIRMATION THE MENU OPENS, and the settings dialog
+          // closes on the way: two dialogs stacked over one another is two focus traps, and the
+          // one underneath is not the one being answered.
+          onDelete={() => {
+            setDeleting(settingsFor)
+            setSettingsFor(null)
+          }}
+        />
+      )}
+
       {deleting !== null && (
         <ProjectDeleteDialog
           project={deleting}
@@ -1028,22 +844,26 @@ export default function ProjectsPage(): React.JSX.Element {
         />
       )}
 
-      {/* This channel only ever carries a failure (a successful delete is silent — the
-          row is just gone), so it is deliberately NOT wired to a dismiss timer the way
-          Navbar's and AdminPage's toasts once were. A confirmation may fade on its own;
-          something that went wrong waits for the reader to dismiss it, and the reader is the
-          only thing that clears this one. The AlertCircle marks it as a failure the same way
-          the other two sites now mark theirs, so the appearance carries the fact even
-          without reading the words. */}
+      {/* FAILURE ONLY, and that is the whole vocabulary this list needs. A delete that works says
+          so by the row being gone; the only outcome that leaves nothing on screen to read is the
+          one that failed, and it waits to be dismissed rather than fading.
+          It names the application because this list can be searched, paged and emptied under a
+          notice that would otherwise be left referring to nothing on screen. */}
       {toast !== null && (
         <div
           role="alert"
           data-testid="projects-toast"
-          className="fixed bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-red-600 text-white text-sm font-medium px-4 py-2.5 rounded-xl shadow-lg"
+          className="fixed bottom-6 left-1/2 -translate-x-1/2 flex max-w-[min(34rem,calc(100vw-3rem))] items-start gap-3 rounded-xl bg-red-600 px-4 py-2.5 text-sm font-medium text-white shadow-lg"
         >
-          <AlertCircle size={15} className="flex-shrink-0" data-testid="projects-toast-marker" />
-          {toast}
-          <button onClick={() => setToast(null)} aria-label="Dismiss" className="text-white/80 hover:text-white">
+          <AlertCircle size={15} className="mt-0.5 flex-shrink-0" data-testid="projects-toast-marker" />
+          <span className="min-w-0">
+            <span className="font-bold">{toast.subject}</span> — {toast.text}
+          </span>
+          <button
+            onClick={() => setToast(null)}
+            aria-label="Dismiss"
+            className="mt-0.5 flex-shrink-0 text-white/80 hover:text-white"
+          >
             <X size={15} />
           </button>
         </div>

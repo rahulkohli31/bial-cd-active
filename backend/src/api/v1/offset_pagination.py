@@ -1,14 +1,16 @@
 """Offset paging — the deliberate exception to `pagination.py`, and where its argument goes.
 
-`pagination.py` is the platform's KEYSET contract: keyset, not offset, no `total`/`totalPages`,
-because offset cannot guarantee a duplicate- or skip-free page while rows insert underneath it.
-Two surfaces need page NUMBERS, which keyset cannot express: the marketplace catalog (read-only,
-so that guarantee protects nothing there) and the projects list (numbered pages and a
-rows-per-page selector are the specified design, even though create and delete write to it, so its
-argument does not inherit from the marketplace's). This module holds only the two helpers the
-shape needs — a bounded `page` and its 422 — so a third caller writes its own argument rather than
-treating the import as a blanket blessing of offset. `marketplace/router.py` still carries an
-older, duplicate `clean_page`; adopting this module is deferred while that file is under review.
+`pagination.py` is the platform's KEYSET contract: no `total`/`totalPages`, because offset cannot
+guarantee a duplicate- or skip-free page while rows insert underneath it. Three surfaces need page
+NUMBERS, which keyset cannot express, and each states its own reason rather than inheriting the
+one before it: the marketplace catalog (read-only, so that guarantee protects nothing there), the
+projects list (numbered pages and a rows-per-page selector are the specified design, and create
+and delete are the reader's own writes), and the shared-with-me list (the same design over a list
+MANY people write into — the one place the keyset rule is overruled rather than found
+inapplicable, argued at `services/projects/shares.py`). This module holds only the two helpers the
+shape needs — a bounded `page` and its 422 — so a fourth caller writes its own argument rather
+than treating the import as a blanket blessing. `marketplace/router.py` still carries an older,
+duplicate `clean_page`.
 """
 
 from __future__ import annotations

@@ -25,8 +25,6 @@ import {
 } from '../workspaceChannel'
 import type { BuildSessionStatus } from '../../../utils/buildSessionTypes'
 
-vi.mock('../../layout/Navbar', () => ({ default: () => <div data-testid="navbar" /> }))
-
 const APP_URL = 'https://app-a.example.azurecontainerapps.io/'
 const OTHER_APP_URL = 'https://app-b.example.azurecontainerapps.io/'
 

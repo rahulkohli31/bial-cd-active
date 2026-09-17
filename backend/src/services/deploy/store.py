@@ -273,6 +273,50 @@ async def latest_for_app(db: AsyncSession, *, app_id: uuid.UUID) -> Deployment |
     return row
 
 
+async def latest_published(db: AsyncSession, *, app_id: uuid.UUID) -> Deployment | None:
+    """The most recent attempt that actually PUBLISHED something — succeeded, with a digest
+    naming the image it put there.
+
+    WHY THIS IS NOT `latest_for_app`. `deployments` is append-only and a RESTART claims a row
+    of its own, so a restart that fails leaves a `failed` row newer than the one that published
+    the container still serving. The newest row is then an ATTEMPT fact and says nothing about
+    what is in production — which is exactly the collapse `liveness.live_app_ids` already makes
+    for the lists, and the reason a route asking "what is live" must ask it the same way.
+
+    The takedown axis is deliberately NOT read here — see `latest_takedown`, which is the other
+    half of the same question."""
+    row: Deployment | None = await db.scalar(
+        sa.select(Deployment)
+        .where(
+            Deployment.app_id == app_id,
+            Deployment.status == DeploymentStatus.SUCCEEDED,
+            Deployment.image_digest.is_not(None),
+        )
+        .order_by(Deployment.id.desc())
+        .limit(1)
+    )
+    return row
+
+
+async def latest_takedown(db: AsyncSession, *, app_id: uuid.UUID) -> uuid.UUID | None:
+    """The id of the newest row an owner's take-down has stamped, or `None` if none has.
+
+    COMPARE IT AGAINST `latest_published`, NEVER AGAINST THE NEWEST ROW. `unpublish` stamps
+    whichever row was newest when it ran, and attempts keep arriving afterwards — so the stamp
+    can end up on a row that is neither the newest nor the published one, and a caller testing
+    either of those alone reads a taken-down app as serving. The collapse that answers is a
+    comparison: the app is off when the newest stamp is not older than the newest publish, which
+    is the same `last_unpublished.id < last_success.id` that `liveness.live_app_ids` applies to
+    the lists. UUIDv7 ids are time-sortable, which is what makes the comparison creation order."""
+    stamped: uuid.UUID | None = await db.scalar(
+        sa.select(Deployment.id)
+        .where(Deployment.app_id == app_id, Deployment.unpublished_at.is_not(None))
+        .order_by(Deployment.id.desc())
+        .limit(1)
+    )
+    return stamped
+
+
 async def in_flight(db: AsyncSession, *, app_id: uuid.UUID) -> uuid.UUID | None:
     """The running deployment id for this app, if any. Used to block unpublish while a
     deploy is in progress — letting it through would race the in-flight pipeline's

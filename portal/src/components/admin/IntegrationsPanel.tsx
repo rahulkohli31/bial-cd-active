@@ -469,7 +469,7 @@ export default function IntegrationsPanel({ onToast }: IntegrationsPanelProps) {
         written. The withdrawal sentence before it stays, because it is true.
       */}
       <p className="mt-3 max-w-[840px] text-[11.5px] leading-[1.65] text-neutral">
-        Access is given to a person, so one decision covers every project they own — including
+        Access is given to a person, so one decision covers every application they own — including
         ones they have not made yet. Withdrawing it stops their chats and their published apps at
         the same moment. Every decision is written to the audit log with your name.
       </p>

@@ -24,7 +24,6 @@ import {
 import type { ReactNode } from 'react'
 import type { Project } from '../../../utils/projectApi'
 import type { DeploymentView, PublishState } from '../../../utils/deployApi'
-import { formatStamp } from '../../../utils/publishPresentation'
 
 const api = vi.hoisted(() => ({
   fetchPreviewState: vi.fn(),
@@ -58,9 +57,10 @@ vi.mock('../../../utils/deployApi', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../utils/deployApi')>()),
   getDeployment: api.getDeployment,
 }))
-vi.mock('../../layout/Navbar', () => ({ default: () => <div data-testid="navbar" /> }))
-vi.mock('../../projects/ProjectDescriptionEditor', () => ({
-  default: () => <div data-testid="description-editor" />,
+// The rail's one occupant. Stubbed because this suite is about the shell, the pane and the
+// channel — the composer's own kind picker and draft handling have a suite of their own.
+vi.mock('../RailComposer', () => ({
+  default: () => <div data-testid="rail-composer" />,
 }))
 
 const APP_URL = 'https://app-a.example.azurecontainerapps.io/'
@@ -571,7 +571,7 @@ describe('the app survives the round trip, in BOTH directions', () => {
     expect(frame()).toBe(original)
 
     fireEvent.click(screen.getByText('to project'))
-    await waitFor(() => expect(screen.getByTestId('description-editor')).toBeTruthy())
+    await waitFor(() => expect(railComposer()).toBeTruthy())
     expect(frame()).toBe(original)
     expect(frame()?.getAttribute('src')).toBe(APP_URL)
   })
@@ -605,7 +605,7 @@ describe('the app survives the round trip, in BOTH directions', () => {
 
     fireEvent.click(screen.getByText('to chat'))
     fireEvent.click(screen.getByText('to project'))
-    await waitFor(() => expect(screen.getByTestId('description-editor')).toBeTruthy())
+    await waitFor(() => expect(railComposer()).toBeTruthy())
 
     expect(api.relaunchPreview).not.toHaveBeenCalled()
   })
@@ -627,7 +627,7 @@ describe('the stacked crossing is a class, not a remount', () => {
 
   it('gives the project rail the narrower of the two OPENING widths', async () => {
     render(<Workspace />)
-    await waitFor(() => expect(screen.getByTestId('description-editor')).toBeTruthy())
+    await waitFor(() => expect(railComposer()).toBeTruthy())
 
     expect(rail().style.getPropertyValue('--rail-w')).toBe('400px')
     expect(rail().getAttribute('data-rail-mode')).toBe('details')
@@ -646,7 +646,7 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     render(<Workspace />)
     await waitFor(() => expect(frame()).toBeTruthy())
 
-    const toggle = screen.getByRole('button', { name: /hide details/i })
+    const toggle = screen.getByRole('button', { name: /hide the chat/i })
     expect(screen.getByTestId('workspace-toolbar').contains(toggle)).toBe(true)
     expect(paneRegion()?.contains(toggle)).toBe(false)
     expect(rail().contains(toggle)).toBe(false)
@@ -656,7 +656,7 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     // be whitespace, not a word boundary.
     expect(rail().className).toMatch(/(^|\s)w-0(\s|$)/)
     expect(rail().className).toMatch(/invisible/)
-    const back = screen.getByRole('button', { name: /show details/i })
+    const back = screen.getByTestId('toolbar-collapse')
     expect(back.getAttribute('aria-expanded')).toBe('false')
     expect(back.getAttribute('aria-controls')).toBe(rail().id)
 
@@ -666,12 +666,12 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
 
   it('keeps the rail MOUNTED while collapsed, so nothing inside it is discarded', async () => {
     render(<Workspace />)
-    await waitFor(() => expect(screen.getByTestId('description-editor')).toBeTruthy())
+    await waitFor(() => expect(railComposer()).toBeTruthy())
 
-    fireEvent.click(screen.getByRole('button', { name: /hide details/i }))
+    fireEvent.click(screen.getByRole('button', { name: /hide the chat/i }))
 
     // The subtree is still in the document — a draft and a scroll position survive the cycle.
-    expect(screen.getByTestId('description-editor')).toBeTruthy()
+    expect(railComposer()).toBeTruthy()
     expect(rail().className).toMatch(/invisible/)
   })
 
@@ -684,9 +684,9 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
     expect(frame()).toBeNull()
 
-    fireEvent.click(screen.getByRole('button', { name: /hide details/i }))
+    fireEvent.click(screen.getByRole('button', { name: /hide the chat/i }))
     expect(rail().className).toMatch(/(^|\s)w-0(\s|$)/)
-    fireEvent.click(screen.getByRole('button', { name: /show details/i }))
+    fireEvent.click(screen.getByTestId('toolbar-collapse'))
     expect(rail().className).not.toMatch(/(^|\s)w-0(\s|$)/)
   })
 
@@ -698,7 +698,7 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     await waitFor(() => expect(frame()).toBeTruthy())
     const original = frame()
 
-    fireEvent.click(screen.getByRole('button', { name: /hide details/i }))
+    fireEvent.click(screen.getByRole('button', { name: /hide the chat/i }))
 
     expect(frame()).toBe(original)
   })
@@ -825,79 +825,67 @@ const dirtyAndAlive = () => {
   api.fetchSaveState.mockResolvedValue({ appId: 'app-1', dirty: true, containerHead: 'aaa', savedHead: 'bbb' })
 }
 
-const savedRow = () => screen.getByTestId('status-row-saved')
+/** The rail's one occupant, and the handle every "is the rail there" assertion uses. */
+const railComposer = () => screen.getByTestId('rail-composer')
 const pressSave = async () => fireEvent.click(await screen.findByTestId('save-project'))
 
-describe('★ the LAST SAVED row after a save', () => {
-  it('★ moves off "We could not tell" on the FIRST save a project ever has', async () => {
-    // A project with nothing saved yet: both halves of the row are null, so it says so in words.
+/**
+ * ★ WHAT A SAVE OWES THE SURFACES AROUND IT.
+ *
+ * The provenance rows moved to Settings › Production with the panel that draws them, and their
+ * own suite went with them; `usePublishState`'s suite holds the two rules underneath — that a
+ * failed LATER read keeps what it had, and that one nudge reaches every mounted reader. What is
+ * left here is the half only this composition can answer: a save on the project screen raises
+ * the nudge, exactly once, and the toolbar's chip moves because of it.
+ */
+/**
+ * ★ WHAT THE SAVE CONTROL SAYS, which is the only place that says it now.
+ *
+ * The rail used to write a sentence about unsaved work beside the toolbar's control. Two
+ * renderings of one fact is two things that can disagree, so the sentence went and the control
+ * stayed — it is also where the press is. What must not change is the tri-state's third arm:
+ * `dirty: null` is "the check could not run", and rendering "Saved" over it would be the one
+ * answer this may never give.
+ */
+describe('★ the save control is the whole of what the workspace says about saving', () => {
+  it('offers Save when the workspace is alive and holds work', async () => {
     dirtyAndAlive()
     render(<SavingWorkspace />)
-    await waitFor(() => expect(screen.getByTestId('status-row-saved-unknown')).toBeTruthy())
-
-    api.getDeployment.mockResolvedValue(deployment('draft', { savedHead: SAVED_ONE, savedAt: AT_ONE }))
-    await pressSave()
-
-    await waitFor(() => expect(savedRow().textContent).toContain('11ab22c'))
-    expect(savedRow().textContent).toContain(formatStamp(AT_ONE))
-    // The "cannot tell" rendering is a different element, not merely different text — its absence
-    // is what says the row is now making a claim rather than declining to.
-    expect(screen.queryByTestId('status-row-saved-unknown')).toBeNull()
+    const save = await screen.findByTestId('save-project')
+    expect(save.textContent).toMatch(/save/i)
   })
 
-  it('★ names the NEW version on the second save, not the one before it', async () => {
-    // THE ARM THAT LOOKS PLAUSIBLE WHILE STALE. A row that names a real commit and a real time
-    // reads as correct from across the desk; only the value tells you it is the previous save's.
-    // So this asserts what the row SAYS, and that what it said a moment ago is gone.
-    dirtyAndAlive()
-    api.getDeployment.mockResolvedValue(deployment('draft', { savedHead: SAVED_ONE, savedAt: AT_ONE }))
+  it('★ offers NOTHING when the check could not run, rather than reporting "Saved"', async () => {
+    // Mutation receipt: read `dirty` as a boolean anywhere on this path and a `null` becomes
+    // `false`, which renders the "Saved" chip over a container nobody could read.
+    api.fetchPreviewState.mockResolvedValue(
+      preview({ state: 'alive', alive: true, previewUrl: APP_URL, restorable: true }),
+    )
+    api.fetchSaveState.mockResolvedValue({
+      appId: 'app-1',
+      dirty: null,
+      containerHead: null,
+      savedHead: null,
+    })
     render(<SavingWorkspace />)
-    await waitFor(() => expect(savedRow().textContent).toContain('11ab22c'))
 
-    api.getDeployment.mockResolvedValue(deployment('draft', { savedHead: SAVED_TWO, savedAt: AT_TWO }))
-    await pressSave()
-
-    await waitFor(() => expect(savedRow().textContent).toContain('99ff88e'))
-    expect(savedRow().textContent).toContain(formatStamp(AT_TWO))
-    expect(savedRow().textContent).not.toContain('11ab22c')
-    expect(savedRow().textContent).not.toContain(formatStamp(AT_ONE))
+    // LIVENESS FIRST: the workspace really rendered and really asked, so the absences below are
+    // a control withheld rather than a tree that fell over.
+    await waitFor(() => expect(api.fetchSaveState).toHaveBeenCalled())
+    expect(railComposer()).toBeTruthy()
+    expect(screen.queryByTestId('save-project')).toBeNull()
+    expect(screen.queryByTestId('save-state')).toBeNull()
   })
+})
 
-  it('★ keeps the row it already had when the re-read FAILS, rather than blanking the panel', async () => {
-    // THE RULE NOBODY WROTE DOWN. `usePublishState` sets `loadError` on any failure and the
-    // panel renders that branch FIRST — pill, every provenance row and the action all replaced by
-    // one line — so a 500 on the read that follows a save would blank the whole section on a
-    // screen that has just said "Saved". A stale row is worse than a fresh one and far better
-    // than no panel; the first read is still allowed to report its own failure.
-    //
-    // MUTATION RECEIPT: delete `if (everRead.current) return` from the hook's catch — restoring
-    // the blanking branch — and this goes red on the `status-row-saved` query, which finds
-    // nothing because the panel has become the error line.
-    dirtyAndAlive()
-    api.getDeployment.mockResolvedValue(deployment('draft', { savedHead: SAVED_ONE, savedAt: AT_ONE }))
-    render(<SavingWorkspace />)
-    await waitFor(() => expect(savedRow().textContent).toContain('11ab22c'))
-
-    api.getDeployment.mockRejectedValue(new Error('Failed to read the deployment'))
-    await pressSave()
-
-    await waitFor(() => expect(api.getDeployment).toHaveBeenCalledTimes(2))
-    expect(savedRow().textContent).toContain('11ab22c')
-    expect(screen.getByTestId('app-status-panel').getAttribute('data-publish-state')).toBe('draft')
-    expect(screen.queryByTestId('status-recheck')).toBeNull()
-    expect(screen.getByTestId('status-pill').textContent).toContain('Draft')
-  })
-
-  it('★ the toolbar chip and the rail row agree afterwards — one nudge reconciles both', async () => {
-    // Both surfaces are mounted here: the rail is collapsed, which is the state the toolbar mounts
-    // its chip in, and a collapsed rail is HIDDEN rather than unmounted so the panel keeps its own
-    // read. Two reads of one endpoint is the arrangement the nudge exists for.
+describe('★ a save reconciles the toolbar chip', () => {
+  it('★ moves the chip off the state it was showing, without a reload', async () => {
     dirtyAndAlive()
     api.getDeployment.mockResolvedValue(deployment('live_current', { savedHead: SAVED_ONE, savedAt: AT_ONE }))
     render(<SavingWorkspace />)
-    await waitFor(() => expect(savedRow().textContent).toContain('11ab22c'))
-
-    fireEvent.click(screen.getByRole('button', { name: /hide details/i }))
+    // The chip is drawn beside the title only while the chat is hidden — the state in which the
+    // rail is not carrying the answer itself.
+    fireEvent.click(screen.getByTestId('toolbar-collapse'))
     await waitFor(() => expect(screen.getByTestId('publish-chip').textContent).toContain('Live'))
 
     // The save moves the app off `live_current`: what is live is now one version behind.
@@ -910,19 +898,16 @@ describe('★ the LAST SAVED row after a save', () => {
       expect(screen.getByTestId('publish-chip').getAttribute('data-publish-state')).toBe('live_newer_work'),
     )
     expect(screen.getByTestId('publish-chip').textContent).toContain('newer work saved')
-    // …and the panel behind it says the same thing about the same app, off its own read.
-    expect(screen.getByTestId('app-status-panel').getAttribute('data-publish-state')).toBe('live_newer_work')
-    expect(screen.getByTestId('status-pill').textContent).toContain('newer work saved')
-    expect(savedRow().textContent).toContain('99ff88e')
   })
 
   it('★ issues exactly ONE deployment read per save — the nudge must not stampede', async () => {
     // A window event with no origin is delivered to every listener, so the cost of getting this
     // wrong is a fan-out that grows with the surfaces on screen — or, if a refresh could raise a
-    // nudge of its own, one that never settles. The rail is open here, so the panel is the only
-    // publish read in the tree and the arithmetic is exact.
+    // nudge of its own, one that never settles. The chip is the only publish reader in this tree,
+    // so the arithmetic is exact.
     dirtyAndAlive()
     render(<SavingWorkspace />)
+    fireEvent.click(screen.getByTestId('toolbar-collapse'))
     await waitFor(() => expect(api.getDeployment).toHaveBeenCalledTimes(1))
 
     await pressSave()

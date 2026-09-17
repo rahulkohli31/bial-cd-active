@@ -30,9 +30,6 @@ vi.mock('../../utils/marketplaceApi', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../utils/marketplaceApi')>()
   return { ...actual, ...h }
 })
-// Stubbed like every other page test here: the chrome is not what this file is about, and
-// the real one pulls in auth + router state the assertions do not touch.
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 
 const entry = (over: Partial<Page['items'][number]> = {}) => ({
   name: 'Baggage Belt Faults',

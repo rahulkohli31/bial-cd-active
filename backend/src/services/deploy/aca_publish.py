@@ -38,6 +38,7 @@ from src.services.lake.env import identity_resource_id_for_env
 # here — and under `no_implicit_reexport` the alias is what makes that part of the public
 # surface. Same `from x import y as y` convention the package `__init__`s use.
 from src.services.sandbox.aca import (
+    LRO_POLLING_INTERVAL_SECONDS,
     AcaError,
     await_lro,
     fqdn_of,
@@ -252,7 +253,14 @@ class AcaPublishedApps:
     def __init__(self, config: DeployConfig) -> None:
         self._config = config
         self._credential = DefaultAzureCredential()
-        self._client = ContainerAppsAPIClient(self._credential, config.subscription_id)
+        # The SAME interval the sandbox client sets, and imported rather than respelled: two
+        # byte-identical constructions against one ARM surface is how one of them keeps the
+        # vendor default while the other is fixed.
+        self._client = ContainerAppsAPIClient(
+            self._credential,
+            config.subscription_id,
+            polling_interval=LRO_POLLING_INTERVAL_SECONDS,
+        )
 
     @property
     def config(self) -> DeployConfig:

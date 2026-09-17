@@ -42,7 +42,7 @@ import type { StartOutcome, WorkspaceAction } from './workspaceState'
 import type { WorkspaceReport } from './workspaceChannel'
 
 /** A build already running in THIS project — a different cause with a different remedy. */
-const BUILD_ALREADY_RUNNING = 'A build is already running in this project.'
+const BUILD_ALREADY_RUNNING = 'A build is already running in this application.'
 
 export interface StartAppControlProps {
   action: WorkspaceAction

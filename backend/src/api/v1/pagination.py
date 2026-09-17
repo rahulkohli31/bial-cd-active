@@ -6,10 +6,12 @@ time-sortable UUIDv7 primary key, so the cursor IS the last row's id and a page 
 `WHERE id < :cursor ORDER BY id DESC LIMIT :n+1` — the extra row is how `hasMore` is known.
 The envelope is `{items, nextCursor, hasMore}`, with no `total`/`totalPages`.
 
-TWO SURFACES PAGE BY OFFSET INSTEAD — the marketplace catalog and the projects list, both
-because their designs specify numbered pages and a `Showing 1-8 of 12` count that keyset
-can't cheaply compute. Their helpers live in `offset_pagination.py`. This module stays the
-single source of truth for the platform's page-size ceiling, which offset callers import."""
+THREE SURFACES PAGE BY OFFSET INSTEAD — the marketplace catalog, the projects list and the
+shared-with-me list, all because their designs specify numbered pages and a `Showing 1-8 of 12`
+count that keyset can't cheaply compute. Each carries its OWN argument for paying the cost, and
+the third one's is the weakest of the three: it is the only one with many writers. Their helpers
+live in `offset_pagination.py`. This module stays the single source of truth for the platform's
+page-size ceiling, which offset callers import."""
 
 from __future__ import annotations
 

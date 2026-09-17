@@ -347,3 +347,65 @@ def test_switched_off_and_taken_offline_are_told_apart() -> None:
         unpublished_at=datetime(2026, 8, 20, tzinfo=UTC),
     )
     assert compute_publish_state(live_app, unpublished, _LIVE_SHA) is PublishState.TAKEN_OFFLINE
+
+
+# --- a failed RESTART is an attempt fact, not a production one -------------------------
+#
+# `deployments` is append-only and a restart claims a row of its own, so one that fails leaves
+# a FAILED row newer than the attempt that published the container still serving. Read as a
+# production fact it answers `did_not_start`, while `liveness.live_app_ids` — which reads the
+# last attempt that actually published — goes on reporting the same app live. Two readers, one
+# app, opposite answers, and the surface that believed the first withheld Take down as well as
+# Restart from an owner whose app never went down.
+
+
+@pytest.mark.parametrize("code", ["restart_failed", "restart_not_ready"])
+def test_a_failed_restart_reports_the_live_state_it_left_standing(code: str) -> None:
+    """★ The drift comparison still answers, because a restart copies the live `head_sha` onto
+    its own row — so the reading is the full one, not a fallback to "couldn't check"."""
+    app = _app()
+    deployment = _deployment(status=DeploymentStatus.FAILED, failure_code=code, head_sha=_LIVE_SHA)
+    assert compute_publish_state(app, deployment, _LIVE_SHA) is PublishState.LIVE_CURRENT
+    assert compute_publish_state(app, deployment, _SAVED_SHA) is PublishState.LIVE_NEWER_WORK
+
+
+def test_a_failed_publish_still_reports_that_it_did_not_start() -> None:
+    """★ THE PAIRED NEGATIVE, and the reason the arm keys on the failure CODE. A build that
+    never came up IS a production fact: nothing is serving, and reading it as live would put a
+    "Live" pill over an application that has never run. Its row carries a `head_sha` too, so the
+    code is the only thing telling the two apart."""
+    app = _app()
+    deployment = _deployment(
+        status=DeploymentStatus.FAILED, failure_code="build_failed", head_sha=_LIVE_SHA
+    )
+    assert compute_publish_state(app, deployment, _LIVE_SHA) is PublishState.DID_NOT_START
+
+
+@pytest.mark.parametrize("code", ["restart_failed", "restart_not_ready", "build_failed"])
+def test_a_takedown_says_taken_offline_whatever_attempt_it_landed_on(code: str) -> None:
+    """★ OFFLINE OUTRANKS THE ATTEMPT, AND IT HAS TO NAME ITSELF. `unpublish` stamps whichever row
+    was newest when it ran, which after a failed restart is that failure.
+
+    "not live" is not enough, and asserting only that is what hid the real answer: `DID_NOT_START`
+    satisfies it, and it is a dead end — the production surface reads "Could not restart" about an
+    application the owner has just removed themselves, and offers neither Publish nor Take down
+    beside it. The only lever left was a full re-publish, or an administrator."""
+    app = _app()
+    deployment = _deployment(
+        status=DeploymentStatus.FAILED,
+        failure_code=code,
+        head_sha=_LIVE_SHA,
+        unpublished_at=datetime(2026, 9, 17, 1, 0, tzinfo=UTC),
+    )
+    assert compute_publish_state(app, deployment, _LIVE_SHA) is PublishState.TAKEN_OFFLINE
+
+
+def test_a_failed_restart_with_no_head_claims_nothing_about_a_version() -> None:
+    """A row with no `head_sha` cannot say which version is standing, and this arm's whole
+    licence to report live is that the restart copied one across. Without it the honest answer
+    is the generic failure."""
+    app = _app()
+    deployment = _deployment(
+        status=DeploymentStatus.FAILED, failure_code="restart_failed", head_sha=None
+    )
+    assert compute_publish_state(app, deployment, _LIVE_SHA) is PublishState.DID_NOT_START

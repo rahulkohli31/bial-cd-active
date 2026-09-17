@@ -12,7 +12,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -224,43 +224,153 @@ async def list_shares_for_project(
 @dataclass(frozen=True)
 class SharedProjectEntry:
     """One row of the recipient's "Shared with me" list — the project, who shared it, and
-    when (R12). `share_id` is the keyset cursor `list_shared_with_me` paginates on — the
-    SHARE's own id, not the project's, since ordering is by grant recency and one project can
-    (in principle) recur if it were ever unshared and re-shared."""
+    when (R12). The sharer is the project's OWNER, always, so `shared_by` is also the identity
+    the `shared_by` filter matches on."""
 
-    share_id: uuid.UUID
     project: Project
     shared_by: User
     shared_at: datetime
 
 
-async def list_shared_with_me(
-    db: AsyncSession, user_id: uuid.UUID, *, limit: int, cursor: uuid.UUID | None
-) -> list[SharedProjectEntry]:
-    """Projects shared with the caller, newest grant first — KEYSET paginated (the platform's
-    default, `pagination.py`), deliberately NOT the numbered-offset shape the owner's own
-    project list uses. That list's offset choice is justified specifically because it is
-    single-writer (only the viewer themself creates/deletes their own rows); a shared list is
-    written to by every colleague who shares or revokes with this recipient, so the skew
-    offset pagination cannot promise is a real one here, not the bounded, self-inflicted
-    window the owner's list accepts.
+@dataclass(frozen=True)
+class SharerFacet:
+    """One entry of the "Shared by" filter — a colleague who has shared something with the
+    recipient, and how many of the rows are theirs.
 
-    Joins through `Project.user_id` for the sharer's identity — there is no `shared_by_user_id`
-    column (`db/models/project_share.py` explains why): the project's owner IS who shared it,
-    always, since only an owner can create a share.
-    """
+    ID AND NAME TRAVEL TOGETHER BECAUSE ONLY ONE OF THEM IDENTIFIES ANYBODY. `users.display_name`
+    is nullable and not unique, so filtering on the name would collapse two colleagues who share
+    one into a single entry and hand the recipient the other's applications. The filter matches
+    `user_id`; the name is the label beside it."""
+
+    user_id: uuid.UUID
+    display_name: str | None
+    share_count: int
+
+
+@dataclass(frozen=True)
+class SharedWithMePage:
+    """One numbered page of the recipient's shared list, the total the page numbers are cut
+    from, and the "Shared by" filter's own options.
+
+    THE FACET RIDES THE SAME READ rather than a second endpoint: the filter's options and the
+    rows it filters are one question asked once, and two endpoints would let a colleague appear
+    in the filter after their last share stopped appearing in the list."""
+
+    entries: list[SharedProjectEntry]
+    total: int
+    sharers: list[SharerFacet]
+
+
+#: What the shared list's order control offers. A closed set, validated rather than defaulted:
+#: a typo'd `sort` must be refused rather than quietly served in the default order, which to the
+#: person using the control looks like the control simply does not work.
+SharedSort = Literal["recentlyShared", "name"]
+
+
+def _narrow(
+    query: sa.Select[Any],
+    user_id: uuid.UUID,
+    *,
+    search: str | None,
+    shared_by: uuid.UUID | None,
+) -> sa.Select[Any]:
+    """The shared list's FROM and WHERE, written ONCE and shared by the page, the total and the
+    facet — a total counted over a different predicate than the page is what renders page numbers
+    a person can click and find empty.
+
+    `shared_with_user_id == user_id` IS the isolation boundary: without it this returns every
+    share on the platform. Joining through `Project.user_id` for the sharer is what the absent
+    `shared_by_user_id` column expects (`db/models/project_share.py`) — only an owner can create
+    a share, so the project's owner IS who shared it.
+
+    SEARCH IS DESCRIPTION-ONLY, deliberately, and matches the marketplace's own scope: names are
+    not searched here, and a page promising name search would be making a false offer."""
     query = (
-        sa.select(ProjectShare, Project, User)
+        query.select_from(ProjectShare)
         .join(Project, Project.id == ProjectShare.project_id)
         .join(User, User.id == Project.user_id)
         .where(ProjectShare.shared_with_user_id == user_id)
     )
-    if cursor is not None:
-        query = query.where(ProjectShare.id < cursor)
-    rows = await db.execute(query.order_by(ProjectShare.id.desc()).limit(limit))
-    return [
-        SharedProjectEntry(
-            share_id=share.id, project=project, shared_by=user, shared_at=share.created_at
+    if search is not None:
+        query = query.where(Project.description.icontains(search, autoescape=True))
+    if shared_by is not None:
+        query = query.where(Project.user_id == shared_by)
+    return query
+
+
+async def list_shared_with_me(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    *,
+    page: int,
+    page_size: int,
+    search: str | None = None,
+    shared_by: uuid.UUID | None = None,
+    sort: SharedSort = "recentlyShared",
+) -> SharedWithMePage:
+    """One NUMBERED page of the projects shared with the caller, plus the "Shared by" facet.
+
+    IT PAGES BY OFFSET, AND `pagination.py` SAYS THE PLATFORM DOES NOT. The rule it breaks is
+    about WRITER MULTIPLICITY, not size: keyset is for a list other people write into, and every
+    colleague who shares or revokes writes into this one. "It is bounded and small" is not the
+    answer here — that is the marketplace's argument, and it does not carry.
+
+    The answer that does: numbered pages and a rows-per-page selector are the specified design,
+    neither is expressible without a `total`, and the write frequency on one person's shared list
+    is low enough that a skipped or repeated row at a page boundary is rare rather than
+    impossible. That cost is accepted with open eyes, not argued away.
+
+    WHAT A CONCURRENT WRITE ACTUALLY DOES TO A PAGE WALK, so a reader does not have to guess at
+    the cost. Under `recentlyShared` a new grant lands at position 0, so a share arriving
+    mid-walk shifts the window down by one: the boundary row is seen TWICE, and nothing that
+    existed when the walk began is lost. A revoke shifts it the other way, which is where a row
+    can be missed, and which is also what empties the last page under a reader — the response
+    carries the real `total` for exactly that case, so a reader sitting past the end can step
+    back to a page that exists instead of being left with an empty frame.
+    """
+    # THE SHARE ID UNDER `name` IS NOT DECORATION: names are not unique, and without a total
+    # order two adjacent offset pages can repeat or drop a row with nothing writing at all.
+    # `lower()` keeps the answer the same under a `C` collation, which sorts every capital ahead
+    # of every lowercase. Under `recentlyShared` the UUIDv7 id is already a total order.
+    order: tuple[sa.UnaryExpression[Any], ...] = (
+        (sa.func.lower(Project.name).asc(), ProjectShare.id.desc())
+        if sort == "name"
+        else (ProjectShare.id.desc(),)
+    )
+    rows = await db.execute(
+        _narrow(
+            sa.select(ProjectShare, Project, User), user_id, search=search, shared_by=shared_by
         )
-        for share, project, user in rows.all()
-    ]
+        .order_by(*order)
+        .limit(page_size)
+        .offset((page - 1) * page_size)
+    )
+    total = await db.scalar(
+        _narrow(sa.select(sa.func.count()), user_id, search=search, shared_by=shared_by)
+    )
+    # THE FACET IGNORES `shared_by` AND NOTHING ELSE. Applying the sharer filter to its own
+    # options would leave the recipient holding a filter that offers only the colleague they
+    # already picked, with no way back to the others; applying the search keeps the counts
+    # describing the rows that are actually on screen.
+    share_count = sa.func.count(ProjectShare.id).label("share_count")
+    sharer_rows = await db.execute(
+        _narrow(
+            sa.select(Project.user_id, User.display_name, share_count),
+            user_id,
+            search=search,
+            shared_by=None,
+        )
+        .group_by(Project.user_id, User.display_name)
+        .order_by(sa.desc(share_count), User.display_name, Project.user_id)
+    )
+    return SharedWithMePage(
+        entries=[
+            SharedProjectEntry(project=project, shared_by=sharer, shared_at=share.created_at)
+            for share, project, sharer in rows.all()
+        ],
+        total=int(total or 0),
+        sharers=[
+            SharerFacet(user_id=sharer_id, display_name=display_name, share_count=count)
+            for sharer_id, display_name, count in sharer_rows.all()
+        ],
+    )

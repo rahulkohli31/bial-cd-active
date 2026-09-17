@@ -23,8 +23,10 @@
  * bypassing that guard with a second mechanism it doesn't cover.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import WorkspaceRail from './WorkspaceRail'
-import ProjectRenameDialog from '../projects/ProjectRenameDialog'
+import AppSettingsDialog from '../projects/AppSettingsDialog'
+import ProjectDeleteDialog from '../projects/ProjectDeleteDialog'
 import SharePanel from '../projects/SharePanel'
 import { useWorkspaceState } from './useWorkspaceState'
 import type { StartOutcome } from './workspaceState'
@@ -42,6 +44,8 @@ import type { ReclaimRequest } from './workspaceChannel'
 import { announceDeploymentChanged } from '../../hooks/usePublishState'
 import { resolvePreviewAddress } from '../../utils/previewAddress'
 import { discardUnsavedChanges, fetchCompileState, handOverWorkspace, saveProject } from '../../utils/buildSessionApi'
+import { deleteProject } from '../../utils/projectApi'
+import { projectsListHref } from '../../utils/projectsListMemory'
 import type { HandoverStep, ReclaimBlocked } from '../../utils/buildSessionApi'
 import type { CompileState } from '../../utils/compileState'
 import type { Project } from '../../utils/projectApi'
@@ -59,14 +63,18 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   // just pressed a button to bring up, which reads as the press having done nothing.
   const [startedPreviewUrl, setStartedPreviewUrl] = useState<string | null>(null)
   const [reclaim, setReclaim] = useState<{ blocked: ReclaimBlocked; retry: () => Promise<void> } | null>(null)
-  // THE RENAME'S STATE IS HERE BECAUSE ITS DATA IS. The control is in the shell's toolbar row,
-  // which sits above the Outlet and has no project object; this surface has both the project and
-  // the update callback, so the row publishes a press upward and the editing happens down here.
   // WHAT THE HAND-OVER IS DOING RIGHT NOW, published to the dialog so it narrates instead of
   // spinning. Held here because this surface performs the sequence.
   const [step, setStep] = useState<HandoverStep | null>(null)
-  const [renaming, setRenaming] = useState(false)
-  const startRename = useCallback(() => setRenaming(true), [])
+  // THE SETTINGS DIALOG'S STATE IS HERE BECAUSE ITS DATA IS. The control is in the shell's
+  // toolbar row, which sits above the Outlet and has no project object; this surface has both
+  // the project and the update callback, so the row publishes a press upward and the editing
+  // happens down here. It is the SAME dialog the home list opens, on the same application —
+  // one surface for a name, a description, sharing, integrations and production.
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const openSettings = useCallback(() => setSettingsOpen(true), [])
+  const [deleting, setDeleting] = useState(false)
+  const navigate = useNavigate()
   // THE SHARE PANEL'S STATE IS HERE FOR THE SAME REASON RENAME'S IS: the control that opens it
   // lives in the shell's toolbar row, which has no project object, while this surface has the
   // project id and name the panel needs (#198).
@@ -360,7 +368,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     {
       save: workspace.save ? save : null,
       discard: workspace.save ? discard : null,
-      rename: startRename,
+      settings: openSettings,
       share: startShare,
     },
   )
@@ -373,12 +381,32 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
 
   return (
     <>
-      <WorkspaceRail {...props} save={workspace.save} />
-      {renaming && (
-        <ProjectRenameDialog
+      <WorkspaceRail project={project} />
+      {settingsOpen && (
+        <AppSettingsDialog
           project={project}
           onProjectUpdate={props.onProjectUpdate}
-          onClose={() => setRenaming(false)}
+          onClose={() => setSettingsOpen(false)}
+          // DELETING THE APPLICATION YOU ARE STANDING IN. The dialog hands off rather than
+          // deleting, exactly as it does from the list, so the confirmation is the same two
+          // steps — and the settings surface closes first, because leaving it open behind a
+          // confirmation about the thing it describes is a dialog over its own obituary.
+          onDelete={() => {
+            setSettingsOpen(false)
+            setDeleting(true)
+          }}
+        />
+      )}
+      {deleting && (
+        <ProjectDeleteDialog
+          project={project}
+          onClose={() => setDeleting(false)}
+          onConfirm={async (remark) => {
+            await deleteProject(project.id, remark)
+            // THE LIST, NOT BACK. Back would be this application's own address, which no longer
+            // names anything — the citizen would arrive at a dead page they just emptied.
+            navigate(projectsListHref(), { replace: true })
+          }}
         />
       )}
       {sharing && (

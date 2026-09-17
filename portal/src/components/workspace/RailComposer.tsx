@@ -217,7 +217,7 @@ function RailComposerBody({ projectId }: RailComposerProps) {
             // REJECTS, so the composer keeps everything. SILENT for the same reason as the
             // guardrail above: the dialog is the explanation, and a line under the composer
             // repeating it in weaker words is noise over the top of it.
-            throw new SendRefusal('the workspace is held by another project', { silent: true })
+            throw new SendRefusal('the workspace is held by another application', { silent: true })
           }
           // NOTHING SAVED TO BRING BACK IS NOT A FAILED SEND. Asking for the workspace
           // is how this surface poses the one-workspace question, but a project that has never been

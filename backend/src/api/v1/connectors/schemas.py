@@ -76,6 +76,21 @@ class ConsentLine(CamelModel):
     body: str
 
 
+class ConnectorOnProject(CamelModel):
+    """One project behind the Integrations card's disclosure — a name, and nothing else.
+
+    NO WINDOW, NO RECORD COUNT, NO LAST-READ DATE. The page answers who may read the data, never
+    what was read or for how long, so a window has no place on this shape — putting one here would
+    be a usage-shaped fact on a page that is not allowed to state one. The days a project reads
+    are set where the switch is, in that project's own settings.
+
+    NO `enabled` EITHER. Every project on this list has the switch up — that is the list's whole
+    definition — so a field that is always `true` would be a second, weaker statement of it."""
+
+    project_id: uuid.UUID
+    name: str
+
+
 class ConnectorEntry(CamelModel):
     """One registry connector as the asking person sees it. See the module docblock.
 
@@ -111,7 +126,20 @@ class ConnectorEntry(CamelModel):
     #: `approved` only: how many of the caller's own projects have this connector switched on,
     #: for `On in 2 projects ›`. `None` — not `0` — in every other state: "we did not count"
     #: and "none" are different answers, and only one of them belongs on a row with no access.
+    #: It is the LENGTH of `on_projects`, never a second count of the same rows, so the sentence
+    #: and the list under it cannot disagree.
     on_project_count: int | None = None
+    #: The caller's own projects with this connector switched on — the Integrations card's
+    #: disclosure, listed rather than counted.
+    #:
+    #: IT IS A FACT ABOUT THE PROJECTS, NOT ABOUT THE PERSON, so it is present in every state and
+    #: filters on the project's own switch alone — never on `effectivelyOn`, which folds the
+    #: person's approval in. Were a grant withdrawn while switches stayed up, those projects stay
+    #: listed and `state` is the one place that says access is gone; rows vanishing instead would
+    #: leave the page silently short for a reason it never gives. A person who has never been
+    #: approved has switched nothing on, so their list is empty as a CONSEQUENCE of the filter
+    #: rather than as a special case.
+    on_projects: list[ConnectorOnProject]
     #: `declined` only. The administrator's words reach the citizen VERBATIM and are rendered as
     #: plain text on every surface, never through a markdown component: one user writes this and
     #: another reads it.
@@ -241,33 +269,6 @@ class ProjectConnectorListResponse(CamelModel):
     under it come to disagree with nothing on screen admitting it."""
 
     connectors: list[ProjectConnectorEntry]
-
-
-class ConnectorProjectEntry(CamelModel):
-    """One of the caller's projects, on the drill-down list behind an approved connector row.
-
-    The board draws the project's name, a switch, and the window chip — `Last 7 days` for a
-    preset, `1 – 30 Sep` for a fixed range — with an em dash where a project has no window
-    because the connector was never switched on there."""
-
-    project_id: uuid.UUID
-    name: str
-    enabled: bool
-    #: `null` for a project this connector was never switched on in. See `ProjectConnectorEntry`.
-    window: ConnectorWindow | None = None
-
-
-class ConnectorProjectListResponse(CamelModel):
-    """Every project the caller owns, for one connector, newest first — and whether that IS all
-    of them.
-
-    `truncated` EXISTS BECAUSE NOTHING BOUNDS A CITIZEN'S PROJECT COUNT. The projects listing
-    pages at 25 and no per-user cap exists anywhere, so this read stops at a cap and SAYS so
-    rather than silently returning a prefix — the panel renders it as a line pointing at the
-    search. Same shape, and the same reasoning, as the admin registry listing."""
-
-    projects: list[ConnectorProjectEntry]
-    truncated: bool = False
 
 
 class RelativeWindowChoice(CamelModel):

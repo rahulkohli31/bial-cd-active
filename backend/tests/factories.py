@@ -23,6 +23,7 @@ from src.db.models.app_registry import AppRegistry, AppStatus, mint_app_key
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.project import Project
+from src.db.models.project_share import ProjectShare
 from src.db.models.user import User
 from src.services.messages.store import dump_for_row
 
@@ -43,6 +44,39 @@ class ProjectFactory:
         await db.flush()
         await db.refresh(project)
         return project
+
+
+class ProjectShareFactory:
+    """Builds a share row — the junction between a project and the colleague it is shared with.
+
+    `create_share` is the product's path and gates on a saved snapshot in the object store; this
+    is for tests about the shared LIST, where that gate is not the subject and a bundle per row
+    would be scaffolding the assertions never look at."""
+
+    @staticmethod
+    def build(
+        project_id: uuid.UUID, shared_with_user_id: uuid.UUID, **overrides: Any
+    ) -> ProjectShare:
+        data: dict[str, Any] = {
+            "project_id": project_id,
+            "shared_with_user_id": shared_with_user_id,
+        }
+        data.update(overrides)
+        return ProjectShare(**data)
+
+    @classmethod
+    async def create(
+        cls,
+        db: AsyncSession,
+        project_id: uuid.UUID,
+        shared_with_user_id: uuid.UUID,
+        **overrides: Any,
+    ) -> ProjectShare:
+        share = cls.build(project_id, shared_with_user_id, **overrides)
+        db.add(share)
+        await db.flush()
+        await db.refresh(share)
+        return share
 
 
 class UserFactory:

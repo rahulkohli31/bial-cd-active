@@ -59,8 +59,8 @@ import {
   MAX_DELETE_REASON_WORDS,
   MIN_DELETE_REASON_WORDS,
 } from '../../utils/words'
-import { dayMonth } from '../connectors/ConnectorRow'
-import { clockTime } from './columns'
+import { dayMonth } from '../connectors/connectorPresentation'
+import { clockTime } from '../connectors/connectorPresentation'
 
 /**
  * The box's own furniture — the two headings and the consent panel's title, true of any
@@ -272,7 +272,7 @@ export default function ConnectorReviewDialog({
             </DialogTitle>
             {/* `they own`, not the board's `she owns` — see the pronoun paragraph above. */}
             <DialogDescription className="mt-[5px] text-xs leading-[1.6] text-neutral">
-              Asked on {asked}. One decision, covering every project they own.
+              Asked on {asked}. One decision, covering every application they own.
             </DialogDescription>
           </div>
           <button

@@ -11,8 +11,9 @@
  * no fetch and holds no conversation, and every surface below declares its own scroller.
  */
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { ChevronRight } from 'lucide-react'
 import { memo, useCallback, useEffect, useLayoutEffect, useState, type CSSProperties } from 'react'
-import Navbar from '../layout/Navbar'
+import { useNavReveal } from '../layout/NavReveal'
 import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
 import AppPane from './AppPane'
 import RailResizeHandle from './RailResizeHandle'
@@ -22,7 +23,7 @@ import { projectsListHref } from '../../utils/projectsListMemory'
 import type { DeviceName } from './devices'
 import { WORKSPACE_RAIL_ID } from './railId'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
-import { WorkspaceExitProvider, useUnsavedWorkGuard } from './UnsavedWorkGuard'
+import { useRegisterWorkspaceExit, useUnsavedWorkGuard } from './UnsavedWorkGuard'
 import { canBePutBack } from '../../utils/buildSessionApi'
 import {
   WorkspaceChannelProvider,
@@ -107,7 +108,7 @@ function railWidthClass(collapsed: boolean, paneVisible: boolean): string {
  * ONE FACT, ONE ARGUMENT, TWO EXITS. `UnsavedWorkGuard` applies exactly this rule to the in-place
  * exit and writes the reasoning out in full, including what it emphatically is NOT: a claim that
  * anything was saved. Both guards read the SAME `SaveReading` off the channel, which is what stops
- * the tab and the navbar disagreeing about the same app in the same moment.
+ * the tab and the in-place exit disagreeing about the same app in the same moment.
  */
 function useUnsavedWorkWarning(): void {
   const { dirty, recoveryAt } = useWorkspaceSaveState()
@@ -171,6 +172,15 @@ function ShellFrame() {
   const mode = railModeFor(useLocation().pathname)
   const [collapsed, setCollapsed] = useState(false)
   usePublishRail(mode, collapsed)
+  // THE REVEAL NEEDS TO KNOW WHEN THE CHAT IS AWAY, because that is the one layout where the
+  // left edge belongs entirely to the application: the hover zone is not installed at all there,
+  // and a panel sliding over the app on a stray pointer is what that layout exists to prevent.
+  // The shell is the only writer of `collapsed`, so it is the only honest reporter of it.
+  const reveal = useNavReveal()
+  const reportChatHidden = reveal?.setChatHidden
+  useEffect(() => {
+    reportChatHidden?.(collapsed)
+  }, [reportChatHidden, collapsed])
   // THE DEVICE WIDTH AND THE RELOAD NONCE ARE THE SHELL'S. Their controls are in the row above
   // the grid, so the state comes up here with them, and the pane receives both as props down a
   // chain of shell-owned siblings. Holding them here also means the chosen width survives a route
@@ -203,9 +213,11 @@ function ShellFrame() {
   // than becoming a per-mode table here.
   const paneVisible = useWorkspacePaneVisible()
 
-  // THE IN-PLACE GUARD, MOUNTED HERE AND NOT IN THE OUTLET CHILD. The exits it exists for —
-  // the navbar's links, the breadcrumb — sit ABOVE the Outlet, so a guard mounted below it would
-  // lose coverage of exactly the departing controls it was written for.
+  // THE IN-PLACE GUARD, MOUNTED HERE AND NOT IN THE OUTLET CHILD. The exits it exists for — the
+  // navigation's destinations, the brand link, the breadcrumb — sit ABOVE the Outlet, so a guard
+  // mounted below it would lose coverage of exactly the departing controls it was written for.
+  // It is PUBLISHED UPWARDS rather than provided downwards, because the navigation is rendered by
+  // the shell that frames this one: see `WorkspaceExitHost`.
   //
   // `workspaceIsAlive` comes from the one computed state rather than from a second read: a `null`
   // save state means "could not tell" only while the workspace is running, and means "nobody
@@ -256,12 +268,12 @@ function ShellFrame() {
     guard(() => navigate(to))
   }, [guard, navigate, mode, heading.projectId])
 
+  useRegisterWorkspaceExit(guard)
+
   return (
-    <WorkspaceExitProvider value={guard}>
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
       <ReclaimSlot />
       {unsavedWorkDialog}
-      <Navbar />
       {/* ONE TOOLBAR ROW, DRAWN ONCE, ABOVE THE GRID — so it survives a collapse of the rail it
           used to live inside, and so it is a single element across a project↔chat move rather
           than three headers that appear and disappear. */}
@@ -302,6 +314,30 @@ function ShellFrame() {
         >
           <RailOutlet />
         </div>
+        {/* THE 26px STUB THE CHAT LEAVES BEHIND, and the second way back from a collapse.
+            Until now the toolbar control was the only route, which makes one control the single
+            point of failure for a state that hides the whole left column. The stub is the same
+            rule the toolbar control follows — a toggle may never live inside the thing it hides
+            — applied once more: it sits OUTSIDE the collapsed column, as its own sibling, so it
+            is visible and tabbable precisely when the column is neither. */}
+        {paneVisible && collapsed && (
+          <div
+            data-testid="chat-stub"
+            className="flex w-[26px] flex-shrink-0 items-start justify-center border-r border-bial-border bg-white pt-2"
+          >
+            <button
+              type="button"
+              onClick={() => setCollapsed(false)}
+              aria-expanded={false}
+              aria-controls={WORKSPACE_RAIL_ID}
+              aria-label="Show the chat"
+              title="Show the chat"
+              className="inline-flex h-6 w-6 items-center justify-center rounded text-neutral transition hover:bg-bial-bg hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+            >
+              <ChevronRight size={14} />
+            </button>
+          </div>
+        )}
         {/* THE HANDLE, BETWEEN THE TWO COLUMNS. Rendered only when there are two: a collapsed rail
             has no boundary to move, and a surface that declares no pane — every plan chat — is the
             whole window, so a divider in it would divide nothing. Its own class hides it below the
@@ -321,7 +357,6 @@ function ShellFrame() {
         <AppPane device={device} reloadNonce={reloadNonce} />
       </div>
     </div>
-    </WorkspaceExitProvider>
   )
 }
 

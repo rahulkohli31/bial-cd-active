@@ -108,7 +108,7 @@ describe('createProject', () => {
     expect(err).toBeInstanceOf(ApiError)
     expect((err as ApiError).status).toBe(422)
     expect((err as ApiError).message).toContain('at most 120 characters')
-    expect((err as ApiError).message).not.toContain('Failed to create project')
+    expect((err as ApiError).message).not.toContain('Failed to create application')
   })
 })
 

@@ -407,7 +407,7 @@ export async function launchSharedPreview(
   const body = await postJson(
     `${BASE}/projects/${encodeURIComponent(projectId)}/shared-launch`,
     undefined,
-    'Could not open this shared project',
+    'Could not open this shared application',
     deps,
   )
   return toSharedPreviewResponse(body)
@@ -426,7 +426,7 @@ export async function refreshSharedPreview(
   const body = await postJson(
     `${BASE}/projects/${encodeURIComponent(projectId)}/shared-refresh`,
     undefined,
-    'Could not refresh this shared project',
+    'Could not refresh this shared application',
     deps,
   )
   return toSharedPreviewResponse(body)
@@ -475,7 +475,7 @@ export async function stopActiveBuild(projectId: string, deps: AuthFetchDeps = {
     await postJson(
       `${BASE}/projects/${encodeURIComponent(projectId)}/stop-active-build`,
       undefined,
-      'Could not stop the build in the other project',
+      'Could not stop the build in the other application',
       deps,
     ),
   )
@@ -490,7 +490,7 @@ export async function readStopStateOf(
   return readStopState(
     await getJson(
       `${BASE}/projects/${encodeURIComponent(projectId)}/stop-state`,
-      'Could not check on the other project',
+      'Could not check on the other application',
       deps,
       signal,
     ),

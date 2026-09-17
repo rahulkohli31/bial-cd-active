@@ -3,16 +3,16 @@ import { ApiError, extractApiCode, extractApiMessage, isSuspended, readApiError 
 
 describe('extractApiMessage — envelope 1: {error:{message, code?}}', () => {
   it('returns the domain message', () => {
-    expect(extractApiMessage({ error: { message: 'Project not found.' } }, 404, 'Failed to load project')).toBe('Project not found.')
+    expect(extractApiMessage({ error: { message: 'Project not found.' } }, 404, 'Failed to load application')).toBe('Project not found.')
   })
   it('falls back when `error` is present but carries no message', () => {
-    expect(extractApiMessage({ error: {} }, 500, 'Failed to load project')).toBe('Failed to load project (500).')
+    expect(extractApiMessage({ error: {} }, 500, 'Failed to load application')).toBe('Failed to load application (500).')
   })
   it('falls back when `error.message` is an empty string', () => {
-    expect(extractApiMessage({ error: { message: '' } }, 500, 'Failed to load project')).toBe('Failed to load project (500).')
+    expect(extractApiMessage({ error: { message: '' } }, 500, 'Failed to load application')).toBe('Failed to load application (500).')
   })
   it('falls back when `error` is not an object', () => {
-    expect(extractApiMessage({ error: 'boom' }, 500, 'Failed to load project')).toBe('Failed to load project (500).')
+    expect(extractApiMessage({ error: 'boom' }, 500, 'Failed to load application')).toBe('Failed to load application (500).')
   })
 })
 
@@ -31,7 +31,7 @@ describe('extractApiMessage — envelope 2: {detail: string}', () => {
 describe('extractApiMessage — envelope 3: {detail:[{type,loc,msg}]}', () => {
   it('surfaces the Pydantic field message', () => {
     const body = { detail: [{ type: 'string_too_long', loc: ['body', 'name'], msg: 'String should have at most 120 characters' }] }
-    expect(extractApiMessage(body, 422, 'Failed to create project')).toContain('at most 120 characters')
+    expect(extractApiMessage(body, 422, 'Failed to create application')).toContain('at most 120 characters')
   })
   it('joins two entries with "; "', () => {
     const body = {
@@ -40,15 +40,15 @@ describe('extractApiMessage — envelope 3: {detail:[{type,loc,msg}]}', () => {
         { type: 'string_too_long', loc: ['body', 'description'], msg: 'String should have at most 2000 characters' },
       ],
     }
-    expect(extractApiMessage(body, 422, 'Failed to create project')).toBe(
+    expect(extractApiMessage(body, 422, 'Failed to create application')).toBe(
       'String should have at most 120 characters; String should have at most 2000 characters',
     )
   })
   it('falls back when the array carries no usable msg', () => {
-    expect(extractApiMessage({ detail: [{ type: 'x', loc: ['body'] }] }, 422, 'Failed to create project')).toBe('Failed to create project (422).')
+    expect(extractApiMessage({ detail: [{ type: 'x', loc: ['body'] }] }, 422, 'Failed to create application')).toBe('Failed to create application (422).')
   })
   it('falls back on an empty detail array', () => {
-    expect(extractApiMessage({ detail: [] }, 422, 'Failed to create project')).toBe('Failed to create project (422).')
+    expect(extractApiMessage({ detail: [] }, 422, 'Failed to create application')).toBe('Failed to create application (422).')
   })
 })
 
@@ -117,7 +117,7 @@ describe('readApiError', () => {
   const res = (status: number, json: () => Promise<unknown>) => ({ status, json }) as unknown as Response
 
   it('builds an ApiError from the domain envelope', async () => {
-    const err = await readApiError(res(404, async () => ({ error: { message: 'Project not found.' } })), 'Failed to load project')
+    const err = await readApiError(res(404, async () => ({ error: { message: 'Project not found.' } })), 'Failed to load application')
     expect(err.status).toBe(404)
     expect(err.message).toBe('Project not found.')
     expect(err.code).toBeNull()
@@ -130,7 +130,7 @@ describe('readApiError', () => {
     expect(err.code).toBe('daily_token_limit_exceeded')
   })
   it('builds from the Pydantic 422 envelope', async () => {
-    const err = await readApiError(res(422, async () => ({ detail: [{ msg: 'String should have at most 120 characters' }] })), 'Failed to create project')
+    const err = await readApiError(res(422, async () => ({ detail: [{ msg: 'String should have at most 120 characters' }] })), 'Failed to create application')
     expect(err.message).toContain('at most 120 characters')
     expect(err.status).toBe(422)
   })

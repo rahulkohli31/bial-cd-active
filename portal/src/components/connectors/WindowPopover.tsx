@@ -168,7 +168,7 @@ export default function WindowPopover({
       // divider above the grid and the amber note are inset differently from the footer.
       //
       // THE HEIGHT CAP IS NOT COSMETIC — it is what keeps `Apply` reachable. This popover is a
-      // fixed ~520px tall, and the chip that opens it sits high in the rail, so on a 900px
+      // fixed ~520px tall, and the chip that opens it can sit high on the screen, so on a 900px
       // window the footer landed 75px BELOW the fold (rendered, focusable, and impossible to
       // click), while on an 800px window Radix flipped it upward and the title and presets went
       // off the TOP at y=-105. Both were found in a real browser; jsdom computes no layout, so

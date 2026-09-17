@@ -783,13 +783,13 @@ function heldElsewhere(preview: PreviewState, startOutcome: StartOutcome | null)
   // it. Half an attribution can neither label a navigation nor route one, so it is read as none.
   const attributed = name !== null && id !== null
   const standing = attributed
-    ? 'You have one workspace at a time. Open that project to pick up where you left off.'
-    : 'You have one workspace at a time, and we could not tell which project has it.'
+    ? 'You have one workspace at a time. Open that application to pick up where you left off.'
+    : 'You have one workspace at a time, and we could not tell which application has it.'
   return {
     name: 'held-by-another-project',
     headline: attributed
       ? `“${name}” is using your workspace.`
-      : 'Another project is using your workspace.',
+      : 'Another application is using your workspace.',
     // THE SERVER'S OWN WORDS WHEN A TAKE-BACK JUST FAILED, and the standing sentence otherwise.
     // Ending 1's prose is `buildSessionApi.ts`'s ceiling sentence — "still saving its work.
     // Nothing has changed…" — which is authored there, is true only there, and is carried
@@ -800,7 +800,7 @@ function heldElsewhere(preview: PreviewState, startOutcome: StartOutcome | null)
     // wherever there is a project to lead to.
     action: attributed
       ? { kind: 'go-to-project', label: `Open “${name}”`, projectId: id }
-      : { kind: 'take-back', label: 'Stop the other project and open this app instead' },
+      : { kind: 'take-back', label: 'Stop the other application and open this one instead' },
     secondAction: attributed
       ? { kind: 'take-back', label: `Stop “${name}” and open this app instead` }
       : null,

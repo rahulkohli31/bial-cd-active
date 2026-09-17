@@ -14,7 +14,7 @@
  * real connector's panel were compiled into the component, this suite would still be green — so
  * the suite supplies copy that exists nowhere else, and a component that ignored it goes red.
  *
- * THE PANEL DOES NOT CALL THE API. `onSubmit` is the dialog's, so these tests can watch the exact
+ * THE PANEL DOES NOT CALL THE API. `onSubmit` is the page's, so these tests can watch the exact
  * boundary that matters: whether a remark the form already knows is too short ever reaches it.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
@@ -22,7 +22,6 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 
 import AskAccessPanel from '../AskAccessPanel'
 import type { ConnectorEntry } from '../../../utils/connectorApi'
-import { Dialog, DialogContent } from '../../ui/dialog'
 
 /** The three ticked lines this suite's connector sends, and the whole of what may reach the box. */
 const CONSENT = [
@@ -49,6 +48,7 @@ const entry: ConnectorEntry = {
   approvedAt: null,
   approvedByName: null,
   onProjectCount: null,
+  onProjects: [],
   decidedAt: null,
   decidedByName: null,
   decisionRemarks: null,
@@ -61,33 +61,23 @@ interface Handlers {
   entry?: ConnectorEntry
   busy?: boolean
   onBack?: () => void
-  onClose?: () => void
   onSubmit?: (remarks: string) => Promise<void>
 }
 
-/**
- * Mounted inside a real `Dialog`, because that is where it lives: `DialogTitle` is a Radix
- * primitive and reads its id off the dialog's context, so a bare render would throw.
- */
+/** A bare render: this is a body of the Integrations PAGE, with no dialog above it. */
 const mount = ({
   entry: shown = entry,
   busy = false,
   onBack,
-  onClose,
   onSubmit,
 }: Handlers = {}): void => {
   render(
-    <Dialog open>
-      <DialogContent hideClose aria-describedby={undefined}>
-        <AskAccessPanel
-          entry={shown}
-          busy={busy}
-          onBack={onBack ?? (() => {})}
-          onClose={onClose ?? (() => {})}
-          onSubmit={onSubmit ?? (() => Promise.resolve())}
-        />
-      </DialogContent>
-    </Dialog>,
+    <AskAccessPanel
+      entry={shown}
+      busy={busy}
+      onBack={onBack ?? (() => {})}
+      onSubmit={onSubmit ?? (() => Promise.resolve())}
+    />,
   )
 }
 
@@ -240,19 +230,18 @@ describe('the form agrees with the server about what is required', () => {
   })
 })
 
-describe('the two ways out', () => {
-  it('the back chevron and Cancel both return to the list; the X closes the dialog', () => {
+describe('the one way out', () => {
+  it('the back chevron and Cancel both return to the list, and nothing else leaves', () => {
     const onBack = vi.fn()
-    const onClose = vi.fn()
-    mount({ onBack, onClose })
+    mount({ onBack })
 
     fireEvent.click(screen.getByRole('button', { name: 'Back to integrations' }))
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(onBack).toHaveBeenCalledTimes(2)
-    expect(onClose).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
-    expect(onClose).toHaveBeenCalledTimes(1)
-    expect(onBack).toHaveBeenCalledTimes(2)
+    // ABSENCE, PAIRED. The panel really rendered — the ask is right there — so the missing
+    // close control is this panel being a page body, not a mount that failed.
+    expect(screen.getByRole('button', { name: 'Ask an administrator' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Close' })).toBeNull()
   })
 })

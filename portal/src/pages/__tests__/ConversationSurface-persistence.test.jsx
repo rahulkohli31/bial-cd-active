@@ -34,7 +34,6 @@ vi.mock('../../utils/conversationApi', async (importOriginal) => ({
   createConversation: (...a) => h.createConversation(...a),
   listProjectConversations: h.listProjectConversations,
 }))
-vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 // A rendered file-part message would mount AttachmentChips, which fetches the object URL over the
 // real (relative-URL) network — stub it so the transcript render triggers no unhandled fetch.

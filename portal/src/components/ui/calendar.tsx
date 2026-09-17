@@ -18,7 +18,7 @@ import { cn } from "@/lib/utils"
  * worked out its own bounds would put a browser clock in Bangalore against a server clock in UTC
  * and offer a date the next read refuses.
  *
- * THE THREE FORMATTERS ARE SPELLED OUT, not left to a locale, for the reason `ConnectorRow.tsx`
+ * THE THREE FORMATTERS ARE SPELLED OUT, not left to a locale, for the reason `connectorPresentation.tsx`
  * gives at its own month list: en-GB and en-IN abbreviate September as `Sept` under current CLDR
  * and en-US reorders the parts, so the one form the board specifies is not any runtime's default
  * and a suite that pinned it would be pinning the machine it ran on.

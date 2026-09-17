@@ -1,27 +1,16 @@
 /**
- * One connector, one project: a switch and the days it reads. BUILT ONCE AND MOUNTED TWICE.
+ * One connector, one project: a switch and the days it reads.
  *
- * THE TWO MOUNTS, and the reason the props are shaped the way they are:
- *
- *   - The drill-down (`ConnectorProjectsPanel`) mounts one per project the citizen owns.
- *     `projectName` is that project's name, which is what the row draws on the left and what both
- *     controls name themselves after.
- *   - The rail's DATA section (`DataSection`) mounts one per registry connector, on the
- *     project screen. `projectName` is `null` there — the project IS the screen — so the row
- *     draws the connector's name instead and the controls say `in this project`. The rail also
- *     passes `leading` (the connector's teal tile) and `detail` (its state sentence), and, for
- *     the two states that have no switch to offer, `trailing` (`Request →` / an inert `Waiting`).
- *
- * THE RAIL MUST NOT NEED TO FORK THIS. The switch and the chip being the same components in both
- * places is what makes "the two must read from one source and cannot disagree"
- * structural rather than an assertion — the rail and the drill-down cannot show different
- * switch positions for one project, because there is one component and one write.
+ * THE ROW IS ABOUT ONE APPLICATION, AND IT IS ALWAYS THE SURFACE'S OWN. Its only mount is
+ * Settings › Integrations, which draws one per registry connector — so the row is named for the
+ * CONNECTOR and both controls say `in this application`, because the application is the dialog
+ * they are in. That mount also passes `leading` (the connector's teal tile), `detail` (its state
+ * sentence), and, for the two states with no switch to offer, `trailing` (an inert read-out).
  *
  * IT OWNS ITS WRITE, NOT ITS TRUTH. The row holds no fetch and no list; the mount site passes
  * `onSet` and gets `onSettled` back. What the row DOES own is the mechanics of one write — the
- * optimistic flip, the rollback, the in-flight lock and the sequence stamp — because those are
- * what both mounts would otherwise reimplement, and the second implementation is where they
- * would drift.
+ * optimistic flip, the rollback, the in-flight lock and the sequence stamp — because a second
+ * mount reimplementing them is where the two would drift.
  *
  * THE LOCK AND THE STAMP ARE TWO DIFFERENT GUARDS, and only one of them can be dropped without
  * anything going red, which is why both are here and both have a test:
@@ -43,14 +32,15 @@
  */
 import { useCallback, useRef, useState } from 'react'
 import type { ConnectorWindow, WindowChoice } from '../../utils/connectorApi'
+import { errorText } from '../../utils/apiError'
 import { Popover } from '../ui/popover'
 import { Switch } from '../ui/switch'
 import WindowChip, { formatWindowLabel } from './WindowChip'
 import WindowPopover from './WindowPopover'
 
 /**
- * The two facts this row renders. Both wire objects that a write can answer with —
- * `ProjectConnectorEntry` and `ConnectorProjectEntry` — carry them, so either satisfies this.
+ * The two facts this row renders — a narrowing rather than a wire type, so any object a write can
+ * answer with satisfies it. `ProjectConnectorEntry` is the one that does today.
  */
 export interface ProjectConnectorState {
   enabled: boolean
@@ -60,20 +50,13 @@ export interface ProjectConnectorState {
 export interface ProjectConnectorRowProps {
   /** The connector's display name, off the wire. Both controls name it. */
   connectorName: string
-  /**
-   * The project this row is about, when the row is one of several projects. `null` in the rail,
-   * where the row is the connector and the project is the whole screen — it selects the bold
-   * label AND how the two controls name themselves.
-   */
-  projectName: string | null
-  /** Drawn before the label. The rail passes the connector's tile; the drill-down passes none. */
+  /** Drawn before the label. The settings tab passes the connector's teal tile. */
   leading?: React.ReactNode
-  /** A sentence under the label — the rail's project-state line. The drill-down has none. */
+  /** A sentence under the label — the settings tab's project-state line. */
   detail?: React.ReactNode
   /**
-   * Replaces the chip and the switch entirely. The rail's states c and d have no switch to
-   * offer (`Request →`, and an inert `Waiting`); a row with no access must not draw a control
-   * that would be refused.
+   * Replaces the chip and the switch entirely. The two states with no access have no switch to
+   * offer; a row with no access must not draw a control that would be refused.
    */
   trailing?: React.ReactNode
   enabled: boolean
@@ -86,8 +69,8 @@ export interface ProjectConnectorRowProps {
    */
   onSet: (update: { enabled: boolean; window?: WindowChoice }) => Promise<ProjectConnectorState>
   /**
-   * The settled server answer, for a mount that keeps a count or a sentence beside the row —
-   * the rail's `1 of 2 on` and its `Reading N days of flight data`. The drill-down needs none.
+   * The settled server answer, for a mount that keeps a sentence or a count beside the row — the
+   * settings tab's `Reading N days of flight data`. A mount that re-reads instead needs none.
    */
   onSettled?: (settled: ProjectConnectorState) => void
   /** A failed TOGGLE, in the mount site's own words channel. A silent rollback reads as a missed click. */
@@ -101,13 +84,8 @@ function signature(state: ProjectConnectorState): string {
   return `${state.enabled}|${w === null ? '' : `${w.kind}:${w.start}:${w.end}:${w.days}`}`
 }
 
-function message(caught: unknown): string {
-  return caught instanceof Error ? caught.message : String(caught)
-}
-
 export default function ProjectConnectorRow({
   connectorName,
-  projectName,
   leading,
   detail,
   trailing,
@@ -119,8 +97,7 @@ export default function ProjectConnectorRow({
   testId,
 }: ProjectConnectorRowProps): React.JSX.Element {
   // THE ROW'S OWN NEWER ANSWER, or `null` for "what the props say". A write settles here rather
-  // than waiting for the mount site to re-read: the drill-down deliberately does not reload the
-  // whole list on one switch press, so project A's answer must not touch project B's row.
+  // than waiting for the mount site to re-read, so one row's answer never touches another's.
   const [override, setOverride] = useState<ProjectConnectorState | null>(null)
   const [switchBusy, setSwitchBusy] = useState(false)
   const [popoverOpen, setPopoverOpen] = useState(false)
@@ -169,7 +146,7 @@ export default function ProjectConnectorRow({
           // Back to the props, AND said out loud. Restoring the switch in silence looks
           // identical to the press never landing.
           setOverride(null)
-          onError(message(caught))
+          onError(errorText(caught))
         })
         .finally(() => setSwitchBusy(false))
     },
@@ -185,8 +162,6 @@ export default function ProjectConnectorRow({
     [shown.enabled, write],
   )
 
-  const where = projectName === null ? 'this project' : projectName
-  const label = projectName ?? connectorName
 
   return (
     <li
@@ -195,7 +170,7 @@ export default function ProjectConnectorRow({
     >
       {leading}
       <div className="min-w-0 flex-1">
-        <div className="truncate text-[12.5px] font-semibold text-primary-900">{label}</div>
+        <div className="truncate text-[12.5px] font-semibold text-primary-900">{connectorName}</div>
         {detail}
       </div>
 
@@ -207,7 +182,7 @@ export default function ProjectConnectorRow({
                   Sep` alone says nothing about which of five projects it belongs to. */}
               <WindowChip
                 window={shown.window}
-                accessibleName={`Days ${connectorName} reads in ${where}: ${formatWindowLabel(shown.window)}`}
+                accessibleName={`Days ${connectorName} reads in this application: ${formatWindowLabel(shown.window)}`}
               />
               {popoverOpen && (
                 <WindowPopover
@@ -227,7 +202,7 @@ export default function ProjectConnectorRow({
           <Switch
             checked={shown.enabled}
             aria-disabled={switchBusy}
-            aria-label={`Read ${connectorName} in ${where}`}
+            aria-label={`Read ${connectorName} in this application`}
             onCheckedChange={toggle}
           />
         </>

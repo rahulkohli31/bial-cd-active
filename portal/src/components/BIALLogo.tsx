@@ -12,30 +12,36 @@
  */
 export interface BIALLogoProps {
   dark?: boolean
+  /**
+   * The mark alone, for the collapsed rail. The wordmark is dropped rather than folded: at 56px
+   * there is no width it could occupy, and a clipped brand name is worse than none.
+   */
+  compact?: boolean
 }
 
-export default function BIALLogo({ dark = false }: BIALLogoProps) {
+export default function BIALLogo({ dark = false, compact = false }: BIALLogoProps) {
   return (
-    <div className="flex items-center gap-2.5">
+    <div className="flex min-w-0 items-center gap-2.5">
       <span className={`inline-flex items-center shrink-0 ${dark ? 'bg-white rounded-lg p-1.5' : ''}`}>
         <img
           src={`${import.meta.env.BASE_URL}bial-logo.png`}
           alt="BIAL — Kempegowda International Airport Bengaluru"
           // `block` kills the inline baseline gap; the fixed height is the single source of
           // the mark's size, so no call site can scale it differently.
-          className="block h-8 w-auto"
+          className={`block w-auto ${compact ? 'h-9' : 'h-11'}`}
         />
       </span>
-      {/* THE BOARD'S WORDMARK: 15px, weight 800, brand teal #0D7377, -0.2px tracking. It was
-          18px/700 in #00818A — a teal that is not the brand teal and that no board draws. The
-          `dark` arm keeps white, for the login panel the boards do not cover. */}
-      <span
-        className={`font-manrope text-[15px] font-extrabold leading-tight tracking-[-0.2px] ${
-          dark ? 'text-white' : 'text-primary'
-        }`}
-      >
-        BIAL Citizen Developer
-      </span>
+      {/* THE BOARD'S WORDMARK: weight 800, brand teal #0D7377, -0.2px tracking. The `dark` arm
+          keeps white, for the login panel the boards do not cover. */}
+      {!compact && (
+        <span
+          className={`min-w-0 font-manrope text-[15px] font-extrabold leading-tight tracking-[-0.2px] ${
+            dark ? 'text-white' : 'text-primary'
+          }`}
+        >
+          BIAL Citizen Developer
+        </span>
+      )}
     </div>
   )
 }

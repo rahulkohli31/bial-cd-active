@@ -303,6 +303,42 @@ async def _gate_rows(db, app_id) -> list[AuditLog]:
     return list(rows.scalars().all())
 
 
+async def test_a_settle_that_itself_fails_does_not_escape_the_pipeline(
+    wire, db_session, monkeypatch
+) -> None:
+    """★ `_run` PROMISES NEVER TO RAISE, and the arms that keep that promise settle the row by
+    WRITING to it — which is exactly what fails when the database is the thing that has gone.
+
+    The success arm used to sit outside the `except` meant to catch it, and a `_fail` that raised
+    escaped its own handler. Either way the exception leaves the detached task, the row stays
+    `running`, and an owner watches Deploy 409 until the stale-claim window expires. The
+    reconciler settles it against ARM; what this guarantees is that it gets the chance to."""
+    user, app, _conversation = await _project(db_session)
+
+    async def _boom(*_a: object, **_k: object) -> None:
+        raise RuntimeError("the database went away mid-settle")
+
+    monkeypatch.setattr(type(wire.service), "_succeed", _boom, raising=True)
+
+    started = await wire.service.start(
+        db_session, user_id=user.id, app_id=app.id, project_id=app.project_id, conversation_id=None
+    )
+    # THE TASKS ARE HELD BEFORE DRAINING, because `drain` suppresses — so awaiting it proves
+    # nothing on its own, and asking the settled task for its exception is the only place the
+    # promise is observable at all.
+    tasks = list(wire.service._tasks)
+    assert tasks, "the pipeline runs detached; with no task there is nothing to make a promise"
+    await wire.service.drain()
+
+    for task in tasks:
+        assert task.exception() is None
+
+    # And the row is left for the reconciler rather than silently marked failed.
+    row = await db_session.get(Deployment, started.deployment_id)
+    await db_session.refresh(row)
+    assert row.status is DeploymentStatus.RUNNING
+
+
 # --- the happy path ---------------------------------------------------------------
 
 
