@@ -70,6 +70,10 @@ export interface AppTileProps {
   foot: React.ReactNode
   /** One DOM handle per surface, so a suite can tell an owner's tile from a recipient's. */
   testId: string
+  /** OPTIONAL, unlike `trailing`. Rendered beside the name — the owner's grid is the only caller
+   *  that ever has one; the recipient's `SharedAppTile` passes nothing and renders exactly as it
+   *  did before this prop existed. */
+  marker?: React.ReactNode
 }
 
 export default function AppTile({
@@ -79,6 +83,7 @@ export default function AppTile({
   trailing,
   foot,
   testId,
+  marker,
 }: AppTileProps): React.JSX.Element {
   const hasDescription = typeof description === 'string' && description.trim().length > 0
 
@@ -91,9 +96,12 @@ export default function AppTile({
       className="group relative flex flex-col gap-3 rounded-2xl px-5 py-4 hover:border-primary/40 hover:shadow-sm transition font-manrope"
     >
       <div className="flex items-start justify-between gap-3">
-        <h3 className="min-w-0 flex-1">
-          <NameButton name={name} onOpen={onOpen} />
-        </h3>
+        <div className="flex items-center gap-2 min-w-0 flex-1">
+          <h3 className="min-w-0 flex-1">
+            <NameButton name={name} onOpen={onOpen} />
+          </h3>
+          {marker}
+        </div>
         {/* ALWAYS VISIBLE, never `opacity-0 group-hover:opacity-100` as the bare delete control
             it replaced was: a hover-only control has no keyboard route and no touch route. */}
         {trailing}

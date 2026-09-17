@@ -33,6 +33,7 @@ import {
   type ProjectFilter,
 } from '../utils/projectApi'
 import { ApiError } from '../utils/apiError'
+import { fetchActivity, type ActivityPhase, type ProjectActivity } from '../utils/buildSessionApi'
 import ProjectCard from '../components/projects/ProjectCard'
 import ProjectRow from '../components/projects/ProjectRow'
 import ProjectCreateModal from '../components/projects/ProjectCreateModal'
@@ -62,6 +63,13 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
  * it is derived from the response, two causes can print two sentences again.
  */
 export const PROJECT_GONE_NOTICE = 'That application is no longer available.'
+
+/**
+ * HOW OFTEN THE ACTIVITY MARKERS ARE RE-ASKED, and ONLY while at least one is showing — see the
+ * effect that reads it. Exported so the suite can advance exactly this far rather than guessing
+ * a number that could drift from the source.
+ */
+export const ACTIVITY_POLL_MS = 5_000
 
 /**
  * The three summary tiles, and the filter each one applies.
@@ -328,6 +336,77 @@ export default function ProjectsPage(): React.JSX.Element {
     // response above changes it, which is not a real trigger for asking again.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadNonce])
+
+  // ─── activity: starting, open, or closing down, right now ───────────────────────────────
+  //
+  // ONE ADDED CALL, NOT ONE PER ROW. `fetchActivity` is user-scoped and answers for every
+  // application at once, which is also why it lives here rather than inside a row.
+  //
+  // THE CADENCE EXISTS SO A CLOSING MARKER CAN CLEAR. This page has no other polling timer — it
+  // fetches on mount and on `reloadNonce` only. A closing container eventually goes away with
+  // nobody pressing anything, so something has to ask again; asking forever on a quiet account
+  // would be a standing cost nobody is using. The interval below runs ONLY while `activity` is
+  // non-empty and stops the moment an answer comes back empty.
+  const [activity, setActivity] = useState<ProjectActivity[]>([])
+  const activityRequestId = useRef(0)
+  const loadActivity = useCallback(async (): Promise<void> => {
+    const id = ++activityRequestId.current
+    try {
+      const rows = await fetchActivity()
+      if (activityRequestId.current !== id) return // superseded by a later read
+      setActivity(rows)
+    } catch {
+      // A READ THAT COULD NOT ANSWER SAYS NOTHING — `useWorkspaceState.ts`'s catch arm. Clearing
+      // the markers on a network blip would tell a citizen their app had stopped when nobody
+      // managed to ask; the existing markers are held exactly as they were.
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadActivity()
+  }, [loadActivity])
+
+  useEffect(() => {
+    if (activity.length === 0) return undefined
+    const id = setInterval(() => void loadActivity(), ACTIVITY_POLL_MS)
+    return () => clearInterval(id)
+  }, [activity.length, loadActivity])
+
+  // THE RE-PROBE. A citizen who started a build from another tab, or whose laptop slept through
+  // a tick, needs the answer the moment they look back rather than up to `ACTIVITY_POLL_MS`
+  // later — and this fires whether or not anything is currently showing, which is how a marker
+  // gets to APPEAR after a quiet page went still.
+  useEffect(() => {
+    const onFocus = (): void => void loadActivity()
+    const onVisibility = (): void => {
+      if (document.visibilityState === 'visible') void loadActivity()
+    }
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [loadActivity])
+
+  const activityByProject = useMemo(
+    () => new Map(activity.map((row) => [row.projectId, row] as const)),
+    [activity],
+  )
+
+  // THE ONE LIVE REGION FOR THE WHOLE LIST — rendered below, beside the rows. It says nothing
+  // until the SET of active phases actually changes, so it announces a marker arriving or
+  // clearing without repeating itself on every tick that changed nothing.
+  const activitySummary = useMemo(() => {
+    if (activity.length === 0) return ''
+    const counts: Record<ActivityPhase, number> = { starting: 0, open: 0, closing: 0 }
+    for (const row of activity) counts[row.phase] += 1
+    const said: string[] = []
+    if (counts.starting > 0) said.push(`${counts.starting} starting`)
+    if (counts.open > 0) said.push(`${counts.open} open`)
+    if (counts.closing > 0) said.push(`${counts.closing} closing down`)
+    return said.join(', ')
+  }, [activity])
 
   // Paged past the end — a delete elsewhere can shrink the list under a reader. Step back
   // rather than stranding them on a blank page with no way out.
@@ -684,6 +763,13 @@ export default function ProjectsPage(): React.JSX.Element {
           </div>
         ) : null}
 
+        {/* THE ONE LIVE REGION FOR EVERY MARKER IN THE LIST BELOW — see the effect that computes
+            `activitySummary`. Visually hidden: the badges beside each name already say this,
+            and a visible duplicate would be the same sentence read twice. */}
+        <div role="status" aria-live="polite" data-testid="projects-activity" className="sr-only">
+          {activitySummary}
+        </div>
+
         {showRows && (
           <>
             {view === 'list' ? (
@@ -709,6 +795,7 @@ export default function ProjectsPage(): React.JSX.Element {
                     project={project}
                     onOpen={() => openProject(project.id)}
                     onSettings={() => setSettingsFor(project)}
+                    activityPhase={activityByProject.get(project.id)?.phase}
                   />
                 ))}
               </div>
@@ -720,6 +807,7 @@ export default function ProjectsPage(): React.JSX.Element {
                     project={project}
                     onOpen={() => openProject(project.id)}
                     onSettings={() => setSettingsFor(project)}
+                    activityPhase={activityByProject.get(project.id)?.phase}
                   />
                 ))}
               </div>
