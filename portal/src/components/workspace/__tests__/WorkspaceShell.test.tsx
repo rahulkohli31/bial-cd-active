@@ -11,12 +11,12 @@
  * `workspaceChannel.ts` names each one.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
+import path from 'node:path'
 import { useState, type ReactNode } from 'react'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import WorkspaceShell from '../WorkspaceShell'
-import { WorkspaceExitHost, useWorkspaceExit } from '../UnsavedWorkGuard'
 import {
   useAppPaneVisible,
   usePublishAddress,
@@ -40,22 +40,17 @@ import type { ReclaimBlocked } from '../../../utils/buildSessionApi'
  * the pane host's tree position. That property is asserted where it lives: `App.test.jsx` for
  * the shell, `AppPaneHost.test.tsx` for the frame.
  *
- * `chrome` is what sits OUTSIDE the shell, where the navigation really is — the exits the guard
- * exists for are rendered by the shell that FRAMES this one, not by it. `WorkspaceExitHost` is
- * mounted above both, exactly as `App.tsx` mounts it, because that is the only arrangement in
- * which the workspace's guard and the controls that leave it can see each other at all.
+ * `chrome` is what sits OUTSIDE the shell, where the navigation really is.
  */
 function renderShell(child: ReactNode, chrome?: ReactNode) {
   return render(
     <MemoryRouter initialEntries={['/projects/p1']}>
-      <WorkspaceExitHost>
-        {chrome}
-        <Routes>
-          <Route element={<WorkspaceShell />}>
-            <Route path="/projects/:projectId" element={<>{child}</>} />
-          </Route>
-        </Routes>
-      </WorkspaceExitHost>
+      {chrome}
+      <Routes>
+        <Route element={<WorkspaceShell />}>
+          <Route path="/projects/:projectId" element={<>{child}</>} />
+        </Route>
+      </Routes>
     </MemoryRouter>,
   )
 }
@@ -210,24 +205,24 @@ describe('WorkspaceShell — the reclaim dialog is mounted here, its handlers st
   })
 })
 
-describe('WorkspaceShell — the unsaved-work warning, hoisted here (the leaving-the-page half)', () => {
-  /** Ask the browser to leave, and report whether anything objected. */
-  const tryToLeave = (): boolean => {
-    const event = new Event('beforeunload', { cancelable: true })
-    window.dispatchEvent(event)
-    return event.defaultPrevented
-  }
-
-  /** THE RECOVERY INSTANT DEFAULTS TO `null` — "the platform holds no copy of this" — so every
-   *  scenario written before it existed still describes work that leaving would genuinely cost
-   *  somebody, and a scenario that wants the recoverable case has to ask for it by name. */
+/**
+ * WHAT THIS DESCRIBE USED TO PIN, INVERTED RATHER THAN DELETED: a `beforeunload` prompt that
+ * warned before a tab close discarded unsaved work, narrowly, on a tri-state and a recovery
+ * instant. Shutdown now writes that same work back automatically under an ancestry guard before a
+ * container is destroyed — `WorkspaceLifecycleNotes` states the one case that write-back can fail
+ * — so a tab close has nothing left to ask about. The save states the old warning branched on
+ * still reach the channel (`WorkspaceLifecycleNotes` reads some of them), so this keeps exercising
+ * all of them; only the expectation flips, from "warns" to "arms nothing at all".
+ */
+describe('WorkspaceShell — no tab-close warning is ever armed (the leaving-the-page half, inverted)', () => {
+  /** THE RECOVERY INSTANT DEFAULTS TO `null`, matching the states the old warning distinguished. */
   function Surface({ dirty, recoveryAt = null }: { dirty: boolean | null; recoveryAt?: string | null }) {
     useWorkspaceProject('p1')
     usePublishSaveState({ dirty, recoveryAt })
     return <div data-testid="surface" />
   }
 
-  /** A conversation that publishes, then a project screen that does not — the hoist's whole point. */
+  /** A conversation that publishes, then a project screen that does not. */
   function Workspace({
     conversationMounted,
     dirty,
@@ -257,99 +252,98 @@ describe('WorkspaceShell — the unsaved-work warning, hoisted here (the leaving
     )
   }
 
-  it('warns on a definite `true`, and GOES ON warning after the conversation unmounts', () => {
-    // THE ONLY USER-VISIBLE CONSEQUENCE OF THE HOIST: bound to the builder page instead, the
-    // effect would disarm the moment the citizen navigates away — exactly when they are most
-    // likely to close the tab.
-    const view = render(<Workspace conversationMounted dirty />)
-    expect(tryToLeave()).toBe(true)
+  /** Every `addEventListener` call the tree makes, so an unload-family listener has nowhere to hide. */
+  function watchListeners() {
+    const added: string[] = []
+    const original = window.addEventListener.bind(window)
+    const spy = vi.spyOn(window, 'addEventListener').mockImplementation((type, ...rest) => {
+      added.push(String(type))
+      return original(type, ...(rest as [EventListenerOrEventListenerObject]))
+    })
+    return { added, restore: () => spy.mockRestore() }
+  }
 
+  it('arms no listener on a definite `true`, mounted or after the conversation unmounts', () => {
+    const { added, restore } = watchListeners()
+    const view = render(<Workspace conversationMounted dirty />)
     view.rerender(<Workspace conversationMounted={false} dirty />)
 
     expect(screen.getByTestId('project-only')).toBeTruthy()
-    expect(tryToLeave()).toBe(true)
+    expect(added).not.toContain('beforeunload')
+    restore()
   })
 
-  it('says nothing when the state is definitely clean', () => {
+  it('arms no listener when the state is definitely clean', () => {
+    const { added, restore } = watchListeners()
     render(<Workspace conversationMounted dirty={false} />)
-    expect(tryToLeave()).toBe(false)
+    expect(added).not.toContain('beforeunload')
+    restore()
   })
 
-  it('says nothing when the state is UNKNOWN, and claims nothing either way', () => {
-    // `null` is "could not check", never "clean" — the silence is deliberate, not an oversight:
-    // the browser's fixed prompt can't carry a "we could not check" sentence (the in-app dialog
-    // does), and arming it anyway is how people learn to dismiss it. What must NOT happen is the
-    // other failure: claiming there is nothing unsaved.
+  it('arms no listener when the state is UNKNOWN, and claims nothing on screen either', () => {
+    const { added, restore } = watchListeners()
     const { container } = render(<Workspace conversationMounted dirty={null} />)
 
-    expect(tryToLeave()).toBe(false)
+    expect(added).not.toContain('beforeunload')
     expect(container.textContent).not.toMatch(/no unsaved|nothing unsaved|all saved|up to date/i)
+    restore()
   })
 
-  it('says nothing when NOBODY has published, and asks nothing to find out', () => {
-    // "Nobody has reported" is the same `null` as "the check failed", and nothing here calls the
-    // save-state endpoint — that check costs two `git` executions inside the container, which a
-    // screen with no conversation has nothing to compare.
+  it('asks nothing when NOBODY has published a save state', () => {
+    // Nothing here calls the save-state endpoint — that check costs two `git` executions inside
+    // the container, which a screen with no conversation has nothing to compare.
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const { added, restore } = watchListeners()
     try {
       render(<Workspace conversationMounted={false} dirty={null} />)
-      expect(tryToLeave()).toBe(false)
       expect(fetchSpy).not.toHaveBeenCalled()
+      expect(added).not.toContain('beforeunload')
     } finally {
       fetchSpy.mockRestore()
+      restore()
     }
   })
 
-  it('★ says nothing when the platform is holding a copy it can put back', () => {
-    // THE REPORTED BUG, at the tab-closing exit. A freshly built app that nobody has saved is
-    // `dirty: true` — there is no VERSION, because Save is the citizen's own act — and the
-    // browser's fixed-text prompt fired on somebody closing a tab over work the platform can put
-    // back at any time. `newest_restore_source` hands that copy to every automatic restore.
-    //
-    // MUTATION RECEIPT: drop `|| canBePutBack(recoveryAt)` from the effect's guard and this goes
-    // red while every other case in this describe stays green.
-    const { container } = render(<Workspace conversationMounted dirty recoveryAt="2026-09-10T10:38:43Z" />)
-
-    // Alive and mounted — so the silence below is the rule's, not a component that failed to render.
-    expect(screen.getByTestId('surface')).toBeTruthy()
-    expect(tryToLeave()).toBe(false)
-    // …and nothing on screen claims the work was SAVED, which it was not.
-    expect(container.textContent).not.toMatch(/all saved|up to date/i)
-  })
-
-  it('★ goes on warning when the same `true` has NO recovery copy', () => {
-    // The half that keeps the carve-out narrow: work the platform is holding nothing for is still
-    // work closing the tab would cost somebody.
-    render(<Workspace conversationMounted dirty recoveryAt={null} />)
-
-    expect(tryToLeave()).toBe(true)
-  })
-
-  it('★ FOLLOWS the instant when a later reading takes it away', () => {
-    // A poll answers again, and only the recovery instant is different — which is a reading the
-    // channel's cell has to let through. Its value comparator is what decides that, and one blind
-    // to this field would hold the first answer forever: the guard would go on letting somebody
-    // out over work the platform has since stopped holding a copy of, for the life of the tab.
-    //
-    // MUTATION RECEIPT: drop the `recoveryAt` conjunct from `sameReading` in `workspaceChannel.ts`
-    // and this goes red — the second reading is discarded and the prompt never re-arms.
+  it('arms no listener whether or not the platform holds a recoverable copy', () => {
+    // The distinction this describe used to warn on both sides of — recoverable and not — collapses
+    // to the same outcome now: neither arms anything.
+    const { added, restore } = watchListeners()
     const view = render(<Workspace conversationMounted dirty recoveryAt="2026-09-10T10:38:43Z" />)
-    expect(tryToLeave()).toBe(false)
+    expect(screen.getByTestId('surface')).toBeTruthy()
 
     view.rerender(<Workspace conversationMounted dirty recoveryAt={null} />)
 
-    expect(tryToLeave()).toBe(true)
+    expect(added).not.toContain('beforeunload')
+    restore()
   })
+})
 
-  it('disarms when the state goes from dirty back to clean', () => {
-    // The listener has to come off, not merely stop mattering: a stale one left bound would warn
-    // about a container that has since been saved, for the life of the tab.
-    const view = render(<Workspace conversationMounted dirty />)
-    expect(tryToLeave()).toBe(true)
+/**
+ * THE SOURCE-LEVEL HALF OF THE SAME CLAIM. The render-based tests above only see what THEIR OWN
+ * tree mounts; a listener added by a module none of them renders would pass every one of them and
+ * still ship. Read as source, over the whole client, so there is nowhere left for one to hide.
+ */
+describe('no `beforeunload` listener remains anywhere in the client', () => {
+  function sourceFiles(dir: string): string[] {
+    return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      if (entry.name === '__tests__' || entry.name === 'node_modules') return []
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) return sourceFiles(full)
+      return /\.(ts|tsx|js|jsx)$/.test(entry.name) ? [full] : []
+    })
+  }
 
-    view.rerender(<Workspace conversationMounted dirty={false} />)
-
-    expect(tryToLeave()).toBe(false)
+  it('is absent from every shipped file', () => {
+    const offending = sourceFiles('src').flatMap((file) =>
+      readFileSync(file, 'utf8')
+        .split('\n')
+        .flatMap((line, i) => {
+          const code = line.trimStart()
+          if (code.startsWith('//') || code.startsWith('*') || code.startsWith('/*')) return []
+          return /beforeunload/i.test(line) ? [`${file}:${i + 1}`] : []
+        }),
+    )
+    expect(offending).toEqual([])
   })
 })
 
@@ -477,124 +471,5 @@ describe('the workspace channel — what survives its publisher\'s unmount, and 
 
     view.rerender(<At project="p2" />) // a different project is a different app
     expect(probe()).toContain('none')
-  })
-})
-
-/**
- * THE IN-PLACE GUARD, MOUNTED AT SHELL LEVEL. Two guards divide the work: `beforeunload` covers
- * leaving the TAB and arms only on a definite `true`; this one covers leaving the WORKSPACE
- * without an unload and warns on `null` too, since an in-app dialog can carry a reason the
- * browser's fixed prompt cannot. Mounted here rather than in the Outlet child because the exits
- * it guards — the navbar's links — sit above the Outlet. What they now AGREE on is the
- * recoverable case: neither stops anybody over a `true` the platform holds a recovery copy of.
- */
-describe('WorkspaceShell — the in-place unsaved-work guard', () => {
-  /** Stands in for the chrome that exits through the guard — a navigation destination, the brand
-   *  link, Sign out. Mounted OUTSIDE the shell, where all three really are: a stand-in placed
-   *  inside it would read the guard down a path no shipped control takes. */
-  function ChromeExitLink() {
-    const exit = useWorkspaceExit()
-    return (
-      <button type="button" onClick={() => exit(() => {})}>
-        leave to projects
-      </button>
-    )
-  }
-
-  function SurfaceWithSaveState({
-    dirty,
-    running,
-    recoveryAt = null,
-  }: {
-    dirty: boolean | null
-    running: boolean
-    recoveryAt?: string | null
-  }) {
-    usePublishSaveState({ dirty, recoveryAt })
-    useWorkspaceChannel()?.workspace.set({
-      state: running
-        ? { name: 'running', headline: 'Your app is running.', detail: null, action: null }
-        : { name: 'not-running', headline: 'Your app is saved.', detail: null, action: null },
-      projectId: 'p1',
-      onStarted: () => {},
-      onStartPending: () => {},
-      onStartOutcome: () => {},
-      onRefresh: () => {},
-      onReclaimRefusal: () => {},
-    })
-    return <div data-testid="surface" />
-  }
-
-  it('★ intercepts a navbar link when the workspace holds unsaved work', async () => {
-    renderShell(<SurfaceWithSaveState dirty running />, <ChromeExitLink />)
-
-    fireEvent.click(await screen.findByRole('button', { name: /leave to projects/i }))
-
-    expect(screen.getByRole('dialog').textContent).toMatch(/changes that are not saved yet/i)
-  })
-
-  it('lets the same link through when the workspace is clean', async () => {
-    renderShell(<SurfaceWithSaveState dirty={false} running />, <ChromeExitLink />)
-
-    fireEvent.click(await screen.findByRole('button', { name: /leave to projects/i }))
-
-    expect(screen.queryByRole('dialog')).toBeNull()
-  })
-
-  it('★ warns about nothing on a STOPPED project, where the check was never asked', async () => {
-    // The fourth case. A stopped project's save state is `null` because `fetchSaveState` may only
-    // be called on a live workspace — not because a check failed.
-    renderShell(<SurfaceWithSaveState dirty={null} running={false} />, <ChromeExitLink />)
-
-    fireEvent.click(await screen.findByRole('button', { name: /leave to projects/i }))
-
-    expect(screen.queryByRole('dialog')).toBeNull()
-  })
-
-  it('★ lets a navbar link through when the work is recoverable — the SEAM, end to end', async () => {
-    // THE WIRING THIS FIX IS: the instant is published on the channel beside the tri-state, read
-    // by the shell, and handed to the guard as one reading. Nothing here reaches into the guard —
-    // it is the same publish a conversation surface makes, and the same navbar link a citizen
-    // presses — so a break in ANY hop of that chain shows up right here.
-    //
-    // MUTATION RECEIPT: delete the `recoveryAt` line from the shell's `useUnsavedWorkGuard` call
-    // and this goes red on its own (the guard then defaults to `null` and stops them again).
-    renderShell(<SurfaceWithSaveState dirty running recoveryAt="2026-09-10T10:38:43Z" />, <ChromeExitLink />)
-
-    fireEvent.click(await screen.findByRole('button', { name: /leave to projects/i }))
-
-    expect(screen.queryByRole('dialog')).toBeNull()
-    // …and the shell is alive and the link is still there, so the absent dialog is the rule's
-    // doing rather than a render that fell over.
-    expect(screen.getByTestId('surface')).toBeTruthy()
-    expect(screen.getByRole('button', { name: /leave to projects/i })).toBeTruthy()
-  })
-
-  it('★ still intercepts the same link when the work is NOT recoverable', async () => {
-    // Same publish, same link, one field different — the assertion that stops the fix from
-    // becoming "never warn about anything".
-    renderShell(<SurfaceWithSaveState dirty running recoveryAt={null} />, <ChromeExitLink />)
-
-    fireEvent.click(await screen.findByRole('button', { name: /leave to projects/i }))
-
-    expect(screen.getByRole('dialog').textContent).toMatch(/changes that are not saved yet/i)
-  })
-
-  it('★ there is exactly ONE guard, not two', async () => {
-    // "Never two guards" is held by construction here rather than by remembering to delete one:
-    // the hoisted unload handler is extended, never duplicated — no second `beforeunload`
-    // listener and no second hook.
-    const added: string[] = []
-    const original = window.addEventListener.bind(window)
-    const spy = vi.spyOn(window, 'addEventListener').mockImplementation((type, ...rest) => {
-      added.push(String(type))
-      return original(type, ...(rest as [EventListenerOrEventListenerObject]))
-    })
-
-    renderShell(<SurfaceWithSaveState dirty running />)
-    await screen.findByTestId('surface')
-
-    expect(added.filter((t) => t === 'beforeunload')).toHaveLength(1)
-    spy.mockRestore()
   })
 })

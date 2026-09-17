@@ -767,15 +767,15 @@ describe('the back control, and the menu that replaced two controls', () => {
     expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
   })
 
-  it('★ asks first when there is unsaved work, rather than discarding it in silence', async () => {
-    // One of the two most-used exits out of a workspace, and it used to leave unsaved work behind
-    // without a word. It routes through the same guard the navigation's links do.
+  it('★ completes at once with unsaved work in play, asking nothing first', async () => {
+    // Shutdown now writes unsaved work back automatically under an ancestry guard before a
+    // container is destroyed, so this exit has nothing left to ask about.
     render(<Workspace project={{ heading: PROJECT_HEADING, save: { dirty: true, saving: false, error: null } }} />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
 
-    expect(await screen.findByRole('dialog')).toBeTruthy()
-    expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
+    await waitFor(() => expect(screen.getByTestId('where').textContent).toBe('/projects'))
+    expect(screen.queryByRole('dialog')).toBeNull()
   })
 
   it.each([

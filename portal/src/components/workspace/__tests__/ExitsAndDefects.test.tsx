@@ -1,10 +1,17 @@
 /**
  * THE UPHELD DEFECTS IN THESE FILES.
  *
- * Five things the review upheld, gathered here because they share one property: every one of them
- * is a silence. Nothing on the screen was wrong — something simply did not happen, and the citizen
- * had no way to know. A suite that asserts what IS rendered would have stayed green through all
- * five, which is why each scenario below asserts the thing that was missing.
+ * What remains, gathered here because they share one property: every one of them is a silence.
+ * Nothing on the screen was wrong — something simply did not happen, and the citizen had no way
+ * to know. A suite that asserts what IS rendered would have stayed green through all of them,
+ * which is why each scenario below asserts the thing that was missing.
+ *
+ * THE FIRST DESCRIBE IS INVERTED, NOT DELETED. It used to pin a dialog that asked before an exit
+ * discarded unsaved work. Shutdown now writes the work back automatically under an ancestry guard
+ * before a container is destroyed — `WorkspaceLifecycleNotes` states the one case that write-back
+ * can fail — so there is nothing left to lose by asking, and the prompt is gone. The exits it
+ * enumerated (sign-out, the back control) still exist and still have to complete cleanly; only the
+ * question changes.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
@@ -53,7 +60,6 @@ vi.mock('../../projects/ProjectDescriptionEditor', () => ({
 const WorkspaceShell = (await import('../WorkspaceShell')).default
 const ProjectWorkspace = (await import('../ProjectWorkspace')).default
 const ProfileCluster = (await import('../../layout/ProfileCluster')).default
-const { WorkspaceExitHost } = await import('../UnsavedWorkGuard')
 
 const PROJECT: Project = {
   id: 'pB',
@@ -73,12 +79,7 @@ function Where() {
   return <span data-testid="where">{useLocation().pathname}</span>
 }
 
-/**
- * THE ROUTE'S HALF, which the real `ProjectPage` performs. Reproduced rather than skipped because
- * one of the scenarios below is about the guard NAMING the project, and the name reaches it
- * through the heading the route publishes — a harness that omitted it would assert the fallback
- * and call it a pass.
- */
+/** THE ROUTE'S HALF, which the real `ProjectPage` performs. */
 function Route_({ children }: { children: React.ReactNode }) {
   usePublishHeading({ projectId: PROJECT.id, projectName: PROJECT.name, chatTitle: null, chatKind: null })
   return <>{children}</>
@@ -86,31 +87,28 @@ function Route_({ children }: { children: React.ReactNode }) {
 
 /**
  * THE PROFILE CLUSTER IS MOUNTED BESIDE THE WORKSPACE, NOT INSIDE IT, because that is where it
- * is: the navigation frames the workspace rather than living in it. `WorkspaceExitHost` above
- * both is what lets the workspace's guard and the sign-out control see each other — the same
- * arrangement `App.tsx` ships, and the only one in which either half of this scenario is real.
+ * is: the navigation frames the workspace rather than living in it — the same arrangement
+ * `App.tsx` ships.
  */
 function Workspace() {
   return (
     <MemoryRouter initialEntries={['/projects/pB']}>
-      <WorkspaceExitHost>
-        <Where />
-        <ProfileCluster />
-        <Routes>
-          <Route element={<WorkspaceShell />}>
-            <Route
-              path="/projects/:projectId"
-              element={
-                <Route_>
-                  <ProjectWorkspace project={PROJECT} onProjectUpdate={() => {}} />
-                </Route_>
-              }
-            />
-          </Route>
-          <Route path="/login" element={<div data-testid="login" />} />
-          <Route path="/projects" element={<div data-testid="projects-list" />} />
-        </Routes>
-      </WorkspaceExitHost>
+      <Where />
+      <ProfileCluster />
+      <Routes>
+        <Route element={<WorkspaceShell />}>
+          <Route
+            path="/projects/:projectId"
+            element={
+              <Route_>
+                <ProjectWorkspace project={PROJECT} onProjectUpdate={() => {}} />
+              </Route_>
+            }
+          />
+        </Route>
+        <Route path="/login" element={<div data-testid="login" />} />
+        <Route path="/projects" element={<div data-testid="projects-list" />} />
+      </Routes>
     </MemoryRouter>
   )
 }
@@ -136,7 +134,7 @@ beforeEach(() => {
 })
 afterEach(cleanup)
 
-const guardDialog = () => screen.queryByText(/save your changes before you go/i)
+const exitPrompt = () => screen.queryByText(/save your changes before you go/i)
 
 /**
  * Sign out through the navigation's profile menu. It is a Radix `DropdownMenu`, so the trigger
@@ -148,20 +146,20 @@ const signOutFromTheProfileMenu = async () => {
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Sign out' }))
 }
 
-describe('★ no exit discards unsaved work in silence', () => {
-  it('SIGNING OUT asks first — the most final button on the screen, and it did not', async () => {
-    // Every navigation DESTINATION is routed through the guard and the one control that ends the
-    // session entirely was not. Mutation receipt: call `handleLogout` directly again and this
-    // goes red while the sign-out-when-clean scenario below stays green.
+describe('★ no exit asks before leaving, whether or not there is unsaved work', () => {
+  it('SIGNING OUT completes at once, with unsaved work in play', async () => {
+    // INVERTED, NOT DELETED: this used to pin a dialog stopping the most final button on the
+    // screen. Shutdown now writes the work back automatically under an ancestry guard, so sign-out
+    // has nothing left to ask about.
     dirtyAndAlive()
     render(<Workspace />)
     await waitFor(() => expect(screen.getByTestId('save-project')).toBeTruthy())
 
     await signOutFromTheProfileMenu()
 
-    await waitFor(() => expect(guardDialog()).toBeTruthy())
-    expect(api.logout).not.toHaveBeenCalled()
-    expect(screen.queryByTestId('login')).toBeNull()
+    await waitFor(() => expect(api.logout).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByTestId('login')).toBeTruthy())
+    expect(exitPrompt()).toBeNull()
   })
 
   it('signing out with nothing unsaved still signs out', async () => {
@@ -174,47 +172,18 @@ describe('★ no exit discards unsaved work in silence', () => {
 
     await waitFor(() => expect(api.logout).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(screen.getByTestId('login')).toBeTruthy())
-    expect(guardDialog()).toBeNull()
+    expect(exitPrompt()).toBeNull()
   })
 
-  it('THE BACK CONTROL asks first too', async () => {
+  it('THE BACK CONTROL completes at once too, with unsaved work in play', async () => {
     dirtyAndAlive()
     render(<Workspace />)
     await waitFor(() => expect(screen.getByTestId('save-project')).toBeTruthy())
 
     fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
 
-    await waitFor(() => expect(guardDialog()).toBeTruthy())
-    expect(screen.getByTestId('where').textContent).toBe('/projects/pB')
-  })
-
-  it('cancelling the guard leaves the citizen signed in and where they were', async () => {
-    dirtyAndAlive()
-    render(<Workspace />)
-    await waitFor(() => expect(screen.getByTestId('save-project')).toBeTruthy())
-    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
-    await waitFor(() => expect(guardDialog()).toBeTruthy())
-
-    fireEvent.click(screen.getByRole('button', { name: /stay/i }))
-
-    await waitFor(() => expect(guardDialog()).toBeNull())
-    expect(screen.getByTestId('where').textContent).toBe('/projects/pB')
-    expect(api.logout).not.toHaveBeenCalled()
-    // LIVENESS: the workspace is still rendering, not merely un-navigated.
-    expect(screen.getByTestId('save-project')).toBeTruthy()
-  })
-
-  it("★ names WHICH project's work is at risk", async () => {
-    // "This app has changes that are not saved yet" is ambiguous the moment somebody has more than
-    // one project — and both exits this dialog covers are taken while thinking about another one.
-    dirtyAndAlive()
-    render(<Workspace />)
-    await waitFor(() => expect(screen.getByTestId('save-project')).toBeTruthy())
-
-    fireEvent.click(screen.getByRole('button', { name: 'Back to My Applications' }))
-
-    await waitFor(() => expect(guardDialog()).toBeTruthy())
-    expect(document.body.textContent).toContain('“Visitor Log” has changes that are not saved yet')
+    await waitFor(() => expect(screen.getByTestId('where').textContent).toBe('/projects'))
+    expect(exitPrompt()).toBeNull()
   })
 })
 

@@ -5,14 +5,17 @@
  * list crept back during the rewrite; and the save-state tri-state reaches the shell UNCOLLAPSED
  * (`null` as `null`).
  *
- * The last one matters most: `WorkspaceShell.test.tsx` covers what the guard does with
- * `true`/`false`/`null`, but not whether THIS surface hands it a `null` at all, or quietly turns
- * one into a boolean on the way past. This file does.
+ * The last one matters most: nothing else asserts whether THIS surface hands the channel a
+ * `null` at all, or quietly turns one into a boolean on the way past. This file does.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, waitFor, cleanup, within, fireEvent } from '@testing-library/react'
+import { render, screen, waitFor, cleanup, within, fireEvent } from '@testing-library/react'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
+import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import WorkspaceShell from '../../components/workspace/WorkspaceShell'
+import ConversationSurface from '../../components/chat/ConversationSurface'
+import { useWorkspaceSaveState } from '../../components/workspace/workspaceChannel'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), getBuild: vi.fn(),
@@ -199,70 +202,80 @@ describe('no chat list came back while the pages were being rewritten', () => {
   })
 })
 
-describe('the save-state TRI-STATE is published uncollapsed', () => {
-  /** Ask the browser to leave, and report whether anything objected. */
-  const tryToLeave = () => {
-    const event = new Event('beforeunload', { cancelable: true })
-    window.dispatchEvent(event)
-    return event.defaultPrevented
+describe('the save-state TRI-STATE reaches the channel uncollapsed', () => {
+  // READ DIRECTLY OFF THE CHANNEL, not through a consumer's side effect. This used to observe the
+  // reading via the shell's `beforeunload` prompt; that prompt is gone, but the fact it stood in
+  // for — whether THIS surface hands the channel a `null` at all, or quietly turns one into a
+  // boolean on the way past — is still this file's claim, so the probe reads the channel itself.
+  function SaveStateProbe() {
+    const { dirty, recoveryAt } = useWorkspaceSaveState()
+    return <div data-testid="save-state-probe">{`${String(dirty)}|${recoveryAt ?? 'none'}`}</div>
   }
 
-  it('a definite `true` reaches the shell and arms the guard', async () => {
+  function renderWithProbe({ deps: bsDeps, projectId = 'p1', hasSavedBuild = null } = {}) {
+    return render(
+      <MemoryRouter initialEntries={['/chat/build-X?projectId=p1&kind=build']}>
+        <Routes>
+          <Route element={<WorkspaceShell />}>
+            <Route
+              path="/chat/:chatId"
+              element={
+                <>
+                  <SaveStateProbe />
+                  <ConversationSurface
+                    projectId={projectId}
+                    projectName="VIP Movement"
+                    projectHasSavedBuild={hasSavedBuild}
+                    buildSessionDeps={bsDeps}
+                  />
+                </>
+              }
+            />
+          </Route>
+          <Route path="/projects" element={<div>projects index</div>} />
+          <Route path="/projects/:pid" element={<div>project page</div>} />
+        </Routes>
+      </MemoryRouter>,
+    )
+  }
+
+  const probe = () => screen.getByTestId('save-state-probe').textContent
+
+  it('a definite `true` reaches the channel as `true`', async () => {
     h.fetchSaveState.mockResolvedValue({ dirty: true })
-    renderBuilder({ deps: deps().deps })
+    renderWithProbe({ deps: deps().deps })
     await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalled())
-    await waitFor(() => expect(tryToLeave()).toBe(true))
+    await waitFor(() => expect(probe()).toBe('true|none'))
   })
 
-  it('a definite `false` does not', async () => {
+  it('a definite `false` reaches the channel as `false`', async () => {
     h.fetchSaveState.mockResolvedValue({ dirty: false })
-    renderBuilder({ deps: deps().deps })
+    renderWithProbe({ deps: deps().deps })
     await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalled())
-    expect(tryToLeave()).toBe(false)
+    await waitFor(() => expect(probe()).toBe('false|none'))
   })
 
-  it('★ carries the RECOVERY INSTANT with the flag, and it is what disarms the prompt', async () => {
-    // THE PRODUCER HOP OF THE REPORTED BUG. `refreshSaveState` read the save state and kept
-    // `state.dirty` alone, dropping the instant that says the platform can put this tree back —
-    // so a citizen who described an app, watched it get built and touched nothing got the
-    // browser's unload prompt over work they had never done.
+  it('★ carries the RECOVERY INSTANT alongside the flag', async () => {
+    // THE PRODUCER HOP OF A PAST BUG. `refreshSaveState` once read the save state and kept
+    // `state.dirty` alone, dropping the instant that says the platform can put this tree back.
     //
-    // TWO RUNS, ONE FIELD APART, AND THE FIRST IS THE CONTROL: it proves this wait is long enough
-    // for a reading to reach the shell at all, which is the only thing that makes the second
-    // run's silence mean anything. Without it a publish that never happened would read as a pass.
-    //
-    // MUTATION RECEIPT: drop `recoveryAt: state.recoveryAt` from `refreshSaveState` and the
-    // second half goes red — the instant never reaches the channel and the prompt arms again.
-    h.fetchSaveState.mockResolvedValue({ dirty: true, recoveryAt: null })
-    renderBuilder({ deps: deps().deps })
-    await waitFor(() => expect(tryToLeave()).toBe(true))
-    cleanup()
-
-    h.fetchSaveState.mockClear()
+    // MUTATION RECEIPT: drop `recoveryAt: state.recoveryAt` from `refreshSaveState` and this goes
+    // red — the instant never reaches the channel.
     h.fetchSaveState.mockResolvedValue({ dirty: true, recoveryAt: '2026-09-10T10:38:43Z' })
-    renderBuilder({ deps: deps().deps })
-    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalled())
-    await waitFor(() => expect(tryToLeave()).toBe(false))
-
-    // …and NOTHING here claims the work was saved. `dirty` is still true, Save is still the
-    // citizen's own act, and the only thing that changed is that leaving stopped being treated as
-    // a way to lose something the platform can put back.
-    expect(screen.queryByText(/no unsaved|nothing unsaved|all saved|up to date/i)).toBeNull()
+    renderWithProbe({ deps: deps().deps })
+    await waitFor(() => expect(probe()).toBe('true|2026-09-10T10:38:43Z'))
   })
 
   it('an UNKNOWN stays unknown — it is not collapsed into either boolean', async () => {
     // THE CASE THAT MATTERS, and the one this surface could break on its own. `null` means "we
-    // could not check", never "clean": collapsing it to `false` reports the work as safe when
-    // nobody asked the question, and collapsing it to `true` arms a browser prompt with nothing
+    // could not check", never "clean" — collapsing it to `false` reports the work as safe when
+    // nobody asked the question, and collapsing it to `true` claims unsaved work with nothing
     // answerable behind it. The read FAILS here, which is exactly how a `null` arises in
     // production.
     h.fetchSaveState.mockRejectedValue(new Error('the workspace could not be reached'))
-    renderBuilder({ deps: deps().deps })
+    renderWithProbe({ deps: deps().deps })
     await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalled())
-
-    expect(tryToLeave()).toBe(false)
-    // …and nothing on screen claims the work IS saved, which is the other half of the failure.
-    expect(screen.queryByText(/no unsaved|nothing unsaved|all saved|up to date/i)).toBeNull()
+    await waitFor(() => expect(probe()).toBe('null|none'))
   })
 })
 

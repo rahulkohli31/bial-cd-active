@@ -2,7 +2,6 @@ import { useId } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion, LayoutGroup } from 'motion/react'
 import { PanelLeftClose, PanelLeftOpen } from 'lucide-react'
-import { useWorkspaceExit } from '../workspace/UnsavedWorkGuard'
 import { useUsageToday } from '../../hooks/useUsageToday'
 import { projectsListHref } from '../../utils/projectsListMemory'
 import BIALLogo from '../BIALLogo'
@@ -20,10 +19,7 @@ import { NAV_RAIL_PX, NAV_WIDTH_PX } from '../../lib/motion'
  * labels fold to zero width rather than unmounting — so the collapse cannot change what a screen
  * reader finds, and React has nothing to reconcile across the transition.
  *
- * THE LOGO RUNS THE WORKSPACE-EXIT ROUTINE BEFORE NAVIGATING, exactly as the header's did, and
- * for the same reason: a single-page navigation is not an unload, so `beforeunload` cannot cover
- * it and leaving by the brand link used to discard unsaved work in silence. It lands on the
- * remembered list rather than page one.
+ * THE LOGO LANDS ON THE REMEMBERED LIST rather than page one.
  *
  * THE USAGE READ IS SHARED WITH THE WORKSPACE TOOLBAR, which draws the same figures compactly
  * while this panel is hidden. A null read hides the meter without collapsing the foot — the nav's
@@ -50,7 +46,6 @@ export default function NavPanel({
   onMenuOpenChange,
 }: Props) {
   const navigate = useNavigate()
-  const exit = useWorkspaceExit()
   const usage = useUsageToday()
   const scope = useId()
 
@@ -68,7 +63,7 @@ export default function NavPanel({
       >
         <button
           type="button"
-          onClick={() => exit(() => navigate(projectsListHref()))}
+          onClick={() => navigate(projectsListHref())}
           className="flex min-w-0 items-center gap-2.5 rounded-lg text-left outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1"
           aria-label="BIAL Citizen Developer — go to My Applications"
         >
