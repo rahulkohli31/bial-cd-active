@@ -86,7 +86,7 @@ from src.services.build_sessions.integrity import (
     IntegrityVerdict,
     WorkspaceState,
     container_state,
-    only_regenerated_files_changed,
+    holds_unsaved_work,
     workspace_integrity,
 )
 from src.services.build_sessions.liveness import flag_liveness_overpromise
@@ -123,6 +123,7 @@ from src.services.build_sessions.reaper import is_a_shared_sandbox_name, reap_us
 from src.services.build_sessions.shutdown import (
     ShutdownReason,
     claim_the_teardown_we_owe,
+    cut_the_turn_where_it_stands,
     shut_it_down_in_the_background,
 )
 from src.services.build_sessions.snapshot import (
@@ -913,24 +914,6 @@ class _OutgoingTurn:
     at_its_boundary: uuid.UUID | None = None
     #: Every other kind, cancelled now: there is no boundary in a single agent run.
     cut_where_it_stands: uuid.UUID | None = None
-
-
-async def _cut_the_turn_where_it_stands(conversation_id: uuid.UUID) -> None:
-    """Cancel the turn running in this conversation and DO NOT WAIT for it to unwind.
-
-    `stop_turn` returns the moment the cancel is issued, which is the property this path needs —
-    the citizen's own next project is starting while this happens, and the container the
-    cancelled turn was using is destroyed by the shutdown routine rather than here.
-
-    Local import: the engine imports this module."""
-    from src.services.turns.engine import TurnNotRunningError, get_turn_engine
-
-    engine = get_turn_engine()
-    running = engine.active_turn_info(conversation_id)
-    if running is None:
-        return
-    with suppress(TurnNotRunningError):
-        await engine.stop_turn(conversation_id, running.turn_id)
 
 
 async def _occupying_shared_project(
@@ -2213,22 +2196,11 @@ class SessionManager:
         # of the version you saved", not "nothing here is saved", and a client that lost the
         # saved version would be describing a bigger loss than the one that happened.
         #
-        # ...BUT FRAMEWORK CHURN IS NOT WORK, and this arm is where that was forgotten. `next dev`
-        # rewrites `next-env.d.ts` and normalises `tsconfig.json` on every boot, so merely OPENING
-        # a project — never touching it — made the porcelain non-empty and every reader of this
-        # flag act on it: the rail announced "You have changes that are not saved yet", the reclaim
-        # dialog offered to save them, and the exit guard demanded a save before leaving. On one
-        # observed hand-over that cost a citizen forty seconds of a modal spinner to store two
-        # files a framework had rewritten by itself.
-        #
-        # THE PREDICATE IS THE SAVE INDICATOR'S OWN, NOT THE REAPER'S, and the difference is not
-        # tidiness. `clean_but_for_churn` also forgives `tsconfig.json`, which the model is
-        # explicitly invited to edit — `prompt_blocks.py` lists it under "editable". Forgiving it
-        # HERE would report "Everything is saved" over an agent's own change — the one
-        # wrong answer this indicator must never give. `only_regenerated_files_changed` forgives
-        # only what the framework rewrites and the agent may not touch, and fails CLOSED on a
-        # truncated porcelain, so routing through it cannot turn a genuinely dirty tree clean.
-        if state.uncommitted and not only_regenerated_files_changed(state):
+        # ...BUT FRAMEWORK CHURN IS NOT WORK. `next dev` rewrites `next-env.d.ts` and normalises
+        # `tsconfig.json` on every boot, so merely OPENING a project — never touching it — makes
+        # the porcelain non-empty, and every reader of this flag acts on it: the rail announces
+        # "You have changes that are not saved yet" and the reclaim dialog offers to save them.
+        if holds_unsaved_work(state):
             return SaveState(
                 app_id=app_id,
                 dirty=True,
@@ -2482,7 +2454,7 @@ class SessionManager:
         # before the debt is published is a citizen's work stopped for a switch nobody is left to
         # finish.
         if leaving.cut_where_it_stands is not None:
-            await _cut_the_turn_where_it_stands(leaving.cut_where_it_stands)
+            await cut_the_turn_where_it_stands(leaving.cut_where_it_stands)
         shut_it_down_in_the_background(
             owed,
             redis=redis,

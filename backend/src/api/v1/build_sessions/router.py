@@ -70,7 +70,6 @@ from src.api.v1.build_sessions.schemas import (
 )
 from src.api.v1.build_sessions.sse import build_sse_response
 from src.api.v1.live_build import ReclaimBlockedError, reclaim_blocked_response
-from src.config import settings
 from src.core.errors import AppApiError
 from src.core.integrity_types import WorkspaceState
 from src.db.models.app_registry import AppRegistry
@@ -95,9 +94,8 @@ from src.services.build_sessions import (
     app_name_for,
     sweep_all,
 )
-from src.services.build_sessions.drain import draining_at
+from src.services.build_sessions.drain import draining_at, the_ceiling_switch
 from src.services.build_sessions.locks import (
-    an_instant_on_the_hash,
     read_registry,
     read_registry_and_starting_marker,
     renew_presence_stay,
@@ -129,7 +127,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
 )
 from src.services.sandbox import SandboxError
-from src.services.sandbox.base import CompileState, SandboxIdentity
+from src.services.sandbox.base import TAG_CREATED_AT, CompileState, identity_from_tags
 from src.services.storage import StorageError
 
 router = APIRouter(prefix="/build-sessions", tags=["build_sessions"])
@@ -504,25 +502,17 @@ async def _project_owning_app_name(
     return next((app.project_id for app in apps if app_name_for(app.id) == app_name), None)
 
 
-def _drain_switch() -> tuple[bool, int]:
-    """The ceiling's flag and its hours, or `(False, 0)` with no sandbox configured — the
-    same reading `reaper.py`'s own switch gives."""
-    if settings.sandbox is None:
-        return False, 0
-    return settings.sandbox.drain_enabled, settings.sandbox.drain_after_hours
+def _when_this_one_closes(reg: dict[str, str]) -> datetime | None:
+    """The ceiling instant for the container this registry record names, or `None`.
 
-
-def _registry_identity(reg: dict[str, str]) -> SandboxIdentity:
-    """The minimal identity `draining_at` needs. This route's budget allows no container
-    call, so the only field worth populating is the one the registry hash can answer."""
-    return SandboxIdentity(
-        kind=None,
-        user_id=None,
-        app_id=None,
-        control_plane=None,
-        created_at=an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT),
-        backfilled_at=None,
-        reclaim_staged_at=None,
+    These routes have no container-call budget, so the created-at stamp on the hash is the only
+    field worth populating — the same fallback the sweep's own age source lands on when ARM
+    cannot be asked."""
+    enabled, after_hours = the_ceiling_switch()
+    return draining_at(
+        identity_from_tags({TAG_CREATED_AT: reg.get(REGISTRY_FIELD_CREATED_AT, "")}),
+        enabled=enabled,
+        after_hours=after_hours,
     )
 
 
@@ -563,10 +553,7 @@ async def build_session_activity(user: CurrentUser, db: DbSession) -> ActivityRe
                     phases[project_id] = (
                         ActivityPhase.OPEN if stamp_is_proven(reg) else ActivityPhase.STARTING
                     )
-                    enabled, after_hours = _drain_switch()
-                    mark = draining_at(
-                        _registry_identity(reg), enabled=enabled, after_hours=after_hours
-                    )
+                    mark = _when_this_one_closes(reg)
                     if mark is not None:
                         draining[project_id] = mark
 
@@ -1416,10 +1403,7 @@ async def renew_presence(
         if outcome is RenewalOutcome.RENEWED:
             reg = await read_registry(redis, user.id)
             if reg is not None:
-                enabled, after_hours = _drain_switch()
-                mark = draining_at(
-                    _registry_identity(reg), enabled=enabled, after_hours=after_hours
-                )
+                mark = _when_this_one_closes(reg)
         return RenewPresenceResponse(outcome=outcome, stay_until=stay_until, draining_at=mark)
     raise _coordination_is_gone()
 

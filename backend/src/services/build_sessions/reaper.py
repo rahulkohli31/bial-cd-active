@@ -43,7 +43,11 @@ from src.services.build_sessions.alarms import (
     SERVING_PROOF_ABSENT_AT_TEARDOWN,
     SERVING_PROOF_STAMP_REFUSED,
 )
-from src.services.build_sessions.drain import is_drained, past_the_turn_bound
+from src.services.build_sessions.drain import (
+    is_drained,
+    past_the_turn_bound,
+    the_ceiling_switch,
+)
 from src.services.build_sessions.durable_copy import CopyVerdict, confirm_durable_copy
 from src.services.build_sessions.integrity import container_state
 from src.services.build_sessions.locks import (
@@ -987,23 +991,6 @@ async def _container_age_source(
         if identity.created_at is not None:
             return identity
     return identity_from_tags({TAG_CREATED_AT: reg.get(REGISTRY_FIELD_CREATED_AT, "")})
-
-
-def the_ceiling_switch() -> tuple[bool, int]:
-    """The ceiling's flag and its hours, or `(False, 0)` when no sandbox is configured.
-
-    A LOCAL IMPORT, like `workers/sandbox_reap.py`'s destroy gate: this module is imported by the
-    worker and by a standalone-import test, and neither may be made to drag the settings tree in
-    at module level.
-
-    Shared with the shutdown routine rather than re-read there: two readings of "what the ceiling
-    is" would be two numbers to keep in step, on the one question that decides whether a
-    container can be immortal."""
-    from src.config import settings
-
-    if settings.sandbox is None:
-        return False, 0
-    return settings.sandbox.drain_enabled, settings.sandbox.drain_after_hours
 
 
 def _the_jammed_turn_grace() -> float:

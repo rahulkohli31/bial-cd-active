@@ -21,6 +21,23 @@ import datetime as dt
 from src.services.sandbox.base import SandboxIdentity
 
 
+def the_ceiling_switch() -> tuple[bool, int]:
+    """The ceiling's flag and its hours, or `(False, 0)` when no sandbox is configured.
+
+    A LOCAL IMPORT, like `workers/sandbox_reap.py`'s destroy gate: this module is reached from
+    the worker and from a standalone-import test, and neither may be made to drag the settings
+    tree in at module level.
+
+    One reading, here beside the mark it feeds, because the sweep, the shutdown routine and the
+    screen all ask it: two readings of "what the ceiling is" would be two numbers to keep in
+    step, on the one question that decides whether a container can be immortal."""
+    from src.config import settings
+
+    if settings.sandbox is None:
+        return False, 0
+    return settings.sandbox.drain_enabled, settings.sandbox.drain_after_hours
+
+
 def draining_at(
     identity: SandboxIdentity, *, enabled: bool, after_hours: int
 ) -> dt.datetime | None:

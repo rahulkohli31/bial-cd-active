@@ -47,7 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models.app_registry import AppRegistry
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.pending_teardown import PendingTeardown
-from src.services.build_sessions.drain import is_drained
+from src.services.build_sessions.drain import is_drained, the_ceiling_switch
 from src.services.build_sessions.locks import (
     an_instant_on_the_hash,
     read_registry,
@@ -55,11 +55,7 @@ from src.services.build_sessions.locks import (
     reap_lock,
     release_liveness_lease,
 )
-from src.services.build_sessions.reaper import (
-    is_a_sandbox_name,
-    is_a_shared_sandbox_name,
-    the_ceiling_switch,
-)
+from src.services.build_sessions.reaper import is_a_sandbox_name, is_a_shared_sandbox_name
 from src.services.build_sessions.snapshot import SavedCopyOutcome, write_saved_copy_under_guard
 from src.services.messages.projection import TURN_TERMINAL_KIND
 from src.services.redis import REGISTRY_STATE_ENDING, legacy_registry_key, registry_key
@@ -464,18 +460,22 @@ async def _stop_the_outgoing_turn(
     # conversation nobody stopped would end the citizen's NEXT message at its first tool result.
     with suppress(Exception):
         await take_cooperative_stop(conversation_id)
-    await _cut_the_turn(conversation_id)
+    await cut_the_turn_where_it_stands(conversation_id)
     await _wait_for_the_turn_to_end(
         owed, factory, after_seq, bound_s=_UNWIND_AFTER_THE_CUT_SECONDS
     )
 
 
-async def _cut_the_turn(conversation_id: uuid.UUID) -> None:
-    """The hard cut, KEYED BY CONVERSATION.
+async def cut_the_turn_where_it_stands(conversation_id: uuid.UUID) -> None:
+    """The hard cut, KEYED BY CONVERSATION, and it DOES NOT WAIT for the turn to unwind.
 
     `stop_user_turn_and_wait` is keyed by USER and would cancel whichever of this citizen's turns
     it found first — after a switch, that is the incoming project's fresh turn. The engine's
-    registry is per-process and empty on the worker, where nothing is running anyway."""
+    registry is per-process and empty on the worker, where nothing is running anyway.
+
+    Returning the moment the cancel is issued is the property the switch needs: the citizen's own
+    next project is already starting, and the container the cancelled turn was using is destroyed
+    by the shutdown routine rather than here."""
     from src.services.turns.engine import TurnNotRunningError, get_turn_engine
 
     engine = get_turn_engine()
