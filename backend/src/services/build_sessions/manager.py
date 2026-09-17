@@ -1220,29 +1220,16 @@ class SharedPreview:
 
 class SharedProjectHasNoAppError(Exception):
     """The shared project's owner has no app row at all — UNREACHABLE in practice: `create_share`
-    (#198 slice 1) refuses to create a share unless the owner's app exists with a saved
-    snapshot, and deleting the project cascades the share away with it, so a live share always
-    implies a live app row for its owner. Defensive only; the router maps it to the same 404
-    `NoSnapshotToRelaunchError` gets — from the recipient's side, "nothing to launch" reads
-    identically whichever of the two facts is missing."""
+    refuses to create a share unless the owner's app exists with a saved snapshot, and deleting
+    the project cascades the share away with it, so a live share always implies a live app row
+    for its owner. Defensive only; the router maps it to the same 404 `NoSnapshotToRelaunchError`
+    gets — from the recipient's side, "nothing to launch" reads identically whichever of the two
+    facts is missing. Kept as its own type rather than folded into that one: the payload differs
+    (a project id here, with no app id to carry — that's exactly the fact this reports)."""
 
     def __init__(self, project_id: uuid.UUID) -> None:
         super().__init__("shared project's owner has no app to launch")
         self.project_id = project_id
-
-    # Is the dev server actually SERVING this URL yet? False on either reading that says the URL
-    # is framable with nothing painting behind it: the attach arm's readiness wait lapsing
-    # (`_ATTACHED_READY_BUDGET_SECONDS` elapsed with the app still not answering), or the app root
-    # answering with something that is not a page — a 404 while the agent has yet to write
-    # `app/page.tsx`, the measured blank-white-pane defect — which happens on EITHER arm. The URL
-    # is framable either way; this says whether framing it will paint or wait.
-    #
-    # NOT THE SAME FACT AS A PROVEN `serving_since` STAMP, and the single case that separates them
-    # is stated at the stamp site so the two cannot drift silently: when the supervisor cannot be
-    # asked whether the app is showing a page, this stays True — declining to demote a preview
-    # that may be painting — while the stamp is withheld, because a transport error is not a
-    # sighting. On every other arm they are set together or withheld together.
-    ready: bool = True
 
 
 @dataclass(frozen=True)

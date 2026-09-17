@@ -932,6 +932,20 @@ async def release_project(
 
 # --- a colleague's shared-runtime view ----------------------------------------
 
+# Launch and Refresh document the identical error surface — both go through
+# `_shared_preview_or_refuse` and can fail in exactly the same ways.
+_SHARED_PREVIEW_ERROR_RESPONSES = error_responses(
+    (403, ErrorEnvelope, "CSRF check failed"),
+    AUTH_401,
+    (404, ErrorEnvelope, "Project not found, not shared with you, or nothing saved yet"),
+    (
+        409,
+        BuildConflictEnvelope,
+        "You have a build running, or another project holds your workspace with unsaved work",
+    ),
+    (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
+)
+
 
 async def _shared_preview_or_refuse(
     project_id: uuid.UUID,
@@ -998,17 +1012,7 @@ async def _shared_preview_or_refuse(
     "/projects/{project_id}/shared-launch",
     response_model=SharedPreviewResponse,
     dependencies=[RequireCsrf],
-    responses=error_responses(
-        (403, ErrorEnvelope, "CSRF check failed"),
-        AUTH_401,
-        (404, ErrorEnvelope, "Project not found, not shared with you, or nothing saved yet"),
-        (
-            409,
-            BuildConflictEnvelope,
-            "You have a build running, or another project holds your workspace with unsaved work",
-        ),
-        (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
-    ),
+    responses=_SHARED_PREVIEW_ERROR_RESPONSES,
 )
 async def launch_shared_project(
     project_id: uuid.UUID,
@@ -1029,17 +1033,7 @@ async def launch_shared_project(
     "/projects/{project_id}/shared-refresh",
     response_model=SharedPreviewResponse,
     dependencies=[RequireCsrf],
-    responses=error_responses(
-        (403, ErrorEnvelope, "CSRF check failed"),
-        AUTH_401,
-        (404, ErrorEnvelope, "Project not found, not shared with you, or nothing saved yet"),
-        (
-            409,
-            BuildConflictEnvelope,
-            "You have a build running, or another project holds your workspace with unsaved work",
-        ),
-        (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
-    ),
+    responses=_SHARED_PREVIEW_ERROR_RESPONSES,
 )
 async def refresh_shared_project(
     project_id: uuid.UUID,
