@@ -138,6 +138,7 @@ from src.services.build_sessions.snapshot import (
     write_recovery_copy,
     write_snapshot,
 )
+from src.services.build_sessions.versions import record as record_version
 from src.services.lake.copy import schedule_window_copy
 from src.services.messages.projection import WORKSPACE_DISCARDED_KIND
 from src.services.messages.store import SeqContentionError, append_batch
@@ -173,6 +174,7 @@ from src.services.storage import (
     parse_bundle_head_sha,
     recovery_key,
     snapshot_key,
+    version_key,
 )
 from src.services.storage.base import ObjectMeta
 
@@ -680,6 +682,9 @@ class SaveOutcome:
 
     app_id: uuid.UUID
     head_sha: str | None
+    #: The version this Save recorded. Every Save makes one — a chat turn and the platform
+    #: autosave do not, which is what keeps "try something and walk away" possible.
+    version_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -1942,6 +1947,7 @@ class SessionManager:
         project_id: uuid.UUID,
         *,
         sandbox_client: SandboxClient,
+        description: str | None = None,
     ) -> SaveOutcome:
         """THE SAVE — the user's click, and the only thing that writes their work to Blob.
         Requires a LIVE container (the tree only exists there); `NoLiveSandboxError` is the
@@ -1969,12 +1975,36 @@ class SessionManager:
         # Commits inside the container before bundling, so a save captures the working tree
         # whether or not the agent had committed it, and the bundle carries HEAD's whole
         # history.
-        await write_snapshot(sandbox_client, handle, app_id)
+        # ★ THE VERSION IS STAMPED HERE, NOT READ BACK FROM THE STORE. `last_modified` could
+        # answer this while there was exactly one saved copy; with a list, an older entry has
+        # either no object of its own or one that was overwritten. The instant the save happened
+        # is a fact the platform owns, so it names it once and both the bundle key and the row
+        # carry the same one.
+        saved_at = datetime.now(UTC)
+        head_sha = await write_snapshot(
+            sandbox_client,
+            handle,
+            app_id,
+            also=Destination.version(app_id, saved_at),
+        )
+        version = await record_version(
+            db,
+            user_id=user.id,
+            app_id=app_id,
+            saved_at=saved_at,
+            head_sha=head_sha,
+            blob_key=version_key(app_id, saved_at),
+            description=description,
+        )
         # Read the head AFTER the save: `write_snapshot` runs `git init` + commit itself, so on
         # a first save this is the commit it just created — the value the client needs to
         # settle its indicator, and one that did not exist a moment ago.
         saved = await container_state(sandbox_client, handle)
-        return SaveOutcome(app_id=app_id, head_sha=saved.head if saved else None)
+        return SaveOutcome(
+            app_id=app_id,
+            head_sha=saved.head if saved else None,
+            version_id=version.id,
+        )
 
     async def discard_unsaved_changes(
         self,

@@ -63,6 +63,7 @@ from src.api.v1.build_sessions.schemas import (
     RenewalOutcome,
     RenewPresenceRequest,
     RenewPresenceResponse,
+    SaveRequest,
     SharedPreviewResponse,
     StopBuildRequest,
     StopBuildResponse,
@@ -824,6 +825,7 @@ async def save_project(
     db: DbSession,
     manager: SessionManagerDep,
     sandbox: OptionalSandbox,
+    body: SaveRequest | None = None,
 ) -> SaveResponse:
     """THE SAVE. The agent commits inside the container as it works; this is the only thing
     that pushes the result to durable storage, and it happens because the user asked.
@@ -831,12 +833,22 @@ async def save_project(
     409, not 200, when there is no live workspace: a Save that reports success having stored
     nothing is the single worst outcome available here — the user walks away believing their
     work is kept. 409 as well while the agent is still writing, which is the SECOND worst: that
-    save succeeded, and stored a tree caught mid-edit as the version a Relaunch would restore."""
+    save succeeded, and stored a tree caught mid-edit as the version a Relaunch would restore.
+
+    THE BODY IS OPTIONAL BECAUSE TWO CALLERS HAVE NO DIALOG. The leave-page guard and the
+    hand-over stop→save→release both reach this endpoint with no Save button in front of
+    them; they post nothing and their version carries no description."""
     if sandbox is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
     await owned_project_or_404(db, user.id, project_id)
     try:
-        outcome = await manager.save_project_snapshot(db, user, project_id, sandbox_client=sandbox)
+        outcome = await manager.save_project_snapshot(
+            db,
+            user,
+            project_id,
+            sandbox_client=sandbox,
+            description=body.description if body else None,
+        )
     except NoLiveSandboxError:
         raise AppApiError(
             status.HTTP_409_CONFLICT,

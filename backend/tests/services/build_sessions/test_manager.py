@@ -76,6 +76,7 @@ from src.services.build_sessions.snapshot import (
     RecoveryWrite,
     write_snapshot,
 )
+from src.services.build_sessions.versions import most_recent
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -3049,6 +3050,98 @@ async def test_save_still_succeeds_while_the_app_is_switched_off(
     # THE WORK REACHED DURABLE STORAGE. Not "no exception was raised" — a refusal that
     # returned quietly would pass that, and the citizen's work would still be gone.
     assert snapshot_key(app_id) in fake_storage.objects
+
+
+async def test_a_save_records_a_version_beside_the_saved_bundle(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ ONE BUNDLE, STORED TWICE, AND A ROW NAMING THE SECOND COPY.
+
+    The forty seconds a production save was measured at is bundling — commit, `git bundle`,
+    base64 out of the container. Recording a version adds one `put` of bytes already in memory,
+    so the history costs a write rather than a second save. Asserted as two stored keys from one
+    save, because the cheapness is the design claim and a comment cannot fail.
+
+    The row carries what the bundle cannot: the citizen's own line, and the instant the save
+    happened — stamped here rather than read back from the store, which could only answer
+    while there was exactly one saved copy.
+
+    Mutation receipt: drop `also=` from the save and the version bundle is never stored, so the
+    row names a key that holds nothing.
+    """
+    user, project_id = await _mk(db_session, "save-version@rvaiglobal.com")
+    app_id = await _a_switched_off_app(db_session, user, project_id, fake_storage)
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    client.attach_handle = SandboxHandle(
+        fqdn="live.example",
+        token="tok",
+        app_name=app_name_for(app_id),
+        preview_url="https://live.example/",
+        ready=True,
+    )
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: app_name_for(app_id),
+            REGISTRY_FIELD_FQDN: "live.example",
+            REGISTRY_FIELD_TOKEN_REF: "ref",
+            REGISTRY_FIELD_CREATED_AT: "2026-09-07T00:00:00+00:00",
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+        },
+    )
+
+    outcome = await manager.save_project_snapshot(
+        db_session,
+        user,
+        project_id,
+        sandbox_client=client,
+        description="Added the manager approval step",
+    )
+
+    assert outcome.version_id is not None
+    offered = await most_recent(db_session, user_id=user.id, app_id=app_id)
+    assert [v.description for v in offered] == ["Added the manager approval step"]
+    # The row names a key, and the key holds the same bundle the save just stored.
+    assert offered[0].blob_key in fake_storage.objects
+    assert fake_storage.objects[offered[0].blob_key] == fake_storage.objects[snapshot_key(app_id)]
+
+
+async def test_a_save_with_no_description_records_one_anyway(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """An empty line never blocks a Save, and it never blocks the version either — the two
+    dialog-less callers save exactly this way. Stored as no description rather than as an empty
+    string, so the list has one state to render instead of two that mean the same thing."""
+    user, project_id = await _mk(db_session, "save-undescribed@rvaiglobal.com")
+    app_id = await _a_switched_off_app(db_session, user, project_id, fake_storage)
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    client.attach_handle = SandboxHandle(
+        fqdn="live.example",
+        token="tok",
+        app_name=app_name_for(app_id),
+        preview_url="https://live.example/",
+        ready=True,
+    )
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: app_name_for(app_id),
+            REGISTRY_FIELD_FQDN: "live.example",
+            REGISTRY_FIELD_TOKEN_REF: "ref",
+            REGISTRY_FIELD_CREATED_AT: "2026-09-07T00:00:00+00:00",
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+        },
+    )
+
+    await manager.save_project_snapshot(
+        db_session, user, project_id, sandbox_client=client, description="   "
+    )
+
+    offered = await most_recent(db_session, user_id=user.id, app_id=app_id)
+    assert len(offered) == 1
+    assert offered[0].description is None
 
 
 # --- the connector coordinates reach BOTH birth arms ------------------------------------------

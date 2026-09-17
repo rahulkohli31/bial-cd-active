@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.integrity_types import WorkspaceState
+from src.db.models.app_version import MAX_DESCRIPTION
 from src.schemas import CamelModel
 from src.services.sandbox import SandboxClient
 from src.services.sandbox.base import CompileState
@@ -322,6 +323,21 @@ class RelaunchPreviewRequest(CamelModel):
     # bundle is untouched either way, so `dirty` stays true and Save is still their click.
     # Set from an explicit user action ("go back to my last saved version"), never inferred.
     prefer_saved: bool = False
+
+
+class SaveRequest(CamelModel):
+    """The optional line a citizen attaches to the version this Save creates.
+
+    ★ THE WHOLE BODY IS OPTIONAL, and that is load-bearing rather than tidy. Two shipped
+    flows call this endpoint with no Save button in front of them — the leave-page guard and
+    the hand-over stop→save→release — and they must keep posting nothing. A required body would
+    refuse them, and a dialog in front of them would open inside an already-open modal.
+
+    An empty line never blocks the Save: it is stored as "no description", which is one state
+    rather than two the list would have to treat alike.
+    """
+
+    description: str | None = Field(default=None, max_length=MAX_DESCRIPTION)
 
 
 class DiscardRequest(CamelModel):
