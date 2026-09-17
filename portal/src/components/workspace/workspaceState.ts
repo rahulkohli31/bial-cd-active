@@ -46,7 +46,7 @@
  * "saved but not running". `not running` survives only as an internal state name, never rendered,
  * and no sentence names a duration the platform has not measured.
  */
-import type { PreviewLifeState, PreviewState } from '../../utils/buildSessionApi'
+import type { PreviewLifeState, PreviewState, SurfacePresence } from '../../utils/buildSessionApi'
 import { assertNever } from '../../utils/assertNever'
 
 /**
@@ -184,6 +184,41 @@ export const STARTING_PROBE_MS = 3_000
  * the same ceiling covering the whole wait it is now a ceiling on.
  */
 export const STARTING_PROBE_LIMIT = 100
+
+/**
+ * HOW OFTEN A HIDDEN SURFACE ASKS — and why it is not the same 45 seconds a visible one uses.
+ *
+ * A backgrounded tab cannot promise to come back on any cadence at all. Chrome throttles
+ * background timers hard after a few minutes, Edge ships sleeping tabs on by default, and Safari
+ * suspends them outright — so this number is a floor on how often we *try*, never a guarantee of
+ * how often we succeed. The guarantee comes from the other two halves: the longer budget a hidden
+ * renewal asks for, and the renewal that fires the moment the tab wakes.
+ */
+export const HIDDEN_PROBE_MS = 120_000
+
+/**
+ * Does THIS tick renew the container's lease, and on which budget?
+ *
+ * SHARED BY BOTH POLLS, deliberately, exactly like {@link nextProbeCadence}. There are two
+ * surfaces that can frame a project — the project workspace and the chat route — and a surface
+ * that frames an app WITHOUT renewing is a silent container-killer: the citizen is looking right
+ * at their app while the platform counts it as abandoned. Putting this decision on one screen's
+ * hook is precisely how the chat route would be missed, so it lives here where neither can drift
+ * from the other and neither can forget it.
+ *
+ * `null` means this tick does not renew.
+ *
+ * NEVER ON AN ACCELERATED TICK. A container in `starting` is held by the start-in-flight marker
+ * and the lock, not by a stay, so a renewal there writes a deadline onto a record that is not
+ * being judged by it — the same reason the save read sits behind the same gate.
+ */
+export function presenceToRenew(
+  accelerated: boolean,
+  documentHidden: boolean,
+): SurfacePresence | null {
+  if (accelerated) return null
+  return documentHidden ? 'hidden' : 'visible'
+}
 
 /**
  * The poll's cadence, and how much of the accelerated window it has spent.

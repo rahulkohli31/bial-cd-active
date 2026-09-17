@@ -7,7 +7,7 @@ import asyncio
 import contextlib
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -23,7 +23,10 @@ from src.api.v1.build_sessions.deps import (
     sandbox_dependency,
     sandbox_or_none_dependency,
 )
-from src.api.v1.build_sessions.schemas import BuildSessionStatus
+from src.api.v1.build_sessions.schemas import (
+    SURFACE_PRESENT_STAY_SECONDS,
+    BuildSessionStatus,
+)
 from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import ChatKind
@@ -37,7 +40,11 @@ from src.services.redis import (
     REGISTRY_STATE_ENDING,
     registry_key,
 )
-from src.services.redis.keys import REGISTRY_FIELD_STATE
+from src.services.redis.keys import (
+    REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
+    REGISTRY_FIELD_STATE,
+    REGISTRY_FIELD_STAY_WRITER,
+)
 from src.services.sandbox.aca import AcaControlPlane, AcaTransientError
 from src.services.sandbox.base import (
     SandboxError,
@@ -101,6 +108,39 @@ async def test_relaunch_happy_returns_200_ready_preview(
     # Relaunch does NOT occupy the build slot: the lock is free and no session is live.
     assert wire.manager._active_by_user == {}
     assert await lock_is_held(fake_redis, user.id) is False
+
+
+async def test_a_served_preview_is_handed_to_the_screen_that_asked_for_it(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """THE GRANT AT THE MOMENT A PREVIEW BECOMES VIEWABLE IS THE SHORT ONE, and that is the whole
+    hand-over: from here the surface framing the app renews on its own poll, so what this grant
+    owes is the gap until the first renewal arrives — not a reprieve of its own.
+
+    A thirty-minute stamp here would keep a container nobody came back to alive for half an hour
+    after the tab closed, which is the cost presence renewal exists to stop paying, reintroduced
+    at the one moment every relaunch passes through.
+
+    Mutation check: change the writer back to `BUILDER_ACTED` and both assertions go red."""
+    user, project = await _user_project(db_session, "served@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+    before = datetime.now(UTC)
+
+    resp = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+    assert resp.status_code == 200
+
+    raw = await fake_redis.hmget(
+        registry_key(user.id),
+        [REGISTRY_FIELD_STAY_WRITER, REGISTRY_FIELD_PREVIEW_STAY_UNTIL],
+    )
+    writer, stamp = raw[0], raw[1]
+    assert (writer.decode() if isinstance(writer, bytes) else str(writer)) == "surface_present"
+    stay = datetime.fromisoformat(stamp.decode() if isinstance(stamp, bytes) else str(stamp))
+    assert stay - before <= timedelta(seconds=SURFACE_PRESENT_STAY_SECONDS + 5)
 
 
 async def test_relaunch_after_failed_build_signals_last_saved_version(

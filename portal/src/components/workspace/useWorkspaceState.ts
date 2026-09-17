@@ -41,15 +41,18 @@
  * stay on a plain read would be a new way to hold a container claimed, which nobody has built.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { checkWorkspace, fetchPreviewState, fetchSaveState, samePreviewState, sameSaveState } from '../../utils/buildSessionApi'
+import { checkWorkspace, fetchPreviewState, fetchSaveState, renewPresence, samePreviewState, sameSaveState } from '../../utils/buildSessionApi'
 import type { PreviewState, SaveState } from '../../utils/buildSessionApi'
 import {
   BACKGROUND_CADENCE,
+  HIDDEN_PROBE_MS,
+  PREVIEW_PROBE_MS,
   STARTING_PROBE_MS,
   asDecidedReading,
   isTerminalReading,
   mayHaveStopped,
   nextProbeCadence,
+  presenceToRenew,
   resolveWorkspaceState,
   spendProbeCadence,
   type ProbeCadence,
@@ -174,10 +177,19 @@ export function useWorkspaceState({
       timer = null
       armed = null
     }
+    // WHAT A HIDDEN TAB IS ACTUALLY WORTH ASKING AT. The background cadence is sized for somebody
+    // watching; a tab nobody is looking at is renewing a lease and nothing else, and it asks on
+    // the longer budget that renewal buys. An ACCELERATED window is never slowed: it belongs to a
+    // start somebody pressed, and it closes itself within five minutes either way.
+    const delayForNow = () =>
+      cadence.delayMs === PREVIEW_PROBE_MS && document.visibilityState !== 'visible'
+        ? HIDDEN_PROBE_MS
+        : cadence.delayMs
     const keepAsking = () => {
-      if (timer !== null && armed === cadence.delayMs) return
+      const delay = delayForNow()
+      if (timer !== null && armed === delay) return
       if (timer !== null) clearInterval(timer)
-      armed = cadence.delayMs
+      armed = delay
       // The tick carries HOW IT WAS SCHEDULED, decided here rather than read from `cadence` when
       // it fires: the answer that closes an accelerated window is the one that changes `cadence`,
       // so a tick reading it at fire time would call itself a background read on the strength of
@@ -190,7 +202,22 @@ export function useWorkspaceState({
     // fresh surface and a deliberate human act — neither is the 3-second timer, and neither
     // should be denied the container read a background tick makes.
     const read = async (accelerated = false) => {
-      if (!live || document.visibilityState !== 'visible') return
+      if (!live) return
+      // A HIDDEN TAB STILL READS AND STILL RENEWS, and admits nothing else.
+      //
+      // The renewal is the reason: a screen that frames a project holds its container open, and a
+      // tab that goes quiet the moment somebody switches away would have its app collected while
+      // they are two tabs over reading the docs for it. The preview read rides along because the
+      // renewal needs no answer of its own and re-arming the poll from a stale reading on the way
+      // back is worse than one cheap read.
+      //
+      // WHAT STAYS VISIBLE-ONLY, and this is the half that matters: `fetchSaveState` costs two
+      // `git` executions in the container, and `checkWorkspace` can PUT THE CONTAINER AWAY. A
+      // background tab that could reach either would be spending a container call, or ending a
+      // workspace, with nobody looking.
+      const hidden = document.visibilityState !== 'visible'
+      const presence = presenceToRenew(accelerated, hidden)
+      if (presence) void renewPresence(projectId, presence)
       const generation = ++latest
       try {
         const next = await fetchPreviewState(projectId)
@@ -239,7 +266,7 @@ export function useWorkspaceState({
           // cheap reads and nothing else. SKIPPED, NOT RETURNED FROM: this read still owes
           // the timer below its cadence decision, and an early exit here would leave the 3-second
           // interval running over an app that is already up.
-          if (!accelerated) {
+          if (!accelerated && !hidden) {
             const state = await fetchSaveState(projectId).catch(() => null)
             if (!live || generation !== latest || projectRef.current !== projectId) return
             setSave((prev) => (sameSaveState(prev, state) ? prev : state))
@@ -260,7 +287,7 @@ export function useWorkspaceState({
         // its cadence decision to that one. Never on an accelerated tick: that timer is watching a
         // start land, and a check there is a container call about a dev server still booting.
         if (next.state !== 'alive' && next.state !== 'unknown') frameStalledRef.current = false
-        if (!accelerated && mayHaveStopped(next.state, frameStalledRef.current, cadence)) {
+        if (!accelerated && !hidden && mayHaveStopped(next.state, frameStalledRef.current, cadence)) {
           await checkWorkspace(projectId)
           if (!live || generation !== latest) return
           void read(true)
@@ -298,14 +325,28 @@ export function useWorkspaceState({
     // tabbing back to the project — never on a clock, so they are bounded by the person rather
     // than by a cadence. They are also the only backstop for the one thing this effect's inputs
     // cannot see: another tab restoring, or taking, this project's workspace.
+    // A RENEWAL ON WAKING, not merely on the next tick. A throttled or frozen tab may have missed
+    // several ticks before it came back, so the lease can be minutes old at exactly the moment
+    // somebody starts looking at the app again. `read` renews on its way through.
+    //
+    // BOTH EDGES RE-ARM THE TIMER and only one of them reads. `visibilitychange` fires on hiding
+    // too, and that edge is what drops the poll to the hidden cadence; a read there would be a
+    // request spent on the way out of the room.
+    const onVisibility = () => {
+      // ONLY RE-ARMS A POLL THAT IS STILL RUNNING. A settled answer stops the timer for good, and
+      // a visibility change is not new information about the workspace — re-arming here would let
+      // tabbing away and back restart a poll that had correctly heard everything there was to hear.
+      if (timer !== null) keepAsking()
+      if (document.visibilityState === 'visible') void read()
+    }
     const onVisible = () => void read()
-    document.addEventListener('visibilitychange', onVisible)
+    document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('focus', onVisible)
     keepAsking()
     void read()
     return () => {
       live = false
-      document.removeEventListener('visibilitychange', onVisible)
+      document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('focus', onVisible)
       stopAsking()
     }

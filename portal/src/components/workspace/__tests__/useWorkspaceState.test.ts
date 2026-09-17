@@ -19,6 +19,7 @@ const api = vi.hoisted(() => ({
   fetchSaveState: vi.fn(),
   fetchCompileState: vi.fn(),
   checkWorkspace: vi.fn(),
+  renewPresence: vi.fn(),
 }))
 
 vi.mock('../../../utils/buildSessionApi', async (importOriginal) => {
@@ -29,6 +30,7 @@ vi.mock('../../../utils/buildSessionApi', async (importOriginal) => {
 const { useWorkspaceState } = await import('../useWorkspaceState')
 const {
   BACKGROUND_CADENCE,
+  HIDDEN_PROBE_MS,
   PREVIEW_PROBE_MS,
   STARTING_PROBE_LIMIT,
   STARTING_PROBE_MS,
@@ -50,6 +52,22 @@ function reading(over: Partial<PreviewState> = {}): PreviewState {
 
 const SAVE: SaveState = { appId: 'app-1', dirty: false, containerHead: 'abc1234', savedHead: 'abc1234', recoveryAt: null }
 
+/**
+ * Put the document out of sight, or bring it back, and fire the event the browser would.
+ *
+ * `visibilityState` is a read-only getter, so it is redefined rather than assigned — jsdom has no
+ * real tab to hide. THIS IS WHY THE HIDDEN-TAB BEHAVIOUR IS ALSO PROVED IN A REAL BROWSER: jsdom
+ * will happily keep firing a timer that Chrome throttles and Edge freezes, so everything below
+ * proves the CODE asks correctly, and nothing below proves the browser lets it.
+ */
+function hide(hidden: boolean): void {
+  Object.defineProperty(document, 'visibilityState', {
+    configurable: true,
+    get: () => (hidden ? 'hidden' : 'visible'),
+  })
+  document.dispatchEvent(new Event('visibilitychange'))
+}
+
 /** The hook, mounted against a project, with the defaults every scenario shares. */
 const mount = (projectId: string | null = 'proj-1', projectHasSavedBuild: boolean | null = null) =>
   renderHook(() => useWorkspaceState({ projectId, projectHasSavedBuild }))
@@ -59,6 +77,8 @@ beforeEach(() => {
   for (const fn of Object.values(api)) fn.mockReset()
   api.fetchPreviewState.mockResolvedValue(reading())
   api.fetchSaveState.mockResolvedValue(SAVE)
+  api.renewPresence.mockResolvedValue('renewed')
+  hide(false)
 })
 
 afterEach(() => {
@@ -828,5 +848,113 @@ describe('a wait that looks stuck asks whether the app has stopped', () => {
     expect(api.fetchPreviewState.mock.calls.length).toBeGreaterThan(readsBefore)
     // …and asked nothing more.
     expect(api.checkWorkspace).toHaveBeenCalledTimes(1)
+  })
+})
+
+
+describe('presence renewal — what holds the container open', () => {
+  it('renews on the ordinary tick, so a screen left open keeps its app', async () => {
+    // The whole mechanism in one assertion: nobody is typing, nobody presses anything, and the
+    // container stays because a screen that can frame it is still here.
+    mount()
+    await settle()
+
+    expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'visible')
+  })
+
+  it('renews from a HIDDEN tab, and asks for the longer budget', async () => {
+    // A citizen reading the docs for their own app in the next tab has not left. A poll that went
+    // silent while hidden would have the platform collect their container out from under them.
+    hide(true)
+    mount()
+    await settle()
+
+    expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'hidden')
+  })
+
+  it('asks a hidden tab for nothing but the read and the renewal', async () => {
+    // THE HALF THAT MATTERS. `fetchSaveState` costs two `git` executions inside the container and
+    // `checkWorkspace` can PUT THE CONTAINER AWAY — doing either with nobody looking is the
+    // opposite of what renewing from a hidden tab is for.
+    api.fetchPreviewState.mockResolvedValue(reading({ state: 'alive', alive: true }))
+    hide(true)
+    mount()
+    await settle()
+
+    expect(api.renewPresence).toHaveBeenCalled()
+    expect(api.fetchSaveState).not.toHaveBeenCalled()
+    expect(api.checkWorkspace).not.toHaveBeenCalled()
+  })
+
+  it('renews the moment a hidden tab is woken, without waiting for a tick', async () => {
+    // A throttled or frozen tab can miss several ticks before it comes back, so the lease may be
+    // minutes old at exactly the moment somebody starts looking at the app again.
+    hide(true)
+    mount()
+    await settle()
+    api.renewPresence.mockClear()
+
+    hide(false)
+    await settle()
+
+    expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'visible')
+  })
+
+  it('polls a hidden tab on the longer cadence, not the visible one', async () => {
+    mount()
+    await settle()
+    hide(true)
+    await settle()
+    api.renewPresence.mockClear()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS + 1)
+    })
+    expect(api.renewPresence).not.toHaveBeenCalled()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(HIDDEN_PROBE_MS)
+    })
+    expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'hidden')
+  })
+
+  it('never renews on the accelerated starting tick', async () => {
+    // A container in `starting` is held by the start-in-flight marker and the lock, not by a stay,
+    // so a renewal there writes a deadline onto a record nothing is judging it by.
+    api.fetchPreviewState.mockResolvedValue(reading({ state: 'starting' }))
+    mount()
+    await settle()
+    api.renewPresence.mockClear()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
+    })
+
+    expect(api.fetchPreviewState).toHaveBeenCalled()
+    expect(api.renewPresence).not.toHaveBeenCalled()
+  })
+
+  it('renders nothing and assumes nothing when a renewal cannot be made', async () => {
+    // 401, 403 and 503 are facts about the request, not about the container. A screen that painted
+    // "your workspace is going away" on one would be over-claiming from an outage; a lease that
+    // genuinely lapsed arrives through the preview read instead.
+    api.fetchPreviewState.mockResolvedValue(reading({ state: 'alive', alive: true }))
+    api.renewPresence.mockResolvedValue(null)
+
+    const { result } = mount()
+    await waitFor(() => expect(result.current.state.name).toBe('running'))
+
+    expect(result.current.state.name).toBe('running')
+  })
+
+  it('sends nothing at all on unmount — leaving is silence, not a message', async () => {
+    const { unmount } = mount()
+    await settle()
+    api.renewPresence.mockClear()
+
+    unmount()
+    await settle()
+
+    expect(api.renewPresence).not.toHaveBeenCalled()
   })
 })

@@ -1005,3 +1005,60 @@ export async function discardUnsavedChanges(
     notice: isRecord(body) ? toDiscardNotice(body.notice) : null,
   }
 }
+
+/**
+ * WHETHER A SCREEN IS ON SCREEN, which is the whole of what the renewal below sends.
+ *
+ * A word rather than a number of seconds: the server maps it to a budget, and a client that
+ * named its own would be a client that could ask a container to live longer than the platform's
+ * ceiling allows.
+ */
+export type SurfacePresence = 'visible' | 'hidden'
+
+/**
+ * The three things a renewal can mean, mirroring the server's closed set exactly. Nothing is
+ * rendered from any of them — see `renewPresence` for why a failure here says nothing.
+ */
+export type RenewalOutcome = 'renewed' | 'not_this_container' | 'nothing_running'
+
+/**
+ * Tell the platform a screen that can frame this project is still open, so its container stays.
+ *
+ * PRESENCE IS THE SIGNAL, AND SILENCE IS DEPARTURE. Nothing is sent when somebody leaves:
+ * navigating away, closing the tab, sleeping the machine and losing the network all simply stop
+ * the renewals. That is the whole mechanism — there is no departure message that can fail to
+ * arrive, and no handler on an unload path to get wrong.
+ *
+ * IT NEVER THROWS AND IT NEVER REPORTS. A renewal that could not be made says nothing about the
+ * container: 401, 403 and 503 are facts about the request, not about the app, and a screen that
+ * painted "your workspace is going away" on one would be over-claiming from an outage. A lease
+ * that genuinely lapsed reaches the citizen through `fetchPreviewState`, which is the one read
+ * allowed to say a preview is gone. The outcome is returned for callers that re-arm their poll
+ * on it, and `null` means the ask itself did not complete.
+ */
+export async function renewPresence(
+  projectId: string,
+  presence: SurfacePresence,
+  deps: AuthFetchDeps = {},
+): Promise<RenewalOutcome | null> {
+  try {
+    const res = await authFetch(
+      `${BASE}/projects/${encodeURIComponent(projectId)}/renew`,
+      {
+        method: 'POST',
+        headers: { ...JSON_HEADERS, ...csrfHeaders() },
+        body: JSON.stringify({ presence }),
+      },
+      deps,
+    )
+    if (!res.ok) return null
+    const body: unknown = await res.json().catch(() => null)
+    if (!isRecord(body)) return null
+    const outcome = body.outcome
+    return outcome === 'renewed' || outcome === 'not_this_container' || outcome === 'nothing_running'
+      ? outcome
+      : null
+  } catch {
+    return null
+  }
+}

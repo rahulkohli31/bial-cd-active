@@ -36,13 +36,12 @@ import {
   relaunchPreview,
 } from '../../utils/buildSessionApi'
 import type { HandoverStep, ReclaimBlocked } from '../../utils/buildSessionApi'
-import { ApiError } from '../../utils/apiError'
 import { assertNever } from '../../utils/assertNever'
-import type { StartOutcome, WorkspaceAction } from './workspaceState'
+import { BUILD_ALREADY_RUNNING, serverMessage, startApp } from './startApp'
+import type { WorkspaceAction } from './workspaceState'
 import type { WorkspaceReport } from './workspaceChannel'
 
 /** A build already running in THIS project — a different cause with a different remedy. */
-const BUILD_ALREADY_RUNNING = 'A build is already running in this application.'
 
 export interface StartAppControlProps {
   action: WorkspaceAction
@@ -82,61 +81,18 @@ export default function StartAppControl({ action, report, inert = false, takeBac
   }, [])
 
   const start = useCallback(async () => {
-    const projectId = report.projectId
-    if (!projectId || inFlight.current) return
+    if (!report.projectId || inFlight.current) return
     inFlight.current = true
     setPending(true)
-    // THE PANE HEARS THE PRESS IMMEDIATELY, not on the next poll tick. The server's own `starting`
-    // is the authority and it arrives later; this is what stops the sentence above this button
-    // saying nothing happened for up to forty-five seconds.
-    report.onStartPending(true)
     try {
-      const res = await relaunchPreview({ projectId })
-      // NO MOUNTED GUARD BEFORE THE REPORT, and the distinction is the bug it was written as.
-      //
-      // `mounted` protects THIS component's own state. The report's handlers write into the
-      // SURFACE — the workspace read, the address, the outcome slot — all of which outlive this
-      // button and all of which need the answer. And this control unmounts routinely mid-flight:
-      // the moment the press reaches the map, the state becomes `starting`, which offers no
-      // action, so the button that fired the request is gone before the request comes back.
-      //
-      // Guarding here meant a start that SUCCEEDED reported nothing: no URL for the pane to frame,
-      // no outcome to clear the wait. The screen sat on "Getting your app ready." forever while a
-      // perfectly good container served underneath it.
-      // THE URL FIRST, and before the outcome. It is what the surface frames, and reporting it
-      // second would leave one commit in which the state says "running" and the pane has no
-      // address to show for it. Handed over even when `ready` is false: the container is up and
-      // the document is what has not arrived, so the frame's own load-gated reveal is the right
-      // thing to be waiting on rather than a sentence in front of it.
-      if (res.previewUrl) report.onStarted(res.previewUrl)
-      // `ready === false` is "started but not painted yet", NOT "dead" — and an ABSENT `ready`
-      // reads `true` by the wire's recorded contract, which is exactly why liveness can never hang
-      // off this boolean. Safe here only because both sides of the read are non-destructive.
-      report.onStartOutcome(res.ready ? null : { kind: 'not-painted' })
-    } catch (err) {
-      // Same reasoning as the success path above: a refusal has to reach the surface whether or
-      // not the button that provoked it is still on screen.
-      // DISCRIMINATED ON THE CODE BEFORE ANYTHING ELSE. A bare 409 is not self-describing: it
-      // fires for a same-project reattach and for a cross-project block, and the two have
-      // different remedies.
-      const blocked = asReclaimBlocked(err)
-      if (blocked) {
-        // Another project holds the one workspace. Routed to the ONE dialog rather than shown as
-        // a retry — retrying against an occupied slot can only fail the same way again.
-        report.onReclaimRefusal(blocked, start)
-        return
-      }
-      if (err instanceof BuildSessionAlreadyActiveError) {
-        // Your own other chat is building. A different cause with a different remedy — finish or
-        // stop it — so it must not be merged into the reclaim dialog, which would offer a Save
-        // button that cannot help.
-        report.onStartOutcome({ kind: 'failed', reason: BUILD_ALREADY_RUNNING })
-        return
-      }
-      report.onStartOutcome(outcomeFor(err))
+      // `start` is handed to the refusal path as the retry, so a remedy leads back to the request
+      // that was refused rather than to a fresh one.
+      await startApp(report, () => start())
     } finally {
       inFlight.current = false
-      report.onStartPending(false)
+      // `mounted` is what keeps this from writing into a component the citizen has already
+      // navigated away from. It guards THIS control's own spinner and nothing else — everything
+      // the surface needs was already reported inside `startApp`, which unmounting must not skip.
       if (mounted.current) setPending(false)
     }
   }, [report])
@@ -582,24 +538,9 @@ export function useTakeBack(report: WorkspaceReport | null): TakeBack {
  * that drifts when it is stated twice. What they still decide for themselves is what to SAY when
  * the answer is `null` — and those two sentences are deliberately different.
  */
-function serverMessage(err: unknown): string | null {
-  return err instanceof ApiError && err.message ? err.message : null
-}
-
 /** WHY A TAKE-BACK STOPPED, in the server's own words wherever it gave any. */
 function reasonFor(err: unknown): string {
   return serverMessage(err) ?? 'Nothing came back, so we could not tell what happened.'
-}
-
-/**
- * Anything the server named, carried verbatim; anything it did not, called a timeout.
- *
- * A start that does not end in a running app says WHICH WAY it ended: "we waited and nothing came
- * back" is a different sentence from "the server said why".
- */
-function outcomeFor(err: unknown): StartOutcome {
-  const reason = serverMessage(err)
-  return reason === null ? { kind: 'timed-out' } : { kind: 'failed', reason }
 }
 
 interface ControlProps {

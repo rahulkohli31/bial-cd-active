@@ -22,12 +22,13 @@
  * second tracker; `observe.ts`'s per-project guard makes a repeat call a no-op, so the risk is
  * bypassing that guard with a second mechanism it doesn't cover.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import WorkspaceRail from './WorkspaceRail'
 import AppSettingsDialog from '../projects/AppSettingsDialog'
 import ProjectDeleteDialog from '../projects/ProjectDeleteDialog'
 import SharePanel from '../projects/SharePanel'
+import { startApp } from './startApp'
 import { useWorkspaceState } from './useWorkspaceState'
 import type { StartOutcome } from './workspaceState'
 import {
@@ -252,6 +253,30 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     }),
     [workspace, project.id, onReclaimRefusal],
   )
+
+  // THE APP STARTS BECAUSE SOMEBODY OPENED THE PROJECT. There is no press, and nothing on the way
+  // in asks whether they meant it: opening a project IS the intent, and a control whose only
+  // sensible answer was "yes" was a question nobody needed to be asked.
+  //
+  // DRIVEN BY THE READ, NOT BY THE MOUNT, and that is what keeps it from being a restart button.
+  // This surface remounts on every project → chat → project crossing, and a mount-triggered start
+  // would tear down and rebuild an app the citizen is looking at. Waiting for the workspace read
+  // to say `not-running` means the question is asked of the CONTAINER rather than of the
+  // component's lifecycle: an app already serving is left exactly where it is.
+  //
+  // `not-running` ONLY. `never-built` has nothing to start, `could-not-read` is not an answer,
+  // and `held-by-another-project` belongs to the arbitration path. A start that fails leaves the
+  // retry the start-outcome path already renders.
+  //
+  // ONCE PER PROJECT, guarded by a ref: the reading stays `not-running` until the server's own
+  // `starting` lands, so without this the poll would fire a second start on its next tick.
+  const autoStarted = useRef<string | null>(null)
+  useEffect(() => {
+    if (workspace.state.name !== 'not-running') return
+    if (autoStarted.current === project.id) return
+    autoStarted.current = project.id
+    void startApp(report, () => startApp(report, () => Promise.resolve()))
+  }, [workspace.state.name, project.id, report])
 
   const paneView = useMemo(
     () => ({

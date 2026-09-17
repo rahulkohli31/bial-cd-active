@@ -217,15 +217,18 @@ describe('ProjectPage — the app arrives behind one deliberate press', () => {
     expect(screen.queryByRole('button', { name: /launch application/i })).toBeNull()
   })
 
-  it('★ opening the screen STARTS NOTHING — the read is the only call it makes', async () => {
-    // Mutation receipt: make `ProjectWorkspace` call `relaunchPreview` on mount and this goes red.
+  it('★ opening the screen STARTS THE APP — no press, and nothing asks first', async () => {
+    // INVERTED, DELIBERATELY. This case used to pin the opposite: the screen read, and waited for
+    // somebody to press a control. Opening a project IS the intent, and a question whose only
+    // sensible answer was "yes" is one nobody needed to be asked.
+    //
+    // Mutation receipt: remove the read-driven start from `ProjectWorkspace` and this goes red.
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1', hasRelaunchableSnapshot: true }))
     h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
     renderProjectPage()
 
     await screen.findByPlaceholderText(/Describe what you have in mind/i)
-    await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalledWith('p1'))
-    expect(h.relaunchPreview).not.toHaveBeenCalled()
+    await waitFor(() => expect(h.relaunchPreview).toHaveBeenCalledWith({ projectId: 'p1' }))
   })
 
   it('★ never asks a stopped project whether it has unsaved work', async () => {

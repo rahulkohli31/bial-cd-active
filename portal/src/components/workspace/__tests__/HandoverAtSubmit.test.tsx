@@ -122,9 +122,13 @@ const type = (text: string) => fireEvent.change(composer(), { target: { value: t
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // NOTHING FOR THE SCREEN ITSELF TO OPEN. Every scenario below is about what a SEND does when
+  // the workspace is held elsewhere, and the screen now starts an app it finds restorable and
+  // asleep — so a restorable reading here would have the surface correctly opening the workspace
+  // before the composer ever got to ask, which is a different story than the one under test.
   api.fetchPreviewState.mockResolvedValue({
     state: 'asleep', alive: false, previewUrl: null, occupyingProjectName: null,
-    occupyingProjectId: null, restorable: true,
+    occupyingProjectId: null, restorable: false,
   })
   api.fetchSaveState.mockResolvedValue(null)
   api.handOverWorkspace.mockResolvedValue(undefined)

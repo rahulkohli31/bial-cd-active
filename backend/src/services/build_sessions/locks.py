@@ -523,6 +523,57 @@ async def renew_presence_stay(
     return outcome, deadline if outcome is RenewalOutcome.RENEWED else None
 
 
+# Retire a provisioning stay now that provisioning is demonstrably over, guarded on the same
+# `app_name` identity every other write here carries.
+#
+# THE ONE WRITE IN THIS MODULE THAT MAY SHORTEN A DEADLINE, and the exception is narrow enough to
+# state exactly: a start grants a long stay because a hung restore can block for the better part
+# of twenty minutes with nothing else protecting the container — not the heartbeat, which is not
+# seeded yet, and not the starting marker, whose TTL is shorter than that worst case. The moment
+# the app answers a request, that reason is gone. Leaving the long stay standing would keep a
+# container nobody came back to alive for half an hour after the tab closed, which is precisely
+# what presence renewal exists to stop paying for.
+#
+# It is issued by the same code path that granted the long stay, at the point that path can prove
+# provisioning ended. `grant_stay_of_execution`'s monotonic rule is untouched and still governs
+# every OTHER writer: it exists so a weaker writer cannot truncate a stronger one's reprieve, and
+# nothing here is a different writer arriving with a weaker claim.
+_CAS_SETTLE_STAY_LUA: Final = (
+    f"if redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}') ~= ARGV[1] then return 0 end "
+    f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_PREVIEW_STAY_UNTIL}', ARGV[2], "
+    f"'{REGISTRY_FIELD_STAY_WRITER}', ARGV[3]) return 1"
+)
+
+
+async def settle_stay_once_the_app_is_serving(
+    redis: aioredis.Redis, user_uuid: uuid.UUID, *, app_name: str
+) -> datetime | None:
+    """Hand this container's lifetime to the screen that asked for it, and return the deadline.
+
+    From here the surface framing the app renews on its own poll, so what the platform owes is the
+    GAP until the first renewal arrives and nothing more.
+
+    NEVER LENGTHENS. A standing stay already shorter than the grace — a presence renewal that has
+    landed while the start was finishing — is left exactly where it is, so this can only ever give
+    a container less time, never more.
+
+    `None` when the registry names a different container, or none at all: a start whose slot was
+    taken while it finished has nothing here to settle."""
+    grace = datetime.now(UTC) + timedelta(seconds=SURFACE_PRESENT_STAY_SECONDS)
+    standing = await _standing_stay(redis, user_uuid)
+    if standing is not None and standing <= grace:
+        return standing
+    settled = await redis.eval(
+        _CAS_SETTLE_STAY_LUA,
+        1,
+        registry_key(user_uuid),
+        app_name,
+        grace.isoformat(),
+        str(DeadlineWriter.SURFACE_PRESENT),
+    )
+    return grace if settled else None
+
+
 async def _standing_stay(redis: aioredis.Redis, user_uuid: uuid.UUID) -> datetime | None:
     """The stay currently on the hash, or `None` when absent or unreadable.
 

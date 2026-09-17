@@ -46,11 +46,14 @@ import { isConversationGone } from '../../utils/chatErrors'
 import { resolvePreviewAddress } from '../../utils/previewAddress'
 import {
   BACKGROUND_CADENCE,
+  HIDDEN_PROBE_MS,
+  PREVIEW_PROBE_MS,
   SETTLED_GONE,
   STARTING_PROBE_MS,
   asDecidedReading,
   mayHaveStopped,
   nextProbeCadence,
+  presenceToRenew,
   resolveWorkspaceState,
   spendProbeCadence,
 } from '../workspace/workspaceState'
@@ -87,7 +90,7 @@ import type { TurnFrame, PlanOptionsItem, StepItem, DiagnosticFrame, StreamOutco
 import { contextState } from '../../utils/contextLimits'
 import { atLimitSendState, narrativeEnvelopes, turnPhase } from '../../utils/turnNarrative'
 import type { TurnNarrative } from '../../utils/turnNarrative'
-import { discardUnsavedChanges, fetchSaveState, saveProject, handOverWorkspace, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace, samePreviewState } from '../../utils/buildSessionApi'
+import { discardUnsavedChanges, fetchSaveState, saveProject, handOverWorkspace, asReclaimBlocked, fetchPreviewState, fetchCompileState, checkWorkspace, renewPresence, samePreviewState } from '../../utils/buildSessionApi'
 import type { HandoverStep, ReclaimBlocked, PreviewState } from '../../utils/buildSessionApi'
 import { resolvePlanOptions } from '../../utils/turnStreamApi'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../../utils/attachmentStore'
@@ -2484,10 +2487,18 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       timer = null
       armed = null
     }
+    // A tab nobody is looking at is renewing a lease and nothing else, so it asks on the longer
+    // budget that renewal buys. An accelerated window is never slowed — it belongs to a start
+    // somebody pressed, and it closes itself either way.
+    const delayForNow = () =>
+      cadence.delayMs === PREVIEW_PROBE_MS && document.visibilityState !== 'visible'
+        ? HIDDEN_PROBE_MS
+        : cadence.delayMs
     const keepAsking = () => {
-      if (timer !== null && armed === cadence.delayMs) return
+      const delay = delayForNow()
+      if (timer !== null && armed === delay) return
       if (timer !== null) clearInterval(timer)
-      armed = cadence.delayMs
+      armed = delay
       // The tick carries HOW IT WAS SCHEDULED rather than reading `cadence` when it fires: the
       // answer that closes an accelerated window is the one that changes `cadence`, so a tick
       // reading it at fire time would call itself a background probe on a decision it had not
@@ -2499,7 +2510,21 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // surface and a deliberate human act are not the three-second timer, and neither should be
     // denied the container reads a background tick makes.
     const probe = async (accelerated = false) => {
-      if (!live || document.visibilityState !== 'visible') return
+      if (!live) return
+      // A HIDDEN TAB STILL READS AND STILL RENEWS, and admits nothing else.
+      //
+      // This surface frames the app too, so it holds the container open exactly as the project
+      // screen does — a chat route that went silent the moment somebody switched tabs would have
+      // its citizen's app collected while they were reading something else for two minutes. The
+      // renewal decision is shared with the project surface (`presenceToRenew`) so the two
+      // surfaces cannot drift, and so neither can forget it.
+      //
+      // WHAT STAYS VISIBLE-ONLY: `fetchCompileState` and `checkWorkspace` below. The second can
+      // PUT THE CONTAINER AWAY, and doing that with nobody looking is the opposite of what this
+      // change is for.
+      const hidden = document.visibilityState !== 'visible'
+      const presence = presenceToRenew(accelerated, hidden)
+      if (presence) void renewPresence(projectId, presence)
       const generation = ++latestProbe
       try {
         const state = await fetchPreviewState(projectId)
@@ -2556,7 +2581,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         // reads and buy nothing else. This one and the workspace check below both wait for the
         // next background tick — within one accelerated interval of when they would have run with
         // no acceleration at all.
-        if (!accelerated && state.state === 'alive' && liveTurnIdRef.current === null) {
+        if (!accelerated && !hidden && state.state === 'alive' && liveTurnIdRef.current === null) {
           const compiling = await fetchCompileState(projectId)
           if (!live || generation !== latestProbe) return
           // Still no live turn: one may have started while this was in flight, and the stream
@@ -2590,7 +2615,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         const claimToCheck =
           state.state === 'alive' && standingClaimRef.current !== null && !workspaceLostRef.current
         const mayBeStopped = mayHaveStopped(state.state, frameStalledRef.current, cadence)
-        if (!accelerated && liveTurnIdRef.current === null && (claimToCheck || mayBeStopped)) {
+        if (!accelerated && !hidden && liveTurnIdRef.current === null && (claimToCheck || mayBeStopped)) {
           const lost = await checkWorkspace(projectId)
           if (!live || generation !== latestProbe) return
           if (lost && claimToCheck && liveTurnIdRef.current === null) setWorkspaceLost(true)
@@ -2629,8 +2654,18 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     // than by a cadence — and they are the backstop for the one thing the invalidation list
     // above cannot see: another tab restoring this project's workspace. A `gone` that has gone
     // stale costs one request to notice, on the very interaction where someone is looking.
+    // BOTH EDGES RE-ARM THE TIMER and only one of them probes. `visibilitychange` fires on hiding
+    // too, and that edge is what drops the poll to the hidden cadence; a probe there would be a
+    // request spent on the way out of the room.
+    const onVisibility = () => {
+      // ONLY RE-ARMS A POLL THAT IS STILL RUNNING. A settled answer stops the timer for good, and
+      // a visibility change is not new information about the workspace — re-arming here would let
+      // tabbing away and back restart a poll that had correctly heard everything there was to hear.
+      if (timer !== null) keepAsking()
+      if (document.visibilityState === 'visible') void probe()
+    }
     const onVisible = () => void probe()
-    document.addEventListener('visibilitychange', onVisible)
+    document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('focus', onVisible)
     // THE PANE'S STALL EDGE ASKS THROUGH HERE, NOT THROUGH THE EPOCH. A re-run clears the reading
     // first, and the framed address follows the reading, so re-arming this effect would unframe the
@@ -2641,7 +2676,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     return () => {
       live = false
       probeNowRef.current = null
-      document.removeEventListener('visibilitychange', onVisible)
+      document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('focus', onVisible)
       stopAsking()
     }

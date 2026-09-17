@@ -108,6 +108,7 @@ from src.services.build_sessions.locks import (
     reap_lock,
     release_lock_as_holder,
     renew_lock,
+    settle_stay_once_the_app_is_serving,
     stamp_is_proven,
     write_heartbeat,
     write_starting_marker,
@@ -3717,16 +3718,22 @@ class SessionManager:
                 # tears the container down + releases the lock instead of 500ing with a live
                 # container behind a held lock. The scope releases the lock on clean exit.
                 await write_heartbeat(redis, user_id)
-                # …and RE-grant the bounded lease that actually owns this container's
-                # lifetime: nothing renews that heartbeat, so without a stay the background
-                # sweep would reap a preview the user is still reading (and without the
-                # sweep the container would outlive everyone). Re-granted rather than
-                # granted because the provision window above already needed one — this
-                # second stamp simply re-bases the 30 minutes on the instant the preview
-                # actually became viewable. Inside the protected region for the same reason
-                # as the heartbeat: a failure here tears the container down rather than
-                # leaving it running with no owner at all.
-                await grant_stay_of_execution(redis, user_id, writer=DeadlineWriter.BUILDER_ACTED)
+                # …and hand the container's lifetime to the screen that asked for it. The long
+                # stay granted before the wait was there to survive a restore that can block for
+                # the better part of twenty minutes; the app has now answered a request, so that
+                # reason is spent. From here the surface framing it renews on its own poll, and
+                # what the platform owes is the gap until the first renewal arrives.
+                #
+                # SETTLED, NOT RE-GRANTED. `grant_stay_of_execution` never moves a deadline
+                # backward, so a second grant here could only ever be a no-op behind the long one
+                # — the container would go on living for half an hour after the tab closed, and
+                # the change would read as one that had been made.
+                #
+                # Inside the protected region for the same reason as the heartbeat: a failure here
+                # tears the container down rather than leaving it running with no owner at all.
+                await settle_stay_once_the_app_is_serving(
+                    redis, user_id, app_name=app_name_for(app_id)
+                )
             relaunched = RelaunchedPreview(
                 app_id=app_id,
                 preview_url=preview_url,
