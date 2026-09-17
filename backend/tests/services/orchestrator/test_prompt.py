@@ -12,8 +12,8 @@ the one live carrier of every rule they pinned — so the file asserts against `
 
 `tests/services/agent/test_mode_prompts.py` owns the COMPOSITION properties (BASE + one segment,
 each block emitted exactly once, what Plan may not carry). This file owns what the Write blocks
-must SAY: the golden-template manifest, the Drizzle/migration discipline, the DATABASE /
-COMPLETION / TOOL SURFACE blocks, and the template filesystem those blocks describe."""
+must SAY: the Drizzle/migration discipline, the DATABASE and TOOL SURFACE blocks, and the template
+filesystem those blocks describe."""
 
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ _SandboxOf = Callable[[RunContext[Any]], SandboxSession]
 """The accessor shape `sandbox_toolset` takes — spelled once so the mutation wrappers below
 can wrap the real factory without a type suppression."""
 
-# Repo-root/sandbox/template — the hand-maintained golden template the manifest mirrors.
+# Repo-root/sandbox/template — the golden template every generated app starts from.
 # test file: backend/tests/services/orchestrator/test_prompt.py → parents[4] is the repo root.
 _TEMPLATE_ROOT = Path(__file__).resolve().parents[4] / "sandbox" / "template"
 
@@ -161,61 +161,6 @@ def test_system_prompt_carries_the_generated_app_quality_rules() -> None:
     assert "390px" in lowered
 
 
-def _completion_block(prompt: str) -> str:
-    """The COMPLETION paragraph, sliced out of the composed prompt.
-
-    SLICED RATHER THAN SEARCHED WHOLE-PROMPT, because the retired phrasing this unit removes
-    ("type-check the app") is legitimate copy elsewhere: `BUILD_WORKING_RULES_HEAD` still tells
-    the model the harness type-checks after every turn, which is TRUE and must stay. A
-    prompt-wide `not in` would either go permanently red on that true sentence or have to be
-    weakened until it proved nothing."""
-    return prompt[prompt.index("COMPLETION \u2014") :].split("\n\n", 1)[0]
-
-
-def test_completion_promises_no_round_trip_after_declare_done() -> None:
-    """★ THE PROMPT MOVED WITH THE BEHAVIOUR, WHICH IS THE WHOLE POINT. `declare_done` is
-    terminal on a passing check now; the old wording ("...you will receive the diagnostic")
-    invited the model to write its closing message in a follow-up reply this unit no longer
-    buys — the good message was thrown away with the round-trip.
-
-    TWO HALVES, DELIBERATELY. The inertness half searches for the retired phrasing and requires
-    zero hits. The liveness half requires the repair arm's promise to still be there, because it
-    is still TRUE — and an inertness guard alone would pass just as happily against a
-    COMPLETION block someone had deleted outright.
-
-    Asserted on the COMPOSED prompt rather than on `prompt_blocks`, so a composition site that
-    stopped including the block would be caught here too. The Write mode segment composes the
-    same single source (`BUILD_WORKING_RULES_TAIL`), which is what makes one assertion enough."""
-    completion = _completion_block(_BUILD_PROMPT)
-
-    # INERTNESS — the retired round-trip promise, gone.
-    for retired in (
-        "The harness then verifies",
-        "if it is not green yet",
-        "type-check",
-    ):
-        assert retired not in completion, f"{retired!r} still promises a follow-up round-trip"
-
-    # THE TERMINAL CONDITION, said out loud and said conditionally (the verdict still decides).
-    assert "ENDS THE TURN" in completion
-    assert "passing check" in completion
-
-    # And what the summary must BE, since it is now the last thing the user reads.
-    assert "the last thing the user reads" in completion
-    assert "what they can now do" in completion
-    # THE VOCABULARY CLAUSE IS GONE, and its absence is asserted rather than merely unmentioned.
-    # "with no file names, commands, libraries or frameworks in it" told the agent which WORDS
-    # its closing message could not contain — a restriction on what it may say rather than on
-    # who it is saying it to. What replaced it is the audience: an account of what the person
-    # can now do with their app, written to the person who asked for it.
-    assert "no file names, commands, libraries or frameworks" not in completion
-    assert "written to the person who asked for it" in completion
-
-    # LIVENESS — the repair arm's promise is unchanged and still made.
-    assert "does NOT check out you will receive the diagnostic" in completion
-    assert "Do not declare done prematurely" in completion
-
-
 def test_the_type_check_is_prohibited_not_merely_unnecessary() -> None:
     """★ THE INVITATION IS NOW A PROHIBITION.
 
@@ -245,23 +190,6 @@ def test_the_type_check_is_prohibited_not_merely_unnecessary() -> None:
     assert "the harness type-checks the app (`tsc --noemit`)" in lowered
 
 
-def test_completion_never_makes_type_checking_the_agents_job() -> None:
-    """The other half of the same rule: the closing guidance must not hand the
-    verification back to the model at the last moment.
-
-    Sliced to the COMPLETION block on purpose (see `_completion_block`): "type-check" is
-    legitimate copy elsewhere in this prompt — DATA INTEGRITY prescribes verifying by
-    type-checking and rendering rather than by mutating rows, and ENVIRONMENT describes what the
-    harness does — so a prompt-wide search would either be permanently red or have to be watered
-    down until it proved nothing."""
-    completion = _completion_block(_BUILD_PROMPT).lower()
-    assert "type-check" not in completion
-    assert "tsc" not in completion
-    # LIVENESS beside it — the block still says what ends the turn and what the summary must be.
-    assert "declare_done" in completion
-    assert "ends the turn" in completion
-
-
 def test_prompt_has_no_stale_app_records_demo_reference() -> None:
     """The `app/records` demo route was removed from the template, so the prompt must
     no longer tell the model to hunt for and delete it. Only the stale REMOVE SCAFFOLDING
@@ -286,17 +214,6 @@ def test_prompt_names_no_demonstration_data_model_or_example_component() -> None
     assert re.search(r"\bitems\b", lowered) is None
     assert "audit_events" not in lowered
     assert "item_status" not in lowered
-
-
-def test_the_golden_template_manifest_names_no_removed_path() -> None:
-    """The other half of the manifest tripwire.
-    `test_every_golden_template_manifest_file_exists` proves every path the manifest names still
-    exists; it says nothing about a path the template used to ship staying named after it is
-    deleted. Pinned separately so reverting only the manifest edit (and not the file deletions)
-    still trips something."""
-    manifest = _BUILD_PROMPT[_BUILD_PROMPT.index("The app starts from a minimal") :]
-    for removed in ("0000_baseline.sql", "0000_snapshot.json", "example-request-board.tsx"):
-        assert removed not in manifest, f"the manifest still names the removed path {removed!r}"
 
 
 def test_responsive_advice_survives_the_deleted_reference_component() -> None:
@@ -446,30 +363,6 @@ def test_honest_ui_keeps_its_claim_matching_argument() -> None:
     assert "interval" in honest_ui
     assert "focus" in honest_ui
     assert "real-time" in honest_ui
-
-
-def test_every_golden_template_manifest_file_exists() -> None:
-    """Durable guard: every path the manifest advertises as an editable starting point must
-    exist under `sandbox/template/`, so a template change that drops or renames a file cannot
-    leave the prompt pointing at a phantom. Walks the manifest text in the rendered prompt and
-    stats each path — the `components/ui/*.tsx` glob and the comma-list line included.
-
-    `sql` is in the extension set on purpose: the generated migrations under `drizzle/` are the
-    one manifest entry that is BUILT rather than hand-written, so it is the entry most likely to
-    go missing (an over-eager `.gitignore` line, a fresh clone). Without `sql` here the manifest
-    could advertise a migrations directory that does not exist and nothing would notice."""
-    manifest = _BUILD_PROMPT[_BUILD_PROMPT.index("The app starts from a minimal") :]
-    tokens = re.findall(r"[\w./*-]+\.(?:tsx|ts|css|json|mjs|sql)", manifest)
-    assert tokens, "manifest path extraction found nothing — the regex drifted from the manifest"
-    for token in tokens:
-        if "*" in token:
-            assert list(_TEMPLATE_ROOT.glob(token)), (
-                f"manifest glob {token!r} matched no file under {_TEMPLATE_ROOT}"
-            )
-        else:
-            assert (_TEMPLATE_ROOT / token).is_file(), (
-                f"manifest lists {token!r} but it is missing from {_TEMPLATE_ROOT}"
-            )
 
 
 def test_system_prompt_never_instructs_the_app_to_authenticate() -> None:
@@ -855,40 +748,30 @@ async def test_run_commands_dev_server_rule_is_registered_copy_as_well_as_prompt
 
 
 def test_the_prompt_never_grants_edit_permission_over_the_platform_config() -> None:
-    """★ THE MUTANT THAT MUST FAIL, and it must fail for ALL THREE statements.
+    """★ THE MUTANT THAT MUST FAIL.
 
     `next.config.ts` carries the path the app is served under: lose it and the preview answers
     at `/` while the router asks for `/a/<key>/` and loads blank, while every automated check
     still reports healthy. The file stays technically writable by decision, so this prompt text
     IS the control.
 
-    Three separate statements grant edit permission, they all ship in the SAME composed prompt,
-    and correcting fewer than three leaves a contradiction the model can resolve either way:
-
-      1. the manifest header's categorical "no file is frozen"
-      2. the manifest's own line for the file
-      3. the WRITE SURFACE paragraph's categorical "the WHOLE workspace is editable"
-
-    A test that only checked one would go green against a half-fix, which is exactly how the
-    original review missed the third.
+    WRITE SURFACE is the one statement that grants and excepts, so both halves are asserted: no
+    categorical grant survives anywhere in the composed prompt, and the paragraph names both
+    platform-owned files among its exceptions. An inertness assertion alone would pass just as
+    happily against a paragraph someone had gutted.
     """
     prompt = _BUILD_PROMPT
 
-    # 1 — the categorical grant in the manifest header is gone.
+    # 1 — no categorical grant survives anywhere in the prompt.
     assert "no file is frozen" not in prompt
 
-    # 2 — the file is named as platform-owned rather than listed among the editable ones.
-    assert "next.config.ts" in prompt, "the manifest must still NAME the file"
-    assert "package.json, next.config.ts" not in prompt, (
-        "the file must not sit in the editable comma-list"
-    )
-    assert "PLATFORM-OWNED" in prompt
-
-    # 3 — the WRITE SURFACE paragraph excepts it alongside `.git/`.
+    # 2 — the WRITE SURFACE paragraph excepts both of them alongside `.git/`.
     write_surface = prompt.split("WRITE SURFACE")[1].split("DATA & STORAGE")[0]
     assert "next.config.ts" in write_surface, (
         "the categorical write grant must except the platform config by name"
     )
+    assert "instrumentation-client.ts" in write_surface
+    assert "platform-owned" in write_surface
     assert "the WHOLE workspace is editable" not in write_surface
 
     # And the SAME correction must reach the Write-turn prompt, which is a different composition

@@ -15,57 +15,6 @@ exactly once. `DATA_INTEGRITY_RULES` is the data-safety wording — written once
 
 from __future__ import annotations
 
-# The golden-template file manifest — hard-coded so the model never needs a computed repo
-# map. Mirrors `sandbox/template/`. Everything is an editable starting point EXCEPT two files
-# the platform owns. `next.config.ts` carries the app's assigned base path, and an app whose
-# config loses it serves at `/` while the router asks for `/a/<key>/` — a preview that loads a
-# blank page while every automated check still reports healthy. `instrumentation-client.ts` is
-# the framed document's own proof that it is rendering in the user's browser — the ONLY signal
-# the portal reveals the preview pane on — and an app that loses it sits behind a waiting card
-# however healthy it is. Both stay technically writable by decision (the sandbox is an open
-# workspace and renaming a file out from under the agent mid-build is a larger behavioural change
-# than the risk it removes), so this prompt text is the control. It must agree with the other
-# statements below — the categorical grant in the manifest header, the WRITE SURFACE paragraph,
-# and the `BIAL_PORTAL_ORIGIN` row of the DATA & STORAGE manifest — because all of them ship in
-# the same composed prompt, and a half-correction reads to the model as a contradiction.
-_GOLDEN_TEMPLATE_MANIFEST = """\
-The app starts from a minimal Next.js template (App Router, TypeScript, React, Tailwind v4,
-shadcn/ui, Drizzle + PostgreSQL). Everything below is a starting point you may edit or replace,
-with TWO exceptions — `next.config.ts` and `instrumentation-client.ts` are owned by the platform
-and must be left exactly as they are:
-  app/layout.tsx            root layout — keep the <BialErrorCapture/> mount (it publishes the
-                            portal origin to window.__BIAL_CONFIG and captures runtime errors)
-  app/page.tsx              home page — replace with your app's UI
-  app/globals.css           Tailwind globals
-  db/schema.ts              the Drizzle schema — starts EMPTY, no demonstration tables to work
-                            around or delete; add the tables your app needs
-  db/index.ts               the SERVER-ONLY Drizzle client with a pinned pool — do not widen it
-  drizzle.config.ts         drizzle-kit config; reads the connection string from the environment
-  drizzle/meta/_journal.json  the migration journal — starts empty (see DATABASE above for how
-                            migrations are made); `generate` adds an entry plus its `.sql` file
-                            here, and both stay in the workspace once they exist
-  scripts/db-migrate.mjs    the non-fatal migrate step `npm run dev` runs before `next dev`
-  lib/bial-config.ts        the injected-config type + the window.__BIAL_CONFIG declaration
-  lib/utils.ts              the cn() class helper
-  lib/flight-data.reference.ts  how to read the connected flight data — the file names, the
-                            date columns, and the traps; all line comments, nothing in it runs
-  components/ui/*.tsx        shadcn primitives (button, card, dialog, form, input, label, ...) —
-                            editable
-  components/bial/error-capture.tsx  runtime-error + config-bootstrap shim — editable
-  package.json, tsconfig.json, postcss.config.mjs, components.json  — editable
-  next.config.ts            PLATFORM-OWNED — do NOT edit, replace, or delete it. It carries the
-                            path this app is served under; without it the app answers at `/`
-                            while the platform routes to `/a/<key>/`, and the user sees a blank
-                            page. Nothing you are asked to build needs a change here — put app
-                            configuration in your own files instead.
-  instrumentation-client.ts PLATFORM-OWNED — do NOT edit, replace, or delete it, and do not import
-                            it. It tells the portal that your app's page is actually showing in
-                            the user's browser; without it the user sees a waiting card instead
-                            of your app, however healthy the app is. Never post its `app-mounted`
-                            message from your own code — the platform sends it, and a page that
-                            has nothing on it must not claim otherwise.
-Add routes, components, libraries, and dependencies as your app needs them."""
-
 FIRST_SLICE_RULE = """\
 WHEN A LOT ARRIVES AT ONCE — if a single message asks for many separate things, do not start \
 by building all of them. Call `propose_first_slice` with every piece you picked up, the ones \
@@ -74,18 +23,9 @@ pieces are large — twenty pages describing one screen is ONE piece, and propos
 right. Choose the pieces that give them something they can actually use soonest, not the ones \
 that are quickest for you.
 
-This is for NEW work arriving in bulk, and for nothing else. A question, a fix, a change to \
-something already built, or the next round of something already agreed is simply done. \
-Negotiating a small request wastes the user's turn and reads as reluctance, which is a failure \
-rather than caution.
-
 If they say they want all of it, say once what actually happens — everything at once takes \
 longer to get right and is harder to check — and then build in the order you proposed, \
-finishing each piece to something usable before starting the next.
-
-As each agreed piece lands, say so through `tell_the_user` and pass that piece's name as \
-`finished`. That is how the closing account knows what is left; without it the platform can \
-only say it could not tell."""
+finishing each piece to something usable before starting the next."""
 """When to negotiate scope, and when negotiating is itself the failure.
 
 THE TRIGGER IS THE AGENT'S JUDGEMENT, DELIBERATELY. "Is this new work arriving in bulk, or a
@@ -365,6 +305,12 @@ source. One prompt is left; the block stays where a leaf module can hold it."""
 # full context window of output a turn, the exact diagnostic the harness hands it for free the
 # moment the turn ends. The agent does not do work the platform already does. `npm run build` is
 # named alongside it because that is the stand-in a model reaches for when `tsc` is closed off.
+#
+# WRITE SURFACE'S TWO PLATFORM-OWNED FILES ARE STILL TECHNICALLY WRITABLE, by decision — the
+# sandbox is an open workspace — so this prompt text is the whole control over them. Losing
+# `next.config.ts` serves the app off the address the router asks for, and losing
+# `instrumentation-client.ts` leaves the citizen on a waiting card; both while every automated
+# check still reports healthy.
 BUILD_WORKING_RULES_HEAD = f"""\
 ENVIRONMENT:
 - You have a real shell via `run_command`. You may `npm install` any NEW package your app needs, \
@@ -422,9 +368,7 @@ drop. Add the tables your app needs.
 the new versioned `.sql` file under `drizzle/` and applies it to the database, and reports each \
 step's outcome separately. `what_changed` names the migration file — pass something a person \
 could read six months from now ("add visitors table"), because a migration history nobody can \
-read is one nobody can check. Do NOT drive the underlying commands yourself through \
-`run_command`: both of them can print a failure and still exit zero, and this call is the thing \
-that reads their output and tells you which step actually failed.
+read is one nobody can check.
 - Make ONE kind of change per call. Renaming a column and adding another in the same step is \
 the ambiguity that stops the command: drizzle-kit cannot tell a rename from a drop plus a create, \
 so it stops and ASKS — an interactive question that no flag answers. There is no terminal here \
@@ -512,7 +456,7 @@ action — it is not a cross-user sync requirement.
 
 HONEST UI — the database is a plain request/response store with no realtime channel; nothing \
 is pushed to the browser on its own. If your copy calls a view "live", "shared", or \
-"real-time", or says data is visible "across desks" or to "everyone", you MUST make that \
+"real-time", or says data is visible "across desks" or to "everyone", make that \
 true: refetch on an interval and/or on window focus, so another person's changes appear \
 without a manual reload. If you do not wire that refresh, do not make the claim — describe it \
 honestly as a view that updates when the page is reloaded. The words and the behaviour must \
@@ -531,13 +475,4 @@ most of it: a TOOLBAR stacks instead of overflowing below Tailwind's `sm:` break
 (wrap it in `overflow-x-auto`, as `components/ui/table.tsx` already does); and a FORM's fields \
 stack to one column on a phone and pair up from `sm:` up (`grid sm:grid-cols-2`).
 
-{WRITE_TOOL_SURFACE}
-
-COMPLETION — call `declare_done` once the app is working, and put your closing message to the \
-user in its `summary`. On a passing check that call ENDS THE TURN: the summary is the last thing \
-the user reads, so make it an account of what they can now do with their app, written to the \
-person who asked for it. Do not hold that message back for a reply afterwards; on that path \
-there is no reply to write it in. If the app does NOT check out you will receive the \
-diagnostic and should fix it, then declare done again. Do not declare done prematurely.
-
-{_GOLDEN_TEMPLATE_MANIFEST}"""
+{WRITE_TOOL_SURFACE}"""

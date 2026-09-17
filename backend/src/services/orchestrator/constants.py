@@ -287,7 +287,12 @@ the next turn, so nothing fails — the reasoning is simply never there to store
 
 Asserted against the REAL provider model in test, never a double: the refusal lives in
 `AnthropicModel.prepare_request`, which a stub never executes, so a test that trusted a fake
-would go green on a combination the live gateway rejects."""
+would go green on a combination the live gateway rejects.
+
+DISABLING THINKING IS NOT AN OPTIMISATION, and this is the place someone tuning the effort
+levels below will be reading. With thinking off, this model occasionally writes a tool call into
+visible text instead of a `tool_use` block. In an agentic loop that is a silent failure: no
+error is raised, the call never runs, and the turn carries on as though it had."""
 
 PLAN_EFFORT: Final[AnthropicEffort] = "medium"
 """How hard the model thinks in a planning turn (owner's ruling)."""

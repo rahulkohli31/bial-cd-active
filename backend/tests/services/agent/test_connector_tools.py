@@ -42,6 +42,7 @@ from src.db.models.conversation import ChatKind
 from src.services.agent.agent import ChatDeps
 from src.services.agent.connector_tools import (
     _CATALOGUE,
+    _THE_WHOLE_SCHEMA,
     _UNAVAILABLE,
     CONNECTOR_TOOLSET,
     MAX_DELIVERIES_PER_CONVERSATION,
@@ -54,6 +55,9 @@ from tests.services.orchestrator.model_harness import text_turn
 
 SYSTEM = a_connected_system()
 SHIPPED = (_CATALOGUE / f"{SYSTEM.key}.txt").read_text(encoding="utf-8")
+DELIVERED = f"{SHIPPED}\n\n{_THE_WHOLE_SCHEMA}"
+"""What a first call actually hands back: the artefact untouched, plus the sentence that says it
+is the whole schema and where the worked example lives."""
 
 
 def _ctx(
@@ -100,8 +104,23 @@ async def test_a_connected_project_gets_the_shipped_block_byte_for_byte() -> Non
     has checked. `_cap_redact_cap` is deliberately not applied: there is no untrusted content here
     and nothing to redact — this file is the platform's own."""
     answer = await connector_schema(_ctx(connected=(SYSTEM,)), SYSTEM.connector.display_name)
-    assert answer == SHIPPED
+    assert answer == DELIVERED
     assert answer.startswith("# GENERATED FILE")
+
+
+async def test_the_answer_states_its_own_completeness_and_points_at_the_worked_example() -> None:
+    """★ THE POINTER HAS NO SECOND COPY — and this is the guard that says so.
+
+    `lib/flight-data.reference.ts` carries the packages an app needs to read this data (none of
+    them pre-installed) and the environment variables that address the store. The generated
+    catalogue is schema, traps and KPI rules and must not be hand-edited; the composed prompt names
+    no template file. Lose this clause and an agent that knows every column name has no way to
+    reach the code that reads them."""
+    answer = await connector_schema(_ctx(connected=(SYSTEM,)), SYSTEM.key)
+    assert "lib/flight-data.reference.ts" in answer
+    assert "the whole schema for this system" in answer
+    # The artefact itself is untouched and comes FIRST — the sentence is a tail, not a preface.
+    assert answer.startswith(SHIPPED)
 
 
 async def test_the_key_and_the_display_name_both_resolve() -> None:
@@ -116,7 +135,7 @@ async def test_the_key_and_the_display_name_both_resolve() -> None:
         SYSTEM.connector.display_name.lower(),
         f"  {SYSTEM.connector.display_name}  ",
     ):
-        assert await connector_schema(_ctx(connected=(SYSTEM,)), spelling) == SHIPPED
+        assert await connector_schema(_ctx(connected=(SYSTEM,)), spelling) == DELIVERED
 
 
 async def test_the_database_is_never_touched() -> None:
@@ -125,7 +144,7 @@ async def test_the_database_is_never_touched() -> None:
     needed the database would therefore work on Plan and fail on Build, which is the shape of a
     defect nobody finds until a citizen's build stops mid-turn. Answering identically with `db` at
     `None` is the property that makes one implementation serve both arms."""
-    assert await connector_schema(_ctx(connected=(SYSTEM,), db=None), SYSTEM.key) == SHIPPED
+    assert await connector_schema(_ctx(connected=(SYSTEM,), db=None), SYSTEM.key) == DELIVERED
 
 
 # --------------------------------------------------------------------------------------------
@@ -248,14 +267,28 @@ async def test_the_description_tells_the_model_when_to_call_it_and_what_not_to_c
     lowered = description.lower()
     # What it gives.
     assert "every column with its type" in lowered
-    # When to call it — including the iteration case, which is the realistic failure: the files
-    # hold column names, so the cheap path is to imitate rather than fetch.
+    # When to call it.
     assert "before writing any code that reads the connected data" in lowered
-    assert "already reads it" in lowered
     # What must not leave the block.
     assert "kpi formulas" in lowered
     assert "sla targets" in lowered
     assert "source" in lowered
+
+
+async def test_the_description_demands_no_call_the_model_does_not_make() -> None:
+    """★ MEASURED, NOT ASSUMED. Across five incident conversations the model called this tool
+    exactly once each — including one that ran five citizen turns — so a description asking for a
+    call per column change was spending tokens on an instruction nothing obeys, and teaching the
+    model that instructions are negotiable. The completeness claim moved to the RETURN, which is
+    paid for only by the conversations that fetch."""
+    # Whitespace-flattened: the docstring reaches the model wrapped, so a phrase that spans a
+    # line break is absent from the raw text for a reason that is not about the words.
+    flat = " ".join((await _registered_description()).lower().split())
+    assert "every time" not in flat
+    assert "only adding a column" not in flat
+    # LIVENESS — the two sentences that carry real information stay.
+    assert "column names cannot be guessed from ordinary ones" in flat
+    assert "a query that runs and reports the wrong number" in flat
 
 
 # --------------------------------------------------------------------------------------------
@@ -329,9 +362,9 @@ def _conversation_that_already_holds(*results: str) -> list[ModelMessage]:
 
 async def test_one_earlier_delivery_does_not_trip_the_ceiling() -> None:
     """The ceiling is two, not one — owner ruling, 2026-09-11. A second full copy is allowed."""
-    history = _conversation_that_already_holds(SHIPPED)
+    history = _conversation_that_already_holds(DELIVERED)
     answer = await connector_schema(_ctx(connected=(SYSTEM,), messages=history), SYSTEM.key)
-    assert answer == SHIPPED
+    assert answer == DELIVERED
 
 
 async def test_past_the_ceiling_the_model_is_pointed_back_at_the_copy_it_has() -> None:
@@ -339,7 +372,7 @@ async def test_past_the_ceiling_the_model_is_pointed_back_at_the_copy_it_has() -
     one thing the model should not do — and a WARNING beside it, because a model asking again for
     something its context already holds twice is the clearest sign that the history this turn
     replayed did not reach it the way the list says."""
-    history = _conversation_that_already_holds(*[SHIPPED] * MAX_DELIVERIES_PER_CONVERSATION)
+    history = _conversation_that_already_holds(*[DELIVERED] * MAX_DELIVERIES_PER_CONVERSATION)
     with capture_logs() as captured:
         answer = await connector_schema(_ctx(connected=(SYSTEM,), messages=history), SYSTEM.key)
     assert answer != SHIPPED
@@ -359,7 +392,7 @@ async def test_a_refusal_is_not_a_delivery() -> None:
     refusals = [_UNAVAILABLE, f"{SYSTEM.connector.display_name} is not switched on here."] * 3
     history = _conversation_that_already_holds(*refusals)
     answer = await connector_schema(_ctx(connected=(SYSTEM,), messages=history), SYSTEM.key)
-    assert answer == SHIPPED
+    assert answer == DELIVERED
 
 
 @pytest.mark.parametrize(
@@ -405,6 +438,6 @@ async def test_the_ceiling_reads_the_history_a_real_run_replays(
         deps=_ctx(connected=(SYSTEM,)).deps,
         model=FunctionModel(respond),
         toolsets=[CONNECTOR_TOOLSET],
-        message_history=_conversation_that_already_holds(*[SHIPPED] * earlier),
+        message_history=_conversation_that_already_holds(*[DELIVERED] * earlier),
     )
-    assert (received["answer"] == SHIPPED) is full_schema_again
+    assert (received["answer"] == DELIVERED) is full_schema_again
