@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
 from src.config import settings
-from src.db.models.conversation import ChatKind
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.user import User
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions import manager as manager_module
@@ -47,8 +47,13 @@ from src.services.build_sessions.snapshot import (
     SNAPSHOT_EXEC_TIMEOUT_SECONDS,
     SNAPSHOT_EXECS,
 )
+from src.services.redis.keys import cooperative_stop_key
 from src.services.sandbox.config import SandboxConfig
-from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
+from src.services.turns.engine import (
+    TurnEngine,
+    publish_cooperative_stop,
+    set_turn_engine_for_tests,
+)
 from src.services.turns.guard import _mid_reply
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeSandboxClient, FakeStorage
@@ -150,12 +155,15 @@ async def _a_turn_holding_the_workspace(
     user: User,
     project_id: uuid.UUID,
     turn: _HoldsItsOwnUnwind,
-) -> None:
+) -> Conversation:
     """Start a real Write turn on `project_id` and return once it is genuinely streaming.
 
     The turn pins the project's container through `manager.ensure_sandbox`, so the manager's
     one-per-user slot is held by work the stop can actually reach — which is what every
-    assertion below about `STILL_RUNNING` / `STOPPED` is a statement about."""
+    assertion below about `STILL_RUNNING` / `STOPPED` is a statement about.
+
+    The conversation is handed back for the two tests at the bottom, which need to aim a
+    conversation-keyed ask at this exact turn; every other caller ignores it."""
     conversation = await ConversationFactory.create(
         db, user.id, project_id=project_id, kind=ChatKind.BUILD
     )
@@ -174,6 +182,7 @@ async def _a_turn_holding_the_workspace(
         sandbox_client=client,
     )
     await asyncio.wait_for(turn.stepped.wait(), timeout=10)
+    return conversation
 
 
 async def _nothing_to_persist() -> None:
@@ -625,6 +634,81 @@ async def test_a_stop_that_breaks_is_logged_against_the_citizen_it_broke_for(
     turn.let_go.set()
     retry = manager._stop_records[(user.id, project_a)]
     assert await asyncio.wait_for(retry.task, timeout=10) is StopOutcome.STOPPED
+
+
+# --- the take-back, against a boundary stop already pending ---------------------------
+
+
+async def test_the_take_back_cuts_rather_than_waiting_for_a_tool_result_boundary(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    _fresh_engine: TurnEngine,
+    session_factory,
+) -> None:
+    """A Build turn can be asked to end at its next tool-result boundary instead of being cut.
+    THIS DOOR STILL CUTS, and that is a decision rather than an omission: the boundary can be a
+    cold install away, and the citizen on this path is holding a dialog open waiting for their
+    own workspace back. The bounded wait belongs to the callers nobody is sitting in front of.
+
+    Bounded with `wait_for` so a change that made this door spend the grace FAILS here rather
+    than hanging the suite on a wait nothing in this test can release — the turn parks inside its
+    own cancellation handler and reaches no boundary at all.
+
+    Mutation check: give `stop_user_turn_and_wait` a cooperative phase on the way to its cancel
+    and this goes red at the bound rather than hanging."""
+    user, project_a = await _mk(db_session, "stop10@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    turn = _HoldsItsOwnUnwind()
+
+    conversation = await _a_turn_holding_the_workspace(
+        db_session, _fresh_engine, session_factory, manager, client, user, project_a, turn
+    )
+    await publish_cooperative_stop(conversation.id)
+
+    turn.let_go.set()  # the unwind is not what is under test here; the cut is
+    stopped = await asyncio.wait_for(
+        manager.stop_active_work(db_session, user, project_a, sandbox_client=client),
+        timeout=15,
+    )
+
+    assert stopped is StopOutcome.STOPPED
+    assert turn.unwinding.is_set()  # it was CANCELLED, not waited out
+    assert manager.active_session_for(user.id) is None
+
+
+async def test_a_stop_leaves_no_ask_standing_to_clip_the_citizens_next_message(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    _fresh_engine: TurnEngine,
+    session_factory,
+) -> None:
+    """The composition rule, from the manager's side: one stop path may not leave the OTHER one
+    armed. Presence of the conversation-keyed key IS the ask, so an ask that outlives the turn it
+    was aimed at would end the citizen's very next message in that chat at its first tool result
+    — a stop they never asked for, for a turn that was already over.
+
+    Mutation check: remove the withdrawal from `_stop_liveness_lease` and the key survives."""
+    user, project_a = await _mk(db_session, "stop11@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    turn = _HoldsItsOwnUnwind()
+
+    conversation = await _a_turn_holding_the_workspace(
+        db_session, _fresh_engine, session_factory, manager, client, user, project_a, turn
+    )
+    await publish_cooperative_stop(conversation.id)
+    assert await fake_redis.get(cooperative_stop_key(conversation.id)) is not None
+
+    turn.let_go.set()
+    assert (
+        await manager.stop_active_work(db_session, user, project_a, sandbox_client=client)
+        is StopOutcome.STOPPED
+    )
+
+    assert await fake_redis.get(cooperative_stop_key(conversation.id)) is None
 
 
 # --- the two predicates, held apart --------------------------------------------------

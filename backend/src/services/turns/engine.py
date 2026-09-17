@@ -172,6 +172,7 @@ from src.services.orchestrator.constants import (
     PLAN_EFFORT,
     READINESS_MAX_POLLS,
     READINESS_POLL_S,
+    RUN_COMMAND_SLOW_TIMEOUT_S,
     RUN_TOKEN_BUDGET,
     RUN_WALL_CLOCK_DEADLINE_S,
     SELF_HEAL_MAX_RETRIES,
@@ -193,6 +194,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_SERVING_SINCE,
+    cooperative_stop_key,
 )
 from src.services.sandbox import SandboxClient, SandboxError
 from src.services.sandbox.base import CompileState
@@ -243,6 +245,60 @@ ENDED_TURN_TTL_S = 300.0
 # In-flight friendly steps kept for snapshot consolidation (reads are chatty; the cap only
 # guards a pathological run — the projection re-derives the full list from rows on reload).
 _STEPS_CAP = 256
+
+# HOW LONG A COOPERATIVE STOP MAY WAIT FOR THE NEXT TOOL-RESULT BOUNDARY before whoever asked
+# for it gives up and cuts the turn instead.
+#
+# DERIVED FROM THE SLOW-TOOL BUDGET, NOT FROM `RUN_WALL_CLOCK_DEADLINE_S`. What stands between
+# the ask and the boundary is the tool call in flight, and the longest legitimate one is a slow
+# `run_command` — a cold-base `npm install` routinely spends the whole of it. The run deadline
+# bounds a whole build, several repair rounds included, so a wait sized from it would spare a
+# wedged container for half an hour to save a boundary that was never coming. One lease tick is
+# added on top because a stop published by another process is only seen when the turn's own
+# liveness-lease loop next looks.
+#
+# A STARTING VALUE. The real tool-call duration distribution is uninstrumented — measure before
+# tuning this down.
+COOPERATIVE_STOP_GRACE_S: Final = float(
+    RUN_COMMAND_SLOW_TIMEOUT_S + LIVENESS_LEASE_RENEW_CADENCE_SECONDS
+)
+
+# Why a Build turn ended when it left its loop at a tool-result boundary rather than because the
+# model was finished. Rides out on `TurnEndedFrame.reason` and onto the terminal row, which is
+# what lets the routine that asked for the stop recognize the ending it was waiting for.
+STOPPED_AT_A_BOUNDARY: Final = "stopped_at_a_boundary"
+
+
+async def publish_cooperative_stop(conversation_id: uuid.UUID) -> None:
+    """Ask the Build turn running in this conversation to end at its next tool-result boundary.
+
+    THROUGH REDIS, BECAUSE THE ASK COMES FROM ANYWHERE. The engine's registry is per-process and
+    is empty everywhere but the API replica running the turn, so a caller in the worker has no
+    task to reach for; the turn's own liveness-lease loop picks this up instead.
+
+    KEYED BY CONVERSATION, NEVER BY USER. The liveness lease is per-user, so a user-keyed ask
+    would be read by whichever of that citizen's turns looked first — including the incoming
+    project's fresh turn, which is the one thing this must never stop.
+
+    Presence IS the ask; the value is when it was raised, for an operator reading the key. The
+    TTL is the window in which it still means anything — past the grace the caller cuts instead,
+    and an ask left standing would clip the citizen's next message in the same conversation."""
+    await get_redis().set(
+        cooperative_stop_key(conversation_id),
+        datetime.now(UTC).isoformat(),
+        ex=int(COOPERATIVE_STOP_GRACE_S),
+    )
+
+
+async def take_cooperative_stop(conversation_id: uuid.UUID) -> bool:
+    """Read the ask and CONSUME it in one command, answering whether one was standing.
+
+    `GETDEL` rather than a read and a later delete: the ask is a one-shot, and a reader that
+    leaves the key behind hands the same stop to the next turn in the conversation. This is both
+    how a turn observes its own stop and how a cut withdraws one it has just overtaken — the
+    withdrawal simply discards the answer."""
+    return await get_redis().getdel(cooperative_stop_key(conversation_id)) is not None
+
 
 TurnStatus = Literal["running", "completed", "failed", "stopped"]
 
@@ -757,6 +813,17 @@ class _TurnState:
     # into the cleanup path (which lands inside the CancelledError arm and can eat the
     # terminal frame the subscriber is waiting for).
     stop_requested: bool = False
+    # A stop that asks the Build loop to END AT ITS NEXT TOOL-RESULT BOUNDARY rather than being
+    # cut where it stands: the in-flight tool finishes, its result is persisted, no further model
+    # request is made, and the turn ends with nothing dangling for the transcript to guess at.
+    #
+    # DELIBERATELY NOT `stop_requested`, and the two must never be folded together. That one
+    # means "a cancel has been issued": `stop_turn` returns early on it and
+    # `stop_user_turn_and_wait` guards `task.cancel()` behind it, so a cooperative ask spelt that
+    # way would make the citizen's own Stop button a silent no-op and leave the bounded wait with
+    # no cut to fall back on. Raised in-process by whoever holds the state, and out of process by
+    # the conversation-keyed ask the lease loop reads.
+    cooperative_stop_requested: bool = False
     # The user-facing reason a turn failed, set alongside the in-band `TurnErrorFrame`. The
     # frame lives only in the ring, so a subscriber whose cursor fell past it (or who arrives
     # after) would otherwise read `turn_status="failed"` with no reason attached.
@@ -1101,7 +1168,13 @@ class TurnEngine:
         bills tokens, emits its terminal frame and runs `finish_turn_sandbox`, which is what makes
         the workspace releasable. Releasing earlier tears a container out from under a running
         task. THE VERDICT IS READ FROM THE TASK, not from having asked: `stop_requested` alone
-        reads True mid-`finally`. `timeout_s` bounds the wait, not the shielded unwind."""
+        reads True mid-`finally`. `timeout_s` bounds the wait, not the shielded unwind.
+
+        A HARD CUT, AND IT OUTRANKS A COOPERATIVE STOP RATHER THAN DEFERRING TO ONE. The caller
+        here is a citizen waiting to have their workspace back, so the turn is cancelled where it
+        stands whether or not a boundary stop is already pending — which is why the two are
+        separate flags. Spelling the cooperative ask as `stop_requested` would have made this
+        cancel unreachable, and the citizen's own Stop button with it."""
         state = next(
             (
                 s
@@ -1210,6 +1283,25 @@ class TurnEngine:
                     turn_id=str(state.turn_id),
                 )
 
+        async def _bill_before_ending() -> bool:
+            """Bill from inside an `except` arm, and say whether that arm may go on to its own
+            ending. False means the turn has already been finished here.
+
+            A STOP DELIVERED IN THIS AWAIT IS NOT THE `except asyncio.CancelledError` ARM'S TO
+            CATCH — a sibling `except` never catches what another one is unwinding through — and
+            `_bill_once` narrows to `Exception`, which a cancellation is not. Escaping would
+            carry it clean past `_finish`: no terminal frame, no terminal row, and a turn every
+            subscriber reads as still running until its stall timeout. The same hole
+            `_end_model_unavailable` closes around `at_limit_ending`, closed once for the five
+            arms that bill."""
+            try:
+                await _bill_once()
+            except asyncio.CancelledError:
+                state.end_reason = STOPPED_BY_USER
+                self._finish(state, "stopped")
+                return False
+            return True
+
         async def _fail_generically(exc: BaseException) -> None:
             """How a turn ends when it broke for a reason the citizen cannot act on.
 
@@ -1228,7 +1320,8 @@ class TurnEngine:
             )
             state.error_signature = error_signature(exc)
             # Partial spend before the failure still counts: bill what actually ran.
-            await _bill_once()
+            if not await _bill_before_ending():
+                return
             state.error_message = _TURN_FAILED_MESSAGE
             self._emit(
                 state,
@@ -1255,7 +1348,8 @@ class TurnEngine:
                 status_code=getattr(exc, "status_code", None),
                 error=state.error_signature,
             )
-            await _bill_once()
+            if not await _bill_before_ending():
+                return
             if state.kind is ChatKind.BUILD:
                 # A STOP WHILE THE TREE IS SECURED STILL ENDS THE TURN. This runs inside an
                 # `except`, so a cancellation landing in this await (up to a minute of container
@@ -1291,7 +1385,8 @@ class TurnEngine:
                 turn_id=str(state.turn_id),
                 status_code=status_code,
             )
-            await _bill_once()
+            if not await _bill_before_ending():
+                return
             state.end_reason = code
             state.error_message = text
             self._emit(state, lambda seq: TurnErrorFrame(seq=seq, message=text))
@@ -1587,7 +1682,8 @@ class TurnEngine:
             message = ended.message
             state.error_message = message
             self._emit(state, lambda seq: TurnErrorFrame(seq=seq, message=message))
-            await _bill_once()
+            if not await _bill_before_ending():
+                return
             self._finish(state, "failed")
         except _PersistFailedError:
             _log.exception(
@@ -1596,7 +1692,8 @@ class TurnEngine:
                 turn_id=str(state.turn_id),
             )
             # The model spend still counts even though the reply could not be saved.
-            await _bill_once()
+            if not await _bill_before_ending():
+                return
             state.error_message = _PERSIST_FAILED_MESSAGE
             self._emit(
                 state,
@@ -2151,6 +2248,17 @@ class TurnEngine:
                     ) from exc
                 iteration += 1
 
+                # THE COOPERATIVE STOP LEAVES THE WHOLE LOOP, not just the run inside it, and it
+                # has to leave HERE — above the mutation guard and above `verify`. A stop landing
+                # on a turn that had only read files would otherwise be told it built nothing,
+                # then spend thirty seconds polling a container that is about to be destroyed,
+                # then buy a repair round for a build nobody is waiting for. Ending is not a
+                # failure and owes no diagnostic: the tool results are durable, the reason rides
+                # the terminal, and the caller that asked for the stop is watching for it.
+                if state.cooperative_stop_requested:
+                    state.end_reason = STOPPED_AT_A_BOUNDARY
+                    return
+
                 # THE MUTATION GUARD. A Write turn where the model only read files and
                 # answered a question is an ordinary chat turn that happened to have write
                 # tools available. Verifying it would spend 30s of the user's time and a
@@ -2538,7 +2646,15 @@ class TurnEngine:
                     # unanswered. Left that way, the repair pass hands pydantic-ai a new user
                     # prompt over unprocessed tool calls (it refuses outright), and the
                     # `declare_done` return never reaches a row.
-                    if state.sandbox is not None and state.sandbox.done_requested:
+                    #
+                    # A COOPERATIVE STOP LEAVES BY THE SAME DOOR, and there is no second door it
+                    # could leave by: this is the one point in the walk where every tool answer
+                    # is recorded and the only thing outstanding is a model request nobody is
+                    # going to pay for. Cutting anywhere else leaves a tool call without a
+                    # result, which the transcript can only guess at.
+                    if state.cooperative_stop_requested or (
+                        state.sandbox is not None and state.sandbox.done_requested
+                    ):
                         if Agent.is_model_request_node(node):
                             pending_answers = node.request
                         cut_short = True
@@ -3284,6 +3400,33 @@ class TurnEngine:
             # the guard is what keeps that true if a second caller ever appears.
             return
         while True:
+            # THE COOPERATIVE STOP IS READ HERE BECAUSE THIS IS WHERE THE TURN ALREADY LOOKS AT
+            # REDIS. The ask is written by whoever wants the container back — a different
+            # process, routinely — so the turn has to go and find it; this loop is the only
+            # thing a turn runs on a cadence for its whole life.
+            #
+            # BUILD ONLY, AND EXPLICITLY SO. A Plan turn is a single `chat_agent.run` with no
+            # node walk, so it has no tool-result boundary to end at and would carry the ask
+            # forever without acting on it — consuming a one-shot nothing can honour. Whoever
+            # wants a Plan turn stopped cancels it; there is nothing to wait for.
+            #
+            # Its own arm rather than the lease's: a store error reading the ask must not cost
+            # the renewal below it, which is what keeps the container alive.
+            if state.kind is ChatKind.BUILD and not state.cooperative_stop_requested:
+                try:
+                    if await take_cooperative_stop(state.conversation_id):
+                        state.cooperative_stop_requested = True
+                        _log.info(
+                            "turn_cooperative_stop_observed",
+                            conversation_id=str(state.conversation_id),
+                            turn_id=str(state.turn_id),
+                        )
+                except Exception:
+                    _log.exception(
+                        "turn_cooperative_stop_unreadable",
+                        conversation_id=str(state.conversation_id),
+                        turn_id=str(state.turn_id),
+                    )
             try:
                 if not await renew_liveness_lease(get_redis(), state.user_id):
                     _log.warning(
@@ -3342,7 +3485,16 @@ class TurnEngine:
         because a late frame is lost): releasing the lease early opens a reap window over
         `finish_turn_sandbox`, which can outlive the 90-second heartbeat TTL that is otherwise the
         container's only cover. Failures are swallowed — a Redis blip must not wedge the
-        conversation guard shut, and the cost of not landing is bounded by the lease's own TTL."""
+        conversation guard shut, and the cost of not landing is bounded by the lease's own TTL.
+
+        THE COOPERATIVE ASK DIES WITH THE TURN IT WAS AIMED AT, withdrawn below alongside the
+        lease. An ask published in the seconds a turn was already unwinding is never read by the
+        lease loop, and presence of that key IS the ask — left standing it would end the
+        citizen's next message in this conversation at its first tool result, on the strength of
+        a stop meant for a turn already over. It needs no guard of its own where the lease does:
+        the key is per CONVERSATION, and one turn runs in a conversation at a time. A turn that
+        took the no-lease return above is one an ask could never have been aimed at — it held no
+        container — and the key's TTL bounds that case anyway."""
         task = state.lease_task
         if task is None:
             # NOTHING WAS PUBLISHED, SO NOTHING MAY BE REVOKED. The key is per-USER, not
@@ -3372,6 +3524,10 @@ class TurnEngine:
         # sweep sparing a container nobody is building in for up to a TTL.
         with suppress(Exception):
             await asyncio.shield(release_liveness_lease(get_redis(), state.user_id))
+        # Shielded for the same reason, and last because a lost withdrawal costs only a key that
+        # expires on its own, where a lost lease release costs a container a whole TTL of cover.
+        with suppress(Exception):
+            await asyncio.shield(take_cooperative_stop(state.conversation_id))
 
     def _pending_meta(self, deferred: ToolCallPart | None) -> dict[str, Any] | None:
         """The row meta for a batch that carries the pending options call: the card's id, and

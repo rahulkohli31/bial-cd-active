@@ -2453,8 +2453,15 @@ class SessionManager:
         WHERE THE DANGLING TOOL CALL COMES FROM, known and accepted. The stop cuts the run
         wherever it stands, which is routinely between a tool call and its result. The replay is
         kept valid by `_INTERRUPTED_RESULT` in `messages/store.py` — read the decision recorded
-        beside it before shipping chat history, because landing this stop on a tool-result
-        boundary is what has to change once a past conversation can be reopened."""
+        beside it before shipping chat history.
+
+        A CUT RATHER THAN A BOUNDARY, AND THAT IS A CHOICE. A Build turn can be asked to end at
+        its next tool-result boundary instead, which leaves nothing for the replay to guess at —
+        but that boundary can be a cold `npm install` away, and the citizen on this path is
+        holding a dialog open waiting for their own workspace back. So this door cuts, and a
+        boundary stop already pending is overtaken rather than waited on: the two are separate
+        flags on the turn precisely so that asking for one cannot disarm the other. The bounded
+        wait belongs to the callers nobody is sitting in front of."""
         if not self._live_session_holds(user_id, app_id):
             return StopOutcome.NOTHING_WAS_RUNNING
         session_id = self._active_by_user.get(user_id)
