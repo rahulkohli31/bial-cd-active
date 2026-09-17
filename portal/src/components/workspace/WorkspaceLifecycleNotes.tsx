@@ -17,6 +17,7 @@
  * true on their own.
  */
 import { Clock, FileWarning } from 'lucide-react'
+import { formatResetTime } from '../../utils/turnNarrative'
 
 export interface WorkspaceLifecycleNotesProps {
   /** When this app's container reaches its ceiling, or `null` when no ceiling applies. */
@@ -32,20 +33,26 @@ export interface WorkspaceLifecycleNotesProps {
  */
 const WORTH_MENTIONING_MS = 30 * 60 * 1000
 
-function clockTime(iso: string): string | null {
-  const at = new Date(iso)
-  if (Number.isNaN(at.getTime())) return null
-  return at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+/**
+ * The clock time to name, or `null` when there is nothing worth naming.
+ *
+ * BOUNDED AT BOTH ENDS. Past its ceiling the platform is collecting the container, not planning
+ * to — "this app closes at 4:15" said at 4:30 is a promise about a time that has gone, which is
+ * the one thing a note written to be honest must not become. Nothing is said instead: no instant
+ * this component holds describes what an app does after its ceiling. An unreadable instant fails
+ * the same comparisons and says nothing for the same reason.
+ */
+function closingTime(drainingAt: string): string | null {
+  const untilItCloses = new Date(drainingAt).getTime() - Date.now()
+  const worthMentioning = untilItCloses > 0 && untilItCloses <= WORTH_MENTIONING_MS
+  return worthMentioning ? formatResetTime(drainingAt) : null
 }
 
 export default function WorkspaceLifecycleNotes({
   drainingAt,
   writeBackRefusedAt,
 }: WorkspaceLifecycleNotesProps) {
-  const closingAt =
-    drainingAt !== null && new Date(drainingAt).getTime() - Date.now() <= WORTH_MENTIONING_MS
-      ? clockTime(drainingAt)
-      : null
+  const closingAt = drainingAt !== null ? closingTime(drainingAt) : null
   if (closingAt === null && writeBackRefusedAt === null) return null
 
   return (

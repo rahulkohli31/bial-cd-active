@@ -21,7 +21,6 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { PlayCircle, RotateCcw } from 'lucide-react'
 import { BusyGlyph } from '../ui/Waiting'
 import { assertNever } from '../../utils/assertNever'
-import { startApp } from './startApp'
 import type { WorkspaceAction } from './workspaceState'
 import type { WorkspaceReport } from './workspaceChannel'
 
@@ -32,11 +31,11 @@ export interface StartAppControlProps {
 
 export default function StartAppControl({ action, report }: StartAppControlProps) {
   const [pending, setPending] = useState(false)
-  // TWO GUARDS, AND THEY ARE NOT THE SAME GUARD. The ref is synchronous, so two presses in one
-  // tick collapse to one request — state would not have committed between them. `mounted` is what
-  // keeps every `await` below from writing into a component the citizen has already navigated
-  // away from.
-  const inFlight = useRef(false)
+  // THE ONLY GUARD HERE IS ABOUT THIS COMPONENT. Two presses in one tick collapse to one request
+  // because `report.start` is single-flight — the second press joins the first, which is also what
+  // keeps this control from racing the project opening and the rail's send. `mounted` is a
+  // different question: it keeps the `await` below from writing into a component the citizen has
+  // already navigated away from.
   const mounted = useRef(true)
   useEffect(() => {
     mounted.current = true
@@ -46,16 +45,13 @@ export default function StartAppControl({ action, report }: StartAppControlProps
   }, [])
 
   const start = useCallback(async () => {
-    if (!report.projectId || inFlight.current) return
-    inFlight.current = true
+    if (!report.projectId) return
     setPending(true)
     try {
-      await startApp(report)
+      await report.start()
     } finally {
-      inFlight.current = false
-      // `mounted` is what keeps this from writing into a component the citizen has already
-      // navigated away from. It guards THIS control's own spinner and nothing else — everything
-      // the surface needs was already reported inside `startApp`, which unmounting must not skip.
+      // `mounted` guards THIS control's own spinner and nothing else — everything the surface
+      // needs was already reported inside the start, which unmounting must not skip.
       if (mounted.current) setPending(false)
     }
   }, [report])

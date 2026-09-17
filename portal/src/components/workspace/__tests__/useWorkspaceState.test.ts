@@ -72,6 +72,13 @@ function hide(hidden: boolean): void {
 const mount = (projectId: string | null = 'proj-1', projectHasSavedBuild: boolean | null = null) =>
   renderHook(() => useWorkspaceState({ projectId, projectHasSavedBuild }))
 
+/** The same, but the project arrives as a prop, so a scenario can move the SAME hook to another
+ *  one — which is what the screen does, since nothing keys the surface on the project id. */
+const mountMovable = (projectId: string) =>
+  renderHook(({ id }: { id: string }) => useWorkspaceState({ projectId: id, projectHasSavedBuild: null }), {
+    initialProps: { id: projectId },
+  })
+
 beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true })
   for (const fn of Object.values(api)) fn.mockReset()
@@ -956,5 +963,77 @@ describe('presence renewal — what holds the container open', () => {
     await settle()
 
     expect(api.renewPresence).not.toHaveBeenCalled()
+  })
+})
+
+
+/**
+ * ★ THE CEILING INSTANT IS DROPPED WITH THE CONTAINER IT DESCRIBES.
+ *
+ * It is not an internal number: the pane column announces it ("This app closes at 4:15") on every
+ * surface that frames the app. An instant held past the life of the container it came from is a
+ * sentence about a closing that is not coming, said to the citizen on both surfaces at once.
+ */
+describe('★ what retires the ceiling instant', () => {
+  const ALIVE = reading({ state: 'alive', alive: true, previewUrl: 'https://app.example/' })
+  const soon = () => new Date(Date.now() + 5 * 60_000).toISOString()
+
+  /** A mounted hook that has been told about a ceiling. */
+  const withACeiling = async () => {
+    api.fetchPreviewState.mockResolvedValue(ALIVE)
+    api.renewPresence.mockResolvedValue({ outcome: 'renewed', drainingAt: soon() })
+    const view = mountMovable('proj-1')
+    await waitFor(() => expect(view.result.current.drainingAt).not.toBeNull())
+    return view
+  }
+
+  it('★ drops it when the screen moves to another project', async () => {
+    // Nothing keys the surface on the project id, so the hook is not remounted — and the instant
+    // belongs to one container. Announced over the next project it would name a closing time for
+    // an app the citizen is not looking at.
+    const view = await withACeiling()
+
+    view.rerender({ id: 'proj-2' })
+
+    expect(view.result.current.drainingAt).toBeNull()
+  })
+
+  it('★ drops it when the reading says the container is no longer alive', async () => {
+    // The renewal goes on answering with the same ceiling, so only the teardown can clear it.
+    const view = await withACeiling()
+
+    api.fetchPreviewState.mockResolvedValue(reading({ state: 'asleep' }))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS + 1)
+    })
+
+    await waitFor(() => expect(view.result.current.drainingAt).toBeNull())
+  })
+
+  it('★ drops it when a renewal reaches a container that is not the one on screen', async () => {
+    // The reading stays `alive`, so the teardown path cannot be what clears it. `nothing_running`
+    // and `not_this_container` each say the instant being held describes something else.
+    const view = await withACeiling()
+
+    api.renewPresence.mockResolvedValue({ outcome: 'not_this_container', drainingAt: soon() })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS + 1)
+    })
+
+    await waitFor(() => expect(view.result.current.drainingAt).toBeNull())
+  })
+
+  it('keeps it when the renewal could not be made at all', async () => {
+    // `null` is a fact about the REQUEST — a 401, a 503, a dropped network — and says nothing
+    // about the container. Clearing on one would retract a true sentence on an outage.
+    const view = await withACeiling()
+    const held = view.result.current.drainingAt
+
+    api.renewPresence.mockResolvedValue(null)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS + 1)
+    })
+
+    expect(view.result.current.drainingAt).toBe(held)
   })
 })

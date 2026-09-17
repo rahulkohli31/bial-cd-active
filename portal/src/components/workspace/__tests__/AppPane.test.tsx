@@ -20,6 +20,7 @@ import {
   type WorkspaceReport,
 } from '../workspaceChannel'
 import { asDecidedReading, resolveWorkspaceState, type DecidedPreview, type StartOutcome } from '../workspaceState'
+import { createStarter } from '../startApp'
 import { ApiError } from '../../../utils/apiError'
 import type { PreviewState } from '../../../utils/buildSessionApi'
 
@@ -65,7 +66,17 @@ function reportFor(
   // one. Every test that exercises decision D3 passes it explicitly.
   lastDecidedPreview: DecidedPreview | null = null,
 ): WorkspaceReport {
+  // THE REAL CLAIM, over this report's own sinks — the production starter, stood up by hand
+  // because there is no surface here to hold one. A stub would let the control's press reach
+  // nothing, and every start scenario below would be asserting against a spy.
+  const sinks = {
+    projectId: 'p1',
+    onStarted: vi.fn(),
+    onStartPending: vi.fn(),
+    onStartOutcome: vi.fn(),
+  }
   return {
+    ...sinks,
     state: resolveWorkspaceState({
       preview,
       lastDecidedPreview,
@@ -73,11 +84,8 @@ function reportFor(
       startOutcome,
       startInFlight,
     }),
-    projectId: 'p1',
-    onStarted: vi.fn(),
-    onStartPending: vi.fn(),
-    onStartOutcome: vi.fn(),
     onRefresh: vi.fn(),
+    start: createStarter(() => sinks),
   }
 }
 

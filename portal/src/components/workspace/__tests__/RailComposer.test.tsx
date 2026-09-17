@@ -22,6 +22,7 @@ import {
   type WorkspaceReport,
 } from '../workspaceChannel'
 import { resolveWorkspaceState } from '../workspaceState'
+import { createStarter } from '../startApp'
 import type { PreviewState } from '../../../utils/buildSessionApi'
 
 // THE START THIS RAIL ASKS FOR, held by the test rather than answered by the network. The rail
@@ -417,15 +418,21 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
         startOutcome: null,
         startInFlight,
       })
-    const report: WorkspaceReport = {
-      state: stateFor(false),
+    const sinks = {
       projectId: 'p1',
       onStarted: vi.fn(),
       onStartPending: vi.fn((pending: boolean) => {
         act(() => channel.workspace.set({ ...report, state: stateFor(pending) }))
       }),
       onStartOutcome: vi.fn(),
+    }
+    const report: WorkspaceReport = {
+      ...sinks,
+      state: stateFor(false),
       onRefresh: vi.fn(),
+      // The real claim over this report's own sinks — a stub here would make every send below
+      // assert against a spy instead of against the start the composer actually makes.
+      start: createStarter(() => sinks),
     }
     channel.workspace.set(report)
     return {

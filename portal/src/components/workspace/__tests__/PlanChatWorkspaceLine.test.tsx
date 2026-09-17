@@ -19,6 +19,7 @@ import {
   type WorkspaceReport,
 } from '../workspaceChannel'
 import { resolveWorkspaceState } from '../workspaceState'
+import { createStarter } from '../startApp'
 import type { PreviewState } from '../../../utils/buildSessionApi'
 
 vi.mock('../../../utils/buildSessionApi', async (importOriginal) => ({
@@ -36,24 +37,30 @@ const reading = (over: Partial<PreviewState> = {}): PreviewState => ({
   ...over,
 })
 
-const reportFor = (preview: PreviewState): WorkspaceReport => ({
-  // `lastDecidedPreview: null` is "nothing has ever been decided", which is the cold-load answer
-  // and the only one this surface's scenarios need: every reading below is a decided one, so the
-  // memory is never consulted. Decision D3's own behaviour — an unreadable read rendering the last
-  // settled reading — is pinned where the rule lives, in `workspaceState.test.ts`.
-  state: resolveWorkspaceState({
-    preview,
-    lastDecidedPreview: null,
-    projectHasSavedBuild: null,
-    startOutcome: null,
-    startInFlight: false,
-  }),
-  projectId: 'p1',
-  onStarted: vi.fn(),
-  onStartPending: vi.fn(),
-  onStartOutcome: vi.fn(),
-  onRefresh: vi.fn(),
-})
+const reportFor = (preview: PreviewState): WorkspaceReport => {
+  const sinks = {
+    projectId: 'p1',
+    onStarted: vi.fn(),
+    onStartPending: vi.fn(),
+    onStartOutcome: vi.fn(),
+  }
+  return {
+    ...sinks,
+    // `lastDecidedPreview: null` is "nothing has ever been decided", which is the cold-load answer
+    // and the only one this surface's scenarios need: every reading below is a decided one, so the
+    // memory is never consulted. Decision D3's own behaviour — an unreadable read rendering the
+    // last settled reading — is pinned where the rule lives, in `workspaceState.test.ts`.
+    state: resolveWorkspaceState({
+      preview,
+      lastDecidedPreview: null,
+      projectHasSavedBuild: null,
+      startOutcome: null,
+      startInFlight: false,
+    }),
+    onRefresh: vi.fn(),
+    start: createStarter(() => sinks),
+  }
+}
 
 function renderIn(node: React.ReactElement, prime: (c: WorkspaceChannel) => void) {
   const channel = createWorkspaceChannel()

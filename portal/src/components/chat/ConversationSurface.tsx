@@ -58,9 +58,12 @@ import {
   spendProbeCadence,
 } from '../workspace/workspaceState'
 import type { ProbeCadence, StartOutcome } from '../workspace/workspaceState'
+import { useStartApp } from '../workspace/startApp'
+import type { StartSinks } from '../workspace/startApp'
 import {
   useAppPaneVisible,
   usePublishAddress,
+  usePublishLifecycle,
   usePublishPaneView,
   usePublishSave,
   usePublishWorkspaceReport,
@@ -473,6 +476,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   const [discarding, setDiscarding] = useState(false)
   const [hasSavedVersion, setHasSavedVersion] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  // WHAT THE PLATFORM OWES THIS CITIZEN ABOUT THEIR APP'S LIFE. The renewal below answers the
+  // first; the save read answers the second, which is durable and must be met on a later visit
+  // rather than only in the session the refusal happened in.
+  const [drainingAt, setDrainingAt] = useState<string | null>(null)
+  const [writeBackRefusedAt, setWriteBackRefusedAt] = useState<string | null>(null)
   // `projectHasSavedBuild` arrives as a PROP, read once when the route resolved, and nothing
   // refetches it. But a Save is precisely the act that writes the snapshot bundle that flag
   // reports — so saving, the one thing that makes a relaunch possible, left the Relaunch
@@ -551,6 +559,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       if (projectIdRef.current === activeProjectId && read === saveReadSeq.current) {
         setSaveDirty(state.dirty)
         setHasSavedVersion(state.savedHead !== null)
+        setWriteBackRefusedAt(state.writeBackRefusedAt)
       }
     } catch {
       // UNKNOWN, never "clean". A failed check must not report the work as safe.
@@ -845,6 +854,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     { dirty: saveDirty, saving, error: saveError, discarding, replying: turnRunningHere, hasSavedVersion },
     { save: handleSave, discard: handleDiscard, settings: null, share: null },
   )
+  // THE PANE COLUMN IS WHERE THESE ARE SAID, and it is a sibling of the `<Outlet/>` this surface
+  // fills — so a citizen mid-conversation is told their app is closing, on the same words the
+  // project screen uses.
+  usePublishLifecycle({ drainingAt, writeBackRefusedAt })
 
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
   // aborts it before resubscribing, but nothing did on unmount, leaking the reader (and its
@@ -2462,7 +2475,16 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       // change is for.
       const hidden = document.visibilityState !== 'visible'
       const presence = presenceToRenew(accelerated, hidden)
-      if (presence) void renewPresence(projectId, presence)
+      if (presence) {
+        // NOT AWAITED, and its answer is the only place a ceiling comes from. A renewal that
+        // reached a DIFFERENT container, or no container at all, is describing something other
+        // than the app on screen — so only a `renewed` outcome may move the instant.
+        void renewPresence(projectId, presence).then((renewal) => {
+          if (!live || projectIdRef.current !== projectId) return
+          if (renewal?.outcome === 'renewed') setDrainingAt(renewal.drainingAt)
+          else if (renewal !== null) setDrainingAt(null)
+        })
+      }
       const generation = ++latestProbe
       try {
         const state = await fetchPreviewState(projectId)
@@ -2697,9 +2719,47 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // sentence came back, and pressing again did the same thing. This surface holds the outcome now,
   // exactly as the project surface's hook does, and hands it to the same pure map so the wording
   // still has one author.
+  // THE SINKS ON THEIR OWN, so the single-flight guard can wrap exactly what a start writes into.
+  const startSinks: StartSinks = useMemo(
+    () => ({
+      projectId,
+      // WHERE A START'S URL LANDS ON THIS SURFACE, and without it the start control
+      // did nothing visible here. This surface feeds the resolver's project-scoped arm with
+      // `null` (its own poll only runs over an ALREADY framed URL, by design), and its
+      // `relaunchedUrl` arm used to be fed by a Relaunch button inside the pane that was
+      // retired — so a fresh start had no arm left to populate and the app came up in a
+      // container nothing framed. The relaunched arm is exactly right for it: a restore has no
+      // build lifecycle, which is why that arm resolves its own status to `ready`.
+      onStarted: (previewUrl: string) => {
+        // STAMP THE PROJECT, then record the URL — and the order does not matter, but the
+        // stamp does. Every project-scoped arm of the address resolver is gated by a stamp a
+        // SESSION leaves, and a chat with no session has none; without this a start fired here
+        // resolved to no address at all and the app came up in a container the pane refused to
+        // point at. Setting it is not a widening of the predicate, which must stay independent
+        // of the chat one — it is this surface honestly claiming the project's workspace,
+        // exactly as a reattach does when it adopts a live build.
+        sessionProjectRef.current = projectId
+        setStartedPreviewUrl(previewUrl)
+      },
+      // This surface has no map state of its own to move — it hands the pure map a `preview`
+      // and nothing else — so an in-flight press is local state here, exactly as it is in the
+      // hook the project surface uses.
+      onStartPending: setStartPending,
+      onStartOutcome: (outcome: StartOutcome | null) => {
+        setStartOutcome(outcome)
+        // A start that REACHED the app clears the outcome and asks again immediately, so the
+        // pane arrives at the running app on the press rather than on the next poll tick.
+        if (outcome === null) setPreviewProbeEpoch((n) => n + 1)
+      },
+    }),
+    [projectId],
+  )
+  const startTheApp = useStartApp(startSinks)
   usePublishWorkspaceReport(
     projectId
       ? {
+          ...startSinks,
+          projectId,
           // DERIVED, NOT KEPT BESIDE IT — same reason as `useWorkspaceState`'s call: this
           // surface's own `setPolledPreview` returns the previous object when the reading is
           // `unknown`, so `previewState` only ever HOLDS an `unknown` before anything has been
@@ -2711,36 +2771,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
             startOutcome,
             startInFlight: startPending,
           }),
-          projectId,
-          // WHERE A START'S URL LANDS ON THIS SURFACE, and without it the start control
-          // did nothing visible here. This surface feeds the resolver's project-scoped arm with
-          // `null` (its own poll only runs over an ALREADY framed URL, by design), and its
-          // `relaunchedUrl` arm used to be fed by a Relaunch button inside the pane that was
-          // retired — so a fresh start had no arm left to populate and the app came up in a
-          // container nothing framed. The relaunched arm is exactly right for it: a restore has no
-          // build lifecycle, which is why that arm resolves its own status to `ready`.
-          onStarted: (previewUrl) => {
-            // STAMP THE PROJECT, then record the URL — and the order does not matter, but the
-            // stamp does. Every project-scoped arm of the address resolver is gated by a stamp a
-            // SESSION leaves, and a chat with no session has none; without this a start fired here
-            // resolved to no address at all and the app came up in a container the pane refused to
-            // point at. Setting it is not a widening of the predicate, which must stay independent
-            // of the chat one — it is this surface honestly claiming the project's workspace,
-            // exactly as a reattach does when it adopts a live build.
-            sessionProjectRef.current = projectId
-            setStartedPreviewUrl(previewUrl)
-          },
-          // This surface has no map state of its own to move — it hands the pure map a `preview`
-          // and nothing else — so an in-flight press is local state here, exactly as it is in the
-          // hook the project surface uses.
-          onStartPending: setStartPending,
-          onStartOutcome: (outcome) => {
-            setStartOutcome(outcome)
-            // A start that REACHED the app clears the outcome and asks again immediately, so the
-            // pane arrives at the running app on the press rather than on the next poll tick.
-            if (outcome === null) setPreviewProbeEpoch((n) => n + 1)
-          },
           onRefresh: () => setPreviewProbeEpoch((n) => n + 1),
+          start: startTheApp,
         }
       : null,
   )

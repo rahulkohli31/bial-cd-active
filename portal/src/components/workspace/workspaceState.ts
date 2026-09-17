@@ -350,6 +350,27 @@ export type StartOutcome =
   /** The server named a reason. Carried verbatim — this map does not rewrite server prose. */
   | { readonly kind: 'failed'; readonly reason: string }
 
+/**
+ * HOW A START ATTEMPT ENDED, for the caller that has to decide what to do NEXT — distinct from
+ * `StartOutcome`, which is what the pane SAYS about it.
+ *
+ * The rail's send is the caller that needs the difference: a project with nothing saved to bring
+ * back is not a failed send — the first message is the very thing that provisions a workspace —
+ * while a refusal must stop the address where the citizen is standing.
+ */
+export type StartResult =
+  /** The server answered. Whether it had painted a page yet is the pane's business, not the
+   *  caller's: either way the container is up and the address is worth moving to. */
+  | { readonly kind: 'started' }
+  /** The snapshot gate's own 404: there is no saved build, and deliberately no blank-template
+   *  arm. NOT A FAILURE — nothing was wrong, there was simply nothing to restore. */
+  | { readonly kind: 'nothing-saved' }
+  /** It did not start. `error` is what was thrown, for a caller that must re-say it where the
+   *  citizen is standing rather than only in the pane. */
+  | { readonly kind: 'failed'; readonly error: unknown }
+  /** Nobody could be asked — no project is resolved, so no request was made and nothing failed. */
+  | { readonly kind: 'not-asked' }
+
 // ─── what a person may press ──────────────────────────────────────────────────────────────────
 
 /**

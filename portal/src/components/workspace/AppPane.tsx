@@ -29,8 +29,10 @@ import { inertWhile, usePaneLeaving } from './paneExit'
 import StartAppControl from './StartAppControl'
 import type { DeviceName } from './devices'
 import { WORKSPACE_RAIL_ID } from './railId'
+import WorkspaceLifecycleNotes from './WorkspaceLifecycleNotes'
 import {
   useWorkspaceAddress,
+  useWorkspaceLifecycle,
   useWorkspacePaneVisible,
   useWorkspaceReport,
 } from './workspaceChannel'
@@ -84,6 +86,7 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
   // column is the outermost thing that collapses, so the hold is decided here and handed to the
   // host — the two must not disagree about whether they are still on their way out.
   const leaving = usePaneLeaving(visible)
+  const lifecycle = useWorkspaceLifecycle()
 
   // THE FRAME MOUNTS IF AND ONLY IF THE PLATFORM HAS PROOF THE APP SERVED, and `running` is the
   // only name that carries that proof: the wire's `alive` is now gated on a stamp written where
@@ -174,6 +177,16 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
       >
         Skip past your app
       </button>
+
+      {/* WHAT THE PLATFORM OWES THE CITIZEN ABOUT THIS APP'S LIFE, above whatever the column is
+          showing and outside it. It belongs to the APP, not to the frame or to the card standing
+          in for one, so it is said once here and reads the same whether the address is a project
+          or a chat — this column is a sibling of the `<Outlet/>`, so a route change never reaches
+          it. It draws nothing at all when there is nothing to say, which is the ordinary case. */}
+      <WorkspaceLifecycleNotes
+        drainingAt={lifecycle.drainingAt}
+        writeBackRefusedAt={lifecycle.writeBackRefusedAt}
+      />
 
       {/* THE COLLAPSE CONTROL IS NOT HERE ANY MORE. It moved to the toolbar row, which is drawn
           once above the two-column grid. Here it was already better than living inside the rail

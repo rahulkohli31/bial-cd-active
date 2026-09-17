@@ -28,12 +28,14 @@ import WorkspaceRail from './WorkspaceRail'
 import AppSettingsDialog from '../projects/AppSettingsDialog'
 import ProjectDeleteDialog from '../projects/ProjectDeleteDialog'
 import SharePanel from '../projects/SharePanel'
-import { startApp } from './startApp'
+import { useStartApp } from './startApp'
+import type { StartSinks } from './startApp'
 import { useWorkspaceState } from './useWorkspaceState'
 import type { StartOutcome } from './workspaceState'
 import {
   useAppPaneVisible,
   usePublishAddress,
+  usePublishLifecycle,
   usePublishPaneView,
   usePublishSave,
   usePublishWorkspaceReport,
@@ -188,9 +190,10 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     }
   }, [project.id, alive, framedUrl, workspace.readTick])
 
-  const report = useMemo(
+  // THE SINKS ON THEIR OWN, because the single-flight guard wraps exactly these and has no
+  // business touching the state or the refresh beside them.
+  const sinks: StartSinks = useMemo(
     () => ({
-      state: workspace.state,
       projectId: project.id,
       onStarted: setStartedPreviewUrl,
       onStartPending: workspace.reportStartPending,
@@ -200,9 +203,13 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
         // arrives at the running app on the press rather than on the next tick of a 45-second timer.
         if (outcome === null) workspace.refresh()
       },
-      onRefresh: workspace.refresh,
     }),
     [workspace, project.id],
+  )
+  const start = useStartApp(sinks)
+  const report = useMemo(
+    () => ({ ...sinks, state: workspace.state, onRefresh: workspace.refresh, start }),
+    [sinks, workspace.state, workspace.refresh, start],
   )
 
   // THE APP STARTS BECAUSE SOMEBODY OPENED THE PROJECT. There is no press, and nothing on the way
@@ -225,8 +232,8 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     if (workspace.state.name !== 'not-running') return
     if (autoStarted.current === project.id) return
     autoStarted.current = project.id
-    void startApp(report)
-  }, [workspace.state.name, project.id, report])
+    void start()
+  }, [workspace.state.name, project.id, start])
 
   const paneView = useMemo(
     () => ({
@@ -345,18 +352,16 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   // hidden pane, because "there is nothing here yet" is a thing the app pane should say rather
   // than an absence a citizen has to interpret.
   useAppPaneVisible(true)
+  usePublishLifecycle({
+    drainingAt: workspace.drainingAt,
+    // The save read carries it: a refusal is durable and a citizen must meet it on their NEXT
+    // visit, not only in the session it happened in.
+    writeBackRefusedAt: workspace.save?.writeBackRefusedAt ?? null,
+  })
 
   return (
     <>
-      <WorkspaceRail
-        project={project}
-        lifecycle={{
-          drainingAt: workspace.drainingAt,
-          // The save read carries it: a refusal is durable and a citizen must meet it on their
-          // NEXT visit, not only in the session it happened in.
-          writeBackRefusedAt: workspace.save?.writeBackRefusedAt ?? null,
-        }}
-      />
+      <WorkspaceRail project={project} />
       {settingsOpen && (
         <AppSettingsDialog
           project={project}

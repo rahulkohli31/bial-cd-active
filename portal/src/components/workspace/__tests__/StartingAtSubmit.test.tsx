@@ -11,7 +11,7 @@
  * address that must not move early, and a pane — because a composer mounted alone sees none of it.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { act, render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import type { Project } from '../../../utils/projectApi'
 import { ApiError } from '../../../utils/apiError'
@@ -126,7 +126,8 @@ beforeEach(() => {
   // NOTHING FOR THE SCREEN ITSELF TO OPEN. Every scenario below is about what a SEND does when
   // the workspace is held elsewhere, and the screen now starts an app it finds restorable and
   // asleep — so a restorable reading here would have the surface correctly opening the workspace
-  // before the composer ever got to ask, which is a different story than the one under test.
+  // before the composer ever got to ask, which is a different story than the one under test. The
+  // two running at once is a story of its own, and it has its own block at the foot of this file.
   api.fetchPreviewState.mockResolvedValue({
     state: 'asleep', alive: false, previewUrl: null, occupyingProjectName: null,
     occupyingProjectId: null, restorable: false,
@@ -246,8 +247,8 @@ describe('a project with nothing built yet — the first message anybody sends',
     // The arm is on the CODE, not the status: `owned_project_or_404` answers this endpoint with
     // an uncoded 404 for a deleted or someone else's project. Matching status alone opened a chat
     // onto it, which then died a beat later with no explanation attached to the send.
-    // Mutation receipt: drop `&& err.code === 'no_saved_build'` from the rail and this
-    // goes red while the scenario above stays green.
+    // Mutation receipt: drop `&& err.code === 'no_saved_build'` from the start's classification
+    // and this goes red while the scenario above stays green.
     api.relaunchPreview.mockRejectedValue(projectGone())
     render(<Workspace project={NEVER_BUILT} />)
     type('an app to log visitors at the gate')
@@ -372,5 +373,84 @@ describe('★ a held workspace comes back on its own, with nothing sent', () => 
     // The wire carried the attribution; no surface repeats it. A tab preempted from elsewhere has
     // no cause to name, so naming one here would be the screen guessing.
     expect(document.body.textContent).not.toContain('Car pool')
+  })
+})
+
+
+/**
+ * ★ THREE THINGS START THIS APP, AND ONLY ONE OF THEM MAY BE RUNNING.
+ *
+ * Opening the project starts it, and a cold restore blocks for up to two minutes — which is
+ * exactly long enough for a citizen to type their first message over one. The composer stays live
+ * through that wait deliberately: they may keep typing, and their message is not the platform's to
+ * hold. What must not happen is Send firing a second container's worth of work whose `finally`
+ * clears the first start's busy state and whose answer lands on top of it, leaving the citizen
+ * reading the outcome of a start nobody made against a preview from the one they did.
+ */
+describe('★ a send that arrives while the app is already starting', () => {
+  const SAVED_AND_ASLEEP = {
+    state: 'asleep' as const, alive: false, previewUrl: null,
+    occupyingProjectName: null, occupyingProjectId: null, restorable: true,
+  }
+
+  const paneState = () =>
+    screen.getByTestId('app-pane-empty').getAttribute('data-workspace-state')
+
+  /** Let the send's async path run as far as it can without resolving the start it is waiting on. */
+  const letTheSendRun = () => act(async () => {
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+
+  it('★ joins the start already running instead of making a second one', async () => {
+    let finish: (() => void) | undefined
+    api.fetchPreviewState.mockResolvedValue(SAVED_AND_ASLEEP)
+    api.relaunchPreview.mockImplementation(
+      () => new Promise((resolve) => { finish = () => resolve(STARTED) }),
+    )
+    render(<Workspace />)
+
+    // Opening the project started the app, and the restore is still going.
+    await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(paneState()).toBe('starting'))
+
+    type('add an out-time column')
+    fireEvent.click(send())
+    await letTheSendRun()
+
+    // ONE request, and the pane is still narrating the one start there is — neither the second
+    // request nor the busy flag it would have cleared.
+    expect(api.relaunchPreview).toHaveBeenCalledTimes(1)
+    expect(paneState()).toBe('starting')
+    expect(screen.queryByTestId('chat-opened')).toBeNull()
+
+    finish?.()
+
+    // …and the send is answered by that start, once it lands.
+    await waitFor(() => expect(screen.getByTestId('chat-opened')).toBeTruthy())
+    expect(api.relaunchPreview).toHaveBeenCalledTimes(1)
+  })
+
+  it('★ and the answer it acts on belongs to the start that is actually running', async () => {
+    // The start the project opening made is held open; ANY second one is refused. So a chat that
+    // opens here has provably waited for the first start's own answer rather than acting on one
+    // it made itself.
+    let finish: (() => void) | undefined
+    api.fetchPreviewState.mockResolvedValue(SAVED_AND_ASLEEP)
+    api.relaunchPreview
+      .mockImplementationOnce(() => new Promise((resolve) => { finish = () => resolve(STARTED) }))
+      .mockRejectedValue(sharedViewHolds())
+    render(<Workspace />)
+    await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(1))
+
+    type('add an out-time column')
+    fireEvent.click(send())
+    await letTheSendRun()
+    finish?.()
+
+    await waitFor(() => expect(screen.getByTestId('chat-opened')).toBeTruthy())
+    expect(api.relaunchPreview).toHaveBeenCalledTimes(1)
+    // Nothing told them their message was lost, which is what a second, refused start would have.
+    expect(screen.queryAllByRole('alert')).toHaveLength(0)
   })
 })

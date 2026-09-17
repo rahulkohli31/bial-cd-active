@@ -136,6 +136,13 @@ export function useWorkspaceState({
   // carries nothing about it. `null` means no ceiling applies — never "soon".
   const [drainingAt, setDrainingAt] = useState<string | null>(null)
 
+  // A CEILING BELONGS TO ONE CONTAINER, and this hook is not remounted when the screen moves to
+  // another project — so the instant is dropped with the project it described. Keyed on the
+  // project alone, never on `epoch`: a retry press is not news about the container.
+  useEffect(() => {
+    setDrainingAt(null)
+  }, [projectId])
+
   const refresh = useCallback(() => setEpoch((n) => n + 1), [])
   // WHAT THE PANE LAST SAID ABOUT ITS FRAME. A ref, not state: it changes what the next read ASKS
   // and never what anybody renders, and state would re-arm the poll on both edges. Only the `true`
@@ -234,6 +241,10 @@ export function useWorkspaceState({
         void renewPresence(projectId, presence).then((renewal) => {
           if (!live || projectRef.current !== projectId) return
           if (renewal?.outcome === 'renewed') setDrainingAt(renewal.drainingAt)
+          // THE OTHER TWO OUTCOMES RETIRE IT. Both say the instant being held describes a
+          // container that is gone, or was never the one on screen. A `null` renewal says
+          // nothing at all — it is a fact about the request — so it clears nothing.
+          else if (renewal !== null) setDrainingAt(null)
         })
       }
       const generation = ++latest
@@ -294,6 +305,9 @@ export function useWorkspaceState({
           // state from a container that has since stopped would arm the unsaved-work guard against
           // work that is no longer reachable.
           setSave(null)
+          // AND THE CEILING GOES WITH IT: an instant naming when a container will be collected is
+          // nonsense about one that already has been.
+          setDrainingAt(null)
         }
 
         // HAS THE APP STOPPED? `mayHaveStopped` says which readings ask. A reading that takes the
