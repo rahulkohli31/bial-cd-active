@@ -85,32 +85,13 @@ export const RESTART_FAILED_CODES: ReadonlySet<string> = new Set([
  * complete answer — "Live", "Live · newer work saved" and "Live · couldn't check" are three
  * different things, and the last never reads as "nothing of yours is waiting".
  *
- * `failureCode` CORRECTS EXACTLY ONE STATE and is optional for that reason: every caller that
- * has the deployment in hand should pass it, and a caller that does not still gets the shipped
- * answer for all thirteen. It is read HERE rather than at a surface so the chip and the panel
- * cannot come to describe one failed restart in two ways.
+ * THE STATE VOCABULARY IS NOT THIS REDESIGN'S TO EXTEND. A failed restart and a first deploy
+ * that never came up are different events, and an earlier pass added a fourteenth label to say
+ * so — which changed what the product MEANS by its own states rather than how they are laid out.
+ * The distinction is still drawn, but on the Deployment panel's own notice, where it is an
+ * explanation rather than a status.
  */
-export function presentationFor(state: PublishState, failureCode: string | null = null): Presentation {
-  // A FAILED RESTART IS NOT A FAILED FIRST DEPLOY, and only this one state is renamed. An
-  // administrator's lockout and a pending submission outrank the deployment row server-side, so
-  // a code that outlived its attempt must not shout over "Switched off" or "In review" —
-  // `did_not_start` is the single state a failed restart is spoken as wrongly.
-  if (state === 'did_not_start' && failureCode !== null && RESTART_FAILED_CODES.has(failureCode)) {
-    return {
-      label: 'Could not restart',
-      // No "try again": a restart runs the SAME version, so a restart that keeps failing is an
-      // application whose own code is the fault. Pressing it again is waiting for nothing.
-      sentence:
-        'Your app did not come back up. A restart runs the same version again, so if it keeps ' +
-        'failing the fault is in the app itself — describe the fix in a chat and send it for review.',
-      action: null,
-      version: 'last_published',
-    }
-  }
-  return presentationForState(state)
-}
-
-function presentationForState(state: PublishState): Presentation {
+export function presentationFor(state: PublishState): Presentation {
   switch (state) {
     case 'nothing_built':
       // Canvas, verbatim.

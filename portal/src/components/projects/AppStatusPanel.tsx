@@ -245,8 +245,8 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
 
   const state = deployment?.publishState ?? null
   const presentation = useMemo(
-    () => (state === null ? null : presentationFor(state, deployment?.failureCode ?? null)),
-    [state, deployment?.failureCode],
+    () => (state === null ? null : presentationFor(state)),
+    [state],
   )
   const look = useMemo(() => (state === null ? null : lookFor(state)), [state])
   const rows = useMemo(
