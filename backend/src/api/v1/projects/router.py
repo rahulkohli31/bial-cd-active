@@ -287,13 +287,13 @@ async def check_duplicate_projects(
     citizen's published work, not just the caller's own. What `user` buys here is simply that
     an unauthenticated caller cannot probe the catalog through this endpoint either.
 
-    NEVER 500s on a search failure (R37) — `find_possible_duplicates` catches everything
+    NEVER 500s on a search failure — `find_possible_duplicates` catches everything
     internally and answers an empty result, so this handler has nothing extra to guard.
     """
     result = await find_possible_duplicates(db, body.description, embedder)
-    # R39's first event, fired on EVERY call including a zero-match one — see
-    # `log_matches_shown`'s docstring for why zero is itself worth counting.
-    log_matches_shown(project_id_hint=None, match_count=len(result.matches))
+    # Fired on EVERY call including a zero-match one — see `log_matches_shown`'s docstring
+    # for why zero is itself worth counting.
+    log_matches_shown(match_count=len(result.matches))
     return ProjectDuplicateCheckResponse(matches=result.matches)
 
 

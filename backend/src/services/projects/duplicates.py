@@ -14,7 +14,6 @@ cannot start a project, so every failure mode collapses to "no duplicate found".
 
 from __future__ import annotations
 
-import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -333,17 +332,13 @@ async def _find_possible_duplicates(
     return DuplicateCheckResult(matches=matches)
 
 
-def log_matches_shown(*, project_id_hint: uuid.UUID | None, match_count: int) -> None:
-    """R39's first event: how many matches the check surfaced, every time it runs
-    (including zero — the day-one, empty-catalog case is itself worth counting, since
-    "the check ran and found nothing" is a different fact from "the check never ran")."""
-    logger.info(
-        DUPLICATE_MATCHES_SHOWN_EVENT,
-        match_count=match_count,
-        # `None` on create (no project exists yet to hang the event off) — the caller may
-        # still correlate by request/session if needed; this is a count, not an audit trail.
-        project_id_hint=str(project_id_hint) if project_id_hint is not None else None,
-    )
+def log_matches_shown(*, match_count: int) -> None:
+    """How many matches the check surfaced, every time it runs (including zero — the
+    day-one, empty-catalog case is itself worth counting, since "the check ran and found
+    nothing" is a different fact from "the check never ran"). No project id: this runs
+    BEFORE a project exists, to check a description against the live marketplace before
+    creating one — there is nothing to hang the event off yet."""
+    logger.info(DUPLICATE_MATCHES_SHOWN_EVENT, match_count=match_count)
 
 
 def log_resolution(*, resolution: str) -> None:
