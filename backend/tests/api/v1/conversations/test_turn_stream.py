@@ -499,10 +499,13 @@ async def test_plan_kind_model_sees_no_write_tools(
         "search_files",
         "run_command",
         "present_plan_options",
-        # tell_the_user / propose_first_slice are shared by BOTH kinds. Exact-set on purpose:
-        # a tool meant for both arms that reached only one is drift a subset check would miss.
+        # tell_the_user / propose_first_slice / check_the_app are shared by BOTH kinds. Exact-set
+        # on purpose: a tool meant for both arms that reached only one is drift a subset check
+        # would miss. A Plan turn has no other route to the app's current state, which is why the
+        # state tool is registered here and not only on the Build arm.
         "tell_the_user",
         "propose_first_slice",
+        "check_the_app",
     }
 
 

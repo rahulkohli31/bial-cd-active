@@ -1,8 +1,11 @@
 """The native message store's round-trip property and its seams.
 
-Contract: dump → externalize binaries → redact → JSONB → rehydrate → validate → repair; the
-only differences between what went in and what comes out are redacted values and
-externalized-then-rehydrated binaries. Reasoning blocks are the one redaction exemption.
+Contract: dump → externalize binaries → JSONB → rehydrate → validate → repair; the only
+difference between what went in and what comes out is an externalized-then-rehydrated binary.
+NOTHING IS MASKED ON THE WAY IN: the row is the record of what the model was sent, and a store
+that rewrites what it holds cannot replay the prefix the provider already cached. Masking is the
+chat-feed projection's job — `test_projection.py` is where it is pinned. A row's `meta` is the
+one thing still masked here, and `load_history` never reads it.
 
 Equality here is asserted on CANONICAL DUMPS (`dump_python(..., mode="json")`), not dataclass
 `==`: pydantic-ai 2.5.0 validates an image `BinaryContent` back as its `BinaryImage` subclass, so
@@ -17,7 +20,6 @@ import asyncio
 import base64
 
 import pytest
-from pydantic_ai import Agent
 from pydantic_ai.messages import (
     BinaryContent,
     CachePoint,
@@ -32,12 +34,10 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.models.function import FunctionModel
 
 from src.core.redaction import redact_secrets
 from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
-from src.services.agent.mode_prompts import workspace_note
 from src.services.messages import store
 from src.services.messages.store import (
     ATTACHMENT_REF_KIND,
@@ -143,25 +143,33 @@ async def test_batches_concatenate_in_seq_order(db_session, thread):
     assert _dump(loaded) == _dump(first + second)
 
 
-# --- redaction at the persist seam --------------------------------------------
+# --- the persist seam rewrites nothing, and `meta` is the one exception -----------
 
 
-async def test_dsn_in_tool_return_is_stored_redacted(db_session, thread):
+async def test_a_dsn_in_a_tool_return_is_stored_exactly_as_it_was_sent(db_session, thread):
+    """★ THE PROPERTY EVERY CACHE READ RESTS ON. A build turn that read a `.env` sends the raw
+    line on the wire; if the store masked it, next turn's replay would differ from the prefix
+    the provider holds and the whole request would be paid for again.
+
+    The `meta` assertion beside it is what says the masker is still wired at all — a change that
+    deleted redaction from this module outright would satisfy the first assertion perfectly.
+
+    Mutation check: re-apply `_redact_tree` over the payload in `dump_for_row` and the first
+    assertion goes red."""
     user, conversation = thread
     password = "sup3rs3cretpw"  # noqa: S105 — the value under test
     dsn = f"postgresql://appuser:{password}@dbhost:5432/bialapp"
+    sent = f"BIAL_DATABASE_URL={dsn}"
     history: list[ModelMessage] = [
         ModelResponse(
             parts=[ToolCallPart(tool_name="run_command", args={"argv": ["env"]}, tool_call_id="t")]
         ),
         ModelRequest(
-            parts=[
-                ToolReturnPart(
-                    tool_name="run_command", content=f"BIAL_DATABASE_URL={dsn}", tool_call_id="t"
-                )
-            ]
+            parts=[ToolReturnPart(tool_name="run_command", content=sent, tool_call_id="t")]
         ),
     ]
+    # The premise: this IS a string the masker mangles, so "it arrived intact" means something.
+    assert redact_secrets(sent) != sent
     stored = await append_batch(
         db_session,
         user_id=user.id,
@@ -169,16 +177,22 @@ async def test_dsn_in_tool_return_is_stored_redacted(db_session, thread):
         messages=history,
         entry_kind=MessageEntryKind.STEP,
         kind=ChatKind.BUILD,
+        meta={"kind": "write_reprompt", "detail": sent},
     )
     row = await db_session.get(Message, stored.id)
     assert row is not None
-    flat = str(row.payload)
-    # Both the whole DSN and the bare password are registered redactions (security.md).
-    assert password not in flat
-    assert password not in str(row.meta)
+    assert sent in str(row.payload), (
+        "the store rewrote the transcript, so the replayed prefix is not the prefix"
+    )
+    assert password not in str(row.meta), "system-event metadata is still masked"
 
 
-async def test_dsn_in_tool_args_is_stored_redacted(db_session, thread):
+async def test_a_dsn_in_tool_arguments_is_stored_exactly_as_it_was_sent(db_session, thread):
+    """The other half of one wire message: the model's own arguments, which is where a
+    credential most often appears (`psql postgresql://u:pw@h/db`).
+
+    Its argv is already masked upstream, at composition, by the tool that ran it — so what
+    reaches this seam has been through one redactor and must go into the row unchanged."""
     user, conversation = thread
     password = "arg-secret-pw"  # noqa: S105
     history: list[ModelMessage] = [
@@ -202,37 +216,32 @@ async def test_dsn_in_tool_args_is_stored_redacted(db_session, thread):
     )
     row = await db_session.get(Message, stored.id)
     assert row is not None
-    assert password not in str(row.payload)
+    assert password in str(row.payload)
 
 
 # --- reasoning: verbatim to the row, dropped when it cannot be replayed -------
 
 
-def test_a_reasoning_block_reaches_the_row_verbatim_while_the_prose_beside_it_is_redacted():
-    """The masker's ONE exemption, next to what proves it is scoped rather than a hole.
+def test_reasoning_and_the_prose_beside_it_both_reach_the_row_verbatim():
+    """A reasoning block replays to the SAME provider, which verifies its signature against its
+    content, so one rewritten character gets the next turn rejected outright. That used to be an
+    exemption carved out of a masker; it is now simply what the seam does for everything.
 
-    An agent narrates credential-shaped strings while it works; `redact_secrets` matches on
-    shape and over-redacts, which fails signature verification if one rewritten character
-    reaches a replayed reasoning block — so this field goes to the row byte-for-byte, while
-    the sentence the agent actually SAID, carrying the same token, is masked as ever.
+    Written with strings the masker demonstrably mangles, because text it had no opinion about
+    would prove nothing at all.
 
-    Mutation check: drop `content` from `_THINKING_VERBATIM`, or the `part_kind` guard that
-    selects it, and the reasoning arrives as the masked string this test compares against."""
+    Mutation check: re-apply `_redact_tree` over the payload in `dump_for_row` and every
+    assertion here goes red."""
     reasoning = (
         "The template reads BIAL_DATA_BASE_URL at boot. Setting "
         "BIAL_APP_TOKEN=tok_9f2b1c4d7e in the env file would ship it to the browser, so I will "
         'keep apiKey = "sk_live_51H8xQ2abcdefghijkl" on the server instead.'
     )
-    # A signature is an opaque blob and the masker matches on shape, so a `bial_…`-shaped run
-    # inside one is a collision waiting to happen rather than a contrivance. It is written to be
-    # a string the masker demonstrably rewrites because a signature it happened to leave alone
-    # would prove nothing at all about the exemption.
     signature = "ErUBCkYIBBgCIkAxbial_9f2b1c4d7e0a1b2c3d4e/QQ=="
     spoken = 'I moved apiKey = "sk_live_51H8xQ2abcdefghijkl" to the server, so nothing leaks.'
-    # The premise both assertions below rest on: these are strings the masker MANGLES. Without
-    # this, "arrived intact" could hold for text the masker never had an opinion about.
     assert redact_secrets(reasoning) != reasoning
     assert redact_secrets(signature) != signature
+    assert redact_secrets(spoken) != spoken
 
     [dumped] = dump_for_row(
         [
@@ -252,14 +261,8 @@ def test_a_reasoning_block_reaches_the_row_verbatim_while_the_prose_beside_it_is
     thinking, text = dumped["parts"]
     assert thinking["content"] == reasoning
     assert thinking["signature"] == signature
-    # The exemption is by FIELD, not "any string under a thinking part": a sibling field on the
-    # SAME part is masked like anything else, so a future user-facing field cannot inherit the
-    # exemption merely by being added there.
-    assert thinking["provider_details"] == {"note": "BIAL_APP_TOKEN=***"}
-    # And the prose beside it is redacted as ever — while still reading as a sentence, which is
-    # what says the row holds a masked line rather than nothing at all.
-    assert "sk_live_51H8xQ2abcdefghijkl" not in text["content"]
-    assert text["content"] == 'I moved apiKey = "***" to the server, so nothing leaks.'
+    assert thinking["provider_details"] == {"note": "BIAL_APP_TOKEN=tok_9f2b1c4d7e"}
+    assert text["content"] == spoken
 
 
 async def test_a_provider_redacted_reasoning_block_survives_the_round_trip(db_session, thread):
@@ -1120,68 +1123,6 @@ def test_unswapped_ref_marker_fails_loud_not_silent():
     ]
     with pytest.raises(Exception, match="cache-point|validation"):
         ModelMessagesTypeAdapter.validate_python(raw)
-
-
-async def test_an_injected_note_then_the_prompt_maps_to_ordered_user_messages_on_the_wire():
-    """The wire contract every EPHEMERAL INJECTED NOTE rests on, re-pointed from the retired
-    mode-switch marker to the note that actually rides today.
-
-    The turn engine appends the workspace note to `message_history` as a `user`-role request and
-    then passes this turn's prompt separately, so two consecutive user-role messages reach the
-    wire. The Anthropic API accepts and folds them, IN ORDER — which is what makes the note read
-    as context for the prompt that follows rather than as a message the user sent afterwards.
-    The marker is gone; this contract is not, because the note uses it."""
-    from pydantic_ai.models import ModelRequestParameters
-    from pydantic_ai.models.anthropic import AnthropicModel
-    from pydantic_ai.providers.anthropic import AnthropicProvider
-
-    model = AnthropicModel("claude-sonnet-4-5", provider=AnthropicProvider(api_key="offline"))
-    note = workspace_note(serving=True, still_the_template=False)
-    messages: list[ModelMessage] = [
-        ModelRequest(parts=[UserPromptPart(content="build me an app")]),
-        ModelResponse(parts=[TextPart(content="done")]),
-        ModelRequest(parts=[UserPromptPart(content=note)]),
-        ModelRequest(parts=[UserPromptPart(content="add a dashboard")]),
-    ]
-    params = model.customize_request_parameters(ModelRequestParameters())
-    _, wire = await model._map_message(messages, params, {})  # noqa: SLF001 — pinned-version seam
-    roles = [message["role"] for message in wire]
-    assert roles == ["user", "assistant", "user", "user"]
-    assert "checked this app's workspace just now" in str(wire[2])
-    assert "add a dashboard" in str(wire[3])
-
-
-async def test_no_prompt_run_adopts_a_trailing_injected_note_as_the_prompt():
-    """THE GOTCHA (pinned), re-pointed from the retired marker to the note that rides today.
-
-    Running with no user prompt while an injected note is the last history message makes the
-    model answer the NOTE. The turn engine must always pass a real user prompt; this is the
-    tripwire that keeps that rule honest, and it matters more now than it did with the marker,
-    because the workspace note is appended on EVERY turn that pinned a workspace rather than
-    only at a switch."""
-    seen: list[list[ModelMessage]] = []
-
-    def capture(messages, info):
-        seen.append(messages)
-        return ModelResponse(parts=[TextPart(content="ok")])
-
-    agent = Agent(FunctionModel(capture))
-    note = ModelRequest(
-        parts=[UserPromptPart(content=workspace_note(serving=False, still_the_template=None))]
-    )
-    history: list[ModelMessage] = [
-        ModelRequest(parts=[UserPromptPart(content="real question")]),
-        ModelResponse(parts=[TextPart(content="answer")]),
-        note,
-    ]
-    result = await agent.run(None, message_history=history)
-    assert result is not None
-    last = seen[0][-1]
-    assert isinstance(last, ModelRequest)
-    (part,) = last.parts
-    assert isinstance(part, UserPromptPart)
-    # The note IS the effective prompt — exactly what a caller must never let happen.
-    assert "checked this app's workspace just now" in str(part.content)
 
 
 async def test_unsigned_reasoning_maps_to_a_visible_assistant_text_block():

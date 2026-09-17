@@ -166,18 +166,39 @@ async def _one_turn(
     conversation,
     user_id: uuid.UUID,
     prompt: str,
-    history: list[ModelMessage],
 ) -> list[ModelMessage]:
-    """Drive one real turn and return the message list the model was handed.
+    """Drive one real turn against the stored conversation and return what the model was handed.
 
-    Through the engine rather than through the injection helper: what reaches the model is the
-    claim, and a helper's return value is not that.
+    Everything about the durability path is production's, because the store is where the
+    rewriting this file hunts actually happens:
+
+    - history is LOADED, never carried across in memory;
+    - the prompt row is written by `persist_user_turn`, which the engine calls before the model
+      runs, exactly as the route does;
+    - the reply is written by the engine itself, off `_persistable_messages`.
+
+    That last point is the trap. A test that appends [prompt, reply] itself after the turn writes
+    the reply a second time, and the doubled row shifts every later turn's history — a divergence
+    the fixture manufactured, which no implementation can remove.
     """
+    history = await load_history(
+        db_session, user_id=user_id, conversation_id=conversation.id, rehydrate=_no_refs
+    )
     seen: list[list[ModelMessage]] = []
 
     async def _stream(messages: list[ModelMessage], info: AgentInfo):
         seen.append(list(messages))
         yield "noted."
+
+    async def _persist_prompt() -> None:
+        await append_batch(
+            db_session,
+            user_id=user_id,
+            conversation_id=conversation.id,
+            messages=[ModelRequest(parts=[UserPromptPart(content=prompt)])],
+            entry_kind=MessageEntryKind.TURN,
+            kind=ChatKind.PLAN,
+        )
 
     await engine.start_turn(
         conversation=conversation,
@@ -190,7 +211,7 @@ async def _one_turn(
         manager=SessionManager(),
         model=FunctionModel(stream_function=_stream),
         session_factory=session_factory,
-        persist_user_turn=_noop_persist,
+        persist_user_turn=_persist_prompt,
         sandbox_client=FakeSandboxClient(),
     )
     state = engine.peek(conversation.id)
@@ -217,45 +238,27 @@ async def test_turn_two_reproduces_turn_one_byte_for_byte_up_to_the_new_prompt(
     user = await UserFactory.create(db_session)
     conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.PLAN)
 
-    first_prompt = ModelRequest(parts=[UserPromptPart(content="add a visitors chart")])
-    await append_batch(
-        db_session,
-        user_id=user.id,
-        conversation_id=conv.id,
-        messages=[first_prompt],
-        entry_kind=MessageEntryKind.TURN,
-        kind=ChatKind.PLAN,
-    )
-    history_one = await load_history(
-        db_session, user_id=user.id, conversation_id=conv.id, rehydrate=_no_refs
-    )
-    turn_one = await _one_turn(
-        _fresh_engine, db_session, session_factory, conv, user.id, "and a date filter", history_one
-    )
-
-    # What production persists between the two turns: this turn's prompt and its reply.
+    # The seed ends with an assistant reply, and that is load-bearing rather than decorative: the
+    # provider's mapper folds ADJACENT requests into one wire entry, so a history ending on a user
+    # prompt would merge into turn one's prompt while turn two's — separated by turn one's reply —
+    # would not. The two turns have to meet the mapper in the same shape or the comparison is
+    # measuring the fixture.
     await append_batch(
         db_session,
         user_id=user.id,
         conversation_id=conv.id,
         messages=[
-            ModelRequest(parts=[UserPromptPart(content="and a date filter")]),
-            ModelResponse(parts=[TextPart(content="noted.")]),
+            ModelRequest(parts=[UserPromptPart(content="add a visitors chart")]),
+            ModelResponse(parts=[TextPart(content="the chart is in.")]),
         ],
         entry_kind=MessageEntryKind.TURN,
         kind=ChatKind.PLAN,
     )
-    history_two = await load_history(
-        db_session, user_id=user.id, conversation_id=conv.id, rehydrate=_no_refs
+    turn_one = await _one_turn(
+        _fresh_engine, db_session, session_factory, conv, user.id, "and a date filter"
     )
     turn_two = await _one_turn(
-        _fresh_engine,
-        db_session,
-        session_factory,
-        conv,
-        user.id,
-        "now group by month",
-        history_two,
+        _fresh_engine, db_session, session_factory, conv, user.id, "now group by month"
     )
 
     before = await _wire_bytes(turn_one)
@@ -306,28 +309,11 @@ async def test_the_prefix_holds_across_a_turn_that_called_tools(
         entry_kind=MessageEntryKind.TURN,
         kind=ChatKind.PLAN,
     )
-    history_one = await load_history(
-        db_session, user_id=user.id, conversation_id=conv.id, rehydrate=_no_refs
-    )
     turn_one = await _one_turn(
-        _fresh_engine, db_session, session_factory, conv, user.id, "now add a filter", history_one
-    )
-    await append_batch(
-        db_session,
-        user_id=user.id,
-        conversation_id=conv.id,
-        messages=[
-            ModelRequest(parts=[UserPromptPart(content="now add a filter")]),
-            ModelResponse(parts=[TextPart(content="noted.")]),
-        ],
-        entry_kind=MessageEntryKind.TURN,
-        kind=ChatKind.PLAN,
-    )
-    history_two = await load_history(
-        db_session, user_id=user.id, conversation_id=conv.id, rehydrate=_no_refs
+        _fresh_engine, db_session, session_factory, conv, user.id, "now add a filter"
     )
     turn_two = await _one_turn(
-        _fresh_engine, db_session, session_factory, conv, user.id, "and sort it", history_two
+        _fresh_engine, db_session, session_factory, conv, user.id, "and sort it"
     )
 
     diverged = _first_divergence(await _wire_bytes(turn_one), await _wire_bytes(turn_two))

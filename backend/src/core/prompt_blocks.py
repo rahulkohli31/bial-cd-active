@@ -468,7 +468,9 @@ excluded).
 - `tell_the_user` — Speak into a GAP — a stretch of work long enough that the person waiting \
 would otherwise be watching a still screen.
 - `propose_first_slice` — When a request arrives with a lot of separate things in it, \
-propose what to build first."""
+propose what to build first.
+- `check_the_app` — Find out what this app is doing right now — whether it is serving, and \
+whether the page the user actually looks at is still the starter template."""
 """GENERATED, NOT WRITTEN — a checked-in snapshot of
 `services/agent/toolsets.render_tool_surface(ChatKind.BUILD)`, which renders one line per
 tool from the tool definitions pydantic-ai hands the model at registration.

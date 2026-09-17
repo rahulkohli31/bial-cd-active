@@ -60,7 +60,8 @@ from src.core.integrity_types import BaselineIdentity
 from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.token_usage import TokenUsage
-from src.services.agent.mode_prompts import PromptContext, workspace_note
+from src.services.agent.mode_prompts import PromptContext
+from src.services.agent.toolsets import _APP_STATE_SENTENCES
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
 from src.services.build_sessions.manager import (
@@ -68,10 +69,14 @@ from src.services.build_sessions.manager import (
     SandboxReclaimBlockedError,
     SessionManager,
 )
-from src.services.messages.projection import _LBL_FALLBACK, long_operation_line
+from src.services.messages.projection import (
+    _LBL_FALLBACK,
+    APP_STATE_TOOL,
+    long_operation_line,
+)
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.errors import from_client, from_tsc
-from src.services.orchestrator.selfheal import HealthState, VerifyOutcome
+from src.services.orchestrator.selfheal import AppState, HealthState, VerifyOutcome
 from src.services.sandbox import DevStatus, SandboxError, SandboxHandle, ServedPage
 from src.services.sandbox.base import CompileReport, CompileState, ExecResult
 from src.services.sandbox.client import _ALREADY_RUNNING_PID
@@ -1604,21 +1609,21 @@ def test_the_conflict_and_the_turn_ending_say_the_same_thing_about_the_work() ->
     assert len(set(said)) == 3, f"three states must read as three sentences, got {said!r}"
 
 
-async def test_the_workspace_note_rides_a_build_turn_too(
+async def test_nothing_is_spliced_onto_a_build_turns_history_either(
     _fresh_engine,
     db_session,
     session_factory,
     fake_redis: aioredis.Redis,
     fake_storage,
 ) -> None:
-    """The BUILD half of the workspace note. Injected once, ABOVE the branch that
-    picks the run loop, so both kinds get the same message; the Plan half is proven cheaply
-    by `test_reminders.py::test_the_workspace_note_still_rides_a_turn_off_any_anchor`, while
-    Build needs the provisioned-container harness this file already stands up.
+    """★ THE BUILD HALF of the no-splice property. The Plan half is proven cheaply by
+    `test_reminders.py::test_nothing_at_all_is_spliced_between_the_history_and_the_citizens_
+    prompt`; Build needs the provisioned-container harness this file already stands up, and it
+    is the arm that pinned a workspace, which is exactly when the platform used to push.
 
-    IT ALSO USED TO PIN A MECHANISM THAT IS GONE: the per-turn restatement's cadence-gated
-    injector, now retired (`test_reminders.py` is its inertness guard). The fixture's history
-    length stays as-is so the note-rides-every-turn claim isn't weakened by shortening it."""
+    A COUNT, with the count itself as the liveness half: three prior turns plus this one's
+    prompt is four user messages, so a turn that reached the model with nothing fails the same
+    assertion a turn carrying one extra thing does."""
     engine = _fresh_engine
     user, project, conv = await _write_conversation(db_session, "wt-note@rvaiglobal.com")
     manager, client = SessionManager(), FakeSandboxClient()
@@ -1628,7 +1633,6 @@ async def test_the_workspace_note_rides_a_build_turn_too(
         seen.append(list(messages))
         yield "noted."
 
-    # THREE prior turns, kept at the length the original claim was measured against.
     history: list[ModelMessage] = [
         message
         for n in range(3)
@@ -1658,36 +1662,51 @@ async def test_the_workspace_note_rides_a_build_turn_too(
         for part in message.parts
         if isinstance(part, UserPromptPart)
     ]
-    assert not any("mode is active" in str(p) for p in prompts), (
-        "the fixture must be OFF the reminder cadence, or this proves nothing"
+    assert prompts == ["q0", "q1", "q2", "add a status column"], (
+        f"the model was handed {prompts!r} — the history's three turns and this prompt is all "
+        "a Build turn may carry"
     )
-    assert any("checked this app's workspace just now" in str(p) for p in prompts)
 
 
-async def test_the_workspace_note_never_reaches_a_persisted_row(
+async def test_a_state_reading_reaches_a_persisted_row(
     _fresh_engine,
     db_session,
     session_factory,
     fake_redis: aioredis.Redis,
     fake_storage,
 ) -> None:
-    """The durable side stays clean by CONSTRUCTION, not by a filter that has to remember.
-    `_persistable_messages` drops any request carrying a user prompt, and the note is one — so
-    nothing downstream ever has to strip it, and nothing can forget to."""
+    """★ WHAT A PULL BUYS OVER A PUSH: the answer the model was given is in the transcript, so
+    next turn replays it instead of losing it.
+
+    A pushed note rode injected history, which `new_messages()` structurally excludes — correct
+    for an ephemeral note and fatal for a prefix, because the citizen's prompt beside it IS
+    persisted. A tool return is a `ModelRequest` carrying no user prompt, which is precisely
+    what `_persistable_messages` keeps, so no new persistence rule was needed for this.
+
+    Mutation check: exclude tool-return requests from `_persistable_messages` and the row
+    assertion goes red (and half this repo's dangling-call repair starts firing)."""
     engine = _fresh_engine
     user, project, conv = await _write_conversation(db_session, "wt-note2@rvaiglobal.com")
     manager, client = SessionManager(), FakeSandboxClient()
-    seen: list[list[ModelMessage]] = []
 
-    async def _stream(messages: list[ModelMessage], _info: AgentInfo):
-        seen.append(list(messages))
-        yield "done."
+    async def _asks_then_answers(messages: list[ModelMessage], _info: AgentInfo):
+        if not any(
+            isinstance(part, ToolReturnPart) and part.tool_name == APP_STATE_TOOL
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+        ):
+            yield DeltaToolCalls(
+                {0: DeltaToolCall(name=APP_STATE_TOOL, json_args="{}", tool_call_id="state-1")}
+            )
+        else:
+            yield "done."
 
     await _run(
         engine,
         db_session,
         session_factory,
-        FunctionModel(stream_function=_stream),
+        FunctionModel(stream_function=_asks_then_answers),
         user=user,
         project=project,
         conv=conv,
@@ -1695,47 +1714,39 @@ async def test_the_workspace_note_never_reaches_a_persisted_row(
         client=client,
     )
 
-    # LIVENESS FIRST, and it is not optional. An assert-absence check also passes when the thing
-    # under test never ran at all — this repo has shipped that exact false green before — so if
-    # the note never rode the request, the row check below would be asserting the absence of
-    # something nothing ever produced.
-    rode = " ".join(
-        str(part.content)
-        for message in seen[0]
-        if isinstance(message, ModelRequest)
-        for part in message.parts
-        if isinstance(part, UserPromptPart)
-    )
-    assert "checked this app's workspace" in rode, "it must ride, or the absence is free"
-
     rows = (
         (await db_session.execute(sa.select(Message).where(Message.conversation_id == conv.id)))
         .scalars()
         .all()
     )
-    dumped = " ".join(str(row.payload) for row in rows)
-    assert "checked this app's workspace" not in dumped
+    returned = [
+        part
+        for row in rows
+        for message in row.payload
+        for part in message.get("parts", [])
+        if part.get("part_kind") == "tool-return" and part.get("tool_name") == APP_STATE_TOOL
+    ]
+    assert returned, "the state reading is not in the transcript, so next turn cannot replay it"
+    assert str(returned[0]["content"]) in set(_APP_STATE_SENTENCES.values()), (
+        f"the stored reading is not one of the platform's four verdicts: {returned[0]!r}"
+    )
 
 
-def test_the_note_says_cannot_tell_rather_than_healthy_when_it_could_not_check() -> None:
+def test_the_reading_says_cannot_tell_rather_than_healthy_when_it_could_not_check() -> None:
     """An unanswerable check is reported as one. A model told "your app is fine" on the strength
     of a check that never completed is WORSE off than one told nothing at all — it will now
-    defend the claim to the user who is looking at the broken app."""
-    unknown = workspace_note(serving=None, still_the_template=None)
+    defend the claim to the user who is looking at the broken app.
+
+    The four verdicts are four distinct sentences, checked as a set: two answers collapsed onto
+    one wording is the same defect as one answer missing."""
+    unknown = _APP_STATE_SENTENCES[AppState.UNKNOWN]
     assert "could not tell" in unknown
     assert "check for yourself" in unknown
 
-    half_known = workspace_note(serving=True, still_the_template=None)
-    assert "could not tell" in half_known, "a serving app with an unreadable baseline is not clear"
-
-    down = workspace_note(serving=False, still_the_template=None)
-    assert "not currently serving" in down
-
-    template = workspace_note(serving=True, still_the_template=True)
-    assert "starter template" in template
-
-    live = workspace_note(serving=True, still_the_template=False)
-    assert "no longer the starter template" in live
+    assert "not currently serving" in _APP_STATE_SENTENCES[AppState.NOT_SERVING]
+    assert "starter template" in _APP_STATE_SENTENCES[AppState.STILL_THE_TEMPLATE]
+    assert "no longer the starter template" in _APP_STATE_SENTENCES[AppState.LIVE]
+    assert len(set(_APP_STATE_SENTENCES.values())) == len(AppState)
 
 
 async def test_an_unanswerable_verdict_is_never_narrated_as_a_defect(

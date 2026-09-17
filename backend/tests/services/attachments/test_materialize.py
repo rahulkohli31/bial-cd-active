@@ -382,103 +382,53 @@ async def test_a_transient_storage_failure_still_says_try_again() -> None:
     assert isinstance(caught.value.__cause__, StorageAuthError)
 
 
-# --- the note ------------------------------------------------------------------------
+# --- the listing -----------------------------------------------------------------------
 
 
-def test_the_note_names_the_file_the_path_and_the_reader() -> None:
-    """★ THE SINGLE FAILURE THE DESIGN EXISTS TO PREVENT, pinned as three separate presences.
+def test_the_listing_names_the_file_and_both_of_its_addresses() -> None:
+    """★ HALF OF THE SINGLE FAILURE THE DESIGN EXISTS TO PREVENT, pinned as three presences.
 
     Without the path the agent looks in the app tree and concludes nothing was uploaded. Without
-    the reader it writes its own parser — which takes the first sheet, misses the formulas and
-    inlines a photo, and reports all of it as confidently as a correct answer. Without the file's
-    own name the citizen's question ("what is in the roster?") does not connect to anything.
+    the file's own name the citizen's question ("what is in the roster?") does not connect to
+    anything. The third half — do not write your own parser — is standing text and lives with
+    the rest of the rules in `agent/mode_prompts.ATTACHMENT_RULES`.
+
+    ★ EVERY FILE GETS TWO ADDRESSES because Build has no `read_attachment` tool (R15: it runs,
+    and may edit, the reader through `run_command`), and `run_command` executes inside the app
+    folder — where `.attachments/` does not exist. The listing is kind-blind by design, so it
+    gives both and the rules say which is for what.
 
     Mutation receipt: remove any one of the three and its assertion goes red.
     """
-    note = AttachmentDelivery(
+    listing = AttachmentDelivery(
         files=(_file(name="Gate roster.xlsx", file_name="Gate_roster.xlsx", size=4096),),
         storage=FakeStorage(),
-    ).note()
+    ).listing()
 
-    assert "Gate roster.xlsx" in note
-    assert ".attachments/Gate_roster.xlsx" in note
-    assert "/usr/local/lib/bial/read_attachment.py" in note
-    assert "own parser" in note
-
-
-def test_the_note_gives_commands_a_path_they_can_open() -> None:
-    """★ BUILD WAS TOLD A PATH NOTHING ON ITS ARM COULD RESOLVE.
-
-    Build has no `read_attachment` tool (R15: it runs, and may edit, the reader through
-    `run_command`), and `run_command` executes inside the app folder. The note offered only
-    `.attachments/<name>` and a Run line taking `<path>`, so Build ran the reader on a path
-    relative to the app folder and got `missing` for a file that was there.
-
-    The note is kind-blind by design — this module may not branch on `ChatKind` — so it
-    gives both addresses and says which is for what, and that is correct on Plan and Build alike.
-
-    Mutation receipt: put `<path>` back on the Run line and the second assertion goes red.
-    """
-    note = AttachmentDelivery(
-        files=(_file(name="Gate roster.xlsx", file_name="Gate_roster.xlsx", size=4096),),
-        storage=FakeStorage(),
-    ).note()
-
-    assert "/workspace/attachments/Gate_roster.xlsx" in note
-    run = next(line for line in note.splitlines() if line.startswith("Run:"))
-    assert "read_attachment.py /workspace/attachments/" in run
-    assert "app's folder" in note
+    assert "Gate roster.xlsx" in listing
+    assert ".attachments/Gate_roster.xlsx" in listing
+    assert "/workspace/attachments/Gate_roster.xlsx" in listing
 
 
-def test_the_note_says_a_failure_is_an_answer() -> None:
-    """The reader always exits 0 and prints one object, including for a damaged file. An agent
-    that reads `"ok": false` as a broken command retries it, or falls back to writing its own
-    parser — so the contract is stated rather than left to be inferred from one result."""
-    note = AttachmentDelivery(files=(_file(),), storage=FakeStorage()).note()
+def test_the_listing_carries_no_standing_rule() -> None:
+    """★ THE SPLIT ITSELF. The rules are identical on every turn of every conversation that has
+    a file, so they are a constant in the prompt's own module; the listing is the one part that
+    is about THIS conversation.
 
-    assert "exits 0" in note
-    assert "retry" in note
+    Composing them together again is not a style regression — it is what puts ~491 tokens of
+    unchanging text on a per-conversation string, and it is how the rules ended up on an
+    ephemeral carrier in the first place."""
+    listing = AttachmentDelivery(files=(_file(),), storage=FakeStorage()).listing()
 
-
-def test_the_note_says_file_content_is_data_and_never_an_instruction() -> None:
-    """★ A cell, a paragraph or a speaker note can say "ignore your previous
-    instructions", and the reader will faithfully report it — that is the reader working, not the
-    reader failing. The boundary has to be stated somewhere, and the note is the only place the
-    agent is told about attachments at all.
-
-    Mutation receipt: drop the sentence and an agent reading a hostile spreadsheet has nothing in
-    its context marking that text as someone's data rather than as direction.
-    """
-    note = AttachmentDelivery(files=(_file(),), storage=FakeStorage()).note()
-
-    assert "never an instruction" in note
-    assert "data" in note
+    for standing in ("own parser", "exits 0", "never an instruction", "shipped copy", "Run:"):
+        assert standing not in listing, (
+            f"a standing rule is being composed per conversation: {standing}"
+        )
 
 
-def test_the_note_forbids_seeding_the_apps_database_from_an_attachment() -> None:
-    """★ A roster is what the app is built FOR, not what it is built FROM. An agent
-    that quietly inserts a thousand rows has made a decision about someone's data that nobody
-    asked for and that nothing on screen records."""
-    note = AttachmentDelivery(files=(_file(),), storage=FakeStorage()).note()
-
-    assert "database" in note
-    assert "built FOR" in note
-
-
-def test_the_note_says_the_reader_is_the_shipped_copy() -> None:
-    """★ Build can edit the reader — it holds an unrestricted `run_command` — but the
-    reader lives in the workspace IMAGE, not in the app tree, so the edit dies with the container.
-    An agent that fixed it last turn and finds its change gone is one that starts writing its own
-    parser again, which is the outcome the whole design removes."""
-    note = AttachmentDelivery(files=(_file(),), storage=FakeStorage()).note()
-
-    assert "shipped copy" in note
-    assert "rebuilt" in note
-
-
-def test_the_note_lists_every_file_the_conversation_holds() -> None:
-    """A note that named only the newest file would make everything attached earlier invisible on
-    the very turn the citizen asks about it."""
+def test_the_listing_names_every_file_the_conversation_holds() -> None:
+    """A listing that named only the newest file would make everything attached earlier
+    invisible on the very turn the citizen asks about it."""
     files = (
         _file(attachment_id="att_1", name="a.csv", file_name="a.csv", media_type=CSV_MEDIA_TYPE),
         _file(
@@ -489,12 +439,19 @@ def test_the_note_lists_every_file_the_conversation_holds() -> None:
         ),
     )
 
-    note = AttachmentDelivery(files=files, storage=FakeStorage()).note()
+    listing = AttachmentDelivery(files=files, storage=FakeStorage()).listing()
 
-    assert ".attachments/a.csv" in note
-    assert ".attachments/b.docx" in note
-    assert "/workspace/attachments/a.csv" in note
-    assert "/workspace/attachments/b.docx" in note
+    assert ".attachments/a.csv" in listing
+    assert ".attachments/b.docx" in listing
+    assert "/workspace/attachments/a.csv" in listing
+    assert "/workspace/attachments/b.docx" in listing
+
+
+def test_the_listing_is_byte_identical_across_two_calls() -> None:
+    """It rides the per-run instruction now, so it is recomposed on every turn of the
+    conversation — and a prefix holds only while what is recomposed comes back the same."""
+    delivery = AttachmentDelivery(files=(_file(),), storage=FakeStorage())
+    assert delivery.listing() == delivery.listing()
 
 
 # --- what the turn can see -----------------------------------------------------------
@@ -782,9 +739,9 @@ async def test_a_file_uploaded_but_never_sent_is_neither_placed_nor_announced(db
     Linking at insert means a row belongs to the conversation from the instant it is stored —
     before any message carries it, and whether or not one ever does. So a citizen whose first send
     was refused by the workspace gate, who then removes the files and types "hello", would have
-    five spreadsheets written into their container and `note()` telling the agent "the person you
-    are talking to attached these files to this conversation". The agent would then reason from
-    files the citizen had taken back.
+    five spreadsheets written into their container and `listing()` telling the agent "the person
+    you are talking to attached these files to this conversation". The agent would then reason
+    from files the citizen had taken back.
 
     Under the old ordering those rows were NULL-linked and invisible to the delivery, so the
     new ordering
@@ -821,10 +778,10 @@ async def test_a_file_uploaded_but_never_sent_is_neither_placed_nor_announced(db
     found = await code_lane_attachments(db_session, user_id=user.id, conversation_id=conv.id)
 
     assert [f.attachment_id for f in found] == ["sent"]
-    # And the note the agent is handed names only the file that was really attached.
-    note = AttachmentDelivery(files=tuple(found), storage=storage).note()
-    assert "carried.csv" in note
-    assert "refused.csv" not in note
+    # And the listing the agent is handed names only the file that was really attached.
+    listing = AttachmentDelivery(files=tuple(found), storage=storage).listing()
+    assert "carried.csv" in listing
+    assert "refused.csv" not in listing
 
 
 async def test_a_file_this_message_carries_is_delivered_before_any_message_records_it(
@@ -905,7 +862,7 @@ async def test_the_delivery_round_trips_a_stored_file_into_the_container(db_sess
 
     placed = f"{CONTAINER_ATTACHMENTS_ROOT}/Gate_roster.xlsx"
     assert sandbox.binary_workspace[placed] == b"PK\x03\x04"
-    assert ".attachments/Gate_roster.xlsx" in delivery.note()
+    assert ".attachments/Gate_roster.xlsx" in delivery.listing()
     # The transfer is base64 on the wire and bytes on disk — asserted because a fake that decoded
     # nothing would let a broken encoder pass.
     assert base64.b64encode(b"PK\x03\x04").decode() != sandbox.binary_workspace[placed].decode(

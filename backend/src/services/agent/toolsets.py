@@ -1,5 +1,6 @@
-# `present_plan_options` below is a registered tool: its docstring is sent to the model
-# verbatim as that tool's description. Edit it as prompt text, not as an internal note.
+# `present_plan_options` and `check_the_app` below are registered tools: their docstrings are
+# sent to the model verbatim as those tools' descriptions. Edit them as prompt text, not as
+# internal notes.
 """The chat-kind → toolset registry: tool gating AT THE SERVER.
 
 WHY THIS EXISTS. The registry keys on the server-owned `conversation.kind` — NEVER anything
@@ -13,7 +14,8 @@ gets the runtime's unknown-tool rejection, never a policy check that could be by
 | Plan  | yes (live workspace) | allowlisted, read    | —      | yes                   |
 | Build | yes (live workspace) | full (+SQL guard)    | yes    | —                     |
 
-Both arms also carry `CONVERSATION_TOOLSET` (registered once, so the two lists can't drift).
+Both arms also carry `CONVERSATION_TOOLSET` and `app_state_toolset` (each registered once, so
+the two lists can't drift).
 `toolsets_for_kind` is the ONLY place permitted to read the chat kind to decide capability —
 see its own docstring. Two more things live here, not the registry: the citizen-facing chat-kind
 CATALOGUE (served on `GET /v1/auth/me`) and the TOOL SURFACE prompt-block renderer — each has its
@@ -43,7 +45,9 @@ from src.services.agent.attachment_tools import AttachmentReader, attachment_too
 from src.services.agent.connector_tools import CONNECTOR_TOOLSET
 from src.services.agent.conversation_tools import CONVERSATION_TOOLSET
 from src.services.agent.read_tools import ReadOnlyWorkspace, read_only_toolset
+from src.services.orchestrator.constants import READINESS_POLL_S, WORKSPACE_NOTE_MAX_POLLS
 from src.services.orchestrator.deps import SandboxSession
+from src.services.orchestrator.selfheal import AppState, read_the_app_state
 from src.services.orchestrator.tools import sandbox_toolset
 
 
@@ -113,6 +117,93 @@ _PLAN_OPTIONS_TOOLSET: FunctionToolset[Any] = FunctionToolset[Any](
 )
 
 
+# --- What the app is doing, ASKED FOR rather than pushed ------------------------------------
+#
+# A PULL, AND THE POSITION IS THE REASON. A tool result lands at the absolute tail of the run's
+# own messages and `_persistable_messages` keeps it, so what the model was sent is what the store
+# replays. Anything the platform PUSHES instead lands ahead of the citizen's persisted prompt,
+# where its bytes are gone next turn and every message after them shifts.
+#
+# THE SENTENCES ARE THE VERDICT, NOT THE SIGNALS. `read_the_app_state` applies the ordering rule
+# (could-not-tell > not-serving > the page) and the tool hands over the sentence for the answer
+# it reached. Nothing here invites the model to re-derive a diagnostic: the harness has already
+# offered the agent a `tsc` it could run for itself and withdrawn it, because the model spent
+# 20-40 s and a context window per turn establishing what the platform already knew.
+
+_APP_STATE_SENTENCES: Final[dict[AppState, str]] = {
+    AppState.UNKNOWN: (
+        "The platform could not tell what state this app is in this time. If the user says "
+        "something is wrong, look at the app's files and check for yourself rather than "
+        "assuming it still works."
+    ),
+    AppState.NOT_SERVING: (
+        "The app is not currently serving. Something it needs at startup is most likely "
+        "failing, so treat any question about what the app does today as a question about a "
+        "broken app."
+    ),
+    AppState.STILL_THE_TEMPLATE: (
+        "The app is serving, and its home page is still byte-for-byte the starter template the "
+        "workspace was created with — nothing the user asked for is on the page they actually "
+        "look at. Whatever else exists in the files, the app they see has not been built yet."
+    ),
+    AppState.LIVE: "The app is serving, and its home page is no longer the starter template.",
+}
+
+
+def _no_pinned_sandbox(_ctx: RunContext[Any]) -> SandboxSession | None:
+    """The default app-state accessor: this run has no container.
+
+    A real answer rather than a raise. A Plan turn can run before any workspace exists, and the
+    agent-level surfaces (`ReadDeps`) have no container at all — so `check_the_app` is registered
+    on every run and answers `unknown` where there is nothing to ask."""
+    return None
+
+
+def app_state_toolset[DepsT](
+    sandbox_of: Callable[[RunContext[DepsT]], SandboxSession | None],
+) -> FunctionToolset[DepsT]:
+    """`check_the_app`, over whatever deps `sandbox_of` resolves the container from.
+
+    ONE PROBE PER TOOLSET, MEMOIZED IN THE CLOSURE. A toolset is built per run, so the second
+    `check_the_app` call of a run returns the first one's answer with no container round-trip —
+    the same ceiling `connector_schema` puts on re-delivering its artefact, for the same reason:
+    without it N calls become N readiness polls plus N execs. The Build arm rebuilds its toolsets
+    per self-heal iteration, so a repaired app is read again rather than reported from before the
+    repair.
+
+    The inner tool annotates `RunContext[Any]` rather than the enclosing PEP-695 type param, for
+    the reason `sandbox_toolset` states: pydantic-ai resolves tool annotations with
+    `get_type_hints` at registration, where that param is out of scope under deferred
+    annotations. The factory signature carries the real typing; the `cast` at the return narrows
+    back to it."""
+    memo: list[AppState] = []
+
+    async def check_the_app(ctx: RunContext[Any]) -> str:
+        """Find out what this app is doing right now — whether it is serving, and whether the
+        page the user actually looks at is still the starter template.
+
+        Call this when what you are about to say depends on the app's current state, and
+        whenever the user tells you something is wrong. Earlier messages in this conversation
+        describe how the app WAS; this is how it is. The platform runs the check and hands you
+        its answer, so you do not need to run a type-check or start a server to find out.
+        """
+        if not memo:
+            session = sandbox_of(ctx)
+            memo.append(
+                AppState.UNKNOWN
+                if session is None
+                else await read_the_app_state(
+                    session.sandbox_client,
+                    session.handle,
+                    max_polls=WORKSPACE_NOTE_MAX_POLLS,
+                    poll_s=READINESS_POLL_S,
+                )
+            )
+        return _APP_STATE_SENTENCES[memo[0]]
+
+    return cast(FunctionToolset[DepsT], FunctionToolset[Any]([check_the_app], id="app-state"))
+
+
 # THERE IS NO OPTIONS-ONLY TOOLSET. It existed for exactly one caller: the forced retry that
 # re-issued a Plan run with `present_plan_options` as the only tool the model could reach, after
 # a prose heuristic decided a plan had been written. Both are gone (see the note in
@@ -157,6 +248,7 @@ def toolsets_for_kind[DepsT](
     reader_of: Callable[[RunContext[DepsT]], AttachmentReader] | None = None,
     *,
     connected_systems: Sequence[ConnectedSystem] = (),
+    app_state_of: Callable[[RunContext[DepsT]], SandboxSession | None] = _no_pinned_sandbox,
 ) -> ToolSurface[DepsT]:
     """The per-run tool surface for a chat kind, over whatever deps type the caller's accessors
     resolve the workspace (and, for Build, the sandbox) from.
@@ -179,13 +271,18 @@ def toolsets_for_kind[DepsT](
     surface that ignored it would leave the model to discover the refusal by spending a round
     trip. Absent instead: a forged call meets the runtime's unknown-tool rejection, exactly as a
     Build tool does in a Plan chat. Toolsets are built per run, so a revoked approval takes the
-    tool away on the citizen's next turn with no invalidation step anywhere."""
+    tool away on the citizen's next turn with no invalidation step anywhere.
+
+    `app_state_of` IS THE ONE ACCESSOR THAT MAY ANSWER `None`, and `check_the_app` is registered
+    on BOTH arms off it. Plan has no other route to the answer — it cannot run a command that
+    starts a server — and a run with no container still gets the tool, answering `unknown`."""
     match kind:
         case ChatKind.PLAN:
             plan_toolsets: list[AbstractToolset[DepsT]] = [
                 read_only_toolset(workspace_of),
                 cast(AbstractToolset[DepsT], CONVERSATION_TOOLSET),
                 cast(AbstractToolset[DepsT], _PLAN_OPTIONS_TOOLSET),
+                app_state_toolset(app_state_of),
             ]
             # THE ATTACHMENT CAPABILITY, ON THIS ARM ALONE. Plan already executes in
             # the container, but only the eight read-only binaries on `check_the_guest_list` —
@@ -219,6 +316,7 @@ def toolsets_for_kind[DepsT](
                         sandbox_toolset(sandbox_of),
                         read_only_toolset(workspace_of).filtered(_structured_reads_only),
                         cast(AbstractToolset[DepsT], CONVERSATION_TOOLSET),
+                        app_state_toolset(app_state_of),
                     ],
                     connected_systems,
                 ),

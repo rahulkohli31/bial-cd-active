@@ -3,8 +3,13 @@
 ONE derivation, two consumers: the read API (reload) and the turn engine's catch-up
 snapshot (live). Reads raw ROWS, not validated dataclasses: validating would coerce a
 stored attachment-ref marker to `CachePoint` (the pinned 2.5.0 hazard) and force
-rehydration this read must never pay for; `payload`/`meta` are already redacted at the
-persistence seam, so the Details expander must not re-redact.
+rehydration this read must never pay for.
+
+THIS IS WHERE MASKING HAPPENS. The persistence seam stores what was sent — it has to, or the
+replayed prefix is not the prefix — so a row's `payload` reaches this function with whatever
+credential-shaped text the model wrote in it. `_mask_for_display` is the one place that answer
+is given: it runs over the finished `DisplayItem` list, so both consumers inherit it and no
+future item type can be added on a path that skips it. Pinned by test, not by this sentence.
 
 Hidden rows are excluded from RENDERING but still inform derived state: an unclosed
 `build_started` marker with no later same-session `build_outcome` projects the
@@ -24,6 +29,7 @@ from pydantic import Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL, ATTACHMENT_READ_TOOL
+from src.core.redaction import redact_secrets
 from src.db.models.attachment import Attachment
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.schemas import CamelModel
@@ -51,6 +57,14 @@ registered function's name (pydantic-ai registers a function under its `__name__
 `services/agent/mode_prompts.py`, where the CONNECTED DATA stub tells the agent to call it. A
 prompt naming a tool that is registered under a different spelling is a citizen's turn spent
 discovering an unknown-tool rejection."""
+
+APP_STATE_TOOL: Final = "check_the_app"
+"""The state tool's wire name — the fourth thing that has to agree on a spelling.
+
+Named here for the same reason the three above are: this module labels the call, and the other
+holder of the string is `services/agent/toolsets.py`, where it IS the registered function's name
+(pydantic-ai registers a function under its `__name__`). Without a branch keyed on it the
+fallback below renders `Used check_the_app` into a citizen's feed."""
 
 PLATFORM_TEXT_KIND: Final = "platform_text"
 """`meta.kind` of a row whose sentence is the PLATFORM's, not the model's.
@@ -151,6 +165,12 @@ _LBL_PREVIEW: Final = "Getting your preview ready"
 # degrades to this — the raw argv is DROPPED, never rendered. The open sandbox runs arbitrary
 # commands, so a recognized-only allowlist that leaked argv on the long tail is the bug we refuse.
 _LBL_FALLBACK: Final = "Working on your app"
+
+# The state tool, in the two tenses one step passes through. Every other label in this module is
+# tense-invariant, so this is the one place a settled step reads differently from a running one —
+# `label_when_settled` is what both emitters call, so neither can hold only one of the pair.
+_LBL_CHECKING_APP: Final = "Checking on your app"
+_LBL_CHECKED_APP: Final = "Checked on your app"
 
 # WHAT A LONG OPERATION SAYS WHILE IT IS STILL RUNNING.
 #
@@ -329,6 +349,47 @@ DisplayItem = (
     | TurnTerminalItem
     | WorkspaceDiscardedItem
 )
+
+DISPLAY_TEXT_CAP: Final = 64_000
+"""How much of one display field is scanned for credentials, in characters.
+
+THE CAP IS THE ReDoS DEFENCE, and `core/redaction.py` requires it of every synchronous caller
+that is not the durable record. This one runs on every conversation load and every catch-up
+snapshot, over a whole transcript, on the event loop.
+
+Sized at the platform's own per-message ceiling (`MAX_MESSAGE_TEXT_CHARS`), so no field a
+citizen or the model can legitimately produce is shortened by it — a longer one is a defect
+upstream, and truncating its tail beats stalling the loop over it."""
+
+#: Which string field of each `DisplayItem` type reaches a browser as free text. `StepItem.label`
+#: is deliberately absent: every label is one of this module's own constants or a filename the
+#: citizen chose, and `_classify_command` fails closed so raw argv never becomes one.
+_MASKED_FIELDS: Final[dict[type[Any], str]] = {
+    UserTextItem: "text",
+    AssistantTextItem: "text",
+    BannerItem: "text",
+    TurnTerminalItem: "reason",
+}
+
+
+def _mask_for_display(items: list[DisplayItem]) -> list[DisplayItem]:
+    """`redact_secrets` over every free-text field on the way to a browser — ONE walk over the
+    finished list rather than a call at each of the nine sites that build one.
+
+    WHAT LEAKS IS THE MODEL REPEATING A VALUE IT READ — "I set DATABASE_URL=postgres://u:p@h/db
+    in your config" — which is prose, not a tool return, so masking the machinery would mask
+    nothing. `TurnTerminalItem.reason` is in the set even though it carries a machine token: it
+    is built from a HIDDEN row, and any "mask what is visible" shortcut is exactly what misses
+    it."""
+    masked: list[DisplayItem] = []
+    for item in items:
+        field = _MASKED_FIELDS.get(type(item))
+        value = getattr(item, field, None) if field is not None else None
+        if field is None or not isinstance(value, str) or not value:
+            masked.append(item)
+            continue
+        masked.append(item.model_copy(update={field: redact_secrets(value[:DISPLAY_TEXT_CAP])}))
+    return masked
 
 
 def _an_instant(value: object) -> datetime | None:
@@ -527,11 +588,27 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
         # no import from the connector registry. `checking` is already a `stepIconFor`
         # branch in the portal, so no portal file changes for this.
         return ("Checking what data is connected", False)
+    if tool_name == APP_STATE_TOOL:
+        # THE RUNNING TENSE, because a step is drawn the moment the call is made. `label_when_
+        # settled` turns it past once the result lands. Its own branch rather than the fallback
+        # below, which would print `Used check_the_app` into a citizen's feed.
+        return (_LBL_CHECKING_APP, False)
     if tool_name == "declare_done":
         return ("Wrapping up the build", False)
     if tool_name == "run_command":
         return _classify_command(_command_argv(args))
     return (f"Used {tool_name}", False)
+
+
+def label_when_settled(tool_name: str, label: str) -> str:
+    """One step's label once its result has landed — the same label for every tool but the state
+    tool, which reads "Checked on your app" rather than "Checking on your app".
+
+    PUBLIC AND SHARED, like the three classifiers beside it: the live emitter resolves a step
+    when the return arrives and the reload projection derives the same step from the stored
+    return, so a tense that only one of them applied would be a live/reload disagreement about
+    what the citizen is reading."""
+    return _LBL_CHECKED_APP if tool_name == APP_STATE_TOOL else label
 
 
 def classify_command(argv: list[str]) -> tuple[str, bool]:
@@ -1070,7 +1147,7 @@ def _project_response_parts(
                 StepItem(
                     seq=row.seq,
                     tool=tool_name,
-                    label=label,
+                    label=label if state == "pending" else label_when_settled(tool_name, label),
                     # NOTHING IS HIDDEN WHEN SOMETHING WENT WRONG, whatever class it belongs
                     # to. The group opens itself saying one thing went wrong and then counts
                     # the rows the citizen can see; a hidden failure makes that count name a
@@ -1285,7 +1362,7 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
             elif message.get("kind") == "response":
                 _project_response_parts(row, message, results, items)
 
-    return items
+    return _mask_for_display(items)
 
 
 async def project_conversation(

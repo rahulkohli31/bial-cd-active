@@ -379,6 +379,52 @@ async def where_are_we(
     return Readiness.STILL_TRYING
 
 
+class AppState(enum.StrEnum):
+    """What this app's workspace is doing right now, RESOLVED — one answer, not the two signals
+    it was read from.
+
+    `UNKNOWN` is a member rather than a `None`: a caller told "it's fine" on an incomplete check
+    is worse off than one told nothing, because it will defend the claim."""
+
+    UNKNOWN = "unknown"
+    NOT_SERVING = "not_serving"
+    STILL_THE_TEMPLATE = "still_the_template"
+    LIVE = "live"
+
+
+async def read_the_app_state(
+    sandbox_client: SandboxClient, handle: SandboxHandle, *, max_polls: int, poll_s: float
+) -> AppState:
+    """THE CHEAP HALF OF THE HEALTH VERDICT, resolved to one answer: a bounded readiness poll
+    plus one exec, no `tsc`. It must not cost what `verify` costs, because it runs whenever the
+    agent asks rather than once at the end of a build.
+
+    "STILL STARTING UP" RESOLVES TO `UNKNOWN`, NEVER `NOT_SERVING`: a read taken inside
+    `dev_start`'s compile window would otherwise call every cold app dead.
+
+    ORDER: could-not-tell > not-serving > whatever the page shows. An unanswered check is not a
+    finding, and a down app has no home page worth discussing.
+
+    NEVER RAISES — a failure's value is not knowing, and the caller is a tool the model is
+    holding mid-turn."""
+    try:
+        readiness = await where_are_we(sandbox_client, handle, max_polls=max_polls, poll_s=poll_s)
+    except SandboxError:
+        return AppState.UNKNOWN
+    if readiness is Readiness.STILL_TRYING:
+        return AppState.UNKNOWN
+    if readiness is Readiness.DIED:
+        return AppState.NOT_SERVING
+    baseline = await _ask_the_container_what_it_is_showing(sandbox_client, handle)
+    match baseline:
+        case BaselineIdentity.UNANSWERABLE:
+            return AppState.UNKNOWN
+        case BaselineIdentity.STILL_THE_BASELINE:
+            return AppState.STILL_THE_TEMPLATE
+        case BaselineIdentity.DIVERGED:
+            return AppState.LIVE
+
+
 async def verify(
     sandbox_client: SandboxClient,
     handle: SandboxHandle,

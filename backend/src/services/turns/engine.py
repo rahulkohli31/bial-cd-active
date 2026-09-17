@@ -50,6 +50,7 @@ from pydantic_ai.messages import (
     ModelResponse,
     PartDeltaEvent,
     PartStartEvent,
+    SystemPromptPart,
     TextPart,
     TextPartDelta,
     ThinkingPart,
@@ -97,7 +98,7 @@ from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.user import User
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.attachment_tools import AttachmentReader
-from src.services.agent.mode_prompts import PromptContext, workspace_note
+from src.services.agent.mode_prompts import PromptContext
 from src.services.agent.read_tools import (
     LiveSandboxWorkspace,
     ReadOnlyWorkspace,
@@ -116,7 +117,6 @@ from src.services.build_sessions.alarms import (
 )
 from src.services.build_sessions.counters import count
 from src.services.build_sessions.integrity import (
-    baseline_identity,
     has_ever_been_built,
     stamp_the_watermark,
 )
@@ -156,6 +156,7 @@ from src.services.messages.projection import (
     classify_tool_call,
     finished_from_args,
     finished_slice,
+    label_when_settled,
     long_operation_line,
     proposal_from_args,
     update_from_args,
@@ -176,18 +177,15 @@ from src.services.orchestrator.constants import (
     RUN_TOKEN_BUDGET,
     RUN_WALL_CLOCK_DEADLINE_S,
     SELF_HEAL_MAX_RETRIES,
-    WORKSPACE_NOTE_MAX_POLLS,
 )
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.prompt import build_repair_prompt
 from src.services.orchestrator.selfheal import (
     CONTINUE_PROMPT,
     HealthState,
-    Readiness,
     VerifyOutcome,
     dev_not_ready_error,
     verify,
-    where_are_we,
 )
 from src.services.redis import get_redis
 from src.services.redis.keys import (
@@ -586,19 +584,26 @@ def _without_the_call(messages: list[ModelMessage], tool_call_id: str) -> list[M
 
 def _persistable_messages(new_messages: list[ModelMessage]) -> list[ModelMessage]:
     """The durable transcript slice of a run's `new_messages()`: every `ModelResponse`, PLUS every
-    `ModelRequest` that carries tool returns but NOT a fresh user prompt.
+    `ModelRequest` that carries tool returns but neither a fresh user prompt nor a system prompt.
 
     Persisting the tool-return requests is load-bearing: they answer the `ToolCallPart`s the
     responses make, and a responses-only filter leaves each call unanswered, so reload's dangling-
     call repair papers over a real result with a synthesized "interrupted" one. Requests bearing a
-    `UserPromptPart` are excluded: the user turn is already persisted, and the ephemeral workspace
-    note injected onto `message_history` must never fossilize into a row."""
+    `UserPromptPart` are excluded: the user turn is already persisted by the route.
+
+    A `SystemPromptPart` EXCLUDES A REQUEST TOO, and that arm guards a caller that does not exist
+    yet. A turn-scoped system message is ephemeral by intent, but it arrives on the run's own new
+    messages rather than on injected history — so the user-prompt rule would not catch it and it
+    would land in a row. Replayed next turn, pydantic-ai hoists the opening system parts of the
+    first request into the top-level `system` field, so the message changes both tier and
+    position on rebuild: the same prefix divergence the spliced notes caused, arriving through
+    the one door left open."""
     kept: list[ModelMessage] = []
     for message in new_messages:
         if isinstance(message, ModelResponse):
             kept.append(message)
         elif isinstance(message, ModelRequest) and not any(
-            isinstance(part, UserPromptPart) for part in message.parts
+            isinstance(part, UserPromptPart | SystemPromptPart) for part in message.parts
         ):
             kept.append(message)
     return kept
@@ -1009,6 +1014,18 @@ def _sandbox_of(ctx: RunContext[ChatDeps]) -> SandboxSession:
     return session
 
 
+def _app_state_of(ctx: RunContext[ChatDeps]) -> SandboxSession | None:
+    """The ChatDeps accessor `check_the_app` resolves the container through — and the ONE
+    accessor here that answers `None` instead of raising.
+
+    Its neighbours fail first because a tool that writes to a workspace it does not have is a
+    bug in the attach path. This one is a reading, and "there is no container to read" is a
+    truthful answer the tool has a sentence for: a Plan turn can run before any workspace
+    exists, and a registered tool whose accessor raises kills the turn rather than answering
+    it."""
+    return ctx.deps.sandbox
+
+
 def _reader_of(ctx: RunContext[ChatDeps]) -> AttachmentReader:
     """The ChatDeps accessor Plan's attachment reader resolves through.
 
@@ -1401,33 +1418,22 @@ class TurnEngine:
                 manager=manager,
                 sandbox_client=sandbox_client,
             )
-            # THE WORKSPACE NOTE, UNCONDITIONALLY, on every turn that pinned a sandbox: an
-            # ephemeral tail on `message_history`, structurally excluded from the persisted rows
-            # because `new_messages()` never contains injected history.
+            # NOTHING MAY BE SPLICED ONTO `history` HERE, and the absence is load-bearing.
             #
-            # It is the ONLY thing injected here, and it is injected on EVERY turn rather than on
-            # a cadence, because it tells the model a fact about the app that its history cannot
-            # know — one that can change between any two turns.
-            if workspace is not None:
-                note = await self._workspace_note(state)
-                history = [*history, ModelRequest(parts=[UserPromptPart(content=note)])]
-            # AND THE ATTACHED FILES, ON THE SAME CARRIER AND FOR THE SAME REASON.
+            # Anything appended at this point sits AHEAD of the citizen's prompt, and the
+            # citizen's prompt is persisted while an injected tail is not — so next turn the
+            # prompt replays without it, the bytes vanish from the middle of the history, and
+            # every message after them shifts. That is a cache miss on the whole request. A fact
+            # the model needs either rides a TOOL RESULT (persisted, at the absolute tail) or the
+            # per-run INSTRUCTION, which is not part of history at all.
             #
-            # An ephemeral tail rather than part of the citizen's own message: the paths are a
-            # fact about THIS container, and a container is not what a conversation is stored
-            # against. Persisting them would leave a transcript naming files at paths a later
-            # container may spell differently — and `new_messages()` never contains injected
-            # history, so this cannot reach the stored rows even by accident.
-            #
-            # UNCONDITIONAL WHENEVER THERE IS A FILE, on every turn rather than the turn it was
-            # uploaded on. The issue calls the agent writing its own parser the single failure
-            # this design exists to prevent, and an agent only knows not to when it is told —
-            # every time, because a model reads the turn in front of it.
+            # THE ATTACHED FILES RIDE THE INSTRUCTION because their paths are a fact about THIS
+            # container: a stored transcript naming them would outlive the container it described
+            # and name paths a later one may spell differently.
             if state.attachments is not None:
-                history = [
-                    *history,
-                    ModelRequest(parts=[UserPromptPart(content=state.attachments.note())]),
-                ]
+                prompt_context = replace(
+                    prompt_context, attachment_listing=state.attachments.listing()
+                )
             # WHAT WAS AGREED, READ OUT OF THE CONVERSATION ITSELF. No column, no
             # table, no project field: the agreement is the arguments of the last honourable
             # proposal call in these rows, which is the same bounded route the plan travels. A
@@ -1505,6 +1511,7 @@ class TurnEngine:
                         _workspace_of,
                         reader_of=_reader_of if state.attachments is not None else None,
                         connected_systems=prompt_context.connected_systems,
+                        app_state_of=_app_state_of,
                     ).toolsets
                     # UNCONDITIONAL, BECAUSE THE TOOLSET HAS ALREADY DECIDED IT. A run can only
                     # end deferred if a tool that DEFERS was registered on it, and
@@ -2519,6 +2526,7 @@ class TurnEngine:
                 _workspace_of,
                 _sandbox_of,
                 connected_systems=prompt_context.connected_systems,
+                app_state_of=_app_state_of,
             ).toolsets,
             output_type=str,
             usage_limits=UsageLimits(request_limit=MODEL_TURN_CEILING),
@@ -2876,41 +2884,6 @@ class TurnEngine:
                 conversation_id=str(state.conversation_id),
                 turn_id=str(state.turn_id),
             )
-
-    async def _workspace_note(self, state: _TurnState) -> str:
-        """What this app's workspace is doing RIGHT NOW, as a private note for the model. THE CHEAP
-        HALF OF THE HEALTH VERDICT: runs on every turn in both chat kinds, so it must not cost what
-        `verify` costs — a bounded readiness poll plus one exec, no `tsc`. "STILL STARTING UP"
-        reports as "COULD NOT TELL", never "DOWN", since a note composed inside `dev_start`'s 5-7s
-        compile window would otherwise call every cold turn's app dead. Unlike the verdict, the
-        baseline check also runs for a brand-new project: a false positive there is costly, while
-        the note just tells the model what the user is looking at, true even for an unbuilt app.
-        NEVER RAISES — a failure's value is not knowing."""
-        sandbox = state.sandbox
-        if sandbox is None:
-            return workspace_note(serving=None, still_the_template=None)
-        serving: bool | None
-        try:
-            readiness = await where_are_we(
-                sandbox.sandbox_client,
-                sandbox.handle,
-                max_polls=WORKSPACE_NOTE_MAX_POLLS,
-                poll_s=READINESS_POLL_S,
-            )
-        except SandboxError:
-            serving = None
-        else:
-            serving = {
-                Readiness.READY: True,
-                Readiness.DIED: False,
-                Readiness.STILL_TRYING: None,
-            }[readiness]
-        still_the_template: bool | None = None
-        if serving:
-            baseline = await baseline_identity(sandbox.sandbox_client, sandbox.handle)
-            if baseline is not BaselineIdentity.UNANSWERABLE:
-                still_the_template = baseline is BaselineIdentity.STILL_THE_BASELINE
-        return workspace_note(serving=serving, still_the_template=still_the_template)
 
     def _emit_verify_step(
         self,
@@ -3973,8 +3946,11 @@ class TurnEngine:
         # to prevent. A housekeeping command is plumbing while it works and the whole story the
         # moment it does not, and the group's problem count has to name a row the citizen can
         # actually see.
+        settled_label = label_when_settled(pending.tool, pending.label)
         resolved = pending.model_copy(
-            update={"state": "failed", "hidden": False} if failed else {"state": "ok"}
+            update={"state": "failed", "hidden": False, "label": settled_label}
+            if failed
+            else {"state": "ok", "label": settled_label}
         )
         state.steps[event.tool_call_id] = resolved
         if len(state.steps) > _STEPS_CAP:
