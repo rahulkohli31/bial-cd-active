@@ -116,6 +116,14 @@ def test_neither_agreement_nor_either_solo_bar_is_excluded() -> None:
     assert _select_confident_matches([row]) == []
 
 
+def test_max_matches_is_three() -> None:
+    # Pinned to the LITERAL, not re-derived from the constant: `test_caps_at_max_matches` below
+    # parametrizes its own setup AND assertion off `MAX_MATCHES`, so it stays green no matter
+    # what the constant is widened to. This is the one place a change to it is visible at all —
+    # #191's own acceptance criterion is "at most three", not "at most whatever this says".
+    assert MAX_MATCHES == 3
+
+
 def test_caps_at_max_matches() -> None:
     rows = [
         _row(kw_rank=n, kw_score=1.0, vec_rank=n, vec_score=1.0, name=f"App {n}")

@@ -39,6 +39,15 @@ def _words(n: int) -> str:
     return " ".join(f"w{i}" for i in range(n))
 
 
+def test_the_bound_is_15_to_120_words() -> None:
+    # Pinned to the LITERALS: every test below parametrizes its own setup AND assertion off
+    # these two constants, so all of them stay green no matter what the bound is widened to.
+    # This is the one place a change to either constant is visible at all — the issue's own
+    # acceptance examples name 15 and 120, not "whatever the constants say".
+    assert MIN_PROJECT_DESCRIPTION_WORDS == 15
+    assert MAX_PROJECT_DESCRIPTION_WORDS == 120
+
+
 # --- create ---------------------------------------------------------------------
 
 

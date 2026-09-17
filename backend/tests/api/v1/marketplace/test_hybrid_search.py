@@ -16,7 +16,7 @@ import re
 import pytest
 from sqlalchemy.dialects import postgresql
 
-from src.api.v1.marketplace.router import _ARM_POOL_CAP, _hybrid_catalog
+from src.api.v1.marketplace.router import _ARM_POOL_CAP, _RRF_K, _hybrid_catalog
 
 
 def _compiled(search: str, query_embedding: list[float] | None) -> str:
@@ -24,6 +24,20 @@ def _compiled(search: str, query_embedding: list[float] | None) -> str:
     return str(
         query.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": False})
     )
+
+
+def test_rrf_k_is_60_and_actually_reaches_the_compiled_query() -> None:
+    """The only other RRF test (`test_a_missing_arm_scores_as_unranked_not_zero_similarity`)
+    checks the SHAPE `1/(k+rank)` compiles to, with two keyword ranks and no vector arm — which
+    only proves the formula orders monotonically in rank, true for any `k > 0` and therefore
+    invariant to what `k` actually is. Pinning the literal, and that the SAME number is bound
+    into both arms of the compiled query, is the only thing that would notice a drift."""
+    assert _RRF_K == 60
+    query, _ = _hybrid_catalog("anything", [0.1] * 1536)
+    bound = query.compile(dialect=postgresql.dialect()).params
+    rank_params = [v for k, v in bound.items() if k.startswith("rank_")]
+    assert len(rank_params) == 2  # one per arm — kw_arm and vec_arm
+    assert rank_params == [_RRF_K, _RRF_K]
 
 
 def test_the_at_at_predicate_lives_only_inside_the_keyword_arms_own_cte() -> None:
