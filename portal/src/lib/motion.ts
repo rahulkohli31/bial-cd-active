@@ -45,8 +45,12 @@ export const GRACE_MS = 400
 /** The reveal zone's width. Pointer-transparent until a pointer rests in it. */
 export const EDGE_ZONE_PX = 8
 
-/** The panel's one width. There is no icon rail: it is this, or it is not on screen. */
+/** The navigation's labelled width, wherever it is drawn — floating over an application, or
+ *  docked and expanded on a list route. Named once because both forms must agree. */
 export const NAV_WIDTH_PX = 248
+
+/** The navigation's resting width on the list routes: icons, no labels. */
+export const NAV_RAIL_PX = 56
 
 /**
  * Below this the pointer is not the input device, so there is no hover zone at all and the panel

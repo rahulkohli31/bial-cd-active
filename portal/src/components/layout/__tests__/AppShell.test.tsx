@@ -15,6 +15,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, waitFor, fireEvent, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import { MotionGlobalConfig } from 'motion/react'
+import { NAV_RAIL_PIN_KEY } from '../useNavRail'
 
 const h = vi.hoisted(() => ({
   fetchUsageToday: vi.fn(),
@@ -405,10 +406,10 @@ describe('the navigation rests as a rail and grows when it is approached', () =>
 
   beforeEach(() => {
     h.getStoredUser.mockReturnValue(CITIZEN)
-    window.localStorage.removeItem('bial:nav-pinned')
+    window.localStorage.removeItem(NAV_RAIL_PIN_KEY)
   })
 
-  afterEach(() => window.localStorage.removeItem('bial:nav-pinned'))
+  afterEach(() => window.localStorage.removeItem(NAV_RAIL_PIN_KEY))
 
   it('★ rests collapsed, and grows when the pointer arrives', async () => {
     renderAt('/projects')
@@ -451,7 +452,7 @@ describe('the navigation rests as a rail and grows when it is approached', () =>
     fireEvent.pointerLeave(docked)
     await settle()
     expect(isCollapsed()).toBe(false)
-    expect(window.localStorage.getItem('bial:nav-pinned')).toBe('1')
+    expect(window.localStorage.getItem(NAV_RAIL_PIN_KEY)).toBe('1')
 
     // The preference is the one piece of nav state that outlives the page.
     cleanup()
@@ -484,10 +485,67 @@ describe('the navigation rests as a rail and grows when it is approached', () =>
     await waitFor(() => expect(isCollapsed()).toBe(false))
   })
 
+  it('★ moving from the profile UP to a destination opens it, without leaving the rail', async () => {
+    // THE MOVE THE TEST ABOVE CANNOT EXPRESS. A `pointerOver` with no `relatedTarget` reads as
+    // entering from outside the window, so React fires its synthetic ENTER for it and a handler
+    // bound to `pointerEnter` passes. A real pointer travelling from the profile to a destination
+    // never leaves the aside, so `enter` does not fire again — and the rail stayed shut for as
+    // long as the pointer was inside it. `relatedTarget` is what says "came from in here".
+    renderAt('/projects')
+    await screen.findByTestId('nav-docked')
+
+    const profile = screen.getByTestId('profile-cluster')
+    const projects = screen.getByTestId('nav-projects')
+
+    fireEvent.pointerOver(profile)
+    await settle()
+    expect(isCollapsed()).toBe(true)
+
+    fireEvent.pointerOver(projects, { relatedTarget: profile })
+    await waitFor(() => expect(isCollapsed()).toBe(false))
+  })
+
+  it('★ opens to the keyboard, which is the only way a keyboard reaches Pin', async () => {
+    // THE PIN IS ONLY RENDERED WHILE EXPANDED, so a rail that expands on hover alone has no
+    // keyboard path to it at all — the control cannot be tabbed to because it does not exist yet.
+    renderAt('/projects')
+    await screen.findByTestId('nav-docked')
+    expect(isCollapsed()).toBe(true)
+    expect(screen.queryByTestId('nav-pin')).toBeNull()
+
+    const projects = screen.getByTestId('nav-projects')
+    act(() => projects.focus())
+    await waitFor(() => expect(isCollapsed()).toBe(false))
+    expect(screen.getByTestId('nav-pin')).toBeTruthy()
+
+    // And it lets go again when focus leaves, rather than latching open for the rest of the visit.
+    act(() => projects.blur())
+    await waitFor(() => expect(isCollapsed()).toBe(true))
+  })
+
+  it('★ pinning the rail does not dock a column beside a framed application', async () => {
+    // TWO PREFERENCES ABOUT TWO SCREENS. The rail's pin and the floating panel's dock once shared
+    // one storage key, so pinning the navigation on the list silently took 248px off every
+    // application preview — a switch the owner never threw, on a screen they were not looking at.
+    renderAt('/projects')
+    const docked = await screen.findByTestId('nav-docked')
+    fireEvent.pointerOver(docked)
+    await waitFor(() => expect(isCollapsed()).toBe(false))
+    fireEvent.click(screen.getByTestId('nav-pin'))
+    await settle()
+    expect(window.localStorage.getItem(NAV_RAIL_PIN_KEY)).toBe('1')
+
+    cleanup()
+    renderAt('/chat/c1')
+    await screen.findByTestId('where')
+    expect(screen.queryByTestId('nav-panel')).toBeNull()
+    expect(screen.queryByTestId('nav-docked')).toBeNull()
+  })
+
   it('★ opening the profile menu on a collapsed rail does NOT sweep the panel open', async () => {
-    // The latch that keeps the rail from closing under its own menu was first written as a third
-    // term in the OR, which made pressing the avatar expand the whole navigation — a lot of
-    // movement to answer a click aimed at one control. It freezes the width it found instead.
+    // The latch that keeps the rail from closing under its own menu freezes the width it found
+    // rather than forcing the panel open: a click aimed at one control must not sweep the whole
+    // navigation open behind it.
     renderAt('/projects')
     await screen.findByTestId('nav-panel')
     expect(isCollapsed()).toBe(true)
@@ -532,7 +590,7 @@ describe('the navigation rests as a rail and grows when it is approached', () =>
 describe('the rail keeps the two readings that are not decoration', () => {
   const panel = () => screen.getByTestId('nav-panel')
 
-  beforeEach(() => window.localStorage.removeItem('bial:nav-pinned'))
+  beforeEach(() => window.localStorage.removeItem(NAV_RAIL_PIN_KEY))
 
   it('★ still shows a token reading at rail width', async () => {
     h.getStoredUser.mockReturnValue(CITIZEN)
@@ -558,5 +616,9 @@ describe('the rail keeps the two readings that are not decoration', () => {
     const badge = await screen.findByTestId('waiting-count-nav')
     // The numeral has nowhere to sit at 56px, so the count is announced rather than drawn.
     expect(badge.textContent).toContain('2 apps waiting for review')
+    // AND THE NUMERAL IS GENUINELY GONE. `textContent` alone cannot tell: with the numeral still
+    // drawn it reads '22 apps waiting for review', which contains the sentence above and passes.
+    // The drawn count is the `aria-hidden` node — its absence is the assertion that bites.
+    expect(badge.querySelector('[aria-hidden="true"]')).toBeNull()
   })
 })

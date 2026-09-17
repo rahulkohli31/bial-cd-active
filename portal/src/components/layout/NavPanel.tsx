@@ -9,7 +9,7 @@ import BIALLogo from '../BIALLogo'
 import NavItems from './NavItems'
 import ProfileCluster from './ProfileCluster'
 import TokenRing from './TokenRing'
-import { NAV_PANEL_PX, NAV_RAIL_PX } from './useNavRail'
+import { NAV_RAIL_PX, NAV_WIDTH_PX } from '../../lib/motion'
 
 /**
  * The navigation panel — ONE COLUMN, TWO WIDTHS. It rests as a 56px rail of icons and grows to
@@ -58,7 +58,7 @@ export default function NavPanel({
     <motion.div
       className="flex h-full flex-col overflow-x-hidden overflow-y-auto bg-white"
       initial={false}
-      animate={{ width: collapsed ? NAV_RAIL_PX : NAV_PANEL_PX }}
+      animate={{ width: collapsed ? NAV_RAIL_PX : NAV_WIDTH_PX }}
       transition={{ type: 'tween', ease: 'easeOut', duration: 0.2 }}
       data-testid="nav-panel"
       data-collapsed={collapsed ? 'true' : 'false'}

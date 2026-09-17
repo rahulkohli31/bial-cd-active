@@ -3,7 +3,8 @@ import { useLocation } from 'react-router-dom'
 import { rememberProjectsSearch } from '../../utils/projectsListMemory'
 import NavPanel from './NavPanel'
 import NavReveal, { NavMenuButton, useStackedViewport } from './NavReveal'
-import { useNavRail, NAV_PANEL_PX, NAV_RAIL_PX } from './useNavRail'
+import { useNavRail } from './useNavRail'
+import { NAV_RAIL_PX, NAV_WIDTH_PX } from '../../lib/motion'
 
 /**
  * The frame every route renders inside — the navigation on the left, the page beside it.
@@ -81,10 +82,11 @@ function DockedShell({ children }: { children: ReactNode }) {
     <div className="flex h-screen overflow-hidden bg-bial-bg font-manrope">
       <div
         className="relative h-full shrink-0 transition-[width] duration-200"
-        style={{ width: rail.pinned ? NAV_PANEL_PX : NAV_RAIL_PX }}
+        style={{ width: rail.pinned ? NAV_WIDTH_PX : NAV_RAIL_PX }}
       >
         <aside
           {...rail.hoverProps}
+          {...rail.focusProps}
           data-testid="nav-docked"
           className="absolute inset-y-0 left-0 z-30 border-r border-bial-border shadow-sm"
         >

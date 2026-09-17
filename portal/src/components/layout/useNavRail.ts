@@ -1,33 +1,28 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { PointerEvent } from 'react'
+import type { FocusEvent, PointerEvent } from 'react'
 
 /**
- * The navigation's three inputs, and the one answer they produce.
+ * The navigation's inputs, and the one answer they produce.
  *
- * THE RAIL IS THE RESTING STATE. The navigation is always on screen as a narrow column of icons
- * and grows to its labelled width when the pointer arrives — so the destinations are never gone,
- * only quiet. That is the shape the owner asked for, and it replaces the previous split where a
- * list route carried a permanently docked panel with no way to close it and an application route
- * carried no panel at all.
+ * COLLAPSE IS DERIVED, NOT STORED. Three writers racing to set one boolean is how a panel ends up
+ * disagreeing with itself. `pinned` is a deliberate preference and the only one that survives a
+ * reload; `hovered` and `focused` each say the person is at the navigation right now, and the
+ * second is what keeps it reachable without a pointer.
  *
- * COLLAPSE IS A CONCLUSION, NOT A STATE. It is derived from three independent facts rather than
- * stored, because storing it means three writers racing to set one boolean:
- *
- *   - `pinned`   — a deliberate preference, and the only one that survives a reload.
- *   - `hovered`  — the pointer is over the navigation.
- *   - `menuOpen` — a menu the navigation opened is on screen. It PORTALS OUT of the nav, so the
- *                  pointer moving to it reads as a pointer LEAVING, and without this latch the
- *                  rail collapses out from under the menu the person is reaching for.
- *
- * THE MENU LATCH HOLDS THE WIDTH IT FOUND, IT DOES NOT FORCE THE PANEL OPEN. Written as a third
- * term in the OR, it did the latter: pressing the profile avatar on a collapsed rail swept the
- * whole panel open behind the menu, which is a lot of movement to answer a click that was aimed
- * at one control. Opening a menu is not a request to see the navigation — it is a request to see
- * the menu — so the width freezes at whatever it was when the menu opened and thaws when it
- * closes.
+ * `menuOpen` FREEZES THE WIDTH RATHER THAN FORCING IT OPEN. A menu the navigation opens portals
+ * out of it, so the pointer moving to that menu reads as a pointer LEAVING, and without the latch
+ * the rail collapses out from under the menu being reached for. Opening a menu is a request to
+ * see the menu, not the navigation, so the width holds at whatever it already was.
  */
 
-const PIN_KEY = 'bial:nav-pinned'
+/**
+ * The rail's own pin, deliberately NOT the key `NavReveal` uses for its floating panel.
+ *
+ * One key for both meant pinning the rail on a list route also docked a 248px column beside the
+ * framed application on every application route — two different preferences about two different
+ * screens, collapsed into one switch nobody asked to throw.
+ */
+export const NAV_RAIL_PIN_KEY = 'bial:nav-rail-pinned'
 
 /**
  * How long the rail waits before closing behind a pointer that has left.
@@ -40,7 +35,7 @@ const CLOSE_DELAY_MS = 150
 
 function readPin(): boolean {
   try {
-    return window.localStorage.getItem(PIN_KEY) === '1'
+    return window.localStorage.getItem(NAV_RAIL_PIN_KEY) === '1'
   } catch {
     // A browser with storage denied still gets a working navigation, unpinned.
     return false
@@ -54,8 +49,14 @@ export interface NavRail {
   togglePin: () => void
   /** Spread onto the navigation's own element — the hit area IS the rail. */
   hoverProps: {
-    onPointerEnter: (event: PointerEvent<HTMLElement>) => void
+    onPointerOver: (event: PointerEvent<HTMLElement>) => void
     onPointerLeave: () => void
+  }
+  /** Spread onto the same element. Without it the rail has no keyboard path: its labels and its
+   *  pin only exist while expanded, and only the pointer could expand it. */
+  focusProps: {
+    onFocusCapture: () => void
+    onBlurCapture: (event: FocusEvent<HTMLElement>) => void
   }
   /** Handed to any menu the navigation opens, so reaching for it does not close it. */
   setMenuOpen: (open: boolean) => void
@@ -64,6 +65,7 @@ export interface NavRail {
 export function useNavRail(): NavRail {
   const [pinned, setPinned] = useState(readPin)
   const [hovered, setHovered] = useState(false)
+  const [focused, setFocused] = useState(false)
   /** The width the menu froze, or `null` when no menu is open. */
   const [frozen, setFrozen] = useState<boolean | null>(null)
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -77,18 +79,19 @@ export function useNavRail(): NavRail {
 
   useEffect(() => clearClose, [clearClose])
 
-  const onPointerEnter = useCallback(
+  const onPointerOver = useCallback(
     (event: PointerEvent<HTMLElement>) => {
       clearClose()
       // ARRIVING AT THE PROFILE IS NOT ARRIVING AT THE NAVIGATION. The avatar sits inside the
       // rail, so reaching it means crossing the rail — which opened the whole panel on the way to
-      // a control that was already visible and already pressable. Entering THROUGH the quiet zone
-      // leaves the width alone.
+      // a control that was already visible and already pressable.
       //
-      // Only the ENTRY is filtered, never a later move: this fires once, when the pointer crosses
-      // into the aside. A pointer that came in over the destinations and then travelled down to
-      // the profile has already opened the panel and keeps it open, because this does not run
-      // again on the way down.
+      // THIS IS `over`, NOT `enter`, AND THAT IS THE WHOLE POINT. `enter` fires once, on the way
+      // in, so filtering it left the rail stuck collapsed for as long as the pointer stayed
+      // inside: the move from the profile UP to the destinations never reached the handler.
+      // `over` bubbles on every element transition within the rail, so the same test re-asks the
+      // question on each move and the panel opens the moment the pointer is somewhere that wants
+      // it open.
       if (event.target instanceof Element && event.target.closest('[data-nav-quiet]') !== null) {
         return
       }
@@ -102,11 +105,25 @@ export function useNavRail(): NavRail {
     closeTimer.current = setTimeout(() => setHovered(false), CLOSE_DELAY_MS)
   }, [clearClose])
 
+  const onFocusCapture = useCallback(() => {
+    clearClose()
+    setFocused(true)
+  }, [clearClose])
+
+  const onBlurCapture = useCallback((event: FocusEvent<HTMLElement>) => {
+    // Focus moving between two controls INSIDE the rail is not focus leaving it, and closing on
+    // that would shut the panel under the very key that walked into it.
+    if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) {
+      return
+    }
+    setFocused(false)
+  }, [])
+
   const togglePin = useCallback(() => {
     setPinned((was) => {
       const next = !was
       try {
-        window.localStorage.setItem(PIN_KEY, next ? '1' : '0')
+        window.localStorage.setItem(NAV_RAIL_PIN_KEY, next ? '1' : '0')
       } catch {
         // The preference is lost on reload; the toggle still works for this visit.
       }
@@ -116,7 +133,7 @@ export function useNavRail(): NavRail {
     })
   }, [])
 
-  const live = !pinned && !hovered
+  const live = !pinned && !hovered && !focused
 
   const setMenuOpen = useCallback(
     (open: boolean) => {
@@ -131,10 +148,8 @@ export function useNavRail(): NavRail {
     collapsed: frozen ?? live,
     pinned,
     togglePin,
-    hoverProps: { onPointerEnter, onPointerLeave },
+    hoverProps: { onPointerOver, onPointerLeave },
+    focusProps: { onFocusCapture, onBlurCapture },
     setMenuOpen,
   }
 }
-
-export const NAV_RAIL_PX = 56
-export const NAV_PANEL_PX = 248
