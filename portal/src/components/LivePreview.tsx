@@ -1268,7 +1268,10 @@ export default function LivePreview({
 
       {/* Main area */}
       <div className="flex-1 flex overflow-hidden relative">
-        <div className="flex-1 bg-[#e8edf2] flex p-4 overflow-auto">
+        {/* THE GUTTER ROUND THE FRAMED APP IS 8px, NOT 16. It is a mat, not a margin — its job is
+            to separate the app's own edge from the pane's, and at 16 it was taking a strip off all
+            four sides of the one thing on this screen a citizen is actually trying to look at. */}
+        <div className="flex-1 bg-[#e8edf2] flex p-2 overflow-auto">
           {/* NO EMPTY STATE HERE, and it is structurally unreachable rather than merely unused:
               `AppPane` mounts the host only when the address resolver returned a URL. The
               sentence a citizen reads when there is nothing to frame is `AppPane`'s, drawn from
