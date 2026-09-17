@@ -177,13 +177,13 @@ describe('Delete exists in exactly one place, two steps from the list', () => {
 })
 
 describe('Sharing is the same body the workspace opens', () => {
-  it('mounts it, with its consent sentence', async () => {
+  it('mounts it', async () => {
     open()
     fireEvent.mouseDown(screen.getByTestId('settings-tab-sharing'))
     fireEvent.click(screen.getByTestId('settings-tab-sharing'))
-    // Binding in substance, and it travels with the body rather than with either frame — so a
-    // colleague is never granted access on a surface that forgot to say what access means.
-    expect(await screen.findByText(/Anyone you add can open and use this app/)).toBeTruthy()
+    // The tab's own control, not its prose: the panel explained itself in a paragraph above the
+    // field, and the owner's instruction is that the screens stop narrating what they are.
+    expect(await screen.findByText(/Add a colleague/i)).toBeTruthy()
     await settle()
   })
 })
@@ -197,7 +197,7 @@ describe('every tab the dialog offers has somewhere to go', () => {
     expect(screen.getByTestId('settings-tab-production')).toBeTruthy()
     expect(
       screen.getAllByRole('tab').map((tab) => tab.textContent),
-    ).toEqual(['General', 'Sharing', 'Integrations', 'Production'])
+    ).toEqual(['General', 'Sharing', 'Integrations', 'Deployment'])
   })
 })
 

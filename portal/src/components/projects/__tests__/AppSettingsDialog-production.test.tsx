@@ -13,7 +13,7 @@
  * screen telling them so, which is why the sentences are asserted rather than the buttons alone.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent, waitFor, act, within } from '@testing-library/react'
 
 const h = vi.hoisted(() => ({
   restartApp: vi.fn(),
@@ -87,15 +87,22 @@ describe('a live application', () => {
 
   it('★ says restart runs the SAME version, so nobody presses it expecting a repair', () => {
     mount()
-    const line = screen.getByTestId('production-restart').parentElement?.textContent ?? ''
-    expect(line).toMatch(/same version again/i)
+    // The caveat rides the `i` beside the control rather than a paragraph under it. Read off the
+    // accessible name, which is what a screen reader is handed — a sibling-text scrape never
+    // proved that.
+    const why = within(screen.getByTestId('production-restart').parentElement as HTMLElement)
+      .getByRole('button', { name: /same version again/i })
+      .getAttribute('aria-label') ?? ''
+    expect(why).toMatch(/same version again/i)
     // And it must not promise to pick up work saved since — that is the publish gate's job.
-    expect(line).toMatch(/does not pick up anything you have saved since/i)
+    expect(why).toMatch(/does not pick up anything you have saved since/i)
   })
 
   it('★ take down says what is KEPT, because the fear it answers is losing work', () => {
     mount()
-    const line = screen.getByTestId('production-takedown').parentElement?.textContent ?? ''
+    const line = within(screen.getByTestId('production-takedown').parentElement as HTMLElement)
+      .getByRole('button', { name: /chats, its data and its files are all kept/i })
+      .getAttribute('aria-label') ?? ''
     expect(line).toMatch(/chats, its data and its files are all kept/i)
     expect(line).toMatch(/publish again/i)
   })
@@ -273,7 +280,11 @@ describe('no control is offered where the endpoint would refuse it', () => {
     // …and NOT Restart, which is refused here — the two are not accepted on the same grounds.
     expect(screen.queryByTestId('production-restart')).toBeNull()
     // The server's own reassurance, said where the decision is made rather than after it.
-    expect(screen.getByTestId('production-tab').textContent).toContain(
+    expect(
+      within(screen.getByTestId('production-takedown').parentElement as HTMLElement)
+        .getByRole('button', { name: /version waiting for review is untouched/i })
+        .getAttribute('aria-label') ?? '',
+    ).toContain(
       'The version waiting for review is untouched',
     )
   })

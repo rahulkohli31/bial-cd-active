@@ -51,7 +51,7 @@ const TABS: { value: SettingsTab; label: string }[] = [
   { value: 'general', label: 'General' },
   { value: 'sharing', label: 'Sharing' },
   { value: 'integrations', label: 'Integrations' },
-  { value: 'production', label: 'Production' },
+  { value: 'production', label: 'Deployment' },
 ]
 
 /** The VARCHAR(120) column width — a paste backstop, not the rule a person is told about. */

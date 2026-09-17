@@ -167,14 +167,7 @@ export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.El
 
   return (
     <>
-      {/* Said once, plainly, before anyone is added — and binding in substance, so it sits with
-          the body rather than with either frame. */}
-      <p className="text-xs text-neutral leading-relaxed">
-        Anyone you add can open and use this application. Anything they enter is saved into the
-        application&rsquo;s real data.
-      </p>
-
-      <label className="block mt-5">
+      <label className="block">
         <span className="text-xs font-semibold text-tertiary">Add a colleague</span>
         <input
           autoFocus

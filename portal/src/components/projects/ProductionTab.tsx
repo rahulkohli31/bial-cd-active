@@ -1,11 +1,41 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { AlertTriangle, PowerOff, RotateCcw } from 'lucide-react'
+import { AlertTriangle, Info, PowerOff, RotateCcw } from 'lucide-react'
 import { restartApp, takeAppDown } from '../../utils/deployApi'
 import { ApiError } from '../../utils/apiError'
 import { canBeRestarted, canBeTakenDown, RESTART_FAILED_CODES } from '../../utils/publishPresentation'
 import { BusyGlyph } from '../ui/Waiting'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip'
 import AppStatusPanel from './AppStatusPanel'
 import TakeDownDialog from './TakeDownDialog'
+
+/**
+ * The caveat a control carries, ON DEMAND rather than in the layout.
+ *
+ * Restart and Take down are ordinary words; printing a paragraph under each one spent two lines
+ * of the panel telling a reader what they already knew. What is NOT obvious is the caveat — that
+ * a restart does not pick up saved work, and that a take-down keeps everything — so that stays,
+ * behind an `i` the reader opens only if they want it.
+ */
+function WhatThisDoes({ text }: { text: string }) {
+  return (
+    <TooltipProvider delayDuration={200}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            aria-label={text}
+            className="rounded-full p-1 text-neutral transition hover:bg-surface-muted hover:text-primary-900 outline-none focus-visible:ring-2 focus-visible:ring-primary"
+          >
+            <Info size={14} />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="right" className="max-w-[260px]">
+          {text}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+}
 
 /**
  * SETTINGS › PRODUCTION — where an application stands, and what an owner may do about it.
@@ -141,7 +171,7 @@ export default function ProductionTab({ projectId, appName, onSettled }: Product
             {(canBeRestarted(state) || canBeTakenDown(state, hasServingRow)) && (
               <div className="mt-4 flex flex-col gap-3 border-t border-bial-border pt-4">
                 {canBeRestarted(state) && (
-                <div>
+                <div className="flex items-center gap-1.5">
                   <button
                     type="button"
                     data-testid="production-restart"
@@ -152,15 +182,12 @@ export default function ProductionTab({ projectId, appName, onSettled }: Product
                     {pending === 'restart' ? <BusyGlyph size={14} /> : <RotateCcw size={14} />}
                     {pending === 'restart' ? 'Restarting…' : 'Restart'}
                   </button>
-                  <p className="mt-1.5 text-[11px] leading-relaxed text-neutral">
-                    Runs the same version again at the same address. It does not pick up anything
-                    you have saved since.
-                  </p>
+                  <WhatThisDoes text="Runs the same version again at the same address. It does not pick up anything you have saved since." />
                 </div>
                 )}
 
                 {canBeTakenDown(state, hasServingRow) && (
-                <div>
+                <div className="flex items-center gap-1.5">
                   <button
                     type="button"
                     data-testid="production-takedown"
@@ -171,11 +198,13 @@ export default function ProductionTab({ projectId, appName, onSettled }: Product
                     {pending === 'takedown' ? <BusyGlyph size={14} /> : <PowerOff size={14} />}
                     {pending === 'takedown' ? 'Taking it down…' : 'Take down'}
                   </button>
-                  <p className="mt-1.5 text-[11px] leading-relaxed text-neutral">
-                    Stops serving it to BIAL staff. Its chats, its data and its files are all kept,
-                    and Publish again puts it back at the same address.
-                    {state === 'in_review' && ' The version waiting for review is untouched.'}
-                  </p>
+                  <WhatThisDoes
+                    text={
+                      'Stops serving it to BIAL staff. Its chats, its data and its files are all kept, ' +
+                      'and Publish again puts it back at the same address.' +
+                      (state === 'in_review' ? ' The version waiting for review is untouched.' : '')
+                    }
+                  />
                 </div>
                 )}
               </div>
