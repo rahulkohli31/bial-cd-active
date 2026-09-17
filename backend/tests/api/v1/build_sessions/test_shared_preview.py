@@ -136,6 +136,71 @@ async def test_refresh_restores_again_even_when_already_live(
     assert wire.sbx.restored == [shared_name, shared_name]  # restored TWICE, not attached
 
 
+async def test_refresh_404s_for_the_owner_of_the_project(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """R11's relaxed access applies once per endpoint, not once for the pair — shared-launch's
+    own owner-refusal test does not exercise shared-refresh, which shares the helper but is a
+    separate route with its own dependency chain."""
+    owner, project, app_id, recipient = await _shared_project(
+        db_session, fake_storage, owner_email="owner7@example.com", recipient_email="r7@x.com"
+    )
+
+    resp = await client.post(
+        f"/v1/build-sessions/projects/{project.id}/shared-refresh", headers=auth_headers(owner)
+    )
+    assert resp.status_code == 404
+
+
+async def test_refresh_404s_for_a_stranger_never_shared_with(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    owner, project, app_id, recipient = await _shared_project(
+        db_session, fake_storage, owner_email="owner8@example.com", recipient_email="r8@x.com"
+    )
+    stranger = await UserFactory.create(db_session, email="stranger8@example.com")
+
+    resp = await client.post(
+        f"/v1/build-sessions/projects/{project.id}/shared-refresh",
+        headers=auth_headers(stranger),
+    )
+    assert resp.status_code == 404
+
+
+async def test_two_recipients_of_the_same_project_get_independent_containers(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """Cross-user isolation, the direct form: sharing one project with two colleagues must
+    never let one colleague's launch reach, restore over, or be satisfied by the other's
+    container — each is keyed by `shr_name_for(app_id, THEIR OWN id)`, a different name."""
+    owner = await UserFactory.create(db_session, email="owner9@example.com")
+    project = await ProjectFactory.create(db_session, owner.id, description="Shared with two")
+    app_id = await resolve_app_for_project(db_session, owner.id, project.id)
+    await db_session.commit()
+    await fake_storage.put(snapshot_key(app_id), b"BUNDLE")
+    recipient_a = await UserFactory.create(db_session, email="ra9@example.com")
+    recipient_b = await UserFactory.create(db_session, email="rb9@example.com")
+    await create_share(db_session, project=project, actor_id=owner.id, colleague_id=recipient_a.id)
+    await create_share(db_session, project=project, actor_id=owner.id, colleague_id=recipient_b.id)
+    await db_session.commit()
+
+    resp_a = await client.post(
+        f"/v1/build-sessions/projects/{project.id}/shared-launch",
+        headers=auth_headers(recipient_a),
+    )
+    resp_b = await client.post(
+        f"/v1/build-sessions/projects/{project.id}/shared-launch",
+        headers=auth_headers(recipient_b),
+    )
+
+    assert resp_a.status_code == 200, resp_a.text
+    assert resp_b.status_code == 200, resp_b.text
+    name_a = shr_name_for(app_id, recipient_a.id)
+    name_b = shr_name_for(app_id, recipient_b.id)
+    assert name_a != name_b
+    assert wire.sbx.restored == [name_a, name_b]  # two independent restores, not one shared
+
+
 async def test_launch_without_csrf_is_403(
     client: AsyncClient, db_session: AsyncSession, fake_storage, wire
 ) -> None:

@@ -195,6 +195,12 @@ async def test_share_refuses_self_share(client, db_session, bind_store) -> None:
         json={"sharedWithUserId": str(owner.id)},
     )
     assert resp.status_code == 400
+    # The status code alone is what the sibling no-saved-snapshot refusal also answers with —
+    # asserting the message distinguishes the two refusals, so a mutant that swapped which
+    # check runs first (or dropped the self-share check and fell through to another 400) would
+    # be caught here.
+    assert "yourself" in resp.json()["error"]["message"]
+    assert resp.json()["error"].get("code") != "no_saved_snapshot"
 
 
 async def test_share_refuses_a_project_with_nothing_saved(client, db_session) -> None:

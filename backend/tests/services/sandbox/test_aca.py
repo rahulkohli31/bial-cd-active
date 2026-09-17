@@ -41,7 +41,7 @@ from src.services.sandbox.client import _RESTORE_TIMEOUT_SECONDS, AcaSandboxClie
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from src.services.storage.errors import StorageNotFoundError
-from tests.fakes import FakeStorage, a_fleet_member, a_git_bundle
+from tests.fakes import FakeStorage, a_fleet_member, a_git_bundle, a_shared_sandbox_name
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -184,7 +184,10 @@ async def test_a_shared_restore_is_stamped_with_the_recipient_not_the_owner(
 
     client = _client(aca, handler)
     await fake_storage.put(snapshot_key(APP_ID), a_git_bundle())
-    shared_name = "shr-abc123"
+    # A shape `manager.shr_name_for` could actually have minted — not `"shr-abc123"`, which no
+    # real minter produces and would let a missing-shape guard on the ARM delete path go
+    # unnoticed.
+    shared_name = a_shared_sandbox_name()
     await client.restore_from_snapshot(
         str(recipient), shared_name, app_env=_app_env(), kind="shared_sandbox"
     )

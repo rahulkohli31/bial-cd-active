@@ -24,6 +24,7 @@ from src.services.sandbox.base import (
     SandboxError,
     SandboxHandle,
     SandboxNotReadyError,
+    ServedCount,
 )
 from src.services.sandbox.client import (
     AcaSandboxClient,
@@ -693,6 +694,50 @@ async def test_a_transport_error_reads_unknown_and_does_not_raise() -> None:
     report = await _client(handler).compile_state(_handle())
     assert report.state is CompileState.UNKNOWN
     assert report.reason == "transport_error"
+
+
+# --- served_count() — GET /_sup/served, #239's own "proven only against the fake" gap ---------
+
+
+def _served_handler(status: int, body: object) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/_sup/served"
+        assert request.headers.get("authorization") == "Bearer tok-secret"
+        return httpx.Response(status, json=body)
+
+    return handler
+
+
+async def test_served_count_reads_the_count_and_the_truncated_flag() -> None:
+    result = await _client(_served_handler(200, {"served": 42, "truncated": True})).served_count(
+        _handle()
+    )
+    assert result == ServedCount(count=42, truncated=True)
+
+
+async def test_served_count_defaults_truncated_to_true_when_the_field_is_absent() -> None:
+    """Fail-closed: an unparseable/absent `truncated` must never silently read as "this count
+    is a trustworthy total" — the one direction this signal must never be wrong in."""
+    result = await _client(_served_handler(200, {"served": 7})).served_count(_handle())
+    assert result == ServedCount(count=7, truncated=True)
+
+
+async def test_served_count_reads_none_on_a_non_200() -> None:
+    result = await _client(_served_handler(404, {"detail": "Not Found"})).served_count(_handle())
+    assert result is None
+
+
+async def test_served_count_reads_none_on_a_malformed_body() -> None:
+    result = await _client(_served_handler(200, {"unexpected": "shape"})).served_count(_handle())
+    assert result is None
+
+
+async def test_served_count_reads_none_on_a_transport_error_and_does_not_raise() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=request)
+
+    result = await _client(handler).served_count(_handle())
+    assert result is None
 
 
 async def test_a_non_200_non_404_reads_unknown_and_does_not_raise() -> None:

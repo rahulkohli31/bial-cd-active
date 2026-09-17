@@ -265,6 +265,70 @@ describe('nginx.conf — the framing policy names the apps host without revoking
   })
 })
 
+describe('nginx.conf — the four key-shape allowlists all admit a shared-runtime key, and agree', () => {
+  // The keyed location's own regex is exercised end to end above (a real match, a real
+  // capture). These four are the OTHER places the same `sbx|pub|shr` prefix set is spelled —
+  // #239's own review of #198 found only the keyed location under a test, leaving the other
+  // three free to drift without CI ever noticing. Extracted from the live file rather than
+  // hand-copied, so a changed prefix set here fails on WHAT CHANGED, not on this test's own
+  // guess going stale first.
+  function prefixAlternation(pattern: string): string {
+    const m = pattern.match(/\(\?:([a-z|]+)\)-/)
+    if (!m) throw new Error(`no (?:a|b|c)- prefix alternation found in: ${pattern}`)
+    return m[1]!
+  }
+
+  const refererMap = CODE.match(/map \$http_referer \$key_from_referer \{[\s\S]*?\n\}/)?.[0]
+  const cookieMap = CODE.match(/map \$cookie_bial_app \$key_from_cookie \{[\s\S]*?\n\}/)?.[0]
+  const supDenial = APPS.body.match(/location ~ "(\^\/a\/[^"]+_sup[^"]*)"/)?.[1]
+  const keyedLocation = blocksOf(APPS.body, LOCATION).find((l) =>
+    /set[ \t]+\$app_key[ \t]+\$1[ \t]*;/.test(l.body),
+  )!.header.match(/^~\s*"(.*)"$/)?.[1]
+
+  it('all four sources were actually found in the file (a guard on the guards)', () => {
+    expect(refererMap).toBeTruthy()
+    expect(cookieMap).toBeTruthy()
+    expect(supDenial).toBeTruthy()
+    expect(keyedLocation).toBeTruthy()
+  })
+
+  it('the Referer key map accepts a shr- key from the apps host, and captures it', () => {
+    // `${APPS_HOSTNAME}` is envsubst'd at container start, not by this test — substituted here
+    // with a stand-in host so the match is real rather than a structural guess.
+    const rawSource = refererMap!.match(/"~([^"]+)"/)?.[1]
+    expect(rawSource).toBeTruthy()
+    const source = rawSource!.replace('${APPS_HOSTNAME}', 'apps.example')
+    const re = new RegExp(source)
+    expect(`https://apps.example/a/shr-${HEX28}/`.match(re)?.[1]).toBe(`shr-${HEX28}`)
+  })
+
+  it('the routing-cookie key map accepts a shr- key', () => {
+    const source = cookieMap!.match(/"~([^"]+)"/)?.[1]
+    expect(source).toBeTruthy()
+    const re = new RegExp(source!)
+    expect(`shr-${HEX28}`.match(re)?.[1]).toBe(`shr-${HEX28}`)
+    expect(re.test(`sbx-${HEX28}extra`)).toBe(false) // still anchored to $, not just accepting shr
+  })
+
+  it('the _sup denial location refuses a shared-runtime container\'s supervisor port too', () => {
+    const re = new RegExp(supDenial!)
+    expect(re.test(`/a/shr-${HEX28}/_sup`)).toBe(true)
+    expect(re.test(`/a/shr-${HEX28}/_sup/anything`)).toBe(true)
+  })
+
+  it('every one of the four prefix sets is the identical (?:sbx|pub|shr), not four copies that can drift apart', () => {
+    const sets = {
+      referer: prefixAlternation(refererMap!),
+      cookie: prefixAlternation(cookieMap!),
+      supDenial: prefixAlternation(supDenial!),
+      keyed: prefixAlternation(keyedLocation!),
+    }
+    const values = Object.values(sets)
+    expect(new Set(values).size).toBe(1)
+    expect(values[0]).toBe('sbx|pub|shr')
+  })
+})
+
 describe('vite.config.js — the dev server states the same framing policy as the edge', () => {
   // THE FOURTH COPY, in a different file with no envsubst variable to follow — when the edge
   // learns a new framed origin and this file doesn't, `npm run dev` silently refuses to frame the
