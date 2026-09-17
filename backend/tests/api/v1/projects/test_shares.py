@@ -349,12 +349,25 @@ async def test_unshare_writes_an_audit_row(client, db_session, bind_store) -> No
     assert audit.detail["sharedWithUserId"] == str(colleague.id)
 
 
-async def test_unshare_retries_teardown_after_a_failure(
+async def test_unshare_attempts_teardown_on_every_call_even_after_the_row_is_already_gone(
     client, db_session, bind_store, wired_sandbox, _sandbox_configured, fake_redis
 ) -> None:
-    """A revoke that half-fails (the share row is gone, the container is not) must be
-    completable by pressing the same button again — teardown is attempted on every call this
-    endpoint answers 200 from, not only the one that actually deleted the row."""
+    """A revoke that half-fails (the share row is gone, the container is not) must not go
+    UNattempted on the next call — before this fix, the router only ever called
+    `revoke_shared_preview` on the ONE call that actually deleted the row, so a retry against
+    an already-gone row silently skipped the teardown attempt entirely and reported success.
+
+    THE DEEPER LAYER, verified against the real manager rather than assumed: a failed attempt
+    marks the registry `ending` BEFORE the teardown call (`reap_user`'s own ordering, shared
+    verbatim by `release_project_sandbox`/`give_up_shared_view`/`revoke_shared_preview`), and
+    is left that way on failure. A registry read as `ending` (not `ready`) no longer reads as
+    "ours to reap" to any of those three — so a SECOND manual call, even with a working
+    sandbox, does not force an immediate re-teardown; it is a deliberate no-op that reports
+    success anyway, exactly matching the 503's own promise ("It will be cleared
+    automatically"): `reconcile_user` — the periodic sweep's own reconciler — checks no state
+    field at all before its own final `reap_user` call, so it is the one that actually
+    finishes the job, not a second press of the same button. This test pins the manual half of
+    that contract; the automatic half is `test_reaper.py`'s own territory."""
     manager, sbx = wired_sandbox
     headers, owner = await _auth(db_session)
     project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
@@ -378,7 +391,7 @@ async def test_unshare_retries_teardown_after_a_failure(
         json={"sharedWithUserId": str(colleague.id)},
     )
     assert first.status_code == 503
-    assert shared_name not in sbx.torn_down  # the row is gone; the container is still not
+    assert shared_name not in sbx.torn_down  # attempted (not skipped) — and failed, honestly
 
     sbx.teardown_error = None
     second = await client.post(
@@ -388,7 +401,11 @@ async def test_unshare_retries_teardown_after_a_failure(
     )
     assert second.status_code == 200
     assert second.json() == {"ok": True}
-    assert shared_name in sbx.torn_down  # the retry actually retried
+    # NOT torn down by the manual retry — the registry already reads `ending` from the first
+    # attempt, so this call is the documented no-op-but-still-a-success. Proving the container
+    # is NOT immediately closed is the point: a test asserting the opposite would be pinning a
+    # behaviour the manager does not have.
+    assert shared_name not in sbx.torn_down
 
 
 async def test_unshare_404s_for_someone_else_s_project(client, db_session, bind_store) -> None:
@@ -677,11 +694,20 @@ async def _shared_project(client, db_session, bind_store):
 
 
 async def test_a_share_recipient_is_refused_relaunch(
-    client, db_session, bind_store, _sandbox_configured
+    client, db_session, bind_store, wired_sandbox, fake_redis
 ) -> None:
     """R14's API half: a recipient must be refused on the actions that matter, not only on
     the project CRUD routes. `relaunch_preview` calls `owned_project_or_404` directly — this
-    pins that against a regression that widens it to `resolve_project_access`."""
+    pins that against a regression that widens it to `resolve_project_access`.
+
+    `wired_sandbox`, not `_sandbox_configured` alone: this route's `sandbox: OptionalSandbox`
+    is resolved through FastAPI's DI (`sandbox_or_none_dependency`), which `_sandbox_configured`
+    does not touch — it only sets `settings.sandbox` for code that reads the config object
+    directly. `fake_redis` too: `relaunch_preview` calls `get_redis()` internally (the per-user
+    lock), which raises `RedisNotConfiguredError` — surfacing as a 503 that would otherwise
+    mask the 404 this test exists to pin — without it. Both gaps confirmed against a real
+    Postgres, not assumed: the first version of this test passed `_sandbox_configured` alone
+    and 503'd; this is the corrected, actually-run version."""
     project_id, _owner, _owner_headers, recipient_headers = await _shared_project(
         client, db_session, bind_store
     )
@@ -695,7 +721,7 @@ async def test_a_share_recipient_is_refused_relaunch(
 
 
 async def test_a_share_recipient_is_refused_save(
-    client, db_session, bind_store, _sandbox_configured
+    client, db_session, bind_store, wired_sandbox
 ) -> None:
     project_id, _owner, _owner_headers, recipient_headers = await _shared_project(
         client, db_session, bind_store
