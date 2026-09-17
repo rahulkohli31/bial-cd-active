@@ -41,14 +41,15 @@ from src.core.prompt_blocks import (
     WRITE_IDENTITY,
 )
 from src.db.models.conversation import ChatKind
-from src.services.agent.agent import ChatDeps, chat_agent
+from src.services.agent.agent import ChatDeps, chat_agent, static_instruction_parts
 from src.services.agent.mode_prompts import (
     _PLAN_SEGMENT,
     ATTACHMENT_RULES,
     PromptContext,
-    _base,
     _connected_data_stub,
     compose_kind_prompt,
+    standing_contract,
+    this_conversation,
 )
 from src.services.agent.toolsets import registered_tool_definitions
 from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
@@ -149,7 +150,7 @@ def test_the_connected_data_stub_reaches_both_arms(kind: ChatKind) -> None:
 
 
 @pytest.mark.parametrize("kind", list(ChatKind))
-def test_a_project_with_no_connectors_gets_a_byte_identical_base(kind: ChatKind) -> None:
+def test_a_project_with_no_connectors_gets_a_byte_identical_tail(kind: ChatKind) -> None:
     """★ THE ASSERTION THAT KEEPS THIS FEATURE FREE FOR EVERY OTHER PROJECT ON THE PLATFORM.
 
     Nearly every project reads nothing outside the platform, and for those the composed prompt
@@ -162,21 +163,16 @@ def test_a_project_with_no_connectors_gets_a_byte_identical_base(kind: ChatKind)
     # it against a context built with `connected_systems=()` would be comparing the function with
     # itself — vacuously true, and green against the obvious mistake here: appending
     # `f"\n\n{stub}"` unconditionally, which gives every unconnected project's prompt a trailing
-    # blank line. BASE ends at `FIRST_SLICE_RULE`, so that is what is asserted, and the
-    # unconditional append breaks it.
-    # Asserted on `_base` itself rather than on a slice of the composed prompt: the kind segment
-    # contains blank lines of its own, so no partition of the composed string reliably finds
-    # BASE's tail — an earlier attempt at this test split on the LAST blank line and asserted
-    # about the segment instead.
-    assert _base(_CONTEXT, kind).endswith(FIRST_SLICE_RULE), (
-        "BASE no longer ends at FIRST_SLICE_RULE for a project with no connectors — something is "
-        f"being appended: {_base(_CONTEXT, kind)[-80:]!r}"
+    # blank line. The per-conversation tail is where that byte would land, and for a chat with
+    # neither an attachment nor a connector the tail is the identity sentence and nothing else.
+    tail = this_conversation(_CONTEXT)
+    assert tail.endswith("answer what was asked before acting."), (
+        "the per-conversation tail no longer ends at the identity sentence for a project with "
+        f"no connectors — something is being appended: {tail[-80:]!r}"
     )
-    # And the composed prompt is exactly BASE + one blank line + the kind's segment, so a stray
-    # separator anywhere in BASE's tail moves this comparison too.
-    composed_base = _base(_CONTEXT, kind)
-    assert without.startswith(f"{composed_base}\n\n")
-    assert _SEGMENT_HEADERS[kind] in without[len(composed_base) :]
+    # And the composed prompt is exactly the standing contract, one blank line, then that tail.
+    assert without == f"{'\n\n'.join(standing_contract(kind))}\n\n{tail}"
+    assert _SEGMENT_HEADERS[kind] in without[: -len(tail)]
 
 
 def test_the_stub_names_the_system_exactly_as_the_registry_does() -> None:
@@ -606,7 +602,11 @@ async def test_mode_run_composes_and_never_persists_instructions(db_session) -> 
         prompt_context=_CONTEXT,
     )
     result = await chat_agent.run(
-        "what does my app do?", deps=deps, model=_capturing_model(captured)
+        "what does my app do?",
+        deps=deps,
+        model=_capturing_model(captured),
+        # The kind's standing contract rides the run, exactly as `turns/engine.py` passes it.
+        instructions=static_instruction_parts(ChatKind.PLAN),
     )
     assert captured["instructions"] == compose_kind_prompt(ChatKind.PLAN, _CONTEXT)
 
@@ -672,6 +672,7 @@ async def test_a_plan_turn_carries_the_attachment_rules_and_the_segments_instruc
         deps=deps,
         model=FunctionModel(respond),
         message_history=[],
+        instructions=static_instruction_parts(ChatKind.PLAN),
     )
 
     # The segment's INSTRUCTION and the attachment rules, both on the instructions channel.

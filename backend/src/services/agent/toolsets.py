@@ -161,6 +161,8 @@ def _no_pinned_sandbox(_ctx: RunContext[Any]) -> SandboxSession | None:
 
 def app_state_toolset[DepsT](
     sandbox_of: Callable[[RunContext[DepsT]], SandboxSession | None],
+    *,
+    noticed: Callable[[AppState], None] | None = None,
 ) -> FunctionToolset[DepsT]:
     """`check_the_app`, over whatever deps `sandbox_of` resolves the container from.
 
@@ -171,6 +173,11 @@ def app_state_toolset[DepsT](
     per self-heal iteration, so a repaired app is read again rather than reported from before the
     repair.
 
+    `noticed` IS HANDED THE READING AS THE TOOL ANSWERS, so the turn can act on the same fact the
+    model was given rather than re-deriving it from the sentence that carried it. It fires on
+    every call including the memoized one: a second call in the same run is still a turn in which
+    the model consulted the platform, which is the fact the detection counters count.
+
     The inner tool annotates `RunContext[Any]` rather than the enclosing PEP-695 type param, for
     the reason `sandbox_toolset` states: pydantic-ai resolves tool annotations with
     `get_type_hints` at registration, where that param is out of scope under deferred
@@ -179,13 +186,14 @@ def app_state_toolset[DepsT](
     memo: list[AppState] = []
 
     async def check_the_app(ctx: RunContext[Any]) -> str:
-        """Find out what this app is doing right now — whether it is serving, and whether the
-        page the user actually looks at is still the starter template.
+        """Call this before you say anything about what the app does now, and whenever the user
+        tells you something is wrong.
 
-        Call this when what you are about to say depends on the app's current state, and
-        whenever the user tells you something is wrong. Earlier messages in this conversation
-        describe how the app WAS; this is how it is. The platform runs the check and hands you
-        its answer, so you do not need to run a type-check or start a server to find out.
+        It tells you what this app is doing right now — whether it is serving, and whether the
+        page the user actually looks at is still the starter template. Earlier messages in this
+        conversation describe how the app WAS; this is how it is. The platform runs the check and
+        hands you its answer, so you do not need to run a type-check or start a server to find
+        out.
         """
         if not memo:
             session = sandbox_of(ctx)
@@ -199,6 +207,8 @@ def app_state_toolset[DepsT](
                     poll_s=READINESS_POLL_S,
                 )
             )
+        if noticed is not None:
+            noticed(memo[0])
         return _APP_STATE_SENTENCES[memo[0]]
 
     return cast(FunctionToolset[DepsT], FunctionToolset[Any]([check_the_app], id="app-state"))
@@ -249,6 +259,7 @@ def toolsets_for_kind[DepsT](
     *,
     connected_systems: Sequence[ConnectedSystem] = (),
     app_state_of: Callable[[RunContext[DepsT]], SandboxSession | None] = _no_pinned_sandbox,
+    app_state_noticed: Callable[[AppState], None] | None = None,
 ) -> ToolSurface[DepsT]:
     """The per-run tool surface for a chat kind, over whatever deps type the caller's accessors
     resolve the workspace (and, for Build, the sandbox) from.
@@ -275,14 +286,15 @@ def toolsets_for_kind[DepsT](
 
     `app_state_of` IS THE ONE ACCESSOR THAT MAY ANSWER `None`, and `check_the_app` is registered
     on BOTH arms off it. Plan has no other route to the answer — it cannot run a command that
-    starts a server — and a run with no container still gets the tool, answering `unknown`."""
+    starts a server — and a run with no container still gets the tool, answering `unknown`.
+    `app_state_noticed` rides beside it so the caller hears what the tool answered."""
     match kind:
         case ChatKind.PLAN:
             plan_toolsets: list[AbstractToolset[DepsT]] = [
                 read_only_toolset(workspace_of),
                 cast(AbstractToolset[DepsT], CONVERSATION_TOOLSET),
                 cast(AbstractToolset[DepsT], _PLAN_OPTIONS_TOOLSET),
-                app_state_toolset(app_state_of),
+                app_state_toolset(app_state_of, noticed=app_state_noticed),
             ]
             # THE ATTACHMENT CAPABILITY, ON THIS ARM ALONE. Plan already executes in
             # the container, but only the eight read-only binaries on `check_the_guest_list` —
@@ -316,7 +328,7 @@ def toolsets_for_kind[DepsT](
                         sandbox_toolset(sandbox_of),
                         read_only_toolset(workspace_of).filtered(_structured_reads_only),
                         cast(AbstractToolset[DepsT], CONVERSATION_TOOLSET),
-                        app_state_toolset(app_state_of),
+                        app_state_toolset(app_state_of, noticed=app_state_noticed),
                     ],
                     connected_systems,
                 ),

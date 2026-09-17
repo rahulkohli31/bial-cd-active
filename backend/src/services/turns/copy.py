@@ -40,11 +40,89 @@ project — and without saying so, the honest reading of the first sentence is "
 app"."""
 
 CHAT_TOO_LONG_CODE: Final = "context_hard_limit_exceeded"
-"""The code the too-long refusal carries.
+"""The code the too-long refusal carries. A member of `END_REASONS` below."""
 
-NOTHING IN THIS CODEBASE FORCES A READER TO HANDLE A NEW CODE — no `Literal` union, no native
-enum, no exhaustiveness anywhere on the refusal path; every code is an open string compared by
-hand. So adding one is free and silent, and only a test can notice a reader dropping it."""
+DOCUMENT_TOO_LONG_CODE: Final = "DOCUMENT_TOO_MANY_PAGES"
+"""The code a provider refusal on a document's page count carries.
+
+UPPERCASE, UNLIKE EVERY OTHER REASON IN THE SYSTEM. It is the provider's own token, stored rows
+already carry it, and normalising it here would make every one of those rows unreadable to the
+lookup that renders them."""
+
+
+# --- HOW A TURN OR A BUILD ENDED, as a closed set ------------------------------------------
+#
+# ONE COLLECTION, AND EVERY PRODUCER SPELLS ITS REASON OUT OF IT. There are five producers
+# across three modules — the `_WriteEndedError` raise sites, the model-unavailable ending, the
+# named refusals, the turn's own cancellation arm, and the session end in `build_sessions` — and
+# while each of them held its own string literal, a reason could be added in one of them and
+# reach a citizen through a lookup that had never heard of it. That is not hypothetical: the
+# portal's reason→sentence table has shipped three separate endings with no copy, each one
+# surfacing as "The build failed." over a working app.
+#
+# THE COLLECTION IS WHAT THE CROSS-LANGUAGE PIN COMPARES. The TypeScript half is a closed union
+# whose copy table is total over it, so a member added there without a sentence is a compile
+# error; nothing compels the reverse, and the pin test is the answer to that half. It must be
+# able to see every producer, which is why this lives here — `turns/copy.py` already exports
+# reason codes and imports nothing, so the engine, `build_sessions/outcome.py` and the session
+# manager can all reach it without a cycle. A collection inside `turns/engine.py` could not see
+# the refusal codes or the session-end tokens at all.
+
+SANDBOX_UNAVAILABLE_REASON: Final = "sandbox_unavailable"
+WORKSPACE_UNREADABLE_REASON: Final = "workspace_unreadable"
+WORKSPACE_UNRECOVERABLE_REASON: Final = "workspace_unrecoverable"
+WORKSPACE_RESTORED_REASON: Final = "workspace_restored"
+ATTACHMENT_UNAVAILABLE_REASON: Final = "attachment_unavailable"
+WALL_CLOCK_DEADLINE_EXCEEDED_REASON: Final = "wall_clock_deadline_exceeded"
+REQUEST_LIMIT_REASON: Final = "request_limit"
+RUN_BUDGET_REACHED_REASON: Final = "run_budget_reached"
+BUILD_WROTE_NOTHING_REASON: Final = "build_wrote_nothing"
+VERDICT_UNANSWERABLE_REASON: Final = "verdict_unanswerable"
+SELF_HEAL_BUDGET_EXHAUSTED_REASON: Final = "self_heal_budget_exhausted"
+QUOTA_EXCEEDED_REASON: Final = "quota_exceeded"
+
+MODEL_UNAVAILABLE_CODE: Final = "model_unavailable"
+"""The machine-readable half of a model service that failed mid-turn: the `reason` on the terminal
+frame, mirrored by the portal's `OUTCOME_COPY`. A token, never prose."""
+
+STOPPED_BY_USER: Final = "stopped_by_user"
+"""The citizen's own Stop, and the session manager's default stop reason."""
+
+FORCE_ENDED: Final = "force_ended"
+"""The one graceful end that DISCARDS its work — any sentence implying otherwise is a lie about
+the citizen's code."""
+
+IDLE_TEARDOWN: Final = "idle_teardown"
+"""The idle reaper's reason. Caller-supplied through `StopBuildRequest.reason`, which is what
+makes it reachable even though nothing in `src` raises it."""
+
+END_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        SANDBOX_UNAVAILABLE_REASON,
+        WORKSPACE_UNREADABLE_REASON,
+        WORKSPACE_UNRECOVERABLE_REASON,
+        WORKSPACE_RESTORED_REASON,
+        ATTACHMENT_UNAVAILABLE_REASON,
+        WALL_CLOCK_DEADLINE_EXCEEDED_REASON,
+        REQUEST_LIMIT_REASON,
+        RUN_BUDGET_REACHED_REASON,
+        BUILD_WROTE_NOTHING_REASON,
+        VERDICT_UNANSWERABLE_REASON,
+        SELF_HEAL_BUDGET_EXHAUSTED_REASON,
+        QUOTA_EXCEEDED_REASON,
+        STOPPED_BY_USER,
+        FORCE_ENDED,
+        IDLE_TEARDOWN,
+        MODEL_UNAVAILABLE_CODE,
+        CHAT_TOO_LONG_CODE,
+        DOCUMENT_TOO_LONG_CODE,
+    }
+)
+"""Every reason a stored row can carry.
+
+A STORED `NULL` IS NOT IN HERE, and that absence is deliberate rather than an oversight: a
+generic failure records no reason at all, so the reader's job is to render the generic sentence
+for it as an arm of its own, not to look up a key that was never written."""
 
 ALREADY_BUILDING_HERE_CODE: Final = "already_building_here"
 """This user's one workspace is committed to another chat of their own, and the remedy is to finish
@@ -82,6 +160,18 @@ STILL_SHOWING_EARLIER: Final = "an earlier version of itself"
 
 STILL_SHOWING_NOTHING: Final = "nothing yet"
 """The app is not serving at all, so there is no version of it to describe."""
+
+APP_STOPPED_WORKING_TEXT: Final = "Your app stopped working after the last change."
+"""The change notice, when the app crossed from serving to not serving during a turn.
+
+A FACT, NOT AN INSTRUCTION. The platform already knows, so it says so rather than telling the
+assistant to go and look — and it lands once, at the turn where the crossing happened, because
+an app that is still down next turn has not changed again."""
+
+APP_WORKING_AGAIN_TEXT: Final = "Your app is working again."
+"""The other edge, and it ships with the first one. A notice that only ever reports the bad
+crossing leaves the last thing on record saying the app is broken, which is worse than silence:
+the assistant reads a stale alarm and keeps repeating it at someone whose app is fine."""
 
 DID_NOT_COME_TOGETHER_TEXT: Final = (
     "That change didn't come together. Your app is still showing {showing}. "
@@ -280,10 +370,6 @@ IT SAYS THE APP IS WORKING, because that is what the piece-at-a-time ordering bu
 fact that makes this ending survivable. `{kept}` is filled by the same securing function the
 daily-budget ending uses, so the reassurance is conditional on a copy actually landing."""
 
-
-MODEL_UNAVAILABLE_CODE: Final = "model_unavailable"
-"""The machine-readable half of a model service that failed mid-turn: the `reason` on the terminal
-frame, mirrored by the portal's `OUTCOME_COPY`. A token, never prose."""
 
 MODEL_UNAVAILABLE_TEXT: Final = (
     "The assistant's service stopped responding partway through, {kept}. "

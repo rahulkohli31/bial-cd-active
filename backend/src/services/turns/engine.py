@@ -37,6 +37,7 @@ from datetime import UTC, datetime
 from functools import partial
 from typing import Any, Final, Literal
 
+import sqlalchemy as sa
 import structlog
 from pydantic_ai import Agent, BinaryContent, RunContext
 from pydantic_ai._agent_graph import AgentNode
@@ -94,9 +95,9 @@ from src.core.error_signature import error_signature
 from src.core.integrity_types import BaselineIdentity
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.harness_counter import HarnessCounter
-from src.db.models.message import MessageEntryKind, MessageVisibility
+from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.user import User
-from src.services.agent.agent import ChatDeps, chat_agent
+from src.services.agent.agent import ChatDeps, chat_agent, static_instruction_parts
 from src.services.agent.attachment_tools import AttachmentReader
 from src.services.agent.mode_prompts import PromptContext
 from src.services.agent.read_tools import (
@@ -142,8 +143,9 @@ from src.services.build_sessions.manager import (
     WorkspaceUnreadableError,
     app_name_for,
 )
-from src.services.build_sessions.outcome import STOPPED_BY_USER
 from src.services.messages.projection import (
+    APP_CHANGE_NOTICE_KIND,
+    APP_STATE_META_KEY,
     PLAN_OPTIONS_TOOL,
     PLATFORM_TEXT_KIND,
     PROPOSE_SLICE_TOOL,
@@ -182,6 +184,7 @@ from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.prompt import build_repair_prompt
 from src.services.orchestrator.selfheal import (
     CONTINUE_PROMPT,
+    AppState,
     HealthState,
     VerifyOutcome,
     dev_not_ready_error,
@@ -197,6 +200,10 @@ from src.services.redis.keys import (
 from src.services.sandbox import SandboxClient, SandboxError
 from src.services.sandbox.base import CompileState
 from src.services.turns.copy import (
+    APP_STOPPED_WORKING_TEXT,
+    APP_WORKING_AGAIN_TEXT,
+    ATTACHMENT_UNAVAILABLE_REASON,
+    BUILD_WROTE_NOTHING_REASON,
     CANNOT_TELL_WHAT_REMAINS_TEXT,
     CHAT_TOO_LONG_CODE,
     CHAT_TOO_LONG_TEXT,
@@ -208,16 +215,28 @@ from src.services.turns.copy import (
     MODEL_UNAVAILABLE_TEXT,
     NOT_RECOVERED_TEXT,
     PLAN_NOT_KEPT_TEXT,
+    QUOTA_EXCEEDED_REASON,
     RECOVERED_TEXT,
     REMAINDER_TEXT,
+    REQUEST_LIMIT_REASON,
+    RUN_BUDGET_REACHED_REASON,
+    SANDBOX_UNAVAILABLE_REASON,
+    SELF_HEAL_BUDGET_EXHAUSTED_REASON,
     SPENT_ENOUGH_TEXT,
     STILL_SHOWING_EARLIER,
     STILL_SHOWING_NOTHING,
     STILL_SHOWING_TEMPLATE,
+    STOPPED_BY_USER,
     UNVERIFIED_TEXT,
+    VERDICT_UNANSWERABLE_REASON,
+    WALL_CLOCK_DEADLINE_EXCEEDED_REASON,
+    WORKSPACE_RESTORED_REASON,
+    WORKSPACE_UNREADABLE_REASON,
+    WORKSPACE_UNRECOVERABLE_REASON,
     WRITING_UP_THE_PLAN_LABEL,
     still_open_send_again_text,
 )
+from src.services.turns.copy import DOCUMENT_TOO_LONG_CODE as DOCUMENT_TOO_LONG_CODE
 from src.services.turns.guard import claim_conversation, release_conversation
 from src.services.turns.plan_options import META_PENDING
 from src.services.usage.gate import (
@@ -367,9 +386,6 @@ DOCUMENT_TOO_LONG_TEXT: Final = (
 Names the file as the cause and gives a remedy that works from where they are standing. Quotes no
 page number deliberately: the limit is the provider's, not the platform's, and a number stated
 here would be one more thing to keep true across a deployment change."""
-
-DOCUMENT_TOO_LONG_CODE: Final = "DOCUMENT_TOO_MANY_PAGES"
-"""The machine-readable half, riding out on the terminal frame beside the sentence."""
 
 
 def _provider_refusal_message(exc: ModelHTTPError) -> str:
@@ -936,6 +952,16 @@ class _TurnState:
     #: counts once — the citizen reads a list of what is left, and a double mark must not be
     #: able to make a piece disappear from it twice or appear as still outstanding.
     finished_pieces: set[str] = field(default_factory=set)
+    #: THE NEWEST READING THIS TURN TOOK of what the app is doing, or None when it took none.
+    #: Two things produce one and they are both tool-call facts: the model calling
+    #: `check_the_app`, and the build loop's own health verdict — a turn that just built and
+    #: served the app has looked at it as squarely as one that asked. Later readings replace
+    #: earlier ones, so this is the state at the end of the turn rather than at its first probe.
+    app_reading: AppState | None = None
+
+    def read_the_app(self, reading: AppState) -> None:
+        """Record what the platform just learned about the app. Latest wins."""
+        self.app_reading = reading
 
     def text_blocks(self) -> list[str]:
         """The prose the citizen has been given so far, one entry per block."""
@@ -989,6 +1015,36 @@ def _what_it_is_showing(outcome: VerifyOutcome, *, ever_built: bool) -> str:
         # is no earlier version. This is it.
         return STILL_SHOWING_TEMPLATE
     return STILL_SHOWING_EARLIER
+
+
+def _reading_from_the_verdict(outcome: VerifyOutcome) -> AppState:
+    """The health verdict, expressed in the vocabulary `check_the_app` answers in.
+
+    SAME ORDERING AS `_what_it_is_showing`, one arm longer: an INDETERMINATE verdict is the
+    verify loop's own "could not tell", and calling that NOT_SERVING would report a crash every
+    time a probe blinked."""
+    if outcome.state is HealthState.INDETERMINATE:
+        return AppState.UNKNOWN
+    if outcome.served is None or not (200 <= outcome.served.status < 400):
+        return AppState.NOT_SERVING
+    if outcome.baseline is BaselineIdentity.STILL_THE_BASELINE:
+        return AppState.STILL_THE_TEMPLATE
+    return AppState.LIVE
+
+
+def _is_serving(reading: AppState | None) -> bool | None:
+    """The one axis the change notice is edge-triggered on, or None for "no reading".
+
+    STILL-THE-TEMPLATE IS SERVING. A citizen whose app answers but shows the starter page has a
+    working app that has not been built yet, which is a different sentence and a different unit's
+    problem; announcing "your app stopped working" at them would be false."""
+    match reading:
+        case None | AppState.UNKNOWN:
+            return None
+        case AppState.NOT_SERVING:
+            return False
+        case AppState.STILL_THE_TEMPLATE | AppState.LIVE:
+            return True
 
 
 def _workspace_of(ctx: RunContext[ChatDeps]) -> ReadOnlyWorkspace:
@@ -1512,6 +1568,11 @@ class TurnEngine:
                         reader_of=_reader_of if state.attachments is not None else None,
                         connected_systems=prompt_context.connected_systems,
                         app_state_of=_app_state_of,
+                        # WHAT THE TOOL ANSWERED, HEARD BY THE TURN. The change notice and the
+                        # detection counters both need the reading the model was handed, and
+                        # recovering it from the sentence that carried it would be a classifier
+                        # over our own prose.
+                        app_state_noticed=state.read_the_app,
                     ).toolsets
                     # UNCONDITIONAL, BECAUSE THE TOOLSET HAS ALREADY DECIDED IT. A run can only
                     # end deferred if a tool that DEFERS was registered on it, and
@@ -1530,6 +1591,11 @@ class TurnEngine:
                         message_history=history,
                         model=model,
                         toolsets=toolsets,
+                        # THE KIND'S STANDING CONTRACT, AS STATIC PARTS. Without a static part
+                        # the instructions breakpoint below resolves to nothing and marks
+                        # nothing; with one it lands after the last of these, so everything
+                        # ahead of the marker is byte-identical for every citizen.
+                        instructions=static_instruction_parts(state.kind),
                         output_type=output_type,
                         usage=turn_usage,
                         event_stream_handler=self._event_handler(state),
@@ -1539,11 +1605,10 @@ class TurnEngine:
                         # medium because a plan is a conversation with the person still in it;
                         # adaptive, not a budget — the model refuses one (ADAPTIVE_THINKING).
                         #
-                        # THE SAME THREE CACHE BREAKPOINTS THE BUILD LOOP SETS, MISSING HERE
-                        # until 2026-09-10. The provider caches only where the REQUEST carries
-                        # `cache_control`, and these three settings place those markers — so every
-                        # plan turn re-read its whole prefix at full price. It hid because build's
-                        # `iter` loop pays off inside one turn; a plan's `run` only across turns.
+                        # THE SAME THREE CACHE BREAKPOINTS THE BUILD LOOP SETS. The provider
+                        # caches only where the REQUEST carries `cache_control`, and these three
+                        # settings place those markers: one after the last static instruction
+                        # part, one on the tool definitions, one on the history tail.
                         # NO `temperature`, AND ITS ABSENCE IS THE FIX FOR A WARNING ON EVERY
                         # SINGLE CALL. The deployed models — every `claude-opus-4-7` and newer
                         # in pydantic-ai's profile — carry `anthropic_disallows_sampling_settings`,
@@ -1756,7 +1821,13 @@ class TurnEngine:
             # boundary: `finally` runs exactly once per turn, on every arm, after whichever
             # `_finish` above set the status. Writing it from the arms instead would mean five
             # call sites and a turn that could leave two rows.
+            #
+            # THE NOTICE GOES FIRST, and the order is the mechanism rather than tidiness: the
+            # terminal row written below carries THIS turn's reading, so writing it first would
+            # leave the comparison asking whether the turn differs from itself.
+            await self._write_change_notice(state, session_factory)
             await self._write_turn_terminal(state, session_factory)
+            await self._count_the_reading(state)
             # The watcher dies FIRST, on every terminal arm and in BOTH kinds. The Build
             # loop already stops its own on the way out, but a Plan turn attaches the same
             # live container — `_attach_sandbox` starts the watcher for whoever attaches —
@@ -1911,7 +1982,7 @@ class TurnEngine:
         over the real one."""
         if sandbox_client is None:
             raise _WriteEndedError(
-                "sandbox_unavailable",
+                SANDBOX_UNAVAILABLE_REASON,
                 "The workspace service is not available right now. Please try again shortly.",
             )
         state.workspace_state = "preparing"
@@ -1928,7 +1999,7 @@ class TurnEngine:
             async with session_factory() as db:
                 user = await db.get(User, state.user_id)
                 if user is None:  # the FK guarantees this; fail loudly if it ever breaks
-                    raise _WriteEndedError("sandbox_unavailable", _TURN_FAILED_MESSAGE)
+                    raise _WriteEndedError(SANDBOX_UNAVAILABLE_REASON, _TURN_FAILED_MESSAGE)
                 session = await manager.ensure_sandbox(
                     db,
                     user,
@@ -1963,7 +2034,7 @@ class TurnEngine:
                     seq=seq, state="unavailable", notice=COULD_NOT_CHECK_TEXT
                 ),
             )
-            raise _WriteEndedError("workspace_unreadable", COULD_NOT_CHECK_TEXT) from exc
+            raise _WriteEndedError(WORKSPACE_UNREADABLE_REASON, COULD_NOT_CHECK_TEXT) from exc
         except _WriteEndedError:
             raise
         except Exception as exc:
@@ -1977,7 +2048,7 @@ class TurnEngine:
             self._emit(
                 state, lambda seq: WorkspaceFrame(seq=seq, state="unavailable", message=message)
             )
-            raise _WriteEndedError("sandbox_unavailable", message) from exc
+            raise _WriteEndedError(SANDBOX_UNAVAILABLE_REASON, message) from exc
 
         if not session.attached:
             # THE CONTAINER-START SUCCESS RATIO'S DENOMINATOR. `relaunch_preview` counts the
@@ -2040,13 +2111,13 @@ class TurnEngine:
             # Nothing was put back, and the container is showing a template. The one thing
             # that must not happen is the agent building on it and the turn-end copy making that
             # permanent, so the turn ends here.
-            raise _WriteEndedError("workspace_unrecoverable", NOT_RECOVERED_TEXT)
+            raise _WriteEndedError(WORKSPACE_UNRECOVERABLE_REASON, NOT_RECOVERED_TEXT)
         if session.restored:
             # THE HELD MESSAGE. The instruction was written against a workspace that no
             # longer exists; running it now would execute an instruction whose premise was true
             # when it was typed and false when it ran. The citizen re-sends when they have looked
             # at what came back.
-            raise _WriteEndedError("workspace_restored", RECOVERED_TEXT)
+            raise _WriteEndedError(WORKSPACE_RESTORED_REASON, RECOVERED_TEXT)
         state.sandbox = SandboxSession(
             sandbox_client=sandbox_client,
             handle=session.handle,
@@ -2093,7 +2164,7 @@ class TurnEngine:
                     state,
                     lambda seq: WorkspaceFrame(seq=seq, state="unavailable", message=unplaced),
                 )
-                raise _WriteEndedError("attachment_unavailable", unplaced) from exc
+                raise _WriteEndedError(ATTACHMENT_UNAVAILABLE_REASON, unplaced) from exc
         # FENCE OFF ANY BROWSER CRASH REPORT THAT PREDATES THIS TURN. A report describes
         # the tree the browser was rendering when it crashed, and this turn is about to change
         # that tree; draining it at the end would fail a verify on a fault the agent may have
@@ -2183,7 +2254,7 @@ class TurnEngine:
         summary says it in the reader's."""
         sandbox = state.sandbox
         if sandbox is None:  # `_pin_workspace` sets it or raises; belt for the impossible
-            raise _WriteEndedError("sandbox_unavailable", _TURN_FAILED_MESSAGE)
+            raise _WriteEndedError(SANDBOX_UNAVAILABLE_REASON, _TURN_FAILED_MESSAGE)
         budget = SELF_HEAL_MAX_RETRIES
         turn_prompt: str | list[str | BinaryContent] = prompt
         messages: list[ModelMessage] = list(history)
@@ -2204,7 +2275,7 @@ class TurnEngine:
                     # MOST likely to be reached with a wedged container, so it is the one that
                     # can least afford to promise a save it never performed.
                     raise _WriteEndedError(
-                        "wall_clock_deadline_exceeded",
+                        WALL_CLOCK_DEADLINE_EXCEEDED_REASON,
                         await self._bounded_run_ending(state),
                     )
                 # The count ceilings bound requests and repairs; this bounds elapsed time,
@@ -2250,7 +2321,7 @@ class TurnEngine:
                     # and the remainder from what was agreed. `end_reason` keeps which bound
                     # fired distinguishable for the person who can act on it.
                     raise _WriteEndedError(
-                        "request_limit",
+                        REQUEST_LIMIT_REASON,
                         await self._bounded_run_ending(state),
                     ) from exc
                 iteration += 1
@@ -2287,7 +2358,7 @@ class TurnEngine:
                 if not (mutated or sandbox.done_requested):
                     if state.expects_mutation:
                         raise _WriteEndedError(
-                            "build_wrote_nothing",
+                            BUILD_WROTE_NOTHING_REASON,
                             "Nothing was built — the assistant finished this run without "
                             "creating or changing a single file, so your app is unchanged. "
                             "Send a message describing what you want built and it will "
@@ -2296,7 +2367,7 @@ class TurnEngine:
                     return
                 if state.expects_mutation and not mutated:
                     raise _WriteEndedError(
-                        "build_wrote_nothing",
+                        BUILD_WROTE_NOTHING_REASON,
                         "Nothing was built — the assistant reported the build as finished "
                         "without creating or changing a single file, so your app is unchanged. "
                         "Send a message describing what you want built and it will "
@@ -2318,6 +2389,11 @@ class TurnEngine:
                     had_prior_building_turns=state.had_prior_building_turns,
                 )
                 self._emit_verify_step(state, iteration, phase="finished", verdict=outcome.state)
+                # A BUILD ACTION IS A READING IN ITS OWN RIGHT. This turn just built and looked
+                # at the app; the change notice needs that as much as it needs the model's own
+                # `check_the_app`, and a build turn that never calls the tool would otherwise
+                # look like a turn in which nobody looked.
+                state.read_the_app(_reading_from_the_verdict(outcome))
 
                 if outcome.dev_ready:
                     # THE PROOF RIDES THE OBSERVATION, NEVER THE CLAIM — and this is the caller
@@ -2410,7 +2486,7 @@ class TurnEngine:
                     # clock alone. The budget is checked before it is spent, so the last
                     # iteration ends the turn rather than buying a run it cannot pay for.
                     if sandbox.done_requested or budget <= 0:
-                        raise _WriteEndedError("verdict_unanswerable", COULD_NOT_CONFIRM_TEXT)
+                        raise _WriteEndedError(VERDICT_UNANSWERABLE_REASON, COULD_NOT_CONFIRM_TEXT)
                     turn_prompt = CONTINUE_PROMPT
                     budget -= 1
                     continue
@@ -2430,7 +2506,7 @@ class TurnEngine:
                     # changes sit in the workspace until the user's Save click.
                     if error is None:
                         raise _WriteEndedError(
-                            "self_heal_budget_exhausted",
+                            SELF_HEAL_BUDGET_EXHAUSTED_REASON,
                             "Your app checks out — the assistant just ran out of steps "
                             "before wrapping up. Your changes are still in the workspace — "
                             "click Save to keep them, or send a message to continue.",
@@ -2441,7 +2517,7 @@ class TurnEngine:
                     # verdict rather than from a guess, because that is what decides what they
                     # should do next. The holding state on the preview stops with it.
                     raise _WriteEndedError(
-                        "self_heal_budget_exhausted",
+                        SELF_HEAL_BUDGET_EXHAUSTED_REASON,
                         DID_NOT_COME_TOGETHER_TEXT.format(
                             showing=_what_it_is_showing(
                                 outcome, ever_built=state.had_prior_building_turns
@@ -2527,14 +2603,19 @@ class TurnEngine:
                 _sandbox_of,
                 connected_systems=prompt_context.connected_systems,
                 app_state_of=_app_state_of,
+                app_state_noticed=state.read_the_app,
             ).toolsets,
+            # Same static contract as the Plan arm, off the same function — see the note there
+            # for why a run with no static part gets no instructions breakpoint at all.
+            instructions=static_instruction_parts(ChatKind.BUILD),
             output_type=str,
             usage_limits=UsageLimits(request_limit=MODEL_TURN_CEILING),
             # Without `max_tokens` pydantic-ai's Anthropic default of 4096 truncates a
             # whole-file `write_file` mid-string — the file lands syntactically broken and
             # the model spends a self-heal round repairing its own truncation. The three
             # cache flags put breakpoints on the context this loop re-sends VERBATIM every
-            # step: the instructions and tool definitions never change across a build.
+            # step: the standing contract and the tool definitions never change across a build,
+            # and the marker sits after the last static instruction part.
             # NO `temperature` — see the plan turn's note above. It is stripped by the
             # deployed model's profile and warns once per step; the effort and thinking mode
             # below are the knobs that actually reach this deployment.
@@ -2583,7 +2664,7 @@ class TurnEngine:
                             ),
                         )
                         raise _WriteEndedError(
-                            "quota_exceeded",
+                            QUOTA_EXCEEDED_REASON,
                             (await at_limit_ending(state.sandbox)).message,
                         ) from exc
                     # THE PLATFORM'S OWN BOUND, at the same seam and for the same reason.
@@ -2613,7 +2694,7 @@ class TurnEngine:
                             budget=RUN_TOKEN_BUDGET,
                         )
                         raise _WriteEndedError(
-                            "run_budget_reached",
+                            RUN_BUDGET_REACHED_REASON,
                             await self._bounded_run_ending(state),
                         )
                     async with node.stream(run.ctx) as stream:
@@ -4050,6 +4131,7 @@ class TurnEngine:
         only job is a LATER reload. Logged and swallowed."""
         if state.status not in ("completed", "failed", "stopped"):
             return
+        recorded = state.app_reading if _is_serving(state.app_reading) is not None else None
         try:
             async with session_factory() as db:
                 await append_batch(
@@ -4074,6 +4156,10 @@ class TurnEngine:
                         "turnId": str(state.turn_id),
                         "status": state.status,
                         "reason": state.end_reason,
+                        # THE READING THIS TURN TOOK, and only when it took a KNOWN one. This is
+                        # what the next turn compares against, so writing `unknown` here would
+                        # make the next real reading look like a change the app never made.
+                        **({APP_STATE_META_KEY: recorded.value} if recorded is not None else {}),
                         # WHAT BROKE IT, on a turn that reached the generic ending or the
                         # model-service one (a stop that landed while that ending secured the tree
                         # included) — class names, status, provider type and code location only
@@ -4093,6 +4179,98 @@ class TurnEngine:
                 conversation_id=str(state.conversation_id),
                 turn_id=str(state.turn_id),
             )
+
+    async def _recorded_reading(self, db: AsyncSession, state: _TurnState) -> AppState | None:
+        """The last reading on record in this conversation, or None when there is none.
+
+        READ OUT OF THE CONVERSATION'S OWN ROWS, which is what makes this survive a restart and
+        need no table: each turn stamps its reading on the terminal row it already writes. A row
+        whose stamp does not parse, or parses to `unknown`, is no reading — same rule the writer
+        follows, so a stored `unknown` can never masquerade as the state we last knew."""
+        stamped = await db.scalar(
+            sa.select(Message.meta)
+            .where(
+                Message.conversation_id == state.conversation_id,
+                Message.user_id == state.user_id,
+                Message.entry_kind == MessageEntryKind.SYSTEM_EVENT,
+                Message.meta[APP_STATE_META_KEY].astext.is_not(None),
+            )
+            .order_by(Message.seq.desc())
+            .limit(1)
+        )
+        if not isinstance(stamped, dict):
+            return None
+        try:
+            reading = AppState(stamped[APP_STATE_META_KEY])
+        except ValueError:
+            return None
+        return reading if _is_serving(reading) is not None else None
+
+    async def _write_change_notice(
+        self, state: _TurnState, session_factory: SessionFactory
+    ) -> None:
+        """The one push that survives: a persisted row saying the app crossed between working
+        and not working, written at THIS turn's end.
+
+        THE TIMING IS FORCED. `persist_user_turn` runs before the turn has any reading at all, so
+        a row written at the start would replay on the wrong side of the citizen's prompt — ahead
+        of the message it is about. Written here it lands at the offset where the crossing became
+        true, and the next turn replays it exactly where it was sent.
+
+        EDGE-TRIGGERED, BETWEEN KNOWN STATES. Both the newest reading and the one on record must
+        say serving-or-not, and they must differ. An app that is still down next turn has not
+        changed again and gets nothing; a probe that could not answer is not a change either, in
+        either position — `unknown` is the probe failing, not the app moving.
+
+        BEST-EFFORT, like the terminal row beside it: a raise here would take down the release
+        sequence for a row whose only job is the next turn."""
+        serving_now = _is_serving(state.app_reading)
+        if serving_now is None or state.app_reading is None:
+            return
+        try:
+            async with session_factory() as db:
+                before = await self._recorded_reading(db, state)
+                if before is None or _is_serving(before) == serving_now:
+                    return
+                sentence = APP_WORKING_AGAIN_TEXT if serving_now else APP_STOPPED_WORKING_TEXT
+                await append_batch(
+                    db,
+                    user_id=state.user_id,
+                    conversation_id=state.conversation_id,
+                    # THE DISCARD NOTE'S CARRIER: a user-prompt part, so the model reads the
+                    # platform's statement as something it was TOLD rather than as something it
+                    # said. `meta.text` carries the same sentence for the citizen's feed.
+                    messages=[ModelRequest(parts=[UserPromptPart(content=sentence)])],
+                    entry_kind=MessageEntryKind.SYSTEM_EVENT,
+                    kind=state.kind,
+                    meta={
+                        "kind": APP_CHANGE_NOTICE_KIND,
+                        "text": sentence,
+                        "state": state.app_reading.value,
+                    },
+                )
+        except Exception:
+            _log.exception(
+                "app_change_notice_failed",
+                conversation_id=str(state.conversation_id),
+                turn_id=str(state.turn_id),
+            )
+
+    async def _count_the_reading(self, state: _TurnState) -> None:
+        """Did this turn look at the app at all?
+
+        BOTH SIDES ARE TOOL-CALL FACTS — a `check_the_app` answer or a build action's own
+        verdict. Nothing here reads a message, and nothing may: a counter that guessed from prose
+        what the model meant would be measuring the guesser.
+
+        A TUNING INSTRUMENT, NOT A GATE. The ratio says whether the call-timing sentence and the
+        reminder are earning their place; it decides nothing at runtime."""
+        await count(
+            HarnessCounter.APP_READING_TAKEN
+            if state.app_reading is not None
+            else HarnessCounter.APP_READING_MISSING,
+            app_id=state.write_session.app_id if state.write_session else None,
+        )
 
     # -- subscription -------------------------------------------------------------------
 

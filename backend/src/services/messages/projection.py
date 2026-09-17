@@ -89,6 +89,25 @@ WORKSPACE_DISCARDED_KIND: Final = "workspace_discarded"
 """`meta.kind` of the row a discard writes into each conversation that spoke since the save. Its
 payload is the note the model reads; the citizen sees `WorkspaceDiscardedItem` instead."""
 
+APP_CHANGE_NOTICE_KIND: Final = "app_change_notice"
+"""`meta.kind` of the row the engine writes when the app crossed between serving and not serving
+during a turn. Same carrier as the discard note — a payload the model reads on its next turn —
+with the sentence repeated in `meta.text` so the citizen's feed can draw it without the model
+having to be told it in two voices.
+
+`meta.state` is the reading that row recorded, and it is what makes the notice EDGE-TRIGGERED:
+the newest reading is compared against the newest one already on record in this conversation, so
+an unchanged app produces nothing."""
+
+APP_STATE_META_KEY: Final = "appState"
+"""Where a turn writes down the reading it took, on its own terminal row.
+
+ON THE TERMINAL ROW rather than a table of its own, because the question it answers — "what was
+the last thing we knew about this app in this conversation" — is per-conversation and the
+terminal row is already written once per turn, hidden, with a payload nothing replays. A turn
+that took no reading, or one the probe could not answer, writes no key at all: not knowing is
+not a reading, and recording it would make the next known reading look like a change."""
+
 # THERE IS NO DETAILS-EXPANDER CAP HERE ANY MORE, because there is no expander material to
 # cap. A step used to carry the raw arguments and the raw result of its tool call, redacted and
 # clipped to four thousand characters, on every frame and every reload item INCLUDING hidden
@@ -1299,6 +1318,15 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
             if kind == WORKSPACE_DISCARDED_KIND:
                 saved_at = _an_instant(meta.get("savedAt"))
                 items.append(WorkspaceDiscardedItem(seq=row.seq, saved_at=saved_at))
+                continue
+            if kind == APP_CHANGE_NOTICE_KIND:
+                # OUT OF `meta`, not out of the payload: the model-facing copy is a user-prompt
+                # part, which `_payload_text` does not read and should not — the sentence is the
+                # platform's, and reading it back off the payload would make the feed's copy
+                # depend on which part shape the writer happened to use.
+                spoken = meta.get("text")
+                if isinstance(spoken, str) and spoken:
+                    items.append(AssistantTextItem(seq=row.seq, text=spoken))
                 continue
             if kind == PLATFORM_TEXT_KIND:
                 # THE WORDS COME OUT OF `meta`, because the payload is empty on purpose — see

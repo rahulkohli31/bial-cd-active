@@ -151,6 +151,20 @@ class HarnessCounter(enum.StrEnum):
     #: visit to END, which no browser reports reliably.
     PROJECT_OPENED = "project_opened"
     PROJECT_OPENED_CHAT = "project_opened_chat"
+    #: ── Did the turn look at the app, or answer from memory? ────────────────────────────────
+    #: The pair that says whether pulling the app's state is actually happening, now that the
+    #: platform no longer pushes it. One row per turn that reached a terminal, on exactly one of
+    #: the two names, so the ratio needs no correction factor.
+    #:
+    #: BOTH SIDES ARE TOOL-CALL FACTS — a `check_the_app` answer, or a build action's own health
+    #: verdict, which is a turn that built and looked at what it built. There is no term on either
+    #: side that reads what anybody SAID: a counter that decided from prose whether the model
+    #: "meant" to check would be measuring the classifier.
+    #:
+    #: A TUNING INSTRUMENT, NOT A GATE. If the ratio stays bad, the next levers are the tool
+    #: description's call-timing sentence and the reminder's cooldown; these numbers say which.
+    APP_READING_TAKEN = "app_reading_taken"
+    APP_READING_MISSING = "app_reading_missing"
 
 
 class HarnessCount(Base, UUIDv7PrimaryKeyMixin, TimestampMixin):

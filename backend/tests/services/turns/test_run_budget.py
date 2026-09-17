@@ -23,6 +23,7 @@ from src.services.orchestrator.constants import (
     RUN_TOKEN_BUDGET,
     RUN_WALL_CLOCK_DEADLINE_S,
 )
+from src.services.turns import copy as copy_module
 from src.services.turns.copy import KEPT_A_COPY, SPENT_ENOUGH_TEXT
 
 
@@ -83,8 +84,26 @@ def _engine_source() -> str:
     return pathlib.Path(inspect.getfile(engine_module)).read_text()
 
 
+def _reason_of(call: ast.Call) -> str | None:
+    """The end reason a `_WriteEndedError(...)` carries, whether written as a literal or named.
+
+    The reasons are centralised constants now, so a scraper that only reads `ast.Constant` sees
+    none of the seventeen raise sites and every assertion over them passes vacuously. Resolving
+    the name against the module that owns it keeps this reading the code rather than a spelling.
+    """
+    if not call.args:
+        return None
+    first = call.args[0]
+    if isinstance(first, ast.Constant):
+        return first.value if isinstance(first.value, str) else None
+    if isinstance(first, ast.Name):
+        value = getattr(copy_module, first.id, None)
+        return value if isinstance(value, str) else None
+    return None
+
+
 def _bounded_raises() -> dict[str, ast.Raise]:
-    """Every `raise _WriteEndedError("<a bounded reason>", ...)` in the write loop, by reason."""
+    """Every `raise _WriteEndedError(<a bounded reason>, ...)` in the write loop, by reason."""
     found: dict[str, ast.Raise] = {}
     for node in ast.walk(ast.parse(_engine_source())):
         if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
@@ -92,13 +111,10 @@ def _bounded_raises() -> dict[str, ast.Raise]:
         callee = node.exc.func
         if not (isinstance(callee, ast.Name) and callee.id == "_WriteEndedError"):
             continue
-        if not node.exc.args:
-            continue
-        reason = node.exc.args[0]
-        if not isinstance(reason, ast.Constant) or not isinstance(reason.value, str):
-            continue
-        if reason.value in _BOUNDED_REASONS:
-            found[reason.value] = node
+        reason = _reason_of(node.exc)
+        if reason in _BOUNDED_REASONS:
+            assert reason is not None
+            found[reason] = node
     return found
 
 
@@ -152,8 +168,7 @@ def test_the_click_save_sentence_survives_only_where_it_is_still_true() -> None:
         and isinstance(node.exc.func, ast.Name)
         and node.exc.func.id == "_WriteEndedError"
         and len(node.exc.args) > 1
-        and isinstance(node.exc.args[0], ast.Constant)
-        and node.exc.args[0].value == "self_heal_budget_exhausted"
+        and _reason_of(node.exc) == "self_heal_budget_exhausted"
         and isinstance(node.exc.args[1], ast.Constant)
         and isinstance(node.exc.args[1].value, str)
     }

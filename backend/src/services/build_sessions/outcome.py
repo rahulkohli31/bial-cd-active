@@ -70,6 +70,11 @@ _log = structlog.get_logger()
 # first two for its `stop`/`force_end` defaults: the token and the sentence it produces must move
 # together, because a drifted token does not fail loudly — it falls straight back through to
 # "Build finished.", which is the bug these arms exist to fix.
+#
+# SPELLED HERE RATHER THAN IMPORTED FROM `turns/copy.END_REASONS`, which is where every other
+# producer's reason lives: `src/services/turns/__init__` imports the turn engine, and the engine
+# imports this package, so a module-level import of anything under `turns` from here is a cycle.
+# `tests/services/turns/test_end_reasons.py` holds these four against that collection instead.
 STOPPED_BY_USER: Final = "stopped_by_user"
 FORCE_ENDED: Final = "force_ended"
 # The idle reaper's reason — part of the documented terminal set (`build_sessions/schemas.py`).
@@ -79,6 +84,9 @@ FORCE_ENDED: Final = "force_ended"
 # that names it rather than falling back to "Build finished.", which is the whole point of keying
 # these arms on the REASON rather than the status.
 IDLE_TEARDOWN: Final = "idle_teardown"
+QUOTA_EXCEEDED: Final = "quota_exceeded"
+"""The fourth token this module keys an arm on — a spent daily budget, raised by the turn engine
+and read here."""
 
 # The preview link is PARSED, not pattern-checked, and https-only — the same parse the deployed URL
 # gets at the admin boundary (`api/v1/admin/schemas.py::HttpsUrl`). `javascript:` and `data:` fall
@@ -128,7 +136,7 @@ def _summary(status: BuildSessionStatus, reason: str | None) -> str:
     """
     if status is BuildSessionStatus.FAILED:
         return f"The build failed: {reason}" if reason else "The build failed."
-    if reason == "quota_exceeded":
+    if reason == QUOTA_EXCEEDED:
         return "The build stopped: you reached your daily limit."
     if reason == STOPPED_BY_USER:
         return "You stopped this build before it finished."

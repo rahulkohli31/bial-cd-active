@@ -810,17 +810,27 @@ async def test_the_reading_never_invites_the_agent_to_derive_its_own() -> None:
         assert invitation not in described
 
 
-async def test_the_prompt_block_carries_the_registered_first_sentence() -> None:
-    """Only the FIRST SENTENCE of a tool's docstring reaches the generated TOOL SURFACE block;
-    the rest reaches the model on the tool schema. Pinned on the REGISTERED definition rather
-    than on the prompt's own text: the two are slices of one string, and a pin on the prompt
-    side would pin whichever copy happens to be checked in."""
-    definitions = await registered_tool_definitions(ChatKind.BUILD)
+@pytest.mark.parametrize("kind", list(ChatKind), ids=[k.value for k in ChatKind])
+async def test_the_call_timing_rule_is_the_first_sentence(kind: ChatKind) -> None:
+    """★ WHEN TO CALL IT LEADS, and the position is the whole of why this is pinned.
+
+    Only the FIRST SENTENCE of a tool's docstring reaches the generated TOOL SURFACE block; the
+    rest reaches the model on the tool schema. So a description that opens by saying what the
+    tool RETURNS spends its one prompt-surface line on something the model can work out from the
+    name, and the rule that decides whether it calls at all never appears there.
+
+    Pinned on the REGISTERED definition rather than on the prompt's own text: the two are slices
+    of one string, a pin on the prompt side would pin whichever copy happens to be checked in,
+    and that copy is on its way out.
+
+    Mutation check: swap the first two sentences of `check_the_app` back and this goes red while
+    every other assertion about that description stays green."""
+    definitions = await registered_tool_definitions(kind)
     described = definitions["check_the_app"].description
     assert described is not None
     assert first_sentence(described) == (
-        "Find out what this app is doing right now — whether it is serving, and whether the "
-        "page the user actually looks at is still the starter template."
+        "Call this before you say anything about what the app does now, and whenever the user "
+        "tells you something is wrong."
     )
 
 

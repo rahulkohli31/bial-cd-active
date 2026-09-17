@@ -1,15 +1,16 @@
-"""Chat-kind prompt system: one BASE + a positive per-kind segment, per run.
+"""Chat-kind prompt system: one standing contract + this conversation's own facts, per run.
 
 Authoring choices: every segment LEADS with purpose/identity, tool talk second; tool
 surfaces are stated as facts ("you have read tools ...") never bans — the registry
 (`toolsets.py`) makes absent tools structurally uncallable. Plan's output contract is the
 NAMED `present_plan_options` call, gated on the user's click, never tone; its segment names
 WHAT the plan is for and WHO reads it, not a fixed five-part shape. Cross-mode safety rules
-(DATA INTEGRITY) live ONCE, in BASE, single-sourced — never copied (see `_base`).
+(DATA INTEGRITY) live ONCE, in the standing contract, single-sourced — never copied
+(see `standing_contract`).
 
 A chat's kind is fixed at creation, so history can never contradict its toolset — no
-downgrade clarification, no marker rows. Delivery is per-run `@agent.instructions`;
-composed text is never persisted (pinned by test)."""
+downgrade clarification, no marker rows. Delivery is per-run instruction parts — the contract
+static, the tail dynamic — and composed text is never persisted (pinned by test)."""
 
 from __future__ import annotations
 
@@ -37,8 +38,8 @@ from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
 
 @dataclass(frozen=True)
 class PromptContext:
-    """What BASE needs to say who the assistant is working with and on what. Built per
-    turn from the conversation's project + owner; `project_description` is the
+    """What the prompt's tail needs to say who the assistant is working with and on what. Built
+    per turn from the conversation's project + owner; `project_description` is the
     project row's description, absent when the user never wrote/generated one.
 
     `connected_systems` is what this project may actually read from outside the platform,
@@ -121,62 +122,11 @@ If seed data seems needed, say so and let them answer."""
 """The standing rules about reading an attached file — byte-identical on every turn of every
 conversation that has one, which is why they are a constant here and not composed per turn.
 
-GATED, NOT UNCONDITIONAL. `_base` emits this only for a conversation that actually holds a file,
-so the overwhelming majority of turns pay nothing for a feature they never use.
+GATED, NOT UNCONDITIONAL. `this_conversation` emits this only for a chat that actually holds a
+file, so the overwhelming majority of turns pay nothing for a feature they never use.
 
 THE ANTI-INJECTION SENTENCE IS A SECURITY INVARIANT, not copy: a spreadsheet cell can say "ignore
 your previous instructions", and it is a citizen's data either way. It must survive verbatim."""
-
-
-def _base(context: PromptContext, kind: ChatKind) -> str:
-    """BASE — the voice examples, identity, project grounding, the truthful portal
-    self-description, and the one cross-mode safety block. Shared by every kind so each wording
-    exists exactly once.
-
-    THE EXAMPLES COME BEFORE THE IDENTITY SENTENCE. The audience contract has never been missing
-    from this prompt; what it lacked was a position and a pair of sentences to match against.
-    `NARRATION_VOICE` still states the rule where it always has, some 530 words in — this is the
-    same contract shown first, in three pairs the model reads before it writes anything.
-    Anything inserted above it takes that away.
-
-    THE ONE THING BASE VARIES BY KIND: the same `DATA_INTEGRITY_RULES` string with two
-    Build-only clauses dropped (the destructive-SQL sentinel, the migration channel) via
-    `DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY` — byte-identical rules otherwise. This
-    is why `_base` takes a kind at all: the false half of a cross-mode block turned out to be
-    the mode-specific half.
-
-    THE ONE THING IT VARIES BY PROJECT is the CONNECTED DATA stub, which is appended LAST and is
-    absent — leaving BASE byte-identical to what it was — for every project that reads nothing
-    outside the platform, which is nearly all of them. It goes in `_base` because `_base` is the
-    single function `compose_kind_prompt` calls for BOTH kinds, so one insertion point reaches
-    the Plan arm and the Build arm without a second copy to keep in step. It goes LAST because
-    everything above it is the standing contract and this is a fact about today's project.
-
-    THE ATTACHMENT BLOCK SITS AFTER THE FIRST-SLICE RULE and before the per-project stub: the
-    rules are standing contract like everything above, and the listing is the one fact about
-    today's conversation that the rules are useless without."""
-    described = f" — {context.project_description}" if context.project_description else ""
-    identity = (
-        f"You are the Citizen Developer assistant for BIAL, working with "
-        f'{context.user_name} on "{context.project_name}"{described}. You work inside '
-        "this one project: its app, its code, and its data. Ground everything you say "
-        "about the app in its actual files, and answer what was asked before acting."
-    )
-    # The walkthrough caught the model inventing portal features. The relay had this
-    # clause and the mode system did not, so this rule would have regressed the moment the relay
-    # retired — it belongs in BASE, where every mode carries it.
-    integrity = (
-        DATA_INTEGRITY_RULES
-        if kind is ChatKind.BUILD
-        else DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY
-    )
-    stub = _connected_data_stub(context.connected_systems)
-    listing = context.attachment_listing
-    attachments = f"\n\n{listing}\n\n{ATTACHMENT_RULES}" if listing else ""
-    return (
-        f"{NARRATION_EXAMPLES}\n\n{identity}\n\n{PORTAL_SURFACES}\n\n{integrity}\n\n"
-        f"{NARRATION_VOICE}\n\n{FIRST_SLICE_RULE}" + attachments + (f"\n\n{stub}" if stub else "")
-    )
 
 
 _PLAN_SEGMENT = f"""\
@@ -260,15 +210,16 @@ could only ever drift from `orchestrator/prompt.py`" — was true of a COPY and 
 import, which is what this is.
 
 `DATA_INTEGRITY_RULES` is deliberately ABSENT from this list even though a Write turn is told the
-rules: `_base(context)` already appends them for every mode, so naming them again would emit the
+rules: `standing_contract` already carries them for every kind, so naming them again would emit the
 whole block twice in every Write prompt.
 
 `NARRATION_VOICE` (the audience contract) is ABSENT for the same reason and must
-stay so: `_base(context)` names it for every kind, so adding it here would print the whole voice
+stay so: `standing_contract` names it for every kind, so adding it here would print the whole voice
 rule twice. A test counts it at exactly one in the composed prompt, and that count is the guard
 against the deletion this block has already suffered twice.
 
-`NARRATION_EXAMPLES` is ABSENT for a third reason on top of that one: `_base()` names it, and it
+`NARRATION_EXAMPLES` is ABSENT for a third reason on top of that one: `standing_contract` names it,
+and it
 has to lead the composed prompt. Naming it in a segment would put a second copy six hundred words
 down — the position is the point, and a copy in the middle quietly cancels it."""
 
@@ -288,16 +239,75 @@ down — the position is the point, and a copy in the middle quietly cancels it.
 # and a named cache-breaking action.
 
 
-def compose_kind_prompt(kind: ChatKind, context: PromptContext) -> str:
-    """BASE + exactly one segment, for both kinds.
+def standing_contract(kind: ChatKind) -> tuple[str, ...]:
+    """The blocks that are byte-identical for every citizen and every project of this kind, in
+    wire order — the run's STATIC instruction parts, and the prefix a cache marker sits after.
 
-    The segment varies, and so does exactly one clause-pair inside BASE — see `_base`. Which
-    segment a run gets follows from what it can DO, so this selection sits one file away from
-    the toolset registry that decides that, and BASE's one variation follows the same rule: the
-    two dropped clauses describe tools a Plan run is not handed."""
+    THE EXAMPLES COME FIRST. The audience contract has never been missing from this prompt; what
+    it lacked was a position and a pair of sentences to match against. `NARRATION_VOICE` still
+    states the rule where it always has, some 530 words in — this is the same contract shown
+    first, in three pairs the model reads before it writes anything. Anything inserted above it
+    takes that away.
+
+    TWO BLOCKS FOLLOW THE KIND: the contract segment, and the same `DATA_INTEGRITY_RULES` string
+    with two Build-only clauses dropped (the destructive-SQL sentinel, the migration channel) via
+    `DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY` — byte-identical rules otherwise. Both
+    dropped clauses describe tools a Plan run is not handed, which is the same rule the segment
+    selection follows. So the two kinds are two static prefixes, and neither keeps the other
+    honest.
+
+    THE CONTRACT SEGMENT IS LAST among them, so the marker lands after the whole standing text
+    rather than in the middle of it."""
     match kind:
         case ChatKind.PLAN:
+            integrity = DATA_INTEGRITY_RULES_WITHOUT_THE_WRITE_MACHINERY
             segment = _PLAN_SEGMENT
         case ChatKind.BUILD:
+            integrity = DATA_INTEGRITY_RULES
             segment = _WRITE_SEGMENT
-    return f"{_base(context, kind)}\n\n{segment}"
+    return (
+        NARRATION_EXAMPLES,
+        PORTAL_SURFACES,
+        integrity,
+        NARRATION_VOICE,
+        FIRST_SLICE_RULE,
+        segment,
+    )
+
+
+def this_conversation(context: PromptContext) -> str:
+    """The run's one DYNAMIC instruction part: who the assistant is working with, the files this
+    conversation holds, and what this project may read from outside the platform.
+
+    IT SITS AT THE TAIL, behind the whole standing contract, and that position is what makes the
+    contract a byte-stable prefix: two citizens on two projects send the same bytes up to here.
+
+    THE ATTACHMENT LISTING COMES BEFORE ITS RULES, and both before the per-project stub. The
+    rules are standing contract, but they are useless without the one fact about today's
+    conversation, so they travel with it and neither is emitted for a chat holding no file.
+
+    THE CONNECTED DATA STUB IS LAST and is absent for every project that reads nothing outside
+    the platform, which is nearly all of them."""
+    described = f" — {context.project_description}" if context.project_description else ""
+    identity = (
+        f"You are the Citizen Developer assistant for BIAL, working with "
+        f'{context.user_name} on "{context.project_name}"{described}. You work inside '
+        "this one project: its app, its code, and its data. Ground everything you say "
+        "about the app in its actual files, and answer what was asked before acting."
+    )
+    listing = context.attachment_listing
+    attachments = f"\n\n{listing}\n\n{ATTACHMENT_RULES}" if listing else ""
+    stub = _connected_data_stub(context.connected_systems)
+    return identity + attachments + (f"\n\n{stub}" if stub else "")
+
+
+def compose_kind_prompt(kind: ChatKind, context: PromptContext) -> str:
+    """The whole composed prompt for one run, rendered in WIRE ORDER.
+
+    A RENDERING, NOT THE DELIVERY. The run ships this same text as instruction PARTS — the
+    standing contract as static ones (`agent.static_instruction_parts`), the tail through the
+    `@chat_agent.instructions` callable — and pydantic-ai sorts static-first with a stable sort
+    and joins with the same blank line, so the two agree by construction. Keeping this function
+    is what lets the prompt-surface tests and the drift check read one string;
+    `test_agent.py` pins the equality against a real run."""
+    return "\n\n".join((*standing_contract(kind), this_conversation(context)))

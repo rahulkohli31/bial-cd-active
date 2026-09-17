@@ -71,6 +71,7 @@ from src.services.build_sessions.manager import (
 )
 from src.services.messages.projection import (
     _LBL_FALLBACK,
+    APP_STATE_META_KEY,
     APP_STATE_TOOL,
     long_operation_line,
 )
@@ -3072,3 +3073,65 @@ async def test_a_blip_on_the_verify_reading_frames_nothing_and_leaves_the_claim_
     assert _preview_ready_frames(state) == [], "a transport error was framed as a serving app"
     assert state.preview_framed is False
     assert state.claim_preview_frame() is True, "the blip spent the turn's one-shot"
+
+
+# --- a build action is a reading in its own right ------------------------------------------
+
+
+async def test_a_build_turn_records_what_it_saw_without_the_model_asking(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """★ A TURN THAT BUILT AND SERVED THE APP HAS LOOKED AT IT. The health verdict answers the
+    same question `check_the_app` answers, so a build turn that never calls the tool is not a
+    turn in which nobody looked — and treating it as one would make the change notice blind to
+    exactly the turns most likely to have broken something.
+
+    The reading is read off the STORED terminal row rather than off the turn state: the row is
+    what the next turn compares against, and a value that never reaches it is not a record.
+
+    Mutation check: delete the `state.read_the_app(...)` call after `verify` in
+    `_run_write_once` and both assertions go red."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-reading@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+    assert state.status == "completed"
+
+    rows = (
+        (
+            await db_session.execute(
+                sa.select(Message).where(Message.conversation_id == conv.id).order_by(Message.seq)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    stamped = [
+        row.meta[APP_STATE_META_KEY]
+        for row in rows
+        if isinstance(row.meta, dict) and APP_STATE_META_KEY in row.meta
+    ]
+    assert stamped == [AppState.LIVE.value]
+    # LIVENESS: the model really did go the whole turn without asking, so the reading above can
+    # only have come from the build action.
+    called = [
+        part.get("tool_name")
+        for row in rows
+        for message in row.payload
+        if isinstance(message, dict)
+        for part in message.get("parts", [])
+        if isinstance(part, dict)
+    ]
+    assert APP_STATE_TOOL not in called
