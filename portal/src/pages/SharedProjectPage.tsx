@@ -227,8 +227,8 @@ export default function SharedProjectPage(): React.JSX.Element {
           {project?.name || 'Shared application'}
         </h1>
         {/* "Can use", never "view only" — Key Decision 3. What this recipient has is not a
-            read-only preview; anything they enter here is saved into the project's real data,
-            exactly as the share panel that granted it says. */}
+            read-only preview; anything they enter here is saved into the project's real data.
+            This is the only surface that says so, so it says it plainly. */}
         <span className="flex-shrink-0 text-[10px] font-bold uppercase tracking-wide text-neutral bg-bial-bg px-2 py-0.5 rounded-full border border-bial-border">
           Can use
         </span>

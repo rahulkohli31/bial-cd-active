@@ -27,9 +27,7 @@ export default function BIALLogo({ dark = false, compact = false }: BIALLogoProp
           src={`${import.meta.env.BASE_URL}bial-logo.png`}
           alt="BIAL — Kempegowda International Airport Bengaluru"
           // `block` kills the inline baseline gap; the fixed height is the single source of
-          // the mark's size, so no call site can scale it differently. The client asked for a
-          // larger mark: it carries the brand, and at 32px it read as an afterthought beside
-          // its own wordmark.
+          // the mark's size, so no call site can scale it differently.
           className={`block w-auto ${compact ? 'h-9' : 'h-11'}`}
         />
       </span>

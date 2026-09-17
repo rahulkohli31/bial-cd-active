@@ -237,20 +237,19 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
           // the wait (see `NoFrame`), because `aria-busy` on a live region tells a reader to hold
           // its announcements until the busy clears — which would silence the very "entering the
           // wait" announcement this region exists to make.
-          // THE PANE'S OWN MARGIN IS THE APP'S TO HAVE. It was 16px on three sides and 14 on top
-          // around a card that already carries a border and a shadow of its own, which is the
-          // frame drawn twice. Trimmed to a hairline gutter.
+          // THE PANE'S OWN MARGIN IS THE APP'S TO HAVE — a hairline gutter, no more. The card
+          // inside already carries a border and a shadow, so anything wider is the frame drawn
+          // twice at the app's expense.
           className={frameIt ? '' : 'flex min-h-0 flex-1 flex-col px-2 pb-2 pt-2'}
         >
           {!frameIt && (
             // THE EMPTY PANE IS A NAMED REGION WITH A CARD IN IT, which is what every state but
             // `running` draws.
             //
-            // IT CARRIED A "YOUR APP" CAPTION AND NO LONGER DOES. The caption existed to tell a
-            // reader what a blank half of the screen was for — but the card underneath it already
-            // says exactly that, in a sentence ("Describe what you want to build."), so the pane
-            // was answering one question twice and spending a row of the app's own height to do
-            // it. The section's accessible label is unaffected; only the pixels are gone.
+            // NO CAPTION ABOVE IT, DELIBERATELY: the card already says what the blank half of the
+            // screen is for ("Describe what you want to build."), and a heading repeating that
+            // would answer one question twice at the cost of a row of the app's own height. The
+            // section's accessible label carries the name instead.
             <div className="flex min-h-0 flex-1 overflow-hidden rounded-xl border border-canvas-rule bg-white shadow-app-card">
               <NoFrame report={report} takeBack={takeBack} />
             </div>

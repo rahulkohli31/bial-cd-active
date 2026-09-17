@@ -42,9 +42,7 @@ interface Props {
 
 /** The accessible sentences. Singular is not pedantry — "1 apps waiting" is the kind of
  *  thing that makes a person trust the rest of the screen slightly less. */
-// Module-local now that the bell that called it is gone, its only outside caller. Still
-// used by the badge's own sr-only label below, so it stays a function — it just stops
-// advertising itself as part of this module's surface.
+// Module-local: the badge's own sr-only label below is the only caller.
 function waitingForReviewLabel(count: number): string {
   return `${count} ${count === 1 ? 'app' : 'apps'} waiting for review`
 }

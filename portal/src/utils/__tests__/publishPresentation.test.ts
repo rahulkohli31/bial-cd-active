@@ -330,16 +330,15 @@ describe('neither surface holds a second copy of the decision', () => {
  * allowed to change what states the product HAS — that is a change to what the application means,
  * and it belongs to whoever owns the lifecycle, not to whoever is moving a panel.
  *
- * An earlier pass added a fourteenth label ("Could not restart") to separate a failed restart from
- * a first deploy that never came up. The distinction is real and is still drawn — on the Deployment
- * panel's own notice, where it explains rather than renames.
+ * So the count is the guard: thirteen states, no more. Where a failed restart needs explaining,
+ * the Deployment panel's notice explains it rather than the vocabulary naming it.
  */
 describe('the state vocabulary is the product\'s, not a surface\'s', () => {
   it('★ answers from the publish state and from nothing else handed alongside it', () => {
-    // NOT `presentationFor.length`. That reads 1 whether the second parameter is absent or
-    // merely defaulted — and defaulted is exactly how the removed one was declared, so the
-    // arity check passed against the very mutation it was written to catch. Behaviour is the
-    // enforceable half: a second input must not move any answer.
+    // NOT `presentationFor.length`: it reads 1 whether a second parameter is absent or merely
+    // defaulted, so an arity check cannot tell the two apart and passes against the mutation it
+    // would be written to catch. Behaviour is the enforceable half — a second input must not
+    // move any answer.
     const extra = presentationFor as unknown as (s: PublishState, code?: string | null) => unknown
     for (const state of EVERY_STATE) {
       for (const code of ['restart_failed', 'restart_not_ready', 'build_failed', null]) {

@@ -127,10 +127,9 @@ export default function ProfileCluster({ collapsed = false, onMenuOpenChange }: 
           </button>
         </DropdownMenuTrigger>
 
-        {/* A CARD THAT FLOATS CLEAR OF THE NAVIGATION, not a continuation of it. It used to be
-            pinned to the trigger's own width with no offset, so it rose out of the panel in the
-            panel's own white and read as more navigation rather than as a menu — the boundary
-            the reader needs in order to know a different thing is being offered.
+        {/* A CARD THAT FLOATS CLEAR OF THE NAVIGATION, not a continuation of it — a menu that
+            rises out of the panel in the panel's own white reads as more navigation, and the
+            reader loses the boundary that says a different thing is being offered.
             `side="right"` clears the column entirely, and the width is the MENU's own. */}
         <DropdownMenuContent
           side="right"

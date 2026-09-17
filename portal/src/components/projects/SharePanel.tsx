@@ -9,8 +9,9 @@
  *
  * THE GRANT IS "CAN USE", NEVER "VIEW ONLY" (R6, Key Decision 3) — a colleague who opens a
  * shared project can interact with the real, running app, and anything they enter is saved
- * into the project's actual data (R7). Both sentences are said here, once, rather than left
- * for the recipient to discover after the fact.
+ * into the project's actual data (R7). This surface no longer says so: the sentence that said
+ * it was removed with the rest of the panel's explanatory copy. The recipient is still told, on
+ * the page they land on (`SharedProjectPage`); the owner granting the access is not.
  */
 import { useEffect, useRef, useState } from 'react'
 import { X } from 'lucide-react'
@@ -44,17 +45,12 @@ function errorMessage(err: unknown, fallback: string): string {
 }
 
 /**
- * EVERYTHING SHARING DOES, with no frame around it — the consent sentence, the colleague search,
- * and the list of people who already have access, with their grants revocable in place.
+ * EVERYTHING SHARING DOES, with no frame around it — the colleague search, and the list of
+ * people who already have access, with their grants revocable in place.
  *
- * IT IS A BODY RATHER THAN A DIALOG because it has two homes now: the workspace opens it as a
- * dialog of its own, and an application's settings mount it as a tab. One body means an owner
- * cannot be shown two different grant lists, or the consent sentence in one place and not the
- * other.
- *
- * THE CONSENT SENTENCE TRAVELS WITH THE BODY, deliberately. It is binding in substance — it is
- * what a citizen is told before they hand a colleague the ability to write into an application's
- * real data — so it cannot be something a frame remembers to add.
+ * IT IS A BODY RATHER THAN A DIALOG because it has two homes: the workspace opens it as a dialog
+ * of its own, and an application's settings mount it as a tab. One body means an owner cannot be
+ * shown two different grant lists depending on which door they came through.
  */
 export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.Element {
   const [shares, setShares] = useState<ProjectShare[]>([])

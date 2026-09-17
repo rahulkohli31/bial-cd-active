@@ -85,11 +85,13 @@ export const RESTART_FAILED_CODES: ReadonlySet<string> = new Set([
  * complete answer — "Live", "Live · newer work saved" and "Live · couldn't check" are three
  * different things, and the last never reads as "nothing of yours is waiting".
  *
- * THE STATE VOCABULARY IS NOT THIS REDESIGN'S TO EXTEND. A failed restart and a first deploy
- * that never came up are different events, and an earlier pass added a fourteenth label to say
- * so — which changed what the product MEANS by its own states rather than how they are laid out.
- * The distinction is still drawn, but on the Deployment panel's own notice, where it is an
- * explanation rather than a status.
+ * THE STATE VOCABULARY IS NOT THIS REDESIGN'S TO EXTEND: thirteen states, owned by the product's
+ * lifecycle. A redesign may relabel a state or move where it is drawn; adding or removing one
+ * changes what the product MEANS rather than how it is laid out.
+ *
+ * So a failed restart is explained, never named: the Deployment panel carries a notice for it.
+ * That notice covers the application that is STILL SERVING — where a restart left nothing
+ * running, the state word is the only thing said about it.
  */
 export function presentationFor(state: PublishState): Presentation {
   switch (state) {
