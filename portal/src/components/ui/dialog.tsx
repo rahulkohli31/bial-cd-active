@@ -13,8 +13,7 @@ import { cn } from "@/lib/utils"
  * Trigger, close alias, and footer were vendored whole, never reached — both consumers drive
  * the dialog from `open`/`onOpenChange` state and dismiss via the corner control
  * `DialogContent` renders. Portal/overlay stay, only unexported (`DialogContent` composes
- * both). A future consumer IS expected: `UnsavedWorkGuard.tsx` names this as the upgrade
- * path for its focus trap — re-add a trigger together with that caller, not on spec.
+ * both). Re-add a trigger together with a caller that needs one, never on spec.
  */
 
 const Dialog = DialogPrimitive.Root

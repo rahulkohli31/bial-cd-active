@@ -100,8 +100,8 @@ DURABLE_COPY_TASK_NAME: Final = "sandbox_durable_copy"
 class CopyAttempt(enum.StrEnum):
     """What one reap's attempt to secure a container's work before destroying it came to.
 
-    Five outcomes rather than a bare success/failure pair, because the three sparing arms fail
-    for reasons an operator has to act on DIFFERENTLY: an unreachable container needs somebody to
+    Several outcomes rather than a bare success/failure pair, because the sparing arms fail for
+    reasons an operator has to act on DIFFERENTLY: an unreachable container needs somebody to
     look at the container, a refused promotion needs somebody to look at the diverted bundle, and
     a raised write needs somebody to look at the store. Collapsing them would produce a row that
     says a container was spared and nothing about what to do next.
@@ -124,11 +124,6 @@ class CopyAttempt(enum.StrEnum):
     #: The bundle, the read-back or the upload itself raised. Nothing was established, so nothing
     #: is destroyed.
     FAILED = "failed"
-    #: A copy landed, but it is THE FIRST ONE — there was nothing on record to compare it against,
-    #: so the lineage guard never ran. Fine at a turn boundary, where the container is alive and
-    #: the tree is the citizen's; NOT a licence to destroy, because a reverted container has
-    #: exactly this shape and the copy we just took would be the reverted tree.
-    UNGUARDED = "unguarded"
     #: The gate was satisfied by its unreadable-container FALLBACK — a parseable bundle stood in
     #: because the container could not answer — so the destroy proceeded without any comparison
     #: having run. Recorded distinctly because "already current" would be a claim nobody made.
@@ -168,11 +163,6 @@ _ATTEMPT_MEANING: Final[dict[CopyAttempt, tuple[PassOutcome, str]]] = {
         PassOutcome.DECLINED,
         "the container could not be read, so a standing bundle stood in for the comparison; "
         "reclaimed without verifying currency",
-    ),
-    CopyAttempt.UNGUARDED: (
-        PassOutcome.DECLINED,
-        "the copy taken was the first on record, so no lineage guard ran; spared rather than "
-        "destroyed on the strength of an unverified tree",
     ),
 }
 

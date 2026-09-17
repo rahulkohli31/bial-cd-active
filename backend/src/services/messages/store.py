@@ -117,10 +117,14 @@ _EMPTY: Final = -1
 # The window is one turn wide, the citizen is watching, and a wrong guess is visible immediately.
 # WHEN REOPENING PAST CONVERSATIONS / CHAT HISTORY GOES LIVE THAT STOPS HOLDING: an old
 # transcript gets replayed by a run that was not there, nobody is left who saw what happened, and
-# this sentence becomes the ONLY account of it. The fix at that point is to land the stop on a
-# tool-call/tool-result boundary — let the in-flight tool finish and record its result, then
-# unwind — so nothing dangles and nothing has to be guessed. The stop itself is
-# `BuildSessionManager._stop_the_held_session`.
+# this sentence becomes the ONLY account of it.
+#
+# WHICH STOP LANDED HERE IS THE WHOLE QUESTION, and only one of the two can. A Build turn stopped
+# on the platform's behalf — a project switch, a lapsed lease, the age ceiling — waits for the
+# next tool-result boundary, so the in-flight call finishes, its result is recorded, and nothing
+# dangles for this line to guess about. What still reaches it is a stop that CUT the run: the
+# citizen's own Stop button (`BuildSessionManager._stop_the_held_session`), and a cooperative stop
+# whose boundary did not arrive inside its bound.
 _INTERRUPTED_RESULT: Final = (
     "This tool call was interrupted before a result was recorded (the run was cut short). "
     "Treat it as not executed."
