@@ -33,6 +33,7 @@ import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_rbac import CurrentSuperadmin
@@ -43,6 +44,8 @@ from src.api.v1.build_sessions.deps import (
     SessionManagerDep,
 )
 from src.api.v1.build_sessions.schemas import (
+    ActivityPhase,
+    ActivityResponse,
     BuildSessionStatus,
     BuildSessionStatusResponse,
     ClientErrorReportRequest,
@@ -52,6 +55,7 @@ from src.api.v1.build_sessions.schemas import (
     ParkedTree,
     ParkedTreesResponse,
     PreviewLifeState,
+    ProjectActivity,
     PromoteParkedRequest,
     PromoteParkedResponse,
     RelaunchPreviewRequest,
@@ -66,10 +70,13 @@ from src.api.v1.build_sessions.schemas import (
 )
 from src.api.v1.build_sessions.sse import build_sse_response
 from src.api.v1.live_build import ReclaimBlockedError, reclaim_blocked_response
+from src.config import settings
 from src.core.errors import AppApiError
 from src.core.integrity_types import WorkspaceState
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation
+from src.db.models.pending_teardown import PendingTeardown
+from src.db.models.project import Project
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
 from src.services.build_sessions import (
@@ -88,7 +95,13 @@ from src.services.build_sessions import (
     app_name_for,
     sweep_all,
 )
-from src.services.build_sessions.locks import renew_presence_stay
+from src.services.build_sessions.drain import draining_at
+from src.services.build_sessions.locks import (
+    an_instant_on_the_hash,
+    read_registry_and_starting_marker,
+    renew_presence_stay,
+    stamp_is_proven,
+)
 from src.services.build_sessions.snapshot import (
     ParkedTreeNotOursError,
     list_parked_trees,
@@ -103,12 +116,18 @@ from src.services.projects.resolve import (
     resolve_project_access,
 )
 from src.services.redis import (
+    REGISTRY_STATE_READY,
     build_coordination_or_503,
     coordination_is_gone,
     get_redis,
 )
+from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_CREATED_AT,
+    REGISTRY_FIELD_STATE,
+)
 from src.services.sandbox import SandboxError
-from src.services.sandbox.base import CompileState
+from src.services.sandbox.base import CompileState, SandboxIdentity
 from src.services.storage import StorageError
 
 router = APIRouter(prefix="/build-sessions", tags=["build_sessions"])
@@ -463,6 +482,114 @@ async def stop_build(
     session = _owned_or_404(manager, session_id, user.id)
     ended = await manager.stop(session, sandbox, reason=body.reason or "stopped_by_user")
     return StopBuildResponse(session_id=ended.session_id, status=ended.status)
+
+
+async def _project_owning_app_name(
+    db: AsyncSession, user_id: uuid.UUID, app_name: str
+) -> uuid.UUID | None:
+    """The citizen's project whose `app_name_for(app_id)` hashes forward to `app_name`, or
+    `None` when none of their apps do. FORWARD ONLY, matching `app_name_for`'s own contract
+    (`redis/keys.py`, `manager.py`) — nothing here reverse-parses a project out of a name."""
+    apps = (
+        await db.execute(
+            sa.select(AppRegistry.id, AppRegistry.project_id).where(AppRegistry.user_id == user_id)
+        )
+    ).all()
+    return next((app.project_id for app in apps if app_name_for(app.id) == app_name), None)
+
+
+def _drain_switch() -> tuple[bool, int]:
+    """The ceiling's flag and its hours, or `(False, 0)` with no sandbox configured — the
+    same reading `reaper.py`'s own switch gives."""
+    if settings.sandbox is None:
+        return False, 0
+    return settings.sandbox.drain_enabled, settings.sandbox.drain_after_hours
+
+
+def _registry_identity(reg: dict[str, str]) -> SandboxIdentity:
+    """The minimal identity `draining_at` needs. This route's budget allows no container
+    call, so the only field worth populating is the one the registry hash can answer."""
+    return SandboxIdentity(
+        kind=None,
+        user_id=None,
+        app_id=None,
+        control_plane=None,
+        created_at=an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT),
+        backfilled_at=None,
+        reclaim_staged_at=None,
+    )
+
+
+@router.get(
+    "/activity",
+    response_model=ActivityResponse,
+    responses=error_responses(
+        AUTH_401, (503, ErrorEnvelope, "Build coordination is temporarily unavailable")
+    ),
+)
+async def build_session_activity(user: CurrentUser, db: DbSession) -> ActivityResponse:
+    """Which of the citizen's projects are starting, open, or closing down right now — the
+    three markers the applications page draws beside each project's name.
+
+    DECLARED ABOVE `GET /{session_id}` ON PURPOSE: that route's `{session_id}` is a single
+    path segment and would otherwise swallow `/activity` as an unparseable session id, 422ing
+    every call.
+
+    THE SAME BUDGET `preview-state` HOLDS, FOR EVERY PROJECT AT ONCE rather than one: the
+    pipelined registry-hash-plus-starting-marker read, the citizen's owed `PendingTeardown`
+    rows, and no container call of any kind.
+
+    AN EMPTY LIST IS A POSITIVE CLAIM that nothing is starting, open or closing, so this runs
+    inside `build_coordination_or_503` like `renew_presence` beside it: a store that cannot
+    be read answers 503, never a list the client would read as "nothing is happening" and use
+    to clear every marker it is currently showing."""
+    with build_coordination_or_503():
+        reg, starting_project_id = await read_registry_and_starting_marker(get_redis(), user.id)
+
+        phases: dict[uuid.UUID, ActivityPhase] = {}
+        draining: dict[uuid.UUID, datetime] = {}
+
+        if reg is not None:
+            app_name = reg.get(REGISTRY_FIELD_APP_NAME)
+            if app_name and reg.get(REGISTRY_FIELD_STATE) == REGISTRY_STATE_READY:
+                project_id = await _project_owning_app_name(db, user.id, app_name)
+                if project_id is not None:
+                    phases[project_id] = (
+                        ActivityPhase.OPEN if stamp_is_proven(reg) else ActivityPhase.STARTING
+                    )
+                    enabled, after_hours = _drain_switch()
+                    mark = draining_at(
+                        _registry_identity(reg), enabled=enabled, after_hours=after_hours
+                    )
+                    if mark is not None:
+                        draining[project_id] = mark
+
+        if starting_project_id is not None and starting_project_id not in phases:
+            phases[starting_project_id] = ActivityPhase.STARTING
+
+        owed_project_ids = (
+            (
+                await db.execute(
+                    sa.select(PendingTeardown.project_id)
+                    .join(Project, Project.id == PendingTeardown.project_id)
+                    .where(PendingTeardown.user_id == user.id, Project.user_id == user.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for owed_project_id in owed_project_ids:
+            phases.setdefault(owed_project_id, ActivityPhase.CLOSING)
+
+        return ActivityResponse(
+            projects=[
+                ProjectActivity(
+                    project_id=project_id, phase=phase, draining_at=draining.get(project_id)
+                )
+                for project_id, phase in phases.items()
+            ]
+        )
+    raise _coordination_is_gone()
 
 
 @router.get(
