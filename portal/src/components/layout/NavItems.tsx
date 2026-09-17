@@ -134,8 +134,17 @@ export default function NavItems({ onNavigate, onItemFocus, collapsed = false }:
             {active && (
               // ONE ELEMENT WITH A SHARED `layoutId`, NOT A CLASS PER ITEM: the tinted pill
               // travels to the newly active row instead of blinking off one and on at another.
+              //
+              // THE SHARED LAYOUT IS DROPPED AT RAIL WIDTH, and that is a correctness fix rather
+              // than a taste one. A `layoutId` element is measured against its ancestors, and in
+              // the rail its ancestor is the panel ANIMATING ITS OWN WIDTH — so the pill was
+              // positioned from a box that no longer existed by the time it painted, and landed
+              // up and to the left of the icon it is supposed to sit behind. Without the shared
+              // id it is an ordinary absolutely-positioned span on `inset-0`, which is exactly
+              // the icon's own box. The travel is worth having between labelled rows; it is worth
+              // nothing in a 56px column where every row is the same square.
               <motion.span
-                layoutId="nav-active-pill"
+                layoutId={collapsed ? undefined : 'nav-active-pill'}
                 transition={highlightTransition}
                 aria-hidden="true"
                 className="absolute inset-0 rounded-lg bg-primary/10 ring-1 ring-inset ring-primary/30"
