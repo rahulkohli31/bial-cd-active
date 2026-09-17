@@ -102,9 +102,13 @@ from src.services.build_sessions.locks import (
     renew_presence_stay,
     stamp_is_proven,
 )
-from src.services.build_sessions.manager import existing_app_id
+from src.services.build_sessions.manager import (
+    VersionNotOfferedError,
+    existing_app_id,
+)
 from src.services.build_sessions.snapshot import (
     ParkedTreeNotOursError,
+    VersionBundleMissingError,
     list_parked_trees,
     newest_diverted_at,
     promote_parked,
@@ -789,6 +793,16 @@ class SaveStateResponse(CamelModel):
     saved_head: str | None = None
 
 
+class RollbackRequest(CamelModel):
+    """Which version to put back, and the chat the press came from.
+
+    The same shape Discard takes, for the same reason: an absent `conversation_id` is a
+    rollback triggered from outside a chat, and it writes no origin note."""
+
+    version_id: uuid.UUID
+    conversation_id: uuid.UUID | None = None
+
+
 class VersionEntry(CamelModel):
     """One row of the version list.
 
@@ -823,6 +837,16 @@ class DiscardNotice(CamelModel):
 
     seq: int
     saved_at: datetime | None = None
+
+
+class RollbackResponse(SaveStateResponse):
+    """The save state after a rollback, plus the note written into the conversation it came
+    from — `None` when it came from outside one, exactly as a discard answers."""
+
+    notice: DiscardNotice | None = None
+    #: The version the rollback minted. Nothing was destroyed to make it: the restored content
+    #: becomes current and what it replaced becomes previous.
+    version_id: str | None = None
 
 
 class DiscardResponse(SaveStateResponse):
@@ -965,6 +989,97 @@ async def discard_unsaved_changes(
     return DiscardResponse(
         **_save_state_fields(outcome.state),
         notice=DiscardNotice(seq=seq, saved_at=outcome.saved_at) if seq is not None else None,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/rollback",
+    response_model=RollbackResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Project, conversation or version not found"),
+        (409, ErrorEnvelope, "No live workspace, a reply is in flight, or the version is gone"),
+        (503, ErrorEnvelope, "The sandbox or the store is unavailable"),
+    ),
+)
+async def rollback_project(
+    project_id: uuid.UUID,
+    body: RollbackRequest,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> RollbackResponse:
+    """Put the workspace back to a version its owner chose — and keep everything.
+
+    ★ APPEND-ONLY. The restored content becomes the new current version and the one rolled
+    back from becomes previous, so rolling back again returns to where you were. What the
+    workspace held is parked, never deleted.
+
+    THE DEPLOYED APP DOES NOT CHANGE. This restores a workspace; what BIAL staff are running is
+    a separate act with its own approval. Rolling back to the live version is therefore
+    permitted and unremarkable.
+
+    Every conversation of the project that spoke since the restored version was saved gets a
+    note its next reply reads; `notice` is the one written into the conversation the request
+    came from, so the page shows it without a reload."""
+    if sandbox is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
+    await owned_project_or_404(db, user.id, project_id)
+    if body.conversation_id is not None:
+        found = await db.scalar(
+            sa.select(Conversation.id).where(
+                Conversation.id == body.conversation_id,
+                Conversation.user_id == user.id,
+                Conversation.project_id == project_id,
+            )
+        )
+        if found is None:
+            raise AppApiError(status.HTTP_404_NOT_FOUND, "Conversation not found.")
+    try:
+        outcome = await manager.rollback_to_version(
+            db,
+            user,
+            project_id,
+            version_id=body.version_id,
+            sandbox_client=sandbox,
+            conversation_id=body.conversation_id,
+        )
+    except NoLiveSandboxError:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            "Your workspace is not running, so there is nothing to roll back. Send a message "
+            "to bring it back — your versions are intact.",
+        ) from None
+    except BuildSessionConflictError:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT, "Wait for the reply to finish, then roll back."
+        ) from None
+    except VersionNotOfferedError:
+        # ANOTHER TAB SAVED, OR THE AGENT DID. Answered rather than quietly rolling back to
+        # whatever is nearest: the citizen pressed a row, and a different row is not it.
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            "That version is no longer in the list. Open the list again to see what is there.",
+        ) from None
+    except VersionBundleMissingError:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            "That version cannot be restored — the platform has no copy of it.",
+        ) from None
+    except (StorageError, SandboxError) as exc:
+        _log.warning("workspace_rollback_failed", project_id=str(project_id), exc_info=exc)
+        raise AppApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Nothing in your workspace was changed. Try again in a moment.",
+        ) from None
+    seq = outcome.notes.get(body.conversation_id) if body.conversation_id is not None else None
+    return RollbackResponse(
+        **_save_state_fields(outcome.state),
+        notice=DiscardNotice(seq=seq, saved_at=outcome.saved_at) if seq is not None else None,
+        version_id=str(outcome.version_id),
     )
 
 

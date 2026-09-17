@@ -135,12 +135,17 @@ from src.services.build_sessions.snapshot import (
     SavedVersion,
     consecutive_diverts,
     discard_back_to_saved,
+    restore_version,
     write_recovery_copy,
     write_snapshot,
 )
+from src.services.build_sessions.versions import by_id as version_by_id
 from src.services.build_sessions.versions import record as record_version
 from src.services.lake.copy import schedule_window_copy
-from src.services.messages.projection import WORKSPACE_DISCARDED_KIND
+from src.services.messages.projection import (
+    WORKSPACE_DISCARDED_KIND,
+    WORKSPACE_ROLLED_BACK_KIND,
+)
 from src.services.messages.store import SeqContentionError, append_batch
 from src.services.orchestrator.constants import READINESS_POLL_S
 from src.services.redis import RedisNotConfiguredError, get_redis
@@ -687,6 +692,28 @@ class SaveOutcome:
     version_id: uuid.UUID | None = None
 
 
+class VersionNotOfferedError(Exception):
+    """The version pressed is not one this app offers — another tab saved, or the agent did.
+
+    Answered rather than silently rolling back to something else: the citizen chose a row, and a
+    different row is not what they chose."""
+
+    def __init__(self, version_id: uuid.UUID) -> None:
+        super().__init__(f"version {version_id} is not offered")
+        self.version_id = version_id
+
+
+@dataclass(frozen=True)
+class RollbackOutcome:
+    """What a rollback did: the state afterwards, the version it restored, the row it minted,
+    and the note each conversation was given."""
+
+    state: SaveState
+    saved_at: datetime | None
+    version_id: uuid.UUID
+    notes: dict[uuid.UUID, int]
+
+
 @dataclass(frozen=True)
 class SaveState:
     """Is there unsaved work? `dirty=None` is UNKNOWN and is NOT False — no live container, or
@@ -1027,6 +1054,23 @@ def _discard_note(saved_at: datetime | None) -> str:
     )
 
 
+def _rollback_note(saved_at: datetime | None, description: str | None) -> str:
+    """What a conversation's next reply is told after a rollback.
+
+    Names the version by the two things the citizen chose — when they saved it and what they
+    called it — because a sha means nothing to the person the agent is talking to, and the
+    agent is about to discuss files that changed underneath it.
+    """
+    when = f" saved on {saved_at.astimezone(UTC):%d %b %Y at %H:%M} UTC" if saved_at else ""
+    called = f'"{description}"' if description else "with no description"
+    return (
+        "<system-note>The user rolled this app back to an earlier version" + when + ", "
+        f"{called}. Its files are now exactly that version. Anything changed after it, "
+        "including changes made earlier in this conversation, no longer exists. Read the "
+        "files again before relying on what they contain.</system-note>"
+    )
+
+
 async def _note_the_discard(
     db: AsyncSession,
     user_id: uuid.UUID,
@@ -1034,6 +1078,8 @@ async def _note_the_discard(
     *,
     origin: uuid.UUID | None,
     saved: SavedVersion,
+    note: str | None = None,
+    meta_kind: str = WORKSPACE_DISCARDED_KIND,
 ) -> dict[uuid.UUID, int]:
     """Write the discard note into the conversation it came from and into every other one of the
     project that spoke since the save; return each note's seq by conversation id.
@@ -1054,7 +1100,7 @@ async def _note_the_discard(
             )
         )
     ).all()
-    note = ModelRequest(parts=[UserPromptPart(content=_discard_note(saved.saved_at))])
+    told_them = ModelRequest(parts=[UserPromptPart(content=note or _discard_note(saved.saved_at))])
     notes: dict[uuid.UUID, int] = {}
     for conversation_id, kind in conversations:
         try:
@@ -1062,17 +1108,23 @@ async def _note_the_discard(
                 db,
                 user_id=user_id,
                 conversation_id=conversation_id,
-                messages=[note],
+                messages=[told_them],
                 entry_kind=MessageEntryKind.SYSTEM_EVENT,
                 kind=kind,
                 meta={
-                    "kind": WORKSPACE_DISCARDED_KIND,
+                    "kind": meta_kind,
                     "savedAt": saved.saved_at.isoformat() if saved.saved_at else None,
                     "savedHead": saved.head_sha,
                 },
             )
         except SeqContentionError:
-            _log.warning("discard_note_not_written", conversation_id=str(conversation_id))
+            # FAIL SOFT, PER CONVERSATION. The workspace has already been replaced; refusing
+            # now would tell the citizen their changes are still there.
+            _log.warning(
+                "workspace_note_not_written",
+                conversation_id=str(conversation_id),
+                kind=meta_kind,
+            )
             continue
         notes[conversation_id] = stored.seq
     return notes
@@ -2044,6 +2096,87 @@ class SessionManager:
         )
         state = await self._save_state_of(sandbox_client, handle, app_id)
         return DiscardOutcome(state=state, saved_at=saved.saved_at, notes=notes)
+
+    async def rollback_to_version(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        *,
+        version_id: uuid.UUID,
+        sandbox_client: SandboxClient,
+        conversation_id: uuid.UUID | None,
+    ) -> RollbackOutcome:
+        """THE ROLLBACK — the workspace goes back to a version its owner chose, and APPEND-ONLY.
+
+        ★ NOTHING IS DESTROYED. The restored content becomes the new current version and the one
+        rolled back from becomes previous, so rolling back again returns to where you were. The
+        new row carries the RESTORED version's save date and description forward, because what a
+        citizen recognises in the list is the work, not the moment they pressed the button.
+
+        It shares the restored row's bundle rather than copying it: the content is identical, the
+        store has no server-side copy, and a version's bundle outlives the list that offers it.
+
+        REFUSES WHILE ANY SESSION HOLDS THE CONTAINER, as a discard does and a Save does not: a
+        rollback replaces every file, and a Plan reply reading them must not have them reset
+        under it. The deployed app is untouched — this restores a workspace, never what BIAL
+        staff are running.
+        """
+        app_id = await existing_app_id(db, user.id, project_id)
+        if app_id is None:
+            raise NoLiveSandboxError(project_id)
+        version = await version_by_id(db, user_id=user.id, app_id=app_id, version_id=version_id)
+        if version is None:
+            raise VersionNotOfferedError(version_id)
+        async with self._start_lock_for(user.id):
+            if self._live_session_holds(user.id, app_id):
+                raise BuildSessionConflictError(self._active_by_user.get(user.id))
+            handle = await self._attach_for_read(user.id, app_id, sandbox_client)
+            restored = await restore_version(
+                sandbox_client,
+                handle,
+                app_id,
+                blob_key=version.blob_key,
+                taken_at=datetime.now(UTC),
+            )
+            # THE RESTORED TREE IS NOW WHAT THE APP IS SAVED AT. Leaving `snapshot_key` behind
+            # would read as unsaved work against a tree the citizen never edited.
+            await write_snapshot(sandbox_client, handle, app_id)
+        await self._boot_the_tree_we_put_back(sandbox_client, handle, user.id, arm="rollback")
+        minted = await record_version(
+            db,
+            user_id=user.id,
+            app_id=app_id,
+            saved_at=version.saved_at,
+            head_sha=version.head_sha,
+            blob_key=version.blob_key,
+            description=version.description,
+            restored_from=version.id,
+        )
+        notes = await _note_the_discard(
+            db,
+            user.id,
+            project_id,
+            origin=conversation_id,
+            saved=restored,
+            note=_rollback_note(version.saved_at, version.description),
+            meta_kind=WORKSPACE_ROLLED_BACK_KIND,
+        )
+        _log.info(
+            "workspace_rolled_back",
+            app_id=str(app_id),
+            restored_head=restored.head_sha,
+            from_version=str(version.id),
+            parked_at=restored.parked_at,
+            conversations_noted=len(notes),
+        )
+        state = await self._save_state_of(sandbox_client, handle, app_id)
+        return RollbackOutcome(
+            state=state,
+            saved_at=version.saved_at,
+            version_id=minted.id,
+            notes=notes,
+        )
 
     async def project_compile_state(
         self,
@@ -4330,12 +4463,14 @@ class SessionManager:
         handle: SandboxHandle,
         user_id: uuid.UUID,
         *,
-        arm: Literal["restore", "discard"],
+        arm: Literal["restore", "discard", "rollback"],
     ) -> None:
-        """Start the app a restore or a discard just put back, then watch for its first page.
+        """Start the app a restore, a discard or a rollback just put back, then watch for its
+        first page.
 
-        A restore's turn ends before the engine starts anything, and a discard can put back a tree
-        whose server the discarded work had crashed; either way nothing else starts it, and the
+        A restore's turn ends before the engine starts anything, and a discard or rollback can
+        put back a tree whose server the replaced work had crashed; either way nothing else
+        starts it, and the
         preview waits for a page that never comes. `dev_start` is idempotent over a running
         server. A refused start is logged rather than raised: the detached watcher, and the
         reconciler under it, still report whatever the container does next."""

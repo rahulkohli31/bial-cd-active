@@ -114,6 +114,11 @@ async def most_recent(
 ) -> list[Version]:
     """The newest versions first, owner-scoped.
 
+    ★ ORDERED BY WHEN THE ROW WAS MINTED, NOT BY THE DATE IT SHOWS. A rollback carries the
+    restored version's save date forward — that is what a citizen recognises — so ordering by
+    `saved_at` would file the rollback back where it came from and the list would not show it as
+    current. The two facts are deliberately separate columns for exactly this reason.
+
     OWNER-SCOPED EVEN THOUGH `app_id` IMPLIES THE OWNER, like every other read on this platform:
     the id is client-supplied on the paths that reach here, and a dropped predicate is a
     cross-user leak rather than a wrong answer.
@@ -123,7 +128,7 @@ async def most_recent(
             await db.execute(
                 sa.select(AppVersion)
                 .where(AppVersion.user_id == user_id, AppVersion.app_id == app_id)
-                .order_by(AppVersion.saved_at.desc(), AppVersion.id.desc())
+                .order_by(AppVersion.created_at.desc(), AppVersion.id.desc())
                 .limit(limit)
             )
         )
@@ -278,7 +283,7 @@ async def _version_with_head(
                     AppVersion.app_id == app_id,
                     AppVersion.head_sha == head_sha,
                 )
-                .order_by(AppVersion.saved_at.desc(), AppVersion.id.desc())
+                .order_by(AppVersion.created_at.desc(), AppVersion.id.desc())
                 .limit(1)
             )
         )

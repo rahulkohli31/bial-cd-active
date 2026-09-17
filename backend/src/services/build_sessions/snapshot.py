@@ -20,7 +20,7 @@ import secrets
 import time
 import uuid
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -789,6 +789,18 @@ async def promote_parked(app_id: uuid.UUID, *, key: str) -> Promotion:
     return Promotion(True, f"the recovery slot now holds {head_sha}")
 
 
+class VersionBundleMissingError(Exception):
+    """A rollback was asked for, and the version's stored bundle is not there.
+
+    Distinct from having no saved version at all: the row says the platform kept this tree, so
+    its absence is a fault worth naming rather than an empty history."""
+
+    def __init__(self, app_id: uuid.UUID, key: str) -> None:
+        super().__init__(f"app {app_id} has no stored bundle at {key}")
+        self.app_id = app_id
+        self.key = key
+
+
 class NothingSavedToGoBackToError(Exception):
     """A discard was asked for, and this app has no saved version to go back to."""
 
@@ -820,12 +832,70 @@ async def discard_back_to_saved(
     first: if the reset fails, the container still holds work descending from the saved head, and
     the next turn finds it intact. The slot is overwritten, never emptied — an empty slot reads as
     an app that was never built."""
+    return await _restore_over_the_live_tree(
+        sandbox_client,
+        handle,
+        app_id,
+        source_key=snapshot_key(app_id),
+        taken_at=taken_at,
+        missing=lambda: NothingSavedToGoBackToError(app_id),
+    )
+
+
+async def restore_version(
+    sandbox_client: SandboxClient,
+    handle: SandboxHandle,
+    app_id: uuid.UUID,
+    *,
+    blob_key: str,
+    taken_at: datetime,
+) -> SavedVersion:
+    """Put a stored version back into the live container, keeping the tree it replaces.
+
+    The same ordering a discard uses, over a different source key — which is the whole
+    difference between the two operations at this level. Also written into the saved slot by the
+    caller, because the restored content BECOMES what the app is saved at: leaving `snapshot_key`
+    behind would read as unsaved work against a tree the citizen never edited.
+    """
+    return await _restore_over_the_live_tree(
+        sandbox_client,
+        handle,
+        app_id,
+        source_key=blob_key,
+        taken_at=taken_at,
+        missing=lambda: VersionBundleMissingError(app_id, blob_key),
+    )
+
+
+async def _restore_over_the_live_tree(
+    sandbox_client: SandboxClient,
+    handle: SandboxHandle,
+    app_id: uuid.UUID,
+    *,
+    source_key: str,
+    taken_at: datetime,
+    missing: Callable[[], Exception],
+) -> SavedVersion:
+    """Park the live tree, arm the recovery slot, then reset the container. In that order.
+
+    ★ THE RECOVERY SLOT IS WRITTEN BEFORE THE RESET, AND THAT IS NOT TIDINESS.
+    `write_recovery_copy` diverts any tree whose HEAD is not a descendant of the sha stamped on
+    `recovery_key`. Putting an older tree into the container without moving that stamp leaves
+    every later turn writing to `divert_key` and firing `recovery_write_did_not_land` — the slot
+    reads as poisoned from then on, and crash recovery is broken permanently rather than for one
+    turn.
+
+    THE STORE MOVES FIRST for the same reason a discard does it: if the reset fails, the
+    container still holds work descending from a head the store knows, and the next turn finds
+    it intact. The slot is overwritten, never emptied — an empty slot reads as an app that was
+    never built.
+    """
     store = _the_store_first()
     async with _serialized_per_app(app_id):
-        meta = await store.head(snapshot_key(app_id))
+        meta = await store.head(source_key)
         if meta is None:
-            raise NothingSavedToGoBackToError(app_id)
-        data = await store.get(snapshot_key(app_id))
+            raise missing()
+        data = await store.get(source_key)
         saved = _BundledTree(head_sha=parse_bundle_head_sha(data), data=data)
         parked = Destination.quarantine(app_id, taken_at).key
         live = await _bundle_the_tree(sandbox_client, handle, _SaveStepTimings())
