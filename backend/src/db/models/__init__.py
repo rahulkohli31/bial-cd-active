@@ -5,6 +5,7 @@ follow in later phases.
 """
 
 from src.db.models.app_registry import AppRegistry as AppRegistry
+from src.db.models.app_version import AppVersion as AppVersion
 from src.db.models.attachment import Attachment as Attachment
 from src.db.models.audit import AuditLog as AuditLog
 from src.db.models.classification_review import ClassificationReview as ClassificationReview
