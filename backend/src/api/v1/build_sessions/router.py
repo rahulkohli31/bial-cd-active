@@ -102,12 +102,19 @@ from src.services.build_sessions.locks import (
     renew_presence_stay,
     stamp_is_proven,
 )
+from src.services.build_sessions.manager import existing_app_id
 from src.services.build_sessions.snapshot import (
     ParkedTreeNotOursError,
     list_parked_trees,
     newest_diverted_at,
     promote_parked,
 )
+from src.services.build_sessions.versions import Entry as VersionEntry_
+from src.services.build_sessions.versions import (
+    live_head_sha,
+    what_the_next_save_evicts,
+)
+from src.services.build_sessions.versions import offered as versions_offered
 from src.services.orchestrator.client_errors import (
     park_client_error,
 )
@@ -782,6 +789,34 @@ class SaveStateResponse(CamelModel):
     saved_head: str | None = None
 
 
+class VersionEntry(CamelModel):
+    """One row of the version list.
+
+    `id` is null for a live version the platform holds no copy of — an app deployed before this
+    feature shipped. It is listed and marked anyway, with its reason, because an entry that
+    silently vanishes tells the citizen less than one that explains itself.
+    """
+
+    id: str | None = None
+    saved_at: datetime | None = None
+    description: str | None = None
+    #: Every marker that applies, not the one that applies most: a row may be CURRENT and LIVE
+    #: at once, and one replacing the other would list the same content twice.
+    markers: list[str] = []
+    available: bool = False
+    unavailable_reason: str | None = None
+
+
+class VersionListResponse(CamelModel):
+    """The list, and the version the next Save would push off it."""
+
+    versions: list[VersionEntry] = []
+    #: What a Save right now would drop, or null when nothing would — fewer than two versions,
+    #: or the one falling out is live and the list keeps it as a third entry. Null means the
+    #: dialog says nothing at all, rather than saying nothing will be dropped.
+    evicting: VersionEntry | None = None
+
+
 class DiscardNotice(CamelModel):
     """The line a discard wrote into the conversation it came from, so the page can show it where
     a reload would."""
@@ -991,6 +1026,75 @@ async def stop_active_build(
     await owned_project_or_404(db, user.id, project_id)
     state = await manager.request_stop_of_active_work(db, user, project_id, sandbox_client=sandbox)
     return StopActiveBuildResponse(state=state)
+
+
+def _version_entry(entry: VersionEntry_) -> VersionEntry:
+    return VersionEntry(
+        id=str(entry.id) if entry.id else None,
+        saved_at=entry.saved_at,
+        description=entry.description,
+        markers=[marker.value for marker in entry.markers],
+        available=entry.available,
+        unavailable_reason=entry.unavailable_reason,
+    )
+
+
+@router.get(
+    "/projects/{project_id}/versions",
+    response_model=VersionListResponse,
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
+)
+async def list_versions(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> VersionListResponse:
+    """THE LIST: the two most recent saves, plus the live version when it is neither of them.
+
+    Owner-only, through the same scope Save and Discard already carry — a colleague with a
+    shared view never sees a version list or a way back into someone else's workspace.
+
+    ITS OWN ENDPOINT, read when the menu opens rather than folded into the save-state poll.
+    Nothing needs the list before then, the toolbar polls enough already, and the poll only runs
+    while the preview says the workspace is alive — whereas this list must answer on a stopped
+    workspace too, which is exactly when a citizen goes looking for a version to go back to.
+
+    Answers an empty list rather than a 404 for an app that has never been saved: nothing is
+    wrong, there is simply nothing to offer yet."""
+    await owned_project_or_404(db, user.id, project_id)
+    app_id = await existing_app_id(db, user.id, project_id)
+    if app_id is None:
+        return VersionListResponse()
+    # WHETHER A ROLLBACK COULD RUN AT ALL, asked the same way the save state asks it: `dirty` is
+    # null precisely when there is no live container to compare against, which is also when
+    # there is nothing to restore INTO. The rows still list; their actions carry the reason.
+    state = (
+        await manager.project_save_state(db, user, project_id, sandbox_client=sandbox)
+        if sandbox is not None
+        else None
+    )
+    running = state is not None and state.dirty is not None
+    entries = await versions_offered(db, user_id=user.id, app_id=app_id, workspace_running=running)
+    evicting = await what_the_next_save_evicts(
+        db,
+        user_id=user.id,
+        app_id=app_id,
+        live_head_sha=await live_head_sha(db, user_id=user.id, app_id=app_id),
+    )
+    return VersionListResponse(
+        versions=[_version_entry(entry) for entry in entries],
+        evicting=(
+            VersionEntry(
+                id=str(evicting.id),
+                saved_at=evicting.saved_at,
+                description=evicting.description,
+            )
+            if evicting
+            else None
+        ),
+    )
 
 
 @router.get(
