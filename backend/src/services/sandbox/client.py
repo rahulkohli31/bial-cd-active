@@ -613,7 +613,7 @@ class AcaSandboxClient(SandboxClient):
             return ServedCount(
                 count=int(body["served"]), truncated=bool(body.get("truncated", True))
             )
-        except KeyError, TypeError, ValueError:
+        except (KeyError, TypeError, ValueError):  # fmt: skip  # ruff py314 strips parens
             return None
 
     async def what_is_it_serving(self, handle: SandboxHandle) -> ServedPage | None:
@@ -916,6 +916,21 @@ class AcaSandboxClient(SandboxClient):
         for ref in [ref for ref, tok in self._token_refs.items() if tok == token]:
             self._token_refs.pop(ref, None)
 
+    async def _read_supervisor_token(self, app_name: str) -> str | None:
+        """Read a container's supervisor bearer straight off its own ACA env, or `None` when it
+        cannot be read. The ONE place that ARM call happens — `_recover_token` (registry-keyed
+        reattach) and `attach_by_name` (no registry at all) both go through this rather than
+        each reading `get_app_env_value` for itself.
+
+        `AcaError`/`AcaTransientError` collapse to `None` here: this method says only whether the
+        token was read, never why not — the caller holds the context (a registry record, or
+        nothing) needed to turn that into Gone vs NotReady. Never logs the token itself."""
+        try:
+            return await self._aca.get_app_env_value(name=app_name, key=_SUPERVISOR_TOKEN_ENV)
+        except (AcaError, AcaTransientError):  # fmt: skip  # ruff py314 strips parens
+            _log.warning("supervisor_token_recovery_failed", app_name=app_name, exc_info=True)
+            return None
+
     async def _recover_token(self, token_ref: str, app_name: str) -> str | None:
         """Re-read a container's supervisor bearer from its ACA env, re-bound to the registry's
         `token_ref`, or `None` when it cannot be recovered.
@@ -924,12 +939,8 @@ class AcaSandboxClient(SandboxClient):
         restart empties it — and reading that as `SandboxGoneError` used to roll every citizen with
         an open sandbox back to their last save on a routine deploy. The token is minted per
         container into its ACA env at create; that env is its durable home and this process's map
-        was only ever a cache. Never logged."""
-        try:
-            token = await self._aca.get_app_env_value(name=app_name, key=_SUPERVISOR_TOKEN_ENV)
-        except (AcaError, AcaTransientError):  # fmt: skip  # ruff py314 strips parens
-            _log.warning("supervisor_token_recovery_failed", app_name=app_name, exc_info=True)
-            return None
+        was only ever a cache."""
+        token = await self._read_supervisor_token(app_name)
         if token is None:
             return None
         self._token_refs[token_ref] = token
@@ -1203,6 +1214,45 @@ class AcaSandboxClient(SandboxClient):
         except SandboxError:
             _log.warning(
                 "dev_status failed after attach; returning ready=False", app_name=app_name
+            )
+            return handle
+        return replace(handle, ready=status.ready)
+
+    async def attach_by_name(self, *, app_name: str) -> SandboxHandle:
+        """Reach a container from its NAME alone — no registry hash, no `user_id`, no
+        `token_ref`. What survives a switch overwriting the per-user registry with the
+        incoming container's record: the outgoing one is still standing at this name.
+
+        Composed from the same two ARM reads `attach_existing` performs via the registry —
+        `get_app_fqdn` for the address, `_read_supervisor_token` for the bearer — plus the
+        same reachability probe, all keyed by `app_name` directly instead of a Redis lookup.
+
+        ABSENT AND UNREACHABLE ARE DIFFERENT ANSWERS. `SandboxGoneError` means ARM confirms no
+        container answers to this name. `SandboxNotReadyError` means ARM found it but the
+        supervisor did not — a reach failure, retryable, never a death certificate."""
+        try:
+            fqdn = await self._aca.get_app_fqdn(name=app_name)
+        except (AcaError, AcaTransientError) as exc:
+            raise SandboxNotReadyError("could not confirm container liveness") from exc
+        if fqdn is None:
+            raise SandboxGoneError(f"no container answers to {app_name!r}")
+        token = await self._read_supervisor_token(app_name)
+        if token is None:
+            raise SandboxNotReadyError("supervisor token temporarily unrecoverable")
+        handle = SandboxHandle(
+            fqdn=fqdn,
+            token=token,
+            app_name=app_name,
+            preview_url=_public_app_url(app_name),
+            ready=False,
+        )
+        await self._probe_with_retry(handle)
+        try:
+            status = await self.dev_status(handle)
+        except SandboxError:
+            _log.warning(
+                "dev_status failed after attach_by_name; returning ready=False",
+                app_name=app_name,
             )
             return handle
         return replace(handle, ready=status.ready)

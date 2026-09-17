@@ -66,6 +66,7 @@ from src.services.sandbox.base import (
     SandboxClient,
     SandboxGoneError,
     SandboxHandle,
+    SandboxNotReadyError,
     ServedCount,
     ServedPage,
 )
@@ -295,6 +296,15 @@ class FakeSandboxClient(SandboxClient):
         # attach returns this handle when set; otherwise raises SandboxGoneError (the
         # default "no live sandbox" so the caller provisions).
         self.attach_handle: SandboxHandle | None = None
+        # ATTACH_BY_NAME'S OWN WORLD, independent of the registry and of `attach_handle`: a name
+        # absent here means ARM confirms nothing answers to it (`SandboxGoneError`); a name
+        # present in `unreachable_by_name` means ARM confirms the container but the supervisor
+        # does not (`SandboxNotReadyError`) — the reach failure a caller must never read as
+        # absence. `provision_new`/`restore_from_snapshot` register into it and `teardown`
+        # retires the entry, mirroring what ARM would actually know regardless of what the
+        # per-user registry says.
+        self.by_name: dict[str, SandboxHandle] = {}
+        self.unreachable_by_name: set[str] = set()
         self.teardown_error: Exception | None = None
         # Optional per-command exec script; defaults to a clean exit-0 result.
         self.exec_handler: Callable[[list[str]], ExecResult] | None = None
@@ -342,6 +352,7 @@ class FakeSandboxClient(SandboxClient):
         self.provision_env = dict(app_env)
         handle = _fake_handle(app_name)
         await _hydrate_registry(user_id, handle)
+        self.by_name[app_name] = handle
         return handle
 
     async def wait_ready(
@@ -370,6 +381,15 @@ class FakeSandboxClient(SandboxClient):
             raise SandboxGoneError("no live sandbox for user")
         return self.attach_handle
 
+    async def attach_by_name(self, *, app_name: str) -> SandboxHandle:
+        """Mirrors the real client's absent-vs-unreachable split, keyed on `by_name` /
+        `unreachable_by_name` rather than a registry read — there is none for this path."""
+        if app_name not in self.by_name:
+            raise SandboxGoneError(f"no container answers to {app_name!r}")
+        if app_name in self.unreachable_by_name:
+            raise SandboxNotReadyError(f"{app_name!r} exists but the supervisor does not answer")
+        return self.by_name[app_name]
+
     async def restore_from_snapshot(
         self,
         user_id: str,
@@ -396,6 +416,7 @@ class FakeSandboxClient(SandboxClient):
         await _hydrate_registry(
             user_id, handle, shared_project_id=shared_project_id, shared_owner_id=shared_owner_id
         )
+        self.by_name[app_name] = handle
         return handle
 
     async def exec(
@@ -492,6 +513,8 @@ class FakeSandboxClient(SandboxClient):
         if self.teardown_error is not None:
             raise self.teardown_error
         self.torn_down.append(handle.app_name)
+        self.by_name.pop(handle.app_name, None)
+        self.unreachable_by_name.discard(handle.app_name)
 
 
 ProgressSinkFn = Callable[[ProgressEnvelope], Awaitable[None]]
