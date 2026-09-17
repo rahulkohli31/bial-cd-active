@@ -7,20 +7,26 @@
  * changes on a *successful* save (to the server's canonical copy) or by the user
  * typing.
  *
- * REQUIRED AND WORD-BOUNDED (#191): a description can no longer be saved blank — the
- * server rejects both an explicit clear and a whitespace-only write (R11), so Save is
- * gated on the same 15-120 word rule the create form enforces. A project written before
- * #191 that has no description at all still opens and closes normally (R14); it simply
- * cannot be SAVED again until the text clears the bar.
+ * REQUIRED AND WORD-BOUNDED: a description can no longer be saved blank — the server
+ * rejects both an explicit clear and a whitespace-only write, so Save is gated on the same
+ * 15-120 word rule the create form enforces. A project written before the description
+ * requirement existed, with no description at all, still opens and closes normally; it
+ * simply cannot be SAVED again until the text clears the bar.
  */
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { ChangeEvent, ClipboardEvent, KeyboardEvent } from 'react'
-import { Pencil, X } from 'lucide-react'
+import { Info, Pencil, X } from 'lucide-react'
 import { patchProject } from '../../utils/projectApi'
 import type { Project } from '../../utils/projectApi'
 import { ApiError } from '../../utils/apiError'
-import { countWords, MIN_PROJECT_DESCRIPTION_WORDS, MAX_PROJECT_DESCRIPTION_WORDS } from '../../utils/words'
+import {
+  countWords,
+  MIN_PROJECT_DESCRIPTION_WORDS,
+  MAX_PROJECT_DESCRIPTION_WORDS,
+  PROJECT_DESCRIPTION_EXAMPLE,
+} from '../../utils/words'
+import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover'
 
 const MAX_LENGTH = 2000
 /** The read-only summary's empty state — distinct from the textarea's own placeholder
@@ -226,9 +232,28 @@ export default function ProjectDescriptionEditor({
               </button>
             </div>
 
-            {/* THE FIELD'S LABEL (#191 R15) — the same question as the create form asks,
-                applied here too rather than left implicit in the dialog's own title. */}
-            <span className="text-xs font-semibold text-tertiary">What should this app do?</span>
+            {/* THE FIELD'S LABEL — the same question as the create form asks, applied here
+                too rather than left implicit in the dialog's own title. The info control
+                beside it mirrors the create form's own — same worked example, same
+                keyboard-focusable toggle-on-click button, so the field behaves identically
+                everywhere it appears. */}
+            <span className="flex items-center gap-1.5">
+              <span className="text-xs font-semibold text-tertiary">What should this app do?</span>
+              <Popover>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Show an example description"
+                    className="text-neutral hover:text-primary transition"
+                  >
+                    <Info size={13} />
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent className="w-72 text-xs leading-relaxed text-neutral">
+                  {PROJECT_DESCRIPTION_EXAMPLE}
+                </PopoverContent>
+              </Popover>
+            </span>
 
             <textarea
               ref={textareaRef}

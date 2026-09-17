@@ -43,6 +43,13 @@ export const MAX_PROJECT_NAME_WORDS = 8
 export const MIN_PROJECT_DESCRIPTION_WORDS = 15
 export const MAX_PROJECT_DESCRIPTION_WORDS = 120
 
+/** The worked example behind the description field's info control — shared by the create
+ *  form and the edit dialog so a citizen sees the SAME example wherever they meet the field,
+ *  not two examples that can drift apart. */
+export const PROJECT_DESCRIPTION_EXAMPLE =
+  'Ground staff log VIP movement requests for each terminal. A duty supervisor approves ' +
+  "or rejects them, and the day's approved movements appear on a shared dashboard."
+
 /** The delete-reason bounds (#158 §13.2). */
 export const MIN_DELETE_REASON_WORDS = 5
 export const MAX_DELETE_REASON_WORDS = 50

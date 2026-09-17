@@ -54,6 +54,7 @@ function deferred<T>() {
 }
 
 const textarea = () => screen.getByRole('textbox', { name: /project description/i }) as HTMLTextAreaElement
+const infoBtn = () => screen.getByRole('button', { name: /show an example description/i }) as HTMLButtonElement
 const saveBtn = () => screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement
 const cancelBtn = () => screen.getByRole('button', { name: /cancel/i }) as HTMLButtonElement
 const editBtn = () => screen.getByRole('button', { name: /edit/i }) as HTMLButtonElement
@@ -270,6 +271,21 @@ describe('ProjectDescriptionEditor — character backstop', () => {
     fireEvent.change(textarea(), { target: { value: 'edited by hand' } })
 
     expect(screen.queryByText(/cut to 2000 characters/)).toBeNull()
+  })
+})
+
+describe('ProjectDescriptionEditor — the info control', () => {
+  it('is reachable by keyboard and reveals the same worked example the create form shows, without a pointer', async () => {
+    render(<ProjectDescriptionEditor projectId="p1" description={null} onProjectUpdate={vi.fn()} />)
+    openEditor()
+
+    expect(screen.queryByText(/ground staff log vip movement/i)).toBeNull()
+    infoBtn().focus()
+    expect(document.activeElement).toBe(infoBtn())
+
+    fireEvent.click(infoBtn())
+
+    expect(await screen.findByText(/ground staff log vip movement/i)).toBeTruthy()
   })
 })
 

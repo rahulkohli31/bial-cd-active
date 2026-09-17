@@ -28,6 +28,7 @@ import {
   MAX_PROJECT_NAME_WORDS,
   MIN_PROJECT_DESCRIPTION_WORDS,
   MAX_PROJECT_DESCRIPTION_WORDS,
+  PROJECT_DESCRIPTION_EXAMPLE,
 } from '../../utils/words'
 import { X, Info, ExternalLink } from 'lucide-react'
 import { BusyGlyph } from '../ui/Waiting'
@@ -48,14 +49,8 @@ import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover'
 const NAME_MAX = 120
 const DESCRIPTION_MAX = 2000
 
-// The worked example behind the info control (#191 R16) — the issue's own text, so the
-// example a citizen sees matches the one referenced in the requirement itself.
-const DESCRIPTION_EXAMPLE =
-  'Ground staff log VIP movement requests for each terminal. A duty supervisor approves ' +
-  "or rejects them, and the day's approved movements appear on a shared dashboard."
-
-/** A silent, best-effort analytics call (#191 R39) — never lets a failed log line surface
- *  as an error banner over a flow that has nothing left for the citizen to retry. */
+/** A silent, best-effort analytics call — never lets a failed log line surface as an error
+ *  banner over a flow that has nothing left for the citizen to retry. */
 function reportResolution(resolution: 'opened_existing' | 'created_anyway'): void {
   reportDuplicateCheckResolution(resolution).catch(() => {
     /* R39 is telemetry, not a contract with the citizen — a dropped event is not a failure */
@@ -310,7 +305,7 @@ export default function ProjectCreateModal({ onClose, onCreated }: ProjectCreate
                     </button>
                   </PopoverTrigger>
                   <PopoverContent className="w-72 text-xs leading-relaxed text-neutral">
-                    {DESCRIPTION_EXAMPLE}
+                    {PROJECT_DESCRIPTION_EXAMPLE}
                   </PopoverContent>
                 </Popover>
               </span>

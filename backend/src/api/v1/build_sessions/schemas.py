@@ -144,7 +144,7 @@ SERVED_TRAFFIC_STAY_SECONDS = 900
 # longer stay a prior write turn already bought — see `locks.py`.
 TURN_ENDED_UNCHANGED_STAY_SECONDS = 300  # 5 min
 
-# --- The shared-runtime view's absolute session ceiling (#198) --------------
+# --- The shared-runtime view's absolute session ceiling ---------------------
 # Independent of `DeadlineWriter.APP_SERVED_TRAFFIC`'s renewable stay above, so a wedged or
 # spoofed supervisor report can never buy a shared view immortality: every renewable signal in
 # this file bounds how long a container survives WITHOUT proof of use, and this bounds how long
@@ -357,10 +357,12 @@ class RelaunchPreviewResponse(CamelModel):
 
 class SharedPreviewResponse(CamelModel):
     """`POST /v1/build-sessions/projects/{projectId}/shared-launch` and `.../shared-refresh`
-    → 200 (#198). `RelaunchPreviewResponse`'s sibling for a colleague's read-only view of a
-    project shared with them — no `session_id`/`status`/`restored_from_failed_build`: a shared
-    view registers no build session, has no build-outcome history of its own to qualify, and
-    `ready` alone says whether the frame is serving yet."""
+    → 200. `RelaunchPreviewResponse`'s sibling for a project shared with a colleague — NOT
+    "read-only": a share grants "Can use", never "view only", and the colleague can create,
+    update and delete the owner's records through the app's own UI. No
+    `session_id`/`status`/`restored_from_failed_build`: a shared view registers no build
+    session, has no build-outcome history of its own to qualify, and `ready` alone says
+    whether the frame is serving yet."""
 
     app_id: uuid.UUID
     preview_url: str
@@ -368,8 +370,10 @@ class SharedPreviewResponse(CamelModel):
     # When the snapshot NOW BEING SERVED was saved — the answer to "how current is what I'm
     # looking at", which only matters here: a builder's own relaunch is always their newest
     # work, but a colleague's view is frozen at whatever the owner last saved, and Refresh's
-    # entire point is moving this forward. `None` only when the store could not be asked for
-    # the timestamp; the restore itself already confirmed the snapshot exists.
+    # entire point is moving this forward. `None` both when the store could not be asked for
+    # the timestamp AND when this call attached to an already-live container rather than
+    # restoring — see `SharedPreview.snapshot_taken_at` in `services/build_sessions/manager.py`
+    # for why an attach can never honestly answer this.
     snapshot_taken_at: datetime | None
 
 

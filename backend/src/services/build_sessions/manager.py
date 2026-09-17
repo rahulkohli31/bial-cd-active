@@ -387,8 +387,9 @@ _UNKNOWN_REPORT_SILENCE_SECONDS: float = 60.0
 
 # WHICH DOOR into the one-per-user workspace a claim came through, for the claim log line. A
 # closed Literal rather than a bare `str` so a typo cannot invent a fourth arm that no alert
-# rule has ever heard of. `shared_launch` (#198) is the recipient's own door: a colleague's
-# read-only view of a project shared with them, occupying the SAME per-user slot a build would.
+# rule has ever heard of. `shared_launch` is the recipient's own door: a colleague's view of a
+# project shared with them (not read-only — a share grants "Can use", never "view only"),
+# occupying the SAME per-user slot a build would.
 _ClaimArm = Literal["relaunch", "ensure_sandbox", "shared_launch"]
 
 
@@ -3775,11 +3776,12 @@ class SessionManager:
         *,
         force_refresh: bool = False,
     ) -> SharedPreview:
-        """Put a READY, read-only container in front of a project SHARED WITH `recipient` — the
-        recipient's own door into the same one-per-user slot `relaunch_preview` uses for a
-        builder's own project. The ROUTER has already established `recipient` may see this
-        project (`resolve_project_access` returning SHARED); this trusts that and re-checks
-        nothing about access — only about the container.
+        """Put a READY container in front of a project SHARED WITH `recipient` — not read-only
+        (a share grants "Can use", never "view only") — the recipient's own door into the same
+        one-per-user slot `relaunch_preview` uses for a builder's own project. The ROUTER has
+        already established `recipient` may see this project (`resolve_project_access`
+        returning SHARED); this trusts that and re-checks nothing about access — only about
+        the container.
 
         SNAPSHOT-ONLY, ALWAYS (requirement 21). Deliberately NEVER `newest_restore_source`,
         which would prefer the OWNER's crash-recovery bundle over their last deliberate Save —
