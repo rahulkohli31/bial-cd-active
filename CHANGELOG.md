@@ -4,6 +4,64 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.3] - 2026-09-17
+
+The platform's navigation moves to the left of the screen, where it rests as a narrow column of
+icons and grows to its full width when you reach it. An application's row in the list becomes
+somewhere to find an application rather than operate one: everything that acts on an app now
+lives in one settings dialog, which also gains restarting an app and taking it out of
+production. Shared applications and the data an administrator has approved for you each get a
+page of their own.
+
+### Added
+
+- **A navigation rail down the left of every list.** It rests as icons and opens when the
+  pointer or the keyboard arrives, so the destinations are never gone, only quiet. A pin keeps
+  it open, and the preference is remembered. Inside an application it is out of sight entirely
+  and returns on demand, so the app you are building keeps the width.
+- **One settings dialog per application**, opened from the row. It carries the name, the
+  description, who the app is shared with, the data it can read, and its deployment.
+- **Restarting a live application and taking it out of production**, both from that dialog. A
+  take-down asks first and says what it keeps: the app stops serving, and everything it saved
+  stays where it is.
+- **A page for applications a colleague shared with you**, searchable and filterable by who
+  shared it.
+- **A page for the data BIAL already holds**, showing what an administrator has approved for
+  you and how many of your applications use it. Every application also gets its own tab for
+  switching that data on.
+- **Two dates in the applications list** — when an application was created, and when its
+  details last changed — and a summary above it whose tiles filter the list when pressed.
+
+### Changed
+
+- **The description is edited where it is read.** Typing in it is the edit; Save appears
+  because there is something to save. It used to take a second dialog opened on top of the
+  first.
+- **Everything a person reads says "application".** One word for one thing, across every
+  screen.
+- **The row menu holds Open and Settings.** Restarting, taking down and deleting an
+  application are acts on the application, so they live with its settings rather than beside
+  its name.
+- **Settings stops explaining itself.** The paragraphs describing what each control does are
+  gone; where something genuinely needs saying, an information button says it.
+- **The framed application gets the room the chrome was using**, including the caption above
+  it and the padding around it.
+
+### Fixed
+
+- **A restart that failed no longer leaves an application stranded.** The version that was
+  already running keeps running, and the screen says the attempt ended rather than staying
+  silent.
+- **Taking an application down is read as a fact about production** wherever its record
+  landed, so an app that was taken down never reads as live.
+- **A published date reads the same on every machine**, and matches the date the list shows.
+- **The navigation says where you are** on screens you reached through it, including a shared
+  application and a chat, whose addresses share no prefix with the list they came from.
+- **Pinning the navigation no longer reloads the application beside it.**
+- **Take down is offered only where the server will accept it.**
+- **The description counter states both bounds**, so an application whose description predates
+  the word rule no longer shows a greyed-out Save with nothing explaining it.
+
 ## [1.7.2] - 2026-09-14
 
 The preview's starter page stops telling people to describe an app they have already described.
