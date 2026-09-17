@@ -85,7 +85,6 @@ from src.services.build_sessions.counters import count
 from src.services.build_sessions.integrity import (
     IntegrityVerdict,
     WorkspaceState,
-    clean_but_for_churn,
     container_state,
     only_regenerated_files_changed,
     workspace_integrity,
@@ -121,6 +120,11 @@ from src.services.build_sessions.outcome import (
     write_build_outcome,
 )
 from src.services.build_sessions.reaper import is_a_shared_sandbox_name, reap_user, reconcile_user
+from src.services.build_sessions.shutdown import (
+    ShutdownReason,
+    claim_the_teardown_we_owe,
+    shut_it_down_in_the_background,
+)
 from src.services.build_sessions.snapshot import (
     SNAPSHOT_EXEC_TIMEOUT_SECONDS,
     SNAPSHOT_EXECS,
@@ -608,13 +612,19 @@ class NoSnapshotToRelaunchError(Exception):
 
 
 class SandboxReclaimBlockedError(Exception):
-    """Another project holds this user's one sandbox slot and its workspace has unsaved work,
-    so taking the slot would silently destroy it. Reclaiming is not wrong — doing it silently
-    is: the slot is per-user, so something must give it up, but a citizen who loses work must
-    be told first. The router turns this into a 409 naming the occupying project; the client
-    offers a choice, and `release_project_sandbox` is the only thing that actually destroys a
-    container. A clean incumbent never raises this — nothing to lose, so the reclaim stays
-    silent and costs nothing. This is the missing telling, not a new save policy: nothing
+    """Something that is NOT this citizen's own project holds their one sandbox slot, and
+    taking it would destroy a screen nobody asked to lose.
+
+    A COLLEAGUE'S SHARED VIEW IS WHAT THIS MEANS NOW. A citizen's own other project no longer
+    raises it from a start: opening a second project hands the first to the shutdown routine,
+    which writes its tree back over the saved copy before destroying it, so there is nothing
+    left to warn about. A shared view has no such hand-over — it is somebody else's restore of
+    somebody else's bundle — so it is still stated, and `is_shared_view` is how the client tells
+    which dialog to draw. The shared-view LAUNCH raises it the other way round too, when the
+    recipient's own live turn holds the slot that launch needs.
+
+    The router turns this into a 409 naming the occupying project; `give_up_shared_view` and
+    `release_project_sandbox` are the only things that actually destroy a container. Nothing
     here writes a snapshot."""
 
     def __init__(
@@ -796,9 +806,8 @@ class SandboxUnreachableError(NoLiveSandboxError):
     or save"); the split adds a second question — why there is no handle. The parent means
     CERTAIN ABSENCE (registry says nothing of this app is live); this means UNKNOWN (registry
     says it IS live and the attach failed anyway — a cold container, a timeout, or a blip
-    against one that may be alive, holding unsaved work). `_refuse_if_reclaim_would_destroy_work`
-    treats the first as safe to reclaim, the second as a refusal — collapsing them risks the
-    same silent destruction, just rarer."""
+    against one that may be alive, holding unsaved work). Every caller owes the two different
+    answers: reporting the second as absence is how a live container's work gets written off."""
 
 
 async def existing_app_id(
@@ -863,6 +872,65 @@ async def _is_already_on_its_way_out(db: AsyncSession, user_id: uuid.UUID, app_n
         )
     )
     return owed is not None
+
+
+async def _the_conversation_mid_reply_in(
+    db: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
+) -> uuid.UUID | None:
+    """The project's conversation that is generating a reply right now, or `None`.
+
+    TWO HALVES OF ONE FACT, NEITHER SUFFICIENT ALONE. The session map knows a turn is holding
+    this project's container but not which thread it speaks in (`BuildSession.conversation_id`
+    is never set by the live producer), and the in-flight guard knows which threads are mid-reply
+    but not whose project they belong to. Intersecting them names one turn, and at most one can
+    match: a reply pins the one-per-user workspace, which is the very slot being taken.
+
+    The guard is imported here rather than at module scope because `src.services.turns` pulls in
+    the engine, which imports this module."""
+    from src.services.turns.guard import conversation_is_mid_reply
+
+    threads = await db.execute(
+        sa.select(Conversation.id).where(
+            Conversation.project_id == project_id, Conversation.user_id == user_id
+        )
+    )
+    for conversation_id in threads.scalars():
+        if conversation_is_mid_reply(conversation_id):
+            return conversation_id
+    return None
+
+
+@dataclass(frozen=True)
+class _OutgoingTurn:
+    """The turn a switch leaves mid-reply, and which of its two endings it earns.
+
+    At most one field is ever set, and both being empty is the ordinary case: nothing is running
+    in the project being left. They are separate fields rather than a conversation plus a flag
+    because the two endings go to different places — one onto the owed row for the routine to
+    wait on, one straight to the engine here."""
+
+    #: A Build turn, asked to stop at its next tool-result boundary.
+    at_its_boundary: uuid.UUID | None = None
+    #: Every other kind, cancelled now: there is no boundary in a single agent run.
+    cut_where_it_stands: uuid.UUID | None = None
+
+
+async def _cut_the_turn_where_it_stands(conversation_id: uuid.UUID) -> None:
+    """Cancel the turn running in this conversation and DO NOT WAIT for it to unwind.
+
+    `stop_turn` returns the moment the cancel is issued, which is the property this path needs —
+    the citizen's own next project is starting while this happens, and the container the
+    cancelled turn was using is destroyed by the shutdown routine rather than here.
+
+    Local import: the engine imports this module."""
+    from src.services.turns.engine import TurnNotRunningError, get_turn_engine
+
+    engine = get_turn_engine()
+    running = engine.active_turn_info(conversation_id)
+    if running is None:
+        return
+    with suppress(TurnNotRunningError):
+        await engine.stop_turn(conversation_id, running.turn_id)
 
 
 async def _occupying_shared_project(
@@ -1455,6 +1523,17 @@ class SessionManager:
             self._start_locks[user_id] = lock
         return lock
 
+    def _release_the_slot_if_still_ours(self, session: BuildSession) -> None:
+        """Let go of the one-per-user slot, unless somebody else is already holding it.
+
+        A pop by user id alone was safe while nothing could take the slot from a live session.
+        A switch can: it hands the outgoing container to the shutdown routine and starts the
+        incoming project immediately, so the outgoing turn reaches its own ending well after the
+        incoming one has taken the slot. Popping unconditionally there would leave a live
+        session invisible to every guard that reads this map."""
+        if self._active_by_user.get(session.user_id) == session.session_id:
+            self._active_by_user.pop(session.user_id, None)
+
     def _maybe_prune_start_lock(self, user_id: uuid.UUID) -> None:
         """Evict the per-user start lock once no live session remains — bounding the
         otherwise-unbounded `_start_locks` growth. Skipped when a concurrent start currently
@@ -1585,6 +1664,7 @@ class SessionManager:
         project_id: uuid.UUID,
         *,
         arm: _ClaimArm,
+        incumbent_is_leaving: bool,
         spare_app: str | None = None,
     ) -> AsyncIterator[_LockScope]:
         """Reconcile stale state → acquire the one-per-user Redis lock → run the body
@@ -1622,11 +1702,19 @@ class SessionManager:
         503. Both shapes land on one status; neither is a 409 and neither is a 500.
 
         The reconcile passes `certified_dead=True`: every caller of this context manager
-        holds the per-user `_start_lock_for` AND has already verified
-        `user_id not in _active_by_user`, and the deploy contract is single-replica — so a
+        holds the per-user `_start_lock_for`, and the deploy contract is single-replica — so a
         lock/heartbeat still present in Redis here is a dead session's residue, not
         liveness, and reconcile reaps THROUGH it instead of letting the acquire below 409
         on a ghost. The sweep's `reconcile_user` keeps the shield (it holds neither fact).
+
+        `incumbent_is_leaving` IS WHAT KEEPS THAT REAP OFF A LIVE CONTAINER, and it is required
+        rather than defaulted because only the caller knows. It says the container currently in
+        the registry has been handed to the shutdown routine, which is stopping its turn and
+        writing its tree back right now. A reap-through here would both BLOCK this start on an
+        ARM delete measured in tens of seconds and delete that container out from under its own
+        write-back — two parties destroying one container, one of them without saving it. So the
+        branch below releases the lock and touches nothing else, exactly as it does for a
+        container this start is about to reuse.
 
         Failure-safe by construction:
         - Compensation runs on ANY body failure INCLUDING CancelledError — relaunch blocks for
@@ -1653,19 +1741,34 @@ class SessionManager:
         # whether that is where the time went.
         claim_started_at = time.monotonic()
         reclaimed = False
-        if not await _the_live_sandbox_is_already_the_one_we_want(redis, user_id, spare_app):
+        if incumbent_is_leaving or await _the_live_sandbox_is_already_the_one_we_want(
+            redis, user_id, spare_app
+        ):
+            # SPARE THE CONTAINER, NOT THE LOCK. Reconcile does two jobs, and only one of them
+            # is the destructive one this branch exists to skip: it also `reap_lock`s, and that
+            # was the ONLY thing clearing a dead process's residual lock on this path. Skipping
+            # the reap along with the reap-through left `acquire_lock` returning None and the
+            # recovery button answering 409, naming no session, until the sweep caught up
+            # minutes later.
+            #
+            # TWO CONTAINERS EARN THIS BRANCH, for opposite reasons: the one this start is about
+            # to attach to, and the one it has just handed to the shutdown routine. Neither is
+            # ours to destroy here — the first because it is the answer, the second because
+            # somebody else is already saving it.
+            #
+            # THE OUTGOING RECORD GOES, THE OUTGOING CONTAINER STAYS, and the two must not be
+            # confused. `_resolve_sandbox` attaches whenever ANY record is present and builds the
+            # handle FROM it, so a record still naming the outgoing container would hand this
+            # start that container — the incoming project's code restored into the outgoing
+            # project's sandbox, and then bundled back over the outgoing project's saved copy.
+            # The owed row is what still names it from here; nothing in Redis needs to.
+            if incumbent_is_leaving:
+                await delete_registry(redis, user_id)
+            await reap_lock(redis, user_id)
+        else:
             reclaimed = await reconcile_user(
                 redis, user_id, sandbox_client, has_live_session=False, certified_dead=True
             )
-        else:
-            # SPARE THE CONTAINER, NOT THE LOCK. Reconcile does two jobs, and only one of them
-            # is the destructive one this branch exists to skip: it also `reap_lock`s, and that
-            # was the ONLY thing clearing a dead process's residual lock on this path. The
-            # certified-dead facts above say any lock still here is residue — a live holder
-            # would be in `_active_by_user` in this very process — so skipping the reap along
-            # with the reap-through left `acquire_lock` returning None and the recovery button
-            # answering 409, naming no session, until the sweep caught up minutes later.
-            await reap_lock(redis, user_id)
         token = await acquire_lock(redis, user_id)
         if token is None:
             raise BuildSessionConflictError(self._active_by_user.get(user_id))
@@ -1748,7 +1851,11 @@ class SessionManager:
         db: AsyncSession | None,
         requested_project_id: uuid.UUID | None,
     ) -> Exception:
-        """WHICH refusal a held slot has earned.
+        """WHICH refusal a held slot has earned — asked by the shared-view launch alone.
+
+        A CITIZEN'S OWN PROJECTS NO LONGER ARBITRATE FOR A SLOT: opening one hands the incumbent
+        to the shutdown routine instead of refusing. What still refuses is a colleague's shared
+        view, whose start path has no hand-over of its own, and this is the refusal it gives.
 
         `BuildSessionConflictError` (409 `build_session_already_active`) is the "nothing you can
         do but wait" branch of `utils/turnStreamApi.ts`, and reaches the citizen as `ComposerBox`'s
@@ -1756,11 +1863,10 @@ class SessionManager:
         the other build runs. It is honest only for a same-project double-send, which has no
         incumbent to release. A DIFFERENT-project holder has a remedy, stop it, and
         `SandboxReclaimBlockedError` is how it is offered: `ReclaimWorkspaceDialog` already carries
-        the copy and the stop-it-first handler for the `building` arm, unreachable only because
-        this guard answered first with the poorer truth. Falls back to the bare conflict whenever
-        the richer refusal cannot be told truthfully — no `db` to name the project with, no session
-        to read, or a project row that has gone (`_occupying_project`) — since a dialog naming the
-        wrong project is worse than a plain refusal.
+        the copy and the stop-it-first handler for the `building` arm. Falls back to the bare
+        conflict whenever the richer refusal cannot be told truthfully — no `db` to name the
+        project with, no session to read, or a project row that has gone (`_occupying_project`) —
+        since a dialog naming the wrong project is worse than a plain refusal.
         """
         if blocking is None or db is None or requested_project_id is None:
             return BuildSessionConflictError(blocking_id)
@@ -1773,10 +1879,9 @@ class SessionManager:
         )
         if name is None:
             return BuildSessionConflictError(blocking_id)
-        # The SAME predicates `_refuse_if_reclaim_would_destroy_work` uses, so the two refusals
-        # never disagree about what is happening in there. `dirty` is deliberately NOT probed:
-        # `SandboxReclaimBlockedError` states why - a `git status` taken while the agent writes
-        # is true for no instant the citizen cares about.
+        # `dirty` is deliberately NOT probed: `SandboxReclaimBlockedError` states why — a
+        # `git status` taken while the agent writes is true for no instant the citizen cares
+        # about.
         return SandboxReclaimBlockedError(
             project_id=blocking.project_id,
             project_name=name,
@@ -1790,12 +1895,21 @@ class SessionManager:
         self,
         user_id: uuid.UUID,
         *,
-        db: AsyncSession | None = None,
         requested_project_id: uuid.UUID | None = None,
     ) -> None:
-        """Fail closed if this user already holds the one-per-user slot — the pre-check every
-        allocating path runs BEFORE reconcile/acquire. Returns normally when the slot is free
-        (or freed itself while we waited); raises `BuildSessionConflictError` otherwise.
+        """Fail closed if this user already holds the one-per-user slot WITH THE PROJECT BEING
+        ASKED FOR — the pre-check every allocating path runs BEFORE reconcile/acquire. Returns
+        normally when the slot is free, when it freed itself while we waited, or when what holds
+        it is a DIFFERENT project; raises `BuildSessionConflictError` otherwise.
+
+        A DIFFERENT PROJECT IS A SWITCH, NOT A CONFLICT, and that is why this returns rather
+        than refusing: the citizen has opened something else, the incumbent is handed to the
+        shutdown routine a few lines further on, and the only thing a refusal here could offer
+        them is a dialog asking them to arbitrate their own workspace. The refusal that stays is
+        the SAME-project one, which has no incumbent to hand over: two turns in one workspace at
+        once is what the single slot exists to prevent, and a double-send has nothing to switch
+        to. A caller that cannot say which project it wants gets the refusal too — a start that
+        cannot name its project cannot be recognized as a switch.
 
         A live in-process session is the AUTHORITATIVE double-session guard: a second run
         must never launch even if the Redis lock lapsed under the first (a lapsed lock must
@@ -1817,11 +1931,15 @@ class SessionManager:
             return
         blocking_id = self._active_by_user.get(user_id)
         blocking = self._sessions.get(blocking_id) if blocking_id is not None else None
+        if (
+            blocking is not None
+            and requested_project_id is not None
+            and blocking.project_id != requested_project_id
+        ):
+            return
         releasing = _what_will_release_the_slot(blocking)
         if releasing is None:
-            raise await self._slot_conflict_for(
-                user_id, blocking, blocking_id, db, requested_project_id
-            )
+            raise BuildSessionConflictError(blocking_id)
         # The blocking session has already COMMITTED its terminal — it is ended and only letting
         # go. Wait (bounded) for that instead of 409ing the user's own finished work, then fall
         # through to a fresh allocation; on a timeout or an error in there, keep the 409.
@@ -1831,9 +1949,7 @@ class SessionManager:
         try:
             await asyncio.wait_for(letting_go, timeout=_FINALIZE_GRACE_SECONDS)
         except Exception:
-            raise await self._slot_conflict_for(
-                user_id, blocking, blocking_id, db, requested_project_id
-            ) from None
+            raise BuildSessionConflictError(blocking_id) from None
 
     async def save_project_snapshot(
         self,
@@ -2218,29 +2334,6 @@ class SessionManager:
                 "recovery state unknown after retries", app_id=app_id
             ) from exc
 
-    async def _nothing_to_lose(
-        self, sandbox_client: SandboxClient, handle: SandboxHandle, state: SaveState
-    ) -> bool:
-        """Is this workspace provably empty of the user's work? The case this exists for: a
-        Plan or Ask question against a brand-new project also takes the one-per-user
-        workspace, whose container holds only the golden template — yet `dirty` is True for
-        it (a never-built project must show a Save button), and reading that as "unsaved
-        changes" locked a user out of their actual app (observed live). Not `head is None`: a
-        fresh provision seeds one baseline commit, so "no commits" never fires. Four required
-        conditions close each way work could hide (commits <= 1, a clean tree, nothing saved,
-        no recovery bundle); an unanswerable probe is NOT permission — ambiguity denies."""
-        if state.saved_head is not None or state.recovery_at is not None:
-            return False
-        container = await container_state(sandbox_client, handle)
-        if container is None or container.commits == 0:
-            return False  # could not tell — ambiguity denies
-        if container.commits > 1:
-            return False  # work beyond the baseline
-        # ONE spelling of "is this tree empty", shared with the integrity verdict. Two subtly
-        # different ones is how the reclaim gate and the reversion gate would drift into
-        # disagreeing about whether a container may be destroyed.
-        return clean_but_for_churn(container)
-
     async def _refuse_if_reclaim_would_destroy_work(
         self,
         db: AsyncSession,
@@ -2249,41 +2342,40 @@ class SessionManager:
         spare_app: str | None,
         sandbox_client: SandboxClient,
     ) -> None:
-        """The missing telling: raise rather than silently destroy another project's work.
+        """Raise when the container holding this citizen's slot is a COLLEAGUE'S SHARED VIEW.
+
+        THE ONE REFUSAL LEFT, and the scope of what went is the point. A citizen's own other
+        project no longer earns a dialog here, whatever is in it: opening a second project hands
+        the first to the shutdown routine, which stops its turn, writes its tree back over the
+        saved copy and destroys the container in the background. Nothing is lost, so there is
+        nothing to ask about — and the arms that used to ask (an agent writing in there, a
+        container that would not answer, unsaved changes, a pristine tree) all asked about a
+        destruction that no longer happens on this path.
+
+        A SHARED VIEW HAS NO SUCH HAND-OVER. Its launch is somebody else's restore of somebody
+        else's saved bundle, automating it is out of scope, and the recipient reading it right
+        now would simply lose their screen. So this one is still stated, with the same
+        `is_shared_view` discriminator the client already branches on.
+
         Runs BEFORE `_holding_user_lock` — once the reconcile marks the registry `ending` the
-        container can no longer be attached to or questioned. Every `return` below is an
-        assertion that nothing will be lost: only a CERTAIN answer earns one, and "I could not
-        tell" never justifies destroying something. The two exits that instead RAISE do so
-        when the answer is unknown (Redis silent, or the attach unable to confirm anything),
-        with `dirty=None`; the user is not wedged — *Switch anyway* releases through
-        `reap_user`, which needs only the registry entry."""
+        container can no longer be attached to or questioned."""
         redis = get_redis()
-        # Four ways this returns silently — "nothing is being taken", not "another project
-        # holds it": (1) the live container is already the one we want, (2) no registry entry
-        # or it is not READY, (3) the occupying name matches no app this user owns AND carries
-        # no shared-view stamp either (a genuine ghost; the reconcile clears it), (4) the
-        # container is CONFIRMED gone (`NoLiveSandboxError`). Widening any of these into a raise
-        # would put up a dialog about nothing.
+        # Five ways this returns silently — "nothing is being taken", not "a shared view holds
+        # it": (1) the live container is already the one we want, (2) no registry entry or it is
+        # not READY, (3) the container is one the platform has already promised to destroy, so it
+        # is closing down rather than holding anything, (4) the occupying record carries no
+        # shared-view stamp (an ordinary build sandbox — the caller's own project, or a ghost the
+        # reconcile clears), (5) the stamp names a project or an app that has since gone.
+        # Widening any of these into a raise would put up a dialog about nothing.
         #
-        # A `shr-` OCCUPANT IS A FIFTH CASE, and it does NOT fall into (3): it always carries a
-        # name that matches no app the caller owns (the project is somebody else's), which is
-        # exactly why it is checked separately, BEFORE the ghost exit, by reading its stamped
-        # identity straight off the registry hash rather than trying to forward-match it.
+        # A `shr-` OCCUPANT IS READ OFF THE HASH, never forward-matched: `shr_name_for` hashes
+        # the (app, recipient) pair exactly as lossily as `app_name_for` does, and the project
+        # belongs to somebody else, so `_occupying_project`'s search of the CALLER's own app rows
+        # could never resolve one. `launch_shared_preview` stamps the identity at Launch
+        # precisely so this never has to guess.
         #
-        # The clean-incumbent exits below DO raise rather than fall through, deliberately: a
-        # silently reclaimed clean incumbent is true about the work but wrong about the
-        # person — their other project stops with no warning because a screen elsewhere
-        # needed the workspace. Both report `dirty=False` so the dialog says a clean stop, not
-        # unsaved changes that do not exist.
-        #
-        # Two further exits REFUSE rather than return, because the honest answer is unknown:
-        # Redis not answering (the registry is unreadable, not empty — a container may be
-        # live) and the attach failing to confirm anything (`SandboxNotReadyError` and the
-        # like — the container may be alive). Both raise `dirty=None`, which the client
-        # already treats as "may have unsaved changes".
-        #
-        # Only a reachable incumbent with unsaved (or unknowable) work raises. Nothing here
-        # writes a snapshot — saving stays the user's explicit action.
+        # DELIBERATELY UNGUARDED on a Redis failure — see the read below. Nothing here writes a
+        # snapshot: saving stays the user's explicit action.
         if await _the_live_sandbox_is_already_the_one_we_want(redis, user.id, spare_app):
             return
         # DELIBERATELY UNGUARDED. `read_registry` is one of the answer-bearing
@@ -2298,17 +2390,9 @@ class SessionManager:
         if occupied_by is None or occupied_by == spare_app:
             return
         if await _is_already_on_its_way_out(db, user.id, occupied_by):
-            # ONE MORE SILENT EXIT, and it belongs with the four above: nothing is being taken.
             # The container this record names is already owed a deletion, so it is closing down
             # rather than holding anybody's workspace.
             return
-        # A COLLEAGUE'S SHARED VIEW, CHECKED FIRST (#198, requirement 24). `shr_name_for`
-        # hashes the (app, recipient) pair the identical forward-match-only way `app_name_for`
-        # does, so `_occupying_project` below — which searches the CALLER's own app rows — can
-        # never resolve one: the project belongs to somebody else. Before this stamp existed at
-        # Launch, that lookup came back `None` and fell through the ghost exit two lines below,
-        # silently reclaiming a colleague's still-open project with no dialog at all.
-        #
         # NEITHER `building` NOR `agent_working` APPLIES: `launch_shared_preview` mints no
         # `BuildSession` and no chat turn ever writes into this container, so there is no
         # session for `_writing_session_holds`/`_live_session_holds` to find regardless of
@@ -2328,95 +2412,115 @@ class SessionManager:
                 agent_working=False,
                 is_shared_view=True,
             )
-        occupying = await _occupying_project(db, user.id, occupied_by)
-        if occupying is None:
-            return
-        # AN AGENT IS WRITING IN THERE RIGHT NOW — refuse differently, and refuse BEFORE the
-        # probe below. Two reasons the order matters. Asking a container `git status` while the
-        # agent is mid-write returns a tree that is true for no instant the user cares about,
-        # and the honest `dirty` for it is "none of your business yet". And the answer this
-        # guard would otherwise reach — "has unsaved changes, Save or Switch" — offers two
-        # buttons `release_project_sandbox` refuses while a live session owns the container, so
-        # the user gets a choice and then an error whichever they pick. Observed live.
-        #
-        # THE BROAD ANSWER, READ ONCE AND CARRIED TO EVERY REFUSAL BELOW. It is a separate fact
-        # from `building`, not a replacement for it (see `SandboxReclaimBlockedError`): the
-        # hand-over dialog has to tell the citizen whether the other project's agent is
-        # mid-thought before they choose, and a Plan or Ask turn is mid-thought exactly as a
-        # build is. `_live_session_holds` is also what `release_project_sandbox` refuses on, so
-        # this is a prediction of the next step rather than a guess about it.
-        #
-        # READ HERE, ABOVE the `building` arm, so every exit below carries it — including the
-        # two that fire BECAUSE there is nothing to lose. A pristine container held by a plan
-        # turn still has an agent working in it, and the dialog that offers to take it says so.
-        agent_working = self._live_session_holds(user.id, occupying.app_id)
-        # `_writing_session_holds`, NOT `_live_session_holds`, and the difference is a bug this
-        # arm shipped with. Every mode pins the container, so the broader predicate is true
-        # throughout an ordinary Ask or Plan turn — which put a hammer icon and two Stop buttons
-        # in front of a user who had asked a question, and short-circuited `_nothing_to_lose`
-        # below, the escape hatch written for exactly that case ("a question is not work").
-        # THE NARROW PREDICATE STAYS NARROW: `agent_working` above exists so nothing ever needs
-        # to widen this one to answer the hand-over's question.
-        if self._writing_session_holds(user.id, occupying.app_id):
-            raise SandboxReclaimBlockedError(
-                project_id=occupying.project_id,
-                project_name=occupying.project_name,
-                app_id=occupying.app_id,
-                dirty=None,  # deliberately unprobed: see above
-                building=True,
-                agent_working=agent_working,
-            )
-        try:
-            handle = await self._attach_for_read(user.id, occupying.app_id, sandbox_client)
-        except SandboxUnreachableError as exc:
-            # The registry named it READY and it would not answer. That is not evidence of
-            # absence — a cold container or a supervisor timeout looks identical from here to
-            # one holding a day's work. Refuse with the tri-state null rather than guess
-            # "clean", which is the one guess that loses work.
-            raise SandboxReclaimBlockedError(
-                project_id=occupying.project_id,
-                project_name=occupying.project_name,
-                app_id=occupying.app_id,
-                dirty=None,
-                agent_working=agent_working,
-            ) from exc
-        except NoLiveSandboxError:
-            # The plain parent: the registry is certain nothing of this app's is live.
-            return
-        state = await self._save_state_of(sandbox_client, handle, occupying.app_id)
-        # THE ASKING IS NO LONGER CONDITIONAL: this and the arm below are the only two of this
-        # function's returns turned into a raise (the four silent exits above stay untouched —
-        # widening them would put up a dialog about nothing, and the ghost-registry one could
-        # not even name a project in it). ACCEPTED COST: typing one question into a brand-new
-        # project and then starting a second one now raises a dialog about the first, a
-        # pristine container nobody would miss — one click, on a dialog whose clean arm claims
-        # no unsaved work.
-        #
-        # BOTH arms below report `dirty=False` rather than forwarding `state.dirty`, on
-        # purpose: `dirty` answers the SAVE BUTTON's question, where a never-built project is
-        # deliberately "dirty" so the button appears — but this guard asks "would reclaiming
-        # this DESTROY something?", where the same state means the opposite. Forwarding
-        # `state.dirty` here would silently reintroduce the bug this guard fixed.
-        #
-        # `_nothing_to_lose` answers that different question on four conditions (see its
-        # docstring); the `or` below short-circuits deliberately — a known-clean tree is
-        # already proof, not worth a round trip to confirm again.
-        if state.dirty is False or await self._nothing_to_lose(sandbox_client, handle, state):
-            raise SandboxReclaimBlockedError(
-                project_id=occupying.project_id,
-                project_name=occupying.project_name,
-                app_id=occupying.app_id,
-                dirty=False,
-                agent_working=agent_working,
-            )
 
-        raise SandboxReclaimBlockedError(
-            project_id=occupying.project_id,
-            project_name=occupying.project_name,
+    async def _show_the_outgoing_project_the_door(
+        self,
+        db: AsyncSession,
+        user: User,
+        *,
+        spare_app: str | None,
+        sandbox_client: SandboxClient,
+    ) -> bool:
+        """Hand the container holding this citizen's slot to the shutdown routine, and answer
+        whether it is on its way out.
+
+        THE ONE SPAWN SITE. Called once per start, under the per-user start lock, ABOVE
+        `_holding_user_lock` and after the refusal above has had its say. The order is the whole
+        design: the owed row is the only thing that still names the outgoing container once this
+        start overwrites the per-user registry, and it is what the lock below reads to take its
+        lock-only branch instead of reclaiming a container that is being written back.
+
+        NOTHING HERE WAITS. The routine is detached and runs for as long as a stop, a write-back
+        and an ARM delete take; what the citizen waits for is their own project starting.
+
+        TRUE WITHOUT SPAWNING ANYTHING is a real answer and the common one when a citizen
+        presses start twice: a container that already carries an owed row is already closing
+        down, so it earns the same branch and must not be claimed a second time.
+        """
+        redis = get_redis()
+        if await _the_live_sandbox_is_already_the_one_we_want(redis, user.id, spare_app):
+            # OPENING THE PROJECT THAT ALREADY HOLDS THE SLOT IS NOT A SWITCH — nothing is being
+            # left behind, so nothing is torn down and no debt is published.
+            return False
+        reg = await read_registry(redis, user.id)
+        if reg is None or reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_READY:
+            return False
+        outgoing = reg.get(REGISTRY_FIELD_APP_NAME)
+        if outgoing is None or outgoing == spare_app:
+            return False
+        if await _is_already_on_its_way_out(db, user.id, outgoing):
+            return True
+        occupying = await _occupying_project(db, user.id, outgoing)
+        if occupying is None:
+            # A name matching no app this citizen owns: a colleague's shared view (refused
+            # above), or a ghost the reconcile is there to clear. Neither is a project of theirs
+            # whose tree there is anything to write back.
+            return False
+        instance_ref = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
+        if instance_ref is None:
+            # NO BIRTHDAY, NO DISCRIMINATOR. `app_name_for` is stable across teardown and
+            # recreate, so a row written without the stamp could delete a container this citizen
+            # reopens during the wait. Refuse the hand-over rather than aim a delete by name
+            # alone; the reconcile below keeps the behaviour it always had.
+            _log.warning(
+                "the outgoing container carries no registry birthday; not handing it over",
+                user_id=str(user.id),
+                app_name=outgoing,
+            )
+            return False
+        leaving = await self._the_turn_to_stop_on_the_way_out(db, user.id, occupying)
+        owed = await claim_the_teardown_we_owe(
+            db,
+            user_id=user.id,
             app_id=occupying.app_id,
-            dirty=state.dirty,
-            agent_working=agent_working,
+            app_name=outgoing,
+            project_id=occupying.project_id,
+            instance_ref=instance_ref,
+            conversation_id=leaving.at_its_boundary,
         )
+        # THE CUT COMES AFTER THE ROW, like everything else here that can fail: a turn cancelled
+        # before the debt is published is a citizen's work stopped for a switch nobody is left to
+        # finish.
+        if leaving.cut_where_it_stands is not None:
+            await _cut_the_turn_where_it_stands(leaving.cut_where_it_stands)
+        shut_it_down_in_the_background(
+            owed,
+            redis=redis,
+            sandbox_client=sandbox_client,
+            reason=ShutdownReason.PROJECT_SWITCHED,
+        )
+        _log.info(
+            "workspace_handed_over",
+            user_id=str(user.id),
+            outgoing_app_id=str(occupying.app_id),
+            outgoing_project_id=str(occupying.project_id),
+            conversation_id=str(owed.conversation_id) if owed.conversation_id else None,
+        )
+        return True
+
+    async def _the_turn_to_stop_on_the_way_out(
+        self, db: AsyncSession, user_id: uuid.UUID, occupying: _OccupyingProject
+    ) -> _OutgoingTurn:
+        """WHICH conversation the switch leaves mid-reply, and which of the two endings it earns.
+
+        A BUILD TURN IS NAMED ON THE OWED ROW so the routine can ask it to end at its next
+        tool-result boundary and then watch that conversation's own terminal record. Any other
+        kind is cut where it stands and the row carries no conversation: a Plan or Ask run is a
+        single agent run with no boundary inside it, so a bounded wait would delay every
+        ordinary switch to buy a clean ending that was never coming.
+
+        PER-CONVERSATION, BECAUSE EVERY USER-KEYED HANDLE IS THE WRONG ONE HERE. The liveness
+        lease is per user, so the incoming project's first turn renews the very key a user-keyed
+        wait would watch; a user-keyed cut cancels whichever of this citizen's turns it finds
+        first, which after a switch is the one they are sitting in front of."""
+        if not self._live_session_holds(user_id, occupying.app_id):
+            return _OutgoingTurn()
+        conversation_id = await _the_conversation_mid_reply_in(db, user_id, occupying.project_id)
+        if conversation_id is None:
+            return _OutgoingTurn()
+        if self._writing_session_holds(user_id, occupying.app_id):
+            return _OutgoingTurn(at_its_boundary=conversation_id)
+        return _OutgoingTurn(cut_where_it_stands=conversation_id)
 
     async def stop_active_work(
         self,
@@ -2807,11 +2911,15 @@ class SessionManager:
     ) -> None:
         """The guard asked BEFORE the 202 so the answer can be an HTTP 409. `ensure_sandbox`
         runs inside the detached turn task, where a raise becomes a chat message and the
-        client has nothing to act on — no status to branch on, no project id to name, no way
-        to offer Save. The same question asked here, beside the route's other cheap
-        synchronous gates, gives the client a real refusal it can turn into a choice. The
-        guard inside `ensure_sandbox` stays: this one is an early, kind answer, not the
-        enforcement — anything that changes between the two is caught there."""
+        client has nothing to act on — no status to branch on and no project id to name. The
+        same question asked here, beside the route's other cheap synchronous gates, gives the
+        client a refusal it can render. The guard inside `ensure_sandbox` stays: this one is an
+        early, kind answer, not the enforcement — anything that changes between the two is
+        caught there.
+
+        WHAT IT CAN STILL ANSWER is one thing: a colleague's shared view is sitting in this
+        citizen's slot. Their own other project is not a refusal any more — the turn hands it
+        over and starts — so the common case for this call is now silence."""
         spare_app = await _sandbox_name_for_existing_app(db, user.id, project_id)
         await self._refuse_if_reclaim_would_destroy_work(
             db, user, spare_app=spare_app, sandbox_client=sandbox_client
@@ -3281,10 +3389,6 @@ class SessionManager:
             user's project — or a project id that does not exist — is counted and then answered
             404. The portal never sends one; a hand-made request can. It inflates the denominator,
             so the ratio errs LOW, which is the safe direction for a number nobody should flatter.
-          * A reclaim refusal followed by the citizen confirming through it books TWO attempted
-            rows and one reached-running for ONE journey. That is the same press-that-did-not-
-            start rule applied twice and is correct per-press; it just means the ratio has a
-            known floor on that path rather than being a clean per-journey one.
           * The router's own `sandbox is None -> 503` sits ABOVE this method, so "above every
             refusal" is true within the manager and not of the endpoint.
         """
@@ -3333,9 +3437,9 @@ class SessionManager:
             # THE SAME CLAIM, not a copy of it: relaunch is the door the citizen actually walks
             # through — the rail composer preflights this route before it opens a chat — so the
             # refusal that reaches the screen first has to be the one the turn would have given,
-            # a hand-over dialog for a different project's hold and a bounded wait for a turn
-            # that has already ended. Held under the same per-user start lock the claim expects.
-            await self._claim_the_one_build_slot(user_id, db=db, requested_project_id=project_id)
+            # and a switch has to be admitted here for the same reason. Held under the same
+            # per-user start lock the claim expects.
+            await self._claim_the_one_build_slot(user_id, requested_project_id=project_id)
             # WHICH container would satisfy this relaunch? Read-only on purpose, and computed
             # out here because it has to be: `app_id` is not bound until inside the lock, and
             # `resolve_app_for_project` is an UPSERT that mints a DRAFT row — so it can never
@@ -3345,12 +3449,21 @@ class SessionManager:
             # `spare_app=None`), which is the 20-second ACA delete half of the attach arm's cost.
             spare_app = await _sandbox_name_for_existing_app(db, user_id, project_id)
             # Same guard, same reason as `ensure_sandbox`: Relaunch is the other door
-            # into the one slot, and it reclaimed just as silently.
+            # into the one slot, and a colleague's shared view in it is refused from both.
             await self._refuse_if_reclaim_would_destroy_work(
                 db, user, spare_app=spare_app, sandbox_client=sandbox_client
             )
+            incumbent_is_leaving = await self._show_the_outgoing_project_the_door(
+                db, user, spare_app=spare_app, sandbox_client=sandbox_client
+            )
             async with self._holding_user_lock(
-                redis, user_id, sandbox_client, project_id, arm="relaunch", spare_app=spare_app
+                redis,
+                user_id,
+                sandbox_client,
+                project_id,
+                arm="relaunch",
+                incumbent_is_leaving=incumbent_is_leaving,
+                spare_app=spare_app,
             ) as scope:
                 app_id = await resolve_app_for_project(db, user_id, project_id)
                 # The snapshot gate runs BEFORE the commit and the storage provision: the 404
@@ -3842,13 +3955,13 @@ class SessionManager:
         click), else cold-restore.
 
         SAME SLOT, SAME GUARDS AS A BUILD — requirement 27 (never touching the recipient's own
-        `sbx-` container) falls out of reusing them rather than needing its own check:
-        `_refuse_if_reclaim_would_destroy_work` protects the recipient's OWN unsaved build if
-        one currently holds their slot before this ever reaches the lock, `_holding_user_lock`
-        is the identical skeleton `relaunch_preview` runs under, and a build the recipient
-        starts on their own project afterward reaps straight through an unattended shared view
-        exactly as it would through a relaunched preview — no separate teardown path to keep in
-        step with this one.
+        `sbx-` container) falls out of reusing them rather than needing its own check: a live
+        turn of the recipient's own still refuses this outright, an idle container of theirs is
+        handed to the shutdown routine exactly as any other door hands it over (written back,
+        then destroyed in the background), `_holding_user_lock` is the identical skeleton
+        `relaunch_preview` runs under, and a build the recipient starts on their own project
+        afterward reaps straight through an unattended shared view exactly as it would through a
+        relaunched preview — no separate teardown path to keep in step with this one.
 
         DELIBERATELY NARROWER THAN `relaunch_preview` in two ways, both scope decisions rather
         than oversights: no build-outcome/harness-counter instrumentation (`APP_START_ATTEMPTED`
@@ -3905,6 +4018,15 @@ class SessionManager:
             await self._refuse_if_reclaim_would_destroy_work(
                 db, recipient, spare_app=shared_name, sandbox_client=sandbox_client
             )
+            # OPENING A COLLEAGUE'S PROJECT IS OPENING A DIFFERENT PROJECT, so the recipient's
+            # own container leaves the way it leaves at every other door — written back over its
+            # saved copy and destroyed in the background — rather than being reclaimed inline by
+            # the reconcile below, which saves nothing. Asked with the IDENTITY name, never the
+            # `None` a Refresh hands the lock: a live shared view being refreshed is the one we
+            # already want, and handing it over would tear down the very thing being refreshed.
+            incumbent_is_leaving = await self._show_the_outgoing_project_the_door(
+                db, recipient, spare_app=shared_name, sandbox_client=sandbox_client
+            )
             # `_holding_user_lock` asks a NARROWER question than the guard above — not "would
             # this destroy something" but "should the reconcile below treat the live container
             # as the one we already want, or tear it down". Those answers diverge on exactly
@@ -3918,6 +4040,7 @@ class SessionManager:
                 sandbox_client,
                 project.id,
                 arm="shared_launch",
+                incumbent_is_leaving=incumbent_is_leaving,
                 spare_app=spare_app,
             ) as scope:
                 # THE SNAPSHOT GATE — the saved bundle ONLY, never the recovery/autosave copy
@@ -4125,15 +4248,21 @@ class SessionManager:
         async with self._start_lock_for(user.id):
             redis = get_redis()
             user_id = user.id
-            await self._claim_the_one_build_slot(user_id, db=db, requested_project_id=project_id)
+            await self._claim_the_one_build_slot(user_id, requested_project_id=project_id)
             # WHICH container would satisfy this turn? Read-only on purpose — `resolve_app_for
             # _project` below MINTS, and minting out here would leave an app row behind for a
             # turn that then gets refused. No app row yet means nothing live can be ours, which
             # is the correct answer for a project's very first turn.
             spare_app = await _sandbox_name_for_existing_app(db, user_id, project_id)
-            # ABOVE the lock, because the lock's reconcile is what destroys the incumbent
-            # and an `ending` registry can no longer be attached to or questioned.
+            # BOTH ABOVE THE LOCK, because the lock's reconcile is what would otherwise destroy
+            # the incumbent, and an `ending` registry can no longer be attached to or questioned.
+            # A FIRST MESSAGE IS A DOOR: this is the only way a never-built project starts, so a
+            # citizen who switches by typing has to be handed through here exactly as one who
+            # pressed start is handed through the relaunch door.
             await self._refuse_if_reclaim_would_destroy_work(
+                db, user, spare_app=spare_app, sandbox_client=sandbox_client
+            )
+            incumbent_is_leaving = await self._show_the_outgoing_project_the_door(
                 db, user, spare_app=spare_app, sandbox_client=sandbox_client
             )
             async with self._holding_user_lock(
@@ -4142,6 +4271,7 @@ class SessionManager:
                 sandbox_client,
                 project_id,
                 arm="ensure_sandbox",
+                incumbent_is_leaving=incumbent_is_leaving,
                 spare_app=spare_app,
             ) as scope:
                 app_id = await resolve_app_for_project(db, user_id, project_id)
@@ -4836,7 +4966,7 @@ class SessionManager:
                             session_id=str(session.session_id),
                         )
         finally:
-            self._active_by_user.pop(session.user_id, None)
+            self._release_the_slot_if_still_ours(session)
             self._maybe_prune_start_lock(session.user_id)
 
         # 3a. A CONTAINER'S LIFE ENDED, said out loud. Until this line the clean finish was
@@ -4946,10 +5076,9 @@ class SessionManager:
         # been told, twice, that it was unsaved. The 1c autosave below only covers the endings
         # nobody can warn about (a crash, a closed laptop, the idle reaper).
         #
-        # BOTH of those tellings fire on LEAVING, and switching projects inside the SPA is not
-        # leaving — so on that path the user was told neither time. That gap is precisely what
-        # `SandboxReclaimBlockedError` exists to close, which is why the reclaim refusal is not
-        # redundant with the warnings named above and must not be retired as though it were.
+        # SWITCHING PROJECTS IS NOT COVERED BY EITHER TELLING, and it is not meant to be: the
+        # shutdown routine writes that container's tree back over the saved copy before
+        # destroying it, so the work survives the switch without anybody being warned about it.
         #
         # Steps 1b, 2 and 3 of `_do_finalize`, in that order and for those reasons. Deliberately
         # NOT here: the terminal `ended` frame (the turn's own `TurnEndedFrame` owns it),
@@ -5042,7 +5171,12 @@ class SessionManager:
         finally:
             # Guaranteed-run, exactly as in `_do_finalize`: the slot must free even if the
             # pardon raised, or this user can never send another Write message.
-            self._active_by_user.pop(session.user_id, None)
+            #
+            # ONLY IF THE SLOT IS STILL THIS SESSION'S. A switch stops this turn and starts the
+            # citizen's next project without waiting for it to unwind, so by the time an
+            # outgoing turn reaches here the slot can already belong to the incoming one —
+            # and a pop by user id alone would hand that live session's workspace away.
+            self._release_the_slot_if_still_ours(session)
             self._maybe_prune_start_lock(session.user_id)
             # AFTER the pop, so whoever this wakes finds the slot already free.
             finishing.set()

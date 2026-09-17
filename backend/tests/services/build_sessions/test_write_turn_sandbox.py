@@ -32,6 +32,7 @@ from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.config import settings
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import ChatKind
+from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.user import User
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions import manager as manager_module
@@ -45,7 +46,6 @@ from src.services.build_sessions.locks import (
 from src.services.build_sessions.manager import (
     BuildSessionConflictError,
     NoLiveSandboxError,
-    SandboxReclaimBlockedError,
     SessionManager,
     StopOutcome,
     app_name_for,
@@ -114,6 +114,23 @@ def session_factory(db_session):
         yield db_session
 
     return lambda: _session()
+
+
+@pytest.fixture(autouse=True)
+def handed_over(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Every container a start in this file hands to the shutdown routine, recorded not run.
+
+    Left to run, the routine reaches into this file's own doubles at an arbitrary await point
+    and tears the outgoing container down mid-assertion — so `torn_down` would depend on
+    scheduling. What it does once spawned is `test_shutdown.py`'s subject; what these tests are
+    about is what the START does and does not do."""
+    spawned: list[object] = []
+
+    def _record(owed: object, **_aimed_at: object) -> None:
+        spawned.append(owed)
+
+    monkeypatch.setattr(manager_module, "shut_it_down_in_the_background", _record)
+    return spawned
 
 
 # --- attach ------------------------------------------------------------------
@@ -429,19 +446,21 @@ async def test_a_second_message_attaches_instead_of_rebuilding_the_container(
 
 
 async def test_a_different_project_never_steals_the_container(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    handed_over: list[object],
 ) -> None:
     """The other half: the spare is keyed on the APP NAME, not merely "something is live" —
     attaching to whatever container happened to be up would hand project B project A's code.
 
-    Refusing to STEAL the container never implied a licence to DESTROY it, which the code used
-    to do silently, taking A's unsaved work with it. Destruction now lives only in
-    `release_project_sandbox`, reached through a user prompt — see the refusal tests below."""
+    Refusing to STEAL the container never implied a licence to DESTROY it either. The start now
+    goes through — a second project is a switch, not a conflict — but the incumbent leaves by
+    being handed to the shutdown routine, which writes its tree back before deleting it. What
+    must never happen here is the start reaching A's container itself, in either direction."""
     user, project_a = await _mk(db_session, "w11@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
-    # COMMITTED work: a bare fake is a pristine template, which is deliberately reclaimable
-    # (see `test_a_plan_only_project_does_not_block_a_real_one`). The refusal is about work.
     client = _with_head(FakeSandboxClient(), "a" * 40)
 
     first = await manager.ensure_sandbox(
@@ -450,24 +469,29 @@ async def test_a_different_project_never_steals_the_container(
     await manager.finish_turn_sandbox(first, client, touched=True)
     client.attach_handle = first.handle
 
-    with pytest.raises(SandboxReclaimBlockedError) as caught:
-        await manager.ensure_sandbox(
-            db_session, user, project_b, sandbox_client=client, may_write=True
-        )
+    second = await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=client, may_write=True
+    )
 
-    assert caught.value.project_id == project_a  # names the project holding the slot
-    assert client.torn_down == []  # A's container is NOT destroyed to make room
+    assert second.app_id != first.app_id  # B got its own container, never A's
+    assert client.torn_down == []  # and the start destroyed nothing to get it
     assert app_name_for(first.app_id) not in client.restored
+    assert len(handed_over) == 1  # A left by the one door that saves it first
 
 
-async def test_a_clean_incumbent_is_asked_about_and_reported_clean(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+async def test_a_clean_incumbent_is_shown_out_rather_than_asked_about(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    handed_over: list[object],
 ) -> None:
-    """INVERTED DELIBERATELY: a saved-and-clean incumbent used to stay silent, which was true
-    about the work but wrong about the person — their project stopped with no warning.
+    """A saved-and-clean incumbent is neither silently destroyed nor asked about: the citizen's
+    second project starts, and the first is handed to the routine that writes it back and closes
+    it.
 
-    THE SECOND ASSERTION HAS TEETH: opening the dialog is the easy half; reporting the incumbent
-    CLEAN is what stops it telling a citizen their saved project "has unsaved changes"."""
+    A CLEAN INCUMBENT IS THE EASIEST ONE TO GET WRONG, because there is provably nothing to
+    lose — which is the exact reasoning that justifies destroying it inline, and inline is where
+    a container gets deleted out from under the routine reading it."""
     user, project_a = await _mk(db_session, "w12@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
@@ -482,37 +506,32 @@ async def test_a_clean_incumbent_is_asked_about_and_reported_clean(
     _with_head(client, "e" * 40)
     await manager.save_project_snapshot(db_session, user, project_a, sandbox_client=client)
 
-    with pytest.raises(SandboxReclaimBlockedError) as refusal:
-        await manager.ensure_sandbox(
-            db_session, user, project_b, sandbox_client=client, may_write=True
-        )
+    second = await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=client, may_write=True
+    )
 
-    assert refusal.value.project_id == project_a
-    assert refusal.value.dirty is False, "a clean stop must not be reported as unsaved changes"
-    # AND NOTHING WAS TAKEN. The refusal fires BEFORE the teardown, so the incumbent is still up
-    # and the citizen still has a choice — which is the whole point of asking.
-    assert client.torn_down == []
+    assert second.project_id == project_b
+    assert len(handed_over) == 1
+    assert client.torn_down == [], "the start must not delete what it hands over"
 
 
-async def test_releasing_the_incumbent_lets_the_switch_through(
+async def test_giving_up_a_project_explicitly_still_destroys_it_on_the_spot(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """The way out of the refusal: the user gives up A explicitly, then B starts. This is the
-    same teardown as before — it is now something they did, not something done to them."""
+    """The deliberate exit survives the switch. `release` is the one route that destroys a
+    container on purpose, and it is no longer the way out of a refusal — nothing refuses — so
+    what it now has to keep proving is that an EXPLICIT give-up is still immediate and still
+    frees the slot for the next project."""
     user, project_a = await _mk(db_session, "w13@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
-    client = _with_head(FakeSandboxClient(), "b" * 40)  # committed work, so the refusal fires
+    client = _with_head(FakeSandboxClient(), "b" * 40)
 
     first = await manager.ensure_sandbox(
         db_session, user, project_a, sandbox_client=client, may_write=True
     )
     await manager.finish_turn_sandbox(first, client, touched=True)
     client.attach_handle = first.handle
-    with pytest.raises(SandboxReclaimBlockedError):
-        await manager.ensure_sandbox(
-            db_session, user, project_b, sandbox_client=client, may_write=True
-        )
 
     released = await manager.release_project_sandbox(
         db_session, user, project_a, sandbox_client=client
@@ -661,16 +680,17 @@ async def test_a_failing_autosave_never_fails_the_turn(
 
 
 async def test_a_plan_only_project_does_not_block_a_real_one(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    handed_over: list[object],
 ) -> None:
-    """A QUESTION IS NOT WORK, and missing that made this guard worse than the bug it replaced:
-    `_pin_workspace` attaches the container for every mode, so a Plan prompt into a brand-new
-    project takes the one-per-user workspace, and `_save_state_of` reports that untouched
-    template as dirty — read as "unsaved changes" that locked the user out of their real app.
+    """A QUESTION IS NOT WORK. A Plan prompt into a brand-new project takes the one-per-user
+    workspace (`_pin_workspace` attaches for every mode) and the container behind it holds
+    nothing but the golden template — which must never be what stands between a citizen and the
+    project holding their real app.
 
-    Flip any of these and this must go red: a commit beyond the seeded baseline, a tree dirty
-    outside `FRAMEWORK_CHURN`, a saved bundle, or a recovery snapshot. See the inline comment
-    below for why `dirty` must still read False here."""
+    WHAT IS PINNED IS THE CITIZEN REACHING THAT PROJECT, which is now simply a start."""
     user, project_a = await _mk(db_session, "w17@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
@@ -682,26 +702,26 @@ async def test_a_plan_only_project_does_not_block_a_real_one(
     await manager.finish_turn_sandbox(plan_only, client, touched=False)  # a read-only turn
     client.attach_handle = plan_only.handle
 
-    with pytest.raises(SandboxReclaimBlockedError) as refusal:
-        await manager.ensure_sandbox(
-            db_session, user, project_b, sandbox_client=client, may_write=True
-        )
+    real = await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=client, may_write=True
+    )
 
-    # THE ASSERTION THAT MATTERS. `dirty` is deliberately True for a never-built project —
-    # `_save_state_of` answers the Save button's question — so passing `state.dirty` through this
-    # arm would reintroduce the exact lock-out this test was written to prevent, now wearing a
-    # dialog instead of a silent refusal.
-    assert refusal.value.dirty is False
-    assert refusal.value.project_id == project_a
-    assert client.torn_down == []  # asked BEFORE anything was taken
+    assert real.project_id == project_b
+    assert client.torn_down == []  # the pristine container leaves by the door that reads it
+    assert len(handed_over) == 1
 
 
-async def test_a_committed_but_unsaved_workspace_still_blocks(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+async def test_a_committed_but_unsaved_workspace_is_written_back_not_abandoned(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    handed_over: list[object],
 ) -> None:
     """The other side of the same line, so the exemption above cannot quietly widen into
-    "never-saved projects are always disposable". A commit in the container IS work — it is
-    what a Write turn leaves behind — and losing it is the whole point."""
+    "never-saved projects are disposable". A commit in the container IS work — it is what a
+    Write turn leaves behind — and losing it is what the whole hand-over exists to prevent: the
+    switch does not stop for it, but it does not walk away from it either. The debt names the
+    outgoing app, which is what makes the write-back reachable once the registry has moved on."""
     user, project_a = await _mk(db_session, "w18@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
@@ -713,18 +733,22 @@ async def test_a_committed_but_unsaved_workspace_still_blocks(
     await manager.finish_turn_sandbox(first, client, touched=False)
     client.attach_handle = first.handle
 
-    with pytest.raises(SandboxReclaimBlockedError):
-        await manager.ensure_sandbox(
-            db_session, user, project_b, sandbox_client=client, may_write=True
-        )
+    await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=client, may_write=True
+    )
+
     assert client.torn_down == []
+    owed = await db_session.scalar(
+        sa.select(PendingTeardown.app_name).where(PendingTeardown.user_id == user.id)
+    )
+    assert owed == app_name_for(first.app_id)
 
 
-# --- the guard's UNKNOWN arms ----------------------
+# --- an incumbent nobody can question ----------------------
 #
-# Every `return` inside `_refuse_if_reclaim_would_destroy_work` lets the teardown below
-# proceed, so each one asserts "nothing will be lost". These two pin the arms where the
-# honest answer is "I could not tell" — which the first cut answered by reclaiming.
+# The start no longer probes the container it is leaving, so "I could not tell" has stopped
+# being a question the citizen is asked. What it must still never become is a licence to
+# destroy: these two pin the two certainties either side of it.
 
 
 class _UnreachableAttach(FakeSandboxClient):
@@ -733,23 +757,25 @@ class _UnreachableAttach(FakeSandboxClient):
     `SandboxNotReadyError`, not `SandboxGoneError`: the real client draws that line itself
     ("a container ARM confirms is gone has nothing to lose... a container we merely cannot
     authenticate to right now must NOT be destroyed over a transient control-plane failure"),
-    and the guard has to honour it rather than treat every failure as an absence."""
+    and every reader has to honour it rather than treat a failure as an absence."""
 
     async def attach_existing(self, user_id: str) -> SandboxHandle:
         raise SandboxNotReadyError("supervisor unreachable but the container still exists")
 
 
-async def test_an_unreachable_incumbent_refuses_rather_than_reclaiming(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+async def test_an_unreachable_incumbent_is_handed_over_rather_than_reclaimed(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    handed_over: list[object],
 ) -> None:
-    """A transient ARM blip must not become a licence to destroy a container.
+    """A transient ARM blip must not become a licence to destroy a container — the property
+    survives the refusal that used to carry it.
 
-    Attach failing tells us nothing about whether work is in there — a cold container and one
-    holding a day's edits look identical from here. The refusal carries `dirty=None`, which the
-    error, the 409 envelope and the dialog all already read as "may have unsaved changes".
-
-    The user is NOT wedged by this: *Switch without saving* calls `release`, whose teardown goes
-    through `reap_user` and needs only the registry entry, never an attach."""
+    Attach failing tells us nothing about whether work is in there: a cold container and one
+    holding a day's edits look identical from here. So the start asks nothing, destroys nothing,
+    and hands the container to the routine — which has its own retry budget for exactly this,
+    and spares a container it cannot read rather than deleting it unread."""
     user, project_a = await _mk(db_session, "w19@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
@@ -762,14 +788,13 @@ async def test_an_unreachable_incumbent_refuses_rather_than_reclaiming(
 
     # Same registry, same live app — only the attach stops answering.
     blind = _with_head(_UnreachableAttach(), "d" * 40)
-    with pytest.raises(SandboxReclaimBlockedError) as caught:
-        await manager.ensure_sandbox(
-            db_session, user, project_b, sandbox_client=blind, may_write=True
-        )
+    started = await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=blind, may_write=True
+    )
 
-    assert caught.value.project_id == project_a  # still names the project, so the copy works
-    assert caught.value.dirty is None  # UNKNOWN, never a guessed "clean"
-    assert blind.torn_down == []  # and above all: nothing was destroyed
+    assert started.project_id == project_b
+    assert blind.torn_down == []  # above all: nothing was destroyed on a failed probe
+    assert len(handed_over) == 1
 
 
 async def test_a_confirmed_gone_container_still_reclaims_silently(
@@ -869,35 +894,29 @@ async def _nothing_to_persist() -> None:
     return None
 
 
-async def test_a_project_being_built_refuses_with_building_not_unsaved_changes(
+async def test_a_project_being_built_does_not_refuse_the_next_one(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """`building=True`, and `dirty` NOT probed.
+    """THE REFUSAL WITH NO WAY THROUGH, retired. A citizen mid-build who opened another project
+    was told "still being built" and offered a Stop — on the project they had just left, about
+    work they had not asked to interrupt, in a dialog they had to answer before doing anything
+    else. The build is still stopped, but by the routine and at its own boundary, and the
+    citizen's next project starts while that happens.
 
-    Both halves matter. The flag is what lets the client render "still being built" and offer
-    Stop instead of a Save the server would refuse. The unprobed `dirty` is the quieter half:
-    running `git status` in a container while the agent writes returns a tree that is true for
-    no instant the user cares about, and the probe is what produced a half-written snapshot
-    when "Save and switch" reached it."""
+    Mutation-check: restore the writing-session arm and the preflight raises again."""
     user, project_a = await _mk(db_session, "w21@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "f" * 40)
 
-    # A WRITING session, held and not finished — which is the whole of what the guard reads
-    # (`_writing_session_holds`). No turn engine is needed for this one: `reclaim_preflight`
-    # asks the manager's own session map and never touches the work behind it.
+    # A WRITING session, held and not finished — the state the retired arm read.
     await manager.ensure_sandbox(
         db_session, user, project_a, sandbox_client=client, may_write=True
     )
 
-    with pytest.raises(SandboxReclaimBlockedError) as caught:
-        await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+    await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
 
-    assert caught.value.building is True
-    assert caught.value.dirty is None  # deliberately not asked
-    assert caught.value.project_id == project_a
-    assert client.torn_down == []  # the agent keeps working
+    assert client.torn_down == []  # the agent keeps working until the routine stops it
 
 
 async def test_saving_a_project_mid_build_is_refused(
@@ -1018,33 +1037,35 @@ async def test_stop_active_work_will_not_stop_a_different_project(
 # and Plan a `read_only_toolset`, so a non-writing turn CANNOT touch the tree.
 
 
-async def test_a_read_only_turn_is_not_reported_as_building(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+async def test_a_read_only_turn_holding_the_workspace_refuses_nothing_either(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    handed_over: list[object],
 ) -> None:
-    """An Ask or Plan turn holding the workspace must not claim the app is being built.
+    """An Ask or Plan turn pins the container exactly as a Write turn does, so it used to earn
+    the ordinary unsaved-work refusal — the narrower of the two, but still a stop sign in front
+    of a citizen who had asked a question somewhere else. It hands over like any other.
 
-    Mutation-check: swap `_writing_session_holds` back to `_live_session_holds` in the guard
-    and this goes red with `building=True`."""
+    THE KIND OF TURN STILL MATTERS, one layer down: a read-only turn is cut where it stands
+    while a Build turn is asked to stop at a boundary — see `test_switch.py`."""
     user, project_a = await _mk(db_session, "w26@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "3" * 40)
 
-    # A read-only turn pins the container exactly as a Write turn does.
     session = await manager.ensure_sandbox(
         db_session, user, project_a, sandbox_client=client, may_write=False
     )
     client.attach_handle = session.handle
 
-    with pytest.raises(SandboxReclaimBlockedError) as caught:
-        await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+    await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+    await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=client, may_write=True
+    )
 
-    # It still refuses — the incumbent has committed work — but as the ORDINARY refusal, so
-    # the copy talks about unsaved changes rather than a build, and `_nothing_to_lose` below
-    # still gets its say.
-    assert caught.value.building is False
-    assert caught.value.dirty is not None  # the tree WAS probed: it is not moving
     assert client.torn_down == []
+    assert len(handed_over) == 1
 
 
 async def test_a_read_only_turn_does_not_block_the_save_button(
@@ -1070,18 +1091,16 @@ async def test_a_read_only_turn_does_not_block_the_save_button(
     assert snapshot_key(session.app_id) in fake_storage.objects
 
 
-async def test_a_read_only_turn_on_an_empty_project_refuses_as_clean_not_as_building(
+async def test_a_read_only_turn_on_an_empty_project_blocks_nothing_at_all(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """The escape hatch the building arm was short-circuiting — still doing its job, now
-    choosing the COPY over silence. `_nothing_to_lose` exists for a Plan question against a
-    brand-new project; raising `building` above it locked such a user out of the project
-    holding their real app.
+    """THE REGRESSION THIS FILE KEEPS COMING BACK TO, now answered outright. A Plan question
+    typed into a brand-new project pins the one workspace, and the container behind it holds
+    nothing but the golden template — so the citizen was first locked out of their real app,
+    then shown a dialog about a container nobody would miss.
 
-    The refusal is now unconditional, inverting the old "no refusal at all" assertion, but the
-    regression it guarded is not inverted: the failure was always WHICH dialog, not whether one
-    appeared — the building arm shows a hammer and Stop buttons the server refuses, the clean
-    arm a plain stop with no Save button."""
+    The clean-container reasoning is gone with the arm that needed it: no probe, no verdict, no
+    dialog. The citizen reaches their real project."""
     user, project_a = await _mk(db_session, "w28@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
@@ -1092,26 +1111,23 @@ async def test_a_read_only_turn_on_an_empty_project_refuses_as_clean_not_as_buil
     )
     client.attach_handle = plan_only.handle
 
-    with pytest.raises(SandboxReclaimBlockedError) as refusal:
-        await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+    await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+    real = await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=client, may_write=True
+    )
 
-    # NOT the building arm, and not the unsaved-work arm. A question is not work.
-    assert refusal.value.building is False
-    assert refusal.value.dirty is False
-    # ...AND YET THE AGENT IS WORKING, which is a different sentence on the same dialog. This
-    # pair is the whole reason the hand-over's fact rides beside `building` instead of widening
-    # it: a plan turn is mid-thought (so the citizen is told before they choose) while the
-    # container behind it is pristine (so the clean-container escape hatch still ran and there
-    # is no Save button). Fold the two into one flag and one of these two lines becomes a lie.
-    assert refusal.value.agent_working is True
+    assert real.project_id == project_b
+    assert client.torn_down == []
 
 
-async def test_a_write_turn_still_reports_building(
+async def test_a_write_turn_no_longer_stops_the_citizens_next_project(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """The other side of the line, so the narrowing cannot quietly disable the feature: a
-    Write turn holds the container with an agent that CAN write, and that is what the dialog
-    exists for."""
+    """The other side of the line, so retiring the arms cannot be mistaken for retiring the
+    distinction they drew: a Write turn genuinely holds a container with an agent that can write
+    into it, and everything that protects THAT container is still in place. It is simply not the
+    citizen's problem to arbitrate any more — the start goes through, and Save still refuses
+    mid-write, because a bundle taken mid-edit is a corrupt saved version."""
     user, project_a = await _mk(db_session, "w29@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
@@ -1122,13 +1138,9 @@ async def test_a_write_turn_still_reports_building(
     )
     client.attach_handle = session.handle
 
-    with pytest.raises(SandboxReclaimBlockedError) as caught:
-        await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
-    assert caught.value.building is True
-    assert caught.value.dirty is None  # unprobed, because the tree IS moving
-    assert caught.value.agent_working is True  # the wide fact agrees here; it is wider, not other
+    await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
 
-    # ...and Save refuses for the same reason.
+    # ...and Save still refuses while that agent writes.
     with pytest.raises(BuildSessionConflictError):
         await manager.save_project_snapshot(db_session, user, project_a, sandbox_client=client)
 
@@ -1755,14 +1767,16 @@ async def test_an_unreadable_registry_still_propagates_rather_than_being_swallow
         await manager.reclaim_preflight(db_session, user, project_a, sandbox_client=client)
 
 
-async def test_the_two_refusal_codes_stay_apart(
+async def test_neither_refusal_code_reaches_a_citizens_own_second_project(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """`already_building_here` and `sandbox_reclaim_blocked` share a 409 and nothing else.
+    """`build_session_already_active` and `sandbox_reclaim_blocked` shared a 409 and one
+    audience: a citizen being asked to arbitrate their own workspace. BOTH are gone from this
+    path, and asserting the pair together is the point — the slot claim raised the first ABOVE
+    the guard that raised the second, so retiring either alone leaves the citizen refused by the
+    other with no way to tell which.
 
-    Different causes, different remedies — stop that build, versus save or switch that project.
-    Merging them into one "ask first" would put a Save button in front of somebody it cannot help,
-    which is why the widening deliberately leaves the `building` arm alone."""
+    Mutation-check: restore either arm and exactly one of these two calls raises."""
     user, project_a = await _mk(db_session, "w94-codes@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
@@ -1773,9 +1787,11 @@ async def test_the_two_refusal_codes_stay_apart(
     )
     client.attach_handle = session.handle
 
-    # An agent is mid-write: the OTHER arm, with `building=True` and `dirty` deliberately unprobed.
-    with pytest.raises(SandboxReclaimBlockedError) as caught:
-        await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+    # An agent is mid-write in A — the state that used to raise `sandbox_reclaim_blocked` here
+    # and `build_session_already_active` one line into the start.
+    await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+    started = await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=client, may_write=True
+    )
 
-    assert caught.value.building is True
-    assert caught.value.dirty is None, "a tree mid-write is none of the dialog's business yet"
+    assert started.project_id == project_b

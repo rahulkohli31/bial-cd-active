@@ -186,11 +186,14 @@ def _owned_or_404(
 
 
 class BuildConflictEnvelope(CamelModel):
-    """The 409 for a route that can conflict two ways: a build already running for this user
-    (`sessionId`), or another project holding the one workspace with unsaved work
-    (`projectId`/`projectName`/`dirty`). `code` discriminates — `build_session_already_active`
-    vs `sandbox_reclaim_blocked` — and a client must branch on it, since only the second has a
-    remedy the user can act on."""
+    """The 409 for a route that can conflict two ways: this very project's own work already
+    running (`sessionId`), or a COLLEAGUE'S SHARED VIEW holding the one workspace
+    (`projectId`/`projectName`/`isSharedView`). `code` discriminates —
+    `build_session_already_active` vs `sandbox_reclaim_blocked` — and a client must branch on
+    it, since only the second names a project.
+
+    A CITIZEN'S OWN OTHER PROJECT IS NOT IN THIS LIST ANY MORE. Opening one starts it and hands
+    the outgoing container to the shutdown routine, so neither code is raised for it."""
 
     error: _ConflictError | ReclaimBlockedError
 
@@ -385,7 +388,7 @@ async def internal_reap(
         (
             409,
             BuildConflictEnvelope,
-            "A build is already running, or another project holds the workspace with unsaved work",
+            "This project's own work is already running, or a shared view holds the workspace",
         ),
         (422, ErrorEnvelope, "Invalid request body"),
         (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
@@ -415,10 +418,11 @@ async def relaunch_preview(
                 db, user, body.project_id, sandbox, prefer_saved=body.prefer_saved
             )
         except BuildSessionConflictError as exc:
-            # A build is currently running for this user — relaunch never pre-empts it (409).
+            # This project's own work is running — relaunch never pre-empts it (409). A
+            # DIFFERENT project of theirs never reaches here: that is a switch, and it starts.
             return _conflict_response(exc)
         except SandboxReclaimBlockedError as exc:
-            # Another project holds the one slot and has unsaved work.
+            # A colleague's shared view holds the one slot, and it has no hand-over.
             return reclaim_blocked_response(exc)
         except NoSnapshotToRelaunchError as exc:
             # Confirmed-absent (or vanished) snapshot: nothing to relaunch, and there is no
