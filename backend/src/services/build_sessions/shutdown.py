@@ -1,10 +1,12 @@
 """The one shutdown routine: claim the debt, stop the agent, write the work back, destroy the
 container — by NAME and by INSTANCE.
 
-THREE TRIGGERS, ONE IMPLEMENTATION. A project switch, a lapsed presence lease and the absolute
-age ceiling all arrive here and differ only in the reason they record. Everything else — the
-owed row, the cooperative stop, the ancestry-guarded write-back, the ordered destruction — is
-the same code on all three.
+WHAT ACTUALLY ARRIVES HERE IS THE PROJECT SWITCH, and one retry of a debt a switch left behind.
+A lapsed presence lease and the absolute age ceiling are decided in `reaper.reconcile_user` and
+fall through to `reap_user`, which carries its own ordering, its own guarded write-back and its
+own release — a second implementation of the same act. The two answer differently on a diverted
+tree, and only this one stops the outgoing turn at a boundary or re-checks the registry before
+each Redis write. Anything changed about how a container ends has to be changed in both.
 
 THE ROW IS WRITTEN BEFORE ANY FALLIBLE AWAIT. A switch overwrites the per-user registry with the
 incoming container's record on the same request, so from that instant nothing in Redis names the
@@ -121,13 +123,14 @@ _NOTHING_WRITTEN_YET: Final = -1
 
 
 class ShutdownReason(enum.StrEnum):
-    """Why this container is being shut down. Three triggers, identical behaviour."""
+    """Why this container is being shut down, recorded on the row and in the log."""
 
     #: The citizen opened a different project, and this one is the outgoing occupant.
     PROJECT_SWITCHED = "project_switched"
-    #: No surface renewed this container's stay inside the grace.
+    #: A debt carried forward: the sweep is retrying a deletion an earlier run could not perform.
     PRESENCE_LAPSED = "presence_lapsed"
-    #: The container outlived the absolute age ceiling.
+    #: The container outlived the absolute age ceiling. Reachable only from a test today — the
+    #: ceiling is enforced in `reaper.reconcile_user`, which reaps through `reap_user` instead.
     PAST_THE_CEILING = "past_the_ceiling"
 
 
