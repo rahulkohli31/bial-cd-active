@@ -9,12 +9,21 @@ import uuid
 import pytest
 from structlog.testing import capture_logs
 
-from src.services.build_sessions.snapshot import SNAPSHOT_STEP_TIMINGS_EVENT, write_snapshot
+from src.services.build_sessions.snapshot import (
+    SNAPSHOT_STEP_TIMINGS_EVENT,
+    WorkspaceHasNoRepositoryError,
+    write_snapshot,
+)
 from src.services.sandbox.base import ExecResult, SandboxError, SandboxHandle
 from src.services.storage import snapshot_key
 from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
 
 APP_ID = uuid.uuid4()
+
+#: Spelled out rather than imported from the module under test, so a changed constant moves the
+#: script and the assertion apart instead of moving them together. It is a shell exit code and
+#: `sandbox/scripts/snapshot.sh` carries the same literal.
+NO_REPO_EXIT = 64
 
 
 def _handle() -> SandboxHandle:
@@ -41,24 +50,46 @@ async def test_write_snapshot_bundles_and_puts_to_blob(fake_storage: FakeStorage
     client.exec_handler = handler
     await write_snapshot(client, _handle(), APP_ID)
     assert fake_storage.objects[snapshot_key(APP_ID)] == a_git_bundle()
-    # The commit script survives a GIT-LESS workspace (the baked image has no .git): it inits
-    # idempotently and guards the nothing-to-commit case. Asserted on the script text — the
-    # dict-backed fake cannot run real git.
-    assert scripts[0].startswith("git init -q")
+    # Asserted on the script text — the dict-backed fake cannot run real git. The commit script
+    # PROBES for a repository and never creates one: a root commit written at the end of a turn
+    # holds the finished app, which makes the starter-page check compare the app against itself.
+    assert "git init" not in scripts[0]
+    assert scripts[0].startswith(f"git rev-parse --git-dir >/dev/null 2>&1 || exit {NO_REPO_EXIT}")
     assert "git diff --cached --quiet || git commit" in scripts[0]
 
 
-async def test_write_snapshot_raises_on_commit_failure(fake_storage: FakeStorage) -> None:
+async def test_a_workspace_with_no_repository_raises_the_named_error(
+    fake_storage: FakeStorage,
+) -> None:
+    """The probe's exit 64, end to end: a named error and nothing written to the store."""
     client = FakeSandboxClient()
 
     def handler(cmd: list[str]) -> ExecResult:
-        if cmd[:2] == ["sh", "-c"] and "git init" in cmd[2]:
-            return ExecResult(stdout="", stderr="fatal: not a work tree", exit=128)
+        if cmd[:2] == ["sh", "-c"]:
+            return ExecResult(stdout="", stderr="", exit=NO_REPO_EXIT)
         return ExecResult(stdout="", stderr="", exit=0)
 
     client.exec_handler = handler
-    with pytest.raises(SandboxError, match="commit failed"):
+    with pytest.raises(WorkspaceHasNoRepositoryError):
         await write_snapshot(client, _handle(), APP_ID)
+    assert snapshot_key(APP_ID) not in fake_storage.objects
+
+
+async def test_write_snapshot_raises_on_commit_failure(fake_storage: FakeStorage) -> None:
+    """A commit that failed for ANY other reason — a full disk, a locked index — stays the
+    generic snapshot failure. The named error is the discriminator's alone, so a caller that
+    branches on it cannot be handed a disk-full container to quarantine and restore."""
+    client = FakeSandboxClient()
+
+    def handler(cmd: list[str]) -> ExecResult:
+        if cmd[:2] == ["sh", "-c"]:
+            return ExecResult(stdout="", stderr="fatal: unable to write new index file", exit=128)
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    client.exec_handler = handler
+    with pytest.raises(SandboxError, match="commit failed") as caught:
+        await write_snapshot(client, _handle(), APP_ID)
+    assert not isinstance(caught.value, WorkspaceHasNoRepositoryError)
     assert snapshot_key(APP_ID) not in fake_storage.objects
 
 

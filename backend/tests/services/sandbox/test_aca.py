@@ -127,8 +127,33 @@ def _app_env() -> dict[str, str]:
     }
 
 
+def _seed_reply() -> httpx.Response:
+    """The provision's one git-repo seed exec, answered.
+
+    A provision seeds the workspace repo or fails, so every handler that a `provision_new` runs
+    through has to speak for `/_sup/exec` — a generic 200 carrying no `exit` reads as a seed that
+    did not work. Tests whose subject IS an exec answer it themselves and never reach this.
+    """
+    return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
+
+
+def _answering_supervisor(request: httpx.Request) -> httpx.Response:
+    """A supervisor that is simply up, for the tests whose subject is the control plane.
+
+    A provision now seeds the workspace repo or fails, so reaching the supervisor is part of
+    provisioning rather than housekeeping beside it. Without this default those tests would
+    exercise an unreachable host and fail on the connection, which says nothing about the ARM
+    seam they exist to check. Tests whose subject IS the supervisor pass their own handler.
+    """
+    if request.url.path == "/_sup/exec":
+        return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
+    if request.url.path == "/_sup/files":
+        return httpx.Response(200, json={"ok": True, "created": "app.bundle.b64"})
+    return httpx.Response(404)
+
+
 def _client(aca: FakeAca, handler: Handler | None = None) -> AcaSandboxClient:
-    transport = httpx.MockTransport(handler) if handler is not None else None
+    transport = httpx.MockTransport(handler or _answering_supervisor)
     return AcaSandboxClient(_config(), transport=transport, aca=aca)
 
 
@@ -286,6 +311,8 @@ async def test_attach_existing_reconnects_without_a_new_create(fake_redis: aiore
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         if request.url.path.endswith("/dev/status"):
             return httpx.Response(200, json={"running": True, "ready": True, "port": 3000})
         return httpx.Response(200, json={"ok": True})  # /_sup/health probe
@@ -309,6 +336,8 @@ async def test_attach_existing_dev_status_blip_falls_back_to_not_ready(
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         if request.url.path.endswith("/dev/status"):
             return httpx.Response(500)
         return httpx.Response(200, json={"ok": True})
@@ -328,6 +357,8 @@ async def test_attach_unreachable_and_confirmed_gone_raises_gone(
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         raise httpx.ConnectError("supervisor down")
 
     client = _client(aca, handler)
@@ -347,6 +378,8 @@ async def test_attach_unreachable_but_exists_raises_not_ready(
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         raise httpx.ConnectError("transient blip")
 
     client = _client(aca, handler)
@@ -362,6 +395,8 @@ async def test_attach_ending_state_raises_gone_without_probing(fake_redis: aiore
     probes = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         probes["n"] += 1
         return httpx.Response(200, json={"ok": True})
 
@@ -413,6 +448,8 @@ async def test_restore_with_no_snapshot_never_creates_a_container_to_clean_up(
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         return httpx.Response(200, json={"ok": True})
 
     client = _client(aca, handler)
@@ -604,6 +641,8 @@ async def test_attach_transient_during_confirm_gone_maps_to_not_ready(
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         raise httpx.ConnectError("supervisor unreachable")
 
     client = _client(aca, handler)
@@ -816,6 +855,8 @@ async def test_attach_agrees_with_provision_about_where_a_person_goes(
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         if request.url.path.endswith("/dev/status"):
             return httpx.Response(200, json={"running": True, "ready": True, "port": 3000})
         return httpx.Response(200, json={"ok": True})  # /_sup/health probe

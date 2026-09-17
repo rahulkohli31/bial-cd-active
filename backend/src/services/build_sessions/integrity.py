@@ -71,12 +71,12 @@ BASELINE_COMMIT_SUBJECT: Final = "bial: golden template baseline"
 
 MATCHED, NOT ASSUMED, and this is the difference between a check and an accusation. The whole
 comparison rests on "the root commit IS the golden template", and that is only true when the root
-was written by `client._INIT_REPO_SCRIPT` — which is BEST-EFFORT: it logs and carries on when it
-fails. The documented fallback is `snapshot._COMMIT_SCRIPT`, whose `git init && git add -A &&
-git commit -m bial-snapshot` creates the repository at the END of a turn, so its root commit holds
-the FINISHED APP. Comparing against that root would find `app/page.tsx` identical forever, and the
-app would be permanently and irreversibly accused of serving the starter page — a completion claim
-that can never be earned again, which is worse than the false claim this check exists to stop.
+was written by `client._INIT_REPO_SCRIPT`, which is the system's only writer of a root commit — a
+provision that cannot seed the repository fails outright rather than leaving one to be forged
+later. A root written at the END of a turn would hold the FINISHED APP, and comparing against it
+would find `app/page.tsx` identical forever: the app would be permanently and irreversibly accused
+of serving the starter page, a completion claim that can never be earned again, which is worse
+than the false claim this check exists to stop.
 
 Spelled here rather than imported from `services/sandbox/client.py` for the reason `reaper.py`
 documents about that direction of import: this module must stay importable by the worker. The two
@@ -114,11 +114,10 @@ def parse_baseline_identity(stdout: str) -> BaselineIdentity:
         # probe will keep saying so.
         return BaselineIdentity.UNANSWERABLE
     if subject_text.strip() != BASELINE_COMMIT_SUBJECT:
-        # THE ROOT IS NOT THE SEEDED TEMPLATE. Either the provision-time `git init` did not run
-        # and a later snapshot created the repository from a tree that already held the app, or
-        # the agent re-initialised it in its own shell. Either way there is no birth certificate
-        # to compare against — and answering "still the template" on a root that IS the app is
-        # how a working app gets locked out of ever completing again.
+        # THE ROOT IS NOT THE SEEDED TEMPLATE — the agent re-initialised the repository in its
+        # own shell, or fetched an unrelated history over it. Either way there is no birth
+        # certificate to compare against, and answering "still the template" on a root that IS
+        # the app is how a working app gets locked out of ever completing again.
         return BaselineIdentity.UNANSWERABLE
     baseline_blob = baseline_text.strip()
     if not baseline_blob:
@@ -638,14 +637,6 @@ def judge_workspace(container: ContainerState, facts: _DurableFacts) -> Integrit
         # silently failed — a live state, not a hypothetical — and which then factory-resets has
         # NO durable copy at all, so an ordering that reached the "nothing to compare against,
         # carry on" arm first would let the agent build on the wiped tree.
-        #
-        # THE FALSE POSITIVE THIS ACCEPTS, stated rather than hidden. `_INIT_REPO_SCRIPT` is
-        # best-effort: it logs and carries on when it fails. A BRAND-NEW project whose seed
-        # failed is also repo-less with no durable copy, and it will be told its workspace was
-        # reset and could not be recovered — on its first message. That is wrong, and it is a
-        # knowing trade: nothing is destroyed on this arm (there is nothing to restore FROM, and
-        # the tree being set aside is a bare template), so the cost is one false sentence,
-        # against a silent, permanent loss of somebody's finished app.
         return verdict(WorkspaceState.REVERTED, "the workspace has no repository at all")
 
     if not facts.any_copy:

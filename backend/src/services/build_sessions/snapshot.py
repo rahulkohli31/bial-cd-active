@@ -59,14 +59,25 @@ _log = structlog.get_logger()
 # the turn boundary as step one of every bundle. So "HEAD unchanged + a dirty tree" is the normal
 # shape of a building turn, and any reader that decides from a sha taken before this script runs
 # is reading the previous turn's.
+
+_NO_REPOSITORY_EXIT: Final = 64
+"""The exit code `_COMMIT_SCRIPT`'s leading probe reserves for "there is no repository here".
+
+A DISCRIMINATOR, not a guess: a full disk and a locked `.git/index` also fail the commit step, and
+`WorkspaceHasNoRepositoryError` is raised on this code alone. Every other non-zero exit stays the
+generic snapshot failure. Sized out of the way of git's own 1/128."""
+
+# THIS SCRIPT NEVER CREATES A REPOSITORY. The repo is seeded at provision
+# (`sandbox/client._INIT_REPO_SCRIPT`), so a workspace that reaches here without one has LOST it —
+# and a root commit written here would hold the finished app, which makes "is this still the
+# starter page?" compare the app against itself forever. Refuse instead; the next turn's integrity
+# verdict routes a repo-less container into quarantine-and-restore.
 #
-# The baked image ships /workspace/app WITHOUT a `.git` (git identity, `init.defaultBranch`,
-# and `safe.directory` are baked system-wide in Dockerfile.sandbox), so the FIRST snapshot must
-# `git init` — idempotent on every later snapshot (mirrors sandbox/scripts/snapshot.sh). Commit
-# only when something is staged (`git commit` exits non-zero on a clean tree); a no-change
-# re-snapshot still bundles the existing HEAD below.
+# Commit only when something is staged (`git commit` exits non-zero on a clean tree); a no-change
+# re-snapshot still bundles the existing HEAD below. Mirrors sandbox/scripts/snapshot.sh.
 _COMMIT_SCRIPT = (
-    "git init -q && git add -A && { git diff --cached --quiet || git commit -q -m bial-snapshot; }"
+    f"git rev-parse --git-dir >/dev/null 2>&1 || exit {_NO_REPOSITORY_EXIT}; "
+    "git add -A && { git diff --cached --quiet || git commit -q -m bial-snapshot; }"
 )
 # The on-disk bundle path is PER-CALL, never the fixed `app.bundle` it used to be. Two snapshots
 # can run against one container at the same time — the commonest pair being a user clicking Save
@@ -572,6 +583,17 @@ async def _timed_store(
     timings.store_ms = _elapsed_ms(started)
 
 
+class WorkspaceHasNoRepositoryError(SandboxError):
+    """The container's workspace carries no git repository, so there is nothing to snapshot.
+
+    A `SandboxError` so every caller that already narrow-catches one keeps working; its own type
+    so "this container lost its repository" is told apart from "the commit step failed", which a
+    full disk or a locked index also produces. Raised only on `_NO_REPOSITORY_EXIT`."""
+
+    def __init__(self) -> None:
+        super().__init__("the workspace has no git repository to snapshot")
+
+
 async def _bundle_the_tree(
     sandbox_client: SandboxClient,
     handle: SandboxHandle,
@@ -591,6 +613,8 @@ async def _bundle_the_tree(
         handle, ["sh", "-c", _COMMIT_SCRIPT], timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS
     )
     timings.commit_ms = _elapsed_ms(commit_started)
+    if commit.exit == _NO_REPOSITORY_EXIT:
+        raise WorkspaceHasNoRepositoryError
     if commit.exit != 0:
         raise SandboxError(f"snapshot commit failed (exit {commit.exit})")
     try:
