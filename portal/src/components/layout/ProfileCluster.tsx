@@ -33,7 +33,15 @@ import FeedbackModal from '../FeedbackModal'
  * platform does not make — `isAdmin` is the only role it models, and the Admin entry above is
  * how that is already visible.
  */
-export default function ProfileCluster() {
+export interface ProfileClusterProps {
+  /** Avatar only, centred, at rail width. */
+  collapsed?: boolean
+  /** Told when the menu opens, so the rail it sits in does not collapse out from under it —
+   *  the menu portals outside the nav, so reaching for it reads as the pointer leaving. */
+  onMenuOpenChange?: (open: boolean) => void
+}
+
+export default function ProfileCluster({ collapsed = false, onMenuOpenChange }: ProfileClusterProps) {
   const navigate = useNavigate()
   const exit = useWorkspaceExit()
   const [menuOpen, setMenuOpen] = useState(false)
@@ -78,51 +86,79 @@ export default function ProfileCluster() {
       {/* `modal={false}`, as in the header this replaces: a modal Radix menu puts `aria-hidden`
           on everything outside itself, which would hide the whole navigation from a screen
           reader for as long as this menu is open. */}
-      <DropdownMenu modal={false} open={menuOpen} onOpenChange={setMenuOpen}>
+      <DropdownMenu
+        modal={false}
+        open={menuOpen}
+        onOpenChange={(open) => {
+          setMenuOpen(open)
+          onMenuOpenChange?.(open)
+        }}
+      >
         <DropdownMenuTrigger asChild>
           <button
             data-testid="profile-cluster"
-            className="flex w-full items-center gap-2.5 border-t border-bial-border px-4 py-3 text-left transition hover:bg-surface-muted"
+            title={collapsed ? displayName : undefined}
+            className={`flex w-full items-center border-t border-bial-border py-3 text-left transition hover:bg-surface-muted ${
+              collapsed ? 'justify-center px-0' : 'gap-2.5 px-4'
+            }`}
+          >
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary text-xs font-bold text-white">
+              {avatarInitial}
+            </span>
+            {/* FOLDED, NOT UNMOUNTED — the same rule the destination labels follow. Dropping the
+                name from the DOM would leave this button announcing a single letter, so the rail's
+                only route to Sign out would be an unnamed control. It is clipped to zero width
+                instead, and the accessible name survives the collapse. */}
+            <span
+              className={`min-w-0 overflow-hidden transition-[opacity,max-width] duration-200 ${
+                collapsed ? 'max-w-0 opacity-0' : 'max-w-[150px] opacity-100'
+              }`}
+            >
+              <span className="block truncate text-[13px] font-semibold text-primary-900">{displayName}</span>
+              {secondaryLine && (
+                <span className="block truncate text-[11px] text-neutral">{secondaryLine}</span>
+              )}
+            </span>
+            {!collapsed && <ChevronUp size={16} className="ml-auto shrink-0 text-neutral" />}
+          </button>
+        </DropdownMenuTrigger>
+
+        {/* A CARD THAT FLOATS CLEAR OF THE NAVIGATION, not a continuation of it. It used to be
+            pinned to the trigger's own width with no offset, so it rose out of the panel in the
+            panel's own white and read as more navigation rather than as a menu — the boundary
+            the reader needs in order to know a different thing is being offered.
+            `side="right"` clears the column entirely, and the width is the MENU's own. */}
+        <DropdownMenuContent
+          side="right"
+          align="end"
+          sideOffset={10}
+          className="min-w-[232px] rounded-xl border border-bial-border bg-white p-1.5 shadow-2xl"
+        >
+          <DropdownMenuLabel
+            data-testid="user-menu-identity"
+            className="flex items-center gap-2.5 rounded-lg px-2.5 py-2 font-normal"
           >
             <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary text-xs font-bold text-white">
               {avatarInitial}
             </span>
             <span className="min-w-0">
               <span className="block truncate text-[13px] font-semibold text-primary-900">{displayName}</span>
-              {secondaryLine && (
-                <span className="block truncate text-[11px] text-neutral">{secondaryLine}</span>
-              )}
+              <span className="block truncate text-[11px] text-neutral">{secondaryLine}</span>
             </span>
-            <ChevronUp size={16} className="ml-auto shrink-0 text-neutral" />
-          </button>
-        </DropdownMenuTrigger>
-
-        {/* `side="top"`: the cluster sits at the foot of the panel, so the menu opens upward
-            into the navigation rather than off the bottom of the viewport. */}
-        <DropdownMenuContent
-          side="top"
-          align="start"
-          className="w-[--radix-dropdown-menu-trigger-width] min-w-56 rounded-xl border-bial-border bg-white p-0 py-2 shadow-xl"
-        >
-          <DropdownMenuLabel
-            data-testid="user-menu-identity"
-            className="border-b border-bial-border px-4 py-2.5 font-normal"
-          >
-            <p className="text-xs font-bold text-tertiary">{displayName}</p>
-            <p className="text-[10px] text-neutral">{secondaryLine}</p>
           </DropdownMenuLabel>
+          <div role="separator" className="my-1.5 h-px bg-bial-border" />
           <DropdownMenuItem
             onSelect={() => setFeedbackOpen(true)}
-            className="mt-1 gap-2.5 rounded-none px-4 py-2.5 text-sm text-tertiary hover:bg-surface-muted focus:bg-surface-muted"
+            className="gap-2.5 rounded-lg px-2.5 py-2 text-sm text-tertiary hover:bg-surface-muted focus:bg-surface-muted"
           >
-            <MessageSquare size={13} />
+            <MessageSquare size={15} />
             Feedback
           </DropdownMenuItem>
           <DropdownMenuItem
             onSelect={() => exit(() => void handleLogout())}
-            className="gap-2.5 rounded-none px-4 py-2.5 text-sm text-danger hover:bg-red-50 focus:bg-red-50 focus:text-danger"
+            className="gap-2.5 rounded-lg px-2.5 py-2 text-sm text-danger hover:bg-red-50 focus:bg-red-50 focus:text-danger"
           >
-            <LogOut size={13} />
+            <LogOut size={15} />
             Sign out
           </DropdownMenuItem>
         </DropdownMenuContent>

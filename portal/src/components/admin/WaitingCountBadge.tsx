@@ -29,6 +29,15 @@ interface Props {
   /** The sentence to announce. Omitted means the app review queue's, so the two older mounts
    *  keep the exact words they shipped with. */
   subject?: WaitingSubject
+  /**
+   * A dot instead of a numeral, for the collapsed navigation rail.
+   *
+   * The number has no room there, and the ALTERNATIVE — drawing nothing — is what this guards
+   * against: an administrator who leaves the pointer away from the navigation would lose every
+   * trace that a queue is waiting. The announced sentence is unchanged, so the count is still
+   * read out in full; only the pixels shrink.
+   */
+  compact?: boolean
 }
 
 /** The accessible sentences. Singular is not pedantry — "1 apps waiting" is the kind of
@@ -44,7 +53,7 @@ function waitingForAccessLabel(count: number): string {
   return `${count} ${count === 1 ? 'person' : 'people'} waiting for access`
 }
 
-export default function WaitingCountBadge({ count, where, subject = 'apps' }: Props) {
+export default function WaitingCountBadge({ count, where, subject = 'apps', compact = false }: Props) {
   if (count === null || count <= 0) return null
   return (
     <span
@@ -52,9 +61,13 @@ export default function WaitingCountBadge({ count, where, subject = 'apps' }: Pr
       // `relative` contains the sr-only sentence: sr-only is position:absolute, so
       // without a positioned ancestor it would anchor to the page and drag the badge's
       // layout with it (the same trap `ToolActivityLine` documents).
-      className="relative inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1.5 rounded-full bg-danger text-white text-[10px] font-bold leading-none"
+      className={
+        compact
+          ? 'relative block h-2 w-2 rounded-full bg-danger ring-2 ring-white'
+          : 'relative inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1.5 rounded-full bg-danger text-white text-[10px] font-bold leading-none'
+      }
     >
-      <span aria-hidden="true">{count}</span>
+      {!compact && <span aria-hidden="true">{count}</span>}
       <span className="sr-only">
         {subject === 'people' ? waitingForAccessLabel(count) : waitingForReviewLabel(count)}
       </span>

@@ -27,15 +27,24 @@ interface Props {
   usage: UsageToday
   /** The compact form for the workspace toolbar, where the row is already full. */
   compact?: boolean
+  /**
+   * The collapsed rail: the arc and the percentage inside it, with no figures beside it.
+   *
+   * THE COUNTER STILL NEVER DISAPPEARS, which is the client's actual requirement. A 56px column
+   * cannot hold "412,000 / 1,000,000", so the reading that survives the collapse is the percent
+   * written inside the arc — a number, on screen, at every width. The full figures come back the
+   * moment the navigation opens, and the title carries them meanwhile.
+   */
+  rail?: boolean
 }
 
-export default function TokenRing({ usage, compact = false }: Props) {
+export default function TokenRing({ usage, compact = false, rail = false }: Props) {
   // A zero limit would make every reading NaN. It is not a state the server produces, but the
   // division is here and the meter is the one element that may never render nonsense.
   const fraction = usage.limit > 0 ? Math.min(1, usage.used / usage.limit) : 0
   const spent = usage.remaining <= 0
   const percent = Math.round(fraction * 100)
-  const size = compact ? 30 : 38
+  const size = rail ? 34 : compact ? 30 : 38
   // TOKENS, NEVER A SECOND NAME FOR A COLOUR THE RAMP ALREADY OWNS. Amber is `accent`, whose
   // only other use in this product is the unsaved dot on Save; red is `danger`, and the spent
   // figure takes the status ramp's own red ink.
@@ -44,11 +53,17 @@ export default function TokenRing({ usage, compact = false }: Props) {
   return (
     <div
       className={
-        compact
-          ? 'flex items-center gap-2 select-none'
-          : 'flex items-center gap-2.5 mx-3 mb-2.5 px-3 py-2.5 border border-bial-border rounded-xl select-none'
+        rail
+          ? 'flex justify-center select-none mb-2.5'
+          : compact
+            ? 'flex items-center gap-2 select-none'
+            : 'flex items-center gap-2.5 mx-3 mb-2.5 px-3 py-2.5 border border-bial-border rounded-xl select-none'
       }
-      title="Daily AI tokens used today · resets at midnight IST"
+      title={
+        rail
+          ? `${usage.used.toLocaleString('en-US')} / ${usage.limit.toLocaleString('en-US')} tokens today · resets at midnight IST`
+          : 'Daily AI tokens used today · resets at midnight IST'
+      }
       data-testid="usage-meter"
     >
       <svg width={size} height={size} viewBox="0 0 42 42" aria-hidden="true">
@@ -78,7 +93,7 @@ export default function TokenRing({ usage, compact = false }: Props) {
           </text>
         )}
       </svg>
-      <div className="leading-tight">
+      <div className={`leading-tight ${rail ? 'hidden' : ''}`}>
         {/* Tabular figures: the two numbers sit under each other as the budget is spent, and a
             counter that reflows every few thousand tokens reads as a glitch. */}
         <div

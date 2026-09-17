@@ -58,9 +58,12 @@ interface Props {
   /** Opens the panel when focus lands on an item — a panel that vanishes under the keyboard is
    *  a trap. Held open by the panel itself for as long as focus is inside it. */
   onItemFocus?: () => void
+  /** Icons only. The label still renders — it is what `title` and the accessible name read —
+   *  but it is folded to zero width so the row centres on its icon. */
+  collapsed?: boolean
 }
 
-export default function NavItems({ onNavigate, onItemFocus }: Props) {
+export default function NavItems({ onNavigate, onItemFocus, collapsed = false }: Props) {
   const navigate = useNavigate()
   const exit = useWorkspaceExit()
   const { pathname } = useLocation()
@@ -116,10 +119,15 @@ export default function NavItems({ onNavigate, onItemFocus }: Props) {
             onFocus={onItemFocus}
             aria-current={active ? 'page' : undefined}
             data-testid={`nav-${to.slice(1)}`}
+            // The rail's only label. A collapsed row is an icon, and an icon alone is a guess
+            // for anyone who has not already learned this navigation.
+            title={collapsed ? label : undefined}
             // FOCUS MUST NOT LOOK LIKE ACTIVE. The active item carries a tinted ground; focus
             // carries a ring. Without the distinction a keyboard user on a non-active item sees
             // two highlighted rows and cannot tell which one Enter will open.
-            className={`relative flex items-center gap-2.5 rounded-lg px-2.5 py-2.5 text-left text-[13.5px] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 ${
+            className={`relative flex items-center gap-2.5 rounded-lg py-2.5 text-left text-[13.5px] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 ${
+              collapsed ? 'justify-center px-0' : 'px-2.5'
+            } ${
               active ? 'font-semibold text-primary' : 'font-medium text-neutral hover:text-primary-900'
             }`}
           >
@@ -133,11 +141,30 @@ export default function NavItems({ onNavigate, onItemFocus }: Props) {
                 className="absolute inset-0 rounded-lg bg-primary/10 ring-1 ring-inset ring-primary/30"
               />
             )}
-            <Icon size={17} className="relative shrink-0" />
-            <span className="relative">{label}</span>
+            <Icon size={18} className="relative shrink-0" />
+            {/* FOLDED, NOT UNMOUNTED. Removing the text would take the button's accessible name
+                with it, so a screen reader on the rail would read five unnamed buttons. It is
+                clipped to zero width instead, and the name survives the collapse. */}
+            <span
+              className={`relative overflow-hidden whitespace-nowrap transition-[opacity,max-width] duration-200 ${
+                collapsed ? 'max-w-0 opacity-0' : 'max-w-[160px] opacity-100'
+              }`}
+            >
+              {label}
+            </span>
             {to === ADMIN_DESTINATION.to && (
-              <span className="relative ml-auto">
-                <WaitingCountBadge count={waiting} where="nav" />
+              // THE COUNT SURVIVES THE COLLAPSE, because it is the one thing in this navigation
+              // that is not a destination but a summons — an administrator with applications
+              // waiting must not lose the signal by leaving the pointer elsewhere. At rail width
+              // the number has nowhere to sit, so it becomes a dot pinned to the icon.
+              <span
+                className={
+                  collapsed
+                    ? 'pointer-events-none absolute right-1.5 top-1.5'
+                    : 'relative ml-auto'
+                }
+              >
+                <WaitingCountBadge count={waiting} where="nav" compact={collapsed} />
               </span>
             )}
           </button>

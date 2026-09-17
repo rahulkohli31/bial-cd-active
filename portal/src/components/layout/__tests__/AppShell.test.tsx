@@ -391,3 +391,148 @@ describe('the foot of the navigation', () => {
     await waitFor(() => expect(h.logout).toHaveBeenCalled())
   })
 })
+
+/**
+ * ★ THE RAIL — the navigation's resting state, and the three things that change its width.
+ *
+ * Width itself is not assertable here: the panel animates it through Motion, and jsdom reports
+ * no layout. `data-collapsed` is the state the width is computed FROM, which is the honest thing
+ * to assert and the thing a regression would break first.
+ */
+describe('the navigation rests as a rail and grows when it is approached', () => {
+  const panel = () => screen.getByTestId('nav-panel')
+  const isCollapsed = () => panel().getAttribute('data-collapsed') === 'true'
+
+  beforeEach(() => {
+    h.getStoredUser.mockReturnValue(CITIZEN)
+    window.localStorage.removeItem('bial:nav-pinned')
+  })
+
+  afterEach(() => window.localStorage.removeItem('bial:nav-pinned'))
+
+  it('★ rests collapsed, and grows when the pointer arrives', async () => {
+    renderAt('/projects')
+    await screen.findByTestId('nav-panel')
+    expect(isCollapsed()).toBe(true)
+
+    fireEvent.pointerEnter(screen.getByTestId('nav-docked'))
+    await waitFor(() => expect(isCollapsed()).toBe(false))
+  })
+
+  it('★ waits before closing behind a pointer that has left', async () => {
+    // FAKE TIMERS ARE INSTALLED AFTER THE RENDER, NOT BEFORE. `findBy*` polls on real timers, so
+    // faking them first hangs the query until the test times out — and a timed-out test never
+    // reaches its own restore, which leaves every later test in the file running on fake timers.
+    renderAt('/projects')
+    const docked = await screen.findByTestId('nav-docked')
+
+    vi.useFakeTimers()
+    try {
+      fireEvent.pointerEnter(docked)
+      expect(isCollapsed()).toBe(false)
+
+      fireEvent.pointerLeave(docked)
+      // Still open immediately after: the delay is what forgives a pointer merely crossing it.
+      expect(isCollapsed()).toBe(false)
+      act(() => { vi.advanceTimersByTime(200) })
+      expect(isCollapsed()).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('★ stays open once pinned, with the pointer nowhere near it, and remembers across a mount', async () => {
+    renderAt('/projects')
+    const docked = await screen.findByTestId('nav-docked')
+    fireEvent.pointerEnter(docked)
+    await waitFor(() => expect(isCollapsed()).toBe(false))
+
+    fireEvent.click(screen.getByTestId('nav-pin'))
+    fireEvent.pointerLeave(docked)
+    await settle()
+    expect(isCollapsed()).toBe(false)
+    expect(window.localStorage.getItem('bial:nav-pinned')).toBe('1')
+
+    // The preference is the one piece of nav state that outlives the page.
+    cleanup()
+    renderAt('/projects')
+    await screen.findByTestId('nav-panel')
+    expect(isCollapsed()).toBe(false)
+  })
+
+  it('★ opening the profile menu on a collapsed rail does NOT sweep the panel open', async () => {
+    // The latch that keeps the rail from closing under its own menu was first written as a third
+    // term in the OR, which made pressing the avatar expand the whole navigation — a lot of
+    // movement to answer a click aimed at one control. It freezes the width it found instead.
+    renderAt('/projects')
+    await screen.findByTestId('nav-panel')
+    expect(isCollapsed()).toBe(true)
+
+    openRadix(screen.getByTestId('profile-cluster'))
+    await settle()
+    // Liveness beside the absence: the menu really did open, so "still collapsed" is the latch
+    // behaving rather than the press missing.
+    expect(await screen.findByTestId('user-menu-identity')).toBeTruthy()
+    expect(isCollapsed()).toBe(true)
+  })
+
+  it('★ …and does not let the rail close under the menu when it was already open', async () => {
+    // The other half, and THE load-bearing one of the pair. The menu renders outside the nav, so
+    // reaching for it reads as the pointer LEAVING — without the freeze the panel collapses out
+    // from under the thing the person is reaching for.
+    //
+    // IT HAS TO OUTLAST THE CLOSE DELAY TO PROVE ANYTHING. Asserting straight after the leave
+    // passes either way, because the rail has not had time to close yet — which is how the first
+    // version of this test let the freeze be deleted without going red.
+    renderAt('/projects')
+    const docked = await screen.findByTestId('nav-docked')
+    fireEvent.pointerEnter(docked)
+    await waitFor(() => expect(isCollapsed()).toBe(false))
+
+    openRadix(screen.getByTestId('profile-cluster'))
+    await settle()
+    expect(await screen.findByTestId('user-menu-identity')).toBeTruthy()
+
+    fireEvent.pointerLeave(docked)
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 400)) })
+    expect(isCollapsed()).toBe(false)
+  })
+})
+
+/**
+ * ★ WHAT THE COLLAPSE MAY NOT TAKE WITH IT. Two readings on this panel are not decoration: the
+ * token budget is a client requirement, and the review queue is the one thing here that summons
+ * an administrator rather than merely pointing somewhere. A rail that dropped either would be a
+ * regression nobody would notice until it mattered.
+ */
+describe('the rail keeps the two readings that are not decoration', () => {
+  const panel = () => screen.getByTestId('nav-panel')
+
+  beforeEach(() => window.localStorage.removeItem('bial:nav-pinned'))
+
+  it('★ still shows a token reading at rail width', async () => {
+    h.getStoredUser.mockReturnValue(CITIZEN)
+    h.fetchUsageToday.mockResolvedValue(USAGE)
+    renderAt('/projects')
+    await screen.findByTestId('nav-panel')
+    expect(panel().getAttribute('data-collapsed')).toBe('true')
+
+    const meter = await screen.findByTestId('usage-meter')
+    // The percent written inside the arc is what survives the collapse; the full figures need a
+    // width the rail does not have, so the title carries them instead.
+    expect(meter.textContent).toContain('54%')
+    expect(meter.getAttribute('title')).toContain('537,102 / 1,000,000')
+  })
+
+  it('★ still shows the review queue is waiting, for an administrator', async () => {
+    h.getStoredUser.mockReturnValue(ADMIN)
+    h.fetchAppStatusCounts.mockResolvedValue(counts(2))
+    renderAt('/projects')
+    await screen.findByTestId('nav-panel')
+    expect(panel().getAttribute('data-collapsed')).toBe('true')
+
+    const badge = await screen.findByTestId('waiting-count-nav')
+    // The numeral has nowhere to sit at 56px, so the count is announced rather than drawn.
+    expect(badge.textContent).toContain('2 apps waiting for review')
+  })
+})

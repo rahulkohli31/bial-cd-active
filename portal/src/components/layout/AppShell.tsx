@@ -3,6 +3,7 @@ import { useLocation } from 'react-router-dom'
 import { rememberProjectsSearch } from '../../utils/projectsListMemory'
 import NavPanel from './NavPanel'
 import NavReveal, { NavMenuButton, useStackedViewport } from './NavReveal'
+import { useNavRail, NAV_PANEL_PX, NAV_RAIL_PX } from './useNavRail'
 
 /**
  * The frame every route renders inside — the navigation on the left, the page beside it.
@@ -61,11 +62,40 @@ export default function AppShell({ children }: { children: ReactNode }) {
     )
   }
 
+  return <DockedShell>{children}</DockedShell>
+}
+
+/**
+ * The list routes: a navigation that is ALWAYS on screen, resting as a rail and growing under
+ * the pointer.
+ *
+ * THE COLUMN RESERVES THE RAIL'S WIDTH, NOT THE PANEL'S. The expanded panel floats over the page
+ * rather than pushing it, so arriving at the navigation does not reflow a list of thirteen rows
+ * sideways under the reader. Pinning is the one thing that moves the page, because pinning is the
+ * request for a permanent column.
+ */
+function DockedShell({ children }: { children: ReactNode }) {
+  const rail = useNavRail()
+
   return (
     <div className="flex h-screen overflow-hidden bg-bial-bg font-manrope">
-      <aside className="h-full shrink-0 border-r border-bial-border" data-testid="nav-docked">
-        <NavPanel />
-      </aside>
+      <div
+        className="relative h-full shrink-0 transition-[width] duration-200"
+        style={{ width: rail.pinned ? NAV_PANEL_PX : NAV_RAIL_PX }}
+      >
+        <aside
+          {...rail.hoverProps}
+          data-testid="nav-docked"
+          className="absolute inset-y-0 left-0 z-30 border-r border-bial-border shadow-sm"
+        >
+          <NavPanel
+            collapsed={rail.collapsed}
+            pinned={rail.pinned}
+            onTogglePin={rail.togglePin}
+            onMenuOpenChange={rail.setMenuOpen}
+          />
+        </aside>
+      </div>
       <div className="min-w-0 flex-1 overflow-y-auto">{children}</div>
     </div>
   )

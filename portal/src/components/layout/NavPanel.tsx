@@ -1,7 +1,7 @@
 import { useId } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { LayoutGroup } from 'motion/react'
-import { Pin, PinOff } from 'lucide-react'
+import { motion, LayoutGroup } from 'motion/react'
+import { PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 import { useWorkspaceExit } from '../workspace/UnsavedWorkGuard'
 import { useUsageToday } from '../../hooks/useUsageToday'
 import { projectsListHref } from '../../utils/projectsListMemory'
@@ -9,13 +9,16 @@ import BIALLogo from '../BIALLogo'
 import NavItems from './NavItems'
 import ProfileCluster from './ProfileCluster'
 import TokenRing from './TokenRing'
-import { NAV_WIDTH_PX } from '../../lib/motion'
+import { NAV_PANEL_PX, NAV_RAIL_PX } from './useNavRail'
 
 /**
- * The navigation panel — ONE WIDTH, TWO POSITIONS. It is 248px docked into the layout on the list
- * routes, or floating over the content inside an application. There is no icon rail: a third,
- * narrower form is a third set of states to draw, test and keep honest, for a saving the hidden
- * state already beats.
+ * The navigation panel — ONE COLUMN, TWO WIDTHS. It rests as a 56px rail of icons and grows to
+ * 248px of labelled destinations when the pointer arrives or the pin is set. There is no third
+ * form: a separate drawer would be a third set of states to draw, test and keep honest.
+ *
+ * THE WIDTH IS ANIMATED, THE CONTENT IS NOT SWAPPED. Both states render the same elements — the
+ * labels fold to zero width rather than unmounting — so the collapse cannot change what a screen
+ * reader finds, and React has nothing to reconcile across the transition.
  *
  * THE LOGO RUNS THE WORKSPACE-EXIT ROUTINE BEFORE NAVIGATING, exactly as the header's did, and
  * for the same reason: a single-page navigation is not an unload, so `beforeunload` cannot cover
@@ -28,18 +31,23 @@ import { NAV_WIDTH_PX } from '../../lib/motion'
  */
 
 interface Props {
-  /** Shown only where the panel floats: docking it is meaningless when it is already docked. */
+  /** Icons only, at rail width. */
+  collapsed?: boolean
   pinned?: boolean
   onTogglePin?: () => void
   onNavigate?: () => void
   onItemFocus?: () => void
+  /** Told when a menu this panel owns opens, so the rail does not close under it. */
+  onMenuOpenChange?: (open: boolean) => void
 }
 
 export default function NavPanel({
-  pinned,
+  collapsed = false,
+  pinned = false,
   onTogglePin,
   onNavigate,
   onItemFocus,
+  onMenuOpenChange,
 }: Props) {
   const navigate = useNavigate()
   const exit = useWorkspaceExit()
@@ -47,52 +55,50 @@ export default function NavPanel({
   const scope = useId()
 
   return (
-    <div
-      className="flex h-full flex-col overflow-y-auto bg-white"
-      style={{ width: NAV_WIDTH_PX }}
+    <motion.div
+      className="flex h-full flex-col overflow-x-hidden overflow-y-auto bg-white"
+      initial={false}
+      animate={{ width: collapsed ? NAV_RAIL_PX : NAV_PANEL_PX }}
+      transition={{ type: 'tween', ease: 'easeOut', duration: 0.2 }}
       data-testid="nav-panel"
+      data-collapsed={collapsed ? 'true' : 'false'}
     >
-      <div className="flex items-center gap-2.5 px-4 pb-4 pt-[18px]">
+      <div
+        className={`flex shrink-0 items-center pb-4 pt-[18px] ${collapsed ? 'justify-center px-2' : 'gap-2 px-4'}`}
+      >
         <button
           type="button"
           onClick={() => exit(() => navigate(projectsListHref()))}
-          className="flex items-center gap-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 rounded-lg"
+          className="flex min-w-0 items-center gap-2.5 rounded-lg text-left outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1"
           aria-label="BIAL Citizen Developer — go to My Applications"
         >
-          {/* The mark CARRIES the wordmark — a second copy beside it drew the brand twice, and
-              at 248px the two overlapped into "Develope" on top of "Developer" with the pin
-              glyph across them. It wraps to two lines here on its own. */}
-          <BIALLogo />
+          <BIALLogo compact={collapsed} />
         </button>
-        {onTogglePin && (
+        {onTogglePin && !collapsed && (
           <button
             type="button"
             onClick={onTogglePin}
             data-testid="nav-pin"
             aria-pressed={pinned}
-            title={pinned ? 'Unpin the navigation' : 'Pin the navigation open'}
-            className="ml-auto shrink-0 rounded-lg p-1.5 text-neutral transition hover:bg-surface-muted hover:text-primary-900 outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            title={pinned ? 'Let the navigation collapse' : 'Keep the navigation open'}
+            className="ml-auto shrink-0 rounded-lg p-1.5 text-neutral outline-none transition hover:bg-surface-muted hover:text-primary-900 focus-visible:ring-2 focus-visible:ring-primary"
           >
-            {pinned ? <PinOff size={15} /> : <Pin size={15} />}
+            {pinned ? <PanelLeftClose size={16} /> : <PanelLeftOpen size={16} />}
           </button>
         )}
       </div>
 
       {/* ONE NAMESPACE PER PANEL. The active-destination pill travels between ROWS by sharing a
-          `layoutId`, and pinning mounts a second panel while the first one is still leaving — two
-          elements claiming one id, which pairs them ACROSS the two panels and leaves the exit
-          unfinished, so the floating copy never goes away. */}
+          `layoutId`, and two panels mounted at once would pair them ACROSS the two and leave an
+          exit unfinished, so the floating copy never goes away. */}
       <LayoutGroup id={scope}>
-        <NavItems
-          onNavigate={onNavigate}
-          onItemFocus={onItemFocus}
-        />
+        <NavItems collapsed={collapsed} onNavigate={onNavigate} onItemFocus={onItemFocus} />
       </LayoutGroup>
 
       <div className="mt-auto flex flex-col">
-        {usage && <TokenRing usage={usage} />}
-        <ProfileCluster />
+        {usage && <TokenRing usage={usage} rail={collapsed} />}
+        <ProfileCluster collapsed={collapsed} onMenuOpenChange={onMenuOpenChange} />
       </div>
-    </div>
+    </motion.div>
   )
 }
