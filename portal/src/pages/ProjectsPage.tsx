@@ -23,7 +23,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { Plus, Search, AlertTriangle, AlertCircle, CheckCircle2, Info, X } from 'lucide-react'
+import { Plus, Search, AlertTriangle, AlertCircle, Info, X } from 'lucide-react'
 import {
   listProjects,
   listProjectCounts,
@@ -171,9 +171,7 @@ export default function ProjectsPage(): React.JSX.Element {
    * application, because this list can scroll, filter and empty underneath a notice that then
    * refers to nothing on screen.
    */
-  const [toast, setToast] = useState<
-    { text: string; tone: 'failure' | 'confirmation'; subject: string } | null
-  >(null)
+  const [toast, setToast] = useState<{ text: string; subject: string } | null>(null)
 
   const { view, setView, density, setDensity } = useListView()
 
@@ -373,7 +371,6 @@ export default function ProjectsPage(): React.JSX.Element {
       setReloadNonce((n) => n + 1)
       setToast({
         text: caught instanceof Error ? caught.message : 'Could not delete the application.',
-        tone: 'failure',
         subject: project.name,
       })
     } finally {
@@ -847,28 +844,18 @@ export default function ProjectsPage(): React.JSX.Element {
         />
       )}
 
-      {/* NEITHER OUTCOME IS SILENT ANY MORE, and the two do not share a voice. A delete stays
-          silent on success — the row is simply gone, which says it — but a take-down leaves the
-          row exactly where it was, so without a sentence the only signal is a chip changing
-          colour somewhere a reader may have already scrolled past.
-          A confirmation fades on its own; something that went wrong waits to be dismissed, and
-          the marker carries which one it is without reading the words. Both name the application:
-          this list can be searched, paged and emptied under a notice that would otherwise be
-          left referring to nothing on screen. */}
+      {/* FAILURE ONLY, and that is the whole vocabulary this list needs. A delete that works says
+          so by the row being gone; the only outcome that leaves nothing on screen to read is the
+          one that failed, and it waits to be dismissed rather than fading.
+          It names the application because this list can be searched, paged and emptied under a
+          notice that would otherwise be left referring to nothing on screen. */}
       {toast !== null && (
         <div
           role="alert"
           data-testid="projects-toast"
-          data-tone={toast.tone}
-          className={`fixed bottom-6 left-1/2 -translate-x-1/2 flex max-w-[min(34rem,calc(100vw-3rem))] items-start gap-3 rounded-xl px-4 py-2.5 text-sm font-medium shadow-lg ${
-            toast.tone === 'failure' ? 'bg-red-600 text-white' : 'bg-primary text-white'
-          }`}
+          className="fixed bottom-6 left-1/2 -translate-x-1/2 flex max-w-[min(34rem,calc(100vw-3rem))] items-start gap-3 rounded-xl bg-red-600 px-4 py-2.5 text-sm font-medium text-white shadow-lg"
         >
-          {toast.tone === 'failure' ? (
-            <AlertCircle size={15} className="mt-0.5 flex-shrink-0" data-testid="projects-toast-marker" />
-          ) : (
-            <CheckCircle2 size={15} className="mt-0.5 flex-shrink-0" data-testid="projects-toast-done" />
-          )}
+          <AlertCircle size={15} className="mt-0.5 flex-shrink-0" data-testid="projects-toast-marker" />
           <span className="min-w-0">
             <span className="font-bold">{toast.subject}</span> — {toast.text}
           </span>
