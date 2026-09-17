@@ -35,19 +35,16 @@ import {
   useAppPaneVisible,
   usePublishAddress,
   usePublishPaneView,
-  usePublishReclaim,
   usePublishSave,
   usePublishSaveState,
   usePublishWorkspaceReport,
   useWorkspaceProject,
 } from './workspaceChannel'
-import type { ReclaimRequest } from './workspaceChannel'
 import { announceDeploymentChanged } from '../../hooks/usePublishState'
 import { resolvePreviewAddress } from '../../utils/previewAddress'
-import { discardUnsavedChanges, fetchCompileState, handOverWorkspace, saveProject } from '../../utils/buildSessionApi'
+import { discardUnsavedChanges, fetchCompileState, saveProject } from '../../utils/buildSessionApi'
 import { deleteProject } from '../../utils/projectApi'
 import { projectsListHref } from '../../utils/projectsListMemory'
-import type { HandoverStep, ReclaimBlocked } from '../../utils/buildSessionApi'
 import type { CompileState } from '../../utils/compileState'
 import type { Project } from '../../utils/projectApi'
 
@@ -63,10 +60,6 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   // build lifecycle. Without it the pane waits for the next poll tick to frame an app the citizen
   // just pressed a button to bring up, which reads as the press having done nothing.
   const [startedPreviewUrl, setStartedPreviewUrl] = useState<string | null>(null)
-  const [reclaim, setReclaim] = useState<{ blocked: ReclaimBlocked; retry: () => Promise<void> } | null>(null)
-  // WHAT THE HAND-OVER IS DOING RIGHT NOW, published to the dialog so it narrates instead of
-  // spinning. Held here because this surface performs the sequence.
-  const [step, setStep] = useState<HandoverStep | null>(null)
   // THE SETTINGS DIALOG'S STATE IS HERE BECAUSE ITS DATA IS. The control is in the shell's
   // toolbar row, which sits above the Outlet and has no project object; this surface has both
   // the project and the update callback, so the row publishes a press upward and the editing
@@ -196,46 +189,6 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     }
   }, [project.id, alive, framedUrl, workspace.readTick])
 
-  const onReclaimRefusal = useCallback((blocked: ReclaimBlocked, retry: () => Promise<void>) => {
-    // FIRST REFUSAL WINS. The dialog must not change under the person reading it: they read one
-    // project's name, and by the time they press a button the props would describe another — an
-    // irreversible action taken against a sentence nobody saw.
-    setReclaim((held) => held ?? { blocked, retry })
-  }, [])
-
-  const request: ReclaimRequest | null = useMemo(() => {
-    if (!reclaim) return null
-    return {
-      blocked: reclaim.blocked,
-      // The project this surface IS — the one being started, which is what the dialog leads with.
-      startingProjectName: project.name,
-      step,
-      resolve: async (save: boolean) => {
-        try {
-          // Stop, then WAIT FOR THE STOP TO GENUINELY FINISH, then save, then release — the
-          // ordering invariant lives in `handOverWorkspace`, and so does the refusal to proceed
-          // on a stop that only timed out.
-          await handOverWorkspace(reclaim.blocked, save, {}, setStep)
-          // The retry is AWAITED BEFORE the dialog is dismissed, so a switch that fails can still
-          // be reported instead of vanishing with the dialog. It is the whole of what was refused:
-          // starting this project's app, and — from the rail — opening the chat with the message
-          // the citizen typed, which has been held in the composer throughout.
-          setStep('starting')
-          await reclaim.retry()
-          setReclaim(null)
-        } finally {
-          setStep(null)
-        }
-      },
-      cancel: () => {
-        // CANCELLING CHANGES NOTHING ANYWHERE. Nothing has been stopped, nothing released, and the
-        // typed message and its staged files are still in the composer that never sent them.
-        setReclaim(null)
-        setStep(null)
-      },
-    }
-  }, [reclaim, project.name, step])
-
   const report = useMemo(
     () => ({
       state: workspace.state,
@@ -249,9 +202,8 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
         if (outcome === null) workspace.refresh()
       },
       onRefresh: workspace.refresh,
-      onReclaimRefusal,
     }),
-    [workspace, project.id, onReclaimRefusal],
+    [workspace, project.id],
   )
 
   // THE APP STARTS BECAUSE SOMEBODY OPENED THE PROJECT. There is no press, and nothing on the way
@@ -264,9 +216,8 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   // to say `not-running` means the question is asked of the CONTAINER rather than of the
   // component's lifecycle: an app already serving is left exactly where it is.
   //
-  // `not-running` ONLY. `never-built` has nothing to start, `could-not-read` is not an answer,
-  // and `held-by-another-project` belongs to the arbitration path. A start that fails leaves the
-  // retry the start-outcome path already renders.
+  // `not-running` ONLY. `never-built` has nothing to start and `could-not-read` is not an answer.
+  // A start that fails leaves the retry the start-outcome path already renders.
   //
   // ONCE PER PROJECT, guarded by a ref: the reading stays `not-running` until the server's own
   // `starting` lands, so without this the poll would fire a second start on its next tick.
@@ -275,7 +226,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     if (workspace.state.name !== 'not-running') return
     if (autoStarted.current === project.id) return
     autoStarted.current = project.id
-    void startApp(report, () => startApp(report, () => Promise.resolve()))
+    void startApp(report)
   }, [workspace.state.name, project.id, report])
 
   const paneView = useMemo(
@@ -397,7 +348,6 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       share: startShare,
     },
   )
-  usePublishReclaim(request)
   // TWO COLUMNS ARE THE REST STATE of the project screen — not something contingent on a build
   // having run. A project with nothing built shows the empty-state sentence IN the pane, not a
   // hidden pane, because "there is nothing here yet" is a thing the app pane should say rather

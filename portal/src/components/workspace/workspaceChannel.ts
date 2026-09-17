@@ -4,20 +4,19 @@
  * WHY THIS MODULE EXISTS AT ALL. The app pane host is a SIBLING of the `<Outlet/>`, not a
  * descendant of it — `AppPaneHost` owns that rule. Everything it needs is produced below that
  * Outlet — the resolved address, the pane's toolbar slots, whether the surface wants the pane
- * visible, the reclaim dialog's state, the save-state reading — and a sibling cannot read any
- * of it by props. So the mechanism has to be named once, in one place, or three implementers
- * will pick three and the seam will have three shapes.
+ * visible, the save-state reading — and a sibling cannot read any of it by props. So the mechanism
+ * has to be named once, in one place, or three implementers will pick three and the seam will have
+ * three shapes.
  *
  * WHAT TRAVELS ON IT, AND NOTHING ELSE:
  *
  *  1. the resolved preview address, its status and its liveness  (`utils/previewAddress.ts`)
  *  2. the pane's view — visibility and the pane's own pass-through props
- *  3. the reclaim dialog's open state
- *  4. one save-state reading — the tri-state flag and the recovery instant, together
- *  5. the app-revealed callback, the reveal stop-clock
- *  6. the rail mode, its collapse, and an opaque per-mode bag that outlives a chat
- *  7. what to SAY about the workspace — one computed value, and the handlers for its one action
- *  8. what the toolbar row NAMES, and the save control's values and its action
+ *  3. one save-state reading — the tri-state flag and the recovery instant, together
+ *  4. the app-revealed callback, the reveal stop-clock
+ *  5. the rail mode, its collapse, and an opaque per-mode bag that outlives a chat
+ *  6. what to SAY about the workspace — one computed value, and the handlers for its one action
+ *  7. what the toolbar row NAMES, and the save control's values and its action
  *
  * TWO RULES MAKE IT SAFE, and they are the whole contract:
  *
@@ -59,7 +58,7 @@ import { createContext, useContext, useLayoutEffect, useRef, useSyncExternalStor
 import type LivePreview from '../LivePreview'
 import type { PreviewAddress } from '../../utils/previewAddress'
 import type { CompileState } from '../../utils/compileState'
-import type { HandoverStep, PreviewLifeState, ReclaimBlocked } from '../../utils/buildSessionApi'
+import type { PreviewLifeState } from '../../utils/buildSessionApi'
 import { sameWorkspaceState } from './workspaceState'
 import type { StartOutcome, WorkspaceState } from './workspaceState'
 
@@ -179,36 +178,6 @@ export type UnacceptedPaneProps = Exclude<keyof PaneView, keyof ComponentProps<t
 
 const _paneViewIsASubsetOfLivePreviewProps: UnacceptedPaneProps extends never ? true : never = true
 void _paneViewIsASubsetOfLivePreviewProps
-
-/**
- * The reclaim dialog's open state. The CLASSIFICATION stays where it is — this is only the slot.
- *
- * The handlers travel with it because they are the publisher's: stopping the other project's
- * build, saving it, releasing it and retrying the refused call are all things the surface that
- * made that call knows how to do, and a shell that re-derived them would be a second authority on
- * a refusal that already has one.
- */
-export interface ReclaimRequest {
-  blocked: ReclaimBlocked
-  /**
-   * The project being STARTED. The refusal carries only the incumbent,
-   * so the name of the app the person is actually trying to open has to travel with the request:
-   * the dialog leads with it, because "can I build THIS one?" is the question being asked.
-   */
-  startingProjectName: string | null
-  /** `true` saves the other project before releasing it; `false` releases without saving. */
-  resolve: (save: boolean) => Promise<void>
-  cancel: () => void
-  /**
-   * WHICH STEP THE HAND-OVER HAS REACHED, or `null` before one starts.
-   *
-   * It travels with the request rather than being derived by the dialog, because the SEQUENCE is
-   * the publisher's: stop the other project, wait for that to finish, save, release, start this
-   * one, then open the chat. Those take real time, and a dialog left spinning through them is
-   * indistinguishable from one that has hung.
-   */
-  step: HandoverStep | null
-}
 
 /**
  * The rail's slot — WHICH RAIL IS SHOWING, and how the shell is laying it out.
@@ -412,8 +381,8 @@ const sameReading = (a: SaveReading, b: SaveReading) =>
  * WHAT THE PANE NEEDS IN ORDER TO SAY WHAT THE WORKSPACE IS DOING. The `state` is the one computed
  * value — a sentence and at most one action, with no destructive verb in its type — and it travels
  * on the channel for the same reason the address does. THE HANDLERS TRAVEL WITH IT because they
- * are the publisher's, exactly as the reclaim request's are: a shell that re-derived them would be
- * a second authority on a question that already has one. `null` MEANS NOBODY HAS COMPUTED ONE, and
+ * are the publisher's: a shell that re-derived them would be a second authority on a question that
+ * already has one. `null` MEANS NOBODY HAS COMPUTED ONE, and
  * the pane then renders nothing.
  */
 export interface WorkspaceReport {
@@ -441,12 +410,6 @@ export interface WorkspaceReport {
   onStarted: (previewUrl: string) => void
   /** Ask the platform again, now. A retry press, or a start that just finished. */
   onRefresh: () => void
-  /**
-   * Route a reclaim refusal to the one dialog, carrying the retry that resumes what was refused.
-   * The CLASSIFICATION already happened at the call site — this is the slot, not a second
-   * classifier, and a bare 409 is not self-describing enough to have two of those.
-   */
-  onReclaimRefusal: (blocked: ReclaimBlocked, retry: () => Promise<void>) => void
 }
 
 export interface WorkspaceChannel {
@@ -459,7 +422,6 @@ export interface WorkspaceChannel {
   project: Cell<string | null>
   pane: Cell<PaneView | null>
   visible: Cell<boolean>
-  reclaim: Cell<ReclaimRequest | null>
   /** One save-state reading — see `SaveReading`. `NO_SAVE_READING` means nobody has reported. */
   saveReading: Cell<SaveReading>
   rail: Cell<RailSlot>
@@ -495,7 +457,6 @@ export function createWorkspaceChannel(): WorkspaceChannel {
     project: createCell<string | null>(null),
     pane: createCell<PaneView | null>(null),
     visible: createCell<boolean>(false),
-    reclaim: createCell<ReclaimRequest | null>(null),
     saveReading: createCell<SaveReading>(NO_SAVE_READING, sameReading),
     rail: createCell<RailSlot>(NO_RAIL, sameRail),
     heading: createCell<WorkspaceHeading>(NO_HEADING, sameHeading),
@@ -553,10 +514,6 @@ export function useWorkspacePane(): PaneView | null {
 /** Whether any mounted surface is asking for the pane to be SEEN. Absent means no. */
 export function useWorkspacePaneVisible(): boolean {
   return useCell(useWorkspaceChannel()?.visible, false)
-}
-
-export function useWorkspaceReclaim(): ReclaimRequest | null {
-  return useCell(useWorkspaceChannel()?.reclaim, null)
 }
 
 /**
@@ -623,10 +580,6 @@ export function useWorkspaceActions(): () => WorkspaceActions {
 //                         only the address to keep running, so dropping these costs nothing and
 //                         keeping them would render a departed conversation's toolbar.
 //   visible    CLEARED  — a surface that is gone is not asking for anything to be shown.
-//   reclaim    CLEARED  — its buttons close over the publisher's own save/release/retry handlers.
-//                         A dialog left standing after they died is a dialog whose buttons do
-//                         nothing, which is precisely the dead end the reclaim flow exists to
-//                         remove.
 //   saveReading KEPT    — the unsaved work is in the CONTAINER, not in the component. Clearing on
 //                         unmount would disarm the unload warning the moment the user navigated
 //                         from the chat to the project screen, which is the exact coverage the
@@ -672,9 +625,9 @@ export function usePublishHeading(heading: WorkspaceHeading): void {
 /**
  * Publish the save control's values, and its action.
  *
- * BOTH ARE CLEARED ON UNMOUNT, for the same reason the reclaim request is: the action closes over
- * the publisher's own session, and a Save button left standing after that publisher died does
- * nothing. The reading on the SEPARATE `saveReading` cell is the one that is KEPT.
+ * BOTH ARE CLEARED ON UNMOUNT, for the same reason the pane view is: the action closes over the
+ * publisher's own session, and a Save button left standing after that publisher died does nothing.
+ * The reading on the SEPARATE `saveReading` cell is the one that is KEPT.
  */
 export function usePublishSave(
   save: Omit<SaveSlot, 'canSave' | 'canDiscard'>,
@@ -728,11 +681,6 @@ export function useAppPaneVisible(visible: boolean): void {
   usePublish(useWorkspaceChannel()?.visible, visible, false)
 }
 
-/** Publish the reclaim dialog's open state. The CLASSIFICATION stays with its publisher. */
-export function usePublishReclaim(request: ReclaimRequest | null): void {
-  usePublish(useWorkspaceChannel()?.reclaim, request, null)
-}
-
 /**
  * Publish ONE save-state reading. Survives this surface's unmount — see the table above.
  *
@@ -753,9 +701,9 @@ export function usePublishSaveState(reading: SaveReading): void {
 
 /**
  * Publish what to say about the workspace. CLEARED ON UNMOUNT, like the pane view and for the same
- * reason: its handlers close over the departing surface's own read, its outcome slot and its
- * refusal routing, so a state left standing would render a sentence whose one button calls into a
- * component that no longer exists.
+ * reason: its handlers close over the departing surface's own read and its outcome slot, so a
+ * state left standing would render a sentence whose one button calls into a component that is not
+ * mounted.
  */
 export function usePublishWorkspaceReport(report: WorkspaceReport | null): void {
   usePublish(useWorkspaceChannel()?.workspace, report, null)

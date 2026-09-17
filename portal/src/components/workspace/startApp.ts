@@ -3,9 +3,8 @@
  *
  * WHY THIS EXISTS
  * The app starts two ways now: because somebody opened the project, and because somebody pressed
- * the control a failed start leaves behind. They are the same request with the same four ways to
- * fail, and the classification below is the part that must never differ between them — a refusal
- * read as a generic failure offers a Retry that can only fail identically forever.
+ * the control a failed start leaves behind. They are the same request with the same ways to fail,
+ * and the classification below is the part that must never differ between them.
  *
  * It is a plain async function rather than a hook because the auto-start calls it from an effect
  * and the control calls it from a press; neither needs React state from here. The caller owns its
@@ -13,11 +12,7 @@
  * tick, and a mount effect must not fire twice for one arrival.
  */
 import { ApiError } from '../../utils/apiError'
-import {
-  BuildSessionAlreadyActiveError,
-  asReclaimBlocked,
-  relaunchPreview,
-} from '../../utils/buildSessionApi'
+import { BuildSessionAlreadyActiveError, relaunchPreview } from '../../utils/buildSessionApi'
 import type { StartOutcome } from './workspaceState'
 import type { WorkspaceReport } from './workspaceChannel'
 
@@ -42,19 +37,22 @@ export function outcomeFor(err: unknown): StartOutcome {
 /**
  * Start this project's app and route the answer to the surface.
  *
- * `retry` is what a reclaim refusal is given to call once the slot is freed — the same function,
- * so the remedy leads back to the request that was refused rather than to a fresh one.
- *
  * NOTHING IS REPORTED THROUGH A MOUNTED GUARD. Every handler here writes into the SURFACE — the
  * workspace read, the address, the outcome slot — all of which outlive whatever called this, and
  * all of which need the answer. The start control in particular unmounts routinely mid-flight: the
  * press makes the state `starting`, which offers no action, so the button that fired the request
  * is gone before the request comes back.
+ *
+ * NO REFUSAL OPENS A QUESTION HERE, AND `sandbox_reclaim_blocked` IS NOT AN EXCEPTION. The server
+ * takes the one workspace for whichever project was asked for and tears the outgoing one down
+ * behind it, so a citizen's own other project can no longer refuse this call. What still can is a
+ * colleague's shared view sitting in the slot, and pressing start cannot move that — the server
+ * refuses it whatever the citizen answers. So it lands where every other named refusal lands: the
+ * server's own sentence, carried verbatim as a start failure with nothing to press. A refusal
+ * arriving with `isSharedView` false would be the server contradicting its own switch, which is a
+ * fault to fix behind the wire rather than a state to draw a screen for.
  */
-export async function startApp(
-  report: WorkspaceReport,
-  retry: () => Promise<void>,
-): Promise<void> {
+export async function startApp(report: WorkspaceReport): Promise<void> {
   const projectId = report.projectId
   if (!projectId) return
   // THE SURFACE HEARS THE PRESS IMMEDIATELY, not on the next poll tick. The server's own
@@ -74,20 +72,9 @@ export async function startApp(
     // this boolean. Safe here only because both sides of the read are non-destructive.
     report.onStartOutcome(res.ready ? null : { kind: 'not-painted' })
   } catch (err) {
-    // DISCRIMINATED ON THE CODE BEFORE ANYTHING ELSE. A bare 409 is not self-describing: it fires
-    // for a same-project reattach and for a cross-project block, and the two have different
-    // remedies.
-    const blocked = asReclaimBlocked(err)
-    if (blocked) {
-      // Another party holds the one workspace. Routed to the ONE dialog rather than shown as a
-      // retry — retrying against an occupied slot can only fail the same way again.
-      report.onReclaimRefusal(blocked, retry)
-      return
-    }
     if (err instanceof BuildSessionAlreadyActiveError) {
-      // Your own other chat is building. A different cause with a different remedy — finish or
-      // stop it — so it must not be merged into the reclaim dialog, which would offer a Save
-      // button that cannot help.
+      // Your own other chat is building. The server names it in wire terms, so this one refusal
+      // is re-said in the citizen's — the remedy is to finish or stop that build.
       report.onStartOutcome({ kind: 'failed', reason: BUILD_ALREADY_RUNNING })
       return
     }

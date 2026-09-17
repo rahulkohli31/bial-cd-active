@@ -9,38 +9,22 @@
  * enforcement. The address comes only from `utils/previewAddress.ts`, whose precedence — a live
  * turn's preview outranks the session URL — a `PreviewState` in hand here would silently drop.
  *
- * FIVE STATES A CITIZEN READS, PLUS ONE INTERNAL, AND THAT COUNT IS THE RECENT CHANGE.
- *
- * There were ten. Five of them were hedges against a single lie on the wire: `alive` used to mean
- * a container had been SCHEDULED, never that anything had watched the app ANSWER a request. So the
- * map carried its own second opinion — "your app is up, but it has not served a page yet", "your
- * app did not answer in time", "we could not start your app" — three sentences describing a FETCH
- * rather than a workspace, plus a second held arm and a sentence about our own plumbing. The
- * backend now proves the serve before it says `alive`, so the hedges have nothing left to hedge
- * and the states they carried collapse into the wait that was always the honest answer:
+ * FOUR STATES A CITIZEN READS, PLUS ONE INTERNAL.
  *
  *   NEW       nothing to launch                             never-built
  *   BUILDING  something under way, nothing proven serving    starting
  *   RUNNING   proven serving                                 running
  *   SAVED     a saved copy, nothing serving it               not-running
- *   HELD      another of this user's projects has the slot   held-by-another-project
  *
  * plus `could-not-read`, which is INTERNAL: it is what is left when a read decided nothing AND
  * nothing has ever been decided before. See {@link WorkspaceInputs.lastDecidedPreview}.
  *
- * THE ACTION UNION REACHES NOTHING DESTRUCTIVE UNASKED. Four members: start, retry, go to the
- * project holding the workspace, and take it back. No restore, rebuild or teardown verb exists in
- * the type, so a signal this client could not interpret has nowhere destructive to land — not
- * because a guard checks something first, but because the union has no other verb. That property
- * used to be spelled out by four defensive arms all landing on "try again"; it is carried by the
- * type alone, which is exactly why deleting those arms costs nothing.
- *
- * THE FOURTH MEMBER ACTS ON SOMEBODY ELSE'S APP and still reaches nothing on its own: pressing it
- * asks this project's own start, and the server's refusal opens `ReclaimWorkspaceDialog`, which
- * saves the holder's work first and refuses to release anything on a failed save. Every verb the
- * client may reach is in this union, each `switch` failing to compile until a new member is
- * handled — but that closes the CLIENT half only. `POST /relaunch` is the server's, so a client
- * test asserting "this component made no restore call" passes in the very state that loses work.
+ * THE ACTION UNION REACHES NOTHING DESTRUCTIVE UNASKED. Two members: start and retry. No restore,
+ * rebuild, teardown or stop-somebody-else verb exists in the type, so a signal this client could
+ * not interpret has nowhere destructive to land — not because a guard checks something first, but
+ * because the union has no other verb. That closes the CLIENT half only. `POST /relaunch` is the
+ * server's, so a client test asserting "this component made no restore call" passes in the very
+ * state that loses work.
  *
  * THE COPY RULE: the pane says what IS, never what is not — "Your app is saved.", full stop, not
  * "saved but not running". `not running` survives only as an internal state name, never rendered,
@@ -344,15 +328,13 @@ function spendOpenWindow(held: ProbeCadence): ProbeCadence {
 /**
  * How the most recent press of the start control ended — and only the endings that are this map's
  * business. A start that SUCCEEDED produces none of these: the read takes over and reports
- * `alive` on its own. A reclaim refusal produces none either — it opens the hand-over dialog
- * which is a question, not a state of the workspace.
+ * `alive` on its own.
  *
- * FOUR ENDINGS, AND NONE OF THEM IS A STATE ANY MORE. This union used to select three whole cards
- * of its own. It no longer selects anything: the READING decides which card is on screen, and an
- * ending contributes at most a `note` — the server's own words about a press the citizen made and
- * is owed an answer to. Two of the four have no such words and so change nothing a person sees;
- * they are kept because the producers still have to say how a press ended, and "it ended with
- * nothing to report" is a different fact from "no press has been made".
+ * NONE OF THE THREE IS A STATE. The READING decides which card is on screen, and an ending
+ * contributes at most a `note` — the server's own words about a press the citizen made and is owed
+ * an answer to. Two of the three have no such words and so change nothing a person sees; they are
+ * kept because the producers still have to say how a press ended, and "it ended with nothing to
+ * report" is a different fact from "no press has been made".
  */
 export type StartOutcome =
   /** The server answered, and answered `ready: false` — the container is up and has not served a
@@ -367,61 +349,18 @@ export type StartOutcome =
   | { readonly kind: 'timed-out' }
   /** The server named a reason. Carried verbatim — this map does not rewrite server prose. */
   | { readonly kind: 'failed'; readonly reason: string }
-  /**
-   * A TAKE-BACK THAT DID NOT FINISH — and the one ending that has to say what it did
-   * to somebody ELSE's app on the way.
-   *
-   * It is a member of this union rather than a field beside it because it is the same kind of
-   * fact: how the most recent press ended. It is a member of its OWN rather than a flag on
-   * `failed` because it lands differently — a take-back that got as far as stopping the holder
-   * leaves the slot held, so the reading is still `slot_taken` and `heldElsewhere` renders it,
-   * replacing that arm's standing sentence, where a plain `failed` reaches only the note.
-   */
-  | {
-      readonly kind: 'take-back-failed'
-      /** Whichever step refused, in the server's own words. Carried verbatim, same as `failed`. */
-      readonly reason: string
-      /**
-       * THE HOLDER WE ALREADY STOPPED, or `null` when the stop itself is what failed.
-       *
-       * This field exists for exactly one purpose: three of the five endings leave the other
-       * project down — a failed save, a failed release, and a relaunch that could not take the
-       * freed slot — and a pane that did not say so would leave somebody wondering why their
-       * other app went quiet.
-       * `null` is the ending where nothing moved, and only there may a sentence say so.
-       */
-      readonly stoppedHolder: string | null
-    }
 
 // ─── what a person may press ──────────────────────────────────────────────────────────────────
 
 /**
- * EXACTLY FOUR VERBS EXIST. Adding a fifth is a deliberate act at this declaration, visible in a
- * diff, and every `switch` over it fails to compile until it is handled. That is the whole
- * mechanism behind "no unreadable signal can reach a destructive verb from the client".
+ * EXACTLY TWO VERBS EXIST, AND NEITHER REACHES ANYBODY ELSE'S APP. Adding a third is a deliberate
+ * act at this declaration, visible in a diff, and every `switch` over it fails to compile until it
+ * is handled. That is the whole mechanism behind "no unreadable signal can reach a destructive
+ * verb from the client".
  */
 export type WorkspaceAction =
   | { readonly kind: 'start'; readonly label: string }
   | { readonly kind: 'retry'; readonly label: string }
-  | { readonly kind: 'go-to-project'; readonly label: string; readonly projectId: string }
-  /**
-   * TAKE THE ONE WORKSPACE BACK — and it deliberately carries NO id.
-   *
-   * The obvious payload would be the holder's `occupyingProjectId`, mirroring the member above.
-   * It is absent because the take-back does not act on the reading that produced this action: it
-   * asks THIS project's own start for the workspace, and the holder it then names comes off the
-   * server's `sandbox_reclaim_blocked` refusal — which carries the id, the name, and the `dirty`
-   * tri-state the hand-over dialog's three copy arms are chosen from, none of which a
-   * `PreviewState` has. That also makes the take-back correct in the one case a held id could not
-   * be: another tab taking the slot mid-sequence, where the refusal names the NEW holder and the
-   * reading names the old one.
-   *
-   * IT IS ALSO WHAT MAKES THE UNNAMED HELD ARM SAFE. Carrying no id means it needs no attribution
-   * to be correct: it asks for this user's own one-per-user slot, which `registry:{user_id}`
-   * scopes, so whatever is holding it is this user's own container and no third party's work is
-   * reachable from the press.
-   */
-  | { readonly kind: 'take-back'; readonly label: string }
 
 /** The person's word for the thing is their app. "Preview" is the developer's word. */
 export const LAUNCH_LABEL = 'Launch Application'
@@ -438,19 +377,17 @@ const RETRY: WorkspaceAction = { kind: 'retry', label: RETRY_LABEL }
  * `not-running` is the one to watch: it is a state name here and on the wire, and it is the exact
  * phrase the copy rule forbids on screen.
  *
- * FIVE ARE DRAWN AND ONE IS NOT. `could-not-read` is reachable only when a read decided nothing
+ * FOUR ARE DRAWN AND ONE IS NOT. `could-not-read` is reachable only when a read decided nothing
  * AND nothing had ever been decided before it — see {@link WorkspaceInputs.lastDecidedPreview}. It
- * is kept in the union deliberately rather than deleted with the other four: the surfaces that
- * special-case it — `AppPane`'s frame veto, which leaves a standing frame alone, and the Plan
- * chat's spoken set — are the reason a coordination-store blip cannot pull a running app off
- * somebody's screen.
+ * is kept in the union deliberately: the surfaces that special-case it — `AppPane`'s frame veto,
+ * which leaves a standing frame alone, and the Plan chat's spoken set — are the reason a
+ * coordination-store blip cannot pull a running app off somebody's screen.
  */
 export type WorkspaceStateName =
   | 'never-built'
   | 'not-running'
   | 'starting'
   | 'running'
-  | 'held-by-another-project'
   | 'could-not-read'
 
 export interface WorkspaceState {
@@ -461,42 +398,18 @@ export interface WorkspaceState {
   /** The line under it, or `null` when the headline is the whole of it. */
   readonly detail: string | null
   /**
-   * THE ONE A SURFACE LEADS WITH. `null` is a real answer — "nothing built" and "starting" both
-   * offer none.
+   * THE ONE THING A SURFACE MAY OFFER. `null` is a real answer — "nothing built" and "starting"
+   * both offer none, and no arm offers two: a workspace has one remedy at a time.
    *
-   * ON THE HELD ARM IT IS THE GO-TO WHENEVER THERE IS ONE, per the owner: `Open “<holder>”`, same
-   * label, same behaviour, still the thing the pane leads with. Where the server withheld the
-   * attribution there is no go-to to lead with and the take-back occupies this slot instead —
-   * which is not the swap the owner refused (that one demoted a go-to that EXISTED) but the only
-   * way a pane which draws its second control INSIDE `state.action && …` can render a lone
-   * alternative at all.
+   * OPTIONAL MEMBERS BELOW ARE MANDATORY IN THE MAP, and the asymmetry is deliberate rather than a
+   * softness. A dozen suites hand-build a `WorkspaceState` to stand a component up, and requiring
+   * every one of them to restate a null they have no opinion about buys nothing: the totality that
+   * matters is the MAP's, and `workspaceState.test.ts` pins its whole key set, so an arm that
+   * forgets a field fails a test rather than passing a compile.
    */
   readonly action: WorkspaceAction | null
   /**
-   * A SECOND THING TO PRESS, AND ONLY ONE ARM HAS EVER FILLED IT.
-   *
-   * OPTIONAL IN THE TYPE, MANDATORY IN THE MAP — and the asymmetry is deliberate rather than a
-   * softness. A dozen suites hand-build a `WorkspaceState` to stand a component up, and requiring
-   * every one of them to restate two nulls they have no opinion about buys nothing: the totality
-   * that matters is the MAP's, and `workspaceState.test.ts` pins its whole key set, so an arm that
-   * forgets either field fails a test rather than passing a compile. The same note applies to
-   * `note` and `busy` below.
-   *
-   * A SLOT RATHER THAN A LIST, and the choice is worth recording because a list was the obvious
-   * shape. Two things decided it. The pane's two controls are not peers — one is the remedy the
-   * product has always offered and the other is an alternative to it, so a surface that wants
-   * exactly the first (`PlanChatWorkspaceLine`, which renders the go-to and nothing else) reads a
-   * named field instead of searching an array and re-narrowing what it finds. And every arm of
-   * this map answers "at most one, plus at most one alternative", which an unbounded list would
-   * stop saying.
-   *
-   * NEVER FILLED WITHOUT `action`, AND `AppPane` DEPENDS ON THAT: it draws this control inside the
-   * first one's block, so a second action beside a null first would be a remedy nothing renders.
-   * Filled on the held arm, and there only where the attribution arrived.
-   */
-  readonly secondAction?: WorkspaceAction | null
-  /**
-   * ONE EXTRA LINE — WHAT THE LAST PRESS ENDED AS, AND WHAT IT DID TO SOMEBODY ELSE.
+   * ONE EXTRA LINE — WHAT THE LAST PRESS ENDED AS.
    *
    * IT IS THE FIELD THE NEGATIVE-COPY SWEEP EXEMPTS, AND THAT IS WHY SERVER PROSE RIDES HERE
    * rather than in `detail`. The sweep forbids the pane describing this app by what it is not —
@@ -506,11 +419,7 @@ export interface WorkspaceState {
    * in `detail` and one refusal containing the words "not running" turns a green suite red on a
    * string this client does not control.
    *
-   * TWO SUBJECTS, ONE FIELD, AND THE ORDER IS LOAD-BEARING. The map's own sentence about the OTHER
-   * project goes first because it is properly terminated; server prose has no punctuation contract
-   * at all, so leading with it would run the two together.
-   *
-   * `null` on every arm where no press has ended and nothing was done to anybody.
+   * `null` on every arm where no press has ended.
    */
   readonly note?: string | null
   /**
@@ -530,9 +439,9 @@ export interface WorkspaceState {
    * TRUE ON EXACTLY ONE ARM. `could-not-read` is pointedly not busy — a read that failed is not
    * work in progress — and neither is an at-rest arm carrying a finished press's note.
    *
-   * OPTIONAL IN THE TYPE, MANDATORY IN THE MAP, for the reason `secondAction` states above: the
-   * suites that hand-build a state must not have to restate a `false` they have no opinion about,
-   * and `workspaceState.test.ts` pins the map's whole key set so an arm that forgets it goes red.
+   * OPTIONAL IN THE TYPE, MANDATORY IN THE MAP, for the reason `action` states above: the suites
+   * that hand-build a state must not have to restate a `false` they have no opinion about, and
+   * `workspaceState.test.ts` pins the map's whole key set so an arm that forgets it goes red.
    * IT IS ALSO COMPARED BY {@link sameWorkspaceState} — a field this map can change and that
    * comparator cannot see is a pane that never re-renders, with nothing red anywhere.
    */
@@ -570,7 +479,6 @@ const STATE_FIELD_EQ: {
   note: (a, b) => (a ?? null) === (b ?? null),
   busy: (a, b) => (a ?? false) === (b ?? false),
   action: (a, b) => sameAction(a, b),
-  secondAction: (a, b) => sameAction(a ?? null, b ?? null),
 }
 
 /** The field names the comparator covers — the test's totality pin reads this rather than a
@@ -595,16 +503,7 @@ export const sameWorkspaceState = (a: WorkspaceState, b: WorkspaceState): boolea
   )
 
 const sameAction = (a: WorkspaceAction | null, b: WorkspaceAction | null): boolean =>
-  a === b ||
-  (a !== null &&
-    b !== null &&
-    a.kind === b.kind &&
-    a.label === b.label &&
-    // Only `go-to-project` carries one, and comparing it on the arms that do not is `undefined`
-    // against `undefined` — true, which is the right answer for them. `take-back` deliberately
-    // carries no id of its own (see the union), so it is covered by that same comparison, and its
-    // holder is inside the label anyway: a different holder is a different sentence.
-    (a as { projectId?: string }).projectId === (b as { projectId?: string }).projectId)
+  a === b || (a !== null && b !== null && a.kind === b.kind && a.label === b.label)
 
 // ─── the inputs ───────────────────────────────────────────────────────────────────────────────
 
@@ -678,21 +577,12 @@ export interface WorkspaceInputs {
  *     that a container was scheduled — which is why the arms that used to hedge against it are
  *     gone.
  *  5. `starting` → BUILDING. Something under way, nothing proven to be serving.
- *  6. `slot_taken` → HELD. This outranks a start outcome deliberately: another project holding the
- *     workspace offers the REMEDY, never a plain retry, and a retry against an occupied slot can
- *     only fail the same way again. ONE ENDING IS CARRIED ACROSS IT RATHER THAN OUTRANKED, and it
- *     is not an exception to that rule but the same rule read properly: `take-back-failed`
- *     describes a press made FROM this arm, against this holder, so it is not a stale fact about
- *     some earlier attempt — it is what just happened here.
- *  7. `asleep` / `never_built` → SAVED or NEW, resolved against whether anything can be brought
- *     back.
+ *  6. `slot_taken` / `asleep` / `never_built` → SAVED or NEW, resolved against whether anything can
+ *     be brought back. `slot_taken` shares that arm rather than having one of its own — see the
+ *     case below for why the citizen's own other project holding the slot is not a negotiation.
  *
- * A START OUTCOME SELECTS NO ARM OF ITS OWN, and that is the change. It contributes a `note` — the
- * server's words about a press the citizen made — to whichever arm the READING chose. Three cards
- * went away with that: "your app is up, but it has not served a page yet" and "your app did not
- * answer in time" were sentences about a fetch rather than about a workspace, and "we could not
- * start your app" was the same situation as "your app is saved" wearing a different shape and
- * inviting a different gesture.
+ * A START OUTCOME SELECTS NO ARM OF ITS OWN. It contributes a `note` — the server's words about a
+ * press the citizen made — to whichever arm the READING chose.
  *
  * A SERVER STATE THIS CLIENT DOES NOT RECOGNISE never reaches here: `asPreviewLifeState` narrows it
  * to `unknown` at the wire, which resolves to the last decided reading — never to a confident
@@ -721,14 +611,17 @@ export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
         // from a press that has since succeeded is worse than noise.
         detail: null,
         action: null,
-        secondAction: null,
         note: null,
         busy: false,
       }
     case 'starting':
       return gettingReady(note)
+    // ANOTHER OF THIS CITIZEN'S PROJECTS HOLDS THE SLOT, AND THAT IS NOT A QUESTION FOR THEM.
+    // Pressing start takes the workspace: the server starts the project that was asked for and
+    // tears the outgoing one down behind it. So this reads exactly as a saved, stopped app does —
+    // the same sentence and the same one control — and it names no other project, because a tab
+    // whose container was taken by a switch made elsewhere has no cause to name.
     case 'slot_taken':
-      return heldElsewhere(reading, startOutcome)
     case 'asleep':
     case 'never_built':
       return atRest(reading, projectHasSavedBuild, note)
@@ -740,16 +633,16 @@ export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
 /**
  * WHAT THE LAST PRESS ENDED AS, AS ONE LINE — or `null` when it left nothing worth saying.
  *
- * TWO OF THE FOUR ENDINGS SAY NOTHING, AND THAT IS THE POINT rather than an omission.
+ * TWO OF THE THREE ENDINGS SAY NOTHING, AND THAT IS THE POINT rather than an omission.
  * `not-painted` is "the container is up and has not served a page yet", which is the DEFINITION of
  * the wait the citizen is already sitting in — the serving stamp is empty, so the next read
  * answers `starting` and the wait says it properly, with one author. `timed-out` is a fact about a
  * fetch that did not come back; it is not evidence about the container, and inventing a sentence
  * out of it is how a guess about a duration reached a screen in the first place.
  *
- * THE OTHER TWO CARRY SERVER PROSE VERBATIM. Rewriting it would put a second author on a sentence
+ * THE THIRD CARRIES SERVER PROSE VERBATIM. Rewriting it would put a second author on a sentence
  * that already has one and lose the only specific thing we know. See {@link WorkspaceState.note}
- * for why it rides in that field rather than in `detail`, and why the map's own sentence leads.
+ * for why it rides in that field rather than in `detail`.
  */
 function pressNote(outcome: StartOutcome | null): string | null {
   if (outcome === null) return null
@@ -759,94 +652,8 @@ function pressNote(outcome: StartOutcome | null): string | null {
       return null
     case 'failed':
       return outcome.reason
-    case 'take-back-failed':
-      // Reached with a holder only from the ending that stopped one. A take-back whose very first
-      // ask failed never got that far, and says nothing it did not do.
-      return outcome.stoppedHolder
-        ? `“${outcome.stoppedHolder}” was stopped. ${outcome.reason}`
-        : outcome.reason
     default:
       return assertNever(outcome)
-  }
-}
-
-/**
- * ONE HELD STATE, TWO SENTENCES — the merge, and what it deliberately does NOT change.
- *
- * With a name and an id: name the project and offer the two ways out of it. Without them: say that
- * another project holds the workspace and NAME NONE. That withholding is a first-class wire state,
- * not a bug to paper over — the server declines to attribute a container it cannot map to a project
- * this person owns, because naming the wrong project in a sentence about somebody's work is worse
- * than naming none. The failure this arm is written against is a sentence with an empty pair of
- * quotes in it, which is what a template does when it trusts the name to be there.
- *
- * IT USED TO BE TWO STATES AND THE SECOND ONE WAS A DEAD END. `held-unattributed` offered `action`
- * and `secondAction` both null: a card that named the problem, named no remedy, and left the
- * citizen with nothing to press at all. A missing holder name is a reason to say less, not a
- * reason to DO less, so the merge keeps the affordance and degrades only the sentence.
- *
- * THE TAKE-BACK IS SAFE WITHOUT A NAME, and this is the reasoning it rests on rather than a
- * softening of the old arm's caution. That caution said agreeing to stop an app the platform
- * cannot identify is agreeing to something unbounded. It is not: the registry key is
- * `registry:{user_id}`, so the only thing that can be in this user's one slot is this user's own
- * container — a ghost in it is their own, and there is no third party whose work the press could
- * reach. The label degrades with the sentence and names the holder when there is one to name.
- *
- * WHICH SLOT EACH CONTROL TAKES, AND WHY IT IS NOT THE SWAP THAT WAS REFUSED. `action` is the go-to
- * whenever there is a go-to, exactly as before — `PlanChatWorkspaceLine` narrows on
- * `action.kind === 'go-to-project'` and never reads `secondAction`, so moving the go-to down would
- * leave the one surface whose whole job is to send somebody elsewhere rendering a card with no
- * button on it. On the unattributed arm there is no go-to at all, and `AppPane` draws the second
- * control INSIDE the first one's block, so a take-back parked in `secondAction` there would be a
- * remedy nothing renders. It leads because it is the only one, not because it was promoted.
- *
- * AND THE TAKE-BACK CARRIES NO ID FROM HERE.
- *
- * `occupyingProjectId` is in hand and is deliberately NOT put on it — see the union. The take-back
- * asks this project's own start for the workspace and takes the holder off the server's refusal,
- * which is fresher than this reading and carries the `dirty` tri-state the hand-over dialog needs
- * and a `PreviewState` does not have.
- */
-function heldElsewhere(preview: PreviewState, startOutcome: StartOutcome | null): WorkspaceState {
-  const { occupyingProjectName: name, occupyingProjectId: id } = preview
-  // WHAT A TAKE-BACK JUST DID, when it did not finish — endings 1, 3 and 4. All three land
-  // back here — the slot is still held — and they are told apart by one fact: whether the holder
-  // is down. Any other start outcome is still outranked, exactly as before.
-  const failure = startOutcome?.kind === 'take-back-failed' ? startOutcome : null
-  // THE ATTRIBUTION IS ALL OR NOTHING, and the wire says so: the name and the id go missing
-  // together, because the server withholds the whole attribution rather than guessing at half of
-  // it. Half an attribution can neither label a navigation nor route one, so it is read as none.
-  const attributed = name !== null && id !== null
-  const standing = attributed
-    ? 'You have one workspace at a time. Open that application to pick up where you left off.'
-    : 'You have one workspace at a time, and we could not tell which application has it.'
-  return {
-    name: 'held-by-another-project',
-    headline: attributed
-      ? `“${name}” is using your workspace.`
-      : 'Another application is using your workspace.',
-    // THE SERVER'S OWN WORDS WHEN A TAKE-BACK JUST FAILED, and the standing sentence otherwise.
-    // Ending 1's prose is `buildSessionApi.ts`'s ceiling sentence — "still saving its work.
-    // Nothing has changed…" — which is authored there, is true only there, and is carried
-    // verbatim rather than restated. That is also why nothing here writes a "nothing has changed"
-    // of its own: on the save-failed and release-failed endings it would be a lie.
-    detail: failure ? failure.reason : standing,
-    // UNCHANGED, PER THE OWNER: same label, same behaviour, still the thing the pane leads with —
-    // wherever there is a project to lead to.
-    action: attributed
-      ? { kind: 'go-to-project', label: `Open “${name}”`, projectId: id }
-      : { kind: 'take-back', label: 'Stop the other application and open this one instead' },
-    secondAction: attributed
-      ? { kind: 'take-back', label: `Stop “${name}” and open this app instead` }
-      : null,
-    // THE HOLDER IS DOWN AND THE SLOT IS STILL HELD, which is a pair of facts nobody would guess
-    // from the headline alone — it says the other project is USING the workspace, and it is,
-    // without anything running in it. Said in one sentence rather than left for the citizen to
-    // discover by opening the other project and finding it stopped.
-    note: failure?.stoppedHolder
-      ? `“${failure.stoppedHolder}” was stopped, and it still holds your workspace.`
-      : null,
-    busy: false,
   }
 }
 
@@ -884,7 +691,6 @@ function atRest(
       headline: 'Your app is saved.',
       detail: 'It stays running while you work, so you only do this once.',
       action: START,
-      secondAction: null,
       note,
       busy: false,
     }
@@ -896,7 +702,6 @@ function atRest(
     headline: 'Describe what you want to build.',
     detail: 'Your app will appear here as it takes shape.',
     action: null,
-    secondAction: null,
     note,
     busy: false,
   }
@@ -945,7 +750,6 @@ function gettingReady(note: string | null): WorkspaceState {
     headline: 'Getting your app ready.',
     detail: 'Setting up somewhere for it to run.',
     action: null,
-    secondAction: null,
     // WHY A WAIT MAY CARRY A REFUSAL. A press refused while a start really was in flight — the
     // server answering `BUILD_ALREADY_RUNNING` to somebody pressing Launch during a build — is a
     // question the citizen asked and is owed an answer to, and the honest answer does not change
@@ -980,7 +784,6 @@ function couldNotRead(): WorkspaceState {
     headline: 'We could not check on your app.',
     detail: 'Nothing has changed while we were asking.',
     action: RETRY,
-    secondAction: null,
     note: null,
     busy: false,
   }

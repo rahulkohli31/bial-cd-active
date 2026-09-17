@@ -4,7 +4,7 @@
  * The shell's ROUTING claim — that the same element survives a move between the two addresses —
  * is `src/App.test.jsx`'s, because it is a claim about the route table and a hand-built table
  * here would prove the component instead of the wiring. This file has everything the shell does
- * once mounted: the height model, the grid, the reclaim slot, and above all the channel's rules.
+ * once mounted: the height model, the grid, and above all the channel's rules.
  *
  * Two rules give the channel teeth: a publish must not wake a subscriber that did not care, and
  * whether a payload survives its publisher's unmount is decided per payload — the table in
@@ -18,10 +18,10 @@ import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import WorkspaceShell from '../WorkspaceShell'
 import {
+  createWorkspaceChannel,
   useAppPaneVisible,
   usePublishAddress,
   usePublishPaneView,
-  usePublishReclaim,
   usePublishSaveState,
   useWorkspaceAddress,
   useWorkspaceChannel,
@@ -30,9 +30,7 @@ import {
   useWorkspaceProject,
   useWorkspaceSaveState,
   type PaneView,
-  type ReclaimRequest,
 } from '../workspaceChannel'
-import type { ReclaimBlocked } from '../../../utils/buildSessionApi'
 
 /**
  * Mount `child` as the shell's outlet content, the way a route element is. Every probe below
@@ -167,41 +165,25 @@ describe('WorkspaceShell — the grid is the shell\'s own', () => {
   })
 })
 
-describe('WorkspaceShell — the reclaim dialog is mounted here, its handlers stay with the publisher', () => {
-  const blocked: ReclaimBlocked = {
-    projectId: 'p-other', projectName: 'Other Project', dirty: true, building: false, agentWorking: false,
-    isSharedView: false,
-  }
-
-  function SurfaceWithRefusal({ onResolve }: { onResolve: (save: boolean) => Promise<void> }) {
-    const [request, setRequest] = useState<ReclaimRequest | null>(null)
-    usePublishReclaim(request)
-    return (
-      <button
-        type="button"
-        onClick={() => setRequest({ blocked, startingProjectName: 'Visitor Log', step: null, resolve: onResolve, cancel: () => setRequest(null) })}
-      >
-        refuse
-      </button>
-    )
-  }
-
-  it('opens from the channel and routes its answer back to the surface that was refused', async () => {
-    // Only the OPEN STATE travels — stopping, saving, and retrying stay with the surface that
-    // made the call, so the shell is never a second authority on a refusal that already has one.
-    const onResolve = vi.fn().mockResolvedValue(undefined)
-    renderShell(<SurfaceWithRefusal onResolve={onResolve} />)
+/**
+ * ★ WHAT THIS DESCRIBE PINS, INVERTED RATHER THAN DELETED: the shell used to mount a dialog that
+ * asked the citizen which of their own two projects should keep the one workspace. The server now
+ * gives the workspace to whichever project was asked for, so there is no question to put and
+ * nothing here to mount it with.
+ */
+describe('WorkspaceShell — no dialog is mounted here at all', () => {
+  it('★ the shell has no modal slot, and none appears however a surface publishes', () => {
+    renderShell(<div data-testid="surface" />)
 
     expect(screen.queryByRole('dialog')).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'refuse' }))
+    // LIVENESS: the shell really rendered, so an empty tree cannot green this.
+    expect(screen.getByTestId('surface')).toBeTruthy()
+  })
 
-    const dialog = await screen.findByRole('dialog')
-    expect(dialog.textContent).toMatch(/Other Project/)
-    // …and the STARTING project too, so the dialog can name whose changes are lost.
-    expect(dialog.textContent).toMatch(/Visitor Log/)
-
-    fireEvent.click(screen.getByRole('button', { name: /stop “Other Project” without saving/i }))
-    expect(onResolve).toHaveBeenCalledWith(false)
+  it('★ and the channel carries no slot one could be published into', () => {
+    // Asserted on the channel itself rather than on a render: a cell that still existed would let
+    // any surface put a modal back over the pane without a single component changing.
+    expect(Object.keys(createWorkspaceChannel())).not.toContain('reclaim')
   })
 })
 

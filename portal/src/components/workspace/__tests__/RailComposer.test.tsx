@@ -426,7 +426,6 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
       }),
       onStartOutcome: vi.fn(),
       onRefresh: vi.fn(),
-      onReclaimRefusal: vi.fn(),
     }
     channel.workspace.set(report)
     return {

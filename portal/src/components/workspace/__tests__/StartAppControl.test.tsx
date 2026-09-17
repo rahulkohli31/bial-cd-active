@@ -36,7 +36,6 @@ function reportSpy(over: Partial<WorkspaceReport> = {}): WorkspaceReport {
     onStartPending: vi.fn(),
     onStartOutcome: vi.fn(),
     onRefresh: vi.fn(),
-    onReclaimRefusal: vi.fn(),
     ...over,
   }
 }
@@ -161,41 +160,71 @@ describe('a start that did not end in a running app says which way it ended', ()
   })
 })
 
-describe('the two 409s stay apart — one status, two causes, two remedies', () => {
-  it('★ routes a reclaim refusal to the ONE dialog, not to a retry', async () => {
-    const err = new ApiError('another project', 409, 'sandbox_reclaim_blocked')
-    Object.assign(err, { details: { projectId: 'p-other', projectName: 'Car pool apps', dirty: true } })
-    api.relaunchPreview.mockRejectedValue(err)
+describe('★ no refusal opens a question — the 409s are sentences, not dialogs', () => {
+  /** The server's refusal, with whichever `isSharedView` the body carried. */
+  const refusal = (isSharedView: boolean) => {
+    const err = new ApiError('“Car pool apps” is open for a colleague right now.', 409, 'sandbox_reclaim_blocked')
+    Object.assign(err, {
+      details: { projectId: 'p-other', projectName: 'Car pool apps', dirty: true, isSharedView },
+    })
+    return err
+  }
+
+  it('★ a colleague`s shared view is stated in the server`s own words, with nothing to press', async () => {
+    // Pressing start cannot move a shared view — the server refuses it whatever the citizen
+    // answers — so a dialog offering to hand it over would be a question with no true answer.
+    api.relaunchPreview.mockRejectedValue(refusal(true))
     const report = reportSpy()
-    renderControl(START, report)
+    const { container } = renderControl(START, report)
     fireEvent.click(button())
 
-    await waitFor(() => expect(report.onReclaimRefusal).toHaveBeenCalled())
-    expect(report.onStartOutcome).not.toHaveBeenCalled()
-    const [blocked] = (report.onReclaimRefusal as ReturnType<typeof vi.fn>).mock.calls[0]
-    expect(blocked).toMatchObject({ projectId: 'p-other', projectName: 'Car pool apps' })
+    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalled())
+    expect(report.onStartOutcome).toHaveBeenCalledWith({
+      kind: 'failed',
+      reason: '“Car pool apps” is open for a colleague right now.',
+    })
+    expect(container.querySelector('[role="dialog"]')).toBeNull()
   })
 
-  it('does NOT route your own running build to that dialog', async () => {
-    // Different cause, different remedy — finish or stop it, versus save or switch that project.
-    // Merging them would put a Save button in front of somebody it cannot help.
+  it('★ and a refusal claiming it is NOT a shared view renders no dialog either', async () => {
+    // The switch means this citizen's own project can no longer refuse the call, so this body is
+    // the server contradicting itself. It is reported as an ordinary start failure; what must not
+    // happen is a question being put to somebody about a conflict that should not exist.
+    api.relaunchPreview.mockRejectedValue(refusal(false))
+    const report = reportSpy()
+    const { container } = renderControl(START, report)
+    fireEvent.click(button())
+
+    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalled())
+    expect((report.onStartOutcome as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+      kind: 'failed',
+    })
+    expect(container.querySelector('[role="dialog"]')).toBeNull()
+  })
+
+  it('your own running build keeps its own sentence, not the server`s wire words', async () => {
+    // Different cause, different remedy — finish or stop that build.
     api.relaunchPreview.mockRejectedValue(new BuildSessionAlreadyActiveError('already', 's-1'))
     const report = reportSpy()
     renderControl(START, report)
     fireEvent.click(button())
 
     await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalled())
-    expect(report.onReclaimRefusal).not.toHaveBeenCalled()
+    expect(report.onStartOutcome).toHaveBeenCalledWith({
+      kind: 'failed',
+      reason: 'A build is already running in this application.',
+    })
   })
 
-  it('does not treat an uncoded 409 as the reclaim refusal', async () => {
+  it('an uncoded 409 is an ordinary failure too', async () => {
     api.relaunchPreview.mockRejectedValue(new ApiError('conflict', 409))
     const report = reportSpy()
     renderControl(START, report)
     fireEvent.click(button())
 
-    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalled())
-    expect(report.onReclaimRefusal).not.toHaveBeenCalled()
+    await waitFor(() =>
+      expect(report.onStartOutcome).toHaveBeenCalledWith({ kind: 'failed', reason: 'conflict' }),
+    )
   })
 })
 
@@ -265,7 +294,7 @@ describe('marked unavailable, never disabled', () => {
   })
 })
 
-describe('the other two verbs, and the one that does not exist', () => {
+describe('the second verb, and the ones that do not exist', () => {
   it('a retry clears the last outcome before asking again', async () => {
     // Without the clear, a second failure of the same kind leaves the sentence unchanged and the
     // press looks like it did nothing.
@@ -277,24 +306,26 @@ describe('the other two verbs, and the one that does not exist', () => {
     await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalled())
   })
 
-  it('the go-to action navigates and starts NOTHING', async () => {
-    const report = reportSpy()
-    renderControl({ kind: 'go-to-project', label: 'Open “Roster”', projectId: 'p-other' }, report)
-    fireEvent.click(button())
+  it('★ neither verb leaves this project — nothing here navigates anywhere', async () => {
+    // Both members ask THIS project's own start. A control that could send somebody to another
+    // project is how a workspace sentence turns back into an arbitration.
+    for (const action of [START, RETRY]) {
+      const report = reportSpy()
+      renderControl(action, report)
+      fireEvent.click(button())
 
-    await waitFor(() => expect(screen.getByTestId('path').textContent).toBe('/projects/p-other'))
-    expect(api.relaunchPreview).not.toHaveBeenCalled()
+      await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalled())
+      expect(screen.getByTestId('path').textContent).toBe('/projects/p1')
+      cleanup()
+      api.relaunchPreview.mockClear()
+    }
   })
 
   it('★ names no destructive verb, in any action, in any state', async () => {
-    // The type is the enforcement — three members, none destructive — but a LABEL can still say a
-    // dangerous word, and this is what catches that.
+    // The type is the enforcement — two members, neither destructive — but a LABEL can still say
+    // a dangerous word, and this is what catches that.
     const destructive = /\b(restore|rebuild|reset|delete|destroy|tear down|discard|wipe|erase)\b/i
-    const actions: WorkspaceAction[] = [
-      START,
-      RETRY,
-      { kind: 'go-to-project', label: 'Open “Roster”', projectId: 'p-other' },
-    ]
+    const actions: WorkspaceAction[] = [START, RETRY]
     for (const action of actions) {
       const { container } = renderControl(action, reportSpy())
       expect(container.textContent ?? '').not.toMatch(destructive)

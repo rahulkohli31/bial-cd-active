@@ -18,7 +18,7 @@ import { validatePrompt } from '../../utils/promptGuardrails'
 import type { PromptViolation } from '../../utils/promptGuardrails'
 import { uuidv7 } from '../../utils/conversationApi'
 import { chatKindFor } from '../../utils/chatKind'
-import { asReclaimBlocked, relaunchPreview } from '../../utils/buildSessionApi'
+import { relaunchPreview } from '../../utils/buildSessionApi'
 import { ApiError } from '../../utils/apiError'
 import { useWorkspaceReport } from './workspaceChannel'
 import Composer from '../chat/Composer'
@@ -169,9 +169,9 @@ function RailComposerBody({ projectId }: RailComposerProps) {
         })
       }
 
-      // NOTHING TO ASK FOR WITHOUT A REPORT. A rail rendered outside a workspace has no channel to
-      // route a refusal onto and no pane to start anything into; opening the chat is then the same
-      // behaviour this surface has always had.
+      // NOTHING TO ASK FOR WITHOUT A REPORT. A rail rendered outside a workspace has no pane to
+      // start anything into; opening the chat is then the same behaviour this surface has always
+      // had.
       if (!report) {
         open()
         return
@@ -207,18 +207,6 @@ function RailComposerBody({ projectId }: RailComposerProps) {
           report.onStartOutcome(res.ready ? null : { kind: 'not-painted' })
           open()
         } catch (err) {
-          // DISCRIMINATED ON THE CODE. Another project holding the one workspace is a QUESTION
-          // with a remedy; everything else is a failure to report.
-          const blocked = asReclaimBlocked(err)
-          if (blocked) {
-            // The retry is this whole function again — start, then open — so a transfer that
-            // succeeds lands the citizen in the chat their message was typed for, exactly once.
-            report.onReclaimRefusal(blocked, attempt)
-            // REJECTS, so the composer keeps everything. SILENT for the same reason as the
-            // guardrail above: the dialog is the explanation, and a line under the composer
-            // repeating it in weaker words is noise over the top of it.
-            throw new SendRefusal('the workspace is held by another application', { silent: true })
-          }
           // NOTHING SAVED TO BRING BACK IS NOT A FAILED SEND. Asking for the workspace
           // is how this surface poses the one-workspace question, but a project that has never been
           // built has nothing to restore: the server's snapshot gate answers 404 by design — there
@@ -232,10 +220,6 @@ function RailComposerBody({ projectId }: RailComposerProps) {
           // a chat onto it too, which then failed a beat later with nothing left to blame. Only
           // the snapshot gate carries `no_saved_build`; every other 404 is a real failure and is
           // reported as one.
-          //
-          // THE QUESTION IS STILL ASKED FIRST, which is why this is a mapping and not a skipped
-          // preflight. The server refuses a held workspace ABOVE the snapshot gate, so a brand-new
-          // project's first message still meets the dialog before any address changes.
           if (err instanceof ApiError && err.status === 404 && err.code === 'no_saved_build') {
             open()
             return

@@ -14,7 +14,6 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { ChevronRight } from 'lucide-react'
 import { memo, useCallback, useEffect, useLayoutEffect, useState, type CSSProperties } from 'react'
 import { useNavReveal } from '../layout/NavReveal'
-import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
 import AppPane from './AppPane'
 import RailResizeHandle from './RailResizeHandle'
 import WorkspaceToolbar from './WorkspaceToolbar'
@@ -30,7 +29,6 @@ import {
   useWorkspaceChannel,
   useWorkspaceHeading,
   useWorkspacePaneVisible,
-  useWorkspaceReclaim,
 } from './workspaceChannel'
 
 /**
@@ -77,29 +75,6 @@ function railWidthClass(collapsed: boolean, paneVisible: boolean): string {
   if (!paneVisible) return 'flex-1 bg-white'
   // Stacked below the threshold (`flex-1`, sharing the column), the citizen's own width above it.
   return 'flex-1 wide:flex-none wide:w-[var(--rail-w)]'
-}
-
-/**
- * The cross-project reclaim dialog, mounted at shell level.
- *
- * Its open state travels on the channel; the CLASSIFICATION stays exactly where it is, on the
- * surface that made the call that was refused. Nothing here inspects a refusal or classifies one —
- * a bare 409 is not self-describing, and a second competing classifier is how the reclaim path
- * loses its one authority.
- */
-function ReclaimSlot() {
-  const reclaim = useWorkspaceReclaim()
-  if (!reclaim) return null
-  return (
-    <ReclaimWorkspaceDialog
-      blocked={reclaim.blocked}
-      startingProjectName={reclaim.startingProjectName}
-      step={reclaim.step}
-      onSaveAndSwitch={() => reclaim.resolve(true)}
-      onSwitchAnyway={() => reclaim.resolve(false)}
-      onCancel={reclaim.cancel}
-    />
-  )
 }
 
 /**
@@ -195,7 +170,6 @@ function ShellFrame() {
 
   return (
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
-      <ReclaimSlot />
       {/* ONE TOOLBAR ROW, DRAWN ONCE, ABOVE THE GRID — so it survives a collapse of the rail it
           used to live inside, and so it is a single element across a project↔chat move rather
           than three headers that appear and disappear. */}

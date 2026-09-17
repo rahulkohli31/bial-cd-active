@@ -345,17 +345,17 @@ describe('the per-conversation guardrail reaches the composer', () => {
   })
 })
 
-describe('the offer\'s Build reaches the SAME hand-over dialog as the composer', () => {
-  it('opens the shell\'s dialog naming both projects, in citizen language', async () => {
-    // THE THIRD DOOR: three presses can be refused because another project holds the one
-    // workspace — a rail send, the pane's start control, and this one — and this is the one of
-    // the three with no coverage elsewhere, proving it converges on the SAME dialog rather than
-    // degrading silently.
+describe('the offer\'s Build opens no question either', () => {
+  it('★ reports a refusal in the server\'s own words, and puts nothing up to be answered', async () => {
+    // THE THIRD DOOR: three presses can meet a refusal about the one workspace — a rail send, the
+    // pane's start control, and this one — and this is the one of the three with no coverage
+    // elsewhere. What it proves is that it degrades the same way they do: a sentence, not a
+    // dialog, because the workspace follows whichever project asked for it.
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Here is the plan.', PLAN_CARD_ID)))
     h.buildFromPlan.mockRejectedValue(
-      Object.assign(new Error('“Car pool” is still open.'), {
+      Object.assign(new Error('“Car pool” is open for a colleague right now.'), {
         code: 'sandbox_reclaim_blocked',
-        details: { projectId: 'pA', projectName: 'Car pool', dirty: false, building: false },
+        details: { projectId: 'pA', projectName: 'Car pool', dirty: false, building: false, isSharedView: true },
       }),
     )
     renderBuilder({ deps: deps().deps })
@@ -363,15 +363,12 @@ describe('the offer\'s Build reaches the SAME hand-over dialog as the composer',
 
     fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
 
-    const dialog = await screen.findByRole('dialog')
-    const text = dialog.textContent ?? ''
-    // The SAME two names the rail's own scenario asserts (HandoverAtSubmit.test.tsx): the app
-    // being started leads, and the one in the way is named so the choice is about something.
-    expect(text).toContain('VIP Movement')
-    expect(text).toContain('Car pool')
-    for (const word of [/container/i, /sandbox/i, /workspace slot/i, /session/i, /409/]) {
-      expect(text, String(word)).not.toMatch(word)
-    }
+    // The server's sentence reaches the citizen where they are standing…
+    await waitFor(() =>
+      expect(screen.getByRole('alert').textContent).toContain('“Car pool” is open for a colleague right now.'),
+    )
+    // …and nothing was put to them to decide.
+    expect(screen.queryByRole('dialog')).toBeNull()
   })
 })
 
