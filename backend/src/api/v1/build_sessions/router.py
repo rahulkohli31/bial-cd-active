@@ -56,6 +56,9 @@ from src.api.v1.build_sessions.schemas import (
     PromoteParkedResponse,
     RelaunchPreviewRequest,
     RelaunchPreviewResponse,
+    RenewalOutcome,
+    RenewPresenceRequest,
+    RenewPresenceResponse,
     SharedPreviewResponse,
     StopBuildRequest,
     StopBuildResponse,
@@ -85,6 +88,7 @@ from src.services.build_sessions import (
     app_name_for,
     sweep_all,
 )
+from src.services.build_sessions.locks import renew_presence_stay
 from src.services.build_sessions.snapshot import (
     ParkedTreeNotOursError,
     list_parked_trees,
@@ -512,8 +516,14 @@ async def build_events(
 # `_renew_and_state` helper: the portal's keep-alive loop that was their only caller was
 # itself deleted, and a route with no caller is not neutral — it reads as a supported way to
 # hold the lock, and the next person needing one would have wired the loop straight back.
-# What holds a turn open now is the wall-clock lease the SERVER renews, legible to a sweep
-# in another process, which a browser timer never was.
+# What holds a TURN open is the wall-clock lease the SERVER renews, legible to a sweep in
+# another process, which a browser timer never was.
+#
+# What holds a CONTAINER open, between turns, is a browser timer again — `projects/{project_id}/
+# renew` below. The difference that makes it safe is the absolute age ceiling: the retired lock
+# ops had no bound at all, so a tab that would not stop renewing made a container unreclaimable,
+# and the renewal here cannot push past the ceiling `reaper.py` evaluates in both sparing arms.
+# It renews the preview's stay and nothing else — never the lock, never the heartbeat.
 #
 # `force-end` was the last one standing and it has now gone the same way, its client exports
 # with it. The kill switch a citizen actually reaches is
@@ -1191,6 +1201,71 @@ async def workspace_check(
         return WorkspaceCheckResponse(state=WorkspaceState.UNREADABLE, reverted=False)
     state = await manager.project_workspace_check(db, user, project_id, sandbox_client=sandbox)
     return WorkspaceCheckResponse(state=state, reverted=state is WorkspaceState.REVERTED)
+
+
+@router.post(
+    "/projects/{project_id}/renew",
+    response_model=RenewPresenceResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        AUTH_401,
+        (403, ErrorEnvelope, "CSRF check failed"),
+        (404, ErrorEnvelope, "Project not found"),
+        (503, ErrorEnvelope, "Build coordination is temporarily unavailable"),
+    ),
+)
+async def renew_presence(
+    project_id: uuid.UUID,
+    body: RenewPresenceRequest,
+    user: CurrentUser,
+    db: DbSession,
+) -> RenewPresenceResponse:
+    """A screen that can frame this project is still open; hold its container.
+
+    PRESENCE IS THE SIGNAL, AND SILENCE IS DEPARTURE. Nothing is sent when a citizen leaves —
+    navigating away, closing the tab, sleeping the machine and losing the network all simply stop
+    the renewals, so all four are one event with no code of their own and nothing that can fail to
+    arrive. What remains is a short stay that lapses, which is what a departure was always meant
+    to produce.
+
+    A POST, WITH CSRF, for the same reason `workspace-check` is one: it is not a free read. It
+    writes a deadline onto coordination state, and a deadline a third-party page could push
+    forward from a citizen's browser is a deadline an attacker can use to run up a bill.
+
+    THE CONTAINER IS NEVER NAMED ON THE WIRE. The server resolves which container this project
+    owns from its own app row — `app_name_for` is the same forward mapping the sandbox is named
+    by — and the write is refused inside Redis when the record names anything else. A caller that
+    could supply a name could hold somebody else's container open.
+
+    200 ON ALL THREE OUTCOMES. `not_this_container` is the ordinary reading a moment after
+    somebody opens a second project, and `nothing_running` is what a screen polling through a
+    teardown sees; neither is an error, and neither is something to show anybody. A lease that
+    genuinely lapsed reaches the citizen through `preview-state`, which is the one route allowed
+    to say a preview is gone."""
+    await owned_project_or_404(db, user.id, project_id)
+    # Owner AND project in the predicate, for the reason `report_client_error` states: the
+    # second clause is what keeps this scoped if the query is ever moved somewhere that has not
+    # already refused another user's project.
+    app_id = (
+        await db.execute(
+            sa.select(AppRegistry.id).where(
+                AppRegistry.project_id == project_id, AppRegistry.user_id == user.id
+            )
+        )
+    ).scalar_one_or_none()
+    if app_id is None:
+        # No app row means nothing was ever built for this project, so there is no container a
+        # surface could be holding open. A 404 would be wrong — the PROJECT exists and is theirs.
+        return RenewPresenceResponse(outcome=RenewalOutcome.NOTHING_RUNNING)
+    with build_coordination_or_503():
+        outcome, stay_until = await renew_presence_stay(
+            get_redis(),
+            user.id,
+            app_name=app_name_for(app_id),
+            presence=body.presence,
+        )
+        return RenewPresenceResponse(outcome=outcome, stay_until=stay_until)
+    raise _coordination_is_gone()
 
 
 @router.get(

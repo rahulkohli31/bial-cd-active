@@ -46,13 +46,17 @@ from redis.exceptions import RedisError
 
 from src.api.v1.build_sessions.schemas import (
     HEARTBEAT_TTL_SECONDS,
+    HIDDEN_SURFACE_PRESENT_STAY_SECONDS,
     LIVENESS_LEASE_CLOCK_SKEW_GRACE_SECONDS,
     LIVENESS_LEASE_TTL_SECONDS,
     LOCK_TTL_SECONDS,
     RELAUNCH_PREVIEW_STAY_SECONDS,
     SERVED_TRAFFIC_STAY_SECONDS,
     STARTING_MARKER_TTL_SECONDS,
+    SURFACE_PRESENT_STAY_SECONDS,
     TURN_ENDED_UNCHANGED_STAY_SECONDS,
+    RenewalOutcome,
+    SurfacePresence,
 )
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
@@ -382,9 +386,11 @@ class DeadlineWriter(enum.StrEnum):
     #: Requests the generated app actually served, self-reported by the sandbox and excluding
     #: control-plane probes. Buys a BOUNDED extension — never indefinite life.
     APP_SERVED_TRAFFIC = "app_served_traffic"
-    #: Save / stop / relaunch / deploy. Needs no new machinery and no keystroke listener: each of
-    #: those already calls a project-scoped endpoint, so the extension is a side effect of the
-    #: request the builder was making anyway.
+    #: A deliberate act that puts a container in front of the builder: the relaunch of a saved
+    #: preview, and a colleague's shared launch. Both are already project-scoped requests, so the
+    #: extension is a side effect of the call being made anyway — no keystroke listener, no new
+    #: machinery. Save, Stop and Deploy do NOT write it: they act on a container whose lifetime is
+    #: already held by the turn's lease or by the presence of a surface.
     BUILDER_ACTED = "builder_acted"
     #: A turn ended having WRITTEN NOTHING (`workspace_touched` is False). The
     #: weakest evidence in the set on purpose: it is pure keyboard, with nothing on the container
@@ -393,6 +399,12 @@ class DeadlineWriter(enum.StrEnum):
     #: producing anything to keep it pinned for. Never chosen for a FAILED turn's write attempt —
     #: `_pardon_the_container` keys on WHAT the turn did, not on how it ended.
     TURN_ENDED_UNCHANGED = "turn_ended_unchanged"
+    #: A screen that can frame this project is open and polling. The only writer a BROWSER can
+    #: reach, and the only one that keeps renewing while nobody types: presence is what holds a
+    #: container, and silence is how leaving is spelled. Bounded twice over — by its own short
+    #: TTL, so the renewals stopping is enough on its own, and by the absolute age ceiling, which
+    #: nothing here can push past.
+    SURFACE_PRESENT = "surface_present"
 
 
 #: How long each writer's evidence is worth. Traffic buys less than a deliberate action because it
@@ -402,6 +414,16 @@ DEADLINE_WRITER_TTL_SECONDS: Final[Mapping[DeadlineWriter, int]] = {
     DeadlineWriter.APP_SERVED_TRAFFIC: SERVED_TRAFFIC_STAY_SECONDS,
     DeadlineWriter.BUILDER_ACTED: RELAUNCH_PREVIEW_STAY_SECONDS,
     DeadlineWriter.TURN_ENDED_UNCHANGED: TURN_ENDED_UNCHANGED_STAY_SECONDS,
+    DeadlineWriter.SURFACE_PRESENT: SURFACE_PRESENT_STAY_SECONDS,
+}
+
+#: What a surface's visibility is worth, and the reason the client sends a WORD rather than a
+#: number: a client naming its own seconds is a client that can ask for more life than the
+#: ceiling allows. A hidden tab earns the longer budget because its timer is not trustworthy —
+#: browsers throttle, sleep and freeze background tabs — not because it is better evidence.
+PRESENCE_STAY_SECONDS: Final[Mapping[SurfacePresence, int]] = {
+    SurfacePresence.VISIBLE: SURFACE_PRESENT_STAY_SECONDS,
+    SurfacePresence.HIDDEN: HIDDEN_SURFACE_PRESENT_STAY_SECONDS,
 }
 
 
@@ -443,6 +465,62 @@ async def grant_stay_of_execution(
         },
     )
     return deadline
+
+
+# Push the stay forward, but ONLY onto the hash that still names the container the caller aimed
+# at. Three reads and a write, atomic — a Redis Lua script runs single-threaded.
+#
+# WHY THE IDENTITY GUARD HAS TO BE INSIDE THE SCRIPT. `registry:{user_id}` is per USER, and it
+# survives a container swap: opening a second project rewrites the same key in place. A browser
+# renewing on a timer is exactly the caller that can be mid-flight across that swap, and a
+# Python-side read followed by a Python-side write leaves open the interleaving where the tab
+# holding project A pushes a stay onto project B's freshly registered container — sparing a
+# container A's own teardown is about to delete, under a reprieve nobody granted it.
+#
+# A refusal is not an error. `not_this_container` is the ordinary reading a moment after somebody
+# opens another project, and the tab that asked is told which of the three happened.
+_CAS_GRANT_PRESENCE_STAY_LUA: Final = (
+    "if redis.call('EXISTS', KEYS[1]) == 0 then return 'nothing_running' end "
+    f"if redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}') ~= ARGV[1] "
+    "then return 'not_this_container' end "
+    f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_PREVIEW_STAY_UNTIL}', ARGV[2], "
+    f"'{REGISTRY_FIELD_STAY_WRITER}', ARGV[3]) return 'renewed'"
+)
+
+
+async def renew_presence_stay(
+    redis: aioredis.Redis,
+    user_uuid: uuid.UUID,
+    *,
+    app_name: str,
+    presence: SurfacePresence,
+) -> tuple[RenewalOutcome, datetime | None]:
+    """Hold this project's container open because a surface framing it is still there.
+
+    THE DEADLINE STILL NEVER MOVES BACKWARD. The `max(standing, computed)` that
+    `grant_stay_of_execution` performs is performed here too, and it matters more: a hidden
+    surface buys twenty minutes and a visible one buys five, so the very next tick after a tab
+    comes back on screen would otherwise cut fifteen minutes off a reprieve already granted.
+
+    The monotonic comparison reads the standing value first and the guarded write happens second,
+    which is the same shape `grant_stay_of_execution` uses and is safe for the same reason: the
+    only hazard worth a lock is writing onto the WRONG container, and that is what the script's
+    `app_name` check refuses — atomically, after the read."""
+    ttl = PRESENCE_STAY_SECONDS[presence]
+    deadline = datetime.now(UTC) + timedelta(seconds=ttl)
+    standing = await _standing_stay(redis, user_uuid)
+    if standing is not None and standing > deadline:
+        deadline = standing
+    answer = await redis.eval(
+        _CAS_GRANT_PRESENCE_STAY_LUA,
+        1,
+        registry_key(user_uuid),
+        app_name,
+        deadline.isoformat(),
+        str(DeadlineWriter.SURFACE_PRESENT),
+    )
+    outcome = RenewalOutcome(answer.decode() if isinstance(answer, bytes) else str(answer))
+    return outcome, deadline if outcome is RenewalOutcome.RENEWED else None
 
 
 async def _standing_stay(redis: aioredis.Redis, user_uuid: uuid.UUID) -> datetime | None:

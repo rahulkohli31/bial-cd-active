@@ -217,18 +217,32 @@ def test_the_sweep_ships_on_and_the_new_reclamation_ships_off() -> None:
     assert s.sandbox.reclaim_destroy is False
 
 
-def test_the_drain_offers_no_switch_because_it_has_no_caller() -> None:
-    """A FLAG THAT DOES NOTHING IS WORSE THAN A MISSING FEATURE.
+def test_the_ceiling_has_a_switch_and_it_is_off() -> None:
+    """The absolute age ceiling is an operator switch, and it ships OFF like its reclamation
+    neighbours — a deployment that wants no ceiling sets nothing.
 
-    `drain.py` is written and tested, but nothing in `src/` reads a drain setting — `is_drained`
-    takes `enabled`/`after_hours` as explicit arguments, with no caller passing them. Declaring
-    `SANDBOX__DRAIN_ENABLED` anyway would mislead an operator relying on it mid-incident, so
-    `extra="forbid"` turns the absence into a loud one: setting it now fails at startup instead
-    of being silently absorbed. When the drain gets a caller, the flags come back alongside it.
+    Both knobs are real: `reaper.py` reads them in the stay arm and again in the liveness-lease
+    arm, which is what stops a screen renewing on a timer from making a container immortal.
 
-    Mutation-check: re-add `drain_enabled` to `SandboxConfig` and this goes red."""
+    Mutation-check: delete `drain_enabled` from `SandboxConfig` and the flag assertion below
+    raises `ValidationError` under `extra="forbid"`."""
+    assert _settings(sandbox=_SANDBOX).sandbox is not None
+    default = _settings(sandbox=_SANDBOX).sandbox
+    assert default is not None
+    assert default.drain_enabled is False
+    assert default.drain_after_hours == 2
+
+    switched = _settings(sandbox={**_SANDBOX, "drain_enabled": True, "drain_after_hours": 6})
+    assert switched.sandbox is not None
+    assert switched.sandbox.drain_enabled is True
+    assert switched.sandbox.drain_after_hours == 6
+
+
+def test_the_ceiling_refuses_a_zero_or_negative_span() -> None:
+    """`PositiveInt`, not `int`: a ceiling of zero hours would collect every container the
+    instant it was created, and a negative one reads as a ceiling already passed."""
     with pytest.raises(ValidationError):
-        _settings(sandbox={**_SANDBOX, "drain_enabled": True})
+        _settings(sandbox={**_SANDBOX, "drain_after_hours": 0})
 
 
 def test_redis_rejects_unknown_nested_key() -> None:

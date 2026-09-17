@@ -43,6 +43,7 @@ from src.services.build_sessions.alarms import (
     SERVING_PROOF_ABSENT_AT_TEARDOWN,
     SERVING_PROOF_STAMP_REFUSED,
 )
+from src.services.build_sessions.drain import is_drained, past_the_turn_bound
 from src.services.build_sessions.durable_copy import CopyVerdict, confirm_durable_copy
 from src.services.build_sessions.integrity import container_state
 from src.services.build_sessions.locks import (
@@ -75,7 +76,13 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
 )
 from src.services.sandbox import DevStatus, SandboxClient, SandboxError, SandboxHandle
-from src.services.sandbox.base import SANDBOX_NAME_PREFIX, SHARED_SANDBOX_NAME_PREFIX
+from src.services.sandbox.base import (
+    SANDBOX_NAME_PREFIX,
+    SHARED_SANDBOX_NAME_PREFIX,
+    TAG_CREATED_AT,
+    SandboxIdentity,
+    identity_from_tags,
+)
 
 _log = structlog.get_logger()
 
@@ -923,6 +930,88 @@ def _shared_view_past_its_ceiling(reg: dict[str, str], now: datetime) -> bool:
     return now - created >= _SHARED_PREVIEW_ABSOLUTE_CEILING
 
 
+async def _container_age_source(
+    sandbox_client: SandboxClient, reg: dict[str, str], app_name: str
+) -> SandboxIdentity:
+    """What the ceiling is measured from: the CONTAINER's own birthday, not the record's.
+
+    The registry `created_at` is re-stamped on every registration and is dropped entirely by the
+    failed-teardown arm, so a container whose delete failed would come back looking newborn and
+    earn another full ceiling — precisely the population a ceiling exists to collect. The ARM tag
+    is stamped once, at create, and survives both.
+
+    THE FALLBACK IS THE REGISTRY, NOT `None`, and an ARM that will not answer must not be the
+    reason a container becomes immortal: a tag read that fails or comes back untagged leaves the
+    record's own birthday, which under-states the age and therefore only ever spares. Neither
+    source answering means no age, and no age means no ceiling (`drain.draining_at`)."""
+    try:
+        tags = await sandbox_client.get_app_tags(name=app_name)
+    except SandboxError:
+        tags = None
+    if tags is not None:
+        identity = identity_from_tags(tags)
+        if identity.created_at is not None:
+            return identity
+    return identity_from_tags({TAG_CREATED_AT: reg.get(REGISTRY_FIELD_CREATED_AT, "")})
+
+
+def _the_ceiling_switch() -> tuple[bool, int]:
+    """The ceiling's flag and its hours, or `(False, 0)` when no sandbox is configured.
+
+    A LOCAL IMPORT, like `workers/sandbox_reap.py`'s destroy gate: this module is imported by the
+    worker and by a standalone-import test, and neither may be made to drag the settings tree in
+    at module level."""
+    from src.config import settings
+
+    if settings.sandbox is None:
+        return False, 0
+    return settings.sandbox.drain_enabled, settings.sandbox.drain_after_hours
+
+
+def _the_jammed_turn_grace() -> float:
+    """How long past the ceiling a turn is still given the benefit of the doubt.
+
+    One whole wall-clock run plus one slow tool call: the run deadline is checked BETWEEN steps,
+    so a run that entered its slowest tool one moment before the deadline legitimately overruns
+    it by that tool's whole budget. Past the sum, nothing honest is still working."""
+    from src.services.orchestrator.constants import (
+        RUN_COMMAND_SLOW_TIMEOUT_S,
+        RUN_WALL_CLOCK_DEADLINE_S,
+    )
+
+    return RUN_WALL_CLOCK_DEADLINE_S + RUN_COMMAND_SLOW_TIMEOUT_S
+
+
+async def _past_the_ceiling(
+    sandbox_client: SandboxClient, reg: dict[str, str], *, now: datetime, outranks_a_turn: bool
+) -> bool:
+    """Has this container outlived the absolute ceiling?
+
+    `outranks_a_turn` picks WHICH of the two marks is asked about — the ordinary one, which a
+    turn in flight would outrank, or the outer one, which nothing does. The caller knows which
+    arm it is standing in; this does not guess.
+
+    Costs one ARM tag read, and only while the flag is on and something is about to be spared."""
+    enabled, after_hours = _the_ceiling_switch()
+    if not enabled:
+        return False
+    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+    if not app_name:
+        return False
+    identity = await _container_age_source(sandbox_client, reg, app_name)
+    if outranks_a_turn:
+        return past_the_turn_bound(
+            identity,
+            now=now,
+            enabled=True,
+            after_hours=after_hours,
+            turn_grace_seconds=_the_jammed_turn_grace(),
+        )
+    return is_drained(
+        identity, now=now, enabled=True, after_hours=after_hours, turn_in_flight=False
+    )
+
+
 async def reconcile_user(
     redis: aioredis.Redis,
     user_uuid: uuid.UUID,
@@ -974,7 +1063,18 @@ async def reconcile_user(
     # renewal it grants THIS pass must be visible to the stay check further down THIS SAME pass —
     # picking it up only on the next sweep would needlessly reap a session that just proved active.
     await _renew_shared_view_from_traffic(redis, user_uuid, sandbox_client, reg)
-    if not certified_dead and await liveness_lease_is_held(redis, user_uuid):
+    if (
+        not certified_dead
+        and await liveness_lease_is_held(redis, user_uuid)
+        # THE CEILING IS EVALUATED HERE AS WELL AS IN THE STAY ARM, and a bound placed only
+        # there would be dead code: this arm returns ABOVE it, so a container held by a lease
+        # never reaches the stay's own ceiling clause at all. The mark asked for here is the
+        # OUTER one — a whole run plus a slow tool call past the ceiling — because a lease is
+        # what a real turn holds and a real turn must not be cut short.
+        and not await _past_the_ceiling(
+            sandbox_client, reg, now=datetime.now(UTC), outranks_a_turn=True
+        )
+    ):
         # The one liveness input readable from a process that is not running the build.
         # Checked BEFORE the lock/heartbeat pair below because it outranks it in both
         # directions — a live build has lost that pair 90 seconds in, and a dead one leaves
@@ -1016,6 +1116,13 @@ async def reconcile_user(
         # absolute ceiling falls straight through to the reap below EVEN THOUGH its stay is
         # still current — the one condition nothing renews, by design (requirement 20).
         and not _shared_view_past_its_ceiling(reg, datetime.now(UTC))
+        # The build sandbox's own absolute ceiling, and the reason presence renewal is safe: a
+        # surface renewing on a timer pushes this stay forward indefinitely, and this clause is
+        # the only thing that ever stops it. SUBTRACTS from what the stay would spare, exactly
+        # like the shared view's ceiling above; it never adds a reason to spare one.
+        and not await _past_the_ceiling(
+            sandbox_client, reg, now=datetime.now(UTC), outranks_a_turn=False
+        )
     ):
         # A relaunched preview holds no lock and renews no heartbeat, so the stay is all that
         # stands between it and the sweep, which passes True. Reconcile-on-start keeps the

@@ -26,13 +26,19 @@ import pytest
 import redis.asyncio as aioredis
 
 from src.api.v1.build_sessions.schemas import (
+    HIDDEN_SURFACE_PRESENT_STAY_SECONDS,
     RELAUNCH_PREVIEW_STAY_SECONDS,
     SERVED_TRAFFIC_STAY_SECONDS,
+    SURFACE_PRESENT_STAY_SECONDS,
     TURN_ENDED_UNCHANGED_STAY_SECONDS,
     BuildSessionStatus,
 )
 from src.services.build_sessions import locks
-from src.services.build_sessions.locks import DeadlineWriter, grant_stay_of_execution
+from src.services.build_sessions.locks import (
+    DEADLINE_WRITER_TTL_SECONDS,
+    DeadlineWriter,
+    grant_stay_of_execution,
+)
 from src.services.build_sessions.manager import BuildSession, SessionManager
 from src.services.build_sessions.reaper import reconcile_user
 from src.services.redis import registry_key
@@ -80,16 +86,40 @@ async def _stay(redis: aioredis.Redis) -> tuple[datetime | None, str | None]:
 # --- the writer set is closed, and named ------------------------------------------
 
 
-def test_the_writer_set_is_exactly_four() -> None:
+def test_the_writer_set_is_exactly_five() -> None:
     """A CLOSED SET is the requirement, not a side effect: adding a way to keep a container alive
-    should be a deliberate, reviewed act, never an anonymous extension. `turn_ended_unchanged` is
-    the fourth member, for a turn that held the workspace but wrote nothing to it."""
+    should be a deliberate, reviewed act, never an anonymous extension. `turn_ended_unchanged`
+    covers a turn that held the workspace but wrote nothing to it; `surface_present` is the only
+    member a BROWSER can reach, and it is what makes leaving a screen mean something."""
     assert {w.value for w in DeadlineWriter} == {
         "turn_in_flight",
         "app_served_traffic",
         "builder_acted",
         "turn_ended_unchanged",
+        "surface_present",
     }
+
+
+def test_every_writer_has_a_ttl_of_its_own() -> None:
+    """The TTL comes from the writer's IDENTITY, so a member with no entry would raise a
+    `KeyError` inside a grant — a container failing to be spared because of a missing dict row."""
+    assert set(DEADLINE_WRITER_TTL_SECONDS) == set(DeadlineWriter)
+
+
+def test_a_present_surface_buys_no_more_than_the_grantable_ceiling() -> None:
+    """`stay_of_execution_is_current` reads any deadline beyond `RELAUNCH_PREVIEW_STAY_SECONDS`
+    as absurd and fails CLOSED. A presence budget above that bound would therefore spare nothing
+    at all — the renewal would be written, read as nonsense, and the container reaped under a
+    citizen who is sitting right there."""
+    assert SURFACE_PRESENT_STAY_SECONDS <= RELAUNCH_PREVIEW_STAY_SECONDS
+    assert HIDDEN_SURFACE_PRESENT_STAY_SECONDS <= RELAUNCH_PREVIEW_STAY_SECONDS
+
+
+def test_a_hidden_surface_earns_the_longer_budget() -> None:
+    """Not because it is better evidence — because its clock is not trustworthy. Browsers
+    throttle, sleep and freeze background timers, so a hidden tab cannot promise to come back in
+    45 seconds and must not lose its container for failing to."""
+    assert HIDDEN_SURFACE_PRESENT_STAY_SECONDS > SURFACE_PRESENT_STAY_SECONDS
 
 
 def test_a_turn_that_changed_nothing_buys_the_least_of_the_four() -> None:

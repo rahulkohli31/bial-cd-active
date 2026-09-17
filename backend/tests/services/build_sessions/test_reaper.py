@@ -15,11 +15,13 @@ from pathlib import Path
 import pytest
 import redis.asyncio as aioredis
 import structlog.testing
+from pydantic import SecretStr
 
 from src.api.v1.build_sessions.schemas import (
     LIVENESS_LEASE_TTL_SECONDS,
     RELAUNCH_PREVIEW_STAY_SECONDS,
 )
+from src.config import settings
 from src.services.build_sessions import locks, pass_history, reaper
 from src.services.build_sessions.alarms import SERVING_PROOF_ABSENT_AT_TEARDOWN
 from src.services.build_sessions.pass_history import CopyAttempt
@@ -44,7 +46,14 @@ from src.services.redis.keys import (
     starting_key,
 )
 from src.services.sandbox import SandboxError, SandboxHandle
-from src.services.sandbox.base import DevStatus, ExecResult
+from src.services.sandbox.base import (
+    KIND_BUILD_SANDBOX,
+    TAG_CREATED_AT,
+    TAG_KIND,
+    DevStatus,
+    ExecResult,
+)
+from src.services.sandbox.config import SandboxConfig
 from src.services.storage import recovery_key
 from tests.fakes import (
     FakeSandboxClient,
@@ -1757,3 +1766,189 @@ def test_thinning_never_reaches_the_arm_that_stamps_an_unproven_container() -> N
             reaper._what_this_record_is_missing(unproven, now, USER, thin_the_re_ask=True)
             == "stamp"
         ), f"an unproven container was thinned out of its own stamp on pass {pass_offset}"
+
+
+# --- the absolute age ceiling ------------------------------------------------
+#
+# Two arms, not one, and the second is the whole reason this section exists: `reconcile_user`'s
+# liveness-lease arm RETURNS above the stay arm, so a bound written only into the stay would
+# never see a container with a turn in flight and would be dead code from the day it landed.
+
+
+@pytest.fixture
+def ceiling_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two hours, switched on. Off everywhere by default, so every other test in this file goes
+    on exercising a platform with no ceiling at all."""
+    monkeypatch.setattr(
+        settings, "sandbox", _sandbox_config_with(drain_enabled=True, drain_after_hours=2)
+    )
+
+
+def _sandbox_config_with(*, drain_enabled: bool, drain_after_hours: int) -> SandboxConfig:
+    return SandboxConfig(
+        subscription_id="s",
+        resource_group="r",
+        region="westeurope",
+        managed_environment_name="aca-env",
+        acr_server="acr.azurecr.io",
+        acr_username="acr-user",
+        acr_password=SecretStr("acr-pass"),
+        image_ref="acr/img:latest",
+        drain_enabled=drain_enabled,
+        drain_after_hours=drain_after_hours,
+    )
+
+
+def _hours_ago(hours: float) -> str:
+    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+
+
+class _ArmKnowsItsAge(FakeSandboxClient):
+    """A client whose ARM answers with a container birthday — the source the ceiling actually
+    measures from, as opposed to the registry record's, which is re-stamped and deleted."""
+
+    def __init__(self, *, created_at: str | None) -> None:
+        super().__init__()
+        self._created_at = created_at
+
+    async def get_app_tags(self, *, name: str) -> dict[str, str] | None:
+        if self._created_at is None:
+            return None
+        return {TAG_KIND: KIND_BUILD_SANDBOX, TAG_CREATED_AT: self._created_at}
+
+
+async def test_a_screen_left_open_for_three_hours_is_collected_at_two(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """THE RENEWING TAB, BOUNDED. A present surface pushes the stay forward forever — that is
+    what presence renewal is — so the ceiling is the only thing between an open tab and an
+    immortal container."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    await locks.grant_stay_of_execution(
+        fake_redis, USER, writer=locks.DeadlineWriter.SURFACE_PRESENT
+    )
+    client = _ArmKnowsItsAge(created_at=_hours_ago(3))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is True
+    assert SBX in client.torn_down
+
+
+async def test_a_screen_open_for_one_hour_keeps_its_container(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """The other half of the same rule, and the one a citizen actually lives in: inside the
+    ceiling, a renewed stay is honoured exactly as it was before."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    await locks.grant_stay_of_execution(
+        fake_redis, USER, writer=locks.DeadlineWriter.SURFACE_PRESENT
+    )
+    client = _ArmKnowsItsAge(created_at=_hours_ago(1))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is False
+    assert client.torn_down == []
+
+
+async def test_a_turn_in_flight_at_the_ceiling_is_deferred_not_cut(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """The ceiling does not interrupt work. A held lease means an agent is making tool calls
+    inside that container, and a build that crossed the mark while running is entitled to finish:
+    it keeps a whole wall-clock run plus the one slow tool call that run can be sitting inside."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    await locks.renew_liveness_lease(fake_redis, USER)
+    client = _ArmKnowsItsAge(created_at=_hours_ago(2.2))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is False
+    assert client.torn_down == []
+
+
+async def test_a_lease_that_will_not_stop_renewing_is_no_longer_spared(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """THE ARM THE WHOLE SECOND CLAUSE EXISTS FOR. A jammed lease is indistinguishable from a
+    working agent, so the arm that protects real work protects a wedged container forever. Past
+    the ceiling plus a whole run plus a slow tool call, nothing honest is still in there.
+
+    Mutation check: delete the ceiling clause from `reconcile_user`'s liveness-lease arm and this
+    test alone goes red — the stay arm's clause can never reach this case, because the lease arm
+    returns above it."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    await locks.renew_liveness_lease(fake_redis, USER)
+    client = _ArmKnowsItsAge(created_at=_hours_ago(24))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is True
+    assert SBX in client.torn_down
+
+
+async def test_the_ceiling_measures_the_container_not_its_registry_record(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """A container whose teardown FAILED loses its registry record, and the next registration
+    stamps a brand-new birthday onto the same still-running container. Measuring the record
+    would hand a fresh two hours to precisely the population the ceiling exists to collect."""
+    await _seed(
+        fake_redis, USER, with_lock=False, with_heartbeat=False, created_at=_hours_ago(0.1)
+    )
+    await locks.grant_stay_of_execution(
+        fake_redis, USER, writer=locks.DeadlineWriter.SURFACE_PRESENT
+    )
+    client = _ArmKnowsItsAge(created_at=_hours_ago(9))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is True, "the record's fresh birthday was believed over the container's own"
+
+
+async def test_an_arm_that_cannot_answer_falls_back_to_the_record(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """An ARM outage must not be the reason a container becomes immortal. The record's birthday
+    can only UNDER-state the age, so the fallback only ever spares — and it still collects a
+    container the record itself says is old enough."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False, created_at=_hours_ago(5))
+    await locks.grant_stay_of_execution(
+        fake_redis, USER, writer=locks.DeadlineWriter.SURFACE_PRESENT
+    )
+    client = _ArmKnowsItsAge(created_at=None)
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is True
+
+
+async def test_with_the_ceiling_off_a_renewed_stay_is_immortal_again(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The flag's default posture, stated as the behaviour it produces rather than as a boolean:
+    with no ceiling configured, an ancient container inside a standing stay is spared."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    await locks.grant_stay_of_execution(
+        fake_redis, USER, writer=locks.DeadlineWriter.SURFACE_PRESENT
+    )
+    client = _ArmKnowsItsAge(created_at=_hours_ago(500))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is False
