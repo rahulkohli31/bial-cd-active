@@ -66,6 +66,7 @@ _RECONCILE_CONCURRENCY = 8
 _ATTACHMENTS_ROOT = "att/"
 _SNAPSHOTS_ROOT = "snapshots/"
 _RECOVERY_ROOT = "recovery/"
+_VERSIONS_ROOT = "versions/"
 _SUBMISSIONS_ROOT = "submissions/"
 _APPS_ROOT = "apps/"
 
@@ -93,6 +94,7 @@ class StorageReconcileReport:
     attachments: PrefixCounts
     snapshots: PrefixCounts
     recovery: PrefixCounts
+    versions: PrefixCounts
     submissions: PrefixCounts
     apps: PrefixCounts
     # Ownerless submission bundles past grace — `submissions/{app_id}/` blobs whose `app_id`
@@ -222,6 +224,14 @@ async def reconcile_orphaned_storage(
     recovery_counts = await _reconcile_prefix(
         storage, _RECOVERY_ROOT, _owned_by_app_row(app_ids), cutoff=cutoff, delete_eligible=True
     )
+    # ★ THE LIST OFFERS TWO AND DELETES NONE, so this prefix grows by one full source tree per
+    # save and never shrinks on its own. That makes it the root most worth reconciling, and the
+    # ownership rule is the same as the other two: a version bundle whose app row is gone is an
+    # orphan. Deleting one here is not the version list changing its mind — the app it belonged
+    # to no longer exists.
+    versions_counts = await _reconcile_prefix(
+        storage, _VERSIONS_ROOT, _owned_by_app_row(app_ids), cutoff=cutoff, delete_eligible=True
+    )
     # Report-only: the immutable approval record — surface, never delete.
     submissions_counts = await _reconcile_prefix(
         storage,
@@ -239,6 +249,7 @@ async def reconcile_orphaned_storage(
         attachments=attachments_counts,
         snapshots=snapshots_counts,
         recovery=recovery_counts,
+        versions=versions_counts,
         submissions=submissions_counts,
         apps=apps_counts,
         # The ownerless-submission set = unowned + past-grace under `submissions/`. Within-grace

@@ -355,6 +355,7 @@ class StorageReconcileResponse(CamelModel):
     # `snapshots/` means saved versions are outliving their app rows, while one under `recovery/`
     # means the same for bundles no user ever asked for.
     recovery: PrefixReconcileCounts
+    versions: PrefixReconcileCounts
     submissions: PrefixReconcileCounts
     apps: PrefixReconcileCounts
     ownerless_submissions: int
