@@ -114,9 +114,8 @@ function Workspace({ project = PROJECT }: { project?: Project } = {}) {
   )
 }
 
-// THE PLAN PLACEHOLDER, because the rail's kind picker now defaults to Plan (2026-09-10).
-// The hand-over this file is about is identical on either kind — what changed is only which
-// wording the untouched picker is showing when the citizen starts typing.
+// THE PLAN PLACEHOLDER, because the rail's kind picker defaults to Plan. The hand-over this
+// file is about is identical on either kind; the picker only decides which wording is showing.
 const composer = () => screen.getByPlaceholderText(/Describe what you have in mind/i)
 const send = () => screen.getByTestId('composer-send')
 const where = () => screen.getByTestId('where').textContent ?? ''

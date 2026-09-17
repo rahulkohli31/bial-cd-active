@@ -291,6 +291,23 @@ async def owe_a_teardown_the_reap_could_not_perform(
     behaviour in place, which spares rather than forgets."""
     if app_id is None or instance_ref is None:
         return False
+    # THE NAME AND THE APP ID ARRIVE FROM DIFFERENT READS, so the row is only sound if they
+    # describe the same container. The caller resolves `app_id` from one registry read and the
+    # reap re-reads the registry for itself; a slot swap between the two hands this function one
+    # container's name and another's id, and the ownership query below would still pass. The row
+    # is what stands between a name and an ARM delete: a mismatched pair bundles the wrong tree
+    # against the wrong saved head and marks the wrong project as closing. Local import — the
+    # manager imports this module.
+    from src.services.build_sessions.manager import app_name_for, shr_name_for
+
+    if app_name not in (app_name_for(app_id), shr_name_for(app_id, user_id)):
+        _log.error(
+            "refusing the debt: the name and the app id describe different containers",
+            user_id=str(user_id),
+            app_id=str(app_id),
+            app_name=app_name,
+        )
+        return False
     factory = session_factory if session_factory is not None else _the_default_factory()
     async with factory() as db:
         project_id = await db.scalar(

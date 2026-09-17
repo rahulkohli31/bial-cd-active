@@ -1996,6 +1996,49 @@ async def test_a_lease_that_will_not_stop_renewing_is_no_longer_spared(
     assert SBX in client.torn_down
 
 
+async def test_a_jam_holding_lease_lock_and_heartbeat_together_is_still_collected(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """THE SHAPE A REAL JAM ACTUALLY MAKES, which the lease-only test above cannot produce.
+
+    `_hold_liveness_lease` renews the lease, the lock and the heartbeat on one 30-second loop —
+    their only clock — so a wedged turn holds all three at once. The arm above seeds
+    `with_lock=False, with_heartbeat=False`, a shape the engine never leaves behind, and passes
+    on a ceiling clause that reaches only the lease. With all three held, the lease arm declines
+    to spare and control falls through to the lock/heartbeat pair.
+
+    Mutation check: delete the ceiling clause from the lock/heartbeat arm and this test alone
+    goes red — every other ceiling test seeds the pair off and never reaches it."""
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
+    await locks.renew_liveness_lease(fake_redis, USER)
+    client = _ArmKnowsItsAge(created_at=_hours_ago(24))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is True
+    assert SBX in client.torn_down
+
+
+async def test_a_live_turn_inside_the_outer_mark_keeps_all_three_signals(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """The other half, and the reason the pair's clause asks the OUTER mark rather than the
+    ordinary one: a real agent mid-run holds exactly the same three signals as a jam. Inside the
+    bound it must be left alone, or the ceiling cuts working builds short."""
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
+    await locks.renew_liveness_lease(fake_redis, USER)
+    client = _ArmKnowsItsAge(created_at=_hours_ago(0.1))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is False
+    assert client.torn_down == []
+
+
 async def test_the_ceiling_measures_the_container_not_its_registry_record(
     fake_redis: aioredis.Redis, ceiling_on: None
 ) -> None:

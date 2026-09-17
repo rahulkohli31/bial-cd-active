@@ -754,8 +754,8 @@ async def reap_user(
     # resolved. `sweep_all`'s own `_owning_app_id` currently maps a `shr-` registry record to the
     # OWNER's app id (`_app_names_to_owners` keys every `shr-` name off the recipient, but the
     # value it carries is still the shared app's id) — passing that here would gate this
-    # RECIPIENT's teardown against the OWNER's saved copy, and R22 says that storage is
-    # read-never-write for a recipient. Worse, a refused guarded write then REFUSES the reap
+    # RECIPIENT's teardown against the OWNER's saved copy, and a recipient's access to that
+    # storage is read-never-write. Worse, a refused guarded write then REFUSES the reap
     # outright, sparing the container forever — the exact bill-forever leak the ceiling exists to
     # close. A shared view holds nothing worth preserving in the first place: the recipient never
     # edits its tree directly, and what they own of it is a restore of the owner's own snapshot,
@@ -1091,11 +1091,12 @@ async def reconcile_user(
     if (
         not certified_dead
         and await liveness_lease_is_held(redis, user_uuid)
-        # THE CEILING IS EVALUATED HERE AS WELL AS IN THE STAY ARM, and a bound placed only
-        # there would be dead code: this arm returns ABOVE it, so a container held by a lease
-        # never reaches the stay's own ceiling clause at all. The mark asked for here is the
-        # OUTER one — a whole run plus a slow tool call past the ceiling — because a lease is
-        # what a real turn holds and a real turn must not be cut short.
+        # EVERY ARM A JAM CAN HOLD NEEDS ITS OWN CLAUSE. Each arm returns above the next, so a
+        # bound placed in one of them is unreachable from the others — and a jammed turn holds
+        # the lease, the lock and the heartbeat together, because one loop renews all three. The
+        # mark asked for here is the OUTER one — a whole run plus a slow tool call past the
+        # ceiling — because a lease is what a real turn holds and a real turn must not be cut
+        # short. The stay arm asks the ordinary mark: a tab renewing on a timer is not a turn.
         and not await _past_the_ceiling(
             sandbox_client, reg, now=datetime.now(UTC), outranks_a_turn=True
         )
@@ -1127,6 +1128,14 @@ async def reconcile_user(
         not certified_dead
         and await lock_is_held(redis, user_uuid)
         and await heartbeat_is_alive(redis, user_uuid)
+        # THE SAME OUTER MARK AS THE LEASE ARM, and for the same reason one arm further down.
+        # `_hold_liveness_lease` renews the lease, the lock AND the heartbeat on one 30-second
+        # loop — their only clock — so the jammed turn the outer bound exists for holds all
+        # three. Bounding only the lease arm lets that jam fall through to this pair and be
+        # spared here forever, which is the one population the ceiling was written to end.
+        and not await _past_the_ceiling(
+            sandbox_client, reg, now=datetime.now(UTC), outranks_a_turn=True
+        )
     ):
         # looks live + recent (bounded by the heartbeat TTL) — leave it
         await _observe_the_serving_proof(
