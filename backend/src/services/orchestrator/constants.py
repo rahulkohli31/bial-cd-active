@@ -315,7 +315,11 @@ cache-WRITE premium and read nothing back: a net cost INCREASE over not caching 
 
 Why 1h is the safe pick: a 1h write costs ~2× base input (vs ~1.25× for 5m) but reads at ~0.1×, and
 the whole build is bounded by `RUN_WALL_CLOCK_DEADLINE_S` (1800s / 30 min) — so every step of a
-single build lands inside ONE 1-hour window: one write, then reads for the rest of the run."""
+single build lands inside ONE 1-hour window: one write, then reads for the rest of the run.
+
+The citizen's meter charges the tier this constant names: `usage/gate.py` weighs a cache write by
+tier, and `tests/services/usage/test_gate.py` pins its tier against this one — so moving this
+value without repricing the meter is a red test, not a quiet mis-bill."""
 
 # --- the read ignore set ---------------------------------------------------------
 

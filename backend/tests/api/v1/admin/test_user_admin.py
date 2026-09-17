@@ -162,8 +162,8 @@ async def test_usage_today_is_cost_weighted(client, db_session) -> None:
 
     body = await _roster(client, headers)
     by_email = {u["email"]: u for u in body["users"]}
-    # Weighted: fresh=100-3-4=93 + output 20 + reads 0.3 + writes 5 = 118.3 → rounds to 118.
-    assert by_email["spender@rvaiglobal.com"]["usageToday"] == 118
+    # Weighted: fresh=100-3-4=93 + output 20 + reads 0.3 + writes 8 = 121.3 → rounds to 121.
+    assert by_email["spender@rvaiglobal.com"]["usageToday"] == 121
     assert by_email["idle@rvaiglobal.com"]["usageToday"] == 0
     assert idle.suspended_at is None
 
@@ -185,8 +185,8 @@ async def test_roster_usage_today_agrees_with_the_daily_gate(client, db_session)
     body = await _roster(client, headers)
     roster_used = {u["email"]: u["usageToday"] for u in body["users"]}["agree@rvaiglobal.com"]
     gate_used = await _used_today(db_session, user.id, ist_today())
-    # Weighted: fresh=200-50-60=90 + output 40 + reads 50/10(=5) + writes 60*1.25(=75) = 210.
-    assert roster_used == gate_used == 210
+    # Weighted: fresh=200-50-60=90 + output 40 + reads 50/10(=5) + writes 60*2(=120) = 255.
+    assert roster_used == gate_used == 255
 
 
 async def test_review_spend_is_its_own_roster_figure_never_folded(client, db_session) -> None:
@@ -235,8 +235,8 @@ async def test_roster_build_figure_equals_the_gates_with_review_spend_present(
     body = await _roster(client, headers)
     roster_used = {u["email"]: u["usageToday"] for u in body["users"]}["both-kinds@rvaiglobal.com"]
     gate_used = await _used_today(db_session, user.id, ist_today())
-    # The weighted build total (fresh=90 + 40 + 5 + 75 = 210); the review row moves neither.
-    assert roster_used == gate_used == 210
+    # The weighted build total (fresh=90 + 40 + 5 + 120 = 255); the review row moves neither.
+    assert roster_used == gate_used == 255
 
 
 async def test_usage_respects_ist_day_boundary(client, db_session) -> None:

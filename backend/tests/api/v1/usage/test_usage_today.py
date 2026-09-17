@@ -37,7 +37,8 @@ async def test_usage_today_reflects_recorded_usage_and_override(client, db_sessi
     user = await UserFactory.create(db_session)
     db_session.add(UserLimit(user_id=user.id, daily_token_limit=1000))
     # `used` is the COST-WEIGHTED spend: input=100 includes cr=30+cw=20 (pydantic-ai), so
-    # fresh=50; used = 50 + 50 + 30/10 + 20*1.25 = 128.
+    # fresh=50; used = 50 + 50 + 30/10 + 20*2 = 143. The write weight is 2x because every
+    # breakpoint in the platform buys the 1-hour tier.
     await record_usage(
         db_session,
         user.id,
@@ -52,9 +53,9 @@ async def test_usage_today_reflects_recorded_usage_and_override(client, db_sessi
     assert resp.status_code == 200
     body = resp.json()
     assert body == {
-        "used": 128,
+        "used": 143,
         "limit": 1000,
-        "remaining": 872,
+        "remaining": 857,
         "resetsAt": body["resetsAt"],  # value asserted in the gate unit test
     }
 

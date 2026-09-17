@@ -29,7 +29,8 @@ import asyncio
 import datetime
 import uuid
 from dataclasses import dataclass
-from typing import Protocol
+from decimal import Decimal
+from typing import Final, Protocol
 
 import sqlalchemy as sa
 import structlog
@@ -129,12 +130,26 @@ async def effective_daily_limit(db: AsyncSession, user_id: uuid.UUID) -> int:
     return resolve_daily_limit(override)
 
 
-# Cost weights for the two cache classes, matching the Anthropic pricing shape: a cache READ
-# costs ~10% of a fresh input token, a cache WRITE ~125%. SQLAlchemy compiles `/` as true
-# division (`/ CAST(10 AS NUMERIC)`); the single outer BIGINT cast rounds ONCE at the end, so
-# the whole day's total is exact-weighted to within half a token.
+# Cost weights for the two cache classes, matching the Anthropic pricing shape. A cache READ
+# costs ~10% of a fresh input token at either TTL tier; a cache WRITE is priced BY THE TIER the
+# breakpoint bought, so its weight is looked up from the tier rather than baked into a number.
+# SQLAlchemy compiles `/` as true division (`/ CAST(10 AS NUMERIC)`) and `Decimal` params bind as
+# NUMERIC, so the arithmetic stays exact and the single outer BIGINT cast rounds ONCE at the end
+# — the whole day's total is exact-weighted to within half a token.
 _CACHE_READ_DIVISOR = 10  # read ≈ fresh / 10
-_CACHE_WRITE_SURCHARGE_DIVISOR = 4  # write ≈ fresh + fresh / 4 (125%)
+
+_CACHE_WRITE_MULTIPLIER_BY_TTL: Final[dict[str, Decimal]] = {
+    "5m": Decimal("1.25"),
+    "1h": Decimal("2"),
+}
+
+# The tier every breakpoint in the platform buys. Restated rather than imported from
+# `orchestrator.constants`, which cannot be reached from a service without dragging the API layer
+# in behind it (`orchestrator/progress.py`); `tests/services/usage/test_gate.py` pins this against
+# the TTL constants that actually set the breakpoints. A `TokenUsage` row carries no per-row TTL,
+# so one weight is only correct while the whole codebase buys one tier — which that test also pins.
+_BILLED_CACHE_TIER: Final = "1h"
+_CACHE_WRITE_MULTIPLIER: Final = _CACHE_WRITE_MULTIPLIER_BY_TTL[_BILLED_CACHE_TIER]
 
 
 def weighted_spend(
@@ -148,7 +163,7 @@ def weighted_spend(
 
     THE SECOND READER OF ONE POLICY, NOT A SECOND POLICY: `billable_spend` is a SQL column
     expression and cannot evaluate against a live `RunUsage`. Both spell the same arithmetic
-    from the same two divisors, and the test suite pins them to agree — a per-run bound
+    from the same two weights, and the test suite pins them to agree — a per-run bound
     weighting differently from the daily meter would mean two ceilings measuring two
     different things while both are described to the citizen as spend. See the module
     docstring's WHY THIS EXISTS for why weighting matters at all."""
@@ -156,15 +171,15 @@ def weighted_spend(
     return int(
         fresh
         + output_tokens
-        + cache_read_tokens / _CACHE_READ_DIVISOR
-        + cache_write_tokens
-        + cache_write_tokens / _CACHE_WRITE_SURCHARGE_DIVISOR
+        + Decimal(cache_read_tokens) / _CACHE_READ_DIVISOR
+        + cache_write_tokens * _CACHE_WRITE_MULTIPLIER
     )
 
 
 def billable_spend() -> sa.ColumnElement[int]:
     """The daily billable token total as a column expression, COST-WEIGHTED per token class:
-    `fresh_input + output + cache_read/10 + cache_write*1.25`.
+    `fresh_input + output + cache_read/10 + cache_write × the tier's write weight` (2× while
+    `_BILLED_CACHE_TIER` is the 1-hour one).
 
     THE single source of truth both readers share (`_used_today` here and the admin roster in
     `api/v1/admin/router.py`), so a fix can never half-land with one reader still folding cache.
@@ -179,8 +194,7 @@ def billable_spend() -> sa.ColumnElement[int]:
         fresh
         + TokenUsage.output_tokens
         + TokenUsage.cache_read_tokens / _CACHE_READ_DIVISOR
-        + TokenUsage.cache_write_tokens
-        + TokenUsage.cache_write_tokens / _CACHE_WRITE_SURCHARGE_DIVISOR,
+        + TokenUsage.cache_write_tokens * _CACHE_WRITE_MULTIPLIER,
         sa.BigInteger,
     )
 

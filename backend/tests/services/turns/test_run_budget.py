@@ -259,25 +259,22 @@ def test_the_platform_s_thinking_is_not_charged_to_the_citizen() -> None:
 def test_the_run_bound_and_the_daily_meter_weigh_a_token_identically() -> None:
     """ONE POLICY, TWO READERS. The daily meter is a SQL column expression and the run bound is
     an in-process scalar, so they cannot share an implementation — but they must not drift into
-    two numbers the citizen hears the same word for. Both spell the weighting from the same two
-    divisors, and this pins that they agree on real arithmetic rather than merely importing the
-    same constants.
+    two numbers the citizen hears the same word for. Both spell the weighting from the same read
+    divisor and the same tier-derived write multiplier, and this pins that they agree on real
+    arithmetic rather than merely importing the same constants.
 
-    Mutation check: change either divisor in `weighted_spend` alone and this goes red."""
+    The write side is a MULTIPLIER now, not a surcharge divisor, because a cache write is priced
+    by the TTL tier its breakpoint bought rather than at one fixed ratio.
+
+    Mutation check: change either weight in `weighted_spend` alone and this goes red."""
     from src.services.usage.gate import (
         _CACHE_READ_DIVISOR,
-        _CACHE_WRITE_SURCHARGE_DIVISOR,
+        _CACHE_WRITE_MULTIPLIER,
         weighted_spend,
     )
 
     fresh, output, read, write = 1_000, 500, 40_000, 8_000
-    expected = (
-        fresh
-        + output
-        + read / _CACHE_READ_DIVISOR
-        + write
-        + write / _CACHE_WRITE_SURCHARGE_DIVISOR
-    )
+    expected = fresh + output + read / _CACHE_READ_DIVISOR + write * float(_CACHE_WRITE_MULTIPLIER)
     assert weighted_spend(
         input_tokens=fresh + read + write,  # the grand total, as pydantic-ai reports it
         output_tokens=output,
