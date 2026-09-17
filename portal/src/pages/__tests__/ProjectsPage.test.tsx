@@ -24,8 +24,6 @@ const h = vi.hoisted(() => ({
   createProject: vi.fn(),
   deleteProject: vi.fn(),
   listProjectConversations: vi.fn(),
-  restartApp: vi.fn(),
-  takeAppDown: vi.fn(),
   patchProject: vi.fn(),
 }))
 
@@ -35,11 +33,6 @@ vi.mock('../../utils/projectApi', () => ({
   createProject: h.createProject,
   deleteProject: h.deleteProject,
   patchProject: h.patchProject,
-}))
-vi.mock('../../utils/deployApi', async (importOriginal) => ({
-  ...(await importOriginal<Record<string, unknown>>()),
-  restartApp: h.restartApp,
-  takeAppDown: h.takeAppDown,
 }))
 vi.mock('../../utils/conversationApi', () => ({
   // The send path creates the chat before its first upload; stubbed so no network is reached.
@@ -129,14 +122,20 @@ function answersWithTheRequestedPage(
   )
 }
 
-/**
- * Delete an application the way a citizen now must: through the row's `⋯` menu. Two steps on
- * purpose — a list does not hand out a one-click route to an irreversible action. The trigger is
- * Radix, so it opens on POINTERDOWN rather than click.
- */
-async function deleteFromRowMenu(): Promise<void> {
+/** The row's `⋯`, then Settings. The trigger is Radix, so it opens on POINTERDOWN, not click. */
+async function openSettingsFromRowMenu(): Promise<void> {
   fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
-  fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete' }))
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Settings…' }))
+}
+
+/**
+ * Delete an application the way a citizen must: through Settings, which is the only door there
+ * is. The list itself offers no route — an irreversible action does not get one from a page of
+ * thirteen rows.
+ */
+async function deleteFromSettings(): Promise<void> {
+  await openSettingsFromRowMenu()
+  fireEvent.click(await screen.findByTestId('settings-delete'))
 }
 
 /** Radix's Select is a button, not a `<select>`: `fireEvent.change` on it silently no-ops. */
@@ -182,8 +181,6 @@ beforeEach(() => {
   h.listProjects.mockResolvedValue(page([]))
   h.listProjectCounts.mockResolvedValue(COUNTS)
   h.listProjectConversations.mockResolvedValue([])
-  h.restartApp.mockResolvedValue({ deploymentId: 'd1' })
-  h.takeAppDown.mockResolvedValue({ message: 'done' })
 })
 afterEach(() => cleanup())
 
@@ -561,7 +558,7 @@ describe('create and delete', () => {
     renderPage()
     await screen.findByText('Alpha')
 
-    await deleteFromRowMenu()
+    await deleteFromSettings()
     // The dialog gates on a 5-50 word reason, which the page forwards to the
     // API. Its own bounds are asserted in ProjectDeleteDialog.test.tsx; here it just has to
     // be valid so the delete runs.
@@ -584,7 +581,7 @@ describe('create and delete', () => {
     renderPage()
     await screen.findByText('Alpha')
 
-    await deleteFromRowMenu()
+    await deleteFromSettings()
     fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
       target: { value: 'no longer needed by ground ops' },
     })
@@ -724,7 +721,7 @@ describe('create and delete', () => {
     renderPage()
     await screen.findByText('Alpha')
 
-    await deleteFromRowMenu()
+    await deleteFromSettings()
     fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
       target: { value: 'no longer needed by ground ops' },
     })
@@ -790,7 +787,7 @@ describe('create and delete', () => {
     await screen.findByText('Alpha')
     h.listProjects.mockClear()
 
-    await deleteFromRowMenu()
+    await deleteFromSettings()
     fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {
       target: { value: 'no longer needed by ground ops' },
     })
@@ -1076,166 +1073,11 @@ describe('page, search and rows-per-page live in the URL', () => {
 })
 
 /**
- * RESTART AND TAKE DOWN, REACHED FROM THE LIST.
- *
- * The list is not a polling surface and does not become one: it refetches ONCE when an
- * operation returns, the same refresh a delete already triggers. What it must get right is that
- * two rows acting at once settle independently — a shared boolean would freeze a whole page of
- * applications because one of them is restarting.
+ * THE SETTINGS DIALOG, OPENED FROM A ROW. It is an overlay over this list rather than a route, so
+ * the handover in both directions is the list's problem: what the dialog saves has to reach the
+ * rows, and what it closes has to stay closed.
  */
-describe('ProjectsPage — the production actions', () => {
-  const serving = (id: string, name: string) => mkProject(id, name, { isServing: true })
-
-  async function openRowMenu(index = 0): Promise<void> {
-    fireEvent.pointerDown(screen.getAllByTestId('app-menu-row')[index])
-    await screen.findByRole('menuitem', { name: 'Open' })
-  }
-
-  /** Take-down is asked about before it runs; restart is not. */
-  async function pressTakeDown(): Promise<void> {
-    fireEvent.click(await screen.findByTestId('menu-takedown'))
-    fireEvent.click(await screen.findByTestId('take-down-confirm'))
-  }
-
-  it('runs menu-restart against the row it was opened on', async () => {
-    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Draft App'), serving('p2', 'Ramp Ops')]))
-    renderPage()
-    await screen.findByText('Ramp Ops')
-    // The first row is not serving, so its menu carries neither entry — the SECOND row's does.
-    await openRowMenu(1)
-    fireEvent.click(await screen.findByTestId('menu-restart'))
-    await waitFor(() => expect(h.restartApp).toHaveBeenCalledWith('p2'))
-  })
-
-  it('runs menu-takedown against the row it was opened on, once confirmed', async () => {
-    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Draft App'), serving('p2', 'Ramp Ops')]))
-    renderPage()
-    await screen.findByText('Ramp Ops')
-    await openRowMenu(1)
-    await pressTakeDown()
-    await waitFor(() => expect(h.takeAppDown).toHaveBeenCalledWith('p2'))
-  })
-
-  it('★ takes nothing down until the owner says so, and names which one it is asking about', async () => {
-    // THE CALIBRATION THIS FIXES. One click in a menu ended an application for everyone at BIAL,
-    // with no question and nothing to undo — beside a Delete that demands a written reason and a
-    // Send for review, which changes nothing, that opens a questionnaire.
-    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops')]))
-    renderPage()
-    await screen.findByText('Ramp Ops')
-    await openRowMenu()
-    fireEvent.click(await screen.findByTestId('menu-takedown'))
-
-    expect(screen.getByText(/Take “Ramp Ops” out of production\?/)).toBeTruthy()
-    expect(h.takeAppDown).not.toHaveBeenCalled()
-
-    fireEvent.click(screen.getByTestId('take-down-cancel'))
-    await waitFor(() => expect(screen.queryByTestId('take-down-confirm')).toBeNull())
-    // The row is still there and still serving — a cancel that quietly ran it anyway is exactly
-    // the failure an absence assertion on its own would miss.
-    expect(h.takeAppDown).not.toHaveBeenCalled()
-    expect(screen.getByText('Ramp Ops')).toBeTruthy()
-  })
-
-  it('★ says what a take-down kept, in the server\'s own words', async () => {
-    // The server composes the sentence — it names what survives, and appends the review-queue
-    // fact when a version is waiting — and both callers dropped it, so a take-down that worked
-    // produced no message at all: the only signal was a chip changing colour in a row a reader
-    // may have scrolled past.
-    h.takeAppDown.mockResolvedValue({
-      message: 'Your app is no longer running in production. Everything it holds is kept.',
-    })
-    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops')]))
-    renderPage()
-    await screen.findByText('Ramp Ops')
-    await openRowMenu()
-    await pressTakeDown()
-
-    const notice = await screen.findByTestId('projects-toast')
-    expect(notice.getAttribute('data-tone')).toBe('confirmation')
-    expect(notice.textContent).toContain('Everything it holds is kept')
-    // And it names its subject, because this list can be searched and paged out from under it.
-    expect(notice.textContent).toContain('Ramp Ops')
-  })
-
-  it('★ a restart that was accepted says so — the route answers with no words of its own', async () => {
-    // The route returns 202 with a deployment id the moment the work is claimed, and the work
-    // then runs for MINUTES. The row's busy state ends at that 202, so without an authored
-    // sentence the only signal was a control going briefly dim and then nothing at all.
-    h.restartApp.mockResolvedValue({ deploymentId: 'd9' })
-    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops')]))
-    renderPage()
-    await screen.findByText('Ramp Ops')
-    await openRowMenu()
-    fireEvent.click(await screen.findByTestId('menu-restart'))
-
-    const notice = await screen.findByTestId('projects-toast')
-    expect(notice.getAttribute('data-tone')).toBe('confirmation')
-    expect(notice.textContent).toContain('Ramp Ops')
-    // It promises the recycle STARTED, not that it finished — a 202 knows nothing more.
-    expect(notice.textContent).toMatch(/Restarting/)
-  })
-
-  it('re-reads the list once the operation returns, so the chip stops being stale', async () => {
-    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops')]))
-    renderPage()
-    await screen.findByText('Ramp Ops')
-    const before = h.listProjects.mock.calls.length
-    await openRowMenu()
-    await pressTakeDown()
-    await waitFor(() => expect(h.listProjects.mock.calls.length).toBeGreaterThan(before))
-  })
-
-  it("★ says the server's own reason when it refuses, not a generic failure", async () => {
-    // Every refusal on these two routes names something the owner can act on — publish it
-    // again, wait for the deploy to finish, ask an administrator. Flattening them into
-    // "something went wrong" throws away the only part that helps.
-    h.restartApp.mockRejectedValue(
-      new ApiError('This app has been taken offline. Publish again to put it back.', 409, 'taken_offline'),
-    )
-    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops')]))
-    renderPage()
-    await screen.findByText('Ramp Ops')
-    await openRowMenu()
-    fireEvent.click(await screen.findByTestId('menu-restart'))
-    expect((await screen.findByTestId('projects-toast')).textContent).toContain(
-      'This app has been taken offline. Publish again to put it back.',
-    )
-  })
-
-  it('★ one row acting does not freeze the other', async () => {
-    // Mutation receipt: make `actingIds` a single `actingId` string and this goes red — the
-    // second application would be announced inert because an unrelated one is restarting.
-    h.restartApp.mockReturnValue(new Promise(() => {}))
-    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops'), serving('p2', 'Gate Board')]))
-    renderPage()
-    await screen.findByText('Gate Board')
-
-    await openRowMenu(0)
-    fireEvent.click(await screen.findByTestId('menu-restart'))
-
-    await openRowMenu(1)
-    const restart = await screen.findByTestId('menu-restart')
-    expect(restart.getAttribute('aria-disabled')).toBe('false')
-    fireEvent.click(restart)
-    await waitFor(() => expect(h.restartApp).toHaveBeenCalledTimes(2))
-    expect(h.restartApp.mock.calls.map((c: unknown[]) => c[0])).toEqual(['p1', 'p2'])
-  })
-
-  it('★ the acting row itself IS announced inert while its own operation runs', async () => {
-    // The paired positive for the test above: scoping per row must not mean nothing is scoped.
-    h.restartApp.mockReturnValue(new Promise(() => {}))
-    h.listProjects.mockResolvedValue(page([serving('p1', 'Ramp Ops')]))
-    renderPage()
-    await screen.findByText('Ramp Ops')
-    await openRowMenu()
-    fireEvent.click(await screen.findByTestId('menu-restart'))
-    await openRowMenu()
-    await waitFor(() =>
-      expect(screen.getByTestId('menu-restart').getAttribute('aria-disabled')).toBe('true'),
-    )
-  })
-
+describe('ProjectsPage — the settings dialog', () => {
   it('★ a rename that lands after the dialog closed does not bring it back', async () => {
     // THE NAME COMMITS ON BLUR, so its answer can arrive at any moment afterwards — including
     // after the X, or after Delete handed off to its confirmation. Writing the returned project
@@ -1247,8 +1089,7 @@ describe('ProjectsPage — the production actions', () => {
     renderPage()
     await screen.findByText('Ramp Ops')
 
-    await openRowMenu()
-    fireEvent.click(await screen.findByRole('menuitem', { name: 'Settings…' }))
+    await openSettingsFromRowMenu()
     const dialog = await screen.findByTestId('app-settings-dialog')
 
     const name = within(dialog).getByLabelText('Application name')
@@ -1267,17 +1108,6 @@ describe('ProjectsPage — the production actions', () => {
     // Still gone. Paired with liveness, because "no dialog" is also what a crashed page looks like.
     expect(screen.queryByTestId('app-settings-dialog')).toBeNull()
     expect(screen.getByTestId('project-row')).toBeTruthy()
-  })
-
-  it('offers neither entry on an application that is not serving', async () => {
-    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Draft App')]))
-    renderPage()
-    await screen.findByText('Draft App')
-    await openRowMenu()
-    // Liveness beside the absence: the menu opened and carries its ordinary entries.
-    expect(screen.getByRole('menuitem', { name: 'Settings…' })).toBeTruthy()
-    expect(screen.queryByTestId('menu-restart')).toBeNull()
-    expect(screen.queryByTestId('menu-takedown')).toBeNull()
   })
 })
 

@@ -59,7 +59,7 @@ describe('ProjectRow — the description', () => {
     // obvious remedy — and this goes red on the first assertion, because the truncation lands
     // in the DOM and a screen reader loses exactly what a sighted reader loses.
     stubClip(true)
-    render(<ProjectRow project={project({ description: LONG })} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project({ description: LONG })} onOpen={vi.fn()} onSettings={vi.fn()} />)
 
     const description = screen.getByText(LONG)
     expect(description.textContent).toBe(LONG)
@@ -73,7 +73,7 @@ describe('ProjectRow — the description', () => {
     // them: the row is alive and the affordance it does have works.
     stubClip(true)
     const onOpen = vi.fn()
-    render(<ProjectRow project={project({ description: LONG })} onOpen={onOpen} onSettings={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project({ description: LONG })} onOpen={onOpen} onSettings={vi.fn()} />)
 
     const description = screen.getByText(LONG)
     expect(description.className).not.toMatch(/cursor-pointer/)
@@ -91,7 +91,7 @@ describe('ProjectRow — the description', () => {
     // stretched ::after, so it wires `onOpen` back explicitly rather than relying on an
     // overlay jsdom cannot see.
     const onOpen = vi.fn()
-    render(<ProjectRow project={project({ description: LONG })} onOpen={onOpen} onSettings={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project({ description: LONG })} onOpen={onOpen} onSettings={vi.fn()} />)
 
     fireEvent.click(screen.getByText(LONG))
 
@@ -109,7 +109,6 @@ describe('ProjectRow — the name keeps its tooltip', () => {
         project={project({ name: 'A Very Long Project Name That Has To Clip' })}
         onOpen={vi.fn()}
         onSettings={vi.fn()}
-        onDelete={vi.fn()}
       />,
     )
 
@@ -121,7 +120,7 @@ describe('ProjectRow — the name keeps its tooltip', () => {
 
   it('opens nothing on a name that already fits', () => {
     stubClip(false)
-    render(<ProjectRow project={project()} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project()} onOpen={vi.fn()} onSettings={vi.fn()} />)
 
     fireEvent.focus(screen.getByRole('button', { name: 'Visitor Log' }))
 
@@ -140,12 +139,12 @@ describe('ProjectRow — the ref never remounts across a clipped transition', ()
     // again.
     stubClip(true)
     const { rerender } = render(
-      <ProjectRow project={project({ name: 'Clipped today' })} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />,
+      <ProjectRow project={project({ name: 'Clipped today' })} onOpen={vi.fn()} onSettings={vi.fn()} />,
     )
     const before = screen.getByRole('button', { name: 'Clipped today' })
 
     stubClip(false)
-    rerender(<ProjectRow project={project({ name: 'Fits now' })} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
+    rerender(<ProjectRow project={project({ name: 'Fits now' })} onOpen={vi.fn()} onSettings={vi.fn()} />)
     const after = screen.getByRole('button', { name: 'Fits now' })
 
     expect(after).toBe(before) // same DOM node, not a fresh mount
@@ -159,7 +158,7 @@ describe('ProjectRow — a project with no description', () => {
     // no `onClick` — a dead strip across the newest, emptiest projects, the ones most likely
     // to be clicked into.
     const onOpen = vi.fn()
-    render(<ProjectRow project={project({ description: null })} onOpen={onOpen} onSettings={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project({ description: null })} onOpen={onOpen} onSettings={vi.fn()} />)
 
     fireEvent.click(screen.getByText('No description yet'))
 
@@ -172,7 +171,7 @@ describe('ProjectRow — no nested interactive elements, still', () => {
     // The tooltip restructuring wraps the name in TooltipProvider/Tooltip/TooltipTrigger —
     // worth re-confirming the invariant survives the extra nesting. A browser would forgive a
     // nested button and jsdom would not notice, so the DOM relationship is what is asserted.
-    render(<ProjectRow project={project()} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project()} onOpen={vi.fn()} onSettings={vi.fn()} />)
 
     const menu = screen.getByTestId('app-menu-row')
     const open = screen.getByRole('button', { name: 'Visitor Log' })
@@ -181,24 +180,24 @@ describe('ProjectRow — no nested interactive elements, still', () => {
     expect(menu.parentElement?.closest('button')).toBeNull()
   })
 
-  it('reaches Delete through the menu, and not by one click on the row', async () => {
+  it('reaches Settings through the menu, and not by one click on the row', async () => {
     const onOpen = vi.fn()
-    const onDelete = vi.fn()
-    render(<ProjectRow project={project()} onOpen={onOpen} onSettings={vi.fn()} onDelete={onDelete} />)
+    const onSettings = vi.fn()
+    render(<ProjectRow project={project()} onOpen={onOpen} onSettings={onSettings} />)
 
-    // There is no bare delete control any more: an irreversible action does not get a
-    // one-click route from a list.
+    // Nothing destructive has a bare control here: what a row hands out in one press is the
+    // application itself, and everything else is two steps away behind Settings.
     expect(screen.queryByLabelText('Delete Visitor Log')).toBeNull()
 
     fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
-    fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete' }))
-    expect(onDelete).toHaveBeenCalledTimes(1)
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Settings…' }))
+    expect(onSettings).toHaveBeenCalledTimes(1)
     expect(onOpen).not.toHaveBeenCalled()
   })
 
   it('opens the menu by keyboard, without opening the project', async () => {
     const onOpen = vi.fn()
-    render(<ProjectRow project={project()} onOpen={onOpen} onSettings={vi.fn()} onDelete={vi.fn()} />)
+    render(<ProjectRow project={project()} onOpen={onOpen} onSettings={vi.fn()} />)
     const trigger = screen.getByTestId('app-menu-row')
     trigger.focus()
     expect(document.activeElement).toBe(trigger)
@@ -210,71 +209,29 @@ describe('ProjectRow — no nested interactive elements, still', () => {
 })
 
 /**
- * THE TWO PRODUCTION ENTRIES. They exist only while the application is serving — which is the
- * precondition the endpoints enforce anyway, so a control offered here in order to be refused
- * teaches a citizen to distrust the screen.
+ * A LIST ROW IS WHERE AN APPLICATION IS FOUND, NOT WHERE IT IS OPERATED. Restart, Take down and
+ * Delete live in Settings, each on the tab that owns the thing it changes.
  */
-describe('ProjectRow — Restart and Take down', () => {
-  it.each([
-    ['Restart', 'menu-restart'],
-    ['Take down', 'menu-takedown'],
-  ])('offers %s only while the application is serving', async (label, testid) => {
-    // Absence PAIRED WITH LIVENESS. The menu really opened and really carries its other
-    // entries, so this is the two production entries being withheld — not a menu that failed
-    // to render, which is what an unpaired `toBeNull()` would also accept.
-    render(<ProjectRow project={project({ isServing: false })} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} />)
+describe('ProjectRow — the menu is two entries, and stays two', () => {
+  it('★ offers exactly Open and Settings…, even on an application that IS serving', async () => {
+    // SERVING IS THE CASE THAT MATTERS. `isServing` is the one fact about an application that
+    // could make this menu differ at all, so a guard written against a dormant one proves
+    // nothing about the rule it is meant to hold shut.
+    //
+    // The exact list IS the liveness half: a menu that failed to render has no two entries to
+    // enumerate, so the absences underneath cannot be a crash reading as a pass.
+    render(<ProjectRow project={project({ isServing: true })} onOpen={vi.fn()} onSettings={vi.fn()} />)
     fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
-    expect(await screen.findByRole('menuitem', { name: 'Open' })).toBeTruthy()
-    expect(screen.queryByTestId(testid)).toBeNull()
-    expect(screen.queryByRole('menuitem', { name: label })).toBeNull()
+
+    await screen.findByRole('menuitem', { name: 'Open' })
+    expect(screen.getAllByRole('menuitem').map((item) => item.textContent)).toEqual([
+      'Open',
+      'Settings…',
+    ])
+    expect(screen.queryByTestId('menu-restart')).toBeNull()
+    expect(screen.queryByTestId('menu-takedown')).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: 'Delete' })).toBeNull()
   })
-
-  it('offers both once it IS serving', async () => {
-    render(
-      <ProjectRow
-        project={project({ isServing: true })}
-        onOpen={vi.fn()}
-        onSettings={vi.fn()}
-        onDelete={vi.fn()}
-        live={{ onRestart: vi.fn(), onTakeDown: vi.fn(), busy: false }}
-      />,
-    )
-    fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
-    expect(await screen.findByTestId('menu-restart')).toBeTruthy()
-    expect(screen.getByTestId('menu-takedown')).toBeTruthy()
-  })
-
-  it.each([
-    ['menu-restart', 'onRestart'],
-    ['menu-takedown', 'onTakeDown'],
-  ] as const)('runs %s through its own handler', async (testid, handler) => {
-    const live = { onRestart: vi.fn(), onTakeDown: vi.fn(), busy: false }
-    render(
-      <ProjectRow project={project({ isServing: true })} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} live={live} />,
-    )
-    fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
-    fireEvent.click(await screen.findByTestId(testid))
-    expect(live[handler]).toHaveBeenCalledTimes(1)
-  })
-
-  it('★ mid-operation the two entries are UNAVAILABLE, not absent', async () => {
-    // A control that vanishes while its own action runs reads as a broken screen — the citizen
-    // pressed a thing and the thing left. It stays, announced inert, and refuses the press.
-    const live = { onRestart: vi.fn(), onTakeDown: vi.fn(), busy: true }
-    render(
-      <ProjectRow project={project({ isServing: true })} onOpen={vi.fn()} onSettings={vi.fn()} onDelete={vi.fn()} live={live} />,
-    )
-    fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
-    const restart = await screen.findByTestId('menu-restart')
-    expect(restart.getAttribute('aria-disabled')).toBe('true')
-    expect(screen.getByTestId('menu-takedown').getAttribute('aria-disabled')).toBe('true')
-
-    fireEvent.click(restart)
-    fireEvent.click(screen.getByTestId('menu-takedown'))
-    expect(live.onRestart).not.toHaveBeenCalled()
-    expect(live.onTakeDown).not.toHaveBeenCalled()
-  })
-
 })
 
 describe('ProjectRow — the dates', () => {
@@ -288,7 +245,6 @@ describe('ProjectRow — the dates', () => {
         }}
         onOpen={vi.fn()}
         onSettings={vi.fn()}
-        onDelete={vi.fn()}
       />,
     )
     expect(screen.getByText('12 Aug 2026')).toBeTruthy()
@@ -304,7 +260,6 @@ describe('ProjectRow — the dates', () => {
         project={{ ...project(), createdAt: at, updatedAt: at }}
         onOpen={vi.fn()}
         onSettings={vi.fn()}
-        onDelete={vi.fn()}
       />,
     )
     const both = screen.getAllByText('14 Sep 2026')
@@ -326,7 +281,6 @@ describe('ProjectRow — the dates', () => {
         project={project({ appStatus: 'rejected' })}
         onOpen={vi.fn()}
         onSettings={vi.fn()}
-        onDelete={vi.fn()}
       />,
     )
     const pill = screen.getByText('Changes requested')

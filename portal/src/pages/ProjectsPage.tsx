@@ -35,12 +35,9 @@ import {
 import { ApiError } from '../utils/apiError'
 import ProjectCard from '../components/projects/ProjectCard'
 import ProjectRow from '../components/projects/ProjectRow'
-import type { AppRowMenuProps } from '../components/projects/AppRowMenu'
 import ProjectCreateModal from '../components/projects/ProjectCreateModal'
 import ProjectDeleteDialog from '../components/projects/ProjectDeleteDialog'
-import TakeDownDialog from '../components/projects/TakeDownDialog'
 import AppSettingsDialog from '../components/projects/AppSettingsDialog'
-import { restartApp, takeAppDown } from '../utils/deployApi'
 import { ListPager, ListSkeleton, ViewControls } from '../components/projects/listChrome'
 import { COLUMN, DENSITY_COLS, DEFAULT_PAGE_SIZE, PAGE_SIZES } from '../utils/listView'
 import { useListView } from '../hooks/useListView'
@@ -65,18 +62,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
  * it is derived from the response, two causes can print two sentences again.
  */
 export const PROJECT_GONE_NOTICE = 'That application is no longer available.'
-
-/**
- * WHAT A RESTART SAYS WHEN IT IS ACCEPTED, and it is authored here because the route does not
- * write one: it answers 202 with a deployment id the moment the work is claimed, and the work
- * then runs for minutes. The row's busy state ends at that 202, so without this the only signal
- * an owner got was a control going briefly dim and then nothing at all — for the one action on
- * this list whose effect they cannot see from here.
- *
- * It promises the recycle has STARTED rather than finished, because that is all a 202 knows.
- */
-const RESTART_ACCEPTED =
-  'Restarting. It keeps serving the version it is already running until the new one is up.'
 
 /**
  * The three summary tiles, and the filter each one applies.
@@ -176,63 +161,19 @@ export default function ProjectsPage(): React.JSX.Element {
   const navigate = useNavigate()
   const [showCreate, setShowCreate] = useState(false)
   const [deleting, setDeleting] = useState<Project | null>(null)
-  const [takingDown, setTakingDown] = useState<Project | null>(null)
   // THE SETTINGS DIALOG IS AN OVERLAY OVER THIS LIST, not a route. Opening it changes no
   // address, so a citizen who came from a search and a page is still on that search and that
   // page when they close it.
   const [settingsFor, setSettingsFor] = useState<Project | null>(null)
-  // WHICH ROWS HAVE AN OPERATION OF THEIR OWN IN FLIGHT. A set rather than a boolean, for the
-  // reason the delete set already gives: two rows acting at once must settle independently.
-  // The list does NOT become a polling surface — it refetches once when an operation returns,
-  // which is the same refresh a delete already triggers.
-  const [actingIds, setActingIds] = useState<ReadonlySet<string>>(() => new Set())
-
   /**
    * WHAT THE STRIP AT THE FOOT SAYS, and whether it is bad news. The tone is carried rather than
-   * assumed: a take-down that worked has something an owner needs to be told — nothing was
-   * deleted, and a version waiting for review is untouched — and a red bar is the wrong voice for
-   * it. `subject` names the application, because this list can scroll, filter and empty
-   * underneath a notice that then refers to nothing on screen.
+   * assumed, so a failure and a confirmation cannot come to share one voice. `subject` names the
+   * application, because this list can scroll, filter and empty underneath a notice that then
+   * refers to nothing on screen.
    */
   const [toast, setToast] = useState<
     { text: string; tone: 'failure' | 'confirmation'; subject: string } | null
   >(null)
-
-  const runProduction = useCallback(
-    (project: Project, run: (id: string) => Promise<unknown>, accepted?: string) => {
-      setActingIds((ids) => new Set(ids).add(project.id))
-      void (async () => {
-        try {
-          const settled: unknown = await run(project.id)
-          // THE SENTENCE THE SERVER ALREADY WROTE. A take-down composes one — it says what is
-          // kept, and appends the review-queue fact when there is a version waiting — and both
-          // callers used to drop it, so a successful take-down produced no message at all and
-          // the only signal was a chip changing colour in a row you may have scrolled past.
-          const said =
-            typeof settled === 'object' && settled !== null && 'message' in settled
-              ? String((settled as { message: unknown }).message)
-              : (accepted ?? '')
-          if (said !== '') setToast({ text: said, tone: 'confirmation', subject: project.name })
-        } catch (caught) {
-          // THE SERVER'S STATED REASON. Every refusal on these two routes names something the
-          // owner can act on, and flattening them into "something went wrong" throws that away.
-          setToast({
-            text: caught instanceof Error ? caught.message : 'That did not work. Try again.',
-            tone: 'failure',
-            subject: project.name,
-          })
-        } finally {
-          setActingIds((ids) => {
-            const next = new Set(ids)
-            next.delete(project.id)
-            return next
-          })
-          setReloadNonce((n) => n + 1)
-        }
-      })()
-    },
-    [],
-  )
 
   const { view, setView, density, setDensity } = useListView()
 
@@ -397,20 +338,6 @@ export default function ProjectsPage(): React.JSX.Element {
   }, [loading, page, totalPages, commit])
 
   const openProject = (id: string): void => navigate(`/projects/${id}`)
-
-  /** The row menu's two production entries, or `undefined` where there is nothing serving to act
-   *  on. The list and the grid draw different components and must offer the SAME two actions. */
-  const liveControls = (project: Project): AppRowMenuProps['live'] =>
-    project.isServing
-      ? {
-          onRestart: () => runProduction(project, restartApp, RESTART_ACCEPTED),
-          // ASKED ABOUT, NOT PERFORMED. Restart interrupts the application for a moment; a
-          // take-down ends it for everyone at BIAL until somebody publishes again, and the two
-          // sat next to each other in one menu at the same single click.
-          onTakeDown: () => setTakingDown(project),
-          busy: actingIds.has(project.id),
-        }
-      : undefined
 
   const handleCreated = (project: Project): void => {
     setShowCreate(false)
@@ -785,8 +712,6 @@ export default function ProjectsPage(): React.JSX.Element {
                     project={project}
                     onOpen={() => openProject(project.id)}
                     onSettings={() => setSettingsFor(project)}
-                    onDelete={() => setDeleting(project)}
-                    live={liveControls(project)}
                   />
                 ))}
               </div>
@@ -798,8 +723,6 @@ export default function ProjectsPage(): React.JSX.Element {
                     project={project}
                     onOpen={() => openProject(project.id)}
                     onSettings={() => setSettingsFor(project)}
-                    onDelete={() => setDeleting(project)}
-                    live={liveControls(project)}
                   />
                 ))}
               </div>
@@ -921,21 +844,6 @@ export default function ProjectsPage(): React.JSX.Element {
           project={deleting}
           onClose={() => setDeleting(null)}
           onConfirm={(remark) => handleDelete(deleting, remark)}
-        />
-      )}
-
-      {takingDown !== null && (
-        <TakeDownDialog
-          appName={takingDown.name}
-          onClose={() => setTakingDown(null)}
-          onConfirm={() => {
-            // The dialog closes on the press rather than on the answer: the row carries the busy
-            // state from here on, and a modal held open over a list that is refreshing underneath
-            // is a second thing to dismiss for no gain.
-            const project = takingDown
-            setTakingDown(null)
-            runProduction(project, takeAppDown)
-          }}
         />
       )}
 

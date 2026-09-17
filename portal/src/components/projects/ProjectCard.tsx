@@ -4,25 +4,22 @@
  * cannot describe one application differently, and the same presentational half the recipient's
  * grid uses, so the two lists stay one component family.
  *
- * Purely presentational: the page owns navigation and deletion and injects them as
- * `onOpen`/`onDelete`/`onSettings`, so this renders trivially in a test with no router.
+ * Purely presentational: the page owns navigation and injects it as `onOpen`/`onSettings`, so
+ * this renders trivially in a test with no router.
  */
 import type { Project } from '../../utils/projectApi'
 import { tileDateRange, tileDateTitle } from '../../utils/projectDates'
 import AppTile from './AppTile'
 import AppStatusBadge from './AppStatusBadge'
 import AppRowMenu from './AppRowMenu'
-import type { AppRowMenuProps } from './AppRowMenu'
 
 export interface ProjectCardProps {
   project: Project
   onOpen: () => void
   onSettings: () => void
-  onDelete: () => void
-  live?: AppRowMenuProps['live']
 }
 
-export default function ProjectCard({ project, onOpen, onSettings, onDelete, live }: ProjectCardProps): React.JSX.Element {
+export default function ProjectCard({ project, onOpen, onSettings }: ProjectCardProps): React.JSX.Element {
   const name = project.name || 'Untitled application'
 
   return (
@@ -36,8 +33,6 @@ export default function ProjectCard({ project, onOpen, onSettings, onDelete, liv
           appName={name}
           onOpen={onOpen}
           onSettings={onSettings}
-          onDelete={onDelete}
-          live={live}
           where="tile"
         />
       }

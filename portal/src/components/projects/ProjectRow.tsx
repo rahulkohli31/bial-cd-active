@@ -16,17 +16,14 @@ import type { Project } from '../../utils/projectApi'
 import AppListRow from './AppListRow'
 import AppStatusBadge from './AppStatusBadge'
 import AppRowMenu from './AppRowMenu'
-import type { AppRowMenuProps } from './AppRowMenu'
 
 export interface ProjectRowProps {
   project: Project
   onOpen: () => void
   onSettings: () => void
-  onDelete: () => void
-  live?: AppRowMenuProps['live']
 }
 
-export default function ProjectRow({ project, onOpen, onSettings, onDelete, live }: ProjectRowProps): React.JSX.Element {
+export default function ProjectRow({ project, onOpen, onSettings }: ProjectRowProps): React.JSX.Element {
   return (
     <AppListRow
       testId="project-row"
@@ -55,8 +52,6 @@ export default function ProjectRow({ project, onOpen, onSettings, onDelete, live
           appName={project.name}
           onOpen={onOpen}
           onSettings={onSettings}
-          onDelete={onDelete}
-          live={live}
           where="row"
         />
       }
