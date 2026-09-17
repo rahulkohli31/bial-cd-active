@@ -2,11 +2,11 @@
 
 All models subclass the shared `CamelModel` (snake_case in Python, camelCase on the wire),
 live here in `src/schemas/`, and are re-exported from `src/schemas/__init__.py`. The name and
-description write rules (strip, required, length/word cap — KD-8, #191) are enforced HERE at
-the Pydantic boundary, not the DB column: a `ValueError` in a validator becomes the API's 422.
-Neither field may be blanked to empty/whitespace any more — that was description's old
-behaviour (normalize to NULL) before #191 made it required; the column itself stays nullable
-regardless, so a project written before #191 with no description is untouched.
+description write rules (strip, required, length/word cap) are enforced HERE at the Pydantic
+boundary, not the DB column: a `ValueError` in a validator becomes the API's 422. Neither field
+may be blanked to empty/whitespace any more — description used to normalize a blank write to
+NULL before it became required; the column itself stays nullable regardless, so a project
+written before the description requirement existed, with no description, is untouched.
 
 ONE FUNCTION HERE IS NOT ABOUT PROJECTS. `clean_stated_reason` is the platform's shared "say
 why" rule, and its callers now reach past this domain — the admin app-delete and the connector
@@ -63,29 +63,29 @@ def _clean_name(value: str) -> str:
 
 
 def _clean_description(value: str) -> str:
-    """The ONE description rule (#191), shared by `ProjectCreate` and `ProjectPatch` the same
-    way `_clean_name` is — one change covers create and edit both.
+    """The ONE description rule, shared by `ProjectCreate` and `ProjectPatch` the same way
+    `_clean_name` is — one change covers create and edit both.
 
-    A description is required and WORD-bounded — 15 to 120 (#191 R12) — following
+    A description is required and WORD-bounded — 15 to 120 — following
     `clean_stated_reason`'s shape (char-cap backstop first, then the word-count checks
     each with their own message), NOT `_clean_name`'s (which only ever checks a maximum).
     The minimum exists because a one-line description embeds into a single vector for
-    semantic search (slice 3) and a description too short to say anything embeds to nothing
-    worth matching; the maximum exists because a long multi-topic description embeds to a
-    vector that matches everything weakly, and `ts_rank_cd` has no document-length
-    normalisation to protect a precise description from being out-ranked by a rambling one.
+    semantic search and a description too short to say anything embeds to nothing worth
+    matching; the maximum exists because a long multi-topic description embeds to a vector
+    that matches everything weakly, and `ts_rank_cd` has no document-length normalisation to
+    protect a precise description from being out-ranked by a rambling one.
 
-    Blank-to-NULL normalization is GONE (KD-8's old behaviour): a description can no longer
-    be written as empty, because it is no longer optional. The column itself stays nullable
-    (R13) — a project created before #191 with no description is untouched and keeps
-    working (R14); this validator only governs what a NEW write may contain.
+    Blank-to-NULL normalization is GONE: a description can no longer be written as empty,
+    because it is no longer optional. The column itself stays nullable — a project created
+    before the description requirement existed, with no description, is untouched and keeps
+    working; this validator only governs what a NEW write may contain.
     """
     value = value.strip()
     if not value:
         raise ValueError("What should this app do?")
     # The character bound stays: the column has no width limit of its own, but the field is
-    # injected into every project chat turn (KD-8), so this remains the paste backstop. The
-    # WORD rule is the one a person is told about; this one they should never meet.
+    # injected into every project chat turn, so this remains the paste backstop. The WORD
+    # rule is the one a person is told about; this one they should never meet.
     if len(value) > MAX_PROJECT_DESCRIPTION:
         raise ValueError(
             f"That description is too long. Keep it under {MAX_PROJECT_DESCRIPTION} characters."
@@ -107,12 +107,12 @@ class ProjectCreate(CamelModel):
 
 
 class ProjectDuplicateCheckRequest(CamelModel):
-    """The body `POST /v1/projects:check-duplicates` takes (#191 slice 4, R31) — searched
-    against the live marketplace BEFORE a project exists, so there is no project id to hang
-    this off yet. Validated by the SAME rule `ProjectCreate.description` uses: the create
-    form only reaches this check after its own description already clears the word bound,
-    so a request that fails validation here is not a citizen typing, it is a caller
-    bypassing the form."""
+    """The body `POST /v1/projects:check-duplicates` takes — searched against the live
+    marketplace BEFORE a project exists, so there is no project id to hang this off yet.
+    Validated by the SAME rule `ProjectCreate.description` uses: the create form only
+    reaches this check after its own description already clears the word bound, so a
+    request that fails validation here is not a citizen typing, it is a caller bypassing
+    the form."""
 
     description: str
 
@@ -120,8 +120,8 @@ class ProjectDuplicateCheckRequest(CamelModel):
 
 
 class ProjectDuplicateCheckResponse(CamelModel):
-    """At most `services.projects.duplicates.MAX_MATCHES` entries (R34's confidence bar
-    already applied), each the SAME four-field shape the marketplace itself shows (R33) —
+    """At most `services.projects.duplicates.MAX_MATCHES` entries (the confidence bar
+    already applied), each the SAME four-field shape the marketplace itself shows —
     reusing `MarketplaceEntry` rather than a parallel type keeps the exposure boundary that
     schema documents in one place."""
 
@@ -129,17 +129,17 @@ class ProjectDuplicateCheckResponse(CamelModel):
 
 
 class ProjectDuplicateResolution(CamelModel):
-    """The body `POST /v1/projects:duplicate-check-resolved` takes (#191 R39) — what the
-    citizen did once shown possible duplicates. A closed set: FastAPI 422s a typo instead of
-    silently logging an event nothing downstream recognises."""
+    """The body `POST /v1/projects:duplicate-check-resolved` takes — what the citizen did
+    once shown possible duplicates. A closed set: FastAPI 422s a typo instead of silently
+    logging an event nothing downstream recognises."""
 
     resolution: Literal["opened_existing", "created_anyway"]
 
 
 class ProjectPatch(CamelModel):
     """Partial update — apply only fields present in `model_fields_set` (absent ≠ null).
-    Neither `name` nor `description` may be cleared to NULL (enforced in the route) —
-    #191 widened the rename path's existing rule to cover description too."""
+    Neither `name` nor `description` may be cleared to NULL (enforced in the route) — the
+    rename path's existing rule was widened to cover description too."""
 
     name: str | None = None
     description: str | None = None
@@ -154,7 +154,7 @@ class ProjectPatch(CamelModel):
     @classmethod
     def _v_description(cls, value: str | None) -> str | None:
         # Same shape as `_v_name` above: a provided description is cleaned; an explicit
-        # null is left for the route to reject (R11 — description cannot be cleared either).
+        # null is left for the route to reject — description cannot be cleared either.
         return None if value is None else _clean_description(value)
 
 
@@ -282,12 +282,12 @@ class ProjectResponse(CamelModel):
     # ONLY the single-project GET computes it: the list endpoint would need one HEAD per row,
     # and nothing on that surface offers Relaunch. It stays `null` there and no caller reads it.
     has_relaunchable_snapshot: bool | None = None
-    # WHETHER THE OWNER HAS EVER SAVED — narrower than `has_relaunchable_snapshot` on purpose
-    # (#198 R10's second sentence). The shared runtime restores ONLY from the saved bundle,
-    # never the autosave/recovery copy `has_relaunchable_snapshot` also counts (R21) — a
-    # recipient told "restorable" on the strength of an autosave alone would press Launch into
-    # a guaranteed 404. Computed by the same `snapshot_presence` check `create_share` (R10's
-    # first sentence) already refuses a share creation on, so the two surfaces agree.
+    # WHETHER THE OWNER HAS EVER SAVED — narrower than `has_relaunchable_snapshot` on purpose.
+    # The shared runtime restores ONLY from the saved bundle, never the autosave/recovery copy
+    # `has_relaunchable_snapshot` also counts — a recipient told "restorable" on the strength
+    # of an autosave alone would press Launch into a guaranteed 404. Computed by the same
+    # `snapshot_presence` check `create_share` already refuses a share creation on, so the two
+    # surfaces agree.
     #
     # `null` for an owner's own view (irrelevant there — an owner uses Relaunch, which reads
     # `has_relaunchable_snapshot` instead) and for a shared view with no app at all. `false`
@@ -296,8 +296,8 @@ class ProjectResponse(CamelModel):
     has_saved_snapshot: bool | None = None
     created_at: datetime
     updated_at: datetime
-    # WHO THE CALLER IS TO THIS PROJECT (#198 R11/R14) — "owner" everywhere except the one
-    # place a share can widen access, `get_project`. This is what the restricted workspace
+    # WHO THE CALLER IS TO THIS PROJECT — "owner" everywhere except the one place a share
+    # can widen access, `get_project`. This is what the restricted workspace
     # view keys off client-side; the API's OWN refusal of every mutating action for a
     # recipient does not depend on this field at all (those routes call the strict
     # `owned_project_or_404`, which a share never satisfies) — it exists so the UI can decide

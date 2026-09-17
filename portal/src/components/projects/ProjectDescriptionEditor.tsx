@@ -15,7 +15,7 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import type { ChangeEvent, KeyboardEvent } from 'react'
+import type { ChangeEvent, ClipboardEvent, KeyboardEvent } from 'react'
 import { Pencil, X } from 'lucide-react'
 import { patchProject } from '../../utils/projectApi'
 import type { Project } from '../../utils/projectApi'
@@ -54,6 +54,12 @@ export default function ProjectDescriptionEditor({
   const [mode, setMode] = useState<Mode>('idle')
   const [error, setError] = useState<string | null>(null)
   const [editing, setEditing] = useState(false)
+  // A paste that would exceed MAX_LENGTH is silently truncated by the textarea's own native
+  // `maxLength` — the browser drops the excess before `onChange` ever sees it, so a paste of
+  // 5,000 characters and one of exactly 2,000 are indistinguishable from inside the handler.
+  // This is computed in `onPaste`, BEFORE that truncation happens, from the clipboard text and
+  // the current selection — the one place the real, untruncated length is still visible.
+  const [pasteTruncated, setPasteTruncated] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const cardRef = useRef<HTMLDivElement>(null)
   const editButtonRef = useRef<HTMLButtonElement>(null)
@@ -75,7 +81,18 @@ export default function ProjectDescriptionEditor({
   const outOfWordBounds = words < MIN_PROJECT_DESCRIPTION_WORDS || words > MAX_PROJECT_DESCRIPTION_WORDS
   const invalid = over || outOfWordBounds
 
-  const onChange = (e: ChangeEvent<HTMLTextAreaElement>) => setText(e.target.value)
+  const onChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
+    setText(e.target.value)
+    setPasteTruncated(false)
+  }
+
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const pasted = e.clipboardData.getData('text')
+    const target = e.currentTarget
+    const resultingLength =
+      target.value.length - (target.selectionEnd - target.selectionStart) + pasted.length
+    setPasteTruncated(resultingLength > MAX_LENGTH)
+  }
 
   const openEditor = () => {
     setError(null)
@@ -219,6 +236,7 @@ export default function ProjectDescriptionEditor({
               placeholder={TEXTAREA_PLACEHOLDER}
               value={text}
               onChange={onChange}
+              onPaste={onPaste}
               disabled={busy}
               maxLength={MAX_LENGTH}
               rows={10}
@@ -232,6 +250,11 @@ export default function ProjectDescriptionEditor({
                 {words}/{MAX_PROJECT_DESCRIPTION_WORDS} words
               </span>
             </div>
+            {pasteTruncated && (
+              <p role="status" className="text-[11px] text-danger mt-1">
+                Pasted text was cut to {MAX_LENGTH} characters.
+              </p>
+            )}
 
             {/* THE WRITE-SURFACE NOTICE (#147, widened #191 R17). This field was introduced
                 as CHAT GROUNDING — private context for the builder's own assistant — and the

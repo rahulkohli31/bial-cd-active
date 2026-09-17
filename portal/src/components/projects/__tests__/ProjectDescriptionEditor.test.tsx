@@ -241,6 +241,36 @@ describe('ProjectDescriptionEditor — character backstop', () => {
 
     expect(h.patchProject).not.toHaveBeenCalled()
   })
+
+  it('says so when a paste is cut to the 2000-character cap — the native maxLength truncates silently otherwise', () => {
+    render(<ProjectDescriptionEditor projectId="p1" description={null} onProjectUpdate={vi.fn()} />)
+    openEditor()
+
+    const pasted = 'x'.repeat(2500)
+    fireEvent.paste(textarea(), { clipboardData: { getData: () => pasted } })
+
+    expect(screen.getByText('Pasted text was cut to 2000 characters.')).toBeTruthy()
+  })
+
+  it('says nothing for a paste that fits inside the cap', () => {
+    render(<ProjectDescriptionEditor projectId="p1" description={null} onProjectUpdate={vi.fn()} />)
+    openEditor()
+
+    fireEvent.paste(textarea(), { clipboardData: { getData: () => 'a short paste' } })
+
+    expect(screen.queryByText(/cut to 2000 characters/)).toBeNull()
+  })
+
+  it('clears the notice once the citizen types again', () => {
+    render(<ProjectDescriptionEditor projectId="p1" description={null} onProjectUpdate={vi.fn()} />)
+    openEditor()
+    fireEvent.paste(textarea(), { clipboardData: { getData: () => 'x'.repeat(2500) } })
+    expect(screen.getByText(/cut to 2000 characters/)).toBeTruthy()
+
+    fireEvent.change(textarea(), { target: { value: 'edited by hand' } })
+
+    expect(screen.queryByText(/cut to 2000 characters/)).toBeNull()
+  })
 })
 
 describe('ProjectDescriptionEditor — required + word bound (#191)', () => {

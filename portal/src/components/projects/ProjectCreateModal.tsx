@@ -22,6 +22,7 @@
  * available beneath the matches at all times (R36) — this is a courtesy, never a gate.
  */
 import { useState } from 'react'
+import type { ClipboardEvent } from 'react'
 import {
   countWords,
   MAX_PROJECT_NAME_WORDS,
@@ -113,6 +114,18 @@ export default function ProjectCreateModal({ onClose, onCreated }: ProjectCreate
   // what the citizen typed, not a fresh instance of this component.
   const [screen, setScreen] = useState<'form' | 'duplicates'>('form')
   const [duplicates, setDuplicates] = useState<MarketplaceEntry[]>([])
+  // A paste over DESCRIPTION_MAX is silently truncated by the textarea's own native
+  // `maxLength` before `onChange` ever sees it — computed in `onPasteDescription`, before
+  // that truncation happens, from the clipboard text and the current selection.
+  const [descriptionPasteTruncated, setDescriptionPasteTruncated] = useState(false)
+
+  const onPasteDescription = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const pasted = e.clipboardData.getData('text')
+    const target = e.currentTarget
+    const resultingLength =
+      target.value.length - (target.selectionEnd - target.selectionStart) + pasted.length
+    setDescriptionPasteTruncated(resultingLength > DESCRIPTION_MAX)
+  }
 
   const trimmedName = name.trim()
   const nameTooLong = name.length > NAME_MAX
@@ -303,7 +316,11 @@ export default function ProjectCreateModal({ onClose, onCreated }: ProjectCreate
               </span>
               <textarea
                 value={description}
-                onChange={(e) => setDescription(e.target.value)}
+                onChange={(e) => {
+                  setDescription(e.target.value)
+                  setDescriptionPasteTruncated(false)
+                }}
+                onPaste={onPasteDescription}
                 placeholder="Who uses it, and what do they do with it?"
                 maxLength={DESCRIPTION_MAX}
                 rows={4}
@@ -321,6 +338,11 @@ export default function ProjectCreateModal({ onClose, onCreated }: ProjectCreate
                   {descriptionWords}/{MAX_PROJECT_DESCRIPTION_WORDS} words
                 </span>
               </div>
+              {descriptionPasteTruncated && (
+                <p role="status" className="text-[11px] text-danger mt-1">
+                  Pasted text was cut to {DESCRIPTION_MAX} characters.
+                </p>
+              )}
               {/* THE WRITE-SURFACE NOTICE (#191 R17), mirroring the one already in
                   `ProjectDescriptionEditor` — stated here too because this is the OTHER
                   place the field is written from. */}

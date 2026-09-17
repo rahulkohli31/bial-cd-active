@@ -275,6 +275,23 @@ describe('ProjectCreateModal — submit', () => {
     })
   })
 
+  it('says so when a paste is cut to the 2000-character cap — the native maxLength truncates silently otherwise', () => {
+    render(<ProjectCreateModal onClose={vi.fn()} onCreated={vi.fn()} />)
+
+    const pasted = 'x'.repeat(2500)
+    fireEvent.paste(descriptionInput(), { clipboardData: { getData: () => pasted } })
+
+    expect(screen.getByText('Pasted text was cut to 2000 characters.')).toBeTruthy()
+  })
+
+  it('says nothing for a description paste that fits inside the cap', () => {
+    render(<ProjectCreateModal onClose={vi.fn()} onCreated={vi.fn()} />)
+
+    fireEvent.paste(descriptionInput(), { clipboardData: { getData: () => 'a short paste' } })
+
+    expect(screen.queryByText(/cut to 2000 characters/)).toBeNull()
+  })
+
   it('Cancel closes without creating anything', () => {
     const onClose = vi.fn()
     render(<ProjectCreateModal onClose={onClose} onCreated={vi.fn()} />)
