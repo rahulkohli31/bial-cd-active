@@ -97,6 +97,10 @@ export default function ProfileCluster({ collapsed = false, onMenuOpenChange }: 
         <DropdownMenuTrigger asChild>
           <button
             data-testid="profile-cluster"
+            // THE RAIL'S QUIET ZONE. Reaching this control must not be what opens the navigation:
+            // it is visible and pressable at either width, so expanding the panel to reach it is
+            // movement that buys nothing. `useNavRail` reads this attribute on entry.
+            data-nav-quiet=""
             title={collapsed ? displayName : undefined}
             className={`flex w-full items-center border-t border-bial-border py-3 text-left transition hover:bg-surface-muted ${
               collapsed ? 'justify-center px-0' : 'gap-2.5 px-4'

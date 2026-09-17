@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import type { PointerEvent } from 'react'
 
 /**
  * The navigation's three inputs, and the one answer they produce.
@@ -53,7 +54,7 @@ export interface NavRail {
   togglePin: () => void
   /** Spread onto the navigation's own element — the hit area IS the rail. */
   hoverProps: {
-    onPointerEnter: () => void
+    onPointerEnter: (event: PointerEvent<HTMLElement>) => void
     onPointerLeave: () => void
   }
   /** Handed to any menu the navigation opens, so reaching for it does not close it. */
@@ -76,10 +77,25 @@ export function useNavRail(): NavRail {
 
   useEffect(() => clearClose, [clearClose])
 
-  const onPointerEnter = useCallback(() => {
-    clearClose()
-    setHovered(true)
-  }, [clearClose])
+  const onPointerEnter = useCallback(
+    (event: PointerEvent<HTMLElement>) => {
+      clearClose()
+      // ARRIVING AT THE PROFILE IS NOT ARRIVING AT THE NAVIGATION. The avatar sits inside the
+      // rail, so reaching it means crossing the rail — which opened the whole panel on the way to
+      // a control that was already visible and already pressable. Entering THROUGH the quiet zone
+      // leaves the width alone.
+      //
+      // Only the ENTRY is filtered, never a later move: this fires once, when the pointer crosses
+      // into the aside. A pointer that came in over the destinations and then travelled down to
+      // the profile has already opened the panel and keeps it open, because this does not run
+      // again on the way down.
+      if (event.target instanceof Element && event.target.closest('[data-nav-quiet]') !== null) {
+        return
+      }
+      setHovered(true)
+    },
+    [clearClose],
+  )
 
   const onPointerLeave = useCallback(() => {
     clearClose()

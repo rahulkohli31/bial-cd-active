@@ -460,6 +460,30 @@ describe('the navigation rests as a rail and grows when it is approached', () =>
     expect(isCollapsed()).toBe(false)
   })
 
+  it('★ reaching the profile is not what opens the navigation', async () => {
+    // THE JOURNEY IS THE TEST. The avatar sits inside the rail, so a real pointer crosses the
+    // rail to reach it — and the rail opened on the way, which is what the owner reported. The
+    // enter is fired ON THE NAV with the profile as its target, which is what the browser does
+    // when the pointer crosses into the aside at the profile row; dispatching straight at the
+    // avatar never crosses the boundary and so proves nothing.
+    renderAt('/projects')
+    await screen.findByTestId('nav-docked')
+    expect(isCollapsed()).toBe(true)
+
+    // `pointerOver` on the inner element, not `pointerEnter` on the nav: React synthesises its
+    // enter from `pointerover`, so this is the event the browser actually delivers, carrying the
+    // element under the pointer as its target. `fireEvent`'s `target` option assigns to the NODE,
+    // not to the event, so it cannot express "entered here" at all.
+    fireEvent.pointerOver(screen.getByTestId('profile-cluster'))
+    await settle()
+    expect(isCollapsed()).toBe(true)
+
+    // The paired positive, without which the assertion above is satisfied by a rail that never
+    // opens at all: arriving over the destinations still opens it.
+    fireEvent.pointerOver(screen.getByTestId('nav-projects'))
+    await waitFor(() => expect(isCollapsed()).toBe(false))
+  })
+
   it('★ opening the profile menu on a collapsed rail does NOT sweep the panel open', async () => {
     // The latch that keeps the rail from closing under its own menu was first written as a third
     // term in the OR, which made pressing the avatar expand the whole navigation — a lot of
