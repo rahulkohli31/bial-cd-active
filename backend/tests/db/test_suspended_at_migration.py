@@ -59,7 +59,9 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # because a database that already ran it keeps a revision alembic still knows, so a plain
     # `alembic upgrade head` finishes the job. 0041_project_shares (#198 slice 1 — the platform's
     # first junction table) grew off 0040 alongside it, and 0042_merge_shares_connectors joins the
-    # two the same way. 0034 had already been re-parented
+    # two the same way. 0043_pending_teardown sits on top of that merge: the durable record of a
+    # container deletion the platform still owes, which has to survive the per-user registry being
+    # overwritten by whatever the citizen opened next. 0034 had already been re-parented
     # TWICE by this assertion: authored as an 0029 off 0028_deployment_unpublished_at, moved
     # to 0033 off 0032_rejection_standing on one rebase, and to 0034 off 0033_harness_counters
     # on the next — each time because main took the ordinal first. Which is exactly the silent
@@ -72,4 +74,4 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # `down_revision` really is the head you expected to build on.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0042_merge_shares_connectors"]
+    assert heads == ["0043_pending_teardown"]
