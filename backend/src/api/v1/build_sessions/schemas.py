@@ -579,7 +579,7 @@ class RenewPresenceResponse(CamelModel):
     draining_at: datetime | None = None
 
 
-# --- The activity read (R13) --------------------------------------------------
+# --- What is starting, open, or closing down -----------------------------------
 
 
 class ActivityPhase(enum.StrEnum):

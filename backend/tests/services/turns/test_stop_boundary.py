@@ -247,8 +247,9 @@ async def test_a_hard_cut_leaves_the_tool_call_for_the_transcript_to_guess_at(
     fake_redis: aioredis.Redis,
     fake_storage,
 ) -> None:
-    """THE BASELINE, and the error path R11 falls back to when no boundary arrives inside the
-    bound: the run is cut where it stands, the turn ends `stopped`, and the tool call already on
+    """THE BASELINE, and the error path a cooperative stop falls back to when no boundary
+    arrives inside the bound: the run is cut where it stands, the turn ends `stopped`, and the
+    tool call already on
     the record has no result — so `messages/store.py` synthesizes one on reload.
 
     That synthesized note is the whole reason this unit needs no marker of its own. It is also
@@ -733,7 +734,7 @@ async def test_the_ask_dies_with_the_turn_it_was_aimed_at(
 
 
 def test_the_bound_is_derived_from_the_slow_tool_budget_not_the_run_deadline() -> None:
-    """R11's wait is sized by WHAT STANDS BETWEEN THE ASK AND THE BOUNDARY — the tool call in
+    """The wait is sized by WHAT STANDS BETWEEN THE ASK AND THE BOUNDARY — the tool call in
     flight — and the longest legitimate one is a slow `run_command`, which a cold-base install
     routinely spends in full. The run deadline bounds a whole build with its repair rounds, so a
     wait cut from it would spare a wedged container for half an hour to save a boundary that was

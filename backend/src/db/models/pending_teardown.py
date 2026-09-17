@@ -60,7 +60,7 @@ class PendingTeardown(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, B
     # How many times this row has been claimed, counting the write that created it. Past the
     # service-layer cap the routine destroys rather than spares — see the module docstring.
     attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default=sa.text("1"))
-    # No default: the value is always the writer's own claim, computed from R11's bound, and a
+    # No default: the value is always the writer's own claim, computed from the stop's bound, and a
     # server-generated "now" would read as an already-lapsed claim on a row nobody has acted on
     # yet.
     claimed_until: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)

@@ -715,7 +715,7 @@ async def reap_user(
     # value it carries is still the shared app's id) — passing that here would gate this
     # RECIPIENT's teardown against the OWNER's saved copy, and R22 says that storage is
     # read-never-write for a recipient. Worse, a refused guarded write then REFUSES the reap
-    # outright, sparing the container forever — the exact bill-forever leak R16/R17 exist to
+    # outright, sparing the container forever — the exact bill-forever leak the ceiling exists to
     # close. A shared view holds nothing worth preserving in the first place: the recipient never
     # edits its tree directly, and what they own of it is a restore of the owner's own snapshot,
     # already durable at its source.
