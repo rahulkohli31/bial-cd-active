@@ -4,19 +4,17 @@
  * WHY THIS MODULE EXISTS AT ALL. The app pane host is a SIBLING of the `<Outlet/>`, not a
  * descendant of it — `AppPaneHost` owns that rule. Everything it needs is produced below that
  * Outlet — the resolved address, the pane's toolbar slots, whether the surface wants the pane
- * visible, the save-state reading — and a sibling cannot read any of it by props. So the mechanism
- * has to be named once, in one place, or three implementers will pick three and the seam will have
- * three shapes.
+ * visible — and a sibling cannot read any of it by props. So the mechanism has to be named once,
+ * in one place, or three implementers will pick three and the seam will have three shapes.
  *
  * WHAT TRAVELS ON IT, AND NOTHING ELSE:
  *
  *  1. the resolved preview address, its status and its liveness  (`utils/previewAddress.ts`)
  *  2. the pane's view — visibility and the pane's own pass-through props
- *  3. one save-state reading — the tri-state flag and the recovery instant, together
- *  4. the app-revealed callback, the reveal stop-clock
- *  5. the rail mode, its collapse, and an opaque per-mode bag that outlives a chat
- *  6. what to SAY about the workspace — one computed value, and the handlers for its one action
- *  7. what the toolbar row NAMES, and the save control's values and its action
+ *  3. the app-revealed callback, the reveal stop-clock
+ *  4. the rail mode, its collapse, and an opaque per-mode bag that outlives a chat
+ *  5. what to SAY about the workspace — one computed value, and the handlers for its one action
+ *  6. what the toolbar row NAMES, and the save control's values and its action
  *
  * TWO RULES MAKE IT SAFE, and they are the whole contract:
  *
@@ -35,8 +33,8 @@
  * object re-renders EVERY consumer whenever ANY field changes. Each payload is therefore its own
  * cell with its own listener set, read through `useSyncExternalStore`.
  *
- * BE PRECISE ABOUT WHAT THAT BUYS, because the tempting sentence is not true. A save-state publish
- * reaches only the shell's unload effect. A keystroke touches neither the address nor the save
+ * BE PRECISE ABOUT WHAT THAT BUYS, because the tempting sentence is not true. A heading publish
+ * reaches only the toolbar row. A keystroke touches neither the address nor the save
  * state nor the visibility — but it DOES republish the pane view, because that view is rebuilt by
  * identity every render (its toolbar nodes and its handlers are fresh closures), so the pane host
  * re-renders once per character exactly as `LivePreview` did when the page rendered it directly.
@@ -282,43 +280,6 @@ export const NO_SAVE: SaveSlot = {
 }
 
 /**
- * ONE READING OF THE SAVE STATE — TWO FACTS THAT TRAVEL TOGETHER OR NOT AT ALL.
- *
- * This used to be a bare `boolean | null` on the channel, and the second fact is here because a
- * bare `dirty` cannot tell the platform's two very different `true`s apart. `dirty` answers "is
- * there a saved VERSION of this tree?", so THE BUILD ITSELF makes it true: a citizen who described
- * an app, watched it get built and touched nothing arrives at `dirty: true, savedHead: null`, and
- * every surface reading that flag alone announced unsaved changes and blocked their exit over work
- * they had never done. `recoveryAt` is the fact that separates them — see
- * `SaveState.recoveryAt` in `utils/buildSessionApi.ts`, and `SessionManager.newest_restore_source`
- * behind it, for why a non-null instant means "the platform can put this back".
- *
- * WHY ONE CELL AND NOT TWO. The pair comes from a single `GET save-state` response, and every rule
- * written against it — the rail's sentence, the exit dialog, the unload prompt — is only sound if
- * both halves describe THE SAME reading. Two independently published cells would let a consumer
- * combine a dirty flag from one moment with a recovery instant from another, which is exactly how
- * a "safe to leave" gets computed from a recovery copy that no longer covers the current tree.
- * Publishing them together in one `set` makes that arithmetic impossible rather than merely
- * unlikely.
- *
- * IT IS NOT A CLAIM THAT ANYTHING WAS SAVED. A recovery copy is the platform's doing; a version is
- * the citizen's, and Save stays MANUAL. `dirty` stays true beside a non-null instant.
- */
-export interface SaveReading {
-  /** TRI-STATE. `true` definitely dirty, `false` definitely clean, `null` "could not tell". */
-  dirty: boolean | null
-  /** When the platform last wrote a recovery copy of this tree (ISO-8601), or `null` for none. */
-  recoveryAt: string | null
-}
-
-/**
- * NOBODY HAS REPORTED, which reads as the same "could not tell" a failed check produces — and
- * carries NO recovery instant, because the reading that would have named one never happened.
- * Fail toward warning: an absent fact must never be the reason somebody loses work.
- */
-export const NO_SAVE_READING: SaveReading = { dirty: null, recoveryAt: null }
-
-/**
  * THE ROW'S HANDLERS, held apart from every compared value on purpose.
  *
  * Every one is something a citizen PRESSES, so none is needed at render time — which is what lets
@@ -371,12 +332,6 @@ const sameSave = (a: SaveSlot, b: SaveSlot) =>
   a.canSave === b.canSave &&
   a.canDiscard === b.canDiscard
 
-/** BOTH FIELDS, and the second one is not optional: a comparator blind to `recoveryAt` would
- *  hold the first reading forever and freeze every sentence and every guard decision derived
- *  from it at whatever the first poll happened to say. */
-const sameReading = (a: SaveReading, b: SaveReading) =>
-  a.dirty === b.dirty && a.recoveryAt === b.recoveryAt
-
 /**
  * WHAT THE PANE NEEDS IN ORDER TO SAY WHAT THE WORKSPACE IS DOING. The `state` is the one computed
  * value — a sentence and at most one action, with no destructive verb in its type — and it travels
@@ -422,8 +377,6 @@ export interface WorkspaceChannel {
   project: Cell<string | null>
   pane: Cell<PaneView | null>
   visible: Cell<boolean>
-  /** One save-state reading — see `SaveReading`. `NO_SAVE_READING` means nobody has reported. */
-  saveReading: Cell<SaveReading>
   rail: Cell<RailSlot>
   /** What the toolbar row NAMES. Published by the routes — see `WorkspaceHeading`. */
   heading: Cell<WorkspaceHeading>
@@ -457,7 +410,6 @@ export function createWorkspaceChannel(): WorkspaceChannel {
     project: createCell<string | null>(null),
     pane: createCell<PaneView | null>(null),
     visible: createCell<boolean>(false),
-    saveReading: createCell<SaveReading>(NO_SAVE_READING, sameReading),
     rail: createCell<RailSlot>(NO_RAIL, sameRail),
     heading: createCell<WorkspaceHeading>(NO_HEADING, sameHeading),
     save: createCell<SaveSlot>(NO_SAVE, sameSave),
@@ -516,15 +468,6 @@ export function useWorkspacePaneVisible(): boolean {
   return useCell(useWorkspaceChannel()?.visible, false)
 }
 
-/**
- * THE WHOLE READING, not just its tri-state. `dirty` is `true` definitely dirty, `false`
- * definitely clean, `null` "could not tell"; `recoveryAt` says whether the platform is holding a
- * copy it can put back. Both, from one read — see `SaveReading` for why they are never separated.
- */
-export function useWorkspaceSaveState(): SaveReading {
-  return useCell(useWorkspaceChannel()?.saveReading, NO_SAVE_READING)
-}
-
 export function useRailSlot(): RailSlot {
   return useCell(useWorkspaceChannel()?.rail, NO_RAIL)
 }
@@ -580,10 +523,6 @@ export function useWorkspaceActions(): () => WorkspaceActions {
 //                         only the address to keep running, so dropping these costs nothing and
 //                         keeping them would render a departed conversation's toolbar.
 //   visible    CLEARED  — a surface that is gone is not asking for anything to be shown.
-//   saveReading KEPT    — the unsaved work is in the CONTAINER, not in the component. Clearing on
-//                         unmount would disarm the unload warning the moment the user navigated
-//                         from the chat to the project screen, which is the exact coverage the
-//                         hoist to the shell exists to add.
 
 function usePublish<T>(cell: Cell<T> | undefined, value: T, onUnmount?: T, abstain = false): void {
   // LAYOUT effect, not a passive one. The host is a sibling that re-renders from the store, so a
@@ -614,9 +553,9 @@ export function useWorkspaceProject(projectId: string | null): void {
  * Name the workspace for the toolbar row. PUBLISHED BY THE ROUTE, not by the surface below it —
  * see `WorkspaceHeading`.
  *
- * CLEARED ON UNMOUNT, unlike `project` and `saveReading`. A heading describes an ADDRESS, and the two
- * routes that publish one swap within a single commit, so there is no frame in which the row is
- * blank. Keeping it would leave a chat's title standing over the project screen while it loads.
+ * CLEARED ON UNMOUNT, unlike `project`. A heading describes an ADDRESS, and the two routes that
+ * publish one swap within a single commit, so there is no frame in which the row is blank. Keeping
+ * it would leave a chat's title standing over the project screen while it loads.
  */
 export function usePublishHeading(heading: WorkspaceHeading): void {
   usePublish(useWorkspaceChannel()?.heading, heading, NO_HEADING)
@@ -627,7 +566,6 @@ export function usePublishHeading(heading: WorkspaceHeading): void {
  *
  * BOTH ARE CLEARED ON UNMOUNT, for the same reason the pane view is: the action closes over the
  * publisher's own session, and a Save button left standing after that publisher died does nothing.
- * The reading on the SEPARATE `saveReading` cell is the one that is KEPT.
  */
 export function usePublishSave(
   save: Omit<SaveSlot, 'canSave' | 'canDiscard'>,
@@ -680,24 +618,6 @@ export function usePublishPaneView(view: PaneView): void {
 export function useAppPaneVisible(visible: boolean): void {
   usePublish(useWorkspaceChannel()?.visible, visible, false)
 }
-
-/**
- * Publish ONE save-state reading. Survives this surface's unmount — see the table above.
- *
- * ADDS NO PRODUCER AND NO TRAFFIC. Whoever calls this already knows the answer; the shell reads
- * whatever was last published and treats "nobody has published" as `NO_SAVE_READING`. A project
- * screen with no conversation mounted therefore costs no container round trip and warns about
- * nothing.
- *
- * TAKES THE PAIR, NOT A FLAG PLUS AN OPTIONAL EXTRA. The two facts have to reach the cell in one
- * `set` for a consumer to be allowed to reason across them — `SaveReading` records why — so the
- * call site names both or it does not compile. A FRESH OBJECT EVERY RENDER IS FREE: the cell is
- * value-compared, so an unchanged reading wakes nobody however often it is republished.
- */
-export function usePublishSaveState(reading: SaveReading): void {
-  usePublish(useWorkspaceChannel()?.saveReading, reading)
-}
-
 
 /**
  * Publish what to say about the workspace. CLEARED ON UNMOUNT, like the pane view and for the same

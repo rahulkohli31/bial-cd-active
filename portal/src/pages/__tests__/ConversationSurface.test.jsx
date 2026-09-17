@@ -1,21 +1,13 @@
 /**
  * WHAT THIS FILE ITSELF CLAIMS — properties true of the surface as a WHOLE, not any one behaviour:
  * a running turn stays STOPPABLE now the old stop card is gone; exactly ONE control starts a
- * build; exactly ONE scroll container in the chat slot and no `calc(100vh - …)` anywhere; no chat
- * list crept back during the rewrite; and the save-state tri-state reaches the shell UNCOLLAPSED
- * (`null` as `null`).
- *
- * The last one matters most: nothing else asserts whether THIS surface hands the channel a
- * `null` at all, or quietly turns one into a boolean on the way past. This file does.
+ * build; exactly ONE scroll container in the chat slot and no `calc(100vh - …)` anywhere; and no
+ * chat list crept back during the rewrite.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup, within, fireEvent } from '@testing-library/react'
+import { screen, waitFor, cleanup, within, fireEvent } from '@testing-library/react'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
-import WorkspaceShell from '../../components/workspace/WorkspaceShell'
-import ConversationSurface from '../../components/chat/ConversationSurface'
-import { useWorkspaceSaveState } from '../../components/workspace/workspaceChannel'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), getBuild: vi.fn(),
@@ -199,83 +191,6 @@ describe('no chat list came back while the pages were being rewritten', () => {
     // LIVENESS: the surface DID load those conversations — it reads them for the build-blocked
     // advisory — so their absence is a rendering decision rather than a failed fetch.
     await waitFor(() => expect(h.listProjectConversations).toHaveBeenCalled())
-  })
-})
-
-describe('the save-state TRI-STATE reaches the channel uncollapsed', () => {
-  // READ DIRECTLY OFF THE CHANNEL, not through a consumer's side effect. This used to observe the
-  // reading via the shell's `beforeunload` prompt; that prompt is gone, but the fact it stood in
-  // for — whether THIS surface hands the channel a `null` at all, or quietly turns one into a
-  // boolean on the way past — is still this file's claim, so the probe reads the channel itself.
-  function SaveStateProbe() {
-    const { dirty, recoveryAt } = useWorkspaceSaveState()
-    return <div data-testid="save-state-probe">{`${String(dirty)}|${recoveryAt ?? 'none'}`}</div>
-  }
-
-  function renderWithProbe({ deps: bsDeps, projectId = 'p1', hasSavedBuild = null } = {}) {
-    return render(
-      <MemoryRouter initialEntries={['/chat/build-X?projectId=p1&kind=build']}>
-        <Routes>
-          <Route element={<WorkspaceShell />}>
-            <Route
-              path="/chat/:chatId"
-              element={
-                <>
-                  <SaveStateProbe />
-                  <ConversationSurface
-                    projectId={projectId}
-                    projectName="VIP Movement"
-                    projectHasSavedBuild={hasSavedBuild}
-                    buildSessionDeps={bsDeps}
-                  />
-                </>
-              }
-            />
-          </Route>
-          <Route path="/projects" element={<div>projects index</div>} />
-          <Route path="/projects/:pid" element={<div>project page</div>} />
-        </Routes>
-      </MemoryRouter>,
-    )
-  }
-
-  const probe = () => screen.getByTestId('save-state-probe').textContent
-
-  it('a definite `true` reaches the channel as `true`', async () => {
-    h.fetchSaveState.mockResolvedValue({ dirty: true })
-    renderWithProbe({ deps: deps().deps })
-    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalled())
-    await waitFor(() => expect(probe()).toBe('true|none'))
-  })
-
-  it('a definite `false` reaches the channel as `false`', async () => {
-    h.fetchSaveState.mockResolvedValue({ dirty: false })
-    renderWithProbe({ deps: deps().deps })
-    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalled())
-    await waitFor(() => expect(probe()).toBe('false|none'))
-  })
-
-  it('★ carries the RECOVERY INSTANT alongside the flag', async () => {
-    // THE PRODUCER HOP OF A PAST BUG. `refreshSaveState` once read the save state and kept
-    // `state.dirty` alone, dropping the instant that says the platform can put this tree back.
-    //
-    // MUTATION RECEIPT: drop `recoveryAt: state.recoveryAt` from `refreshSaveState` and this goes
-    // red — the instant never reaches the channel.
-    h.fetchSaveState.mockResolvedValue({ dirty: true, recoveryAt: '2026-09-10T10:38:43Z' })
-    renderWithProbe({ deps: deps().deps })
-    await waitFor(() => expect(probe()).toBe('true|2026-09-10T10:38:43Z'))
-  })
-
-  it('an UNKNOWN stays unknown — it is not collapsed into either boolean', async () => {
-    // THE CASE THAT MATTERS, and the one this surface could break on its own. `null` means "we
-    // could not check", never "clean" — collapsing it to `false` reports the work as safe when
-    // nobody asked the question, and collapsing it to `true` claims unsaved work with nothing
-    // answerable behind it. The read FAILS here, which is exactly how a `null` arises in
-    // production.
-    h.fetchSaveState.mockRejectedValue(new Error('the workspace could not be reached'))
-    renderWithProbe({ deps: deps().deps })
-    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalled())
-    await waitFor(() => expect(probe()).toBe('null|none'))
   })
 })
 

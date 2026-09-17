@@ -26,7 +26,6 @@ import {
   usePublishHeading,
   usePublishPaneView,
   usePublishSave,
-  usePublishSaveState,
   useWorkspaceProject,
   type PaneView,
   type SaveSlot,
@@ -130,9 +129,6 @@ function Surface({
   // cell is identity-compared, so this is what makes a keystroke reach the channel at all.
   usePublishPaneView({ ...EMPTY_PANE })
   usePublishSave(slot, { save: null, discard: null, settings: null, share: null, ...actions })
-  // The row's own `save` slot carries no recovery instant — it is not the row's question — so the
-  // reading published here names the flag it does have and no copy it cannot vouch for.
-  usePublishSaveState({ dirty: slot.dirty, recoveryAt: null })
   useAppPaneVisible(paneVisible)
   return <div data-testid="surface" />
 }

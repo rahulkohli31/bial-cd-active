@@ -311,22 +311,6 @@ export interface SaveState {
   writeBackRefusedAt: string | null
 }
 
-/**
- * IS THE PLATFORM HOLDING A COPY OF THIS TREE THAT IT CAN PUT BACK? Named once because three
- * surfaces ask it — the rail's sentence, the in-place exit dialog and the browser-unload prompt —
- * and three hand-written readings of one fact are three chances for them to disagree about the
- * same app in the same moment.
- *
- * ANYTHING THAT IS NOT AN ACTUAL INSTANT IS "NO", `undefined` INCLUDED, and that is the whole
- * reason this is a function rather than `!== null` written out three times. Written that way, an
- * `undefined` — a caller that never set the field, a test double that predates it, a body the
- * server did not send — reads as YES. That is the one direction this fact may never fail in:
- * every consumer uses a YES to STOP warning somebody, so an absent field would silently disarm a
- * warning about work that exists only inside a container. Absent means warn.
- */
-export const canBePutBack = (recoveryAt: string | null | undefined): boolean =>
-  typeof recoveryAt === 'string' && recoveryAt !== ''
-
 /** Two readings that say the same thing. Every field is a primitive, so this is exact rather
  *  than an approximation — and it exists so a poll that keeps reporting the same answer stops
  *  handing consumers a new object to re-render for.

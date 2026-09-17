@@ -10,7 +10,6 @@ import {
   fetchPreviewState,
   fetchSaveState,
   sameSaveState,
-  canBePutBack,
   handOverWorkspace,
   discardUnsavedChanges,
   STOP_CEILING_MS,
@@ -954,21 +953,5 @@ describe('sameSaveState — what a poll is allowed to call "no change"', () => {
     // comparator that answered `false` for everything would pass the test above by doing nothing.
     const instant = '2026-09-10T10:38:43Z'
     expect(sameSaveState(reading({ recoveryAt: instant }), reading({ recoveryAt: instant }))).toBe(true)
-  })
-})
-
-describe('★ canBePutBack — absent means warn', () => {
-  it('answers yes only to an actual instant', () => {
-    expect(canBePutBack('2026-09-10T10:38:43Z')).toBe(true)
-  })
-
-  it('★ answers NO to undefined, to null and to an empty string alike', () => {
-    // The fail-open this replaced: written as `recoveryAt !== null`, an `undefined` from a caller
-    // that predates the field reads as "the platform has a copy" and silently disarms a warning
-    // about work that exists only inside a container. Every consumer of this asks it in order to
-    // STOP warning somebody, so every unusable value has to answer no.
-    expect(canBePutBack(undefined)).toBe(false)
-    expect(canBePutBack(null)).toBe(false)
-    expect(canBePutBack('')).toBe(false)
   })
 })

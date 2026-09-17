@@ -59,16 +59,13 @@ import {
 } from '../workspace/workspaceState'
 import type { ProbeCadence, StartOutcome } from '../workspace/workspaceState'
 import {
-  NO_SAVE_READING,
   useAppPaneVisible,
   usePublishAddress,
   usePublishPaneView,
   usePublishSave,
-  usePublishSaveState,
   usePublishWorkspaceReport,
   useWorkspaceProject,
 } from '../workspace/workspaceChannel'
-import type { SaveReading } from '../workspace/workspaceChannel'
 import { notifyUsageChanged } from '../../utils/usage'
 import { createBuildLock, openBuildLockChannel } from '../../utils/buildLock'
 import type { BuildLock } from '../../utils/buildLock'
@@ -467,18 +464,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // where the closed-over state value would be whatever it was when the build STARTED.
   const turnPreviewRef = useRef<TurnNarrative['preview']>({ url: null, state: null })
   const [turnQuota, setTurnQuota] = useState<TurnNarrative['quota']>(null)
-  // THE SAVE MODEL, HELD AS ONE READING RATHER THAN AS A FLAG. `dirty` is TRI-STATE — null is
-  // UNKNOWN, not clean — and `recoveryAt` says whether the platform is holding a copy of this tree
-  // it can put back. The two are one `useState` because they answer one `GET save-state` and every
-  // consumer of them reasons ACROSS them: the rail picks its sentence from the pair, and the exit
-  // guard decides whether leaving can cost anybody anything from the pair. Two states could drift
-  // apart by a render and let a consumer combine halves of two different readings — `SaveReading`
-  // in `workspaceChannel.ts` records why that is the bug and not a nicety.
-  const [saveReading, setSaveReading] = useState<SaveReading>(NO_SAVE_READING)
+  // TRI-STATE — `null` is UNKNOWN, not clean. A citizen who described an app, watched it build
+  // and touched nothing has genuinely unsaved work, so this must never default toward `false`.
+  const [saveDirty, setSaveDirty] = useState<boolean | null>(null)
   // Only the newest save-state answer may land: each read, and each Save, takes the next number.
   const saveReadSeq = useRef(0)
-  // The tri-state on its own, for the two consumers that genuinely only want the flag.
-  const saveDirty = saveReading.dirty
   const [saving, setSaving] = useState(false)
   const [discarding, setDiscarding] = useState(false)
   const [hasSavedVersion, setHasSavedVersion] = useState(false)
@@ -558,20 +548,14 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     const read = ++saveReadSeq.current
     try {
       const state = await fetchSaveState(activeProjectId)
-      // BOTH HALVES OF THE ONE ANSWER. Taking `state.dirty` alone was the whole of the reported
-      // bug: the recovery instant arrived on the wire, was dropped here, and every surface
-      // downstream was left announcing unsaved changes about a freshly built app the platform
-      // could put back at any moment.
       if (projectIdRef.current === activeProjectId && read === saveReadSeq.current) {
-        setSaveReading({ dirty: state.dirty, recoveryAt: state.recoveryAt })
+        setSaveDirty(state.dirty)
         setHasSavedVersion(state.savedHead !== null)
       }
     } catch {
-      // UNKNOWN, never "clean". A failed check must not report the work as safe — and it drops the
-      // recovery instant with it rather than leaving the previous one standing beside a tri-state
-      // that no longer came from the same read. A reading nobody has is not a reading.
+      // UNKNOWN, never "clean". A failed check must not report the work as safe.
       if (projectIdRef.current === activeProjectId && read === saveReadSeq.current) {
-        setSaveReading(NO_SAVE_READING)
+        setSaveDirty(null)
       }
     }
   }, [])
@@ -590,13 +574,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       // about, and a citizen who navigated away still wants the chip they left behind corrected.
       announceDeploymentChanged(activeProjectId)
       if (projectIdRef.current === activeProjectId) {
-        // The recovery instant is carried forward untouched: a Save writes the citizen's own
-        // bundle and destroys no recovery copy, and with `dirty` false nothing reads the instant
-        // anyway. Inventing one here — or clearing one that still exists — would be this surface
-        // reporting a fact it did not read.
         // A read still on the wire describes the tree before this save, so it must not land after it.
         saveReadSeq.current += 1
-        setSaveReading((held) => ({ ...held, dirty: false }))
+        setSaveDirty(false)
         // There is now a snapshot to relaunch from — say so without waiting for a reload.
         setSavedBuildProjectId(activeProjectId)
         setHasSavedVersion(true)
@@ -606,9 +586,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       // work is stored. The 409 copy from the server already names the way out.
       if (projectIdRef.current === activeProjectId) {
         setSaveError(err instanceof Error ? err.message : 'Could not save your work. Try again.')
-        // Same fail-toward-warning as the failed check above: the whole reading goes unknown,
-        // because a Save that threw leaves this surface unable to say what the container holds.
-        setSaveReading(NO_SAVE_READING)
+        // Same fail-toward-warning as the failed check above: a Save that threw leaves this
+        // surface unable to say what the container holds.
+        setSaveDirty(null)
       }
     } finally {
       setSaving(false)
@@ -629,7 +609,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       announceDeploymentChanged(activeProjectId)
       if (projectIdRef.current === activeProjectId) {
         saveReadSeq.current += 1
-        setSaveReading({ dirty: saveState.dirty, recoveryAt: saveState.recoveryAt })
+        setSaveDirty(saveState.dirty)
         setHasSavedVersion(saveState.savedHead !== null)
         if (notice !== null) {
           seqRef.current = Math.max(seqRef.current, notice.seq + 1)
@@ -853,22 +833,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     void refreshSaveState(projectId)
   }, [projectId, refreshSaveState])
 
-  // THE PRODUCER STAYS HERE; THE WARNING DOES NOT. `refreshSaveState` above is still
-  // the only thing that asks the server, and this is still the only surface that asks it — no new
-  // caller was added anywhere. What moved is the browser-unload effect, to the shell, because this
-  // page is an outlet child now and unmounts on every move to the project screen: left here, the
-  // warning would disarm exactly when the citizen navigated away from the conversation that knew
-  // about the unsaved work. THE READING IS CARRIED WHOLE, never collapsed to its flag — `null`
-  // means "could not check", and the recovery instant beside it is what lets the shell tell a
-  // build nobody has saved yet from work that leaving would actually cost somebody.
-  usePublishSaveState(saveReading)
-  // THE SAVE CONTROL ITSELF LIVES IN THE TOOLBAR ROW NOW, so its three values and
-  // its action go up the channel rather than into the pane's view. Two cells rather than one, and
-  // the split is deliberate: the values are compared and drive a render, the action is read at
-  // press time and drives none. `usePublishSaveState` above stays separate — it is the reading the
-  // shell's two exit guards arm on, and it is KEPT across an unmount, while these two are cleared
-  // with their publisher. THE ROW WANTS THE FLAG ALONE, deliberately: its chip reports whether a
-  // version exists, which is the question `dirty` answers, and a recovery copy is not one.
+  // THE SAVE CONTROL ITSELF LIVES IN THE TOOLBAR ROW, so its values and its action go up the
+  // channel rather than into the pane's view. Two cells rather than one, and the split is
+  // deliberate: the values are compared and drive a render, the action is read at press time and
+  // drives none.
   // Scoped to this project — see `turnRunning` on the pane view below, which reads the same value.
   const turnRunningHere =
     generatingChatId !== null &&

@@ -36,7 +36,6 @@ import {
   usePublishAddress,
   usePublishPaneView,
   usePublishSave,
-  usePublishSaveState,
   usePublishWorkspaceReport,
   useWorkspaceProject,
 } from './workspaceChannel'
@@ -318,13 +317,6 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     }
   }, [project.id, discarding, workspace])
 
-  // ONE OBJECT, BOTH FACTS. `workspace.save` is a single `GET save-state` response, so the pair
-  // published here is by construction one reading — and a project screen holding no reading at all
-  // publishes the "nobody has said" pair rather than a bare `null` that has lost the second half.
-  usePublishSaveState({
-    dirty: workspace.save?.dirty ?? null,
-    recoveryAt: workspace.save?.recoveryAt ?? null,
-  })
   // SAVE IS REACHABLE FROM THE PROJECT SCREEN, and it was not.
   //
   // The only writer of the bundle lived on the conversation surface, so a citizen who had built
