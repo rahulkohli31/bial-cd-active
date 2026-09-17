@@ -729,6 +729,18 @@ def only_regenerated_files_changed(container: ContainerState) -> bool:
     )
 
 
+def holds_unsaved_work(container: ContainerState) -> bool:
+    """Is there anything in this tree a durable copy would be poorer for missing?
+
+    The save side's question in its positive sense, and the ONE spelling of it — the composition
+    is what the predicate above is *for*, and two call sites writing it out by hand is how one of
+    them eventually forgets the `uncommitted` half or reaches for `clean_but_for_churn` instead.
+    Reaching for the reap side's twin here would forgive `tsconfig.json`, which the agent is
+    invited to edit: a wrong answer on this side costs the citizen that change, where on the reap
+    side it costs a confirmation prompt."""
+    return container.uncommitted and not only_regenerated_files_changed(container)
+
+
 async def workspace_integrity(
     sandbox_client: SandboxClient,
     handle: SandboxHandle,

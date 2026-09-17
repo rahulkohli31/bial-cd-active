@@ -719,7 +719,9 @@ async def test_an_intact_app_whose_dev_server_stopped_is_put_away_so_it_can_be_l
     user, project_id = await _mk(db_session, "u4-stopped@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
+    # Both slots: the restore offer reads the recovery copy, the durable-copy gate the saved one.
     await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     _script_dev(monkeypatch, client, _STOPPED)
     raised: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(

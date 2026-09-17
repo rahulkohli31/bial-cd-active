@@ -598,7 +598,7 @@ async def test_the_scheduled_janitor_takes_the_copy_before_it_deletes_anything(
     `reap_the_container_we_judged` and this goes red on `destroyed == 1`."""
     from src.services.redis import registry_key
     from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_STATE
-    from src.services.storage import recovery_key
+    from src.services.storage import snapshot_key
     from src.workers import reclamation
 
     user_id, app_id = uuid.uuid4(), uuid.uuid4()
@@ -611,7 +611,7 @@ async def test_the_scheduled_janitor_takes_the_copy_before_it_deletes_anything(
         mapping={REGISTRY_FIELD_APP_NAME: doomed, REGISTRY_FIELD_STATE: "ready"},
     )
     await fake_storage.put(
-        recovery_key(app_id), a_git_bundle("b" * 40), metadata={"head_sha": "b" * 40}
+        snapshot_key(app_id), a_git_bundle("b" * 40), metadata={"head_sha": "b" * 40}
     )
     plane = _DestroyerYouCanAlsoBundleFrom(head="a" * 40, bundles_to="c" * 40)
 
@@ -624,7 +624,7 @@ async def test_the_scheduled_janitor_takes_the_copy_before_it_deletes_anything(
 
     assert destroyed == 1
     assert plane.torn_down == [doomed]
-    meta = await fake_storage.head(recovery_key(app_id))
+    meta = await fake_storage.head(snapshot_key(app_id))
     assert meta is not None and (meta.metadata or {})["head_sha"] == "c" * 40, (
         "the janitor destroyed the container without first securing its newest work"
     )

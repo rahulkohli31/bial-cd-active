@@ -29,7 +29,12 @@ from typing import Final, Literal
 import structlog
 
 from src.services.build_sessions.alarms import RECOVERY_WRITE_DID_NOT_LAND_EVENT
-from src.services.build_sessions.integrity import Ancestry, container_state, is_a_commit_sha
+from src.services.build_sessions.integrity import (
+    Ancestry,
+    container_state,
+    holds_unsaved_work,
+    is_a_commit_sha,
+)
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
 from src.services.storage import (
     SNAPSHOT_HEAD_METADATA_KEY,
@@ -164,7 +169,12 @@ class Destination:
 
     @classmethod
     def saved(cls, app_id: uuid.UUID) -> Destination:
-        """The user's explicit Save. The one key a platform-initiated write must never touch."""
+        """The user's explicit Save, and the key nothing may write unasked.
+
+        ONE PLATFORM WRITER REACHES IT, and only through `write_saved_copy_under_guard`: a
+        shutdown the citizen never asked for leaves their work here, but only a tree proved to
+        descend from what is already here. Anything else — including this destination handed to
+        `write_snapshot`, which writes unconditionally — is the user's own click."""
         return cls(snapshot_key(app_id))
 
     @classmethod
@@ -405,6 +415,129 @@ async def _where_head_sits_relative_to(
         return Ancestry.REFERENCE_ABSENT
     state = await container_state(sandbox_client, handle, reference_sha=recorded)
     return state.ancestry if state is not None else Ancestry.UNREADABLE
+
+
+SAVED_COPY_WRITE_DID_NOT_LAND_EVENT: Final = "saved_copy_write_did_not_land"
+"""A shutdown's write-back could not be promoted into the saved copy, and the tree was parked.
+
+Fields: `app_id`, `recorded_head`, `bundled_head`, `ancestry`, `diverted_to`. The two shas
+together say why the promotion was refused; `diverted_to` is the key the tree is sitting under,
+which the operator promote procedure takes as its input."""
+
+
+class SavedCopyOutcome(enum.StrEnum):
+    """What happened to one shutdown's attempt to leave a container's work in the saved copy."""
+
+    #: The saved copy now holds this container's tree.
+    WRITTEN = "written"
+    #: Nothing to write — the tree holds nothing the saved copy does not already have.
+    SKIPPED = "skipped"
+    #: The guard would not promote this tree over the saved copy, and the bundle was preserved
+    #: under `divert_key` rather than thrown away.
+    DIVERTED = "diverted"
+
+
+@dataclass(frozen=True)
+class SavedCopyWrite:
+    outcome: SavedCopyOutcome
+    reason: str
+    #: The sha the saved copy held before this write, when it held one.
+    recorded_head: str | None = None
+    #: The sha this shutdown actually bundled. `None` on `SKIPPED`, which bundles nothing.
+    bundled_head: str | None = None
+    #: Set on `DIVERTED` — where the refused tree went, so it can be offered back.
+    diverted_to: str | None = None
+
+
+async def write_saved_copy_under_guard(
+    sandbox_client: SandboxClient,
+    handle: SandboxHandle,
+    app_id: uuid.UUID,
+    *,
+    taken_at: datetime,
+) -> SavedCopyWrite:
+    """Leave a shutting-down container's tree in the citizen's saved copy — but only if it can be
+    shown to descend from what is there.
+
+    `Destination.saved` is the one key a platform-initiated write must never touch, and a teardown
+    nobody asked for is the most platform-initiated write there is. So the promotion demands
+    positive proof of descent, and every other tree is PARKED under `divert_key` BEFORE this
+    returns: in a false refusal those bytes are the newest copy of somebody's afternoon.
+
+    NO PROOF MEANS NO PROMOTION, AND AN EMPTY SLOT IS NOT PROOF. A container that has reverted to
+    its baked image presents exactly as a first write, and a template tree written into the saved
+    copy becomes the newest thing an automatic restore can hand back — the loss this guard exists
+    to prevent, performed by the guard.
+
+    ONE PROBE ANSWERS BOTH QUESTIONS, and it runs BEFORE the bundle's commit step: the dirty read
+    has to see the tree as the citizen left it, and ancestry taken before a commit still holds
+    after one, since committing only ever adds a child on top of HEAD.
+
+    Raises `SandboxError` when the container will not answer: an unestablished fact on a path that
+    ends in an ARM delete is not an outcome to return."""
+    timings = _SaveStepTimings()
+    lock_wait_started = time.monotonic()
+    try:
+        async with _serialized_per_app(app_id):
+            timings.lock_wait_ms = _elapsed_ms(lock_wait_started)
+            store = _the_store_first()
+            meta = await store.head(snapshot_key(app_id))
+            recorded = head_sha_from_metadata(meta.metadata if meta else None)
+            # A stamp that is not sha-shaped never reaches the shell, and refuses by the same
+            # door an absent copy does: metadata naming a tree we cannot ask about is not a
+            # licence to overwrite the object that metadata belongs to. The raw value is still
+            # reported, so the alarm carries the stamp somebody has to go and look at.
+            comparable = recorded if is_a_commit_sha(recorded) else None
+            state = await container_state(sandbox_client, handle, reference_sha=comparable)
+            if state is None:
+                raise SandboxError("the container would not answer its state probe")
+
+            refusal: str | None = None
+            if comparable is None:
+                refusal = "no saved copy this tree can be shown to descend from"
+            elif state.head == comparable and not holds_unsaved_work(state):
+                return SavedCopyWrite(
+                    SavedCopyOutcome.SKIPPED,
+                    "the tree holds nothing the saved copy does not",
+                    recorded_head=recorded,
+                )
+            elif state.ancestry is not Ancestry.DESCENDANT:
+                refusal = f"the tree is {state.ancestry.value} of the saved copy"
+
+            tree = await _bundle_the_tree(sandbox_client, handle, timings)
+            if refusal is None:
+                # THE PROOF IS IN REACHING HERE: a comparable head on record, and the probe
+                # answering that this tree descends from it. This is the only line in the system
+                # that writes the saved copy without a person having asked for it.
+                await _timed_store(store, snapshot_key(app_id), tree, timings)
+                return SavedCopyWrite(
+                    SavedCopyOutcome.WRITTEN,
+                    "this container built on the copy it is replacing",
+                    recorded_head=recorded,
+                    bundled_head=tree.head_sha,
+                )
+            where = divert_key(app_id, taken_at)
+            await _timed_store(store, where, tree, timings)
+            _log.error(
+                SAVED_COPY_WRITE_DID_NOT_LAND_EVENT,
+                app_id=str(app_id),
+                recorded_head=recorded,
+                bundled_head=tree.head_sha,
+                ancestry=state.ancestry.value,
+                diverted_to=where,
+            )
+            return SavedCopyWrite(
+                SavedCopyOutcome.DIVERTED,
+                refusal,
+                recorded_head=recorded,
+                bundled_head=tree.head_sha,
+                diverted_to=where,
+            )
+    finally:
+        # SUPPRESSED, because this runs in a `finally` on a path that may be propagating the
+        # citizen's real failure, and an instrument that raised would replace it with its own.
+        with suppress(Exception):
+            _log.info(SNAPSHOT_STEP_TIMINGS_EVENT, app_id=str(app_id), **asdict(timings))
 
 
 def _the_store_first() -> ObjectStorage:

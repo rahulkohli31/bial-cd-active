@@ -54,7 +54,7 @@ from src.services.sandbox.base import (
     ExecResult,
 )
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import recovery_key
+from src.services.storage import snapshot_key
 from tests.fakes import (
     FakeSandboxClient,
     FakeStorage,
@@ -404,8 +404,8 @@ async def test_the_scheduled_sweep_resolves_the_owning_app_id_and_the_operator_o
 
 
 async def _preserve(store: FakeStorage, app_id: uuid.UUID, *, head: str = "a" * 40) -> None:
-    """A recovery copy the durable-copy gate will accept, so these tests are about the reap."""
-    await store.put(recovery_key(app_id), a_git_bundle(head), metadata={"head_sha": head})
+    """A saved copy the durable-copy gate will accept, so these tests are about the reap."""
+    await store.put(snapshot_key(app_id), a_git_bundle(head), metadata={"head_sha": head})
 
 
 async def test_the_janitor_destroys_the_container_it_judged_not_the_one_the_record_names(
@@ -479,7 +479,7 @@ async def test_the_four_step_ordering_still_runs_when_the_record_does_name_it(
 async def test_the_janitor_is_still_refused_when_the_work_is_not_preserved(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """The name-keyed reap is not a way around the durable-copy gate. No recovery copy means
+    """The name-keyed reap is not a way around the durable-copy gate. No saved copy means
     nothing was established, and nothing established never authorises a delete."""
     await _seed(fake_redis, USER, app_name=SBX)
     client = FakeSandboxClient()
@@ -552,7 +552,7 @@ def _a_container_that_bundles(
 async def test_the_janitor_takes_the_copy_before_it_destroys_what_it_judged(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
 ) -> None:
-    """★ THE SECOND CALL SITE. The recovery copy is behind the container, so the durable-copy
+    """★ THE SECOND CALL SITE. The saved copy is behind the container, so the durable-copy
     policy says take one and then reclaim — this path used to just spare and log, unread.
 
     Deleting this test leaves the janitor's copy unproven: `test_durable_copy_gate.py` drives
@@ -570,7 +570,7 @@ async def test_the_janitor_takes_the_copy_before_it_destroys_what_it_judged(
 
     assert destroyed is True
     assert client.torn_down == [SBX]
-    meta = await fake_storage.head(recovery_key(APP))
+    meta = await fake_storage.head(snapshot_key(APP))
     assert meta is not None and (meta.metadata or {})["head_sha"] == "c" * 40
     assert attempts == [CopyAttempt.COPIED]
 
