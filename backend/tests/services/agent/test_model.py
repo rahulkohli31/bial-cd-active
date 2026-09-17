@@ -7,6 +7,7 @@ import contextlib
 import json
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
+from types import SimpleNamespace
 from typing import Any
 
 # THE SDK'S VENDORED HTTPX, NOT THE ONE `src/` USES. The Anthropic client moved onto a fork
@@ -17,13 +18,24 @@ from typing import Any
 # fails loudly at the swap below, which is the right way for it to fail.
 import httpx2
 import pytest
-from anthropic import APITimeoutError, AsyncAnthropicFoundry, Timeout
+from anthropic import APITimeoutError, AsyncAnthropic, AsyncAnthropicFoundry, Timeout
 from anthropic.types import RawContentBlockDeltaEvent, TextBlock, TextDelta
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    SystemPromptPart,
+    TextPart,
+    UserPromptPart,
+)
+from pydantic_ai.models import ModelRequestParameters
+from pydantic_ai.models import anthropic as anthropic_models
 from pydantic_ai.models.anthropic import AnthropicModel
 
 from src.config import FoundryConfig
+from src.services.agent import model as model_module
 from src.services.agent.model import (
     FoundryOnlyError,
+    InlineSystemPromptShapeError,
     _assert_foundry_only,
     build_foundry_client,
     build_foundry_model,
@@ -292,3 +304,132 @@ async def test_slow_but_alive_stream_survives_the_read_timeout() -> None:
             if isinstance(event, RawContentBlockDeltaEvent) and isinstance(event.delta, TextDelta):
                 text += event.delta.text
     assert text == "hello world"  # completed — no mid-stream timeout abort
+
+
+# --- the widened inline-system-prompt exclusion -----------------------------------------
+#
+# The platform sends one turn-scoped system message at the tail of a request. The library
+# excludes the Foundry client from serving those as `{'role': 'system'}` entries, and the
+# fallback is not "drop it" — it is a rewrite into the citizen's own user message, or a hoist
+# into the shared top-level system block. Both move bytes the cached prefix depends on, so this
+# module widens the exclusion at import. What follows pins that it still works and that it
+# still fails loudly when it stops working.
+
+_A_TAIL_SENTENCE = "the app may have moved on."
+
+
+def _system_capable_model(deployment: str = "claude-opus-5") -> AnthropicModel:
+    """A real Foundry-client model, on a deployment name the profile recognises.
+
+    The name matters as much as the client: the base flag is set per model family, so a
+    deployment the profile does not know carries no inline-system capability whatever this
+    module does to the exclusion."""
+    return build_foundry_model(_config(deployment=deployment))
+
+
+async def _wire(model: AnthropicModel, messages: list[Any]) -> tuple[Any, list[dict[str, Any]]]:
+    """What the provider is actually handed, through the library's own two steps.
+
+    `prepare_messages` is half the answer here rather than an implementation detail — it is the
+    step that performs the `<system>`-tagged rewrite when the capability is absent, so a mapping
+    that skipped it would show the tail sentence surviving on a transport that cannot serve it."""
+    params = model.customize_request_parameters(ModelRequestParameters())
+    prepared = model.prepare_messages(messages, params)
+    system, entries = await model._map_message(prepared, params, {})  # noqa: SLF001 — pinned seam
+    return system, [dict(entry) for entry in entries]
+
+
+def _a_conversation_ending_in_a_tail_sentence() -> list[Any]:
+    """Two turns and a system part at the very end — mid-conversation, not leading.
+
+    The leading request's opening system parts are the run's own prompt and hoist to the
+    top-level `system` field by design. Only a part that follows other messages is the thing
+    under test, so the fixture has to have something before it."""
+    return [
+        ModelRequest(parts=[UserPromptPart(content="add a visitors chart")]),
+        ModelResponse(parts=[TextPart(content="the chart is in.")]),
+        ModelRequest(
+            parts=[
+                UserPromptPart(content="and a date filter"),
+                SystemPromptPart(content=_A_TAIL_SENTENCE),
+            ]
+        ),
+    ]
+
+
+async def test_a_foundry_request_carries_the_tail_sentence_as_a_system_entry() -> None:
+    """★ THE TRANSPORT, on the built request rather than on the setting that asks for it.
+
+    The second half is the mutation, kept in the same test because it is the whole reason the
+    first half is worth asserting: put the exclusion back and the sentence does not disappear —
+    it reappears as `<system>`-tagged text inside the citizen's message, which is the outcome
+    this override exists to prevent and the one a presence-only assertion would not notice."""
+    _, entries = await _wire(_system_capable_model(), _a_conversation_ending_in_a_tail_sentence())
+
+    assert entries[-1]["role"] == "system"
+    assert entries[-1]["content"] == [{"text": _A_TAIL_SENTENCE, "type": "text"}]
+    assert "<system>" not in json.dumps(entries)
+
+    with pytest.MonkeyPatch.context() as restore:
+        restore.setattr(
+            anthropic_models,
+            "_INLINE_SYSTEM_PROMPT_UNSUPPORTED_CLIENTS",
+            (AsyncAnthropicFoundry,),
+        )
+        _, fallback = await _wire(
+            _system_capable_model(), _a_conversation_ending_in_a_tail_sentence()
+        )
+
+    assert [entry for entry in fallback if entry["role"] == "system"] == []
+    assert f"<system>{_A_TAIL_SENTENCE}</system>" in json.dumps(fallback)
+
+
+async def test_a_deployment_the_profile_does_not_know_carries_no_system_entry() -> None:
+    """The override is necessary but not sufficient, and the missing half is configuration.
+
+    `FOUNDRY__DEPLOYMENT` is an operator-chosen name. Anthropic publishes the feature per model
+    family, so a resource whose deployment is called something else gets no inline system
+    capability at all — which is why the emitter asks the model rather than assuming."""
+    _, entries = await _wire(
+        _system_capable_model("our-house-model"), _a_conversation_ending_in_a_tail_sentence()
+    )
+
+    assert [entry for entry in entries if entry["role"] == "system"] == []
+
+
+def test_the_shape_assertion_refuses_a_symbol_that_is_not_a_tuple_of_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Asserted against a STAND-IN module, never by editing the real one.
+
+    Three ways the symbol can stop being what this module patches, and all three have to raise
+    rather than leave the patch quietly doing nothing: gone, renamed into something of another
+    type, or still a tuple of client types that no longer names Foundry.
+
+    THE MESSAGE IS MATCHED, not just the exception type. Both halves of the guard raise the same
+    class, so `raises(...)` alone stays green when the symbol check is deleted — the derivation
+    half fires instead and the test cannot tell the difference."""
+    for broken in (None, "a tuple once", (AsyncAnthropic,)):
+        stand_in = SimpleNamespace()
+        if broken is not None:
+            stand_in._INLINE_SYSTEM_PROMPT_UNSUPPORTED_CLIENTS = broken
+        monkeypatch.setattr(model_module, "anthropic_models", stand_in)
+        with pytest.raises(InlineSystemPromptShapeError, match="no longer a tuple"):
+            model_module._widen_foundry_inline_system_prompts()
+
+
+def test_the_shape_assertion_refuses_a_flag_that_no_longer_derives_from_the_tuple(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE HALF THAT CATCHES AN INERT PATCH, which is the failure with no symptom.
+
+    The tuple can keep its name, its type and its membership while the decision moves somewhere
+    else — and then emptying it changes nothing, the sentence rides a channel it was never
+    meant to, and every assertion about the symbol still passes. The stand-in here is
+    well-formed on purpose; what makes it raise is that the real library's flag no longer
+    answers to it."""
+    stand_in = SimpleNamespace(_INLINE_SYSTEM_PROMPT_UNSUPPORTED_CLIENTS=(AsyncAnthropicFoundry,))
+    monkeypatch.setattr(model_module, "anthropic_models", stand_in)
+
+    with pytest.raises(InlineSystemPromptShapeError, match="no longer decides anything"):
+        model_module._widen_foundry_inline_system_prompts()

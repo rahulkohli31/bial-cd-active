@@ -99,6 +99,7 @@ from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.user import User
 from src.services.agent.agent import ChatDeps, chat_agent, static_instruction_parts
 from src.services.agent.attachment_tools import AttachmentReader
+from src.services.agent.capabilities import TurnScopedSystemMessage
 from src.services.agent.mode_prompts import PromptContext
 from src.services.agent.read_tools import (
     LiveSandboxWorkspace,
@@ -670,6 +671,44 @@ def _citizen_output_tokens(usage: RunUsage | RequestUsage) -> int:
     return max(usage.output_tokens - usage.details.get(THINKING_TOKENS_KEY, 0), 0)
 
 
+_RAW_CACHE_KEYS: Final = (
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+"""The provider's OWN per-call counters, as they arrive in `RequestUsage.details`.
+
+NOT `usage.input_tokens`, and the difference is the whole point of reading them: pydantic-ai's
+normalised figure already folds the cache classes in, so a cached prefix and a fresh one are
+indistinguishable there. These three are the raw Anthropic response fields, which is what a
+question about caching has to be asked of."""
+
+
+def _raw_cache_tokens(usage: RequestUsage) -> dict[str, int]:
+    """One call's raw counters, defaulted to zero for the keys a response omits.
+
+    DIAGNOSTIC ONLY. Nothing here may become the seed of a spend figure: what a citizen is
+    charged is weighted in `usage/gate.py`, and three separate incidents have started with a
+    second, unweighted arithmetic growing beside it."""
+    return {key: int(usage.details.get(key, 0)) for key in _RAW_CACHE_KEYS}
+
+
+def _log_cache_tokens(state: _TurnState, usage: RequestUsage, *, arm: str) -> None:
+    """One event per MODEL CALL, always on.
+
+    The row `db/models/token_usage.py` writes already carries a turn's cache totals; what it
+    cannot answer is which CALL read nothing, and that is the only shape that distinguishes a
+    prefix that broke on turn two from one that broke at step nine of a long build. Cheap
+    enough to leave on: three integers the response already carried."""
+    _log.info(
+        "model_call_cache_tokens",
+        conversation_id=str(state.conversation_id),
+        turn_id=str(state.turn_id),
+        arm=arm,
+        **_raw_cache_tokens(usage),
+    )
+
+
 def _run_spend(usage: RunUsage) -> int:
     """What this run has spent, weighted the way the citizen's daily meter weights it.
 
@@ -958,10 +997,47 @@ class _TurnState:
     #: served the app has looked at it as squarely as one that asked. Later readings replace
     #: earlier ones, so this is the state at the end of the turn rather than at its first probe.
     app_reading: AppState | None = None
+    #: Has this turn already been handed the turn-scoped system message? ONE PER TURN is the
+    #: whole cooldown: a sentence on every request inside a turn moves the bytes the next
+    #: request in that same turn has to reproduce, so a long build turn would re-break its own
+    #: prefix at every step — strictly worse than the lapse the sentence answers.
+    nudged_to_look: bool = False
+    #: How many model requests this turn has sent, counted across every `agent.iter` run a
+    #: self-heal loop makes rather than per run.
+    requests_sent: int = 0
 
     def read_the_app(self, reading: AppState) -> None:
         """Record what the platform just learned about the app. Latest wins."""
         self.app_reading = reading
+
+    def another_request_and_still_no_reading(self) -> bool:
+        """Count one outgoing model request and answer whether it carries the sentence.
+
+        THE WHOLE TRIGGER, AND IT IS A TOOL-CALL FACT. `app_reading` is set by exactly two
+        things — the model calling `check_the_app`, and the build loop's own health verdict —
+        so "this turn produced no reading" is read off what ran, never off what anybody wrote.
+        Reading prose to infer intent is this tree's recorded failure (`_looks_plan_shaped`),
+        and a classifier here would be the same mistake with a different input.
+
+        THE FIRST REQUEST OF A TURN NEVER CARRIES IT, and that is what keeps this a detected
+        lapse rather than a cadence. At the opening request the turn has had no opportunity to
+        read anything, so "no reading yet" is true of every turn there and firing on it would
+        be the every-N reminder this work exists to not build. From the second request on, the
+        turn has run a tool batch and none of it looked at the app: that is the lapse.
+
+        Counting and answering are one method because they are one fact — a request either
+        went out or it did not, and a caller that could ask without counting would let the
+        sentence ride the opening request after all.
+
+        It still over-fires on turns that were never about the app — somebody asking for a
+        rename, whose first step is a file read, gets it too. That is accepted and bounded by
+        the once-per-turn flag; sharpening it is what a classifier would be for."""
+        self.requests_sent += 1
+        return self.requests_sent > 1 and self.app_reading is None and not self.nudged_to_look
+
+    def note_the_nudge(self) -> None:
+        """Close the cooldown: this turn has had its one sentence."""
+        self.nudged_to_look = True
 
     def text_blocks(self) -> list[str]:
         """The prose the citizen has been given so far, one entry per block."""
@@ -1596,6 +1672,18 @@ class TurnEngine:
                         # nothing; with one it lands after the last of these, so everything
                         # ahead of the marker is byte-identical for every citizen.
                         instructions=static_instruction_parts(state.kind),
+                        # THE TURN-SCOPED SYSTEM MESSAGE, ARMED FOR THIS TURN. The trigger and
+                        # the cooldown are the turn's, not the capability's, so the same two
+                        # methods arm the Build arm below. Plan is included rather than
+                        # excluded: a Plan chat cannot change the app, but it answers questions
+                        # about one that other chats keep changing, and `check_the_app` is on
+                        # this arm's toolset for exactly that reason.
+                        capabilities=[
+                            TurnScopedSystemMessage(
+                                should_send=state.another_request_and_still_no_reading,
+                                on_sent=state.note_the_nudge,
+                            )
+                        ],
                         output_type=output_type,
                         usage=turn_usage,
                         event_stream_handler=self._event_handler(state),
@@ -1629,6 +1717,11 @@ class TurnEngine:
                             anthropic_cache=CACHE_TTL,
                         ),
                     )
+                    # PER CALL, not per run: a Plan turn that used tools made several requests,
+                    # and a total cannot say which of them read the cache.
+                    for message in result.new_messages():
+                        if isinstance(message, ModelResponse):
+                            _log_cache_tokens(state, message.usage, arm="plan")
                     persistable = _persistable_messages(result.new_messages())
                     deferred = _deferred_call(result.output)
 
@@ -2608,6 +2701,16 @@ class TurnEngine:
             # Same static contract as the Plan arm, off the same function — see the note there
             # for why a run with no static part gets no instructions breakpoint at all.
             instructions=static_instruction_parts(ChatKind.BUILD),
+            # The turn-scoped system message, as on the Plan arm. A fresh instance per self-heal
+            # round behaves as one: the cooldown it consults belongs to the turn, so a repair
+            # round re-entering here cannot send a second, and a build turn's dozens of chained
+            # requests carry one sentence between them.
+            capabilities=[
+                TurnScopedSystemMessage(
+                    should_send=state.another_request_and_still_no_reading,
+                    on_sent=state.note_the_nudge,
+                )
+            ],
             output_type=str,
             usage_limits=UsageLimits(request_limit=MODEL_TURN_CEILING),
             # Without `max_tokens` pydantic-ai's Anthropic default of 4096 truncates a
@@ -2702,6 +2805,7 @@ class TurnEngine:
                             self._on_event(state, event)
                     node = await run.next(node)
                     if Agent.is_call_tools_node(node):
+                        _log_cache_tokens(state, node.model_response.usage, arm="build")
                         await self._record_write_step(
                             state, node.model_response.usage, session_factory
                         )
