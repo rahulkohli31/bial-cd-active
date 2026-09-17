@@ -205,7 +205,7 @@ async def test_an_unreadable_standing_stay_does_not_block_a_fresh_grant(
 
     granted = await grant_stay_of_execution(fake_redis, USER, writer=DeadlineWriter.BUILDER_ACTED)
 
-    standing, _ = await _stay(fake_redis)
+    standing, _ = await _stay_for(fake_redis, USER)
     assert standing == granted
 
 
@@ -378,3 +378,35 @@ async def test_the_sweep_spares_a_container_inside_the_short_stay_and_reaps_thro
     assert reaped_after is True
     assert sandbox.torn_down == [app_name]
     assert await fake_redis.exists(registry_key(user_id)) == 0
+
+
+async def test_the_presence_script_keeps_the_longer_standing_deadline_on_its_own(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ THE SCRIPT, ASKED DIRECTLY, WITHOUT ITS PYTHON CALLER.
+
+    The route-level test cannot tell an in-script comparison from a correct caller-side one,
+    because with nothing racing they agree. This asks the script alone, which is where the
+    difference lives: a script that compares cannot be interleaved with, and one that does not
+    can be, however careful the caller is.
+
+    Mutation check: delete the `standing >= ARGV[2]` clause and this goes red while every
+    route-level renewal test that has a live caller in front of it stays green."""
+    await _register(fake_redis)
+    longer = (datetime.now(UTC) + timedelta(hours=9)).isoformat(timespec="microseconds")
+    await fake_redis.hset(registry_key(USER), locks.REGISTRY_FIELD_PREVIEW_STAY_UNTIL, longer)
+    shorter = (datetime.now(UTC) + timedelta(minutes=5)).isoformat(timespec="microseconds")
+
+    answer = await fake_redis.eval(
+        locks._CAS_GRANT_PRESENCE_STAY_LUA,
+        1,
+        registry_key(USER),
+        "sbx-x",
+        shorter,
+        str(locks.DeadlineWriter.SURFACE_PRESENT),
+    )
+
+    kept = answer.decode() if isinstance(answer, bytes) else str(answer)
+    assert kept == f"renewed:{longer}"
+    standing, _ = await _stay(fake_redis)
+    assert standing == datetime.fromisoformat(longer)

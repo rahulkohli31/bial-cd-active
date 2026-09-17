@@ -8,6 +8,7 @@ the tests here are as much about what is NOT written as about what is.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -145,6 +146,60 @@ async def test_a_visible_renewal_never_shortens_a_hidden_ones_reprieve(
     assert after_waking == hidden_stay
 
 
+async def test_the_comparison_that_protects_the_deadline_happens_inside_the_script(
+    client: AsyncClient, db_session: AsyncSession, fake_redis
+) -> None:
+    """★ WHERE the monotonic comparison lives, which is the whole of whether it can be raced.
+
+    A surface renews every forty-five seconds and a project can be framed by two of them, so
+    "read the standing value, compare, write" is three steps with a gap a second renewal fits
+    inside — the shorter write lands last and cuts the longer reprieve. Comparing INSIDE the
+    script closes the gap by construction.
+
+    WHAT THIS CAN AND CANNOT SEE, stated plainly. A stay written straight onto the hash, longer
+    than anything a presence renewal can buy, must survive a renewal that asks for less — so
+    deleting the script's clause and leaving nothing in its place goes red here. It CANNOT
+    distinguish a correct caller-side comparison from the in-script one: with nothing racing, the
+    two compute the same answer. The interleaving that separates them needs two real clients and
+    is not reproducible in this suite; `test_deadline_writers.py` pins the script itself instead,
+    which is where the atomicity actually lives.
+
+    Mutation check: delete the `standing >= ARGV[2]` clause from
+    `_CAS_GRANT_PRESENCE_STAY_LUA` and this goes red."""
+    user, project, app_id = await _user_project_app(db_session, "inscript@bial.test")
+    await _register(fake_redis, user.id, app_name_for(app_id))
+
+    far_off = datetime.now(UTC) + timedelta(seconds=HIDDEN_SURFACE_PRESENT_STAY_SECONDS * 4)
+    await fake_redis.hset(
+        registry_key(user.id),
+        REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
+        far_off.isoformat(timespec="microseconds"),
+    )
+
+    body = await _renew(client, user, project, presence="visible")
+
+    settled, _ = await _stay(fake_redis, user.id)
+    assert settled == far_off, "a shorter renewal overwrote a longer standing deadline"
+    assert body["stayUntil"] is not None
+    assert datetime.fromisoformat(body["stayUntil"]) == far_off
+
+
+async def test_a_renewal_reports_the_deadline_actually_in_force(
+    client: AsyncClient, db_session: AsyncSession, fake_redis
+) -> None:
+    """The wire value, not the one the caller proposed. A visible renewal arriving behind a
+    standing hidden one keeps the longer deadline, and `stayUntil` has to say so — a client shown
+    the five minutes it asked for would be told the app closes long before it does."""
+    user, project, app_id = await _user_project_app(db_session, "inforce@bial.test")
+    await _register(fake_redis, user.id, app_name_for(app_id))
+
+    hidden = await _renew(client, user, project, presence="hidden")
+    visible = await _renew(client, user, project, presence="visible")
+
+    assert visible["outcome"] == "renewed"
+    assert visible["stayUntil"] == hidden["stayUntil"]
+
+
 # --- what must not be written ------------------------------------------------
 
 
@@ -245,14 +300,17 @@ async def test_an_unreadable_coordination_store_answers_503(
 ) -> None:
     """A store that will not answer is a 503, never a quiet `nothing_running` — the client
     re-arms on the difference, and reading an outage as "your container is gone" is exactly the
-    mistake `preview-state` was reshaped to stop making."""
+    mistake `preview-state` was reshaped to stop making.
+
+    PATCHED ON `eval`, WHICH IS THE ONE CALL THIS ROUTE MAKES. Refusing a method the route never
+    invokes would leave this green whatever the route did with an outage."""
     user, project, app_id = await _user_project_app(db_session, "outage@bial.test")
     await _register(fake_redis, user.id, app_name_for(app_id))
 
     async def _refuse(*_args: object, **_kwargs: object) -> None:
         raise RedisConnectionError("coordination store is gone")
 
-    monkeypatch.setattr(fake_redis, "hget", _refuse)
+    monkeypatch.setattr(fake_redis, "eval", _refuse)
 
     resp = await client.post(
         f"/v1/build-sessions/projects/{project.id}/renew",

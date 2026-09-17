@@ -460,7 +460,7 @@ async def grant_stay_of_execution(
     await redis.hset(
         registry_key(user_uuid),
         mapping={
-            REGISTRY_FIELD_PREVIEW_STAY_UNTIL: deadline.isoformat(),
+            REGISTRY_FIELD_PREVIEW_STAY_UNTIL: deadline.isoformat(timespec="microseconds"),
             REGISTRY_FIELD_STAY_WRITER: str(writer),
         },
     )
@@ -479,12 +479,29 @@ async def grant_stay_of_execution(
 #
 # A refusal is not an error. `not_this_container` is the ordinary reading a moment after somebody
 # opens another project, and the tab that asked is told which of the three happened.
+# THE MONOTONIC COMPARISON HAPPENS IN HERE, not in the caller. Reading the standing deadline in
+# Python and writing the larger one back is two round trips with a gap between them, and a surface
+# is renewing every forty-five seconds: a hidden tab buying twenty minutes and a visible one buying
+# five can interleave so the five-minute write lands last and cuts fifteen minutes off a reprieve
+# already granted — the exact thing this function's docstring promises can never happen.
+#
+# THE COMPARISON IS LEXICOGRAPHIC, AND THAT IS ONLY SOUND BECAUSE THE VALUES ARE FIXED WIDTH. Every
+# writer here stamps `isoformat(timespec="microseconds")` on an aware UTC instant, so the strings
+# share one offset and one length and sort exactly as the instants do. Drop the timespec and a
+# whole-microsecond value renders three characters shorter, which sorts BEFORE a longer string in
+# the same second — wrong, rarely, in a guard whose whole job is never to be wrong.
+#
+# A standing value that is longer WINS and is returned, so the caller reports the deadline that is
+# actually in force rather than the one it proposed.
 _CAS_GRANT_PRESENCE_STAY_LUA: Final = (
     "if redis.call('EXISTS', KEYS[1]) == 0 then return 'nothing_running' end "
     f"if redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}') ~= ARGV[1] "
     "then return 'not_this_container' end "
+    f"local standing = redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_PREVIEW_STAY_UNTIL}') "
+    "if standing and standing ~= '' and standing >= ARGV[2] "
+    "then return 'renewed:' .. standing end "
     f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_PREVIEW_STAY_UNTIL}', ARGV[2], "
-    f"'{REGISTRY_FIELD_STAY_WRITER}', ARGV[3]) return 'renewed'"
+    f"'{REGISTRY_FIELD_STAY_WRITER}', ARGV[3]) return 'renewed:' .. ARGV[2]"
 )
 
 
@@ -502,25 +519,22 @@ async def renew_presence_stay(
     surface buys twenty minutes and a visible one buys five, so the very next tick after a tab
     comes back on screen would otherwise cut fifteen minutes off a reprieve already granted.
 
-    The monotonic comparison reads the standing value first and the guarded write happens second,
-    which is the same shape `grant_stay_of_execution` uses and is safe for the same reason: the
-    only hazard worth a lock is writing onto the WRONG container, and that is what the script's
-    `app_name` check refuses — atomically, after the read."""
+    The comparison and the write are ONE script, so two surfaces renewing at once cannot interleave
+    into a shorter deadline; the returned instant is whichever one is actually in force."""
     ttl = PRESENCE_STAY_SECONDS[presence]
     deadline = datetime.now(UTC) + timedelta(seconds=ttl)
-    standing = await _standing_stay(redis, user_uuid)
-    if standing is not None and standing > deadline:
-        deadline = standing
     answer = await redis.eval(
         _CAS_GRANT_PRESENCE_STAY_LUA,
         1,
         registry_key(user_uuid),
         app_name,
-        deadline.isoformat(),
+        deadline.isoformat(timespec="microseconds"),
         str(DeadlineWriter.SURFACE_PRESENT),
     )
-    outcome = RenewalOutcome(answer.decode() if isinstance(answer, bytes) else str(answer))
-    return outcome, deadline if outcome is RenewalOutcome.RENEWED else None
+    raw = answer.decode() if isinstance(answer, bytes) else str(answer)
+    if not raw.startswith("renewed:"):
+        return RenewalOutcome(raw), None
+    return RenewalOutcome.RENEWED, _the_instant_in_force(raw.removeprefix("renewed:"))
 
 
 # Retire a provisioning stay now that provisioning is demonstrably over, guarded on the same
@@ -568,10 +582,22 @@ async def settle_stay_once_the_app_is_serving(
         1,
         registry_key(user_uuid),
         app_name,
-        grace.isoformat(),
+        grace.isoformat(timespec="microseconds"),
         str(DeadlineWriter.SURFACE_PRESENT),
     )
     return grace if settled else None
+
+
+def _the_instant_in_force(raw: str) -> datetime | None:
+    """The deadline the script reported it kept, or `None` when it cannot be read.
+
+    `None` here means only that the CALLER cannot name the instant — the write itself succeeded
+    and the hash holds whichever value won. A renewal reporting no instant is still a renewal."""
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 async def _standing_stay(redis: aioredis.Redis, user_uuid: uuid.UUID) -> datetime | None:
