@@ -32,6 +32,7 @@ from pydantic_ai.messages import (
     ModelResponse,
     PartDeltaEvent,
     PartStartEvent,
+    RetryPromptPart,
     TextPart,
     TextPartDelta,
     ToolCallPart,
@@ -73,8 +74,11 @@ from src.services.messages.projection import (
     _LBL_FALLBACK,
     APP_STATE_META_KEY,
     APP_STATE_TOOL,
+    StepItem,
     long_operation_line,
+    project_rows,
 )
+from src.services.messages.store import append_batch, load_rows
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.errors import from_client, from_tsc
 from src.services.orchestrator.selfheal import AppState, HealthState, VerifyOutcome
@@ -2135,6 +2139,14 @@ def _returned(tool: str, call_id: str) -> FunctionToolResultEvent:
     )
 
 
+def _refused(tool: str, call_id: str) -> FunctionToolResultEvent:
+    """The other shape a tool result arrives in: a `RetryPromptPart`, which is what the engine
+    reads as a step that failed."""
+    return FunctionToolResultEvent(
+        part=RetryPromptPart(content="it did not run", tool_name=tool, tool_call_id=call_id)
+    )
+
+
 def _step_labels(state: _TurnState, phase: str | None = None) -> list[str]:
     return [
         frame.item.label
@@ -2619,6 +2631,65 @@ async def test_an_unclassified_command_says_nothing_about_its_argv(_fresh_engine
         assert token not in frame.item.label
         assert token not in restated
     await engine._drain_long_operations(state)
+
+
+async def test_a_step_that_failed_says_so_on_the_live_feed_and_on_a_reload(
+    _fresh_engine, db_session
+) -> None:
+    """★ THE PARITY THE UNIT EXISTS FOR, asserted across the two modules that compose it. The
+    live label is set at CALL time, in the running tense, before anyone knows how the call ends;
+    the reload label is derived from the stored rows afterwards. A citizen who watched a step go
+    red and then reloaded must read the same thing both times.
+
+    Same friendly base, both sides naming the failure, neither showing argv — asserted as one
+    equality rather than as two independent expectations, so a change to the wording on one side
+    alone cannot pass.
+
+    Mutation-check: leave `_resolve_step` on `pending.label` (drop the `failed=` argument and the
+    re-derivation) and the live half goes red while the reload half stays green."""
+    engine = _fresh_engine
+    args = '{"command": ["npm", "install", "zod"]}'
+    state = _bare_state()
+
+    engine._on_event(state, _called("run_command", args, "c1"))
+    engine._on_event(state, _refused("run_command", "c1"))
+    live = state.steps["c1"]
+    await engine._drain_long_operations(state)
+
+    user, _project, conv = await _write_conversation(db_session, "u25p@rvaiglobal.com")
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conv.id,
+        messages=[
+            ModelResponse(
+                parts=[ToolCallPart(tool_name="run_command", args=args, tool_call_id="c1")]
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content="that command could not run",
+                        tool_name="run_command",
+                        tool_call_id="c1",
+                    )
+                ]
+            ),
+        ],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.BUILD,
+    )
+    rows = await load_rows(
+        db_session, user_id=user.id, conversation_id=conv.id, include_hidden=True
+    )
+    reloaded = [item for item in project_rows(rows) if isinstance(item, StepItem)]
+
+    assert len(reloaded) == 1, "the reload half projected no step, so this proves nothing"
+    assert live.state == "failed"
+    assert reloaded[0].state == "failed"
+    assert live.label == reloaded[0].label
+    assert live.label == "Setting up the tools your app needs — this step did not finish"
+    for token in ("npm", "install", "zod", "$ "):
+        assert token not in live.label
 
 
 # --- the spend bound, end to end -------------------------------------------------

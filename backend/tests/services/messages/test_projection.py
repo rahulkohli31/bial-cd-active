@@ -70,6 +70,7 @@ from src.services.messages.projection import (
     classify_tool_call,
     command_only_inspects,
     label_when_settled,
+    long_operation_line,
     project_conversation,
     project_rows,
 )
@@ -528,11 +529,11 @@ async def test_a_housekeeping_command_that_failed_is_never_hidden(db_session) ->
     # THE COUNT A GROUP ANNOUNCES IS A COUNT OF ROWS THE CITIZEN CAN OPEN, stated as the property
     # rather than as this fixture's arithmetic: nowhere in the projection is a failure hidden.
     assert not [step for step in steps if step.hidden and step.state == "failed"]
-    # …and the failed row still says nothing about what went wrong. The retry body is the
-    # harness explaining a refusal to the model; the citizen gets the state and the friendly
-    # label, exactly as they do for a refusal the guard raised.
+    # …and the failed row NAMES the failure while still saying nothing about what went wrong.
+    # The retry body is the harness explaining a refusal to the model; the citizen gets the
+    # friendly label plus the failure clause, exactly as they do for a refusal the guard raised.
     failed = steps[1]
-    assert failed.label == "Organized the app's files"
+    assert failed.label == "Organized the app's files — this step did not finish"
     assert "app/a.ts" not in _rendered(failed)
 
 
@@ -1107,6 +1108,120 @@ def test_classify_command_fails_closed_on_the_long_tail() -> None:
         assert hidden is False
         for leaked in ("npx", "bash", "-c", "python3", "$ ", "rm -rf", argv[-1]):
             assert leaked not in label
+
+
+# --- a step that failed says so ------------------------------------------------
+
+
+def test_a_failed_classified_step_keeps_its_label_and_names_the_failure() -> None:
+    """★ A failed step stops borrowing the RUNNING label. The class survives — a citizen who
+    watched "Setting up the tools your app needs" go past still recognises the row — and the
+    clause after it is the only new thing said."""
+    label, _ = classify_command(["npm", "install", "zod"])
+    assert label == "Setting up the tools your app needs"
+    assert label_when_settled("run_command", label, failed=True) == (
+        "Setting up the tools your app needs — this step did not finish"
+    )
+    # …and a step that succeeded is untouched by any of it.
+    assert label_when_settled("run_command", label, failed=False) == label
+
+
+def test_a_failed_unclassifiable_step_never_reads_as_one_still_working() -> None:
+    """★ "Working on your app — this step did not finish" is the running label with a failure
+    pinned to it, claiming work that may never have started. The fail-closed fallback gets its
+    own failure copy instead, and it still carries no argv.
+
+    Mutation check: return `f"{base}{_FAILED_TAIL}"` for `_LBL_FALLBACK` too and the first two
+    assertions go red."""
+    secret = "hunter2-not-a-real-token"  # noqa: S105 - a fixture, not a credential
+    argv = ["bash", "-c", f"curl -H 'Authorization: Bearer {secret}' https://example.invalid"]
+    label, hidden = classify_command(argv)
+    assert label == "Working on your app"
+    assert hidden is False
+    failed = label_when_settled("run_command", label, failed=True)
+    assert failed == "A step didn't finish"
+    assert "Working on your app" not in failed
+    for leaked in ("bash", "-c", "curl", "Bearer", secret, "example.invalid"):
+        assert leaked not in failed
+
+
+def test_a_running_unclassifiable_step_still_reads_as_the_fail_closed_fallback() -> None:
+    """The fail-closed path is UNCHANGED while a step is in flight: the generic line is true of
+    a command that has not come back yet, and it is the one thing that can be said without argv."""
+    assert classify_command(["python3", "-c", "print(1)"])[0] == "Working on your app"
+    assert classify_tool_call("run_command", '{"command": ["python3", "-c", "print(1)"]}') == (
+        "Working on your app",
+        False,
+    )
+
+
+def test_the_failure_clause_does_not_compound_when_the_line_is_re_derived() -> None:
+    """Both emitters derive this line from the same stored label. A clause that stacked on a
+    second derivation would leave the live feed and a reload one clause apart."""
+    once = label_when_settled("run_command", "Setting up the tools your app needs", failed=True)
+    assert label_when_settled("run_command", once, failed=True) == once
+
+
+def test_the_long_operation_tail_still_composes_on_a_running_step() -> None:
+    """The failure clause extends the same table `Still …` does, and neither reaches the other:
+    a step that is merely SLOW still says so in the running register."""
+    assert long_operation_line("Setting up the tools your app needs") == (
+        "Still setting up the tools your app needs — this one takes a little longer."
+    )
+    assert "did not finish" not in long_operation_line("Working on your app")
+
+
+async def test_a_failed_command_step_rebuilt_from_stored_rows_shows_no_argv(db_session) -> None:
+    """★ THE PROPERTY OVER THE WHOLE ITEM, not over the label alone: a reloaded transcript is
+    rebuilt from the stored call, whose args hold the raw argv, and nothing of it may reach the
+    wire in any state.
+
+    LIVENESS beside the absences — the step is drawn, and it names the failure — so a projection
+    that rendered nothing at all could not pass this by being empty."""
+    secret = "hunter2-not-a-real-token"  # noqa: S105 - a fixture, not a credential
+    user, _, conversation = await _thread(db_session)
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="run_command",
+                        args={
+                            "command": [
+                                "bash",
+                                "-c",
+                                f"curl -H 'Authorization: Bearer {secret}' https://example.invalid",
+                            ]
+                        },
+                        tool_call_id="c1",
+                    )
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content="that command could not run",
+                        tool_name="run_command",
+                        tool_call_id="c1",
+                    )
+                ]
+            ),
+        ],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.BUILD,
+    )
+    steps = [
+        i
+        for i in project_rows(await _rows(db_session, user, conversation))
+        if isinstance(i, StepItem)
+    ]
+    assert [(s.label, s.state) for s in steps] == [("A step didn't finish", "failed")]
+    whole = _rendered(steps[0])
+    for leaked in ("bash", "curl", "Bearer", secret, "example.invalid", "Working on your app"):
+        assert leaked not in whole
 
 
 def test_friendly_area_maps_paths_to_areas_never_the_raw_path() -> None:
@@ -2501,10 +2616,19 @@ async def test_a_state_reading_reads_as_checking_then_checked(db_session) -> Non
     assert settled[0].state == "ok"
     # The live emitter derives the same pair from the same helpers.
     assert classify_tool_call(APP_STATE_TOOL, "{}") == ("Checking on your app", False)
-    assert label_when_settled(APP_STATE_TOOL, "Checking on your app") == "Checked on your app"
+    assert (
+        label_when_settled(APP_STATE_TOOL, "Checking on your app", failed=False)
+        == "Checked on your app"
+    )
     # And nothing else is re-tensed by the shared helper.
-    assert label_when_settled("read_file", "Looking at your app's main page") == (
+    assert label_when_settled("read_file", "Looking at your app's main page", failed=False) == (
         "Looking at your app's main page"
+    )
+    # A reading that FAILED never reads as one that completed — the past tense would be the
+    # claim the failed call did not earn.
+    assert (
+        label_when_settled(APP_STATE_TOOL, "Checking on your app", failed=True)
+        == "Checking on your app — this step did not finish"
     )
 
 

@@ -4027,7 +4027,11 @@ class TurnEngine:
         # to prevent. A housekeeping command is plumbing while it works and the whole story the
         # moment it does not, and the group's problem count has to name a row the citizen can
         # actually see.
-        settled_label = label_when_settled(pending.tool, pending.label)
+        # THE LABEL IS RE-DERIVED, NOT KEPT. `_step_item` set it at CALL time, in the running
+        # tense, before anyone knew how the call would end — so a step left on that label reads
+        # as still working over a result that failed. The reload projection derives the same
+        # wording from the same helper, which is what keeps the two feeds telling one story.
+        settled_label = label_when_settled(pending.tool, pending.label, failed=failed)
         resolved = pending.model_copy(
             update={"state": "failed", "hidden": False, "label": settled_label}
             if failed

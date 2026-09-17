@@ -391,63 +391,7 @@ client into browser code would ship the connection string to the browser.
 - The pool size in `db/index.ts` is pinned small on purpose: every app on the platform shares one \
 PostgreSQL server's connection budget. Leave it alone; fix slow queries with an index instead."""
 
-WRITE_TOOL_SURFACE = """\
-TOOL SURFACE:
-- `read_file` — Read a file's contents (line-numbered).
-- `write_file` — Create or overwrite a file with `file_text`.
-- `edit_file` — Replace the single exact occurrence of `old_str` with `new_str` in `path`.
-- `insert_lines` — Insert `insert_text` into `path` after line `insert_line` (0-based; \
-0 inserts at the top).
-- `declare_done` — Declare the build finished, and put your closing message to the user in \
-`summary`.
-- `run_command` — Run a shell command in the app workspace and get its output back.
-- `fetch_output_slice` — Read the part of a command's output that was cut, using the handle \
-from its truncation notice.
-- `apply_schema_change` — Apply the schema edits you just made in `db/schema.ts` — this \
-generates the migration and runs it in one call, and tells you truthfully which step failed if \
-either did.
-- `list_files` — List every file in the app (relative paths; heavy dirs like node_modules \
-excluded).
-- `search_files` — Search the app's files for a regex `pattern` (grep-like; case-sensitive).
-- `tell_the_user` — Speak into a GAP — a stretch of work long enough that the person waiting \
-would otherwise be watching a still screen.
-- `propose_first_slice` — When a request arrives with a lot of separate things in it, \
-propose what to build first.
-- `check_the_app` — Call this before you say anything about what the app does now, and \
-whenever the user tells you something is wrong."""
-"""GENERATED, NOT WRITTEN — a checked-in snapshot of
-`services/agent/toolsets.render_tool_surface(ChatKind.BUILD)`, which renders one line per
-tool from the tool definitions pydantic-ai hands the model at registration.
-
-It is pasted here rather than computed because THIS MODULE IS A LEAF (see the file docstring): a
-`services.*` import from `core/` closes the cycle the whole file exists to avoid. So the guarantee
-is enforced by test instead — `test_prompt.py`'s drift check recomputes it and fails on any
-difference, including one that is only in the WORDING. Regenerate and re-paste with the one-liner
-beside `render_tool_surface` in `toolsets.py`.
-
-★ IT IS ACCURATE EVERYWHERE NOW. `BUILD_WORKING_RULES_TAIL` used to carry this block into two
-prompts: `mode_prompts._WRITE_SEGMENT`, which registers all twelve tools named above, and the
-standalone build harness's system prompt, whose agent was constructed with
-`toolsets=[sandbox_toolset(...)]` and nothing else — eight. That arm was told on every request
-that it had `list_files`, `search_files`, `tell_the_user` and `propose_first_slice`, and calling
-any of them got the runtime's unknown-tool rejection. The defect is gone because the harness is:
-the bare `POST` on `/v1/build-sessions` and everything reachable only from it were deleted, so
-`_WRITE_SEGMENT` is the ONLY consumer of this block and the twelve names match the twelve
-registrations. The guard that watched the discrepancy went with it, by its own design — its
-docstring said it would go red the day the harness was deleted.
-
-WHY IT HAD TO STOP BEING PROSE. The hand-written block named six tools while the Write arm handed
-the model eight — `list_files` and `search_files` were absent from the prompt for their whole
-life. Worse, a later change to what `declare_done` DOES left the sentence describing it still
-promising a follow-up round-trip; a name-set comparison is structurally blind to that, and the
-generated line is not, because it IS the tool's description.
-
-The line breaks above are `\\`-continued so the constant stays one line per tool no matter how the
-source is wrapped — `render_tool_surface` emits exactly one `\\n` between entries, and a real
-newline inside an entry would fail the drift check for a reason that has nothing to do with the
-tools."""
-
-BUILD_WORKING_RULES_TAIL = f"""\
+BUILD_WORKING_RULES_TAIL = """\
 AFTER A WRITE — the browser is showing the data as of its last fetch, so a create, edit, or \
 delete the user performs does NOT change what is already on screen on its own. Refetch after \
 every write (or apply the write's own response to local state) so the user sees their own change \
@@ -473,6 +417,4 @@ sideways. Design and check the narrow width, not only the desktop layout. Three 
 most of it: a TOOLBAR stacks instead of overflowing below Tailwind's `sm:` breakpoint \
 (`flex-col sm:flex-row`); a wide TABLE scrolls inside its own box instead of widening the page \
 (wrap it in `overflow-x-auto`, as `components/ui/table.tsx` already does); and a FORM's fields \
-stack to one column on a phone and pair up from `sm:` up (`grid sm:grid-cols-2`).
-
-{WRITE_TOOL_SURFACE}"""
+stack to one column on a phone and pair up from `sm:` up (`grid sm:grid-cols-2`)."""

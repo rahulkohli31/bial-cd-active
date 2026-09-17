@@ -18,13 +18,13 @@ Both arms also carry `CONVERSATION_TOOLSET` and `app_state_toolset` (each regist
 the two lists can't drift).
 `toolsets_for_kind` is the ONLY place permitted to read the chat kind to decide capability —
 see its own docstring. Two more things live here, not the registry: the citizen-facing chat-kind
-CATALOGUE (served on `GET /v1/auth/me`) and the TOOL SURFACE prompt-block renderer — each has its
-own banner below, kept beside the registry so a change to one puts the other under your cursor.
+CATALOGUE (served on `GET /v1/auth/me`) and the registry read the gating guards ask their
+questions through — each has its own banner below, kept beside the registry so a change to one
+puts the other under your cursor.
 """
 
 from __future__ import annotations
 
-import re
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -273,8 +273,7 @@ def toolsets_for_kind[DepsT](
     actually read from outside the platform, resolved once at the router off
     `resolve_window(...).effectively_on` — the project's switch AND the owner's approval. Empty is
     the ordinary case and adds nothing, so a project with no connector pays nothing for this
-    feature on any turn and the checked-in `WRITE_TOOL_SURFACE` snapshot still renders at twelve
-    tools.
+    feature on any turn.
 
     THE GATE IS REGISTRATION, NOT REFUSAL, and that is the whole reason it lives here rather than
     inside the tool. The platform already has a flow whose purpose is to say no to a project — an
@@ -402,71 +401,27 @@ fetches before first paint — and read on the client by the single module `chat
 from. No second endpoint, no second wording."""
 
 
-# --- The prompt's TOOL SURFACE block is GENERATED, never hand-written ----------------------
+# --- Reading the registry back, without running any of it ----------------------------------
 #
-# WHY. Prose drifts in two directions and a name list only catches one of them. The
-# hand-written block named SIX tools while the Write arm registered eight (`list_files` and
-# `search_files` were simply missing), and — the class a name comparison is blind to — a later
-# change to what `declare_done` DOES left the sentence describing it still promising a
-# follow-up round-trip. Rendering the block from the registry closes both: a tool the mode
-# does not register cannot be named, one it does register cannot be missed, and no line can
-# describe a tool differently from how the model is told it behaves, because the line and
-# the tool schema are the same string.
-#
-# WHERE IT LANDS. `core/prompt_blocks.py` is a LEAF module by construction (see its
-# docstring): a `services.*` import from there closes a real cycle, and this module is on
-# it — toolsets → orchestrator.tools → orchestrator.sql_guard → core.prompt_blocks. So the
-# prompt carries a checked-in SNAPSHOT of this renderer's output (`WRITE_TOOL_SURFACE`) and
-# `tests/services/orchestrator/test_prompt.py` goes red the moment the two disagree.
-# Regenerate the snapshot with:
-#
-#   uv run python -c "import asyncio;from src.db.models.conversation import ChatKind\
-# ;from src.services.agent.toolsets import render_tool_surface as r\
-# ;print(asyncio.run(r(ChatKind.BUILD)))"
-#
-# THE FIRST SENTENCE, NOT THE WHOLE DOCSTRING — the one decision this unit left to
-# implementation. pydantic-ai already sends every description IN FULL on the tool schema of
-# every request, so rendering the whole docstring here would put each one in front of the
-# model TWICE per turn: ~350 extra words on a request whose token budget is already tight.
-# The first sentence is a roll-call — "these are the tools you have, this is
-# what each is for" — and the registration carries the detail. Both are slices of the one
-# string, so the two can restate each other but can never contradict each other, which is
-# the property this check actually asks for.
+# The gating rules above are only as good as something that can ask what a kind actually
+# registers: that Plan is offered no write tool, that a project with no approved connector is
+# offered no connector tool. Those guards read this, and they have to be able to run with no
+# workspace, no sandbox and no model — so every accessor here raises if it is ever called.
 
 
-def _the_renderer_never_calls_a_model(
+def _reading_the_registry_never_calls_a_model(
     _messages: list[ModelMessage], _info: AgentInfo
 ) -> ModelResponse:
-    raise AssertionError("the tool-surface renderer enumerates registrations; it runs nothing")
+    raise AssertionError("reading the registry enumerates registrations; it runs nothing")
 
 
-_RENDER_ONLY_MODEL: Final = FunctionModel(_the_renderer_never_calls_a_model)
+_REGISTRY_ONLY_MODEL: Final = FunctionModel(_reading_the_registry_never_calls_a_model)
 """`RunContext` requires a model; `get_tools` never reads it. A model that raises if it is
 ever asked for a response keeps that fact honest rather than parking a live client here."""
 
 
-def _the_renderer_never_calls_a_tool(_ctx: RunContext[Any]) -> Any:
-    raise AssertionError("the tool-surface renderer reads tool definitions; it calls no tool")
-
-
-_SENTENCE_END: Final = re.compile(r"\.(?=\s|$)")
-"""A period that ends a sentence: one followed by whitespace or the end of the text. Linear,
-unbounded-quantifier-free (the ReDoS constraint every regex in this repo holds to)."""
-
-_ABBREVIATIONS: Final = ("e.g.", "i.e.", "etc.", "vs.")
-"""Periods that end a WORD, not a sentence. `read_tools.run_command`'s description opens
-`… pass argv tokens, e.g. …` and would otherwise be cut off mid-example."""
-
-
-def first_sentence(description: str) -> str:
-    """The first sentence of a tool description, with its docstring line breaks flattened."""
-    flattened = " ".join(description.split())
-    for match in _SENTENCE_END.finditer(flattened):
-        candidate = flattened[: match.end()]
-        if candidate.endswith(_ABBREVIATIONS):
-            continue
-        return candidate
-    return flattened
+def _reading_the_registry_never_calls_a_tool(_ctx: RunContext[Any]) -> Any:
+    raise AssertionError("reading the registry reads tool definitions; it calls no tool")
 
 
 async def registered_tool_definitions(
@@ -477,43 +432,22 @@ async def registered_tool_definitions(
 
     The accessors are the ones that raise: resolving a workspace or a sandbox is what a tool
     CALL needs, and nothing here calls a tool. That is deliberate rather than convenient — a
-    renderer that needed a live sandbox to describe the surface could not run in a test, and
-    a drift check that cannot run is not a check.
+    reader that needed a live sandbox to describe the surface could not run in a test, and a
+    gating guard that cannot run is not a guard.
 
     `connected_systems` MIRRORS `toolsets_for_kind`'s, DEFAULT AND ALL. It has to: without it the
-    connector-on registration is not expressible from a test, and with a different default the
-    checked-in `WRITE_TOOL_SURFACE` snapshot would render a tool that most projects never see."""
-    sandbox_of = _the_renderer_never_calls_a_tool if kind is ChatKind.BUILD else None
-    ctx: RunContext[Any] = RunContext(deps=None, model=_RENDER_ONLY_MODEL, usage=RunUsage())
+    connector-on registration is not expressible from a test, and a different default here would
+    let the guard pass over a surface no ordinary project is ever given."""
+    sandbox_of = _reading_the_registry_never_calls_a_tool if kind is ChatKind.BUILD else None
+    ctx: RunContext[Any] = RunContext(deps=None, model=_REGISTRY_ONLY_MODEL, usage=RunUsage())
     definitions: dict[str, ToolDefinition] = {}
     surface = toolsets_for_kind(
-        kind, _the_renderer_never_calls_a_tool, sandbox_of, connected_systems=connected_systems
+        kind,
+        _reading_the_registry_never_calls_a_tool,
+        sandbox_of,
+        connected_systems=connected_systems,
     )
     for toolset in surface.toolsets:
         for name, tool in (await toolset.get_tools(ctx)).items():
             definitions[name] = tool.tool_def
     return definitions
-
-
-async def render_tool_surface(
-    kind: ChatKind, *, connected_systems: Sequence[ConnectedSystem] = ()
-) -> str:
-    """The prompt's TOOL SURFACE block for `kind`, generated from the tools it registers.
-
-    THE DEFAULT IS WHAT `WRITE_TOOL_SURFACE` IS A SNAPSHOT OF, and regenerating that snapshot with
-    a connector passed here would bake the connected-data tool into the Build prompt of every
-    project on the platform — including one whose administrator refused the connector, which is
-    the case registration-gating exists to serve. The block is a fact about the PLATFORM's
-    surface; what a particular project adds to it is described in its own CONNECTED DATA stub,
-    beside the data it reads, so the description appears exactly when the tool does."""
-    lines = ["TOOL SURFACE:"]
-    for name, definition in (
-        await registered_tool_definitions(kind, connected_systems=connected_systems)
-    ).items():
-        if not definition.description:
-            raise ValueError(
-                f"`{name}` is registered with no description, so the prompt has nothing "
-                "truthful to say about it. Give the tool a docstring — it is prompt copy."
-            )
-        lines.append(f"- `{name}` — {first_sentence(definition.description)}")
-    return "\n".join(lines)

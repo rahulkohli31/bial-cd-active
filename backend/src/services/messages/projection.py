@@ -202,6 +202,18 @@ _LBL_CHECKED_APP: Final = "Checked on your app"
 _LONG_OPERATION_TAIL: Final = " — this one takes a little longer."
 _STILL: Final = "Still "
 
+# WHAT A STEP THAT FAILED SAYS, extending the same table for the same reason `_STILL` does: a
+# short clause after a label already in the citizen's register turns any of them into a truthful
+# failure sentence, and a label added tomorrow is covered for free.
+#
+# `_LBL_FALLBACK` IS THE ONE LABEL THAT MUST NOT TAKE THE CLAUSE. It is what an unrecognised
+# command degrades to, and "Working on your app — this step did not finish" is the running label
+# with a failure pinned to it: it claims work that may never have started. A failed step nobody
+# could classify says only that something did not finish — no jargon, no command, no exit code,
+# which is the same fail-closed rule `_classify_command` holds to.
+_FAILED_TAIL: Final = " — this step did not finish"
+_LBL_FAILED_FALLBACK: Final = "A step didn't finish"
+
 # Friendly file-area copy (`_friendly_area`): the citizen sees an app AREA, never a filename.
 _AREA_MAIN_PAGE: Final = "your app's main page"
 _AREA_LAYOUT: Final = "your app's overall look"
@@ -619,14 +631,39 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
     return (f"Used {tool_name}", False)
 
 
-def label_when_settled(tool_name: str, label: str) -> str:
-    """One step's label once its result has landed — the same label for every tool but the state
-    tool, which reads "Checked on your app" rather than "Checking on your app".
+def failed_step_line(label: str) -> str:
+    """A step's friendly label, restated for a step whose result came back a failure.
+
+    FAILS CLOSED LIKE THE TABLE, and the input is always a label this module already produced, so
+    it carries no argv and no file path. An empty one, or the unrecognised-command fallback,
+    degrades to `_LBL_FAILED_FALLBACK` rather than borrowing a running step's words.
+
+    IDEMPOTENT, for the reason `long_operation_line` is: both emitters re-derive it from the same
+    stored label, and a line that grew a second clause on the second derivation would put the
+    live feed and a reload one clause apart."""
+    base = label.strip()
+    if not base or base == _LBL_FALLBACK:
+        return _LBL_FAILED_FALLBACK
+    if base.endswith(_FAILED_TAIL):
+        return base
+    return f"{base}{_FAILED_TAIL}"
+
+
+def label_when_settled(tool_name: str, label: str, *, failed: bool) -> str:
+    """One step's label once its result has landed: the failure wording when the call came back
+    a failure, "Checked on your app" for the state tool, and the label unchanged otherwise.
 
     PUBLIC AND SHARED, like the three classifiers beside it: the live emitter resolves a step
     when the return arrives and the reload projection derives the same step from the stored
-    return, so a tense that only one of them applied would be a live/reload disagreement about
-    what the citizen is reading."""
+    return, so wording that only one of them applied would be a live/reload disagreement about
+    what the citizen is reading. `failed` is keyword-only and has NO DEFAULT — both callers
+    already know the step's state, and a default would let the next one forget the arm nobody
+    looks at until it matters.
+
+    A FAILED STATE-TOOL STEP STAYS IN THE PRESENT TENSE. "Checked on your app" is a claim the
+    check completed, which is the one thing a failed call did not do."""
+    if failed:
+        return failed_step_line(label)
     return _LBL_CHECKED_APP if tool_name == APP_STATE_TOOL else label
 
 
@@ -634,10 +671,9 @@ def classify_command(argv: list[str]) -> tuple[str, bool]:
     """Public entry to the run_command classifier — the LIVE emitter (`orchestrator/tools.py`)
     shares this exact logic with the reload projection: same friendly BASE label + `hidden`
     flag + step state, neither feed ever shows raw shell/argv, and a command classifies
-    identically on both. The ONE live-only affordance is a short human SUFFIX the live
-    emitter appends to a blocked/failed step; on reload the same reason rides the step's
-    Details expander instead. So parity is 'same friendly item, no raw shell', not
-    byte-identical labels on a failure."""
+    identically on both. Parity on a FAILURE is the same friendly base with both sides naming
+    the failure — through `failed_step_line`, or through the more specific suffix the live
+    emitter has for a command it refused to run — never byte-identical labels, and never argv."""
     return _classify_command(argv)
 
 
@@ -1166,7 +1202,11 @@ def _project_response_parts(
                 StepItem(
                     seq=row.seq,
                     tool=tool_name,
-                    label=label if state == "pending" else label_when_settled(tool_name, label),
+                    label=(
+                        label
+                        if state == "pending"
+                        else label_when_settled(tool_name, label, failed=state == "failed")
+                    ),
                     # NOTHING IS HIDDEN WHEN SOMETHING WENT WRONG, whatever class it belongs
                     # to. The group opens itself saying one thing went wrong and then counts
                     # the rows the citizen can see; a hidden failure makes that count name a

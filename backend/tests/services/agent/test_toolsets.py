@@ -39,9 +39,7 @@ from src.services.agent.toolsets import (
     ReadDeps,
     ToolSurface,
     app_state_toolset,
-    first_sentence,
     registered_tool_definitions,
-    render_tool_surface,
     toolsets_for_kind,
     workspace_from_read_deps,
 )
@@ -476,11 +474,10 @@ async def test_the_default_is_no_connectors_and_that_default_is_the_whole_guard(
     The manual form is: make `connected_systems` default to a connected system in
     `toolsets_for_kind`, and `test_a_project_that_reads_no_connected_data_is_offered_none` goes
     red. Run it before merging. What is asserted HERE is the property that mutation breaks — the
-    signature's default is empty, in all three functions that take it — because a default that
-    drifted in only one of them would leave `WRITE_TOOL_SURFACE` rendering a tool most projects
-    never get, and only the snapshot drift check standing between that and every citizen's Build
-    prompt."""
-    for function in (toolsets_for_kind, registered_tool_definitions, render_tool_surface):
+    signature's default is empty, in both functions that take it — because a default that drifted
+    in only one of them would hand the connector tool to a project whose administrator refused it,
+    and the guard that reads the registry back would be reading the widened default too."""
+    for function in (toolsets_for_kind, registered_tool_definitions):
         default = inspect.signature(function).parameters["connected_systems"].default
         assert default == (), f"{function.__name__} defaults to {default!r}"
 
@@ -811,27 +808,34 @@ async def test_the_reading_never_invites_the_agent_to_derive_its_own() -> None:
 
 
 @pytest.mark.parametrize("kind", list(ChatKind), ids=[k.value for k in ChatKind])
-async def test_the_call_timing_rule_is_the_first_sentence(kind: ChatKind) -> None:
-    """★ WHEN TO CALL IT LEADS, and the position is the whole of why this is pinned.
+async def test_when_to_call_it_survives_in_the_description(kind: ChatKind) -> None:
+    """★ WHEN TO CALL IT is the sentence that decides whether this tool is reached for at all,
+    and the registered description is the ONLY place the model is told it.
 
-    Only the FIRST SENTENCE of a tool's docstring reaches the generated TOOL SURFACE block; the
-    rest reaches the model on the tool schema. So a description that opens by saying what the
-    tool RETURNS spends its one prompt-surface line on something the model can work out from the
-    name, and the rule that decides whether it calls at all never appears there.
-
-    Pinned on the REGISTERED definition rather than on the prompt's own text: the two are slices
-    of one string, a pin on the prompt side would pin whichever copy happens to be checked in,
-    and that copy is on its way out.
-
-    Mutation check: swap the first two sentences of `check_the_app` back and this goes red while
-    every other assertion about that description stays green."""
+    Pinned as a literal rather than derived from the docstring, so trimming the rule away cannot
+    quietly take the expectation with it. Mutation check: delete the sentence from
+    `check_the_app`'s docstring and this goes red while every other assertion about that
+    description stays green."""
     definitions = await registered_tool_definitions(kind)
     described = definitions["check_the_app"].description
     assert described is not None
-    assert first_sentence(described) == (
+    assert (
         "Call this before you say anything about what the app does now, and whenever the user "
         "tells you something is wrong."
-    )
+    ) in " ".join(described.split())
+
+
+@pytest.mark.parametrize("kind", list(ChatKind), ids=[k.value for k in ChatKind])
+async def test_every_registered_tool_reaches_the_model_with_a_description(kind: ChatKind) -> None:
+    """★ A tool's docstring is the only thing that tells the model what the tool is FOR, so one
+    registered without a description arrives as a bare name to guess at.
+
+    Asserted over the registry rather than over a list somebody keeps, so it covers a tool nobody
+    thought to write a test for."""
+    definitions = await registered_tool_definitions(kind)
+    assert definitions, f"{kind} registers nothing at all"
+    for name, definition in definitions.items():
+        assert definition.description, f"`{name}` is registered with no description"
 
 
 def test_the_toolset_module_imports_from_a_bare_interpreter() -> None:

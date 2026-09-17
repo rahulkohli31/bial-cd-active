@@ -11,14 +11,12 @@ share one fail-closed write guard (absolute/`..` escape + `.git/` deny). No tool
 `session.handle`/`handle.token`.
 
 WHY THIS EXISTS: every tool docstring below is PROMPT COPY sent to the model by pydantic-ai
-at registration, and `core/prompt_blocks.WRITE_TOOL_SURFACE` is a generated snapshot of them
-(`agent/toolsets.render_tool_surface` is what generates it) — edit one here and
-`test_prompt.py`'s drift check goes red until it is regenerated. Write the FIRST SENTENCE as
-the line you want in the prompt; the rest is detail the model reads on the tool schema. Two
-sentences are load-bearing beyond their own tool and must survive any trim: `run_command`'s
-don't-start-or-restart-the-dev-server rule (the only thing covering a second `next dev`
-started through `/exec`, which the supervisor's child env cannot tell from the real one), and
-`declare_done`'s terminal-on-a-passing-check statement — a model promised a follow-up
+at registration, and it is the ONLY place the model is told what these tools do — the prompt
+states no tool surface of its own, so a sentence trimmed here is a sentence the model never
+reads. Two sentences are load-bearing beyond their own tool and must survive any trim:
+`run_command`'s don't-start-or-restart-the-dev-server rule (the only thing covering a second
+`next dev` started through `/exec`, which the supervisor's child env cannot tell from the real
+one), and `declare_done`'s terminal-on-a-passing-check statement — a model promised a follow-up
 round-trip withholds its closing message from `summary`, and there is no reply to put it in.
 
 `fetch_output_slice` is the seventh, and it exists because the output cap used to be
@@ -44,13 +42,10 @@ Write chat turn; the harness is deleted and the chat turn is the one left. The f
 because the accessor closure is still what lets one tool body serve whatever deps type a run
 carries, and the tool tests drive it over their own.
 
-ONE SURFACE NOW, AND THE PROMPT FINALLY MATCHES IT. The harness took THIS toolset and nothing
-else — eight tools — while `WRITE_TOOL_SURFACE` described the Write chat arm's twelve and
-shipped in both prompts, so the harness was told about four tools it could not call. A Write
-chat turn takes this toolset plus `list_files`/`search_files` off `read_only_toolset` and the
-two `CONVERSATION_TOOLSET` tools — twelve, exactly what the snapshot names. Recorded at
-`core/prompt_blocks.WRITE_TOOL_SURFACE`; guarded by
-`test_prompt.py::test_the_prompts_tool_list_is_exactly_what_the_write_arm_registers`.
+ONE SURFACE NOW. A Write chat turn takes this toolset plus `list_files`/`search_files` off
+`read_only_toolset` and the two `CONVERSATION_TOOLSET` tools — twelve, and the model is handed
+all twelve schemas on every request. `agent/toolsets.registered_tool_definitions` is what the
+gating guards read that list back through.
 """
 
 from __future__ import annotations
@@ -77,6 +72,7 @@ from src.services.messages.projection import (
     classify_tool_call,
     command_needs_the_long_timeout,
     command_only_inspects,
+    failed_step_line,
 )
 from src.services.orchestrator.constants import (
     OUTPUT_SLICE_MAX_LINES,
@@ -853,9 +849,9 @@ def sandbox_toolset[DepsT](
         # route-around behaviour stays observable in BRAIN traces.
         refusal = you_shall_not_pass(command)
         if refusal is not None:
-            # The `— blocked …`/`— couldn't finish` suffixes are a LIVE-ONLY affordance on the
-            # friendly base: on reload the state (failed) matches and the reason rides the Details
-            # expander instead, so parity stays 'same friendly item, no raw shell' (see
+            # THE ONE FAILURE SUFFIX THAT IS NOT `failed_step_line`'s, because it says something
+            # the generic clause cannot: the command was refused before it ran. It names the
+            # reason and still shows no argv, which is the whole parity rule (see
             # classify_command).
             await _step(
                 session,
@@ -899,7 +895,7 @@ def sandbox_toolset[DepsT](
             await _step(
                 session,
                 name="run_command",
-                label=f"{friendly} — couldn't finish",
+                label=failed_step_line(friendly),
                 state="failed",
                 hidden=hidden,
             )
@@ -912,7 +908,7 @@ def sandbox_toolset[DepsT](
             await _step(
                 session,
                 name="run_command",
-                label=f"{friendly} — couldn't finish",
+                label=failed_step_line(friendly),
                 state="failed",
                 hidden=hidden,
             )
@@ -1047,7 +1043,7 @@ def sandbox_toolset[DepsT](
                 await _step(
                     session,
                     name=APPLY_SCHEMA_CHANGE_TOOL,
-                    label=f"{friendly} — couldn't finish",
+                    label=failed_step_line(friendly),
                     state="failed",
                     hidden=hidden,
                 )
@@ -1056,7 +1052,7 @@ def sandbox_toolset[DepsT](
                 await _step(
                     session,
                     name=APPLY_SCHEMA_CHANGE_TOOL,
-                    label=f"{friendly} — couldn't finish",
+                    label=failed_step_line(friendly),
                     state="failed",
                     hidden=hidden,
                 )
