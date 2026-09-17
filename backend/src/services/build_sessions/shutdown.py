@@ -69,6 +69,7 @@ from src.services.redis.keys import (
 )
 from src.services.sandbox import SandboxClient, SandboxError, SandboxGoneError, SandboxHandle
 from src.services.sandbox.base import identity_from_tags
+from src.services.storage import StorageError
 
 _log = structlog.get_logger()
 
@@ -434,6 +435,20 @@ async def run_the_shutdown(
     except SandboxError as exc:
         return await _spare_or_go_in_unread(
             owed, redis, sandbox_client, factory, reason, why=f"the tree could not be read: {exc}"
+        )
+    except StorageError as exc:
+        # A STORE THAT WILL NOT TAKE THE COPY IS THE SAME SITUATION AS A CONTAINER THAT WILL NOT
+        # ANSWER, and it must land in the same budget. Letting this raise instead spares the
+        # container through the caller's catch-all, which keeps the debt WITHOUT counting the
+        # attempt — so a store outage that outlives the strikes would be retried forever and the
+        # container billed forever, against the one bound that was supposed to stop it.
+        return await _spare_or_go_in_unread(
+            owed,
+            redis,
+            sandbox_client,
+            factory,
+            reason,
+            why=f"the copy could not be stored: {exc}",
         )
     if written.outcome is SavedCopyOutcome.DIVERTED:
         # DESTROYED ANYWAY, and that is safe rather than brave: the guard uploaded the refused

@@ -58,7 +58,7 @@ from src.services.redis.keys import (
 )
 from src.services.sandbox import SandboxHandle, SandboxNotReadyError
 from src.services.sandbox.base import KIND_BUILD_SANDBOX, TAG_CREATED_AT, TAG_KIND, ExecResult
-from src.services.storage import snapshot_key
+from src.services.storage import StorageError, snapshot_key
 from tests.factories import (
     AppRegistryFactory,
     ConversationFactory,
@@ -697,6 +697,47 @@ async def test_a_container_that_will_not_answer_is_spared_inside_its_budget(
     rows = await _rows_for(scene)
     assert len(rows) == 1 and rows[0].last_error is not None
     assert await fake_redis.exists(registry_key(scene.user_id)) == 1
+
+
+async def test_a_store_that_will_not_take_the_copy_lands_in_the_same_budget(
+    fake_redis: aioredis.Redis, scene: _Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ A STORE OUTAGE IS SPARED ON A COUNT, NOT FOREVER.
+
+    The container answers perfectly; it is the object store that will not take the copy. Left
+    to raise, that escapes into the caller's catch-all, which keeps the debt WITHOUT counting the
+    attempt — so an outage lasting longer than the strikes would be retried every sweep with the
+    count frozen, and the container billed for as long as the store stayed down. The bound that
+    exists to stop exactly that only applies if this lands inside it.
+
+    Mutation check: drop the `except StorageError` arm and this goes red — the routine raises
+    instead of returning, and no attempt is recorded on the row."""
+    born = _born_at(10)
+    await _seed_registry(fake_redis, scene.user_id, app_name=scene.app_name, created_at=born)
+    client = _Sandbox()
+    client.by_name[scene.app_name] = SandboxHandle(
+        fqdn="", token="", app_name=scene.app_name, preview_url="", ready=True
+    )
+    owed = await _owe(scene, instance_ref=born)
+
+    async def _the_store_is_down(*_args: object, **_kwargs: object) -> None:
+        raise StorageError("the object store is unreachable")
+
+    monkeypatch.setattr(shutdown_module, "write_saved_copy_under_guard", _the_store_is_down)
+
+    outcome = await run_the_shutdown(
+        owed,
+        redis=fake_redis,
+        sandbox_client=client,
+        reason=ShutdownReason.PRESENCE_LAPSED,
+        session_factory=scene.factory,
+    )
+
+    assert outcome is ShutdownOutcome.SPARED
+    assert client.torn_down == [], "a container must not be destroyed over a store outage"
+    rows = await _rows_for(scene)
+    assert len(rows) == 1
+    assert rows[0].last_error is not None and "stored" in rows[0].last_error
 
 
 async def test_a_container_unreadable_past_the_strikes_is_destroyed_unread_and_alarmed(
