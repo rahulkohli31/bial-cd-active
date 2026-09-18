@@ -144,7 +144,7 @@ def _user_from_registry_key(key: str) -> uuid.UUID | None:
         return None
 
 
-def _handle_named(app_name: str, *, fqdn: str = "") -> SandboxHandle:
+def handle_named(app_name: str, *, fqdn: str = "") -> SandboxHandle:
     """The minimal teardown handle — ACA delete is keyed by `app_name` alone; `fqdn` is carried
     when known, left empty otherwise, and read by nothing on the teardown path.
 
@@ -163,7 +163,7 @@ def _handle_named(app_name: str, *, fqdn: str = "") -> SandboxHandle:
 
 def _minimal_handle(reg: dict[str, str]) -> SandboxHandle:
     """The same handle, reconstructed from a registry record — the shape `reap_user` tears down."""
-    return _handle_named(
+    return handle_named(
         reg.get(REGISTRY_FIELD_APP_NAME, ""), fqdn=reg.get(REGISTRY_FIELD_FQDN, "")
     )
 
@@ -880,7 +880,7 @@ async def reap_the_container_we_judged(
         await mark_registry_ending(redis, user_uuid)  # step 1: guard a concurrent attach
     try:
         await sandbox_client.teardown(
-            _handle_named(app_name, fqdn=(reg or {}).get(REGISTRY_FIELD_FQDN, ""))
+            handle_named(app_name, fqdn=(reg or {}).get(REGISTRY_FIELD_FQDN, ""))
         )
     except SandboxError:
         # KEEP whatever state there is so a later pass retries; clearing it now would orphan a

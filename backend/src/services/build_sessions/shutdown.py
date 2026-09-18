@@ -58,7 +58,11 @@ from src.services.build_sessions.locks import (
     reap_lock,
     release_liveness_lease,
 )
-from src.services.build_sessions.reaper import is_a_sandbox_name, is_a_shared_sandbox_name
+from src.services.build_sessions.reaper import (
+    handle_named,
+    is_a_sandbox_name,
+    is_a_shared_sandbox_name,
+)
 from src.services.build_sessions.snapshot import SavedCopyOutcome, write_saved_copy_under_guard
 from src.services.messages.projection import TURN_TERMINAL_KIND
 from src.services.redis import REGISTRY_STATE_ENDING, registry_key
@@ -582,10 +586,6 @@ async def _mark_ending_if_still_ours(redis: aioredis.Redis, owed: OwedTeardown) 
     return bool(marked)
 
 
-async def _delete_registry_if_still_ours(redis: aioredis.Redis, owed: OwedTeardown) -> bool:
-    return await delete_registry_if_it_still_names(redis, owed.user_id, owed.app_name)
-
-
 async def _a_different_instance_answers(redis: aioredis.Redis, owed: OwedTeardown) -> bool:
     """Has the citizen reopened this project, so the name now belongs to a NEW container?
 
@@ -631,7 +631,9 @@ async def _destroy(
 
     await _mark_ending_if_still_ours(redis, owed)
     try:
-        await sandbox_client.teardown(handle if handle is not None else _teardown_handle(owed))
+        await sandbox_client.teardown(
+            handle if handle is not None else handle_named(owed.app_name)
+        )
     except SandboxError as exc:
         # The container is still standing, so the debt stays — but the citizen's slot does not. A
         # failure on this platform's side must never cost them their next project.
@@ -647,13 +649,6 @@ async def _destroy(
     return ShutdownOutcome.DESTROYED
 
 
-def _teardown_handle(owed: OwedTeardown) -> SandboxHandle:
-    """The minimal handle an ARM delete needs — the name, and nothing else the teardown path
-    reads. `preview_url` stays empty rather than composed: teardown never shows one to a browser,
-    and one composed over a missing fqdn is a string that says nothing."""
-    return SandboxHandle(fqdn="", token="", app_name=owed.app_name, preview_url="", ready=False)
-
-
 async def _let_go_of_the_slot(redis: aioredis.Redis, owed: OwedTeardown) -> None:
     """Release this citizen's coordination state — but only while it still belongs to THIS
     container.
@@ -662,7 +657,7 @@ async def _let_go_of_the_slot(redis: aioredis.Redis, owed: OwedTeardown) -> None
     identity at all, so what guards them is a fresh read taken right here: a registry that has
     come back names a replacement, and a starting marker means a start already holds the lock.
     Neither is ours to clear."""
-    if not await _delete_registry_if_still_ours(redis, owed):
+    if not await delete_registry_if_it_still_names(redis, owed.user_id, owed.app_name):
         return
     if await read_registry(redis, owed.user_id) is not None:
         return

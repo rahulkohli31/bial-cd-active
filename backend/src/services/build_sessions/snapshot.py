@@ -440,7 +440,6 @@ class SavedCopyOutcome(enum.StrEnum):
 @dataclass(frozen=True)
 class SavedCopyWrite:
     outcome: SavedCopyOutcome
-    reason: str
     #: The sha the saved copy held before this write, when it held one.
     recorded_head: str | None = None
     #: The sha this shutdown actually bundled. `None` on `SKIPPED`, which bundles nothing.
@@ -492,27 +491,25 @@ async def write_saved_copy_under_guard(
             if state is None:
                 raise SandboxError("the container would not answer its state probe")
 
-            refusal: str | None = None
-            if comparable is None:
-                refusal = "no saved copy this tree can be shown to descend from"
-            elif state.head == comparable and not holds_unsaved_work(state):
-                return SavedCopyWrite(
-                    SavedCopyOutcome.SKIPPED,
-                    "the tree holds nothing the saved copy does not",
-                    recorded_head=recorded,
-                )
-            elif state.ancestry is not Ancestry.DESCENDANT:
-                refusal = f"the tree is {state.ancestry.value} of the saved copy"
+            # No comparable head on record is a refusal exactly as a non-descendant tree is: in
+            # both, this tree cannot be SHOWN to contain the saved work, and the guard promotes
+            # only on proof. The alarm below carries which of the two it was.
+            refused = comparable is None or state.ancestry is not Ancestry.DESCENDANT
+            if (
+                comparable is not None
+                and state.head == comparable
+                and not holds_unsaved_work(state)
+            ):
+                return SavedCopyWrite(SavedCopyOutcome.SKIPPED, recorded_head=recorded)
 
             tree = await _bundle_the_tree(sandbox_client, handle, timings)
-            if refusal is None:
+            if not refused:
                 # THE PROOF IS IN REACHING HERE: a comparable head on record, and the probe
                 # answering that this tree descends from it. This is the only line in the system
                 # that writes the saved copy without a person having asked for it.
                 await _timed_store(store, snapshot_key(app_id), tree, timings)
                 return SavedCopyWrite(
                     SavedCopyOutcome.WRITTEN,
-                    "this container built on the copy it is replacing",
                     recorded_head=recorded,
                     bundled_head=tree.head_sha,
                 )
@@ -528,7 +525,6 @@ async def write_saved_copy_under_guard(
             )
             return SavedCopyWrite(
                 SavedCopyOutcome.DIVERTED,
-                refusal,
                 recorded_head=recorded,
                 bundled_head=tree.head_sha,
                 diverted_to=where,
