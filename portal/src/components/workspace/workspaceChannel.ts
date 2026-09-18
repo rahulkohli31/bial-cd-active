@@ -252,6 +252,13 @@ export interface SaveSlot {
   /** A Save or a Discard that failed, in the server's words. */
   error: string | null
   discarding: boolean
+  /**
+   * A rollback is running. SEPARATE FROM `discarding` even though both replace every file: each
+   * refuses while the other runs, and a single flag would let a control name the wrong one in its
+   * refusal. The toolbar's elapsed counter covers this as well as `saving` — a rollback is the
+   * same long wait with the same nothing to look at.
+   */
+  rollingBack: boolean
   /** A reply is running. Discard waits for it: the files are the reply's to read or change. */
   replying: boolean
   /** A saved version exists for Discard to go back to. */
@@ -274,6 +281,7 @@ export const NO_SAVE: SaveSlot = {
   saving: false,
   error: null,
   discarding: false,
+  rollingBack: false,
   replying: false,
   hasSavedVersion: false,
   canSave: false,
@@ -308,10 +316,19 @@ export const NO_LIFECYCLE: WorkspaceLifecycle = { drainingAt: null, writeBackRef
  * rather than about the app running beside it belong.
  */
 export interface WorkspaceActions {
-  save: (() => void) | null
+  /**
+   * Save, with the citizen's own words for the version it creates.
+   *
+   * IT RETURNS A PROMISE, and that is load-bearing: the naming dialog closes only once the save
+   * has actually succeeded, so a failure leaves the typed line where it was typed.
+   */
+  save: ((description?: string) => Promise<void>) | null
   /** Put the app back to its saved version. Settles once the attempt is over, success or not, so
    *  the confirmation it was pressed from can stay busy until then. */
   discard: (() => Promise<void>) | null
+  /** Put the workspace back to a chosen version. Settles once the attempt is over, success or
+   *  not, like `discard` — the menu row it was pressed from can stay busy until then. */
+  rollback: ((versionId: string) => Promise<void>) | null
   /** Open this application's settings — the same dialog the home list opens, which is where the
    *  name, the description, the status and the data access all live now. */
   settings: (() => void) | null
@@ -320,7 +337,13 @@ export interface WorkspaceActions {
   share: (() => void) | null
 }
 
-export const NO_ACTIONS: WorkspaceActions = { save: null, discard: null, settings: null, share: null }
+export const NO_ACTIONS: WorkspaceActions = {
+  save: null,
+  discard: null,
+  rollback: null,
+  settings: null,
+  share: null,
+}
 
 /**
  * The address, plus the ONE thing that can invalidate it after its publisher is gone.
@@ -347,6 +370,7 @@ const sameSave = (a: SaveSlot, b: SaveSlot) =>
   a.saving === b.saving &&
   a.error === b.error &&
   a.discarding === b.discarding &&
+  a.rollingBack === b.rollingBack &&
   a.replying === b.replying &&
   a.hasSavedVersion === b.hasSavedVersion &&
   a.canSave === b.canSave &&

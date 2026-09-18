@@ -60,7 +60,7 @@ async def test_save_happy_path_returns_the_app_id_and_head_sha(
     # overwrite a different project's saved bundle.
     seen: list[tuple[uuid.UUID, uuid.UUID]] = []
 
-    async def _fake_save(db, user, project_id, *, sandbox_client) -> SaveOutcome:
+    async def _fake_save(db, user, project_id, *, sandbox_client, description=None) -> SaveOutcome:
         seen.append((user.id, project_id))
         return SaveOutcome(app_id=app_id, head_sha="a" * 40)
 
@@ -89,7 +89,7 @@ async def test_save_returns_a_null_head_sha_when_the_state_read_failed(
     user, project = await _user_project(db_session, "save1b@rvaiglobal.com")
     app_id = uuid.uuid4()
 
-    async def _fake_save(db, user, project_id, *, sandbox_client) -> SaveOutcome:
+    async def _fake_save(db, user, project_id, *, sandbox_client, description=None) -> SaveOutcome:
         return SaveOutcome(app_id=app_id, head_sha=None)
 
     wire.manager.save_project_snapshot = _fake_save
@@ -110,7 +110,7 @@ async def test_save_with_no_live_workspace_is_409(
     # BEFORE the raise, since an append placed after it would be unreachable and prove nothing.
     seen: list[tuple[uuid.UUID, uuid.UUID]] = []
 
-    async def _fake_save(db, user, project_id, *, sandbox_client) -> SaveOutcome:
+    async def _fake_save(db, user, project_id, *, sandbox_client, description=None) -> SaveOutcome:
         seen.append((user.id, project_id))
         raise NoLiveSandboxError(project_id)
 
@@ -129,7 +129,7 @@ async def test_save_while_a_build_is_running_is_409(
     user, project = await _user_project(db_session, "save3@rvaiglobal.com")
     seen: list[tuple[uuid.UUID, uuid.UUID]] = []
 
-    async def _fake_save(db, user, project_id, *, sandbox_client) -> SaveOutcome:
+    async def _fake_save(db, user, project_id, *, sandbox_client, description=None) -> SaveOutcome:
         seen.append((user.id, project_id))
         raise BuildSessionConflictError(uuid.uuid4())
 
@@ -182,7 +182,7 @@ async def test_save_of_another_users_project_is_404(
     # still answer 404 and pass.
     seen: list[uuid.UUID] = []
 
-    async def _fake_save(db, user, project_id, *, sandbox_client) -> SaveOutcome:
+    async def _fake_save(db, user, project_id, *, sandbox_client, description=None) -> SaveOutcome:
         seen.append(project_id)
         return SaveOutcome(app_id=uuid.uuid4(), head_sha="a" * 40)
 
@@ -454,3 +454,83 @@ async def test_save_refuses_the_missing_sandbox_before_checking_ownership(
     resp = await client.post(_save_url(project.id), headers=auth_headers(intruder))
 
     assert resp.status_code == 503
+
+
+async def test_a_save_with_no_body_still_saves_and_carries_no_description(
+    client: AsyncClient, db_session: AsyncSession, wire
+) -> None:
+    """★ TWO SHIPPED FLOWS REACH THIS ENDPOINT WITH NO SAVE BUTTON IN FRONT OF THEM — the
+    leave-page guard and the hand-over stop→save→release. Both post nothing at all.
+
+    A required body would refuse them outright, and a dialog in front of them would open inside
+    an already-open modal and burn a version slot on a save the citizen never chose. So the body
+    is optional and its absence means "no description", not a validation error.
+
+    Mutation receipt: make the body required and this 422s.
+    """
+    user, project = await _user_project(db_session, "save-nobody@rvaiglobal.com")
+    await db_session.commit()
+    app_id = uuid.uuid7()
+    described: list[str | None] = []
+
+    async def _fake_save(db, user, project_id, *, sandbox_client, description=None) -> SaveOutcome:
+        described.append(description)
+        return SaveOutcome(app_id=app_id, head_sha="c" * 40)
+
+    wire.manager.save_project_snapshot = _fake_save
+
+    resp = await client.post(_save_url(project.id), headers=auth_headers(user))
+
+    assert resp.status_code == 200, resp.text
+    assert described == [None]
+
+
+async def test_a_description_reaches_the_version_the_save_records(
+    client: AsyncClient, db_session: AsyncSession, wire
+) -> None:
+    """The citizen's own words about what changed, carried from the dialog to the row.
+
+    Mutation receipt: drop the body from the handler and the line never reaches the manager.
+    """
+    user, project = await _user_project(db_session, "save-described@rvaiglobal.com")
+    await db_session.commit()
+    app_id = uuid.uuid7()
+    described: list[str | None] = []
+
+    async def _fake_save(db, user, project_id, *, sandbox_client, description=None) -> SaveOutcome:
+        described.append(description)
+        return SaveOutcome(app_id=app_id, head_sha="d" * 40)
+
+    wire.manager.save_project_snapshot = _fake_save
+
+    resp = await client.post(
+        _save_url(project.id),
+        headers=auth_headers(user),
+        json={"description": "Added the manager approval step"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert described == ["Added the manager approval step"]
+
+
+async def test_a_description_past_the_ceiling_is_refused_rather_than_truncated(
+    client: AsyncClient, db_session: AsyncSession, wire
+) -> None:
+    """One line, and the ceiling is the project name's rather than a second invented number.
+
+    Refused rather than silently cut: a description the citizen cannot see the end of is one
+    they cannot trust to identify the version later, which is the only job it has.
+    """
+    user, project = await _user_project(db_session, "save-toolong@rvaiglobal.com")
+    await db_session.commit()
+
+    async def _fake_save(db, user, project_id, *, sandbox_client, description=None) -> SaveOutcome:
+        raise AssertionError("the save must never run for a refused description")
+
+    wire.manager.save_project_snapshot = _fake_save
+
+    resp = await client.post(
+        _save_url(project.id), headers=auth_headers(user), json={"description": "x" * 121}
+    )
+
+    assert resp.status_code == 422

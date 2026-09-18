@@ -63,6 +63,7 @@ from src.api.v1.build_sessions.schemas import (
     RenewalOutcome,
     RenewPresenceRequest,
     RenewPresenceResponse,
+    SaveRequest,
     SharedPreviewResponse,
     StopBuildRequest,
     StopBuildResponse,
@@ -101,12 +102,23 @@ from src.services.build_sessions.locks import (
     renew_presence_stay,
     stamp_is_proven,
 )
+from src.services.build_sessions.manager import (
+    VersionNotOfferedError,
+    existing_app_id,
+)
 from src.services.build_sessions.snapshot import (
     ParkedTreeNotOursError,
+    VersionBundleMissingError,
     list_parked_trees,
     newest_diverted_at,
     promote_parked,
 )
+from src.services.build_sessions.versions import Entry as VersionEntry_
+from src.services.build_sessions.versions import (
+    live_head_sha,
+    what_the_next_save_evicts,
+)
+from src.services.build_sessions.versions import offered as versions_offered
 from src.services.orchestrator.client_errors import (
     park_client_error,
 )
@@ -781,12 +793,67 @@ class SaveStateResponse(CamelModel):
     saved_head: str | None = None
 
 
+class RollbackRequest(CamelModel):
+    """Which version to put back, and the chat the press came from.
+
+    The same shape Discard takes, for the same reason: an absent `conversation_id` is a
+    rollback triggered from outside a chat, and it writes no origin note."""
+
+    version_id: uuid.UUID
+    conversation_id: uuid.UUID | None = None
+
+
+class VersionEntry(CamelModel):
+    """One row of the version list.
+
+    `id` is null for a live version the platform holds no copy of — an app deployed before this
+    feature shipped. It is listed and marked anyway, with its reason, because an entry that
+    silently vanishes tells the citizen less than one that explains itself.
+    """
+
+    id: str | None = None
+    saved_at: datetime | None = None
+    description: str | None = None
+    #: Every marker that applies, not the one that applies most: a row may be CURRENT and LIVE
+    #: at once, and one replacing the other would list the same content twice.
+    markers: list[str] = []
+    available: bool = False
+    unavailable_reason: str | None = None
+
+
+class VersionListResponse(CamelModel):
+    """The list, and the version the next Save would push off it."""
+
+    versions: list[VersionEntry] = []
+    #: What a Save right now would drop, or null when nothing would — fewer than two versions,
+    #: or the one falling out is live and the list keeps it as a third entry. Null means the
+    #: dialog says nothing at all, rather than saying nothing will be dropped.
+    evicting: VersionEntry | None = None
+
+
 class DiscardNotice(CamelModel):
     """The line a discard wrote into the conversation it came from, so the page can show it where
     a reload would."""
 
     seq: int
     saved_at: datetime | None = None
+
+
+class RollbackNotice(DiscardNotice):
+    """A discard's notice plus the restored version's description, so the line the page inserts
+    without a reload carries the same two facts the stored row does."""
+
+    description: str | None = None
+
+
+class RollbackResponse(SaveStateResponse):
+    """The save state after a rollback, plus the note written into the conversation it came
+    from — `None` when it came from outside one, exactly as a discard answers."""
+
+    notice: RollbackNotice | None = None
+    #: The version the rollback minted. Nothing was destroyed to make it: the restored content
+    #: becomes current and what it replaced becomes previous.
+    version_id: str | None = None
 
 
 class DiscardResponse(SaveStateResponse):
@@ -824,6 +891,7 @@ async def save_project(
     db: DbSession,
     manager: SessionManagerDep,
     sandbox: OptionalSandbox,
+    body: SaveRequest | None = None,
 ) -> SaveResponse:
     """THE SAVE. The agent commits inside the container as it works; this is the only thing
     that pushes the result to durable storage, and it happens because the user asked.
@@ -831,12 +899,22 @@ async def save_project(
     409, not 200, when there is no live workspace: a Save that reports success having stored
     nothing is the single worst outcome available here — the user walks away believing their
     work is kept. 409 as well while the agent is still writing, which is the SECOND worst: that
-    save succeeded, and stored a tree caught mid-edit as the version a Relaunch would restore."""
+    save succeeded, and stored a tree caught mid-edit as the version a Relaunch would restore.
+
+    THE BODY IS OPTIONAL BECAUSE TWO CALLERS HAVE NO DIALOG. The leave-page guard and the
+    hand-over stop→save→release both reach this endpoint with no Save button in front of
+    them; they post nothing and their version carries no description."""
     if sandbox is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
     await owned_project_or_404(db, user.id, project_id)
     try:
-        outcome = await manager.save_project_snapshot(db, user, project_id, sandbox_client=sandbox)
+        outcome = await manager.save_project_snapshot(
+            db,
+            user,
+            project_id,
+            sandbox_client=sandbox,
+            description=body.description if body else None,
+        )
     except NoLiveSandboxError:
         raise AppApiError(
             status.HTTP_409_CONFLICT,
@@ -922,6 +1000,101 @@ async def discard_unsaved_changes(
 
 
 @router.post(
+    "/projects/{project_id}/rollback",
+    response_model=RollbackResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Project, conversation or version not found"),
+        (409, ErrorEnvelope, "No live workspace, a reply is in flight, or the version is gone"),
+        (503, ErrorEnvelope, "The sandbox or the store is unavailable"),
+    ),
+)
+async def rollback_project(
+    project_id: uuid.UUID,
+    body: RollbackRequest,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> RollbackResponse:
+    """Put the workspace back to a version its owner chose — and keep everything.
+
+    ★ APPEND-ONLY. The restored content becomes the new current version and the one rolled
+    back from becomes previous, so rolling back again returns to where you were. What the
+    workspace held is parked, never deleted.
+
+    THE DEPLOYED APP DOES NOT CHANGE. This restores a workspace; what BIAL staff are running is
+    a separate act with its own approval. Rolling back to the live version is therefore
+    permitted and unremarkable.
+
+    Every conversation of the project that spoke since the restored version was saved gets a
+    note its next reply reads; `notice` is the one written into the conversation the request
+    came from, so the page shows it without a reload."""
+    if sandbox is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
+    await owned_project_or_404(db, user.id, project_id)
+    if body.conversation_id is not None:
+        found = await db.scalar(
+            sa.select(Conversation.id).where(
+                Conversation.id == body.conversation_id,
+                Conversation.user_id == user.id,
+                Conversation.project_id == project_id,
+            )
+        )
+        if found is None:
+            raise AppApiError(status.HTTP_404_NOT_FOUND, "Conversation not found.")
+    try:
+        outcome = await manager.rollback_to_version(
+            db,
+            user,
+            project_id,
+            version_id=body.version_id,
+            sandbox_client=sandbox,
+            conversation_id=body.conversation_id,
+        )
+    except NoLiveSandboxError:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            "Your workspace is not running, so there is nothing to roll back. Send a message "
+            "to bring it back — your versions are intact.",
+        ) from None
+    except BuildSessionConflictError:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT, "Wait for the reply to finish, then roll back."
+        ) from None
+    except VersionNotOfferedError:
+        # ANOTHER TAB SAVED, OR THE AGENT DID. Answered rather than quietly rolling back to
+        # whatever is nearest: the citizen pressed a row, and a different row is not it.
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            "That version is no longer in the list. Open the list again to see what is there.",
+        ) from None
+    except VersionBundleMissingError:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            "That version cannot be restored — the platform has no copy of it.",
+        ) from None
+    except (StorageError, SandboxError) as exc:
+        _log.warning("workspace_rollback_failed", project_id=str(project_id), exc_info=exc)
+        raise AppApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Nothing in your workspace was changed. Try again in a moment.",
+        ) from None
+    seq = outcome.notes.get(body.conversation_id) if body.conversation_id is not None else None
+    return RollbackResponse(
+        **_save_state_fields(outcome.state),
+        notice=(
+            RollbackNotice(seq=seq, saved_at=outcome.saved_at, description=outcome.description)
+            if seq is not None
+            else None
+        ),
+        version_id=str(outcome.version_id),
+    )
+
+
+@router.post(
     "/projects/{project_id}/stop-active-build",
     response_model=StopActiveBuildResponse,
     dependencies=[RequireCsrf],
@@ -979,6 +1152,75 @@ async def stop_active_build(
     await owned_project_or_404(db, user.id, project_id)
     state = await manager.request_stop_of_active_work(db, user, project_id, sandbox_client=sandbox)
     return StopActiveBuildResponse(state=state)
+
+
+def _version_entry(entry: VersionEntry_) -> VersionEntry:
+    return VersionEntry(
+        id=str(entry.id) if entry.id else None,
+        saved_at=entry.saved_at,
+        description=entry.description,
+        markers=[marker.value for marker in entry.markers],
+        available=entry.available,
+        unavailable_reason=entry.unavailable_reason,
+    )
+
+
+@router.get(
+    "/projects/{project_id}/versions",
+    response_model=VersionListResponse,
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
+)
+async def list_versions(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> VersionListResponse:
+    """THE LIST: the two most recent saves, plus the live version when it is neither of them.
+
+    Owner-only, through the same scope Save and Discard already carry — a colleague with a
+    shared view never sees a version list or a way back into someone else's workspace.
+
+    ITS OWN ENDPOINT, read when the menu opens rather than folded into the save-state poll.
+    Nothing needs the list before then, the toolbar polls enough already, and the poll only runs
+    while the preview says the workspace is alive — whereas this list must answer on a stopped
+    workspace too, which is exactly when a citizen goes looking for a version to go back to.
+
+    Answers an empty list rather than a 404 for an app that has never been saved: nothing is
+    wrong, there is simply nothing to offer yet."""
+    await owned_project_or_404(db, user.id, project_id)
+    app_id = await existing_app_id(db, user.id, project_id)
+    if app_id is None:
+        return VersionListResponse()
+    # WHETHER A ROLLBACK COULD RUN AT ALL, asked the same way the save state asks it: `dirty` is
+    # null precisely when there is no live container to compare against, which is also when
+    # there is nothing to restore INTO. The rows still list; their actions carry the reason.
+    state = (
+        await manager.project_save_state(db, user, project_id, sandbox_client=sandbox)
+        if sandbox is not None
+        else None
+    )
+    running = state is not None and state.dirty is not None
+    entries = await versions_offered(db, user_id=user.id, app_id=app_id, workspace_running=running)
+    evicting = await what_the_next_save_evicts(
+        db,
+        user_id=user.id,
+        app_id=app_id,
+        live_head_sha=await live_head_sha(db, user_id=user.id, app_id=app_id),
+    )
+    return VersionListResponse(
+        versions=[_version_entry(entry) for entry in entries],
+        evicting=(
+            VersionEntry(
+                id=str(evicting.id),
+                saved_at=evicting.saved_at,
+                description=evicting.description,
+            )
+            if evicting
+            else None
+        ),
+    )
 
 
 @router.get(

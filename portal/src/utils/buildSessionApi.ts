@@ -334,11 +334,23 @@ export const sameSaveState = (a: SaveState | null, b: SaveState | null): boolean
 
 /** Push the project's current tree to durable storage. THE USER'S CLICK — nothing else writes
  *  the bundle. A 409 means the workspace is no longer running, and is surfaced, never
- *  swallowed: a Save that reports success having stored nothing is the worst outcome here. */
-export async function saveProject(projectId: string, deps: AuthFetchDeps = {}): Promise<SaveResult> {
+ *  swallowed: a Save that reports success having stored nothing is the worst outcome here.
+ *
+ *  THE DESCRIPTION IS OPTIONAL AND DEFAULTS TO ABSENT, which is what keeps the two flows with
+ *  no Save button in front of them working — the leave-page guard and the hand-over
+ *  stop→save→release. They call this with one argument and post no body at all. */
+export async function saveProject(
+  projectId: string,
+  description: string | null = null,
+  deps: AuthFetchDeps = {},
+): Promise<SaveResult> {
+  // EMPTY IS NO DESCRIPTION, and it must reach the wire as a BODYLESS save — the shape the
+  // leave-page guard and the hand-over path have always sent. An empty string would be a second
+  // way of saying "none" that the server then has to normalise back.
+  const described = (description ?? '').trim() || null
   const body = await postJson(
     `${BASE}/projects/${encodeURIComponent(projectId)}/save`,
-    undefined,
+    described === null ? undefined : { description: described },
     'Could not save your work',
     deps,
   )
@@ -656,7 +668,9 @@ export async function handOverWorkspace(
   }
   if (save) {
     narrate('saving')
-    await saveProject(projectId, deps)
+    // NO DESCRIPTION, DELIBERATELY: this is the hand-over, not a Save the citizen chose, and
+    // there is no dialog in front of it to ask for one.
+    await saveProject(projectId, null, deps)
   }
   narrate('releasing')
   await releaseProject(projectId, deps)
@@ -1106,4 +1120,108 @@ export async function fetchActivity(deps: AuthFetchDeps = {}): Promise<ProjectAc
     rows.push({ projectId, phase: phase as ActivityPhase })
   }
   return rows
+}
+
+/** One row of the version list, as the server resolved it.
+ *
+ *  `id` is null for a live version the platform holds no copy of — an app deployed before
+ *  versions were kept. It is listed and marked anyway, with its reason, because an entry that
+ *  silently vanishes says less about what BIAL staff are running than one that explains itself. */
+export interface AppVersion {
+  id: string | null
+  savedAt: string | null
+  description: string | null
+  /** Every marker that applies, not the one that applies most: a row can be current AND live. */
+  markers: string[]
+  available: boolean
+  unavailableReason: string | null
+}
+
+export interface VersionList {
+  versions: AppVersion[]
+  /** What a Save right now would push off the list, or null when nothing would. */
+  evicting: AppVersion | null
+}
+
+/** A discard's notice plus the restored version's own words, so the line inserted without a
+ *  reload reads exactly as the stored one a reload would render. */
+export interface RollbackNotice extends DiscardNotice {
+  description: string | null
+}
+
+export interface RollbackResult {
+  saveState: SaveState
+  notice: RollbackNotice | null
+}
+
+function toRollbackNotice(value: unknown): RollbackNotice | null {
+  const notice = toDiscardNotice(value)
+  if (notice === null || !isRecord(value)) return null
+  return {
+    ...notice,
+    description: typeof value.description === 'string' ? value.description : null,
+  }
+}
+
+function toVersion(value: unknown): AppVersion | null {
+  if (!isRecord(value)) return null
+  return {
+    id: typeof value.id === 'string' ? value.id : null,
+    savedAt: typeof value.savedAt === 'string' ? value.savedAt : null,
+    description: typeof value.description === 'string' ? value.description : null,
+    markers: Array.isArray(value.markers)
+      ? value.markers.filter((m): m is string => typeof m === 'string')
+      : [],
+    available: value.available === true,
+    unavailableReason:
+      typeof value.unavailableReason === 'string' ? value.unavailableReason : null,
+  }
+}
+
+/** The versions this project offers: the two most recent saves, plus whatever is live.
+ *
+ *  Read when the menu opens rather than polled. The save-state poll only runs while the preview
+ *  says the workspace is alive, and this list must answer on a stopped workspace too — which is
+ *  exactly when someone goes looking for a version to go back to. */
+export async function fetchVersions(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+): Promise<VersionList> {
+  const res = await authFetch(
+    `${BASE}/projects/${encodeURIComponent(projectId)}/versions`,
+    {},
+    deps,
+  )
+  if (!res.ok) throw await readApiError(res, 'Could not read your versions')
+  const body: unknown = await res.json().catch(() => null)
+  if (!isRecord(body)) return { versions: [], evicting: null }
+  return {
+    versions: Array.isArray(body.versions)
+      ? body.versions.map(toVersion).filter((v): v is AppVersion => v !== null)
+      : [],
+    evicting: toVersion(body.evicting),
+  }
+}
+
+/** Put the workspace back to a chosen version. Append-only: what it replaces becomes the
+ *  previous version rather than being destroyed, so rolling back again returns to it.
+ *
+ *  A 409 means the version is no longer offered — another tab saved, or the agent did — and is
+ *  surfaced so the menu can refetch rather than rolling back to something nobody chose. */
+export async function rollbackToVersion(
+  projectId: string,
+  versionId: string,
+  conversationId: string | null,
+  deps: AuthFetchDeps = {},
+): Promise<RollbackResult> {
+  const body = await postJson(
+    `${BASE}/projects/${encodeURIComponent(projectId)}/rollback`,
+    conversationId !== null ? { versionId, conversationId } : { versionId },
+    'Nothing in your workspace was changed',
+    deps,
+  )
+  return {
+    saveState: toSaveState(body),
+    notice: isRecord(body) ? toRollbackNotice(body.notice) : null,
+  }
 }

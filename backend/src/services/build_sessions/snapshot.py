@@ -20,7 +20,7 @@ import secrets
 import time
 import uuid
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -49,6 +49,7 @@ from src.services.storage import (
     quarantine_prefix,
     recovery_key,
     snapshot_key,
+    version_key,
 )
 from src.services.storage.base import ObjectStorage
 from src.services.storage.bundle import BUNDLE_CONTENT_TYPE, parse_bundle_head_sha
@@ -121,6 +122,9 @@ class _SaveStepTimings:
     base64_ms: int | None = None
     cleanup_ms: int | None = None
     store_ms: int | None = None
+    #: The second write, when a save also records a version. Separate from `store_ms` so the
+    #: cost of keeping a history is a measurement rather than a claim.
+    version_store_ms: int | None = None
 
 
 # One serialization lock per app, plus a holder+waiter count so the entry can be dropped when it
@@ -157,10 +161,11 @@ async def _serialized_per_app(app_id: uuid.UUID) -> AsyncIterator[None]:
 
 @dataclass(frozen=True)
 class Destination:
-    """WHERE a bundle goes. Four of them, and they are not interchangeable.
+    """WHERE a bundle goes. Five of them, and they are not interchangeable.
 
-    A VALUE OBJECT RATHER THAN AN ENUM, because two of the four are per-occurrence: a quarantine
-    or divert key carries the instant it was taken, so it cannot be a bare constant. Keeping the
+    A VALUE OBJECT RATHER THAN AN ENUM, because three of the five are per-occurrence: a
+    quarantine, divert or version key carries the instant it was taken, so it cannot be a bare
+    constant. Keeping the
     key-building here (rather than exposing `_write_snapshot_locked`, which is private for a
     reason) means every writer in the system names its destination in the same vocabulary, and
     nothing outside this module has to know that a key is a string at all."""
@@ -188,6 +193,13 @@ class Destination:
     def quarantine(cls, app_id: uuid.UUID, taken_at: datetime) -> Destination:
         """A tree a restore is about to write over. Never overwritten by a later occurrence."""
         return cls(quarantine_key(app_id, taken_at))
+
+    @classmethod
+    def version(cls, app_id: uuid.UUID, saved_at: datetime) -> Destination:
+        """One entry in the app's saved history. Never overwritten by a later save, and never
+        deleted by the list that offers it — a version that falls off the list stops being
+        offered, not stored."""
+        return cls(version_key(app_id, saved_at))
 
     @classmethod
     def divert(cls, app_id: uuid.UUID, taken_at: datetime) -> Destination:
@@ -235,6 +247,7 @@ async def write_snapshot(
     app_id: uuid.UUID,
     *,
     destination: Destination | None = None,
+    also: Destination | None = None,
 ) -> str:
     """Snapshot the sandbox's current tree to Blob and return its HEAD sha.
 
@@ -247,7 +260,18 @@ async def write_snapshot(
 
     Emits `SNAPSHOT_STEP_TIMINGS_EVENT` once, in the `finally`, whether this returns or raises —
     a manual Save can queue behind an autosave holding the same app's lock, and `lock_wait_ms` is
-    the only place that queue is visible at all."""
+    the only place that queue is visible at all.
+
+    ★ `also` STORES THE SAME BUNDLE TWICE, AND THAT IS WHY A HISTORY IS CHEAP. The forty
+    seconds a production save was measured at is `_bundle_the_tree` — commit, `git bundle`, and
+    base64 back out of the container. Recording a version adds one `put` of bytes already in
+    memory, inside a lock already held: no second commit, no second container round trip. The
+    store has no server-side copy, so bundling once and storing twice is also the only shape that
+    avoids reading the whole tree back through this process.
+
+    THE SAVED KEY IS WRITTEN FIRST, deliberately. A crash between the two writes leaves a save
+    that happened with one version missing, which is a history with a gap; the other order leaves
+    a version offered whose content was never what the citizen saved."""
     key = (destination or Destination.saved(app_id)).key
     timings = _SaveStepTimings()
     lock_wait_started = time.monotonic()
@@ -257,6 +281,10 @@ async def write_snapshot(
             store = _the_store_first()
             tree = await _bundle_the_tree(sandbox_client, handle, timings)
             await _timed_store(store, key, tree, timings)
+            if also is not None:
+                started = time.monotonic()
+                await _store_it(store, also.key, tree)
+                timings.version_store_ms = _elapsed_ms(started)
             return tree.head_sha
     finally:
         # SUPPRESSED, because this runs in a `finally` on the save path: a save that failed is
@@ -761,6 +789,18 @@ async def promote_parked(app_id: uuid.UUID, *, key: str) -> Promotion:
     return Promotion(True, f"the recovery slot now holds {head_sha}")
 
 
+class VersionBundleMissingError(Exception):
+    """A rollback was asked for, and the version's stored bundle is not there.
+
+    Distinct from having no saved version at all: the row says the platform kept this tree, so
+    its absence is a fault worth naming rather than an empty history."""
+
+    def __init__(self, app_id: uuid.UUID, key: str) -> None:
+        super().__init__(f"app {app_id} has no stored bundle at {key}")
+        self.app_id = app_id
+        self.key = key
+
+
 class NothingSavedToGoBackToError(Exception):
     """A discard was asked for, and this app has no saved version to go back to."""
 
@@ -792,12 +832,70 @@ async def discard_back_to_saved(
     first: if the reset fails, the container still holds work descending from the saved head, and
     the next turn finds it intact. The slot is overwritten, never emptied — an empty slot reads as
     an app that was never built."""
+    return await _restore_over_the_live_tree(
+        sandbox_client,
+        handle,
+        app_id,
+        source_key=snapshot_key(app_id),
+        taken_at=taken_at,
+        missing=lambda: NothingSavedToGoBackToError(app_id),
+    )
+
+
+async def restore_version(
+    sandbox_client: SandboxClient,
+    handle: SandboxHandle,
+    app_id: uuid.UUID,
+    *,
+    blob_key: str,
+    taken_at: datetime,
+) -> SavedVersion:
+    """Put a stored version back into the live container, keeping the tree it replaces.
+
+    The same ordering a discard uses, over a different source key — which is the whole
+    difference between the two operations at this level. Also written into the saved slot by the
+    caller, because the restored content BECOMES what the app is saved at: leaving `snapshot_key`
+    behind would read as unsaved work against a tree the citizen never edited.
+    """
+    return await _restore_over_the_live_tree(
+        sandbox_client,
+        handle,
+        app_id,
+        source_key=blob_key,
+        taken_at=taken_at,
+        missing=lambda: VersionBundleMissingError(app_id, blob_key),
+    )
+
+
+async def _restore_over_the_live_tree(
+    sandbox_client: SandboxClient,
+    handle: SandboxHandle,
+    app_id: uuid.UUID,
+    *,
+    source_key: str,
+    taken_at: datetime,
+    missing: Callable[[], Exception],
+) -> SavedVersion:
+    """Park the live tree, arm the recovery slot, then reset the container. In that order.
+
+    ★ THE RECOVERY SLOT IS WRITTEN BEFORE THE RESET, AND THAT IS NOT TIDINESS.
+    `write_recovery_copy` diverts any tree whose HEAD is not a descendant of the sha stamped on
+    `recovery_key`. Putting an older tree into the container without moving that stamp leaves
+    every later turn writing to `divert_key` and firing `recovery_write_did_not_land` — the slot
+    reads as poisoned from then on, and crash recovery is broken permanently rather than for one
+    turn.
+
+    THE STORE MOVES FIRST for the same reason a discard does it: if the reset fails, the
+    container still holds work descending from a head the store knows, and the next turn finds
+    it intact. The slot is overwritten, never emptied — an empty slot reads as an app that was
+    never built.
+    """
     store = _the_store_first()
     async with _serialized_per_app(app_id):
-        meta = await store.head(snapshot_key(app_id))
+        meta = await store.head(source_key)
         if meta is None:
-            raise NothingSavedToGoBackToError(app_id)
-        data = await store.get(snapshot_key(app_id))
+            raise missing()
+        data = await store.get(source_key)
         saved = _BundledTree(head_sha=parse_bundle_head_sha(data), data=data)
         parked = Destination.quarantine(app_id, taken_at).key
         live = await _bundle_the_tree(sandbox_client, handle, _SaveStepTimings())

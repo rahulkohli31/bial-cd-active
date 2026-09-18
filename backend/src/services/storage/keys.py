@@ -100,6 +100,32 @@ def quarantine_key(app_id: uuid.UUID, taken_at: datetime) -> str:
     return f"{quarantine_prefix(app_id)}{_stamp(taken_at)}.bundle"
 
 
+def version_prefix(app_id: uuid.UUID) -> str:
+    """The `versions/{app_id}/` base for one app's saved versions."""
+    return f"versions/{app_id}/"
+
+
+def version_key(app_id: uuid.UUID, saved_at: datetime) -> str:
+    """One version the citizen saved: `versions/{app_id}/{stamp}.bundle`.
+
+    ★ NEVER DELETED BY THE VERSION LIST, and that is the rule the whole feature rests on. The
+    list offers the two most recent plus whatever is live; a version that falls off it stops being
+    OFFERED, not stored. Only the app going away takes these with it, through the three sweepers.
+
+    Per-occurrence like `quarantine_key`, and for the sibling reason: `snapshot_key` is
+    overwrite-latest because an app has one current tree, while a history has one object per save
+    and a second save must not destroy the first. Sortable, so a listing reads chronologically
+    without consulting the database. Microsecond precision is collision-free structurally rather
+    than probabilistically: writes for one app are serialized by `snapshot._serialized_per_app`.
+
+    A ROLLBACK MINTS A ROW THAT SHARES THIS KEY rather than copying the bytes. The restored
+    content is identical, the store has no server-side copy, and the never-deleted rule above is
+    what makes the sharing safe — so a key is in use while ANY row names it, never only the row
+    that wrote it.
+    """
+    return f"{version_prefix(app_id)}{_stamp(saved_at)}.bundle"
+
+
 def divert_prefix(app_id: uuid.UUID) -> str:
     """The `divert/{app_id}/` base for trees the recovery guard refused to promote."""
     return f"divert/{app_id}/"
@@ -123,7 +149,7 @@ def _stamp(taken_at: datetime) -> str:
     datetime raises rather than being silently read as UTC, which is the one reading that would
     quietly reorder an operator's evidence."""
     if taken_at.tzinfo is None:
-        raise StorageError("a quarantine or divert stamp needs an aware datetime")
+        raise StorageError("a stamped storage key needs an aware datetime")
     return taken_at.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
 
 

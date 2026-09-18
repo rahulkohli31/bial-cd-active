@@ -38,7 +38,14 @@ import {
  * row's own renders — a wrapper around `WorkspaceToolbar` would only see renders its parent
  * causes, missing the ones the row's own cell subscriptions cause.
  */
-const h = vi.hoisted(() => ({ rowRenders: 0, usage: vi.fn() }))
+const h = vi.hoisted(() => ({ rowRenders: 0, usage: vi.fn(), fetchVersions: vi.fn(), rollback: vi.fn() }))
+// The version list's own read. Its own endpoint, made when the menu opens rather than polled —
+// the save-state poll only runs while the workspace is alive, and this list must answer when it
+// is not, which is exactly when someone goes looking for a version to go back to.
+vi.mock('../../../utils/buildSessionApi', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../utils/buildSessionApi')>()),
+  fetchVersions: h.fetchVersions,
+}))
 // The token counter's read. It is the NAVIGATION's read too — one hook, so the two surfaces can
 // never disagree about the same day's figures — which is why it is stubbed at the hook rather
 // than at the network.
@@ -109,6 +116,7 @@ const QUIET_SAVE: Omit<SaveSlot, 'canSave' | 'canDiscard'> = {
   saving: false,
   error: null,
   discarding: false,
+  rollingBack: false,
   replying: false,
   hasSavedVersion: false,
 }
@@ -128,7 +136,7 @@ function Surface({
   // A FRESH OBJECT PER RENDER, which is what the real conversation surface publishes — the pane
   // cell is identity-compared, so this is what makes a keystroke reach the channel at all.
   usePublishPaneView({ ...EMPTY_PANE })
-  usePublishSave(slot, { save: null, discard: null, settings: null, share: null, ...actions })
+  usePublishSave(slot, { save: null, discard: null, rollback: null, settings: null, share: null, ...actions })
   useAppPaneVisible(paneVisible)
   return <div data-testid="surface" />
 }
@@ -194,7 +202,13 @@ function Workspace({
 const row = () => screen.getByTestId('workspace-toolbar')
 const title = () => screen.getByTestId('toolbar-title')
 
-beforeEach(() => vi.clearAllMocks())
+beforeEach(() => {
+  vi.clearAllMocks()
+  // RESTORED AFTER THE CLEAR, which wipes implementations as well as calls. The version read is
+  // made by the toolbar itself whenever the naming dialog opens, so every scenario in this file
+  // needs an answer for it — not only the ones about versions.
+  h.fetchVersions.mockResolvedValue({ versions: [], evicting: null })
+})
 afterEach(() => cleanup())
 
 describe('what the row names on each address', () => {
@@ -457,7 +471,7 @@ describe('the Save control', () => {
   const withSave = (save: Partial<Omit<SaveSlot, 'canSave' | 'canDiscard'>>, onSave: (() => void) | null = null) =>
     render(
       <Workspace
-        project={{ heading: PROJECT_HEADING, save, actions: { save: onSave, settings: null, share: null } }}
+        project={{ heading: PROJECT_HEADING, save, actions: { save: onSave === null ? null : async () => onSave(), settings: null, share: null } }}
       />,
     )
 
@@ -475,8 +489,11 @@ describe('the Save control', () => {
     withSave({ dirty: true, saving: false, error: null }, () => {})
     const save = screen.getByTestId('save-project')
     expect(save.textContent).toContain('Save')
-    expect(save.className).toMatch(/border-primary/)
-    expect(save.className).not.toMatch(/bg-primary/)
+    // THE TREATMENT MOVED OUT TO THE SHELL and the press stayed where it was. The shell is the
+    // object now — one border, one radius, one ground, two halves inside it — so the border is
+    // read off the parent while the amber dot stays in the half that says "Save".
+    expect(save.parentElement?.className).toMatch(/border-primary/)
+    expect(save.parentElement?.className).not.toMatch(/bg-primary/)
     expect(save.querySelector('.bg-accent')).not.toBeNull()
   })
 
@@ -490,11 +507,16 @@ describe('the Save control', () => {
     expect(onSave).not.toHaveBeenCalled()
   })
 
-  it('calls the published action once per click', () => {
+  it('asks the version for a description before it saves anything', async () => {
+    // ★ THE PRESS OPENS THE DIALOG, IT DOES NOT SAVE. The description is the citizen's own words
+    // for a version they will meet again in a list of two, and asking for it afterwards would be
+    // asking about something already stored.
     const onSave = vi.fn()
     withSave({ dirty: true, saving: false, error: null }, onSave)
     fireEvent.click(screen.getByTestId('save-project'))
-    expect(onSave).toHaveBeenCalledTimes(1)
+    expect(onSave).not.toHaveBeenCalled()
+    fireEvent.click(await screen.findByTestId('save-version-confirm'))
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
   })
 
   it('reports progress while saving, and refuses a second click', () => {
@@ -593,7 +615,7 @@ describe('the Save control', () => {
         project={{
           heading: PROJECT_HEADING,
           save: { dirty: true, saving: true, error: null },
-          actions: { save: () => {}, settings: null, share: null },
+          actions: { save: async () => {}, settings: null, share: null },
         }}
       />,
     )
@@ -618,7 +640,7 @@ describe('the Discard control', () => {
         project={{
           heading: PROJECT_HEADING,
           save: { ...OPEN_WORK, ...save },
-          actions: { save: () => {}, discard: async () => {}, ...handlers },
+          actions: { save: async () => {}, discard: async () => {}, ...handlers },
         }}
       />,
     )
@@ -665,7 +687,7 @@ describe('the Discard control', () => {
         project={{
           heading: PROJECT_HEADING,
           save: { ...OPEN_WORK, ...save },
-          actions: { save: () => {}, discard: async () => {}, ...handlers },
+          actions: { save: async () => {}, discard: async () => {}, ...handlers },
         }}
       />,
     )
@@ -1023,7 +1045,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
         project={{
           heading: PROJECT_HEADING,
           save: { dirty: true, hasSavedVersion: true },
-          actions: { save: () => {}, discard: async () => {}, settings: () => {} },
+          actions: { save: async () => {}, discard: async () => {}, settings: () => {} },
         }}
       />,
     )
@@ -1171,7 +1193,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
         chat={{
           heading: { ...CHAT_HEADING, chatTitle: long },
           save: { dirty: true, saving: false, error: null },
-          actions: { save: () => {}, settings: null, share: null },
+          actions: { save: async () => {}, settings: null, share: null },
         }}
       />,
     )
@@ -1298,5 +1320,169 @@ describe('the token ring in the toolbar', () => {
     expect(screen.getByTestId('nav-panel')).toBeTruthy()
     expect(row().querySelector('[data-testid="usage-meter"]')).toBeNull()
     expect(screen.getAllByTestId('usage-meter')).toHaveLength(1)
+  })
+})
+
+/**
+ * ★ THE VERSION LIST AND THE WAY BACK — the caret inside Save's shell, what it opens, and the
+ * two dialogs on either side of a version's life.
+ *
+ * WHAT THIS FILE IS FOR HERE. The control's three states were one early return; they are now
+ * three, and the one that was previously "render nothing" is the state a citizen is MOST likely
+ * to be in when they want a version — a stopped workspace. The scenarios below pin each arm by
+ * what it renders, not by how it decides.
+ */
+describe('★ versions: the caret, the list, and the way back', () => {
+  const VERSIONS = {
+    versions: [
+      {
+        id: 'v-new',
+        savedAt: '2026-09-17T09:41:00Z',
+        description: 'Added approval',
+        markers: ['current'],
+        available: false,
+        unavailableReason: null,
+      },
+      {
+        id: 'v-old',
+        savedAt: '2026-09-16T14:02:00Z',
+        description: 'First working version',
+        markers: ['previous', 'live'],
+        available: true,
+        unavailableReason: null,
+      },
+    ],
+    evicting: null,
+  }
+
+  const withVersions = (
+    save: Partial<Omit<SaveSlot, 'canSave' | 'canDiscard'>>,
+    actions: Partial<WorkspaceActions> = {},
+  ) =>
+    render(
+      <Workspace
+        project={{
+          heading: PROJECT_HEADING,
+          save,
+          actions: { save: async () => {}, rollback: h.rollback, settings: null, share: null, ...actions },
+        }}
+      />,
+    )
+
+  beforeEach(() => {
+    h.fetchVersions.mockResolvedValue(VERSIONS)
+    h.rollback.mockResolvedValue(undefined)
+  })
+
+  /** The menu is Radix: it opens on POINTERDOWN, never on click. */
+  const openVersions = async () => {
+    fireEvent.pointerDown(await screen.findByTestId('versions-caret'))
+    return screen.findAllByTestId('version-row')
+  }
+
+  /** And a row SELECTS on pointerup, which is what carries `onSelect`. */
+  const pressRow = (row: HTMLElement) => {
+    fireEvent.pointerDown(row)
+    fireEvent.pointerUp(row)
+    fireEvent.click(row)
+  }
+
+  it('★ a stopped workspace keeps the shell and the caret, and says nothing about saved state', async () => {
+    // THE ARM THE WHOLE SPLIT EXISTS FOR. Save has no answer on a stopped workspace, so it shows
+    // no label — but the versions behind the caret are exactly what someone is looking for then,
+    // and a caret bolted onto Save would have vanished with it.
+    withVersions({ dirty: null, hasSavedVersion: true })
+    expect(await screen.findByTestId('versions-caret')).toBeTruthy()
+    // The label half is still there — it is the same object in another state — and it is what
+    // says NOTHING. "Saved" here would be a claim nobody verified.
+    const label = screen.getByTestId('save-project')
+    expect(label.textContent).not.toContain('Saved')
+    expect(label.textContent).not.toContain('Save')
+  })
+
+  it('★ with nothing saved there is no caret and no shell — a caret onto nothing invites a dead press', () => {
+    withVersions({ dirty: null, hasSavedVersion: false })
+    expect(screen.queryByTestId('versions-caret')).toBeNull()
+    expect(screen.queryByTestId('save-state')).toBeNull()
+    expect(screen.queryByTestId('save-project')).toBeNull()
+  })
+
+  it('lists the versions with every marker that applies, not the one that applies most', async () => {
+    withVersions({ dirty: true, hasSavedVersion: true })
+    const rows = await openVersions()
+    expect(rows).toHaveLength(2)
+    expect(rows[0].textContent).toContain('Added approval')
+    // ★ A SET, NOT A CHOICE. The older row is both the previous save and what BIAL staff are
+    // running; listing it twice, or under one heading only, would be two different lies.
+    expect(rows[1].textContent).toContain('Previous')
+    expect(rows[1].textContent).toContain('Live')
+  })
+
+  it('★ the current row is inert — it is what the workspace already holds', async () => {
+    withVersions({ dirty: true, hasSavedVersion: true })
+    const rows = await openVersions()
+    pressRow(rows[0])
+    expect(screen.queryByTestId('rollback-dialog-confirm')).toBeNull()
+    expect(h.rollback).not.toHaveBeenCalled()
+  })
+
+  it('★ confirms before it rolls back, and closes on confirm so the wait shows in the shell', async () => {
+    // THE OPPOSITE CLOSE POLICY FROM THE SAVE DIALOG, and the easiest thing to get backwards. The
+    // rollback's wait belongs in the Save shell where the elapsed counter is, not behind a modal
+    // covering the workspace it is changing.
+    withVersions({ dirty: true, hasSavedVersion: true })
+    pressRow((await openVersions())[1])
+
+    fireEvent.click(await screen.findByTestId('rollback-dialog-confirm'))
+
+    await waitFor(() => expect(h.rollback).toHaveBeenCalledWith('v-old'))
+    await waitFor(() => expect(screen.queryByTestId('rollback-dialog-confirm')).toBeNull())
+  })
+
+  it('★ the save dialog keeps the typed description when the save fails', async () => {
+    // THE OTHER CLOSE POLICY. A failed save that closed this dialog would take the typed line
+    // with it, on exactly the path where retyping is the whole cost.
+    withVersions(
+      { dirty: true, hasSavedVersion: true },
+      { save: async () => { throw new Error('Your workspace is no longer running.') } },
+    )
+    fireEvent.click(await screen.findByTestId('save-project'))
+    const field = await screen.findByTestId('save-version-description')
+    fireEvent.change(field, { target: { value: 'Added approval' } })
+
+    fireEvent.click(screen.getByTestId('save-version-confirm'))
+
+    await waitFor(() =>
+      expect(screen.getByRole('alert').textContent).toMatch(/no longer running/i),
+    )
+    expect(screen.getByTestId('save-version-description')).toHaveProperty('value', 'Added approval')
+  })
+
+  it('names what the next save drops, and stays silent when nothing does', async () => {
+    // ★ TOLD, NOT DISCOVERED. The two-slot limit is only a rule if the citizen meets it at the
+    // moment it applies; met afterwards it is a loss.
+    h.fetchVersions.mockResolvedValue({
+      ...VERSIONS,
+      evicting: { ...VERSIONS.versions[1], markers: ['previous'] },
+    })
+    withVersions({ dirty: true, hasSavedVersion: true })
+    fireEvent.click(await screen.findByTestId('save-project'))
+
+    const body = await screen.findByTestId('save-version-confirm')
+    const dialog = body.closest('[role="dialog"]')
+    await waitFor(() => expect(dialog?.textContent).toContain('First working version'))
+    // R3's exact promise, in the one place it is load-bearing.
+    expect(dialog?.textContent).toContain('Nothing is deleted')
+  })
+
+  it('★ the caret is a glyph, so it carries BOTH narrow floors — one 44px shell is not two targets', async () => {
+    withVersions({ dirty: true, hasSavedVersion: true })
+    const caret = await screen.findByTestId('versions-caret')
+    expect(caret.className).toContain('narrow:min-h-[44px]')
+    expect(caret.className).toContain('narrow:min-w-[44px]')
+    // And the label half keeps height only: its own words already clear 44px wide.
+    const label = screen.getByTestId('save-project')
+    expect(label.className).toContain('narrow:min-h-[44px]')
+    expect(label.className).not.toContain('narrow:min-w-[44px]')
   })
 })

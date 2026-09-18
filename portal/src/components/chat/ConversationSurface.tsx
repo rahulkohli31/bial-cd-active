@@ -37,7 +37,7 @@ import type { BuildHandoff } from './OfferStrip'
 import ScrollToLatest from './ScrollToLatest'
 import SessionBanners from './SessionBanners'
 import TurnBanner from './TurnBanner'
-import { createConversation, discardNoticeText, listProjectConversations } from '../../utils/conversationApi'
+import { createConversation, discardNoticeText, listProjectConversations, rollbackNoticeText } from '../../utils/conversationApi'
 import type { ConversationHeader } from '../../utils/conversationApi'
 import { ApiError } from '../../utils/apiError'
 import { markAppVisible } from '../../utils/observe'
@@ -89,7 +89,7 @@ import type { TurnFrame, PlanOptionsItem, StepItem, DiagnosticFrame, StreamOutco
 import { contextState } from '../../utils/contextLimits'
 import { atLimitSendState, narrativeEnvelopes, turnPhase } from '../../utils/turnNarrative'
 import type { TurnNarrative } from '../../utils/turnNarrative'
-import { discardUnsavedChanges, fetchSaveState, saveProject, fetchPreviewState, fetchCompileState, checkWorkspace, renewPresence, samePreviewState } from '../../utils/buildSessionApi'
+import { discardUnsavedChanges, rollbackToVersion, fetchSaveState, saveProject, fetchPreviewState, fetchCompileState, checkWorkspace, renewPresence, samePreviewState } from '../../utils/buildSessionApi'
 import type { PreviewState } from '../../utils/buildSessionApi'
 import { resolvePlanOptions } from '../../utils/turnStreamApi'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../../utils/attachmentStore'
@@ -478,6 +478,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   const saveReadSeq = useRef(0)
   const [saving, setSaving] = useState(false)
   const [discarding, setDiscarding] = useState(false)
+  const [rollingBack, setRollingBack] = useState(false)
   const [hasSavedVersion, setHasSavedVersion] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   // WHAT THE PLATFORM OWES THIS CITIZEN ABOUT THEIR APP'S LIFE. The renewal below answers the
@@ -573,13 +574,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     }
   }, [])
 
-  const handleSave = async () => {
+  const handleSave = async (description?: string) => {
     const activeProjectId = projectIdRef.current
     if (!activeProjectId || saving) return
     setSaving(true)
     setSaveError(null)
     try {
-      await saveProject(activeProjectId)
+      await saveProject(activeProjectId, description ?? null)
       // THE SAME NUDGE THE PROJECT SCREEN'S SAVE RAISES. `usePublishState` listens for it
       // and reconciles the toolbar chip, which mounts on this screen too — without it a save from
       // a chat leaves the chip one read behind until its next focus or visibility read. Raised
@@ -603,6 +604,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         // surface unable to say what the container holds.
         setSaveDirty(null)
       }
+      // RECORDED ABOVE AND RAISED ANYWAY, so the naming dialog can hold the typed description
+      // rather than closing over a save that did not happen.
+      throw err
     } finally {
       setSaving(false)
     }
@@ -644,6 +648,44 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       }
     } finally {
       setDiscarding(false)
+    }
+  }
+
+  /** Put a chosen version back. The same shape as Discard — the save state after it, and the line
+   *  this chat now carries — over a version the citizen picked rather than the last save. */
+  const handleRollback = async (versionId: string) => {
+    const activeProjectId = projectIdRef.current
+    if (!activeProjectId || rollingBack) return
+    setRollingBack(true)
+    setSaveError(null)
+    try {
+      const conversationId = buildId && messagesRef.current.some((m) => !m.ephemeral) ? buildId : null
+      const { saveState, notice } = await rollbackToVersion(activeProjectId, versionId, conversationId)
+      announceDeploymentChanged(activeProjectId)
+      if (projectIdRef.current === activeProjectId) {
+        saveReadSeq.current += 1
+        setSaveDirty(saveState.dirty)
+        setHasSavedVersion(saveState.savedHead !== null)
+        if (notice !== null) {
+          seqRef.current = Math.max(seqRef.current, notice.seq + 1)
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `srv_${notice.seq}_r_live`,
+              role: 'assistant',
+              parts: [{ type: 'text', text: rollbackNoticeText(notice.savedAt, notice.description) }],
+              seq: notice.seq,
+              createdAt: new Date().toISOString(),
+            },
+          ])
+        }
+      }
+    } catch (err) {
+      if (projectIdRef.current === activeProjectId) {
+        setSaveError(err instanceof Error ? err.message : 'Could not roll back. Try again.')
+      }
+    } finally {
+      setRollingBack(false)
     }
   }
 
@@ -862,8 +904,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     generatingChatId !== null &&
     (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
   usePublishSave(
-    { dirty: saveDirty, saving, error: saveError, discarding, replying: turnRunningHere, hasSavedVersion },
-    { save: handleSave, discard: handleDiscard, settings: null, share: null },
+    { dirty: saveDirty, saving, error: saveError, discarding, rollingBack, replying: turnRunningHere, hasSavedVersion },
+    { save: handleSave, discard: handleDiscard, rollback: handleRollback, settings: null, share: null },
   )
   // THE PANE COLUMN IS WHERE THESE ARE SAID, and it is a sibling of the `<Outlet/>` this surface
   // fills — so a citizen mid-conversation is told their app is closing, on the same words the

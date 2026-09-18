@@ -33,6 +33,7 @@ from src.services.storage import (
     submissions_prefix,
     sweep_app_containers,
     sweep_blobs,
+    version_prefix,
 )
 
 
@@ -68,13 +69,17 @@ async def nuke_app(
     step — `salt_the_earth`, after `db.commit()` (see `admin.hard_delete`). Adding it here would
     not merely be misplaced, it would fail."""
     submission_keys = await all_keys_under(storage, submissions_prefix(app_id))
+    # Every saved version too. The list offers two and deletes none, so the prefix holds one
+    # bundle per save the app ever had — each a full source tree.
+    version_keys = await all_keys_under(storage, version_prefix(app_id))
     survivors: list[tuple[str, str]] = []
     # `recovery_key` alongside `snapshot_key`: both carry the app's whole tree, and a hard
     # delete that leaves one of them behind has not deleted the app.
     survivors.extend(
         ("blob", key)
         for key in await sweep_blobs(
-            storage, [snapshot_key(app_id), recovery_key(app_id), *submission_keys]
+            storage,
+            [snapshot_key(app_id), recovery_key(app_id), *submission_keys, *version_keys],
         )
     )
     survivors.extend(

@@ -68,3 +68,32 @@ export function tileDateTitle(
 ): string {
   return `Created ${listDate(created)} · Details updated ${listDate(updated)}`
 }
+
+/**
+ * `Today, 14:02` · `Yesterday, 09:41` · `1 Sep, 09:41` — the version list's form.
+ *
+ * RELATIVE FOR THE TWO DAYS THAT HAVE A NAME, ABSOLUTE AFTER THAT, which is the opposite of the
+ * columns above and for the opposite reason. A version list is read top-down as a short stack of
+ * moments in one working session, not scanned as a column: "Today, 14:02" answers *which of my
+ * saves is this* in a way "17 Sep 2026, 14:02" does not, and there are never more than three
+ * rows for the shared left edge to matter.
+ *
+ * THE TIME IS ALWAYS THERE, because two saves on one day is the ordinary case this list exists
+ * for — a date alone could name both of them.
+ *
+ * Browser-local, like every other date the citizen reads here. The rollback dialog's title uses
+ * this same function, so the row a person pressed and the question they are asked about it can
+ * never describe one version differently.
+ */
+export function versionStamp(iso: string | null | undefined): string {
+  const at = parse(iso)
+  if (at === null) return NONE
+  const clock = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
+  const midnight = new Date()
+  midnight.setHours(0, 0, 0, 0)
+  const startOfYesterday = new Date(midnight)
+  startOfYesterday.setDate(startOfYesterday.getDate() - 1)
+  if (at >= midnight) return `Today, ${clock}`
+  if (at >= startOfYesterday) return `Yesterday, ${clock}`
+  return `${dayMonth(iso)}, ${clock}`
+}

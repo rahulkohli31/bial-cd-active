@@ -23,7 +23,13 @@ from src.config import settings
 from src.db.models.attachment import Attachment
 from src.db.models.audit import AuditLog
 from src.services.auth.session_jwt import mint_session_jwt
-from src.services.storage import StorageError, attachment_key, snapshot_key, submission_key
+from src.services.storage import (
+    StorageError,
+    attachment_key,
+    snapshot_key,
+    submission_key,
+    version_key,
+)
 from tests.factories import AppRegistryFactory, ConversationFactory, UserFactory
 from tests.fakes import FakeStorage
 
@@ -225,6 +231,44 @@ async def test_snapshots_report_body(client, app, db_session) -> None:
     assert stale not in store.objects  # the genuine orphan reclaimed
 
 
+async def test_versions_are_swept_only_when_their_app_is_gone(client, app, db_session) -> None:
+    """★ THE ROOT THAT GROWS AND NEVER SHRINKS ON ITS OWN. The version list offers two entries
+    and deletes none, so this prefix gains a full source tree per save forever — which makes it
+    the root most worth reconciling, and the one whose absence from the sweep would be silent:
+    an unlisted root is never scanned, so it never appears in the report as something to look at.
+
+    A version whose app still exists is owned, whatever its age. Sweeping one here would be the
+    list deleting history it promised only to stop offering.
+
+    Mutation receipt: drop `versions/` from the sweep and the orphan below survives, counted
+    nowhere.
+    """
+    store = _wire_shared_storage(app)
+    admin = await _admin(db_session)
+    owner = await UserFactory.create(db_session)
+    live_app = await AppRegistryFactory.create(db_session, user_id=owner.id)
+
+    now = datetime.datetime.now(datetime.UTC)
+    kept = version_key(live_app.id, now - datetime.timedelta(days=30))
+    store.objects[kept] = b"x"
+    store.mtimes[kept] = now - datetime.timedelta(hours=48)  # owned, and old
+    orphan = version_key(uuid.uuid7(), now)
+    store.objects[orphan] = b"x"
+    store.mtimes[orphan] = now - datetime.timedelta(hours=48)  # no app row
+
+    body = (await client.post(_RECONCILE, headers=admin)).json()
+
+    assert body["versions"] == {
+        "scanned": 2,
+        "owned": 1,
+        "withinGrace": 0,
+        "eligible": 1,
+        "deleted": 1,
+    }
+    assert kept in store.objects  # the app still exists, so its history does too
+    assert orphan not in store.objects
+
+
 async def test_submissions_reported_never_deleted_body(client, app, db_session) -> None:
     store = _wire_shared_storage(app)
     admin = await _admin(db_session)
@@ -250,12 +294,13 @@ async def test_clean_system_body_is_all_zero(client, app, db_session) -> None:
         "attachments",
         "snapshots",
         "recovery",
+        "versions",
         "submissions",
         "apps",
         "ownerlessSubmissions",
         "attachmentReclaim",
     }
-    for prefix in ("attachments", "snapshots", "recovery", "submissions", "apps"):
+    for prefix in ("attachments", "snapshots", "recovery", "versions", "submissions", "apps"):
         assert body[prefix] == {
             "scanned": 0,
             "owned": 0,
@@ -277,7 +322,7 @@ async def test_response_body_carries_no_key_list(client, app, db_session) -> Non
 
     body = (await client.post(_RECONCILE, headers=admin)).json()
     # Every value in the body is a count (int), never a key string.
-    for prefix in ("attachments", "snapshots", "recovery", "submissions", "apps"):
+    for prefix in ("attachments", "snapshots", "recovery", "versions", "submissions", "apps"):
         assert all(isinstance(v, int) for v in body[prefix].values())
     assert isinstance(body["ownerlessSubmissions"], int)
     # The reclaim summary is counts only too — never a key or a user id.

@@ -75,6 +75,11 @@ WORKSPACE_DISCARDED_KIND: Final = "workspace_discarded"
 """`meta.kind` of the row a discard writes into each conversation that spoke since the save. Its
 payload is the note the model reads; the citizen sees `WorkspaceDiscardedItem` instead."""
 
+WORKSPACE_ROLLED_BACK_KIND: Final = "workspace_rolled_back"
+"""`meta.kind` of the row a rollback writes into each conversation that spoke since the version
+it restored. Its own kind rather than the discard's, because the two say different things to
+the citizen: a discard goes back to what they last saved, a rollback goes back past it."""
+
 # THERE IS NO DETAILS-EXPANDER CAP HERE ANY MORE, because there is no expander material to
 # cap. A step used to carry the raw arguments and the raw result of its tool call, redacted and
 # clipped to four thousand characters, on every frame and every reload item INCLUDING hidden
@@ -319,6 +324,17 @@ class WorkspaceDiscardedItem(CamelModel):
     saved_at: datetime | None = None
 
 
+class WorkspaceRolledBackItem(CamelModel):
+    """The user put the app back to an earlier version. `saved_at` is when that version was
+    saved and `description` is what they called it — both `None` when the row carries
+    neither."""
+
+    type: Literal["workspace_rolled_back"] = "workspace_rolled_back"
+    seq: int
+    saved_at: datetime | None = None
+    description: str | None = None
+
+
 DisplayItem = (
     UserTextItem
     | AssistantTextItem
@@ -328,6 +344,7 @@ DisplayItem = (
     | PlanOptionsItem
     | TurnTerminalItem
     | WorkspaceDiscardedItem
+    | WorkspaceRolledBackItem
 )
 
 
@@ -1222,6 +1239,16 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
             if kind == WORKSPACE_DISCARDED_KIND:
                 saved_at = _an_instant(meta.get("savedAt"))
                 items.append(WorkspaceDiscardedItem(seq=row.seq, saved_at=saved_at))
+                continue
+            if kind == WORKSPACE_ROLLED_BACK_KIND:
+                described = meta.get("description")
+                items.append(
+                    WorkspaceRolledBackItem(
+                        seq=row.seq,
+                        saved_at=_an_instant(meta.get("savedAt")),
+                        description=described if isinstance(described, str) else None,
+                    )
+                )
                 continue
             if kind == PLATFORM_TEXT_KIND:
                 # THE WORDS COME OUT OF `meta`, because the payload is empty on purpose — see

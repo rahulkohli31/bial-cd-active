@@ -46,6 +46,7 @@ from src.services.storage import (
     recovery_key,
     snapshot_key,
     submissions_prefix,
+    version_prefix,
 )
 
 _log = structlog.get_logger()
@@ -124,6 +125,10 @@ async def delete_project_cascade(
         # Every retained submission bundle — a paginated walk, so a prefix past
         # DEFAULT_PAGE_SIZE is fully gathered, and a StorageError raises (see docstring).
         blob_keys.extend(await all_keys_under(storage, submissions_prefix(app_id)))
+        # ...and every saved version. A prefix walk rather than a key, because the version list
+        # deletes nothing: an app that was saved forty times has forty bundles, each a full
+        # source tree, and only the app going away takes them with it.
+        blob_keys.extend(await all_keys_under(storage, version_prefix(app_id)))
         await db.execute(
             sa.delete(AppRegistry).where(AppRegistry.id == app_id, AppRegistry.user_id == user_id)
         )
