@@ -354,10 +354,11 @@ describe('★ a Save from the chat raises the deployment nudge', () => {
     renderBuilder({ deps: deps().deps })
 
     fireEvent.click(await screen.findByTestId('save-project'))
+    fireEvent.click(await screen.findByTestId('save-version-confirm'))
 
     // LIVENESS FIRST: the save actually happened. Without this the nudge assertion below would
     // stay green over a Save that never wrote anything — an event about nothing.
-    await waitFor(() => expect(h.saveProject).toHaveBeenCalledWith('p1'))
+    await waitFor(() => expect(h.saveProject).toHaveBeenCalledWith('p1', ''))
     // …and the toolbar has taken the answer, so the press ran to completion rather than throwing.
     expect(await screen.findByText('Saved')).toBeTruthy()
 
@@ -388,7 +389,8 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
     await waitFor(() => expect(answerLate).toBeTypeOf('function'))
 
     fireEvent.click(screen.getByTestId('save-project'))
-    await waitFor(() => expect(h.saveProject).toHaveBeenCalledWith('p1'))
+    fireEvent.click(await screen.findByTestId('save-version-confirm'))
+    await waitFor(() => expect(h.saveProject).toHaveBeenCalledWith('p1', ''))
     expect(await screen.findByText('Saved')).toBeTruthy()
 
     answerLate({ dirty: true })

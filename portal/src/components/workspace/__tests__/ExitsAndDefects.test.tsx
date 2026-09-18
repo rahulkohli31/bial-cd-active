@@ -199,8 +199,11 @@ describe('★ save is reachable from the project screen', () => {
     const button = await screen.findByTestId('save-project')
     expect(button.tagName).toBe('BUTTON')
     fireEvent.click(button)
+    // The press opens the naming dialog; the confirm is what saves. The description is optional
+    // and empty here, which is the path that must keep working exactly as the bodyless save did.
+    fireEvent.click(await screen.findByTestId('save-version-confirm'))
 
-    await waitFor(() => expect(api.saveProject).toHaveBeenCalledWith('pB'))
+    await waitFor(() => expect(api.saveProject).toHaveBeenCalledWith('pB', ''))
   })
 
   it('says so when a save fails, rather than letting it look successful', async () => {
@@ -209,7 +212,12 @@ describe('★ save is reachable from the project screen', () => {
     render(<Workspace />)
 
     fireEvent.click(await screen.findByTestId('save-project'))
+    fireEvent.click(await screen.findByTestId('save-version-confirm'))
 
-    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/no longer running/i))
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole('alert').some((el) => /no longer running/i.test(el.textContent ?? '')),
+      ).toBe(true),
+    )
   })
 })

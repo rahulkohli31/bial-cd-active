@@ -48,6 +48,9 @@ vi.mock('../../../utils/buildSessionApi', async (importOriginal) => ({
   checkWorkspace: api.checkWorkspace,
   relaunchPreview: api.relaunchPreview,
   saveProject: api.saveProject,
+  // The naming dialog reads the list to name what the save drops. Stubbed empty here: this suite
+  // is about the nudge arithmetic, and an unmocked read would put a real fetch in the middle of it.
+  fetchVersions: vi.fn(async () => ({ versions: [], evicting: null })),
 }))
 // THE PUBLISH READ IS PART OF THIS SCREEN, not a stub. The rail's APP STATUS panel holds
 // one and the toolbar's chip holds another, and the LAST SAVED row this suite asserts about is a
@@ -862,7 +865,13 @@ const dirtyAndAlive = () => {
 
 /** The rail's one occupant, and the handle every "is the rail there" assertion uses. */
 const railComposer = () => screen.getByTestId('rail-composer')
-const pressSave = async () => fireEvent.click(await screen.findByTestId('save-project'))
+/** A save from the toolbar, end to end. The press opens the naming dialog and the confirm is
+ *  what actually saves — the description is the citizen's own words for a version they will meet
+ *  again in a list, so it is asked for before the version exists rather than after. */
+const pressSave = async () => {
+  fireEvent.click(await screen.findByTestId('save-project'))
+  fireEvent.click(await screen.findByTestId('save-version-confirm'))
+}
 
 /**
  * ★ WHAT A SAVE OWES THE SURFACES AROUND IT.

@@ -344,9 +344,13 @@ export async function saveProject(
   description: string | null = null,
   deps: AuthFetchDeps = {},
 ): Promise<SaveResult> {
+  // EMPTY IS NO DESCRIPTION, and it must reach the wire as a BODYLESS save — the shape the
+  // leave-page guard and the hand-over path have always sent. An empty string would be a second
+  // way of saying "none" that the server then has to normalise back.
+  const described = (description ?? '').trim() || null
   const body = await postJson(
     `${BASE}/projects/${encodeURIComponent(projectId)}/save`,
-    description === null ? undefined : { description },
+    described === null ? undefined : { description: described },
     'Could not save your work',
     deps,
   )
@@ -1139,6 +1143,26 @@ export interface VersionList {
   evicting: AppVersion | null
 }
 
+/** A discard's notice plus the restored version's own words, so the line inserted without a
+ *  reload reads exactly as the stored one a reload would render. */
+export interface RollbackNotice extends DiscardNotice {
+  description: string | null
+}
+
+export interface RollbackResult {
+  saveState: SaveState
+  notice: RollbackNotice | null
+}
+
+function toRollbackNotice(value: unknown): RollbackNotice | null {
+  const notice = toDiscardNotice(value)
+  if (notice === null || !isRecord(value)) return null
+  return {
+    ...notice,
+    description: typeof value.description === 'string' ? value.description : null,
+  }
+}
+
 function toVersion(value: unknown): AppVersion | null {
   if (!isRecord(value)) return null
   return {
@@ -1189,7 +1213,7 @@ export async function rollbackToVersion(
   versionId: string,
   conversationId: string | null,
   deps: AuthFetchDeps = {},
-): Promise<DiscardResult> {
+): Promise<RollbackResult> {
   const body = await postJson(
     `${BASE}/projects/${encodeURIComponent(projectId)}/rollback`,
     conversationId !== null ? { versionId, conversationId } : { versionId },
@@ -1198,6 +1222,6 @@ export async function rollbackToVersion(
   )
   return {
     saveState: toSaveState(body),
-    notice: isRecord(body) ? toDiscardNotice(body.notice) : null,
+    notice: isRecord(body) ? toRollbackNotice(body.notice) : null,
   }
 }

@@ -160,6 +160,20 @@ export function discardNoticeText(savedAt: string | null): string {
   return 'You discarded the unsaved changes. Your app is back to the version you last saved.'
 }
 
+/** The rollback notice's sentence.
+ *
+ *  A DIFFERENT SENTENCE FROM THE DISCARD'S, not the same one reworded: a discard goes back to
+ *  what the citizen last saved, a rollback goes back PAST it. Naming the version by its date and
+ *  the citizen's own words is what makes it recognisable — a sha would not be.
+ */
+export function rollbackNoticeText(savedAt: string | null, description: string | null): string {
+  const called = description ? ` “${description}”` : ''
+  if (isUsableInstant(savedAt)) {
+    return `You rolled this app back to the version${called} you saved on ${formatStamp(savedAt)}. Anything changed after it is no longer in your workspace.`
+  }
+  return `You rolled this app back to an earlier version${called}. Anything changed after it is no longer in your workspace.`
+}
+
 /**
  * Server projection items → the in-memory message shape the pages render
  * ({id, role, parts, seq}). The reload read returns DISPLAY ITEMS derived
@@ -178,6 +192,8 @@ export function discardNoticeText(savedAt: string | null): string {
  *     sentence when the ending needs explaining and silent when it does not (see its arm).
  *   - `workspace_discarded` — the app was put back to its last saved version; rendered as a
  *     plain sentence naming when that version was saved.
+ *   - `workspace_rolled_back` — the app was put back to a version FURTHER back than the last
+ *     save; its own sentence, naming that version by its date and the citizen's words for it.
  *
  * @param onUnknown Injected so a test can assert the surfaced item rather than scrape the console.
  *   A parameter with a default rather than module state: every existing call site is unchanged and
@@ -379,6 +395,22 @@ export function messagesFromProjection(
       // no snapshot verdict — so synthesising one would answer the pane's question with a guess,
       // on every stopped Plan turn as well. The reload fix above supplies only the sentence, never
       // a build part.
+    } else if (item.type === 'workspace_rolled_back') {
+      seal()
+      messages.push({
+        id: `srv_${item.seq}_r_${index}`,
+        role: 'assistant',
+        parts: [
+          {
+            type: 'text',
+            text: rollbackNoticeText(
+              typeof item.savedAt === 'string' ? item.savedAt : null,
+              typeof item.description === 'string' ? item.description : null,
+            ),
+          },
+        ],
+        seq: item.seq,
+      })
     } else if (item.type === 'workspace_discarded') {
       seal()
       messages.push({

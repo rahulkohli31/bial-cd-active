@@ -43,7 +43,7 @@ import {
 } from './workspaceChannel'
 import { announceDeploymentChanged } from '../../hooks/usePublishState'
 import { resolvePreviewAddress } from '../../utils/previewAddress'
-import { discardUnsavedChanges, fetchCompileState, saveProject } from '../../utils/buildSessionApi'
+import { discardUnsavedChanges, fetchCompileState, rollbackToVersion, saveProject } from '../../utils/buildSessionApi'
 import { deleteProject } from '../../utils/projectApi'
 import { projectsListHref } from '../../utils/projectsListMemory'
 import type { CompileState } from '../../utils/compileState'
@@ -296,22 +296,30 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
    * last-saved row and the toolbar's publish chip come off the deployment read, whose `savedHead`
    * and `savedAt` this save just changed — so it raises the shared nudge, never a second reader.
    */
-  const save = useCallback(async () => {
-    if (saving) return
-    setSaving(true)
-    setSaveError(null)
-    try {
-      await saveProject(project.id)
-      workspace.refresh()
-      announceDeploymentChanged(project.id)
-    } catch (err) {
-      setSaveError(err instanceof Error ? err.message : 'Could not save your work. Try again.')
-    } finally {
-      setSaving(false)
-    }
-  }, [project.id, saving, workspace])
+  const save = useCallback(
+    async (description?: string) => {
+      if (saving) return
+      setSaving(true)
+      setSaveError(null)
+      try {
+        await saveProject(project.id, description ?? null)
+        workspace.refresh()
+        announceDeploymentChanged(project.id)
+      } catch (err) {
+        setSaveError(err instanceof Error ? err.message : 'Could not save your work. Try again.')
+        // RECORDED HERE AND RAISED ANYWAY. The toolbar is still where the failure is read, but the
+        // naming dialog has to know the save did not happen, or it closes and takes the typed
+        // description with it on exactly the path where retyping is the whole cost.
+        throw err
+      } finally {
+        setSaving(false)
+      }
+    },
+    [project.id, saving, workspace],
+  )
 
   const [discarding, setDiscarding] = useState(false)
+  const [rollingBack, setRollingBack] = useState(false)
 
   /** Put the saved version back. A refusal shares Save's error slot beside the controls, and the
    *  same two reads a Save makes stale are refreshed the same way. */
@@ -330,6 +338,27 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     }
   }, [project.id, discarding, workspace])
 
+  /** Roll back from the project screen. No conversation to note — the server writes the line into
+   *  every chat of the project that spoke since the restored version was saved regardless. */
+  const rollback = useCallback(
+    async (versionId: string) => {
+      if (rollingBack) return
+      setRollingBack(true)
+      setSaveError(null)
+      try {
+        await rollbackToVersion(project.id, versionId, null)
+        workspace.refresh()
+        announceDeploymentChanged(project.id)
+      } catch (err) {
+        setSaveError(err instanceof Error ? err.message : 'Could not roll back. Try again.')
+      } finally {
+        setRollingBack(false)
+      }
+    },
+    [project.id, rollingBack, workspace],
+  )
+
+
   // SAVE IS REACHABLE FROM THE PROJECT SCREEN, and it was not.
   //
   // The only writer of the bundle lived on the conversation surface, so a citizen who had built
@@ -342,6 +371,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       saving,
       error: saveError,
       discarding,
+      rollingBack,
       // No reply runs on this screen; one running in a chat is refused by the server in its words.
       replying: false,
       hasSavedVersion: (workspace.save?.savedHead ?? null) !== null,
@@ -349,6 +379,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     {
       save: workspace.save ? save : null,
       discard: workspace.save ? discard : null,
+      rollback: workspace.save ? rollback : null,
       settings: openSettings,
       share: startShare,
     },

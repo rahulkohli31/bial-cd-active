@@ -21,11 +21,13 @@
  * feature by the owner's decision — an affordance for a drawer nobody can open is worse than
  * no affordance, so it is neither built nor left as a disabled stub.
  */
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   ExternalLink,
+  Layers,
   MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
@@ -43,12 +45,18 @@ import {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
 } from '../ui/dropdown-menu'
 import { NavMenuButton, useNavReveal } from '../layout/NavReveal'
 import { BusyGlyph, useElapsedSeconds, ELAPSED_AFTER_MS } from '../ui/Waiting'
 import { usePublishState } from '../../hooks/usePublishState'
 import { chatKindFor } from '../../utils/chatKind'
 import DiscardChangesDialog from './DiscardChangesDialog'
+import RollbackVersionDialog from './RollbackVersionDialog'
+import SaveVersionDialog from './SaveVersionDialog'
+import { fetchVersions } from '../../utils/buildSessionApi'
+import type { AppVersion, VersionList } from '../../utils/buildSessionApi'
+import { versionStamp } from '../../utils/projectDates'
 import { useRailSlot, useWorkspaceActions, useWorkspaceAddress, useWorkspaceHeading, useWorkspacePaneVisible, useWorkspaceSave } from './workspaceChannel'
 import type { SaveSlot, WorkspaceActions } from './workspaceChannel'
 import { DEVICES, type DeviceName } from './devices'
@@ -334,7 +342,7 @@ export default function WorkspaceToolbar({
         )}
 
         <DiscardControl save={save} readActions={readActions} projectId={heading.projectId} />
-        <SaveControl save={save} readActions={readActions} />
+        <SaveControl save={save} readActions={readActions} projectId={heading.projectId} />
 
         {/* THE TOKEN COUNTER FOLLOWS THE CITIZEN INTO THE WORKSPACE, which is the one screen
             where tokens are actually spent. It lives in the navigation panel, and the panel is
@@ -398,8 +406,9 @@ export default function WorkspaceToolbar({
 /**
  * THE SAVE CONTROL, in the board's three states. Clean is an outlined "Saved" chip; dirty is a
  * teal outline on pale teal with a 6px amber dot, one of only two accent-colour uses on the
- * canvas — a loud filled control gets ignored. `dirty === null` means "could not tell" and renders
- * nothing, never "Saved": the git check costs two executions, so a stopped project has no answer.
+ * canvas — a loud filled control gets ignored. `dirty === null` means "could not tell" and shows
+ * no label at all, never "Saved": the git check costs two executions, so a stopped project has no
+ * answer. It no longer renders NOTHING in that state, though — see the caret below.
  * With no action published it is a real `<span>`, not a button, so nothing invites a no-op press.
  * While it works it now SHOWS that too — through `BusyGlyph`, which owns both motion registers:
  * a spinning glyph where motion is allowed, and NO spinner at all where it is not, because a
@@ -407,13 +416,32 @@ export default function WorkspaceToolbar({
  * live elapsed count appears beside it, which is the only signal that proves liveness without
  * moving; a production save was measured at forty seconds.
  */
-function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () => WorkspaceActions }) {
-  const { dirty, saving, discarding, error, canSave } = save
+function SaveControl({
+  save,
+  readActions,
+  projectId,
+}: {
+  save: SaveSlot
+  readActions: () => WorkspaceActions
+  projectId: string | null
+}) {
+  const { dirty, saving, discarding, rollingBack, error, canSave } = save
   // Before the early return: hooks may not sit behind a conditional, and `dirty === null` is a
   // real render path here rather than an edge case.
-  const elapsed = useElapsedSeconds(saving)
+  // ★ THE COUNTER COVERS BOTH WAITS. A rollback replaces every file over the same container and
+  // takes the same tens of seconds as a save; a counter that only ran for saves would leave the
+  // longer of the two waits with nothing moving and nothing counting.
+  const busy = saving || rollingBack
+  const elapsed = useElapsedSeconds(busy)
   const showElapsed = elapsed * 1000 >= ELAPSED_AFTER_MS
-  if (dirty === null) return null
+  const [naming, setNaming] = useState(false)
+  // ★ THE SHELL SURVIVES A STOPPED WORKSPACE, and only the LABEL goes. Save renders no answer
+  // there because it has none; a caret bolted onto Save would vanish with it, taking the list
+  // with it — and a stopped workspace is exactly when someone goes looking for a version to go
+  // back to. With no saves at all there is nothing behind the caret either, so the whole control
+  // goes: a caret that opens onto nothing invites a press that goes nowhere.
+  const versionsOnly = dirty === null
+  if (versionsOnly && !save.hasSavedVersion) return null
 
   const look = dirty
     ? 'border-primary bg-canvas-savedirty text-primary font-bold'
@@ -422,7 +450,15 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
   // below the stacking threshold. The floor is on the shared shell rather than on the
   // button alone: the pressable and the unpressable rendering of this control are meant to be the
   // same object in two states, and one of them quietly changing height would say otherwise.
-  const shell = `inline-flex items-center gap-[7px] whitespace-nowrap rounded-[9px] border px-[13px] py-1.5 text-[12.5px] narrow:min-h-[44px] ${look}`
+  // ONE SHELL, TWO HALVES. The border, the radius and the ground belong to the object; each half
+  // carries its own padding and its own 44px floor below the stacking threshold, because two
+  // press targets inside one 44px box is not two press targets. The label half keeps the
+  // padding the control always had, so nothing about Save moves.
+  const shell = `inline-flex items-stretch overflow-hidden whitespace-nowrap rounded-[9px] border text-[12.5px] ${look}`
+  // HEIGHT ONLY, as the worded controls have always had it: the label half is comfortably past
+  // 44px wide on its own words, and a width floor on it would be a floor nothing needs. The CARET
+  // half is a glyph, so it carries both.
+  const labelHalf = `inline-flex items-center gap-[7px] px-[13px] py-1.5 narrow:min-h-[44px]`
   const body = (
     <>
       {/* THE WAIT'S BOX — the spinner and the one sentence that describes it, together inside the
@@ -436,22 +472,33 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
           and `dirty` flips on its own while a turn edits files — announcing every flip would be
           noise in the same region the wait needs to cut through. */}
       <span role="status" aria-live="polite" className="inline-flex items-center gap-[7px]">
-        {saving ? <BusyGlyph size={14} testId="save-spinner" /> : <Save size={14} />}
-        {saving ? 'Saving…' : null}
+        {busy ? (
+          <BusyGlyph size={14} testId="save-spinner" />
+        ) : versionsOnly ? (
+          // A LAYERS GLYPH WHERE THE LABEL WOULD BE. The control still says what it is for
+          // when it cannot say what the workspace holds.
+          <Layers size={14} />
+        ) : (
+          <Save size={14} />
+        )}
+        {/* ONE REGION, TWO WAITS, AND THEY MUST NOT BORROW EACH OTHER'S WORD. "Saving…" during a
+            rollback would tell a reader their work is being stored at the moment it is being
+            replaced — the opposite of what is happening. */}
+        {saving ? 'Saving…' : rollingBack ? 'Going back…' : null}
         {/* THE NUMBER, once the wait has earned it. A save measured at forty seconds in production
             spent all of them showing one unchanging word; under `prefers-reduced-motion` the glyph
             beside it did not turn either, and the control was reported as dead. */}
         {/* `aria-hidden` for the reason `WaitingLine`'s count is: this span sits INSIDE the
             polite region above, and a number changing once a second is announced once a second.
             "Saving…" is what a reader needs; the count is for the eye. */}
-        {saving && showElapsed ? (
+        {busy && showElapsed ? (
           <span aria-hidden="true" className="tabular-nums">
             {elapsed}s
           </span>
         ) : null}
       </span>
-      {!saving && (dirty ? 'Save' : 'Saved')}
-      {dirty && !saving && <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-accent" aria-hidden="true" />}
+      {!busy && !versionsOnly && (dirty ? 'Save' : 'Saved')}
+      {dirty && !busy && <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-accent" aria-hidden="true" />}
     </>
   )
 
@@ -462,34 +509,305 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
           {error}
         </span>
       )}
-      {canSave ? (
-        // THE ACTION IS READ AT PRESS TIME, never held across a render — see `useWorkspaceActions`. A
-        // `null` read means the publisher unmounted between this render and the click, which is a
-        // press with nothing to do rather than a crash.
-        <button
-          type="button"
-          data-testid="save-project"
-          // `aria-disabled`, NEVER `disabled`: a disabled control throws focus to the document body.
-          aria-disabled={saving || discarding || dirty === false}
-          // THE THIRD REGISTER, and a silent one: `aria-busy` is what a reader consults when asked
-          // rather than something it speaks, so it costs the wait's sentence nothing. `undefined`
-          // when idle — `aria-busy={false}` would ship a permanent `aria-busy="false"` on a control
-          // that is not waiting, which is a state where the honest answer is no answer.
-          aria-busy={saving || undefined}
-          onClick={() => {
-            if (saving || discarding || dirty === false) return
-            readActions().save?.()
-          }}
-          className={`${shell} transition ${saving ? 'opacity-70' : ''}`}
-        >
-          {body}
-        </button>
-      ) : (
-        <span data-testid="save-state" className={shell} aria-busy={saving || undefined}>
-          {body}
-        </span>
+      {/* ONE SHELL, TWO HALVES, AND THE OUTER ELEMENT PRESSES NOTHING. The border, the radius and
+          the ground are the object; the label and the caret are each their own target inside it. */}
+      <span className={`${shell} ${busy ? 'opacity-70' : ''}`}>
+        {canSave ? (
+          // THE ACTION IS READ AT PRESS TIME, never held across a render — see `useWorkspaceActions`. A
+          // `null` read means the publisher unmounted between this render and the click, which is a
+          // press with nothing to do rather than a crash.
+          <button
+            type="button"
+            data-testid="save-project"
+            // `aria-disabled`, NEVER `disabled`: a disabled control throws focus to the document body.
+            aria-disabled={busy || discarding || dirty === false}
+            // THE THIRD REGISTER, and a silent one: `aria-busy` is what a reader consults when asked
+            // rather than something it speaks, so it costs the wait's sentence nothing. `undefined`
+            // when idle — `aria-busy={false}` would ship a permanent `aria-busy="false"` on a control
+            // that is not waiting, which is a state where the honest answer is no answer.
+            aria-busy={busy || undefined}
+            onClick={() => {
+              if (busy || discarding || dirty === false) return
+              // THE DIALOG IS THE SAVE NOW. It asks for the version's description and names what
+              // the save drops; the request itself is what it confirms into.
+              setNaming(true)
+            }}
+            className={`${labelHalf} transition`}
+          >
+            {body}
+          </button>
+        ) : (
+          <span data-testid="save-state" className={labelHalf} aria-busy={busy || undefined}>
+            {body}
+          </span>
+        )}
+        {/* THE CARET, only where there is something behind it. A hairline rather than a gap: the
+            two halves are one object, and a gap would read as two controls that happen to touch. */}
+        {save.hasSavedVersion && projectId !== null && (
+          <>
+            <span aria-hidden="true" className="w-px flex-shrink-0 self-stretch bg-current opacity-20" />
+            <VersionsMenu
+              save={save}
+              readActions={readActions}
+              projectId={projectId}
+              caretClass="inline-flex items-center px-2 transition narrow:min-h-[44px] narrow:min-w-[44px] narrow:justify-center"
+            />
+          </>
+        )}
+      </span>
+      {naming && projectId !== null && (
+        <SaveNaming
+          projectId={projectId}
+          onClose={() => setNaming(false)}
+          onConfirm={(description) => readActions().save?.(description)}
+        />
+      )}
+      {/* NO PROJECT ID MEANS NO LIST AND NO DIALOG, so the save keeps its old bodyless shape
+          rather than opening a dialog that cannot say what it would drop. */}
+      {naming && projectId === null && (
+        <SaveVersionDialog
+          evicting={null}
+          onClose={() => setNaming(false)}
+          onConfirm={(description) => readActions().save?.(description)}
+        />
       )}
     </span>
+  )
+}
+
+/** The dialog, with what the save would drop read from the same list the menu shows. */
+function SaveNaming({
+  projectId,
+  onClose,
+  onConfirm,
+}: {
+  projectId: string
+  onClose: () => void
+  onConfirm: (description: string) => void | Promise<void>
+}) {
+  const { list } = useVersions(projectId, true)
+  return <SaveVersionDialog evicting={list?.evicting ?? null} onClose={onClose} onConfirm={onConfirm} />
+}
+
+/**
+ * The version list, read when it is asked for rather than polled.
+ *
+ * WHY NOT THE SAVE-STATE POLL. That poll only runs while the preview reports the workspace alive,
+ * and this list has to answer on a STOPPED workspace too — which is exactly when someone goes
+ * looking for a version to go back to. So it is its own read, made when the menu opens.
+ *
+ * `open` gates the fetch rather than the caller mounting this conditionally, because a hook may
+ * not sit behind a condition and the list must survive the menu closing and reopening without a
+ * blank frame in between.
+ */
+function useVersions(projectId: string, open: boolean) {
+  const [list, setList] = useState<VersionList | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  // One token per read: a slow answer for a menu that has since closed, or for another project,
+  // must not paint over a newer one.
+  const read = useRef(0)
+
+  useEffect(() => {
+    if (!open) return
+    const mine = ++read.current
+    setError(null)
+    void fetchVersions(projectId)
+      .then((next) => {
+        if (read.current === mine) setList(next)
+      })
+      .catch((err: unknown) => {
+        if (read.current !== mine) return
+        setError(err instanceof Error ? err.message : 'Could not read your versions')
+      })
+  }, [projectId, open])
+
+  return { list, error }
+}
+
+/** One marker, as a chip. LIVE is the only one that carries colour — it is the only one that is a
+ *  fact about BIAL staff rather than about this workspace. */
+function MarkerChip({ marker }: { marker: string }) {
+  const live = marker === 'live'
+  const look = live
+    ? 'border-primary-100 bg-primary-50 text-primary'
+    : 'border-bial-border bg-surface-muted text-neutral'
+  return (
+    <span
+      className={`rounded-full border px-1.5 py-px text-[9.5px] font-bold uppercase tracking-[0.04em] ${look}`}
+    >
+      {marker === 'current' ? 'Current' : live ? 'Live' : 'Previous'}
+    </span>
+  )
+}
+
+/**
+ * THE CARET AND WHAT IT OPENS — the two most recent versions, plus whatever is live.
+ *
+ * A NON-CURRENT ROW IS THE ACTION. The whole row presses rather than carrying a button inside it:
+ * there is exactly one thing to do with a version, and a row that shows a control beside itself
+ * invites the question of what pressing the rest of the row does. The current row is inert — it is
+ * what the workspace already holds — and an unavailable one states its reason before the press
+ * rather than failing after it.
+ */
+function VersionsMenu({
+  save,
+  readActions,
+  projectId,
+  caretClass,
+}: {
+  save: SaveSlot
+  readActions: () => WorkspaceActions
+  projectId: string
+  caretClass: string
+}) {
+  const [open, setOpen] = useState(false)
+  const [confirming, setConfirming] = useState<AppVersion | null>(null)
+  const { list, error } = useVersions(projectId, open)
+
+  const rows = list?.versions ?? null
+
+  return (
+    <>
+      <DropdownMenu open={open} onOpenChange={setOpen}>
+        <DropdownMenuTrigger asChild>
+          <button
+            type="button"
+            data-testid="versions-caret"
+            aria-label="Versions"
+            // `aria-disabled`, never `disabled`, for the label half's reason.
+            aria-disabled={save.rollingBack || undefined}
+            className={caretClass}
+          >
+            <ChevronDown size={14} />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          align="end"
+          data-testid="versions-menu"
+          className="w-[290px] rounded-md border-bial-border bg-white p-1 shadow-lg"
+        >
+          <DropdownMenuLabel className="px-2.5 pb-1 pt-1.5 text-[11px] font-bold uppercase tracking-[0.04em] text-neutral">
+            Versions
+          </DropdownMenuLabel>
+          {error !== null ? (
+            <p role="alert" className="px-2.5 py-2 text-[12px] text-danger">
+              {error}
+            </p>
+          ) : rows === null ? (
+            // D8 — the menu opens NOW and says it is reading, rather than opening on a read that
+            // has already landed. A menu that waits to appear reads as a press that did nothing.
+            <p className="px-2.5 py-2 text-[12px] text-neutral" data-testid="versions-loading">
+              Reading your versions…
+            </p>
+          ) : rows.length === 0 ? (
+            <p className="px-2.5 py-2 text-[12px] text-neutral">
+              You have not saved a version of this app yet.
+            </p>
+          ) : (
+            rows.map((version, index) => {
+              const press = version.available && version.id !== null && !save.rollingBack
+              return (
+                <DropdownMenuItem
+                  key={version.id ?? `live-${index}`}
+                  data-testid="version-row"
+                  disabled={!press}
+                  onSelect={() => {
+                    if (press) setConfirming(version)
+                  }}
+                  className={`flex flex-col items-start gap-1 rounded-sm px-2.5 py-2 ${
+                    press
+                      ? 'cursor-pointer text-primary-900 focus:bg-surface-muted'
+                      : 'cursor-default opacity-60 focus:bg-transparent'
+                  }`}
+                >
+                  <span className="flex w-full items-center gap-1.5">
+                    <span className="text-[12.5px] font-semibold text-tertiary">
+                      {version.savedAt !== null ? versionStamp(version.savedAt) : 'Deployed earlier'}
+                    </span>
+                    <span className="ml-auto flex items-center gap-1">
+                      {version.markers.map((marker) => (
+                        <MarkerChip key={marker} marker={marker} />
+                      ))}
+                    </span>
+                  </span>
+                  {version.description !== null && (
+                    <span className="w-full truncate text-[12px] text-neutral">
+                      {version.description}
+                    </span>
+                  )}
+                  {/* THE REASON, BEFORE THE PRESS. `discardRefusal`'s rule: a control that
+                      refuses silently teaches nothing, and one that refuses after the press
+                      teaches it too late. */}
+                  {version.unavailableReason !== null && (
+                    <span className="w-full text-[11px] text-neutral">
+                      {version.unavailableReason}
+                    </span>
+                  )}
+                </DropdownMenuItem>
+              )
+            })
+          )}
+          <p className="border-t border-bial-border px-2.5 py-2 text-[11px] leading-relaxed text-neutral">
+            Your two most recent versions are listed, plus whatever BIAL staff are running. Going
+            back keeps the version you are on now.
+          </p>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      {confirming !== null && (
+        <RollbackConfirmation
+          projectId={projectId}
+          version={confirming}
+          dirty={save.dirty === true}
+          onClose={() => setConfirming(null)}
+          onConfirm={async () => {
+            const versionId = confirming.id
+            // CLOSED BEFORE THE AWAIT, unlike the save dialog: the wait belongs in the Save shell
+            // where the elapsed counter is, not behind a modal covering the thing it changes.
+            setConfirming(null)
+            if (versionId !== null) await readActions().rollback?.(versionId)
+          }}
+        />
+      )}
+    </>
+  )
+}
+
+/**
+ * The rollback confirmation, with its conditional clauses read from the deployment.
+ *
+ * ★ THE DEPLOYMENT READ MOUNTS WITH THE DIALOG, NOT WITH THE MENU. `usePublishState` is a READER:
+ * every mounted one answers the shared nudge, so putting it on the menu would have added a second
+ * deployment read to every screen the toolbar draws and doubled the fan-out of every save —
+ * `ProjectWorkspace.test.tsx`'s stampede test is what says so, and it caught exactly this. The
+ * clauses are only needed once the dialog is on screen, so that is where the read belongs.
+ */
+function RollbackConfirmation({
+  projectId,
+  version,
+  dirty,
+  onClose,
+  onConfirm,
+}: {
+  projectId: string
+  version: AppVersion
+  dirty: boolean
+  onClose: () => void
+  onConfirm: () => void | Promise<void>
+}) {
+  const { deployment } = usePublishState(projectId)
+  return (
+    <RollbackVersionDialog
+      savedAt={version.savedAt}
+      description={version.description}
+      dirty={dirty}
+      live={(deployment?.url ?? null) !== null && (deployment?.unpublishedAt ?? null) === null}
+      // THE PIN, not the status. `approvedCommitSha` is the exact fact a rollback invalidates: the
+      // publish path compares it against the head, so a rollback that moves the head off it is
+      // what costs the app its approval. A status word would be a proxy for that.
+      approved={(deployment?.approval?.approvedCommitSha ?? null) !== null}
+      onClose={onClose}
+      onConfirm={onConfirm}
+    />
   )
 }
 
