@@ -41,7 +41,6 @@ const h = vi.hoisted(() => ({
   stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
   relaunchPreview: vi.fn(),
-  stop: vi.fn(),
   getStatus: vi.fn(),
   fetchPreviewState: vi.fn(),
 }))
@@ -214,7 +213,6 @@ describe('BuilderPage — the build-turn flow', () => {
     // beside it for now and does the same thing, but this is the one that survives its deletion.
     fireEvent.click(screen.getByTestId('stop-turn'))
     await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith(LIVE_CHAT_ID, BUILD_TURN_ID))
-    expect(h.stop).not.toHaveBeenCalled() // never the build-session stop
 
     // THE CONTAINER IS NOT TORN DOWN BY A STOP: `finish_turn_sandbox` pardons it with no branch
     // on how the turn ended, and the stopped arm is reached precisely because Stop arrives as a
@@ -421,7 +419,6 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
 
     h.buildFromPlan.mockClear()
-    h.stop.mockClear()
     h.startTurn.mockClear()
 
     // SENDING is what waits — not typing. The text box and attach stay live so the
@@ -439,7 +436,6 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     fireEvent.keyDown(textarea, { key: 'Enter' })
     expect(await screen.findByText(/send unlocks when it is done/i)).toBeTruthy()
     expect(h.startTurn).not.toHaveBeenCalled()
-    expect(h.stop).not.toHaveBeenCalled()
     expect(h.buildFromPlan).not.toHaveBeenCalled()
     expect(document.querySelector('iframe')).toBeTruthy() // the live build is untouched
 
@@ -466,13 +462,11 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     expect(screen.getByTestId('composer-attach').disabled).toBe(false)
 
     h.buildFromPlan.mockClear()
-    h.stop.mockClear()
     h.startTurn.mockClear()
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Build it, but dark.', 'opt-2')))
     await send('make it dark mode')
 
     await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
-    expect(h.stop).not.toHaveBeenCalled()
     expect(h.buildFromPlan).not.toHaveBeenCalled()
   })
 
@@ -510,7 +504,6 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
 
     h.buildFromPlan.mockClear()
-    h.stop.mockClear()
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Build it, but dark.', 'opt-2')))
     await sendPrompt('make it dark mode')
 
@@ -519,7 +512,6 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     await waitFor(() =>
       expect(h.buildFromPlan).toHaveBeenCalledWith(LIVE_CHAT_ID, 'opt-2', expect.any(String)),
     )
-    expect(h.stop).not.toHaveBeenCalled()
   })
 
   it('a RELOAD mid-build re-takes the gate from the transcript', async () => {
@@ -639,10 +631,8 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
 
     // …and the send genuinely goes out, rather than being refused on A's behalf.
     h.startTurn.mockClear()
-    h.stop.mockClear()
     await send('what does this app do?')
     await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
-    expect(h.stop).not.toHaveBeenCalled()
   })
 
   it('a Send in a DIFFERENT project does NOT tear down another project\'s live build', async () => {
@@ -693,7 +683,6 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
       previewState(id === 'pA' ? 'alive' : 'unknown'),
     )
     h.buildFromPlan.mockClear()
-    h.stop.mockClear()
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Build B, please.', 'opt-B')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
@@ -711,7 +700,6 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
     // The refusal is surfaced ON the card, where the click was, and the card re-arms as a retry.
     expect(await screen.findByText(/running in another project/i)).toBeTruthy()
-    expect(h.stop).not.toHaveBeenCalled()
     const retry = screen.getByRole('button', { name: /^Build this plan$/ })
     expect(retry.disabled).toBe(false)
   })

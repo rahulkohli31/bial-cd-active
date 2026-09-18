@@ -350,9 +350,9 @@ class RelaunchPreviewResponse(CamelModel):
     preview_url: str
     status: BuildSessionStatus  # `ready`, or `provisioning` when the app is not serving yet.
     # The "last saved version" signal: True when the project's NEWEST recorded build
-    # outcome was FAILED — `_do_finalize` snapshots pass and fail alike, so the restored
-    # workspace is the last SAVED state, not that build's intent. The portal labels the
-    # relaunched preview accordingly instead of presenting an unqualified "ready".
+    # outcome was FAILED. Nothing about a failed verdict withheld the snapshot of the day, so
+    # the restored workspace is the last SAVED state, not that build's intent. The portal labels
+    # the relaunched preview accordingly instead of presenting an unqualified "ready".
     restored_from_failed_build: bool
     # Is the app SERVING the URL above yet? False only on the attach arm's fail-open path — the
     # container is alive and holds the user's work, the app is just slow to answer. The portal
@@ -391,19 +391,6 @@ class SharedPreviewResponse(CamelModel):
     snapshot_taken_at: datetime | None
 
 
-class StopBuildRequest(CamelModel):
-    """`POST /v1/build-sessions/{sessionId}/stop` body."""
-
-    reason: str | None = None  # optional free-text reason for the audit/activity feed.
-
-
-class StopBuildResponse(CamelModel):
-    """`POST /v1/build-sessions/{sessionId}/stop` → 200."""
-
-    session_id: uuid.UUID
-    status: BuildSessionStatus  # `ended` after a graceful stop.
-
-
 class BuildSessionStatusResponse(CamelModel):
     """`GET /v1/build-sessions/{sessionId}` → 200. The poll surface and the
     source of the framable `preview_url`."""
@@ -425,20 +412,8 @@ class BuildSessionStatusResponse(CamelModel):
 # `acquire` / `renew` / `release` / `heartbeat` were retired along with their response models
 # (`LockStateResponse`, `LockReleaseResponse`, `HeartbeatResponse`) — the portal's keep-alive
 # loop that was their only caller was itself deleted, and nothing else ever called these
-# routes. `force-end` was the sole survivor and its route is now gone too: it had had no
-# control on any surface since the block banner's Force-end button went, which both
-# `buildSessionApi.ts` and `useBuildSession.ts` said in their own comments.
-
-
-class ForceEndResponse(CamelModel):
-    """The 200 the deleted force-end lock op returned. NO ROUTE PRODUCES IT.
-    `SessionManager.force_end` itself survives — it is one of the two entry points into the
-    end sequence and carries the terminal-commit race invariant its service tests pin — but
-    nothing calls it any more, and retiring it is a separate change that reaches into
-    `_do_finalize`'s `force_ended` arms."""
-
-    session_id: uuid.UUID
-    status: BuildSessionStatus  # `ended`.
+# routes. `force-end` was the last of them to go, and its `ForceEndResponse` went with the end
+# sequence the lock op drove.
 
 
 # --- the app's own client-error report ----------------

@@ -11,7 +11,7 @@ import { FakeEventSource, makeClient, primeClient, renderBuilder } from './_buil
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
-  stop: vi.fn(), getStatus: vi.fn(),
+  getStatus: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({

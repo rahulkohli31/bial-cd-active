@@ -38,7 +38,7 @@ const h = vi.hoisted(() => ({
   resolvePlanOptions: vi.fn(), uuidv7: vi.fn(),
   loadBuilds: vi.fn(), getBuild: vi.fn(),
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
-  stop: vi.fn(), getStatus: vi.fn(),
+  getStatus: vi.fn(),
 }))
 
 // Both kinds of chat run on the turn stream now, so the mock below is the only transport this
@@ -236,9 +236,6 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     mintBuild('new-A2', 'First build (refined)')
     await buildFrom(a.container, 'make it dark mode')
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(2))
-    // `session.start()` is deleted, not merely unused — `h.stop` pins that the retired
-    // stop-a-live-session arm is never reached on this path, not that a candidate was skipped.
-    expect(h.stop).not.toHaveBeenCalled()
     await within(a.container).findByTestId('stop-turn')
 
     const b = renderBuilder('build-B')

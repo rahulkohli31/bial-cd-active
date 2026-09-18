@@ -60,13 +60,12 @@ async def _user_project(db: AsyncSession, email: str):
 async def _completed_session(client, db, wire, email):
     """A session that ran to its terminal, with the exact three-frame story the feed replays.
 
-    Re-fixtured off the deleted start route. What produced these frames was a `run_build` task
-    emitting seq 1-2 and the manager synthesizing the terminal seq 3; the task is gone, so the
-    two progress frames are handed to `manager.on_progress` directly (the generic progress sink,
-    which documents that it must derive correct state from envelopes pushed by tests) and the
-    terminal comes from `manager.stop` — still the single emitter of the `ended` frame, still
-    downstream of the finalize snapshot. `_bare_session()` below is the same technique with no
-    manager at all; this one keeps the manager because the feed is reached over HTTP."""
+    Re-fixtured off the deleted start route and then off the deleted end sequence. What produced
+    these frames was a `run_build` task emitting seq 1-2 and the manager synthesizing the
+    terminal seq 3; both are gone, so all three are handed to `manager.on_progress` directly —
+    the generic progress sink, which documents that it must derive correct state from envelopes
+    pushed by tests. `_bare_session()` below is the same technique with no manager at all; this
+    one keeps the manager because the feed is reached over HTTP."""
     user, project = await _user_project(db, email)
     session = await a_live_session(wire, db, user, project.id)
     await wire.manager.on_progress(
@@ -75,7 +74,16 @@ async def _completed_session(client, db, wire, email):
     await wire.manager.on_progress(
         session, PreviewReadyEvent(seq=2, preview_url="https://preview.example/")
     )
-    await wire.manager.stop(session, wire.sbx, reason="completed")
+    await wire.manager.on_progress(
+        session,
+        EndedEvent(
+            seq=3,
+            status=BuildSessionStatus.ENDED,
+            preview_url="https://preview.example/",
+            snapshot_committed=True,
+            reason="completed",
+        ),
+    )
     return user, str(session.session_id)
 
 
@@ -115,7 +123,6 @@ async def test_replay_of_a_finished_session_has_exactly_one_truthful_terminal(
     terminals = [e for e in events if e["type"] == "ended"]
     assert len(terminals) == 1
     assert events[-1] is terminals[0]  # terminal is last
-    # The truth settled by the end sequence's own snapshot step, never a claim that predates it.
     assert terminals[0]["snapshot_committed"] is True
     assert terminals[0]["reason"] == "completed"
     assert terminals[0]["status"] == "ended"
@@ -273,7 +280,6 @@ async def test_sse_recovers_a_dropped_terminal_from_the_buffer(
     )
     session.last_seq = 2
     session.terminal_emitted = True
-    session.terminal_committed = True
     await asyncio.wait_for(drainer, timeout=2.0)
 
     text = b"".join(collected).decode()

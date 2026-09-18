@@ -809,10 +809,9 @@ def _closed_sessions(rows: Sequence[Message]) -> set[str]:
     """Session ids that have a recorded `build_outcome` row.
 
     Both halves of the pair it answers about are legacy now: `write_build_started` is deleted and
-    `write_build_outcome` only still runs on the `stop` path of a session nothing can create. The
-    two writers had to go or stay TOGETHER — deleting the start marker's writer alone would have
-    left every legacy build rendering as permanently in progress, and deleting the outcome
-    writer alone would have done the same to any build that did start."""
+    `write_build_outcome` no longer runs on any path production takes. The rows themselves are
+    permanent, which is why this reader stays — deleting it would leave every legacy build
+    rendering as permanently in progress."""
     closed: set[str] = set()
     for row in rows:
         if (

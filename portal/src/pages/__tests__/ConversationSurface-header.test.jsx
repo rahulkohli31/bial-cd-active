@@ -26,7 +26,7 @@ const h = vi.hoisted(() => ({
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  stop: vi.fn(), getStatus: vi.fn(), relaunchPreview: vi.fn(),
+  getStatus: vi.fn(), relaunchPreview: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({

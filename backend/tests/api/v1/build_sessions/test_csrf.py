@@ -28,11 +28,10 @@ _TTL = settings.auth.access_ttl_seconds
 # also carries the superadmin gate, so the caller is allowlisted to prove CSRF (not RBAC) is the
 # failing check.
 _MUTATING_POSTS = [
-    "/v1/build-sessions/{sid}/stop",
     # Lock coordination (`lock/acquire`/`lock/renew`/`lock/release`/`heartbeat`, and finally
-    # `lock/force-end`) is retired — the block banner's Force-end button was its last caller —
-    # so THERE ARE NO LOCK OPS IN THIS TABLE AT ALL. The kill switch a citizen actually reaches
-    # is `projects/{project_id}/stop-active-build`, below.
+    # `lock/force-end`) is retired, and so is the session-scoped `{sid}/stop` that outlasted it,
+    # so THERE IS NO SESSION-SCOPED MUTATION IN THIS TABLE AT ALL. The stop a citizen actually
+    # reaches is `projects/{project_id}/stop-active-build`, below.
     "/v1/build-sessions/internal/reap",
     "/v1/build-sessions/projects/{project_id}/save",
     "/v1/build-sessions/projects/{project_id}/discard",

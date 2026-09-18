@@ -6,8 +6,8 @@
  * Wire format is camelCase; bodies are untrusted `unknown`, narrowed with `toX()` guards — never
  * cast, never `any`. Every non-2xx becomes an `ApiError`, so callers branch on `.status`/`.code`.
  *
- * CSRF: `relaunchPreview` / `stop` (and the project-scoped save / release / stop-active
- * calls below) are mutating POSTs and carry the signed double-submit token (`X-CSRF-Token`,
+ * CSRF: `relaunchPreview` (and the project-scoped save / release / stop-active calls below)
+ * are mutating POSTs and carry the signed double-submit token (`X-CSRF-Token`,
  * reusing `auth.ts` `getCsrfToken()`); `getStatus` GET and the SSE GET (a separate transport,
  * `buildSessionEvents.ts`) are safe methods and carry NO token. This is net-new: no prior
  * business route in the portal enforces CSRF.
@@ -23,8 +23,6 @@ import type {
   RelaunchPreviewRequest,
   RelaunchPreviewResponse,
   SharedPreviewResponse,
-  StopBuildRequest,
-  StopBuildResponse,
 } from './buildSessionTypes'
 
 /**
@@ -136,11 +134,6 @@ function toBuildSessionStatusResponse(value: unknown): BuildSessionStatusRespons
   }
 }
 
-function toStopBuildResponse(value: unknown): StopBuildResponse {
-  if (!isRecord(value)) throw new ApiError('The server returned a build session we could not read.', 500)
-  return { sessionId: requireSessionId(value), status: toBuildSessionStatus(value.status) }
-}
-
 // ─── request plumbing ────────────────────────────────────────────────────────
 
 /** The double-submit CSRF header for a mutating POST, or `{}` when no csrf cookie is readable (parity with `auth.ts`). */
@@ -231,13 +224,6 @@ export async function relaunchPreview(
   return toRelaunchPreviewResponse(body)
 }
 
-/** `stop` — graceful stop (snapshot → teardown → release). Idempotent. `reason` is only sent when supplied. */
-export async function stop(sessionId: string, args: StopBuildRequest = {}, deps: AuthFetchDeps = {}): Promise<StopBuildResponse> {
-  const body = args.reason !== undefined ? { reason: args.reason } : {}
-  const res = await postJson(`${BASE}/${encodeURIComponent(sessionId)}/stop`, body, 'Failed to stop build session', deps)
-  return toStopBuildResponse(res)
-}
-
 /** `getStatus` — the poll surface and the source of the framable `previewUrl` + `lastSeq`. A safe GET: no CSRF. */
 export async function getStatus(sessionId: string, deps: AuthFetchDeps = {}): Promise<BuildSessionStatusResponse> {
   const res = await authFetch(`${BASE}/${encodeURIComponent(sessionId)}`, {}, deps)
@@ -251,12 +237,9 @@ export async function getStatus(sessionId: string, deps: AuthFetchDeps = {}): Pr
 // keep-alive loop that was their only caller was itself deleted, same as `renewLock` and
 // `heartbeat` before them (see the note above).
 //
-// `forceEnd` is gone too, and so is the ROUTE it spoke to. It was the owner-only kill switch
-// for a session stuck mid-`building` that never emits a terminal `ended`, but its one control
-// was the block banner's Force-end button, deleted with the banner — so no surface could reach
-// it any more, and keeping a client for it only advertised a way to end a build that a citizen
-// could not actually take. What a live build offers now is `stop` (graceful, the whole
-// interrupt vocabulary of a turn) and, project-scoped, `stopActiveBuild`.
+// `forceEnd` is gone too, and so is the ROUTE it spoke to; the session-scoped `stop` that
+// replaced it in this comment has since been retired the same way, route and all. What a live
+// build offers now is the turn's own stop and, project-scoped, `stopActiveBuild`.
 
 /**
  * The dependency bag the client + event feed accept, so a hook and a page
@@ -266,14 +249,12 @@ export async function getStatus(sessionId: string, deps: AuthFetchDeps = {}): Pr
  */
 export interface BuildSessionClient {
   relaunchPreview: typeof relaunchPreview
-  stop: typeof stop
   getStatus: typeof getStatus
 }
 
 /** The real, wired-by-default client — already the final implementation, so no later swap between mock and real is needed. */
 export const buildSessionClient: BuildSessionClient = {
   relaunchPreview,
-  stop,
   getStatus,
 }
 

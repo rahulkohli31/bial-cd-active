@@ -237,8 +237,8 @@ async def test_no_writer_can_buy_more_than_its_own_ceiling(
 
 
 # --- `_pardon_the_container` picks the writer from what the turn DID ---------------
-# `_pardon_the_container` is the one place `finish_turn_sandbox` and `_do_finalize` hand a
-# container its keep-alive stay. These tests drive it directly — no HTTP layer, no database —
+# `_pardon_the_container` is where `finish_turn_sandbox` hands a container its keep-alive
+# stay. These tests drive it directly — no HTTP layer, no database —
 # because the fact under test is entirely Redis-visible: which writer, and which deadline,
 # `grant_stay_of_execution` ends up recording.
 

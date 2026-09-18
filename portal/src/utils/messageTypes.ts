@@ -226,8 +226,8 @@ function isEndReason(reason: string): reason is EndReason {
  * states the outcome plainly rather than decoratively.
  *
  * THE REASON IS CONSULTED BEFORE THE STATUS, and that is the one ordering difference from
- * `outcome.py::_summary` — do not "restore" it to match. On the SERVER, `_terminal_status` maps a
- * Stop, a force-end and an idle reap all onto ENDED, so a FAILED status there really does mean
+ * `outcome.py::_summary` — do not "restore" it to match. On the SERVER, a Stop, a force-end and
+ * an idle reap all carried ENDED, so a FAILED status there really does mean
  * something broke and can be answered first. On the turn stream it does not: `_WriteEndedError`
  * finishes as `failed` for every named graceful end there is, quota and workspace-restore
  * included. Answering the status first is exactly what printed "The build failed: quota_exceeded"

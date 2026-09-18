@@ -255,8 +255,8 @@ SANDBOX_TORN_DOWN_EVENT: Final = "sandbox_torn_down"
 """A container's life ended cleanly. The clean finish is silent today, so the log holds starts
 with no ends and no way to tell a tidy shutdown from a process that simply vanished.
 
-Fields: `reason` (`turn_finalize` | `reap_idle` | `reclaim_for_other_project` | `operator` — one
-event, four reasons in a FIELD, per THE ONE RULE), `pardoned`, `lifetime_ms`, and `served: bool`
+Fields: `reason` (`reap_idle` | `reclaim_for_other_project` | `operator` — one event, three
+reasons in a FIELD, per THE ONE RULE), `pardoned`, `lifetime_ms`, and `served: bool`
 read off the serving stamp — the most useful retrospective field in the set, because it answers
 whether this container was ever any use to anybody at all."""
 

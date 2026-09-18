@@ -178,7 +178,7 @@ async def test_every_primitive_but_acquire_still_surfaces_redis_errors(
     # `release_lock_as_holder` and `write_heartbeat` are here for a DIFFERENT reason, and it is
     # the one that is easy to get wrong: they look like compensation paths that deserve a guard,
     # but every caller that wants one already guards at the call site
-    # (`_compensate_lock_and_container`, `_pardon_the_container`, `_do_finalize`), and inside
+    # (`_compensate_lock_and_container`, `_pardon_the_container`), and inside
     # `_holding_user_lock` / `relaunch_preview` the raise is precisely what triggers that
     # compensation. See the two `test_relaunch_spares_the_container_when_*` tests in
     # `test_manager.py`, which pin that behaviour end to end.

@@ -28,7 +28,7 @@ const h = vi.hoisted(() => ({
   resolvePlanOptions: vi.fn(),
   previewProps: [],
   authFetch: vi.fn(),
-  stop: vi.fn(), getStatus: vi.fn(),
+  getStatus: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({

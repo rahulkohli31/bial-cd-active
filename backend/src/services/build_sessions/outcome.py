@@ -9,18 +9,14 @@ session" is unanswerable once the tab is gone. Builds take minutes and users clo
 portal-only design would miss exactly the users the record exists for. The thing that always
 knows a build finished is the thing that finished it, so the server writes.
 
-THE WRITE HALF IS HALF GONE. `write_build_started` — the hidden `build_started` marker — went
-with `SessionManager.start`, its only caller, when the start route was deleted; so did
+THE WRITE HALF IS PARKED, NOT LIVE. `write_build_started` — the hidden `build_started` marker —
+went with `SessionManager.start`, its only caller, when the start route was deleted; so did
 `transcript_head_seq`, which existed to capture that marker's `startedSeq`. `write_build_outcome`
-STAYS, but read the next sentence before trusting it: the live `stop` path does reach
-`_record_outcome` through `_end` -> `_finalize`, and `_record_outcome` then returns immediately
-on `if session.conversation_id is None`. Nothing in `src/` sets that field — the one production
-`BuildSession(...)` omits it, and the only assignment in the repository is a test fixture whose
-own docstring says it builds a shape production cannot produce. So the CALL is reachable and
-the BODY is not. The function is kept rather than deleted because the `{sessionId}` routes it
-belongs to are kept (they read `build_outcome` rows already in the production database), and
-cutting the writer while keeping that reader is the half-state this deletion deliberately
-avoided. Treat it as parked, not as live.
+STAYS, and nothing in `src/` calls it any more: the end sequence that did was retired with the
+session-scoped stop route. It is kept rather than deleted because the `{sessionId}` routes it
+belongs to are kept — they read `build_outcome` rows already in the production database — and it
+is how those readers are tested against a faithful row rather than a hand-built dict. Treat it as
+parked: a writer for tests and for a future re-home, not a path production takes.
 
 Two consequences to know rather than rediscover. (1) No new `build_started`
 rows are written, so `projection._closed_sessions()` has nothing to close and the projection's
@@ -36,10 +32,6 @@ native. Idempotency keys on
 `meta->>'sessionId'`; `startedSeq` was the attachment-consumption boundary the now-deleted
 `attachments.py` read. Seq allocation and the two-writer retry live in the store's
 `append_batch`.
-
-Written BEFORE the terminal frame: `_do_finalize` calls this immediately before emitting
-`ended`, so the row exists before any client learns the build is over — reversed, this would
-race every reader.
 
 TODO: once BRAIN persists its full transcript per step, this row becomes that stream's terminal
 lifecycle entry (provisioned/quota/stopped/reaped entries join it); re-home the writer then.
@@ -66,10 +58,9 @@ from src.services.messages.store import (
 
 _log = structlog.get_logger()
 
-# The graceful end reasons whose prose differs from a natural finish. `manager.py` imports the
-# first two for its `stop`/`force_end` defaults: the token and the sentence it produces must move
-# together, because a drifted token does not fail loudly — it falls straight back through to
-# "Build finished.", which is the bug these arms exist to fix.
+# The graceful end reasons whose prose differs from a natural finish. The token and the sentence
+# it produces must move together, because a drifted token does not fail loudly — it falls
+# straight back through to "Build finished.", which is the bug these arms exist to fix.
 #
 # SPELLED HERE RATHER THAN IMPORTED FROM `turns/copy.END_REASONS`, which is where every other
 # producer's reason lives: `src/services/turns/__init__` imports the turn engine, and the engine
@@ -78,11 +69,8 @@ _log = structlog.get_logger()
 STOPPED_BY_USER: Final = "stopped_by_user"
 FORCE_ENDED: Final = "force_ended"
 # The idle reaper's reason — part of the documented terminal set (`build_sessions/schemas.py`).
-# NOTHING IN `src` IMPORTS IT, and it is not dead: `_summary` reads it below, and that arm is
-# reachable because `StopBuildRequest.reason` is caller-supplied — `stop_build` passes it straight
-# through to `manager.stop(..., reason=...)`. So a stop carrying this reason produces the prose
-# that names it rather than falling back to "Build finished.", which is the whole point of keying
-# these arms on the REASON rather than the status.
+# Read by `_summary` below, which keys its arms on the REASON rather than the status precisely so
+# that a row carrying this one reads as what it was instead of "Build finished.".
 IDLE_TEARDOWN: Final = "idle_teardown"
 QUOTA_EXCEEDED: Final = "quota_exceeded"
 """The fourth token this module keys an arm on — a spent daily budget, raised by the turn engine
@@ -129,9 +117,9 @@ def _summary(status: BuildSessionStatus, reason: str | None) -> str:
     """The outcome's prose. This is the payload's TEXT, so it is both what a reader sees and what
     the model is replayed as history on the user's next turn — hence plain, factual wording.
 
-    Every arm under the FAILED one keys on the REASON, because the STATUS cannot tell these apart:
-    `_terminal_status` maps a natural finish, a Stop, a force-end and an idle reap ALL onto ENDED.
-    Reading the status alone is what recorded a build stopped at minute two as "Build finished." —
+    Every arm under the FAILED one keys on the REASON, because the STATUS cannot tell these
+    apart: a natural finish, a Stop, a force-end and an idle reap all carry ENDED. Reading the
+    status alone is what recorded a build stopped at minute two as "Build finished." —
     permanently, and then replayed that back to the model as history on the user's next turn.
     """
     if status is BuildSessionStatus.FAILED:
@@ -141,8 +129,8 @@ def _summary(status: BuildSessionStatus, reason: str | None) -> str:
     if reason == STOPPED_BY_USER:
         return "You stopped this build before it finished."
     if reason == FORCE_ENDED:
-        # The one graceful end that DISCARDS its work: `_do_finalize` skips the snapshot when
-        # `force_ended` is set, so any summary implying otherwise is a lie about the user's code.
+        # The one graceful end that DISCARDED its work — the kill switch skipped the snapshot —
+        # so any summary implying otherwise is a lie about the user's code.
         return "This build was force-stopped before it finished, and its work was discarded."
     if reason == IDLE_TEARDOWN:
         return "This build was stopped because it sat idle."

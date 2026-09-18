@@ -14,7 +14,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  stop: vi.fn(), getStatus: vi.fn(), relaunchPreview: vi.fn(),
+  getStatus: vi.fn(), relaunchPreview: vi.fn(),
   fetchSaveState: vi.fn(), fetchPreviewState: vi.fn(), saveProject: vi.fn(),
   discardUnsavedChanges: vi.fn(),
 }))
@@ -104,9 +104,8 @@ describe('a running turn is STILL stoppable now the card is gone', () => {
     const stop = await screen.findByTestId('stop-turn')
     expect(stop.textContent).toMatch(/stop/i)
     fireEvent.click(stop)
-    // The TURN stop, with the conversation and the turn read at PRESS time — never the session's.
+    // The TURN stop, with the conversation and the turn read at PRESS time.
     await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith('build-X', 'turn-7'))
-    expect(h.stop).not.toHaveBeenCalled()
 
     // PAIRED WITH A LIVENESS ASSERTION, because a surface that rendered nothing would also have
     // no build card.

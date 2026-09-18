@@ -20,7 +20,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(),
+  relaunchPreview: vi.fn(), getStatus: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -311,7 +311,6 @@ describe('showing the outcome', () => {
     // meaning the same thing afterwards.
     fireEvent.click(await screen.findByTestId('stop-turn'))
     await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith('thread-1', 't1'))
-    expect(h.stop).not.toHaveBeenCalled() // never a session-level stop
 
     await turn.frame(T_BUILD_END({ turnId: 't1', status: 'stopped', reason: 'stopped_by_user' }))
     await turn.end('completed')

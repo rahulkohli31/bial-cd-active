@@ -404,7 +404,7 @@ async def test_revoke_never_touches_the_recipients_own_build(
     session = await manager.ensure_sandbox(
         db_session, recipient, recipient_project.id, sandbox_client=build_client, may_write=True
     )
-    await manager._finalize(session, "completed", build_client)  # noqa: SLF001 - pardons it
+    await manager.finish_turn_sandbox(session, build_client, touched=True)  # pardons it
 
     revoked = await manager.revoke_shared_preview(
         recipient.id, app_id, sandbox_client=build_client
@@ -465,7 +465,7 @@ async def test_give_up_shared_view_never_touches_the_recipients_own_build(
     session = await manager.ensure_sandbox(
         db_session, recipient, recipient_project.id, sandbox_client=build_client, may_write=True
     )
-    await manager._finalize(session, "completed", build_client)  # noqa: SLF001 - pardons it
+    await manager.finish_turn_sandbox(session, build_client, touched=True)  # pardons it
 
     gave_up = await manager.give_up_shared_view(recipient.id, sandbox_client=build_client)
 

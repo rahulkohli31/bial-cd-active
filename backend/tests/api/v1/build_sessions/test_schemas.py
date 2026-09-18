@@ -28,14 +28,12 @@ from src.api.v1.build_sessions.schemas import (
     ErrorEvent,
     ErrorSource,
     EscalationEvent,
-    ForceEndResponse,
     PreviewReadyEvent,
     PreviewReconnectingEvent,
     ProgressEnvelope,
     QuotaExceededEvent,
     StartBuildResponse,
     StepEvent,
-    StopBuildResponse,
 )
 from src.main import create_app
 
@@ -128,27 +126,12 @@ def test_start_response_requires_its_fields() -> None:
         StartBuildResponse.model_validate({"session_id": str(uuid.uuid4())})
 
 
-# --- lock-op response models ----------------------------------------------------
+# --- lock-op response models: none left -----------------------------------------
 # `LockStateResponse` / `LockReleaseResponse` / `HeartbeatResponse` were retired along with the
 # `acquire` / `renew` / `release` / `heartbeat` routes they served — nothing called them (the
-# portal's keep-alive loop that was their only caller was itself deleted).
-# `ForceEndResponse` outlived them and has now outlived its own route too: the `POST
-# /{session_id}/lock/force-end` route was deleted, so NO ROUTE SERVES THIS MODEL. It is kept
-# because `tests/test_import_graph.py` freezes the schema surface at this location, and the
-# shape is still what `SessionManager.force_end` — which keeps its service tests — would answer
-# with.
-
-
-def test_force_end_response_validates() -> None:
-    sid = uuid.uuid4()
-    assert ForceEndResponse(session_id=sid, status=BuildSessionStatus.ENDED).status is (
-        BuildSessionStatus.ENDED
-    )
-
-
-def test_stop_response_carries_terminal_status() -> None:
-    resp = StopBuildResponse(session_id=uuid.uuid4(), status=BuildSessionStatus.ENDED)
-    assert resp.status is BuildSessionStatus.ENDED
+# portal's keep-alive loop that was their only caller was itself deleted). `ForceEndResponse`
+# outlived them, then went with the end sequence its route drove; `StopBuildRequest` /
+# `StopBuildResponse` went the same way with `POST /{session_id}/stop`.
 
 
 # --- the tagged-union progress envelope ---------------------------------------

@@ -207,33 +207,24 @@ async def _the_slot_is_free(manager: SessionManager, user_id: uuid.UUID) -> None
 # --- the budget, derived rather than chosen -------------------------------------------
 
 
-def test_the_stop_budget_sits_above_the_unwind_each_branch_actually_runs() -> None:
+def test_the_stop_budget_sits_above_the_unwind_it_waits_on() -> None:
     """The budget is COMPUTED FROM THE PRIMITIVES here, not the module's derived intermediate,
     so it is a check and not a restatement: if the per-exec bound or exec count moves, this
-    recomputes the branch's real cost and the budget has to keep up. A budget below either
-    branch's real bound reports a healthy stop as one that did not finish.
+    recomputes the real cost and the budget has to keep up. A budget below the unwind's own
+    bound reports a healthy stop as one that did not finish.
 
-    ONE OF THE TWO BRANCHES IS NO LONGER REACHED FROM THIS BUDGET, and it is kept anyway. The
-    build arm of `_stop_the_held_session` went with `SessionManager.start`, so a stop no longer
-    runs `_do_finalize` — but `_do_finalize` still costs exactly this much on the `stop` /
-    `force_end` path, and `_STOP_ACTIVE_WORK_TIMEOUT_SECONDS`'s own derivation in `manager.py`
-    still names it as the larger of the two it is set from. Dropping the assertion would let the
-    constant fall under the number its comment says it clears, silently. The WRITE assertion is
-    the live one; the build assertion holds the constant to its own stated derivation.
+    TWO NUMBERS, because the unwind has two parts. `finish_turn_sandbox`'s recovery autosave
+    carries its own bound, and whatever the turn was doing when it was cut has to come back
+    first — the widest per-container bound anything carries is the snapshot layer's, which is
+    what the ceiling clears.
 
-    Mutation check: make the budget the sum of the recovery autosave and the record again and the
-    build-branch assertion goes red while the write-branch one stays green."""
-    build_branch = (
-        SNAPSHOT_EXECS * SNAPSHOT_EXEC_TIMEOUT_SECONDS
-        + manager_module._OUTCOME_WRITE_TIMEOUT_SECONDS
-    )
-    write_branch = (
-        manager_module._RECOVERY_SNAPSHOT_TIMEOUT_SECONDS
-        + manager_module._OUTCOME_WRITE_TIMEOUT_SECONDS
-    )
-    assert build_branch > 0 and write_branch > 0  # liveness: both parts are real numbers
-    assert manager_module._STOP_ACTIVE_WORK_TIMEOUT_SECONDS >= build_branch
-    assert manager_module._STOP_ACTIVE_WORK_TIMEOUT_SECONDS >= write_branch
+    Mutation check: drop either term from the derivation in `manager.py` and one of the two
+    assertions below goes red."""
+    cut_short = SNAPSHOT_EXECS * SNAPSHOT_EXEC_TIMEOUT_SECONDS
+    autosave = manager_module._RECOVERY_SNAPSHOT_TIMEOUT_SECONDS
+    assert cut_short > 0 and autosave > 0  # liveness: both parts are real numbers
+    assert manager_module._STOP_ACTIVE_WORK_TIMEOUT_SECONDS > cut_short
+    assert manager_module._STOP_ACTIVE_WORK_TIMEOUT_SECONDS > autosave
 
 
 # --- the status read -----------------------------------------------------------------
@@ -431,15 +422,11 @@ async def test_a_dropped_connection_mid_stop_loses_no_work_and_takes_no_containe
     picks the answer up exactly where it was — which is only possible because the stop is a
     detached task and the ask was recorded, not because anything guessed from elapsed time.
 
-    WHAT "LOST NOTHING" MEANS ON THIS PATH. A stopped BUILD ran `_do_finalize`, whose step 1
-    pushed the saved snapshot, and this ended by finding it in storage. A stopped TURN takes the
-    other ending: `finish_turn_sandbox` PARDONS the container rather than tearing it down,
-    deliberately — a Write turn's container is the preview the citizen is looking at, and the
-    turn ending is not a reason for their app to vanish. So the tree that held their work is
-    still running behind a lease, which is asserted here instead: nothing torn down and the
-    registry — the sweep's only map to it — still there. Weaker in no direction that matters: on
-    the build path the container went and the bundle was all that survived; here the container
-    itself survives."""
+    WHAT "LOST NOTHING" MEANS ON THIS PATH. A stopped turn PARDONS its container rather than
+    tearing it down, deliberately — a Write turn's container is the preview the citizen is
+    looking at, and the turn ending is not a reason for their app to vanish. So the tree that
+    held their work is still running behind a lease, which is what is asserted here: nothing
+    torn down and the registry — the sweep's only map to it — still there."""
     user, project_a = await _mk(db_session, "stop6@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()

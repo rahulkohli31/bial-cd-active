@@ -91,8 +91,8 @@ FORCE_ENDED: Final = "force_ended"
 the citizen's code."""
 
 IDLE_TEARDOWN: Final = "idle_teardown"
-"""The idle reaper's reason. Caller-supplied through `StopBuildRequest.reason`, which is what
-makes it reachable even though nothing in `src` raises it."""
+"""The idle reaper's reason. Carried by rows the reaper already wrote; nothing in `src` raises
+it today."""
 
 END_REASONS: Final[frozenset[str]] = frozenset(
     {

@@ -81,17 +81,6 @@ export interface SharedPreviewResponse {
   snapshotTakenAt: string | null
 }
 
-/** `POST …/stop` body — an optional free-text reason for the audit / activity feed. */
-export interface StopBuildRequest {
-  reason?: string | null
-}
-
-/** `POST …/stop` → 200. `status` is `ended` after a graceful stop (idempotent). */
-export interface StopBuildResponse {
-  sessionId: string
-  status: BuildSessionStatus
-}
-
 /**
  * `GET /v1/build-sessions/{id}` → 200. The poll surface and the source of the
  * framable `previewUrl`. `previewUrl` is null until `ready`, then STABLE. `lastSeq`

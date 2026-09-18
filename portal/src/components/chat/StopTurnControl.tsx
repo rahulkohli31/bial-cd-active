@@ -22,25 +22,24 @@ export interface StopTurnControlProps {
   /** A turn — or a legacy build session — is running. No run, no control: this renders `null`. */
   running: boolean
   /**
-   * Resolve the live turn AT PRESS TIME, returning `null` when there is no turn id — a legacy
-   * build session, not an error. A getter rather than a plain `turnId` prop is not ceremony: the
+   * Resolve the live turn AT PRESS TIME, returning `null` when there is no turn id — the window
+   * between a turn being marked running and its first frame. A getter rather than a plain
+   * `turnId` prop is not ceremony: the
    * surface holds the live turn id in a ref because the stop handler is created once and would
    * otherwise close over whichever turn was live at its first render — a prop read during render
-   * reintroduces that staleness one layer up, silently (stopping the previous turn, or falling to
-   * the session arm early). Reading at press time is the only version that cannot be stale.
+   * reintroduces that staleness one layer up, silently, stopping the previous turn. Reading at
+   * press time is the only version that cannot be stale.
    */
   resolveTarget: () => StopTarget | null
   /**
    * Stop the live turn, with the conversation id and turn id `resolveTarget` returned.
    *
    * The resolved value is deliberately `unknown`: `stopTurn` answers `"stopping"` or
-   * `"already_settled"` and `session.stop()` answers a boolean. This control cares only that the
-   * request SETTLED — a rejection is the failure, and "already settled" is a perfectly good
-   * outcome for someone who pressed Stop as the turn was finishing anyway.
+   * `"already_settled"`. This control cares only that the request SETTLED — a rejection is the
+   * failure, and "already settled" is a perfectly good outcome for someone who pressed Stop as
+   * the turn was finishing anyway.
    */
   onStopTurn: (conversationId: string, turnId: string) => Promise<unknown>
-  /** Stop a legacy build session, which has no turn id. */
-  onStopSession: () => Promise<unknown>
   /**
    * A stop request failed. The caller decides where the sentence lands — the surface
    * consolidates those onto its assertive slot. What this component guarantees is that a
@@ -55,7 +54,6 @@ export default function StopTurnControl({
   running,
   resolveTarget,
   onStopTurn,
-  onStopSession,
   onStopFailed,
 }: StopTurnControlProps) {
   const [stopping, setStopping] = useState(false)
@@ -77,14 +75,15 @@ export default function StopTurnControl({
     setStopping(true)
     try {
       const target = resolveTarget()
+      // A press with no turn to name does nothing: this control is turn-only now, and the
+      // session-scoped stop it used to fall back to is retired along with its route.
       if (target) await onStopTurn(target.conversationId, target.turnId)
-      else await onStopSession()
     } catch {
       onStopFailed(STOP_FAILED)
     } finally {
       if (mounted.current) setStopping(false)
     }
-  }, [stopping, resolveTarget, onStopTurn, onStopSession, onStopFailed])
+  }, [stopping, resolveTarget, onStopTurn, onStopFailed])
 
   if (!running) return null
 

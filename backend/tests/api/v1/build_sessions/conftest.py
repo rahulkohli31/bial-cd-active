@@ -75,11 +75,10 @@ async def a_live_session(
     `{session_id}` routes can resolve. Every test in this package that used to conjure a session
     by starting a build now comes through here.
 
-    Two things the deleted start route produced that this deliberately does NOT: a `run_build` task
-    (`session.task` is `None` on every session production can build now) and any envelopes. A
-    test that needs progress frames pushes them through `manager.on_progress`, which documents
-    that it must derive correct state from envelopes handed to it directly; a test that needs a
-    terminal drives `manager.stop(...)`, the same method the surviving stop route calls.
+    One thing the deleted start route produced that this deliberately does NOT: envelopes. A
+    test that needs progress frames — a terminal `ended` included — pushes them through
+    `manager.on_progress`, which documents that it must derive correct state from envelopes
+    handed to it directly.
 
     `may_write=True` by default because that is what the guards this package tests actually
     branch on — `_writing_session_holds` is what makes Save refuse — and a read-only default
@@ -97,9 +96,9 @@ def wire(app: FastAPI, db_session, monkeypatch: pytest.MonkeyPatch) -> SimpleNam
     the same instance the routes resolve. (This fixture used to say the test sets its own
     `run_build_dependency` override; that seam is deleted along with the start route.)
 
-    The manager's session factory is bound to the ROLLED-BACK test session: the end sequence
-    writes the build outcome through its own session, so an unbound manager would commit real
-    rows into the test database and leak them across tests.
+    The manager's session factory is bound to the ROLLED-BACK test session: the manager opens
+    its OWN session for work that outlives a request, so an unbound one would commit real rows
+    into the test database and leak them across tests.
     """
     monkeypatch.setattr(settings, "sandbox", _sandbox_config())
 

@@ -50,7 +50,7 @@ async def test_last_seq_hands_the_baton_to_the_session_api_terminal() -> None:
     await emitter.step(name="scaffold", label="Scaffolding…", state="started")
     await emitter.preview_ready(preview_url="https://x/")
 
-    # What `_do_finalize` does with the verdict's `last_seq`.
+    # What a terminal frame does with the verdict's `last_seq`.
     terminal_seq = emitter.last_seq + 1
     assert terminal_seq == 3
     assert terminal_seq == max(env.seq for env in captured) + 1

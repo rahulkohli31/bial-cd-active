@@ -154,10 +154,9 @@ async def test_ensure_sandbox_allocates_a_build_worth_of_state_without_the_build
     assert await heartbeat_is_alive(fake_redis, user.id) is True
     assert await read_registry(fake_redis, user.id) is not None
 
-    # And nothing a build would run. `attachments` used to be the fourth of these; the field
-    # itself is gone from `BuildSession` now that nothing can populate it, so its absence is
-    # structural rather than something a test has to keep watching.
-    assert session.task is None
+    # And nothing a build would run. `attachments` used to be one of these, and `task` another;
+    # both fields are gone from `BuildSession` now that nothing can populate them, so their
+    # absence is structural rather than something a test has to keep watching.
     assert session.prompt == ""
     assert session.started_seq is None
     assert session.conversation_id is None
@@ -266,7 +265,6 @@ async def test_the_turn_terminal_does_not_save_because_saving_is_the_users_call(
     await manager.finish_turn_sandbox(session, client, touched=True)
 
     assert snapshot_key(session.app_id) not in fake_storage.objects
-    assert session.snapshot_committed is False
 
 
 async def test_the_user_clicking_save_is_what_writes_the_bundle(
@@ -396,9 +394,8 @@ async def test_no_workspace_reads_as_unknown_never_as_clean(
 async def test_the_terminal_pardons_the_container_so_the_preview_outlives_the_turn(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    # The Write path diverges from `_do_finalize` here rather than omitting from it: a build's
-    # container is scaffolding that survives only a clean success, but a Write turn's container
-    # IS the preview on screen — the turn ending is not a reason for it to go dark.
+    # A Write turn's container IS the preview on screen, so the turn ending is not a reason for
+    # it to go dark: it is pardoned, never torn down.
     user, project_id = await _mk(db_session, "w7@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()

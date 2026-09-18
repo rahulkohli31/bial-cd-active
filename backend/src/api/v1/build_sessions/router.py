@@ -2,19 +2,18 @@
 
 WHY THIS EXISTS
 
-`stop` / `status` + the SSE feed + `relaunch` + the project-scoped save/preview/stop ops + the
+`status` + the SSE feed + `relaunch` + the project-scoped save/preview/stop ops + the
 superadmin `internal/reap`, all owner-scoped by `user.id`: every not-found-or-other-user case
 is a non-leaking 404. The mutating POSTs carry the reusable `RequireCsrf` dependency; the
 `status` GET and the GET-SSE progress feed (`sse.py`, `Last-Event-ID`-resumable) are exempt.
 
-THERE IS NO `start` ANY MORE, and the three `{session_id}` routes below serve HISTORICAL sessions
+THERE IS NO `start` ANY MORE, and the two `{session_id}` routes below serve HISTORICAL sessions
 only. The bare `POST` on this collection — the start route — lost its browser client and was
-deleted here with the whole harness behind it; the last lock op, `lock/force-end`, went with it
-(it had had no UI since the block banner's Force-end button was removed, which both
-`buildSessionApi.ts` and `useBuildSession.ts` recorded in their own comments). The only remaining
-producer of a session id the portal can reach is a `build_started` transcript row written before
-that deletion — those rows are permanent, so `status`/`stop`/`events` stay as their reader. A
-build now runs as an ordinary Write chat turn, which registers its workspace through
+deleted here with the whole harness behind it; the last lock op, `lock/force-end`, went with it,
+and the session-scoped `stop` followed once nothing could mint a session id for a client to name.
+The only remaining producer of a session id the portal can reach is a `build_started` transcript
+row written before that deletion — those rows are permanent, so `status`/`events` stay as their
+reader. A build now runs as an ordinary Write chat turn, which registers its workspace through
 `SessionManager.ensure_sandbox` and never serialises a session id at all.
 
 One inbound route here is not a control op at all — `projects/{project_id}/client-error`,
@@ -64,8 +63,6 @@ from src.api.v1.build_sessions.schemas import (
     RenewPresenceRequest,
     RenewPresenceResponse,
     SharedPreviewResponse,
-    StopBuildRequest,
-    StopBuildResponse,
     WorkspaceCheckResponse,
 )
 from src.api.v1.build_sessions.sse import build_sse_response
@@ -465,27 +462,6 @@ async def relaunch_preview(
             ready=relaunched.ready,
         )
     raise _coordination_is_gone()
-
-
-@router.post(
-    "/{session_id}/stop",
-    dependencies=[RequireCsrf],
-    responses=error_responses(
-        (403, ErrorEnvelope, "CSRF check failed"),
-        AUTH_401,
-        (404, ErrorEnvelope, "Build session not found"),
-    ),
-)
-async def stop_build(
-    session_id: uuid.UUID,
-    body: StopBuildRequest,
-    user: CurrentUser,
-    sandbox: SandboxDep,
-    manager: SessionManagerDep,
-) -> StopBuildResponse:
-    session = _owned_or_404(manager, session_id, user.id)
-    ended = await manager.stop(session, sandbox, reason=body.reason or "stopped_by_user")
-    return StopBuildResponse(session_id=ended.session_id, status=ended.status)
 
 
 async def _project_owning_app_name(

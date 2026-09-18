@@ -1,9 +1,11 @@
-"""Build-session control ops: stop / status (cookie auth + CSRF, owner-scoping).
+"""Build-session control ops: status (cookie auth + CSRF, owner-scoping) and the
+project-scoped stop-and-switch.
 
-`start` is gone from the title and from this file. The bare `POST /v1/build-sessions` was
-deleted along with `SessionManager.start`, and every test whose subject was that route went with
-it; the ones below test surfaces that survive it, re-fixtured onto `a_live_session` — the
-`ensure_sandbox` door production uses."""
+`start` is gone from the title and from this file, and so is the session-scoped `stop`. The bare
+`POST /v1/build-sessions` was deleted along with `SessionManager.start`, and `POST
+/{session_id}/stop` followed with the end sequence behind it; every test whose subject was
+either route went with it. The ones below test surfaces that survive, re-fixtured onto
+`a_live_session` — the `ensure_sandbox` door production uses."""
 
 from __future__ import annotations
 
@@ -15,7 +17,12 @@ from fastapi import FastAPI
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.build_sessions.schemas import PreviewReadyEvent, StepEvent
+from src.api.v1.build_sessions.schemas import (
+    BuildSessionStatus,
+    EndedEvent,
+    PreviewReadyEvent,
+    StepEvent,
+)
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.manager import StopOutcome
 from src.services.build_sessions.snapshot import RecoveryOutcome, RecoveryWrite
@@ -35,11 +42,10 @@ async def test_status_after_completion_carries_preview_and_last_seq(
     """The status read reports a FINISHED session's terminal state — the three fields the
     portal branches on, and the reason the route survived the start route's deletion.
 
-    Re-fixtured onto `a_live_session` + the real end sequence. The two progress frames are
-    pushed straight through `manager.on_progress` (which documents that it must derive state
-    from envelopes handed to it directly) instead of coming out of a brain, and the terminal is
-    the one `manager.stop` synthesizes — the same seq-3 `ended` a natural completion produced,
-    from the same emitter."""
+    Re-fixtured onto `a_live_session`. All three frames are pushed straight through
+    `manager.on_progress`, which documents that it must derive state from any envelope handed to
+    it directly; the terminal `ended` is the frame a finished session's feed carries, so the
+    status this asserts is derived exactly as production derives it."""
     user, project = await _user_project(db_session, "ctl5@rvaiglobal.com")
     session = await a_live_session(wire, db_session, user, project.id)
     await wire.manager.on_progress(
@@ -48,7 +54,16 @@ async def test_status_after_completion_carries_preview_and_last_seq(
     await wire.manager.on_progress(
         session, PreviewReadyEvent(seq=2, preview_url="https://preview.example/")
     )
-    await wire.manager.stop(session, wire.sbx, reason="completed")
+    await wire.manager.on_progress(
+        session,
+        EndedEvent(
+            seq=3,
+            status=BuildSessionStatus.ENDED,
+            preview_url="https://preview.example/",
+            snapshot_committed=True,
+            reason="completed",
+        ),
+    )
 
     sid = session.session_id
     s = await client.get(f"/v1/build-sessions/{sid}", headers=auth_headers(user))
@@ -69,21 +84,6 @@ async def test_status_of_another_users_session_is_404(
         f"/v1/build-sessions/{session.session_id}", headers=auth_headers(intruder)
     )
     assert s.status_code == 404  # non-leaking
-
-
-async def test_stop_is_idempotent(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
-) -> None:
-    """Two stops on one session both answer `ended` — the second joins the first's shielded
-    end sequence (`_await_end_sequence`) rather than starting a second one. The session is a
-    live workspace rather than a build now; the route's idempotence is unchanged by that."""
-    user, project = await _user_project(db_session, "ctl7@rvaiglobal.com")
-    session = await a_live_session(wire, db_session, user, project.id)
-    sid = session.session_id
-    s1 = await client.post(f"/v1/build-sessions/{sid}/stop", json={}, headers=auth_headers(user))
-    assert s1.status_code == 200 and s1.json()["status"] == "ended"
-    s2 = await client.post(f"/v1/build-sessions/{sid}/stop", json={}, headers=auth_headers(user))
-    assert s2.status_code == 200 and s2.json()["status"] == "ended"  # idempotent
 
 
 # --- stop-and-switch, over HTTP -------------------------------------------------------

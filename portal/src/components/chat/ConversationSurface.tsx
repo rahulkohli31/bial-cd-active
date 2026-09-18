@@ -423,8 +423,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // belongs to the press-session, and the control that is pressed is the one that can hold it.
   const [livePlanOptions, setLivePlanOptions] = useState<PlanOptionsItem | null>(null)
   const [planOverrides, setPlanOverrides] = useState<Record<string, PlanOverrideValue>>({})
-  // `turnError` covers the chat half (429 daily cap, refused turn, in-band failure);
-  // `session.error` covers the build half. Distinct sources, both above the composer.
+  // `turnError` covers the chat half: 429 daily cap, refused turn, in-band failure.
   const [turnError, setTurnError] = useState<string | null>(null)
   // What the PLATFORM has to say about the workspace itself: it was reset and is being put
   // back, it was reset and cannot be, we could not check it. These arrive as `workspace` frames
@@ -779,22 +778,20 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // app was running, and then refused to point the pane at the very URL that read had handed it.
   //
   // WHY THE CLAIM IS HONEST, AND WHY THE GUARD IS THE WHOLE OF IT. One instance of this component
-  // survives a project switch, so an unconditional stamp would hand project A's live session, the
-  // error left by A's failed attempt, and the URL A's start produced to project B — `showSession`,
-  // `buildActive`, `urgentText` and the relaunched arm all read this ref. So the claim is made only
-  // while this surface holds NOTHING attributed to another project: no session id, no error from an
-  // attempt that failed, no URL from a start. In that state the stamp moves exactly one thing — the
-  // project arm, whose input is a read keyed on the open project by construction — because every
-  // other gate it opens has nothing to say.
+  // survives a project switch, so an unconditional stamp would hand project A's live session and
+  // the URL A's start produced to project B — `showSession`, `buildActive` and the relaunched arm
+  // all read this ref. So the claim is made only while this surface holds NOTHING attributed to
+  // another project: no session id, no URL from a start. In that state the stamp moves exactly one
+  // thing — the project arm, whose input is a read keyed on the open project by construction —
+  // because every other gate it opens has nothing to say.
   //
   // Assigned during render, like the refs above and for the reason the block below gives: a gate
   // that depends on declaration order is one reorder away from silently opening.
-  if (projectId && session.sessionId === null && session.error === null && startedPreviewUrl === null) {
+  if (projectId && session.sessionId === null && startedPreviewUrl === null) {
     sessionProjectRef.current = projectId
   }
-  // The session's surfaces render only while viewing a chat of ITS project (it is project-scoped).
-  // `error` comes from an attempt that FAILED (the reset leaves sessionId null), so it gates on the
-  // project stamp alone; the live surfaces also require a sessionId.
+  // The session's surfaces render only while viewing a chat of ITS project (it is project-scoped),
+  // so they require both the project stamp and a sessionId.
   //
   // Derived HERE, above every handler, and not down beside the JSX where the rest of the render
   // derivations live: `handleSend` reads `buildActive`, and a gate that depends on declaration
@@ -1801,12 +1798,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       sessionId: sid,
       previewUrl: session.previewUrl ?? null,
       endedAt: new Date().toISOString(),
-      // UNKNOWN, not false. `finishSession('ended')` closes the feed the moment the stop HTTP call
-      // resolves, so the real `ended` frame — which for a graceful stop says snapshot_committed:
-      // true, because `_do_finalize` DID snapshot — may never be dispatched here. Collapsing that
-      // into `false` warned the user their code wasn't saved about a build that saved it. The card
-      // warns only on an explicit `false`, and the server's row (which always carries the real
-      // value) replaces this one on reload.
+      // UNKNOWN, not false. `finishSession` can settle before the real `ended` frame is
+      // dispatched here, and that frame is the only thing that knows whether a bundle was
+      // written. Collapsing the gap into `false` warned the user their code wasn't saved about a
+      // build that saved it. The card warns only on an explicit `false`, and the server's row
+      // (which always carries the real value) replaces this one on reload.
       snapshotCommitted: ended?.snapshot_committed ?? null,
       reason: ended?.reason ?? null,
     })
@@ -1967,16 +1963,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       if (sessionLive && sessionProjectRef.current !== projectId) {
         setUrgent('You already have a build running in another application. Stop it before starting one here.')
         return
-      }
-      if (sessionLive) {
-        // The refine loop: end THIS project's live session gracefully before the fresh
-        // build (the server would reap through it anyway; a courteous stop keeps its
-        // snapshot + terminal clean).
-        const stopped = await session.stop()
-        if (!stopped) {
-          setUrgent(session.error || 'Could not stop the running build — try again.')
-          return
-        }
       }
       const outcome = await buildFromPlan(activeBuildId, toolCallId, newChatId)
       setPlanOverrides((prev) => ({ ...prev, [toolCallId]: 'build' }))
@@ -2878,10 +2864,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     return conversationId && turnId ? { conversationId, turnId } : null
   }, [])
 
-  const handleStopSession = useCallback(async () => {
-    await sessionRef.current.stop()
-  }, [])
-
   /**
    * The thread's own cancel, which is what registers the runtime's `cancel` capability.
    *
@@ -2890,12 +2872,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
    */
   const handleCancel = useCallback(async () => {
     const target = stopTarget()
-    if (target) {
-      await stopTurn(target.conversationId, target.turnId)
-      return
-    }
-    await handleStopSession()
-  }, [stopTarget, handleStopSession])
+    if (target) await stopTurn(target.conversationId, target.turnId)
+  }, [stopTarget])
 
   /**
    * WHY SEND IS UNAVAILABLE, when the reason is not simply "a reply is in flight".
@@ -2948,7 +2926,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // Named once, because the region's presence test and its content have to be the same value —
   // written out twice they are two expressions that can be edited apart, and the failure mode is
   // an empty `role="alert"` box or a sentence with no box around it.
-  const urgentText = urgent ?? (sessionProjectMatches ? session.error : null)
+  const urgentText = urgent
 
   return (
     <div className="flex flex-1 min-h-0 overflow-hidden">
@@ -3094,16 +3072,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
             // `buildActiveHere` is a LEGACY build session adopted on a reload, which sets no
             // streaming flag at all. Gating on the turn alone left a reloaded mid-build tab with a
             // running build and no way to stop it — the exact hole the deleted bubble's own
-            // session-scoped condition used to cover. `resolveTarget` returns `null` when there is
-            // no turn id, which is precisely how the control reaches `onStopSession`.
+            // session-scoped condition used to cover.
             stop={
               isRunning || buildActiveHere
-                ? {
-                    running: true,
-                    resolveTarget: stopTarget,
-                    onStopTurn: stopTurn,
-                    onStopSession: handleStopSession,
-                  }
+                ? { running: true, resolveTarget: stopTarget, onStopTurn: stopTurn }
                 : undefined
             }
             offer={

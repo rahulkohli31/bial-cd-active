@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import {
   relaunchPreview,
-  stop,
   getStatus,
   buildSessionClient,
   BuildSessionAlreadyActiveError,
@@ -53,12 +52,12 @@ function headerOf(m: ReturnType<typeof jsonFetch>, name: string, call = 0): stri
 // `renewLock` / `releaseLock` / `heartbeat` after they were gone, unnoticed because nothing
 // forced its stale keys to be read against the real surface. This test fails LOUDLY the
 // moment `buildSessionClient` gains or loses a member, so the next removal cannot leave the
-// same kind of residue behind unnoticed — it did its job again for `forceEnd`'s removal,
-// which is why the set is DOWN to three and not quietly still four.
-const _CLIENT_MEMBERS = new Set(['relaunchPreview', 'stop', 'getStatus'])
+// same kind of residue behind unnoticed — it did its job again for `forceEnd`'s removal and
+// again for the session-scoped `stop`'s, which is why the set is DOWN to two.
+const _CLIENT_MEMBERS = new Set(['relaunchPreview', 'getStatus'])
 
 describe('buildSessionApi — buildSessionClient member set (inertness guard)', () => {
-  it('exposes exactly the three surviving client operations', () => {
+  it('exposes exactly the two surviving client operations', () => {
     expect(new Set(Object.keys(buildSessionClient))).toEqual(_CLIENT_MEMBERS)
   })
 })
@@ -169,16 +168,10 @@ describe('buildSessionApi — control operations', () => {
 })
 
 describe('buildSessionApi — CSRF discipline', () => {
-  // RE-POINTED OFF THE DELETED LOCK OPS. This ran a `cases` loop over `acquireLock` /
-  // `releaseLock`, then over the lone surviving `forceEnd`; with the kill switch gone the loop
-  // had nothing to iterate. `relaunchPreview` and `stop` are the mutating session POSTs the
-  // portal still makes, and the contract — every one of them carries the token — is unchanged.
-  it('attaches X-CSRF-Token on every mutating POST (relaunchPreview / stop)', async () => {
-    const stopImpl = jsonFetch(200, { sessionId: 's', status: 'ended' })
-    await stop('s', {}, { fetchImpl: stopImpl })
-    expect(headerOf(stopImpl, 'X-CSRF-Token')).toBe(CSRF)
-    expect(optsOf(stopImpl).method).toBe('POST')
-
+  // RE-POINTED OFF THE DELETED LOCK OPS, and again off the session-scoped `stop`.
+  // `relaunchPreview` is the one session-namespace mutating POST the portal still makes, and
+  // the contract — every mutating POST carries the token — is unchanged.
+  it('attaches X-CSRF-Token on the mutating POST (relaunchPreview)', async () => {
     const relaunchImpl = jsonFetch(200, { appId: 'a1', previewUrl: null, status: 'ready', ready: true, restoredFromFailedBuild: false })
     await relaunchPreview({ projectId: 'p1' }, { fetchImpl: relaunchImpl })
     expect(headerOf(relaunchImpl, 'X-CSRF-Token')).toBe(CSRF)
@@ -187,26 +180,13 @@ describe('buildSessionApi — CSRF discipline', () => {
 
   it('omits the CSRF header when no csrf cookie is readable (parity with auth.js)', async () => {
     document.cookie = 'csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT'
-    const impl = jsonFetch(200, { sessionId: 's', status: 'ended' })
-    await stop('s', {}, { fetchImpl: impl })
+    const impl = jsonFetch(200, { appId: 'a1', previewUrl: null, status: 'ready', ready: true, restoredFromFailedBuild: false })
+    await relaunchPreview({ projectId: 'p1' }, { fetchImpl: impl })
     expect(headerOf(impl, 'X-CSRF-Token')).toBeUndefined()
   })
 })
 
 describe('buildSessionApi — lock ops + fail-closed errors', () => {
-  it('stop: sends {reason} when supplied, and a valid empty StopBuildRequest {} otherwise', async () => {
-    const withReason = jsonFetch(200, { sessionId: 's', status: 'ended' })
-    await stop('s', { reason: 'user cancelled' }, { fetchImpl: withReason })
-    expect(JSON.parse(optsOf(withReason).body as string)).toEqual({ reason: 'user cancelled' })
-
-    // A bare stop still carries a body — {} is a complete StopBuildRequest (reason
-    // defaults to None), so it always satisfies the body model. The bodyless
-    // POSTs, by contrast, send NO body (asserted below via the absent Content-Type).
-    const noReason = jsonFetch(200, { sessionId: 's', status: 'ended' })
-    await stop('s', {}, { fetchImpl: noReason })
-    expect(JSON.parse(optsOf(noReason).body as string)).toEqual({})
-  })
-
   // RE-POINTED OFF `forceEnd`, the same way it was once re-pointed onto it off
   // `acquireLock` / `releaseLock`. The CONTRACT is `postJson`'s `body === undefined` branch — send
   // no JSON body and therefore no Content-Type — and the kill switch was only ever its vehicle.
