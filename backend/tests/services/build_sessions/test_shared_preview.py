@@ -280,6 +280,52 @@ async def test_launch_refuses_while_the_recipient_is_mid_build_on_their_own_proj
     assert caught.value.building is True
 
 
+async def test_launch_refuses_while_the_recipients_own_sandbox_is_idle_but_unsaved(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """R24's own acceptance example, the one #239 flagged as covered only in the reverse
+    direction: a recipient holding their own IDLE sandbox (no build in flight — the mid-build
+    case above already pins that half) presses Launch on a shared project. The idle container
+    still holds unsaved work, so the SAME hand-over dialog must fire — a silent reclaim would
+    destroy it with no warning, the exact defect R24 exists to close."""
+    owner, project, app_id = await _owner_with_saved_app(
+        db_session, fake_storage, email="owner7b@example.com"
+    )
+    recipient = await UserFactory.create(db_session, email="recipient7b@example.com")
+    recipient_project = await ProjectFactory.create(
+        db_session, recipient.id, description="Recipient's own idle project"
+    )
+    manager = SessionManager()
+    build_client = FakeSandboxClient()
+    session = await manager.ensure_sandbox(
+        db_session, recipient, recipient_project.id, sandbox_client=build_client, may_write=True
+    )
+    # END THE TURN with `touched=True` — the agent actually wrote something this turn, so
+    # `finish_turn_sandbox` autosaves it to the recovery slot (manager.py's step 1c) before
+    # pardoning the container. That recovery bundle is what makes this workspace provably NOT
+    # `_nothing_to_lose`: a bare `ensure_sandbox`+pardon with `touched=False` leaves only the
+    # freshly-provisioned baseline commit and no recovery bundle, which reads as genuinely
+    # empty and IS silently reclaimable — the container must be idle (no build in flight) but
+    # still hold unsaved work for the R24 hand-over dialog to be the correct outcome here.
+    await manager.finish_turn_sandbox(session, build_client, touched=True)
+
+    # Once the turn ends, `_writing_session_holds` no longer shortcuts the check (unlike the
+    # mid-build sibling above), so the reclaim guard actually ATTACHES to confirm what the
+    # idle container holds. `FakeSandboxClient.attach_existing` refuses with `SandboxGoneError`
+    # unless `attach_handle` is set — a fresh, unscripted client reads as "no live sandbox",
+    # which silently waves the reclaim through instead of raising. Reusing `build_client`, the
+    # same fake that actually holds this container, with its handle stamped for attach, is what
+    # makes the probe find the real (unsaved) state instead of a false "nothing there".
+    build_client.attach_handle = session.handle
+
+    with pytest.raises(SandboxReclaimBlockedError) as caught:
+        await manager.launch_shared_preview(db_session, recipient, project, build_client)
+
+    assert caught.value.project_id == recipient_project.id
+    assert caught.value.building is False  # idle, not mid-build — the property under test
+    assert caught.value.is_shared_view is False  # the recipient's OWN project, not a shared one
+
+
 async def test_revoke_tears_down_a_live_shared_view(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:

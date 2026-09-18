@@ -755,6 +755,33 @@ async def test_a_share_recipient_is_refused_starting_a_chat(
     assert resp.status_code == 404
 
 
+async def test_a_share_recipient_is_refused_publish(client, db_session, bind_store) -> None:
+    """The last of R14's API half: `deploy_project` calls `owned_project_or_404` as the very
+    FIRST thing it does, before any sandbox/storage/deploy-service dependency is even
+    consulted — so a recipient is refused with a plain 404, never a 503 from something
+    unconfigured masking the ownership check. No `wired_sandbox`/`fake_redis` needed for
+    that reason: nothing past the ownership check ever runs."""
+    project_id, _owner, _owner_headers, recipient_headers = await _shared_project(
+        client, db_session, bind_store
+    )
+
+    resp = await client.post(
+        f"/v1/projects/{project_id}/deploy",
+        headers=recipient_headers,
+        json={
+            "answers": {
+                "credentialsSecrets": False,
+                "healthData": False,
+                "personalInformation": False,
+                "financialData": False,
+                "confidentialBusinessData": False,
+                "publicData": False,
+            }
+        },
+    )
+    assert resp.status_code == 404
+
+
 # --- GET /colleagues -------------------------------------------------------------
 
 
