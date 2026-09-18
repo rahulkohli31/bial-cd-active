@@ -380,6 +380,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // remount — so the boolean form gated chat B's send on chat A's turn. Same per-chat scoping
   // `buildActiveHere` already applies to the build half.
   const [generatingChatId, setGeneratingChatId] = useState<string | null>(null)
+  /** When the running turn opened its stream. The working line's elapsed count is derived from
+   *  this rather than from its own mount, because the row is rebuilt on every reasoning burst
+   *  (`streamingParts`) and a self-timed row reports the burst instead of the turn. */
+  const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null)
   /**
    * WHERE THE RE-TOLD TURN BEGINS — the seq of the user message a re-attach re-told from;
    * `null` when nothing on screen is re-telling a stored turn. Exists so a reload mid-build
@@ -1177,6 +1181,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   const endGenerating = useCallback(
     (activeId: string) => {
       setGeneratingChatId((prev) => (prev === activeId ? null : prev))
+      setTurnStartedAt(null)
       // THE ADVISORY CLAIM IS RETRACTED HERE, at the one point every turn path settles through
       // (the send, the reattach, and the reload-mid-build). It used to be released in the
       // build-watcher's `finally`, which worked only while the build ran in the chat that
@@ -1395,6 +1400,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_r`
     const sink = newSink()
+    setTurnStartedAt(Date.now())
     setGeneratingChatId(activeId)
     // THE BOUNDARY IS LATCHED HERE, from the transcript this re-telling is about to sit on top of
     // (see `reToldFromSeq`). Read off `prior` rather than the `messages` state: this runs inside
@@ -1559,6 +1565,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_a`
     const sink = newSink()
+    setTurnStartedAt(Date.now())
     setGeneratingChatId(activeId)
     setTurnError(null)
     resetTurnNarrative()
@@ -3001,6 +3008,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
             onGroupSealed={setSealedSummary}
             interruptedMessageIds={interruptedIds}
             footer={ViewportFooter}
+            turnStartedAt={turnStartedAt}
           />
         </div>
 
