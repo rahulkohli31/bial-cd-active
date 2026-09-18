@@ -54,11 +54,9 @@ lookup that renders them."""
 #
 # ONE COLLECTION, AND EVERY PRODUCER SPELLS ITS REASON OUT OF IT. There are five producers
 # across three modules — the `_WriteEndedError` raise sites, the model-unavailable ending, the
-# named refusals, the turn's own cancellation arm, and the session end in `build_sessions` — and
-# while each of them held its own string literal, a reason could be added in one of them and
-# reach a citizen through a lookup that had never heard of it. That is not hypothetical: the
-# portal's reason→sentence table has shipped three separate endings with no copy, each one
-# surfacing as "The build failed." over a working app.
+# named refusals, the turn's own cancellation arm, and the session end in `build_sessions`. A
+# reason spelled anywhere but here reaches a citizen through a lookup that has never heard of it,
+# and surfaces as "The build failed." over a working app.
 #
 # THE COLLECTION IS WHAT THE CROSS-LANGUAGE PIN COMPARES. The TypeScript half is a closed union
 # whose copy table is total over it, so a member added there without a sentence is a compile

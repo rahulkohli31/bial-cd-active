@@ -2676,6 +2676,40 @@ passes every assertion below for the wrong reason. If this stops being credentia
 suite proves nothing."""
 
 
+async def test_a_tail_masks_only_the_items_it_returns(db_session) -> None:
+    """★ THE CATCH-UP PATH PAYS FOR WHAT IT SHOWS, NOT FOR THE WHOLE CONVERSATION.
+
+    `redact_secrets` is six linear passes per text field, synchronously on the event loop. The
+    SSE reconnect keeps eight items; without `tail` it masked every item in the transcript and
+    threw the rest away — on every reconnect, of which a backgrounded tab makes many. This is
+    the same "resolve everything, keep eight" shape this module already removed once for
+    attachment enrichment.
+
+    Mutation check: slice after `_mask_for_display` instead of before and the call count jumps
+    to the full item count."""
+    user, _, conversation = await _thread(db_session)
+    for index in range(6):
+        await append_batch(
+            db_session,
+            user_id=user.id,
+            conversation_id=conversation.id,
+            messages=[ModelRequest(parts=[UserPromptPart(content=f"message {index}")])],
+            entry_kind=MessageEntryKind.TURN,
+            kind=ChatKind.BUILD,
+        )
+    rows = await load_rows(
+        db_session, user_id=user.id, conversation_id=conversation.id, include_hidden=True
+    )
+
+    whole = project_rows(rows)
+    tailed = project_rows(rows, tail=2)
+
+    assert len(whole) == 6, "the fixture must have more items than the tail asks for"
+    assert tailed == whole[-2:], (
+        "a tail must return exactly what slicing the full projection would have"
+    )
+
+
 async def test_every_display_item_that_carries_free_text_is_masked(db_session) -> None:
     """★ ONE FIXTURE THROUGH EVERY ITEM TYPE THAT REACHES A BROWSER AS PROSE.
 

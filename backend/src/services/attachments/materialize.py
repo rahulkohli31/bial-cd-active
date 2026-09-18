@@ -55,6 +55,8 @@ CONTAINER_ATTACHMENTS_ROOT = "/workspace/attachments"
 # One path segment, and a conservative one. Everything outside this is replaced rather than
 # dropped, so two files whose names differ only in punctuation stay distinguishable.
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+#: Every whitespace or control character, including the ones a name can legally carry.
+_CONTROL_OR_SPACE = re.compile(r"[\s\x00-\x1f\x7f]+")
 # Long enough that a real name survives whole; short enough that the segment can never approach a
 # filesystem limit once a disambiguating prefix is added.
 _MAX_STEM = 96
@@ -88,6 +90,22 @@ class CodeLaneAttachment:
         """The path the AGENT is given. The read surface translates this prefix and vets it as
         the ordinary relative token it is, so the model never handles a container-absolute path."""
         return f"{ATTACHMENTS_PREFIX}{self.file_name}"
+
+
+def one_line_name(display_name: str) -> str:
+    """A citizen's file name, flattened to a single line for a prompt that quotes it.
+
+    THE LISTING RIDES THE RUN'S INSTRUCTIONS, which is the operator tier — the same channel the
+    standing guardrails sit in, and the one `agent/capabilities.py` states nothing untrusted may
+    ride. A file name is citizen-controlled text, so a name carrying newlines can close the
+    listing and open whatever it likes at that authority. Collapsing every run of whitespace and
+    control characters to one space removes the shape that makes that possible; the same 96-char
+    bound `safe_file_name` uses removes the other one, a name long enough to push the guardrails
+    out of the window.
+
+    The name is NOT otherwise rewritten: it is shown to the model so it can talk to the citizen
+    about the file the citizen named, and mangling the spelling would defeat that."""
+    return _CONTROL_OR_SPACE.sub(" ", display_name).strip()[:_MAX_STEM] or "attachment"
 
 
 def safe_file_name(display_name: str, media_type: str) -> str:
@@ -374,8 +392,8 @@ class AttachmentDelivery:
             "",
         ]
         lines += [
-            f"- {file.display_name} — {file.model_path} (on disk: {file.container_path}; "
-            f"{file.size:,} bytes)"
+            f"- {one_line_name(file.display_name)} — {file.model_path} "
+            f"(on disk: {file.container_path}; {file.size:,} bytes)"
             for file in self.files
         ]
         return "\n".join(lines)

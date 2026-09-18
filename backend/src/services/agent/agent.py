@@ -15,8 +15,8 @@ The per-run system prompt has two sources, selected by `deps.kind` (U9/D4):
 - `kind` set — a turn on the turn engine (which always sets it), in TWO pieces: the kind's
   standing contract, passed per run as static parts by `static_instruction_parts`, and this
   conversation's own facts, returned by the callable below from `deps.prompt_context`. BOTH
-  kinds: a Build turn is an ordinary turn with more tools (U5's convergence), so it composes
-  here like a Plan turn and carries a `SandboxSession` in `deps.sandbox`.
+  kinds: a Build turn is an ordinary turn with more tools, so it composes here like a Plan turn
+  and carries a `SandboxSession` in `deps.sandbox`.
 
 Either way the text is applied through `instructions`, NOT `system_prompt`: instructions are
 never baked into stored message history, so prompts evolve without rewriting history — the

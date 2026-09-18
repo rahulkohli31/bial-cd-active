@@ -31,12 +31,11 @@ describe('outcomeSummary — the bounded endings the turn engine names', () => {
 })
 
 /**
- * ★ THE CLOSED UNION, WHICH IS WHAT THIS FILE IS NOW ABOUT.
+ * ★ THE CLOSED UNION: every ending the server can store has a sentence of its own.
  *
- * The assertion that used to sit here said an unlisted reason SHOULD render "The build failed."
- * — it certified the defect. Three separate endings shipped with no copy and reached a citizen
- * through exactly that arm, the last of them over a working dashboard. "The build failed." is now
- * the sentence for an ending that recorded no reason at all, and for nothing else.
+ * "The build failed." is the sentence for an ending that recorded no reason at all, and for
+ * nothing else — a NAMED ending reaching it means the copy table has a hole, which is the one
+ * thing this block exists to catch.
  */
 describe('every ending the server can store has a sentence of its own', () => {
   const EVERY_REASON = Object.keys(OUTCOME_COPY) as EndReason[]
@@ -53,17 +52,24 @@ describe('every ending the server can store has a sentence of its own', () => {
     }
   })
 
-  it('a completed build whose last check could not answer reads as finished', () => {
-    // U8's decision, in copy: six green signals are not overridden by a seventh that could not
-    // answer, so the sentence does not foreground the one probe that failed.
-    expect(outcomeSummary({ status: 'ended', reason: 'verdict_unanswerable' })).toBe(
-      NEUTRAL_BUILD_SUMMARY,
-    )
+  it('★ a build whose last check could not answer never claims to have finished', () => {
+    // The backend keeps this cause vetoing for a stated reason: a container reverted to its
+    // baked image compiles, serves 200, logs no crash and shows the starter page — so six green
+    // signals cannot tell it apart from a working app. The hedged live sentence is never
+    // persisted, so on RELOAD this lookup is the only thing the citizen sees; rendering the
+    // neutral summary here is the portal asserting a completion the backend refused to confirm,
+    // which is a false success rather than the false failure this work removed.
+    const text = outcomeSummary({ status: 'failed', reason: 'verdict_unanswerable' })
+    expect(text).not.toBe(NEUTRAL_BUILD_SUMMARY)
+    expect(text).toMatch(/couldn't confirm/i)
+    // And it points somewhere: an unconfirmed change is something the person at the preview can
+    // settle in a second, which is the whole reason this does not read as a failure either.
+    expect(text).toMatch(/preview/i)
   })
 
   it('a refusal reads the same on reload as it did when it happened', () => {
     // Both refusal codes reach the citizen live on a `TurnErrorFrame`; on RELOAD the banner is
-    // rebuilt from the stored reason through this lookup, which is where they used to fall out.
+    // rebuilt from the stored reason through this lookup, so the two paths must agree.
     expect(outcomeSummary({ status: 'failed', reason: 'context_hard_limit_exceeded' })).toMatch(
       /start a new chat/i,
     )

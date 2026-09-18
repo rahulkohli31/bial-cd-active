@@ -756,7 +756,7 @@ def sandbox_toolset[DepsT](
             raise  # terminal infra failure — propagate to the sandbox_gone escalation
         except SandboxError as exc:
             raise ModelRetry(f"Could not write `{path}`: {exc}.") from exc
-        session.workspace_touched = True
+        session.writes += 1
         label, hidden = classify_file_step("write_file", path)
         await _step(session, name="edit", label=label, state="ok", hidden=hidden)
         return f"Wrote `{path}`."
@@ -777,7 +777,7 @@ def sandbox_toolset[DepsT](
             # A files() error from a tool → enrich into a ModelRetry so the model self-corrects
             # in-run.
             raise ModelRetry(await _reanchor(session, path)) from exc
-        session.workspace_touched = True
+        session.writes += 1
         label, hidden = classify_file_step("edit_file", path)
         await _step(session, name="edit", label=label, state="ok", hidden=hidden)
         return f"Edited `{path}`."
@@ -798,7 +798,7 @@ def sandbox_toolset[DepsT](
             raise  # terminal infra failure — propagate to the sandbox_gone escalation
         except SandboxError as exc:
             raise ModelRetry(f"Could not insert into `{path}`: {exc}.") from exc
-        session.workspace_touched = True
+        session.writes += 1
         label, hidden = classify_file_step("insert_lines", path)
         await _step(session, name="edit", label=label, state="ok", hidden=hidden)
         return f"Inserted into `{path}`."
@@ -939,7 +939,7 @@ def sandbox_toolset[DepsT](
         # real mutation needs the workspace's own answer (a `git status` round-trip), which is a
         # bigger change than this guard is worth. Acting on the workspace is the line; TALKING
         # about it is not.
-        session.workspace_touched = True
+        session.writes += 1
         # DE-NOISE A BUILD LOG, NEVER A FILE. `run_command` is the open sandbox's general shell,
         # so the same call that runs `npm install` also runs `cat`, `sed -n '40,80p'` and `grep`
         # — and there the "output" IS file content. Dropping a line from it is a silent edit to
@@ -1067,7 +1067,7 @@ def sandbox_toolset[DepsT](
                 ) from exc
             # A step that RAN acted on the workspace — same rule `run_command` applies, and for
             # the same reason: the generate writes files and the migrate writes tables.
-            session.workspace_touched = True
+            session.writes += 1
             outcomes.append(
                 _StepOutcome(
                     step=step,

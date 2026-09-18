@@ -1007,7 +1007,19 @@ class _TurnState:
     requests_sent: int = 0
 
     def read_the_app(self, reading: AppState) -> None:
-        """Record what the platform just learned about the app. Latest wins."""
+        """Record what the platform just learned about the app. Latest wins — except that a
+        reading which learned NOTHING may not displace one that did.
+
+        `UNKNOWN` is "the probe could not answer", not a state of the app, and both consumers of
+        this field read it as no reading at all: the terminal row is not stamped and the change
+        notice is not written. So a single blinked probe late in a turn would otherwise cost the
+        turn its stamp, cost the citizen the "your app is working again" sentence, and leave the
+        NEXT turn comparing against a record this turn should have moved.
+
+        A FIRST `UNKNOWN` STILL LANDS, and must: it is what tells the reminder this turn did
+        consult the platform, so the turn is not nudged for a lapse that did not happen."""
+        if reading is AppState.UNKNOWN and self.app_reading is not None:
+            return
         self.app_reading = reading
 
     def another_request_and_still_no_reading(self) -> bool:
@@ -1486,9 +1498,7 @@ class TurnEngine:
             send again — none of which "the assistant hit a problem" says. ONLY the service's own
             failures count: a status the SDK retries (`_is_transient_model_status`) or a
             `ModelAPIError` (a connection that never answered, or a stream that ended in an error
-            event). A 400 about a media type or a 401 keeps the generic ending. A Build turn
-            secures its tree through the function the run bounds use, so `{kept}` is verified
-            before it is said; a Plan turn has no tree."""
+            event). A 400 about a media type or a 401 keeps the generic ending."""
             state.error_signature = error_signature(exc)
             _log.warning(
                 "turn_model_unavailable",
@@ -2782,11 +2792,6 @@ class TurnEngine:
                     # would reset on every repair, which is the shape that ran away in the
                     # first place. `state.tokens_spent` carries the closed runs; `run.usage`
                     # carries the one in flight.
-                    #
-                    # THE SAME SECURING FUNCTION AS THE QUOTA ARM ABOVE, with its own sentence.
-                    # Copy first, then say: this is the one path in the codebase where getting
-                    # that ordering wrong loses a citizen's tree, so there is one function that
-                    # does it and two sentences it can carry.
                     spent = state.tokens_spent + _run_spend(run.usage)
                     if spent >= RUN_TOKEN_BUDGET:
                         _log.info(
@@ -4372,13 +4377,23 @@ class TurnEngine:
         what the model meant would be measuring the guesser.
 
         A TUNING INSTRUMENT, NOT A GATE. The ratio says whether the call-timing sentence and the
-        reminder are earning their place; it decides nothing at runtime."""
+        reminder are earning their place; it decides nothing at runtime.
+
+        THE THIRD ROW ANSWERS A DIFFERENT QUESTION, and it is separate for that reason: whether
+        anybody BUILT here, not whether this turn looked. The reading pair cannot answer that — it
+        is written for every terminal turn holding a workspace, Plan turns and turns that wrote
+        nothing included — so counting a build out of it credits a project nobody has built in.
+        `workspace_touched` is the platform's own evidence, set by the mutating tools, and it
+        never resets within a turn."""
+        app_id = state.write_session.app_id if state.write_session else None
         await count(
             HarnessCounter.APP_READING_TAKEN
             if state.app_reading is not None
             else HarnessCounter.APP_READING_MISSING,
-            app_id=state.write_session.app_id if state.write_session else None,
+            app_id=app_id,
         )
+        if app_id is not None and state.sandbox is not None and state.sandbox.workspace_touched:
+            await count(HarnessCounter.WORKSPACE_WAS_WRITTEN, app_id=app_id)
 
     # -- subscription -------------------------------------------------------------------
 

@@ -682,8 +682,10 @@ async def turn_events(
             rows = await load_rows(
                 db, user_id=user.id, conversation_id=conversation.id, include_hidden=True
             )
-            projected = await project_conversation(db, user_id=user.id, rows=rows)
-            items = projected[-8:]  # the turn's own tail; full history is a separate GET
+            # The turn's own tail; full history is a separate GET. Asked for as a `tail` rather
+            # than sliced off the result so redaction and the attachment read are paid for eight
+            # items, not for the whole conversation on every reconnect.
+            items = await project_conversation(db, user_id=user.id, rows=rows, tail=8)
         snapshot = engine.build_snapshot(state, items=items)
 
     # Every DB read this route needs is done. Commit now so the pooled connection goes back

@@ -165,6 +165,18 @@ class HarnessCounter(enum.StrEnum):
     #: description's call-timing sentence and the reminder's cooldown; these numbers say which.
     APP_READING_TAKEN = "app_reading_taken"
     APP_READING_MISSING = "app_reading_missing"
+    #: ── The platform's own memory that somebody BUILT here ───────────────────────────────────
+    #: One row per terminal turn that actually MUTATED the tree, so a project's whole history of
+    #: real building is answerable when no container survives to be asked.
+    #:
+    #: IT IS NOT THE READING PAIR, AND THE DISTINCTION IS THE WHOLE POINT. Those two are written
+    #: for every terminal turn that held a workspace — a Plan turn, a turn that stopped before
+    #: writing anything, a turn that only looked. Answering "has anybody built here?" out of them
+    #: credits a project nobody has built in.
+    #:
+    #: The write is gated on `workspace_touched` — the platform's own evidence, set by the
+    #: mutating tools and never reset — rather than on anything the model said.
+    WORKSPACE_WAS_WRITTEN = "workspace_was_written"
 
 
 class HarnessCount(Base, UUIDv7PrimaryKeyMixin, TimestampMixin):

@@ -422,12 +422,17 @@ describe('the copy table', () => {
       'failed',
       'The assistant could not get an answer from its service, so this build stopped.',
     ],
-    // The closed union (U7): every way a build can end now carries copy, so adding a member
+    // The closed union: every way a build can end carries copy, so adding a member
     // without a sentence is a compile error on the server side and a red row here. The
     // sentences are TYPED OUT rather than imported — importing them would let this table agree
     // with whatever `OUTCOME_COPY` happens to say, which is the drift it exists to catch.
     ['run_budget_reached', 'failed', 'This build stopped after doing as much as it does in one go.'],
-    ['verdict_unanswerable', 'failed', 'Build finished.'],
+    [
+      'verdict_unanswerable',
+      'failed',
+      "Your app looks like it's running, but we couldn't confirm this change went in. " +
+        "Open the preview and see — and if something looks wrong, say so and we'll fix it.",
+    ],
     [
       'self_heal_budget_exhausted',
       'failed',

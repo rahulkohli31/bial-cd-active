@@ -551,3 +551,39 @@ async def test_the_counters_separate_a_turn_that_looked_from_one_that_did_not(
 
     assert await _counted(db_session, HarnessCounter.APP_READING_TAKEN) == took_before + 1
     assert await _counted(db_session, HarnessCounter.APP_READING_MISSING) == missed_before + 1
+
+
+async def test_a_turn_that_wrote_nothing_leaves_no_record_that_somebody_built_here(
+    _fresh_engine, db_session, session_factory, scripted_probe
+) -> None:
+    """★ THE BUILD RECORD IS WRITTEN FOR A BUILD, NEVER FOR A LOOK.
+
+    `WORKSPACE_WAS_WRITTEN` means "somebody built here" and the row is permanent, so a turn that
+    merely HELD the workspace — a Plan turn, a turn that stopped before writing, a turn that only
+    looked — must leave none. One written for a look would say a project nobody has built in has
+    been, and nothing later can take it back.
+
+    The reading counters beside it are deliberately still written here: they measure whether the
+    turn looked, which this turn did.
+
+    Mutation check: gate the write on `state.write_session` instead of `workspace_touched` and
+    this goes red while the reading assertion above stays green."""
+    user, conv = await _a_conversation(db_session)
+    built_before = await _counted(db_session, HarnessCounter.WORKSPACE_WAS_WRITTEN)
+    took_before = await _counted(db_session, HarnessCounter.APP_READING_TAKEN)
+
+    scripted_probe.append(AppState.LIVE)
+    await _a_turn(
+        _fresh_engine,
+        db_session,
+        session_factory,
+        conv,
+        user.id,
+        "how does it look?",
+        _looking_model(),
+    )
+
+    assert await _counted(db_session, HarnessCounter.WORKSPACE_WAS_WRITTEN) == built_before
+    # Liveness: the turn really did reach its terminal, so the absence above is an absence
+    # rather than a turn that never counted anything at all.
+    assert await _counted(db_session, HarnessCounter.APP_READING_TAKEN) == took_before + 1

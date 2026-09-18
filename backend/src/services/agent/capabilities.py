@@ -1,38 +1,22 @@
 """The turn-scoped system message: one short operator sentence at the absolute tail.
 
-WHAT IT IS
-A `SystemPromptPart` appended to the end of the request the model is about to read, preceded by
-a pinned cache breakpoint, and never persisted. It says one fact — the transcript records how
-the app WAS, and `check_the_app` answers how it IS — because a conversation's messages age while
-the container they describe keeps changing.
+WHY THIS EXISTS
+A conversation's messages age while the container they describe keeps changing — the transcript
+records how the app WAS, and only `check_the_app` answers how it IS. This module is the single
+home of that sentence and of the one channel that carries it: a `SystemPromptPart` appended to
+the request the model is about to read, preceded by a pinned cache breakpoint, never persisted.
 
-WHY `wrap_model_request` AND NOT `before_model_request`
-Both hooks hand over a message list, and only one of them is ephemeral. What
-`before_model_request` returns is written back into the run's own history, so a sentence added
-there reaches `new_messages()`, and the request it rode — the one carrying the tool results —
-is then refused wholesale by the persistence predicate, which drops those results and orphans
-the calls they answer. `wrap_model_request` runs after that write-back, on the list built for
-the wire alone, and this hook rebuilds the tail request with `dataclasses.replace` rather than
-mutating it. The sentence therefore exists only in the bytes of one request. Running that late
-also means the library's history cleanup and its `prepare_messages` pass have both already
-happened, so nothing merges the sentence into a neighbouring message or moves it off the tail.
+THE PIN IS NOT OPTIONAL. Without a breakpoint immediately before it, a sentence at the tail of
+request *k* sits where request *k+1* puts its tool results, so *k+1* cannot read *k*'s write and
+falls back to the tool-definitions boundary for the rest of the turn. The `CachePoint` marks the
+last block of the user content, so the cached prefix ends where the sentence begins and every
+later request in the turn still hits it. It claims the single message-slot breakpoint the
+request budget leaves (`tests/services/turns/test_cache_breakpoints.py` pins the arithmetic).
 
-A splice into `message_history` would do the opposite of all of this — it lands AHEAD of the
-citizen's persisted prompt, the position that breaks the cached prefix on the following turn.
-
-THE PIN IS NOT OPTIONAL
-Without a breakpoint immediately before it, a sentence at the tail of request *k* sits where
-request *k+1* puts its tool results, so *k+1* cannot read *k*'s write and falls back to the
-tool-definitions boundary for the rest of the turn. The `CachePoint` authored just before the
-sentence marks the last block of the user content, so the cached prefix ends where the sentence
-begins and every later request in the turn still hits it. It claims the single message-slot
-breakpoint the request budget leaves (`tests/services/turns/test_cache_breakpoints.py` pins the
-arithmetic).
-
-NOTHING UNTRUSTED MAY RIDE THIS CHANNEL
-System content carries operator authority, so the sentence is a module constant and this class
-takes no text argument at all. There is no parameter through which sandbox output, a tool
-result or an attachment's contents could reach the system role.
+NOTHING UNTRUSTED MAY RIDE THIS CHANNEL. System content carries operator authority, so the
+sentence is a module constant and this class takes no text argument at all. There is no
+parameter through which sandbox output, a tool result or an attachment's contents could reach
+the system role.
 """
 
 from __future__ import annotations
@@ -106,6 +90,16 @@ class TurnScopedSystemMessage(AbstractCapability[ChatDeps]):
         request_context: ModelRequestContext,
         handler: WrapModelRequestHandler,
     ) -> ModelResponse:
+        """Rebuild the tail request for the WIRE alone, then let the call proceed.
+
+        WHY NOT `before_model_request`: what that hook returns is written back into the run's own
+        history, so a sentence added there reaches `new_messages()` — and the request it rode,
+        the one carrying the tool results, is then refused wholesale by the persistence predicate,
+        which drops those results and orphans the calls they answer. This hook runs after that
+        write-back, and after the library's history cleanup and `prepare_messages` pass, so
+        nothing merges the sentence into a neighbour or moves it off the tail. A splice into
+        `message_history` lands AHEAD of the citizen's persisted prompt instead — the one position
+        that breaks the cached prefix on the following turn."""
         self._append_to_the_tail(request_context)
         return await handler(request_context)
 

@@ -1137,10 +1137,38 @@ class AcaSandboxClient(SandboxClient):
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
-        handle = await self._provision_container(
-            uuid.UUID(user_id), app_name, app_env, arm="provision_new"
-        )
-        await _make_it_a_repo(self, handle)
+        user_uuid = uuid.UUID(user_id)
+        handle = await self._provision_container(user_uuid, app_name, app_env, arm="provision_new")
+        try:
+            await _make_it_a_repo(self, handle)
+        except Exception:
+            # SEEDING IS THE SECOND FALLIBLE STEP, AND IT RUNS AFTER THE RECORD SAYS READY.
+            # `_write_registry` stamps READY at container-create time, so a container left
+            # behind here is one `_the_live_sandbox_is_already_the_one_we_want` hands straight
+            # back to the next request — a container that builds fine and whose every Save
+            # raises `WorkspaceHasNoRepositoryError`, with no self-service way out. The caller
+            # cannot clean this up either: it never received a handle, so the compensation in
+            # `_holding_user_lock` has nothing to tear down.
+            #
+            # Same shape as the restore arm below, including the conditional registry drop:
+            # `_safe_teardown` swallows an `AcaError`, so clearing the record unconditionally
+            # would orphan a container that is probably still running.
+            torn_down = await self._safe_teardown(app_name)
+            if torn_down:
+                await self._delete_registry(user_uuid, app_name)
+            else:
+                _log.error(
+                    "provision_cleanup_left_registry_for_the_reaper",
+                    app_name=app_name,
+                    detail=(
+                        "ACA refused the delete during seed-failure cleanup, so the ownership "
+                        "record is deliberately kept: a later sweep retries the teardown "
+                        "instead of meeting an anonymous container."
+                    ),
+                )
+            self._evict_token(handle.token)
+            self._app_owners.pop(app_name, None)
+            raise
         return handle
 
     async def _probe_with_retry(self, handle: SandboxHandle) -> None:

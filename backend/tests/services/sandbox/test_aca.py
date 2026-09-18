@@ -28,7 +28,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_TOKEN_REF,
 )
 from src.services.sandbox import client as client_module
-from src.services.sandbox.aca import AcaControlPlane, AcaTransientError
+from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError
 from src.services.sandbox.base import (
     FleetMember,
     SandboxError,
@@ -65,6 +65,10 @@ class FakeAca(AcaControlPlane):
         self.create_calls = 0
         self.transient_before_success = 0
         self.get_returns_none = False
+        # A delete ARM refuses. The distinction is load-bearing for cleanup paths: a container
+        # that could not be deleted must keep its ownership record, or the sweep that would
+        # retry the teardown meets an anonymous container instead.
+        self.delete_error: Exception | None = None
         self.fqdn = "app-xyz.westeurope.azurecontainerapps.io"
         # Which connector identity, if any, each container was born with.
         self.identities: dict[str, str | None] = {}
@@ -94,6 +98,8 @@ class FakeAca(AcaControlPlane):
 
     async def delete_app(self, *, name: str) -> None:
         self.deleted.append(name)
+        if self.delete_error is not None:
+            raise self.delete_error
         self.created.pop(name, None)
         self.tags.pop(name, None)
 
@@ -623,6 +629,60 @@ async def test_provision_persistent_transient_raises_and_self_cleans(
         await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
     assert APP_NAME in aca.deleted  # self-clean attempted, no orphan
     assert await fake_redis.hgetall(registry_key(USER)) == {}
+    await client.aclose()
+
+
+async def test_a_failed_repo_seed_leaves_no_registered_container_behind(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ THE SECOND FALLIBLE STEP, AND THE ONE THAT RUNS AFTER THE RECORD SAYS READY.
+
+    The container is created and the registry stamped before the repo is seeded, so a seed that
+    fails without self-cleaning leaves a container the next request is handed straight back —
+    one that builds fine and whose every Save raises `WorkspaceHasNoRepositoryError`. The
+    caller cannot clean it up: it never received a handle.
+
+    Mutation check: drop the `except` around `_make_it_a_repo` and both assertions go red."""
+
+    def _refuses_to_seed(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return httpx.Response(200, json={"stdout": "", "stderr": "no git", "exit": 1})
+        return httpx.Response(404)
+
+    aca = FakeAca()
+    client = _client(aca, _refuses_to_seed)
+
+    with pytest.raises(SandboxError):
+        await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+
+    assert APP_NAME in aca.deleted, "the half-provisioned container was left running"
+    assert await fake_redis.hgetall(registry_key(USER)) == {}, (
+        "the registry still points at a container with no repository, so the next request "
+        "attaches to it instead of provisioning a clean one"
+    )
+    await client.aclose()
+
+
+async def test_a_container_aca_refuses_to_delete_keeps_its_registry_for_the_reaper(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The other half: clearing the record unconditionally would orphan a container that is
+    probably still running, leaving nothing that knows its name. A refused delete therefore
+    KEEPS the ownership record so a later sweep retries the teardown."""
+
+    def _refuses_to_seed(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return httpx.Response(200, json={"stdout": "", "stderr": "no git", "exit": 1})
+        return httpx.Response(404)
+
+    aca = FakeAca()
+    aca.delete_error = AcaError("ARM refused the delete")
+    client = _client(aca, _refuses_to_seed)
+
+    with pytest.raises(SandboxError):
+        await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+
+    assert await fake_redis.hgetall(registry_key(USER)) != {}
     await client.aclose()
 
 

@@ -724,10 +724,10 @@ async def test_a_container_that_cannot_answer_reads_as_could_not_tell() -> None:
     assert probe.polls == 1, "the probe must have been attempted, or the answer came for free"
 
 
-async def test_a_second_call_in_the_same_run_costs_no_container_round_trip() -> None:
+async def test_a_second_call_with_no_writes_between_costs_no_container_round_trip() -> None:
     """★ THE CEILING. Without it, N calls in one turn are N readiness polls plus N commands,
-    inside a turn the citizen is waiting on — and the answer cannot have changed, because
-    nothing between two tool calls touches the container.
+    inside a turn the citizen is waiting on — and with no write between them the answer cannot
+    have changed, because nothing else a tool call does reaches the container's tree.
 
     Mutation check: drop the memo and the second assertion goes red at two polls."""
     probe = _CountingProbe()
@@ -743,6 +743,34 @@ async def test_a_second_call_in_the_same_run_costs_no_container_round_trip() -> 
         f"the second call went back to the container: {probe.polls} polls, "
         f"{probe.commands} commands"
     )
+
+
+async def test_a_write_between_two_calls_makes_the_second_one_look_again() -> None:
+    """★ THE TOOL PROMISES "RIGHT NOW", AND A WRITE IS WHAT MAKES THAT A LIE.
+
+    A Build run holds the mutating tools and this one together for up to `MODEL_TURN_CEILING`
+    requests. The sequence this pins is the ordinary repair: the model reads NOT_SERVING, fixes
+    the bug, and checks again. Memoized for the whole run it is handed its own pre-fix answer
+    under a docstring promising the app's state right now — and says so to the citizen in prose
+    the platform streams live and never gates.
+
+    Mutation check: key the memo on anything but `session.writes` and the second reading comes
+    back STILL_THE_TEMPLATE at one poll."""
+    probe = _CountingProbe()
+    session = _session_over(probe)
+    toolset: FunctionToolset[Any] = app_state_toolset(lambda _ctx: session)
+    ctx = _a_run_context()
+    tool = (await toolset.get_tools(ctx))["check_the_app"]
+
+    await toolset.call_tool("check_the_app", {}, ctx, tool)
+    session.writes += 1  # what write_file / edit_file / run_command do
+    await toolset.call_tool("check_the_app", {}, ctx, tool)
+
+    assert probe.polls == 2, "the reading survived a write that could have changed it"
+    # And a third call that writes nothing is served from the refreshed memo, so invalidating
+    # on a write did not simply delete the ceiling.
+    await toolset.call_tool("check_the_app", {}, ctx, tool)
+    assert probe.polls == 2
 
 
 async def test_a_fresh_run_reads_the_app_again() -> None:

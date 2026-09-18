@@ -433,3 +433,27 @@ def test_the_shape_assertion_refuses_a_flag_that_no_longer_derives_from_the_tupl
 
     with pytest.raises(InlineSystemPromptShapeError, match="no longer decides anything"):
         model_module._widen_foundry_inline_system_prompts()
+
+
+def test_the_probe_ignores_a_foundry_base_url_in_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE PROBE MUST NOT BE ABLE TO STOP THE API FROM BOOTING.
+
+    The Foundry client reads `ANTHROPIC_FOUNDRY_BASE_URL` whenever `base_url` is None, and then
+    refuses a `base_url` and a `resource` together. Built with a `resource`, this probe therefore
+    raises on any deployment that exports that variable — at import, so nothing serves, with a
+    traceback naming a helper that has nothing to do with that variable.
+
+    Mutation check: build the probe with `resource=...` again and this goes red with
+    `base_url and resource are mutually exclusive`."""
+    monkeypatch.setenv(
+        "ANTHROPIC_FOUNDRY_BASE_URL", "https://someone-elses.services.ai.azure.com/anthropic/"
+    )
+
+    model = model_module._foundry_probe_model()
+
+    assert "inline-system-probe" in str(model.client.base_url), (
+        "the probe took its address from the environment, so it is not the address this "
+        "module reasoned about"
+    )

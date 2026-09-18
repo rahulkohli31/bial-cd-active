@@ -114,10 +114,10 @@ export type BuildOutcomeStatus = 'ended' | 'failed' | 'stopped'
 /**
  * EVERY REASON A STORED ROW CAN CARRY — the closed union, and the whole point of closing it.
  *
- * The server has five producers of an ending across three modules, and each one used to hold its
- * own string literal. A reason added in one of them reached a citizen through the table below,
- * which had never heard of it, and fell out as "The build failed." over a working app. That has
- * shipped three times.
+ * The server has five producers of an ending across three modules. Closing the union is what
+ * makes the table below TOTAL over it: a reason the server can send but this bundle has no
+ * sentence for is a compile error here, rather than a generic "The build failed." shown over a
+ * working app.
  *
  * It mirrors `backend/src/services/turns/copy.py::END_REASONS`, and
  * `backend/tests/services/turns/test_end_reasons.py` is what keeps the two equal — nothing else
@@ -165,9 +165,7 @@ export type EndReason =
  *
  * WHERE ONE SENTENCE SERVES SEVERAL REASONS, that is deliberate: `request_limit`,
  * `wall_clock_deadline_exceeded` and `run_budget_reached` are three internal ceilings a citizen
- * cannot act on differently, and `verdict_unanswerable` is a finished build whose last check
- * could not answer — six other signals were green, so foregrounding the one that failed would
- * hand them doubt the platform has already decided it does not have.
+ * cannot act on differently.
  */
 export const OUTCOME_COPY: Readonly<Record<EndReason, string>> = {
   quota_exceeded: 'The build stopped: you reached your daily limit.',
@@ -181,7 +179,17 @@ export const OUTCOME_COPY: Readonly<Record<EndReason, string>> = {
   run_budget_reached: 'This build stopped after doing as much as it does in one go.',
   model_unavailable:
     'The assistant could not get an answer from its service, so this build stopped.',
-  verdict_unanswerable: 'Build finished.',
+  // WORD FOR WORD WHAT THE LIVE FRAME SAID (`turns/copy.py::COULD_NOT_CONFIRM_TEXT`). That
+  // sentence is emitted as a live-only error frame and never persisted, so on reload this table
+  // is the ONLY thing the citizen sees for this ending. Rendering the neutral "Build finished."
+  // here made the portal assert a completion the backend deliberately refuses to confirm: the
+  // verdict is unanswerable precisely because a reverted container serving the starter page
+  // compiles, serves 200 and logs no crash. TYPED OUT rather than imported, like every other
+  // entry — importing the server's constant is what would let the two agree by construction and
+  // stop catching the drift this table exists to catch.
+  verdict_unanswerable:
+    "Your app looks like it's running, but we couldn't confirm this change went in. " +
+    'Open the preview and see — and if something looks wrong, say so and we\'ll fix it.',
   self_heal_budget_exhausted:
     'Your app is running — the assistant just ran out of steps before it finished tidying up.',
   build_wrote_nothing: 'This build ended without changing anything in your app.',
@@ -206,7 +214,7 @@ const NAMED_ENDINGS: ReadonlySet<string> = new Set(Object.keys(OUTCOME_COPY))
  *
  * THE UNION IS CLOSED AND THE WIRE IS NOT. A server one deploy ahead can send a reason this
  * bundle has never heard of, so the narrowing happens once, here, at the boundary — which is what
- * lets the dispatch below be exhaustive instead of open.
+ * lets the lookup below be total instead of open.
  */
 function isEndReason(reason: string): reason is EndReason {
   return NAMED_ENDINGS.has(reason)
@@ -243,32 +251,7 @@ export function outcomeSummary({
   reason: string | null
 }): string {
   if (reason === null || !isEndReason(reason)) return genericEnding(status)
-  switch (reason) {
-    // Every member, listed rather than looked up straight, so a reason added to `EndReason`
-    // fails HERE as well as on the table above — the table catches a missing sentence, this
-    // catches an ending nobody thought about at all.
-    case 'quota_exceeded':
-    case 'stopped_by_user':
-    case 'force_ended':
-    case 'idle_teardown':
-    case 'workspace_restored':
-    case 'request_limit':
-    case 'wall_clock_deadline_exceeded':
-    case 'run_budget_reached':
-    case 'model_unavailable':
-    case 'verdict_unanswerable':
-    case 'self_heal_budget_exhausted':
-    case 'build_wrote_nothing':
-    case 'attachment_unavailable':
-    case 'sandbox_unavailable':
-    case 'workspace_unreadable':
-    case 'workspace_unrecoverable':
-    case 'context_hard_limit_exceeded':
-    case 'DOCUMENT_TOO_MANY_PAGES':
-      return OUTCOME_COPY[reason]
-    default:
-      return assertNever(reason)
-  }
+  return OUTCOME_COPY[reason]
 }
 
 /** The sentence for an ending that recorded no reason, shaped by how the turn finished. */

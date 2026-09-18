@@ -55,8 +55,16 @@ class InlineSystemPromptShapeError(RuntimeError):
 
 def _foundry_probe_model() -> AnthropicModel:
     """A throwaway Foundry-client model, built only to read a profile flag. No socket is opened
-    by construction, and the client is never used to make a request."""
-    probe_client = AsyncAnthropicFoundry(resource="inline-system-probe", api_key="probe")
+    by construction, and the client is never used to make a request.
+
+    THE ADDRESS IS PASSED IN FULL RATHER THAN AS A `resource`, AND THAT IS NOT A STYLE CHOICE.
+    The client falls back to `ANTHROPIC_FOUNDRY_BASE_URL` whenever `base_url` is None, and then
+    refuses a `base_url` and a `resource` together — so a deployment that happens to export that
+    variable would make this probe raise. It runs at import, so the whole API would fail to boot,
+    with a traceback pointing at a helper that has nothing to do with that variable's purpose."""
+    probe_client = AsyncAnthropicFoundry(
+        base_url="https://inline-system-probe.services.ai.azure.com/anthropic/", api_key="probe"
+    )
     return AnthropicModel(
         _INLINE_PROBE_DEPLOYMENT, provider=AnthropicProvider(anthropic_client=probe_client)
     )

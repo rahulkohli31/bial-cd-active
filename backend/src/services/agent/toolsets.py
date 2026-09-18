@@ -166,12 +166,18 @@ def app_state_toolset[DepsT](
 ) -> FunctionToolset[DepsT]:
     """`check_the_app`, over whatever deps `sandbox_of` resolves the container from.
 
-    ONE PROBE PER TOOLSET, MEMOIZED IN THE CLOSURE. A toolset is built per run, so the second
-    `check_the_app` call of a run returns the first one's answer with no container round-trip —
+    ONE PROBE PER UNCHANGED TREE, MEMOIZED IN THE CLOSURE. Repeated calls that the model makes
+    without editing anything in between return the first answer with no container round-trip —
     the same ceiling `connector_schema` puts on re-delivering its artefact, for the same reason:
-    without it N calls become N readiness polls plus N execs. The Build arm rebuilds its toolsets
-    per self-heal iteration, so a repaired app is read again rather than reported from before the
-    repair.
+    without it N calls become N readiness polls plus N execs.
+
+    THE MEMO IS KEYED ON `session.writes`, NOT ON THE RUN, and that is what keeps the tool's
+    promise honest. A Build run holds the mutating tools and this one together for up to
+    `MODEL_TURN_CEILING` requests, so "memoize for the whole run" means a model that reads
+    NOT_SERVING, fixes the bug, and checks again is handed its own pre-fix answer under a
+    docstring that says "right now" — and then tells the citizen so in prose the platform streams
+    live and never gates. Any write invalidates the reading; a run that never writes still pays
+    for exactly one probe.
 
     `noticed` IS HANDED THE READING AS THE TOOL ANSWERS, so the turn can act on the same fact the
     model was given rather than re-deriving it from the sentence that carried it. It fires on
@@ -183,7 +189,7 @@ def app_state_toolset[DepsT](
     `get_type_hints` at registration, where that param is out of scope under deferred
     annotations. The factory signature carries the real typing; the `cast` at the return narrows
     back to it."""
-    memo: list[AppState] = []
+    memo: list[tuple[int, AppState]] = []
 
     async def check_the_app(ctx: RunContext[Any]) -> str:
         """Call this before you say anything about what the app does now, and whenever the user
@@ -195,21 +201,27 @@ def app_state_toolset[DepsT](
         hands you its answer, so you do not need to run a type-check or start a server to find
         out.
         """
-        if not memo:
-            session = sandbox_of(ctx)
-            memo.append(
-                AppState.UNKNOWN
-                if session is None
-                else await read_the_app_state(
-                    session.sandbox_client,
-                    session.handle,
-                    max_polls=WORKSPACE_NOTE_MAX_POLLS,
-                    poll_s=READINESS_POLL_S,
+        session = sandbox_of(ctx)
+        # No session means no container to read and no writes to invalidate against, so the
+        # one UNKNOWN it produces is cached under a count that can never move.
+        writes = session.writes if session is not None else 0
+        if not memo or memo[0][0] != writes:
+            memo[:] = [
+                (
+                    writes,
+                    AppState.UNKNOWN
+                    if session is None
+                    else await read_the_app_state(
+                        session.sandbox_client,
+                        session.handle,
+                        max_polls=WORKSPACE_NOTE_MAX_POLLS,
+                        poll_s=READINESS_POLL_S,
+                    ),
                 )
-            )
+            ]
         if noticed is not None:
-            noticed(memo[0])
-        return _APP_STATE_SENTENCES[memo[0]]
+            noticed(memo[0][1])
+        return _APP_STATE_SENTENCES[memo[0][1]]
 
     return cast(FunctionToolset[DepsT], FunctionToolset[Any]([check_the_app], id="app-state"))
 

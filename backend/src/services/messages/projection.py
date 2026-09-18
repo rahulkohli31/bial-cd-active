@@ -5,11 +5,19 @@ snapshot (live). Reads raw ROWS, not validated dataclasses: validating would coe
 stored attachment-ref marker to `CachePoint` (the pinned 2.5.0 hazard) and force
 rehydration this read must never pay for.
 
-THIS IS WHERE MASKING HAPPENS. The persistence seam stores what was sent — it has to, or the
-replayed prefix is not the prefix — so a row's `payload` reaches this function with whatever
-credential-shaped text the model wrote in it. `_mask_for_display` is the one place that answer
-is given: it runs over the finished `DisplayItem` list, so both consumers inherit it and no
-future item type can be added on a path that skips it. Pinned by test, not by this sentence.
+THIS IS WHERE MASKING HAPPENS FOR EVERYTHING READ BACK FROM STORAGE. The persistence seam stores
+what was sent — it has to, or the replayed prefix is not the prefix — so a row's `payload` reaches
+this function with whatever credential-shaped text the model wrote in it. `_mask_for_display` is
+the one place that answer is given: it runs over the finished `DisplayItem` list, so both
+consumers inherit it and no future item type can be added on a path that skips it. Pinned by test,
+not by this sentence.
+
+IT IS NOT THE ONLY WAY PROSE REACHES A BROWSER, and reading that sentence as "no unmasked model
+text can reach a citizen" would be wrong. The live SSE text stream (`turns/engine.py::_push_text`)
+carries the model's words straight through as they are generated and has never been redacted —
+so a credential the model echoes is visible live, and masked only once the page is reloaded.
+Closing that is a separate piece of work: the stream emits deltas, and a secret can straddle two
+of them, so a per-delta pass would not see it.
 
 Hidden rows are excluded from RENDERING but still inform derived state: an unclosed
 `build_started` marker with no later same-session `build_outcome` projects the
@@ -1268,10 +1276,17 @@ def measured_context_tokens(rows: Sequence[Message]) -> int | None:
     return max(measured, default=None)
 
 
-def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
+def project_rows(rows: Sequence[Message], *, tail: int | None = None) -> list[DisplayItem]:
     """The one history→display derivation. `rows` must be the `include_hidden=True` read —
     hidden rows render nothing directly, but unclosed `build_started` markers derive the
-    in-progress anchor."""
+    in-progress anchor.
+
+    `tail` KEEPS ONLY THE LAST N ITEMS, AND IT IS A COST CONTROL RATHER THAN A CONVENIENCE. The
+    whole transcript still has to be projected — an item's meaning depends on rows before it —
+    but masking does not: `_mask_for_display` runs `redact_secrets` over every text field, and a
+    caller that slices afterwards pays for a whole conversation's redaction on every SSE
+    reconnect to show eight items. Slicing here is safe because masking is per-item; slicing
+    the ROWS would not be."""
     closed = _closed_sessions(rows)
     first_steps = _first_step_rows(rows)
     synthetic = _synthetic_resolutions(rows)
@@ -1430,11 +1445,11 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
             elif message.get("kind") == "response":
                 _project_response_parts(row, message, results, items)
 
-    return _mask_for_display(items)
+    return _mask_for_display(items if tail is None else items[-tail:])
 
 
 async def project_conversation(
-    db: AsyncSession, *, user_id: uuid.UUID, rows: Sequence[Message]
+    db: AsyncSession, *, user_id: uuid.UUID, rows: Sequence[Message], tail: int | None = None
 ) -> list[DisplayItem]:
     """`project_rows`, with every attachment chip filled in. THE ENTRY POINT ROUTES USE.
 
@@ -1452,11 +1467,15 @@ async def project_conversation(
     conversation with forty attachments costs one read rather than forty — the N+1 this
     codebase treats as a defect rather than a style note.
 
+    `tail` IS PASSED STRAIGHT THROUGH, and a caller that wants only the last N items must use it
+    rather than slicing the result: everything this function does — redaction and the attachment
+    read — is then paid for the whole transcript and thrown away.
+
     An id with no row is left with empty name and media type on purpose: the row is gone
     (reclaimed with its conversation) but the reference survives in the payload forever, and
     the browser draws "attachment unavailable" from exactly that state.
     """
-    items = project_rows(rows)
+    items = project_rows(rows, tail=tail)
     wanted = {
         ref.attachment_id
         for item in items
