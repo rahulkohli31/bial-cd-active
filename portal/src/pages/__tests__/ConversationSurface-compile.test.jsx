@@ -162,7 +162,7 @@ beforeEach(() => {
   h.startTurn.mockResolvedValue({ turnId: 't1' })
   h.fetchCompileState.mockResolvedValue('unknown')
   h.checkWorkspace.mockResolvedValue(false)
-  h.fetchSaveState.mockResolvedValue({ appId: null, dirty: null, containerHead: null, savedHead: null, recoveryAt: null })
+  h.fetchSaveState.mockResolvedValue({ appId: null, dirty: null, containerHead: null, savedHead: null })
   h.fetchPreviewState.mockResolvedValue({
     state: 'unknown', alive: false, previewUrl: null, occupyingProjectName: null, restorable: null,
   })

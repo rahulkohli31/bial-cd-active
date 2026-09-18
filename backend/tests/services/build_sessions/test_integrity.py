@@ -13,6 +13,8 @@ import uuid
 import pytest
 
 from src.core.integrity_types import BaselineIdentity
+from src.db.models.harness_counter import HarnessCounter
+from src.services.build_sessions.counters import count
 from src.services.build_sessions.integrity import (
     _CHANGED_SINCE_GUARDED,
     BASELINE_COMMIT_SUBJECT,
@@ -24,7 +26,6 @@ from src.services.build_sessions.integrity import (
     stamp_the_watermark,
 )
 from src.services.sandbox import SandboxError
-from src.services.storage import StorageError, recovery_key
 from tests.services.orchestrator.fake_sandbox import (
     BASELINE_DIVERGED_STDOUT,
     BASELINE_ROOT_SHA,
@@ -181,29 +182,50 @@ async def test_stamping_reports_whether_it_landed() -> None:
 # =============================================================================
 
 
-async def test_storage_unconfigured_is_a_confirmed_absent() -> None:
-    """A fact about the DEPLOYMENT, not about anybody's work: with no store there can be no
-    recovery copy for anyone, so the content check is skipped rather than run against a fiction."""
+async def test_a_project_nobody_has_built_in_is_a_confirmed_absent(
+    empty_harness_counts: None,
+) -> None:
+    """A brand-new project is SUPPOSED to be showing the starter template, so asking the content
+    question about one would manufacture an accusation."""
     assert await has_ever_been_built(_APP) is False
 
 
-async def test_a_recovery_copy_means_a_turn_has_done_real_work(fake_storage) -> None:
+async def test_a_turn_that_wrote_the_workspace_means_it_has_been_built(
+    empty_harness_counts: None,
+) -> None:
+    """★ THE COUNTER ROW IS THE SOURCE, and it has to be: a container that factory-resets loses
+    everything it could be asked, and the row survives — which is exactly when the content check
+    most needs to run.
+    Mutation check: answer this from the container or the store and a reverted app stops being
+    checked."""
     assert await has_ever_been_built(_APP) is False  # liveness: the absent case is the default
-    await fake_storage.put(recovery_key(_APP), b"a bundle")
+    await count(HarnessCounter.WORKSPACE_WAS_WRITTEN, app_id=_APP)
     assert await has_ever_been_built(_APP) is True
 
 
-async def test_an_unreadable_store_fails_closed_toward_checking(
-    fake_storage, monkeypatch: pytest.MonkeyPatch
+async def test_a_row_for_another_app_is_never_read_as_this_ones(
+    empty_harness_counts: None,
+) -> None:
+    """The table is deployment-wide, so a predicate that dropped `app_id` would report every app
+    as built the moment anybody built anything."""
+    await count(HarnessCounter.WORKSPACE_WAS_WRITTEN, app_id=uuid.uuid4())
+
+    assert await has_ever_been_built(_APP) is False
+
+
+async def test_a_database_that_will_not_answer_fails_closed_toward_checking(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """★ THE TWO "NO"s FAIL IN OPPOSITE DIRECTIONS, on purpose: the worst case of checking an app
     that turns out to be brand-new is one honest sentence saying it is still the starter page;
     the worst case of NOT checking is a completion claim shipped over an untouched template,
     during an outage nobody would connect it to.
-    Mutation check: return False from the `StorageError` arm and this goes red."""
+    Mutation check: return False from the `except` arm and this goes red."""
+    import src.db.base as db_base
 
-    async def blows_up(_key: str) -> object:
-        raise StorageError("the store would not answer")
+    def explode() -> object:
+        raise RuntimeError("the session factory itself is broken")
 
-    monkeypatch.setattr(fake_storage, "head", blows_up)
+    monkeypatch.setattr(db_base, "async_session_factory", explode)
+
     assert await has_ever_been_built(_APP) is True

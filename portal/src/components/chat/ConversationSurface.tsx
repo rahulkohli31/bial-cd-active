@@ -233,6 +233,11 @@ const DIAGNOSTIC_FALLBACK = 'We hit a problem finishing that change.'
  */
 const BUILD_WAS_RUNNING = 'A build was running here when this chat was last open.'
 
+/** What a citizen is told when their Save did not land and the server gave no sentence of its
+ *  own. The effect first, then the one thing they can do about it — nobody to contact, because
+ *  there is no one who can put this right on their behalf. */
+const SAVE_DID_NOT_LAND = 'Your app was not saved. Try again.'
+
 /** The key a diagnostic row takes in the turn's parts.
  *
  * A diagnostic is not a tool call, so it has no tool-call id of its own — but it IS drawn as a
@@ -479,11 +484,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   const [discarding, setDiscarding] = useState(false)
   const [hasSavedVersion, setHasSavedVersion] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
-  // WHAT THE PLATFORM OWES THIS CITIZEN ABOUT THEIR APP'S LIFE. The renewal below answers the
-  // first; the save read answers the second, which is durable and must be met on a later visit
-  // rather than only in the session the refusal happened in.
+  // WHAT THE PLATFORM OWES THIS CITIZEN ABOUT THEIR APP'S LIFE — answered by the renewal below.
   const [drainingAt, setDrainingAt] = useState<string | null>(null)
-  const [writeBackRefusedAt, setWriteBackRefusedAt] = useState<string | null>(null)
   // `projectHasSavedBuild` arrives as a PROP, read once when the route resolved, and nothing
   // refetches it. But a Save is precisely the act that writes the snapshot bundle that flag
   // reports — so saving, the one thing that makes a relaunch possible, left the Relaunch
@@ -562,7 +564,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       if (projectIdRef.current === activeProjectId && read === saveReadSeq.current) {
         setSaveDirty(state.dirty)
         setHasSavedVersion(state.savedHead !== null)
-        setWriteBackRefusedAt(state.writeBackRefusedAt)
       }
     } catch {
       // UNKNOWN, never "clean". A failed check must not report the work as safe.
@@ -594,10 +595,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         setHasSavedVersion(true)
       }
     } catch (err) {
-      // Surfaced, never swallowed: a Save that silently fails leaves the user believing their
-      // work is stored. The 409 copy from the server already names the way out.
+      // ON THE ASSERTIVE SLOT, with every other failure this surface consolidates there: a Save
+      // that fails silently leaves the citizen believing their work is stored, and the small
+      // alert beside the control is not where somebody mid-conversation is looking. The server's
+      // own sentence when it has one — the 409 already names the way out.
       if (projectIdRef.current === activeProjectId) {
-        setSaveError(err instanceof Error ? err.message : 'Could not save your work. Try again.')
+        setUrgent(err instanceof Error ? err.message : SAVE_DID_NOT_LAND)
         // Same fail-toward-warning as the failed check above: a Save that threw leaves this
         // surface unable to say what the container holds.
         setSaveDirty(null)
@@ -865,7 +868,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // THE PANE COLUMN IS WHERE THESE ARE SAID, and it is a sibling of the `<Outlet/>` this surface
   // fills — so a citizen mid-conversation is told their app is closing, on the same words the
   // project screen uses.
-  usePublishLifecycle({ drainingAt, writeBackRefusedAt })
+  usePublishLifecycle({ drainingAt })
 
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
   // aborts it before resubscribing, but nothing did on unmount, leaking the reader (and its

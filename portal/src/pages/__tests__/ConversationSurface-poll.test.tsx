@@ -222,7 +222,7 @@ beforeEach(() => {
   ])
   h.buildUserParts.mockImplementation(async (text: string) => [{ type: 'text', text }])
   h.startTurn.mockResolvedValue({ turnId: 't1' })
-  h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: false, savedHead: null, containerHead: null, recoveryAt: null })
+  h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: false, savedHead: null, containerHead: null })
   h.fetchPreviewState.mockResolvedValue(answer('alive'))
 })
 afterEach(() => {

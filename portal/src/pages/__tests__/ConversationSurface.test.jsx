@@ -365,6 +365,32 @@ describe('★ a Save from the chat raises the deployment nudge', () => {
     await waitFor(() => expect(nudges).toHaveLength(1))
     expect(nudges[0].projectId).toBe('p1')
   })
+
+  it('★ says so on the assertive slot when the save does not land', async () => {
+    // A Save that fails silently leaves the citizen believing their work is stored, and the small
+    // alert beside the control is not where somebody mid-conversation is looking. The server's
+    // own sentence, on the same slot every other failure here lands on.
+    // Mutation check: point the catch arm back at the inline slot and the banner never appears.
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    h.saveProject.mockRejectedValue(new Error('Your workspace is no longer running.'))
+    renderBuilder({ deps: deps().deps })
+
+    fireEvent.click(await screen.findByTestId('save-project'))
+
+    const banner = await screen.findByTestId('urgent-banner')
+    expect(banner.textContent).toMatch(/no longer running/i)
+  })
+
+  it('falls back to a plain sentence when the failure carries none', async () => {
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    h.saveProject.mockRejectedValue('nope')
+    renderBuilder({ deps: deps().deps })
+
+    fireEvent.click(await screen.findByTestId('save-project'))
+
+    const banner = await screen.findByTestId('urgent-banner')
+    expect(banner.textContent).toBe('Your app was not saved. Try again.')
+  })
 })
 
 /**
@@ -421,9 +447,9 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
   it('★ a Discard sends this chat, shows the line its next reply reads, and settles Save', async () => {
     // Mutation check: drop the chat's id, the appended line, or the returned save state.
     const SAVED = 'a'.repeat(40)
-    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: SAVED, recoveryAt: null })
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: SAVED })
     h.discardUnsavedChanges.mockResolvedValue({
-      saveState: { appId: 'a1', dirty: false, containerHead: SAVED, savedHead: SAVED, recoveryAt: null },
+      saveState: { appId: 'a1', dirty: false, containerHead: SAVED, savedHead: SAVED },
       notice: { seq: 9, savedAt: '2026-09-13T14:32:00Z' },
     })
     renderBuilder({ deps: deps().deps })
@@ -444,9 +470,9 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
     // Mutation check: revert the `!m.ephemeral` filter in `handleDiscard` and this sends the
     // chat's buildId instead of null.
     const SAVED = 'a'.repeat(40)
-    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: SAVED, recoveryAt: null })
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: SAVED })
     h.discardUnsavedChanges.mockResolvedValue({
-      saveState: { appId: 'a1', dirty: false, containerHead: SAVED, savedHead: SAVED, recoveryAt: null },
+      saveState: { appId: 'a1', dirty: false, containerHead: SAVED, savedHead: SAVED },
       notice: null,
     })
     renderBuilder({ deps: deps().deps })
@@ -464,7 +490,7 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
 
   it('a Discard waits while this chat is replying', async () => {
     // Mutation check: publish `replying: false` from this page and the control stays pressable.
-    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40), recoveryAt: null })
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
     h.readTurnStream.mockImplementation(() => new Promise(() => {}))
     renderBuilder({ deps: deps().deps })
     await send('add a date filter')

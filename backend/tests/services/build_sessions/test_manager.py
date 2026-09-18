@@ -66,10 +66,6 @@ from src.services.build_sessions.manager import (
 )
 from src.services.build_sessions.outcome import write_build_outcome
 from src.services.build_sessions.reaper import sweep_all
-from src.services.build_sessions.snapshot import (
-    RecoveryOutcome,
-    RecoveryWrite,
-)
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -934,17 +930,16 @@ async def test_next_start_sweeps_an_expired_ended_session(
 # --- the turn seam: a message sent the instant a turn ends ----------------------------
 
 
-def _a_gated_recovery_copy(
+def _a_gated_closing_step(
     entered: asyncio.Event, gate: asyncio.Event
-) -> Callable[..., Awaitable[RecoveryWrite]]:
-    """Hold `finish_turn_sandbox` open inside its recovery write — the turn is over, its
-    terminal is written, and the one-per-user slot is still held. That is the window a citizen's
-    next message lands in, and the recovery write is what makes it long enough to matter."""
+) -> Callable[..., Awaitable[None]]:
+    """Hold `finish_turn_sandbox` open inside its closing work — the turn is over, its terminal
+    is written, and the one-per-user slot is still held. That is the window a citizen's next
+    message lands in, and a container round trip is what makes it long enough to matter."""
 
-    async def gated(*_args: object, **_kwargs: object) -> RecoveryWrite:
+    async def gated(*_args: object, **_kwargs: object) -> None:
         entered.set()
         await gate.wait()
-        return RecoveryWrite(outcome=RecoveryOutcome.WRITTEN, reason="written")
 
     return gated
 
@@ -958,7 +953,7 @@ async def test_a_message_sent_while_a_turn_is_still_letting_go_waits_instead_of_
     """The sibling above, through the door every ordinary message takes. A turn's end runs
     `finish_turn_sandbox`, which leaves nothing behind but the event it sets — so an escape that
     asked for anything else would answer "still building" on every finished turn and refuse the
-    citizen's next message for as long as the recovery copy takes to write.
+    citizen's next message for as long as that closing work takes.
 
     Mutation check: drop `_what_will_release_the_slot`'s `turn_finish` arm and this goes red."""
     user, project_id = await _mk(db_session, "m19b@rvaiglobal.com")
@@ -971,7 +966,7 @@ async def test_a_message_sent_while_a_turn_is_still_letting_go_waits_instead_of_
 
     entered, gate = asyncio.Event(), asyncio.Event()
     monkeypatch.setattr(
-        manager_module, "write_recovery_copy", _a_gated_recovery_copy(entered, gate)
+        manager_module, "flag_liveness_overpromise", _a_gated_closing_step(entered, gate)
     )
 
     # DETACHED, and that is the shape rather than the convenience: the turn awaits its own
@@ -1011,7 +1006,7 @@ async def test_a_turn_that_never_lets_go_of_the_slot_keeps_the_conflict(
 
     entered, gate = asyncio.Event(), asyncio.Event()
     monkeypatch.setattr(
-        manager_module, "write_recovery_copy", _a_gated_recovery_copy(entered, gate)
+        manager_module, "flag_liveness_overpromise", _a_gated_closing_step(entered, gate)
     )
     monkeypatch.setattr(manager_module, "_FINALIZE_GRACE_SECONDS", 0.05)
 
@@ -1488,7 +1483,7 @@ async def test_a_relaunch_while_a_turn_is_still_letting_go_waits_like_a_message_
 
     entered, gate = asyncio.Event(), asyncio.Event()
     monkeypatch.setattr(
-        manager_module, "write_recovery_copy", _a_gated_recovery_copy(entered, gate)
+        manager_module, "flag_liveness_overpromise", _a_gated_closing_step(entered, gate)
     )
     finishing = asyncio.create_task(manager.finish_turn_sandbox(session, client, touched=True))
     await entered.wait()

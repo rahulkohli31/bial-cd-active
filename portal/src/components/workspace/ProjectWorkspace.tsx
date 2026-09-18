@@ -358,12 +358,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   // hidden pane, because "there is nothing here yet" is a thing the app pane should say rather
   // than an absence a citizen has to interpret.
   useAppPaneVisible(true)
-  usePublishLifecycle({
-    drainingAt: workspace.drainingAt,
-    // The save read carries it: a refusal is durable and a citizen must meet it on their NEXT
-    // visit, not only in the session it happened in.
-    writeBackRefusedAt: workspace.save?.writeBackRefusedAt ?? null,
-  })
+  usePublishLifecycle({ drainingAt: workspace.drainingAt })
 
   return (
     <>

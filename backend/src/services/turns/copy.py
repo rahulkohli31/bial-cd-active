@@ -249,41 +249,17 @@ was checked, nothing was changed, and trying again is likely to work — so this
 `UNVERIFIED_TEXT`'s proceeds."""
 
 
-KEPT_A_COPY: Final = "we've kept a copy of your app, so nothing you did today is lost"
-"""The reassuring half of `AT_LIMIT_TEXT`, said only when a copy has actually been stored.
-
-A SEPARATE CONSTANT BECAUSE THE CLAIM IS CONDITIONAL. Folding "your app is safe" into the at-limit
-sentence would make the platform assert it on the one path where it might not be true — and a false
-reassurance is worse here than no reassurance at all, because the citizen acts on it by closing the
-tab."""
-
-
-COULD_NOT_KEEP_A_COPY: Final = (
-    "we weren't able to keep a copy of your app just now, so save it before you leave this page"
-)
-"""The other half, said ONLY when the platform tried to keep a copy and failed.
-
-Saying it only when it is true is what gives it teeth: a save instruction attached to every
-at-limit message, whether or not anything was secured, reads as a formality and is ignored — so on
-the day the copy genuinely did not land, the one alarming sentence looks like boilerplate. The
-wording has to carry that ordering too, since the platform tried first: this is a request for help
-rather than an instruction the citizen was always going to be given."""
-
-
 AT_LIMIT_TEXT: Final = (
-    "You've used up your building budget for today, {kept}. "
+    "You've used up your building budget for today. "
     "You can carry on after midnight, and if you need more before then, email {contact}."
 )
-"""What a citizen is told when their daily budget runs out. THREE FACTS, EACH LOAD-BEARING.
+"""What a citizen is told when their daily budget runs out. TWO FACTS, EACH LOAD-BEARING.
 
 *What happened*, in the words the person used to ask for the app: a budget for the day, used up.
 Not a token cap, not a quota, not a limit exceeded — none of which tell a non-technical reader
 whether they broke something, whether it will happen again, or whether it is about them at all.
 "Budget" is also the word the existing surfaces already use for the same fact, so the citizen is
 not asked to learn a second name for one thing.
-
-*Whether their work survived*, filled from `KEPT_A_COPY` / `COULD_NOT_KEEP_A_COPY` by the caller
-that actually performed the write — so the reassurance is never a guess dressed as a fact.
 
 *When it comes back, and who to ask if that is too late.* `{contact}` is a single configured
 support address (`ApiSettings.SUPPORT_CONTACT_EMAIL`) rather than a role, which the citizen has no
@@ -348,7 +324,7 @@ is not, and this is what it says instead — "could not tell" is never collapsed
 
 
 SPENT_ENOUGH_TEXT: Final = (
-    "This one has taken as much as I want to spend on it in a single go, {kept}. "
+    "This one has taken as much as I want to spend on it in a single go. "
     "Your app is working — have a look, and send me the next bit when you are ready."
 )
 """How a turn ends when it reaches the platform's spend bound.
@@ -365,12 +341,11 @@ wrong and has not hit a limit of their own — the daily budget is a different s
 confusing the two would tell them to wait until midnight when they can carry on right now.
 
 IT SAYS THE APP IS WORKING, because that is what the piece-at-a-time ordering buys and it is the
-fact that makes this ending survivable. `{kept}` is filled by the same securing function the
-daily-budget ending uses, so the reassurance is conditional on a copy actually landing."""
+fact that makes this ending survivable."""
 
 
 MODEL_UNAVAILABLE_TEXT: Final = (
-    "The assistant's service stopped responding partway through, {kept}. "
+    "The assistant's service stopped responding partway through. "
     "Send your message again in a minute and it will carry on from here."
 )
 """What a citizen is told when the model service fails mid-build: a retryable status that outlived
@@ -378,8 +353,7 @@ the SDK's own retries, a connection that never answered, or a stream that ended 
 
 WHY NOT THE GENERIC SENTENCE. "The assistant hit a problem and this turn was stopped" is right for
 a platform bug and wrong here: the assistant is fine, the workspace is exactly as the last write
-left it, and the thing to do is send again. `{kept}` is filled by the same securing function the
-daily budget and the run bounds use, so the reassurance is verified rather than assumed.
+left it, and the thing to do is send again.
 
 NOT A CLAIM ABOUT 2026-09-11. That incident's generic failure is still unexplained: Foundry's
 metrics for the minute show only status 200, no errors and no client-closed requests. The terminal
@@ -389,7 +363,7 @@ MODEL_UNAVAILABLE_PLAN_TEXT: Final = (
     "The assistant's service stopped responding partway through. "
     "Send your message again in a minute."
 )
-"""The same ending in a Plan chat, where there is no workspace to have kept a copy of."""
+"""The same ending in a Plan chat, where there is no workspace at all."""
 
 
 DEPENDENCY_DRIFT_TEXT: Final = (

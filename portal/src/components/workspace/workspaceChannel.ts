@@ -281,23 +281,20 @@ export const NO_SAVE: SaveSlot = {
 }
 
 /**
- * WHAT THE PLATFORM OWES THE CITIZEN ABOUT THEIR APP'S LIFE — the container's ceiling, and a
- * write-back that was refused. `WorkspaceLifecycleNotes` states both, and it is mounted in the
- * pane column, which is a sibling of the `<Outlet/>`: the surface that READS these facts is never
- * the one that renders them, which is why they travel.
+ * WHAT THE PLATFORM OWES THE CITIZEN ABOUT THEIR APP'S LIFE — the container's ceiling.
+ * `WorkspaceLifecycleNotes` states it, and it is mounted in the pane column, which is a sibling of
+ * the `<Outlet/>`: the surface that READS the fact is never the one that renders it, which is why
+ * it travels.
  *
- * ONE CELL FOR THE PAIR, because one note states both and both come from the same surface's reads.
- * `null` ON EITHER HALF IS A POSITIVE CLAIM — no ceiling applies, no write-back was refused — so a
- * surface that has not asked yet publishes two nulls and the note says nothing until it can.
+ * `null` IS A POSITIVE CLAIM — no ceiling applies — so a surface that has not asked yet publishes
+ * `null` and the note says nothing until it can.
  */
 export interface WorkspaceLifecycle {
   /** When this app's container reaches its ceiling, or `null` when no ceiling applies. */
   drainingAt: string | null
-  /** When a platform write-back for this app was last refused, or `null` if none ever was. */
-  writeBackRefusedAt: string | null
 }
 
-export const NO_LIFECYCLE: WorkspaceLifecycle = { drainingAt: null, writeBackRefusedAt: null }
+export const NO_LIFECYCLE: WorkspaceLifecycle = { drainingAt: null }
 
 /**
  * THE ROW'S HANDLERS, held apart from every compared value on purpose.
@@ -352,8 +349,7 @@ const sameSave = (a: SaveSlot, b: SaveSlot) =>
   a.canSave === b.canSave &&
   a.canDiscard === b.canDiscard
 
-const sameLifecycle = (a: WorkspaceLifecycle, b: WorkspaceLifecycle) =>
-  a.drainingAt === b.drainingAt && a.writeBackRefusedAt === b.writeBackRefusedAt
+const sameLifecycle = (a: WorkspaceLifecycle, b: WorkspaceLifecycle) => a.drainingAt === b.drainingAt
 
 /**
  * WHAT THE PANE NEEDS IN ORDER TO SAY WHAT THE WORKSPACE IS DOING. The `state` is the one computed

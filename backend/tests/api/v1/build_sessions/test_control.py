@@ -25,7 +25,6 @@ from src.api.v1.build_sessions.schemas import (
 )
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.manager import StopOutcome
-from src.services.build_sessions.snapshot import RecoveryOutcome, RecoveryWrite
 from tests.api.v1.build_sessions.conftest import a_live_session, auth_headers
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 
@@ -346,32 +345,29 @@ async def test_the_release_refusal_names_the_project_holding_the_workspace(
 # --- the window between a turn's terminal and its release ------------------------------
 
 
-async def test_a_finished_turn_keeps_the_workspace_until_its_recovery_copy_is_written(
+async def test_a_finished_turn_keeps_the_workspace_until_its_closing_work_is_done(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, monkeypatch
 ) -> None:
     """The two halves of the turn seam, over the wire and at once: the release still refuses
-    while the finished turn writes its recovery copy, and the next message waits for that write
-    instead of being refused.
+    while the finished turn does its closing work against the live container, and the next
+    message waits for it instead of being refused.
 
-    The ordering is the point. Admitting the next message by freeing the slot ahead of the
-    recovery copy would buy the same green test and cost the citizen the one copy standing
-    between them and a lost session — the release would be admitted mid-write and tear the
-    container down underneath it.
+    The ordering is the point. Admitting the next message by freeing the slot first would buy the
+    same green test and cost the citizen the container out from under a call still using it.
 
-    Mutation check: move the `_active_by_user` pop above the recovery write in
-    `finish_turn_sandbox` and the release below answers 200."""
+    Mutation check: move the `_active_by_user` pop above step 1b in `finish_turn_sandbox` and the
+    release below answers 200."""
     user, project = await _user_project(db_session, "ctl-finish1@rvaiglobal.com")
     session = await a_live_session(wire, db_session, user, project.id)
     wire.sbx.attach_handle = session.handle  # the pardoned container answers the next message
 
     entered, gate = asyncio.Event(), asyncio.Event()
 
-    async def gated_recovery_copy(*_args: object, **_kwargs: object) -> RecoveryWrite:
+    async def gated_closing_work(*_args: object, **_kwargs: object) -> None:
         entered.set()
         await gate.wait()
-        return RecoveryWrite(outcome=RecoveryOutcome.WRITTEN, reason="written")
 
-    monkeypatch.setattr(manager_module, "write_recovery_copy", gated_recovery_copy)
+    monkeypatch.setattr(manager_module, "flag_liveness_overpromise", gated_closing_work)
     finishing = asyncio.create_task(
         wire.manager.finish_turn_sandbox(session, wire.sbx, touched=True)
     )
@@ -381,7 +377,7 @@ async def test_a_finished_turn_keeps_the_workspace_until_its_recovery_copy_is_wr
         f"/v1/build-sessions/projects/{project.id}/release", headers=auth_headers(user)
     )
     assert held.status_code == 409, held.text
-    assert wire.sbx.torn_down == []  # nothing was taken out from under the write
+    assert wire.sbx.torn_down == []  # nothing was taken out from under the closing work
 
     # ...and the next message, arriving in that same window, waits rather than bouncing.
     next_message = asyncio.create_task(a_live_session(wire, db_session, user, project.id))

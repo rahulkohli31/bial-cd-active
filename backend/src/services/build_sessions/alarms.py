@@ -64,30 +64,6 @@ add the new verb to whichever of the two it belongs in. Until that ships the pla
 screen — degraded, not broken."""
 
 
-RECOVERY_WRITE_DID_NOT_LAND_EVENT: Final = "recovery_write_did_not_land"
-"""A turn ended and its work did not reach the recovery slot.
-
-Fires on all THREE ways a turn's work fails to reach the slot, distinguished by `reason` rather
-than by three event names — one operational question, one event, filterable by field:
-
-* `refused` — the guard would not promote this tree (an unreadable lineage, a head_sha that is
-  not a sha). The existing copy is untouched.
-* `diverted` — same refusal, and the bundle was preserved under `divert_key` instead, so the tree
-  is recoverable by the operator promote procedure rather than thrown away.
-* `failed` — the bundle or the upload itself did not complete. This is the swallowed case, and it
-  is raised from the CALL SITE, which is the only place that knows the write raised. THE SWALLOW
-  STAYS — a safety net that can fail a turn is not a safety net — so this event is the whole of
-  the trace such a failure leaves, and without it nobody can tell a platform that failed to CHECK
-  the workspace from one that failed to make it DURABLE.
-
-Fields: `app_id`, `reason`, and — where the guard formed an opinion — `recorded_head` and
-`bundled_head`, which together say WHY a tree was refused.
-
-WHAT TO DO: read the app's `divert/{app_id}/` prefix. A `diverted` event means a real tree is
-sitting there; `services/build_sessions/snapshot.py::write_recovery_copy` documents the guard that
-put it there, and the operator promote endpoint is how it gets moved back."""
-
-
 WORKSPACE_LOST_WHILE_IDLE_EVENT: Final = "workspace_lost_while_idle"
 """A reversion was caught at the preview poll rather than at a turn.
 

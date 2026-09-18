@@ -273,23 +273,6 @@ export interface SaveState {
   dirty: boolean | null
   containerHead: string | null
   savedHead: string | null
-  /** WHEN THE PLATFORM LAST PUT THIS APP'S NEWEST TREE SOMEWHERE IT CAN BE BROUGHT BACK FROM —
-   *  an ISO instant, or `null` if it never has. Kept as the string it arrived as: the only
-   *  question anything asks of it is null-vs-not, and no surface here does date arithmetic.
-   *
-   *  IT IS NOT A SECOND `savedHead` AND MAY NEVER BE READ AS ONE. A recovery copy is the
-   *  platform's own doing; a saved version is the citizen's, Save stays MANUAL, and `dirty`
-   *  stays true while this is set. What it licenses is a truer WARNING, never a claim of
-   *  safety-by-saving — the rail's `saveSentence` is where that reasoning is written down. */
-  recoveryAt: string | null
-  /** WHEN A PLATFORM WRITE-BACK FOR THIS APP WAS LAST REFUSED, or `null` if none ever was.
-   *
-   *  Shutdown writes the citizen's work back with nobody watching. When the tree does not descend
-   *  from what they themselves saved, the guard sets it aside and the app comes back from the
-   *  SAVED version instead — which, from the screen, looks exactly like an ordinary reopen. This
-   *  is what lets the project screen say so, and saying so is what makes removing the exit
-   *  prompts honest rather than merely quieter. */
-  writeBackRefusedAt: string | null
 }
 
 /** Two readings that say the same thing. Every field is a primitive, so this is exact rather
@@ -300,8 +283,7 @@ export interface SaveState {
  *  THE NEW VALUE. The caller keeps the PREVIOUS object whenever this answers "same"
  *  (`useWorkspaceState`: `sameSaveState(prev, state) ? prev : state`), so a field this cannot
  *  see never reaches the screen at all: the reading that changed is thrown away and the rail
- *  goes on saying the sentence that belonged to the old one. `recoveryAt` is polled like the
- *  rest of them, and it decides which sentence the rail says. */
+ *  goes on saying the sentence that belonged to the old one. */
 export const sameSaveState = (a: SaveState | null, b: SaveState | null): boolean =>
   a === b ||
   (a !== null &&
@@ -309,9 +291,7 @@ export const sameSaveState = (a: SaveState | null, b: SaveState | null): boolean
     a.appId === b.appId &&
     a.dirty === b.dirty &&
     a.containerHead === b.containerHead &&
-    a.savedHead === b.savedHead &&
-    a.recoveryAt === b.recoveryAt &&
-    a.writeBackRefusedAt === b.writeBackRefusedAt)
+    a.savedHead === b.savedHead)
 
 /** Push the project's current tree to durable storage. THE USER'S CLICK — nothing else writes
  *  the bundle. A 409 means the workspace is no longer running, and is surfaced, never
@@ -925,9 +905,6 @@ function toSaveState(body: unknown): SaveState {
     dirty: typeof body.dirty === 'boolean' ? body.dirty : null,
     containerHead: typeof body.containerHead === 'string' ? body.containerHead : null,
     savedHead: typeof body.savedHead === 'string' ? body.savedHead : null,
-    recoveryAt: typeof body.recoveryAt === 'string' ? body.recoveryAt : null,
-    writeBackRefusedAt:
-      typeof body.writeBackRefusedAt === 'string' ? body.writeBackRefusedAt : null,
   }
 }
 

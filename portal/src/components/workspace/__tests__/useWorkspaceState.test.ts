@@ -50,7 +50,7 @@ function reading(over: Partial<PreviewState> = {}): PreviewState {
   }
 }
 
-const SAVE: SaveState = { appId: 'app-1', dirty: false, containerHead: 'abc1234', savedHead: 'abc1234', recoveryAt: null, writeBackRefusedAt: null }
+const SAVE: SaveState = { appId: 'app-1', dirty: false, containerHead: 'abc1234', savedHead: 'abc1234' }
 
 /**
  * Put the document out of sight, or bring it back, and fire the event the browser would.

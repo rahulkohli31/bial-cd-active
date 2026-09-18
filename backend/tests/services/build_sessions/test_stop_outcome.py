@@ -213,18 +213,15 @@ def test_the_stop_budget_sits_above_the_unwind_it_waits_on() -> None:
     recomputes the real cost and the budget has to keep up. A budget below the unwind's own
     bound reports a healthy stop as one that did not finish.
 
-    TWO NUMBERS, because the unwind has two parts. `finish_turn_sandbox`'s recovery autosave
-    carries its own bound, and whatever the turn was doing when it was cut has to come back
-    first — the widest per-container bound anything carries is the snapshot layer's, which is
-    what the ceiling clears.
+    Whatever the turn was doing when it was cut has to come back first, and the widest
+    per-container bound anything carries is the snapshot layer's — which is what the ceiling
+    clears.
 
-    Mutation check: drop either term from the derivation in `manager.py` and one of the two
-    assertions below goes red."""
+    Mutation check: drop the headroom term from the derivation in `manager.py` and this goes
+    red."""
     cut_short = SNAPSHOT_EXECS * SNAPSHOT_EXEC_TIMEOUT_SECONDS
-    autosave = manager_module._RECOVERY_SNAPSHOT_TIMEOUT_SECONDS
-    assert cut_short > 0 and autosave > 0  # liveness: both parts are real numbers
+    assert cut_short > 0  # liveness: the derivation is over a real number
     assert manager_module._STOP_ACTIVE_WORK_TIMEOUT_SECONDS > cut_short
-    assert manager_module._STOP_ACTIVE_WORK_TIMEOUT_SECONDS > autosave
 
 
 # --- the status read -----------------------------------------------------------------

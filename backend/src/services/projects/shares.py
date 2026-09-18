@@ -55,11 +55,9 @@ async def create_share(
     IDEMPOTENT (R3): re-sharing with the same colleague returns the existing row rather than
     erroring, duplicating, or writing a second audit entry for a grant that already stood.
 
-    REFUSES SELF-SHARE (R2) and REFUSES A PROJECT WITH NOTHING SAVED (R10) — EXPLICITLY the
-    saved snapshot via `snapshot_presence`, never `restorable_presence`'s broader "saved OR
-    autosaved" answer: the shared runtime only ever restores from the saved version (R21), so
-    a share backed only by an autosave would hand a recipient nothing launchable. An UNKNOWN
-    presence (`None` — the object store could not be reached) refuses too: this is a CREATE
+    REFUSES SELF-SHARE (R2) and REFUSES A PROJECT WITH NOTHING SAVED (R10), via
+    `snapshot_presence`. An UNKNOWN presence (`None` — the object store could not be reached)
+    refuses too: this is a CREATE
     gate, not Launch's own missing-snapshot disable (R10's second sentence), and the safer
     direction when the platform cannot tell is closed, not open.
     """

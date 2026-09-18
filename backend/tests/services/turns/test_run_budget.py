@@ -24,7 +24,7 @@ from src.services.orchestrator.constants import (
     RUN_WALL_CLOCK_DEADLINE_S,
 )
 from src.services.turns import copy as copy_module
-from src.services.turns.copy import KEPT_A_COPY, SPENT_ENOUGH_TEXT
+from src.services.turns.copy import SPENT_ENOUGH_TEXT
 
 
 def test_the_bound_is_a_number_the_platform_holds() -> None:
@@ -49,24 +49,23 @@ def test_the_ending_names_no_bound_and_no_limit_the_citizen_did_not_set() -> Non
     by `copy.py`'s register rule; it stays in the record and logs instead. It must also not read
     as the DAILY budget, whose ending says "carry on after midnight" — wrong advice here, since
     the citizen can carry on immediately, and the easy mistake once two endings share a function.
-    Mutation check: pass `AT_LIMIT_TEXT` as the spend bound's sentence and this goes red on
-    `midnight`."""
-    rendered = SPENT_ENOUGH_TEXT.format(kept=KEPT_A_COPY)
-
+    Mutation check: use `AT_LIMIT_TEXT` for the spend bound and this goes red on `midnight`."""
     for platform_word in ("token", "budget for today", "midnight", "limit", "ceiling", "quota"):
-        assert platform_word not in rendered.lower(), f"the ending names {platform_word!r}"
+        assert platform_word not in SPENT_ENOUGH_TEXT.lower(), (
+            f"the ending names {platform_word!r}"
+        )
     # What it DOES say: the app works, and what to do next.
-    assert "working" in rendered
-    assert "next bit" in rendered
+    assert "working" in SPENT_ENOUGH_TEXT
+    assert "next bit" in SPENT_ENOUGH_TEXT
 
 
-def test_the_ending_carries_the_conditional_reassurance_rather_than_asserting_it() -> None:
-    """`{kept}` is the same field the daily-budget sentence uses, filled by the same securing
-    function — so "your work is safe" is said only where a copy actually landed. A sentence
-    that asserted it unconditionally would be a false reassurance the citizen acts on by
-    closing the tab."""
-    assert "{kept}" in SPENT_ENOUGH_TEXT
-    assert KEPT_A_COPY in SPENT_ENOUGH_TEXT.format(kept=KEPT_A_COPY)
+def test_the_ending_promises_nothing_about_whether_the_work_was_kept() -> None:
+    """★ NO CLAIM ABOUT DURABILITY. The container survives a bounded run — nothing on this path
+    stores anything — and a reassurance the platform did not earn is the one a citizen acts on by
+    closing the tab.
+    Mutation check: fold a "we've kept a copy of your app" clause back in and this goes red."""
+    assert "kept a copy" not in SPENT_ENOUGH_TEXT.lower()
+    assert "{" not in SPENT_ENOUGH_TEXT, "every field is filled by the time a citizen reads it"
 
 
 # --- three bounds, one ending ---------------------------------------------------------------
@@ -118,13 +117,12 @@ def _bounded_raises() -> dict[str, ast.Raise]:
     return found
 
 
-def test_all_three_internal_bounds_end_through_the_one_securing_function() -> None:
+def test_all_three_internal_bounds_end_through_the_one_function() -> None:
     """★ The "three bounds, one ending" rule, asserted structurally rather than by reading copy.
 
-    Each ceiling must hand its message to `_bounded_run_ending`, the only thing here that
-    secures the tree before composing a word — a second call site means a divergent
-    snapshot-then-teardown order that loses someone's work. All three render the same sentence
-    now, so a test reading only the message couldn't tell a securing arm from one that doesn't.
+    Each ceiling must hand its message to `_bounded_run_ending`. All three render the same
+    sentence, so a test reading only the message could not tell one arm from another — and a
+    second composition site is how one of them drifts into naming the bound that fired.
     Mutation check: restore any one arm to a bare string literal and this goes red naming it."""
     raises = _bounded_raises()
     assert set(raises) == _BOUNDED_REASONS, (
@@ -133,15 +131,13 @@ def test_all_three_internal_bounds_end_through_the_one_securing_function() -> No
 
     for reason, node in sorted(raises.items()):
         assert isinstance(node.exc, ast.Call)
-        message = node.exc.args[1]
-        assert isinstance(message, ast.Await), f"{reason} does not await its ending"
-        call = message.value
-        assert isinstance(call, ast.Call), f"{reason} awaits something other than a call"
+        call = node.exc.args[1]
+        assert isinstance(call, ast.Call), f"{reason} composes its ending inline"
         attribute = call.func
         assert isinstance(attribute, ast.Attribute), f"{reason} does not call a method"
         assert attribute.attr == "_bounded_run_ending", (
             f"{reason} composes its own ending ({attribute.attr}) instead of going through the "
-            "one function that secures the tree first"
+            "one function all three share"
         )
 
 
@@ -199,7 +195,7 @@ def test_which_bound_fired_stays_in_the_record_while_the_citizen_reads_one_sente
     message either way."""
     raises = _bounded_raises()
     assert len(set(raises)) == 3, "the three bounds collapsed into one record value"
-    rendered = SPENT_ENOUGH_TEXT.format(kept=KEPT_A_COPY).lower()
+    rendered = SPENT_ENOUGH_TEXT.lower()
     for reason in _BOUNDED_REASONS:
         for word in reason.split("_"):
             assert word not in rendered, f"the shared ending leaks {reason!r} at {word!r}"

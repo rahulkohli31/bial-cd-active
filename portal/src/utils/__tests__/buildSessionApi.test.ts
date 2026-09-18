@@ -800,40 +800,38 @@ describe('fetchPreviewState — the wire mirror', () => {
 })
 
 /**
- * ★ THE SAVE-STATE WIRE, AND THE ONE FIELD THE PORTAL USED TO THROW AWAY.
+ * ★ THE SAVE-STATE WIRE, FIELD BY FIELD.
  *
- * `recoveryAt` says whether the platform is holding a copy of this app's tree it can put back, and
- * three surfaces decide what to SAY and whether to STOP somebody from it. It arrived on the wire
- * long before anything here parsed it: the reported bug was a freshly built app announcing unsaved
- * changes and blocking its owner's exit while the answer sat unread in the response body.
+ * `savedHead` is what the rail's sentence and the Discard control both read, so a body the parse
+ * mis-narrows is a screen making a claim about somebody's work that nobody checked.
  */
-describe('fetchSaveState — the recovery instant, parsed like its siblings', () => {
+describe('fetchSaveState — the saved head, whitelisted and narrowed', () => {
   const saveFetch = (body: unknown) => ({ fetchImpl: async () => res(200, body) })
 
-  it('★ keeps a string instant exactly as it arrived', async () => {
+  it('★ keeps a string head exactly as it arrived', async () => {
     const state = await fetchSaveState(
       'p1',
-      saveFetch({ appId: 'a1', dirty: true, containerHead: '059d936', savedHead: null, recoveryAt: '2026-09-10T10:38:43Z' }),
+      saveFetch({ appId: 'a1', dirty: true, containerHead: '059d936', savedHead: 'aaa1111' }),
     )
-    expect(state.recoveryAt).toBe('2026-09-10T10:38:43Z')
-    // …and the rest of the reading is untouched by the addition — `dirty` STAYS TRUE beside it,
-    // because a recovery copy is not a saved version and nothing here promotes one into one.
+    expect(state.savedHead).toBe('aaa1111')
+    // …and the rest of the reading is untouched — `dirty` STAYS TRUE beside it, because a saved
+    // head older than the container's is exactly the state the indicator exists to report.
     expect(state.dirty).toBe(true)
-    expect(state.savedHead).toBeNull()
+    expect(state.containerHead).toBe('059d936')
   })
 
-  it('★ reads an ABSENT field as no copy at all, rather than inventing one', async () => {
-    // The direction this fact is allowed to fail in. Every consumer uses a non-null instant to
-    // STOP warning somebody, so a field the server did not send must never arrive as one.
+  it('★ reads an ABSENT field as nothing saved, rather than inventing one', async () => {
+    // The direction this fact is allowed to fail in: a field the server did not send must never
+    // arrive as a version somebody can be told they have.
     const state = await fetchSaveState('p1', saveFetch({ appId: 'a1', dirty: true }))
-    expect(state.recoveryAt).toBeNull()
+    expect(state.savedHead).toBeNull()
     // …and the reading is otherwise alive, so this is not a null from a body that failed to parse.
     expect(state.dirty).toBe(true)
   })
 
-  it('refuses a non-string instant instead of coercing it', async () => {
-    const state = await fetchSaveState('p1', saveFetch({ appId: 'a1', dirty: true, recoveryAt: 1757500723 }))
-    expect(state.recoveryAt).toBeNull()
+  it('refuses a non-string head instead of coercing it', async () => {
+    const state = await fetchSaveState('p1', saveFetch({ appId: 'a1', dirty: true, savedHead: 1757500723 }))
+    expect(state.savedHead).toBeNull()
     expect(state.dirty).toBe(true)
   })
 })
@@ -844,8 +842,6 @@ describe('discardUnsavedChanges — the Discard button', () => {
     dirty: false,
     containerHead: 'aaa',
     savedHead: 'aaa',
-    recoveryAt: null,
-    writeBackRefusedAt: null,
   }
 
   it('POSTs to the discard route with the CSRF header and the conversationId body', async () => {
@@ -904,34 +900,27 @@ describe('sameSaveState — what a poll is allowed to call "no change"', () => {
     dirty: true,
     containerHead: '059d936',
     savedHead: null,
-    recoveryAt: null,
-    writeBackRefusedAt: null,
     ...over,
   })
 
-  it('★ sees a change in `recoveryAt` and nothing else', () => {
+  it('★ sees a change in `savedHead` and nothing else', () => {
     // THE MUTANT THAT MATTERS. `useWorkspaceState` keeps the PREVIOUS object whenever this says
-    // "same", so a comparator blind to this field discards the reading that changed: the rail
-    // freezes on the first poll's sentence and the exit guard on the first poll's verdict, with
-    // no other test in the repo going red. Drop the `a.recoveryAt === b.recoveryAt` conjunct and
-    // this is the assertion that catches it.
-    expect(sameSaveState(reading(), reading({ recoveryAt: '2026-09-10T10:38:43Z' }))).toBe(false)
+    // "same", so a comparator blind to a field discards the reading that changed: the rail
+    // freezes on the first poll's sentence, with no other test in the repo going red. Drop the
+    // `a.savedHead === b.savedHead` conjunct and this is the assertion that catches it.
+    expect(sameSaveState(reading(), reading({ savedHead: 'aaa1111' }))).toBe(false)
   })
 
-  it('★ sees a change in `writeBackRefusedAt` too', () => {
-    // The same mutant, one field along, and this one is a SAFETY sentence: the project screen
-    // says a platform write-back was refused, and that notice is the whole of what makes removing
-    // the exit prompts honest. A comparator blind to it would keep the previous reading and the
-    // sentence would never appear.
-    expect(
-      sameSaveState(reading(), reading({ writeBackRefusedAt: '2026-09-17T22:14:00Z' })),
-    ).toBe(false)
+  it('★ sees a change in `containerHead` too', () => {
+    // The same mutant, one field along: the container's head is half of the comparison the dirty
+    // indicator is, so a comparator blind to it would keep reporting the previous answer while
+    // the workspace moved underneath it.
+    expect(sameSaveState(reading(), reading({ containerHead: 'bbb2222' }))).toBe(false)
   })
 
-  it('still calls two identical readings the same, recovery instant included', () => {
+  it('still calls two identical readings the same', () => {
     // The other half: this exists to stop a poll re-rendering on an unchanged answer, and a
-    // comparator that answered `false` for everything would pass the test above by doing nothing.
-    const instant = '2026-09-10T10:38:43Z'
-    expect(sameSaveState(reading({ recoveryAt: instant }), reading({ recoveryAt: instant }))).toBe(true)
+    // comparator that answered `false` for everything would pass the tests above by doing nothing.
+    expect(sameSaveState(reading({ savedHead: 'aaa1111' }), reading({ savedHead: 'aaa1111' }))).toBe(true)
   })
 })

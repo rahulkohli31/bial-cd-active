@@ -48,8 +48,6 @@ from src.services.build_sessions.drain import (
     past_the_turn_bound,
     the_ceiling_switch,
 )
-from src.services.build_sessions.durable_copy import CopyVerdict, confirm_durable_copy
-from src.services.build_sessions.integrity import container_state
 from src.services.build_sessions.locks import (
     DeadlineWriter,
     an_instant_on_the_hash,
@@ -69,7 +67,7 @@ from src.services.build_sessions.locks import (
     stamp_is_proven,
     stay_of_execution_is_current,
 )
-from src.services.build_sessions.snapshot import SavedCopyOutcome, write_saved_copy_under_guard
+from src.services.build_sessions.snapshot import SavedCopyOutcome, write_the_tree_back
 from src.services.redis import REGISTRY_STATE_READY, registry_key, registry_scan_patterns
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
@@ -197,47 +195,22 @@ def is_a_shared_sandbox_name(app_name: str) -> bool:
     return len(slug) == _NAME_SLUG_LENGTH and all(c in _HEX_LOWER for c in slug)
 
 
-@dataclass(frozen=True)
-class _Reachable:
-    """The container we are judging: attached, and whatever it said about itself.
-
-    The HANDLE is carried, never re-derived: the registry is the one input that can change under
-    us, and a second read could bundle a builder's freshly started sandbox — the WRONG tree —
-    into this app's recovery slot. `head` and `uncommitted` are both `None` when the probe did
-    not answer, and are separate fields because a head alone conflates "nothing changed" with
-    "nothing was COMMITTED", so a gate reading only the head would destroy uncommitted work as
-    preserved. `confirm_durable_copy` refuses `None` rather than guessing."""
-
-    handle: SandboxHandle
-    head: str | None
-    uncommitted: bool | None
-
-
 async def _reach_the_container(
     sandbox_client: SandboxClient, user_uuid: uuid.UUID
-) -> _Reachable | None:
-    """Attach to this user's container and ask it for its `HEAD`. `None` if it cannot be asked.
+) -> SandboxHandle | None:
+    """Attach to this user's container. `None` when it cannot be reached at all.
 
-    THE GATE IS ONLY A GATE IF THIS RUNS. `confirm_durable_copy` reads `None` as "unreachable, so
-    a parseable recovery bundle stands in" — the fallback for a dead orphan. Pass `None`
-    UNCONDITIONALLY instead and that fallback becomes the only reachable branch: the `STALE`
-    comparison is dead code, and work newer than the last autosave reads as preserved and dies.
-    Uses the ladder `project_save_state` answers with (`attach_existing`, then `container_state`)
-    — a reaper must not hold a second opinion about what HEAD means."""
+    THE HANDLE IS TAKEN ONCE AND CARRIED, never re-derived: the registry is the one input that
+    can change under us, and a second read could bundle a builder's freshly started sandbox —
+    the WRONG tree — into this app's saved copy. No state probe here: the write-back runs its
+    own, and a second one would cost an exec per swept container to answer a question nobody on
+    this path asks."""
     try:
-        handle = await sandbox_client.attach_existing(str(user_uuid))
+        return await sandbox_client.attach_existing(str(user_uuid))
     except SandboxError:
         # Gone, ending, unreachable, or its bearer unrecoverable — every one of them means "this
-        # container cannot be asked anything", which is precisely the case the fallback is for.
+        # container cannot be asked anything".
         return None
-    state = await container_state(sandbox_client, handle)
-    return _Reachable(
-        handle=handle,
-        head=state.head if state is not None else None,
-        # BOTH FIELDS COME FROM THE SAME PROBE, so a state that did not answer leaves both
-        # unknown rather than leaving `uncommitted` looking like a confident "clean".
-        uncommitted=state.uncommitted if state is not None else None,
-    )
 
 
 # --- the serving proof, watched out of turn -------------------------------------------------
@@ -574,19 +547,20 @@ async def _take_the_copy_we_promised(
     sandbox_client: SandboxClient,
     *,
     app_id: uuid.UUID,
-    verdict: CopyVerdict,
-    reached: _Reachable | None,
+    reached: SandboxHandle | None,
     expected_name: str,
 ) -> bool:
     """True when this container may now be reclaimed.
 
-    A copy is TAKEN when the newest durable copy predates the newest change. Both call sites once
-    spared, so a failed autosave billed forever behind a log line repeating every fifteen minutes
-    and looked, to anyone reading it, like the guard working correctly. This really happened. The
-    copy goes through `write_saved_copy_under_guard`, not a raw `put`: it promotes only a tree that
-    descends from the saved copy — the same slot `confirm_durable_copy` reads, or a copy this
-    function took could never satisfy the gate that asked for it — and parks everything else.
-    Every failing arm SPARES and RECORDS."""
+    WRITE THE TREE BACK, THEN DESTROY. Both call sites once spared instead, so a failed copy
+    billed forever behind a log line repeating every fifteen minutes and looked, to anyone
+    reading it, like the guard working correctly. This really happened. Every failing arm SPARES
+    and RECORDS, so the next pass retries.
+
+    THE UNREACHABLE ARM STILL COLLECTS, and that is what stops a wedged container being spared
+    forever: nothing can be bundled from a container that will not attach, so the question
+    becomes whether a saved bundle already stands for this app. One head call, and an absent or
+    unreadable store spares."""
     # IMPORTED HERE, NOT AT MODULE SCOPE, and the reason is weight rather than a cycle. There is
     # no import cycle — `src.workers.reclamation` imports the reaper function-scoped, so nothing
     # closes a loop at module-import time. The weight is real: `pass_history` reaches
@@ -598,39 +572,24 @@ async def _take_the_copy_we_promised(
         record_durable_copy_attempt,
     )
 
-    if verdict.may_destroy:
-        # SPLIT ON WHY, not just on the verdict, because `may_destroy` is True for two different
-        # facts. One is "the sha comparison ran and the copy matches" — genuinely nothing to take.
-        # The other is `confirm_durable_copy`'s deliberate fallback: the container could not be
-        # read, so a present, parseable bundle stands in. In that second case NOTHING about
-        # currency was established, and recording it as "the durable copy was already current"
-        # writes the one row an operator would use to find "we destroyed containers we could not
-        # verify" and makes it say the opposite.
-        compared = reached is not None and reached.head is not None
-        await record_durable_copy_attempt(
-            CopyAttempt.NOTHING_TO_COPY if compared else CopyAttempt.UNVERIFIED_FALLBACK
-        )
-        return True
-    if reached is None or reached.handle.app_name != expected_name:
-        # NOTHING TO COPY FROM. Either the container would not attach, or — and this is the one
-        # worth spelling out — the registry has moved on and the handle we hold names a DIFFERENT
-        # container. `attach_existing` builds its handle from the record, so a builder who started
-        # a fresh sandbox between the record read and the attach hands us their live container.
-        # Bundling that tree into this app's saved copy would overwrite one app's only copy
-        # with another app's work; the guarded write would probably divert it, but "probably
-        # caught one layer down" is not a reason to hand it the wrong tree.
+    if reached is None:
+        return await _a_saved_bundle_stands_in(app_id)
+    if reached.app_name != expected_name:
+        # THE REGISTRY HAS MOVED ON and the handle we hold names a DIFFERENT container.
+        # `attach_existing` builds its handle from the record, so a builder who started a fresh
+        # sandbox between the record read and the attach hands us their live container. Bundling
+        # that tree into this app's saved copy would overwrite one app's only copy with another
+        # app's work.
         _log.warning(
             "no copy taken: nothing to copy from, so this container is spared again",
             app_id=str(app_id),
             expected=expected_name,
-            reached=reached.handle.app_name if reached else None,
+            reached=reached.app_name,
         )
         await record_durable_copy_attempt(CopyAttempt.UNREACHABLE)
         return False
     try:
-        written = await write_saved_copy_under_guard(
-            sandbox_client, reached.handle, app_id, taken_at=datetime.now(UTC)
-        )
+        written = await write_the_tree_back(sandbox_client, reached, app_id)
     except Exception:
         # BROAD ON PURPOSE, and it is the fail-CLOSED direction. Every way this can fail — the
         # exec, the bundle, the base64 read-back, the store, bytes that will not parse as a
@@ -641,34 +600,58 @@ async def _take_the_copy_we_promised(
         # `CancelledError` is a `BaseException` and still propagates, so a shutdown still stops
         # the sweep rather than being logged and swallowed.
         _log.exception(
-            "no copy taken: the guarded write raised, so this container is spared again",
+            "no copy taken: the write-back raised, so this container is spared again",
             app_id=str(app_id),
             app_name=expected_name,
         )
         await record_durable_copy_attempt(CopyAttempt.FAILED)
         return False
-    if written.outcome is SavedCopyOutcome.DIVERTED:
-        # The guarded write refused to promote this tree and preserved it under `divert_key`. It
-        # has already raised the pinned "did not land" alarm with the two shas that explain why,
-        # so nothing is re-alarmed here — the container is simply spared, which is the only answer
-        # available when the tree in hand cannot be shown to contain the work.
-        #
-        # A CONTAINER THAT HAS REVERTED TO ITS BAKED IMAGE ARRIVES HERE, and so does an app with
-        # no saved copy at all, because the guard refuses to promote against a slot it cannot
-        # compare with. Both would otherwise stamp a template tree in as the app's newest durable
-        # copy and then read that write as proof the container may go.
-        await record_durable_copy_attempt(CopyAttempt.REFUSED)
-        return False
-    # WRITTEN, or SKIPPED because the tree held nothing the saved copy does not. Both mean the
-    # saved copy now contains what the container contains, which is the fact the gate wanted and
-    # could not establish from the outside — and both compared against a real recorded head, which
-    # is what makes them evidence rather than an assumption.
     await record_durable_copy_attempt(
         CopyAttempt.COPIED
         if written.outcome is SavedCopyOutcome.WRITTEN
         else CopyAttempt.NOTHING_TO_COPY
     )
     return True
+
+
+async def _a_saved_bundle_stands_in(app_id: uuid.UUID) -> bool:
+    """May a container nobody can attach to be destroyed? Only against a saved bundle.
+
+    WITHOUT THIS A WEDGED CONTAINER IS SPARED ON EVERY PASS, FOREVER, billing forever — the
+    exact leak the age ceiling exists to close, since neither `reap_user` nor
+    `reap_the_container_we_judged` carries a strike count. An unconfigured or unreadable store is
+    a fact about the deployment or about this moment, never about anybody's work, so both spare.
+    """
+    from src.services.build_sessions.pass_history import (
+        CopyAttempt,
+        record_durable_copy_attempt,
+    )
+    from src.services.storage import (
+        StorageError,
+        StorageUnconfiguredError,
+        get_storage,
+        snapshot_key,
+    )
+
+    try:
+        stands = await get_storage().head(snapshot_key(app_id)) is not None
+    except StorageUnconfiguredError, StorageError:  # fmt: skip  # ruff py314 strips the parens
+        _log.warning(
+            "no copy taken: the store could not answer, so this container is spared again",
+            app_id=str(app_id),
+            exc_info=True,
+        )
+        stands = False
+    if not stands:
+        _log.warning(
+            "no copy taken: nothing to copy from and no saved bundle, so this container is "
+            "spared again",
+            app_id=str(app_id),
+        )
+    await record_durable_copy_attempt(
+        CopyAttempt.NOTHING_TO_COPY if stands else CopyAttempt.UNREACHABLE
+    )
+    return stands
 
 
 async def _hand_the_debt_over(
@@ -721,7 +704,7 @@ async def reap_user(
     was resolved, so `strict=True` re-raises and it can answer 503. On a failed teardown the
     deletion is handed to the owed-row ledger and this citizen's lock + registry are released;
     only when nothing can take that debt are they kept for a later sweep instead. `app_id` opts
-    into the durable-copy gate AND is what the ledger needs to take the debt at all: `None` suits
+    into the write-back AND is what the ledger needs to take the debt at all: `None` suits
     callers whose builder is about to get a fresh container; the unwatched janitor always passes
     it."""
     reg = await read_registry(redis, user_uuid)
@@ -750,44 +733,28 @@ async def reap_user(
         await release_liveness_lease(redis, user_uuid)
         await reap_lock(redis, user_uuid)
         return False
-    # THE DURABLE-COPY GATE NEVER RUNS FOR A SHARED VIEW (#198), whatever `app_id` the caller
-    # resolved. `sweep_all`'s own `_owning_app_id` currently maps a `shr-` registry record to the
-    # OWNER's app id (`_app_names_to_owners` keys every `shr-` name off the recipient, but the
-    # value it carries is still the shared app's id) — passing that here would gate this
-    # RECIPIENT's teardown against the OWNER's saved copy, and a recipient's access to that
-    # storage is read-never-write. Worse, a refused guarded write then REFUSES the reap
-    # outright, sparing the container forever — the exact bill-forever leak the ceiling exists to
-    # close. A shared view holds nothing worth preserving in the first place: the recipient never
-    # edits its tree directly, and what they own of it is a restore of the owner's own snapshot,
+    # THE WRITE-BACK NEVER RUNS FOR A SHARED VIEW (#198), whatever `app_id` the caller resolved.
+    # `sweep_all`'s own `_owning_app_id` currently maps a `shr-` registry record to the OWNER's
+    # app id (`_app_names_to_owners` keys every `shr-` name off the recipient, but the value it
+    # carries is still the shared app's id) — passing that here would write this RECIPIENT's tree
+    # over the OWNER's saved copy, and a recipient's access to that storage is read-never-write.
+    # A shared view holds nothing worth preserving in the first place: the recipient never edits
+    # its tree directly, and what they own of it is a restore of the owner's own snapshot,
     # already durable at its source.
     if app_id is not None and not is_a_shared_sandbox_name(registered_name):
-        # THE REAL HEAD, not a hardcoded `None`. See `_reach_the_container`: a constant `None`
-        # here made the gate's fallback its only branch, and the comparison it exists to perform
-        # unreachable. A container that will not answer still falls back — it just has to
-        # actually not answer first.
-        reached = await _reach_the_container(sandbox_client, user_uuid)
-        verdict = await confirm_durable_copy(
-            app_id,
-            container_head=reached.head if reached else None,
-            container_dirty=reached.uncommitted if reached else None,
-        )
-        # AND THEN TAKE THE COPY, rather than sparing on the strength of the
-        # verdict alone.
         if not await _take_the_copy_we_promised(
             sandbox_client,
             app_id=app_id,
-            verdict=verdict,
-            reached=reached,
+            reached=await _reach_the_container(sandbox_client, user_uuid),
             expected_name=registered_name,
         ):
             # SPARE AND REPORT — never destroy. The container keeps its lock and registry, so a
-            # later pass retries once the store is readable again or a copy has been taken.
+            # later pass retries once the store is readable again or the tree has been written
+            # back.
             _log.warning(
-                "reap refused: this container's work is not provably preserved",
+                "reap refused: this container's work could not be written back",
                 user_id=str(user_uuid),
                 app_id=str(app_id),
-                copy_state=str(verdict.state),
-                reason=verdict.reason,
             )
             return False
     await mark_registry_ending(redis, user_uuid)  # step 1: guard a concurrent attach
@@ -847,33 +814,21 @@ async def reap_the_container_we_judged(
     reg = await read_registry(redis, user_uuid)
     ours = reg is not None and reg.get(REGISTRY_FIELD_APP_NAME) == app_name
     # The container is only reachable THROUGH the registry — `attach_existing` builds its handle
-    # from that record — so a container the store no longer claims can be judged on its saved
-    # copy alone. That is the gate's documented fallback, and it still demands a parseable bundle.
-    # It is also why no copy can be taken for an unregistered orphan: there is no address to
-    # bundle from, and the address we DO have belongs to somebody else's container.
+    # from that record — so a container the registry no longer claims is judged on its saved copy
+    # alone. It is also why no copy can be taken for an unregistered orphan: there is no address
+    # to bundle from, and the address we DO have belongs to somebody else's container.
     reached = await _reach_the_container(sandbox_client, user_uuid) if ours else None
-    verdict = await confirm_durable_copy(
-        app_id,
-        container_head=reached.head if reached else None,
-        container_dirty=reached.uncommitted if reached else None,
-    )
-    # AND THEN TAKE THE COPY. The janitor is the caller with nobody watching it.
+    # THE JANITOR IS THE CALLER WITH NOBODY WATCHING IT.
     if not await _take_the_copy_we_promised(
-        sandbox_client,
-        app_id=app_id,
-        verdict=verdict,
-        reached=reached,
-        expected_name=app_name,
+        sandbox_client, app_id=app_id, reached=reached, expected_name=app_name
     ):
-        # SPARE AND REPORT — never destroy. Nothing is cleared, so the next pass retries once a
-        # copy exists or the store is readable again.
+        # SPARE AND REPORT — never destroy. Nothing is cleared, so the next pass retries once the
+        # tree is written back or the store is readable again.
         _log.warning(
-            "reclamation refused: this container's work is not provably preserved",
+            "reclamation refused: this container's work could not be written back",
             app_name=app_name,
             user_id=str(user_uuid),
             app_id=str(app_id),
-            copy_state=str(verdict.state),
-            reason=verdict.reason,
         )
         return False
     if ours:
@@ -1180,15 +1135,14 @@ def _owning_app_id(
 
     THE UNMATCHED CASE IS A DELIBERATE, NARROW HOLE and is logged rather than hidden. A registry
     record naming a container with no app row describes an app that no longer exists, so there is
-    no recovery slot to compare against: the gate would return UNCONFIRMED forever and the
-    container would be spared until it was deleted by hand, which is the leak this system exists
-    to close."""
+    nowhere to write its tree back to: without this the container would be spared until it was
+    deleted by hand, which is the leak this system exists to close."""
     if app_ids_by_name is None:
         return None
     app_id = app_ids_by_name.get(reg.get(REGISTRY_FIELD_APP_NAME, ""))
     if app_id is None:
         _log.info(
-            "reaping a registered container with no app row; nothing to preserve, gate skipped",
+            "reaping a registered container with no app row; nothing to preserve",
             user_id=str(user_uuid),
             app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
         )

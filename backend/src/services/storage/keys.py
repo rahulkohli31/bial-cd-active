@@ -72,14 +72,11 @@ def snapshot_key(app_id: uuid.UUID) -> str:
 
 
 def recovery_key(app_id: uuid.UUID) -> str:
-    """Key for an app's AUTOSAVED tree: `recovery/{app_id}/app.bundle`.
+    """Key for an app's `recovery/{app_id}/app.bundle` object — a DELETE-SIDE key.
 
-    A separate namespace from `snapshot_key`, deliberately: Save is the user's explicit action, and
-    writing autosaves to `snapshot_key` would reverse that by the back door — it is the bundle
-    `submit` copies and a relaunch restores, so an autosave there IS a save. It IS restored in
-    place of the saved bundle when it holds a newer tree (`SessionManager.newest_restore_source`),
-    but that is resumption, not promotion: `snapshot_key` stays untouched, so `dirty` stays true
-    and only the user's click makes a VERSION. Overwrite-latest — a safety net, not a history."""
+    NOTHING WRITES THIS. Deployed stores hold these objects, each a whole codebase, so the two
+    delete paths (project delete, admin hard delete) still sweep the key by name; the operator
+    storage-reconcile sweep collects the rest once an app row is gone."""
     return f"recovery/{app_id}/app.bundle"
 
 
@@ -100,21 +97,6 @@ def quarantine_key(app_id: uuid.UUID, taken_at: datetime) -> str:
     return f"{quarantine_prefix(app_id)}{_stamp(taken_at)}.bundle"
 
 
-def divert_prefix(app_id: uuid.UUID) -> str:
-    """The `divert/{app_id}/` base for trees the recovery guard refused to promote."""
-    return f"divert/{app_id}/"
-
-
-def divert_key(app_id: uuid.UUID, taken_at: datetime) -> str:
-    """One tree the recovery guard refused to write over a good recovery copy:
-    `divert/{app_id}/{stamp}.bundle`.
-
-    Mirrors `quarantine_key`, including the per-occurrence rule and for the same reason: a shared
-    overwrite-latest key means a second refusal destroys the forensic evidence the alarm exists to
-    preserve."""
-    return f"{divert_prefix(app_id)}{_stamp(taken_at)}.bundle"
-
-
 def _stamp(taken_at: datetime) -> str:
     """A sortable, path-safe UTC instant: `20260823T134500123456Z`.
 
@@ -123,7 +105,7 @@ def _stamp(taken_at: datetime) -> str:
     datetime raises rather than being silently read as UTC, which is the one reading that would
     quietly reorder an operator's evidence."""
     if taken_at.tzinfo is None:
-        raise StorageError("a quarantine or divert stamp needs an aware datetime")
+        raise StorageError("a quarantine stamp needs an aware datetime")
     return taken_at.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
 
 

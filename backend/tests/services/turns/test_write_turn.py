@@ -86,14 +86,13 @@ from src.services.sandbox import DevStatus, SandboxError, SandboxHandle, ServedP
 from src.services.sandbox.base import CompileReport, CompileState, ExecResult
 from src.services.sandbox.client import _ALREADY_RUNNING_PID
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import recovery_key, snapshot_key
+from src.services.storage import snapshot_key
 from src.services.turns import copy as copy_module
 from src.services.turns import engine as engine_module
 from src.services.turns.copy import (
     AT_LIMIT_TEXT,
     COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
-    KEPT_A_COPY,
     REMAINDER_TEXT,
     SPENT_ENOUGH_TEXT,
     STILL_SHOWING_EARLIER,
@@ -399,15 +398,12 @@ async def test_the_daily_cap_is_checked_before_every_model_request(
     assert state.end_reason == "quota_exceeded"
     # THE WHOLE SENTENCE, not the substring "budget" — which the previous hardcoded string also
     # contained, so the weaker assertion stayed green through a full revert of the unit. It names
-    # what happened, that a copy was kept, when it resets, and who to ask.
-    assert state.error_message == AT_LIMIT_TEXT.format(
-        kept=KEPT_A_COPY, contact=settings.SUPPORT_CONTACT_EMAIL
-    )
-    # …AND THE WORK IS DURABLE BEFORE THE CITIZEN IS TOLD. That is the unit's entire guarantee and
-    # it lives at this one call site: without it the turn's work exists only inside a container
-    # the reaper is entitled to collect, and nothing said so.
-    assert state.write_session is not None, "the turn must have taken a workspace to secure"
-    assert await fake_storage.head(recovery_key(state.write_session.app_id)) is not None
+    # what happened, when it resets, and who to ask.
+    assert state.error_message == AT_LIMIT_TEXT.format(contact=settings.SUPPORT_CONTACT_EMAIL)
+    # AND NOTHING WAS SAVED THROUGH. The container survives an at-limit ending, so the citizen's
+    # Save is still theirs to click.
+    assert state.write_session is not None, "the turn must have taken a workspace"
+    assert await fake_storage.head(snapshot_key(state.write_session.app_id)) is None
 
 
 async def test_one_write_turn_folds_its_usage_exactly_once(
@@ -2735,7 +2731,7 @@ async def test_a_build_that_reaches_the_spend_bound_ends_saying_the_app_works(
     # a banner rather than a generic failure.
     assert state.status == "failed"
     assert state.error_message is not None
-    assert SPENT_ENOUGH_TEXT.split("{")[0].strip() in state.error_message
+    assert SPENT_ENOUGH_TEXT in state.error_message
     assert "working" in state.error_message  # the app survives the bound, and it says so
     # WHICH BOUND FIRED IS IN THE RECORD, and only in the record: the citizen reads one ending
     # whichever of the three ceilings ended the turn, because the next move is the same either
@@ -2958,7 +2954,7 @@ async def test_a_turn_held_by_a_restore_leaves_a_serving_preview_behind(
     app_id = first.write_session.app_id
     client.attach_handle = first.write_session.handle
     await fake_storage.put(
-        recovery_key(app_id), a_git_bundle("a" * 40), metadata={"head_sha": "a" * 40}
+        snapshot_key(app_id), a_git_bundle("a" * 40), metadata={"head_sha": "a" * 40}
     )
     client.exec_handler = _the_repository_is_gone
     requests_before = counts["requests"]

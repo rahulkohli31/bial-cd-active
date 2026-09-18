@@ -16,7 +16,6 @@ and both are pinned here:
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import inspect
 import uuid
@@ -35,7 +34,6 @@ from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
-from src.services.build_sessions.outcome import STOPPED_BY_USER
 from src.services.sandbox.config import SandboxConfig
 from src.services.turns import engine as engine_module
 from src.services.turns.copy import (
@@ -50,7 +48,6 @@ from src.services.turns.engine import (
     set_turn_engine_for_tests,
 )
 from src.services.turns.guard import _mid_reply
-from src.services.usage.gate import AtLimitEnding
 from tests.factories import ConversationFactory, UserFactory
 from tests.fakes import FakeSandboxClient
 
@@ -328,23 +325,16 @@ async def test_a_completed_turn_writes_no_error_key(
     assert "error" not in meta
 
 
-# --- a Build turn, and a stop that lands while it secures --------------------------------------
+# --- a Build turn ------------------------------------------------------------------------------
 
 
-async def test_a_build_turn_secures_its_tree_before_the_sentence_says_so(
-    _fresh_engine, db_session, session_factory, monkeypatch: pytest.MonkeyPatch
+async def test_a_build_turn_is_told_in_its_own_words_rather_than_the_generic_one(
+    _fresh_engine, db_session, session_factory
 ) -> None:
-    """★ The kind the incident was. A Build turn's sentence comes from `at_limit_ending`, the one
-    securing path the run bounds use, carrying this ending's own template, so `{kept}` says what
-    the securing actually achieved. Also the `ModelAPIError` case on the persisted row. Mutation
-    check: format `MODEL_UNAVAILABLE_TEXT` directly and this goes red on the securing call."""
-    securing_calls: list[str | None] = []
-
-    async def _securing(workspace, *, sentence=None):
-        securing_calls.append(sentence)
-        return AtLimitEnding(message="secured, then said", work_is_secured=True)
-
-    monkeypatch.setattr(engine_module, "at_limit_ending", _securing)
+    """★ The kind the incident was: the assistant is fine, the workspace is exactly as the last
+    write left it, and the thing to do is send again — none of which the generic ending says.
+    Also the `ModelAPIError` case on the persisted row.
+    Mutation check: fall through to the generic failure sentence and this goes red."""
     conv_id, state = await _run_until_settled(
         _fresh_engine,
         db_session,
@@ -353,49 +343,10 @@ async def test_a_build_turn_secures_its_tree_before_the_sentence_says_so(
         kind=ChatKind.BUILD,
     )
 
-    assert securing_calls == [MODEL_UNAVAILABLE_TEXT]
     assert state.status == "failed"
     assert _terminal(state).reason == MODEL_UNAVAILABLE_CODE
-    assert _last_error(state) == "secured, then said"
+    assert _last_error(state) == MODEL_UNAVAILABLE_TEXT
     meta = await _terminal_meta(db_session, conv_id)
     assert meta["reason"] == MODEL_UNAVAILABLE_CODE
     assert str(meta["error"]).startswith("ModelAPIError")
     assert "5521" not in str(meta["error"])
-
-
-async def test_a_stop_while_the_tree_is_secured_still_ends_the_turn(
-    _fresh_engine, db_session, session_factory, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """★ Stop pressed during the securing await. That await runs inside an `except`, where the
-    `except asyncio.CancelledError` arm cannot reach it, so escaping would skip `_finish` and
-    leave the turn running with no terminal frame and no terminal row. Mutation check: remove the
-    `except asyncio.CancelledError` around `at_limit_ending` and this goes red on the status."""
-    securing = asyncio.Event()
-
-    async def _slow_securing(workspace, *, sentence=None):
-        securing.set()
-        await asyncio.sleep(3600)
-        return AtLimitEnding(message="never said", work_is_secured=False)
-
-    monkeypatch.setattr(engine_module, "at_limit_ending", _slow_securing)
-    conv_id, turn_id, state = await _start(
-        _fresh_engine,
-        db_session,
-        session_factory,
-        _refusing_model(ModelHTTPError(status_code=529, model_name="opus", body=OVERLOADED_BODY)),
-        kind=ChatKind.BUILD,
-    )
-    await asyncio.wait_for(securing.wait(), timeout=10)
-
-    task = state.task
-    assert task is not None
-    assert await _fresh_engine.stop_turn(conv_id, turn_id)
-    with contextlib.suppress(BaseException):
-        await asyncio.wait_for(task, timeout=10)
-
-    assert state.status == "stopped"
-    assert _terminal(state).reason == STOPPED_BY_USER
-    assert _last_error(state) is None
-    meta = await _terminal_meta(db_session, conv_id)
-    assert meta["status"] == "stopped"
-    assert meta["reason"] == STOPPED_BY_USER

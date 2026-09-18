@@ -202,7 +202,7 @@ beforeEach(() => {
   h.startTurn.mockResolvedValue({ turnId: 't1' })
   h.fetchCompileState.mockResolvedValue('clean')
   h.checkWorkspace.mockResolvedValue(false)
-  h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: false, containerHead: null, savedHead: null, recoveryAt: null })
+  h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: false, containerHead: null, savedHead: null })
 })
 
 afterEach(() => {

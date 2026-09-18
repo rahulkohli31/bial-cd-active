@@ -41,8 +41,6 @@ _MUTATING_POSTS = [
     # deadline forward on coordination state, and a deadline a third-party page could extend
     # from a citizen's browser is a bill an attacker can run up.
     "/v1/build-sessions/projects/{project_id}/renew",
-    "/v1/build-sessions/internal/apps/{app_id}/parked",
-    "/v1/build-sessions/internal/apps/{app_id}/promote",
     "/v1/build-sessions/relaunch",
     "/v1/build-sessions/projects/{project_id}/stop-active-build",
     "/v1/build-sessions/projects/{project_id}/release",

@@ -107,7 +107,7 @@ beforeEach(() => {
   h.listProjectConversations.mockResolvedValue([])
   h.buildUserParts.mockImplementation(async (t: string) => [{ type: 'text', text: t }])
   h.fetchSaveState.mockResolvedValue({
-    appId: null, dirty: null, containerHead: null, savedHead: null, recoveryAt: null,
+    appId: null, dirty: null, containerHead: null, savedHead: null,
   })
   h.fetchPreviewState.mockResolvedValue({
     state: 'unknown', alive: false, previewUrl: null, occupyingProjectName: null, restorable: null,

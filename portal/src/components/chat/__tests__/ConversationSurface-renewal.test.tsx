@@ -97,7 +97,7 @@ beforeEach(() => {
     { id: 'build-X', kind: 'build', title: 'My build', updatedAt: new Date().toISOString() },
   ])
   h.buildUserParts.mockImplementation(async (text: string) => [{ type: 'text', text }])
-  h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: false, savedHead: null, containerHead: null, recoveryAt: null })
+  h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: false, savedHead: null, containerHead: null })
   h.fetchCompileState.mockResolvedValue({ state: 'unknown' })
   h.checkWorkspace.mockResolvedValue(false)
   h.fetchPreviewState.mockResolvedValue(LIVE)

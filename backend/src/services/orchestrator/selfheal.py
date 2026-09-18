@@ -295,9 +295,9 @@ class VerifyOutcome:
         """tsc clean AND dev ready AND a clean log tail AND no browser crash AND the app serves
         AND it is no longer the starter page.
 
-        A PROPERTY rather than a field, for the reason `durable_copy.CopyVerdict.may_destroy`
-        exists: `state is HealthState.HEALTHY` spelled out at every call site is a chance at each
-        one to write `is not UNHEALTHY` instead — which would read an INDETERMINATE verdict as a
+        A PROPERTY rather than a field, for the reason `IntegrityVerdict.may_restore` exists:
+        `state is HealthState.HEALTHY` spelled out at every call site is a chance at each one to
+        write `is not UNHEALTHY` instead — which would read an INDETERMINATE verdict as a
         completion claim."""
         return self.state is HealthState.HEALTHY
 

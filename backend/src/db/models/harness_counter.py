@@ -50,10 +50,6 @@ class HarnessCounter(enum.StrEnum):
     HOLDING_SHOWN_MS = "holding_shown_ms"
     #: A workspace was restored after a confirmed reversion.
     RESTORE_PERFORMED = "restore_performed"
-    #: A turn's work did not reach the recovery slot. This is the distinction between "the
-    #: platform failed to CHECK the workspace" and "the platform failed to make it DURABLE" —
-    #: otherwise unanswerable after the fact.
-    RECOVERY_WRITE_MISSED = "recovery_write_missed"
     #: Words in a completed build's agent-facing traffic, and tokens for the same build.
     BUILD_WORDS = "build_words"
     BUILD_TOKENS = "build_tokens"

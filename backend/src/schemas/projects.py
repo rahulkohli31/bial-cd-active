@@ -266,12 +266,7 @@ class ProjectResponse(CamelModel):
     # `null` = the object store could not be reached, so the platform declines to claim
     # anything in either direction and the client renders the plain empty state.
     #
-    # Computed by `restorable_presence`, which is the platform's turn-boundary recovery copy
-    # OR the user's explicit Save — the same pair a restore
-    # actually consults. The saved bundle alone under-reported by exactly one person: the
-    # builder who worked across several turns and never pressed Save. The field name still
-    # says "snapshot" because renaming a shipped wire field to fix a nuance is a worse trade
-    # than this comment; read it as "restorable".
+    # Computed by `snapshot_presence` — the one bundle a restore consults.
     #
     # It cannot be derived from `app_status`. `AppStatus.DRAFT` is minted by PROVISION, and a
     # successfully built app stays `draft` until someone submits it for approval — so the
@@ -282,12 +277,9 @@ class ProjectResponse(CamelModel):
     # ONLY the single-project GET computes it: the list endpoint would need one HEAD per row,
     # and nothing on that surface offers Relaunch. It stays `null` there and no caller reads it.
     has_relaunchable_snapshot: bool | None = None
-    # WHETHER THE OWNER HAS EVER SAVED — narrower than `has_relaunchable_snapshot` on purpose
-    # (#198 R10's second sentence). The shared runtime restores ONLY from the saved bundle,
-    # never the autosave/recovery copy `has_relaunchable_snapshot` also counts (R21) — a
-    # recipient told "restorable" on the strength of an autosave alone would press Launch into
-    # a guaranteed 404. Computed by the same `snapshot_presence` check `create_share` (R10's
-    # first sentence) already refuses a share creation on, so the two surfaces agree.
+    # WHETHER THE OWNER HAS EVER SAVED (#198 R10's second sentence). Computed by the same
+    # `snapshot_presence` check `create_share` (R10's first sentence) already refuses a share
+    # creation on, so the two surfaces agree.
     #
     # `null` for an owner's own view (irrelevant there — an owner uses Relaunch, which reads
     # `has_relaunchable_snapshot` instead) and for a shared view with no app at all. `false`

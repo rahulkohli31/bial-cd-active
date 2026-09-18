@@ -186,10 +186,7 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
           in for one, so it is said once here and reads the same whether the address is a project
           or a chat — this column is a sibling of the `<Outlet/>`, so a route change never reaches
           it. It draws nothing at all when there is nothing to say, which is the ordinary case. */}
-      <WorkspaceLifecycleNotes
-        drainingAt={lifecycle.drainingAt}
-        writeBackRefusedAt={lifecycle.writeBackRefusedAt}
-      />
+      <WorkspaceLifecycleNotes drainingAt={lifecycle.drainingAt} />
 
       {/* THE COLLAPSE CONTROL IS NOT HERE ANY MORE. It moved to the toolbar row, which is drawn
           once above the two-column grid. Here it was already better than living inside the rail

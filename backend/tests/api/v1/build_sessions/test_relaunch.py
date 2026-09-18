@@ -54,7 +54,7 @@ from src.services.sandbox.base import (
 )
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import recovery_key, snapshot_key
+from src.services.storage import snapshot_key
 from tests.api.v1.build_sessions.conftest import (
     a_live_session,
     auth_headers,
@@ -78,12 +78,12 @@ async def _seed_snapshot(db: AsyncSession, user, project, store) -> uuid.UUID:
 
 
 async def _seed_worked_on(store, app_id: uuid.UUID) -> None:
-    """Mark this app as holding real work: the reclaim guard reads a recovery bundle as proof
-    that a turn touched files."""
-    key = recovery_key(app_id)
-    await store.put(key, b"RECOVERY-BUNDLE")
+    """Mark this app as holding real work: the reclaim guard reads a saved bundle as proof that
+    something was built here."""
+    key = snapshot_key(app_id)
+    await store.put(key, b"SAVED-BUNDLE")
     # `FakeStorage.head` reads `last_modified` off `mtimes`, and the guard keys on that
-    # timestamp — a bundle with no mtime reads as "no recovery bundle".
+    # timestamp — a bundle with no mtime reads as "no bundle".
     store.mtimes[key] = datetime.now(UTC)
 
 

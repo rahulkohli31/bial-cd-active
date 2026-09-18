@@ -78,7 +78,7 @@ from src.services.build_sessions import (
     reap_user,
     shr_name_for,
 )
-from src.services.build_sessions.manager import restorable_presence, snapshot_presence
+from src.services.build_sessions.manager import snapshot_presence
 from src.services.deploy.liveness import live_app_ids
 from src.services.deploy.registry_delete import sweep_app_repositories
 from src.services.deploy.teardown import sweep_published_apps
@@ -739,7 +739,7 @@ async def get_project(project_id: uuid.UUID, user: CurrentUser, db: DbSession) -
     resolved = await resolve_project_access(db, user.id, project_id)
     project = resolved.project
     # OWNER-SCOPED CHILD LOOKUPS USE THE PROJECT'S OWNER, NEVER THE CALLER. For a shared
-    # recipient the two differ, and `_project_app`/`restorable_presence`/`_serving_now` all
+    # recipient the two differ, and `_project_app`/`snapshot_presence`/`_serving_now` all
     # answer "does THIS PROJECT's app exist / is it live" — one right answer regardless of who
     # is asking. Passing `user.id` here (the pre-#198 shape) would silently read as "no app"
     # for every recipient, since `AppRegistry` is scoped to the OWNER's id, never the viewer's.
@@ -748,12 +748,9 @@ async def get_project(project_id: uuid.UUID, user: CurrentUser, db: DbSession) -
     # No app row means no bundle can exist, and that is a CONFIRMED absent rather than an
     # unknown: skipping the store call here is an answer, not an omission.
     #
-    # `restorable_presence`, NOT `snapshot_presence`: the saved bundle alone missed the
-    # builder who worked for an hour and never pressed Save, and told them their project had
-    # nothing to restore while the platform sat on their entire workspace. This is also the
-    # exact predicate `preview-state` answers with, so a cold page load and the 45-second poll
-    # can never disagree about whether a restore is on offer.
-    relaunchable = False if app_id is None else await restorable_presence(app_id)
+    # The exact predicate `preview-state` answers with, so a cold page load and the 45-second
+    # poll can never disagree about whether a restore is on offer.
+    relaunchable = False if app_id is None else await snapshot_presence(app_id)
     # R10's SECOND SENTENCE, computed ONLY for a shared viewer: an owner never reads this
     # field (they have `has_relaunchable_snapshot` for their own Relaunch), and paying for a
     # second object-store HEAD on every owner page load — the far more common reader of this

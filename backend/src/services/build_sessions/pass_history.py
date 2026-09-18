@@ -5,11 +5,11 @@ is emitted *by the pass*, so a crashlooping worker emits none and reads like a h
 fleet. The pass writes a record on every outcome; this module reads the ABSENCE of one as the
 alarm.
 
-WHY A WRITER LIVES HERE TOO: the reaper's durable copy shares the failure mode — a container
-whose copy cannot be taken is SPARED, indistinguishable from an empty fleet, and bills forever
-silently (the `confirm_durable_copy` call sites once only logged this). So this writes a
-`worker_passes` row on every outcome too, for the same reason: it's the only thing an operator
-can look for that does not depend on the failing component to speak up."""
+WHY A WRITER LIVES HERE TOO: the reaper's write-back shares the failure mode — a container
+whose tree cannot be written back is SPARED, indistinguishable from an empty fleet, and bills
+forever silently. So this writes a `worker_passes` row on every outcome too, for the same reason:
+it's the only thing an operator can look for that does not depend on the failing component to
+speak up."""
 
 from __future__ import annotations
 
@@ -102,32 +102,25 @@ class CopyAttempt(enum.StrEnum):
 
     Several outcomes rather than a bare success/failure pair, because the sparing arms fail for
     reasons an operator has to act on DIFFERENTLY: an unreachable container needs somebody to
-    look at the container, a refused promotion needs somebody to look at the diverted bundle, and
-    a raised write needs somebody to look at the store. Collapsing them would produce a row that
-    says a container was spared and nothing about what to do next.
+    look at the container, and a raised write needs somebody to look at the store. Collapsing
+    them would produce a row that says a container was spared and nothing about what to do next.
     """
 
-    #: The gate was already satisfied — the durable copy is current, so there was nothing to take
-    #: before reclaiming. The zero-candidate case, and it is recorded for the same reason a
-    #: zero-candidate pass is: a quiet fleet and a dead process are otherwise one observation.
+    #: Nothing was written back, and nothing needed to be: the container still held the untouched
+    #: starter template, or it could not be attached at all but a saved bundle already stands for
+    #: this app. Recorded for the same reason a zero-candidate pass is: a quiet fleet and a dead
+    #: process are otherwise one observation.
     NOTHING_TO_COPY = "nothing_to_copy"
-    #: A fresh copy landed in the recovery slot, and the container may go.
+    #: The tree landed in the saved copy, and the container may go.
     COPIED = "copied"
-    #: There was nothing to copy FROM. The container would not attach, or the record no longer
-    #: names the container we are judging — in which case the tree we could reach belongs to
-    #: somebody else's build and must never be bundled into this app's slot.
+    #: There was nothing to copy FROM and no saved bundle to stand in. The container would not
+    #: attach, or the record no longer names the container we are judging — in which case the tree
+    #: we could reach belongs to somebody else's build and must never be bundled into this app's
+    #: slot.
     UNREACHABLE = "unreachable"
-    #: The lineage guard would not promote this tree over the copy on record: the lineage is broken
-    #: or unreadable. The bundle is preserved under `divert_key`, the existing copy is untouched,
-    #: and the container is spared — a refusal is never a licence to destroy.
-    REFUSED = "refused"
     #: The bundle, the read-back or the upload itself raised. Nothing was established, so nothing
     #: is destroyed.
     FAILED = "failed"
-    #: The gate was satisfied by its unreadable-container FALLBACK — a parseable bundle stood in
-    #: because the container could not answer — so the destroy proceeded without any comparison
-    #: having run. Recorded distinctly because "already current" would be a claim nobody made.
-    UNVERIFIED_FALLBACK = "unverified_fallback"
 
 
 #: How each outcome reads to the operator endpoint: the native enum it stores under, and the one
@@ -141,34 +134,25 @@ class CopyAttempt(enum.StrEnum):
 _ATTEMPT_MEANING: Final[dict[CopyAttempt, tuple[PassOutcome, str]]] = {
     CopyAttempt.NOTHING_TO_COPY: (
         PassOutcome.OK,
-        "the durable copy was already current; nothing to take before reclaiming",
+        "there was nothing to write back before reclaiming",
     ),
     CopyAttempt.COPIED: (
         PassOutcome.OK,
-        "a recovery copy was taken before the container was reclaimed",
+        "the tree was written back before the container was reclaimed",
     ),
     CopyAttempt.UNREACHABLE: (
         PassOutcome.DECLINED,
-        "the container we judged could not be reached, so no copy could be taken; spared",
-    ),
-    CopyAttempt.REFUSED: (
-        PassOutcome.DECLINED,
-        "the working tree is not a descendant of the copy on record; diverted and spared",
+        "the container we judged could not be reached, so nothing could be written back; spared",
     ),
     CopyAttempt.FAILED: (
         PassOutcome.FAILED,
-        "the recovery write raised; see the traceback on the reaper's log line. Spared",
-    ),
-    CopyAttempt.UNVERIFIED_FALLBACK: (
-        PassOutcome.DECLINED,
-        "the container could not be read, so a standing bundle stood in for the comparison; "
-        "reclaimed without verifying currency",
+        "the write-back raised; see the traceback on the reaper's log line. Spared",
     ),
 }
 
 #: The arms that leave a container standing. Read once here rather than re-derived at the write,
 #: because "which outcomes spared something" is the only question this row is ever asked.
-_SPARED: Final = frozenset({CopyAttempt.UNREACHABLE, CopyAttempt.REFUSED, CopyAttempt.FAILED})
+_SPARED: Final = frozenset({CopyAttempt.UNREACHABLE, CopyAttempt.FAILED})
 
 
 async def record_durable_copy_attempt(attempt: CopyAttempt) -> None:

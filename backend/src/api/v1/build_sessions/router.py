@@ -51,12 +51,8 @@ from src.api.v1.build_sessions.schemas import (
     ClientErrorReportResponse,
     CompileStateResponse,
     DiscardRequest,
-    ParkedTree,
-    ParkedTreesResponse,
     PreviewLifeState,
     ProjectActivity,
-    PromoteParkedRequest,
-    PromoteParkedResponse,
     RelaunchPreviewRequest,
     RelaunchPreviewResponse,
     RenewalOutcome,
@@ -97,12 +93,6 @@ from src.services.build_sessions.locks import (
     read_registry_and_starting_marker,
     renew_presence_stay,
     stamp_is_proven,
-)
-from src.services.build_sessions.snapshot import (
-    ParkedTreeNotOursError,
-    list_parked_trees,
-    newest_diverted_at,
-    promote_parked,
 )
 from src.services.orchestrator.client_errors import (
     park_client_error,
@@ -247,86 +237,6 @@ def _coordination_is_gone() -> AppApiError:
 
 
 @router.post(
-    "/internal/apps/{app_id}/parked",
-    dependencies=[RequireCsrf],
-    responses=error_responses(AUTH_401, (403, ErrorEnvelope, "CSRF check failed")),
-)
-async def parked_trees(
-    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
-) -> ParkedTreesResponse:
-    """The trees set aside for one app — quarantined or diverted.
-
-    WITHOUT THIS THEY ARE WRITE-ONLY: no reader, no retention, no runbook. In a false-`REVERTED`
-    case those objects hold the only copy of a citizen's newest work.
-
-    `CurrentSuperadmin`, and mounted beside `internal/reap` deliberately: this is an operator
-    action in the same category as the reaper, not a user-facing viewing surface. Audited,
-    like every gated action."""
-    trees = await list_parked_trees(app_id)
-    await append_audit(
-        db,
-        actor_id=admin.id,
-        action="harness:parked:list",
-        resource_type="app",
-        resource_id=str(app_id),
-        detail={"found": len(trees)},
-    )
-    await db.commit()
-    return ParkedTreesResponse(
-        trees=[
-            ParkedTree(
-                key=tree.key,
-                kind=tree.kind,
-                head_sha=tree.head_sha,
-                size_bytes=tree.size_bytes,
-                taken_at=tree.taken_at,
-            )
-            for tree in trees
-        ]
-    )
-
-
-@router.post(
-    "/internal/apps/{app_id}/promote",
-    dependencies=[RequireCsrf],
-    responses=error_responses(AUTH_401, (403, ErrorEnvelope, "CSRF check failed")),
-)
-async def promote_parked_tree(
-    app_id: uuid.UUID,
-    body: PromoteParkedRequest,
-    admin: CurrentSuperadmin,
-    db: DbSession,
-) -> PromoteParkedResponse:
-    """Put one parked tree back into the recovery slot.
-
-    THROUGH THE DIVERSION'S OWN GUARD, never around it. A promotion whose tree is not a
-    descendant of what the slot already holds is REFUSED and alarmed rather than forced. The
-    key is named explicitly rather than "the newest": a request that cannot say what it means
-    is one that can be misread."""
-    # An operator recovering the wrong tree over somebody's newest work is the precise failure
-    # the guard exists to stop, and "an operator asked for it" is not evidence that the tree is
-    # the right one.
-    try:
-        outcome = await promote_parked(app_id, key=body.key)
-    except ParkedTreeNotOursError as exc:
-        # A 400, not a 500: pasting the wrong key is an ordinary operator mistake, and rendering
-        # it as an internal fault sends them looking for a broken store instead of at the key.
-        raise AppApiError(
-            status.HTTP_400_BAD_REQUEST, "That parked tree belongs to a different app."
-        ) from exc
-    await append_audit(
-        db,
-        actor_id=admin.id,
-        action="harness:parked:promote",
-        resource_type="app",
-        resource_id=str(app_id),
-        detail={"key": body.key, "promoted": outcome.promoted},
-    )
-    await db.commit()
-    return PromoteParkedResponse(promoted=outcome.promoted, detail=outcome.detail)
-
-
-@router.post(
     "/internal/reap",
     dependencies=[RequireCsrf],
     responses=error_responses(
@@ -409,9 +319,7 @@ async def relaunch_preview(
     # so before the split a Redis blip here told the user a build was already running.
     with build_coordination_or_503():
         try:
-            relaunched = await manager.relaunch_preview(
-                db, user, body.project_id, sandbox, prefer_saved=body.prefer_saved
-            )
+            relaunched = await manager.relaunch_preview(db, user, body.project_id, sandbox)
         except BuildSessionConflictError as exc:
             # This project's own work is running — relaunch never pre-empts it (409). A
             # DIFFERENT project of theirs never reaches here: that is a switch, and it starts.
@@ -719,41 +627,6 @@ class SaveStateResponse(CamelModel):
     app_id: str | None = None
     dirty: bool | None = None
     container_head: str | None = None
-    # When the platform last wrote this app's tree to the recovery slot, or None if it never has
-    # (also None when the store would not answer — an offer nobody can honour is one this does
-    # not make). Lets the UI offer unsaved work back after a reclaim instead of quietly
-    # forgetting it.
-    #
-    # AND IT IS THE ANSWER TO "CAN THE PLATFORM PUT THIS BACK?", which is a stronger fact than
-    # this comment used to claim. It said `savedHead` was the only thing a relaunch restores;
-    # that stopped being true when `SessionManager.newest_restore_source` landed. Every
-    # automatic restore now goes through it, and it hands back the RECOVERY bundle in preference
-    # to the saved one — deliberately, to close the data-loss bug its own docstring describes,
-    # where a reclaimed container was rebuilt from the last SAVED tree and everything done after
-    # that Save then existed nowhere. Where it does hand back the saved one, that bundle is the
-    # newer of the two or holds the same tree, so a non-null instant here means the same thing
-    # either way: what comes back is no older than this. A client may say so, and may stop
-    # treating a bare `dirty: true` as work about to be lost — the state a citizen is in the
-    # moment a build finishes, having saved nothing because there was nothing yet to save.
-    #
-    # STILL NEVER A SUBSTITUTE FOR THE USER'S OWN SAVE, and that distinction is the whole point:
-    # RESUMPTION, NOT PROMOTION. `snapshot_key` is untouched, `dirty` stays true, and nothing on
-    # this path creates a VERSION — only the citizen's own Save does, and Save stays manual. A
-    # recovery copy is what the platform can resume from; `savedHead` is what its owner chose to
-    # keep, and only that one is a thing they can ask to come back to.
-    recovery_at: datetime | None = None
-    # WHEN A PLATFORM WRITE-BACK FOR THIS APP WAS LAST REFUSED, or None if none ever was.
-    #
-    # Shutdown writes the citizen's work back with nobody watching, and when the tree does not
-    # descend from what they themselves saved, the ancestry guard sets it aside and the app comes
-    # back from the SAVED version — which from the screen is indistinguishable from an ordinary
-    # reopen. This is what lets the project screen say so, and saying so is the whole of what
-    # makes removing the exit prompts honest rather than merely quieter.
-    #
-    # None ALSO COVERS "COULD NOT ASK". A notice that cannot be substantiated is one not made:
-    # claiming a refusal that did not happen would send somebody looking for work that was never
-    # set aside.
-    write_back_refused_at: datetime | None = None
     saved_head: str | None = None
 
 
@@ -778,7 +651,6 @@ def _save_state_fields(state: SaveState) -> dict[str, Any]:
         "dirty": state.dirty,
         "container_head": state.container_head,
         "saved_head": state.saved_head,
-        "recovery_at": state.recovery_at,
     }
 
 
@@ -1434,12 +1306,7 @@ async def save_state(
     if sandbox is None:
         return SaveStateResponse()
     state = await manager.project_save_state(db, user, project_id, sandbox_client=sandbox)
-    # ASKED HERE RATHER THAN INSIDE THE SAVE STATE, because it is a fact about the OBJECT STORE
-    # and not about the container: a write-back refused days ago is still owed a sentence, and
-    # the save state is a comparison of two commits. One list and one head, alongside the two
-    # heads this read already pays for.
-    refused = await newest_diverted_at(state.app_id) if state.app_id else None
-    return SaveStateResponse(**_save_state_fields(state), write_back_refused_at=refused)
+    return SaveStateResponse(**_save_state_fields(state))
 
 
 # --- the app's own client-error report ----------------

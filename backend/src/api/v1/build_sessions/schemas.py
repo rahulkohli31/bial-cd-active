@@ -316,12 +316,6 @@ class RelaunchPreviewRequest(CamelModel):
     resolved from the project."""
 
     project_id: uuid.UUID  # REQUIRED — the owning project; the app is resolved from it.
-    # Put the LAST SAVED version back instead of resuming the newest workspace. Default False
-    # because the newest tree is what the user was looking at, and restoring an older one over
-    # it is the failure that costs them work. Neither choice promotes anything: the saved
-    # bundle is untouched either way, so `dirty` stays true and Save is still their click.
-    # Set from an explicit user action ("go back to my last saved version"), never inferred.
-    prefer_saved: bool = False
 
 
 class DiscardRequest(CamelModel):
@@ -819,45 +813,3 @@ commit, and there is no request-scoped `get_db` on a background task. Tests bind
 the rolled-back test session — the same substitution the conversation suites make via
 `dependency_overrides` on `_shared.billing_session_factory`.
 """
-
-
-class ParkedTree(CamelModel):
-    """One tree set aside instead of promoted: a `quarantine` is what a restore was about to
-    write over, a `divert` is what the recovery guard refused to promote. Both live under
-    per-occurrence keys, so a later one never overwrites an earlier one."""
-
-    key: str
-    kind: Literal["quarantine", "divert"]
-    head_sha: str | None
-    size_bytes: int
-    taken_at: datetime | None
-
-
-class ParkedTreesResponse(CamelModel):
-    """`POST /v1/build-sessions/internal/apps/{app_id}/parked` → 200.
-
-    THE TREES WOULD OTHERWISE BE WRITE-ONLY: no reader, no retention, no runbook. In a
-    false-`REVERTED` case those objects hold the only copy of a citizen's newest work, so this
-    response must not reproduce that write-only shape. Newest first, because the useful one is
-    almost always the last one."""
-
-    trees: list[ParkedTree]
-
-
-class PromoteParkedRequest(CamelModel):
-    """`POST /v1/build-sessions/internal/apps/{app_id}/promote` — put one parked tree back.
-
-    The key is named explicitly rather than "the newest": an operator promoting the wrong tree
-    over somebody's recovery slot is the failure, and a request that
-    cannot name what it means is one that can be misread."""
-
-    key: str
-
-
-class PromoteParkedResponse(CamelModel):
-    """What the promotion did. `promoted` is False when the guard refused it — which is not an
-    error and must not read as one: it means the tree is not a descendant of what the slot holds,
-    and forcing it would be the data loss the guard exists to prevent."""
-
-    promoted: bool
-    detail: str

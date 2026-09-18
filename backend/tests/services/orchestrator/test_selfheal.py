@@ -671,7 +671,7 @@ async def test_patience_is_bounded_and_an_unanswerable_verdict_is_returned_as_on
 
 
 async def test_may_never_be_green_is_true_for_exactly_one_state() -> None:
-    """`green` is a property, not a field, for the reason `CopyVerdict.may_destroy` is one:
+    """`green` is a property, not a field, for the reason `IntegrityVerdict.may_restore` is one:
     `state is HEALTHY` spelled out at every call site is a chance at each one to write `is not
     UNHEALTHY` instead — which reads an unanswerable verdict as a completion claim."""
     greens = [

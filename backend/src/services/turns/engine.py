@@ -91,6 +91,7 @@ from src.api.v1.conversations.schemas import (
     WorkingFrame,
     WorkspaceFrame,
 )
+from src.config import settings
 from src.core.error_signature import error_signature
 from src.core.integrity_types import BaselineIdentity
 from src.db.models.conversation import ChatKind, Conversation
@@ -203,6 +204,7 @@ from src.services.sandbox.base import CompileState
 from src.services.turns.copy import (
     APP_STOPPED_WORKING_TEXT,
     APP_WORKING_AGAIN_TEXT,
+    AT_LIMIT_TEXT,
     ATTACHMENT_UNAVAILABLE_REASON,
     BUILD_WROTE_NOTHING_REASON,
     CANNOT_TELL_WHAT_REMAINS_TEXT,
@@ -242,7 +244,6 @@ from src.services.turns.guard import claim_conversation, release_conversation
 from src.services.turns.plan_options import META_PENDING
 from src.services.usage.gate import (
     DailyTokenLimitExceededError,
-    at_limit_ending,
     enforce_daily_limit,
     next_ist_midnight_iso,
     record_usage,
@@ -1453,7 +1454,6 @@ class TurnEngine:
             `_bill_once` narrows to `Exception`, which a cancellation is not. Escaping would
             carry it clean past `_finish`: no terminal frame, no terminal row, and a turn every
             subscriber reads as still running until its stall timeout. The same hole
-            `_end_model_unavailable` closes around `at_limit_ending`, closed once for the five
             arms that bill."""
             try:
                 await _bill_once()
@@ -1509,22 +1509,11 @@ class TurnEngine:
             )
             if not await _bill_before_ending():
                 return
-            if state.kind is ChatKind.BUILD:
-                # A STOP WHILE THE TREE IS SECURED STILL ENDS THE TURN. This runs inside an
-                # `except`, so a cancellation landing in this await (up to a minute of container
-                # round trips) is not the `except asyncio.CancelledError` arm's to catch, and
-                # escaping would skip `_finish`: no terminal frame, no terminal row, a turn
-                # "running" until every subscriber's stall timeout. The run bounds secure BEFORE
-                # they raise, inside the `try`, which is why they never needed this.
-                try:
-                    ending = await at_limit_ending(state.sandbox, sentence=MODEL_UNAVAILABLE_TEXT)
-                except asyncio.CancelledError:
-                    state.end_reason = STOPPED_BY_USER
-                    self._finish(state, "stopped")
-                    return
-                message = ending.message
-            else:
-                message = MODEL_UNAVAILABLE_PLAN_TEXT
+            message = (
+                MODEL_UNAVAILABLE_TEXT
+                if state.kind is ChatKind.BUILD
+                else MODEL_UNAVAILABLE_PLAN_TEXT
+            )
             state.end_reason = MODEL_UNAVAILABLE_CODE
             state.error_message = message
             self._emit(state, lambda seq: TurnErrorFrame(seq=seq, message=message))
@@ -2371,15 +2360,12 @@ class TurnEngine:
         try:
             while True:
                 if time.monotonic() - loop_started > RUN_WALL_CLOCK_DEADLINE_S:
-                    # ONE ENDING FOR ALL THREE BOUNDS. What stood here named the
-                    # bound and then told the citizen to "click Save to keep them" — the exact
-                    # sentence `at_limit_ending`'s docstring records as the one that secured
-                    # nothing and asserted something nobody had checked. This arm is the one
-                    # MOST likely to be reached with a wedged container, so it is the one that
-                    # can least afford to promise a save it never performed.
+                    # ONE ENDING FOR ALL THREE BOUNDS, and it promises nothing about the
+                    # citizen's work: this arm is the one most likely to be reached with a
+                    # wedged container.
                     raise _WriteEndedError(
                         WALL_CLOCK_DEADLINE_EXCEEDED_REASON,
-                        await self._bounded_run_ending(state),
+                        self._bounded_run_ending(state),
                     )
                 # The count ceilings bound requests and repairs; this bounds elapsed time,
                 # which neither of them does. Checked BETWEEN iterations, so a run already
@@ -2425,7 +2411,7 @@ class TurnEngine:
                     # fired distinguishable for the person who can act on it.
                     raise _WriteEndedError(
                         REQUEST_LIMIT_REASON,
-                        await self._bounded_run_ending(state),
+                        self._bounded_run_ending(state),
                     ) from exc
                 iteration += 1
 
@@ -2752,12 +2738,9 @@ class TurnEngine:
             pending_answers: ModelRequest | None = None
             while not isinstance(node, End):
                 if Agent.is_model_request_node(node):
-                    # THE SESSION CLOSES BEFORE THE ENDING IS BUILT, which is why the `try`
-                    # is on the outside now. `at_limit_ending` bundles and uploads the
-                    # citizen's tree, and doing that inside the `async with` would pin a
-                    # pooled connection for the duration of a container round trip — on the
-                    # one path where every user who hits their cap in the same hour arrives
-                    # at once. Nothing else about this block moved.
+                    # THE SESSION CLOSES BEFORE THE ENDING IS BUILT, which is why the `try` is on
+                    # the outside: holding a pooled connection open across the ending is what
+                    # every user who hits their cap in the same hour would queue behind.
                     try:
                         async with session_factory() as gate_db:
                             await enforce_daily_limit(gate_db, state.user_id)
@@ -2778,7 +2761,7 @@ class TurnEngine:
                         )
                         raise _WriteEndedError(
                             QUOTA_EXCEEDED_REASON,
-                            (await at_limit_ending(state.sandbox)).message,
+                            AT_LIMIT_TEXT.format(contact=settings.SUPPORT_CONTACT_EMAIL),
                         ) from exc
                     # THE PLATFORM'S OWN BOUND, at the same seam and for the same reason.
                     # Inside the loop, before the request fires, where the run's
@@ -2803,7 +2786,7 @@ class TurnEngine:
                         )
                         raise _WriteEndedError(
                             RUN_BUDGET_REACHED_REASON,
-                            await self._bounded_run_ending(state),
+                            self._bounded_run_ending(state),
                         )
                     async with node.stream(run.ctx) as stream:
                         async for event in stream:
@@ -3003,16 +2986,13 @@ class TurnEngine:
         except Exception as exc:
             raise _PersistFailedError from exc
 
-    async def _bounded_run_ending(self, state: _TurnState) -> str:
-        """THREE BOUNDS, ONE ENDING: durable first, then the sentence, then what is left.
-        Request count, wall clock and spend can each end a run; which one fired is not
-        something a citizen can act on differently, so it lives in `end_reason` and the logs,
-        never in the copy. All three route through one securing function, `at_limit_ending`,
-        so "your changes are still in the workspace" is verified rather than resting on a
-        best-effort autosave that could fail silently. The daily quota is NOT one of these: it
-        is the citizen's own budget, resets at midnight, and keeps its own sentence.
-        `workspace_touched=False` truthfully means nothing was built."""
-        message = (await at_limit_ending(state.sandbox, sentence=SPENT_ENOUGH_TEXT)).message
+    def _bounded_run_ending(self, state: _TurnState) -> str:
+        """THREE BOUNDS, ONE ENDING: the sentence, then what is left. Request count, wall clock
+        and spend can each end a run; which one fired is not something a citizen can act on
+        differently, so it lives in `end_reason` and the logs, never in the copy. The daily
+        quota is NOT one of these: it is the citizen's own budget, resets at midnight, and keeps
+        its own sentence. `workspace_touched=False` truthfully means nothing was built."""
+        message = SPENT_ENOUGH_TEXT
         remainder = self._what_is_still_outstanding(
             state,
             workspace_touched=state.sandbox is not None and state.sandbox.workspace_touched,

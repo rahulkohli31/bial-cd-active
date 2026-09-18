@@ -33,8 +33,6 @@ from src.services.storage.keys import app_file_key as app_file_key
 from src.services.storage.keys import assert_owned as assert_owned
 from src.services.storage.keys import attachment_key as attachment_key
 from src.services.storage.keys import container_name as container_name
-from src.services.storage.keys import divert_key as divert_key
-from src.services.storage.keys import divert_prefix as divert_prefix
 from src.services.storage.keys import head_sha_from_metadata as head_sha_from_metadata
 from src.services.storage.keys import normalize_metadata as normalize_metadata
 from src.services.storage.keys import owner_prefix as owner_prefix

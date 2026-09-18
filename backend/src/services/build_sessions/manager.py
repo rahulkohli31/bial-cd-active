@@ -14,10 +14,10 @@ memory, NOT Postgres. On a single replica the whole session is in-process; the f
 (lock/heartbeat/registry) are the durable cross-restart coordination.
 
 Lock-release belongs to this module, SESSION-API-owned, not the turn itself. `finish_turn_sandbox`
-runs the end of a turn: the recovery autosave, then the PARDON — the container stays up under the
-bounded stay-of-execution lease (registry kept, lock released) so the user can go on using the app
-they are looking at — and finally the release of the one-per-user slot. Teardown is the reaper's
-and the shutdown routine's: nothing here executes a container.
+runs the end of a turn: the PARDON — the container stays up under the bounded stay-of-execution
+lease (registry kept, lock released) so the user can go on using the app they are looking at — and
+then the release of the one-per-user slot. Teardown is the reaper's and the shutdown routine's:
+nothing here executes a container.
 
 The sandbox client is threaded IN from the router's `Depends`, never resolved inline, so
 `app.dependency_overrides` reach it in tests.
@@ -67,7 +67,6 @@ from src.services.build_sessions.alarms import (
     APP_STOPPED_WHILE_IDLE_EVENT,
     BUILD_WORKSPACE_CLAIMED_EVENT,
     PREVIEW_STATE_REPORTED_UNKNOWN_EVENT,
-    RECOVERY_WRITE_DID_NOT_LAND_EVENT,
     SANDBOX_DEV_STARTED_EVENT,
     SERVING_PROOF_STAMP_REFUSED,
     WORKSPACE_LOST_WHILE_IDLE_EVENT,
@@ -119,11 +118,8 @@ from src.services.build_sessions.snapshot import (
     SNAPSHOT_EXEC_TIMEOUT_SECONDS,
     SNAPSHOT_EXECS,
     Destination,
-    RecoveryOutcome,
     SavedVersion,
-    consecutive_diverts,
     discard_back_to_saved,
-    write_recovery_copy,
     write_snapshot,
 )
 from src.services.lake.copy import schedule_window_copy
@@ -159,10 +155,8 @@ from src.services.storage import (
     StorageUnconfiguredError,
     get_storage,
     parse_bundle_head_sha,
-    recovery_key,
     snapshot_key,
 )
-from src.services.storage.base import ObjectMeta
 
 _log = structlog.get_logger()
 
@@ -228,25 +222,6 @@ async def snapshot_presence(app_id: uuid.UUID) -> bool | None:
     return await head_presence(snapshot_key(app_id))
 
 
-async def restorable_presence(app_id: uuid.UUID) -> bool | None:
-    """Could the platform put this app back, from anything? Checks `recovery_key` OR
-    `snapshot_key` — the pair `newest_restore_source` also consults, since offering a restore
-    means "would a restore find something". `snapshot_presence` alone under-reports a builder
-    who worked across turns but never pressed save: they have only the turn-boundary recovery
-    copy, and "no saved build" is the wrong thing to tell them while holding their workspace.
-    Container-independent on purpose (`SaveState.recovery_at` is null in exactly these
-    reclaimed cases). Tri-state: confirmed presence wins immediately, two confirmed absences
-    are a real `False`, an unreadable store returns `None`."""
-    recovery = await head_presence(recovery_key(app_id))
-    if recovery:
-        return True
-    saved = await snapshot_presence(app_id)
-    if saved:
-        return True
-    # Both are now False-or-unknown. One unknown is enough to disqualify a confident "no".
-    return False if recovery is False and saved is False else None
-
-
 async def snapshot_exists_or_bust(app_id: uuid.UUID) -> bool:
     """The build path's reading of `snapshot_presence`: an unknown state ABORTS the start
     rather than provisioning over work that may be restorable."""
@@ -298,26 +273,13 @@ _STOP_UNWIND_HEADROOM_SECONDS: float = 10.0
 # into a fast one; it only makes the citizen stare at a spinner before we hand back the very
 # same URL. 15s is comfortably above a warm attach (measured at ~380ms end to end) and low
 # enough that a slow app degrades promptly instead of two minutes later.
-# The autosave runs on a turn's exit path, so the whole SEQUENCE gets one bound. Each exec in it
-# is already capped individually, but five of them in a row is minutes, and a wedged container must
-# not hold the turn's ending open. Generous enough for a real bundle over the supervisor, short
-# enough that failing is quicker than hanging.
-#
-# AND IT IS THE TURN-BOUNDARY RECOVERY COPY'S ONLY BOUND. A separate 180 s budget used to wrap
-# that copy; the autosave reconciliation replaced its `asyncio.timeout` arm with this one and
-# left the constant behind, unread, contradicting the number actually enforced — so it has been
-# swept. The copy is bounded here, not unbounded, and `_STOP_ACTIVE_WORK_TIMEOUT_SECONDS` below
-# derives from THIS number. (The reaper's own copy is a different path and carries no wrapper.)
-_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS: float = 60.0
-
 # How long "stop the work so I can switch projects" waits for the turn to actually unwind.
 #
 # IT MUST SIT ABOVE THE UNWIND, not below it. The old 30 s was picked to bound a REQUEST the
 # citizen was sitting in front of, and it was under the unwind's own bounds — so an ordinary,
 # healthy turn could outlast it and be reported as "still running" for doing exactly what it is
 # supposed to do. What `_stop_the_held_session` waits on is the whole turn task unwinding after a
-# hard cancel: whatever the turn was mid-way through has to come back first, and then
-# `finish_turn_sandbox` runs its recovery autosave under `_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS`.
+# hard cancel: whatever the turn was mid-way through has to come back first.
 #
 # THE CEILING IS DELIBERATE HEADROOM, NOT A DERIVATION. A cancelled tool exec is not instant, and
 # the per-exec bound the snapshot layer applies (`SNAPSHOT_EXECS` × `SNAPSHOT_EXEC_TIMEOUT_
@@ -332,8 +294,7 @@ _RECOVERY_SNAPSHOT_TIMEOUT_SECONDS: float = 60.0
 _SNAPSHOT_WRITE_BUDGET_SECONDS: float = SNAPSHOT_EXECS * SNAPSHOT_EXEC_TIMEOUT_SECONDS
 
 _STOP_ACTIVE_WORK_TIMEOUT_SECONDS: float = (
-    max(_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS, _SNAPSHOT_WRITE_BUDGET_SECONDS)
-    + _STOP_UNWIND_HEADROOM_SECONDS
+    _SNAPSHOT_WRITE_BUDGET_SECONDS + _STOP_UNWIND_HEADROOM_SECONDS
 )
 
 # How long a settled stop record is kept so a status read can still tell "stopped" from "nothing
@@ -393,10 +354,6 @@ class SnapshotUnavailableError(Exception):
 #: How the integrity gate tells the turn what it found, BEFORE it acts on it. A coroutine rather
 #: than a return value because the sentence has to reach the citizen while the slow work runs.
 RecoveryAnnouncer = Callable[["RecoveryNews"], Awaitable[None]]
-
-#: Consecutive refusals after which the integrity gate stops trusting the recovery slot (see
-#: `_source_that_is_not_poisoned`).
-_POISONED_SLOT_REFUSALS: Final = 2
 
 
 async def _say(announce: RecoveryAnnouncer | None, news: RecoveryNews) -> None:
@@ -651,28 +608,6 @@ class SaveState:
     dirty: bool | None
     container_head: str | None
     saved_head: str | None
-    # When the platform last wrote this app's tree to the recovery slot, or None if it never
-    # has. Distinct from `saved_head`, which is the user's own save: this exists so a workspace
-    # that was reclaimed while dirty can be OFFERED back ("unsaved work from 14:32") rather than
-    # silently forgotten.
-    #
-    # AND IT IS ALSO THE ANSWER TO "CAN THE PLATFORM PUT THIS BACK?", which is a stronger fact
-    # than the clause that used to end this comment. It said the restore ladder still only ever
-    # restores the user's bundle; that stopped being true when `newest_restore_source` landed,
-    # 1,168 lines below in this same module. EVERY automatic restore goes through it now, and it
-    # hands back the RECOVERY bundle in preference to the saved one whenever the recovery copy is
-    # the newer of the two — deliberately, to close the data-loss bug its own docstring
-    # describes. Where it does hand back the saved bundle, that bundle is either newer or holds
-    # the same tree, so a non-null instant here means one thing either way: what a restore brings
-    # back is no older than this. `restorable_presence` counts this slot for the same reason, and
-    # `SaveStateResponse.recovery_at` carries the fact — and this reasoning — onto the wire, where
-    # the rail and the exit guard read it to stop calling a fresh build's `dirty=True` a warning.
-    #
-    # RESUMPTION, NOT PROMOTION — the half of the old comment that was true stands unchanged. A
-    # recovery copy is not a VERSION: `snapshot_key` is untouched, `dirty` stays True beside a
-    # non-null instant, and nothing on this path performs the citizen's Save for them. Save stays
-    # MANUAL, and only Save produces something they can ask to come back to by name.
-    recovery_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -724,32 +659,6 @@ class PreviewState:
         tab loaded before this change is still reading it, and a tab that read a missing field
         as `false` would paint "gone" over a live preview. New clients read `state`."""
         return self.state is PreviewLifeState.ALIVE
-
-
-def _head_of(meta: ObjectMeta | None) -> str | None:
-    """The tree a stored bundle holds, from the metadata `write_snapshot` stamps on it.
-
-    None for a bundle written before that stamp existed, which is why every caller treats a
-    missing value as "cannot compare" and falls back to timestamps rather than to equality."""
-    if meta is None or not meta.metadata:
-        return None
-    value = meta.metadata.get("head_sha")
-    return value if isinstance(value, str) else None
-
-
-@dataclass(frozen=True)
-class RecoverableWork:
-    """A crash-recovery copy that is NEWER than the user's last saved version.
-
-    Returned only when a copy exists and post-dates the saved one, so a caller can offer it
-    rather than silently restoring the older saved bundle and presenting the app as healthy —
-    the failure mode that made losing a container invisible. `written_at` is the store's own
-    `last_modified`, which is what makes "newer" answerable at all: two bundle HEAD shas tell
-    you nothing about which came first. It is the value shown to the user ("your work from
-    14:47"), so it must be the write time, never `now`."""
-
-    app_id: uuid.UUID
-    written_at: datetime
 
 
 class NoLiveSandboxError(Exception):
@@ -943,22 +852,9 @@ async def _saved_head(app_id: uuid.UUID) -> str | None:
     return head
 
 
-async def _recovery_written_at(app_id: uuid.UUID) -> datetime | None:
-    """When the platform last autosaved this app, or None if it never has / we cannot tell.
-
-    Unknown and never collapse into "there is nothing" — but here they are the same ANSWER,
-    because this only ever adds an offer. A recovery bundle we cannot see is one we do not
-    mention; nothing is claimed either way, and the user's saved version is untouched."""
-    try:
-        meta = await get_storage().head(recovery_key(app_id))
-    except StorageError, StorageUnconfiguredError:
-        return None
-    return meta.last_modified if meta else None
-
-
 async def _snapshot_written_at(app_id: uuid.UUID) -> datetime | None:
     """When the app's SAVED snapshot was last written (#198) — best-effort, for
-    `SharedPreview`'s "as of" line, `_recovery_written_at`'s own sibling. `None` on any failure
+    `SharedPreview`'s "as of" line. `None` on any failure
     to ask, including a confirmed-absent snapshot: by the time a caller wants this, the restore
     it feeds into has ALREADY confirmed presence via `snapshot_exists_or_bust`, so a `None`
     here is a missing DETAIL, never a missing snapshot."""
@@ -2017,12 +1913,7 @@ class SessionManager:
             # running and empty — conflating them would retract a completion claim every time a
             # workspace merely went to sleep.
             return WorkspaceState.UNREADABLE
-        verdict = await workspace_integrity(
-            sandbox_client,
-            handle,
-            app_id,
-            restore_source_key=await self._restore_source_for_the_gate(app_id),
-        )
+        verdict = await workspace_integrity(sandbox_client, handle, app_id)
         _idle_checks[app_id] = _IdleCheck(asked_at=now, verdict=verdict.state)
         if verdict.state is WorkspaceState.REVERTED:
             _log.error(
@@ -2127,7 +2018,6 @@ class SessionManager:
         if state is None:
             # Could not ask the container — the only honest unknown.
             return SaveState(app_id=app_id, dirty=None, container_head=None, saved_head=None)
-        recovery_at = await _recovery_written_at(app_id)
         saved_head = await _saved_head(app_id)
         # UNCOMMITTED WORK IS DIRTY regardless of what the commits say — see the docstring.
         # `saved_head` is still reported alongside it: the answer is "there is unsaved work on top
@@ -2144,7 +2034,6 @@ class SessionManager:
                 dirty=True,
                 container_head=state.head,
                 saved_head=saved_head,
-                recovery_at=recovery_at,
             )
         if state.head is None:
             # No commit yet. A fresh template has no `.git`, so this is every brand-new
@@ -2155,7 +2044,6 @@ class SessionManager:
                 dirty=saved_head is None,
                 container_head=None,
                 saved_head=saved_head,
-                recovery_at=recovery_at,
             )
         if saved_head is None:
             # Committed work, nothing ever saved.
@@ -2164,85 +2052,13 @@ class SessionManager:
                 dirty=True,
                 container_head=state.head,
                 saved_head=None,
-                recovery_at=recovery_at,
             )
         return SaveState(
             app_id=app_id,
             dirty=state.head != saved_head,
             container_head=state.head,
             saved_head=saved_head,
-            recovery_at=recovery_at,
         )
-
-    async def recoverable_work(self, app_id: uuid.UUID) -> RecoverableWork | None:
-        """Is there a crash-recovery copy strictly NEWER than the saved version? Answered from
-        the store's `last_modified`, not the bundles: two HEAD shas tell you which trees
-        differ, never which came first, and ancestry would cost a download plus real git. Two
-        kinds of "no": a store that answered and holds nothing newer returns `None`; a store
-        that would NOT answer RAISES — a display surface can treat that as "no offer", but a
-        caller about to RESTORE must not silently hand back an older tree instead.
-        Deliberately not part of `project_save_state`, asked precisely when the container is
-        gone."""
-        try:
-            store = get_storage()
-        except StorageUnconfiguredError:
-            return None
-        try:
-            recovery = await store.head(recovery_key(app_id))
-            saved = await store.head(snapshot_key(app_id))
-        except StorageError:
-            # An unreadable store is NOT "nothing to recover", and the difference matters to
-            # whoever is about to act on the answer. Callers that merely display the offer can
-            # treat it as absent; a caller about to RESTORE must not (see
-            # `_restore_source_or_bust`, which re-asks and refuses rather than silently
-            # handing back an older tree).
-            _log.warning("could not determine recoverable work", app_id=str(app_id))
-            raise
-        if recovery is None or recovery.last_modified is None:
-            return None
-        # No saved version at all, but a recovery copy exists: everything the user has ever
-        # done is in it, so it is unambiguously worth offering.
-        if saved is None or saved.last_modified is None:
-            return RecoverableWork(app_id=app_id, written_at=recovery.last_modified)
-        # SAME TREE, whatever the clocks say. `touched` means "a mutating tool ran", not "the
-        # tree changed", so a turn that only read files still rewrites the recovery bundle from
-        # an unchanged worktree. Comparing the stamped HEAD answers this exactly and stops a
-        # permanent, contradictory "you have unsaved work" against a `dirty=False` save state.
-        if _head_of(recovery) is not None and _head_of(recovery) == _head_of(saved):
-            return None
-        # ORDERING, with the tie broken TOWARD the newer work. Azure stamps `last_modified` in
-        # whole seconds, so a Save and a turn-boundary write inside one second compare EQUAL —
-        # and `<` alone resolved that to "the save wins", which restored the older tree over the
-        # user's newer work. That is the loss this whole mechanism exists to prevent, reappearing
-        # inside a one-second window; a live end-to-end run reproduced it. The shas above have
-        # already established the trees differ, so an equal stamp means "written together, and
-        # the recovery copy is the one written at the turn boundary" — resume it. Restoring a
-        # tree that turns out to be the same age costs nothing (it is still not a promotion:
-        # `dirty` stays true); restoring the older one costs the user their work.
-        if recovery.last_modified < saved.last_modified:
-            return None  # the save is genuinely newer — nothing extra to offer
-        return RecoverableWork(app_id=app_id, written_at=recovery.last_modified)
-
-    async def newest_restore_source(self, app_id: uuid.UUID) -> str | None:
-        """The key of the bundle holding the app's MOST RECENT tree, or None for the saved
-        one. Every automatic restore goes through here, closing a real data-loss bug: pulling
-        `snapshot_key` unconditionally used to rebuild a reclaimed container from the last
-        SAVED tree, and that turn's own recovery write then overwrote the recovery bundle —
-        work done after the last Save survived one turn and then existed nowhere. RESUMPTION,
-        NOT PROMOTION: `snapshot_key` is untouched and `dirty` stays true. FAILS CLOSED like
-        every read here — an unreadable store raises `SnapshotUnavailableError` rather than
-        silently restoring an older tree over newer work."""
-        presence = await head_presence(recovery_key(app_id))
-        if presence is None:
-            raise SnapshotUnavailableError("recovery state unknown after retries", app_id=app_id)
-        if not presence:
-            return None
-        try:
-            return recovery_key(app_id) if await self.recoverable_work(app_id) else None
-        except StorageError as exc:
-            raise SnapshotUnavailableError(
-                "recovery state unknown after retries", app_id=app_id
-            ) from exc
 
     async def _refuse_if_reclaim_would_destroy_work(
         self,
@@ -2663,12 +2479,12 @@ class SessionManager:
         # carries the project id). Only then do the existing arms run: never-built, asleep,
         # and the registry-sourced `slot_taken`.
         #
-        # THE RESTORE QUESTION IS ONLY ASKED WHEN ITS ANSWER CAN CHANGE THE SCREEN. This used
-        # to call `restorable_presence` before the registry read — one or two Blob round trips
-        # per tab per 45 seconds to answer "could we put this back?" about an app that is
-        # currently running. Every surface that renders the answer only exists when nothing is
-        # serving the project, so the alive and starting arms return `None` (no claim) and the
-        # client falls through to the answer the project route already gave it at load.
+        # THE RESTORE QUESTION IS ONLY ASKED WHEN ITS ANSWER CAN CHANGE THE SCREEN. Asking it
+        # before the registry read costs a Blob round trip per tab per 45 seconds to answer
+        # "could we put this back?" about an app that is currently running. Every surface that
+        # renders the answer only exists when nothing is serving the project, so the alive and
+        # starting arms return `None` (no claim) and the client falls through to the answer the
+        # project route already gave it at load.
         #
         # NOT BUILT ON `_refuse_if_reclaim_would_destroy_work`: it answers a different question
         # — whose container holds the slot — and letting a `RedisError` from it turn a poll into
@@ -2684,7 +2500,7 @@ class SessionManager:
             if app_id is None:
                 return PreviewState(state=PreviewLifeState.NEVER_BUILT, restorable=False)
             return PreviewState(
-                state=PreviewLifeState.ASLEEP, restorable=await restorable_presence(app_id)
+                state=PreviewLifeState.ASLEEP, restorable=await snapshot_presence(app_id)
             )
         except RedisError:
             # AMBIGUITY. The store exists and would not answer, so this decided nothing —
@@ -2708,7 +2524,7 @@ class SessionManager:
             self._say_the_preview_read_failed(user.id, project_id)
             return PreviewState(
                 state=PreviewLifeState.UNKNOWN,
-                restorable=await restorable_presence(app_id) if app_id is not None else None,
+                restorable=await snapshot_presence(app_id) if app_id is not None else None,
             )
         mine = app_name_for(app_id) if app_id is not None else None
         if mine is not None and reg is not None and _registry_serves_and_is_ready(reg, mine):
@@ -2720,7 +2536,7 @@ class SessionManager:
                 # right now" page while the live region announced the preview was live.
                 #
                 # WHY IT SITS HERE AND NOWHERE ELSE, three times over:
-                #  * ABOVE `restorable_presence`, so the whole pre-serve window — every 3s
+                #  * ABOVE `snapshot_presence`, so the whole pre-serve window — every 3s
                 #    accelerated poll of it — costs no object-store HEAD. Placing it after that
                 #    call would quietly move the build window onto the expensive path.
                 #  * INSIDE this block, so the app-name/state comparison happens exactly once.
@@ -2761,7 +2577,7 @@ class SessionManager:
                 state=PreviewLifeState.SLOT_TAKEN,
                 occupying_project_id=starting,
                 occupying_project_name=occupying_name,
-                restorable=(await restorable_presence(app_id) if app_id is not None else False),
+                restorable=(await snapshot_presence(app_id) if app_id is not None else False),
             )
         if app_id is None:
             # NEVER BUILT — BUT ONLY IF THE WORKSPACE IS NOT SOMEBODY ELSE'S, and that ordering is
@@ -2791,7 +2607,7 @@ class SessionManager:
         # Everything below is a workspace that is NOT serving this project and has no start in
         # flight — which is the only place the restore offer is rendered, so this is the one
         # place the answer earns its round trip.
-        restorable = await restorable_presence(app_id)
+        restorable = await snapshot_presence(app_id)
         if reg is None:
             return PreviewState(state=PreviewLifeState.ASLEEP, restorable=restorable)
         live_app = reg.get(REGISTRY_FIELD_APP_NAME)
@@ -3211,19 +3027,9 @@ class SessionManager:
         user: User,
         project_id: uuid.UUID,
         sandbox_client: SandboxClient,
-        *,
-        prefer_saved: bool = False,
     ) -> RelaunchedPreview:
         """Put a READY sandbox in front of a project's saved app — for an app whose live build
         session has already been torn down.
-
-        Resumes the NEWEST tree by default; `prefer_saved` is the user's explicit "put my last
-        saved version back" and is the only way to get the older one. The default is inverted
-        from the obvious reading on purpose: the failure that costs a user their work is
-        restoring an older tree over a newer one, and the failure that costs them nothing is
-        showing them their own most recent workspace. Neither is a promotion — `snapshot_key`
-        is untouched either way, so `dirty` stays true and Save is still their click.
-        `save_state.recoverableWorkAt` is what lets the portal offer the choice.
 
         TWO ARMS, cheapest first. If the container serving this exact app is already up and
         healthy, ATTACH to it and drive the dev server; only otherwise restore the snapshot
@@ -3311,9 +3117,7 @@ class SessionManager:
         with _one_relaunch_in_the_log(
             build_id=str(uuid.uuid7()), user_id=str(user.id), project_id=str(project_id)
         ):
-            return await self._relaunch_under_one_build_id(
-                db, user, project_id, sandbox_client, prefer_saved=prefer_saved
-            )
+            return await self._relaunch_under_one_build_id(db, user, project_id, sandbox_client)
 
     async def _relaunch_under_one_build_id(
         self,
@@ -3321,8 +3125,6 @@ class SessionManager:
         user: User,
         project_id: uuid.UUID,
         sandbox_client: SandboxClient,
-        *,
-        prefer_saved: bool,
     ) -> RelaunchedPreview:
         """The whole of `relaunch_preview` — go there for what it does and why it does it that
         way; this half is the same code, one indent level out.
@@ -3371,12 +3173,7 @@ class SessionManager:
                 # uncommitted insert back) nor provision blob storage for an app that was
                 # never built. No fresh-provision fallback: a confirmed-absent bundle is a
                 # dead end (404), never a blank template.
-                # Gate on EITHER bundle. Gating on the saved one alone told the user who
-                # built an app across several turns and never clicked Save — the expected
-                # behaviour for a non-developer, not an edge case — to "build the app first",
-                # while `save-state` was simultaneously reporting that their work existed.
-                relaunch_source = await self.newest_restore_source(app_id)
-                if relaunch_source is None and not await self._snapshot_exists_or_bust(app_id):
+                if not await self._snapshot_exists_or_bust(app_id):
                     raise NoSnapshotToRelaunchError(app_id)
                 # The "last saved version" signal: when the newest recorded outcome FAILED,
                 # the snapshot being restored is the last SAVED state, not that build's intent.
@@ -3474,18 +3271,13 @@ class SessionManager:
                     # `_restore_or_bust` re-raises `StorageNotFoundError` (a bundle that
                     # vanished between head-check and pull) — the same 404 bucket.
                     try:
-                        # `prefer_saved` is the user's explicit "put my last saved version
-                        # back" — the one case where the older tree is what they want. Absent
-                        # it, relaunch resumes the newest tree for the same reason every other
-                        # restore does.
-                        source_key = None if prefer_saved else relaunch_source
                         scope.handle = await self._restore_or_bust(
                             sandbox_client,
                             user_id,
                             app_name_for(app_id),
                             app_id,
                             env,
-                            source_key=source_key,
+                            source_key=None,
                         )
                     except StorageNotFoundError as exc:
                         raise NoSnapshotToRelaunchError(app_id) from exc
@@ -3843,11 +3635,6 @@ class SessionManager:
         project (`resolve_project_access` returning SHARED); this trusts that and re-checks
         nothing about access — only about the container.
 
-        SNAPSHOT-ONLY, ALWAYS (requirement 21). Deliberately NEVER `newest_restore_source`,
-        which would prefer the OWNER's crash-recovery bundle over their last deliberate Save —
-        a shared view is restored from what the owner chose to publish to their colleagues, not
-        from whatever their build container happened to hold when it last crashed.
-
         `force_refresh=True` is Refresh (requirement 22): skip the attach-and-reuse arm even
         when a live container already answers for this exact (project, recipient) pair, and
         restore again from whatever is CURRENTLY saved — which may have moved since Launch.
@@ -3941,8 +3728,7 @@ class SessionManager:
                 incumbent_is_leaving=incumbent_is_leaving,
                 spare_app=spare_app,
             ) as scope:
-                # THE SNAPSHOT GATE — the saved bundle ONLY, never the recovery/autosave copy
-                # (requirement 21). `newest_restore_source` is never called on this path.
+                # THE SNAPSHOT GATE — the OWNER's saved bundle (requirement 21).
                 if not await self._snapshot_exists_or_bust(owner_app_id):
                     raise NoSnapshotToRelaunchError(owner_app_id)
                 snapshot_taken_at = await _snapshot_written_at(owner_app_id)
@@ -4321,10 +4107,7 @@ class SessionManager:
         REACHES A TEARDOWN — not defensive coding, the entire safety property: `REVERTED`
         requires three independent facts to agree, and the two unanswerable states leave the
         container running, attached and untouched."""
-        source = await self._restore_source_for_the_gate(app_id)
-        verdict = await workspace_integrity(
-            sandbox_client, handle, app_id, restore_source_key=source
-        )
+        verdict = await workspace_integrity(sandbox_client, handle, app_id)
         if verdict.state is WorkspaceState.INTACT:
             return _ResolvedSandbox(handle, attached=True)
         if verdict.state is WorkspaceState.UNREADABLE:
@@ -4370,7 +4153,7 @@ class SessionManager:
                 app_name,
                 app_id,
                 env,
-                source_key=self._source_that_is_not_poisoned(app_id, source),
+                source_key=None,
             )
         except StorageError, SandboxError, SnapshotUnavailableError:
             # `restore_from_snapshot` fetches BEFORE it destroys anything and self-cleans on the
@@ -4390,37 +4173,6 @@ class SessionManager:
         return _ResolvedSandbox(
             restored, attached=False, news=RecoveryNews.RESTORING, restored=True
         )
-
-    async def _restore_source_for_the_gate(self, app_id: uuid.UUID) -> str | None:
-        """Which bundle would a restore hand back? — asked so the verdict compares against it.
-
-        `newest_restore_source` RAISES when the store will not answer, and on this path that is
-        the same fact as a container that will not answer: we cannot tell, so we must not judge.
-        Mapped to `None` here and left for `workspace_integrity`'s own store read to surface as
-        `UNREADABLE`, rather than aborting the turn with a different error shape."""
-        try:
-            return await self.newest_restore_source(app_id)
-        except SnapshotUnavailableError:
-            return None
-
-    def _source_that_is_not_poisoned(self, app_id: uuid.UUID, source: str | None) -> str | None:
-        """Which bundle to actually restore, when the recovery slot may itself be the problem.
-
-        THE SLOT CAN BE POISONED, and `recoverable_work` cannot tell. It ranks the two bundles by
-        `last_modified`, never by ancestry, so a recovery copy that was overwritten with a bad
-        tree outranks a perfectly good saved one — and every restore afterwards hands back the
-        poison. Two consecutive refusals by the integrity guard signal that the slot, rather
-        than the turn, is the problem: fall back to the user's own Save, which no platform
-        write ever touches, and escalate."""
-        if source is None or consecutive_diverts(app_id) < _POISONED_SLOT_REFUSALS:
-            return source
-        _log.error(
-            "recovery_slot_looks_poisoned",
-            app_id=str(app_id),
-            consecutive_refusals=consecutive_diverts(app_id),
-            detail="restoring the user's saved bundle instead of the recovery slot",
-        )
-        return None
 
     async def _park_the_tree_aside(
         self,
@@ -4479,19 +4231,10 @@ class SessionManager:
         # container is simply reused on the next start. Disabled storage (dev/test) yields {} — a
         # no-op merge.
         env = {**env, **await provision_app_storage(app_id)}
-        recovery_source = await self.newest_restore_source(app_id)
-        if recovery_source is not None or await self._snapshot_exists_or_bust(app_id):
+        if await self._snapshot_exists_or_bust(app_id):
             try:
-                # NEWEST, not the saved one. See `newest_restore_source`: pulling `snapshot_key`
-                # here is what used to discard everything the user did after their last Save,
-                # one turn after a container was reclaimed.
                 return await self._restore_or_bust(
-                    sandbox_client,
-                    user_id,
-                    app_name,
-                    app_id,
-                    env,
-                    source_key=recovery_source,
+                    sandbox_client, user_id, app_name, app_id, env, source_key=None
                 )
             except StorageNotFoundError:
                 # The ONLY error that may reach provision_new: the store positively answered
@@ -4516,8 +4259,9 @@ class SessionManager:
         shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         """Pull the known-present snapshot into a fresh container, with bounded retry.
-        `source_key` selects WHICH bundle (default the saved snapshot; relaunch passes the
-        recovery key). A transient npm or storage blip is retried rather than falling back to
+        `source_key` selects WHICH bundle — `None` is this app's own saved snapshot, and
+        `launch_shared_preview` passes the OWNER's. A transient npm or storage blip is retried
+        rather than falling back to
         a fresh template — that fallback caused silent, permanent data loss, since the bundle
         EXISTS here and finalize would overwrite it. A PERSISTENT failure deliberately strands
         the session instead: a 503 with the user's work intact beats a start that silently
@@ -4702,16 +4446,10 @@ class SessionManager:
         lets the next message reuse it is `_the_live_sandbox_is_already_the_one_we_want`, not
         the pardon alone — an earlier version of this docstring claimed otherwise, and
         reconcile-on-start destroyed the pardoned container on every turn until fixed."""
-        # The consequence of "no save" is deliberate and belongs in the UI, not buried here:
-        # work that is never saved is lost when the container is reclaimed, and what earns that
-        # is the dirty indicator — the citizen's one standing telling that there is something
-        # unsaved. Nothing warns them on the way out; no leave prompt ships. The 1c autosave
-        # below is what stands in for that warning, and it covers the endings nobody could have
-        # warned about anyway (a crash, a closed laptop, the idle reaper).
-        #
-        # SWITCHING PROJECTS IS NOT COVERED BY THE INDICATOR EITHER, and it is not meant to be:
-        # the shutdown routine writes that container's tree back over the saved copy before
-        # destroying it, so the work survives the switch without anybody being warned about it.
+        # NOTHING WARNS THE CITIZEN ON THE WAY OUT, and no leave prompt ships. What earns that
+        # is the write-back every teardown performs: the container that holds this tree is never
+        # destroyed without it being written to the saved copy first, whether the ending is a
+        # project switch, the idle reaper or the age ceiling.
         #
         # Deliberately NOT here: the terminal `ended` frame (the turn's own `TurnEndedFrame` owns
         # it), an outcome record (the turn's own rows are the record now), any mode restore (Write
@@ -4739,53 +4477,6 @@ class SessionManager:
                 session_id=session.session_id,
             )
 
-        # 1c. AUTOSAVE to the recovery slot. NOT a save: `recovery_key` is a separate
-        #     namespace that `submit` never copies and a relaunch never restores in place of
-        #     the user's bundle — what becomes a saved VERSION is still their
-        #     click. This only stops the endings nobody can warn about (a crash, a closed
-        #     laptop, the idle reaper) from costing the whole session.
-        #
-        #     Best-effort and swallowed, deliberately: a safety net that can fail a turn is
-        #     not a safety net. The bounded timeout matters too: each exec inside the write is
-        #     already capped (120s in `snapshot.py`, 30s for the ancestry probe), but five in
-        #     sequence is minutes on a path whose job is to end.
-        if session.handle is not None and touched:
-            try:
-                async with asyncio.timeout(_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS):
-                    written = await write_recovery_copy(
-                        sandbox_client,
-                        session.handle,
-                        session.app_id,
-                        taken_at=datetime.now(UTC),
-                    )
-                if written.outcome is RecoveryOutcome.DIVERTED:
-                    # THE NUMBER THAT SETTLES A PAST INCIDENT the next time it happens: the
-                    # difference between "the platform failed to CHECK the workspace" and "the
-                    # platform failed to make it DURABLE" — a distinction nobody could answer
-                    # the day it actually mattered.
-                    await count(HarnessCounter.RECOVERY_WRITE_MISSED, app_id=session.app_id)
-                _log.info(
-                    "recovery copy",
-                    app_id=str(session.app_id),
-                    session_id=str(session.session_id),
-                    outcome=written.outcome.value,
-                    detail=written.reason,
-                )
-            except TimeoutError, Exception:  # fmt: skip  # ruff py314 strips the parens
-                # STILL SWALLOWED — a safety net that can fail a turn is not a safety net — but
-                # no longer SILENT. The swallow is exactly what once made a past reversion
-                # unfalsifiable: nobody could say afterwards whether the platform had failed to
-                # check the workspace or failed to make it durable, because a write that never
-                # landed left no trace an operator would ever look for.
-                _log.error(
-                    RECOVERY_WRITE_DID_NOT_LAND_EVENT,
-                    app_id=str(session.app_id),
-                    session_id=str(session.session_id),
-                    reason="failed",
-                    exc_info=True,
-                )
-                await count(HarnessCounter.RECOVERY_WRITE_MISSED, app_id=session.app_id)
-
         # 2/3. Pardon: grant the stay while the lock is STILL HELD, then release. The order
         #      is load-bearing (see `_pardon_the_container`) — releasing first opens a window
         #      where a concurrent sweep sees lock-gone with no lease yet and executes the
@@ -4793,7 +4484,7 @@ class SessionManager:
         #      to the container, and deleting it would orphan a live sandbox.
         #
         #      `touched` THREADS STRAIGHT THROUGH from this method's own parameter —
-        #      the same fact steps 1b/1c above already key on. A turn that wrote nothing buys
+        #      the same fact step 1b above already keys on. A turn that wrote nothing buys
         #      the shorter stay; this is where a Plan-kind chat's ordinary Q&A turn (which can
         #      never touch the tree — its toolset has no write tool) stops paying for a
         #      30-minute reprieve it never earned, without this method ever asking what kind of

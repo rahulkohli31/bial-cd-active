@@ -24,30 +24,16 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Final, Literal
+from typing import Final
 
 import structlog
 
-from src.services.build_sessions.alarms import RECOVERY_WRITE_DID_NOT_LAND_EVENT
-from src.services.build_sessions.integrity import (
-    Ancestry,
-    container_state,
-    holds_unsaved_work,
-    is_a_commit_sha,
-)
+from src.services.build_sessions.integrity import container_state, is_the_untouched_starter
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
 from src.services.storage import (
     SNAPSHOT_HEAD_METADATA_KEY,
-    StorageError,
-    StorageUnconfiguredError,
-    all_keys_under,
-    divert_key,
-    divert_prefix,
     get_storage,
-    head_sha_from_metadata,
     quarantine_key,
-    quarantine_prefix,
-    recovery_key,
     snapshot_key,
 )
 from src.services.storage.base import ObjectStorage
@@ -114,17 +100,17 @@ derive rather than count by reading this file."""
 #: `store_ms`. Save is synchronous in-request with no client-side timeout, so this is the only
 #: record of which of the three candidates — the four execs, the per-app queue, or the blob
 #: write — a slow save actually lost its time to. One event per save, success or failure; a
-#: step never reached (a failed exec, or the recovery guard's no-op skip) stays `None`.
+#: step never reached (a failed exec, or a write-back that skipped the starter template)
+#: stays `None`.
 SNAPSHOT_STEP_TIMINGS_EVENT: Final = "snapshot_step_timings"
 
 
 @dataclass
 class _SaveStepTimings:
     """Filled in as one save's steps complete, across two scopes: the per-app lock wait and the
-    store write happen in `write_snapshot`/`write_recovery_copy`, the four execs happen inside
-    `_bundle_the_tree`. MUTABLE and passed in rather than returned, so a step that raises still
-    leaves every step before it on the record — a return value cannot do that once the raise has
-    already unwound past it."""
+    store write happen in the writer, the four execs happen inside `_bundle_the_tree`. MUTABLE
+    and passed in rather than returned, so a step that raises still leaves every step before it
+    on the record — a return value cannot do that once the raise has already unwound past it."""
 
     lock_wait_ms: int | None = None
     commit_ms: int | None = None
@@ -168,43 +154,27 @@ async def _serialized_per_app(app_id: uuid.UUID) -> AsyncIterator[None]:
 
 @dataclass(frozen=True)
 class Destination:
-    """WHERE a bundle goes. Four of them, and they are not interchangeable.
+    """WHERE a bundle goes. Two of them, and they are not interchangeable.
 
-    A VALUE OBJECT RATHER THAN AN ENUM, because two of the four are per-occurrence: a quarantine
-    or divert key carries the instant it was taken, so it cannot be a bare constant. Keeping the
-    key-building here (rather than exposing `_write_snapshot_locked`, which is private for a
-    reason) means every writer in the system names its destination in the same vocabulary, and
-    nothing outside this module has to know that a key is a string at all."""
+    A VALUE OBJECT RATHER THAN AN ENUM, because a quarantine key carries the instant it was
+    taken, so it cannot be a bare constant. Keeping the key-building here means every writer in
+    the system names its destination in the same vocabulary, and nothing outside this module has
+    to know that a key is a string at all."""
 
     key: str
 
     @classmethod
     def saved(cls, app_id: uuid.UUID) -> Destination:
-        """The user's explicit Save, and the key nothing may write unasked.
+        """The citizen's app, as a relaunch hands it back.
 
-        ONE PLATFORM WRITER REACHES IT, and only through `write_saved_copy_under_guard`: a
-        shutdown the citizen never asked for leaves their work here, but only a tree proved to
-        descend from what is already here. Anything else — including this destination handed to
-        `write_snapshot`, which writes unconditionally — is the user's own click."""
+        Two writers: the citizen's own Save, and `write_the_tree_back` when the platform is
+        about to destroy the container holding this tree."""
         return cls(snapshot_key(app_id))
-
-    @classmethod
-    def recovery(cls, app_id: uuid.UUID) -> Destination:
-        """The platform's autosave. Prefer `write_recovery_copy`, which guards the promotion —
-        this is the raw destination, for the operator promote path that has already
-        decided."""
-        return cls(recovery_key(app_id))
 
     @classmethod
     def quarantine(cls, app_id: uuid.UUID, taken_at: datetime) -> Destination:
         """A tree a restore is about to write over. Never overwritten by a later occurrence."""
         return cls(quarantine_key(app_id, taken_at))
-
-    @classmethod
-    def divert(cls, app_id: uuid.UUID, taken_at: datetime) -> Destination:
-        """A tree the recovery guard refused to promote. Never overwritten by a later
-        occurrence."""
-        return cls(divert_key(app_id, taken_at))
 
 
 @dataclass(frozen=True)
@@ -213,31 +183,6 @@ class _BundledTree:
 
     head_sha: str
     data: bytes
-
-
-class RecoveryOutcome(enum.StrEnum):
-    """What happened to one turn's attempt to make its work durable."""
-
-    #: The recovery slot now holds this turn's tree.
-    WRITTEN = "written"
-    #: Nothing to write — the tree was clean and HEAD is where the copy already is. Normal, and
-    #: the only outcome that does not alarm.
-    SKIPPED = "skipped"
-    #: The guard would not promote this tree over the existing copy, and the bundle was preserved
-    #: under `divert_key` rather than thrown away.
-    DIVERTED = "diverted"
-
-
-@dataclass(frozen=True)
-class RecoveryWrite:
-    outcome: RecoveryOutcome
-    reason: str
-    #: The sha the recovery slot held before this turn, when it held one.
-    recorded_head: str | None = None
-    #: The sha this turn actually bundled.
-    bundled_head: str | None = None
-    #: Set on `DIVERTED` — where the refused tree went, so an operator can find it.
-    diverted_to: str | None = None
 
 
 async def write_snapshot(
@@ -250,15 +195,14 @@ async def write_snapshot(
     """Snapshot the sandbox's current tree to Blob and return its HEAD sha.
 
     Step 1 of the ordered end — the caller runs teardown + release AFTER this returns.
-    `destination` defaults to the user's SAVED bundle; the autosave goes through
-    `write_recovery_copy`, the same write with a guard in front. The head sha is stamped into the
-    object's metadata and callers compare THAT, not `last_modified`: Azure stamps mtimes in whole
-    seconds, so a Save and an autosave in the same second cannot be told apart by time, and the tie
-    would restore an older tree over newer work. Serialized per app: callers queue, never race.
+    `destination` defaults to the user's SAVED bundle. The head sha is stamped into the object's
+    metadata and callers compare THAT, not `last_modified`: Azure stamps mtimes in whole seconds,
+    so two writes in the same second cannot be told apart by time. Serialized per app: callers
+    queue, never race.
 
     Emits `SNAPSHOT_STEP_TIMINGS_EVENT` once, in the `finally`, whether this returns or raises —
-    a manual Save can queue behind an autosave holding the same app's lock, and `lock_wait_ms` is
-    the only place that queue is visible at all."""
+    a manual Save can queue behind a write-back holding the same app's lock, and `lock_wait_ms`
+    is the only place that queue is visible at all."""
     key = (destination or Destination.saved(app_id)).key
     timings = _SaveStepTimings()
     lock_wait_started = time.monotonic()
@@ -277,269 +221,53 @@ async def write_snapshot(
             _log.info(SNAPSHOT_STEP_TIMINGS_EVENT, app_id=str(app_id), **asdict(timings))
 
 
-# HOW MANY TIMES IN A ROW THIS APP'S RECOVERY WRITE HAS BEEN REFUSED. Process-local like the
-# snapshot locks, and self-pruning: any outcome that is not a refusal drops the entry, so a streak
-# only ever means consecutive refusals seen by this process.
-_consecutive_diverts: dict[uuid.UUID, int] = {}
-
-
-def consecutive_diverts(app_id: uuid.UUID) -> int:
-    """How many turns in a row have failed to promote a tree into this app's recovery slot."""
-    return _consecutive_diverts.get(app_id, 0)
-
-
-def reset_divert_streaks_for_tests() -> None:
-    """Drop the per-app refusal counters. Process-local state, so a streak must not leak."""
-    _consecutive_diverts.clear()
-
-
-async def write_recovery_copy(
-    sandbox_client: SandboxClient,
-    handle: SandboxHandle,
-    app_id: uuid.UUID,
-    *,
-    taken_at: datetime,
-) -> RecoveryWrite:
-    """The turn-end autosave, with a guard that will not overwrite a good copy with a bad tree.
-
-    THE NO-OP SKIP IS DECIDED ON THE BUNDLED SHA, AND THAT ORDERING IS THE WHOLE TRICK.
-    `_COMMIT_SCRIPT` commits as step ONE inside the bundle, so a naive "skip when HEAD has not
-    moved" reading the sha BEFORE it would discard every turn's recovery copy: the agent does not
-    commit as it works, so "HEAD unchanged + dirty tree" is the normal shape of a building turn
-    (`test_a_dirty_tree_at_unchanged_head_still_writes_a_recovery_copy`). NEVER RAISES FOR A
-    REFUSAL — only bundle/upload failure is raised, at the call site that saw it throw.
-
-    Emits `SNAPSHOT_STEP_TIMINGS_EVENT` once, in the `finally`, whether this returns or raises —
-    `store_ms` stays `None` on the `SKIPPED` outcome below, the one arm that writes nothing."""
-    timings = _SaveStepTimings()
-    lock_wait_started = time.monotonic()
-    try:
-        async with _serialized_per_app(app_id):
-            timings.lock_wait_ms = _elapsed_ms(lock_wait_started)
-            store = _the_store_first()
-            meta = await store.head(recovery_key(app_id))
-            recorded = head_sha_from_metadata(meta.metadata if meta else None)
-            tree = await _bundle_the_tree(sandbox_client, handle, timings)
-
-            if meta is None:
-                # NO OBJECT AT ALL. There is nothing to overwrite and nothing to compare
-                # against, so the first write simply proceeds.
-                await _timed_store(store, recovery_key(app_id), tree, timings)
-                _consecutive_diverts.pop(app_id, None)
-                return RecoveryWrite(
-                    RecoveryOutcome.WRITTEN,
-                    "no previous copy to protect",
-                    bundled_head=tree.head_sha,
-                )
-
-            if recorded is None:
-                # AN OBJECT IS THERE AND WE CANNOT COMPARE AGAINST IT — a bundle predating the
-                # head stamp. That is not a licence to overwrite it: an app whose container has
-                # reverted has exactly this shape, so writing would stamp the reverted tree over
-                # the user's only durable copy, into a store with neither versioning nor soft
-                # delete — and the reaper reads a WRITTEN as proof the work is safe and deletes
-                # the container in the same call. Diverted instead, so the bytes are kept for an
-                # operator to promote. Same reasoning `_where_head_sits_relative_to` applies to a
-                # `recorded` that is not sha-shaped.
-                where = divert_key(app_id, taken_at)
-                await _timed_store(store, where, tree, timings)
-                _consecutive_diverts[app_id] = _consecutive_diverts.get(app_id, 0) + 1
-                _log.error(
-                    RECOVERY_WRITE_DID_NOT_LAND_EVENT,
-                    app_id=str(app_id),
-                    reason=RecoveryOutcome.DIVERTED.value,
-                    recorded_head=None,
-                    bundled_head=tree.head_sha,
-                    ancestry="uncomparable",
-                    diverted_to=where,
-                )
-                return RecoveryWrite(
-                    RecoveryOutcome.DIVERTED,
-                    "the copy on record carries no head to compare against",
-                    bundled_head=tree.head_sha,
-                    diverted_to=where,
-                )
-
-            if tree.head_sha == recorded:
-                # The commit step found nothing to commit AND the tree is where the copy already
-                # is. Normal, and it must NOT alarm: this is every read-only turn.
-                _consecutive_diverts.pop(app_id, None)
-                return RecoveryWrite(
-                    RecoveryOutcome.SKIPPED,
-                    "the tree has not moved since the last copy",
-                    recorded_head=recorded,
-                    bundled_head=tree.head_sha,
-                )
-
-            ancestry = await _where_head_sits_relative_to(sandbox_client, handle, recorded)
-            if ancestry is Ancestry.DESCENDANT:
-                await _timed_store(store, recovery_key(app_id), tree, timings)
-                _consecutive_diverts.pop(app_id, None)
-                return RecoveryWrite(
-                    RecoveryOutcome.WRITTEN,
-                    "this turn built on the copy it is replacing",
-                    recorded_head=recorded,
-                    bundled_head=tree.head_sha,
-                )
-
-            # EVERYTHING ELSE DIVERTS. The tree in hand is not a descendant of the copy on
-            # record — or we could not establish that it is — so promoting it would replace a
-            # known-good bundle with one whose relationship to the user's work is unknown. The
-            # bytes are kept rather than dropped: in a false refusal they are the newest copy of
-            # somebody's afternoon.
-            where = divert_key(app_id, taken_at)
-            await _timed_store(store, where, tree, timings)
-            _consecutive_diverts[app_id] = _consecutive_diverts.get(app_id, 0) + 1
-            _log.error(
-                RECOVERY_WRITE_DID_NOT_LAND_EVENT,
-                app_id=str(app_id),
-                reason=RecoveryOutcome.DIVERTED.value,
-                recorded_head=recorded,
-                bundled_head=tree.head_sha,
-                ancestry=ancestry.value,
-                diverted_to=where,
-            )
-            return RecoveryWrite(
-                RecoveryOutcome.DIVERTED,
-                f"the tree is {ancestry.value} of the copy on record",
-                recorded_head=recorded,
-                bundled_head=tree.head_sha,
-                diverted_to=where,
-            )
-    finally:
-        # SUPPRESSED, because this runs in a `finally` on the save path: a save that failed is
-        # propagating an exception through here, and an instrument that raised would replace the
-        # citizen's real failure with its own. A measurement is never worth a diagnosis.
-        with suppress(Exception):
-            _log.info(SNAPSHOT_STEP_TIMINGS_EVENT, app_id=str(app_id), **asdict(timings))
-
-
-async def _where_head_sits_relative_to(
-    sandbox_client: SandboxClient, handle: SandboxHandle, recorded: str
-) -> Ancestry:
-    """One exec: was this tree built on top of the one the recovery slot holds?
-
-    A `recorded` sha that is not sha-shaped never reaches the shell, and comes back
-    `REFERENCE_ABSENT` — which diverts, exactly as it should: metadata naming a tree we cannot
-    ask about is not a licence to overwrite the object that metadata belongs to."""
-    if not is_a_commit_sha(recorded):
-        return Ancestry.REFERENCE_ABSENT
-    state = await container_state(sandbox_client, handle, reference_sha=recorded)
-    return state.ancestry if state is not None else Ancestry.UNREADABLE
-
-
-SAVED_COPY_WRITE_DID_NOT_LAND_EVENT: Final = "saved_copy_write_did_not_land"
-"""A shutdown's write-back could not be promoted into the saved copy, and the tree was parked.
-
-Fields: `app_id`, `recorded_head`, `bundled_head`, `ancestry`, `diverted_to`. The two shas
-together say why the promotion was refused; `diverted_to` is the key the tree is sitting under,
-which the operator promote procedure takes as its input."""
-
-
 class SavedCopyOutcome(enum.StrEnum):
-    """What happened to one shutdown's attempt to leave a container's work in the saved copy."""
+    """What happened to one teardown's attempt to leave a container's work in the saved copy."""
 
     #: The saved copy now holds this container's tree.
     WRITTEN = "written"
-    #: Nothing to write — the tree holds nothing the saved copy does not already have.
+    #: Nothing was written: this container is still serving the untouched starter template, so
+    #: there is no app here yet to save.
     SKIPPED = "skipped"
-    #: The guard would not promote this tree over the saved copy, and the bundle was preserved
-    #: under `divert_key` rather than thrown away.
-    DIVERTED = "diverted"
 
 
 @dataclass(frozen=True)
 class SavedCopyWrite:
     outcome: SavedCopyOutcome
-    #: The sha the saved copy held before this write, when it held one.
-    recorded_head: str | None = None
-    #: The sha this shutdown actually bundled. `None` on `SKIPPED`, which bundles nothing.
+    #: The sha this write-back bundled. `None` on `SKIPPED`, which bundles nothing.
     bundled_head: str | None = None
-    #: Set on `DIVERTED` — where the refused tree went, so it can be offered back.
-    diverted_to: str | None = None
 
 
-async def write_saved_copy_under_guard(
+async def write_the_tree_back(
     sandbox_client: SandboxClient,
     handle: SandboxHandle,
     app_id: uuid.UUID,
-    *,
-    taken_at: datetime,
 ) -> SavedCopyWrite:
-    """Leave a shutting-down container's tree in the citizen's saved copy — but only if it can be
-    shown to descend from what is there.
+    """Leave a dying container's tree in the citizen's saved copy.
 
-    `Destination.saved` is the one key a platform-initiated write must never touch, and a teardown
-    nobody asked for is the most platform-initiated write there is. So the promotion demands
-    positive proof of descent, and every other tree is PARKED under `divert_key` BEFORE this
-    returns: in a false refusal those bytes are the newest copy of somebody's afternoon.
+    RUN ONLY WHERE THE CONTAINER IS ABOUT TO BE DESTROYED. Nothing else about the tree survives
+    the delete, so it goes into the one slot a relaunch reads. The single exception is a
+    container still holding the untouched starter template: writing that over a saved app is the
+    loss this skip exists to prevent, and it is the reason the probe reads the CONTAINER rather
+    than the store — a reverted container and a first write are indistinguishable from the store.
 
-    NO PROOF MEANS NO PROMOTION, AND AN EMPTY SLOT IS NOT PROOF. A container that has reverted to
-    its baked image presents exactly as a first write, and a template tree written into the saved
-    copy becomes the newest thing an automatic restore can hand back — the loss this guard exists
-    to prevent, performed by the guard.
-
-    ONE PROBE ANSWERS BOTH QUESTIONS, and it runs BEFORE the bundle's commit step: the dirty read
-    has to see the tree as the citizen left it, and ancestry taken before a commit still holds
-    after one, since committing only ever adds a child on top of HEAD.
-
-    Raises `SandboxError` when the container will not answer: an unestablished fact on a path that
-    ends in an ARM delete is not an outcome to return."""
+    Raises `SandboxError` when the container will not answer, and
+    `WorkspaceHasNoRepositoryError` out of the bundle: an unestablished fact on a path that ends
+    in an ARM delete is not an outcome to return, and both callers spare the container on it."""
     timings = _SaveStepTimings()
     lock_wait_started = time.monotonic()
     try:
         async with _serialized_per_app(app_id):
             timings.lock_wait_ms = _elapsed_ms(lock_wait_started)
             store = _the_store_first()
-            meta = await store.head(snapshot_key(app_id))
-            recorded = head_sha_from_metadata(meta.metadata if meta else None)
-            # A stamp that is not sha-shaped never reaches the shell, and refuses by the same
-            # door an absent copy does: metadata naming a tree we cannot ask about is not a
-            # licence to overwrite the object that metadata belongs to. The raw value is still
-            # reported, so the alarm carries the stamp somebody has to go and look at.
-            comparable = recorded if is_a_commit_sha(recorded) else None
-            state = await container_state(sandbox_client, handle, reference_sha=comparable)
+            state = await container_state(sandbox_client, handle)
             if state is None:
                 raise SandboxError("the container would not answer its state probe")
-
-            # No comparable head on record is a refusal exactly as a non-descendant tree is: in
-            # both, this tree cannot be SHOWN to contain the saved work, and the guard promotes
-            # only on proof. The alarm below carries which of the two it was.
-            refused = comparable is None or state.ancestry is not Ancestry.DESCENDANT
-            if (
-                comparable is not None
-                and state.head == comparable
-                and not holds_unsaved_work(state)
-            ):
-                return SavedCopyWrite(SavedCopyOutcome.SKIPPED, recorded_head=recorded)
-
+            if is_the_untouched_starter(state):
+                return SavedCopyWrite(SavedCopyOutcome.SKIPPED)
             tree = await _bundle_the_tree(sandbox_client, handle, timings)
-            if not refused:
-                # THE PROOF IS IN REACHING HERE: a comparable head on record, and the probe
-                # answering that this tree descends from it. This is the only line in the system
-                # that writes the saved copy without a person having asked for it.
-                await _timed_store(store, snapshot_key(app_id), tree, timings)
-                return SavedCopyWrite(
-                    SavedCopyOutcome.WRITTEN,
-                    recorded_head=recorded,
-                    bundled_head=tree.head_sha,
-                )
-            where = divert_key(app_id, taken_at)
-            await _timed_store(store, where, tree, timings)
-            _log.error(
-                SAVED_COPY_WRITE_DID_NOT_LAND_EVENT,
-                app_id=str(app_id),
-                recorded_head=recorded,
-                bundled_head=tree.head_sha,
-                ancestry=state.ancestry.value,
-                diverted_to=where,
-            )
-            return SavedCopyWrite(
-                SavedCopyOutcome.DIVERTED,
-                recorded_head=recorded,
-                bundled_head=tree.head_sha,
-                diverted_to=where,
-            )
+            await _timed_store(store, snapshot_key(app_id), tree, timings)
+            return SavedCopyWrite(SavedCopyOutcome.WRITTEN, bundled_head=tree.head_sha)
     finally:
         # SUPPRESSED, because this runs in a `finally` on a path that may be propagating the
         # citizen's real failure, and an instrument that raised would replace it with its own.
@@ -555,11 +283,10 @@ def _the_store_first() -> ObjectStorage:
 
 
 async def _store_it(store: ObjectStorage, key: str, tree: _BundledTree) -> None:
-    """STAMP THE TREE, not just the bytes. `last_modified` is whole seconds on Azure, so a Save
-    and a turn-boundary write inside one second are indistinguishable by time — and the restore
-    path picks the newer of the two. Recording which tree each bundle holds is what lets a reader
-    answer "same content?" and "which is newer?" without a download, and without a tie silently
-    resolving to the older tree."""
+    """STAMP THE TREE, not just the bytes. `last_modified` is whole seconds on Azure, so two
+    writes inside one second are indistinguishable by time. Recording which tree each bundle
+    holds is what lets a reader answer "same content?" without a download — the comparison the
+    save indicator and the integrity verdict both rest on."""
     await store.put(
         key,
         tree.data,
@@ -575,9 +302,8 @@ def _elapsed_ms(started: float) -> int:
 async def _timed_store(
     store: ObjectStorage, key: str, tree: _BundledTree, timings: _SaveStepTimings
 ) -> None:
-    """`_store_it`, timed onto the shared accumulator. A separate wrapper rather than inlining
-    at each call site: `write_recovery_copy` picks one of four keys to write to, and every arm
-    must time the same way."""
+    """`_store_it`, timed onto the shared accumulator. A separate wrapper rather than inlining at
+    each call site, so every writer times the same way."""
     started = time.monotonic()
     await _store_it(store, key, tree)
     timings.store_ms = _elapsed_ms(started)
@@ -654,137 +380,6 @@ async def _bundle_the_tree(
         timings.cleanup_ms = _elapsed_ms(cleanup_started)
 
 
-class ParkedTreeNotOursError(Exception):
-    """The key named for promotion does not live under this app's quarantine or divert prefix.
-
-    ITS OWN TYPE so the route can answer 400 rather than 500. An operator who pasted the wrong key
-    has made an ordinary mistake and needs to be told so; a `StorageError` here would render as an
-    internal fault and send them looking for a broken store."""
-
-    def __init__(self, key: str) -> None:
-        super().__init__(f"{key} does not belong to this app")
-        self.key = key
-
-
-@dataclass(frozen=True)
-class ParkedTree:
-    """One bundle the recovery guard set aside, as an operator needs to see it."""
-
-    key: str
-    kind: Literal["quarantine", "divert"]
-    head_sha: str | None
-    size_bytes: int
-    taken_at: datetime | None
-
-
-@dataclass(frozen=True)
-class Promotion:
-    promoted: bool
-    detail: str
-
-
-async def newest_diverted_at(app_id: uuid.UUID) -> datetime | None:
-    """When a platform write-back for this app was last REFUSED, or `None` if none ever was.
-
-    The citizen is owed this sentence. Shutdown now writes their work back with nobody watching,
-    and when the ancestry guard refuses, the tree is parked and their app comes back from the last
-    SAVED version instead — which looks, from the screen, exactly like a normal reopen. Saying so
-    is what makes removing the exit prompts honest rather than merely quieter.
-
-    ONE LIST AND ONE HEAD, unlike `list_parked_trees`, which heads every object it finds: this is
-    on a poll, and it needs only the newest. The keys are stamped sortably for exactly this.
-
-    `None` on an unconfigured or unreadable store. A notice we cannot substantiate is one we do
-    not make — the opposite failure, claiming a refusal that did not happen, would send somebody
-    looking for work that was never set aside."""
-    try:
-        store = get_storage()
-    except StorageUnconfiguredError:
-        return None
-    try:
-        keys = await all_keys_under(store, divert_prefix(app_id))
-    except StorageError:
-        return None
-    if not keys:
-        return None
-    meta = await store.head(max(keys))
-    return meta.last_modified if meta else None
-
-
-async def list_parked_trees(app_id: uuid.UUID) -> list[ParkedTree]:
-    """Every quarantine and divert object for one app, newest first — the useful one is almost
-    always the last, and scrolling to the bottom is how an operator promotes the wrong one.
-
-    Returns an empty list rather than raising on an unconfigured or unreadable store: this is a
-    read for a human already dealing with an incident, and a 500 mid-incident is not help. The
-    empty case reads honestly as "nothing parked" either way."""
-    try:
-        store = get_storage()
-    except StorageUnconfiguredError:
-        return []
-    found: list[ParkedTree] = []
-    for kind, prefix in (
-        ("quarantine", quarantine_prefix(app_id)),
-        ("divert", divert_prefix(app_id)),
-    ):
-        try:
-            keys = await all_keys_under(store, prefix)
-        except StorageError:
-            _log.warning("parked_trees_unreadable", app_id=str(app_id), prefix=prefix)
-            continue
-        for key in keys:
-            meta = await store.head(key)
-            if meta is None:
-                continue
-            found.append(
-                ParkedTree(
-                    key=key,
-                    kind=kind,  # type: ignore[arg-type]
-                    head_sha=head_sha_from_metadata(meta.metadata),
-                    size_bytes=meta.size,
-                    taken_at=meta.last_modified,
-                )
-            )
-    # Sorted on the STAMP INSIDE the key, not on the whole key and not on `last_modified`.
-    #
-    # Not the whole key, because the two prefixes differ before the stamp does: `divert/...` and
-    # `quarantine/...` sort by their first letter, so a whole-key sort silently groups by KIND and
-    # only orders within each group — which reads as chronological right up until an app has both,
-    # which is exactly the incident an operator is looking at when they open this.
-    #
-    # Not `last_modified`, because Azure stamps it in whole seconds and would tie two objects
-    # taken in the same one; the filename stamp is microseconds and is written by us.
-    return sorted(found, key=lambda tree: tree.key.rsplit("/", 1)[-1], reverse=True)
-
-
-async def promote_parked(app_id: uuid.UUID, *, key: str) -> Promotion:
-    """Copy one parked tree into the recovery slot, THROUGH the guard — not a two-line blob copy.
-
-    THE ANCESTRY QUESTION CANNOT BE ASKED HERE: the turn-end guard asks a live container `git
-    merge-base --is-ancestor`, but this runs against two store objects with no container in sight.
-    So the check is the one that IS answerable — refuse when the slot already holds the same tree,
-    otherwise require an explicit promotion — which is weaker than the turn-end guard, stated
-    rather than dressed up. The compensating control is that this route is superadmin-only,
-    audited, and per-occurrence keys mean the replaced object is still there."""
-    store = get_storage()
-    if not key.startswith((quarantine_prefix(app_id), divert_prefix(app_id))):
-        # THE KEY COMES FROM A REQUEST BODY. It names an object to READ and an app to write it
-        # into, so without this an operator — or anything that reached this route — could promote
-        # one app's tree into another app's recovery slot. The prefix check is the whole of the
-        # scoping, and it is a `startswith` against two app-derived prefixes rather than a
-        # substring test for exactly that reason.
-        raise ParkedTreeNotOursError(key)
-    data = await store.get(key)
-    head_sha = parse_bundle_head_sha(data)
-    async with _serialized_per_app(app_id):
-        current = await store.head(recovery_key(app_id))
-        if head_sha_from_metadata(current.metadata if current else None) == head_sha:
-            return Promotion(False, "the recovery slot already holds this tree")
-        await _store_it(store, recovery_key(app_id), _BundledTree(head_sha=head_sha, data=data))
-    _log.warning("parked_tree_promoted", app_id=str(app_id), key=key, head_sha=head_sha)
-    return Promotion(True, f"the recovery slot now holds {head_sha}")
-
-
 class NothingSavedToGoBackToError(Exception):
     """A discard was asked for, and this app has no saved version to go back to."""
 
@@ -811,11 +406,9 @@ async def discard_back_to_saved(
 ) -> SavedVersion:
     """Put the saved version back into the live container, keeping the tree it replaces.
 
-    Under the per-app lock, so a Save or an autosave waits: park the live tree in quarantine,
-    write the saved bundle into the recovery slot, then reset the container. The store moves
-    first: if the reset fails, the container still holds work descending from the saved head, and
-    the next turn finds it intact. The slot is overwritten, never emptied — an empty slot reads as
-    an app that was never built."""
+    Under the per-app lock, so a Save or a write-back waits: park the live tree in quarantine,
+    then reset the container. The store moves first: if the reset fails, the container still
+    holds work descending from the saved head, and the next turn finds it intact."""
     store = _the_store_first()
     async with _serialized_per_app(app_id):
         meta = await store.head(snapshot_key(app_id))
@@ -826,6 +419,5 @@ async def discard_back_to_saved(
         parked = Destination.quarantine(app_id, taken_at).key
         live = await _bundle_the_tree(sandbox_client, handle, _SaveStepTimings())
         await _store_it(store, parked, live)
-        await _store_it(store, recovery_key(app_id), saved)
         await sandbox_client.reset_to_bundle(handle, saved.data)
     return SavedVersion(head_sha=saved.head_sha, saved_at=meta.last_modified, parked_at=parked)

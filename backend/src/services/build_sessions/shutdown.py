@@ -3,10 +3,10 @@ container — by NAME and by INSTANCE.
 
 WHAT ACTUALLY ARRIVES HERE IS THE PROJECT SWITCH, and one retry of a debt a switch left behind.
 A lapsed presence lease and the absolute age ceiling are decided in `reaper.reconcile_user` and
-fall through to `reap_user`, which carries its own ordering, its own guarded write-back and its
-own release — a second implementation of the same act. The two answer differently on a diverted
-tree, and only this one stops the outgoing turn at a boundary or re-checks the registry before
-each Redis write. Anything changed about how a container ends has to be changed in both.
+fall through to `reap_user`, which carries its own ordering, its own write-back and its own
+release — a second implementation of the same act. Only this one stops the outgoing turn at a
+boundary or re-checks the registry before each Redis write. Anything changed about how a
+container ends has to be changed in both.
 
 THE ROW IS WRITTEN BEFORE ANY FALLIBLE AWAIT. A switch overwrites the per-user registry with the
 incoming container's record on the same request, so from that instant nothing in Redis names the
@@ -63,7 +63,7 @@ from src.services.build_sessions.reaper import (
     is_a_sandbox_name,
     is_a_shared_sandbox_name,
 )
-from src.services.build_sessions.snapshot import SavedCopyOutcome, write_saved_copy_under_guard
+from src.services.build_sessions.snapshot import write_the_tree_back
 from src.services.messages.projection import TURN_TERMINAL_KIND
 from src.services.redis import REGISTRY_STATE_ENDING, registry_key
 from src.services.redis.keys import (
@@ -433,9 +433,7 @@ async def run_the_shutdown(
         return await _destroy(owed, redis, sandbox_client, factory, handle, reason)
 
     try:
-        written = await write_saved_copy_under_guard(
-            sandbox_client, handle, owed.app_id, taken_at=datetime.now(UTC)
-        )
+        await write_the_tree_back(sandbox_client, handle, owed.app_id)
     except SandboxError as exc:
         return await _spare_or_go_in_unread(
             owed, redis, sandbox_client, factory, reason, why=f"the tree could not be read: {exc}"
@@ -454,15 +452,6 @@ async def run_the_shutdown(
             factory,
             reason,
             why=f"the copy could not be stored: {exc}",
-        )
-    if written.outcome is SavedCopyOutcome.DIVERTED:
-        # DESTROYED ANYWAY, and that is safe rather than brave: the guard uploaded the refused
-        # tree under the divert key BEFORE returning this verdict, so those bytes are already
-        # parked. Sparing here would hold a container for a tree that is already saved.
-        _log.warning(
-            "the write-back was diverted; the tree is parked and the container goes",
-            diverted_to=written.diverted_to,
-            **_about(owed, reason),
         )
     return await _destroy(owed, redis, sandbox_client, factory, handle, reason)
 
