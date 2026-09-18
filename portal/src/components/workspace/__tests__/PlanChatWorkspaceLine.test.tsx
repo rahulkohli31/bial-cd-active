@@ -46,6 +46,7 @@ const reportFor = (preview: PreviewState): WorkspaceReport => {
   }
   return {
     ...sinks,
+    settled: true,
     // `lastDecidedPreview: null` is "nothing has ever been decided", which is the cold-load answer
     // and the only one this surface's scenarios need: every reading below is a decided one, so the
     // memory is never consulted. Decision D3's own behaviour — an unreadable read rendering the

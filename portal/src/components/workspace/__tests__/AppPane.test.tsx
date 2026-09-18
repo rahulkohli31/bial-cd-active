@@ -77,6 +77,7 @@ function reportFor(
   }
   return {
     ...sinks,
+    settled: true,
     state: resolveWorkspaceState({
       preview,
       lastDecidedPreview,
@@ -258,6 +259,34 @@ describe('the seam is the resolved address, not a URL that happens to be in hand
     // Calling `LivePreview` from here would build a second host — see `AppPaneHost`.
     const { container } = renderPane((c) => c.workspace.set(reportFor(reading())))
     expect(container.querySelector('iframe')).toBeNull()
+  })
+
+  it('★ says nothing while the first read is still out, and speaks once it fails', () => {
+    // THE OPENING FRAME OF EVERY COLD OPEN. An unresolved reading and a read that genuinely
+    // could not be made both resolve to `could-not-read`, so publishing on the first commit
+    // painted "We could not check on your app." — a platform failure reported before anything
+    // had been asked — and replaced it a round trip later.
+    //
+    // Mutation check: drop the `settled` guard in `NoFrame` and the first half goes red.
+    const unsettled = { ...reportFor(null), settled: false }
+    const { unmount } = renderPane((c) => {
+      c.workspace.set(unsettled)
+      c.project.set('p1')
+      c.visible.set(true)
+    })
+    expect(screen.queryByTestId('app-pane-empty')).toBeNull()
+    unmount()
+
+    // ...and a genuine outage is NOT swallowed: once an attempt has finished, the same state is
+    // drawn, with the control that offers another try.
+    renderPane((c) => {
+      c.workspace.set({ ...reportFor(null), settled: true })
+      c.project.set('p1')
+      c.visible.set(true)
+    })
+    const card = screen.getByTestId('app-pane-empty')
+    expect(card.getAttribute('data-workspace-state')).toBe('could-not-read')
+    expect(card.textContent).toContain('We could not check on your app.')
   })
 
   it('says nothing at all when nobody has computed a state', () => {

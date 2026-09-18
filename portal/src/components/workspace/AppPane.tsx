@@ -267,6 +267,11 @@ function NoFrame({ report }: { report: ReturnType<typeof useWorkspaceReport> }) 
   if (!report) return null
 
   const { state } = report
+  // NOTHING HAS BEEN ASKED YET, so there is nothing to report. `could-not-read` is what an
+  // unresolved reading resolves to as well as a failed one, and on the first commit of every cold
+  // open it is the former — which drew a platform-failure card, with a Try again button, as the
+  // opening frame. Once a read has settled the same state is a genuine outage and is drawn.
+  if (!report.settled && state.name === 'could-not-read') return null
   // See `STATE_GLYPH`: every board that draws an empty pane draws a mark above the headline, and
   // `running` — the one state with no board at all — is the only entry that answers with none.
   const Glyph = STATE_GLYPH[state.name]

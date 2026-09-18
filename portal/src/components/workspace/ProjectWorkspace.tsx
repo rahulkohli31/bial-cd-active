@@ -208,8 +208,14 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   )
   const start = useStartApp(sinks)
   const report = useMemo(
-    () => ({ ...sinks, state: workspace.state, onRefresh: workspace.refresh, start }),
-    [sinks, workspace.state, workspace.refresh, start],
+    () => ({
+      ...sinks,
+      state: workspace.state,
+      settled: workspace.settled,
+      onRefresh: workspace.refresh,
+      start,
+    }),
+    [sinks, workspace.state, workspace.settled, workspace.refresh, start],
   )
 
   // THE APP STARTS BECAUSE SOMEBODY OPENED THE PROJECT. There is no press, and nothing on the way

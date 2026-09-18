@@ -93,6 +93,9 @@ export interface WorkspaceReading {
    * poll's cadence without a second timer and without this hook learning about compile state.
    */
   readTick: number
+  /** Has any read FINISHED, by answering or by failing? False only before the first attempt
+   *  settles, which is the one window in which no verdict may be drawn. */
+  settled: boolean
   /** Record how the most recent start attempt ended. `null` clears it (a start that worked). */
   reportStartOutcome: (outcome: StartOutcome | null) => void
   /** A press has begun, or finished. Drives the map's in-flight arm. */
@@ -131,6 +134,13 @@ export function useWorkspaceState({
   // See `WorkspaceReading.readTick`. Counted rather than flagged for the same reason `epoch` is:
   // a boolean that means "a read landed" can be batched away between two commits, a number cannot.
   const [readTick, setReadTick] = useState(0)
+  // HAS ANY READ FINISHED YET? Distinct from `readTick`, which counts only reads that ANSWERED —
+  // a read that threw is deliberately no tick. This one turns true on either outcome, because it
+  // answers a different question: may a consumer draw a verdict at all? Before the first attempt
+  // settles there is no verdict to draw, and an unresolved reading renders as "we could not check
+  // on your app" — a platform-failure card on the first painted frame of every cold open, before
+  // anything has been asked.
+  const [settled, setSettled] = useState(false)
   // WHEN THIS CONTAINER REACHES THE CEILING, reported by the renewal that reaches it. Held as
   // state rather than derived, because only a renewal can answer it and the poll's own read
   // carries nothing about it. `null` means no ceiling applies — never "soon".
@@ -281,6 +291,7 @@ export function useWorkspaceState({
         // afterwards may delay or cancel it. Still inside the `try`, so a read that THREW is still
         // no tick — a network blip must not masquerade as a fresh look at the world.
         setReadTick((n) => n + 1)
+        setSettled(true)
 
         if (next.state === 'alive') {
           // THE SAVE READ IS A CONTAINER CALL, and it is gated on a live container for the
@@ -333,6 +344,11 @@ export function useWorkspaceState({
         if (isTerminalReading(next)) stopAsking()
         else keepAsking()
       } catch {
+        // AN ATTEMPT THAT FAILED IS STILL AN ATTEMPT THAT FINISHED. This is the whole reason
+        // `settled` is not `readTick > 0`: a genuine outage must reach the card that offers Try
+        // again, and a tick this arm deliberately withholds would leave it behind a blank pane
+        // with no way out.
+        setSettled(true)
         // A read that could not answer SAYS NOTHING. Painting "gone" on a network blip is the
         // over-claiming this whole shape exists to remove, and the timer is left running so the
         // next tick can correct it.
@@ -401,6 +417,7 @@ export function useWorkspaceState({
     save,
     drainingAt,
     readTick,
+    settled,
     reportStartOutcome,
     reportStartPending,
     refresh,

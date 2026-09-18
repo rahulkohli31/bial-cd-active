@@ -428,6 +428,7 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
     }
     const report: WorkspaceReport = {
       ...sinks,
+      settled: true,
       state: stateFor(false),
       onRefresh: vi.fn(),
       // The real claim over this report's own sinks — a stub here would make every send below

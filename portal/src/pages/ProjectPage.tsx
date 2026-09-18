@@ -24,7 +24,11 @@ import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft } from 'lucide-react'
 import ProjectWorkspace from '../components/workspace/ProjectWorkspace'
-import { usePublishHeading, useWorkspaceProject } from '../components/workspace/workspaceChannel'
+import {
+  useAppPaneVisible,
+  usePublishHeading,
+  useWorkspaceProject,
+} from '../components/workspace/workspaceChannel'
 import { getProject } from '../utils/projectApi'
 import type { Project } from '../utils/projectApi'
 import { ApiError } from '../utils/apiError'
@@ -69,6 +73,13 @@ export default function ProjectPage() {
   // able to notice. `ProjectWorkspace` declares it again once the project resolves; the channel's
   // value comparison makes the second call free.
   useWorkspaceProject(projectId ?? null)
+  // AND THAT THIS SCREEN WANTS THE PANE, declared here rather than only in `ProjectWorkspace` for
+  // the same reason: the loading branch is still this project's screen. Without it the pane's
+  // visibility clears the moment the outgoing surface unmounts and is only re-declared once
+  // `getProject` returns, so arriving here from a chat collapsed the framed app, reflowed both
+  // columns and emptied the toolbar row for a whole round trip — the app appearing to crash and
+  // recover. The frame is never unmounted, only hidden, so nothing reloads either way.
+  useAppPaneVisible(true)
   const navigate = useNavigate()
 
   const [project, setProject] = useState<Project | null>(null)

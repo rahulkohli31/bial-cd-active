@@ -42,6 +42,7 @@ function reportSpy(over: Partial<WorkspaceReport> = {}): WorkspaceReport {
     ...over,
   }
   return {
+    settled: true,
     state: { name: 'not-running', headline: 'Your app is saved.', detail: null, action: START },
     ...sinks,
     onRefresh: vi.fn(),

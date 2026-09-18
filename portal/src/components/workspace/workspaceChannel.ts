@@ -365,6 +365,18 @@ const sameLifecycle = (a: WorkspaceLifecycle, b: WorkspaceLifecycle) =>
  */
 export interface WorkspaceReport {
   state: WorkspaceState
+  /**
+   * HAS ANY READ FINISHED, BY ANSWERING OR BY FAILING?
+   *
+   * `state` cannot answer this on its own: an unresolved reading and a read that genuinely could
+   * not be made both resolve to `could-not-read`, and the first painted frame of every cold open
+   * is the former. Without this the pane opened on "We could not check on your app." — a platform
+   * failure reported before anything had been asked.
+   *
+   * IT IS NOT "a read SUCCEEDED". A read that threw still finished, and a genuine outage must
+   * reach the card that offers Try again rather than sit behind an empty pane forever.
+   */
+  settled: boolean
   /** The project the state describes. `null` while a route is still resolving one. */
   projectId: string | null
   /** Record how a start attempt ended; `null` clears it (a start that reached the app). */

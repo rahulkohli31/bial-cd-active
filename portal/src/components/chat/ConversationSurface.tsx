@@ -2764,6 +2764,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
           // surface's own `setPolledPreview` returns the previous object when the reading is
           // `unknown`, so `previewState` only ever HOLDS an `unknown` before anything has been
           // decided, which is the one case whose answer is the fallback sentence anyway.
+          // ALWAYS SETTLED FROM THIS SURFACE, deliberately. The guard `settled` feeds exists to
+          // stop the cold-open failure card on the PROJECT screen, which is where a citizen
+          // arrives from the applications list. This surface reaches the pane by a different
+          // route and its readiness is already expressed by the address it publishes; claiming
+          // otherwise here withholds the pane's only control for as long as the first read takes.
+          settled: true,
           state: resolveWorkspaceState({
             preview: previewState,
             lastDecidedPreview: asDecidedReading(previewState),
