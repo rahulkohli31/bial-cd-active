@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
-from typing import Literal
 
 import pytest
 import redis.asyncio as aioredis
@@ -286,9 +285,7 @@ async def test_the_sentence_arrives_before_the_restore_runs(
         *,
         app_env: dict[str, str],
         source_key: str | None = None,
-        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
         shared_project_id: uuid.UUID | None = None,
-        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         order.append("restored")
         return await real_restore(
@@ -296,9 +293,7 @@ async def test_the_sentence_arrives_before_the_restore_runs(
             app_name,
             app_env=app_env,
             source_key=source_key,
-            kind=kind,
             shared_project_id=shared_project_id,
-            shared_owner_id=shared_owner_id,
         )
 
     monkeypatch.setattr(client, "restore_from_snapshot", watched_restore)
@@ -440,9 +435,7 @@ async def test_a_restore_that_fails_still_tells_the_citizen(
         *,
         app_env: dict[str, str],
         source_key: str | None = None,
-        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
         shared_project_id: uuid.UUID | None = None,
-        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         raise SandboxError("the restore did not complete")
 

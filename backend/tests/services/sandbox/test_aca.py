@@ -165,11 +165,12 @@ async def test_a_provisioned_sandbox_is_judgeable_without_redis(
 async def test_a_shared_restore_is_stamped_with_the_recipient_not_the_owner(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """#198: `kind="shared_sandbox"` on a restore is what makes a `shr-` container judgeable
-    by the reclaimer's `KIND_SHARED_SANDBOX` branch instead of being silently mis-tagged as an
+    """A `shr-` `app_name` on a restore is what makes the container judgeable by the
+    reclaimer's `KIND_SHARED_SANDBOX` branch instead of being silently mis-tagged as an
     ordinary build sandbox — which every OTHER restore call defaults to (`RECIPIENT` here is
     deliberately a DIFFERENT id from `USER`/`APP_ID`'s owner, the same distinction
-    `KIND_SHARED_SANDBOX`'s own docstring in `sandbox/base.py` draws)."""
+    `KIND_SHARED_SANDBOX`'s own docstring in `sandbox/base.py` draws). No `kind` parameter to
+    pass any more — the prefix on `shared_name` itself is what `_provision_container` reads."""
     from src.services.sandbox.base import KIND_SHARED_SANDBOX
 
     recipient = uuid.uuid4()
@@ -188,9 +189,7 @@ async def test_a_shared_restore_is_stamped_with_the_recipient_not_the_owner(
     # real minter produces and would let a missing-shape guard on the ARM delete path go
     # unnoticed.
     shared_name = a_shared_sandbox_name()
-    await client.restore_from_snapshot(
-        str(recipient), shared_name, app_env=_app_env(), kind="shared_sandbox"
-    )
+    await client.restore_from_snapshot(str(recipient), shared_name, app_env=_app_env())
 
     identity = identity_from_tags(aca.tags[shared_name])
     assert identity.kind == KIND_SHARED_SANDBOX
@@ -203,8 +202,9 @@ async def test_a_shared_restore_is_stamped_with_the_recipient_not_the_owner(
 async def test_an_ordinary_restore_still_defaults_to_a_build_sandbox(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """Regression guard for the signature widening: every call site that predates `kind`
-    must keep stamping exactly what it always stamped."""
+    """Regression guard: an ordinary `sbx-` name must keep stamping exactly what it always
+    stamped, now that the ARM identity is derived from `app_name`'s own prefix rather than a
+    separate `kind` parameter."""
     from src.services.sandbox.base import KIND_BUILD_SANDBOX
 
     aca = FakeAca()

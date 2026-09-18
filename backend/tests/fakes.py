@@ -48,13 +48,13 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_SERVING_SINCE,
-    REGISTRY_FIELD_SHARED_OWNER_ID,
     REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_SHARED_SERVED_COUNT,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
 )
 from src.services.sandbox.base import (
+    SHARED_SANDBOX_NAME_PREFIX,
     CompileReport,
     CompileState,
     DevLogs,
@@ -221,7 +221,6 @@ async def _hydrate_registry(
     handle: SandboxHandle,
     *,
     shared_project_id: uuid.UUID | None = None,
-    shared_owner_id: uuid.UUID | None = None,
 ) -> None:
     """The one real-client side effect a canned fake must not omit: `_provision_container`
     writes the registry hash at container-create, for BOTH `provision_new` and
@@ -236,8 +235,8 @@ async def _hydrate_registry(
     never served" arm would be unreachable from any test that provisions through this double.
     Green, and blind to the whole change.
 
-    `shared_project_id`/`shared_owner_id` (#198) mirror the real client's `_write_registry`:
-    stamped only when given, `None` on the ordinary `provision_new` arm."""
+    `shared_project_id` mirrors the real client's `_write_registry`: stamped only when given,
+    `None` on the ordinary `provision_new` arm."""
     key = registry_key(uuid.UUID(user_id))
     await get_redis().hset(
         key,
@@ -255,20 +254,14 @@ async def _hydrate_registry(
     )
     if shared_project_id is not None:
         await get_redis().hset(
-            key,
-            mapping={
-                REGISTRY_FIELD_SHARED_PROJECT_ID: str(shared_project_id),
-                REGISTRY_FIELD_SHARED_OWNER_ID: str(shared_owner_id),
-            },
+            key, mapping={REGISTRY_FIELD_SHARED_PROJECT_ID: str(shared_project_id)}
         )
     # `shared_served_count` disowned UNCONDITIONALLY — mirrors the real client's own fix: a
     # high-water mark left behind by a PRIOR occupant of this slot (build sandbox or a
     # replaced shared view) must never be compared against a fresh container's first reading.
     await get_redis().hdel(key, REGISTRY_FIELD_SHARED_SERVED_COUNT)
     if shared_project_id is None:
-        await get_redis().hdel(
-            key, REGISTRY_FIELD_SHARED_PROJECT_ID, REGISTRY_FIELD_SHARED_OWNER_ID
-        )
+        await get_redis().hdel(key, REGISTRY_FIELD_SHARED_PROJECT_ID)
 
 
 class FakeSandboxClient(SandboxClient):
@@ -281,11 +274,12 @@ class FakeSandboxClient(SandboxClient):
         self.provisioned: list[str] = []
         self.restored: list[str] = []
         self.restored_from: list[str | None] = []
-        # #198 — the `kind` each restore was called with, parallel to `restored`.
+        # Which ARM identity each restore's `app_name` implies (mirrors the real client's own
+        # `is_a_shared_sandbox_name(app_name)` derivation — there is no separate `kind`
+        # parameter to record instead), parallel to `restored`.
         self.restored_as_kind: list[Literal["build_sandbox", "shared_sandbox"]] = []
-        # #198 — the `(shared_project_id, shared_owner_id)` each restore was called with,
-        # parallel to `restored_as_kind`.
-        self.restored_shared_identity: list[tuple[uuid.UUID | None, uuid.UUID | None]] = []
+        # The `shared_project_id` each restore was called with, parallel to `restored_as_kind`.
+        self.restored_shared_project_id: list[uuid.UUID | None] = []
         self.torn_down: list[str] = []
         # The env dict each BIRTH arm actually handed the container, recorded separately from the
         # names so "was the SAS / the per-project DSN injected on THIS arm" stays answerable. The
@@ -377,25 +371,23 @@ class FakeSandboxClient(SandboxClient):
         *,
         app_env: dict[str, str],
         source_key: str | None = None,
-        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
         shared_project_id: uuid.UUID | None = None,
-        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         self.restored.append(app_name)
         # Which bundle a restore PULLED is the whole question for the recovery flow, so record
         # it — `restored` only says a restore happened, never from what.
         self.restored_from.append(source_key)
-        # #198 — which ARM identity this restore would have stamped. The fake tracks no ARM
-        # tags at all (see `test_aca.py` for the real client's own tag-stamping coverage), so
-        # this is the one place a manager-level test can assert it asked for the right kind.
-        self.restored_as_kind.append(kind)
-        # #198 — the registry-hash half of that same identity, parallel to `restored_as_kind`.
-        self.restored_shared_identity.append((shared_project_id, shared_owner_id))
+        # Which ARM identity this restore would have stamped, derived from `app_name`'s own
+        # prefix exactly as the real client does. The fake tracks no ARM tags at all (see
+        # `test_aca.py` for the real client's own tag-stamping coverage), so this is the one
+        # place a manager-level test can assert it asked for the right kind.
+        is_shared = app_name.startswith(SHARED_SANDBOX_NAME_PREFIX)
+        self.restored_as_kind.append("shared_sandbox" if is_shared else "build_sandbox")
+        # The registry-hash half of that same identity, parallel to `restored_as_kind`.
+        self.restored_shared_project_id.append(shared_project_id)
         self.restore_env = dict(app_env)
         handle = _fake_handle(app_name)
-        await _hydrate_registry(
-            user_id, handle, shared_project_id=shared_project_id, shared_owner_id=shared_owner_id
-        )
+        await _hydrate_registry(user_id, handle, shared_project_id=shared_project_id)
         return handle
 
     async def exec(
@@ -516,9 +508,7 @@ class DevServerDownUntilStarted(FakeSandboxClient):
         *,
         app_env: dict[str, str],
         source_key: str | None = None,
-        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
         shared_project_id: uuid.UUID | None = None,
-        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         self._serving.discard(app_name)
         return await super().restore_from_snapshot(
@@ -526,9 +516,7 @@ class DevServerDownUntilStarted(FakeSandboxClient):
             app_name,
             app_env=app_env,
             source_key=source_key,
-            kind=kind,
             shared_project_id=shared_project_id,
-            shared_owner_id=shared_owner_id,
         )
 
     async def dev_start(

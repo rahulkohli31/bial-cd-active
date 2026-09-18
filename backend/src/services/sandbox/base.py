@@ -56,9 +56,10 @@ unrelated workloads sharing the resource group. A drift between those two would 
 orphan reconciler quietly report nothing."""
 
 SHARED_SANDBOX_NAME_PREFIX = "shr-"
-"""The prefix every SHARED-RUNTIME container carries (`manager.shr_name_for`, #198) — a
-colleague's read-only, app-frame-only view of a project shared with them, restored from the
-builder's own saved snapshot. A THIRD lineage beside `sbx-` (the builder's own build sandbox)
+"""The prefix every SHARED-RUNTIME container carries (`manager.shr_name_for`) — a colleague's
+app-frame-only view of a project shared with them (not read-only — a share grants "Can use",
+never "view only"), restored from the builder's own saved snapshot. A THIRD lineage beside
+`sbx-` (the builder's own build sandbox)
 and `pub-` (a published app), never a variant of either: it is neither the builder's live
 workspace nor a citizen's shipped app, and every place that already tells those two apart by
 name (the portal edge's routing regex, the reaper, the fleet reclaimer) has to learn this
@@ -138,8 +139,9 @@ coming back to it must get their sandbox, not a refusal."""
 KIND_BUILD_SANDBOX: Final = "build-sandbox"
 KIND_PUBLISHED_APP: Final = "published-app"
 KIND_SHARED_SANDBOX: Final = "shared-sandbox"
-"""A colleague's read-only view of a project shared with them (#198). `TAG_USER_ID` on a
-container of this kind names the RECIPIENT, not the project's owner — the recipient is whose
+"""A colleague's view of a project shared with them (not read-only — a share grants "Can use",
+never "view only"). `TAG_USER_ID` on a container of this kind names the RECIPIENT, not the
+project's owner — the recipient is whose
 per-slot occupancy and whose access (revocable independent of the project) this container's
 lifecycle actually tracks; `TAG_APP_ID` still names the underlying app being viewed, same as
 every other kind. The owner is recoverable from `TAG_APP_ID` via the app row itself, so no
@@ -709,9 +711,7 @@ class SandboxClient(abc.ABC):
         *,
         app_env: dict[str, str],
         source_key: str | None = None,
-        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
         shared_project_id: uuid.UUID | None = None,
-        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         """Provision a FRESH container and restore a git-bundle onto its local disk (git ops
         over `/_sup/exec`), then RE-INJECT the app-data credential from `app_env`. Returns a
@@ -722,20 +722,22 @@ class SandboxClient(abc.ABC):
         copy is written at all. Optional with a default rather than required, because every
         existing caller means "the saved one" and should keep reading that way.
 
-        `kind` (#198) selects the ARM identity the fresh container is stamped with —
-        `sandbox_tags` (the default, `user_id` as OWNER) or `shared_sandbox_tags` (`user_id` as
-        RECIPIENT). ADDED, not widened from a callback: every existing caller means the default
-        and this keeps meaning it without touching a single call site. `is_a_shared_sandbox_name`
-        already matched this shape before any caller could produce it — a widening kept in step
-        with the guard it feeds, never announced ahead of one.
+        `app_name`'s OWN PREFIX selects the ARM identity the fresh container is stamped
+        with — `sandbox_tags` (`sbx-`, `user_id` as OWNER) or `shared_sandbox_tags` (`shr-`,
+        `user_id` as RECIPIENT), via `is_a_shared_sandbox_name(app_name)`. Not a separate
+        `kind` parameter: the caller that wants a `shared_sandbox` arm is the same caller that
+        built `app_name` with `shr_name_for` in the first place, so a second parameter here
+        would only ever restate what the name it just built already says — and could disagree
+        with it, silently, if it ever didn't.
 
-        `shared_project_id`/`shared_owner_id` (#198) are the registry-hash counterpart of
-        `kind="shared_sandbox"`: written to `REGISTRY_FIELD_SHARED_PROJECT_ID`/
-        `REGISTRY_FIELD_SHARED_OWNER_ID` so a LATER occupancy check (`_occupying_project`'s
+        `shared_project_id` is the registry-hash counterpart of a `shr-` name: written to
+        `REGISTRY_FIELD_SHARED_PROJECT_ID` so a LATER occupancy check (`_occupying_project`'s
         sibling in `manager.py`) can recognize "this slot holds a colleague's shared view"
         without reverse-parsing `shr_name_for`'s hash — which, like every other name this
-        platform derives, is forward-match-only. `None` on the `build_sandbox` arm, always;
-        supplying one without the other is a caller error, never a partial stamp."""
+        platform derives, is forward-match-only. `None` on the `build_sandbox` arm, always.
+        The project's OWNER is not stamped alongside it: that occupancy check already holds
+        (or cheaply gets) the `Project` row this id resolves to, so a second field here would
+        only ever restate `projects.user_id`."""
         ...
 
     @abc.abstractmethod

@@ -40,7 +40,6 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_SERVING_SINCE,
-    REGISTRY_FIELD_SHARED_OWNER_ID,
     REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_SHARED_SERVED_COUNT,
     REGISTRY_FIELD_STATE,
@@ -54,6 +53,7 @@ from src.services.sandbox.aca import (
 )
 from src.services.sandbox.base import (
     SERVED_HEAD_MAX_CHARS,
+    SHARED_SANDBOX_NAME_PREFIX,
     CompileReport,
     CompileState,
     DevLogs,
@@ -728,7 +728,6 @@ class AcaSandboxClient(SandboxClient):
         fqdn: str,
         token_ref: str,
         shared_project_id: uuid.UUID | None = None,
-        shared_owner_id: uuid.UUID | None = None,
     ) -> None:
         """Hydrate the registry hash for a JUST-CREATED container.
 
@@ -745,12 +744,11 @@ class AcaSandboxClient(SandboxClient):
         The platform used to treat this instant as "the app is running"; that is the defect
         the field exists to end.
 
-        `shared_project_id`/`shared_owner_id` (#198) are the SAME disown story as
-        `preview_stay_until`, and for the identical reason: this slot can hold either the
-        user's own build sandbox or a colleague's shared view, and a stamp left behind by
-        one must never be inherited by the other. `shared_project_id is None` means "this is
-        an ordinary build sandbox" and both fields are `hdel`-ed; passing one without the
-        other is a caller error (`launch_shared_preview` always supplies both together)."""
+        `shared_project_id` is the SAME disown story as `preview_stay_until`, and for the
+        identical reason: this slot can hold either the user's own build sandbox or a
+        colleague's shared view, and a stamp left behind by one must never be inherited by
+        the other. `None` means "this is an ordinary build sandbox" and the field is
+        `hdel`-ed."""
         key = registry_key(user_uuid)
         await get_redis().hset(
             key,
@@ -780,26 +778,21 @@ class AcaSandboxClient(SandboxClient):
         if shared_project_id is not None:
             await get_redis().hset(
                 key,
-                mapping={
-                    REGISTRY_FIELD_SHARED_PROJECT_ID: str(shared_project_id),
-                    REGISTRY_FIELD_SHARED_OWNER_ID: str(shared_owner_id),
-                },
+                mapping={REGISTRY_FIELD_SHARED_PROJECT_ID: str(shared_project_id)},
             )
         # `shared_served_count` DISOWNED UNCONDITIONALLY, on EVERY fresh container — unlike
-        # `shared_project_id`/`shared_owner_id` below, which only need clearing when THIS arm is
-        # an ordinary build sandbox. A high-water mark left behind survives into whatever comes
-        # next in this slot, whether that is a build sandbox or a REPLACEMENT shared view: the
-        # new container's first `/served` reading then compares against the OLD occupant's
-        # total, `count <= last_seen` reads as "no new traffic" immediately, and the sweep's
+        # `shared_project_id` below, which only needs clearing when THIS arm is an ordinary
+        # build sandbox. A high-water mark left behind survives into whatever comes next in
+        # this slot, whether that is a build sandbox or a REPLACEMENT shared view: the new
+        # container's first `/served` reading then compares against the OLD occupant's total,
+        # `count <= last_seen` reads as "no new traffic" immediately, and the sweep's
         # `APP_SERVED_TRAFFIC` renewal (`reaper.py::_renew_shared_view_from_traffic`) never
         # fires for it at all.
         await get_redis().hdel(
             key, REGISTRY_FIELD_PREVIEW_STAY_UNTIL, REGISTRY_FIELD_SHARED_SERVED_COUNT
         )
         if shared_project_id is None:
-            await get_redis().hdel(
-                key, REGISTRY_FIELD_SHARED_PROJECT_ID, REGISTRY_FIELD_SHARED_OWNER_ID
-            )
+            await get_redis().hdel(key, REGISTRY_FIELD_SHARED_PROJECT_ID)
         # Deferred import — see the cycle note at the top of this module.
         from src.services.build_sessions.alarms import SANDBOX_REGISTRY_MARKED_PENDING_EVENT
 
@@ -1020,9 +1013,7 @@ class AcaSandboxClient(SandboxClient):
         app_env: dict[str, str],
         *,
         arm: _BirthArm,
-        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
         shared_project_id: uuid.UUID | None = None,
-        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         """Create the container, write the registry hash at container-create (before
         any fallible post-create step, so a mid-provision death is reaper-visible), and
@@ -1032,11 +1023,11 @@ class AcaSandboxClient(SandboxClient):
         bare `str` so a second spelling of either value is a type error rather than a field
         that quietly stops matching in the log — the same discipline the event names get.
 
-        `kind` (#198) selects which ARM identity gets stamped — see
-        `SandboxClient.restore_from_snapshot`'s own docstring for why `user_uuid` means the
-        RECIPIENT, not the app's owner, on the `shared_sandbox` arm. `shared_project_id`/
-        `shared_owner_id` are the registry-hash half of that same distinction — see
-        `_write_registry`'s own docstring — and are only ever non-`None` on that arm."""
+        `app_name`'s OWN PREFIX (`is_a_shared_sandbox_name`) selects which ARM identity gets
+        stamped — see `SandboxClient.restore_from_snapshot`'s own docstring for why `user_uuid`
+        means the RECIPIENT, not the app's owner, on a `shr-` name. `shared_project_id` is the
+        registry-hash half of that same distinction — see `_write_registry`'s own docstring —
+        and is only ever non-`None` on that arm."""
         token = secrets.token_urlsafe(_SUPERVISOR_TOKEN_BYTES)
         # The supervisor bearer lives ONLY in the container env (the supervisor keeps it out of
         # the scrubbed child env) and in-process; Redis stores a token_ref, never the token.
@@ -1062,7 +1053,7 @@ class AcaSandboxClient(SandboxClient):
         app_id = uuid.UUID(app_env["BIAL_APP_ID"])
         tags = (
             shared_sandbox_tags(recipient_id=user_uuid, app_id=app_id)
-            if kind == "shared_sandbox"
+            if app_name.startswith(SHARED_SANDBOX_NAME_PREFIX)
             else sandbox_tags(user_id=user_uuid, app_id=app_id)
         )
         # WHETHER THIS CONTAINER MAY READ A CONNECTOR'S DATA, read back out of the environment
@@ -1090,7 +1081,6 @@ class AcaSandboxClient(SandboxClient):
                 fqdn=fqdn,
                 token_ref=token_ref,
                 shared_project_id=shared_project_id,
-                shared_owner_id=shared_owner_id,
             )
         except Exception:
             await self._safe_teardown(app_name)
@@ -1237,9 +1227,7 @@ class AcaSandboxClient(SandboxClient):
         *,
         app_env: dict[str, str],
         source_key: str | None = None,
-        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
         shared_project_id: uuid.UUID | None = None,
-        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         user_uuid = uuid.UUID(user_id)
         # The caller supplies the app_id via app_env (the frozen client signature carries no
@@ -1288,9 +1276,7 @@ class AcaSandboxClient(SandboxClient):
             app_name,
             app_env,
             arm="restore_from_snapshot",
-            kind=kind,
             shared_project_id=shared_project_id,
-            shared_owner_id=shared_owner_id,
         )
         try:
             await self._restore_snapshot_into(handle, bundle)

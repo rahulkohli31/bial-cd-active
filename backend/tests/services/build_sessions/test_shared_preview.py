@@ -32,7 +32,6 @@ from src.services.build_sessions.manager import (
 )
 from src.services.redis import registry_key
 from src.services.redis.keys import (
-    REGISTRY_FIELD_SHARED_OWNER_ID,
     REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_SHARED_SERVED_COUNT,
 )
@@ -133,11 +132,13 @@ async def test_the_restored_container_is_tagged_as_a_shared_sandbox(
 async def test_launch_stamps_the_registry_with_the_shared_projects_identity(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """The registry-hash half of requirement 24 (#198 slice 5): Launch must stamp WHICH
-    project this slot is a shared view of, and WHOSE, so a later occupancy check can
-    recognize it without reverse-parsing `shr_name_for`'s hash. See
+    """The registry-hash half of requirement 24: Launch must stamp WHICH project this slot is
+    a shared view of, so a later occupancy check can recognize it without reverse-parsing
+    `shr_name_for`'s hash. See
     `test_a_live_shared_view_earns_the_hand_over_dialog_instead_of_silent_reclaim` for the
-    behavior this stamp exists to enable."""
+    behavior this stamp exists to enable. No owner id stamped alongside it: the occupancy
+    check already loads the `Project` row this id resolves to, and its owner is right there
+    (`_occupying_shared_project`)."""
     owner, project, app_id = await _owner_with_saved_app(
         db_session, fake_storage, email="owner3b@example.com"
     )
@@ -150,7 +151,6 @@ async def test_launch_stamps_the_registry_with_the_shared_projects_identity(
     reg = await read_registry(fake_redis, recipient.id)
     assert reg is not None
     assert reg[REGISTRY_FIELD_SHARED_PROJECT_ID] == str(project.id)
-    assert reg[REGISTRY_FIELD_SHARED_OWNER_ID] == str(owner.id)
 
 
 async def test_refresh_disowns_the_prior_containers_served_count(
@@ -318,11 +318,10 @@ async def test_revoke_is_a_noop_when_nothing_is_there(
 async def test_a_live_shared_view_earns_the_hand_over_dialog_instead_of_silent_reclaim(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """Requirement 24 / #161's own mechanism, extended to a `shr-` occupant.
+    """Requirement 24's own mechanism, extended to a `shr-` occupant.
 
-    Before the two registry fields this slice adds (`REGISTRY_FIELD_SHARED_PROJECT_ID`/
-    `REGISTRY_FIELD_SHARED_OWNER_ID`, stamped at Launch), a `shr-` name matched no app the
-    recipient owns, so `_occupying_project` returned `None` and `_refuse_if_reclaim_would_
+    Before `REGISTRY_FIELD_SHARED_PROJECT_ID` (stamped at Launch), a `shr-` name matched no
+    app the recipient owns, so `_occupying_project` returned `None` and `_refuse_if_reclaim_would_
     destroy_work` fell through its ghost exit — the recipient's still-open shared view was
     torn down with no dialog at all. This pins the fix: starting a build in a DIFFERENT
     project of the recipient's own must raise `SandboxReclaimBlockedError` naming the SHARED
@@ -370,9 +369,9 @@ async def test_an_ordinary_build_disowns_a_prior_occupants_shared_stamp(
 ) -> None:
     """The MERGE half of the same fix: `hset(mapping=...)` only ADDS fields, so once a shared
     view is revoked and the recipient's OWN build takes the freed slot, the new registry
-    record must not still carry the PRIOR occupant's `shared_project_id`/`shared_owner_id` —
-    a leftover stamp would make `_occupying_shared_project` misidentify an ordinary build
-    sandbox as somebody else's shared view."""
+    record must not still carry the PRIOR occupant's `shared_project_id` — a leftover stamp
+    would make `_occupying_shared_project` misidentify an ordinary build sandbox as somebody
+    else's shared view."""
     owner, project, app_id = await _owner_with_saved_app(
         db_session, fake_storage, email="owner3c@example.com"
     )
@@ -393,7 +392,6 @@ async def test_an_ordinary_build_disowns_a_prior_occupants_shared_stamp(
     reg = await read_registry(fake_redis, recipient.id)
     assert reg is not None
     assert REGISTRY_FIELD_SHARED_PROJECT_ID not in reg
-    assert REGISTRY_FIELD_SHARED_OWNER_ID not in reg
 
 
 async def test_revoke_never_touches_the_recipients_own_build(

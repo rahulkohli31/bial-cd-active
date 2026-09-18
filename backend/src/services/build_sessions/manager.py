@@ -140,7 +140,6 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_SERVING_SINCE,
-    REGISTRY_FIELD_SHARED_OWNER_ID,
     REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_STATE,
     REGISTRY_STATE_READY,
@@ -850,35 +849,34 @@ async def _occupying_shared_project(
     db: AsyncSession, reg: dict[str, str]
 ) -> _OccupyingProject | None:
     """The `shr-` counterpart of `_occupying_project` above — and the reason it can be a
-    plain lookup rather than another forward-match loop (#198, requirement 24).
+    plain lookup rather than another forward-match loop.
 
     `_occupying_project` exists ONLY because `app_name_for` cannot be reverse-parsed, so a
     caller's own app rows must be re-derived and matched forward one at a time. `shr_name_for`
     is exactly as lossy, but a `shr-` occupant's slot is stamped with
-    `REGISTRY_FIELD_SHARED_PROJECT_ID`/`REGISTRY_FIELD_SHARED_OWNER_ID` at Launch
-    (`launch_shared_preview`) precisely so this never needs to guess: the identity is read
-    straight off the hash, not re-derived from a name.
+    `REGISTRY_FIELD_SHARED_PROJECT_ID` at Launch (`launch_shared_preview`) precisely so this
+    never needs to guess: the project is read straight off the hash, not re-derived from a
+    name — and its owner comes from the `Project` row this function already has to load,
+    never a second stamped field that would only ever restate `projects.user_id`.
 
     Called BEFORE `_occupying_project`, not after — a `shr-` occupant belongs to the
     PROJECT'S OWNER, who is almost never the caller (`user_id` in `_occupying_project`'s own
     query), so the forward-match loop there would search the wrong person's app rows and
-    always miss. Absent fields (an ordinary build sandbox) or a project since deleted both
+    always miss. An absent field (an ordinary build sandbox) or a project since deleted both
     return `None` — the second is the identical 'ghost' reading `_occupying_project` gives a
     dangling registry entry: nothing left to warn about, so the caller falls through and
     reclaims silently."""
     project_id_raw = reg.get(REGISTRY_FIELD_SHARED_PROJECT_ID)
-    owner_id_raw = reg.get(REGISTRY_FIELD_SHARED_OWNER_ID)
-    if not project_id_raw or not owner_id_raw:
+    if not project_id_raw:
         return None
     project_id = uuid.UUID(project_id_raw)
-    owner_id = uuid.UUID(owner_id_raw)
-    project_name = await db.scalar(sa.select(Project.name).where(Project.id == project_id))
-    if project_name is None:
+    project = await db.get(Project, project_id)
+    if project is None:
         return None
-    app_id = await existing_app_id(db, owner_id, project_id)
+    app_id = await existing_app_id(db, project.user_id, project_id)
     if app_id is None:
         return None
-    return _OccupyingProject(app_id=app_id, project_id=project_id, project_name=project_name)
+    return _OccupyingProject(app_id=app_id, project_id=project_id, project_name=project.name)
 
 
 async def _project_name_owned_by(
@@ -3907,9 +3905,7 @@ class SessionManager:
                             owner_app_id,
                             env,
                             source_key=snapshot_key(owner_app_id),
-                            kind="shared_sandbox",
                             shared_project_id=project.id,
-                            shared_owner_id=project.user_id,
                         )
                     except StorageNotFoundError as exc:
                         # The bundle vanished between the head-check above and the pull — the
@@ -4443,9 +4439,7 @@ class SessionManager:
         env: dict[str, str],
         *,
         source_key: str | None = None,
-        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
         shared_project_id: uuid.UUID | None = None,
-        shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         """Pull the known-present snapshot into a fresh container, with bounded retry.
         `source_key` selects WHICH bundle (default the saved snapshot; relaunch passes the
@@ -4456,11 +4450,11 @@ class SessionManager:
         destroys it. Self-cleans on every exception, so each attempt starts from no container;
         `StorageNotFoundError` must not retry — it is the caller's fresh-provision arm.
 
-        `kind` (#198) forwards to `SandboxClient.restore_from_snapshot` unchanged — every
-        existing caller means the default (a build sandbox); `launch_shared_preview` is the
-        one caller that passes `shared_sandbox`, and it is also the one caller that ever
-        passes `shared_project_id`/`shared_owner_id` — see that method's own docstring for
-        why the occupancy check needs them stamped."""
+        `app_name`'s OWN PREFIX is what `SandboxClient.restore_from_snapshot` reads to decide
+        the ARM identity — `launch_shared_preview` is the one caller whose `app_name`
+        (`shr_name_for`'s output) is a `shr-` name, and it is also the one caller that ever
+        passes `shared_project_id` — see that method's own docstring for why the occupancy
+        check needs it stamped."""
         attempt = 0
         while True:
             attempt += 1
@@ -4470,9 +4464,7 @@ class SessionManager:
                     app_name,
                     app_env=env,
                     source_key=source_key,
-                    kind=kind,
                     shared_project_id=shared_project_id,
-                    shared_owner_id=shared_owner_id,
                 )
             except StorageNotFoundError:
                 # Discriminated by TYPE, and this clause MUST stay first: `StorageNotFoundError`
