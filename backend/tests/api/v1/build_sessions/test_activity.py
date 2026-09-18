@@ -1,5 +1,5 @@
 """`GET /v1/build-sessions/activity` — one user-scoped read answering which of a citizen's
-projects are starting, open right now, or closing down, and when one is near its ceiling.
+projects are starting, open right now, or closing down.
 """
 
 from __future__ import annotations
@@ -11,12 +11,10 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from httpx import AsyncClient
-from pydantic import SecretStr
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import src.api.v1.build_sessions.router as router_module
-from src.config import settings
 from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.project import Project
 from src.services.build_sessions.appdata import resolve_app_for_project
@@ -31,26 +29,10 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_TOKEN_REF,
     starting_key,
 )
-from src.services.sandbox.config import SandboxConfig
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
 
 _UNPROVEN = ""  # the registry's own sentinel for "exists, never served"
-
-
-def _sandbox_config(**overrides: Any) -> SandboxConfig:
-    data: dict[str, Any] = {
-        "subscription_id": "s",
-        "resource_group": "r",
-        "region": "westeurope",
-        "managed_environment_name": "aca-env",
-        "acr_server": "acr.azurecr.io",
-        "acr_username": "acr-user",
-        "acr_password": SecretStr("acr-pass"),
-        "image_ref": "acr/img:latest",
-    }
-    data.update(overrides)
-    return SandboxConfig(**data)
 
 
 async def _user_project_app(db: AsyncSession, email: str):
@@ -67,7 +49,6 @@ async def _register(
     app_name: str,
     *,
     serving_since: str,
-    created_at: datetime | None = None,
 ) -> None:
     await redis.hset(
         registry_key(user_id),
@@ -75,7 +56,7 @@ async def _register(
             REGISTRY_FIELD_APP_NAME: app_name,
             REGISTRY_FIELD_FQDN: f"{app_name}.example.azurecontainerapps.io",
             REGISTRY_FIELD_TOKEN_REF: f"ref-{app_name}",
-            REGISTRY_FIELD_CREATED_AT: (created_at or datetime.now(UTC)).isoformat(),
+            REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
             REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
             REGISTRY_FIELD_SERVING_SINCE: serving_since,
         },
@@ -142,7 +123,6 @@ async def test_a_starting_container_reads_starting(
 
     entries = _by_project(body)
     assert entries[str(project.id)]["phase"] == "starting"
-    assert entries[str(project.id)]["drainingAt"] is None
 
 
 async def test_a_registered_but_unproven_container_also_reads_starting(
@@ -185,51 +165,6 @@ async def test_a_serving_container_and_an_owed_row_read_open_and_closing(
     entries = _by_project(body)
     assert entries[str(open_project.id)]["phase"] == "open"
     assert entries[str(closing_project.id)]["phase"] == "closing"
-    assert entries[str(closing_project.id)]["drainingAt"] is None
-
-
-async def test_an_open_container_carries_its_drain_mark_when_the_ceiling_is_on(
-    client: AsyncClient,
-    db_session: AsyncSession,
-    fake_redis,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`drainingAt` comes from the registry's own `created_at`, the same age source the read's
-    fixed budget allows (no ARM tag call) — and is null the moment the flag is off."""
-    monkeypatch.setattr(
-        settings, "sandbox", _sandbox_config(drain_enabled=True, drain_after_hours=2)
-    )
-    user, project, app_id = await _user_project_app(db_session, "ceiling@bial.test")
-    created_at = datetime.now(UTC) - timedelta(minutes=10)
-    await _register(
-        fake_redis,
-        user.id,
-        app_name_for(app_id),
-        serving_since=datetime.now(UTC).isoformat(),
-        created_at=created_at,
-    )
-
-    body = await _activity(client, user)
-
-    draining_at = _by_project(body)[str(project.id)]["drainingAt"]
-    assert draining_at is not None
-    expected = created_at + timedelta(hours=2)
-    assert abs((datetime.fromisoformat(draining_at) - expected).total_seconds()) < 5
-
-
-async def test_the_drain_mark_is_absent_with_the_ceiling_off(
-    client: AsyncClient, db_session: AsyncSession, fake_redis
-) -> None:
-    """No sandbox config is bound by this file's fixtures — `settings.sandbox` is `None`, the
-    ordinary reading outside `wire` — so the ceiling must read as off, never as a guess."""
-    user, project, app_id = await _user_project_app(db_session, "noceiling@bial.test")
-    await _register(
-        fake_redis, user.id, app_name_for(app_id), serving_since=datetime.now(UTC).isoformat()
-    )
-
-    body = await _activity(client, user)
-
-    assert _by_project(body)[str(project.id)]["drainingAt"] is None
 
 
 # --- edge cases ------------------------------------------------------------------

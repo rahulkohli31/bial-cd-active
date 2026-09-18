@@ -608,11 +608,6 @@ class ProjectActivity(CamelModel):
 
     project_id: uuid.UUID
     phase: ActivityPhase
-    #: When this project's container is due to be drained, or `None` when no ceiling applies
-    #: to it right now. NEVER a claim that collection is imminent — only that a bound exists.
-    #: Always `None` on a `closing` entry (already on its way out, ceiling or not) and on a
-    #: `starting` entry whose container has not been created yet (no age, no bound).
-    draining_at: datetime | None = None
 
 
 class ActivityResponse(CamelModel):

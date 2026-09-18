@@ -1079,7 +1079,6 @@ export type ActivityPhase = 'starting' | 'open' | 'closing'
 export interface ProjectActivity {
   projectId: string
   phase: ActivityPhase
-  drainingAt: string | null
 }
 
 const ACTIVITY_PHASES: ReadonlySet<string> = new Set(['starting', 'open', 'closing'])
@@ -1101,14 +1100,10 @@ export async function fetchActivity(deps: AuthFetchDeps = {}): Promise<ProjectAc
   const rows: ProjectActivity[] = []
   for (const raw of body.projects) {
     if (!isRecord(raw)) continue
-    const { projectId, phase, drainingAt } = raw
+    const { projectId, phase } = raw
     if (typeof projectId !== 'string' || typeof phase !== 'string') continue
     if (!ACTIVITY_PHASES.has(phase)) continue
-    rows.push({
-      projectId,
-      phase: phase as ActivityPhase,
-      drainingAt: typeof drainingAt === 'string' ? drainingAt : null,
-    })
+    rows.push({ projectId, phase: phase as ActivityPhase })
   }
   return rows
 }

@@ -505,8 +505,8 @@ async def _project_owning_app_name(
 def _when_this_one_closes(reg: dict[str, str]) -> datetime | None:
     """The ceiling instant for the container this registry record names, or `None`.
 
-    These routes have no container-call budget, so the created-at stamp on the hash is the only
-    field worth populating — the same fallback the sweep's own age source lands on when ARM
+    This route has no container-call budget, so the created-at stamp on the hash is the only
+    field worth reading — the same fallback the sweep's own age source lands on when ARM
     cannot be asked."""
     enabled, after_hours = the_ceiling_switch()
     return draining_at(
@@ -543,7 +543,6 @@ async def build_session_activity(user: CurrentUser, db: DbSession) -> ActivityRe
         reg, starting_project_id = await read_registry_and_starting_marker(get_redis(), user.id)
 
         phases: dict[uuid.UUID, ActivityPhase] = {}
-        draining: dict[uuid.UUID, datetime] = {}
 
         if reg is not None:
             app_name = reg.get(REGISTRY_FIELD_APP_NAME)
@@ -553,9 +552,6 @@ async def build_session_activity(user: CurrentUser, db: DbSession) -> ActivityRe
                     phases[project_id] = (
                         ActivityPhase.OPEN if stamp_is_proven(reg) else ActivityPhase.STARTING
                     )
-                    mark = _when_this_one_closes(reg)
-                    if mark is not None:
-                        draining[project_id] = mark
 
         if starting_project_id is not None and starting_project_id not in phases:
             phases[starting_project_id] = ActivityPhase.STARTING
@@ -576,9 +572,7 @@ async def build_session_activity(user: CurrentUser, db: DbSession) -> ActivityRe
 
         return ActivityResponse(
             projects=[
-                ProjectActivity(
-                    project_id=project_id, phase=phase, draining_at=draining.get(project_id)
-                )
+                ProjectActivity(project_id=project_id, phase=phase)
                 for project_id, phase in phases.items()
             ]
         )

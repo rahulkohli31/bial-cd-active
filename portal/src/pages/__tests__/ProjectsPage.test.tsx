@@ -1304,7 +1304,6 @@ describe('★ the activity markers — starting, open, or closing down, beside t
   const mkActivity = (projectId: string, phase: ActivityPhase): ProjectActivity => ({
     projectId,
     phase,
-    drainingAt: null,
   })
 
   /** Point `matchMedia` at an answer, the same shim `Waiting.test.tsx` uses. The suite-wide
