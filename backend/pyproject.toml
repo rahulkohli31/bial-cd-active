@@ -1,6 +1,6 @@
 [project]
 name = "bial-backend"
-version = "0.1.0"
+version = "1.7.4"
 description = "BIAL Citizen Developer Platform — FastAPI control-plane"
 requires-python = ">=3.14"
 dependencies = [
