@@ -390,8 +390,10 @@ async def test_the_presence_script_keeps_the_longer_standing_deadline_on_its_own
     difference lives: a script that compares cannot be interleaved with, and one that does not
     can be, however careful the caller is.
 
-    Mutation check: delete the `standing >= ARGV[2]` clause and this goes red while every
-    route-level renewal test that has a live caller in front of it stays green."""
+    Mutation check: move the `standing >= ARGV[2]` comparison out to the caller — read the
+    standing deadline, compare in Python, write the larger one back. Every route-level renewal
+    test stays green, because with nothing racing a caller-side comparison reaches the same
+    answer. This one goes red, because it asks the script with no caller in front of it."""
     await _register(fake_redis)
     longer = (datetime.now(UTC) + timedelta(hours=9)).isoformat(timespec="microseconds")
     await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_PREVIEW_STAY_UNTIL, longer)

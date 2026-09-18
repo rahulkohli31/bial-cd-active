@@ -439,9 +439,10 @@ async def run_the_shutdown(
     except StorageError as exc:
         # A STORE THAT WILL NOT TAKE THE COPY IS THE SAME SITUATION AS A CONTAINER THAT WILL NOT
         # ANSWER, and it must land in the same budget. Letting this raise instead spares the
-        # container through the caller's catch-all, which keeps the debt WITHOUT counting the
-        # attempt — so a store outage that outlives the strikes would be retried forever and the
-        # container billed forever, against the one bound that was supposed to stop it.
+        # container through the caller's catch-all, which never reaches the strike test — the
+        # attempt is still counted, by the claim, but nothing ever compares that count against
+        # the strikes, so a store outage that outlives them is retried forever and the container
+        # billed forever, against the one bound that was supposed to stop it.
         return await _spare_or_go_in_unread(
             owed,
             redis,
@@ -573,6 +574,7 @@ _CAS_MARK_ENDING_LUA: Final = (
     f"if redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}') ~= ARGV[1] then return 0 end "
     f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_STATE}', '{REGISTRY_STATE_ENDING}') return 1"
 )
+
 
 async def _mark_ending_if_still_ours(redis: aioredis.Redis, owed: OwedTeardown) -> bool:
     run_script = redis.eval  # aliased to keep the call off the JS-oriented eval guard

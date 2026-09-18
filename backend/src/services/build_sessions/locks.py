@@ -487,9 +487,10 @@ async def grant_stay_of_execution(
 #
 # THE COMPARISON IS LEXICOGRAPHIC, AND THAT IS ONLY SOUND BECAUSE THE VALUES ARE FIXED WIDTH. Every
 # writer here stamps `isoformat(timespec="microseconds")` on an aware UTC instant, so the strings
-# share one offset and one length and sort exactly as the instants do. Drop the timespec and a
-# whole-microsecond value renders three characters shorter, which sorts BEFORE a longer string in
-# the same second — wrong, rarely, in a guard whose whole job is never to be wrong.
+# share one offset and one length and sort exactly as the instants do. Drop the timespec and the
+# width becomes conditional — an instant landing on a whole second renders seven characters
+# shorter — and soundness then rests on which punctuation happens to collate first rather than on
+# anything this guard states. One shape per writer is what makes the `>=` mean what it reads as.
 #
 # A standing value that is longer WINS and is returned, so the caller reports the deadline that is
 # actually in force rather than the one it proposed.

@@ -705,13 +705,15 @@ async def test_a_store_that_will_not_take_the_copy_lands_in_the_same_budget(
     """★ A STORE OUTAGE IS SPARED ON A COUNT, NOT FOREVER.
 
     The container answers perfectly; it is the object store that will not take the copy. Left
-    to raise, that escapes into the caller's catch-all, which keeps the debt WITHOUT counting the
-    attempt — so an outage lasting longer than the strikes would be retried every sweep with the
-    count frozen, and the container billed for as long as the store stayed down. The bound that
-    exists to stop exactly that only applies if this lands inside it.
+    to raise, that escapes into the caller's catch-all, which never reaches the strike test —
+    the claim still advances the count, but nothing ever compares it against the strikes, so an
+    outage lasting longer than them is retried every sweep and the container billed for as long
+    as the store stays down. The bound that exists to stop exactly that only applies if this
+    lands inside it.
 
     Mutation check: drop the `except StorageError` arm and this goes red — the routine raises
-    instead of returning, and no attempt is recorded on the row."""
+    instead of answering SPARED, and the row carries no `last_error` because the debt was never
+    kept through this path."""
     born = _born_at(10)
     await _seed_registry(fake_redis, scene.user_id, app_name=scene.app_name, created_at=born)
     client = _Sandbox()
