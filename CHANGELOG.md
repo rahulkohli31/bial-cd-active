@@ -6,9 +6,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.7.4] - 2026-09-18
 
-An application starts because you opened it and goes away because everyone left. The control
-that used to sit on a never-built project, waiting to be pressed before anything could happen,
-is gone: the first message is what brings the workspace up. Leaving is now a single event
+An application starts because you opened it and goes away because everyone left. Opening a
+project is what brings its app up, so the control that offered to launch it is now a fallback
+you meet after a failed start rather than a step on the way in. Leaving is now a single event
 however it happens — closing the tab, switching project, letting the laptop sleep, losing the
 network — and nothing asks the citizen to arbitrate what should become of the container they
 are walking away from. The applications page says which apps are starting, open or closing
@@ -41,6 +41,19 @@ down, and it says so without calling a single container.
   its work written back, its container destroyed.
 - **Nothing asks about unsaved work on the way out.** The citizen is never asked to arbitrate
   their own workspace, because nothing is lost by leaving one.
+
+### Removed
+
+- **The dialog that stopped you on the way out of a workspace holding unsaved work.** Leaving
+  is no longer a moment where work can be lost, so there is nothing to confirm: the platform
+  writes the tree back by itself. The Discard control keeps its own confirmation, because
+  discarding is still a deliberate act.
+- **The dialog asking you to arbitrate your own workspace.** Opening a second project used to
+  put a question in front of you about what should happen to the first. The switch now hands
+  the first one over by itself. A colleague's shared view sitting in your slot is still
+  refused — that one has no hand-over to perform.
+- **The navigation interception that went with them** — the guard that intercepted a navbar
+  link, the back control, and in-place navigation out of a workspace.
 
 ### Fixed
 
