@@ -301,23 +301,15 @@ export interface SaveState {
    *  stays true while this is set. What it licenses is a truer WARNING, never a claim of
    *  safety-by-saving — the rail's `saveSentence` is where that reasoning is written down. */
   recoveryAt: string | null
+  /** WHEN A PLATFORM WRITE-BACK FOR THIS APP WAS LAST REFUSED, or `null` if none ever was.
+   *
+   *  Shutdown writes the citizen's work back with nobody watching. When the tree does not descend
+   *  from what they themselves saved, the guard sets it aside and the app comes back from the
+   *  SAVED version instead — which, from the screen, looks exactly like an ordinary reopen. This
+   *  is what lets the project screen say so, and saying so is what makes removing the exit
+   *  prompts honest rather than merely quieter. */
+  writeBackRefusedAt: string | null
 }
-
-/**
- * IS THE PLATFORM HOLDING A COPY OF THIS TREE THAT IT CAN PUT BACK? Named once because three
- * surfaces ask it — the rail's sentence, the in-place exit dialog and the browser-unload prompt —
- * and three hand-written readings of one fact are three chances for them to disagree about the
- * same app in the same moment.
- *
- * ANYTHING THAT IS NOT AN ACTUAL INSTANT IS "NO", `undefined` INCLUDED, and that is the whole
- * reason this is a function rather than `!== null` written out three times. Written that way, an
- * `undefined` — a caller that never set the field, a test double that predates it, a body the
- * server did not send — reads as YES. That is the one direction this fact may never fail in:
- * every consumer uses a YES to STOP warning somebody, so an absent field would silently disarm a
- * warning about work that exists only inside a container. Absent means warn.
- */
-export const canBePutBack = (recoveryAt: string | null | undefined): boolean =>
-  typeof recoveryAt === 'string' && recoveryAt !== ''
 
 /** Two readings that say the same thing. Every field is a primitive, so this is exact rather
  *  than an approximation — and it exists so a poll that keeps reporting the same answer stops
@@ -337,7 +329,8 @@ export const sameSaveState = (a: SaveState | null, b: SaveState | null): boolean
     a.dirty === b.dirty &&
     a.containerHead === b.containerHead &&
     a.savedHead === b.savedHead &&
-    a.recoveryAt === b.recoveryAt)
+    a.recoveryAt === b.recoveryAt &&
+    a.writeBackRefusedAt === b.writeBackRefusedAt)
 
 /** Push the project's current tree to durable storage. THE USER'S CLICK — nothing else writes
  *  the bundle. A 409 means the workspace is no longer running, and is surfaced, never
@@ -635,10 +628,10 @@ export async function handOverWorkspace(
 ): Promise<void> {
   if (blocked.isSharedView) {
     // NARRATE AFTER, NOT BEFORE. A caller that reads its OWN narration callback as a record of
-    // how far the hand-over got (`StartAppControl.tsx`'s `useTakeBack`, which infers "was
-    // anything stopped?" from the last step it observed) must see NO step at all when this
-    // throws — nothing here ever stops anything, on either outcome, so a step recorded before
-    // the call would make a rejection look exactly like a successful stop of the OWNER's app.
+    // how far the hand-over got (`SharedProjectPage.tsx`, which infers "was anything stopped?"
+    // from the last step it observed) must see NO step at all when this throws — nothing here
+    // ever stops anything, on either outcome, so a step recorded before the call would make a
+    // rejection look exactly like a successful stop of the OWNER's app.
     await giveUpSharedView(deps)
     narrate('releasing')
     return
@@ -952,6 +945,8 @@ function toSaveState(body: unknown): SaveState {
     containerHead: typeof body.containerHead === 'string' ? body.containerHead : null,
     savedHead: typeof body.savedHead === 'string' ? body.savedHead : null,
     recoveryAt: typeof body.recoveryAt === 'string' ? body.recoveryAt : null,
+    writeBackRefusedAt:
+      typeof body.writeBackRefusedAt === 'string' ? body.writeBackRefusedAt : null,
   }
 }
 
@@ -1004,4 +999,111 @@ export async function discardUnsavedChanges(
     saveState: toSaveState(body),
     notice: isRecord(body) ? toDiscardNotice(body.notice) : null,
   }
+}
+
+/**
+ * WHETHER A SCREEN IS ON SCREEN, which is the whole of what the renewal below sends.
+ *
+ * A word rather than a number of seconds: the server maps it to a budget, and a client that
+ * named its own would be a client that could ask a container to live longer than the platform's
+ * ceiling allows.
+ */
+export type SurfacePresence = 'visible' | 'hidden'
+
+/**
+ * The three things a renewal can mean, mirroring the server's closed set exactly. Nothing is
+ * rendered from any of them — see `renewPresence` for why a failure here says nothing.
+ */
+export type RenewalOutcome = 'renewed' | 'not_this_container' | 'nothing_running'
+
+/** What a renewal answered, and when the container it reached hits its absolute ceiling. */
+export interface Renewal {
+  outcome: RenewalOutcome
+  /**
+   * When this container is collected no matter who is renewing it, or `null` when no ceiling
+   * applies. NULL IS NOT "SOON" — a screen that read it as imminent would announce a collection
+   * that is not coming.
+   */
+  drainingAt: string | null
+}
+
+/**
+ * Tell the platform a screen that can frame this project is still open, so its container stays.
+ *
+ * PRESENCE IS THE SIGNAL, AND SILENCE IS DEPARTURE. Nothing is sent when somebody leaves:
+ * navigating away, closing the tab, sleeping the machine and losing the network all simply stop
+ * the renewals. That is the whole mechanism — there is no departure message that can fail to
+ * arrive, and no handler on an unload path to get wrong.
+ *
+ * IT NEVER THROWS AND IT NEVER REPORTS. A renewal that could not be made says nothing about the
+ * container: 401, 403 and 503 are facts about the request, not about the app, and a screen that
+ * painted "your workspace is going away" on one would be over-claiming from an outage. A lease
+ * that genuinely lapsed reaches the citizen through `fetchPreviewState`, which is the one read
+ * allowed to say a preview is gone. The outcome is returned for callers that re-arm their poll
+ * on it, and `null` means the ask itself did not complete.
+ */
+export async function renewPresence(
+  projectId: string,
+  presence: SurfacePresence,
+  deps: AuthFetchDeps = {},
+): Promise<Renewal | null> {
+  try {
+    const res = await authFetch(
+      `${BASE}/projects/${encodeURIComponent(projectId)}/renew`,
+      {
+        method: 'POST',
+        headers: { ...JSON_HEADERS, ...csrfHeaders() },
+        body: JSON.stringify({ presence }),
+      },
+      deps,
+    )
+    if (!res.ok) return null
+    const body: unknown = await res.json().catch(() => null)
+    if (!isRecord(body)) return null
+    const outcome = body.outcome
+    if (outcome !== 'renewed' && outcome !== 'not_this_container' && outcome !== 'nothing_running') {
+      return null
+    }
+    return {
+      outcome,
+      drainingAt: typeof body.drainingAt === 'string' ? body.drainingAt : null,
+    }
+  } catch {
+    return null
+  }
+}
+
+/** One app's activity, as the applications page reads it. */
+export type ActivityPhase = 'starting' | 'open' | 'closing'
+
+export interface ProjectActivity {
+  projectId: string
+  phase: ActivityPhase
+}
+
+const ACTIVITY_PHASES: ReadonlySet<string> = new Set(['starting', 'open', 'closing'])
+
+/**
+ * Which of this citizen's apps are starting, open right now, or closing down.
+ *
+ * IT THROWS RATHER THAN ANSWERING EMPTY. An empty list is a positive statement that nothing is
+ * happening, and the page clears every marker on it — so a read that could not be made must reach
+ * the caller as a failure, where the existing markers are held, rather than as an answer.
+ */
+export async function fetchActivity(deps: AuthFetchDeps = {}): Promise<ProjectActivity[]> {
+  const res = await authFetch(`${BASE}/activity`, {}, deps)
+  if (!res.ok) throw await readApiError(res, 'Could not check what is running')
+  const body: unknown = await res.json().catch(() => null)
+  if (!isRecord(body) || !Array.isArray(body.projects)) {
+    throw new ApiError('Could not check what is running', res.status)
+  }
+  const rows: ProjectActivity[] = []
+  for (const raw of body.projects) {
+    if (!isRecord(raw)) continue
+    const { projectId, phase } = raw
+    if (typeof projectId !== 'string' || typeof phase !== 'string') continue
+    if (!ACTIVITY_PHASES.has(phase)) continue
+    rows.push({ projectId, phase: phase as ActivityPhase })
+  }
+  return rows
 }

@@ -130,6 +130,10 @@ export interface AppListRowProps {
   trailing: React.ReactNode
   /** One DOM handle per surface, so a suite can tell an owner's row from a recipient's. */
   testId: string
+  /** OPTIONAL, unlike `trailing`. Rendered beside the name, never inside `columns` — the owner's
+   *  list is the only caller that ever has one; the recipient's `SharedAppRow` passes nothing and
+   *  renders exactly as it did before this prop existed. */
+  marker?: React.ReactNode
 }
 
 export default function AppListRow({
@@ -139,6 +143,7 @@ export default function AppListRow({
   columns,
   trailing,
   testId,
+  marker,
 }: AppListRowProps): React.JSX.Element {
   return (
     <div
@@ -148,7 +153,12 @@ export default function AppListRow({
       <div className="min-w-0 flex-1">
         {/* The open affordance. Its ::after covers the row, so the whole row is the target
             without the row itself being interactive. */}
-        <ClampedName name={name} onOpen={onOpen} />
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="min-w-0 flex-1">
+            <ClampedName name={name} onOpen={onOpen} />
+          </div>
+          {marker}
+        </div>
         <ClampedDescription text={description} onOpen={onOpen} />
       </div>
 

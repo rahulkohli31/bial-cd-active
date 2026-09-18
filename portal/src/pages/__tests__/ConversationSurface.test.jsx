@@ -1,13 +1,8 @@
 /**
  * WHAT THIS FILE ITSELF CLAIMS — properties true of the surface as a WHOLE, not any one behaviour:
  * a running turn stays STOPPABLE now the old stop card is gone; exactly ONE control starts a
- * build; exactly ONE scroll container in the chat slot and no `calc(100vh - …)` anywhere; no chat
- * list crept back during the rewrite; and the save-state tri-state reaches the shell UNCOLLAPSED
- * (`null` as `null`).
- *
- * The last one matters most: `WorkspaceShell.test.tsx` covers what the guard does with
- * `true`/`false`/`null`, but not whether THIS surface hands it a `null` at all, or quietly turns
- * one into a boolean on the way past. This file does.
+ * build; exactly ONE scroll container in the chat slot and no `calc(100vh - …)` anywhere; and no
+ * chat list crept back during the rewrite.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, waitFor, cleanup, within, fireEvent } from '@testing-library/react'
@@ -199,73 +194,6 @@ describe('no chat list came back while the pages were being rewritten', () => {
   })
 })
 
-describe('the save-state TRI-STATE is published uncollapsed', () => {
-  /** Ask the browser to leave, and report whether anything objected. */
-  const tryToLeave = () => {
-    const event = new Event('beforeunload', { cancelable: true })
-    window.dispatchEvent(event)
-    return event.defaultPrevented
-  }
-
-  it('a definite `true` reaches the shell and arms the guard', async () => {
-    h.fetchSaveState.mockResolvedValue({ dirty: true })
-    renderBuilder({ deps: deps().deps })
-    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalled())
-    await waitFor(() => expect(tryToLeave()).toBe(true))
-  })
-
-  it('a definite `false` does not', async () => {
-    h.fetchSaveState.mockResolvedValue({ dirty: false })
-    renderBuilder({ deps: deps().deps })
-    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalled())
-    expect(tryToLeave()).toBe(false)
-  })
-
-  it('★ carries the RECOVERY INSTANT with the flag, and it is what disarms the prompt', async () => {
-    // THE PRODUCER HOP OF THE REPORTED BUG. `refreshSaveState` read the save state and kept
-    // `state.dirty` alone, dropping the instant that says the platform can put this tree back —
-    // so a citizen who described an app, watched it get built and touched nothing got the
-    // browser's unload prompt over work they had never done.
-    //
-    // TWO RUNS, ONE FIELD APART, AND THE FIRST IS THE CONTROL: it proves this wait is long enough
-    // for a reading to reach the shell at all, which is the only thing that makes the second
-    // run's silence mean anything. Without it a publish that never happened would read as a pass.
-    //
-    // MUTATION RECEIPT: drop `recoveryAt: state.recoveryAt` from `refreshSaveState` and the
-    // second half goes red — the instant never reaches the channel and the prompt arms again.
-    h.fetchSaveState.mockResolvedValue({ dirty: true, recoveryAt: null })
-    renderBuilder({ deps: deps().deps })
-    await waitFor(() => expect(tryToLeave()).toBe(true))
-    cleanup()
-
-    h.fetchSaveState.mockClear()
-    h.fetchSaveState.mockResolvedValue({ dirty: true, recoveryAt: '2026-09-10T10:38:43Z' })
-    renderBuilder({ deps: deps().deps })
-    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalled())
-    await waitFor(() => expect(tryToLeave()).toBe(false))
-
-    // …and NOTHING here claims the work was saved. `dirty` is still true, Save is still the
-    // citizen's own act, and the only thing that changed is that leaving stopped being treated as
-    // a way to lose something the platform can put back.
-    expect(screen.queryByText(/no unsaved|nothing unsaved|all saved|up to date/i)).toBeNull()
-  })
-
-  it('an UNKNOWN stays unknown — it is not collapsed into either boolean', async () => {
-    // THE CASE THAT MATTERS, and the one this surface could break on its own. `null` means "we
-    // could not check", never "clean": collapsing it to `false` reports the work as safe when
-    // nobody asked the question, and collapsing it to `true` arms a browser prompt with nothing
-    // answerable behind it. The read FAILS here, which is exactly how a `null` arises in
-    // production.
-    h.fetchSaveState.mockRejectedValue(new Error('the workspace could not be reached'))
-    renderBuilder({ deps: deps().deps })
-    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalled())
-
-    expect(tryToLeave()).toBe(false)
-    // …and nothing on screen claims the work IS saved, which is the other half of the failure.
-    expect(screen.queryByText(/no unsaved|nothing unsaved|all saved|up to date/i)).toBeNull()
-  })
-})
-
 describe('the per-conversation guardrail reaches the composer', () => {
   // ★ WHY THIS FILE AND NOT A UNIT TEST: `contextLimits.ts` and `Composer`'s rendering of the
   // prop are BOTH unit-tested, and both stayed green while the one line joining them was
@@ -332,17 +260,17 @@ describe('the per-conversation guardrail reaches the composer', () => {
   })
 })
 
-describe('the offer\'s Build reaches the SAME hand-over dialog as the composer', () => {
-  it('opens the shell\'s dialog naming both projects, in citizen language', async () => {
-    // THE THIRD DOOR: three presses can be refused because another project holds the one
-    // workspace — a rail send, the pane's start control, and this one — and this is the one of
-    // the three with no coverage elsewhere, proving it converges on the SAME dialog rather than
-    // degrading silently.
+describe('the offer\'s Build opens no question either', () => {
+  it('★ reports a refusal in the server\'s own words, and puts nothing up to be answered', async () => {
+    // THE THIRD DOOR: three presses can meet a refusal about the one workspace — a rail send, the
+    // pane's start control, and this one — and this is the one of the three with no coverage
+    // elsewhere. What it proves is that it degrades the same way they do: a sentence, not a
+    // dialog, because the workspace follows whichever project asked for it.
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Here is the plan.', PLAN_CARD_ID)))
     h.buildFromPlan.mockRejectedValue(
-      Object.assign(new Error('“Car pool” is still open.'), {
+      Object.assign(new Error('“Car pool” is open for a colleague right now.'), {
         code: 'sandbox_reclaim_blocked',
-        details: { projectId: 'pA', projectName: 'Car pool', dirty: false, building: false },
+        details: { projectId: 'pA', projectName: 'Car pool', dirty: false, building: false, isSharedView: true },
       }),
     )
     renderBuilder({ deps: deps().deps })
@@ -350,15 +278,12 @@ describe('the offer\'s Build reaches the SAME hand-over dialog as the composer',
 
     fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
 
-    const dialog = await screen.findByRole('dialog')
-    const text = dialog.textContent ?? ''
-    // The SAME two names the rail's own scenario asserts (HandoverAtSubmit.test.tsx): the app
-    // being started leads, and the one in the way is named so the choice is about something.
-    expect(text).toContain('VIP Movement')
-    expect(text).toContain('Car pool')
-    for (const word of [/container/i, /sandbox/i, /workspace slot/i, /session/i, /409/]) {
-      expect(text, String(word)).not.toMatch(word)
-    }
+    // The server's sentence reaches the citizen where they are standing…
+    await waitFor(() =>
+      expect(screen.getByRole('alert').textContent).toContain('“Car pool” is open for a colleague right now.'),
+    )
+    // …and nothing was put to them to decide.
+    expect(screen.queryByRole('dialog')).toBeNull()
   })
 })
 

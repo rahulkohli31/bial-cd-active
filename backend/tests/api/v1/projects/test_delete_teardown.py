@@ -1191,10 +1191,13 @@ async def test_a_raising_redis_during_the_reap_is_logged_and_the_delete_still_su
 async def test_an_arm_delete_that_raises_keeps_the_registry_entry_for_a_later_sweep(
     app: Any, client: AsyncClient, db_session: AsyncSession, fake_redis: Any
 ) -> None:
-    # `reap_user`'s failure arm, reached through this route: KEEP the registry so a later sweep
-    # retries — clearing it would orphan a container that is still standing, which is the one
-    # state nothing can ever find again. `strict=False` is what keeps the raise inside the
-    # reaper instead of at a delete that has already committed.
+    # `reap_user`'s failure arm, reached through this route. The deletion becomes a debt: the
+    # owed-row ledger takes it where it can, and where it CANNOT — no app owns the container, or
+    # the record cannot say which instance it is — the registry stays exactly where it was so a
+    # later sweep retries through it. That is this case: the project row is gone by the time the
+    # teardown raises, so nothing can take the debt and sparing is the only honest answer.
+    # `strict=False` is what keeps the raise inside the reaper rather than at a delete that has
+    # already committed.
     from src.services.sandbox import SandboxError
     from tests.fakes import FakeSandboxClient
 
@@ -1216,7 +1219,7 @@ async def test_an_arm_delete_that_raises_keeps_the_registry_entry_for_a_later_sw
     survivor = await fake_redis.hgetall(_registry(user.id))
     assert survivor[REGISTRY_FIELD_APP_NAME] == _named(app_row.id)
     assert any(
-        e.get("event") == "reaper teardown failed; leaving state for a later sweep"
+        e.get("event") == "reaper teardown failed; the deletion is now a debt this platform owes"
         for e in captured
     )
 

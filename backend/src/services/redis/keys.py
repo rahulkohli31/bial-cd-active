@@ -4,21 +4,23 @@ These key strings are a **byte-stable cross-track contract**, built only through
 `ns()` choke point — a hand-written key drifts a prefix invisible to another track. Builders take
 `uuid.UUID` and enforce it at RUNTIME: a UUID cannot contain a `:`, so the type IS the boundary.
 
-Five sandbox families share the environment-scoped root `bial:{environment}:sandbox:`:
+Six sandbox families share the environment-scoped root `bial:{environment}:sandbox:` — five
+keyed by user, and one, the cooperative stop, keyed by conversation:
 
     lock:{user_id}       string — one-per-user lock (SET NX EX)
     heartbeat:{user_id}  string — idle timer (presence = active)
     registry:{user_id}   hash   — see REGISTRY_FIELD_* below
     lease:{user_id}      string — liveness lease (epoch seconds, TTL mandatory)
     starting:{user_id}   string — start-in-flight marker (project id, TTL mandatory)
+    stop:{conversation_id} string — cooperative stop ask (TTL mandatory)
 
-A SEVENTH DOMAIN, `bial:{environment}:lake:`, holds the connector data-plane copy — parquet
+AN EIGHTH DOMAIN, `bial:{environment}:lake:`, holds the connector data-plane copy — parquet
 bytes and the index that orders them. It is DELIBERATELY NOT under `sandbox:`: that segment is
 reserved for sandbox LIFECYCLE state, a fleet sweep scans it and deletes Azure containers on the
 strength of what it finds, and a family of file blobs sitting in the middle of that would be
 read by a reader who assumed everything below `sandbox:` describes a container.
 
-A sixth family, taskiq's queue in `src/broker.py`, sits under `bial:` but outside `sandbox:` —
+A seventh family, taskiq's queue in `src/broker.py`, sits under `bial:` but outside `sandbox:` —
 `bial:{env}:taskiq:stream`, where those braces are a literal Redis hash tag, not a placeholder.
 Only the library-derived `autoclaim:<group>:<stream>` lock has a literal prefix outside `bial:`.
 There is deliberately NO `:channel` family — single-replica means build progress is in-process.
@@ -66,6 +68,7 @@ FAMILY_HEARTBEAT: Final = "heartbeat"
 FAMILY_REGISTRY: Final = "registry"
 FAMILY_LEASE: Final = "lease"
 FAMILY_STARTING: Final = "starting"
+FAMILY_COOPERATIVE_STOP: Final = "stop"
 
 # The two lake families. `file` holds one copied parquet file's BYTES; `index` is the single
 # sorted set that orders every copied file by when it was copied, and is what the trim walks.
@@ -157,6 +160,23 @@ def starting_key(user_id: uuid.UUID) -> str:
     DELIBERATELY NOT A REGISTRY FIELD: written before a container exists, it would read as a
     live container that is not there, and get spared rather than collected."""
     return ns(FAMILY_STARTING, user_id)
+
+
+def cooperative_stop_key(conversation_id: uuid.UUID) -> str:
+    """`bial:{env}:sandbox:stop:{conversation_id}` — the cooperative stop ask (family 6).
+
+    KEYED BY CONVERSATION, the one family here that is not keyed by user, and that is the whole
+    reason it exists rather than riding an existing key. The liveness lease above is per USER, so
+    a user-keyed ask would be read by whichever of that citizen's turns looked first — including
+    the incoming project's fresh turn, which is the one turn it must never stop.
+
+    PRESENCE IS THE ASK; the value records when it was raised, for an operator reading the key.
+    It **must** carry a TTL and is consumed on read: an ask that outlives the turn it was aimed
+    at would end the citizen's next message in the same conversation at its first tool result.
+
+    `ns` names its parameter for the user-keyed families that came first; a conversation id is a
+    `uuid.UUID` and passes the same segment guard, which is what that guard is actually for."""
+    return ns(FAMILY_COOPERATIVE_STOP, conversation_id)
 
 
 def legacy_registry_key(user_id: uuid.UUID) -> str:

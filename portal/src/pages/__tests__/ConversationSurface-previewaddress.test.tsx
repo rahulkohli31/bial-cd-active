@@ -527,20 +527,18 @@ describe('BuilderPage — the project arm, and the hard load it exists for', () 
     view.unmount()
   })
 
-  it('a `slot_taken` answer frames NOTHING, and the held arm renders instead', async () => {
-    // The arm's contract is `alive` and nothing else. Another project is holding the one slot, so
-    // there is no framable URL — and the pane says so rather than framing a guess.
+  it('a `slot_taken` answer frames NOTHING, and reads as the saved app it is', async () => {
+    // The arm's contract is `alive` and nothing else. Another of this citizen's projects is
+    // holding the one slot, so there is no framable URL — and the pane says so rather than framing
+    // a guess. What it says is the ordinary saved sentence: the workspace follows whichever
+    // project is asked for, so a held slot is a switch away rather than a negotiation.
     h.fetchPreviewState.mockResolvedValue(polled('slot_taken', true))
 
     const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA', deps: deps() })
 
     await waitFor(() => expect(screen.queryByTestId('app-pane-empty')).not.toBeNull())
-    // ★ ONE HELD ARM NOW, WHATEVER THE SERVER COULD ATTRIBUTE. This read to `held-unattributed`,
-    // a second held state offering `action` and `secondAction` both null — a card that named the
-    // problem, named no remedy and left nothing to press at all. A missing holder name is a reason
-    // to say LESS, not to DO less, so the merge keeps the take-back and degrades only the sentence.
     expect(screen.getByTestId('app-pane-empty').getAttribute('data-workspace-state'))
-      .toBe('held-by-another-project')
+      .toBe('not-running')
     expect(frame()).toBeNull()
     view.unmount()
   })

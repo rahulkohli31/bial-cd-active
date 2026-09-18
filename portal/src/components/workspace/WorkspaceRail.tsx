@@ -20,7 +20,9 @@ import type { Project } from '../../utils/projectApi'
  * rename control (all surrendered to the toolbar row the shell draws above both columns), the
  * recents list (deleted by the owner's ruling), and the application's data access, status and
  * description — each of which now has a home in that application's settings, reachable from the
- * toolbar's menu and from the home list alike.
+ * toolbar's menu and from the home list alike. Nor what the platform owes the citizen about their
+ * app's life — its ceiling and a refused write-back are stated in the pane column, so that a
+ * citizen mid-conversation is told, and a column that is a chat's empty state cannot reach them.
  */
 export interface WorkspaceRailProps {
   project: Project

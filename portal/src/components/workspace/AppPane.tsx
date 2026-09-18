@@ -16,27 +16,23 @@
  * at all, and after the serving stamp it takes exactly one name to mount the frame — see `frameIt`.
  *
  * The pane is a cross-origin iframe whose tab sequence and focus belong to the framed app, so a way
- * past it must live outside it. The take-back's sequence and dialog mount here because this is what
- * outlives their wait: the controls that start it live inside `NoFrame` and stop rendering the
- * instant the state moves, so a dialog owned by one of them would vanish mid-sequence. The dialog
- * is drawn OUTSIDE the section, which carries `aria-hidden` and `inert` whenever no surface wants
- * the pane; inside it the modal would be announced as absent and unreachable by keyboard.
+ * past it must live outside it.
  *
  * ACA wildcard DNS answers for a hostname whose container is gone, so a framed URL can resolve to a
  * host serving nothing; the workspace state draws the empty, stopped and gone states, not the origin.
  */
 import { memo, useCallback, useEffect, useState } from 'react'
-import { Box, FolderOpen, Locate, Play, WifiOff, type LucideIcon } from 'lucide-react'
+import { Box, Locate, Play, WifiOff, type LucideIcon } from 'lucide-react'
 import AppPaneHost from './AppPaneHost'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 import { inertWhile, usePaneLeaving } from './paneExit'
-import StartAppControl, { useTakeBack, type TakeBack } from './StartAppControl'
-import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
+import StartAppControl from './StartAppControl'
 import type { DeviceName } from './devices'
 import { WORKSPACE_RAIL_ID } from './railId'
+import WorkspaceLifecycleNotes from './WorkspaceLifecycleNotes'
 import {
   useWorkspaceAddress,
-  useWorkspaceHeading,
+  useWorkspaceLifecycle,
   useWorkspacePaneVisible,
   useWorkspaceReport,
 } from './workspaceChannel'
@@ -52,20 +48,14 @@ import type { WorkspaceStateName } from './workspaceState'
  * ONE ENTRY IS `null` AND IT IS AN ANSWER, NOT A GAP. `running` draws no card at all — the frame
  * IS the state — so there is nothing for a mark to sit above.
  *
- * IT USED TO BE SEVEN NULLS, WHICH WAS THE SAME DRIFT THE FRAME VETO HAD. Four of the seven named
- * states the ten-to-five collapse deleted outright, and `running` is the one that keeps its null.
- * The last two draw a real card — a real headline, a real detail, real buttons — and stood there
- * bare. Both now carry the mark THIS PRODUCT ALREADY USES for what they are, which is neither
- * borrowing one of the three boards' marks nor inventing a vocabulary: `ReclaimWorkspaceDialog`
- * draws `FolderOpen` for the project holding the workspace, and `LivePreview` draws `WifiOff` for
- * the platform having lost touch with what it was watching.
+ * `could-not-read` BORROWS NOTHING AND INVENTS NOTHING: `LivePreview` already draws `WifiOff` for
+ * the platform having lost touch with what it was watching, which is what that state is.
  */
 const STATE_GLYPH: Readonly<Record<WorkspaceStateName, LucideIcon | null>> = {
   'never-built': Locate, // NothingBuilt — the ticked circle, the same mark the rail's Plan picker has
   'not-running': Play, // PreviewOff — "Your app is saved", and the press that brings it back
   starting: Box, // PreviewStarting — "Setting up somewhere for it to run"
   running: null, // The frame is up; this pane draws no card at all.
-  'held-by-another-project': FolderOpen, // The other project that is holding the one workspace
   'could-not-read': WifiOff, // The read itself never came back — see `couldNotRead` in the map
 }
 
@@ -92,22 +82,11 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
   // ZERO IN BOTH DIRECTIONS, because this column sits in a flex row above the stacking threshold
   // and a flex COLUMN below it — a width alone leaves a full-height band under a stacked rail.
   const visible = useWorkspacePaneVisible()
-  // THE TAKE-BACK'S WHOLE SEQUENCE — held here because this is what outlives it. See the docblock.
-  // `null` when nobody has computed a state; the hook is unconditional, as hooks are.
-  //
-  // THE WHOLE REPORT, NOT ITS HANDLERS: the hook reads `projectId` off it to know whose sequence
-  // it is holding, and a pane that outlives a navigation would otherwise carry one project's
-  // dialog and busy flag onto the next.
-  const takeBack = useTakeBack(report)
-  // THE APP THE CITIZEN IS TRYING TO OPEN — the framing half the dialog leads with. Published by
-  // the routes (`ProjectPage` / `ChatRoute`), not by the surfaces, so it is read from the channel
-  // rather than derived here. `null` before a project's own fetch lands, and the dialog then falls
-  // back to its plain phrasing rather than quoting an empty string.
-  const heading = useWorkspaceHeading()
   // THE EXIT THE BOARD DRAWS, and the reason it needs a state of its own: see `paneExit.ts`. This
   // column is the outermost thing that collapses, so the hold is decided here and handed to the
   // host — the two must not disagree about whether they are still on their way out.
   const leaving = usePaneLeaving(visible)
+  const lifecycle = useWorkspaceLifecycle()
 
   // THE FRAME MOUNTS IF AND ONLY IF THE PLATFORM HAS PROOF THE APP SERVED, and `running` is the
   // only name that carries that proof: the wire's `alive` is now gated on a stamp written where
@@ -115,13 +94,10 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
   // been SCHEDULED. The eight seconds a citizen spent reading "This app isn't running right now"
   // INSIDE this pane on 2026-09-10 are the distance between those two meanings.
   //
-  // IT REPLACES A FIVE-MEMBER VETO SET WITH EXCEPTIONS WRITTEN BESIDE IT, and the shape is the
-  // point rather than the line count: a list of the states that withhold the frame has to be
-  // revisited every time the map grows, and every exception on it is one more judgement about a
-  // state whose meaning can move underneath it — which is how a list of names drifts away from
-  // the question it was answering. A rule cannot fall behind. Every state but one withholds, and
-  // none of them needs an entry anywhere to do it: the three start outcomes that used to need an
-  // exception are gone from the map entirely, and so is the second held state that needed a member.
+  // IT IS A RULE, NOT A LIST OF STATES THAT WITHHOLD THE FRAME, and the shape is the point rather
+  // than the line count: a list has to be revisited every time the map grows, and every entry on
+  // it is one more judgement about a state whose meaning can move underneath it. A rule cannot
+  // fall behind. Every state but one withholds, and none of them needs an entry anywhere to do it.
   //
   // AND ONLY A VERDICT MOVES THE FRAME — the invariant this pane has always kept, restated as a
   // rule about EVIDENCE rather than as a name on an exception list: an unreadable read must never
@@ -160,151 +136,121 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
   }, [])
 
   return (
-    <>
-      <section
-        data-testid="app-pane-region"
-        aria-label="Your app"
-        // ANNOUNCED AS GONE THE MOMENT IT IS UNWANTED, even while it is still on its way out. The
-        // movement is for the eye; a reader who is not watching it should not be told about an app
-        // that is leaving.
-        aria-hidden={!visible}
-        // AND OUT OF REACH ON THE SAME FACT, from the same moment. `aria-hidden` is the half a
-        // screen reader obeys; this is the half a keyboard obeys, and they are given one condition
-        // so they cannot come apart.
-        //
-        // IT IS THE LEAVE THAT NEEDS IT. At rest the pane is `visibility:hidden`, which drops its
-        // subtree from the tab order on its own — but the column holds its SIZE for one animation so
-        // the card can be watched going, and an invisible element has nothing to animate. For that
-        // quarter of a second the skip control below and the framed app were both still one Tab
-        // away, on a region already announced as gone. See `paneExit.ts` for the empty string.
-        {...inertWhile(!visible)}
-        className={
-          visible
-            ? 'flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden'
-            : leaving
-              ? // ON ITS WAY OUT. The column keeps its size for one animation while the card slides
-                // right and fades — `w-0` here instead would make the keyframe unobservable, which
-                // is why the utility existed unused. The rail beside it is already growing, which
-                // is the board's "the conversation is already settling towards the middle of the
-                // window".
-                'flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden animate-pane-leave'
-              : // Hidden, never unmounted — the whole point of the sibling host is that leaving a
-                // build chat for a plan chat must not re-issue the frame's `src`.
-                `w-0 h-0 flex-shrink-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`
-        }
+    <section
+      data-testid="app-pane-region"
+      aria-label="Your app"
+      // ANNOUNCED AS GONE THE MOMENT IT IS UNWANTED, even while it is still on its way out. The
+      // movement is for the eye; a reader who is not watching it should not be told about an app
+      // that is leaving.
+      aria-hidden={!visible}
+      // AND OUT OF REACH ON THE SAME FACT, from the same moment. `aria-hidden` is the half a
+      // screen reader obeys; this is the half a keyboard obeys, and they are given one condition
+      // so they cannot come apart.
+      //
+      // IT IS THE LEAVE THAT NEEDS IT. At rest the pane is `visibility:hidden`, which drops its
+      // subtree from the tab order on its own — but the column holds its SIZE for one animation so
+      // the card can be watched going, and an invisible element has nothing to animate. For that
+      // quarter of a second the skip control below and the framed app were both still one Tab
+      // away, on a region already announced as gone. See `paneExit.ts` for the empty string.
+      {...inertWhile(!visible)}
+      className={
+        visible
+          ? 'flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden'
+          : leaving
+            ? // ON ITS WAY OUT. The column keeps its size for one animation while the card slides
+              // right and fades — `w-0` here instead would make the keyframe unobservable, which
+              // is why the utility existed unused. The rail beside it is already growing, which
+              // is the board's "the conversation is already settling towards the middle of the
+              // window".
+              'flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden animate-pane-leave'
+            : // Hidden, never unmounted — the whole point of the sibling host is that leaving a
+              // build chat for a plan chat must not re-issue the frame's `src`.
+              `w-0 h-0 flex-shrink-0 overflow-hidden ${HIDDEN_BUT_MOUNTED}`
+      }
+    >
+      {/* VISIBLE ON FOCUS ONLY. It is the standard skip-link treatment: out of the way for a
+          pointer, and the first thing a keyboard reaches on its way into the frame. */}
+      <button
+        type="button"
+        onClick={skipPastTheApp}
+        className="sr-only focus:not-sr-only focus:absolute focus:z-30 focus:m-2 focus:rounded-lg focus:bg-white focus:px-3 focus:py-2 focus:text-sm focus:font-semibold focus:text-primary focus:shadow-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
       >
-        {/* VISIBLE ON FOCUS ONLY. It is the standard skip-link treatment: out of the way for a
-            pointer, and the first thing a keyboard reaches on its way into the frame. */}
-        <button
-          type="button"
-          onClick={skipPastTheApp}
-          className="sr-only focus:not-sr-only focus:absolute focus:z-30 focus:m-2 focus:rounded-lg focus:bg-white focus:px-3 focus:py-2 focus:text-sm focus:font-semibold focus:text-primary focus:shadow-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
-        >
-          Skip past your app
-        </button>
+        Skip past your app
+      </button>
 
-        {/* THE COLLAPSE CONTROL IS NOT HERE ANY MORE. It moved to the toolbar row, which is drawn
-            once above the two-column grid. Here it was already better than living inside the rail
-            it hides — a collapsed rail is invisible and untabbable, so a toggle in it is a one-way
-            door — but it still appeared and disappeared with the pane. In the row it has one home
-            in every state, beside the title that now also survives a collapse. */}
+      {/* WHAT THE PLATFORM OWES THE CITIZEN ABOUT THIS APP'S LIFE, above whatever the column is
+          showing and outside it. It belongs to the APP, not to the frame or to the card standing
+          in for one, so it is said once here and reads the same whether the address is a project
+          or a chat — this column is a sibling of the `<Outlet/>`, so a route change never reaches
+          it. It draws nothing at all when there is nothing to say, which is the ordinary case. */}
+      <WorkspaceLifecycleNotes
+        drainingAt={lifecycle.drainingAt}
+        writeBackRefusedAt={lifecycle.writeBackRefusedAt}
+      />
 
-        {/* THE PANE'S LIVE REGION, MOUNTED UNCONDITIONALLY AND WRAPPING ITS CONTENT.
+      {/* THE COLLAPSE CONTROL IS NOT HERE ANY MORE. It moved to the toolbar row, which is drawn
+          once above the two-column grid. Here it was already better than living inside the rail
+          it hides — a collapsed rail is invisible and untabbable, so a toggle in it is a one-way
+          door — but it still appeared and disappeared with the pane. In the row it has one home
+          in every state, beside the title that now also survives a collapse. */}
 
-            IT USED TO LIVE INSIDE THE ROW THAT DRAWS THE BUTTONS, which meant the one state with a
-            wait in it and no button — `starting`, whose `action` is `null` — had NO REGION AT ALL.
-            A citizen sat through a two-minute sandbox start with nothing said, entering or leaving.
-            That is the whole defect, and moving this element out of `NoFrame`'s
-            `state.action &&` block is the whole of the fix: the region is now born with the pane,
-            holds whatever the board is saying, and outlives every transition between boards.
+      {/* THE PANE'S LIVE REGION, MOUNTED UNCONDITIONALLY AND WRAPPING ITS CONTENT.
 
-            IT WRAPS THE EMPTY-PANE CONTENT AND POINTEDLY NOT THE FRAMED HOST. `LivePreview` keeps
-            its own permanent region and speaks for every framed state; wrapping the host as well
-            would put a second polite region around the first and announce the cover, the stall and
-            the reveal twice — the exact duplication `LivePreview`'s own docblock forbids. The two
-            regions divide the pane between them: this one owns the states with no app in them.
+          IT USED TO LIVE INSIDE THE ROW THAT DRAWS THE BUTTONS, which meant the one state with a
+          wait in it and no button — `starting`, whose `action` is `null` — had NO REGION AT ALL.
+          A citizen sat through a two-minute sandbox start with nothing said, entering or leaving.
+          That is the whole defect, and moving this element out of `NoFrame`'s
+          `state.action &&` block is the whole of the fix: the region is now born with the pane,
+          holds whatever the board is saying, and outlives every transition between boards.
 
-            SO WHEN THE APP IS FRAMED THIS ELEMENT IS EMPTY, and it keeps standing anyway. A live
-            region inserted together with its text announces inconsistently — the convention stated
-            at `LivePreview.tsx` and at `TurnBanner.tsx` — so it must exist before it has anything
-            to say. Empty, its only child is absolutely positioned, so it occupies no height and the
-            host beside it is unaffected. */}
-        <div
-          data-testid="app-pane-live"
-          role="status"
-          aria-live="polite"
-          // NO `aria-busy` HERE, DELIBERATELY. The wait's busy flag goes on the board that draws
-          // the wait (see `NoFrame`), because `aria-busy` on a live region tells a reader to hold
-          // its announcements until the busy clears — which would silence the very "entering the
-          // wait" announcement this region exists to make.
-          // THE PANE'S OWN MARGIN IS THE APP'S TO HAVE — a hairline gutter, no more. The card
-          // inside already carries a border and a shadow, so anything wider is the frame drawn
-          // twice at the app's expense.
-          className={frameIt ? '' : 'flex min-h-0 flex-1 flex-col px-2 pb-2 pt-2'}
-        >
-          {!frameIt && (
-            // THE EMPTY PANE IS A NAMED REGION WITH A CARD IN IT, which is what every state but
-            // `running` draws.
-            //
-            // NO CAPTION ABOVE IT, DELIBERATELY: the card already says what the blank half of the
-            // screen is for ("Describe what you want to build."), and a heading repeating that
-            // would answer one question twice at the cost of a row of the app's own height. The
-            // section's accessible label carries the name instead.
-            <div className="flex min-h-0 flex-1 overflow-hidden rounded-xl border border-canvas-rule bg-white shadow-app-card">
-              <NoFrame report={report} takeBack={takeBack} />
-            </div>
-          )}
-          {/* WHAT A TAKE-BACK THAT WORKED DID TO THE OTHER PROJECT.
+          IT WRAPS THE EMPTY-PANE CONTENT AND POINTEDLY NOT THE FRAMED HOST. `LivePreview` keeps
+          its own permanent region and speaks for every framed state; wrapping the host as well
+          would put a second polite region around the first and announce the cover, the stall and
+          the reveal twice — the exact duplication `LivePreview`'s own docblock forbids. The two
+          regions divide the pane between them: this one owns the states with no app in them.
 
-              THE FAILURE ARM ALREADY HAD A SENTENCE and it is NOT produced here: the map writes it
-              onto `state.note` and the board above renders it, and it announces now purely because
-              this region moved. A second producer for it would be the same news said twice.
+          SO WHEN THE APP IS FRAMED THIS ELEMENT IS EMPTY, and it keeps standing anyway. A live
+          region inserted together with its text announces inconsistently — the convention stated
+          at `LivePreview.tsx` and at `TurnBanner.tsx` — so it must exist before it has anything
+          to say. Empty, its only child is absolutely positioned, so it occupies no height and the
+          host beside it is unaffected. */}
+      <div
+        data-testid="app-pane-live"
+        role="status"
+        aria-live="polite"
+        // NO `aria-busy` HERE, DELIBERATELY. The wait's busy flag goes on the board that draws
+        // the wait (see `NoFrame`), because `aria-busy` on a live region tells a reader to hold
+        // its announcements until the busy clears — which would silence the very "entering the
+        // wait" announcement this region exists to make.
+        // THE PANE'S OWN MARGIN IS THE APP'S TO HAVE — a hairline gutter, no more. The card
+        // inside already carries a border and a shadow, so anything wider is the frame drawn
+        // twice at the app's expense.
+        className={frameIt ? '' : 'flex min-h-0 flex-1 flex-col px-2 pb-2 pt-2'}
+      >
+        {!frameIt && (
+          // THE EMPTY PANE IS A NAMED REGION WITH A CARD IN IT, which is what every state but
+          // `running` draws.
+          //
+          // NO CAPTION ABOVE IT, DELIBERATELY: the card already says what the blank half of the
+          // screen is for ("Describe what you want to build."), and a heading repeating that
+          // would answer one question twice at the cost of a row of the app's own height. The
+          // section's accessible label carries the name instead.
+          <div className="flex min-h-0 flex-1 overflow-hidden rounded-xl border border-canvas-rule bg-white shadow-app-card">
+            <NoFrame report={report} />
+          </div>
+        )}
+      </div>
+      {/* THE FRAME IS THE HOST'S. Everything from the frame inward — the cover that holds on an
+          unknown, the `load`-gated reveal, the frame key, the inbound-message gate on origin AND
+          source, the sandbox token list — is unchanged and stays there. The device WIDTH is the
+          shell's now, because the control that picks it is in the row, and it is passed through
+          rather than held: two owners of one width is how the card and the switcher disagree.
 
-              THE SUCCESS ARM HAD NOTHING, which is the half this adds. A take-back that works ends
-              with the other citizen's app stopped and this pane quietly framing an app — so the
-              person who pressed it learned nothing at all about what they had just taken. It is
-              `sr-only` because on this ending the pane is showing the running app: there is no card
-              left to put a sentence in, and a line floating over the frame would be the pane
-              talking about itself. Nothing else on screen says it, so this is not a duplicate. */}
-          {takeBack.outcome !== null && <p className="sr-only">{takeBack.outcome}</p>}
-        </div>
-        {/* THE FRAME IS THE HOST'S. Everything from the frame inward — the cover that holds on an
-            unknown, the `load`-gated reveal, the frame key, the inbound-message gate on origin AND
-            source, the sandbox token list — is unchanged and stays there. The device WIDTH is the
-            shell's now, because the control that picks it is in the row, and it is passed through
-            rather than held: two owners of one width is how the card and the switcher disagree.
-
-            IT DRAWS ITS OWN CARD — `LivePreview` frames the iframe in a padded `#e8edf2` box with a
-            rounded, shadowed white surround — which is why the card above is on the EMPTY arm only.
-            A second card around the first would be two borders and two shadows on one app. */}
-        {frameIt && <AppPaneHost device={device} reloadNonce={reloadNonce} leaving={leaving} />}
-      </section>
-      {/* THE TAKE-BACK IS ROUTED THROUGH THE DIALOG THAT ALREADY EXISTS, with its three copy arms
-          and its `agentWorking` sentence reused unchanged. No new copy is written for it anywhere
-          in this unit.
-
-          FORCE-REMOUNTED, KEYED ON THE HOLDER, and that is not a rendering nicety. When another tab
-          takes the freed slot mid-sequence the refusal names a DIFFERENT project, and this dialog
-          captures focus in a MOUNT-time effect: updating it in place would leave a keyboard user's
-          focus parked on the card where the busy state put it, while the copy in front of them
-          silently changed which project it is talking about — an irreversible choice, re-aimed
-          under their hands. A new key is a new mount, so the focus goes where the new question is.
-
-          AND THE HANDLERS ARE PASSED THROUGH RATHER THAN WRAPPED. The dialog's `run()` turns any
-          rejection into its own alert and stays up; every ending of `resolve` resolves, and the
-          pane behind is what reports. */}
-      {takeBack.asking && (
-        <ReclaimWorkspaceDialog
-          key={takeBack.asking.projectId}
-          blocked={takeBack.asking}
-          startingProjectName={heading.projectName}
-          step={takeBack.step}
-          onSaveAndSwitch={() => takeBack.resolve(true)}
-          onSwitchAnyway={() => takeBack.resolve(false)}
-          onCancel={takeBack.cancel}
-        />
-      )}
-    </>
+          IT DRAWS ITS OWN CARD — `LivePreview` frames the iframe in a padded `#e8edf2` box with a
+          rounded, shadowed white surround — which is why the card above is on the EMPTY arm only.
+          A second card around the first would be two borders and two shadows on one app. */}
+      {frameIt && <AppPaneHost device={device} reloadNonce={reloadNonce} leaving={leaving} />}
+    </section>
   )
 }
 
@@ -314,19 +260,18 @@ function AppPane({ device, reloadNonce }: AppPaneProps) {
  * They are drawn here from one computed value, so a pane sentence has exactly one author and a
  * state nobody is in cannot have chrome drawn for it.
  */
-function NoFrame({
-  report,
-  takeBack,
-}: {
-  report: ReturnType<typeof useWorkspaceReport>
-  takeBack: TakeBack
-}) {
+function NoFrame({ report }: { report: ReturnType<typeof useWorkspaceReport> }) {
   // NOBODY HAS COMPUTED A STATE. A surface mounted outside a workspace, or one still resolving its
   // project. Saying nothing is the honest answer — inventing a sentence here would be a second
   // author for the one thing this whole design gives a single one.
   if (!report) return null
 
   const { state } = report
+  // NOTHING HAS BEEN ASKED YET, so there is nothing to report. `could-not-read` is what an
+  // unresolved reading resolves to as well as a failed one, and on the first commit of every cold
+  // open it is the former — which drew a platform-failure card, with a Try again button, as the
+  // opening frame. Once a read has settled the same state is a genuine outage and is drawn.
+  if (!report.settled && state.name === 'could-not-read') return null
   // See `STATE_GLYPH`: every board that draws an empty pane draws a mark above the headline, and
   // `running` — the one state with no board at all — is the only entry that answers with none.
   const Glyph = STATE_GLYPH[state.name]
@@ -362,9 +307,9 @@ function NoFrame({
         )}
         <p className="text-base font-bold text-tertiary">{state.headline}</p>
         {state.detail && <p className="mt-2 text-sm text-neutral leading-relaxed">{state.detail}</p>}
-        {/* WHAT A TAKE-BACK DID TO SOMEBODY ELSE'S APP — its own line, because it has its own
-            subject. Emphasised rather than greyed: it is the half of the outcome a citizen cannot
-            find out any other way without opening the other project. */}
+        {/* THE SERVER'S OWN WORDS ABOUT THE LAST PRESS — its own line, because it has its own
+            subject. Emphasised rather than greyed: a refusal the citizen asked for is not a
+            footnote to the sentence above it. */}
         {state.note && (
           <p data-testid="app-pane-note" className="mt-2 text-sm font-semibold text-tertiary leading-relaxed">
             {state.note}
@@ -375,31 +320,13 @@ function NoFrame({
             number that moves is the cheapest possible evidence that the platform is still working,
             and unlike a bar every position on it is a measured fact. */}
         {state.busy === true && <ElapsedSinceTheWaitBegan />}
-        {/* THE ROW IS NO LONGER THE POLITE REGION. It was, and that was the defect: a region
-            mounted inside `state.action &&` does not exist on the one state that has a wait and no
-            action. The region moved up to `AppPane`, where it wraps this whole board — so the
-            take-back still renames ITSELF inside it and is still announced once on entering and
-            again on leaving, and the headline, the detail and the note are announced too. */}
+        {/* THE ROW IS NOT THE POLITE REGION, and must not become one again: a region mounted
+            inside `state.action &&` does not exist on the one state that has a wait and no action.
+            It lives on `AppPane`, wrapping this whole board, so the headline, the detail, the note
+            and the control renaming itself are all announced. */}
         {state.action && (
-          <div className="mt-5 flex flex-wrap justify-center gap-2.5">
-            {/* THE SEQUENCE GOES TO BOTH SLOTS, and the leading one needs it as much as the second.
-                It used to be handed only to `secondAction`, on the reasonable-looking assumption
-                that a take-back can only ever be the second control. The held-state merge broke
-                that assumption: when the platform cannot name the holder there is no go-to to
-                lead with, so the take-back IS `action` — and `StartAppControl` renders NOTHING at
-                all for a take-back it was given no sequence for ("no sequence in the parent, no
-                verb"). The card then named the problem and offered nothing to press, which is the
-                exact dead end the merge existed to remove, rebuilt one slot along.
-                Harmless on every other kind: only the take-back arm reads this prop. */}
-            <StartAppControl action={state.action} report={report} takeBack={takeBack} inert={takeBack.working} />
-            {state.secondAction && (
-              <StartAppControl
-                action={state.secondAction}
-                report={report}
-                takeBack={takeBack}
-                inert={takeBack.working}
-              />
-            )}
+          <div className="mt-5 flex justify-center">
+            <StartAppControl action={state.action} report={report} />
           </div>
         )}
       </div>

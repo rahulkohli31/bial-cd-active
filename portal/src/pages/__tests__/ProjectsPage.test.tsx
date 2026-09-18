@@ -25,6 +25,7 @@ const h = vi.hoisted(() => ({
   deleteProject: vi.fn(),
   listProjectConversations: vi.fn(),
   patchProject: vi.fn(),
+  fetchActivity: vi.fn(),
 }))
 
 vi.mock('../../utils/projectApi', () => ({
@@ -40,10 +41,17 @@ vi.mock('../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
   CONVERSATION_LIST_CAP: 200,
 }))
+vi.mock('../../utils/buildSessionApi', async (orig) => ({
+  ...(await orig<typeof import('../../utils/buildSessionApi')>()),
+  fetchActivity: h.fetchActivity,
+}))
 
-import ProjectsPage, { PROJECT_GONE_NOTICE } from '../ProjectsPage'
+import ProjectsPage, { PROJECT_GONE_NOTICE, ACTIVITY_POLL_MS } from '../ProjectsPage'
 import { ApiError } from '../../utils/apiError'
 import type { Project } from '../../utils/projectApi'
+import type { ActivityPhase, ProjectActivity } from '../../utils/buildSessionApi'
+import { SharedAppRow, SharedAppTile } from '../../components/projects/SharedAppRow'
+import type { SharedProject } from '../../utils/sharingApi'
 
 function LocationProbe(): React.JSX.Element {
   const loc = useLocation()
@@ -181,8 +189,12 @@ beforeEach(() => {
   h.listProjects.mockResolvedValue(page([]))
   h.listProjectCounts.mockResolvedValue(COUNTS)
   h.listProjectConversations.mockResolvedValue([])
+  h.fetchActivity.mockResolvedValue([])
 })
-afterEach(() => cleanup())
+afterEach(() => {
+  cleanup()
+  vi.useRealTimers()
+})
 
 // --- what changes without saying so ----------------------------------
 
@@ -1274,5 +1286,193 @@ describe('★ the three summary tiles filter the list beneath them', () => {
     await screen.findByText('Nothing Built')
     expect(h.listProjects).toHaveBeenLastCalledWith(expect.objectContaining({ filter: undefined }))
     expect(tile(/Total applications/).getAttribute('aria-pressed')).toBe('true')
+  })
+})
+
+// --- activity markers: starting, open, or closing down, right now --------------
+
+/**
+ * ONE READ, NOT ONE PER ROW. `fetchActivity` answers for every application at once, so the
+ * markers below are proven through the ONE call this page makes, never through a per-row mock.
+ *
+ * `AppActivityMarker` carries its own copy decisions (the "Editor closing" qualifier, the tone),
+ * so most of what these prove is WIRING: the marker sits beside the name and never inside the
+ * Status column, the cadence starts and stops with what is actually showing, and a failed read
+ * holds whatever was there rather than erasing it.
+ */
+describe('★ the activity markers — starting, open, or closing down, beside the name', () => {
+  const mkActivity = (projectId: string, phase: ActivityPhase): ProjectActivity => ({
+    projectId,
+    phase,
+  })
+
+  /** Point `matchMedia` at an answer, the same shim `Waiting.test.tsx` uses. The suite-wide
+   *  default (`test-setup.ts`) always says `false`. */
+  const setReducedMotion = (reduce: boolean): void => {
+    Object.defineProperty(window, 'matchMedia', {
+      writable: true,
+      configurable: true,
+      value: (query: string) =>
+        ({
+          media: query,
+          matches: reduce && query.includes('prefers-reduced-motion'),
+          onchange: null,
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          addListener: () => {},
+          removeListener: () => {},
+          dispatchEvent: () => false,
+        }) as unknown as MediaQueryList,
+    })
+  }
+  afterEach(() => setReducedMotion(false))
+
+  it('renders a starting marker beside the name, never inside the Status column', async () => {
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Visitor Log', { appStatus: 'draft' })]))
+    h.fetchActivity.mockResolvedValue([mkActivity('p1', 'starting')])
+    renderPage()
+
+    const marker = await screen.findByTestId('app-activity-marker')
+    expect(marker.textContent).toContain('Starting')
+    const statusColumn = screen.getByTestId('status-column')
+    expect(statusColumn.contains(marker)).toBe(false)
+    // Liveness beside the absence: the status column really did draw its own pill.
+    expect(within(statusColumn).getByText('Draft')).toBeTruthy()
+  })
+
+  it('shows a Draft status and an Open marker together, without contradiction', async () => {
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Visitor Log', { appStatus: 'draft' })]))
+    h.fetchActivity.mockResolvedValue([mkActivity('p1', 'open')])
+    renderPage()
+
+    expect(await screen.findByText('Draft')).toBeTruthy()
+    expect(screen.getByTestId('app-activity-marker').textContent).toContain('Open now')
+  })
+
+  it('qualifies the closing marker when the app is Live, so it cannot read as an outage', async () => {
+    h.listProjects.mockResolvedValue(
+      page([mkProject('p1', 'Visitor Log', { isServing: true, appStatus: 'approved' })]),
+    )
+    h.fetchActivity.mockResolvedValue([mkActivity('p1', 'closing')])
+    renderPage()
+
+    expect(await screen.findByText('Live')).toBeTruthy()
+    const marker = screen.getByTestId('app-activity-marker')
+    expect(marker.textContent).toContain('Editor closing')
+    expect(marker.textContent).not.toMatch(/closing down/i)
+  })
+
+  it('says "Closing down" plainly for an app that was never Live', async () => {
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Visitor Log', { appStatus: 'draft' })]))
+    h.fetchActivity.mockResolvedValue([mkActivity('p1', 'closing')])
+    renderPage()
+
+    expect((await screen.findByTestId('app-activity-marker')).textContent).toContain('Closing down')
+  })
+
+  it('a closing marker clears on a later tick, without a reload', async () => {
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Visitor Log')]))
+    h.fetchActivity.mockResolvedValueOnce([mkActivity('p1', 'closing')]).mockResolvedValueOnce([])
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('app-activity-marker')).toBeTruthy())
+    expect(h.listProjects).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ACTIVITY_POLL_MS + 1)
+    })
+
+    await waitFor(() => expect(screen.queryByTestId('app-activity-marker')).toBeNull())
+    expect(h.fetchActivity).toHaveBeenCalledTimes(2)
+    // NO RELOAD — the project list itself was asked for exactly once, start to finish.
+    expect(h.listProjects).toHaveBeenCalledTimes(1)
+  })
+
+  it('polls nothing extra when there is no activity to report', async () => {
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Visitor Log')]))
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    renderPage()
+    await screen.findByText('Visitor Log')
+    await waitFor(() => expect(h.fetchActivity).toHaveBeenCalledTimes(1))
+    expect(screen.queryByTestId('app-activity-marker')).toBeNull()
+
+    // NO INTERVAL WAS EVER ARMED — fast-forwarded well past several poll ticks, and still
+    // exactly the one request. A 50ms real wait cannot prove this: the cadence is seconds wide.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ACTIVITY_POLL_MS * 4)
+    })
+    expect(h.fetchActivity).toHaveBeenCalledTimes(1)
+  })
+
+  it('holds an existing marker when a later activity read fails, rather than clearing it', async () => {
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Visitor Log')]))
+    h.fetchActivity
+      .mockResolvedValueOnce([mkActivity('p1', 'starting')])
+      .mockRejectedValueOnce(new Error('boom'))
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    renderPage()
+    await waitFor(() =>
+      expect(screen.getByTestId('app-activity-marker').textContent).toContain('Starting'),
+    )
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ACTIVITY_POLL_MS + 1)
+    })
+    await waitFor(() => expect(h.fetchActivity).toHaveBeenCalledTimes(2))
+
+    // STILL THERE. The failed read said nothing, rather than announcing the app had stopped.
+    expect(screen.getByTestId('app-activity-marker').textContent).toContain('Starting')
+  })
+
+  it('draws a static glyph under reduced motion', async () => {
+    setReducedMotion(true)
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Visitor Log')]))
+    h.fetchActivity.mockResolvedValue([mkActivity('p1', 'starting')])
+    renderPage()
+
+    const glyph = await screen.findByTestId('app-activity-glyph')
+    // Spinning carries `animate-spin`; the reduced register never does — the same proof
+    // `Waiting.test.tsx` uses for `BusyGlyph` itself.
+    expect(glyph.classList.contains('animate-spin')).toBe(false)
+  })
+
+  it('announces a marker arriving and clearing, in one polite region', async () => {
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Visitor Log')]))
+    h.fetchActivity.mockResolvedValueOnce([mkActivity('p1', 'starting')]).mockResolvedValueOnce([])
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    renderPage()
+    const region = await screen.findByTestId('projects-activity')
+    await waitFor(() => expect(region.textContent).toContain('1 starting'))
+    expect(region.getAttribute('aria-live')).toBe('polite')
+    expect(region.getAttribute('role')).toBe('status')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ACTIVITY_POLL_MS + 1)
+    })
+    await waitFor(() => expect(screen.getByTestId('projects-activity').textContent).toBe(''))
+  })
+
+  it('the shared applications page keeps rendering through the same halves, with no marker', () => {
+    const shared: SharedProject = {
+      projectId: 'p9',
+      projectName: 'Shared With Me',
+      projectDescription: null,
+      projectUpdatedAt: '2026-07-10T00:00:00Z',
+      sharedByUserId: 'u2',
+      sharedByDisplayName: 'A Colleague',
+      sharedAt: '2026-07-10T00:00:00Z',
+    }
+    render(<SharedAppRow project={shared} onOpen={vi.fn()} />)
+    expect(screen.getByText('Shared With Me')).toBeTruthy()
+    expect(screen.queryByTestId('app-activity-marker')).toBeNull()
+    cleanup()
+
+    render(<SharedAppTile project={shared} onOpen={vi.fn()} />)
+    expect(screen.getByText('Shared With Me')).toBeTruthy()
+    expect(screen.queryByTestId('app-activity-marker')).toBeNull()
   })
 })

@@ -18,8 +18,6 @@ import { validatePrompt } from '../../utils/promptGuardrails'
 import type { PromptViolation } from '../../utils/promptGuardrails'
 import { uuidv7 } from '../../utils/conversationApi'
 import { chatKindFor } from '../../utils/chatKind'
-import { asReclaimBlocked, relaunchPreview } from '../../utils/buildSessionApi'
-import { ApiError } from '../../utils/apiError'
 import { useWorkspaceReport } from './workspaceChannel'
 import Composer from '../chat/Composer'
 import { type ComposerSubmission } from '../chat/ComposerBox'
@@ -169,84 +167,31 @@ function RailComposerBody({ projectId }: RailComposerProps) {
         })
       }
 
-      // NOTHING TO ASK FOR WITHOUT A REPORT. A rail rendered outside a workspace has no channel to
-      // route a refusal onto and no pane to start anything into; opening the chat is then the same
-      // behaviour this surface has always had.
+      // NOTHING TO ASK FOR WITHOUT A REPORT. A rail rendered outside a workspace has no pane to
+      // start anything into; opening the chat is then the same behaviour this surface has always
+      // had.
       if (!report) {
         open()
         return
       }
 
-      const attempt = async (): Promise<void> => {
-        // THE FLAG GOES UP BEFORE THE REQUEST, AND THE NAVIGATE HAPPENS AFTER IT — which is what
-        // makes this the pane's ONLY narration for the whole wait, not a duplicate of the chat's.
-        //
-        // IT LOOKS DELETABLE AND IS NOT. The tempting reading is that it "fires on a page
-        // navigation is about to unmount", which would make it a wasted commit and a wasted
-        // announcement. That reading is wrong, and the order below is the proof: `open()` —
-        // the navigate — sits BELOW the `await` on the next line, not beside this call, and the
-        // no-saved-build arm's `open()` is below it too. This surface stays mounted for the
-        // entire `relaunchPreview` POST, which blocks server-side until the
-        // container answers and whose cold arm is bounded at `_COLD_READY_BUDGET_SECONDS` = 120s
-        // (`build_sessions/manager.py`). So for a project with a saved build the citizen sits on
-        // THIS page, watching THIS pane, for up to two minutes. Without this line that wait is
-        // silent: the pane goes on saying "Your app is saved." over a start that is already
-        // running, and a screen reader is told nothing at all — the one moment somebody most
-        // needs to be told something is happening.
-        //
-        // THE DUPLICATE IS THE SECOND SENTENCE, NOT THIS ONE. What repeats is the chat surface
-        // re-publishing the same state for the same project after the navigate, and the place to
-        // stop that is where it is produced — silencing the first author to quieten the second
-        // trades a real duplicate for a real silence.
-        report.onStartPending(true)
-        try {
-          const res = await relaunchPreview({ projectId })
-          // THE PANE FRAMES IT BEFORE THE CHAT OPENS, so the app is on screen as the transcript
-          // arrives rather than a beat behind it.
-          if (res.previewUrl) report.onStarted(res.previewUrl)
-          report.onStartOutcome(res.ready ? null : { kind: 'not-painted' })
-          open()
-        } catch (err) {
-          // DISCRIMINATED ON THE CODE. Another project holding the one workspace is a QUESTION
-          // with a remedy; everything else is a failure to report.
-          const blocked = asReclaimBlocked(err)
-          if (blocked) {
-            // The retry is this whole function again — start, then open — so a transfer that
-            // succeeds lands the citizen in the chat their message was typed for, exactly once.
-            report.onReclaimRefusal(blocked, attempt)
-            // REJECTS, so the composer keeps everything. SILENT for the same reason as the
-            // guardrail above: the dialog is the explanation, and a line under the composer
-            // repeating it in weaker words is noise over the top of it.
-            throw new SendRefusal('the workspace is held by another application', { silent: true })
-          }
-          // NOTHING SAVED TO BRING BACK IS NOT A FAILED SEND. Asking for the workspace
-          // is how this surface poses the one-workspace question, but a project that has never been
-          // built has nothing to restore: the server's snapshot gate answers 404 by design — there
-          // is no blank-template arm — and the first message is the very thing that provisions one,
-          // through the turn's own `ensure_sandbox`. Rethrowing it made onboarding a dead end: a
-          // citizen who created a project, described their app and pressed Send read "That message
-          // did not send" and got no chat, on every attempt.
-          //
-          // ON THE CODE, NOT THE STATUS. This endpoint answers 404 for a second, unrelated reason
-          // — a project that is deleted or is not this citizen's — and a bare status match opened
-          // a chat onto it too, which then failed a beat later with nothing left to blame. Only
-          // the snapshot gate carries `no_saved_build`; every other 404 is a real failure and is
-          // reported as one.
-          //
-          // THE QUESTION IS STILL ASKED FIRST, which is why this is a mapping and not a skipped
-          // preflight. The server refuses a held workspace ABOVE the snapshot gate, so a brand-new
-          // project's first message still meets the dialog before any address changes.
-          if (err instanceof ApiError && err.status === 404 && err.code === 'no_saved_build') {
-            open()
-            return
-          }
-          throw err
-        } finally {
-          report.onStartPending(false)
-        }
-      }
-
-      await attempt()
+      // THE APP IS ASKED FOR BEFORE THE ADDRESS MOVES — `open()`, the navigate, sits BELOW this
+      // await, which is what stops a citizen landing in a chat whose workspace turns out not to be
+      // theirs. This surface stays mounted for the whole of it: the POST blocks server-side until
+      // the container answers, and a cold restore is bounded at two minutes, so the pane's
+      // narration of that wait comes from the start's own pending flag rather than from here.
+      //
+      // JOINS A START ALREADY RUNNING rather than making a second one. Opening the project starts
+      // the app, and a citizen who types over that two-minute restore is precisely the person who
+      // would otherwise fire a second container's worth of work and be shown its answer instead of
+      // their own.
+      const result = await report.start()
+      // A REFUSAL IS RE-SAID WHERE THEY ARE STANDING, and stops the address: the message stays in
+      // the composer and no chat opens onto a workspace this citizen has not got. Everything else
+      // opens the chat — including a project with nothing saved to bring back, whose first message
+      // is the very thing that provisions a workspace.
+      if (result.kind === 'failed') throw result.error
+      open()
     },
     [kind, navigate, projectId, report],
   )

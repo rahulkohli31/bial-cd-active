@@ -197,6 +197,17 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     # restored into their own per-user slot rather than the owner's, and `shared-view/release`,
     # the self-service exit from a shared view that needs no project id to ask for.
     #
+    # It includes `projects/{project_id}/renew`, the one browser-driven renewal on this surface:
+    # a present screen holds its own container open on the poll it is already making, and what
+    # keeps that from being the retired keep-alive loop under a new name is the absolute age
+    # ceiling, which no renewal can push past.
+    #
+    # It also includes `activity` — the one user-scoped read the applications page polls for
+    # its three markers (starting / open / closing), answering for every project at once from
+    # the same registry-hash-plus-starting-marker pipeline `preview-state` reads for one,
+    # plus the citizen's owed `PendingTeardown` rows. Declared above the `{session_id}` routes,
+    # like `internal/reap` above it, or `session_id` parses "activity" as a UUID and 422s.
+    #
     # It excludes the lock ops (`lock/acquire`/`renew`/`release`/`heartbeat`/`force-end`):
     # nothing calls them any more. The portal's keep-alive loop, the only caller of the first
     # four, is gone, and the block banner's Force-end button, the only caller of the fifth, is
@@ -206,8 +217,8 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     # removed together with the harness, the module-level build agent, and the run-build
     # dependency it was the sole door into, once the workspace moved onto the chat turn and
     # took away its only browser client.
-    assert len(build_session_paths) == 20, (
-        f"the C3 build-session route surface changed: expected 20 paths, found "
+    assert len(build_session_paths) == 22, (
+        f"the C3 build-session route surface changed: expected 22 paths, found "
         f"{len(build_session_paths)}. If a route was deliberately added or removed, amend C3 "
         f"and update this number in the same change.\n{sorted(build_session_paths)}"
     )

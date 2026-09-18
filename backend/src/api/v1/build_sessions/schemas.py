@@ -49,9 +49,10 @@ class BuildSessionStatus(enum.StrEnum):
 
 
 # --- Frozen lock TTL + cadence constants -------------------------------------
-# There is no portal keep-alive loop anymore and no HTTP surface to renew them from a browser
-# (the `lock/renew` / `heartbeat` routes were retired) — the server itself is the only renewer
-# now, in-process, via `locks.py`/`manager.py`/`turns/engine.py`/`reaper.py`.
+# The lock and the heartbeat have no browser renewal surface: they are renewed in-process, by
+# `locks.py`/`manager.py`/`turns/engine.py`/`reaper.py`. A browser renews ONE thing and one only
+# — the preview's stay of execution, through `projects/{project_id}/renew`, bounded by the
+# absolute ceiling below so a tab left open cannot make a container immortal.
 
 LOCK_TTL_SECONDS = 900  # 15 min — lock auto-expires if not renewed (the reaper reconciles).
 # THE TWO CADENCES BELOW HAVE NO RUNTIME READER LEFT, and saying so is the point: they were
@@ -154,6 +155,23 @@ TURN_ENDED_UNCHANGED_STAY_SECONDS = 300  # 5 min
 # mid-read by a number nobody chose on purpose, short enough that a spoofed or wedged traffic
 # report cannot keep a container alive indefinitely.
 SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS = 4 * 60 * 60  # 4 hours
+
+# --- A surface that is holding the project open ------------------------------
+# PRESENCE RENEWS; SILENCE IS DEPARTURE. Every screen that can frame a project already polls
+# `preview-state`; on that same tick it renews this stay. Navigating away, closing the tab,
+# sleeping the machine and losing the network all stop the renewals, so all four become one
+# event with no code of their own and nothing to fail to arrive.
+#
+# TWO BUDGETS, BECAUSE A HIDDEN TAB IS NOT A RELIABLE CLOCK. Chrome throttles background timers
+# hard, Edge sleeps tabs by default after minutes, Safari suspends them — so a hidden surface
+# asks for a longer budget and renews on waking as well as on its tick. A visible surface is
+# renewing every 45 seconds and needs no more than the grace a departure earns.
+#
+# Both are UNDER `RELAUNCH_PREVIEW_STAY_SECONDS`, and that is a hard constraint rather than a
+# coincidence: `locks.py::stay_of_execution_is_current` reads any deadline beyond that bound as
+# absurd and fails closed, so a presence budget above it would spare nothing at all.
+SURFACE_PRESENT_STAY_SECONDS = 300  # 5 min — the grace a departure earns.
+HIDDEN_SURFACE_PRESENT_STAY_SECONDS = 1200  # 20 min — a throttled tab's budget.
 
 
 class PreviewLifeState(enum.StrEnum):
@@ -500,6 +518,107 @@ class ClientErrorReportResponse(CamelModel):
     copies were collected, and would leave a client with no way to see it is being throttled."""
 
     recorded: bool
+
+
+class SurfacePresence(enum.StrEnum):
+    """Whether the surface asking for a renewal is on screen, which is the whole of what the
+    server needs to pick a budget.
+
+    The CLIENT says which; the SERVER maps it to seconds. A client that named its own number
+    would be a client that could ask for a longer life than the ceiling permits."""
+
+    VISIBLE = "visible"
+    HIDDEN = "hidden"
+
+
+class RenewalOutcome(enum.StrEnum):
+    """THREE NAMED STATES, never a boolean, following `StopActiveBuildResponse`.
+
+    A `renewed: false` collapses "your container is gone" into "the container answering for this
+    user is a different project's" — and the second is the ordinary reading a moment after
+    somebody opens another project, where nothing is wrong and nothing should be said."""
+
+    #: The stay was pushed forward. The container is this project's and it is holding.
+    RENEWED = "renewed"
+    #: A container is registered for this citizen, but it is serving a DIFFERENT project. Nothing
+    #: was written — the other project's container is not this surface's to hold open.
+    NOT_THIS_CONTAINER = "not_this_container"
+    #: No registry record at all. Nothing is running to renew, and no hash is conjured to say so.
+    NOTHING_RUNNING = "nothing_running"
+
+
+class RenewPresenceRequest(CamelModel):
+    """`POST /v1/build-sessions/projects/{projectId}/renew` body.
+
+    Carries the surface's visibility and NOTHING ELSE — above all, no container name. The server
+    resolves which container this project owns from its own app row; a name on the wire would be
+    a name a caller could substitute."""
+
+    presence: SurfacePresence = SurfacePresence.VISIBLE
+
+
+class RenewPresenceResponse(CamelModel):
+    """`POST /v1/build-sessions/projects/{projectId}/renew` → 200.
+
+    Every outcome is a 200. None of the three is an error: the client re-arms its poll on the two
+    that are not `renewed` and renders nothing, because a lease that genuinely lapsed surfaces
+    through `preview-state`, which is the one route allowed to say a preview is gone."""
+
+    outcome: RenewalOutcome
+    #: When the stay now lapses, or `None` when nothing was renewed. The client does not display
+    #: it; it is what makes a renewal auditable from a response body.
+    stay_until: datetime | None = None
+    #: When this container reaches the absolute ceiling and is collected no matter who is
+    #: renewing it, or `None` when no ceiling applies.
+    #:
+    #: IT RIDES THE RENEWAL RATHER THAN A READ OF ITS OWN. The screen that needs to say this is
+    #: the screen already renewing every 45 seconds, and the instant is a fact about the very
+    #: container being renewed — a second endpoint call per tick would buy nothing. NULL IS NOT
+    #: "SOON": it means no ceiling applies, and a client that rendered it as imminent would be
+    #: announcing a collection that is not coming.
+    draining_at: datetime | None = None
+
+
+# --- What is starting, open, or closing down -----------------------------------
+
+
+class ActivityPhase(enum.StrEnum):
+    """What one project is doing to its container right now — the three markers the
+    applications page draws beside a project's name. A CLOSED set, like `PreviewLifeState`:
+    the client maps every member, so a phase added later with no client update fails loudly
+    instead of drawing nothing.
+
+    NO `unknown` MEMBER, unlike `PreviewLifeState` — a coordination-store read this route
+    cannot complete is a 503 on the whole response, never a member here standing in for one
+    project. An `unknown` phase in a list the client otherwise reads as "here is what's
+    happening" would still be taken as a claim."""
+
+    #: Provisioning is under way, or the container exists but has never yet answered a
+    #: request — the same two situations `PreviewLifeState.STARTING` names for one project.
+    STARTING = "starting"
+    #: The container is up and has been watched to serve a request.
+    OPEN = "open"
+    #: The platform still owes a deletion for this project's container. A `PendingTeardown`
+    #: row's existence is the whole of the state — there is no status to read instead.
+    CLOSING = "closing"
+
+
+class ProjectActivity(CamelModel):
+    """One project's entry in the activity read."""
+
+    project_id: uuid.UUID
+    phase: ActivityPhase
+
+
+class ActivityResponse(CamelModel):
+    """`GET /v1/build-sessions/activity` → 200.
+
+    ONE READ FOR EVERY PROJECT AT ONCE, which is what lets the applications page clear a
+    marker it drew a moment ago: an empty list is the positive claim that nothing is
+    starting, open or closing, so the route behind this runs inside `build_coordination_or_503`
+    and answers 503 rather than emptying the list when the coordination store cannot be read."""
+
+    projects: list[ProjectActivity]
 
 
 # =============================================================================

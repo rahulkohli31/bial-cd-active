@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { motion } from 'motion/react'
 import { LayoutGrid, Users, Store, Database, ShieldCheck } from 'lucide-react'
-import { useWorkspaceExit } from '../workspace/UnsavedWorkGuard'
 import { getStoredUser, isAuthenticated } from '../../utils/auth'
 import { fetchAppStatusCounts } from '../../utils/appRegistryApi'
 import { projectsListHref } from '../../utils/projectsListMemory'
@@ -10,14 +9,7 @@ import WaitingCountBadge from '../admin/WaitingCountBadge'
 import { highlightTransition } from '../../lib/motion'
 
 /**
- * The five destinations, and the one thing about them that is not cosmetic: EVERY ONE OF THEM
- * LEAVES THE WORKSPACE THROUGH ITS GUARD.
- *
- * The header this replaces wired `useWorkspaceExit()` onto the logo AND onto each of its links,
- * separately. Wiring it once here and missing one would change behaviour by omission — the
- * unsaved-work dialog, the save offer and the failed-save refusal would simply stop happening on
- * that route, silently, on a plan whose scope explicitly excludes touching that path.
- * `AppShell.test.tsx` asserts it per destination for that reason.
+ * The five destinations.
  *
  * THE LIST LINK CARRIES THE LIST BACK. `projectsListHref()` is read at CLICK time, not memoised
  * at render, so a search typed a moment ago on the list is what this lands on rather than a
@@ -65,7 +57,6 @@ interface Props {
 
 export default function NavItems({ onNavigate, onItemFocus, collapsed = false }: Props) {
   const navigate = useNavigate()
-  const exit = useWorkspaceExit()
   const { pathname } = useLocation()
   const user = getStoredUser()
   const isAdmin = user?.isAdmin === true
@@ -98,10 +89,8 @@ export default function NavItems({ onNavigate, onItemFocus, collapsed = false }:
 
   const go = (to: string) => {
     const href = to === '/projects' ? projectsListHref() : to
-    exit(() => {
-      navigate(href)
-      onNavigate?.()
-    })
+    navigate(href)
+    onNavigate?.()
   }
 
   return (

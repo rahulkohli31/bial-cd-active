@@ -4,20 +4,18 @@
  * WHY THIS MODULE EXISTS AT ALL. The app pane host is a SIBLING of the `<Outlet/>`, not a
  * descendant of it — `AppPaneHost` owns that rule. Everything it needs is produced below that
  * Outlet — the resolved address, the pane's toolbar slots, whether the surface wants the pane
- * visible, the reclaim dialog's state, the save-state reading — and a sibling cannot read any
- * of it by props. So the mechanism has to be named once, in one place, or three implementers
- * will pick three and the seam will have three shapes.
+ * visible — and a sibling cannot read any of it by props. So the mechanism has to be named once,
+ * in one place, or three implementers will pick three and the seam will have three shapes.
  *
  * WHAT TRAVELS ON IT, AND NOTHING ELSE:
  *
  *  1. the resolved preview address, its status and its liveness  (`utils/previewAddress.ts`)
  *  2. the pane's view — visibility and the pane's own pass-through props
- *  3. the reclaim dialog's open state
- *  4. one save-state reading — the tri-state flag and the recovery instant, together
- *  5. the app-revealed callback, the reveal stop-clock
- *  6. the rail mode, its collapse, and an opaque per-mode bag that outlives a chat
- *  7. what to SAY about the workspace — one computed value, and the handlers for its one action
- *  8. what the toolbar row NAMES, and the save control's values and its action
+ *  3. the app-revealed callback, the reveal stop-clock
+ *  4. the rail mode, its collapse, and an opaque per-mode bag that outlives a chat
+ *  5. what to SAY about the workspace — one computed value, and the handlers for its one action
+ *  6. what the toolbar row NAMES, and the save control's values and its action
+ *  7. what the platform owes the citizen about their app's life — its ceiling, and a refusal
  *
  * TWO RULES MAKE IT SAFE, and they are the whole contract:
  *
@@ -36,8 +34,8 @@
  * object re-renders EVERY consumer whenever ANY field changes. Each payload is therefore its own
  * cell with its own listener set, read through `useSyncExternalStore`.
  *
- * BE PRECISE ABOUT WHAT THAT BUYS, because the tempting sentence is not true. A save-state publish
- * reaches only the shell's unload effect. A keystroke touches neither the address nor the save
+ * BE PRECISE ABOUT WHAT THAT BUYS, because the tempting sentence is not true. A heading publish
+ * reaches only the toolbar row. A keystroke touches neither the address nor the save
  * state nor the visibility — but it DOES republish the pane view, because that view is rebuilt by
  * identity every render (its toolbar nodes and its handlers are fresh closures), so the pane host
  * re-renders once per character exactly as `LivePreview` did when the page rendered it directly.
@@ -59,9 +57,9 @@ import { createContext, useContext, useLayoutEffect, useRef, useSyncExternalStor
 import type LivePreview from '../LivePreview'
 import type { PreviewAddress } from '../../utils/previewAddress'
 import type { CompileState } from '../../utils/compileState'
-import type { HandoverStep, PreviewLifeState, ReclaimBlocked } from '../../utils/buildSessionApi'
+import type { PreviewLifeState } from '../../utils/buildSessionApi'
 import { sameWorkspaceState } from './workspaceState'
-import type { StartOutcome, WorkspaceState } from './workspaceState'
+import type { StartOutcome, StartResult, WorkspaceState } from './workspaceState'
 
 type Listener = () => void
 
@@ -181,36 +179,6 @@ const _paneViewIsASubsetOfLivePreviewProps: UnacceptedPaneProps extends never ? 
 void _paneViewIsASubsetOfLivePreviewProps
 
 /**
- * The reclaim dialog's open state. The CLASSIFICATION stays where it is — this is only the slot.
- *
- * The handlers travel with it because they are the publisher's: stopping the other project's
- * build, saving it, releasing it and retrying the refused call are all things the surface that
- * made that call knows how to do, and a shell that re-derived them would be a second authority on
- * a refusal that already has one.
- */
-export interface ReclaimRequest {
-  blocked: ReclaimBlocked
-  /**
-   * The project being STARTED. The refusal carries only the incumbent,
-   * so the name of the app the person is actually trying to open has to travel with the request:
-   * the dialog leads with it, because "can I build THIS one?" is the question being asked.
-   */
-  startingProjectName: string | null
-  /** `true` saves the other project before releasing it; `false` releases without saving. */
-  resolve: (save: boolean) => Promise<void>
-  cancel: () => void
-  /**
-   * WHICH STEP THE HAND-OVER HAS REACHED, or `null` before one starts.
-   *
-   * It travels with the request rather than being derived by the dialog, because the SEQUENCE is
-   * the publisher's: stop the other project, wait for that to finish, save, release, start this
-   * one, then open the chat. Those take real time, and a dialog left spinning through them is
-   * indistinguishable from one that has hung.
-   */
-  step: HandoverStep | null
-}
-
-/**
  * The rail's slot — WHICH RAIL IS SHOWING, and how the shell is laying it out.
  *
  * `WorkspaceShell` derives the mode from the address and publishes it here; `WorkspaceRail` reads
@@ -313,41 +281,23 @@ export const NO_SAVE: SaveSlot = {
 }
 
 /**
- * ONE READING OF THE SAVE STATE — TWO FACTS THAT TRAVEL TOGETHER OR NOT AT ALL.
+ * WHAT THE PLATFORM OWES THE CITIZEN ABOUT THEIR APP'S LIFE — the container's ceiling, and a
+ * write-back that was refused. `WorkspaceLifecycleNotes` states both, and it is mounted in the
+ * pane column, which is a sibling of the `<Outlet/>`: the surface that READS these facts is never
+ * the one that renders them, which is why they travel.
  *
- * This used to be a bare `boolean | null` on the channel, and the second fact is here because a
- * bare `dirty` cannot tell the platform's two very different `true`s apart. `dirty` answers "is
- * there a saved VERSION of this tree?", so THE BUILD ITSELF makes it true: a citizen who described
- * an app, watched it get built and touched nothing arrives at `dirty: true, savedHead: null`, and
- * every surface reading that flag alone announced unsaved changes and blocked their exit over work
- * they had never done. `recoveryAt` is the fact that separates them — see
- * `SaveState.recoveryAt` in `utils/buildSessionApi.ts`, and `SessionManager.newest_restore_source`
- * behind it, for why a non-null instant means "the platform can put this back".
- *
- * WHY ONE CELL AND NOT TWO. The pair comes from a single `GET save-state` response, and every rule
- * written against it — the rail's sentence, the exit dialog, the unload prompt — is only sound if
- * both halves describe THE SAME reading. Two independently published cells would let a consumer
- * combine a dirty flag from one moment with a recovery instant from another, which is exactly how
- * a "safe to leave" gets computed from a recovery copy that no longer covers the current tree.
- * Publishing them together in one `set` makes that arithmetic impossible rather than merely
- * unlikely.
- *
- * IT IS NOT A CLAIM THAT ANYTHING WAS SAVED. A recovery copy is the platform's doing; a version is
- * the citizen's, and Save stays MANUAL. `dirty` stays true beside a non-null instant.
+ * ONE CELL FOR THE PAIR, because one note states both and both come from the same surface's reads.
+ * `null` ON EITHER HALF IS A POSITIVE CLAIM — no ceiling applies, no write-back was refused — so a
+ * surface that has not asked yet publishes two nulls and the note says nothing until it can.
  */
-export interface SaveReading {
-  /** TRI-STATE. `true` definitely dirty, `false` definitely clean, `null` "could not tell". */
-  dirty: boolean | null
-  /** When the platform last wrote a recovery copy of this tree (ISO-8601), or `null` for none. */
-  recoveryAt: string | null
+export interface WorkspaceLifecycle {
+  /** When this app's container reaches its ceiling, or `null` when no ceiling applies. */
+  drainingAt: string | null
+  /** When a platform write-back for this app was last refused, or `null` if none ever was. */
+  writeBackRefusedAt: string | null
 }
 
-/**
- * NOBODY HAS REPORTED, which reads as the same "could not tell" a failed check produces — and
- * carries NO recovery instant, because the reading that would have named one never happened.
- * Fail toward warning: an absent fact must never be the reason somebody loses work.
- */
-export const NO_SAVE_READING: SaveReading = { dirty: null, recoveryAt: null }
+export const NO_LIFECYCLE: WorkspaceLifecycle = { drainingAt: null, writeBackRefusedAt: null }
 
 /**
  * THE ROW'S HANDLERS, held apart from every compared value on purpose.
@@ -402,22 +352,31 @@ const sameSave = (a: SaveSlot, b: SaveSlot) =>
   a.canSave === b.canSave &&
   a.canDiscard === b.canDiscard
 
-/** BOTH FIELDS, and the second one is not optional: a comparator blind to `recoveryAt` would
- *  hold the first reading forever and freeze every sentence and every guard decision derived
- *  from it at whatever the first poll happened to say. */
-const sameReading = (a: SaveReading, b: SaveReading) =>
-  a.dirty === b.dirty && a.recoveryAt === b.recoveryAt
+const sameLifecycle = (a: WorkspaceLifecycle, b: WorkspaceLifecycle) =>
+  a.drainingAt === b.drainingAt && a.writeBackRefusedAt === b.writeBackRefusedAt
 
 /**
  * WHAT THE PANE NEEDS IN ORDER TO SAY WHAT THE WORKSPACE IS DOING. The `state` is the one computed
  * value — a sentence and at most one action, with no destructive verb in its type — and it travels
  * on the channel for the same reason the address does. THE HANDLERS TRAVEL WITH IT because they
- * are the publisher's, exactly as the reclaim request's are: a shell that re-derived them would be
- * a second authority on a question that already has one. `null` MEANS NOBODY HAS COMPUTED ONE, and
+ * are the publisher's: a shell that re-derived them would be a second authority on a question that
+ * already has one. `null` MEANS NOBODY HAS COMPUTED ONE, and
  * the pane then renders nothing.
  */
 export interface WorkspaceReport {
   state: WorkspaceState
+  /**
+   * HAS ANY READ FINISHED, BY ANSWERING OR BY FAILING?
+   *
+   * `state` cannot answer this on its own: an unresolved reading and a read that genuinely could
+   * not be made both resolve to `could-not-read`, and the first painted frame of every cold open
+   * is the former. Without this the pane opened on "We could not check on your app." — a platform
+   * failure reported before anything had been asked.
+   *
+   * IT IS NOT "a read SUCCEEDED". A read that threw still finished, and a genuine outage must
+   * reach the card that offers Try again rather than sit behind an empty pane forever.
+   */
+  settled: boolean
   /** The project the state describes. `null` while a route is still resolving one. */
   projectId: string | null
   /** Record how a start attempt ended; `null` clears it (a start that reached the app). */
@@ -442,11 +401,14 @@ export interface WorkspaceReport {
   /** Ask the platform again, now. A retry press, or a start that just finished. */
   onRefresh: () => void
   /**
-   * Route a reclaim refusal to the one dialog, carrying the retry that resumes what was refused.
-   * The CLASSIFICATION already happened at the call site — this is the slot, not a second
-   * classifier, and a bare 409 is not self-describing enough to have two of those.
+   * START THIS APP, OR JOIN THE START ALREADY RUNNING FOR IT.
+   *
+   * Three things start an app and none can see the others — the project opening, the pane's
+   * control, and the rail's first send. They travel this one function so a second trigger waits
+   * for the running start's real answer instead of provisioning a second container and reporting
+   * over the first. `useStartApp` holds the claim.
    */
-  onReclaimRefusal: (blocked: ReclaimBlocked, retry: () => Promise<void>) => void
+  start: () => Promise<StartResult>
 }
 
 export interface WorkspaceChannel {
@@ -459,14 +421,13 @@ export interface WorkspaceChannel {
   project: Cell<string | null>
   pane: Cell<PaneView | null>
   visible: Cell<boolean>
-  reclaim: Cell<ReclaimRequest | null>
-  /** One save-state reading — see `SaveReading`. `NO_SAVE_READING` means nobody has reported. */
-  saveReading: Cell<SaveReading>
   rail: Cell<RailSlot>
   /** What the toolbar row NAMES. Published by the routes — see `WorkspaceHeading`. */
   heading: Cell<WorkspaceHeading>
   /** The save control's values. Its ACTION is the next cell, deliberately. */
   save: Cell<SaveSlot>
+  /** The ceiling and the refused write-back — see `WorkspaceLifecycle`. */
+  lifecycle: Cell<WorkspaceLifecycle>
   /**
    * THE ROW'S ACTIONS, AND NOTHING SUBSCRIBES TO THEM. Republished on every render of whichever
    * surface owns them, compared by identity, and read imperatively by the row at press time. That
@@ -495,11 +456,10 @@ export function createWorkspaceChannel(): WorkspaceChannel {
     project: createCell<string | null>(null),
     pane: createCell<PaneView | null>(null),
     visible: createCell<boolean>(false),
-    reclaim: createCell<ReclaimRequest | null>(null),
-    saveReading: createCell<SaveReading>(NO_SAVE_READING, sameReading),
     rail: createCell<RailSlot>(NO_RAIL, sameRail),
     heading: createCell<WorkspaceHeading>(NO_HEADING, sameHeading),
     save: createCell<SaveSlot>(NO_SAVE, sameSave),
+    lifecycle: createCell<WorkspaceLifecycle>(NO_LIFECYCLE, sameLifecycle),
     actions: createCell<WorkspaceActions>(NO_ACTIONS),
     workspace: createCell<WorkspaceReport | null>(null, sameReport),
   }
@@ -555,19 +515,6 @@ export function useWorkspacePaneVisible(): boolean {
   return useCell(useWorkspaceChannel()?.visible, false)
 }
 
-export function useWorkspaceReclaim(): ReclaimRequest | null {
-  return useCell(useWorkspaceChannel()?.reclaim, null)
-}
-
-/**
- * THE WHOLE READING, not just its tri-state. `dirty` is `true` definitely dirty, `false`
- * definitely clean, `null` "could not tell"; `recoveryAt` says whether the platform is holding a
- * copy it can put back. Both, from one read — see `SaveReading` for why they are never separated.
- */
-export function useWorkspaceSaveState(): SaveReading {
-  return useCell(useWorkspaceChannel()?.saveReading, NO_SAVE_READING)
-}
-
 export function useRailSlot(): RailSlot {
   return useCell(useWorkspaceChannel()?.rail, NO_RAIL)
 }
@@ -585,6 +532,11 @@ export function useWorkspaceHeading(): WorkspaceHeading {
 /** The save control's VALUES. Its action is read at press time — see `useWorkspaceActions`. */
 export function useWorkspaceSave(): SaveSlot {
   return useCell(useWorkspaceChannel()?.save, NO_SAVE)
+}
+
+/** The ceiling and the refused write-back, as the mounted surface last read them. */
+export function useWorkspaceLifecycle(): WorkspaceLifecycle {
+  return useCell(useWorkspaceChannel()?.lifecycle, NO_LIFECYCLE)
 }
 
 /**
@@ -623,14 +575,10 @@ export function useWorkspaceActions(): () => WorkspaceActions {
 //                         only the address to keep running, so dropping these costs nothing and
 //                         keeping them would render a departed conversation's toolbar.
 //   visible    CLEARED  — a surface that is gone is not asking for anything to be shown.
-//   reclaim    CLEARED  — its buttons close over the publisher's own save/release/retry handlers.
-//                         A dialog left standing after they died is a dialog whose buttons do
-//                         nothing, which is precisely the dead end the reclaim flow exists to
-//                         remove.
-//   saveReading KEPT    — the unsaved work is in the CONTAINER, not in the component. Clearing on
-//                         unmount would disarm the unload warning the moment the user navigated
-//                         from the chat to the project screen, which is the exact coverage the
-//                         hoist to the shell exists to add.
+//   lifecycle  CLEARED  — both halves are READINGS, and the column that renders them outlives
+//                         every surface that makes one. A reading left standing would go on
+//                         naming a closing time nobody is still checking; two nulls say nothing,
+//                         which is the honest answer until the next surface's first read lands.
 
 function usePublish<T>(cell: Cell<T> | undefined, value: T, onUnmount?: T, abstain = false): void {
   // LAYOUT effect, not a passive one. The host is a sibling that re-renders from the store, so a
@@ -661,9 +609,9 @@ export function useWorkspaceProject(projectId: string | null): void {
  * Name the workspace for the toolbar row. PUBLISHED BY THE ROUTE, not by the surface below it —
  * see `WorkspaceHeading`.
  *
- * CLEARED ON UNMOUNT, unlike `project` and `saveReading`. A heading describes an ADDRESS, and the two
- * routes that publish one swap within a single commit, so there is no frame in which the row is
- * blank. Keeping it would leave a chat's title standing over the project screen while it loads.
+ * CLEARED ON UNMOUNT, unlike `project`. A heading describes an ADDRESS, and the two routes that
+ * publish one swap within a single commit, so there is no frame in which the row is blank. Keeping
+ * it would leave a chat's title standing over the project screen while it loads.
  */
 export function usePublishHeading(heading: WorkspaceHeading): void {
   usePublish(useWorkspaceChannel()?.heading, heading, NO_HEADING)
@@ -672,9 +620,8 @@ export function usePublishHeading(heading: WorkspaceHeading): void {
 /**
  * Publish the save control's values, and its action.
  *
- * BOTH ARE CLEARED ON UNMOUNT, for the same reason the reclaim request is: the action closes over
- * the publisher's own session, and a Save button left standing after that publisher died does
- * nothing. The reading on the SEPARATE `saveReading` cell is the one that is KEPT.
+ * BOTH ARE CLEARED ON UNMOUNT, for the same reason the pane view is: the action closes over the
+ * publisher's own session, and a Save button left standing after that publisher died does nothing.
  */
 export function usePublishSave(
   save: Omit<SaveSlot, 'canSave' | 'canDiscard'>,
@@ -728,34 +675,19 @@ export function useAppPaneVisible(visible: boolean): void {
   usePublish(useWorkspaceChannel()?.visible, visible, false)
 }
 
-/** Publish the reclaim dialog's open state. The CLASSIFICATION stays with its publisher. */
-export function usePublishReclaim(request: ReclaimRequest | null): void {
-  usePublish(useWorkspaceChannel()?.reclaim, request, null)
-}
-
 /**
- * Publish ONE save-state reading. Survives this surface's unmount — see the table above.
- *
- * ADDS NO PRODUCER AND NO TRAFFIC. Whoever calls this already knows the answer; the shell reads
- * whatever was last published and treats "nobody has published" as `NO_SAVE_READING`. A project
- * screen with no conversation mounted therefore costs no container round trip and warns about
- * nothing.
- *
- * TAKES THE PAIR, NOT A FLAG PLUS AN OPTIONAL EXTRA. The two facts have to reach the cell in one
- * `set` for a consumer to be allowed to reason across them — `SaveReading` records why — so the
- * call site names both or it does not compile. A FRESH OBJECT EVERY RENDER IS FREE: the cell is
- * value-compared, so an unchanged reading wakes nobody however often it is republished.
+ * Publish what the platform owes the citizen about their app's life. CLEARED ON UNMOUNT — see the
+ * table above.
  */
-export function usePublishSaveState(reading: SaveReading): void {
-  usePublish(useWorkspaceChannel()?.saveReading, reading)
+export function usePublishLifecycle(lifecycle: WorkspaceLifecycle): void {
+  usePublish(useWorkspaceChannel()?.lifecycle, lifecycle, NO_LIFECYCLE)
 }
-
 
 /**
  * Publish what to say about the workspace. CLEARED ON UNMOUNT, like the pane view and for the same
- * reason: its handlers close over the departing surface's own read, its outcome slot and its
- * refusal routing, so a state left standing would render a sentence whose one button calls into a
- * component that no longer exists.
+ * reason: its handlers close over the departing surface's own read and its outcome slot, so a
+ * state left standing would render a sentence whose one button calls into a component that is not
+ * mounted.
  */
 export function usePublishWorkspaceReport(report: WorkspaceReport | null): void {
   usePublish(useWorkspaceChannel()?.workspace, report, null)

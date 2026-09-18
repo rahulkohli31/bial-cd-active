@@ -14,7 +14,6 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { ChevronRight } from 'lucide-react'
 import { memo, useCallback, useEffect, useLayoutEffect, useState, type CSSProperties } from 'react'
 import { useNavReveal } from '../layout/NavReveal'
-import ReclaimWorkspaceDialog from '../projects/ReclaimWorkspaceDialog'
 import AppPane from './AppPane'
 import RailResizeHandle from './RailResizeHandle'
 import WorkspaceToolbar from './WorkspaceToolbar'
@@ -23,8 +22,6 @@ import { projectsListHref } from '../../utils/projectsListMemory'
 import type { DeviceName } from './devices'
 import { WORKSPACE_RAIL_ID } from './railId'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
-import { useRegisterWorkspaceExit, useUnsavedWorkGuard } from './UnsavedWorkGuard'
-import { canBePutBack } from '../../utils/buildSessionApi'
 import {
   WorkspaceChannelProvider,
   createWorkspaceChannel,
@@ -32,9 +29,6 @@ import {
   useWorkspaceChannel,
   useWorkspaceHeading,
   useWorkspacePaneVisible,
-  useWorkspaceReclaim,
-  useWorkspaceReport,
-  useWorkspaceSaveState,
 } from './workspaceChannel'
 
 /**
@@ -84,71 +78,6 @@ function railWidthClass(collapsed: boolean, paneVisible: boolean): string {
 }
 
 /**
- * THE ONE WARNING THE SAVE MODEL OWES THE CITIZEN — for the half of leaving that is closing the
- * TAB. Work the platform holds nowhere is gone when the container is reclaimed, so that exit must
- * not be silent; it lives on the shell rather than on an outlet child, which unmounts on every
- * move to the project screen. No new producer and no traffic — the shell reads whatever the
- * mounted surface last published.
- *
- * ARMED ONLY ON A DEFINITE `true`: the tri-state's `null` means "could not check", never "clean",
- * and the browser's unload prompt renders fixed text that cannot carry that distinction. A prompt
- * raised over an unanswered check is a prompt with nothing behind it, and those teach people to
- * dismiss prompts.
- *
- * AND ONLY WHERE THE PLATFORM CANNOT PUT THE WORK BACK — the fourth case, and the reason this
- * effect reads a pair rather than a flag. `dirty` answers "is there a saved VERSION of this
- * tree?", so a build nobody has saved answers no: a citizen who described an app, watched the
- * platform build it and touched nothing arrives at `dirty: true` having done nothing at all, and
- * this effect raised the browser's prompt on them for it. `recoveryAt` is what tells that apart
- * from real loss — non-null means the platform wrote a recovery copy that
- * `SessionManager.newest_restore_source` hands to EVERY automatic restore in preference to the
- * saved bundle, so the tab closing costs nothing. A `true` with NO recovery copy is real unsaved
- * work and still raises the prompt, unchanged.
- *
- * ONE FACT, ONE ARGUMENT, TWO EXITS. `UnsavedWorkGuard` applies exactly this rule to the in-place
- * exit and writes the reasoning out in full, including what it emphatically is NOT: a claim that
- * anything was saved. Both guards read the SAME `SaveReading` off the channel, which is what stops
- * the tab and the in-place exit disagreeing about the same app in the same moment.
- */
-function useUnsavedWorkWarning(): void {
-  const { dirty, recoveryAt } = useWorkspaceSaveState()
-  useEffect(() => {
-    // `canBePutBack` rather than `recoveryAt !== null`, for the reason it records: an absent
-    // fact must not be what disarms this prompt.
-    if (dirty !== true || canBePutBack(recoveryAt)) return undefined
-    const warn = (event: BeforeUnloadEvent) => {
-      event.preventDefault()
-      event.returnValue = ''
-    }
-    window.addEventListener('beforeunload', warn)
-    return () => window.removeEventListener('beforeunload', warn)
-  }, [dirty, recoveryAt])
-}
-
-/**
- * The cross-project reclaim dialog, mounted at shell level.
- *
- * Its open state travels on the channel; the CLASSIFICATION stays exactly where it is, on the
- * surface that made the call that was refused. Nothing here inspects a refusal or classifies one —
- * a bare 409 is not self-describing, and a second competing classifier is how the reclaim path
- * loses its one authority.
- */
-function ReclaimSlot() {
-  const reclaim = useWorkspaceReclaim()
-  if (!reclaim) return null
-  return (
-    <ReclaimWorkspaceDialog
-      blocked={reclaim.blocked}
-      startingProjectName={reclaim.startingProjectName}
-      step={reclaim.step}
-      onSaveAndSwitch={() => reclaim.resolve(true)}
-      onSwitchAnyway={() => reclaim.resolve(false)}
-      onCancel={reclaim.cancel}
-    />
-  )
-}
-
-/**
  * THE RAIL IS THE SHELL'S FOURTH RESPONSIBILITY, AND IT HAS ONE WRITER. A rail mode and a collapse
  * are state about the shell's own chrome, published downward so a surface can read which rail it
  * is rendering into without re-deriving the predicate from `useLocation` in three places. The
@@ -167,7 +96,6 @@ function usePublishRail(mode: RailMode, collapsed: boolean): void {
 
 /** Everything inside the provider, so it can read the channel it is mounted under. */
 function ShellFrame() {
-  useUnsavedWorkWarning()
   const rail = useRailSlot()
   const mode = railModeFor(useLocation().pathname)
   const [collapsed, setCollapsed] = useState(false)
@@ -213,33 +141,6 @@ function ShellFrame() {
   // than becoming a per-mode table here.
   const paneVisible = useWorkspacePaneVisible()
 
-  // THE IN-PLACE GUARD, MOUNTED HERE AND NOT IN THE OUTLET CHILD. The exits it exists for — the
-  // navigation's destinations, the brand link, the breadcrumb — sit ABOVE the Outlet, so a guard
-  // mounted below it would lose coverage of exactly the departing controls it was written for.
-  // It is PUBLISHED UPWARDS rather than provided downwards, because the navigation is rendered by
-  // the shell that frames this one: see `WorkspaceExitHost`.
-  //
-  // `workspaceIsAlive` comes from the one computed state rather than from a second read: a `null`
-  // save state means "could not tell" only while the workspace is running, and means "nobody
-  // asked" otherwise. Conflating them fires a warning on every exit from every stopped project.
-  const report = useWorkspaceReport()
-  // ONE READING, BOTH HALVES — the two arrive on a single cell precisely so this call cannot pair
-  // a dirty flag from one poll with a recovery instant from another. See `SaveReading`.
-  const saveReading = useWorkspaceSaveState()
-  const { guard, dialog: unsavedWorkDialog } = useUnsavedWorkGuard({
-    saveDirty: saveReading.dirty,
-    // WHETHER THE PLATFORM CAN PUT THIS BACK, which decides whether a `true` is worth stopping
-    // anybody for. Threaded from the same read as the flag above and from no second source: a
-    // guard that fetched its own would be answering about a different moment.
-    recoveryAt: saveReading.recoveryAt,
-    workspaceIsAlive: report?.state.name === 'running',
-    projectId: report?.projectId ?? null,
-    // WHOSE WORK IS AT RISK. The heading already carries the name for the toolbar row, and it is
-    // the same fact — so the dialog names the project rather than saying "this app" to somebody
-    // who is, by definition, in the middle of leaving it for another one.
-    projectName: heading.projectName,
-  })
-
   // A RAIL COLLAPSED BESIDE A PANE MUST NOT SURVIVE THE PANE GOING AWAY. The control that restores
   // it lives on the pane side, so a planning conversation — which has no pane at all — would
   // inherit a hidden rail with nothing on screen and no way back. Reset when the pane leaves,
@@ -248,8 +149,7 @@ function ShellFrame() {
     if (!paneVisible) setCollapsed(false)
   }, [paneVisible])
 
-  // THE BACK CONTROL IS DERIVED FROM THE ADDRESS, and it goes through the same guard every other
-  // navigation in the workspace goes through.
+  // THE BACK CONTROL IS DERIVED FROM THE ADDRESS.
   const navigate = useNavigate()
   const back = useCallback(() => {
     // THE CHAT'S OWN PROJECT WHENEVER THERE IS ONE TO GO TO. Keyed on the rail mode rather than on
@@ -265,15 +165,11 @@ function ShellFrame() {
       mode === 'conversation' && heading.projectId
         ? `/projects/${heading.projectId}`
         : projectsListHref()
-    guard(() => navigate(to))
-  }, [guard, navigate, mode, heading.projectId])
-
-  useRegisterWorkspaceExit(guard)
+    navigate(to)
+  }, [navigate, mode, heading.projectId])
 
   return (
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
-      <ReclaimSlot />
-      {unsavedWorkDialog}
       {/* ONE TOOLBAR ROW, DRAWN ONCE, ABOVE THE GRID — so it survives a collapse of the rail it
           used to live inside, and so it is a single element across a project↔chat move rather
           than three headers that appear and disappear. */}
@@ -374,8 +270,7 @@ const RailOutlet = memo(function RailOutlet() {
 
 export default function WorkspaceShell() {
   // Created once and never replaced, so the context value is stable for the life of the shell and
-  // the provider itself never re-renders anybody. Everything that moves lives in the cells, which
-  // is what lets a save-state publish reach the unload warning without touching the pane.
+  // the provider itself never re-renders anybody. Everything that moves lives in the cells.
   const [channel] = useState(createWorkspaceChannel)
   return (
     <WorkspaceChannelProvider value={channel}>

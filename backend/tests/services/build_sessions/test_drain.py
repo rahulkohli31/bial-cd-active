@@ -13,7 +13,7 @@ import datetime as dt
 
 import pytest
 
-from src.services.build_sessions.drain import draining_at, is_drained
+from src.services.build_sessions.drain import draining_at, is_drained, past_the_turn_bound
 from src.services.sandbox.base import (
     KIND_BUILD_SANDBOX,
     TAG_CREATED_AT,
@@ -99,3 +99,68 @@ def test_the_threshold_is_configurable_rather_than_baked(hours: int) -> None:
     mark = draining_at(_aged(0), enabled=True, after_hours=hours)
 
     assert mark == NOW + dt.timedelta(hours=hours)
+
+
+# --- the outer mark, which nothing outranks ---------------------------------
+
+
+def test_a_turn_still_holds_the_container_just_past_the_ceiling() -> None:
+    """The courtesy is real and it must stay real: a build that started shortly before the mark
+    is entitled to finish. Only the sum of a whole run and one slow tool call is long enough to
+    say, honestly, that nothing is working in there."""
+    assert (
+        past_the_turn_bound(
+            _aged(2.4), now=NOW, enabled=True, after_hours=2, turn_grace_seconds=2400
+        )
+        is False
+    )
+
+
+def test_a_lease_that_will_not_stop_renewing_runs_out_of_benefit_of_the_doubt() -> None:
+    """THE HOLE THIS CLOSES. A jammed lease is indistinguishable from an agent making tool calls,
+    so the arm that spares a live turn spares a wedged one forever — and a wedged container is
+    exactly the population a ceiling exists to collect."""
+    assert (
+        past_the_turn_bound(
+            _aged(5), now=NOW, enabled=True, after_hours=2, turn_grace_seconds=2400
+        )
+        is True
+    )
+
+
+def test_the_outer_mark_is_still_a_flag() -> None:
+    """Off everywhere by default, like the mark it sits behind. A deployment that wants no
+    ceiling gets no ceiling, including this one."""
+    assert (
+        past_the_turn_bound(
+            _aged(500), now=NOW, enabled=False, after_hours=2, turn_grace_seconds=2400
+        )
+        is False
+    )
+
+
+def test_an_untagged_container_is_never_torn_out_from_under_an_agent() -> None:
+    """No age means no bound — the escalate-never-destroy rule reaching the one clause that can
+    interrupt live work. A container whose birthday cannot be proved is reported, never cut."""
+    ageless = identity_from_tags({TAG_KIND: KIND_BUILD_SANDBOX})
+
+    assert (
+        past_the_turn_bound(ageless, now=NOW, enabled=True, after_hours=2, turn_grace_seconds=2400)
+        is False
+    )
+
+
+def test_the_outer_mark_is_strictly_later_than_the_ordinary_one() -> None:
+    """Stated as an ordering rather than two numbers: whatever the grace is tuned to, a container
+    must always reach the ordinary ceiling before it reaches the one that cuts a turn."""
+    just_past = _aged(2.1)
+
+    assert (
+        is_drained(just_past, now=NOW, enabled=True, after_hours=2, turn_in_flight=False) is True
+    )
+    assert (
+        past_the_turn_bound(
+            just_past, now=NOW, enabled=True, after_hours=2, turn_grace_seconds=2400
+        )
+        is False
+    )

@@ -19,6 +19,7 @@ import {
   type WorkspaceReport,
 } from '../workspaceChannel'
 import { resolveWorkspaceState } from '../workspaceState'
+import { createStarter } from '../startApp'
 import type { PreviewState } from '../../../utils/buildSessionApi'
 
 vi.mock('../../../utils/buildSessionApi', async (importOriginal) => ({
@@ -36,25 +37,31 @@ const reading = (over: Partial<PreviewState> = {}): PreviewState => ({
   ...over,
 })
 
-const reportFor = (preview: PreviewState): WorkspaceReport => ({
-  // `lastDecidedPreview: null` is "nothing has ever been decided", which is the cold-load answer
-  // and the only one this surface's scenarios need: every reading below is a decided one, so the
-  // memory is never consulted. Decision D3's own behaviour — an unreadable read rendering the last
-  // settled reading — is pinned where the rule lives, in `workspaceState.test.ts`.
-  state: resolveWorkspaceState({
-    preview,
-    lastDecidedPreview: null,
-    projectHasSavedBuild: null,
-    startOutcome: null,
-    startInFlight: false,
-  }),
-  projectId: 'p1',
-  onStarted: vi.fn(),
-  onStartPending: vi.fn(),
-  onStartOutcome: vi.fn(),
-  onRefresh: vi.fn(),
-  onReclaimRefusal: vi.fn(),
-})
+const reportFor = (preview: PreviewState): WorkspaceReport => {
+  const sinks = {
+    projectId: 'p1',
+    onStarted: vi.fn(),
+    onStartPending: vi.fn(),
+    onStartOutcome: vi.fn(),
+  }
+  return {
+    ...sinks,
+    settled: true,
+    // `lastDecidedPreview: null` is "nothing has ever been decided", which is the cold-load answer
+    // and the only one this surface's scenarios need: every reading below is a decided one, so the
+    // memory is never consulted. Decision D3's own behaviour — an unreadable read rendering the
+    // last settled reading — is pinned where the rule lives, in `workspaceState.test.ts`.
+    state: resolveWorkspaceState({
+      preview,
+      lastDecidedPreview: null,
+      projectHasSavedBuild: null,
+      startOutcome: null,
+      startInFlight: false,
+    }),
+    onRefresh: vi.fn(),
+    start: createStarter(() => sinks),
+  }
+}
 
 function renderIn(node: React.ReactElement, prime: (c: WorkspaceChannel) => void) {
   const channel = createWorkspaceChannel()
@@ -97,16 +104,12 @@ describe('the standing line says what this chat DOES', () => {
 })
 
 describe('★ the same value, the same sentence, on both surfaces', () => {
-  // Scoped to the three states this scenario covers, deliberately. Asserting sameness across
+  // Scoped to the two states this scenario covers, deliberately. Asserting sameness across
   // `never_built` and `asleep` too would pin wording this scenario does not require, when the
   // pane's own wording there may need to differ — a Plan chat has no business inviting somebody
   // to press a start control it does not render.
   const spoken: [string, PreviewState][] = [
     ['being got ready', reading({ state: 'starting' })],
-    [
-      'another project holds it, and which one',
-      reading({ state: 'slot_taken', occupyingProjectName: 'Roster', occupyingProjectId: 'p-9' }),
-    ],
     ['it could not be read', reading({ state: 'unknown' })],
   ]
 
@@ -132,7 +135,7 @@ describe('★ the same value, the same sentence, on both surfaces', () => {
   }
 })
 
-describe('sentence always, action selectively — and only one of the three', () => {
+describe('★ the sentence, and never a verb', () => {
   it('★ renders NO start control, in any workspace state', () => {
     // `StartAppControl` renders wherever the map offers an action, with no surface predicate of its
     // own — so the gate is the line's. `asleep` is the sharp case: the map DOES offer the start
@@ -158,36 +161,30 @@ describe('sentence always, action selectively — and only one of the three', ()
     unmount()
   })
 
-  it('DOES render the remedy, and it has to', () => {
-    // The remedy for a taken workspace is a go-to control, and that control must appear in the
-    // chat the person is actually in — so a Plan chat showing the sentence with no way to act would
-    // leave the remedy unreachable from the only surface that can offer it.
-    line(reading({ state: 'slot_taken', occupyingProjectName: 'Roster', occupyingProjectId: 'p-9' }))
-
-    expect(screen.getByRole('button', { name: /open “Roster”/i })).toBeTruthy()
-    expect(screen.getByTestId('plan-chat-workspace-state').textContent).toMatch(/Roster/)
-  })
-
-  it('★ renders NO take-back for an unattributed slot — the map offers one, and this surface refuses it', () => {
-    // ★ THE MAP CHANGED UNDER THIS TEST, AND THE ASSERTION IS STRONGER FOR IT. `held-unattributed`
-    // used to be a state of its own with `action` and `secondAction` BOTH null — a card that named
-    // the problem, named no remedy and left nothing to press anywhere. It is merged into the one
-    // held state now, and a missing holder name degrades the SENTENCE rather than the affordance:
-    // the map's `action` on this arm is the TAKE-BACK.
-    //
-    // So this is no longer "the map offered nothing". It is this surface declining the one thing it
-    // was offered, which is a real gate rather than an accident of the data — and the reason is
-    // `PlanChatWorkspaceLine`'s own: a take-back's wait is a modal narrating a stop, a save and a
-    // start, over a screen with no pane to show the result in.
-    const report = reportFor(reading({ state: 'slot_taken' }))
-    // The map really did offer it, or the refusal below proves nothing.
-    expect(report.state.action?.kind).toBe('take-back')
+  it('★ a taken slot is not spoken here at all, and offers nothing', () => {
+    // A slot held by the citizen's own other project reads as the saved app it is, and `asleep`
+    // is the pane's to speak for — so this surface says its standing line and no more. What it
+    // must never do is grow a control that leaves the chat the person is in.
+    const report = reportFor(reading({ state: 'slot_taken', occupyingProjectName: 'Roster', occupyingProjectId: 'p-9', restorable: true }))
+    expect(report.state.name).toBe('not-running')
 
     renderIn(<PlanChatWorkspaceLine />, (c) => c.workspace.set(report))
 
-    // LIVENESS: the sentence is spoken here, so this is a withheld control on a live line.
-    expect(screen.getByTestId('plan-chat-workspace-state').textContent).toMatch(/another application/i)
+    expect(screen.queryByTestId('plan-chat-workspace-state')).toBeNull()
     expect(screen.queryByRole('button')).toBeNull()
+    // LIVENESS: the standing line really rendered, so an empty tree cannot green this.
+    expect(screen.getByTestId('plan-chat-workspace-line').textContent).toMatch(/Planning is a conversation/)
+  })
+
+  it('★ and no spoken state renders any control at all', () => {
+    // The two verbs that exist both act on this project's app, and this surface deliberately keeps
+    // that app off screen — so neither may appear beside a sentence here.
+    for (const preview of [reading({ state: 'starting' }), reading({ state: 'unknown' })]) {
+      const { unmount } = line(preview)
+      expect(screen.getByTestId('plan-chat-workspace-state').textContent?.length).toBeGreaterThan(0)
+      expect(screen.queryByRole('button')).toBeNull()
+      unmount()
+    }
   })
 
   it('says nothing extra for the states the pane owns alone', () => {

@@ -10,7 +10,6 @@ import {
 } from '../ui/dropdown-menu'
 import { getStoredUser, logout } from '../../utils/auth'
 import { revokeAllAttachmentUrls } from '../../utils/attachmentApi'
-import { useWorkspaceExit } from '../workspace/UnsavedWorkGuard'
 import FeedbackModal from '../FeedbackModal'
 
 /**
@@ -23,10 +22,6 @@ import FeedbackModal from '../FeedbackModal'
  * below is the single reason Escape dismisses it at all. Radix owns Escape for the menu; it owns
  * nothing for the modal. `components/__tests__/FeedbackModal.escape.test.jsx` guards this —
  * deleting the effect leaves every menu test green while a shipped behaviour disappears.
- *
- * SIGN OUT GOES THROUGH THE UNSAVED-WORK GUARD, as it did in the header. It did not, once, and a
- * citizen could lose work by pressing the most final button on the screen, in silence. Outside a
- * workspace `exit` is a passthrough, so every other page's sign-out is unchanged.
  *
  * THE SECOND LINE IS THE EMAIL, not a role. The boards draw "Citizen developer" there; the
  * product has never had a role to show in that slot and inventing one would be a claim the
@@ -43,7 +38,6 @@ export interface ProfileClusterProps {
 
 export default function ProfileCluster({ collapsed = false, onMenuOpenChange }: ProfileClusterProps) {
   const navigate = useNavigate()
-  const exit = useWorkspaceExit()
   const [menuOpen, setMenuOpen] = useState(false)
   const [feedbackOpen, setFeedbackOpen] = useState(false)
   const [toastMsg, setToastMsg] = useState<string | null>(null)
@@ -158,7 +152,7 @@ export default function ProfileCluster({ collapsed = false, onMenuOpenChange }: 
             Feedback
           </DropdownMenuItem>
           <DropdownMenuItem
-            onSelect={() => exit(() => void handleLogout())}
+            onSelect={() => void handleLogout()}
             className="gap-2.5 rounded-lg px-2.5 py-2 text-sm text-danger hover:bg-red-50 focus:bg-red-50 focus:text-danger"
           >
             <LogOut size={15} />

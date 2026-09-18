@@ -7,7 +7,7 @@ import asyncio
 import contextlib
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -23,7 +23,10 @@ from src.api.v1.build_sessions.deps import (
     sandbox_dependency,
     sandbox_or_none_dependency,
 )
-from src.api.v1.build_sessions.schemas import BuildSessionStatus
+from src.api.v1.build_sessions.schemas import (
+    SURFACE_PRESENT_STAY_SECONDS,
+    BuildSessionStatus,
+)
 from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import ChatKind
@@ -37,7 +40,11 @@ from src.services.redis import (
     REGISTRY_STATE_ENDING,
     registry_key,
 )
-from src.services.redis.keys import REGISTRY_FIELD_STATE
+from src.services.redis.keys import (
+    REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
+    REGISTRY_FIELD_STATE,
+    REGISTRY_FIELD_STAY_WRITER,
+)
 from src.services.sandbox.aca import AcaControlPlane, AcaTransientError
 from src.services.sandbox.base import (
     SandboxError,
@@ -101,6 +108,39 @@ async def test_relaunch_happy_returns_200_ready_preview(
     # Relaunch does NOT occupy the build slot: the lock is free and no session is live.
     assert wire.manager._active_by_user == {}
     assert await lock_is_held(fake_redis, user.id) is False
+
+
+async def test_a_served_preview_is_handed_to_the_screen_that_asked_for_it(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """THE GRANT AT THE MOMENT A PREVIEW BECOMES VIEWABLE IS THE SHORT ONE, and that is the whole
+    hand-over: from here the surface framing the app renews on its own poll, so what this grant
+    owes is the gap until the first renewal arrives — not a reprieve of its own.
+
+    A thirty-minute stamp here would keep a container nobody came back to alive for half an hour
+    after the tab closed, which is the cost presence renewal exists to stop paying, reintroduced
+    at the one moment every relaunch passes through.
+
+    Mutation check: change the writer back to `BUILDER_ACTED` and both assertions go red."""
+    user, project = await _user_project(db_session, "served@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+    before = datetime.now(UTC)
+
+    resp = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+    assert resp.status_code == 200
+
+    raw = await fake_redis.hmget(
+        registry_key(user.id),
+        [REGISTRY_FIELD_STAY_WRITER, REGISTRY_FIELD_PREVIEW_STAY_UNTIL],
+    )
+    writer, stamp = raw[0], raw[1]
+    assert (writer.decode() if isinstance(writer, bytes) else str(writer)) == "surface_present"
+    stay = datetime.fromisoformat(stamp.decode() if isinstance(stamp, bytes) else str(stamp))
+    assert stay - before <= timedelta(seconds=SURFACE_PRESENT_STAY_SECONDS + 5)
 
 
 async def test_relaunch_after_failed_build_signals_last_saved_version(
@@ -452,6 +492,22 @@ async def aca_wire(wire, fake_redis) -> AsyncIterator[SimpleNamespace]:
     await sandbox.aclose()
 
 
+@pytest.fixture(autouse=True)
+def handed_over(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Every container a start in this file hands to the shutdown routine, recorded not run.
+
+    Left to run, the routine reaches into this file's own control-plane double at an arbitrary
+    await point and deletes the outgoing container mid-assertion, so `delete_calls` would depend
+    on scheduling. What it does once spawned is `test_shutdown.py`'s subject."""
+    spawned: list[object] = []
+
+    def _record(owed: object, **_aimed_at: object) -> None:
+        spawned.append(owed)
+
+    monkeypatch.setattr(manager_mod, "shut_it_down_in_the_background", _record)
+    return spawned
+
+
 async def _relaunch(client: AsyncClient, user, project) -> httpx.Response:
     return await client.post(
         "/v1/build-sessions/relaunch",
@@ -503,27 +559,34 @@ async def test_the_warm_relaunch_attaches_to_the_pre_existing_container(
     assert warm.json()["previewUrl"] == expected
 
 
-async def test_a_registry_naming_a_different_app_refuses_the_relaunch(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
+async def test_a_registry_naming_a_different_app_is_a_switch_not_a_refusal(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    aca_wire,
+    handed_over: list[object],
 ) -> None:
+    """Pressing start on a second project used to answer 409 `sandbox_reclaim_blocked` naming
+    the first. It answers 200 and starts, and the outgoing container leaves by the hand-over.
+
+    THE DELETE COUNT IS THE ASSERTION WITH TEETH. Two parties aimed at one container is the
+    failure this whole design is built around, so the start must issue no ARM delete at all —
+    the routine it hands to owns that, after the tree is written back."""
     user, project_a = await _user_project(db_session, "rl-otherapp@rvaiglobal.com")
     project_b = await ProjectFactory.create(db_session, user.id)
     app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
-    await _seed_snapshot(db_session, user, project_b, fake_storage)
+    app_b = await _seed_snapshot(db_session, user, project_b, fake_storage)
     await _seed_worked_on(fake_storage, app_a)
 
     assert (await _relaunch(client, user, project_a)).status_code == 200
     resp = await _relaunch(client, user, project_b)
 
-    assert resp.status_code == 409
-    body = resp.json()["error"]
-    assert body["code"] == "sandbox_reclaim_blocked"
-    assert body["projectId"] == str(project_a.id)
-    # `agentWorking` is DERIVED here rather than scripted: A's container is pardoned between
-    # turns, so a field hardcoded true would fail exactly here.
-    assert body["agentWorking"] is False
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["appId"] == str(app_b)
     assert aca_wire.aca.delete_calls == []
-    assert aca_wire.aca.create_calls == [app_name_for(app_a)]
+    assert aca_wire.aca.create_calls == [app_name_for(app_a), app_name_for(app_b)]
+    assert len(handed_over) == 1
 
 
 async def test_a_registry_marked_ending_is_never_attached_to(
@@ -670,9 +733,12 @@ async def _release(client: AsyncClient, user, project) -> httpx.Response:
     )
 
 
-async def test_release_gives_up_the_container_and_unblocks_the_switch(
+async def test_release_gives_up_the_container_on_the_spot(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
 ) -> None:
+    """Release is no longer the way out of a refusal — nothing refuses — but it is still the one
+    route that destroys a container because the citizen said so, and it still has to be
+    immediate: the delete happens inside the request, not on a later sweep."""
     user, project_a = await _user_project(db_session, "rl-release@rvaiglobal.com")
     project_b = await ProjectFactory.create(db_session, user.id)
     app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
@@ -680,7 +746,6 @@ async def test_release_gives_up_the_container_and_unblocks_the_switch(
     await _seed_worked_on(fake_storage, app_a)
 
     assert (await _relaunch(client, user, project_a)).status_code == 200
-    assert (await _relaunch(client, user, project_b)).status_code == 409
 
     released = await _release(client, user, project_a)
 
@@ -947,14 +1012,19 @@ async def test_a_press_refused_by_the_one_slot_conflict_still_counts_as_a_press(
     assert await _counter_values(HarnessCounter.APP_COLD_START_MS) == []
 
 
-async def test_a_press_refused_because_reclaiming_would_destroy_work_still_counts(
+async def test_a_press_that_switches_projects_counts_as_a_press_that_arrived(
     client: AsyncClient,
     db_session: AsyncSession,
     fake_redis,
     fake_storage,
     aca_wire,
     empty_harness_counts,
+    handed_over: list[object],
 ) -> None:
+    """The switch changed what this ratio measures, so it is pinned here rather than left to
+    drift: the second press used to be refused and counted as an attempt that reached nothing.
+    It now starts a container, so both presses arrive — and the denominator is still one row per
+    press, which is what makes the ratio readable at all."""
     user, project_a = await _user_project(db_session, "rl-count-reclaim@rvaiglobal.com")
     project_b = await ProjectFactory.create(db_session, user.id)
     app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
@@ -962,11 +1032,11 @@ async def test_a_press_refused_because_reclaiming_would_destroy_work_still_count
     await _seed_worked_on(fake_storage, app_a)
 
     assert (await _relaunch(client, user, project_a)).status_code == 200
-    assert (await _relaunch(client, user, project_b)).status_code == 409
+    assert (await _relaunch(client, user, project_b)).status_code == 200
 
     assert len(await _counter_values(HarnessCounter.APP_START_ATTEMPTED)) == 2
-    assert len(await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING)) == 1
-    assert len(await _counter_values(HarnessCounter.APP_COLD_START_MS)) == 1
+    assert len(await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING)) == 2
+    assert len(await _counter_values(HarnessCounter.APP_COLD_START_MS)) == 2
 
 
 async def test_a_press_with_nothing_to_restore_still_counts_as_a_press(

@@ -383,6 +383,24 @@ class AcaControlPlane:
         except HttpResponseError as exc:
             if is_transient(exc):
                 raise AcaTransientError("ACA create was throttled or 5xx'd") from exc
+            if exc.status_code == 409:
+                # A CONFLICT ON A CREATE IS SOMETHING IN FLIGHT, NOT A DECISION. This call is an
+                # upsert — an existing container is UPDATED rather than refused — so a 409 here is
+                # not "that name is taken"; it is ARM saying another operation currently owns the
+                # name. The one that matters to this platform is a delete still settling: a
+                # container name is stable across teardown and recreate, so a citizen reopening a
+                # project they just left can arrive inside that window, and a terminal answer there
+                # fails a start that would have succeeded moments later.
+                #
+                # CLASSIFIED BY STATUS, NOT BY A MESSAGE OR A CLAUSE ORDER. The exact ACA error
+                # code for the post-delete name hold is not verified here, and guessing one would
+                # be a branch that reads as tested and can never fire — the failure recorded
+                # against the storage layer's own `ContainerBeingDeleted` retry. Retrying the whole
+                # 409 class costs at most the bounded ladder `_create_with_retry` already owns,
+                # and a conflict that is genuinely terminal still fails at the end of it.
+                raise AcaTransientError(
+                    "ACA create hit a conflict; the name is still busy"
+                ) from exc
             raise AcaError("ACA create failed") from exc
 
     async def delete_app(self, *, name: str) -> None:

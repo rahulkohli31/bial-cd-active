@@ -33,6 +33,7 @@ import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_rbac import CurrentSuperadmin
@@ -43,6 +44,8 @@ from src.api.v1.build_sessions.deps import (
     SessionManagerDep,
 )
 from src.api.v1.build_sessions.schemas import (
+    ActivityPhase,
+    ActivityResponse,
     BuildSessionStatus,
     BuildSessionStatusResponse,
     ClientErrorReportRequest,
@@ -52,10 +55,14 @@ from src.api.v1.build_sessions.schemas import (
     ParkedTree,
     ParkedTreesResponse,
     PreviewLifeState,
+    ProjectActivity,
     PromoteParkedRequest,
     PromoteParkedResponse,
     RelaunchPreviewRequest,
     RelaunchPreviewResponse,
+    RenewalOutcome,
+    RenewPresenceRequest,
+    RenewPresenceResponse,
     SharedPreviewResponse,
     StopBuildRequest,
     StopBuildResponse,
@@ -67,6 +74,8 @@ from src.core.errors import AppApiError
 from src.core.integrity_types import WorkspaceState
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation
+from src.db.models.pending_teardown import PendingTeardown
+from src.db.models.project import Project
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
 from src.services.build_sessions import (
@@ -85,9 +94,17 @@ from src.services.build_sessions import (
     app_name_for,
     sweep_all,
 )
+from src.services.build_sessions.drain import draining_at, the_ceiling_switch
+from src.services.build_sessions.locks import (
+    read_registry,
+    read_registry_and_starting_marker,
+    renew_presence_stay,
+    stamp_is_proven,
+)
 from src.services.build_sessions.snapshot import (
     ParkedTreeNotOursError,
     list_parked_trees,
+    newest_diverted_at,
     promote_parked,
 )
 from src.services.orchestrator.client_errors import (
@@ -99,12 +116,18 @@ from src.services.projects.resolve import (
     resolve_project_access,
 )
 from src.services.redis import (
+    REGISTRY_STATE_READY,
     build_coordination_or_503,
     coordination_is_gone,
     get_redis,
 )
+from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_CREATED_AT,
+    REGISTRY_FIELD_STATE,
+)
 from src.services.sandbox import SandboxError
-from src.services.sandbox.base import CompileState
+from src.services.sandbox.base import TAG_CREATED_AT, CompileState, identity_from_tags
 from src.services.storage import StorageError
 
 router = APIRouter(prefix="/build-sessions", tags=["build_sessions"])
@@ -161,11 +184,14 @@ def _owned_or_404(
 
 
 class BuildConflictEnvelope(CamelModel):
-    """The 409 for a route that can conflict two ways: a build already running for this user
-    (`sessionId`), or another project holding the one workspace with unsaved work
-    (`projectId`/`projectName`/`dirty`). `code` discriminates — `build_session_already_active`
-    vs `sandbox_reclaim_blocked` — and a client must branch on it, since only the second has a
-    remedy the user can act on."""
+    """The 409 for a route that can conflict two ways: this very project's own work already
+    running (`sessionId`), or a COLLEAGUE'S SHARED VIEW holding the one workspace
+    (`projectId`/`projectName`/`isSharedView`). `code` discriminates —
+    `build_session_already_active` vs `sandbox_reclaim_blocked` — and a client must branch on
+    it, since only the second names a project.
+
+    A CITIZEN'S OWN OTHER PROJECT IS NOT IN THIS LIST ANY MORE. Opening one starts it and hands
+    the outgoing container to the shutdown routine, so neither code is raised for it."""
 
     error: _ConflictError | ReclaimBlockedError
 
@@ -360,7 +386,7 @@ async def internal_reap(
         (
             409,
             BuildConflictEnvelope,
-            "A build is already running, or another project holds the workspace with unsaved work",
+            "This project's own work is already running, or a shared view holds the workspace",
         ),
         (422, ErrorEnvelope, "Invalid request body"),
         (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
@@ -390,10 +416,11 @@ async def relaunch_preview(
                 db, user, body.project_id, sandbox, prefer_saved=body.prefer_saved
             )
         except BuildSessionConflictError as exc:
-            # A build is currently running for this user — relaunch never pre-empts it (409).
+            # This project's own work is running — relaunch never pre-empts it (409). A
+            # DIFFERENT project of theirs never reaches here: that is a switch, and it starts.
             return _conflict_response(exc)
         except SandboxReclaimBlockedError as exc:
-            # Another project holds the one slot and has unsaved work.
+            # A colleague's shared view holds the one slot, and it has no hand-over.
             return reclaim_blocked_response(exc)
         except NoSnapshotToRelaunchError as exc:
             # Confirmed-absent (or vanished) snapshot: nothing to relaunch, and there is no
@@ -461,6 +488,97 @@ async def stop_build(
     return StopBuildResponse(session_id=ended.session_id, status=ended.status)
 
 
+async def _project_owning_app_name(
+    db: AsyncSession, user_id: uuid.UUID, app_name: str
+) -> uuid.UUID | None:
+    """The citizen's project whose `app_name_for(app_id)` hashes forward to `app_name`, or
+    `None` when none of their apps do. FORWARD ONLY, matching `app_name_for`'s own contract
+    (`redis/keys.py`, `manager.py`) — nothing here reverse-parses a project out of a name."""
+    apps = (
+        await db.execute(
+            sa.select(AppRegistry.id, AppRegistry.project_id).where(AppRegistry.user_id == user_id)
+        )
+    ).all()
+    return next((app.project_id for app in apps if app_name_for(app.id) == app_name), None)
+
+
+def _when_this_one_closes(reg: dict[str, str]) -> datetime | None:
+    """The ceiling instant for the container this registry record names, or `None`.
+
+    This route has no container-call budget, so the created-at stamp on the hash is the only
+    field worth reading — the same fallback the sweep's own age source lands on when ARM
+    cannot be asked."""
+    enabled, after_hours = the_ceiling_switch()
+    return draining_at(
+        identity_from_tags({TAG_CREATED_AT: reg.get(REGISTRY_FIELD_CREATED_AT, "")}),
+        enabled=enabled,
+        after_hours=after_hours,
+    )
+
+
+@router.get(
+    "/activity",
+    response_model=ActivityResponse,
+    responses=error_responses(
+        AUTH_401, (503, ErrorEnvelope, "Build coordination is temporarily unavailable")
+    ),
+)
+async def build_session_activity(user: CurrentUser, db: DbSession) -> ActivityResponse:
+    """Which of the citizen's projects are starting, open, or closing down right now — the
+    three markers the applications page draws beside each project's name.
+
+    DECLARED ABOVE `GET /{session_id}` ON PURPOSE: that route's `{session_id}` is a single
+    path segment and would otherwise swallow `/activity` as an unparseable session id, 422ing
+    every call.
+
+    THE SAME BUDGET `preview-state` HOLDS, FOR EVERY PROJECT AT ONCE rather than one: the
+    pipelined registry-hash-plus-starting-marker read, the citizen's owed `PendingTeardown`
+    rows, and no container call of any kind.
+
+    AN EMPTY LIST IS A POSITIVE CLAIM that nothing is starting, open or closing, so this runs
+    inside `build_coordination_or_503` like `renew_presence` beside it: a store that cannot
+    be read answers 503, never a list the client would read as "nothing is happening" and use
+    to clear every marker it is currently showing."""
+    with build_coordination_or_503():
+        reg, starting_project_id = await read_registry_and_starting_marker(get_redis(), user.id)
+
+        phases: dict[uuid.UUID, ActivityPhase] = {}
+
+        if reg is not None:
+            app_name = reg.get(REGISTRY_FIELD_APP_NAME)
+            if app_name and reg.get(REGISTRY_FIELD_STATE) == REGISTRY_STATE_READY:
+                project_id = await _project_owning_app_name(db, user.id, app_name)
+                if project_id is not None:
+                    phases[project_id] = (
+                        ActivityPhase.OPEN if stamp_is_proven(reg) else ActivityPhase.STARTING
+                    )
+
+        if starting_project_id is not None and starting_project_id not in phases:
+            phases[starting_project_id] = ActivityPhase.STARTING
+
+        owed_project_ids = (
+            (
+                await db.execute(
+                    sa.select(PendingTeardown.project_id)
+                    .join(Project, Project.id == PendingTeardown.project_id)
+                    .where(PendingTeardown.user_id == user.id, Project.user_id == user.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for owed_project_id in owed_project_ids:
+            phases.setdefault(owed_project_id, ActivityPhase.CLOSING)
+
+        return ActivityResponse(
+            projects=[
+                ProjectActivity(project_id=project_id, phase=phase)
+                for project_id, phase in phases.items()
+            ]
+        )
+    raise _coordination_is_gone()
+
+
 @router.get(
     "/{session_id}",
     responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Build session not found")),
@@ -512,8 +630,14 @@ async def build_events(
 # `_renew_and_state` helper: the portal's keep-alive loop that was their only caller was
 # itself deleted, and a route with no caller is not neutral — it reads as a supported way to
 # hold the lock, and the next person needing one would have wired the loop straight back.
-# What holds a turn open now is the wall-clock lease the SERVER renews, legible to a sweep
-# in another process, which a browser timer never was.
+# What holds a TURN open is the wall-clock lease the SERVER renews, legible to a sweep in
+# another process, which a browser timer never was.
+#
+# What holds a CONTAINER open, between turns, is a browser timer again — `projects/{project_id}/
+# renew` below. The difference that makes it safe is the absolute age ceiling: the retired lock
+# ops had no bound at all, so a tab that would not stop renewing made a container unreclaimable,
+# and the renewal here cannot push past the ceiling `reaper.py` evaluates in both sparing arms.
+# It renews the preview's stay and nothing else — never the lock, never the heartbeat.
 #
 # `force-end` was the last one standing and it has now gone the same way, its client exports
 # with it. The kill switch a citizen actually reaches is
@@ -642,6 +766,18 @@ class SaveStateResponse(CamelModel):
     # recovery copy is what the platform can resume from; `savedHead` is what its owner chose to
     # keep, and only that one is a thing they can ask to come back to.
     recovery_at: datetime | None = None
+    # WHEN A PLATFORM WRITE-BACK FOR THIS APP WAS LAST REFUSED, or None if none ever was.
+    #
+    # Shutdown writes the citizen's work back with nobody watching, and when the tree does not
+    # descend from what they themselves saved, the ancestry guard sets it aside and the app comes
+    # back from the SAVED version — which from the screen is indistinguishable from an ordinary
+    # reopen. This is what lets the project screen say so, and saying so is the whole of what
+    # makes removing the exit prompts honest rather than merely quieter.
+    #
+    # None ALSO COVERS "COULD NOT ASK". A notice that cannot be substantiated is one not made:
+    # claiming a refusal that did not happen would send somebody looking for work that was never
+    # set aside.
+    write_back_refused_at: datetime | None = None
     saved_head: str | None = None
 
 
@@ -1193,6 +1329,79 @@ async def workspace_check(
     return WorkspaceCheckResponse(state=state, reverted=state is WorkspaceState.REVERTED)
 
 
+@router.post(
+    "/projects/{project_id}/renew",
+    response_model=RenewPresenceResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        AUTH_401,
+        (403, ErrorEnvelope, "CSRF check failed"),
+        (404, ErrorEnvelope, "Project not found"),
+        (503, ErrorEnvelope, "Build coordination is temporarily unavailable"),
+    ),
+)
+async def renew_presence(
+    project_id: uuid.UUID,
+    body: RenewPresenceRequest,
+    user: CurrentUser,
+    db: DbSession,
+) -> RenewPresenceResponse:
+    """A screen that can frame this project is still open; hold its container.
+
+    PRESENCE IS THE SIGNAL, AND SILENCE IS DEPARTURE. Nothing is sent when a citizen leaves —
+    navigating away, closing the tab, sleeping the machine and losing the network all simply stop
+    the renewals, so all four are one event with no code of their own and nothing that can fail to
+    arrive. What remains is a short stay that lapses, which is what a departure was always meant
+    to produce.
+
+    A POST, WITH CSRF, for the same reason `workspace-check` is one: it is not a free read. It
+    writes a deadline onto coordination state, and a deadline a third-party page could push
+    forward from a citizen's browser is a deadline an attacker can use to run up a bill.
+
+    THE CONTAINER IS NEVER NAMED ON THE WIRE. The server resolves which container this project
+    owns from its own app row — `app_name_for` is the same forward mapping the sandbox is named
+    by — and the write is refused inside Redis when the record names anything else. A caller that
+    could supply a name could hold somebody else's container open.
+
+    200 ON ALL THREE OUTCOMES. `not_this_container` is the ordinary reading a moment after
+    somebody opens a second project, and `nothing_running` is what a screen polling through a
+    teardown sees; neither is an error, and neither is something to show anybody. A lease that
+    genuinely lapsed reaches the citizen through `preview-state`, which is the one route allowed
+    to say a preview is gone."""
+    await owned_project_or_404(db, user.id, project_id)
+    # Owner AND project in the predicate, for the reason `report_client_error` states: the
+    # second clause is what keeps this scoped if the query is ever moved somewhere that has not
+    # already refused another user's project.
+    app_id = (
+        await db.execute(
+            sa.select(AppRegistry.id).where(
+                AppRegistry.project_id == project_id, AppRegistry.user_id == user.id
+            )
+        )
+    ).scalar_one_or_none()
+    if app_id is None:
+        # No app row means nothing was ever built for this project, so there is no container a
+        # surface could be holding open. A 404 would be wrong — the PROJECT exists and is theirs.
+        return RenewPresenceResponse(outcome=RenewalOutcome.NOTHING_RUNNING)
+    with build_coordination_or_503():
+        redis = get_redis()
+        outcome, stay_until = await renew_presence_stay(
+            redis,
+            user.id,
+            app_name=app_name_for(app_id),
+            presence=body.presence,
+        )
+        # Only for the container this renewal actually reached. A ceiling instant reported
+        # alongside `not_this_container` would be another project's, wearing this one's name.
+        mark: datetime | None = None
+        if outcome is RenewalOutcome.RENEWED:
+            reg = await read_registry(redis, user.id)
+            if reg is not None:
+                mark = _when_this_one_closes(reg)
+        return RenewPresenceResponse(outcome=outcome, stay_until=stay_until, draining_at=mark)
+    raise _coordination_is_gone()
+
+
 @router.get(
     "/projects/{project_id}/compile-state",
     response_model=CompileStateResponse,
@@ -1249,7 +1458,12 @@ async def save_state(
     if sandbox is None:
         return SaveStateResponse()
     state = await manager.project_save_state(db, user, project_id, sandbox_client=sandbox)
-    return SaveStateResponse(**_save_state_fields(state))
+    # ASKED HERE RATHER THAN INSIDE THE SAVE STATE, because it is a fact about the OBJECT STORE
+    # and not about the container: a write-back refused days ago is still owed a sentence, and
+    # the save state is a comparison of two commits. One list and one head, alongside the two
+    # heads this read already pays for.
+    refused = await newest_diverted_at(state.app_id) if state.app_id else None
+    return SaveStateResponse(**_save_state_fields(state), write_back_refused_at=refused)
 
 
 # --- the app's own client-error report ----------------

@@ -14,15 +14,9 @@
  * a test that matched loosely would let the sentence drift back to the negation it was chosen
  * to replace.
  *
- * ★ AND THE COUNT IS NOW PART OF THE CONTRACT. This file used to pin TEN textually distinct arms.
- * Five of them were hedges against a lie on the wire — `alive` meant a container had been
- * SCHEDULED, never that anything had watched the app ANSWER a request — so the map kept a second
- * opinion of its own ("up but not painted", "did not answer in time", "we could not start your
- * app", a second held arm, a sentence about our own plumbing). The backend proves the serve before
- * it says `alive`, the hedges have nothing left to hedge, and the arms they carried collapse into
- * the wait that was always the honest answer. What is pinned below is the FIVE a citizen reads
- * plus the one that is never drawn — and the pin is the count as much as the copy, because a
- * sixth card growing back is the failure this collapse exists to make visible.
+ * ★ AND THE COUNT IS PART OF THE CONTRACT. What is pinned below is the FOUR a citizen reads plus
+ * the one that is never drawn — the count as much as the copy, because a fifth card growing back
+ * is the failure this pin exists to make visible.
  */
 import { readFileSync } from 'node:fs'
 import { resolve as resolvePath } from 'node:path'
@@ -85,23 +79,18 @@ function resolve(over: Partial<WorkspaceInputs> = {}) {
 /**
  * Everything a surface would put on screen for this value, as one string.
  *
- * ALL FOUR SLOTS, not just the two the map used to have. A sweep that read only the headline,
- * the detail and the first action would have gone on passing while the take-back's label and the
- * stopped-holder note said whatever they liked — which is exactly the class of miss the register
- * assertions below exist to catch.
+ * EVERY SLOT A SURFACE DRAWS, not just the sentence pair: a sweep blind to the note or the label
+ * would go on passing while either said whatever it liked, which is exactly the class of miss the
+ * register assertions below exist to catch.
  */
 const rendered = (over: Partial<WorkspaceInputs> = {}) => {
   const state = resolve(over)
-  return [
-    state.headline,
-    state.detail ?? '',
-    state.note ?? '',
-    state.action?.label ?? '',
-    state.secondAction?.label ?? '',
-  ].join(' ')
+  return [state.headline, state.detail ?? '', state.note ?? '', state.action?.label ?? ''].join(' ')
 }
 
-/** A workspace held by a named project — the arm with a second control. */
+/** A workspace this citizen's OTHER project is holding — the server's `slot_taken`, attribution
+ *  and all. The attribution is deliberately still on the wire; what is pinned below is that this
+ *  map never puts it on a screen. */
 const heldBy = (name = 'Car pool apps', id = 'proj-9') =>
   reading({ state: 'slot_taken', occupyingProjectName: name, occupyingProjectId: id })
 
@@ -111,11 +100,9 @@ const EVERY_ENDING: readonly (StartOutcome | null)[] = [
   { kind: 'not-painted' },
   { kind: 'timed-out' },
   { kind: 'failed', reason: 'the image could not be pulled' },
-  { kind: 'take-back-failed', reason: 'Could not save your work', stoppedHolder: null },
-  { kind: 'take-back-failed', reason: 'Could not save your work', stoppedHolder: 'Roster' },
 ]
 
-describe('★ the five a citizen reads, each from its own real inputs', () => {
+describe('★ the four a citizen reads, each from its own real inputs', () => {
   // ONE TEST PER STATE, NAMED FOR THE SITUATION RATHER THAN THE ARM, because the arm names are
   // internal and the situations are what the client signed off. Each asserts the WHOLE sentence
   // pair verbatim: the wording was somebody's decision, and a loose match lets it drift back.
@@ -129,7 +116,6 @@ describe('★ the five a citizen reads, each from its own real inputs', () => {
     expect(state.headline).toBe('Describe what you want to build.')
     expect(state.detail).toBe('Your app will appear here as it takes shape.')
     expect(state.action).toBeNull()
-    expect(state.secondAction ?? null).toBeNull()
     expect(state.busy ?? false).toBe(false)
   })
 
@@ -154,7 +140,6 @@ describe('★ the five a citizen reads, each from its own real inputs', () => {
     expect(state.headline).toBe('Your app is running.')
     expect(state.detail).toBeNull()
     expect(state.action).toBeNull()
-    expect(state.secondAction ?? null).toBeNull()
     expect(state.busy ?? false).toBe(false)
   })
 
@@ -169,37 +154,42 @@ describe('★ the five a citizen reads, each from its own real inputs', () => {
     expect(state.busy ?? false).toBe(false)
   })
 
-  it('HELD — another of this citizen`s projects holding the one workspace names it', () => {
-    const state = resolve({ preview: heldBy('Car pool', 'proj-9') })
+  it('★ HELD BY YOUR OWN OTHER PROJECT — read as the saved app it is, and nobody is named', () => {
+    // Pressing start takes the workspace: the server starts what was asked for and tears the
+    // outgoing container down behind it. So a held slot is the same situation as a stopped app —
+    // the same sentence, the same one control — and the holder is never named, because a tab
+    // preempted from elsewhere has no cause data to name one with.
+    const state = resolve({ preview: heldBy('Car pool', 'proj-9'), projectHasSavedBuild: true })
 
-    expect(state.name).toBe('held-by-another-project')
-    expect(state.headline).toBe('“Car pool” is using your workspace.')
-    expect(state.detail).toBe(
-      'You have one workspace at a time. Open that application to pick up where you left off.',
-    )
+    expect(state.name).toBe('not-running')
+    expect(state.headline).toBe('Your app is saved.')
+    expect(state.detail).toBe('It stays running while you work, so you only do this once.')
+    expect(state.action).toEqual({ kind: 'start', label: 'Launch Application' })
     expect(state.busy ?? false).toBe(false)
+    // NOTHING NAMES THE HOLDER, even though the wire still carries its name and id.
+    expect(rendered({ preview: heldBy('Car pool', 'proj-9'), projectHasSavedBuild: true }))
+      .not.toContain('Car pool')
   })
 
-  it('★ and there are FIVE of them, plus the one that is never drawn — not ten', () => {
-    // THE COUNT IS THE CONTRACT. This assertion used to read `.toBe(10)`, and five of those ten
-    // were second opinions about a wire value nobody could trust. Pinning the number is what makes
-    // a sixth card growing back a red test rather than a review someone has to notice: every new
-    // arm has to be added HERE, beside the reason the collapse happened, by whoever adds it.
+  it('★ and there are FOUR of them, plus the one that is never drawn', () => {
+    // THE COUNT IS THE CONTRACT. Pinning the number is what makes a fifth card growing back a red
+    // test rather than a review someone has to notice: every new arm has to be added HERE by
+    // whoever adds it.
     const everyArm = [
       resolve({ preview: reading({ state: 'never_built', restorable: false }) }),
       resolve({ preview: reading({ state: 'starting' }) }),
       resolve({ preview: reading({ state: 'alive', alive: true }) }),
       resolve({ preview: reading({ state: 'asleep', restorable: true }) }),
-      resolve({ preview: heldBy() }),
+      resolve({ preview: heldBy(), projectHasSavedBuild: true }),
       resolve({ preview: reading({ state: 'unknown' }) }),
     ]
 
     expect(new Set(everyArm.map((s) => s.name))).toEqual(
-      new Set(['never-built', 'starting', 'running', 'not-running', 'held-by-another-project', 'could-not-read']),
+      new Set(['never-built', 'starting', 'running', 'not-running', 'could-not-read']),
     )
-    // Five of the six are DRAWN; the sixth is the internal one, reachable only where nothing has
-    // ever been decided. Asserted as a count so a seventh cannot arrive unnoticed.
-    expect(new Set(everyArm.map((s) => s.name)).size).toBe(6)
+    // Four of the five are DRAWN; the fifth is the internal one, reachable only where nothing has
+    // ever been decided. Asserted as a count so a sixth cannot arrive unnoticed.
+    expect(new Set(everyArm.map((s) => s.name)).size).toBe(5)
   })
 })
 
@@ -244,7 +234,6 @@ describe('★ BUILDING absorbed three cards, and it still has no verb', () => {
           const state = resolve({ ...inputs, startOutcome, projectHasSavedBuild })
           expect(state.name, how).toBe('starting')
           expect(state.action, `${how} / ${startOutcome?.kind ?? 'no ending'}`).toBeNull()
-          expect(state.secondAction ?? null, how).toBeNull()
           // LIVENESS. Every absence above would pass just as happily against an arm that returned
           // an empty husk, so the sentence has to be there too — a withheld verb, not a blank card.
           expect(state.headline).toBe('Getting your app ready.')
@@ -340,21 +329,12 @@ describe('the register — what the pane may and may not say', () => {
       { preview: reading({ state: 'asleep' }), startOutcome: { kind: 'not-painted' } },
       { preview: reading({ state: 'asleep' }), startOutcome: { kind: 'timed-out' } },
       { preview: reading({ state: 'asleep' }), startOutcome: { kind: 'failed', reason: 'no image' } },
-      {
-        preview: heldBy(),
-        startOutcome: { kind: 'take-back-failed', reason: 'no image', stoppedHolder: 'Car pool apps' },
-      },
     ]
 
     for (const inputs of everyState) {
       const state = resolve(inputs)
-      // Everything whose subject is this citizen's own app: the two sentences, and both labels.
-      const text = [
-        state.headline,
-        state.detail ?? '',
-        state.action?.label ?? '',
-        state.secondAction?.label ?? '',
-      ].join(' ')
+      // Everything whose subject is this citizen's own app: the two sentences and the label.
+      const text = [state.headline, state.detail ?? '', state.action?.label ?? ''].join(' ')
       for (const phrase of forbidden) {
         expect(`${JSON.stringify(inputs.preview?.state ?? null)}: ${text}`).not.toMatch(phrase)
       }
@@ -378,9 +358,9 @@ describe('the register — what the pane may and may not say', () => {
     expect(state.note).toBe(refusal)
     expect(state.detail).toBe('It stays running while you work, so you only do this once.')
     expect(state.headline).toBe('Your app is saved.')
-    // And the sweep's own subject — the two sentences and both labels — is still clean, even
+    // And the sweep's own subject — the two sentences and the label — is still clean, even
     // though the value the citizen reads on this very card contains all four forbidden phrases.
-    const swept = [state.headline, state.detail, state.action?.label ?? '', state.secondAction?.label ?? ''].join(' ')
+    const swept = [state.headline, state.detail, state.action?.label ?? ''].join(' ')
     for (const phrase of [/not running/i, /\bstopped\b/i, /unavailable/i, /preview/i]) {
       expect(swept).not.toMatch(phrase)
     }
@@ -390,18 +370,16 @@ describe('the register — what the pane may and may not say', () => {
   })
 
   it('★ and the one carve-out stays exactly one field wide', () => {
-    // The note is the only place "stopped" may appear, it appears only where a take-back stopped
-    // somebody, and it names them. Written as its own assertion so that widening the carve-out —
-    // by moving that sentence into `detail`, say — fails here rather than passing the sweep above
-    // on a technicality.
-    const stopped = resolve({
-      preview: heldBy('Roster', 'p-9'),
-      startOutcome: { kind: 'take-back-failed', reason: 'Could not save your work', stoppedHolder: 'Roster' },
+    // The note is the only place a server's own prose may appear. Written as its own assertion so
+    // that widening the carve-out — by moving that sentence into `detail`, say — fails here rather
+    // than passing the sweep above on a technicality.
+    const refused = resolve({
+      preview: reading({ state: 'asleep', restorable: true }),
+      startOutcome: { kind: 'failed', reason: 'The other app is stopped and the preview is unavailable.' },
     })
 
-    expect(stopped.note).toMatch(/\bstopped\b/)
-    expect(stopped.note).toContain('“Roster”')
-    expect(`${stopped.headline} ${stopped.detail ?? ''}`).not.toMatch(/\bstopped\b/i)
+    expect(refused.note).toMatch(/\bstopped\b/)
+    expect(`${refused.headline} ${refused.detail ?? ''} ${refused.action?.label ?? ''}`).not.toMatch(/\bstopped\b/i)
   })
 
   it('a refusal on a project with NOTHING saved is still acknowledged', () => {
@@ -478,13 +456,13 @@ describe('★ an unreadable read renders the LAST SETTLED reading — decision D
   it('★ the memory covers every settled reading, not only the two above', () => {
     // Written as a sweep because the rule is about the READ deciding nothing, not about which
     // answer happens to be remembered — an implementation that special-cased `alive` would pass
-    // the first test in this block and still move the pane on a blip over a held workspace.
+    // the first test in this block and still move the pane on a blip over a taken slot.
     const remembered: [string, DecidedPreview][] = [
       ['running', settled({ state: 'alive', alive: true })],
       ['starting', settled({ state: 'starting' })],
       ['not-running', settled({ state: 'asleep', restorable: true })],
       ['never-built', settled({ state: 'never_built', restorable: false })],
-      ['held-by-another-project', settled({ state: 'slot_taken', occupyingProjectName: 'Roster', occupyingProjectId: 'p-9' })],
+      ['not-running', settled({ state: 'slot_taken', restorable: true, occupyingProjectName: 'Roster', occupyingProjectId: 'p-9' })],
     ]
 
     for (const [expected, lastDecidedPreview] of remembered) {
@@ -510,248 +488,88 @@ describe('★ an unreadable read renders the LAST SETTLED reading — decision D
 })
 
 /**
- * ★ DECISION D4 — HELD KEEPS TODAY'S BUTTON ORDER.
+ * ★ A SLOT HELD BY YOUR OWN OTHER PROJECT IS NOT A NEGOTIATION.
  *
- * The design proposed promoting the take-back to `action` and demoting the go-to. It is not taken.
- * `PlanChatWorkspaceLine` narrows on `action.kind === 'go-to-project'` and never reads
- * `secondAction`, so the swap would render the held card with NO BUTTON on the one surface whose
- * whole job is to send somebody elsewhere — and it would make the consequential verb the lead
- * control on a card nobody navigated to.
+ * The server takes the one workspace for whichever project was asked for and tears the outgoing
+ * one down behind it, so pressing start simply switches back. That makes `slot_taken` the same
+ * reading a saved, stopped app gets — one sentence, one control — and it is why nothing here may
+ * name another project, offer to navigate to one, or offer to stop one.
  */
-describe('★ the hand-over state — one card, two sentences, and the order is decision D4', () => {
-  it('★ with a name and an id: go-to LEADS, take-back is the alternative, in that order', () => {
-    const state = resolve({ preview: heldBy() })
+describe('★ a taken slot is read as the saved app it is', () => {
+  const EVERY_ATTRIBUTION: [string, PreviewState][] = [
+    ['named and routable', heldBy('Roster', 'p-9')],
+    ['name only', reading({ state: 'slot_taken', occupyingProjectName: 'Roster' })],
+    ['id only', reading({ state: 'slot_taken', occupyingProjectId: 'p-9' })],
+    ['neither', reading({ state: 'slot_taken' })],
+  ]
 
-    expect(state.action).toEqual({
-      kind: 'go-to-project',
-      label: 'Open “Car pool apps”',
-      projectId: 'proj-9',
-    })
-    expect(state.secondAction).toEqual({
-      kind: 'take-back',
-      label: 'Stop “Car pool apps” and open this app instead',
-    })
-    // ★ THE ORDER, ASSERTED AS AN ORDER rather than as two independent facts. Swap the two slots
-    // and both assertions above could be rewritten to pass; this one cannot, because it says which
-    // verb the surfaces LEAD with — and the Plan chat reads only the leader.
-    expect([state.action?.kind, state.secondAction?.kind]).toEqual(['go-to-project', 'take-back'])
-  })
-
-  it('★ with the attribution withheld it names nobody, quotes nothing, and still offers a way out', () => {
-    // A first-class wire state, not a bug to paper over: the server declines to attribute a
-    // container it cannot map to a project this person owns, because naming the WRONG project in
-    // a sentence about somebody's work is worse than naming none. The failure this arm is written
-    // against is a sentence with an empty pair of quotes in it.
-    //
-    // IT USED TO BE A DEAD END — a second state offering `action` and `secondAction` both null: a
-    // card that named the problem, named no remedy, and left nothing to press. A missing holder
-    // name is a reason to say LESS, not to DO less.
-    const state = resolve({ preview: reading({ state: 'slot_taken' }) })
-
-    expect(state.name).toBe('held-by-another-project')
-    expect(state.headline).toBe('Another application is using your workspace.')
-    expect(state.detail).toBe('You have one workspace at a time, and we could not tell which application has it.')
-    expect(rendered({ preview: reading({ state: 'slot_taken' }) })).not.toMatch(/[“"]\s*[”"]/)
-    // The take-back leads because it is the ONLY one, not because it was promoted — there is no
-    // go-to to lead with, and `AppPane` draws its second control INSIDE the first one's block, so
-    // a lone alternative parked in `secondAction` would be a remedy nothing renders.
-    expect(state.action).toEqual({
-      kind: 'take-back',
-      label: 'Stop the other application and open this one instead',
-    })
-    expect(state.secondAction ?? null).toBeNull()
-  })
-
-  it('★ THE INVARIANT: no reading of a taken slot ever leaves both slots empty', () => {
-    // The dead end the merge removed, pinned so it cannot come back through a new arm. Swept over
-    // every attribution shape AND every press ending, because the endings are what would introduce
-    // one: a `take-back-failed` arm that decided to withhold both controls would look reasonable
-    // in review and would strand the citizen with a named problem and nothing to press.
-    const attributions: [string, PreviewState][] = [
-      ['named and routable', heldBy('Roster', 'p-9')],
-      ['name only', reading({ state: 'slot_taken', occupyingProjectName: 'Roster' })],
-      ['id only', reading({ state: 'slot_taken', occupyingProjectId: 'p-9' })],
-      ['neither', reading({ state: 'slot_taken' })],
-    ]
-
-    for (const [shape, preview] of attributions) {
+  it('★ THE INVARIANT: no reading of a taken slot ever names another project or reaches one', () => {
+    // Swept over every attribution shape AND every press ending, because an ending is what would
+    // reintroduce one: an arm that decided to explain who took the workspace would look reasonable
+    // in review and would be drawing on cause data no surface has.
+    for (const [shape, preview] of EVERY_ATTRIBUTION) {
       for (const startOutcome of EVERY_ENDING) {
         for (const projectHasSavedBuild of [true, false, null]) {
           const state = resolve({ preview, startOutcome, projectHasSavedBuild })
-          expect(state.name, shape).toBe('held-by-another-project')
-          const both = (state.action ?? null) === null && (state.secondAction ?? null) === null
-          expect(both, `${shape} / ${startOutcome?.kind ?? 'no ending'} left nothing to press`).toBe(false)
-          // AND A SECOND SLOT IS NEVER FILLED WITHOUT A FIRST, which `AppPane` depends on: it
-          // draws the second control inside the first one's block.
-          if (state.secondAction) expect(state.action, shape).not.toBeNull()
+          expect(['not-running', 'never-built'], shape).toContain(state.name)
+          const text = rendered({ preview, startOutcome, projectHasSavedBuild })
+          expect(text, shape).not.toContain('Roster')
+          expect(text, shape).not.toContain('p-9')
+          expect(text, shape).not.toMatch(/workspace/i)
+          // NO EMPTY QUOTES EITHER — the failure a template hits when it trusts a name to be there.
+          expect(text, shape).not.toMatch(/[“"]\s*[”"]/)
+          // THE VERBS, over the whole union: only the two that act on this citizen's own app.
+          if (state.action) expect(['start', 'retry'], shape).toContain(state.action.kind)
         }
       }
     }
   })
 
-  it('offers no go-to when only half the attribution arrived — a button to nowhere is worse', () => {
-    // THE ATTRIBUTION IS ALL OR NOTHING and the wire says so: the name and the id go missing
-    // together. Half an attribution can neither label a navigation nor route one.
-    const nameOnly = resolve({
-      preview: reading({ state: 'slot_taken', occupyingProjectName: 'Roster' }),
-    })
-    const idOnly = resolve({ preview: reading({ state: 'slot_taken', occupyingProjectId: 'p-9' }) })
-
-    for (const state of [nameOnly, idOnly]) {
-      expect(state.action?.kind).not.toBe('go-to-project')
-      expect(JSON.stringify(state)).not.toContain('Roster')
+  it('★ and it still offers the start, so a switch back is one press', () => {
+    // Saying less is right; doing less is not. Whatever the attribution, a project with something
+    // to bring back gets the same Launch every saved workspace offers.
+    for (const [shape, preview] of EVERY_ATTRIBUTION) {
+      const state = resolve({ preview, projectHasSavedBuild: true })
+      expect(state.name, shape).toBe('not-running')
+      expect(state.action, shape).toEqual({ kind: 'start', label: LAUNCH_LABEL })
     }
   })
 
-  it('a held slot outranks a start outcome — the remedy, never a retry', () => {
-    // A retry against an occupied slot can only fail the same way again.
-    const state = resolve({ preview: heldBy('Roster', 'p-9'), startOutcome: { kind: 'timed-out' } })
-
-    expect(state.action?.kind).toBe('go-to-project')
-  })
-})
-
-describe('★ taking the workspace back — the second control, and its five endings', () => {
-  it('★ the take-back carries no id of its own — the holder comes off the refusal', () => {
-    // Deliberate, and the reason is the ending where a held id would be WRONG: another tab taking
-    // the freed slot mid-sequence. The reading names the old holder; the server`s refusal names
-    // the new one, and carries the `dirty` tri-state the dialog`s copy arms need besides.
-    const second = resolve({ preview: heldBy() }).secondAction
-    expect(second).not.toBeNull()
-    expect(JSON.stringify(second)).not.toContain('proj-9')
-  })
-
-  it('★ ENDING 1 — a stop that failed returns to held and carries the server`s own sentence', () => {
-    // `buildSessionApi.ts` authors the two-minute ceiling sentence, it is true only on this
-    // ending, and the map does not rewrite it. Nothing was stopped, so nothing is said about the
-    // holder having been.
-    const ceiling =
-      'The other app is still saving its work. Nothing has changed — give it a moment and try again.'
+  it('a taken slot outranks nothing — a start outcome rides on it like any other at-rest read', () => {
     const state = resolve({
       preview: heldBy('Roster', 'p-9'),
-      startOutcome: { kind: 'take-back-failed', reason: ceiling, stoppedHolder: null },
-    })
-
-    expect(state.name).toBe('held-by-another-project')
-    expect(state.detail).toBe(ceiling)
-    expect(state.note ?? null).toBeNull()
-    // Both ways out are still offered — the ending changed what is said, not what may be pressed.
-    expect(state.action?.kind).toBe('go-to-project')
-    expect(state.secondAction?.kind).toBe('take-back')
-  })
-
-  for (const [ending, reason] of [
-    ['ENDING 3 — the save failed', 'Could not save your work'],
-    ['ENDING 4 — the save worked and the release failed', 'Could not close the other workspace'],
-  ] as const) {
-    it(`★ ${ending}: held, plus the line saying the holder is down`, () => {
-      // `handOverWorkspace` REJECTS RATHER THAN SWALLOWS, so a failed save is never followed by a
-      // release: the holder is stopped and the slot is still held. Two facts, and the headline
-      // alone tells the citizen neither of them.
-      const state = resolve({
-        preview: heldBy('Roster', 'p-9'),
-        startOutcome: { kind: 'take-back-failed', reason, stoppedHolder: 'Roster' },
-      })
-
-      expect(state.name).toBe('held-by-another-project')
-      expect(state.detail).toBe(reason)
-      expect(state.note).toBe('“Roster” was stopped, and it still holds your workspace.')
-    })
-  }
-
-  it('★ and never reuses ending 1`s "nothing has changed" where it would be false', () => {
-    // The holder is DOWN on both of these. A sentence promising nothing moved is the one thing
-    // this arm must not say.
-    for (const reason of ['Could not save your work', 'Could not close the other workspace']) {
-      const text = rendered({
-        preview: heldBy('Roster', 'p-9'),
-        startOutcome: { kind: 'take-back-failed', reason, stoppedHolder: 'Roster' },
-      })
-      expect(text).not.toMatch(/nothing has changed/i)
-    }
-  })
-
-  it('★ ENDING 2 — the slot was freed and the start failed: SAVED, plus the holder, in `note`', () => {
-    // The acceptance example "Returns to the held-by-another state" is unreachable here: the
-    // release succeeded, so the holder is gone and the reading is no longer `slot_taken`.
-    //
-    // ★ AND IT NO LONGER GETS A CARD OF ITS OWN. `start-failed` drew "We could not start your
-    // app." over a workspace whose situation, honest headline and next step were all identical to
-    // SAVED's — a differently-shaped screen telling the citizen something had changed that had
-    // not. What is left is the ordinary saved card, with two things said in the one field the
-    // negative-copy sweep exempts: what we did to the other project, then the server's own words.
-    const state = resolve({
-      preview: reading({ state: 'asleep', restorable: true }),
-      startOutcome: { kind: 'take-back-failed', reason: 'the image could not be pulled', stoppedHolder: 'Roster' },
+      projectHasSavedBuild: true,
+      startOutcome: { kind: 'failed', reason: 'the image could not be pulled' },
     })
 
     expect(state.name).toBe('not-running')
-    expect(state.headline).toBe('Your app is saved.')
-    expect(state.detail).toBe('It stays running while you work, so you only do this once.')
-    // THE ORDER INSIDE THE NOTE IS LOAD-BEARING: the map's own sentence about the other project is
-    // properly terminated, and server prose has no punctuation contract at all — leading with it
-    // would run the two together.
-    expect(state.note).toBe('“Roster” was stopped. the image could not be pulled')
-    // The remedy is the same Launch a saved workspace always offers.
-    expect(state.action).toEqual({ kind: 'start', label: LAUNCH_LABEL })
-  })
-
-  it('says nothing about a holder it never stopped, even on the freed arm', () => {
-    const state = resolve({
-      preview: reading({ state: 'asleep', restorable: true }),
-      startOutcome: { kind: 'take-back-failed', reason: 'the image could not be pulled', stoppedHolder: null },
-    })
     expect(state.note).toBe('the image could not be pulled')
-    expect(state.note).not.toMatch(/\bstopped\b/)
-    // LIVENESS: it still reports the failure it does know about, on the card it belongs to.
-    expect(state.name).toBe('not-running')
-  })
-
-  it('★ every OTHER start outcome is still outranked by a held slot', () => {
-    // The precedence is unchanged for the three endings that describe an ordinary start. Only the
-    // take-back ending crosses it, because it describes a press made FROM this arm.
-    for (const startOutcome of [
-      { kind: 'timed-out' },
-      { kind: 'not-painted' },
-      { kind: 'failed', reason: 'no image' },
-    ] as const) {
-      const state = resolve({ preview: heldBy('Roster', 'p-9'), startOutcome })
-      expect(state.name).toBe('held-by-another-project')
-      expect(state.detail).toBe('You have one workspace at a time. Open that application to pick up where you left off.')
-      expect(state.note ?? null).toBeNull()
-    }
+    expect(state.action).toEqual({ kind: 'start', label: LAUNCH_LABEL })
   })
 
   it('★ the comparator sees BOTH optional fields, and each one on its own', () => {
     // The channel skips a publish when `sameWorkspaceState` says two readings render identically,
-    // and both optional fields are things a citizen reads. ISOLATED DELIBERATELY: the obvious pair
-    // — two different holders — differs in the headline and in the first action's label too, so a
-    // comparator that had never heard of either field still calls them different and the test
-    // passes vacuously. Each assertion below moves exactly one field.
+    // and both optional fields are things a citizen reads. ISOLATED DELIBERATELY: a pair that
+    // differs in the headline too would pass against a comparator that had never heard of either
+    // field. Each assertion below moves exactly one.
 
-    // THE NOTE, alone: the same failing take-back, told apart only by whether it got as far as
-    // stopping the holder. Same name, same headline, same server prose.
-    const failed = (stoppedHolder: string | null) =>
+    // THE NOTE, alone: the same saved card, told apart only by the server's sentence on it.
+    const saved = (reason: string | null) =>
       resolve({
-        preview: heldBy('Roster', 'p-9'),
-        startOutcome: { kind: 'take-back-failed', reason: 'Could not save your work', stoppedHolder },
+        preview: reading({ state: 'asleep', restorable: true }),
+        startOutcome: reason === null ? null : { kind: 'failed', reason },
       })
-    expect(failed(null).headline).toBe(failed('Roster').headline)
-    expect(failed(null).detail).toBe(failed('Roster').detail)
-    expect(sameWorkspaceState(failed(null), failed('Roster'))).toBe(false)
+    expect(saved(null).headline).toBe(saved('Could not save your work').headline)
+    expect(saved(null).detail).toBe(saved('Could not save your work').detail)
+    expect(sameWorkspaceState(saved(null), saved('Could not save your work'))).toBe(false)
 
-    // THE SECOND SLOT, alone. Hand-built, because the map ties the take-back's label to the holder
-    // name that is also in the headline — and the comparator's contract is over the TYPE, not over
-    // whichever combinations one arm happens to produce today.
-    const held = resolve({ preview: heldBy('Roster', 'p-9') })
+    // AN OMITTED OPTIONAL AND AN EXPLICIT `null` ARE THE SAME CLAIM, and must compare equal.
+    const held = resolve({ preview: heldBy('Roster', 'p-9'), projectHasSavedBuild: true })
     expect(sameWorkspaceState(held, held)).toBe(true)
-    expect(sameWorkspaceState(held, { ...held, secondAction: null })).toBe(false)
-    expect(
-      sameWorkspaceState(held, { ...held, secondAction: { kind: 'take-back', label: 'Stop it' } }),
-    ).toBe(false)
-    // An omitted optional and an explicit `null` are the same claim, and must compare equal.
-    const { secondAction: _s, note: _n, ...bare } = held
-    expect(sameWorkspaceState({ ...bare, secondAction: null, note: null }, bare)).toBe(true)
+    const { note: _n, busy: _b, ...bare } = held
+    expect(sameWorkspaceState({ ...bare, note: null, busy: false }, bare)).toBe(true)
+    // THE ACTION, alone: a different verb behind the same sentences is a different card.
+    expect(sameWorkspaceState(held, { ...held, action: null })).toBe(false)
 
     // ★ AND `busy`, which is the field a wait turns on and nothing else moves. Isolated the same
     // way: hand-built, because the only arm that sets it also changes every other field.
@@ -771,7 +589,6 @@ describe('a start outcome selects no arm of its own — the READING decides the 
       ['not-running', reading({ state: 'asleep', restorable: true })],
       ['never-built', reading({ state: 'never_built', restorable: false })],
       ['starting', reading({ state: 'starting' })],
-      ['held-by-another-project', heldBy('Roster', 'p-9')],
       ['running', reading({ state: 'alive', alive: true })],
     ]
 
@@ -854,8 +671,8 @@ describe('the restore question, and the one answer that suppresses the start con
 
 describe('the properties that hold across every input', () => {
   it('names no destructive verb in any arm', () => {
-    // The type is the real enforcement — the union has four members and none of them is a
-    // teardown — but a sentence can still say a dangerous word, and this is what catches that.
+    // The type is the real enforcement — the union has two members and neither is a teardown —
+    // but a sentence can still say a dangerous word, and this is what catches that.
     const destructive = /\b(restore|restoring|rebuild|rebuilding|reset|delete|deleting|destroy|tear down|teardown|discard|wipe|erase)\b/i
     const states: (PreviewState | null)[] = [
       null,
@@ -887,22 +704,14 @@ describe('the properties that hold across every input', () => {
                 startOutcome,
                 startInFlight,
               })
-              const text = `${state.headline} ${state.detail ?? ''} ${state.note ?? ''} ${state.action?.label ?? ''} ${state.secondAction?.label ?? ''}`
+              const text = `${state.headline} ${state.detail ?? ''} ${state.note ?? ''} ${state.action?.label ?? ''}`
               expect(`${state.name}: ${text}`).not.toMatch(destructive)
-              // Every arm says something, and offers at most one thing to press plus at most one
-              // alternative — never a third.
+              // Every arm says something, and offers at most ONE thing to press — never a second.
               expect(state.headline.length).toBeGreaterThan(0)
-              expect(['start', 'retry', 'go-to-project', 'take-back', undefined]).toContain(state.action?.kind)
-              expect(['take-back', undefined]).toContain(state.secondAction?.kind)
-              // ONLY THE HELD ARM HAS EVER FILLED THE SECOND SLOT, and only ever beside a first.
-              if (state.secondAction) {
-                expect(state.name).toBe('held-by-another-project')
-                expect(state.action).not.toBeNull()
-              }
-              // AND A TAKE-BACK IS ONLY EVER REACHABLE FROM A HELD READING, in either slot. It is
-              // the one verb that acts on somebody else's app, so the arm that offers it is worth
-              // pinning rather than leaving to the union's shape.
-              if (state.action?.kind === 'take-back') expect(state.name).toBe('held-by-another-project')
+              expect(['start', 'retry', undefined]).toContain(state.action?.kind)
+              // AND NOTHING IT OFFERS ACTS ON ANOTHER PERSON'S APP: both verbs ask this project's
+              // own start, which `registry:{user_id}` scopes to this citizen's one slot.
+              expect(Object.keys(state)).not.toContain('secondAction')
             }
           }
         }
@@ -921,10 +730,10 @@ describe('the properties that hold across every input', () => {
     expect(JSON.stringify(state)).not.toContain('https://app.example/')
   })
 
-  it('★ EVERY arm carries the whole key set, so the map stays total over the optional three', () => {
-    // `secondAction`, `note` and `busy` are OPTIONAL in the type, so the suites that hand-build a
-    // state need not restate values they have no opinion about. That optionality is exactly why
-    // the map has to be pinned here instead: TypeScript will not notice an arm that forgets one.
+  it('★ EVERY arm carries the whole key set, so the map stays total over the optional two', () => {
+    // `note` and `busy` are OPTIONAL in the type, so the suites that hand-build a state need not
+    // restate values they have no opinion about. That optionality is exactly why the map has to be
+    // pinned here instead: TypeScript will not notice an arm that forgets one.
     //
     // ★ READ FROM THE COMPARATOR, not hand-kept beside it. This used to be a second literal list,
     // so adding a field meant editing four places and only three of them were forced. The
@@ -938,19 +747,20 @@ describe('the properties that hold across every input', () => {
       ['never-built', resolve({ preview: reading({ state: 'never_built', restorable: false }) })],
       ['not-running', resolve({ preview: reading({ state: 'asleep', restorable: true }) })],
       ['could-not-read', resolve({ preview: null, lastDecidedPreview: null })],
-      ['held-by-another-project', resolve({ preview: heldBy('Roster', 'p-9') })],
     ]
 
-    // Liveness first: the inputs really do reach six DISTINCT arms. Without this the loop below
+    // Liveness first: the inputs really do reach five DISTINCT arms. Without this the loop below
     // could pass while every entry resolved to the same fallback.
-    expect(new Set(arms.map(([, s]) => s.name)).size).toBe(6)
+    expect(new Set(arms.map(([, s]) => s.name)).size).toBe(5)
     for (const [expectedName, armState] of arms) {
       expect(armState.name).toBe(expectedName)
       expect(Object.keys(armState).sort()).toEqual(KEYS)
     }
-    // AND THE UNATTRIBUTED HELD READING IS THE SAME ARM, which is the merge. Asserted beside the
-    // totality pin rather than as a seventh entry, so the count above stays the count of arms.
-    expect(resolve({ preview: reading({ state: 'slot_taken' }) }).name).toBe('held-by-another-project')
+    // AND A TAKEN SLOT CARRIES THE SAME KEY SET, from the same arm — asserted beside the totality
+    // pin rather than as a sixth entry, so the count above stays the count of arms.
+    const taken = resolve({ preview: heldBy('Roster', 'p-9'), projectHasSavedBuild: true })
+    expect(taken.name).toBe('not-running')
+    expect(Object.keys(taken).sort()).toEqual(KEYS)
   })
 
   it('exports the start label from one place so no surface can spell it differently', () => {

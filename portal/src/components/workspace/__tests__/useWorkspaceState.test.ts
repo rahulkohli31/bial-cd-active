@@ -19,6 +19,7 @@ const api = vi.hoisted(() => ({
   fetchSaveState: vi.fn(),
   fetchCompileState: vi.fn(),
   checkWorkspace: vi.fn(),
+  renewPresence: vi.fn(),
 }))
 
 vi.mock('../../../utils/buildSessionApi', async (importOriginal) => {
@@ -29,6 +30,7 @@ vi.mock('../../../utils/buildSessionApi', async (importOriginal) => {
 const { useWorkspaceState } = await import('../useWorkspaceState')
 const {
   BACKGROUND_CADENCE,
+  HIDDEN_PROBE_MS,
   PREVIEW_PROBE_MS,
   STARTING_PROBE_LIMIT,
   STARTING_PROBE_MS,
@@ -48,17 +50,42 @@ function reading(over: Partial<PreviewState> = {}): PreviewState {
   }
 }
 
-const SAVE: SaveState = { appId: 'app-1', dirty: false, containerHead: 'abc1234', savedHead: 'abc1234', recoveryAt: null }
+const SAVE: SaveState = { appId: 'app-1', dirty: false, containerHead: 'abc1234', savedHead: 'abc1234', recoveryAt: null, writeBackRefusedAt: null }
+
+/**
+ * Put the document out of sight, or bring it back, and fire the event the browser would.
+ *
+ * `visibilityState` is a read-only getter, so it is redefined rather than assigned — jsdom has no
+ * real tab to hide. THIS IS WHY THE HIDDEN-TAB BEHAVIOUR IS ALSO PROVED IN A REAL BROWSER: jsdom
+ * will happily keep firing a timer that Chrome throttles and Edge freezes, so everything below
+ * proves the CODE asks correctly, and nothing below proves the browser lets it.
+ */
+function hide(hidden: boolean): void {
+  Object.defineProperty(document, 'visibilityState', {
+    configurable: true,
+    get: () => (hidden ? 'hidden' : 'visible'),
+  })
+  document.dispatchEvent(new Event('visibilitychange'))
+}
 
 /** The hook, mounted against a project, with the defaults every scenario shares. */
 const mount = (projectId: string | null = 'proj-1', projectHasSavedBuild: boolean | null = null) =>
   renderHook(() => useWorkspaceState({ projectId, projectHasSavedBuild }))
+
+/** The same, but the project arrives as a prop, so a scenario can move the SAME hook to another
+ *  one — which is what the screen does, since nothing keys the surface on the project id. */
+const mountMovable = (projectId: string) =>
+  renderHook(({ id }: { id: string }) => useWorkspaceState({ projectId: id, projectHasSavedBuild: null }), {
+    initialProps: { id: projectId },
+  })
 
 beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true })
   for (const fn of Object.values(api)) fn.mockReset()
   api.fetchPreviewState.mockResolvedValue(reading())
   api.fetchSaveState.mockResolvedValue(SAVE)
+  api.renewPresence.mockResolvedValue('renewed')
+  hide(false)
 })
 
 afterEach(() => {
@@ -828,5 +855,209 @@ describe('a wait that looks stuck asks whether the app has stopped', () => {
     expect(api.fetchPreviewState.mock.calls.length).toBeGreaterThan(readsBefore)
     // …and asked nothing more.
     expect(api.checkWorkspace).toHaveBeenCalledTimes(1)
+  })
+})
+
+
+describe('presence renewal — what holds the container open', () => {
+  it('renews on the ordinary tick, so a screen left open keeps its app', async () => {
+    // The whole mechanism in one assertion: nobody is typing, nobody presses anything, and the
+    // container stays because a screen that can frame it is still here.
+    mount()
+    await settle()
+
+    expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'visible')
+  })
+
+  it('renews from a HIDDEN tab, and asks for the longer budget', async () => {
+    // A citizen reading the docs for their own app in the next tab has not left. A poll that went
+    // silent while hidden would have the platform collect their container out from under them.
+    hide(true)
+    mount()
+    await settle()
+
+    expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'hidden')
+  })
+
+  it('asks a hidden tab for nothing but the read and the renewal', async () => {
+    // THE HALF THAT MATTERS. `fetchSaveState` costs two `git` executions inside the container and
+    // `checkWorkspace` can PUT THE CONTAINER AWAY — doing either with nobody looking is the
+    // opposite of what renewing from a hidden tab is for.
+    api.fetchPreviewState.mockResolvedValue(reading({ state: 'alive', alive: true }))
+    hide(true)
+    mount()
+    await settle()
+
+    expect(api.renewPresence).toHaveBeenCalled()
+    expect(api.fetchSaveState).not.toHaveBeenCalled()
+    expect(api.checkWorkspace).not.toHaveBeenCalled()
+  })
+
+  it('renews the moment a hidden tab is woken, without waiting for a tick', async () => {
+    // A throttled or frozen tab can miss several ticks before it comes back, so the lease may be
+    // minutes old at exactly the moment somebody starts looking at the app again.
+    hide(true)
+    mount()
+    await settle()
+    api.renewPresence.mockClear()
+
+    hide(false)
+    await settle()
+
+    expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'visible')
+  })
+
+  it('polls a hidden tab on the longer cadence, not the visible one', async () => {
+    mount()
+    await settle()
+    hide(true)
+    await settle()
+    api.renewPresence.mockClear()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS + 1)
+    })
+    expect(api.renewPresence).not.toHaveBeenCalled()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(HIDDEN_PROBE_MS)
+    })
+    expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'hidden')
+  })
+
+  it('never renews on the accelerated starting tick', async () => {
+    // A container in `starting` is held by the start-in-flight marker and the lock, not by a stay,
+    // so a renewal there writes a deadline onto a record nothing is judging it by.
+    api.fetchPreviewState.mockResolvedValue(reading({ state: 'starting' }))
+    mount()
+    await settle()
+    api.renewPresence.mockClear()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
+    })
+
+    expect(api.fetchPreviewState).toHaveBeenCalled()
+    expect(api.renewPresence).not.toHaveBeenCalled()
+  })
+
+  it('renders nothing and assumes nothing when a renewal cannot be made', async () => {
+    // 401, 403 and 503 are facts about the request, not about the container. A screen that painted
+    // "your workspace is going away" on one would be over-claiming from an outage; a lease that
+    // genuinely lapsed arrives through the preview read instead.
+    api.fetchPreviewState.mockResolvedValue(reading({ state: 'alive', alive: true }))
+    api.renewPresence.mockResolvedValue(null)
+
+    const { result } = mount()
+    await waitFor(() => expect(result.current.state.name).toBe('running'))
+
+    expect(result.current.state.name).toBe('running')
+  })
+
+  it('sends nothing at all on unmount — leaving is silence, not a message', async () => {
+    const { unmount } = mount()
+    await settle()
+    api.renewPresence.mockClear()
+
+    unmount()
+    await settle()
+
+    expect(api.renewPresence).not.toHaveBeenCalled()
+  })
+})
+
+
+/**
+ * ★ THE CEILING INSTANT IS DROPPED WITH THE CONTAINER IT DESCRIBES.
+ *
+ * It is not an internal number: the pane column announces it ("This app closes at 4:15") on every
+ * surface that frames the app. An instant held past the life of the container it came from is a
+ * sentence about a closing that is not coming, said to the citizen on both surfaces at once.
+ */
+describe('★ what retires the ceiling instant', () => {
+  const ALIVE = reading({ state: 'alive', alive: true, previewUrl: 'https://app.example/' })
+  const soon = () => new Date(Date.now() + 5 * 60_000).toISOString()
+
+  /** A mounted hook that has been told about a ceiling. */
+  const withACeiling = async () => {
+    api.fetchPreviewState.mockResolvedValue(ALIVE)
+    api.renewPresence.mockResolvedValue({ outcome: 'renewed', drainingAt: soon() })
+    const view = mountMovable('proj-1')
+    await waitFor(() => expect(view.result.current.drainingAt).not.toBeNull())
+    return view
+  }
+
+  it('★ drops it when the screen moves to another project', async () => {
+    // Nothing keys the surface on the project id, so the hook is not remounted — and the instant
+    // belongs to one container. Announced over the next project it would name a closing time for
+    // an app the citizen is not looking at.
+    const view = await withACeiling()
+
+    view.rerender({ id: 'proj-2' })
+
+    expect(view.result.current.drainingAt).toBeNull()
+  })
+
+  it('★ drops it when the reading says the container is no longer alive', async () => {
+    // The renewal goes on answering with the same ceiling, so only the teardown can clear it.
+    const view = await withACeiling()
+
+    api.fetchPreviewState.mockResolvedValue(reading({ state: 'asleep' }))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS + 1)
+    })
+
+    await waitFor(() => expect(view.result.current.drainingAt).toBeNull())
+  })
+
+  it('★ drops it when a renewal reaches a container that is not the one on screen', async () => {
+    // The reading stays `alive`, so the teardown path cannot be what clears it. `nothing_running`
+    // and `not_this_container` each say the instant being held describes something else.
+    const view = await withACeiling()
+
+    api.renewPresence.mockResolvedValue({ outcome: 'not_this_container', drainingAt: soon() })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS + 1)
+    })
+
+    await waitFor(() => expect(view.result.current.drainingAt).toBeNull())
+  })
+
+  it('keeps it when the renewal could not be made at all', async () => {
+    // `null` is a fact about the REQUEST — a 401, a 503, a dropped network — and says nothing
+    // about the container. Clearing on one would retract a true sentence on an outage.
+    const view = await withACeiling()
+    const held = view.result.current.drainingAt
+
+    api.renewPresence.mockResolvedValue(null)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS + 1)
+    })
+
+    expect(view.result.current.drainingAt).toBe(held)
+  })
+
+})
+
+describe('★ what a project hop drops', () => {
+  it('drops a press that was in flight on the project being left', async () => {
+    // Nothing keys this hook on the project, and `startApp`'s own clear is gated on the start
+    // still being ours — correctly, or a late clear from the outgoing start would wipe the
+    // incoming one's flag. So the hop itself has to drop it, or the next project is drawn
+    // mid-start with nobody having touched it.
+    //
+    // Mutation check: remove `setStartInFlight(false)` from the project-change effect and the
+    // last assertion goes red — the incoming project still reads as getting ready.
+    const view = mountMovable('proj-1')
+    await waitFor(() => expect(view.result.current.preview).not.toBeNull())
+
+    act(() => view.result.current.reportStartPending(true))
+    expect(view.result.current.state.name).toBe('starting')
+
+    await act(async () => {
+      view.rerender({ id: 'proj-2' })
+    })
+
+    expect(view.result.current.state.name).not.toBe('starting')
   })
 })

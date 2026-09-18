@@ -10,7 +10,6 @@ import {
   fetchPreviewState,
   fetchSaveState,
   sameSaveState,
-  canBePutBack,
   handOverWorkspace,
   discardUnsavedChanges,
   STOP_CEILING_MS,
@@ -866,6 +865,7 @@ describe('discardUnsavedChanges — the Discard button', () => {
     containerHead: 'aaa',
     savedHead: 'aaa',
     recoveryAt: null,
+    writeBackRefusedAt: null,
   }
 
   it('POSTs to the discard route with the CSRF header and the conversationId body', async () => {
@@ -925,6 +925,7 @@ describe('sameSaveState — what a poll is allowed to call "no change"', () => {
     containerHead: '059d936',
     savedHead: null,
     recoveryAt: null,
+    writeBackRefusedAt: null,
     ...over,
   })
 
@@ -937,26 +938,20 @@ describe('sameSaveState — what a poll is allowed to call "no change"', () => {
     expect(sameSaveState(reading(), reading({ recoveryAt: '2026-09-10T10:38:43Z' }))).toBe(false)
   })
 
+  it('★ sees a change in `writeBackRefusedAt` too', () => {
+    // The same mutant, one field along, and this one is a SAFETY sentence: the project screen
+    // says a platform write-back was refused, and that notice is the whole of what makes removing
+    // the exit prompts honest. A comparator blind to it would keep the previous reading and the
+    // sentence would never appear.
+    expect(
+      sameSaveState(reading(), reading({ writeBackRefusedAt: '2026-09-17T22:14:00Z' })),
+    ).toBe(false)
+  })
+
   it('still calls two identical readings the same, recovery instant included', () => {
     // The other half: this exists to stop a poll re-rendering on an unchanged answer, and a
     // comparator that answered `false` for everything would pass the test above by doing nothing.
     const instant = '2026-09-10T10:38:43Z'
     expect(sameSaveState(reading({ recoveryAt: instant }), reading({ recoveryAt: instant }))).toBe(true)
-  })
-})
-
-describe('★ canBePutBack — absent means warn', () => {
-  it('answers yes only to an actual instant', () => {
-    expect(canBePutBack('2026-09-10T10:38:43Z')).toBe(true)
-  })
-
-  it('★ answers NO to undefined, to null and to an empty string alike', () => {
-    // The fail-open this replaced: written as `recoveryAt !== null`, an `undefined` from a caller
-    // that predates the field reads as "the platform has a copy" and silently disarms a warning
-    // about work that exists only inside a container. Every consumer of this asks it in order to
-    // STOP warning somebody, so every unusable value has to answer no.
-    expect(canBePutBack(undefined)).toBe(false)
-    expect(canBePutBack(null)).toBe(false)
-    expect(canBePutBack('')).toBe(false)
   })
 })

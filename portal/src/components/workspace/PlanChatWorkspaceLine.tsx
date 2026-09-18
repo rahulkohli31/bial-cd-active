@@ -10,22 +10,12 @@
  *
  * WHY THIS EXISTS
  *
- * `StartAppControl` carries no surface predicate of its own, so the gate lives here and lets
- * exactly one of its four members through: go to the project holding the workspace. START never
- * renders — a Plan chat is the surface that deliberately keeps the app off screen. RETRY never
- * renders either, for the same reason: a second author for a state the pane already owns. GO-TO
- * does render: it is the remedy for a taken workspace, and the asking has to happen in the chat
- * the person is actually in. TAKE-BACK never renders, for START's reason and its own — its wait
- * is a modal narrating a stop, a save and a start over a screen with no pane to show the result in.
- *
- * Nothing here has to gate that fourth member explicitly, because two mechanisms already do: the
- * narrowing below reads `state.action`, never `state.secondAction`, the only slot a take-back
- * ever occupies, and `StartAppControl` only draws one for a caller that hands it the sequence —
- * `AppPane`, and nothing else. Widening this line to read both slots would still render no verb,
- * so failure here stays a missing button, never a modal stopping an app from a surface that
- * cannot report what happened.
+ * A PLAN CHAT SAYS, AND DOES NOT OFFER. It renders the sentence for the states below and no verb
+ * at all: START is the one thing a surface that deliberately keeps the app off screen must not
+ * invite, and RETRY would be a second author for a state the pane already owns. Those are the only
+ * two verbs there are, so this surface draws no control — a failure here is a missing button,
+ * never a press that reaches a container from a screen that cannot show what happened to it.
  */
-import StartAppControl from './StartAppControl'
 import { useWorkspaceReport } from './workspaceChannel'
 import type { WorkspaceStateName } from './workspaceState'
 
@@ -38,11 +28,6 @@ import type { WorkspaceStateName } from './workspaceState'
  */
 const SPOKEN_HERE: ReadonlySet<WorkspaceStateName> = new Set<WorkspaceStateName>([
   'starting',
-  // ONE HELD STATE, NOT TWO. `held-unattributed` used to sit beside this and said the same thing
-  // with the holder's name missing. Whether the platform can NAME the other project degrades the
-  // sentence; it was never a different situation, and a second member here meant a second place
-  // to forget when the copy moved.
-  'held-by-another-project',
   'could-not-read',
 ])
 
@@ -50,11 +35,6 @@ export default function PlanChatWorkspaceLine() {
   const report = useWorkspaceReport()
   const state = report?.state
   const speak = state !== undefined && SPOKEN_HERE.has(state.name)
-  // The ONE action member this surface may render, narrowed off the slot the map LEADS with —
-  // never off `secondAction`, which is where the take-back lives and which this surface has
-  // no business drawing. Read before the early return below so the rule is visible beside the
-  // states it applies to rather than buried in a branch.
-  const remedy = state?.action?.kind === 'go-to-project' ? state.action : null
 
   return (
     // MOUNTED ALWAYS, even before the first read lands. A region that appears together with its
@@ -77,7 +57,6 @@ export default function PlanChatWorkspaceLine() {
           {/* THE SAME SENTENCE THE PANE SHOWS, from the same computed value — never a second
               wording for the same state. */}
           <span className="font-semibold text-tertiary">{state.headline}</span>
-          {remedy && report && <StartAppControl action={remedy} report={report} />}
         </div>
       )}
     </div>

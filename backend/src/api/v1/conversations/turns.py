@@ -452,11 +452,11 @@ async def start_turn(
         # `projectName` for which project holds the workspace, and `agentWorking` for whether
         # that project's agent is mid-thought, of ANY kind (`building` stays narrow, and only
         # marks a turn that can write — see `SandboxReclaimBlockedError`). Neither fact is
-        # obtainable from the cheap state poll: its documented budget forbids the container
-        # round trip the unsaved-work half needs.
+        # obtainable from the cheap state poll, which reads only this citizen's own registry
+        # record and cannot say whose project is sitting in the slot.
         with build_coordination_or_503():
             try:
-                await manager.reclaim_preflight(db, user, project_id, sandbox_client=sandbox)
+                await manager.reclaim_preflight(db, user, project_id)
             except SandboxReclaimBlockedError as exc:
                 return reclaim_blocked_response(exc)
 

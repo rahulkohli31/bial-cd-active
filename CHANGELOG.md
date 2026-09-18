@@ -4,6 +4,79 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.4] - 2026-09-18
+
+An application starts because you opened it and goes away because everyone left. Opening a
+project is what brings its app up, so the control that offered to launch it is now a fallback
+you meet after a failed start rather than a step on the way in. Leaving is now a single event
+however it happens — closing the tab, switching project, letting the laptop sleep, losing the
+network — and nothing asks the citizen to arbitrate what should become of the container they
+are walking away from. The applications page says which apps are starting, open or closing
+down, and it says so without calling a single container.
+
+### Added
+
+- **Opening a project starts its app.** Every surface that frames a project renews a short
+  lease on it, so an app stays up while somebody is looking at it and is collected once
+  nobody is. A hidden tab renews on a longer budget; a frozen or closed one renews not at all.
+- **The applications page marks what is running.** Starting, open, and closing down, from one
+  user-scoped read of the platform's own records. No container is called to draw the list, so
+  the page is the same page whether anything is running or not.
+- **A durable record of a container deletion the platform owes.** If a teardown cannot be
+  performed, the debt is written down and retried rather than dropped, and the citizen's
+  workspace slot is handed back immediately instead of being held for a failure that was ours.
+- **One shutdown routine** — claim the debt, stop the turn at a safe boundary, write the tree
+  back over the saved copy, then destroy the container. The write-back runs under an ancestry
+  guard: a tree that cannot be shown to descend from the saved copy is parked rather than
+  promoted, and the project screen tells the citizen it happened.
+- **A Build turn can be stopped at its next tool-result boundary**, so a container that has to
+  go does not have to interrupt the model mid-thought.
+- **An absolute age ceiling**, off by default, that ends a container no amount of renewing can
+  postpone.
+
+### Changed
+
+- **Opening a different project starts it, from either door** — the applications list or the
+  project screen. The outgoing project is handed over in the background: its turn is stopped,
+  its work written back, its container destroyed.
+- **Nothing asks about unsaved work on the way out.** The citizen is never asked to arbitrate
+  their own workspace, because nothing is lost by leaving one.
+
+### Removed
+
+- **The dialog that stopped you on the way out of a workspace holding unsaved work.** Leaving
+  is no longer a moment where work can be lost, so there is nothing to confirm: the platform
+  writes the tree back by itself. The Discard control keeps its own confirmation, because
+  discarding is still a deliberate act.
+- **The dialog asking you to arbitrate your own workspace.** Opening a second project used to
+  put a question in front of you about what should happen to the first. The switch now hands
+  the first one over by itself. A colleague's shared view sitting in your slot is still
+  refused — that one has no hand-over to perform.
+- **The navigation interception that went with them** — the guard that intercepted a navbar
+  link, the back control, and in-place navigation out of a workspace.
+
+### Fixed
+
+- **A project switch could orphan the container it had just started.** Owning a container's
+  name is not owning its record; a teardown can no longer delete the registry entry belonging
+  to the container that replaced it.
+- **The first frame of every cold open was a platform-failure card.** An unresolved first read
+  and a failed one both read as "we could not check on your app". The pane now says nothing
+  until an attempt has finished, and a genuine outage still reaches the card that offers a
+  retry.
+- **A start in flight followed the citizen to the next project**, drawing the incoming app
+  mid-start with nobody having touched it.
+- **The age ceiling could not reach the jam it was written for.** A wedged turn holds the
+  lease, the lock and the heartbeat at once, and the bound had been placed in only one of the
+  arms that can hold it.
+- **A store outage was spared forever rather than on a count**, because the escape it took
+  never reached the strike test.
+- **The presence stay's monotonic guard could be raced** — the comparison now happens inside
+  the script rather than between two round trips, so a short renewal can no longer truncate a
+  longer one already granted.
+- **The closing notice reaches the citizen it was written for**, and the project screen no
+  longer collapses its whole pane column on the way back from a chat.
+
 ## [1.7.3] - 2026-09-17
 
 The platform's navigation moves to the left of the screen, where it rests as a narrow column of

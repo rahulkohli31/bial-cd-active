@@ -26,13 +26,19 @@ import pytest
 import redis.asyncio as aioredis
 
 from src.api.v1.build_sessions.schemas import (
+    HIDDEN_SURFACE_PRESENT_STAY_SECONDS,
     RELAUNCH_PREVIEW_STAY_SECONDS,
     SERVED_TRAFFIC_STAY_SECONDS,
+    SURFACE_PRESENT_STAY_SECONDS,
     TURN_ENDED_UNCHANGED_STAY_SECONDS,
     BuildSessionStatus,
 )
 from src.services.build_sessions import locks
-from src.services.build_sessions.locks import DeadlineWriter, grant_stay_of_execution
+from src.services.build_sessions.locks import (
+    DEADLINE_WRITER_TTL_SECONDS,
+    DeadlineWriter,
+    grant_stay_of_execution,
+)
 from src.services.build_sessions.manager import BuildSession, SessionManager
 from src.services.build_sessions.reaper import reconcile_user
 from src.services.redis import registry_key
@@ -80,16 +86,40 @@ async def _stay(redis: aioredis.Redis) -> tuple[datetime | None, str | None]:
 # --- the writer set is closed, and named ------------------------------------------
 
 
-def test_the_writer_set_is_exactly_four() -> None:
+def test_the_writer_set_is_exactly_five() -> None:
     """A CLOSED SET is the requirement, not a side effect: adding a way to keep a container alive
-    should be a deliberate, reviewed act, never an anonymous extension. `turn_ended_unchanged` is
-    the fourth member, for a turn that held the workspace but wrote nothing to it."""
+    should be a deliberate, reviewed act, never an anonymous extension. `turn_ended_unchanged`
+    covers a turn that held the workspace but wrote nothing to it; `surface_present` is the only
+    member a BROWSER can reach, and it is what makes leaving a screen mean something."""
     assert {w.value for w in DeadlineWriter} == {
         "turn_in_flight",
         "app_served_traffic",
         "builder_acted",
         "turn_ended_unchanged",
+        "surface_present",
     }
+
+
+def test_every_writer_has_a_ttl_of_its_own() -> None:
+    """The TTL comes from the writer's IDENTITY, so a member with no entry would raise a
+    `KeyError` inside a grant — a container failing to be spared because of a missing dict row."""
+    assert set(DEADLINE_WRITER_TTL_SECONDS) == set(DeadlineWriter)
+
+
+def test_a_present_surface_buys_no_more_than_the_grantable_ceiling() -> None:
+    """`stay_of_execution_is_current` reads any deadline beyond `RELAUNCH_PREVIEW_STAY_SECONDS`
+    as absurd and fails CLOSED. A presence budget above that bound would therefore spare nothing
+    at all — the renewal would be written, read as nonsense, and the container reaped under a
+    citizen who is sitting right there."""
+    assert SURFACE_PRESENT_STAY_SECONDS <= RELAUNCH_PREVIEW_STAY_SECONDS
+    assert HIDDEN_SURFACE_PRESENT_STAY_SECONDS <= RELAUNCH_PREVIEW_STAY_SECONDS
+
+
+def test_a_hidden_surface_earns_the_longer_budget() -> None:
+    """Not because it is better evidence — because its clock is not trustworthy. Browsers
+    throttle, sleep and freeze background timers, so a hidden tab cannot promise to come back in
+    45 seconds and must not lose its container for failing to."""
+    assert HIDDEN_SURFACE_PRESENT_STAY_SECONDS > SURFACE_PRESENT_STAY_SECONDS
 
 
 def test_a_turn_that_changed_nothing_buys_the_least_of_the_four() -> None:
@@ -175,7 +205,7 @@ async def test_an_unreadable_standing_stay_does_not_block_a_fresh_grant(
 
     granted = await grant_stay_of_execution(fake_redis, USER, writer=DeadlineWriter.BUILDER_ACTED)
 
-    standing, _ = await _stay(fake_redis)
+    standing, _ = await _stay_for(fake_redis, USER)
     assert standing == granted
 
 
@@ -348,3 +378,74 @@ async def test_the_sweep_spares_a_container_inside_the_short_stay_and_reaps_thro
     assert reaped_after is True
     assert sandbox.torn_down == [app_name]
     assert await fake_redis.exists(registry_key(user_id)) == 0
+
+
+async def test_the_presence_script_keeps_the_longer_standing_deadline_on_its_own(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ THE SCRIPT, ASKED DIRECTLY, WITHOUT ITS PYTHON CALLER.
+
+    The route-level test cannot tell an in-script comparison from a correct caller-side one,
+    because with nothing racing they agree. This asks the script alone, which is where the
+    difference lives: a script that compares cannot be interleaved with, and one that does not
+    can be, however careful the caller is.
+
+    Mutation check: move the `standing >= ARGV[2]` comparison out to the caller — read the
+    standing deadline, compare in Python, write the larger one back. Every route-level renewal
+    test stays green, because with nothing racing a caller-side comparison reaches the same
+    answer. This one goes red, because it asks the script with no caller in front of it."""
+    await _register(fake_redis)
+    longer = (datetime.now(UTC) + timedelta(hours=9)).isoformat(timespec="microseconds")
+    await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_PREVIEW_STAY_UNTIL, longer)
+    shorter = (datetime.now(UTC) + timedelta(minutes=5)).isoformat(timespec="microseconds")
+
+    answer = await fake_redis.eval(
+        locks._CAS_GRANT_PRESENCE_STAY_LUA,
+        1,
+        registry_key(USER),
+        "sbx-x",
+        shorter,
+        str(locks.DeadlineWriter.SURFACE_PRESENT),
+    )
+
+    kept = answer.decode() if isinstance(answer, bytes) else str(answer)
+    assert kept == f"renewed:{longer}"
+    standing, _ = await _stay(fake_redis)
+    assert standing == datetime.fromisoformat(longer)
+
+
+async def test_a_late_session_cannot_delete_the_record_that_replaced_its_own(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ THE ORPHAN A PROJECT SWITCH USED TO LEAVE, reproduced at the primitive that caused it.
+
+    One key holds whichever container this citizen's single workspace is running. A switch
+    replaces its contents while the outgoing session is still unwinding, so the outgoing session
+    reaches its own ending AFTER the incoming project has registered. Deleting by user id alone
+    takes the incoming record away, and the incoming container keeps running with nothing left
+    that names it — invisible to a sweep that walks the registry namespace, and billing until
+    somebody deletes it by hand. Observed live before this guard existed.
+
+    Mutation check: call the unguarded `delete_registry` here instead and this goes red."""
+    await _register(fake_redis)  # the record names "sbx-x" — the OUTGOING container
+
+    # the incoming project registers its own container into the same per-user key
+    await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_APP_NAME, "sbx-incoming")
+
+    deleted = await locks.delete_registry_if_it_still_names(fake_redis, USER, "sbx-x")
+
+    assert deleted is False, "the outgoing session claimed a record that was no longer its own"
+    reg = await fake_redis.hgetall(registry_key(USER))
+    assert _text(reg.get(REGISTRY_FIELD_APP_NAME)) == "sbx-incoming"
+
+
+async def test_the_guarded_delete_still_clears_a_record_that_is_genuinely_its_own(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The other half: guarding must not turn the ordinary ending into a leak of its own."""
+    await _register(fake_redis)
+
+    deleted = await locks.delete_registry_if_it_still_names(fake_redis, USER, "sbx-x")
+
+    assert deleted is True
+    assert await fake_redis.exists(registry_key(USER)) == 0

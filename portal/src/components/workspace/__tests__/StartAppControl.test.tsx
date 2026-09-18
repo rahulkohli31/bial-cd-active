@@ -13,6 +13,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import StartAppControl from '../StartAppControl'
+import { createStarter } from '../startApp'
+import type { StartSinks } from '../startApp'
 import { LAUNCH_LABEL, type WorkspaceAction } from '../workspaceState'
 import type { WorkspaceReport } from '../workspaceChannel'
 import { ApiError } from '../../../utils/apiError'
@@ -29,14 +31,22 @@ const START: WorkspaceAction = { kind: 'start', label: LAUNCH_LABEL }
 const RETRY: WorkspaceAction = { kind: 'retry', label: 'Try again' }
 
 function reportSpy(over: Partial<WorkspaceReport> = {}): WorkspaceReport {
-  return {
-    state: { name: 'not-running', headline: 'Your app is saved.', detail: null, action: START },
+  // THE REAL CLAIM, over this report's own sinks. The control has no in-flight guard of its own
+  // any more — the one start at a time is the surface's, shared with the project opening and the
+  // rail's send — so a stub here would prove nothing about a press and everything about the stub.
+  const sinks = {
     projectId: 'p1',
     onStarted: vi.fn(),
     onStartPending: vi.fn(),
     onStartOutcome: vi.fn(),
+    ...over,
+  }
+  return {
+    settled: true,
+    state: { name: 'not-running', headline: 'Your app is saved.', detail: null, action: START },
+    ...sinks,
     onRefresh: vi.fn(),
-    onReclaimRefusal: vi.fn(),
+    start: createStarter(() => sinks),
     ...over,
   }
 }
@@ -92,14 +102,20 @@ describe('one deliberate press, one request', () => {
   })
 
   it('★ collapses two presses in the same tick into one request', async () => {
-    // A synchronous ref, not state: state would not have committed between the two clicks, so a
-    // `pending` flag alone lets both through and provisions a second container.
+    // DISPATCHED WITHOUT A COMMIT BETWEEN THEM, which is what a double-click is. `fireEvent`
+    // flushes React between calls, so two of those are two separate presses and the `pending` flag
+    // alone blocks the second — a collapse this scenario would then be claiming without testing.
+    // What actually collapses them is the surface's single-flight claim, shared with the project
+    // opening and the rail's send, and it is the only guard that sees both presses at once.
     let release: (v: unknown) => void = () => {}
     api.relaunchPreview.mockImplementation(() => new Promise((r) => { release = r }))
     renderControl(START, reportSpy())
+    const control = button()
 
-    fireEvent.click(button())
-    fireEvent.click(button())
+    act(() => {
+      control.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      control.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
     release({ ready: true })
 
     await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(1))
@@ -161,41 +177,71 @@ describe('a start that did not end in a running app says which way it ended', ()
   })
 })
 
-describe('the two 409s stay apart — one status, two causes, two remedies', () => {
-  it('★ routes a reclaim refusal to the ONE dialog, not to a retry', async () => {
-    const err = new ApiError('another project', 409, 'sandbox_reclaim_blocked')
-    Object.assign(err, { details: { projectId: 'p-other', projectName: 'Car pool apps', dirty: true } })
-    api.relaunchPreview.mockRejectedValue(err)
+describe('★ no refusal opens a question — the 409s are sentences, not dialogs', () => {
+  /** The server's refusal, with whichever `isSharedView` the body carried. */
+  const refusal = (isSharedView: boolean) => {
+    const err = new ApiError('“Car pool apps” is open for a colleague right now.', 409, 'sandbox_reclaim_blocked')
+    Object.assign(err, {
+      details: { projectId: 'p-other', projectName: 'Car pool apps', dirty: true, isSharedView },
+    })
+    return err
+  }
+
+  it('★ a colleague`s shared view is stated in the server`s own words, with nothing to press', async () => {
+    // Pressing start cannot move a shared view — the server refuses it whatever the citizen
+    // answers — so a dialog offering to hand it over would be a question with no true answer.
+    api.relaunchPreview.mockRejectedValue(refusal(true))
     const report = reportSpy()
-    renderControl(START, report)
+    const { container } = renderControl(START, report)
     fireEvent.click(button())
 
-    await waitFor(() => expect(report.onReclaimRefusal).toHaveBeenCalled())
-    expect(report.onStartOutcome).not.toHaveBeenCalled()
-    const [blocked] = (report.onReclaimRefusal as ReturnType<typeof vi.fn>).mock.calls[0]
-    expect(blocked).toMatchObject({ projectId: 'p-other', projectName: 'Car pool apps' })
+    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalled())
+    expect(report.onStartOutcome).toHaveBeenCalledWith({
+      kind: 'failed',
+      reason: '“Car pool apps” is open for a colleague right now.',
+    })
+    expect(container.querySelector('[role="dialog"]')).toBeNull()
   })
 
-  it('does NOT route your own running build to that dialog', async () => {
-    // Different cause, different remedy — finish or stop it, versus save or switch that project.
-    // Merging them would put a Save button in front of somebody it cannot help.
+  it('★ and a refusal claiming it is NOT a shared view renders no dialog either', async () => {
+    // The switch means this citizen's own project can no longer refuse the call, so this body is
+    // the server contradicting itself. It is reported as an ordinary start failure; what must not
+    // happen is a question being put to somebody about a conflict that should not exist.
+    api.relaunchPreview.mockRejectedValue(refusal(false))
+    const report = reportSpy()
+    const { container } = renderControl(START, report)
+    fireEvent.click(button())
+
+    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalled())
+    expect((report.onStartOutcome as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+      kind: 'failed',
+    })
+    expect(container.querySelector('[role="dialog"]')).toBeNull()
+  })
+
+  it('your own running build keeps its own sentence, not the server`s wire words', async () => {
+    // Different cause, different remedy — finish or stop that build.
     api.relaunchPreview.mockRejectedValue(new BuildSessionAlreadyActiveError('already', 's-1'))
     const report = reportSpy()
     renderControl(START, report)
     fireEvent.click(button())
 
     await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalled())
-    expect(report.onReclaimRefusal).not.toHaveBeenCalled()
+    expect(report.onStartOutcome).toHaveBeenCalledWith({
+      kind: 'failed',
+      reason: 'A build is already running in this application.',
+    })
   })
 
-  it('does not treat an uncoded 409 as the reclaim refusal', async () => {
+  it('an uncoded 409 is an ordinary failure too', async () => {
     api.relaunchPreview.mockRejectedValue(new ApiError('conflict', 409))
     const report = reportSpy()
     renderControl(START, report)
     fireEvent.click(button())
 
-    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalled())
-    expect(report.onReclaimRefusal).not.toHaveBeenCalled()
+    await waitFor(() =>
+      expect(report.onStartOutcome).toHaveBeenCalledWith({ kind: 'failed', reason: 'conflict' }),
+    )
   })
 })
 
@@ -265,7 +311,7 @@ describe('marked unavailable, never disabled', () => {
   })
 })
 
-describe('the other two verbs, and the one that does not exist', () => {
+describe('the second verb, and the ones that do not exist', () => {
   it('a retry clears the last outcome before asking again', async () => {
     // Without the clear, a second failure of the same kind leaves the sentence unchanged and the
     // press looks like it did nothing.
@@ -277,24 +323,26 @@ describe('the other two verbs, and the one that does not exist', () => {
     await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalled())
   })
 
-  it('the go-to action navigates and starts NOTHING', async () => {
-    const report = reportSpy()
-    renderControl({ kind: 'go-to-project', label: 'Open “Roster”', projectId: 'p-other' }, report)
-    fireEvent.click(button())
+  it('★ neither verb leaves this project — nothing here navigates anywhere', async () => {
+    // Both members ask THIS project's own start. A control that could send somebody to another
+    // project is how a workspace sentence turns back into an arbitration.
+    for (const action of [START, RETRY]) {
+      const report = reportSpy()
+      renderControl(action, report)
+      fireEvent.click(button())
 
-    await waitFor(() => expect(screen.getByTestId('path').textContent).toBe('/projects/p-other'))
-    expect(api.relaunchPreview).not.toHaveBeenCalled()
+      await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalled())
+      expect(screen.getByTestId('path').textContent).toBe('/projects/p1')
+      cleanup()
+      api.relaunchPreview.mockClear()
+    }
   })
 
   it('★ names no destructive verb, in any action, in any state', async () => {
-    // The type is the enforcement — three members, none destructive — but a LABEL can still say a
-    // dangerous word, and this is what catches that.
+    // The type is the enforcement — two members, neither destructive — but a LABEL can still say
+    // a dangerous word, and this is what catches that.
     const destructive = /\b(restore|rebuild|reset|delete|destroy|tear down|discard|wipe|erase)\b/i
-    const actions: WorkspaceAction[] = [
-      START,
-      RETRY,
-      { kind: 'go-to-project', label: 'Open “Roster”', projectId: 'p-other' },
-    ]
+    const actions: WorkspaceAction[] = [START, RETRY]
     for (const action of actions) {
       const { container } = renderControl(action, reportSpy())
       expect(container.textContent ?? '').not.toMatch(destructive)
@@ -397,5 +445,60 @@ describe('★ the report reaches the surface even after this control is gone', (
     await waitFor(() =>
       expect(report.onStartOutcome).toHaveBeenCalledWith({ kind: 'failed', reason: 'the sandbox is unavailable' }),
     )
+  })
+})
+
+
+/**
+ * ★ THE CLAIM BELONGS TO ONE PROJECT, AND THE SURFACE HOLDING IT IS NOT REMOUNTED WHEN THE SCREEN
+ * MOVES TO ANOTHER.
+ *
+ * So a start still in the air when the screen changes has two ways to be wrong: it can report a
+ * preview URL, a busy flag or a failure sentence into the project that arrived, and it can be
+ * JOINED by that project's own trigger — which would leave the new app never started and its
+ * citizen waiting on an answer about somebody else's.
+ */
+describe('★ a start that is overtaken by a change of project', () => {
+  const spySinks = (projectId: string): StartSinks => ({
+    projectId,
+    onStarted: vi.fn(),
+    onStartPending: vi.fn(),
+    onStartOutcome: vi.fn(),
+  })
+
+  it('★ reports into nothing once the screen has moved on', async () => {
+    let finish: (() => void) | undefined
+    api.relaunchPreview.mockImplementation(
+      () => new Promise((resolve) => {
+        finish = () => resolve({ appId: 'a1', previewUrl: 'https://app/', status: 'ready', ready: true })
+      }),
+    )
+    let sinks = spySinks('p1')
+    const start = createStarter(() => sinks)
+    const flight = start()
+
+    const arrived = spySinks('p2')
+    sinks = arrived
+    finish?.()
+    await flight
+
+    expect(arrived.onStarted).not.toHaveBeenCalled()
+    expect(arrived.onStartOutcome).not.toHaveBeenCalled()
+    // LIVENESS: the start really did answer — it answered into nobody, which is the point.
+    expect(api.relaunchPreview).toHaveBeenCalledWith({ projectId: 'p1' })
+  })
+
+  it('★ and the project that arrived starts its own app instead of joining it', async () => {
+    api.relaunchPreview.mockImplementation(() => new Promise(() => {}))
+    let sinks = spySinks('p1')
+    const start = createStarter(() => sinks)
+    const first = start()
+
+    sinks = spySinks('p2')
+    const second = start()
+
+    expect(second).not.toBe(first)
+    expect(api.relaunchPreview).toHaveBeenCalledWith({ projectId: 'p2' })
+    expect(api.relaunchPreview).toHaveBeenCalledTimes(2)
   })
 })

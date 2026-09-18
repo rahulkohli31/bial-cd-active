@@ -853,3 +853,40 @@ class SandboxClient(abc.ABC):
         DELIBERATELY NOT abstract, same reason as `someone_has_to_go_first`. The default refuses:
         a client that cannot reset must never report a discard that did not happen."""
         raise SandboxError("this sandbox client cannot reset a workspace in place")
+
+    async def get_app_tags(self, *, name: str) -> dict[str, str] | None:
+        """This container's ARM tags, or `None` when nothing answers to that name.
+
+        THE ONE HONEST SOURCE OF A CONTAINER'S AGE. The per-user registry record carries a
+        birthday too, but it is re-stamped at every registration and dropped entirely when a
+        teardown fails — so a container that outlived its own delete comes back looking newborn.
+        The tag is stamped once, at create, and survives both.
+
+        `None` is "could not ask", NOT "no such container", and a caller must not read it as
+        either an age of zero or a death certificate: the absolute ceiling falls back to the
+        registry on it, which under-states the age and therefore only ever spares.
+
+        DELIBERATELY NOT abstract, same reason as `someone_has_to_go_first`:
+        `test_abstractmethod_set_equals_the_pinned_contract` pins the abstract set, so a new
+        capability arrives non-abstract with a safe default rather than amending it. The default
+        declines — a client with no ARM behind it has no tags to report."""
+        return None
+
+    async def attach_by_name(self, *, app_name: str) -> SandboxHandle:
+        """Reach a container from its NAME alone — no registry hash, no `user_id`, no
+        `token_ref` this process minted. The one reach that still works once the per-user
+        registry has been overwritten to name a replacement: the outgoing container is still
+        standing at this name, and this is the only door left to it.
+
+        A real implementation resolves the address and the supervisor bearer off the container's
+        own ARM record and confirms it with a reachability probe — none of that comes free from
+        the name. ABSENT (no container answers to this name) and UNREACHABLE (one does, but the
+        supervisor does not) are different answers a caller must be able to tell apart: a probe
+        timeout is not a death certificate.
+
+        DELIBERATELY NOT abstract, same reason as `someone_has_to_go_first`:
+        `test_abstractmethod_set_equals_the_pinned_contract` pins the abstract set, so a new
+        capability arrives non-abstract with a safe default rather than amending it. The default
+        refuses outright — it has no ARM behind it to ask, and reporting a handle it cannot back
+        would let a caller believe a container is reachable when nothing was actually asked."""
+        raise SandboxError("this sandbox client cannot attach to a container by name")

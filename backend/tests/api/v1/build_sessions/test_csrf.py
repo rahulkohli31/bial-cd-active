@@ -38,6 +38,10 @@ _MUTATING_POSTS = [
     "/v1/build-sessions/projects/{project_id}/discard",
     "/v1/build-sessions/projects/{project_id}/client-error",
     "/v1/build-sessions/projects/{project_id}/workspace-check",
+    # The one renewal a browser drives. CSRF'd because it is not a free read: it pushes a
+    # deadline forward on coordination state, and a deadline a third-party page could extend
+    # from a citizen's browser is a bill an attacker can run up.
+    "/v1/build-sessions/projects/{project_id}/renew",
     "/v1/build-sessions/internal/apps/{app_id}/parked",
     "/v1/build-sessions/internal/apps/{app_id}/promote",
     "/v1/build-sessions/relaunch",

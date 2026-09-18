@@ -596,9 +596,44 @@ describe('the app survives the round trip, in BOTH directions', () => {
     expect(frame()).toBe(original)
   })
 
-  it('fires no start of its own on a remount', async () => {
+  it('★ opening a project whose app is asleep starts it, and starts it ONCE', async () => {
+    // INVERTED, DELIBERATELY. This case used to assert that nothing started — the product asked
+    // first, with a control. Opening a project IS the ask now, so the start fires with no press.
+    //
+    // What survives unchanged is the half that still matters: it fires ONCE. The reading stays
+    // `asleep` until the server's own `starting` lands, and a second start on the next poll tick
+    // would tear down the container the first one is still building.
     api.fetchPreviewState.mockResolvedValue(
       preview({ state: 'asleep', restorable: true }),
+    )
+    render(<Workspace />)
+
+    await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledWith({ projectId: 'pA' }))
+    // Let every poll answer this suite will produce land, so a second start would show up here.
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(api.relaunchPreview).toHaveBeenCalledTimes(1)
+  })
+
+  it('starts NOTHING for a project that has never been built', async () => {
+    // Nothing to open. `never_built` is the one reading with no container behind it at all, and
+    // a start here would be a request that can only fail.
+    api.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
+    render(<Workspace project={{ ...PROJECT, appId: null, hasRelaunchableSnapshot: false }} />)
+    await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
+
+    expect(api.relaunchPreview).not.toHaveBeenCalled()
+  })
+
+  it('starts nothing for an app that is already serving', async () => {
+    // The remount case, asked of the CONTAINER rather than of the component's lifecycle: this
+    // surface remounts on every project → chat → project crossing, and restarting an app the
+    // citizen is looking at is the defect a mount-triggered start would ship.
+    api.fetchPreviewState.mockResolvedValue(
+      preview({ state: 'alive', alive: true, previewUrl: APP_URL, restorable: true }),
     )
     render(<Workspace />)
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())

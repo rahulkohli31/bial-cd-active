@@ -11,7 +11,6 @@ import ProjectPage from './pages/ProjectPage'
 import SharedProjectPage from './pages/SharedProjectPage'
 import WorkspaceShell from './components/workspace/WorkspaceShell'
 import AppShell from './components/layout/AppShell'
-import { WorkspaceExitHost } from './components/workspace/UnsavedWorkGuard'
 import { isAuthenticated, bootstrapSession } from './utils/auth'
 import { BusyGlyph } from './components/ui/Waiting'
 
@@ -106,18 +105,11 @@ function RequireAuth({ children }: { children: ReactNode }) {
 /**
  * Signed in, and inside the frame. Every authenticated address renders through one shell, so the
  * navigation is a property of the product rather than something each page remembers to draw.
- *
- * THE EXIT HOST IS ABOVE THE SHELL, not inside the workspace. The controls that leave a workspace
- * are mostly in the navigation, which frames the workspace rather than living inside it — so the
- * guard has to be reachable from above. The workspace registers into this host; everything that
- * can navigate away reads from it.
  */
 function Shell({ children }: { children: ReactNode }) {
   return (
     <RequireAuth>
-      <WorkspaceExitHost>
-        <AppShell>{children}</AppShell>
-      </WorkspaceExitHost>
+      <AppShell>{children}</AppShell>
     </RequireAuth>
   )
 }

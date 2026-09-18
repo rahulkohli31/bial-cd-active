@@ -94,18 +94,23 @@ class SandboxConfig(BaseModel):
     # at this number; it is the point at which a human should be told the fleet is larger than
     # anyone intended.
     reclaim_fleet_alarm_threshold: PositiveInt = 25
-    # --- the 24-hour drain --------------------------------------------------
-    # NO SETTINGS HERE, DELIBERATELY, and their absence is the honest report. `drain.py` is
-    # written and tested but has no caller: nothing in `src/` reads a drain flag, and `is_drained`
-    # takes `enabled`/`after_hours` as explicit arguments. Declaring `SANDBOX__DRAIN_ENABLED`
-    # anyway offered an operator a switch that does nothing — worse than a missing feature,
-    # because it reads as a shipped one and would be believed in an incident.
+    # --- the absolute age ceiling -------------------------------------------
+    # THE ONE RULE THAT DOES NOT ASK WHETHER ANYTHING IS CLAIMING THE CONTAINER. Every other
+    # sparing signal — the lease, the starting marker, the lock, the stay — is a claim, so a
+    # container held open by a JAMMED claim is spared by definition and no amount of tier logic
+    # reaches it. Presence renewal makes that population reachable in one more way: a tab left
+    # open renews forever. This is what bounds both.
     #
-    # The module stays. What it closes is the hole the confidence tiers structurally cannot see:
-    # a container held open by a JAMMED signal is claimed by definition, so no amount of tier
-    # logic will ever reclaim it. When a caller exists, the flags come back with it — and the
-    # threshold will still need justifying, since long-session behaviour was never validated
-    # and the longest observed live session is about 31 minutes.
+    # `drain_after_hours` is measured from the CONTAINER's age, not the registry record's: the
+    # registry birthday is re-stamped at each registration and is dropped by the failed-teardown
+    # arm, so reading it would hand a fresh ceiling to precisely the containers the ceiling exists
+    # to collect. `reaper.py` reads the ARM tag and falls back to the registry only when ARM
+    # cannot answer — one tag read per spared user per pass, and only while this flag is on.
+    #
+    # OFF BY DEFAULT, like the reclamation flags above. Two hours is the screen ceiling the
+    # platform commits to; a deployment that wants none sets nothing.
+    drain_enabled: bool = False
+    drain_after_hours: PositiveInt = 2
 
     # ACA sizing (the POC single-sandbox-per-user shape). vCPU cores + memory string.
     cpu: PositiveFloat = 1.0

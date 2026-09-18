@@ -1,11 +1,9 @@
 /**
- * THE SHELL IS THE PRODUCT'S CHROME, AND THE ONE THING IT MUST NOT LOSE IS THE EXIT PATH.
+ * THE SHELL IS THE PRODUCT'S CHROME.
  *
- * The header this replaces wired the unsaved-work guard onto the logo AND onto every one of its
- * links, separately. A shell can very easily wire it once and miss four — and the failure is
- * silent: the dialog, the save offer and the failed-save refusal simply stop happening on four of
- * five routes. So the guard is asserted PER DESTINATION rather than once, and on ordering rather
- * than on arrival: "it navigated" is true whether the guard ran first, last, or not at all.
+ * Every destination navigates directly — nothing asks before an exit any more, so each is
+ * asserted per destination rather than once, the way a per-route regression would otherwise slip
+ * through four of five routes silently.
  *
  * THE OTHER HALF IS WHERE THE NAVIGATION IS. Docked on the list routes; not in the accessible
  * tree at all inside an application until it is summoned. Both are asserted per route, because
@@ -47,7 +45,6 @@ vi.mock('../../../utils/projectsListMemory', () => ({
 
 import AppShell from '../AppShell'
 import { NavMenuButton } from '../NavReveal'
-import { WorkspaceExitHost, useRegisterWorkspaceExit } from '../../workspace/UnsavedWorkGuard'
 
 MotionGlobalConfig.skipAnimations = true
 
@@ -107,40 +104,26 @@ async function summonNav() {
   return screen.findByTestId('nav-panel')
 }
 
-/**
- * Stands in for the workspace, which is the only thing that ever registers a guard — and it does
- * so from INSIDE the shell, which is the whole point. A fixture that provided the guard from
- * outside would prove the navigation can reach a context somebody handed it, not that it can
- * reach the one the workspace actually publishes.
- */
-function RegistersAGuard({ guard }: { guard: (go: () => void) => void }) {
-  useRegisterWorkspaceExit(guard)
-  return null
-}
-
 /** The screen a sign-out lands on, reading the same router state `LoginPage` reads. */
 function Landed() {
   const state = useLocation().state as { signoutWarning?: string } | null
   return <div data-testid="landed">{state?.signoutWarning ?? ''}</div>
 }
 
-function renderAt(path: string, guard?: (go: () => void) => void) {
+function renderAt(path: string) {
   return render(
     <MemoryRouter initialEntries={[path]}>
-      <WorkspaceExitHost>
-        <Routes>
-          <Route path="/login" element={<Landed />} />
-          <Route
-            path="*"
-            element={
-              <AppShell>
-                {guard && <RegistersAGuard guard={guard} />}
-                <Where />
-              </AppShell>
-            }
-          />
-        </Routes>
-      </WorkspaceExitHost>
+      <Routes>
+        <Route path="/login" element={<Landed />} />
+        <Route
+          path="*"
+          element={
+            <AppShell>
+              <Where />
+            </AppShell>
+          }
+        />
+      </Routes>
     </MemoryRouter>,
   )
 }
@@ -227,37 +210,28 @@ describe('the navigation the boards draw', () => {
   })
 })
 
-describe('every destination leaves the workspace through its guard — not just the logo', () => {
+describe('every destination navigates directly — no exit routine in the way', () => {
   it.each([
     ['nav-projects', '/projects'],
     ['nav-shared-applications', '/shared-applications'],
     ['nav-marketplace', '/marketplace'],
     ['nav-integrations', '/integrations'],
     ['nav-admin', '/admin'],
-  ])('%s runs the exit routine BEFORE navigating', async (testId, expected) => {
+  ])('%s navigates straight there, with nothing asked first', async (testId, expected) => {
     h.getStoredUser.mockReturnValue(ADMIN)
-    const order: string[] = []
-    const guard = (go: () => void) => {
-      order.push('guard')
-      go()
-    }
-    renderAt('/chat/c1', guard)
+    renderAt('/chat/c1')
     await summonNav()
     fireEvent.click(await screen.findByTestId(testId))
     await waitFor(() => expect(screen.getByTestId('where').textContent).toBe(expected))
-    order.push('arrived')
-    // ORDERING, NOT ARRIVAL. A shell that navigated without the guard would still arrive.
-    expect(order).toEqual(['guard', 'arrived'])
+    expect(screen.queryByRole('dialog')).toBeNull()
   })
 
-  it('the logo runs it too, and lands on the remembered list rather than page one', async () => {
+  it('the logo navigates too, and lands on the remembered list rather than page one', async () => {
     h.projectsListHref.mockReturnValue('/projects?q=belt&page=3')
-    const seen: string[] = []
-    renderAt('/chat/c1', (go) => { seen.push('guard'); go() })
+    renderAt('/chat/c1')
     await summonNav()
     fireEvent.click(await screen.findByRole('button', { name: /BIAL Citizen Developer/ }))
     await waitFor(() => expect(screen.getByTestId('where').textContent).toBe('/projects?q=belt&page=3'))
-    expect(seen).toEqual(['guard'])
   })
 
   it('remembers what the list address carried, so there is something to read back', async () => {
@@ -380,15 +354,13 @@ describe('the foot of the navigation', () => {
     await waitFor(() => expect(screen.getByTestId('landed').textContent).toBe(''))
   })
 
-  it('signs out through the workspace guard, so unsaved work is not lost in silence', async () => {
-    const guard = vi.fn((go: () => void) => go())
+  it('signs out directly from inside an application, with nothing asked first', async () => {
     h.logout.mockResolvedValue(true)
-    renderAt('/chat/c1', guard)
+    renderAt('/chat/c1')
     await summonNav()
     openRadix(await screen.findByTestId('profile-cluster'))
     await settle()
     fireEvent.click(await screen.findByRole('menuitem', { name: /Sign out/ }))
-    expect(guard).toHaveBeenCalled()
     await waitFor(() => expect(h.logout).toHaveBeenCalled())
   })
 })

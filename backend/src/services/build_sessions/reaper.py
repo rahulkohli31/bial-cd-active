@@ -43,6 +43,11 @@ from src.services.build_sessions.alarms import (
     SERVING_PROOF_ABSENT_AT_TEARDOWN,
     SERVING_PROOF_STAMP_REFUSED,
 )
+from src.services.build_sessions.drain import (
+    is_drained,
+    past_the_turn_bound,
+    the_ceiling_switch,
+)
 from src.services.build_sessions.durable_copy import CopyVerdict, confirm_durable_copy
 from src.services.build_sessions.integrity import container_state
 from src.services.build_sessions.locks import (
@@ -64,7 +69,7 @@ from src.services.build_sessions.locks import (
     stamp_is_proven,
     stay_of_execution_is_current,
 )
-from src.services.build_sessions.snapshot import RecoveryOutcome, write_recovery_copy
+from src.services.build_sessions.snapshot import SavedCopyOutcome, write_saved_copy_under_guard
 from src.services.redis import REGISTRY_STATE_READY, registry_key, registry_scan_patterns
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
@@ -75,7 +80,13 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
 )
 from src.services.sandbox import DevStatus, SandboxClient, SandboxError, SandboxHandle
-from src.services.sandbox.base import SANDBOX_NAME_PREFIX, SHARED_SANDBOX_NAME_PREFIX
+from src.services.sandbox.base import (
+    SANDBOX_NAME_PREFIX,
+    SHARED_SANDBOX_NAME_PREFIX,
+    TAG_CREATED_AT,
+    SandboxIdentity,
+    identity_from_tags,
+)
 
 _log = structlog.get_logger()
 
@@ -133,7 +144,7 @@ def _user_from_registry_key(key: str) -> uuid.UUID | None:
         return None
 
 
-def _handle_named(app_name: str, *, fqdn: str = "") -> SandboxHandle:
+def handle_named(app_name: str, *, fqdn: str = "") -> SandboxHandle:
     """The minimal teardown handle — ACA delete is keyed by `app_name` alone; `fqdn` is carried
     when known, left empty otherwise, and read by nothing on the teardown path.
 
@@ -152,7 +163,7 @@ def _handle_named(app_name: str, *, fqdn: str = "") -> SandboxHandle:
 
 def _minimal_handle(reg: dict[str, str]) -> SandboxHandle:
     """The same handle, reconstructed from a registry record — the shape `reap_user` tears down."""
-    return _handle_named(
+    return handle_named(
         reg.get(REGISTRY_FIELD_APP_NAME, ""), fqdn=reg.get(REGISTRY_FIELD_FQDN, "")
     )
 
@@ -572,9 +583,10 @@ async def _take_the_copy_we_promised(
     A copy is TAKEN when the newest durable copy predates the newest change. Both call sites once
     spared, so a failed autosave billed forever behind a log line repeating every fifteen minutes
     and looked, to anyone reading it, like the guard working correctly. This really happened. The
-    copy goes through `write_recovery_copy`, not a raw `put`: it promotes only a descendant of the
-    copy on record and cannot run against an empty slot or pre-stamp bundle, whose write is kept
-    but does NOT authorise the destroy (`UNGUARDED`). Every failing arm SPARES and RECORDS."""
+    copy goes through `write_saved_copy_under_guard`, not a raw `put`: it promotes only a tree that
+    descends from the saved copy — the same slot `confirm_durable_copy` reads, or a copy this
+    function took could never satisfy the gate that asked for it — and parks everything else.
+    Every failing arm SPARES and RECORDS."""
     # IMPORTED HERE, NOT AT MODULE SCOPE, and the reason is weight rather than a cycle. There is
     # no import cycle — `src.workers.reclamation` imports the reaper function-scoped, so nothing
     # closes a loop at module-import time. The weight is real: `pass_history` reaches
@@ -604,7 +616,7 @@ async def _take_the_copy_we_promised(
         # worth spelling out — the registry has moved on and the handle we hold names a DIFFERENT
         # container. `attach_existing` builds its handle from the record, so a builder who started
         # a fresh sandbox between the record read and the attach hands us their live container.
-        # Bundling that tree into this app's recovery slot would overwrite one app's only copy
+        # Bundling that tree into this app's saved copy would overwrite one app's only copy
         # with another app's work; the guarded write would probably divert it, but "probably
         # caught one layer down" is not a reason to hand it the wrong tree.
         _log.warning(
@@ -616,7 +628,7 @@ async def _take_the_copy_we_promised(
         await record_durable_copy_attempt(CopyAttempt.UNREACHABLE)
         return False
     try:
-        written = await write_recovery_copy(
+        written = await write_saved_copy_under_guard(
             sandbox_client, reached.handle, app_id, taken_at=datetime.now(UTC)
         )
     except Exception:
@@ -629,50 +641,68 @@ async def _take_the_copy_we_promised(
         # `CancelledError` is a `BaseException` and still propagates, so a shutdown still stops
         # the sweep rather than being logged and swallowed.
         _log.exception(
-            "no copy taken: the recovery write raised, so this container is spared again",
+            "no copy taken: the guarded write raised, so this container is spared again",
             app_id=str(app_id),
             app_name=expected_name,
         )
         await record_durable_copy_attempt(CopyAttempt.FAILED)
         return False
-    if written.outcome is RecoveryOutcome.DIVERTED:
+    if written.outcome is SavedCopyOutcome.DIVERTED:
         # The guarded write refused to promote this tree and preserved it under `divert_key`. It
-        # has already raised the pinned "recovery write did not land" alarm with the two shas that
-        # explain why, so nothing is re-alarmed here — the container is simply spared, which is
-        # the only answer available when the tree in hand cannot be shown to contain the work.
+        # has already raised the pinned "did not land" alarm with the two shas that explain why,
+        # so nothing is re-alarmed here — the container is simply spared, which is the only answer
+        # available when the tree in hand cannot be shown to contain the work.
+        #
+        # A CONTAINER THAT HAS REVERTED TO ITS BAKED IMAGE ARRIVES HERE, and so does an app with
+        # no saved copy at all, because the guard refuses to promote against a slot it cannot
+        # compare with. Both would otherwise stamp a template tree in as the app's newest durable
+        # copy and then read that write as proof the container may go.
         await record_durable_copy_attempt(CopyAttempt.REFUSED)
         return False
-    if written.recorded_head is None:
-        # THE COPY LANDED, BUT NO GUARD RAN. There was nothing on record to compare it against, so
-        # `write_recovery_copy` took its first-write arm — which is right at a turn boundary,
-        # where the container is alive and the tree is the citizen's, and wrong here.
-        #
-        # A REVERTED CONTAINER HAS EXACTLY THIS SHAPE. An app whose every autosave failed has an
-        # empty recovery slot, so a reverted container's empty tree becomes the first copy on
-        # record, `recoverable_work` ranks it newest by `last_modified`, and the citizen's next
-        # build is restored from the template over their saved app. Then this function would
-        # return True and delete the container holding the only real tree.
-        #
-        # So: keep the copy (it is strictly better than nothing), and spare. A later pass with a
-        # comparable copy on record can destroy it properly.
-        _log.warning(
-            "no guarded copy: this was the first copy on record, so the container is spared",
-            app_id=str(app_id),
-            app_name=expected_name,
-            bundled_head=written.bundled_head,
-        )
-        await record_durable_copy_attempt(CopyAttempt.UNGUARDED)
-        return False
-    # WRITTEN, or SKIPPED because the commit step found the slot already holding this exact tree.
-    # Both mean the recovery slot now contains what the container contains, which is the fact the
-    # gate wanted and could not establish from the outside — and both compared against a real
-    # recorded head, which is what makes them evidence rather than an assumption.
+    # WRITTEN, or SKIPPED because the tree held nothing the saved copy does not. Both mean the
+    # saved copy now contains what the container contains, which is the fact the gate wanted and
+    # could not establish from the outside — and both compared against a real recorded head, which
+    # is what makes them evidence rather than an assumption.
     await record_durable_copy_attempt(
         CopyAttempt.COPIED
-        if written.outcome is RecoveryOutcome.WRITTEN
+        if written.outcome is SavedCopyOutcome.WRITTEN
         else CopyAttempt.NOTHING_TO_COPY
     )
     return True
+
+
+async def _hand_the_debt_over(
+    reg: dict[str, str], *, user_uuid: uuid.UUID, app_id: uuid.UUID | None
+) -> bool:
+    """Put a deletion this reap could not perform on the owed-row ledger. True when it took it.
+
+    IMPORTED HERE, NOT AT MODULE SCOPE, and the reason is the same weight this module's other
+    function-scoped import cites: the ledger reaches `src.db.base`, which BUILDS THE ORM ENGINE
+    at import, and this module is imported cold by a standalone-import test.
+
+    NEVER RAISES. This sits inside the teardown-failure arm, and an exception escaping it would
+    end the whole sweep on the one path that already knows something went wrong. A ledger that
+    would not take the debt leaves the old behaviour — lock and registry kept for a later pass —
+    which is slower for the citizen but loses nothing."""
+    from src.services.build_sessions.shutdown import owe_a_teardown_the_reap_could_not_perform
+
+    try:
+        return await owe_a_teardown_the_reap_could_not_perform(
+            user_id=user_uuid,
+            app_id=app_id,
+            app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
+            # The record's OWN birthday, which is what the owed row's instance check compares
+            # against: it is re-stamped at every registration, so it can tell this container from
+            # whatever is created under the same name next. No stamp, no discriminator, no row.
+            instance_ref=an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT),
+        )
+    except Exception:
+        _log.exception(
+            "could not record the deletion this reap failed to perform",
+            user_id=str(user_uuid),
+            app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
+        )
+        return False
 
 
 async def reap_user(
@@ -688,9 +718,12 @@ async def reap_user(
     `strict` separates "nothing was registered" from "teardown failed". A sweep needs neither
     (fire-and-forget, retried in five minutes); a caller about to ACT does — a still-standing
     container would walk the client back into the refusal `release_project_sandbox` just told it
-    was resolved, so `strict=True` re-raises and it can answer 503. Lock + registry are KEPT on
-    failure either way. `app_id` opts into the durable-copy gate: `None` suits callers whose
-    builder is about to get a fresh container; the unwatched janitor always passes it."""
+    was resolved, so `strict=True` re-raises and it can answer 503. On a failed teardown the
+    deletion is handed to the owed-row ledger and this citizen's lock + registry are released;
+    only when nothing can take that debt are they kept for a later sweep instead. `app_id` opts
+    into the durable-copy gate AND is what the ledger needs to take the debt at all: `None` suits
+    callers whose builder is about to get a fresh container; the unwatched janitor always passes
+    it."""
     reg = await read_registry(redis, user_uuid)
     if reg is None:
         # No sandbox registered — just clear any orphaned lock so a crashed-tab user is
@@ -721,12 +754,12 @@ async def reap_user(
     # resolved. `sweep_all`'s own `_owning_app_id` currently maps a `shr-` registry record to the
     # OWNER's app id (`_app_names_to_owners` keys every `shr-` name off the recipient, but the
     # value it carries is still the shared app's id) — passing that here would gate this
-    # RECIPIENT's teardown against the OWNER's recovery slot, and R22 says that storage is
-    # read-never-write for a recipient. Worse, a diverted or first-write guarded write then
-    # REFUSES the reap outright, sparing the container forever — the exact bill-forever leak R16/
-    # R17 exist to close. A shared view holds nothing worth preserving in the first place: the
-    # recipient never edits its tree directly, and what they own of it is a restore of the
-    # owner's own snapshot, already durable at its source.
+    # RECIPIENT's teardown against the OWNER's saved copy, and a recipient's access to that
+    # storage is read-never-write. Worse, a refused guarded write then REFUSES the reap
+    # outright, sparing the container forever — the exact bill-forever leak the ceiling exists to
+    # close. A shared view holds nothing worth preserving in the first place: the recipient never
+    # edits its tree directly, and what they own of it is a restore of the owner's own snapshot,
+    # already durable at its source.
     if app_id is not None and not is_a_shared_sandbox_name(registered_name):
         # THE REAL HEAD, not a hardcoded `None`. See `_reach_the_container`: a constant `None`
         # here made the gate's fallback its only branch, and the comparison it exists to perform
@@ -761,11 +794,23 @@ async def reap_user(
     try:
         await sandbox_client.teardown(_minimal_handle(reg))  # step 2: idempotent teardown
     except SandboxError:
-        # Teardown failed — KEEP the lock + registry so a later sweep retries; clearing
-        # them now would orphan a still-live container. Not silent (logged).
+        # THE DELETION BECOMES A DEBT, and the citizen stops paying for it. Holding the lock and
+        # registry here is how a later sweep used to find the container again — and it spent
+        # this citizen's one workspace on a failure of ours, so their next project could not
+        # start until an ARM that was refusing us started answering again. An owed row still
+        # names the container after the record is gone, so the state can go and the retry
+        # survives. Not silent (logged).
         _log.exception(
-            "reaper teardown failed; leaving state for a later sweep", user_id=str(user_uuid)
+            "reaper teardown failed; the deletion is now a debt this platform owes",
+            user_id=str(user_uuid),
         )
+        if await _hand_the_debt_over(reg, user_uuid=user_uuid, app_id=app_id):
+            await delete_registry(redis, user_uuid)
+            await release_liveness_lease(redis, user_uuid)
+            await reap_lock(redis, user_uuid)
+        # Nothing took the debt — no app owns this container, or its record cannot say WHICH
+        # container it is — so the state stays exactly where it was and a later sweep retries
+        # through it. Sparing, never forgetting.
         if strict:
             raise
         return False
@@ -774,10 +819,10 @@ async def reap_user(
     # container's whole life is over, so whether it ever served anybody is now a settled fact.
     _sound_the_alarm_if_the_proof_is_absent(reg, user_uuid=user_uuid)
     await delete_registry(redis, user_uuid)  # registry cleared
-    # ...and the liveness lease goes WITH the record it belonged to. Only here, after a
-    # teardown that actually succeeded: the failure arm above keeps lock + registry so a
-    # later sweep retries, and dropping the lease there would strip the protection off a
-    # container that is still standing and may still be building.
+    # ...and the liveness lease goes WITH the record it belonged to. The failure arm above
+    # releases it too, but only once an owed row has taken the deletion over; where nothing can,
+    # it is kept, because dropping it would strip the protection off a container that is still
+    # standing and may still be building.
     await release_liveness_lease(redis, user_uuid)
     await reap_lock(redis, user_uuid)  # step 3: release the (possibly drifted) lock — LAST
     return True
@@ -802,7 +847,7 @@ async def reap_the_container_we_judged(
     reg = await read_registry(redis, user_uuid)
     ours = reg is not None and reg.get(REGISTRY_FIELD_APP_NAME) == app_name
     # The container is only reachable THROUGH the registry — `attach_existing` builds its handle
-    # from that record — so a container the store no longer claims can be judged on its recovery
+    # from that record — so a container the store no longer claims can be judged on its saved
     # copy alone. That is the gate's documented fallback, and it still demands a parseable bundle.
     # It is also why no copy can be taken for an unregistered orphan: there is no address to
     # bundle from, and the address we DO have belongs to somebody else's container.
@@ -835,7 +880,7 @@ async def reap_the_container_we_judged(
         await mark_registry_ending(redis, user_uuid)  # step 1: guard a concurrent attach
     try:
         await sandbox_client.teardown(
-            _handle_named(app_name, fqdn=(reg or {}).get(REGISTRY_FIELD_FQDN, ""))
+            handle_named(app_name, fqdn=(reg or {}).get(REGISTRY_FIELD_FQDN, ""))
         )
     except SandboxError:
         # KEEP whatever state there is so a later pass retries; clearing it now would orphan a
@@ -923,6 +968,75 @@ def _shared_view_past_its_ceiling(reg: dict[str, str], now: datetime) -> bool:
     return now - created >= _SHARED_PREVIEW_ABSOLUTE_CEILING
 
 
+async def _container_age_source(
+    sandbox_client: SandboxClient, reg: dict[str, str], app_name: str
+) -> SandboxIdentity:
+    """What the ceiling is measured from: the CONTAINER's own birthday, not the record's.
+
+    The registry `created_at` is re-stamped on every registration and is dropped entirely by the
+    failed-teardown arm, so a container whose delete failed would come back looking newborn and
+    earn another full ceiling — precisely the population a ceiling exists to collect. The ARM tag
+    is stamped once, at create, and survives both.
+
+    THE FALLBACK IS THE REGISTRY, NOT `None`, and an ARM that will not answer must not be the
+    reason a container becomes immortal: a tag read that fails or comes back untagged leaves the
+    record's own birthday, which under-states the age and therefore only ever spares. Neither
+    source answering means no age, and no age means no ceiling (`drain.draining_at`)."""
+    try:
+        tags = await sandbox_client.get_app_tags(name=app_name)
+    except SandboxError:
+        tags = None
+    if tags is not None:
+        identity = identity_from_tags(tags)
+        if identity.created_at is not None:
+            return identity
+    return identity_from_tags({TAG_CREATED_AT: reg.get(REGISTRY_FIELD_CREATED_AT, "")})
+
+
+def _the_jammed_turn_grace() -> float:
+    """How long past the ceiling a turn is still given the benefit of the doubt.
+
+    One whole wall-clock run plus one slow tool call: the run deadline is checked BETWEEN steps,
+    so a run that entered its slowest tool one moment before the deadline legitimately overruns
+    it by that tool's whole budget. Past the sum, nothing honest is still working."""
+    from src.services.orchestrator.constants import (
+        RUN_COMMAND_SLOW_TIMEOUT_S,
+        RUN_WALL_CLOCK_DEADLINE_S,
+    )
+
+    return RUN_WALL_CLOCK_DEADLINE_S + RUN_COMMAND_SLOW_TIMEOUT_S
+
+
+async def _past_the_ceiling(
+    sandbox_client: SandboxClient, reg: dict[str, str], *, now: datetime, outranks_a_turn: bool
+) -> bool:
+    """Has this container outlived the absolute ceiling?
+
+    `outranks_a_turn` picks WHICH of the two marks is asked about — the ordinary one, which a
+    turn in flight would outrank, or the outer one, which nothing does. The caller knows which
+    arm it is standing in; this does not guess.
+
+    Costs one ARM tag read, and only while the flag is on and something is about to be spared."""
+    enabled, after_hours = the_ceiling_switch()
+    if not enabled:
+        return False
+    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+    if not app_name:
+        return False
+    identity = await _container_age_source(sandbox_client, reg, app_name)
+    if outranks_a_turn:
+        return past_the_turn_bound(
+            identity,
+            now=now,
+            enabled=True,
+            after_hours=after_hours,
+            turn_grace_seconds=_the_jammed_turn_grace(),
+        )
+    return is_drained(
+        identity, now=now, enabled=True, after_hours=after_hours, turn_in_flight=False
+    )
+
+
 async def reconcile_user(
     redis: aioredis.Redis,
     user_uuid: uuid.UUID,
@@ -974,7 +1088,19 @@ async def reconcile_user(
     # renewal it grants THIS pass must be visible to the stay check further down THIS SAME pass —
     # picking it up only on the next sweep would needlessly reap a session that just proved active.
     await _renew_shared_view_from_traffic(redis, user_uuid, sandbox_client, reg)
-    if not certified_dead and await liveness_lease_is_held(redis, user_uuid):
+    if (
+        not certified_dead
+        and await liveness_lease_is_held(redis, user_uuid)
+        # EVERY ARM A JAM CAN HOLD NEEDS ITS OWN CLAUSE. Each arm returns above the next, so a
+        # bound placed in one of them is unreachable from the others — and a jammed turn holds
+        # the lease, the lock and the heartbeat together, because one loop renews all three. The
+        # mark asked for here is the OUTER one — a whole run plus a slow tool call past the
+        # ceiling — because a lease is what a real turn holds and a real turn must not be cut
+        # short. The stay arm asks the ordinary mark: a tab renewing on a timer is not a turn.
+        and not await _past_the_ceiling(
+            sandbox_client, reg, now=datetime.now(UTC), outranks_a_turn=True
+        )
+    ):
         # The one liveness input readable from a process that is not running the build.
         # Checked BEFORE the lock/heartbeat pair below because it outranks it in both
         # directions — a live build has lost that pair 90 seconds in, and a dead one leaves
@@ -1002,6 +1128,14 @@ async def reconcile_user(
         not certified_dead
         and await lock_is_held(redis, user_uuid)
         and await heartbeat_is_alive(redis, user_uuid)
+        # THE SAME OUTER MARK AS THE LEASE ARM, and for the same reason one arm further down.
+        # `_hold_liveness_lease` renews the lease, the lock AND the heartbeat on one 30-second
+        # loop — their only clock — so the jammed turn the outer bound exists for holds all
+        # three. Bounding only the lease arm lets that jam fall through to this pair and be
+        # spared here forever, which is the one population the ceiling was written to end.
+        and not await _past_the_ceiling(
+            sandbox_client, reg, now=datetime.now(UTC), outranks_a_turn=True
+        )
     ):
         # looks live + recent (bounded by the heartbeat TTL) — leave it
         await _observe_the_serving_proof(
@@ -1016,6 +1150,13 @@ async def reconcile_user(
         # absolute ceiling falls straight through to the reap below EVEN THOUGH its stay is
         # still current — the one condition nothing renews, by design (requirement 20).
         and not _shared_view_past_its_ceiling(reg, datetime.now(UTC))
+        # The build sandbox's own absolute ceiling, and the reason presence renewal is safe: a
+        # surface renewing on a timer pushes this stay forward indefinitely, and this clause is
+        # the only thing that ever stops it. SUBTRACTS from what the stay would spare, exactly
+        # like the shared view's ceiling above; it never adds a reason to spare one.
+        and not await _past_the_ceiling(
+            sandbox_client, reg, now=datetime.now(UTC), outranks_a_turn=False
+        )
     ):
         # A relaunched preview holds no lock and renews no heartbeat, so the stay is all that
         # stands between it and the sweep, which passes True. Reconcile-on-start keeps the

@@ -6,21 +6,28 @@ from __future__ import annotations
 
 import ast
 import base64
+import contextlib
 import time
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 import redis.asyncio as aioredis
+import sqlalchemy as sa
 import structlog.testing
+from pydantic import SecretStr
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
     LIVENESS_LEASE_TTL_SECONDS,
     RELAUNCH_PREVIEW_STAY_SECONDS,
 )
-from src.services.build_sessions import locks, pass_history, reaper
+from src.config import settings
+from src.db.models.pending_teardown import PendingTeardown
+from src.services.build_sessions import app_name_for, locks, pass_history, reaper
 from src.services.build_sessions.alarms import SERVING_PROOF_ABSENT_AT_TEARDOWN
 from src.services.build_sessions.pass_history import CopyAttempt
 from src.services.build_sessions.snapshot import reset_divert_streaks_for_tests
@@ -44,8 +51,16 @@ from src.services.redis.keys import (
     starting_key,
 )
 from src.services.sandbox import SandboxError, SandboxHandle
-from src.services.sandbox.base import DevStatus, ExecResult
-from src.services.storage import recovery_key
+from src.services.sandbox.base import (
+    KIND_BUILD_SANDBOX,
+    TAG_CREATED_AT,
+    TAG_KIND,
+    DevStatus,
+    ExecResult,
+)
+from src.services.sandbox.config import SandboxConfig
+from src.services.storage import snapshot_key
+from tests.factories import AppRegistryFactory, UserFactory
 from tests.fakes import (
     FakeSandboxClient,
     FakeStorage,
@@ -351,12 +366,16 @@ async def test_sweep_all_skips_live_users(fake_redis: aioredis.Redis) -> None:
     assert await locks.read_registry(fake_redis, USER) is not None
 
 
-async def test_reaper_teardown_failure_keeps_state_for_retry(fake_redis: aioredis.Redis) -> None:
+async def test_reaper_teardown_failure_keeps_state_when_nothing_can_own_the_debt(
+    fake_redis: aioredis.Redis,
+) -> None:
+    # No `app_id`, so the owed-row ledger has nothing to write back for and refuses the debt.
+    # Registry + lock are then KEPT for a later sweep — the only retry left, and never an
+    # orphaned live container.
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
     client = FakeSandboxClient()
     client.teardown_error = SandboxError("teardown boom")
     assert await reaper.reap_user(fake_redis, USER, client) is False
-    # Teardown failed -> registry + lock KEPT for a later sweep (never orphan a live box).
     assert await locks.read_registry(fake_redis, USER) is not None
     assert await locks.lock_is_held(fake_redis, USER) is True
 
@@ -395,8 +414,8 @@ async def test_the_scheduled_sweep_resolves_the_owning_app_id_and_the_operator_o
 
 
 async def _preserve(store: FakeStorage, app_id: uuid.UUID, *, head: str = "a" * 40) -> None:
-    """A recovery copy the durable-copy gate will accept, so these tests are about the reap."""
-    await store.put(recovery_key(app_id), a_git_bundle(head), metadata={"head_sha": head})
+    """A saved copy the durable-copy gate will accept, so these tests are about the reap."""
+    await store.put(snapshot_key(app_id), a_git_bundle(head), metadata={"head_sha": head})
 
 
 async def test_the_janitor_destroys_the_container_it_judged_not_the_one_the_record_names(
@@ -470,7 +489,7 @@ async def test_the_four_step_ordering_still_runs_when_the_record_does_name_it(
 async def test_the_janitor_is_still_refused_when_the_work_is_not_preserved(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """The name-keyed reap is not a way around the durable-copy gate. No recovery copy means
+    """The name-keyed reap is not a way around the durable-copy gate. No saved copy means
     nothing was established, and nothing established never authorises a delete."""
     await _seed(fake_redis, USER, app_name=SBX)
     client = FakeSandboxClient()
@@ -543,7 +562,7 @@ def _a_container_that_bundles(
 async def test_the_janitor_takes_the_copy_before_it_destroys_what_it_judged(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
 ) -> None:
-    """★ THE SECOND CALL SITE. The recovery copy is behind the container, so the durable-copy
+    """★ THE SECOND CALL SITE. The saved copy is behind the container, so the durable-copy
     policy says take one and then reclaim — this path used to just spare and log, unread.
 
     Deleting this test leaves the janitor's copy unproven: `test_durable_copy_gate.py` drives
@@ -561,7 +580,7 @@ async def test_the_janitor_takes_the_copy_before_it_destroys_what_it_judged(
 
     assert destroyed is True
     assert client.torn_down == [SBX]
-    meta = await fake_storage.head(recovery_key(APP))
+    meta = await fake_storage.head(snapshot_key(APP))
     assert meta is not None and (meta.metadata or {})["head_sha"] == "c" * 40
     assert attempts == [CopyAttempt.COPIED]
 
@@ -1132,18 +1151,144 @@ async def test_the_reap_clears_the_lease_with_the_registry(fake_redis: aioredis.
     assert await fake_redis.exists(lease_key(USER)) == 0
 
 
-async def test_a_failed_teardown_keeps_the_lease_with_the_rest_of_the_state(
+async def test_a_failed_teardown_keeps_the_lease_when_nothing_can_own_the_debt(
     fake_redis: aioredis.Redis,
 ) -> None:
-    # The teardown-failure arm keeps lock + registry so a later sweep retries. The lease is
-    # part of that state: clearing it while the container is still standing would strip the
-    # protection off a container that may STILL be building.
+    # With no owed row to carry the retry, this arm keeps lock + registry so a later sweep can
+    # find the container again. The lease is part of that state: clearing it while the container
+    # is still standing would strip the protection off one that may STILL be building.
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
     await _hold_a_lease(fake_redis, USER)
     client = FakeSandboxClient()
     client.teardown_error = SandboxError("teardown boom")
     assert await reaper.reap_user(fake_redis, USER, client) is False
     assert await locks.liveness_lease_is_held(fake_redis, USER) is True
+
+
+# --- and when something CAN own it -------------------------------------------
+#
+# The arm above is the fallback, not the shape. Holding a citizen's lock and registry so a later
+# sweep can retry spends their one workspace on a failure of OURS: until an ARM that was refusing
+# us starts answering again, they cannot start their next project at all. An owed row still names
+# the container after the record is gone, so the state can go and the retry survives.
+
+
+async def test_a_failed_teardown_hands_the_debt_over_and_gives_the_slot_back(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ Mutation check: keep the registry and lock here the way the arm above does, and this goes
+    red on both the freed slot and the row that carries the debt."""
+    user = await UserFactory.create(db_session)
+    app = await AppRegistryFactory.create(db_session, user_id=user.id)
+    born = "2026-07-14T00:00:00+00:00"
+    await _seed(
+        fake_redis, user.id, app_name=app_name_for(app.id), with_heartbeat=False, created_at=born
+    )
+    await _hold_a_lease(fake_redis, user.id)
+    await _preserve(fake_storage, app.id)
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert await reaper.reap_user(fake_redis, user.id, client, app_id=app.id) is False
+
+    assert await locks.read_registry(fake_redis, user.id) is None
+    assert await locks.lock_is_held(fake_redis, user.id) is False
+    assert await locks.liveness_lease_is_held(fake_redis, user.id) is False
+    owed = (
+        (
+            await db_session.execute(
+                sa.select(PendingTeardown).where(PendingTeardown.user_id == user.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.app_name for row in owed] == [app_name_for(app.id)]
+    # The record's OWN birthday rides onto the row: it is what tells this container from whatever
+    # is created under the same name next.
+    assert owed[0].instance_ref == datetime.fromisoformat(born)
+    assert owed[0].project_id == app.project_id
+
+
+async def test_a_failed_teardown_keeps_its_state_when_the_app_row_has_gone(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A container whose app no longer exists has no project to name and no copy to promise, so
+    the ledger refuses it and the old retry stands. Sparing, never forgetting.
+
+    The registry carries the name this app id WOULD produce, so the identity guard above waves
+    it through and the refusal under test is the missing app row — seed any other name and this
+    passes for the wrong reason, proving the guard instead.
+
+    Mutation check: answer True from the no-app-row branch and this goes red."""
+    stranger = uuid.uuid4()
+    await _seed(
+        fake_redis, USER, app_name=app_name_for(stranger), with_lock=True, with_heartbeat=False
+    )
+    await _preserve(fake_storage, stranger)
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert await reaper.reap_user(fake_redis, USER, client, app_id=stranger) is False
+
+    assert await locks.read_registry(fake_redis, USER) is not None
+    assert await locks.lock_is_held(fake_redis, USER) is True
+    assert (await db_session.scalar(sa.select(sa.func.count()).select_from(PendingTeardown))) == 0
+
+
+async def test_a_name_and_an_app_id_describing_different_containers_are_refused(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ A REAL APP ROW IS NOT ENOUGH — the name has to belong to it.
+
+    The name and the app id arrive from different reads, so a slot swap between them hands the
+    ledger one container's name and another's id, and the ownership query still passes. Owed
+    against that pair, the teardown would bundle the wrong tree against the wrong saved head
+    and mark the wrong project as closing.
+
+    Mutation check: drop the `app_name not in (...)` guard and this goes red — a row is written,
+    carrying a name no part of this app id can produce."""
+    user = await UserFactory.create(db_session)
+    app = await AppRegistryFactory.create(db_session, user_id=user.id)
+    await _seed(fake_redis, user.id, app_name=SBX, with_lock=True, with_heartbeat=False)
+    await _preserve(fake_storage, app.id)
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert await reaper.reap_user(fake_redis, user.id, client, app_id=app.id) is False
+
+    assert (await db_session.scalar(sa.select(sa.func.count()).select_from(PendingTeardown))) == 0
+
+
+@contextlib.asynccontextmanager
+async def _the_test_session(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[None]:
+    """Bind the ledger's own session factory to the rolled-back test session.
+
+    The ledger resolves `async_session_factory` at CALL time precisely so this is possible — left
+    alone it would open a real connection, commit outside this test's transaction, and then fail
+    to see the user and app rows that only exist inside it."""
+    import src.db.base as db_base
+
+    @contextlib.asynccontextmanager
+    async def _session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    monkeypatch.setattr(db_base, "async_session_factory", lambda: _session())
+    yield
 
 
 # --- the boundary a second process may never cross ---------------------------
@@ -1757,3 +1902,232 @@ def test_thinning_never_reaches_the_arm_that_stamps_an_unproven_container() -> N
             reaper._what_this_record_is_missing(unproven, now, USER, thin_the_re_ask=True)
             == "stamp"
         ), f"an unproven container was thinned out of its own stamp on pass {pass_offset}"
+
+
+# --- the absolute age ceiling ------------------------------------------------
+#
+# Two arms, not one, and the second is the whole reason this section exists: `reconcile_user`'s
+# liveness-lease arm RETURNS above the stay arm, so a bound written only into the stay would
+# never see a container with a turn in flight and would be dead code from the day it landed.
+
+
+@pytest.fixture
+def ceiling_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two hours, switched on. Off everywhere by default, so every other test in this file goes
+    on exercising a platform with no ceiling at all."""
+    monkeypatch.setattr(
+        settings, "sandbox", _sandbox_config_with(drain_enabled=True, drain_after_hours=2)
+    )
+
+
+def _sandbox_config_with(*, drain_enabled: bool, drain_after_hours: int) -> SandboxConfig:
+    return SandboxConfig(
+        subscription_id="s",
+        resource_group="r",
+        region="westeurope",
+        managed_environment_name="aca-env",
+        acr_server="acr.azurecr.io",
+        acr_username="acr-user",
+        acr_password=SecretStr("acr-pass"),
+        image_ref="acr/img:latest",
+        drain_enabled=drain_enabled,
+        drain_after_hours=drain_after_hours,
+    )
+
+
+def _hours_ago(hours: float) -> str:
+    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+
+
+class _ArmKnowsItsAge(FakeSandboxClient):
+    """A client whose ARM answers with a container birthday — the source the ceiling actually
+    measures from, as opposed to the registry record's, which is re-stamped and deleted."""
+
+    def __init__(self, *, created_at: str | None) -> None:
+        super().__init__()
+        self._created_at = created_at
+
+    async def get_app_tags(self, *, name: str) -> dict[str, str] | None:
+        if self._created_at is None:
+            return None
+        return {TAG_KIND: KIND_BUILD_SANDBOX, TAG_CREATED_AT: self._created_at}
+
+
+async def test_a_screen_left_open_for_three_hours_is_collected_at_two(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """THE RENEWING TAB, BOUNDED. A present surface pushes the stay forward forever — that is
+    what presence renewal is — so the ceiling is the only thing between an open tab and an
+    immortal container."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    await locks.grant_stay_of_execution(
+        fake_redis, USER, writer=locks.DeadlineWriter.SURFACE_PRESENT
+    )
+    client = _ArmKnowsItsAge(created_at=_hours_ago(3))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is True
+    assert SBX in client.torn_down
+
+
+async def test_a_screen_open_for_one_hour_keeps_its_container(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """The other half of the same rule, and the one a citizen actually lives in: inside the
+    ceiling, a renewed stay is honoured exactly as it was before."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    await locks.grant_stay_of_execution(
+        fake_redis, USER, writer=locks.DeadlineWriter.SURFACE_PRESENT
+    )
+    client = _ArmKnowsItsAge(created_at=_hours_ago(1))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is False
+    assert client.torn_down == []
+
+
+async def test_a_turn_in_flight_at_the_ceiling_is_deferred_not_cut(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """The ceiling does not interrupt work. A held lease means an agent is making tool calls
+    inside that container, and a build that crossed the mark while running is entitled to finish:
+    it keeps a whole wall-clock run plus the one slow tool call that run can be sitting inside."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    await locks.renew_liveness_lease(fake_redis, USER)
+    client = _ArmKnowsItsAge(created_at=_hours_ago(2.2))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is False
+    assert client.torn_down == []
+
+
+async def test_a_lease_that_will_not_stop_renewing_is_no_longer_spared(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """THE ARM THE WHOLE SECOND CLAUSE EXISTS FOR. A jammed lease is indistinguishable from a
+    working agent, so the arm that protects real work protects a wedged container forever. Past
+    the ceiling plus a whole run plus a slow tool call, nothing honest is still in there.
+
+    Mutation check: delete the ceiling clause from `reconcile_user`'s liveness-lease arm and this
+    test alone goes red — the stay arm's clause can never reach this case, because the lease arm
+    returns above it."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    await locks.renew_liveness_lease(fake_redis, USER)
+    client = _ArmKnowsItsAge(created_at=_hours_ago(24))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is True
+    assert SBX in client.torn_down
+
+
+async def test_a_jam_holding_lease_lock_and_heartbeat_together_is_still_collected(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """THE SHAPE A REAL JAM ACTUALLY MAKES, which the lease-only test above cannot produce.
+
+    `_hold_liveness_lease` renews the lease, the lock and the heartbeat on one 30-second loop —
+    their only clock — so a wedged turn holds all three at once. The arm above seeds
+    `with_lock=False, with_heartbeat=False`, a shape the engine never leaves behind, and passes
+    on a ceiling clause that reaches only the lease. With all three held, the lease arm declines
+    to spare and control falls through to the lock/heartbeat pair.
+
+    Mutation check: delete the ceiling clause from the lock/heartbeat arm and this test alone
+    goes red — every other ceiling test seeds the pair off and never reaches it."""
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
+    await locks.renew_liveness_lease(fake_redis, USER)
+    client = _ArmKnowsItsAge(created_at=_hours_ago(24))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is True
+    assert SBX in client.torn_down
+
+
+async def test_a_live_turn_inside_the_outer_mark_keeps_all_three_signals(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """The other half, and the reason the pair's clause asks the OUTER mark rather than the
+    ordinary one: a real agent mid-run holds exactly the same three signals as a jam. Inside the
+    bound it must be left alone, or the ceiling cuts working builds short."""
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
+    await locks.renew_liveness_lease(fake_redis, USER)
+    client = _ArmKnowsItsAge(created_at=_hours_ago(0.1))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is False
+    assert client.torn_down == []
+
+
+async def test_the_ceiling_measures_the_container_not_its_registry_record(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """A container whose teardown FAILED loses its registry record, and the next registration
+    stamps a brand-new birthday onto the same still-running container. Measuring the record
+    would hand a fresh two hours to precisely the population the ceiling exists to collect."""
+    await _seed(
+        fake_redis, USER, with_lock=False, with_heartbeat=False, created_at=_hours_ago(0.1)
+    )
+    await locks.grant_stay_of_execution(
+        fake_redis, USER, writer=locks.DeadlineWriter.SURFACE_PRESENT
+    )
+    client = _ArmKnowsItsAge(created_at=_hours_ago(9))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is True, "the record's fresh birthday was believed over the container's own"
+
+
+async def test_an_arm_that_cannot_answer_falls_back_to_the_record(
+    fake_redis: aioredis.Redis, ceiling_on: None
+) -> None:
+    """An ARM outage must not be the reason a container becomes immortal. The record's birthday
+    can only UNDER-state the age, so the fallback only ever spares — and it still collects a
+    container the record itself says is old enough."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False, created_at=_hours_ago(5))
+    await locks.grant_stay_of_execution(
+        fake_redis, USER, writer=locks.DeadlineWriter.SURFACE_PRESENT
+    )
+    client = _ArmKnowsItsAge(created_at=None)
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is True
+
+
+async def test_with_the_ceiling_off_a_renewed_stay_is_immortal_again(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The flag's default posture, stated as the behaviour it produces rather than as a boolean:
+    with no ceiling configured, an ancient container inside a standing stay is spared."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    await locks.grant_stay_of_execution(
+        fake_redis, USER, writer=locks.DeadlineWriter.SURFACE_PRESENT
+    )
+    client = _ArmKnowsItsAge(created_at=_hours_ago(500))
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, USER, client, has_live_session=False, honor_stay=True
+    )
+
+    assert reaped is False
