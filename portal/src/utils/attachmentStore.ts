@@ -3,10 +3,12 @@
  * the Anthropic request shape and onto display. A part this composer MINTS is prose, or a `file`
  * whose bytes sit in the object store — there is one producer now, and it is the uploaded one.
  *
- * OLDER PART SHAPES STILL ARRIVE FROM HISTORY and are still rendered: an inline text attachment,
- * an `office` part carrying server-extracted Markdown, a `deck` part naming a converted PDF by
- * `pdfFileId`. Nothing produces them any more, and the readers stay because a transcript written
- * before this change is still a transcript someone opens.
+ * OLDER PART SHAPES STILL ARRIVE FROM HISTORY and still draw a chip: an inline text attachment,
+ * an `office` part, a `deck` part. What they no longer carry INTO the chip is their extras —
+ * the server-extracted Markdown an office part held, and the converted PDF a deck part named by
+ * `pdfFileId` — because nothing produces either any more and nothing reads them. The chip is
+ * drawn from the kind and the media type, which every one of those shapes still has, so a
+ * transcript written before this change is still a transcript someone can open.
  *
  * The send path is byte-free: the browser sends only the new message — prose and OWNED refs for
  * stored binaries (`wireMessageFromParts`); the server rehydrates bytes and replays history from
@@ -16,18 +18,15 @@ import type { PendingAttachment } from './attachmentInput'
 import { uploadAttachment as defaultUpload, deleteAttachment as defaultDelete } from './attachmentApi'
 import type { FilePartImageOrDocument, MessagePart, TextPart } from './messageTypes'
 
-/** The chip descriptor `attachmentsFromParts` builds — traced from its one real
- * consumer, `AttachmentChips.tsx`'s own doc comment: `{ attachmentId, kind,
- * name, mediaType, format?, truncated? }`, plus `truncationNote` (read here,
- * used for the chip's tooltip). */
+/** The chip descriptor `attachmentsFromParts` builds, for its one real consumer,
+ * `AttachmentChips.tsx`. Three more fields lived here — `format`, `truncated` and
+ * `truncationNote` — all of them about server-extracted Markdown, which nothing extracts.
+ * A chip now knows a file by its kind and its media type, which is what it renders from. */
 export interface AttachmentDescriptor {
   attachmentId: string
   kind: string
   name: string
   mediaType: string
-  format?: string
-  truncated?: boolean
-  truncationNote?: string
 }
 
 /** The stateless wire message `wireMessageFromParts` resolves to. */
@@ -67,16 +66,11 @@ export function attachmentsFromParts(parts: MessagePart[]): AttachmentDescriptor
   const out: AttachmentDescriptor[] = []
   for (const p of parts) {
     if (p?.type === 'file') {
-      const d: AttachmentDescriptor = { attachmentId: p.attachmentId, kind: p.kind, name: p.name, mediaType: p.mediaType }
-      if (p.kind === 'office') {
-        d.format = p.format // drives the Word/Excel chip icon
-        d.truncated = p.truncated // chip shows a "truncated" note when set
-        if (p.truncationNote) d.truncationNote = p.truncationNote // human-readable detail for the tooltip
-      }
-      // Deck: surface ONLY name/kind/mediaType (the .pptx). pdfFileId/pageCount are
-      // internal plumbing and must never reach a user-visible field (invisible
-      // conversion), so they're deliberately omitted from the chip descriptor.
-      out.push(d)
+      // ONE SHAPE, because one kind of file part is left. An `office` part carried a Word or
+      // Excel icon and a truncation note for server-extracted Markdown; nothing extracts, so
+      // nothing sets either, and a descriptor field no producer fills is a field a reader
+      // has to defend against for no reason.
+      out.push({ attachmentId: p.attachmentId, kind: p.kind, name: p.name, mediaType: p.mediaType })
     } else if (p?.type === 'text' && p.attachment) {
       out.push({ attachmentId: p.attachment.attachmentId, kind: 'text', name: p.attachment.name, mediaType: p.attachment.mediaType })
     }
@@ -181,16 +175,14 @@ export async function buildUserParts(
 
 /**
  * Best-effort release of the attachments `buildUserParts` already uploaded for a
- * turn that then FAILED to persist/send. Without this, a deck's Files-API PDF +
- * stored `.pptx` (and any image/PDF object) would orphan server-side. Each delete
- * is fire-and-forget and swallows its own error, so cleanup can never throw into —
- * or mask — the original send failure. Decks forward `pdfFileId` so the route also
- * releases the internal converted PDF.
+ * turn that then FAILED to persist/send. Without this, every object uploaded for that
+ * turn orphans server-side. Each delete is fire-and-forget and swallows its own error, so
+ * cleanup can never throw into — or mask — the original send failure.
  */
 export function releaseUploadedAttachments(parts: unknown, del: typeof defaultDelete = defaultDelete): void {
   if (!Array.isArray(parts)) return
   for (const p of parts as MessagePart[]) {
     if (p?.type !== 'file' || typeof p.attachmentId !== 'string') continue
-    Promise.resolve(del(p.attachmentId, { pdfFileId: p.kind === 'deck' ? p.pdfFileId : undefined })).catch(() => {})
+    Promise.resolve(del(p.attachmentId)).catch(() => {})
   }
 }

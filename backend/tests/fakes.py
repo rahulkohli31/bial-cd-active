@@ -60,6 +60,9 @@ from src.services.sandbox.base import (
     DevLogs,
     DevStatus,
     ExecResult,
+    FileCreate,
+    FileCreateBytes,
+    FileDelete,
     FileOp,
     FileResult,
     FleetMember,
@@ -311,6 +314,11 @@ class FakeSandboxClient(SandboxClient):
         # Every bundle a discard reset the container to, in order.
         self.reset_to: list[bytes] = []
         self.warmed: list[str] = []
+        # Every `/files` op this client was handed, and the tree they produced. Both, because
+        # the questions differ: "was a delete attempted" is the op list, and "what would the
+        # agent read" is the tree.
+        self.file_ops: list[FileOp] = []
+        self.written: dict[str, bytes] = {}
         self.warm_status: int | None = 200
         self.compile_report: CompileReport = CompileReport(
             state=CompileState.UNKNOWN, reason="endpoint_absent"
@@ -449,6 +457,19 @@ class FakeSandboxClient(SandboxClient):
         return ExecResult(stdout="", stderr="", exit=0)
 
     async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:
+        """Records the op, and WRITES IT, so a test can assert what reached the container.
+
+        ★ IT USED TO ANSWER `ok` AND KEEP NOTHING, which made every placement assertion
+        impossible to write: a turn that never wrote a byte finished exactly like one that
+        wrote them all. `file_ops` is the record; `written` is the tree they produced.
+        """
+        self.file_ops.append(op)
+        if isinstance(op, FileCreateBytes):
+            self.written[op.path] = base64.b64decode(op.file_b64)
+        elif isinstance(op, FileCreate):
+            self.written[op.path] = op.file_text.encode()
+        elif isinstance(op, FileDelete):
+            self.written.pop(op.path, None)
         return FileResult(ok=True, detail={})
 
     async def reset_to_bundle(self, handle: SandboxHandle, bundle: bytes) -> None:

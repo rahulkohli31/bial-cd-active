@@ -56,6 +56,23 @@ describe('validateAttachmentFiles', () => {
     expect(validateAttachmentFiles([file('deck.pptx', PPTX)], 0)).toEqual({ ok: true })
   })
 
+  it('★ takes an extension-less file at the browser’s word, and refuses it when the browser is silent', () => {
+    // THE SHAPE THE ON-DISK NAMING RULE EXISTS FOR, and the one nothing drove. The server derives
+    // the stored file's suffix from the VERIFIED type precisely because a workbook can arrive
+    // called `Q3 figures` with nothing on the end — but it never gets that far unless the composer
+    // admits it, and in the browser the only evidence available is `File.type`.
+    //
+    // Both halves are one rule from either side: with a type the file is ordinary, and with
+    // neither type nor suffix there is nothing to resolve, so the refusal names the file and the
+    // citizen knows which one to rename.
+    const declared = file('Q3 figures', XLSX)
+    expect(resolveMediaType(declared)).toBe(XLSX)
+    expect(validateAttachmentFiles([declared], 0)).toEqual({ ok: true })
+
+    const silent = file('Q3 figures', '')
+    expect(validateAttachmentFiles([silent], 0).error).toMatch(/Q3 figures/)
+  })
+
   it('refuses plain text, which is a withdrawal rather than a format never added', () => {
     // It works on the branch today and stops. The mechanism argument died with the inline lane —
     // under the routing rule a .txt is simply a file code reads, exactly like a .csv — so the

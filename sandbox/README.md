@@ -19,9 +19,15 @@ directions:
 | New backend, old image | **Degraded, loudly.** Writing an attachment answers `400 … path escapes workspace`, because `/workspace/attachments` does not exist in the old image. That is *not* a control-plane path bug. |
 
 So: **image → portal → backend → worker.** Build with context `sandbox/` and
-`--platform linux/amd64`; push under an immutable tag **and** `:latest` (prod's `SANDBOX__IMAGE_REF`
-is on `:latest`). A template or supervisor change under a reused tag is silently untested — the
-preview comes up on the old image and reports healthy.
+`--platform linux/amd64`, and push under a DATED, IMMUTABLE tag — `attachments-20260916c`, not
+`:latest`. A template or supervisor change under a reused tag is silently untested: the preview
+comes up on the old image and reports healthy.
+
+THE TAG IS NAMED IN CONFIG, NOT INHERITED. `SANDBOX__IMAGE_REF` selects the image, and it names
+one build; deploying a new image is editing that line, which is why the registry holds no
+`:latest` for this repository and nothing reads one. A moving tag would make the running build
+unanswerable from the configuration, and this is a tree where a container's exact image is the
+first thing anyone asks about a failed attachment.
 
 **It is a STARTER, not a CRUD template.** `app/page.tsx` is a placeholder screen that asks the
 framing portal whether a build is running and says so, until the agent replaces it with the app's

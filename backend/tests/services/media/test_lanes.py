@@ -27,6 +27,16 @@ def _ooxml(part: bytes) -> bytes:
     return _ZIP + bytes(2) + part + bytes(32)
 
 
+def _locked_office() -> bytes:
+    """An encrypted Office file: the OLE2 wrapper AND the stream Office puts the package in.
+
+    The stream name is what tells it apart from a legacy `.xls`, which wears the same eight bytes
+    — so a fixture carrying only the signature pins a check that cannot make that distinction.
+    Directory entry names are stored UTF-16 inside a compound document.
+    """
+    return _OLE2 + bytes(48) + "EncryptedPackage".encode("utf-16-le") + bytes(32)
+
+
 def test_the_two_lanes_do_not_overlap() -> None:
     """★ THE INVARIANT THE WHOLE FEATURE RESTS ON. A media type is read by the model or by code,
     never both — a type in both sets would take whichever path happened to check first."""
@@ -68,7 +78,7 @@ def test_an_office_file_must_carry_its_own_opc_part() -> None:
 
 
 def test_a_password_protected_office_file_is_refused_at_the_door() -> None:
-    """★ R6. An encrypted Office file is not a damaged ZIP — it is an OLE2 compound document
+    """★ AN ENCRYPTED OFFICE FILE IS NOT A DAMAGED ZIP — it is an OLE2 compound document
     wrapping the encrypted package, and it announces itself in its first eight bytes. So a locked
     workbook gets the same sentence a locked PDF gets, instead of being accepted, stored, charged,
     and failing inside the sandbox several turns later where nothing can explain it.
@@ -77,7 +87,7 @@ def test_a_password_protected_office_file_is_refused_at_the_door() -> None:
     generic "could not be read" one, which a citizen holding a file they know is fine cannot act
     on.
     """
-    locked = _OLE2 + bytes(64)
+    locked = _locked_office()
 
     assert looks_password_protected(locked)
     refusal = code_lane_refusal(EXCEL_MEDIA_TYPE, "salaries.xlsx", locked)
@@ -89,11 +99,31 @@ def test_the_password_check_runs_before_the_structure_check() -> None:
     """An encrypted file is ALSO a structurally invalid ZIP, so the order decides which sentence
     the citizen meets. "Remove the password" is something a person can do; "this file is damaged",
     about a file they know is fine, reads as the platform being broken."""
-    refusal = code_lane_refusal(WORD_MEDIA_TYPE, "locked.docx", _OLE2 + bytes(64))
+    refusal = code_lane_refusal(WORD_MEDIA_TYPE, "locked.docx", _locked_office())
 
     assert refusal is not None
     assert "read" not in refusal.lower().split("password")[0]
-    assert "password" in refusal.lower()
+
+
+def test_a_renamed_legacy_workbook_is_not_told_to_remove_a_password() -> None:
+    """★ EVERY LEGACY `.xls`, `.doc` AND `.ppt` WEARS THE SAME EIGHT BYTES as an encrypted file.
+
+    Judged on the signature alone, a `sales.xls` renamed to `.xlsx` — an ordinary thing to do, and
+    the reason the door checks bytes at all — was refused with "Remove the password": advice about
+    a password the file does not have, which leads nowhere no matter how carefully it is followed.
+
+    What it needs to hear is that the format is wrong, which is the sentence the structure check
+    already owns.
+
+    Mutation receipt: answer on the signature alone and this file is called password-protected.
+    """
+    legacy = _OLE2 + bytes(48) + "Workbook".encode("utf-16-le") + bytes(32)
+
+    assert not looks_password_protected(legacy)
+    refusal = code_lane_refusal(EXCEL_MEDIA_TYPE, "sales.xlsx", legacy)
+    assert refusal is not None
+    assert "password" not in refusal.lower()
+    assert "re-save" in refusal.lower()
 
 
 def test_delimited_files_are_admitted_on_their_extension() -> None:

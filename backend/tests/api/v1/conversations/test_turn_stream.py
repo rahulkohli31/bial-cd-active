@@ -1557,6 +1557,12 @@ async def test_the_first_message_of_a_new_chat_can_carry_a_spreadsheet(
 
     THE TEST STAYS because the journey it covers is the one that broke: a brand-new chat whose
     very first message carries a spreadsheet, driven through the real routes in the real order.
+
+    AND IT ASSERTS THE PLACEMENT NOW, which is what makes it able to fail. It used to check the
+    202 and the stored link, both decided before the turn body runs, against a fake whose
+    `files` answered `ok` and kept nothing — so a turn that wrote no byte at all finished
+    exactly like one that wrote them. The bytes in the container and the turn's terminal status
+    are the two facts a broken placement moves.
     """
     import base64
     import io
@@ -1598,7 +1604,8 @@ async def test_the_first_message_of_a_new_chat_can_carry_a_spreadsheet(
     # The turn route reads its store through `chat_storage`, not the upload's
     # `storage_dependency` the conftest binds — an attachment id with no store is a typed 503.
     app.dependency_overrides[chat_storage] = lambda: fake_storage
-    app.dependency_overrides[sandbox_or_none_dependency] = lambda: FakeSandboxClient()
+    sandbox = FakeSandboxClient()
+    app.dependency_overrides[sandbox_or_none_dependency] = lambda: sandbox
     try:
         resp = await client.post(
             f"/v1/conversations/{chat_id}/turns",
@@ -1625,6 +1632,13 @@ async def test_the_first_message_of_a_new_chat_can_carry_a_spreadsheet(
         sa.select(Attachment.conversation_id).where(Attachment.attachment_id == "att_first_book")
     )
     assert linked == chat_id
+
+    # ★ THE FILE IS IN THE CONTAINER, at the path the note hands the agent, byte for byte.
+    assert sandbox.written["/workspace/attachments/roster.xlsx"] == book.getvalue()
+    # And the turn ENDED rather than failing on the way in: placement raises, and a raised
+    # placement is the failure this whole journey exists to keep out of the demo.
+    state = _fresh_engine.peek(chat_id)
+    assert state is not None and state.status == "completed"
 
 
 async def test_a_first_message_refused_by_the_workspace_leaves_an_empty_chat_and_no_turn(

@@ -43,18 +43,15 @@ interface UploadAttachmentArgs {
 }
 
 /**
- * The uploaded ref, traced from its one real consumer (`attachmentStore.ts`'s
- * `buildUserParts`, which spreads exactly these fields into a `file` message
- * part per `messageTypes.ts`'s `FilePart` union) — `attachmentId`/`key`/`kind`/
- * `name`/`mediaType`/`size` always; `format`/`text`/`truncated`/`truncationNote`
- * for the office hybrid; `pdfFileId`/`pageCount` for the deck hybrid.
+ * What the upload route answers with, and the whole of it: the six fields
+ * `attachmentStore.ts`'s `buildUserParts` spreads into a `file` message part.
  *
- * `truncationNote` is now also on `messageTypes.ts`'s `FilePartOffice` —
- * added converting `attachmentStore.ts`, closing the gap flagged here.
- *
- * `pageCount` WENT WITH THE PAGE CAP, on both sides of the wire. Its siblings survive because
- * they still render historic messages; a page count was only ever produced by the admission check
- * that is gone, so declaring it here would promise a field the route can never send.
+ * ★ SIX FIELDS BECAUSE SIX IS WHAT AN UPLOAD CAN PRODUCE. Five more lived here —
+ * `format`, `text`, `truncated`, `truncationNote`, `pdfFileId` — for the office and deck
+ * hybrids, and both producers are gone. They survive on the SERVER'S `AttachmentRef`, where
+ * they still render a message sent before that change; this type is the response to a fresh
+ * upload, which can never carry one. Declaring them here promised a field the route cannot
+ * send.
  */
 export interface AttachmentRef {
   attachmentId: string
@@ -63,11 +60,6 @@ export interface AttachmentRef {
   name: string
   mediaType: string
   size: number
-  format?: string
-  text?: string
-  truncated?: boolean
-  truncationNote?: string
-  pdfFileId?: string
 }
 
 /**
@@ -152,19 +144,20 @@ export function revokeAllAttachmentUrls(): void {
 }
 
 /**
- * Delete one attachment object (best-effort) and drop its cached URL. For a deck,
- * pass its `pdfFileId` so the route also releases the internal Files-API PDF (the
- * bare route can't otherwise know it); the conversation-delete sweep is the
- * authoritative cleanup.
+ * Delete one attachment object (best-effort) and drop its cached URL. The
+ * conversation-delete sweep is the authoritative cleanup.
+ *
+ * IT TOOK A `pdfFileId` UNTIL THE DECK LANE WENT. That query parameter asked the route to
+ * release a second object — an internally converted PDF — that nothing converts any more,
+ * and the route stopped reading it; a JSDoc describing a server contract that no longer
+ * exists is worse than none, because it is the only description a caller has.
  */
 export async function deleteAttachment(
   attachmentId: string,
-  { pdfFileId }: { pdfFileId?: string } = {},
   deps: AuthFetchDeps = {},
 ): Promise<void> {
   try {
-    const q = typeof pdfFileId === 'string' && pdfFileId ? `?pdfFileId=${encodeURIComponent(pdfFileId)}` : ''
-    await authFetch(`/api/attachments/${encodeURIComponent(attachmentId)}${q}`, { method: 'DELETE' }, deps)
+    await authFetch(`/api/attachments/${encodeURIComponent(attachmentId)}`, { method: 'DELETE' }, deps)
   } catch {
     // best-effort; the conversation-delete sweep is the authoritative cleanup.
   }

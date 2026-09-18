@@ -1,33 +1,23 @@
 """Which of the two lanes a media type belongs to, and the admission checks for the second.
 
-THE ONE RULE THE WHOLE FEATURE RESTS ON. An attachment is routed by what can be DONE with it, not
-by a list of extensions:
+An attachment is routed by what can be DONE with it, never by a list of extensions: the MODEL
+lane (PNG, JPEG, GIF, WebP, PDF) is read by the model itself and is `magic.ALLOWED_MEDIA`; the
+CODE lane (Excel, Word, PowerPoint, CSV, TSV) is read by code in the workspace, and its bytes
+never reach the model. This module also refuses, at the door, what cannot be read at all: a
+password-protected file, a wrong format wearing the right extension, a truncated archive.
 
-  * the MODEL lane — PNG, JPEG, GIF, WebP, PDF — the model reads the bytes itself. That is
-    `magic.ALLOWED_MEDIA`, unchanged.
-  * the CODE lane — Excel, Word, PowerPoint, CSV, TSV — code in the workspace reads the file and
-    reports what it found. The model never receives the bytes.
+WHY THIS EXISTS
 
-WHY `ALLOWED_MEDIA` IS NOT WIDENED, which is the opposite of the obvious change. That set is the
-magic-byte gate, and it is applied on BOTH paths that end at the model: the upload route
-(`ALLOWED_MEDIA.get` + `magic_matches`) and the store's rehydrator (`bytes_match_declared`).
-Adding OOXML there would make both answer True for a deck, and a spreadsheet would reach the model
-as raw ZIP bytes: expensive, unreadable, and exactly the confident-wrong-answer failure this work
-exists to remove.
+The obvious change — widening `ALLOWED_MEDIA` to admit Office types — is the one that must not be
+made. That set is the magic-byte gate on BOTH paths that end at the model: the upload route and
+the store's rehydrator. Widened, both answer True for a deck and a spreadsheet reaches the model
+as raw ZIP bytes: expensive, unreadable, and the confident-wrong-answer failure this work exists
+to remove. So the second lane is its OWN set, admitted only where an attachment is stored, and
+every model-facing consumer refuses it without a line changing in any of them.
 
-(There was a third — the build session's own attachment resolver, which refused a deck by name.
-It went with the whole legacy build-sessions attachment surface. The count moves; the reasoning
-does not, which is the point of routing by lane rather than by a list of types.)
-
-So the second lane is its own set, admitted only where an attachment is STORED. The three
-model-facing consumers keep the narrow gate they already had, and they refuse the code lane without
-a single line changing in any of them. The separation is structural rather than remembered.
-
-PASSWORD PROTECTION IS DETECTED AT THE DOOR, for every format that can carry it. An encrypted
-Office file is not a damaged ZIP — it is an OLE2 compound document wrapping the encrypted package,
-and it announces itself in its first eight bytes. So a locked workbook is refused with the same
-sentence a locked PDF gets, rather than being accepted, stored, charged, and failing inside the
-sandbox several turns later where nothing can explain it.
+The door checks bytes because the alternative was measured and worse: a locked workbook accepted
+here is stored, charged and then fails inside the sandbox several turns later, where nothing can
+explain it to the citizen.
 """
 
 from __future__ import annotations
@@ -93,6 +83,20 @@ def canonical_suffix(media_type: str) -> str:
 # from an ordinary one WITHOUT opening it — which is what makes refusing at the door possible.
 _OLE2_SIGNATURE: Final = bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
 _ZIP_SIGNATURE: Final = bytes([0x50, 0x4B, 0x03, 0x04])
+# The stream Office writes an encrypted package into, as it appears in the compound document's
+# directory: UTF-16, which is how those entries are stored.
+_ENCRYPTED_PACKAGE: Final = "EncryptedPackage".encode("utf-16-le")
+
+
+def magic_matches(data: bytes, magic: bytes) -> bool:
+    """True iff `data` opens with the `magic` prefix.
+
+    ONE COPY, AND IT LIVES HERE because this is the lower module — `magic.py` imports it, not
+    the other way about. A security-relevant compare written out three times is three places
+    to get the length guard wrong, and the guard is the whole of it: a slice of a short buffer
+    is silently shorter rather than an error.
+    """
+    return len(data) >= len(magic) and data[: len(magic)] == magic
 
 
 def is_code_lane(media_type: str) -> bool:
@@ -116,8 +120,19 @@ def is_opc_archive(media_type: str) -> bool:
 
 
 def looks_password_protected(data: bytes) -> bool:
-    """Is this an encrypted Office file? True for the OLE2 wrapper Office writes for one."""
-    return data[:8] == _OLE2_SIGNATURE
+    """Is this an encrypted Office file?
+
+    ★ THE SIGNATURE ALONE CANNOT TELL, and answering on it sent a citizen somewhere with no
+    way out. Every legacy `.xls`, `.doc` and `.ppt` is an OLE2 compound document too, so a
+    renamed `sales.xls` was refused with "Remove the password" — advice about a password the
+    file does not have, for a file that is merely the wrong format.
+
+    What separates them is inside the container: Office stores an encrypted workbook as a
+    stream named `EncryptedPackage`, while a legacy file's streams are `Workbook`, `WordDocument`
+    or `PowerPoint Document`. Directory entry names are UTF-16, so the search is for those
+    bytes; a legacy file falls through to the structure check and is told its real problem.
+    """
+    return magic_matches(data, _OLE2_SIGNATURE) and _ENCRYPTED_PACKAGE in data
 
 
 PASSWORD_PROTECTED_TEXT: Final = (
@@ -127,8 +142,8 @@ PASSWORD_PROTECTED_TEXT: Final = (
 
 There were two, and they differed in both nouns: a locked PDF was told to "remove the password and
 UPLOAD it again" about "that DOCUMENT", a locked workbook to "attach it again" about "that FILE".
-Same situation, same remedy, two voices — which is the drift R21 exists to prevent, and it is worse
-here than most because the citizen is being told the identical thing twice in different words.
+Same situation, same remedy, two voices — the drift one shared sentence exists to prevent,
+and worse here than most because the citizen is told the identical thing twice in different words.
 
 It names no format, no encryption scheme and no library, so it stays true as the set of formats
 moves."""
@@ -221,6 +236,17 @@ def pdf_refusal(name: str, data: bytes) -> str | None:
     return None
 
 
+def unreadable_office_text(name: str) -> str:
+    """What a citizen is told about an Office file the platform cannot open.
+
+    Shared with the upload door's archive check, which used to answer with the bomb guard's
+    own words — `Malformed archive (no ZIP end-of-central-directory)` — parser vocabulary
+    about a file the citizen sees as a spreadsheet, and under a status that says it was too
+    large when it was not.
+    """
+    return f'"{name}" could not be read as an Office file. Re-save it and attach it again.'
+
+
 def code_lane_refusal(media_type: str, name: str, data: bytes) -> str | None:
     """Why this code-lane upload is refused, or None if it may be stored.
 
@@ -243,8 +269,8 @@ def code_lane_refusal(media_type: str, name: str, data: bytes) -> str | None:
         return f"Unsupported attachment type: {media_type}."
     if looks_password_protected(data):
         return PASSWORD_PROTECTED_TEXT
-    if data[:4] != _ZIP_SIGNATURE:
-        return f'"{name}" could not be read as an Office file. Re-save it and attach it again.'
+    if not magic_matches(data, _ZIP_SIGNATURE):
+        return unreadable_office_text(name)
     if part not in data:
         # The OPC part is stored uncompressed in the ZIP's own headers, so a plain substring search
         # over the bytes is enough to tell the three formats apart without unpacking anything.

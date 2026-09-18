@@ -1,35 +1,30 @@
 """The shared read-only tool surface.
 
-Four tools — `read_file`, `list_files`, `search_files`, `run_command` — as a
-`FunctionToolset` factory over a `ReadOnlyWorkspace` Protocol: a snapshot extraction
-answers about saved code, a live sandbox about the tree in front of the model. WHAT
-these tools allow is written once, here; WHICH workspace answers is a fact about the
-run, not the ability.
+Four tools — `read_file`, `list_files`, `search_files`, `run_command` — as a `FunctionToolset`
+factory over a `ReadOnlyWorkspace` Protocol: a snapshot extraction answers about saved code, a
+live sandbox about the tree in front of the model. WHAT these tools allow is written once,
+here; WHICH workspace answers is a fact about the run, not about the ability.
 
-WHY THIS EXISTS: `run_command` is contained fail-closed and layered — exec-style argv only, no
-shell, so pipes, redirection, and chaining are structurally impossible, and `sh`/`bash` are not
-on the guest list. argv[0] must be on `_GUEST_LIST` (POSIX read-only classics), with per-command
-deny flags catching each binary's write-capable forms (`sed -i`, `find -delete`/`-exec`/
-`-fprintf`, `tail -f`); `sed` additionally goes through a script validator because its danger
-lives in the script argument (`w`/`W` write files, GNU `e` executes) — only the numeric
-range-print form (`sed -n '40,80p' file`) is admitted. Every argv token is vetted against path
-escape (absolute, `~`, `..` segments). WHERE it runs depends on the workspace, and the two differ
-materially: on the LIVE container (the normal case) the command goes through the supervisor into
-the app's own environment — which holds `BIAL_DATABASE_URL` and a Blob SAS — with the
-supervisor's own timeout and secret redaction; on the snapshot fallback (only when no sandbox
-service is configured) it runs jailed on the control-plane server under `_minimal_env` (no DSN,
-no tokens). The policy above is identical either way; the surroundings are not, and the richer
-one is now the normal case. Output is capped, de-escaped, redacted, de-noised, and cut to
-head+tail with the loss stated — mirrors, never imports, `orchestrator/tools`'s
-`_redact_command_output` so this module adds no runtime edge into the sandbox tool module; a
-table-driven test pins the pair identical. `psql` is never on this allowlist.
+The four tool docstrings in `read_only_toolset` are PROMPT COPY: pydantic-ai sends each as the
+tool description, and two render into the Write prompt's `TOOL SURFACE` block. Write the first
+sentence as the prompt line. Refusals teach; there is no "no app exists" case, because a turn's
+workspace always comes from one pinned arm.
 
-THE FOUR TOOL DOCSTRINGS IN `read_only_toolset` ARE PROMPT COPY: pydantic-ai sends each
-as the tool description, and two also render into the Write prompt's `TOOL SURFACE`
-block — `test_prompt.py` catches drift. Write the first sentence as the prompt line.
+WHY THIS EXISTS
 
-Refusals teach (the destructive-SQL sentinel's voice); there is no "no app exists" case
-since a turn's workspace always comes from one pinned arm (`_pin_workspace`).
+`run_command` is contained fail-closed and in layers: exec-style argv only, so pipes,
+redirection and chaining are structurally impossible and no shell is on the guest list; argv[0]
+must be a POSIX read-only classic; per-command deny flags catch each binary's write-capable
+forms (`sed -i`, `find -delete`, `tail -f`); `sed` goes through a script validator because its
+danger lives in the script argument; and every token is vetted for path escape. `psql` is never
+on the allowlist.
+
+WHERE it runs differs materially. On the live container the command goes through the supervisor
+into the app's own environment — which holds a database URL and a Blob SAS — with the
+supervisor's timeout and redaction; on the snapshot fallback it runs jailed on the control
+plane under `_minimal_env`. The policy is identical either way and the richer environment is
+the normal case, so output is capped, redacted and cut to head+tail with the loss stated — a
+mirror of `orchestrator/tools`, pinned identical by a table-driven test rather than imported.
 """
 
 from __future__ import annotations
@@ -41,7 +36,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Final, Protocol, cast
 
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
@@ -52,6 +47,8 @@ from src.core.redaction import (
     leaves_a_credential_value_open,
     scrub_untrusted,
 )
+from src.services.media import CODE_LANE_MEDIA, canonical_suffix, is_opc_archive
+from src.services.sandbox import CONTAINER_ATTACHMENTS_ROOT
 
 if TYPE_CHECKING:
     # Annotation-only, deliberately: `LiveSandboxWorkspace` holds a `SandboxSession`, but this
@@ -117,7 +114,11 @@ IGNORED_DIRS = frozenset({".git", "node_modules", ".next", "dist", ".turbo"})
 # a directory of that name, silently reading somebody's chat files when they asked for their own
 # source. The leading dot makes it a reserved namespace the generated template never writes into.
 ATTACHMENTS_PREFIX = ".attachments/"
-_CONTAINER_ATTACHMENTS_ROOT = "/workspace/attachments"
+#: The attached kinds that are archives rather than text. Derived from the lane definition, so a
+#: sixth format admitted there cannot be forgotten here; the delimited kinds are absent on purpose.
+_NOT_TEXT_SUFFIXES: Final[tuple[str, ...]] = tuple(
+    sorted(canonical_suffix(media) for media in CODE_LANE_MEDIA if is_opc_archive(media))
+)
 
 
 def is_an_attachment_path(path: str) -> bool:
@@ -150,7 +151,7 @@ def to_container_path(path: str) -> str:
     if not is_an_attachment_path(path):
         return path
     tail = path[len(ATTACHMENTS_PREFIX) :] if path.startswith(ATTACHMENTS_PREFIX) else ""
-    return f"{_CONTAINER_ATTACHMENTS_ROOT}/{tail}".rstrip("/")
+    return f"{CONTAINER_ATTACHMENTS_ROOT}/{tail}".rstrip("/")
 
 
 # Dependency lock files, refused at every site the directory set is applied: a lockfile
@@ -412,10 +413,10 @@ def to_model_path(path: str) -> str:
     `.attachments/x`. An app-tree path is returned untouched, so this is a no-op for everything
     except the one reserved prefix.
     """
-    if path == _CONTAINER_ATTACHMENTS_ROOT:
+    if path == CONTAINER_ATTACHMENTS_ROOT:
         return ATTACHMENTS_PREFIX.rstrip("/")
-    if path.startswith(f"{_CONTAINER_ATTACHMENTS_ROOT}/"):
-        return f"{ATTACHMENTS_PREFIX}{path[len(_CONTAINER_ATTACHMENTS_ROOT) + 1 :]}"
+    if path.startswith(f"{CONTAINER_ATTACHMENTS_ROOT}/"):
+        return f"{ATTACHMENTS_PREFIX}{path[len(CONTAINER_ATTACHMENTS_ROOT) + 1 :]}"
     return path
 
 
@@ -518,6 +519,9 @@ class LiveSandboxWorkspace:
         above this does its own line windowing. Handing it pre-numbered text would number it
         twice and quietly corrupt every line the model tried to quote back."""
         self._vet(rel_path)
+        refusal = _refuse_a_binary_attachment(rel_path)
+        if refusal is not None:
+            raise WorkspacePathError(refusal)
         result = await self._read(["cat", "--", to_container_path(rel_path)])
         if result.exit != 0:
             # `cat`'s stderr is the honest reason (missing, a directory, unreadable) and it is
@@ -737,8 +741,8 @@ def _refuse_an_attachment_operand(token: str) -> str | None:
     """
     if ".." in token.split("/"):
         return None
-    absolute = token == _CONTAINER_ATTACHMENTS_ROOT or token.startswith(
-        f"{_CONTAINER_ATTACHMENTS_ROOT}/"
+    absolute = token == CONTAINER_ATTACHMENTS_ROOT or token.startswith(
+        f"{CONTAINER_ATTACHMENTS_ROOT}/"
     )
     if not (is_an_attachment_path(token) or absolute):
         return None
@@ -747,6 +751,29 @@ def _refuse_an_attachment_operand(token: str) -> str | None:
         f"and attachments live outside it. Use the `{ATTACHMENT_READ_TOOL}` tool if you have it, "
         "passing that same path; otherwise say the file could not be read rather than describing "
         "it from its name."
+    )
+
+
+def _refuse_a_binary_attachment(token: str) -> str | None:
+    """Why an attached spreadsheet, document or deck cannot be read as text, or None.
+
+    ★ THE ANSWER WOULD BE BYTES. These kinds are zip archives: `cat` returns their compressed
+    contents, which decode to replacement characters and fill the model's window with nothing it
+    can use. Until the supervisor replaced undecodable bytes, the same read took the whole turn
+    down instead — so this is the difference between a useless answer and a teachable one.
+
+    The delimited kinds are deliberately absent: a `.csv` in the attachments root IS text, and
+    reading it straight is a reasonable thing for an agent to do.
+    """
+    if not is_an_attachment_path(token):
+        return None
+    if not token.lower().endswith(_NOT_TEXT_SUFFIXES):
+        return None
+    return (
+        f"`{token}` is a spreadsheet, document or deck — an archive, not text — so reading it "
+        f"here returns bytes rather than content. Use the `{ATTACHMENT_READ_TOOL}` tool if you "
+        "have it, passing that same path; otherwise say the file could not be read rather than "
+        "describing it from its name."
     )
 
 

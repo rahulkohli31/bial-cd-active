@@ -1,37 +1,32 @@
 #!/usr/bin/env python3
 """Report what an attached file CONTAINS, without sending the file to the model.
 
-WHY THIS SHIPS INSTEAD OF BEING WRITTEN EACH TURN. The platform used to flatten a workbook to
-Markdown on the server, keep the first thousand rows, and say nothing about the rest — so a
-question about a 5,000-row file was answered from a fifth of it, confidently and wrongly. Letting
-an agent write a parser per turn reproduces that: our own from-scratch reader was wrong on its
-first run, and five parsers given one crafted file disagreed on its row count by five orders of
-magnitude. This is known-correct code the agent starts FROM.
+One return shape, always: a single JSON object and exit 0 — a manifest on success, a named
+failure on any other outcome. Never a stack trace, never a bare exception, and never an empty
+manifest, which reads exactly like an empty file. Every truncated list carries the true count
+beside it, because silence about what was omitted is the failure being replaced. It opens one
+path on local disk and reaches no network. Editing it is expected — a Build agent may change
+and re-run it — so the canonical copy lives outside the editable tree and can be restored.
 
-ONE RETURN SHAPE, ALWAYS. Every run prints a single JSON object and exits 0 — a manifest
-on success, a named failure on any other outcome. Never a stack trace, never a bare exception,
-and never an empty manifest, because an empty manifest reads exactly like an empty file and that
-is the class of wrong answer this whole design exists to remove.
+WHY THIS EXISTS
 
-IT STATES THE WHOLE WHENEVER IT SHOWS A PART. Every truncated list carries the true count
-beside it. Silence about what was omitted is the specific failure being replaced.
-
-NO NETWORK. It opens one path on local disk and nothing else. The platform puts the file there
-before the agent's first read; the reader never fetches, so its missing-file branch is a genuine
-error rather than an expected path.
-
-EDITING IT IS EXPECTED. The Build agent may read, change and re-run this file for something the
-base version does not report. The canonical copy is kept outside the editable tree so a working
-copy that has been broken can be restored.
+The platform used to flatten a workbook to Markdown on the server, keep the first thousand rows,
+and say nothing about the rest: a question about a 5,000-row file was answered from a fifth of
+it, confidently and wrongly. Letting an agent write a parser per turn reproduces that — our own
+from-scratch reader was wrong on its first run, and five parsers given one crafted file
+disagreed on its row count by five orders of magnitude. This is known-correct code the agent
+starts FROM rather than a capability it has to invent under time pressure.
 """
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import re
 import signal
 import sys
+import tempfile
 
 # BOUND THE PARALLELISM BEFORE polars IS IMPORTED, which is what makes the memory ceiling below
 # mean anything. `RLIMIT_AS` counts VIRTUAL address space, and polars reserves a stack per worker
@@ -72,8 +67,14 @@ TIME_LIMIT_SECONDS = 30
 # pool is mostly reservation rather than memory in use: measured in this image, a 512 MB
 # `RLIMIT_AS` aborts polars before it reads a byte, and the process dies with an allocator panic
 # that reads as a broken container rather than a refused file. `RLIMIT_DATA` bounds the data the
-# process actually asks for, so polars runs and a genuinely oversized read still raises
-# `MemoryError` — verified both ways rather than assumed.
+# process actually asks for, so polars runs and an oversized read raises `MemoryError` on the
+# paths that allocate through Python.
+#
+# IT IS NOT A GUARANTEE ON EVERY PATH, and saying otherwise hid a real failure. polars
+# allocates through Rust, whose allocator ABORTS when it cannot satisfy a request rather than
+# raising anything Python can catch: the process dies on a signal with an empty stdout, which
+# breaks the one-object-and-exit-0 contract this reader otherwise keeps. Nothing in here can
+# catch it, so the caller names it — see `attachment_tools.read`.
 MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
 
 # How much of any unbounded list is shown. The true total always rides beside it.
@@ -156,6 +157,23 @@ _MERGE_SCAN_LIMIT = 10_000
 # nothing: 0.67 MB on disk inflates to 274 MB of identical tags, which grow the distinct count not
 # at all and so never reach the cap above. This one is what still ends the walk.
 _MERGE_SCAN_MATCHES = 100_000
+
+
+_MERGE_REF = re.compile(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$")
+
+
+def _tops_a_banner(merged: list[str]) -> bool:
+    """Whether the sheet opens with a merged title spanning columns.
+
+    A merge further down the sheet, or one a single column wide, is ordinary formatting and
+    says nothing about where the headings are. A merge that starts on row 1 and covers more
+    than one column is a title bar — and the row beneath it is the real header.
+    """
+    for ref in merged:
+        match = _MERGE_REF.match(ref)
+        if match and match.group(2) == "1" and match.group(1) != match.group(3):
+            return True
+    return False
 
 
 def _merged_ranges(path: Path, sheet_path: str) -> list[str]:
@@ -247,8 +265,15 @@ def read_xlsx(path: Path) -> dict[str, Any]:
         ) from None
 
     sheets = []
-    for name in formulas.sheetnames:
-        fsheet, vsheet = formulas[name], values[name]
+    # ONLY THE TABS THAT HOLD CELLS. A chart moved onto its own sheet (Excel's ordinary
+    # "Move Chart -> New sheet", which the upload door cannot see) is a chartsheet, and a
+    # chartsheet carries no `max_row` — so the first attribute read below raised, the broad
+    # arm caught it, and the whole workbook came back unreadable because one tab held a
+    # picture. `worksheets` is openpyxl's own name for the grid-bearing sheets; a chart tab
+    # has no cells to describe.
+    for fsheet in formulas.worksheets:
+        name = fsheet.title
+        vsheet = values[name]
         # THE DECLARED `<dimension>` IS READ BEFORE IT IS DISCARDED, and discarding it is what
         # stops the damage. A read-only row is truncated to `max_column`, so a 50-row, 3-column
         # sheet declaring `A1:A1` did not merely report one row and one column — its other columns
@@ -259,19 +284,34 @@ def read_xlsx(path: Path) -> dict[str, Any]:
         vsheet.reset_dimensions()
         fsheet.reset_dimensions()
 
-        # ONE PASS FOR BOTH ROWS. A read-only sheet has no random `cell(row=, column=)` access —
-        # that is the API's way of saying it never holds the grid — so the header and the probe
-        # row are taken from the same forward walk rather than looked up per column.
-        frows = fsheet.iter_rows(min_row=1, max_row=2, values_only=True)
-        header_values = list(next(frows, ()) or ())
-        probe_values = list(next(frows, ()) or ())
-        vrows = vsheet.iter_rows(min_row=1, max_row=2, values_only=True)
-        next(vrows, ())
-        cached_values = list(next(vrows, ()) or ())
+        # ★ A MERGED TITLE ACROSS THE TOP IS A BANNER, NOT A HEADER. Read as one it makes the
+        # reader confidently wrong about every column at once: the real headings sit on the row
+        # below, so the names come back empty, every type is judged from a row of text, and a
+        # formula column reports `isFormula: false` — defeating the second pass that exists to
+        # catch exactly that. It is an ordinary corporate layout, and on a streamed read the
+        # merge record is the only evidence of it left.
+        merged = _merged_ranges(path, _sheet_part(fsheet))
+        header_row = 2 if _tops_a_banner(merged) else 1
+
+        # ONE PASS FOR EVERY ROW READ. A read-only sheet has no random `cell(row=, column=)`
+        # access — that is the API's way of saying it never holds the grid — so the header and
+        # the probe row are taken from the same forward walk rather than looked up per column.
+        frows = fsheet.iter_rows(min_row=1, max_row=header_row + 1, values_only=True)
+        seen_rows = [list(row or ()) for row in frows]
+        header_values = seen_rows[header_row - 1] if len(seen_rows) >= header_row else []
+        probe_values = seen_rows[header_row] if len(seen_rows) > header_row else []
+        vrows = vsheet.iter_rows(min_row=1, max_row=header_row + 1, values_only=True)
+        seen_cached = [list(row or ()) for row in vrows]
+        cached_values = seen_cached[header_row] if len(seen_cached) > header_row else []
         width = max(len(header_values), len(probe_values))
 
         rows, cols = declared_rows, max(declared_cols, width)
-        if not declared_rows or declared_cols < width:
+        # `width == 0` JOINS THE WALK, and that is the empty-workbook case. A new workbook
+        # declares `A1:A1`, so believing the record reports one row and one column for a
+        # sheet holding nothing — `ok: true` over an empty file, which the module docstring
+        # promises never to produce. It also covers a sheet whose first rows are blank and
+        # whose data starts further down, where 0 would be just as wrong.
+        if not declared_rows or declared_cols < width or width == 0:
             # WALKED ONLY WHEN THE RECORD IS ABSENT OR CAUGHT OUT. openpyxl's `write_only` writer
             # emits no dimension at all, and a record narrower than the row underneath it has
             # already been proved wrong — in both cases a walk is the only way to the real shape.
@@ -324,7 +364,7 @@ def read_xlsx(path: Path) -> dict[str, Any]:
                 "isFormula": is_formula,
             }
             if is_formula:
-                # THE R24 CASE. A formula with no cached value is not an empty column; saying so
+                # A FORMULA WITH NO CACHED VALUE is not an empty column; saying so
                 # is the whole point of the second pass.
                 column["hasStoredResult"] = cached is not None
                 if not column["hasStoredResult"]:
@@ -341,6 +381,9 @@ def read_xlsx(path: Path) -> dict[str, Any]:
                 "name": _clip(name),
                 "rows": rows,
                 "columns": cols,
+                # WHICH ROW THE NAMES CAME FROM, because it is not always the first one and
+                # an agent reading a column list has no other way to tell.
+                "headerRow": header_row,
                 # BOUNDED LIKE EVERY OTHER LIST HERE. A wide sheet — genuinely wide, or one
                 # declaring 16,384 columns — otherwise emits one clipped cell per column with no
                 # ceiling, and this manifest is returned to the model verbatim: a 7.7 MB workbook
@@ -348,13 +391,121 @@ def read_xlsx(path: Path) -> dict[str, Any]:
                 # header. It was the only list in the manifest that did not state its own whole.
                 "header": _listing(header),
                 "columnDetail": _listing(columns),
-                "mergedRanges": _listing(_merged_ranges(path, _sheet_part(fsheet))),
+                "mergedRanges": _listing(merged),
             }
         )
 
     formulas.close()
     values.close()
     return {"sheets": _listing(sheets), "media": _zip_media(path)}
+
+
+_ENCODING_SAMPLE_BYTES = 64 * 1024
+_TRANSCODE_CHUNK = 1024 * 1024
+
+
+def _text_encoding(path: Path) -> str:
+    """Which encoding a delimited file is actually written in.
+
+    ★ GETTING THIS WRONG IS THE CONFIDENTLY-WRONG CLASS ITSELF. Read as UTF-8, a UTF-16 file
+    comes back `ok: true` with column names built out of interleaved NUL bytes, so the agent
+    describes columns that do not exist. A cp1252 file — what Excel writes by default on
+    Windows — failed to parse at all, and the advice that came back ("re-save it") produces
+    the same bytes a second time.
+
+    A BOM is definitive. Without one: a sample that is a quarter NUL bytes is UTF-16 from a
+    tool that omitted the mark, and which half carries them gives the endianness; otherwise
+    UTF-8 is tried, where a character cut in half by the sample boundary is not a failure;
+    and anything still undecodable is read as cp1252, the estate's own default.
+    """
+    with path.open("rb") as handle:
+        sample = handle.read(_ENCODING_SAMPLE_BYTES)
+    if sample.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig"
+    if sample.startswith(codecs.BOM_UTF16_LE) or sample.startswith(codecs.BOM_UTF16_BE):
+        return "utf-16"
+    if sample.count(0) > len(sample) // 4:
+        return "utf-16-le" if sample[1::2].count(0) >= sample[0::2].count(0) else "utf-16-be"
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(sample)
+    except UnicodeDecodeError:
+        return "cp1252"
+    return "utf-8"
+
+
+_CANDIDATE_SEPARATORS = (",", chr(9), ";", "|")
+
+
+def _outside_quotes(line: str) -> str:
+    """The line with every quoted field removed, for counting delimiters in.
+
+    ★ A HEADING MAY CONTAIN THE OTHER DELIMITER, and counting raw characters let it decide.
+    `gate,"owner; deputy; backup",waiting` holds three semicolons and two commas, so a comma
+    file was read as a semicolon one and came back as four columns wearing pieces of each
+    other's names — with `ok: true`, which is the failure this whole script exists to remove.
+    """
+    kept: list[str] = []
+    quoted = False
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if char == '"':
+            # A doubled quote INSIDE a quoted field is an escaped quote, not the end of it.
+            if quoted and line[index + 1 : index + 2] == '"':
+                index += 2
+                continue
+            quoted = not quoted
+        elif not quoted:
+            kept.append(char)
+        index += 1
+    return "".join(kept)
+
+
+def _separator(path: Path, encoding: str, default: str) -> str:
+    """The delimiter the file actually uses, not the one its extension implies.
+
+    ★ A SEMICOLON CSV IS THE LOCALE DEFAULT ACROSS MUCH OF EUROPE, and Excel writes it
+    whenever the machine's list separator says so. Read as comma-delimited it parses
+    perfectly into ONE column called `gate;owner;busy`, and an agent builds a schema from
+    that — a wrong answer with nothing in it that looks wrong.
+
+    Judged on the header line OUTSIDE its quoted fields, where a delimiter repeats and one
+    inside a heading does not.
+    The extension's own separator wins a tie, so an ordinary file keeps the behaviour it had.
+    """
+    with path.open("rb") as handle:
+        head = handle.read(_ENCODING_SAMPLE_BYTES)
+    lines = head.decode(encoding, errors="replace").splitlines()
+    line = lines[0] if lines else ""
+    bare = _outside_quotes(line)
+    counts = {candidate: bare.count(candidate) for candidate in _CANDIDATE_SEPARATORS}
+    best = max(_CANDIDATE_SEPARATORS, key=lambda candidate: counts[candidate])
+    return best if counts[best] > counts[default] else default
+
+
+def _as_utf8(path: Path, encoding: str) -> Path:
+    """The same file rewritten as UTF-8, for a scanner that reads nothing else.
+
+    polars takes no encoding on a lazy scan, so decoding here is the only way to read what
+    the estate produces. Streamed a megabyte at a time, so a file at the upload cap costs
+    kilobytes of memory rather than its own size twice; the caller removes the copy.
+    """
+    handle, name = tempfile.mkstemp(prefix="attachment-", suffix=".utf8")
+    os.close(handle)
+    target = Path(name)
+    # REPLACING, NOT STRICT. cp1252 leaves five byte values undefined and a truncated file
+    # ends mid-character; either would raise here and turn a readable file back into a
+    # refusal, which is the failure this whole path exists to remove. The manifest names the
+    # encoding, so a citizen can see which reading produced their column names.
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    with path.open("rb") as source, target.open("w", encoding="utf-8", newline="") as out:
+        while True:
+            chunk = source.read(_TRANSCODE_CHUNK)
+            if not chunk:
+                out.write(decoder.decode(b"", True))
+                break
+            out.write(decoder.decode(chunk))
+    return target
 
 
 def read_delimited(path: Path, separator: str) -> dict[str, Any]:
@@ -366,8 +517,11 @@ def read_delimited(path: Path, separator: str) -> dict[str, Any]:
     """
     import polars as pl
 
+    encoding = _text_encoding(path)
+    separator = _separator(path, encoding, separator)
+    source = path if encoding == "utf-8" else _as_utf8(path, encoding)
     try:
-        lazy = pl.scan_csv(path, separator=separator, infer_schema_length=10_000)
+        lazy = pl.scan_csv(source, separator=separator, infer_schema_length=10_000)
         frame = lazy.collect()
     # ★ A FAILURE THAT ALREADY HAS A NAME KEEPS IT, and this clause must stay ABOVE the broad one
     # — placed below it the guard is valid, dead and silent, and nothing in the selected ruff set
@@ -388,22 +542,45 @@ def read_delimited(path: Path, separator: str) -> dict[str, Any]:
             f"This file could not be read as delimited text ({type(exc).__name__}).",
             "Check it opens in a spreadsheet program, re-save it, and attach it again.",
         ) from None
+    finally:
+        if source is not path:
+            source.unlink(missing_ok=True)
 
+    # BOUNDED BEFORE IT IS BUILT, rather than after. `_listing` keeps 50 entries and throws
+    # the rest away — but the comprehension had already asked polars for a null count and a
+    # distinct count per column, two full scans each, for columns nobody would ever see.
+    # Measured at 10,000 columns: 34 seconds, which spends the whole deadline on a 0.11 MB
+    # file and answers `timeout` with advice to attach a smaller one. The schema is hoisted
+    # for the same reason — `frame.schema` rebuilds the whole mapping on every access.
+    schema = frame.schema
     columns = [
         {
             "name": _clip(name),
-            "type": str(frame.schema[name]),
+            "type": str(schema[name]),
             "nulls": int(frame[name].null_count()),
             "distinct": int(frame[name].n_unique()),
         }
-        for name in frame.columns
+        for name in frame.columns[:MAX_ITEMS]
     ]
     sample = [
         {_clip(k): _clip(v) for k, v in row.items()}
         for row in _sample(frame.head(MAX_SAMPLE_ROWS).to_dicts())
     ]
     # `rows` is the TRUE height, not the sample's length — the number the old extractor never said.
-    return {"rows": frame.height, "columns": _listing(columns), "sampleRows": sample}
+    # THE ENCODING IS STATED, because a file read through a fallback is a fact about the
+    # answer: a citizen whose file was read as cp1252 can tell from this whether the accents
+    # in their column names came back as they meant them.
+    return {
+        "rows": frame.height,
+        "encoding": encoding,
+        # WHICH DELIMITER PRODUCED THESE COLUMNS. A file read with the wrong one still
+        # parses, into one column wearing every heading at once, so the answer has to say
+        # which separator it used for the reader of it to tell.
+        "separator": separator,
+        # `total` is every column the file has; `shown` is the 50 described above.
+        "columns": {"total": frame.width, "shown": columns},
+        "sampleRows": sample,
+    }
 
 
 # --- documents and decks ----------------------------------------------------------------------
@@ -431,17 +608,30 @@ def read_docx(path: Path) -> dict[str, Any]:
             "Open it in Word, re-save it as .docx, and attach it again.",
         ) from None
 
+    # BOUNDED AS IT GOES, and the totals counted separately. Building every paragraph of a
+    # 400-page report to show fifty is the shape that cost the delimited reader its whole
+    # deadline; here it costs memory the reader is bounded on, against a file the door
+    # admits at 10 MB.
     paragraphs, headings = [], []
+    paragraph_count = heading_count = 0
     for para in document.paragraphs:
         text = para.text.strip()
         if not text:
             continue
         if (para.style.name or "").startswith("Heading"):
-            headings.append({"level": para.style.name, "text": _clip(text)})
-        paragraphs.append(_clip(text))
+            heading_count += 1
+            if len(headings) < MAX_ITEMS:
+                headings.append({"level": para.style.name, "text": _clip(text)})
+        paragraph_count += 1
+        if len(paragraphs) < MAX_ITEMS:
+            paragraphs.append(_clip(text))
 
     tables = []
+    table_count = 0
     for table in document.tables:
+        table_count += 1
+        if len(tables) >= MAX_ITEMS:
+            continue
         rows = table.rows
         header = [_clip(c.text.strip()) for c in rows[0].cells] if rows else []
         body = [[_clip(c.text.strip()) for c in r.cells] for r in rows[1 : 1 + MAX_SAMPLE_ROWS]]
@@ -457,9 +647,9 @@ def read_docx(path: Path) -> dict[str, Any]:
         )
 
     return {
-        "paragraphs": _listing(paragraphs),
-        "headings": _listing(headings),
-        "tables": _listing(tables),
+        "paragraphs": {"total": paragraph_count, "shown": paragraphs},
+        "headings": {"total": heading_count, "shown": headings},
+        "tables": {"total": table_count, "shown": tables},
         "media": _zip_media(path),
     }
 
@@ -636,6 +826,54 @@ def describe(path: Path) -> dict[str, Any]:
     return {"ok": True, "file": path.name, "kind": path.suffix.lower().lstrip("."), **body}
 
 
+MAX_MANIFEST_CHARS = 200_000
+_TRIMMED_ITEMS = 5
+
+
+def _without(node: Any, key: str) -> Any:
+    """The manifest with one key dropped wherever it appears."""
+    if isinstance(node, list):
+        return [_without(item, key) for item in node]
+    if isinstance(node, dict):
+        return {k: _without(v, key) for k, v in node.items() if k != key}
+    return node
+
+
+def _shorter_listings(node: Any, limit: int) -> Any:
+    """Every bounded list cut further, with its `total` left alone — the whole is the part
+    of a listing an agent reasons about, and it costs nothing to keep."""
+    if isinstance(node, list):
+        return [_shorter_listings(item, limit) for item in node]
+    if isinstance(node, dict):
+        shrunk = {k: _shorter_listings(v, limit) for k, v in node.items()}
+        shown = shrunk.get("shown")
+        if isinstance(shown, list):
+            shrunk["shown"] = shown[:limit]
+        return shrunk
+    return node
+
+
+def _within_budget(result: dict[str, Any]) -> dict[str, Any]:
+    """The manifest, trimmed if it would flood the window it is returned into.
+
+    ★ THE PER-LIST CAPS MULTIPLY, which is why a bound on the whole is a separate thing from
+    the bounds on its parts. Fifty slides each holding fifty tables of fifty cells sits inside
+    every individual cap and is tens of megabytes as one answer — and this is handed to the
+    model verbatim, so a single oversized reply costs the turn it was meant to serve.
+
+    Sample rows go first and described columns second, because a count is what an agent
+    reasons about and a sample is the illustration. `manifestTrimmed` says it happened, since
+    a quietly shortened answer is the confidently-wrong shape this reader exists to remove.
+    """
+    if len(json.dumps(result, default=str)) <= MAX_MANIFEST_CHARS:
+        return result
+    trimmed = _without(result, "sampleRows")
+    if len(json.dumps(trimmed, default=str)) > MAX_MANIFEST_CHARS:
+        trimmed = _shorter_listings(trimmed, _TRIMMED_ITEMS)
+    trimmed["manifestTrimmed"] = True
+    return trimmed
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(
@@ -667,7 +905,7 @@ def main(argv: list[str]) -> int:
     finally:
         if hasattr(signal, "SIGALRM"):
             signal.alarm(0)
-    print(json.dumps(result, default=str))
+    print(json.dumps(_within_budget(result), default=str))
     return 0
 
 
