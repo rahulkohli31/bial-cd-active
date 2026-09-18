@@ -22,10 +22,11 @@
  * host serving nothing; the workspace state draws the empty, stopped and gone states, not the origin.
  */
 import { memo, useCallback, useEffect, useState } from 'react'
-import { Box, Locate, Play, WifiOff, type LucideIcon } from 'lucide-react'
+import { Box, Play, WifiOff, type LucideIcon } from 'lucide-react'
 import AppPaneHost from './AppPaneHost'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 import { inertWhile, usePaneLeaving } from './paneExit'
+import StarterStage from './StarterStage'
 import StartAppControl from './StartAppControl'
 import type { DeviceName } from './devices'
 import { WORKSPACE_RAIL_ID } from './railId'
@@ -52,7 +53,9 @@ import type { WorkspaceStateName } from './workspaceState'
  * the platform having lost touch with what it was watching, which is what that state is.
  */
 const STATE_GLYPH: Readonly<Record<WorkspaceStateName, LucideIcon | null>> = {
-  'never-built': Locate, // NothingBuilt — the ticked circle, the same mark the rail's Plan picker has
+  // NothingBuilt draws the stage instead of a glyph — see `StarterStage`, and the `null` is what
+  // keeps the board from carrying both marks.
+  'never-built': null,
   'not-running': Play, // PreviewOff — "Your app is saved", and the press that brings it back
   starting: Box, // PreviewStarting — "Setting up somewhere for it to run"
   running: null, // The frame is up; this pane draws no card at all.
@@ -296,6 +299,7 @@ function NoFrame({ report }: { report: ReturnType<typeof useWorkspaceReport> }) 
       <div className="flex max-w-sm flex-col items-center text-center">
         {/* 30px, 1.6 stroke, #9AA5B1 — the board's own numbers, 14px above the headline.
             Decorative: the headline beneath it says the same thing in words. */}
+        {state.name === 'never-built' && <StarterStage />}
         {Glyph && (
           <Glyph
             data-testid="app-pane-glyph"

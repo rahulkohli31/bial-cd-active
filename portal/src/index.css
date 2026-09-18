@@ -106,6 +106,86 @@ body {
   scrollbar-color: hsl(var(--muted-foreground) / 0.85) transparent;
 }
 
+/* THE `never-built` BOARD'S MARK — the parts of an app loose around an empty window, drawn by
+ * `components/workspace/StarterStage.tsx`. The geometry is the sandbox starter page's
+ * (`sandbox/template/app/page.tsx`) so the picture does not jump when the generated app takes the
+ * pane over; the assembling loop is NOT lifted, because no build runs on any board that draws this.
+ *
+ * IT SITS ABOVE THE REDUCE BLOCK BELOW ON PURPOSE — that block settles `.starter-piece`, and
+ * source order is what lets it. */
+.starter-stage { --m: 1; position: relative; width: 320px; height: 220px; flex: none; }
+.starter-window {
+  position: absolute;
+  inset: 0;
+  background: #ffffff;
+  border: 1px solid #dae4e5;
+  border-radius: 14px;
+  box-shadow: 0 34px 60px -38px rgba(16, 41, 42, 0.4), 0 2px 6px rgba(16, 41, 42, 0.04);
+  transition: box-shadow 0.8s ease;
+}
+.starter-window::before {
+  content: "";
+  position: absolute;
+  left: 14px;
+  top: 11px;
+  width: 36px;
+  height: 8px;
+  background: radial-gradient(circle at 4px 4px, #d3dedf 3.2px, transparent 3.7px) 0 0 / 13px 8px repeat-x;
+}
+.starter-window::after { content: ""; position: absolute; left: 0; right: 0; top: 29px; height: 1px; background: #edf2f2; }
+.starter-piece {
+  position: absolute;
+  left: var(--x);
+  top: var(--y);
+  width: var(--w);
+  height: var(--h);
+  border-radius: 7px;
+  opacity: 0.8;
+  box-shadow: 0 8px 18px -10px rgba(16, 41, 42, 0.3);
+  transform: translate(calc(var(--sx) * var(--m)), calc(var(--sy) * var(--m))) rotate(var(--sr));
+  animation: starter-bob 5.6s ease-in-out infinite;
+  animation-delay: calc(var(--k) * -0.7s);
+}
+.starter-topbar { --k: 0; --x: 14px; --y: 38px; --w: 292px; --h: 18px; --sx: -40px; --sy: -58px; --sr: -8deg; background: #e8f0f1; }
+.starter-side {
+  --k: 1; --x: 14px; --y: 64px; --w: 64px; --h: 142px; --sx: -150px; --sy: -10px; --sr: 8deg;
+  background-color: #f0f5f5;
+  background-image: repeating-linear-gradient(to bottom, transparent 0 12px, #d5e2e3 12px 18px, transparent 18px 26px);
+  background-size: 40px 100%;
+  background-position: 12px 6px;
+  background-repeat: no-repeat;
+}
+.starter-heading { --k: 2; --x: 90px; --y: 66px; --w: 118px; --h: 11px; --sx: -20px; --sy: -80px; --sr: 5deg; border-radius: 6px; background: #3d5657; }
+.starter-button { --k: 3; --x: 246px; --y: 62px; --w: 60px; --h: 20px; --sx: 150px; --sy: -30px; --sr: -12deg; background: #0d7377; }
+.starter-avatar { --k: 4; --x: 284px; --y: 40px; --w: 14px; --h: 14px; --sx: 60px; --sy: -52px; --sr: 0deg; border-radius: 50%; background: #0d7377; }
+.starter-chart { --k: 5; --x: 90px; --y: 92px; --w: 134px; --h: 66px; --sx: -190px; --sy: 60px; --sr: -7deg; background: #ffffff; border: 1px solid #dfe8e9; }
+.starter-stat { --k: 6; --x: 232px; --y: 92px; --w: 74px; --h: 66px; --sx: 180px; --sy: 50px; --sr: 10deg; background: #e1f0f0; }
+.starter-stat::before { content: ""; position: absolute; left: 10px; top: 13px; width: 40px; height: 14px; border-radius: 4px; background: #0d7377; opacity: 0.85; }
+.starter-stat::after { content: ""; position: absolute; left: 10px; top: 36px; width: 30px; height: 6px; border-radius: 3px; background: #9fc9ca; }
+.starter-rows {
+  --k: 7; --x: 90px; --y: 166px; --w: 216px; --h: 40px; --sx: 130px; --sy: 20px; --sr: 4deg;
+  background-color: #ffffff;
+  background-image: repeating-linear-gradient(to bottom, #e6eeef 0 7px, transparent 7px 16px);
+  background-size: calc(100% - 12px) 100%;
+  background-position: 6px 5px;
+  background-repeat: no-repeat;
+}
+.starter-bar { position: absolute; bottom: 9px; width: 14px; border-radius: 3px 3px 0 0; transform-origin: bottom; }
+.starter-bar:nth-child(1) { --b: 0; left: 12px; height: 22px; background: #0d7377; }
+.starter-bar:nth-child(2) { --b: 1; left: 34px; height: 36px; background: #7fcfcb; }
+.starter-bar:nth-child(3) { --b: 2; left: 56px; height: 28px; background: #0d7377; }
+.starter-bar:nth-child(4) { --b: 3; left: 78px; height: 44px; background: #7fcfcb; }
+.starter-bar:nth-child(5) { --b: 4; left: 100px; height: 32px; background: #0d7377; }
+@keyframes starter-bob {
+  0%, 100% { transform: translate(calc(var(--sx) * var(--m)), calc(var(--sy) * var(--m))) rotate(var(--sr)); }
+  25% { transform: translate(calc(var(--sx) * var(--m) + 9px), calc(var(--sy) * var(--m) - 7px)) rotate(calc(var(--sr) * 0.1)); }
+  50% { transform: translate(calc(var(--sx) * var(--m)), calc(var(--sy) * var(--m) - 16px)) rotate(calc(var(--sr) * -0.7)); }
+  75% { transform: translate(calc(var(--sx) * var(--m) - 9px), calc(var(--sy) * var(--m) - 7px)) rotate(calc(var(--sr) * -0.1)); }
+}
+@media (max-width: 640px) {
+  .starter-stage { --m: 0.5; transform: scale(0.86); margin: -14px 0; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   /* THE PORTAL'S REDUCED-MOTION GUARANTEE. Three mechanisms carry it, and these are all of them.
    *
@@ -148,7 +228,12 @@ body {
   .animate-pane-return,
   .animate-spin,
   .animate-pulse,
-  .animate-bounce {
+  .animate-bounce,
+  /* The `never-built` board's drifting parts. Settling them costs this board nothing: it is an
+     invitation, not a wait, so it makes no claim that stops being true when the picture stops
+     moving. The sandbox's BUILDING screen is the opposite case and is deliberately never
+     suppressed — a settled assembly reads as a finished app. */
+  .starter-piece {
     animation: none;
   }
 }

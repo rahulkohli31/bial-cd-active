@@ -120,3 +120,56 @@ describe('WaitingLine — a long wait says how long', () => {
     expect(screen.queryByTestId('waiting-elapsed')).toBeNull()
   })
 })
+
+/**
+ * THE COUNT MUST NEVER GO BACKWARDS, and a remount is how it did.
+ *
+ * `ChatThread`'s working line is dropped and re-appended on every reasoning burst of a build, so
+ * the component timing the wait is destroyed and rebuilt several times inside ONE turn. Timed from
+ * its own mount it restarts at zero each time, and a citizen watching a long build sees the number
+ * fall — reported from production at 12s, then 9s.
+ *
+ * Both tests below remount deliberately, because a suite that only ever renders once cannot tell
+ * the anchored clock from the self-timed one: both are green on a single mount.
+ */
+describe('WaitingLine — a wait that outlives its own element', () => {
+  it('derives the count from `since`, so a remount mid-wait resumes instead of restarting', () => {
+    vi.useFakeTimers()
+    const startedAt = Date.now()
+    const first = render(<WaitingLine label="Working on your app" since={startedAt} />)
+    act(() => {
+      vi.advanceTimersByTime(12_000)
+    })
+    expect(screen.getByTestId('waiting-elapsed').textContent).toBe('12s')
+
+    // The burst ends, a tool call takes the floor, and the row is torn down and rebuilt.
+    first.unmount()
+    render(<WaitingLine label="Working on your app" since={startedAt} />)
+    // Asserted on the FIRST paint, with no timer advanced: a clock that seeded 0 and caught up on
+    // its next tick would still be wrong for the second the citizen is looking at it.
+    expect(screen.getByTestId('waiting-elapsed').textContent).toBe('12s')
+
+    act(() => {
+      vi.advanceTimersByTime(4_000)
+    })
+    expect(screen.getByTestId('waiting-elapsed').textContent).toBe('16s')
+  })
+
+  it('without `since` a remount restarts — the dialog steps that must keep timing themselves', () => {
+    // The mutant guard for the test above: if `since` were ignored and every wait simply became
+    // turn-anchored, this one would fail. A hand-over step reports ITS age, not the dialog's.
+    vi.useFakeTimers()
+    const first = render(<WaitingLine label="Saving it first…" />)
+    act(() => {
+      vi.advanceTimersByTime(12_000)
+    })
+    expect(screen.getByTestId('waiting-elapsed').textContent).toBe('12s')
+
+    first.unmount()
+    render(<WaitingLine label="Putting it away…" />)
+    act(() => {
+      vi.advanceTimersByTime(ELAPSED_AFTER_MS + 1_000)
+    })
+    expect(screen.getByTestId('waiting-elapsed').textContent).toBe('6s')
+  })
+})

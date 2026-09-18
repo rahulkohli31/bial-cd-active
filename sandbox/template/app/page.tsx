@@ -177,9 +177,14 @@ const STARTER_CSS = `
   animation-delay: calc(1s + var(--b) * 0.08s);
 }
 
+/* FOUR waypoints, not two: a 0/50/100 bob eases to a standstill at every stop, and a piece that
+   is motionless most of the time reads as a still picture rather than a wait. The loop below always
+   has somewhere left to travel. */
 @keyframes starter-bob {
   0%, 100% { transform: translate(calc(var(--sx) * var(--m)), calc(var(--sy) * var(--m))) rotate(var(--sr)); }
-  50% { transform: translate(calc(var(--sx) * var(--m)), calc(var(--sy) * var(--m) - 9px)) rotate(calc(var(--sr) * -0.5)); }
+  25% { transform: translate(calc(var(--sx) * var(--m) + 9px), calc(var(--sy) * var(--m) - 7px)) rotate(calc(var(--sr) * 0.1)); }
+  50% { transform: translate(calc(var(--sx) * var(--m)), calc(var(--sy) * var(--m) - 16px)) rotate(calc(var(--sr) * -0.7)); }
+  75% { transform: translate(calc(var(--sx) * var(--m) - 9px), calc(var(--sy) * var(--m) - 7px)) rotate(calc(var(--sr) * -0.1)); }
 }
 @keyframes starter-assemble {
   0% {
@@ -203,8 +208,8 @@ const STARTER_CSS = `
   .starter-title { font-size: 21px; }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .starter *, .starter *::before, .starter *::after { animation: none !important; transition: none !important; }
-  [data-state="building"] .starter-piece { opacity: 1; transform: none; }
-}
+/* NO reduced-motion guard, deliberately. Suppressing it left transform:none on every piece,
+   which snaps the window together into a finished-looking still — the one reading this screen must
+   never give while a build is running. The wait is the only thing this page has to say, and it says
+   it with movement. */
 `;

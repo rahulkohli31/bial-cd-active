@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.5] - 2026-09-18
+
+The picture of an app being put together moves again. On a machine with animations switched off
+at the operating system — the default on a good many Windows installs — the building screen froze
+every piece into its finished position, which reads as an app that is already done rather than one
+still being built. The screen that greets a project with nothing in it now carries that same
+picture instead of a small mark, so the first pane a citizen meets says what the space is for. And
+the count beside "Working on your app" now measures the whole turn instead of starting again every
+time the model stops to think.
+
+### Fixed
+
+- **The building screen animates on every machine.** The parts fly in and snap together whether or
+  not animations are switched off at the operating system. Suppressing them left a fully assembled
+  window standing still, which claims the build is over while it is still running.
+- **The loose parts drift far enough to be seen.** They travelled nine pixels on one axis and came
+  to a halt at both ends of the path, which is a still picture by any honest reading. They now move
+  on a path that never parks.
+- **The count beside "Working on your app" belongs to the turn.** It restarted every time the model
+  returned to thinking between steps, so a long build reported a number that fell back — twelve
+  seconds, then nine.
+
+### Changed
+
+- **A project with nothing built shows the app-in-pieces picture.** It carried a small mark before.
+  The words beside it are unchanged, and the picture settles rather than drifts for anyone who has
+  asked their machine to reduce motion.
+
+### Deploying this release
+
+- **Deploy the portal, then build a new sandbox image.** The first-pane picture and the turn count
+  ship in the portal. The building screen ships inside the sandbox image, so until a new one is
+  built and pushed, a running app keeps the frozen picture. Existing containers hold their cached
+  image until their revision restarts. No migration and no new settings.
+
 ## [1.7.4] - 2026-09-18
 
 An application starts because you opened it and goes away because everyone left. Opening a

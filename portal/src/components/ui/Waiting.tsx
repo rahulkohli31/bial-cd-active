@@ -54,14 +54,20 @@ export function usePrefersReducedMotion(): boolean {
 export const ELAPSED_AFTER_MS = 5_000
 
 /**
- * Seconds since `active` last became true, ticking once a second; `0` whenever it is false.
+ * Seconds since the wait began, ticking once a second; `0` whenever `active` is false.
  *
  * THE TIMER IS KEYED ON THE TRANSITION, not on mount: these live inside dialogs that stay mounted
  * across several steps of a hand-over, and a counter that kept climbing through all of them would
  * report the dialog's age rather than the step's. Cleared on the way down so a second press starts
  * from zero rather than resuming someone else's clock.
+ *
+ * `since` IS FOR THE OPPOSITE SHAPE — a wait whose ELEMENT comes and goes while the wait itself
+ * runs on. A caller that is torn down and rebuilt mid-wait has no transition to key on: it mounts
+ * fresh each time and, without an anchor it did not choose, would restart from zero and report a
+ * number SMALLER than the one already on screen. Given a timestamp, the count is derived from it
+ * on every mount, so remounting is invisible and the number only ever goes up.
  */
-export function useElapsedSeconds(active: boolean): number {
+export function useElapsedSeconds(active: boolean, since?: number | null): number {
   const [seconds, setSeconds] = useState(0)
   const startedAt = useRef<number | null>(null)
 
@@ -71,14 +77,16 @@ export function useElapsedSeconds(active: boolean): number {
       setSeconds(0)
       return undefined
     }
-    startedAt.current = Date.now()
-    setSeconds(0)
-    const id = setInterval(() => {
-      const from = startedAt.current
-      if (from !== null) setSeconds(Math.floor((Date.now() - from) / 1000))
-    }, 1000)
+    // Clamp: a clock skewed ahead of the anchor would otherwise count backwards from a negative.
+    const from = since ?? Date.now()
+    const read = () => Math.max(0, Math.floor((Date.now() - from) / 1000))
+    startedAt.current = from
+    // Read immediately rather than seeding 0 — on a remount the wait is already underway, and the
+    // first tick is a second away.
+    setSeconds(read())
+    const id = setInterval(() => setSeconds(read()), 1000)
     return () => clearInterval(id)
-  }, [active])
+  }, [active, since])
 
   return seconds
 }
@@ -136,6 +144,9 @@ export interface WaitingLineProps {
   label: string
   /** Whether the wait is running. Drives the elapsed clock; the caller still decides to render. */
   active?: boolean
+  /** When this wait outlives its own element, the moment it began (`Date.now()`), so the count
+   *  survives a remount. Omit it and the clock starts when this component does. */
+  since?: number | null
   className?: string
 }
 
@@ -156,9 +167,10 @@ export interface WaitingLineProps {
 export function WaitingLine({
   label,
   active = true,
+  since,
   className = '',
 }: WaitingLineProps): React.ReactElement {
-  const seconds = useElapsedSeconds(active)
+  const seconds = useElapsedSeconds(active, since)
   const show = seconds * 1000 >= ELAPSED_AFTER_MS
   return (
     <span className={`inline-flex items-center gap-2 ${className}`}>

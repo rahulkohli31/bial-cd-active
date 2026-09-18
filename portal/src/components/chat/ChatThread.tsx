@@ -10,7 +10,7 @@
  * control, `remark-breaks`, and the `mode="static"` guard — that
  * `@assistant-ui/react-markdown` lacks; its 21-case parity checklist must pass first.
  */
-import { useMemo, type FC } from 'react'
+import { createContext, useContext, useMemo, type FC } from 'react'
 
 import { Thread, type ThreadComponents } from '../assistant-ui/thread'
 import MessageContent from './MessageContent'
@@ -29,7 +29,21 @@ export interface ChatThreadProps {
   footer?: FC | undefined
   /** Told what an activity group amounted to as it seals. */
   onGroupSealed?: ((summary: string) => void) | undefined
+  /** When the running turn began (`Date.now()`), so the working line's elapsed count measures the
+   *  TURN. The row itself is torn down and rebuilt between bursts and cannot time itself. */
+  turnStartedAt?: number | null
 }
+
+/**
+ * The running turn's start, held here because this component outlives the row that reads it.
+ *
+ * `working` goes false whenever a tool call takes the floor and true again on the next reasoning
+ * burst, so `streamingParts` drops and re-appends the reasoning part several times in one turn and
+ * `ReasoningGroup` is a NEW component instance each time. A clock owned by that row therefore
+ * measures the burst, and a citizen watching a long build sees the number fall back. The anchor
+ * lives above the remount so the count belongs to the turn.
+ */
+const TurnStartedAtContext = createContext<number | null>(null)
 
 /**
  * The text part, rendered by the portal's own renderer.
@@ -63,15 +77,23 @@ const TextPart: ThreadComponents['TextPart'] = ({ text, isUser }) => (
  * cannot see what the model is thinking about, and the reasoning text is withheld from the
  * browser by design at three separate layers. So the line says the true thing and stops.
  */
-const ReasoningGroup: ThreadComponents['ReasoningGroup'] = () => (
-  <p data-testid="working-status" className="my-1 text-xs text-neutral">
-    <WaitingLine label="Working on your app" active />
-  </p>
-)
+const ReasoningGroup: ThreadComponents['ReasoningGroup'] = () => {
+  const turnStartedAt = useContext(TurnStartedAtContext)
+  return (
+    <p data-testid="working-status" className="my-1 text-xs text-neutral">
+      <WaitingLine label="Working on your app" active since={turnStartedAt} />
+    </p>
+  )
+}
 
 const noAnnouncement = () => {}
 
-const ChatThread: FC<ChatThreadProps> = ({ interruptedMessageIds, footer, onGroupSealed }) => {
+const ChatThread: FC<ChatThreadProps> = ({
+  interruptedMessageIds,
+  footer,
+  onGroupSealed,
+  turnStartedAt = null,
+}) => {
   const components = useMemo<ThreadComponents>(
     () => ({
       TextPart,
@@ -96,7 +118,9 @@ const ChatThread: FC<ChatThreadProps> = ({ interruptedMessageIds, footer, onGrou
   return (
     <InterruptedMessagesContext.Provider value={interrupted}>
       <GroupSealedContext.Provider value={announceSealed}>
-        <Thread components={components} />
+        <TurnStartedAtContext.Provider value={turnStartedAt}>
+          <Thread components={components} />
+        </TurnStartedAtContext.Provider>
       </GroupSealedContext.Provider>
     </InterruptedMessagesContext.Provider>
   )
