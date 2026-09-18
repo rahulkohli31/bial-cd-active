@@ -307,11 +307,11 @@ describe('one author for every pane sentence', () => {
     expect(empty.textContent).toContain('It stays running while you work, so you only do this once.')
   })
 
-  it('★ draws the board\'s mark above the headline on the three states that have one', () => {
-    // `NothingBuilt`, `PreviewOff` and `PreviewStarting` put a 30px #9AA5B1 glyph above the
-    // headline — the only thing that reads a blank half-screen as deliberate, not broken.
+  it('★ draws the board\'s mark above the headline on the two states that carry a glyph', () => {
+    // `PreviewOff` and `PreviewStarting` put a 30px #9AA5B1 glyph above the headline — the only
+    // thing that reads a blank half-screen as deliberate, not broken. `NothingBuilt` carries the
+    // stage instead and is asserted on its own below; a board must carry one mark, never two.
     const withGlyph: [string, PreviewState][] = [
-      ['never-built', reading({ state: 'never_built', restorable: false })],
       ['not-running', reading({ state: 'asleep', restorable: true })],
       ['starting', reading({ state: 'starting' })],
     ]
@@ -341,11 +341,39 @@ describe('one author for every pane sentence', () => {
     for (const [name, preview] of everyBoard) {
       const { unmount } = renderPane((c) => c.workspace.set(reportFor(preview)))
       expect(screen.getByTestId('app-pane-empty').getAttribute('data-workspace-state'), name).toBe(name)
-      const glyph = screen.getByTestId('app-pane-glyph')
-      expect(glyph.getAttribute('width'), name).toBe('30')
-      expect(glyph.getAttribute('aria-hidden'), name).toBe('true')
+      // ONE MARK PER BOARD, whichever kind it is. `never-built` draws the stage; the rest draw a
+      // glyph. Asserted as an exclusive pair rather than "something is present", so a board that
+      // grew a second mark — or swapped its kind by accident — goes red.
+      const glyph = screen.queryByTestId('app-pane-glyph')
+      const stage = screen.queryByTestId('app-pane-stage')
+      if (name === 'never-built') {
+        expect(stage, name).toBeTruthy()
+        expect(glyph, name).toBeNull()
+        expect(stage?.getAttribute('aria-hidden'), name).toBe('true')
+      } else {
+        expect(glyph, name).toBeTruthy()
+        expect(stage, name).toBeNull()
+        expect(glyph?.getAttribute('width'), name).toBe('30')
+        expect(glyph?.getAttribute('aria-hidden'), name).toBe('true')
+      }
       unmount()
     }
+  })
+
+  it('★ NothingBuilt draws the stage, and the stage is the whole picture', () => {
+    // The board the citizen sits on before anything exists. It used to carry a 30px crosshair,
+    // which said "empty" and nothing else; the stage says what the empty pane is FOR.
+    //
+    // The piece count is asserted because a stage that rendered its wrapper and none of its parts
+    // would satisfy every other assertion here while drawing an empty box.
+    renderPane((c) =>
+      c.workspace.set(reportFor(reading({ state: 'never_built', restorable: false }))),
+    )
+    const stage = screen.getByTestId('app-pane-stage')
+    expect(stage.querySelectorAll('.starter-piece')).toHaveLength(8)
+    expect(stage.querySelectorAll('.starter-bar')).toHaveLength(5)
+    // LIVENESS: the approved copy still stands beside it, unchanged.
+    expect(screen.getByTestId('app-pane-empty').textContent).toContain('Describe what you want to build.')
   })
 
   it('★ and `running` is the one entry with no mark, because it draws no card at all', () => {
