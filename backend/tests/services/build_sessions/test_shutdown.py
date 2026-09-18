@@ -981,7 +981,7 @@ async def test_a_container_we_owe_a_deletion_for_does_not_hold_the_citizens_work
     next_project = await ProjectFactory.create(db_session, user_id=scene.user_id)
 
     manager = SessionManager(session_factory=scene.factory)
-    await manager.reclaim_preflight(db_session, user, next_project.id, sandbox_client=client)
+    await manager.reclaim_preflight(db_session, user, next_project.id)
 
 
 async def test_the_background_spawn_returns_before_the_teardown_finishes(

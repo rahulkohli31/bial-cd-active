@@ -2313,7 +2313,6 @@ class SessionManager:
         user: User,
         *,
         spare_app: str | None,
-        sandbox_client: SandboxClient,
     ) -> None:
         """Raise when the container holding this citizen's slot is a COLLEAGUE'S SHARED VIEW.
 
@@ -2736,10 +2735,9 @@ class SessionManager:
         # serving the project, so the alive and starting arms return `None` (no claim) and the
         # client falls through to the answer the project route already gave it at load.
         #
-        # NOT BUILT ON `_refuse_if_reclaim_would_destroy_work`: that would drag in an attach
-        # and a container round trip, let a `RedisError` turn a poll into a 503, and make every
-        # framed preview touch its container every 45 seconds — a manufactured activity signal
-        # that would keep an unused sandbox looking busy forever.
+        # NOT BUILT ON `_refuse_if_reclaim_would_destroy_work`: it answers a different question
+        # — whose container holds the slot — and letting a `RedisError` from it turn a poll into
+        # a 503 would break a read that every framed preview makes every 45 seconds.
         app_id = await existing_app_id(db, user.id, project_id)
         try:
             reg, starting = await read_registry_and_starting_marker(get_redis(), user.id)
@@ -2879,8 +2877,6 @@ class SessionManager:
         db: AsyncSession,
         user: User,
         project_id: uuid.UUID,
-        *,
-        sandbox_client: SandboxClient,
     ) -> None:
         """The guard asked BEFORE the 202 so the answer can be an HTTP 409. `ensure_sandbox`
         runs inside the detached turn task, where a raise becomes a chat message and the
@@ -2894,9 +2890,7 @@ class SessionManager:
         citizen's slot. Their own other project is not a refusal any more — the turn hands it
         over and starts — so the common case for this call is now silence."""
         spare_app = await _sandbox_name_for_existing_app(db, user.id, project_id)
-        await self._refuse_if_reclaim_would_destroy_work(
-            db, user, spare_app=spare_app, sandbox_client=sandbox_client
-        )
+        await self._refuse_if_reclaim_would_destroy_work(db, user, spare_app=spare_app)
 
     async def release_project_sandbox(
         self,
@@ -3423,9 +3417,7 @@ class SessionManager:
             spare_app = await _sandbox_name_for_existing_app(db, user_id, project_id)
             # Same guard, same reason as `ensure_sandbox`: Relaunch is the other door
             # into the one slot, and a colleague's shared view in it is refused from both.
-            await self._refuse_if_reclaim_would_destroy_work(
-                db, user, spare_app=spare_app, sandbox_client=sandbox_client
-            )
+            await self._refuse_if_reclaim_would_destroy_work(db, user, spare_app=spare_app)
             incumbent_is_leaving = await self._show_the_outgoing_project_the_door(
                 db, user, spare_app=spare_app, sandbox_client=sandbox_client
             )
@@ -3988,9 +3980,7 @@ class SessionManager:
             # (`_the_live_sandbox_is_already_the_one_we_want`/`occupied_by == spare_app`) the
             # guard itself runs first, so Refresh on a live view fell through to the shared-
             # occupant branch and reported the recipient's OWN open app as blocking them.
-            await self._refuse_if_reclaim_would_destroy_work(
-                db, recipient, spare_app=shared_name, sandbox_client=sandbox_client
-            )
+            await self._refuse_if_reclaim_would_destroy_work(db, recipient, spare_app=shared_name)
             # OPENING A COLLEAGUE'S PROJECT IS OPENING A DIFFERENT PROJECT, so the recipient's
             # own container leaves the way it leaves at every other door — written back over its
             # saved copy and destroyed in the background — rather than being reclaimed inline by
@@ -4232,9 +4222,7 @@ class SessionManager:
             # A FIRST MESSAGE IS A DOOR: this is the only way a never-built project starts, so a
             # citizen who switches by typing has to be handed through here exactly as one who
             # pressed start is handed through the relaunch door.
-            await self._refuse_if_reclaim_would_destroy_work(
-                db, user, spare_app=spare_app, sandbox_client=sandbox_client
-            )
+            await self._refuse_if_reclaim_would_destroy_work(db, user, spare_app=spare_app)
             incumbent_is_leaving = await self._show_the_outgoing_project_the_door(
                 db, user, spare_app=spare_app, sandbox_client=sandbox_client
             )

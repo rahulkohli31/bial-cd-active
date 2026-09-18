@@ -253,7 +253,7 @@ async def build_it(
         raise AppApiError(409, BUILD_IN_FLIGHT_MSG, code=ALREADY_BUILDING_HERE_CODE)
     with build_coordination_or_503():
         try:
-            await manager.reclaim_preflight(db, user, plan_chat.project_id, sandbox_client=sandbox)
+            await manager.reclaim_preflight(db, user, plan_chat.project_id)
         except SandboxReclaimBlockedError as exc:
             return reclaim_blocked_response(exc)
 

@@ -914,7 +914,7 @@ async def test_a_project_being_built_does_not_refuse_the_next_one(
         db_session, user, project_a, sandbox_client=client, may_write=True
     )
 
-    await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+    await manager.reclaim_preflight(db_session, user, project_b)
 
     assert client.torn_down == []  # the agent keeps working until the routine stops it
 
@@ -1059,7 +1059,7 @@ async def test_a_read_only_turn_holding_the_workspace_refuses_nothing_either(
     )
     client.attach_handle = session.handle
 
-    await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+    await manager.reclaim_preflight(db_session, user, project_b)
     await manager.ensure_sandbox(
         db_session, user, project_b, sandbox_client=client, may_write=True
     )
@@ -1111,7 +1111,7 @@ async def test_a_read_only_turn_on_an_empty_project_blocks_nothing_at_all(
     )
     client.attach_handle = plan_only.handle
 
-    await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+    await manager.reclaim_preflight(db_session, user, project_b)
     real = await manager.ensure_sandbox(
         db_session, user, project_b, sandbox_client=client, may_write=True
     )
@@ -1138,7 +1138,7 @@ async def test_a_write_turn_no_longer_stops_the_citizens_next_project(
     )
     client.attach_handle = session.handle
 
-    await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+    await manager.reclaim_preflight(db_session, user, project_b)
 
     # ...and Save still refuses while that agent writes.
     with pytest.raises(BuildSessionConflictError):
@@ -1695,7 +1695,7 @@ async def test_starting_the_app_that_already_holds_the_workspace_raises_nothing(
     client.attach_handle = first.handle
 
     # No refusal: same user, same project, same container.
-    await manager.reclaim_preflight(db_session, user, project_a, sandbox_client=client)
+    await manager.reclaim_preflight(db_session, user, project_a)
 
 
 async def test_no_live_container_at_all_raises_nothing(
@@ -1706,9 +1706,8 @@ async def test_no_live_container_at_all_raises_nothing(
     the first press of every project in the product."""
     user, project_a = await _mk(db_session, "w94-cold@rvaiglobal.com")
     manager = SessionManager()
-    client = FakeSandboxClient()
 
-    await manager.reclaim_preflight(db_session, user, project_a, sandbox_client=client)
+    await manager.reclaim_preflight(db_session, user, project_a)
 
 
 async def test_a_ghost_registry_entry_raises_nothing_because_it_has_no_project_to_name(
@@ -1722,7 +1721,6 @@ async def test_a_ghost_registry_entry_raises_nothing_because_it_has_no_project_t
     it replaced, because it asks a person to make a decision about something it cannot describe."""
     user, project_a = await _mk(db_session, "w94-ghost@rvaiglobal.com")
     manager = SessionManager()
-    client = FakeSandboxClient()
 
     # A registry entry for an app name that belongs to nothing this user owns.
     await fake_redis.hset(
@@ -1736,7 +1734,7 @@ async def test_a_ghost_registry_entry_raises_nothing_because_it_has_no_project_t
         },
     )
 
-    await manager.reclaim_preflight(db_session, user, project_a, sandbox_client=client)
+    await manager.reclaim_preflight(db_session, user, project_a)
 
 
 async def test_an_unreadable_registry_still_propagates_rather_than_being_swallowed(
@@ -1753,7 +1751,6 @@ async def test_an_unreadable_registry_still_propagates_rather_than_being_swallow
     true statement, rather than becoming a reclaim dialog or a silent pass."""
     user, project_a = await _mk(db_session, "w94-redis@rvaiglobal.com")
     manager = SessionManager()
-    client = FakeSandboxClient()
 
     async def the_registry_will_not_answer(*_args: object, **_kwargs: object) -> dict[str, str]:
         raise RedisError("connection reset")
@@ -1764,7 +1761,7 @@ async def test_an_unreadable_registry_still_propagates_rather_than_being_swallow
     monkeypatch.setattr(fake_redis, "hgetall", the_registry_will_not_answer)
 
     with pytest.raises(RedisError):
-        await manager.reclaim_preflight(db_session, user, project_a, sandbox_client=client)
+        await manager.reclaim_preflight(db_session, user, project_a)
 
 
 async def test_neither_refusal_code_reaches_a_citizens_own_second_project(
@@ -1789,7 +1786,7 @@ async def test_neither_refusal_code_reaches_a_citizens_own_second_project(
 
     # An agent is mid-write in A — the state that used to raise `sandbox_reclaim_blocked` here
     # and `build_session_already_active` one line into the start.
-    await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+    await manager.reclaim_preflight(db_session, user, project_b)
     started = await manager.ensure_sandbox(
         db_session, user, project_b, sandbox_client=client, may_write=True
     )
