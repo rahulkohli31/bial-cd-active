@@ -535,7 +535,9 @@ async def renew_presence_stay(
     raw = answer.decode() if isinstance(answer, bytes) else str(answer)
     if not raw.startswith("renewed:"):
         return RenewalOutcome(raw), None
-    return RenewalOutcome.RENEWED, _the_instant_in_force(raw.removeprefix("renewed:"))
+    # A `None` INSTANT IS STILL A RENEWAL. It says only that the caller cannot name the deadline;
+    # the write succeeded and the hash holds whichever value won.
+    return RenewalOutcome.RENEWED, an_instant_in_utc(raw.removeprefix("renewed:"))
 
 
 # Retire a provisioning stay now that provisioning is demonstrably over, guarded on the same
@@ -589,18 +591,6 @@ async def settle_stay_once_the_app_is_serving(
     return grace if settled else None
 
 
-def _the_instant_in_force(raw: str) -> datetime | None:
-    """The deadline the script reported it kept, or `None` when it cannot be read.
-
-    `None` here means only that the CALLER cannot name the instant — the write itself succeeded
-    and the hash holds whichever value won. A renewal reporting no instant is still a renewal."""
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
-
-
 async def _standing_stay(redis: aioredis.Redis, user_uuid: uuid.UUID) -> datetime | None:
     """The stay currently on the hash, or `None` when absent or unreadable.
 
@@ -611,11 +601,7 @@ async def _standing_stay(redis: aioredis.Redis, user_uuid: uuid.UUID) -> datetim
     raw = await redis.hget(registry_key(user_uuid), REGISTRY_FIELD_PREVIEW_STAY_UNTIL)
     if not raw:
         return None
-    try:
-        parsed = datetime.fromisoformat(raw.decode() if isinstance(raw, bytes) else str(raw))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return an_instant_in_utc(raw.decode() if isinstance(raw, bytes) else str(raw))
 
 
 async def stay_of_execution_is_current(redis: aioredis.Redis, user_uuid: uuid.UUID) -> bool:
@@ -755,7 +741,7 @@ async def clear_serving(redis: aioredis.Redis, user_uuid: uuid.UUID, *, app_name
 
 # --- READING WHAT THE STAMP SAYS ---------------------------------------------------------------
 #
-# THE THREE READERS EVERY OBSERVER SHARES, and they live here because here is the one module the
+# THE READERS EVERY OBSERVER SHARES, and they live here because here is the one module the
 # turn engine, the session manager and the reaper all already import. They were written four
 # times over — `engine._elapsed_ms`, `manager._ms_since_created`, `manager._first_served_at` and
 # `reaper._an_instant_on_the_hash`, plus three more inline subtractions in the reaper — because
@@ -765,6 +751,16 @@ async def clear_serving(redis: aioredis.Redis, user_uuid: uuid.UUID, *, app_name
 # NOT in `redis/keys.py`, which is the FROZEN key/field contract and is imported by
 # `services/sandbox/` — a layer that must not reach into `build_sessions/`. Keys stay a vocabulary;
 # these are the reading of it.
+
+
+def an_instant_in_utc(raw: str) -> datetime | None:
+    """One ISO-8601 instant, or `None` when it cannot be read. The single parser every reader
+    below delegates to, so there is one answer to what a naive or corrupt value means."""
+    try:
+        instant = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return instant if instant.tzinfo is not None else instant.replace(tzinfo=UTC)
 
 
 def an_instant_on_the_hash(reg: Mapping[str, str] | None, field: str) -> datetime | None:
@@ -783,11 +779,7 @@ def an_instant_on_the_hash(reg: Mapping[str, str] | None, field: str) -> datetim
     raw = reg.get(field)
     if not raw:
         return None
-    try:
-        instant = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    return instant if instant.tzinfo is not None else instant.replace(tzinfo=UTC)
+    return an_instant_in_utc(raw)
 
 
 def elapsed_ms(since: datetime | None, until: datetime) -> int | None:
