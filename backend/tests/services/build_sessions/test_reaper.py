@@ -1221,9 +1221,17 @@ async def test_a_failed_teardown_keeps_its_state_when_the_app_row_has_gone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A container whose app no longer exists has no project to name and no copy to promise, so
-    the ledger refuses it and the old retry stands. Sparing, never forgetting."""
+    the ledger refuses it and the old retry stands. Sparing, never forgetting.
+
+    The registry carries the name this app id WOULD produce, so the identity guard above waves
+    it through and the refusal under test is the missing app row — seed any other name and this
+    passes for the wrong reason, proving the guard instead.
+
+    Mutation check: answer True from the no-app-row branch and this goes red."""
     stranger = uuid.uuid4()
-    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
+    await _seed(
+        fake_redis, USER, app_name=app_name_for(stranger), with_lock=True, with_heartbeat=False
+    )
     await _preserve(fake_storage, stranger)
     client = FakeSandboxClient()
     client.teardown_error = SandboxError("ARM said no")
@@ -1233,6 +1241,34 @@ async def test_a_failed_teardown_keeps_its_state_when_the_app_row_has_gone(
 
     assert await locks.read_registry(fake_redis, USER) is not None
     assert await locks.lock_is_held(fake_redis, USER) is True
+    assert (await db_session.scalar(sa.select(sa.func.count()).select_from(PendingTeardown))) == 0
+
+
+async def test_a_name_and_an_app_id_describing_different_containers_are_refused(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ A REAL APP ROW IS NOT ENOUGH — the name has to belong to it.
+
+    The name and the app id arrive from different reads, so a slot swap between them hands the
+    ledger one container's name and another's id, and the ownership query still passes. Owed
+    against that pair, the teardown would bundle the wrong tree against the wrong saved head
+    and mark the wrong project as closing.
+
+    Mutation check: drop the `app_name not in (...)` guard and this goes red — a row is written,
+    carrying a name no part of this app id can produce."""
+    user = await UserFactory.create(db_session)
+    app = await AppRegistryFactory.create(db_session, user_id=user.id)
+    await _seed(fake_redis, user.id, app_name=SBX, with_lock=True, with_heartbeat=False)
+    await _preserve(fake_storage, app.id)
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert await reaper.reap_user(fake_redis, user.id, client, app_id=app.id) is False
+
     assert (await db_session.scalar(sa.select(sa.func.count()).select_from(PendingTeardown))) == 0
 
 
