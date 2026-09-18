@@ -1453,8 +1453,8 @@ class TurnEngine:
             CATCH — a sibling `except` never catches what another one is unwinding through — and
             `_bill_once` narrows to `Exception`, which a cancellation is not. Escaping would
             carry it clean past `_finish`: no terminal frame, no terminal row, and a turn every
-            subscriber reads as still running until its stall timeout. The same hole
-            arms that bill."""
+            subscriber reads as still running until its stall timeout. So the cancellation is
+            caught here, where it can still be turned into a terminal."""
             try:
                 await _bill_once()
             except asyncio.CancelledError:

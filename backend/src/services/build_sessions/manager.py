@@ -2685,7 +2685,10 @@ class SessionManager:
             occupied_by = reg.get(REGISTRY_FIELD_APP_NAME, "")
             if occupied_by != app_name_for(app_id) and not is_a_shared_sandbox_name(occupied_by):
                 return False
-            return await reap_user(redis, user.id, sandbox_client, strict=True)
+            # THE APP ID GOES WITH IT. Without it the reaper has no slot to write this
+            # container's tree back to, and this is the one control a citizen presses that
+            # destroys a container on purpose — with the Save beside it optional.
+            return await reap_user(redis, user.id, sandbox_client, strict=True, app_id=app_id)
 
     async def give_up_shared_view(
         self, user_id: uuid.UUID, *, sandbox_client: SandboxClient

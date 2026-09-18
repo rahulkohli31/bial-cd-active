@@ -4,7 +4,9 @@ fresh, READY sandbox (cookie auth + CSRF, owner-scoping, no build slot taken).""
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -62,6 +64,7 @@ from tests.api.v1.build_sessions.conftest import (
 )
 from tests.conftest import forget_every_harness_count
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
+from tests.fakes import a_git_bundle
 
 
 async def _user_project(db: AsyncSession, email: str):
@@ -448,6 +451,14 @@ class SupervisorScript:
         if path == "/files":
             return httpx.Response(200, json={"ok": True})
         if path == "/exec":
+            # A BUNDLE READ MUST ANSWER WITH A PARSEABLE BUNDLE. Every door that destroys a
+            # container writes its tree back first, and a container that answers the read with
+            # nothing is one whose write-back raises — so a supervisor double that stayed silent
+            # here would make every release in this file spare the container it means to give up.
+            cmd = json.loads(request.content).get("cmd") or []
+            if cmd[:1] == ["base64"]:
+                stdout = base64.b64encode(a_git_bundle()).decode()
+                return httpx.Response(200, json={"stdout": stdout, "stderr": "", "exit": 0})
             return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
         if path == "/dev/start":
             if self.dev_start_status != 200:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from src.core.integrity_types import BaselineIdentity
 from src.db.models.harness_counter import HarnessCounter
@@ -224,8 +225,25 @@ async def test_a_database_that_will_not_answer_fails_closed_toward_checking(
     import src.db.base as db_base
 
     def explode() -> object:
-        raise RuntimeError("the session factory itself is broken")
+        raise OperationalError("SELECT 1", {}, Exception("the database is not answering"))
 
     monkeypatch.setattr(db_base, "async_session_factory", explode)
 
     assert await has_ever_been_built(_APP) is True
+
+
+async def test_a_broken_query_is_raised_rather_than_read_as_never_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other side of the arm above, and the reason it is narrow. A renamed column is a defect
+    of ours, not an outage, and swallowing it would degrade this check permanently and silently —
+    every app would read as built, for as long as nobody happened to look at the warnings."""
+    import src.db.base as db_base
+
+    def explode() -> object:
+        raise AttributeError("HarnessCount has no column 'nam'")
+
+    monkeypatch.setattr(db_base, "async_session_factory", explode)
+
+    with pytest.raises(AttributeError):
+        await has_ever_been_built(_APP)

@@ -316,7 +316,11 @@ class _RecordPassHarness:
 
 
 @pytest.fixture
-def record_pass_writes_here(db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN201
+def record_pass_writes_here(  # noqa: ANN201
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    empty_worker_passes: None,
+):
     """Point the REAL `_record_pass` at this test's connection instead of a fresh factory one.
 
     THE TESTS USED TO CALL A COPY OF IT, proving only that the test file could write a row —

@@ -1131,13 +1131,20 @@ def _owning_app_id(
     app_ids_by_name: Mapping[str, uuid.UUID] | None,
     user_uuid: uuid.UUID,
 ) -> uuid.UUID | None:
-    """The app id behind this registry record, when the caller supplied the map to resolve it.
+    """The app id behind this registry record — the slot this container's tree is written back to.
 
-    THE UNMATCHED CASE IS A DELIBERATE, NARROW HOLE and is logged rather than hidden. A registry
-    record naming a container with no app row describes an app that no longer exists, so there is
-    nowhere to write its tree back to: without this the container would be spared until it was
-    deleted by hand, which is the leak this system exists to close."""
+    BOTH UNRESOLVED CASES END IN A DESTROYED CONTAINER WITH NOTHING WRITTEN, so neither may be
+    silent. They are not the same failure. No map at all is a CALLER that did not supply one:
+    every door onto this sweep is meant to, so it reads as a defect and is logged as one. An
+    unmatched name is a registry record naming a container whose app row is gone — an app that no
+    longer exists has nowhere for its tree to go, and sparing it forever is the leak this sweep
+    exists to close."""
     if app_ids_by_name is None:
+        _log.warning(
+            "sweeping with no app map; these containers are destroyed without a write-back",
+            user_id=str(user_uuid),
+            app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
+        )
         return None
     app_id = app_ids_by_name.get(reg.get(REGISTRY_FIELD_APP_NAME, ""))
     if app_id is None:

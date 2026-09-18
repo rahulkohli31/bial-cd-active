@@ -88,6 +88,7 @@ from src.services.build_sessions import (
     sweep_all,
 )
 from src.services.build_sessions.drain import draining_at, the_ceiling_switch
+from src.services.build_sessions.inventory import owning_app_ids
 from src.services.build_sessions.locks import (
     read_registry,
     read_registry_and_starting_marker,
@@ -264,7 +265,15 @@ async def internal_reap(
     # so `get_redis()` raises here and the trailing `_coordination_is_gone()` answers.
     with build_coordination_or_503():
         redis = get_redis()
-        result = await sweep_all(redis, sandbox, live_users=manager.live_user_ids())
+        # THE SAME MAP THE SCHEDULED PASS SUPPLIES. Without it every container resolves to no
+        # app, and a sweep with no app to name has nowhere to write a tree back to — this door
+        # would destroy every idle citizen's unsaved work and report a clean pass.
+        result = await sweep_all(
+            redis,
+            sandbox,
+            live_users=manager.live_user_ids(),
+            app_ids_by_name=await owning_app_ids(db),
+        )
         await append_audit(
             db,
             actor_id=admin.id,

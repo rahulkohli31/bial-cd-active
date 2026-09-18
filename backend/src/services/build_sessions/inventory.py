@@ -200,6 +200,21 @@ class _KnownContainer:
     kind: str
 
 
+async def owning_app_ids(db: AsyncSession) -> dict[str, uuid.UUID]:
+    """Container name -> the app that owns it, which is what tells a sweep where to write a
+    container's tree back before it destroys it.
+
+    A DATABASE THAT WILL NOT ANSWER FAILS THE CALLER rather than returning an empty map. Empty
+    resolves every container to `None`, which a sweep cannot tell apart from "this caller has no
+    map", and that reads as "there is nowhere to write this tree" -- so an unreachable database
+    would destroy the fleet's unsaved work while reporting a clean pass.
+
+    EVERY DOOR ONTO A SWEEP MUST CALL THIS. The scheduled pass and the operator's by-hand
+    reconciliation both destroy containers, and a door that skips it destroys their work."""
+    owners = await _app_names_to_owners(db)
+    return {name: known.app_id for name, known in owners.items()}
+
+
 async def _app_names_to_owners(db: AsyncSession) -> dict[str, _KnownContainer]:
     """Map every name this platform could have PRODUCED back to who it belongs to — both fleets
     this one Redis-per-user slot can ever hold (#198): a build sandbox (`sbx-`, keyed by its

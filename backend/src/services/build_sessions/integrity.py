@@ -27,6 +27,7 @@ from typing import Final
 
 import sqlalchemy as sa
 import structlog
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.core.integrity_types import BaselineIdentity
 from src.core.integrity_types import WorkspaceState as WorkspaceState
@@ -260,7 +261,11 @@ async def has_ever_been_built(app_id: uuid.UUID) -> bool:
                 .limit(1)
             )
             return row.scalar_one_or_none() is not None
-    except Exception:
+    except SQLAlchemyError:
+        # NARROW ON PURPOSE. A database that will not answer is the case this handles, and
+        # answering `True` costs a starter-page check that was going to pass anyway. A renamed
+        # column or a bad enum value is a defect, not a blip, and swallowing it here would
+        # degrade the check permanently while reporting nothing.
         _log.warning("prior_building_turns_unreadable", app_id=str(app_id), exc_info=True)
         return True
 
@@ -342,9 +347,20 @@ def is_a_commit_sha(value: str | None) -> bool:
     return value is not None and _SHA_RE.match(value) is not None
 
 
+#: Printed instead of the porcelain when `git status` could not run. An empty porcelain because
+#: git FAILED is otherwise byte-identical to an empty porcelain because the tree is CLEAN, and on
+#: the reap side "clean" is permission to destroy a container without writing its tree back — so
+#: the probe has to say which of the two it saw.
+#:
+#: MARKS THE FAILURE, NOT THE SUCCESS, so it cannot be lost to the output cap: it is the only
+#: thing printed on the arm that prints it, where a success marker would ride behind up to
+#: `PORCELAIN_CAP_BYTES` of porcelain and be the first thing cut.
+PORCELAIN_FAILED_MARK: Final = "#porcelain-unreadable"
+
 _STATE_FIELDS: Final = (
     'git rev-parse HEAD 2>/dev/null || true; echo "@@"; '
-    f'git status --porcelain 2>/dev/null | head -c {PORCELAIN_CAP_BYTES}; echo "@@"; '
+    f"{{ git status --porcelain 2>/dev/null || printf '{PORCELAIN_FAILED_MARK}'; }}"
+    f' | head -c {PORCELAIN_CAP_BYTES}; echo "@@"; '
     'git rev-list --count HEAD 2>/dev/null || true; echo "@@"'
 )
 
@@ -412,6 +428,9 @@ class ContainerState:
     commits: int
     # Where HEAD sits relative to the reference sha the probe was given, or `NOT_ASKED`.
     ancestry: Ancestry = Ancestry.NOT_ASKED
+    # Did `git status` run at all? False means the tree is UNKNOWN, not clean. Defaults True so
+    # a hand-built state means what it says; only the parse below ever answers False.
+    porcelain_answered: bool = True
 
 
 def parse_state(stdout: str) -> ContainerState:
@@ -447,13 +466,17 @@ def parse_state(stdout: str) -> ContainerState:
     # indistinguishable from output that was cut there, and "assume truncated" is the arm that
     # refuses a reclaim rather than the one that permits it.
     trimmed = porcelain.strip()
+    answered = PORCELAIN_FAILED_MARK not in trimmed
     return ContainerState(
         head=head_text.strip() or None,
-        uncommitted=bool(trimmed),
+        # AN UNREADABLE TREE IS A DIRTY ONE. The save side asks `uncommitted` and a `False` here
+        # would tell a citizen their unread work is safely saved.
+        uncommitted=bool(trimmed) or not answered,
         changed_paths=tuple(paths),
         commits=commits,
         porcelain_truncated=len(trimmed.encode("utf-8", "surrogateescape")) >= PORCELAIN_CAP_BYTES,
         ancestry=_parse_ancestry(ancestry_text),
+        porcelain_answered=answered,
     )
 
 
@@ -715,6 +738,8 @@ def clean_but_for_churn(container: ContainerState) -> bool:
     about whether a container may be destroyed."""
     if container.porcelain_truncated:
         return False  # too much changed to enumerate, which is itself evidence of real work
+    if not container.porcelain_answered:
+        return False  # git never answered, so there is no empty tree here — only an unread one
     return all(path in FRAMEWORK_CHURN for path in container.changed_paths)
 
 

@@ -217,6 +217,7 @@ async def test_the_real_reaper_sweep_writes_the_tree_back_and_the_resume_keeps_i
     the heartbeat lapses — and the work done after the last Save has to come back."""
     import asyncio as _asyncio
 
+    from src.services.build_sessions.inventory import owning_app_ids
     from src.services.build_sessions.reaper import sweep_all
     from src.services.redis import heartbeat_key, registry_key
 
@@ -245,7 +246,15 @@ async def test_the_real_reaper_sweep_writes_the_tree_back_and_the_resume_keeps_i
     await live_redis.delete(heartbeat_key(user.id))
     await live_redis.hdel(registry_key(user.id), "preview_stay_until")
 
-    result = await sweep_all(live_redis, sandbox, live_users=set())
+    # THE MAP IS THE POINT OF THIS SCENARIO, not boilerplate. Without it the sweep cannot name
+    # the slot to write TREE-B into and deletes the container with it — so a version of this
+    # test that omits it passes for a reason that has nothing to do with the write-back.
+    result = await sweep_all(
+        live_redis,
+        sandbox,
+        live_users=set(),
+        app_ids_by_name=await owning_app_ids(db_session),
+    )
     assert result.reaped == 1 and result.failed == 0
     assert container in sandbox._aca.deleted  # the real container is really gone
 

@@ -267,6 +267,14 @@ async def write_the_tree_back(
                 return SavedCopyWrite(SavedCopyOutcome.SKIPPED)
             tree = await _bundle_the_tree(sandbox_client, handle, timings)
             await _timed_store(store, snapshot_key(app_id), tree, timings)
+            # The one line that says a citizen's unsaved afternoon was kept. Nobody presses
+            # anything on this path, so without it a preserved app and a lost one leave the
+            # same trace.
+            _log.info(
+                "wrote a dying container's tree to the saved copy",
+                app_id=str(app_id),
+                bundled_head=tree.head_sha,
+            )
             return SavedCopyWrite(SavedCopyOutcome.WRITTEN, bundled_head=tree.head_sha)
     finally:
         # SUPPRESSED, because this runs in a `finally` on a path that may be propagating the

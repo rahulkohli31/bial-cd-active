@@ -469,7 +469,9 @@ def test_every_copy_attempt_carries_an_explanation_an_operator_can_act_on() -> N
 
 @pytest.fixture
 def copy_record_writes_here(  # noqa: ANN201
-    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    empty_worker_passes: None,
 ):
     """Point the REAL `record_durable_copy_attempt` at this test's connection.
 

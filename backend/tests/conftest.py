@@ -209,3 +209,30 @@ async def empty_harness_counts():
     await forget_every_harness_count()
     yield
     await forget_every_harness_count()
+
+
+async def forget_every_worker_pass() -> None:
+    """Empty `worker_passes`, for the same reason `harness_counts` is emptied: a pass record is a
+    historical fact written in its own committed session, so no per-test rollback reaches it.
+
+    Worth the fixture because the tests that read this table count EVERY row rather than their
+    own, so one row left behind by an earlier run turns them red on an assertion that names the
+    count and not the cause."""
+    from sqlalchemy import delete
+
+    from src.db.base import async_session_factory
+    from src.db.models.worker_pass import WorkerPass
+
+    async with async_session_factory() as db:
+        await db.execute(delete(WorkerPass))
+        await db.commit()
+
+
+@pytest.fixture
+async def empty_worker_passes() -> None:
+    """An empty `worker_passes` to start from. See `forget_every_worker_pass`.
+
+    BEFORE ONLY, unlike its `harness_counts` sibling: its users monkeypatch the session factory
+    for the duration of the test, so a clean-up after the yield would run through that double
+    and not through a real session. Starting clean is what the counting tests need anyway."""
+    await forget_every_worker_pass()
