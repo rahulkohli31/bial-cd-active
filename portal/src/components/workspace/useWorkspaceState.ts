@@ -146,11 +146,13 @@ export function useWorkspaceState({
   // carries nothing about it. `null` means no ceiling applies — never "soon".
   const [drainingAt, setDrainingAt] = useState<string | null>(null)
 
-  // A CEILING BELONGS TO ONE CONTAINER, and this hook is not remounted when the screen moves to
-  // another project — so the instant is dropped with the project it described. Keyed on the
-  // project alone, never on `epoch`: a retry press is not news about the container.
+  // A CEILING AND A PRESS BOTH BELONG TO ONE CONTAINER, and this hook is not remounted when the
+  // screen moves to another project — so both are dropped with the project they described. A
+  // press left standing tells the map the incoming app is starting when nobody has touched it.
+  // Keyed on the project alone, never on `epoch`: a retry press is not news about the container.
   useEffect(() => {
     setDrainingAt(null)
+    setStartInFlight(false)
   }, [projectId])
 
   const refresh = useCallback(() => setEpoch((n) => n + 1), [])

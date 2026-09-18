@@ -759,6 +759,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // on screen. See `onStarted` at the publish block far below for what fills it.
   const [startedPreviewUrl, setStartedPreviewUrl] = useState<string | null>(null)
   const [startPending, setStartPending] = useState(false)
+  // DROPPED WITH THE PROJECT IT DESCRIBED. This surface is not remounted when the screen moves,
+  // and `startApp`'s own clear is gated on the start still being ours — correctly, or a late
+  // clear from the outgoing start would wipe the incoming one's flag. So the hop itself has to
+  // do it, or the incoming app is drawn mid-start with no press behind it.
+  useEffect(() => {
+    setStartPending(false)
+  }, [projectId])
   // A CHAT LOADED COLD CLAIMS THE OPEN PROJECT'S WORKSPACE.
   //
   // The stamp gates EVERY project-scoped arm of the address, and until now only two things ever

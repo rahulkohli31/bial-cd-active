@@ -1036,4 +1036,28 @@ describe('★ what retires the ceiling instant', () => {
 
     expect(view.result.current.drainingAt).toBe(held)
   })
+
+})
+
+describe('★ what a project hop drops', () => {
+  it('drops a press that was in flight on the project being left', async () => {
+    // Nothing keys this hook on the project, and `startApp`'s own clear is gated on the start
+    // still being ours — correctly, or a late clear from the outgoing start would wipe the
+    // incoming one's flag. So the hop itself has to drop it, or the next project is drawn
+    // mid-start with nobody having touched it.
+    //
+    // Mutation check: remove `setStartInFlight(false)` from the project-change effect and the
+    // last assertion goes red — the incoming project still reads as getting ready.
+    const view = mountMovable('proj-1')
+    await waitFor(() => expect(view.result.current.preview).not.toBeNull())
+
+    act(() => view.result.current.reportStartPending(true))
+    expect(view.result.current.state.name).toBe('starting')
+
+    await act(async () => {
+      view.rerender({ id: 'proj-2' })
+    })
+
+    expect(view.result.current.state.name).not.toBe('starting')
+  })
 })
