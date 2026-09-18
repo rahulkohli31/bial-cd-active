@@ -36,19 +36,17 @@ export interface AppActivityMarkerProps {
   phase: ActivityPhase
   /** Whether Status reads `Live` for this row — see the module docblock. */
   live: boolean
-  className?: string
 }
 
 export default function AppActivityMarker({
   phase,
   live,
-  className = '',
 }: AppActivityMarkerProps): React.JSX.Element {
   return (
     <span
       data-testid="app-activity-marker"
       data-phase={phase}
-      className={`inline-flex flex-shrink-0 items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full whitespace-nowrap ${TONE} ${className}`}
+      className={`inline-flex flex-shrink-0 items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full whitespace-nowrap ${TONE}`}
     >
       {phase === 'open' ? (
         <CircleDot size={11} aria-hidden="true" data-testid="app-activity-glyph" className="flex-shrink-0" />
