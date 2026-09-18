@@ -83,7 +83,8 @@ function nothingToBringBack(err: unknown): boolean {
  */
 export async function startApp(sinks: StartSinks): Promise<StartResult> {
   const projectId = sinks.projectId
-  if (!projectId) return { kind: 'not-asked' }
+  // Nobody to ask: no request was made, so nothing failed.
+  if (!projectId) return { kind: 'ok' }
   // THE SURFACE HEARS THE PRESS IMMEDIATELY, not on the next poll tick. The server's own
   // `starting` is the authority and it arrives later; this is what stops the sentence above the
   // pane saying nothing happened for up to forty-five seconds.
@@ -100,11 +101,12 @@ export async function startApp(sinks: StartSinks): Promise<StartResult> {
     // `true` by the wire's recorded contract, which is exactly why liveness can never hang off
     // this boolean. Safe here only because both sides of the read are non-destructive.
     sinks.onStartOutcome(res.ready ? null : { kind: 'not-painted' })
-    return { kind: 'started' }
+    return { kind: 'ok' }
   } catch (err) {
-    // NOTHING TO RESTORE IS REPORTED AS NOTHING AT ALL — no outcome, so no failure sentence over a
-    // project whose app has simply never been built.
-    if (nothingToBringBack(err)) return { kind: 'nothing-saved' }
+    // NOTHING TO RESTORE IS REPORTED AS NOTHING AT ALL — the snapshot gate's own 404, and
+    // deliberately no blank-template arm. It returns BEFORE `onStartOutcome` below, which is what
+    // keeps a failure sentence off the pane of a project whose app has simply never been built.
+    if (nothingToBringBack(err)) return { kind: 'ok' }
     if (err instanceof BuildSessionAlreadyActiveError) {
       // Your own other chat is building. The server names it in wire terms, so this one refusal
       // is re-said in the citizen's — the remedy is to finish or stop that build.

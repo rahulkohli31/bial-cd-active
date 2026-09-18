@@ -359,17 +359,13 @@ export type StartOutcome =
  * while a refusal must stop the address where the citizen is standing.
  */
 export type StartResult =
-  /** The server answered. Whether it had painted a page yet is the pane's business, not the
-   *  caller's: either way the container is up and the address is worth moving to. */
-  | { readonly kind: 'started' }
-  /** The snapshot gate's own 404: there is no saved build, and deliberately no blank-template
-   *  arm. NOT A FAILURE — nothing was wrong, there was simply nothing to restore. */
-  | { readonly kind: 'nothing-saved' }
+  /** Nothing to re-say where the citizen is standing. The three ways of arriving here — the
+   *  server answered, there was no saved build to restore, nobody could be asked — differ in the
+   *  pane, which the sinks have already been told about, and not to this caller. */
+  | { readonly kind: 'ok' }
   /** It did not start. `error` is what was thrown, for a caller that must re-say it where the
    *  citizen is standing rather than only in the pane. */
   | { readonly kind: 'failed'; readonly error: unknown }
-  /** Nobody could be asked — no project is resolved, so no request was made and nothing failed. */
-  | { readonly kind: 'not-asked' }
 
 // ─── what a person may press ──────────────────────────────────────────────────────────────────
 
