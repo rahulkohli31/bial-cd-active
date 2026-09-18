@@ -52,6 +52,7 @@ from src.db.models.pending_teardown import PendingTeardown
 from src.services.build_sessions.drain import is_drained, the_ceiling_switch
 from src.services.build_sessions.locks import (
     an_instant_on_the_hash,
+    delete_registry_if_it_still_names,
     read_registry,
     read_starting_marker,
     reap_lock,
@@ -60,9 +61,8 @@ from src.services.build_sessions.locks import (
 from src.services.build_sessions.reaper import is_a_sandbox_name, is_a_shared_sandbox_name
 from src.services.build_sessions.snapshot import SavedCopyOutcome, write_saved_copy_under_guard
 from src.services.messages.projection import TURN_TERMINAL_KIND
-from src.services.redis import REGISTRY_STATE_ENDING, legacy_registry_key, registry_key
+from src.services.redis import REGISTRY_STATE_ENDING, registry_key
 from src.services.redis.keys import (
-    REGISTRY_FIELD_ADOPTED_FROM_LEGACY,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_STATE,
@@ -574,21 +574,6 @@ _CAS_MARK_ENDING_LUA: Final = (
     f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_STATE}', '{REGISTRY_STATE_ENDING}') return 1"
 )
 
-# Delete the record under the same guard, and report whether THIS environment adopted it from the
-# legacy prefix — that key is removed here and nowhere else. The guard belongs inside the script:
-# a Python-side read followed by a Python-side delete leaves exactly the gap a start needs to
-# register its replacement. 2 means the legacy key is ours to clear too.
-_CAS_DELETE_REGISTRY_LUA: Final = (
-    f"if redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}') ~= ARGV[1] then return 0 end "
-    f"local adopted = redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_ADOPTED_FROM_LEGACY}') "
-    "redis.call('DEL', KEYS[1]) "
-    "if adopted then return 2 end return 1"
-)
-
-#: `_CAS_DELETE_REGISTRY_LUA`'s "and the legacy key too" answer.
-_ALSO_THE_LEGACY_KEY: Final = 2
-
-
 async def _mark_ending_if_still_ours(redis: aioredis.Redis, owed: OwedTeardown) -> bool:
     run_script = redis.eval  # aliased to keep the call off the JS-oriented eval guard
     marked = await run_script(_CAS_MARK_ENDING_LUA, 1, registry_key(owed.user_id), owed.app_name)
@@ -596,13 +581,7 @@ async def _mark_ending_if_still_ours(redis: aioredis.Redis, owed: OwedTeardown) 
 
 
 async def _delete_registry_if_still_ours(redis: aioredis.Redis, owed: OwedTeardown) -> bool:
-    run_script = redis.eval  # aliased to keep the call off the JS-oriented eval guard
-    deleted = await run_script(
-        _CAS_DELETE_REGISTRY_LUA, 1, registry_key(owed.user_id), owed.app_name
-    )
-    if int(deleted) == _ALSO_THE_LEGACY_KEY:
-        await redis.delete(legacy_registry_key(owed.user_id))
-    return bool(deleted)
+    return await delete_registry_if_it_still_names(redis, owed.user_id, owed.app_name)
 
 
 async def _a_different_instance_answers(redis: aioredis.Redis, owed: OwedTeardown) -> bool:

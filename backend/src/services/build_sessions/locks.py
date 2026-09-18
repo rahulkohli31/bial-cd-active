@@ -957,6 +957,42 @@ async def mark_registry_ending(redis: aioredis.Redis, user_uuid: uuid.UUID) -> N
         await redis.hset(registry_key(user_uuid), REGISTRY_FIELD_STATE, REGISTRY_STATE_ENDING)
 
 
+# Delete the record ONLY while it still names this container, and report whether the legacy key
+# went with it. The guard belongs inside the script: a Python-side read followed by a Python-side
+# delete leaves exactly the gap a start needs to register its replacement. 2 means the legacy key
+# is ours to clear too.
+_CAS_DELETE_REGISTRY_BY_NAME_LUA: Final = (
+    f"if redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}') ~= ARGV[1] then return 0 end "
+    f"local adopted = redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_ADOPTED_FROM_LEGACY}') "
+    "redis.call('DEL', KEYS[1]) "
+    "if adopted then return 2 end return 1"
+)
+
+#: `_CAS_DELETE_REGISTRY_BY_NAME_LUA`'s "and the legacy key too" answer.
+_ALSO_THE_LEGACY_KEY: Final = 2
+
+
+async def delete_registry_if_it_still_names(
+    redis: aioredis.Redis, user_uuid: uuid.UUID, app_name: str
+) -> bool:
+    """Clear this citizen's sandbox record, but only while it still names `app_name`. True when it
+    did.
+
+    THE PER-USER RECORD OUTLIVES THE SESSION THAT WROTE IT. One key holds whichever container this
+    citizen's single workspace is currently running, and a switch replaces its contents while the
+    outgoing session is still unwinding — so a session that deletes by user id alone deletes
+    whatever arrived after it, and the container that record named goes on running with nothing
+    left to find it. Ask by name, and a session that is merely late cannot take the live one's
+    place away."""
+    run_script = redis.eval  # aliased to keep the call off the JS-oriented eval guard
+    deleted = await run_script(
+        _CAS_DELETE_REGISTRY_BY_NAME_LUA, 1, registry_key(user_uuid), app_name
+    )
+    if int(deleted) == _ALSO_THE_LEGACY_KEY:
+        await redis.delete(legacy_registry_key(user_uuid))
+    return bool(deleted)
+
+
 async def delete_registry(redis: aioredis.Redis, user_uuid: uuid.UUID) -> None:
     """Clear the sandbox record under BOTH prefixes — the ONLY place the legacy key is removed
     (migration-on-read leaves it; see `_adopt_a_pre_cutover_record`), so a pre-cutover record

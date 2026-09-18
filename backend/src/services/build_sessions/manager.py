@@ -97,6 +97,7 @@ from src.services.build_sessions.locks import (
     clear_serving,
     clear_starting_marker,
     delete_registry,
+    delete_registry_if_it_still_names,
     elapsed_ms,
     grant_stay_of_execution,
     liveness_lease_is_held,
@@ -4931,7 +4932,16 @@ class SessionManager:
                                 session_id=str(session.session_id),
                             )
                     try:
-                        await delete_registry(redis, session.user_id)
+                        # BY NAME, for the same reason `_release_the_slot_if_still_ours` below
+                        # exists. A switch hands the outgoing container over and starts the
+                        # incoming project at once, so this session reaches its ending well
+                        # after the incoming one has written its own record into the one
+                        # per-user key. Deleting by user id alone takes that record away and
+                        # leaves the incoming container running with nothing able to find it —
+                        # invisible to a sweep that walks the registry namespace.
+                        await delete_registry_if_it_still_names(
+                            redis, session.user_id, session.handle.app_name
+                        )
                     except Exception:
                         _log.exception(
                             "registry delete failed in finalize",

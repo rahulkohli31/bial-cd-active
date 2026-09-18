@@ -410,3 +410,40 @@ async def test_the_presence_script_keeps_the_longer_standing_deadline_on_its_own
     assert kept == f"renewed:{longer}"
     standing, _ = await _stay(fake_redis)
     assert standing == datetime.fromisoformat(longer)
+
+
+async def test_a_late_session_cannot_delete_the_record_that_replaced_its_own(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ THE ORPHAN A PROJECT SWITCH USED TO LEAVE, reproduced at the primitive that caused it.
+
+    One key holds whichever container this citizen's single workspace is running. A switch
+    replaces its contents while the outgoing session is still unwinding, so the outgoing session
+    reaches its own ending AFTER the incoming project has registered. Deleting by user id alone
+    takes the incoming record away, and the incoming container keeps running with nothing left
+    that names it — invisible to a sweep that walks the registry namespace, and billing until
+    somebody deletes it by hand. Observed live before this guard existed.
+
+    Mutation check: call the unguarded `delete_registry` here instead and this goes red."""
+    await _register(fake_redis)  # the record names "sbx-x" — the OUTGOING container
+
+    # the incoming project registers its own container into the same per-user key
+    await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_APP_NAME, "sbx-incoming")
+
+    deleted = await locks.delete_registry_if_it_still_names(fake_redis, USER, "sbx-x")
+
+    assert deleted is False, "the outgoing session claimed a record that was no longer its own"
+    reg = await fake_redis.hgetall(registry_key(USER))
+    assert _text(reg.get(REGISTRY_FIELD_APP_NAME)) == "sbx-incoming"
+
+
+async def test_the_guarded_delete_still_clears_a_record_that_is_genuinely_its_own(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The other half: guarding must not turn the ordinary ending into a leak of its own."""
+    await _register(fake_redis)
+
+    deleted = await locks.delete_registry_if_it_still_names(fake_redis, USER, "sbx-x")
+
+    assert deleted is True
+    assert await fake_redis.exists(registry_key(USER)) == 0
