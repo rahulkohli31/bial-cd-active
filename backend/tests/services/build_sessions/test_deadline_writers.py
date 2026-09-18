@@ -394,7 +394,7 @@ async def test_the_presence_script_keeps_the_longer_standing_deadline_on_its_own
     route-level renewal test that has a live caller in front of it stays green."""
     await _register(fake_redis)
     longer = (datetime.now(UTC) + timedelta(hours=9)).isoformat(timespec="microseconds")
-    await fake_redis.hset(registry_key(USER), locks.REGISTRY_FIELD_PREVIEW_STAY_UNTIL, longer)
+    await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_PREVIEW_STAY_UNTIL, longer)
     shorter = (datetime.now(UTC) + timedelta(minutes=5)).isoformat(timespec="microseconds")
 
     answer = await fake_redis.eval(

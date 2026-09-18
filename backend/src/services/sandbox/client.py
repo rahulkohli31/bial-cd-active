@@ -897,13 +897,22 @@ class AcaSandboxClient(SandboxClient):
         # would have to re-read the key to learn what this write just put there.
         return inherited | {REGISTRY_FIELD_SERVING_SINCE: first_served_at}
 
-    async def _delete_registry(self, user_uuid: uuid.UUID) -> None:
-        """Clear the record under BOTH prefixes — the only place the legacy key is removed, since
-        migration-on-read deliberately leaves it. Two single-key DELs, not one two-key `DEL`:
-        the keys hash to different slots and a multi-key command is rejected on a clustered
-        Redis."""
-        await get_redis().delete(registry_key(user_uuid))
-        await get_redis().delete(legacy_registry_key(user_uuid))
+    async def _delete_registry(self, user_uuid: uuid.UUID, app_name: str) -> bool:
+        """Clear the record under BOTH prefixes, but ONLY while it still names `app_name`.
+
+        OWNING THE NAME IS NOT OWNING THE RECORD. `_app_owners` answers "did this process start a
+        container called this?", and that was the only thing asked here — but the record is keyed
+        by USER and holds whichever container that citizen's single workspace is running now. A
+        switch replaces its contents while the outgoing container is still being torn down, so
+        deleting by user id alone takes the INCOMING container's record and leaves it running with
+        nothing that names it, invisible to a sweep that walks the registry namespace. Asking by
+        name is what makes a late teardown unable to disown a live container.
+
+        Two single-key DELs, not one two-key `DEL`: the keys hash to different slots and a
+        multi-key command is rejected on a clustered Redis."""
+        from src.services.build_sessions.locks import delete_registry_if_it_still_names
+
+        return await delete_registry_if_it_still_names(get_redis(), user_uuid, app_name)
 
     # --- token_ref map -------------------------------------------------------
 
@@ -1354,7 +1363,7 @@ class AcaSandboxClient(SandboxClient):
             # that was probably still running. `teardown()` below has always had this right.
             torn_down = await self._safe_teardown(app_name)
             if torn_down:
-                await self._delete_registry(user_uuid)
+                await self._delete_registry(user_uuid, app_name)
             else:
                 _log.error(
                     "restore_cleanup_left_registry_for_the_reaper",
@@ -1383,7 +1392,7 @@ class AcaSandboxClient(SandboxClient):
         owner = self._app_owners.pop(handle.app_name, None)
         if owner is not None:
             try:
-                await self._delete_registry(owner)
+                await self._delete_registry(owner, handle.app_name)
             except RedisError as exc:
                 # The ACA delete already succeeded — only the coordination-state cleanup
                 # failed. Re-label it to this method's SandboxError-only failure contract

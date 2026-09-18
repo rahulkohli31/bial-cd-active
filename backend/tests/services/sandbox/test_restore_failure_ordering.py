@@ -99,8 +99,12 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
                 return None
             return {"app_name": existing_app, "fqdn": "old.fqdn", "token_ref": "ref"}
 
-        async def _delete_registry(user_uuid: uuid.UUID) -> None:
-            calls["delete_registry"].append(user_uuid)
+        async def _delete_registry(user_uuid: uuid.UUID, app_name: str) -> bool:
+            # BOTH ARGUMENTS ARE RECORDED. The name is what makes the delete refuse a record a
+            # switch has already replaced, so a stub that swallowed it would leave the guard
+            # untestable from here.
+            calls["delete_registry"].append((user_uuid, app_name))
+            return True
 
         async def _write_registry(user_uuid: uuid.UUID, **kwargs: Any) -> None:
             calls["write_registry"].append(kwargs.get("app_name"))
@@ -161,9 +165,11 @@ async def test_a_confirmed_teardown_does_drop_the_ownership_record(wired: Any) -
         )
 
     assert aca.deleted, "the teardown was never attempted"
-    assert calls["delete_registry"] == [_USER], (
+    assert calls["delete_registry"] == [(_USER, _NEW_APP)], (
         "ARM confirmed the container is gone, so the record must be cleared — leaving it "
-        "behind would 409 the builder's next start against a container that does not exist"
+        "behind would 409 the builder's next start against a container that does not exist. "
+        "It must be cleared BY NAME: a delete keyed only by user takes whatever record a "
+        "concurrent switch has since written, orphaning that container."
     )
 
 

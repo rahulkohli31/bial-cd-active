@@ -8,7 +8,6 @@ the tests here are as much about what is NOT written as about what is.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
