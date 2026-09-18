@@ -16,10 +16,12 @@ from collections.abc import AsyncIterator
 
 import pytest
 import redis.asyncio as aioredis
+import sqlalchemy as sa
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
+from src.db.models.message import Message
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.manager import (
@@ -28,6 +30,7 @@ from src.services.build_sessions.manager import (
     VersionNotOfferedError,
 )
 from src.services.build_sessions.versions import most_recent
+from src.services.messages.projection import WORKSPACE_ROLLED_BACK_KIND
 from src.services.sandbox import ExecResult, SandboxHandle
 from src.services.sandbox.base import SandboxError
 from src.services.sandbox.config import SandboxConfig
@@ -38,7 +41,12 @@ from src.services.storage import (
     snapshot_key,
 )
 from src.services.storage.bundle import parse_bundle_head_sha
-from tests.factories import ProjectFactory, UserFactory
+from tests.factories import (
+    ConversationFactory,
+    MessageFactory,
+    ProjectFactory,
+    UserFactory,
+)
 from tests.fakes import DevServerDownUntilStarted, FakeStorage, a_git_bundle
 
 FIRST = "1" * 40
@@ -314,3 +322,53 @@ async def test_a_rollback_is_refused_while_a_conversation_holds_the_workspace(
             sandbox_client=client,
             conversation_id=None,
         )
+
+
+async def test_the_line_a_rollback_leaves_names_the_version_the_citizen_chose(
+    db_session: AsyncSession,
+    manager: SessionManager,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+) -> None:
+    """★ THE STORED LINE CARRIES THE VERSION'S OWN TWO FACTS, and it is the only place they can
+    come from. A version's save date and the citizen's words for it live in the ROW; the bundle
+    knows neither. A note dated off the blob's metadata and carrying no description renders, on
+    every later reload, as a rollback to an unnamed version saved at the wrong moment — while the
+    live insert the page makes reads correctly, so the two disagree the moment anyone refreshes.
+
+    Mutation receipt: drop `describes` from the rollback's `_note_the_discard` call and the stored
+    row loses the description and is dated by the parked bundle instead of by the version.
+    """
+    user, project_id, app_id, client = await _two_saved_versions(
+        db_session, manager, "rb-note@rvaiglobal.com"
+    )
+    conversation = await ConversationFactory.create(db_session, user.id, project_id=project_id)
+    await MessageFactory.create(db_session, user.id, conversation_id=conversation.id, seq=0)
+    older = (await most_recent(db_session, user_id=user.id, app_id=app_id))[-1]
+
+    outcome = await manager.rollback_to_version(
+        db_session,
+        user,
+        project_id,
+        version_id=older.id,
+        sandbox_client=client,
+        conversation_id=conversation.id,
+    )
+
+    assert conversation.id in outcome.notes
+    stored = (
+        await db_session.execute(
+            sa.select(Message)
+            .where(Message.conversation_id == conversation.id)
+            .order_by(Message.seq.desc())
+            .limit(1)
+        )
+    ).scalar_one()
+    meta = stored.meta
+    assert meta is not None
+    assert meta["kind"] == WORKSPACE_ROLLED_BACK_KIND
+    assert meta["description"] == "First working version"
+    assert meta["savedAt"] == older.saved_at.isoformat()
+    # And the answer the page inserts without a reload carries the same two facts, so the live
+    # line and the reloaded one cannot disagree.
+    assert outcome.description == "First working version"

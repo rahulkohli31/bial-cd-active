@@ -139,6 +139,7 @@ from src.services.build_sessions.snapshot import (
     write_recovery_copy,
     write_snapshot,
 )
+from src.services.build_sessions.versions import Version
 from src.services.build_sessions.versions import by_id as version_by_id
 from src.services.build_sessions.versions import record as record_version
 from src.services.lake.copy import schedule_window_copy
@@ -710,6 +711,9 @@ class RollbackOutcome:
 
     state: SaveState
     saved_at: datetime | None
+    #: What the citizen called the restored version, carried so the line the page inserts
+    #: without a reload reads exactly as the stored one a reload would render.
+    description: str | None
     version_id: uuid.UUID
     notes: dict[uuid.UUID, int]
 
@@ -1080,16 +1084,24 @@ async def _note_the_discard(
     saved: SavedVersion,
     note: str | None = None,
     meta_kind: str = WORKSPACE_DISCARDED_KIND,
+    describes: Version | None = None,
 ) -> dict[uuid.UUID, int]:
     """Write the discard note into the conversation it came from and into every other one of the
     project that spoke since the save; return each note's seq by conversation id.
 
     Owner- and project-scoped, so an origin from anywhere else matches nothing. A conversation
     whose seq cannot be allocated goes without: the discard has already happened, and failing it
-    now would tell the user their changes are still there."""
+    now would tell the user their changes are still there.
+
+    `describes` is the ROW a rollback restored, and it is what the stored line is dated and named
+    by. A discard passes none and is dated by the bundle's own metadata — but a version's save
+    date and the citizen's words for it live in the row, and a reloaded transcript that read them
+    off the blob would show the restored line undated and unnamed.
+    """
+    dated_at = describes.saved_at if describes is not None else saved.saved_at
     spoke = sa.exists().where(Message.conversation_id == Conversation.id)
-    if saved.saved_at is not None:
-        spoke = spoke.where(Message.created_at > saved.saved_at)
+    if dated_at is not None:
+        spoke = spoke.where(Message.created_at > dated_at)
     told = [spoke] if origin is None else [spoke, Conversation.id == origin]
     conversations = (
         await db.execute(
@@ -1113,8 +1125,9 @@ async def _note_the_discard(
                 kind=kind,
                 meta={
                     "kind": meta_kind,
-                    "savedAt": saved.saved_at.isoformat() if saved.saved_at else None,
+                    "savedAt": dated_at.isoformat() if dated_at else None,
                     "savedHead": saved.head_sha,
+                    **({"description": describes.description} if describes is not None else {}),
                 },
             )
         except SeqContentionError:
@@ -2161,6 +2174,7 @@ class SessionManager:
             saved=restored,
             note=_rollback_note(version.saved_at, version.description),
             meta_kind=WORKSPACE_ROLLED_BACK_KIND,
+            describes=version,
         )
         _log.info(
             "workspace_rolled_back",
@@ -2174,6 +2188,7 @@ class SessionManager:
         return RollbackOutcome(
             state=state,
             saved_at=version.saved_at,
+            description=version.description,
             version_id=minted.id,
             notes=notes,
         )

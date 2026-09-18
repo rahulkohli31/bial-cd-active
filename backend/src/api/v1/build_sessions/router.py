@@ -839,11 +839,18 @@ class DiscardNotice(CamelModel):
     saved_at: datetime | None = None
 
 
+class RollbackNotice(DiscardNotice):
+    """A discard's notice plus the restored version's description, so the line the page inserts
+    without a reload carries the same two facts the stored row does."""
+
+    description: str | None = None
+
+
 class RollbackResponse(SaveStateResponse):
     """The save state after a rollback, plus the note written into the conversation it came
     from — `None` when it came from outside one, exactly as a discard answers."""
 
-    notice: DiscardNotice | None = None
+    notice: RollbackNotice | None = None
     #: The version the rollback minted. Nothing was destroyed to make it: the restored content
     #: becomes current and what it replaced becomes previous.
     version_id: str | None = None
@@ -1078,7 +1085,11 @@ async def rollback_project(
     seq = outcome.notes.get(body.conversation_id) if body.conversation_id is not None else None
     return RollbackResponse(
         **_save_state_fields(outcome.state),
-        notice=DiscardNotice(seq=seq, saved_at=outcome.saved_at) if seq is not None else None,
+        notice=(
+            RollbackNotice(seq=seq, saved_at=outcome.saved_at, description=outcome.description)
+            if seq is not None
+            else None
+        ),
         version_id=str(outcome.version_id),
     )
 
