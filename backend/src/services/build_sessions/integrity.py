@@ -29,7 +29,7 @@ import sqlalchemy as sa
 import structlog
 from sqlalchemy.exc import SQLAlchemyError
 
-from src.core.integrity_types import BaselineIdentity
+from src.core.integrity_types import BaselineIdentity, BaselineUnanswerable
 from src.core.integrity_types import WorkspaceState as WorkspaceState
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
 from src.services.storage import (
@@ -137,6 +137,32 @@ def parse_baseline_identity(stdout: str) -> BaselineIdentity:
     return BaselineIdentity.DIVERGED
 
 
+def parse_why_unanswerable(stdout: str) -> BaselineUnanswerable | None:
+    """WHICH of the structural causes made the serving question unanswerable, or `None` when it
+    was answered.
+
+    A sibling parse rather than a second return value from `parse_baseline_identity`, for the same
+    reason the history question is parsed beside it: that function answers one thing and returns a
+    three-value enum, and a caller that only wants the answer should not have to unpack a cause it
+    will not read. One exec, two pure parses over the same body.
+
+    It deliberately re-derives rather than sharing a branch chain with its sibling: the two are
+    pinned against each other by test, and a shared chain would let a change to the answer move
+    the cause silently.
+    """
+    roots_text, _, rest = stdout.partition("@@")
+    baseline_text, _, rest = rest.partition("@@")
+    _, _, rest = rest.partition("@@")
+    subject_text, _, _ = rest.partition("@@")
+    if len([line for line in roots_text.split() if line]) != 1:
+        return BaselineUnanswerable.NO_SINGLE_ROOT
+    if subject_text.strip() != BASELINE_COMMIT_SUBJECT:
+        return BaselineUnanswerable.ROOT_IS_NOT_OURS
+    if not baseline_text.strip():
+        return BaselineUnanswerable.BASELINE_MISSING
+    return None
+
+
 async def baseline_identity(
     sandbox_client: SandboxClient, handle: SandboxHandle
 ) -> BaselineIdentity:
@@ -144,16 +170,41 @@ async def baseline_identity(
 
     One exec, bounded, and it never raises: every failure is `UNANSWERABLE`, because a probe that
     could throw would make the health verdict fail a build for a supervisor blip."""
+    stdout = await _run_the_baseline_probe(sandbox_client, handle)
+    if stdout is None:
+        return BaselineIdentity.UNANSWERABLE
+    return parse_baseline_identity(stdout)
+
+
+async def why_unanswerable(
+    sandbox_client: SandboxClient, handle: SandboxHandle
+) -> BaselineUnanswerable | None:
+    """The same question as `baseline_identity`, asked for its CAUSE rather than its answer.
+
+    `PROBE_FAILED` is the transport half and is the one cause a retry can change - it is produced
+    here rather than in the parse because the parse never sees a body at all in that case.
+    """
+    stdout = await _run_the_baseline_probe(sandbox_client, handle)
+    if stdout is None:
+        return BaselineUnanswerable.PROBE_FAILED
+    return parse_why_unanswerable(stdout)
+
+
+async def _run_the_baseline_probe(
+    sandbox_client: SandboxClient, handle: SandboxHandle
+) -> str | None:
+    """One bounded exec of `_BASELINE_SCRIPT`. `None` when it could not be run or came back
+    non-zero, which both parses read as "this container cannot answer"."""
     run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
     try:
         result = await run_command(handle, ["sh", "-c", _BASELINE_SCRIPT], timeout_s=30)
     except SandboxError:
         _log.warning("baseline_identity_probe_failed", app=handle.app_name, exc_info=True)
-        return BaselineIdentity.UNANSWERABLE
+        return None
     if result.exit != 0:
         _log.warning("baseline_identity_probe_nonzero", app=handle.app_name, exit_code=result.exit)
-        return BaselineIdentity.UNANSWERABLE
-    return parse_baseline_identity(result.stdout)
+        return None
+    return result.stdout
 
 
 # THE AGENT'S LAST CHANGE, as the container sees it.

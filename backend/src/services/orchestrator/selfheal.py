@@ -22,7 +22,7 @@ from typing import Final
 import structlog
 
 from src.api.v1.build_sessions.schemas import BuildError
-from src.core.integrity_types import BaselineIdentity
+from src.core.integrity_types import BaselineIdentity, BaselineUnanswerable
 from src.services.orchestrator.client_errors import ClientErrorReport, drain_client_errors
 from src.services.orchestrator.constants import (
     EXEC_TIMEOUT_S,
@@ -551,6 +551,15 @@ async def _ask_the_container_what_it_is_showing(
     return await baseline_identity(sandbox_client, handle)
 
 
+async def _ask_the_container_why_it_could_not_say(
+    sandbox_client: SandboxClient, handle: SandboxHandle
+) -> BaselineUnanswerable | None:
+    """`integrity.why_unanswerable`, reached the same deferred way and for the same reason."""
+    from src.services.build_sessions.integrity import why_unanswerable
+
+    return await why_unanswerable(sandbox_client, handle)
+
+
 async def _verify_once(
     sandbox_client: SandboxClient,
     handle: SandboxHandle,
@@ -630,6 +639,9 @@ async def _verify_once(
     # opposite case: ready is TRUE, `tsc` is clean, and the page is still blank.
     served: ServedPage | None = None
     baseline: BaselineIdentity | None = None
+    # Only read when the baseline question came back unanswerable, because only then does the
+    # reason change what the verdict does — it costs a second exec and buys nothing otherwise.
+    why_unanswerable: BaselineUnanswerable | None = None
     if dev_ready:
         # ONE request does both jobs. It is the same GET at the same URL `someone_has_to_go_first`
         # used to make from here — so the route still gets requested and Next still emits its `⨯`
@@ -656,6 +668,12 @@ async def _verify_once(
         # the attach path already holds (see `integrity.has_ever_been_built`).
         if had_prior_building_turns:
             baseline = await _ask_the_container_what_it_is_showing(sandbox_client, handle)
+            if baseline is BaselineIdentity.UNANSWERABLE:
+                # ASKED ONLY WHEN IT COULD NOT ANSWER, so the ordinary verdict still costs one
+                # exec. Which cause it was decides whether this check keeps its veto.
+                why_unanswerable = await _ask_the_container_why_it_could_not_say(
+                    sandbox_client, handle
+                )
 
     logs = await _try_try_again(lambda: sandbox_client.dev_logs(handle, since=log_cursor))
     # Bound the tail fed to crash detection + redaction: a single unbounded dev-log blob must not
@@ -766,11 +784,20 @@ async def _verify_once(
             else served_badly_error(served.status)
         )
     elif baseline is BaselineIdentity.UNANSWERABLE:
-        # No root commit, more than one, or a baseline the repository never held. Never UNHEALTHY
-        # and never HEALTHY: an app cannot be convicted of showing the template by a check that
-        # could not find the template, and it cannot be cleared by one either.
-        state = HealthState.INDETERMINATE
-        unanswered = Unanswered.BASELINE
+        if why_unanswerable is BaselineUnanswerable.ROOT_IS_NOT_OURS:
+            # ADVISORY, AND ONLY THIS CAUSE. A root carrying someone else's subject is a fact
+            # about the repository, not about the app: there is no birth certificate to compare
+            # against, so this check has nothing to say either way. Every other signal above has
+            # already spoken, and one that cannot answer does not get to overrule six that did.
+            pass
+        else:
+            # Every other cause keeps its veto. `NO_SINGLE_ROOT` is the one that matters: it is
+            # indistinguishable from a container reverted to its baked image, and a reverted
+            # container serving the untouched template is green on all six other signals exactly
+            # when the app is most broken. Waving it through would print a completion claim over
+            # a blank starter page.
+            state = HealthState.INDETERMINATE
+            unanswered = Unanswered.BASELINE
     elif baseline is BaselineIdentity.STILL_THE_BASELINE:
         # The content half. Every server-side check above came back clean and the citizen is
         # looking at the golden template.

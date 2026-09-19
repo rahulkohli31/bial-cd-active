@@ -13,7 +13,7 @@ import uuid
 import pytest
 from sqlalchemy.exc import OperationalError
 
-from src.core.integrity_types import BaselineIdentity
+from src.core.integrity_types import BaselineIdentity, BaselineUnanswerable
 from src.db.models.harness_counter import HarnessCounter
 from src.services.build_sessions.counters import count
 from src.services.build_sessions.integrity import (
@@ -24,6 +24,7 @@ from src.services.build_sessions.integrity import (
     baseline_identity,
     has_ever_been_built,
     parse_baseline_identity,
+    parse_why_unanswerable,
     stamp_the_watermark,
 )
 from src.services.sandbox import SandboxError
@@ -247,3 +248,62 @@ async def test_a_broken_query_is_raised_rather_than_read_as_never_built(
 
     with pytest.raises(AttributeError):
         await has_ever_been_built(_APP)
+
+
+# --- the cause beside the answer, pinned against it -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("@@@@", BaselineUnanswerable.NO_SINGLE_ROOT),
+        ("", BaselineUnanswerable.NO_SINGLE_ROOT),
+        (
+            f"{BASELINE_ROOT_SHA}\n{'b' * 40}@@{'c' * 40}@@{'d' * 40}@@{SEEDED_SUBJECT}",
+            BaselineUnanswerable.NO_SINGLE_ROOT,
+        ),
+        (
+            f"{BASELINE_ROOT_SHA}@@{'c' * 40}@@{'d' * 40}@@not our subject",
+            BaselineUnanswerable.ROOT_IS_NOT_OURS,
+        ),
+        (
+            f"{BASELINE_ROOT_SHA}@@@@{'d' * 40}@@{SEEDED_SUBJECT}",
+            BaselineUnanswerable.BASELINE_MISSING,
+        ),
+    ],
+)
+def test_each_unanswerable_body_names_its_own_cause(
+    stdout: str, expected: BaselineUnanswerable
+) -> None:
+    """One cause per body, and the distinction the health verdict turns on.
+
+    `ROOT_IS_NOT_OURS` is the only one that may be waved through when every other signal is green;
+    every other cause keeps its veto. A body that reported the wrong cause would either hand a
+    completion claim to a reverted container or keep failing builds the plan exists to stop
+    failing, so the mapping is asserted per body rather than in aggregate.
+    """
+    assert parse_why_unanswerable(stdout) is expected
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "@@@@",
+        "",
+        f"{BASELINE_ROOT_SHA}\n{'b' * 40}@@{'c' * 40}@@{'d' * 40}@@{SEEDED_SUBJECT}",
+        f"{BASELINE_ROOT_SHA}@@{'c' * 40}@@{'d' * 40}@@not our subject",
+        f"{BASELINE_ROOT_SHA}@@@@{'d' * 40}@@{SEEDED_SUBJECT}",
+        BASELINE_UNTOUCHED_STDOUT,
+        BASELINE_DIVERGED_STDOUT,
+    ],
+)
+def test_the_two_parses_never_disagree_about_whether_it_was_answered(stdout: str) -> None:
+    """THE PIN THAT EARNS THE SECOND PARSE. `parse_why_unanswerable` re-derives the branch chain
+    rather than sharing one, so that a change to the ANSWER cannot move the CAUSE silently — and
+    this is what makes that duplication safe rather than a second source of truth.
+
+    A cause reported for a body that was answered would make a healthy app advisory; an answered
+    body with no cause would crash the verdict arm that reads it.
+    """
+    unanswered = parse_baseline_identity(stdout) is BaselineIdentity.UNANSWERABLE
+    assert (parse_why_unanswerable(stdout) is not None) is unanswered

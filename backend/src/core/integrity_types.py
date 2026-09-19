@@ -37,6 +37,37 @@ class BaselineIdentity(enum.StrEnum):
     UNANSWERABLE = "unanswerable"
 
 
+class BaselineUnanswerable(enum.StrEnum):
+    """WHY the serving question could not be answered, which decides what the verdict does next.
+
+    `UNANSWERABLE` alone cannot carry that decision: one of these causes may be waved through when
+    every other signal is green, and one of them must never be. Folding them into a single value
+    is what let a probe that could not answer fail a build six other checks agreed was healthy.
+
+    Only `ROOT_IS_NOT_OURS` may become advisory. A root carrying someone else's subject means
+    there is no birth certificate to compare against — that is a fact about the REPOSITORY, not
+    about the app, and it cannot convict a working app of showing the starter page.
+
+    `NO_SINGLE_ROOT` must fail closed however green the rest looks, and the reason is the whole
+    care in this enum: it is indistinguishable from a container reverted to its baked image, and a
+    reverted container serving the untouched template compiles, serves 200, logs no crash and
+    reports no browser error. All six other signals are green exactly when the app is most broken,
+    so waving this one through would print a completion claim over a blank starter page — a false
+    SUCCESS, which is worse than the false failure this work removes.
+    """
+
+    #: The exec did not come back. Transient: a supervisor blip is not a fact about the app, and a
+    #: retry can change the answer.
+    PROBE_FAILED = "probe_failed"
+    #: The root commit is not the seeded template's. Structural, and the one advisory cause.
+    ROOT_IS_NOT_OURS = "root_is_not_ours"
+    #: No root commit, or more than one. Structural, and fails closed.
+    NO_SINGLE_ROOT = "no_single_root"
+    #: The root exists and never held the root route. Structural, and fails closed: clearing an app
+    #: on the strength of a missing file is the same completion claim by another route.
+    BASELINE_MISSING = "baseline_missing"
+
+
 class WorkspaceState(enum.StrEnum):
     """Whether this container still holds the app it is supposed to hold."""
 
