@@ -13,11 +13,9 @@
 import { listDate } from '../../utils/projectDates'
 import { COLUMN } from '../../utils/listView'
 import type { Project } from '../../utils/projectApi'
-import type { ActivityPhase } from '../../utils/buildSessionApi'
 import AppListRow from './AppListRow'
 import AppStatusBadge from './AppStatusBadge'
 import AppRowMenu from './AppRowMenu'
-import AppActivityMarker from './AppActivityMarker'
 
 export interface ProjectRowProps {
   project: Project
@@ -25,14 +23,12 @@ export interface ProjectRowProps {
   onSettings: () => void
   /** Starting, open, or closing down right now — `undefined` when the platform is not holding a
    *  container for this project, which is the ordinary case and draws no marker at all. */
-  activityPhase?: ActivityPhase
 }
 
 export default function ProjectRow({
   project,
   onOpen,
   onSettings,
-  activityPhase,
 }: ProjectRowProps): React.JSX.Element {
   return (
     <AppListRow
@@ -41,7 +37,7 @@ export default function ProjectRow({
       description={project.description}
       onOpen={onOpen}
       marker={
-        activityPhase ? <AppActivityMarker phase={activityPhase} live={project.isServing} /> : undefined
+        undefined
       }
       columns={
         <>

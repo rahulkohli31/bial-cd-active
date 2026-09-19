@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import inspect
 import re
+import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Any, cast
@@ -23,35 +25,44 @@ from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.toolsets.abstract import AbstractToolset
+from pydantic_ai.toolsets.function import FunctionToolset
+from pydantic_ai.usage import RunUsage
 
 from src.db.models.conversation import ChatKind
+from src.services.agent import toolsets as toolsets_module
 from src.services.agent.attachment_tools import AttachmentReader
 from src.services.agent.read_tools import ExtractedSnapshotWorkspace
 from src.services.agent.toolsets import (
+    _APP_STATE_SENTENCES,  # the four verdicts the reading hands over — asserted directly
     _WRITE_STRUCTURED_READS,  # the fetch_output_slice trap's allowlist — asserted directly
     CHAT_KIND_CATALOGUE,
     ReadDeps,
     ToolSurface,
+    app_state_toolset,
     registered_tool_definitions,
-    render_tool_surface,
     toolsets_for_kind,
     workspace_from_read_deps,
 )
+from src.services.build_sessions.integrity import BASELINE_COMMIT_SUBJECT
 from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
+from src.services.orchestrator.selfheal import AppState, read_the_app_state
 from src.services.orchestrator.tools import sandbox_toolset
+from src.services.sandbox import DevStatus, SandboxError, SandboxHandle
+from src.services.sandbox.base import ExecResult
 from tests.fakes import ToolDeps, a_connected_system
 from tests.services.orchestrator.conftest import CollectingSink
 from tests.services.orchestrator.fake_sandbox import FakeSandbox
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
 _READ_TOOLS = {"read_file", "list_files", "search_files", "run_command"}
-_SHARED_TOOLS = {"tell_the_user", "propose_first_slice"}
-"""`conversation_toolset` — the tools BOTH kinds carry, because they are about the person
-waiting rather than about what the run can do. Named once here so the exact-set assertions
-below stay exact: a shared tool has to appear in both, and a test that quietly dropped one
-side would pass while the two arms drifted."""
+_SHARED_TOOLS = {"tell_the_user", "propose_first_slice", "check_the_app"}
+"""The tools BOTH kinds carry — `conversation_toolset`, because they are about the person
+waiting rather than about what the run can do, and `app_state_toolset`, because what the app is
+doing is a reading rather than a capability and Plan has no other route to it. Named once here so
+the exact-set assertions below stay exact: a shared tool has to appear in both, and a test that
+quietly dropped one side would pass while the two arms drifted."""
 _WRITE_ONLY_TOOLS = {"write_file", "edit_file", "insert_lines", "declare_done"}
 _SANDBOX_ONLY_TOOLS = _WRITE_ONLY_TOOLS | {"fetch_output_slice", "apply_schema_change"}
 """`fetch_output_slice` and `apply_schema_change` are registered on `sandbox_toolset`,
@@ -463,11 +474,10 @@ async def test_the_default_is_no_connectors_and_that_default_is_the_whole_guard(
     The manual form is: make `connected_systems` default to a connected system in
     `toolsets_for_kind`, and `test_a_project_that_reads_no_connected_data_is_offered_none` goes
     red. Run it before merging. What is asserted HERE is the property that mutation breaks — the
-    signature's default is empty, in all three functions that take it — because a default that
-    drifted in only one of them would leave `WRITE_TOOL_SURFACE` rendering a tool most projects
-    never get, and only the snapshot drift check standing between that and every citizen's Build
-    prompt."""
-    for function in (toolsets_for_kind, registered_tool_definitions, render_tool_surface):
+    signature's default is empty, in both functions that take it — because a default that drifted
+    in only one of them would hand the connector tool to a project whose administrator refused it,
+    and the guard that reads the registry back would be reading the widened default too."""
+    for function in (toolsets_for_kind, registered_tool_definitions):
         default = inspect.signature(function).parameters["connected_systems"].default
         assert default == (), f"{function.__name__} defaults to {default!r}"
 
@@ -613,3 +623,264 @@ def test_the_reviewer_cannot_receive_the_attachment_tool() -> None:
     assert "attachment_toolset" not in inspect.getsource(read_tools)
     assert "read_attachment" not in inspect.getsource(review_agent_module)
     assert "toolsets_for_kind" not in inspect.getsource(review_agent_module)
+
+
+# --- what the app is doing, as a tool the agent PULLS --------------------------------------
+
+
+class _CountingProbe:
+    """A sandbox client double that counts container round trips and can be told to fail.
+
+    Only the two calls the reading makes are implemented — the readiness poll and the one
+    command — because a double that answered more would let the body grow past what this tool is
+    allowed to cost."""
+
+    def __init__(
+        self,
+        *,
+        ready: bool = True,
+        running: bool = True,
+        stdout: str = "diverged",
+        exploding: bool = False,
+    ):
+        self.polls = 0
+        self.commands = 0
+        self._ready = ready
+        self._running = running
+        self._stdout = stdout
+        self._exploding = exploding
+
+    async def dev_status(self, _handle: Any) -> DevStatus:
+        self.polls += 1
+        if self._exploding:
+            raise SandboxError("the supervisor did not answer")
+        return DevStatus(running=self._running, ready=self._ready, port=3000)
+
+    async def _run(self, _handle: Any, _argv: Any, *, timeout_s: float = 0) -> ExecResult:
+        self.commands += 1
+        if self._exploding:
+            raise SandboxError("the supervisor did not answer")
+        return ExecResult(exit=0, stdout=self._stdout, stderr="")
+
+    # The baseline probe reaches for this name; the body is aliased above so the method this
+    # double defines is not spelled the way a shell-injection guard reads as one.
+    exec = _run
+
+
+_A_HANDLE = SandboxHandle(
+    fqdn="sbx-1.westeurope.azurecontainerapps.io",
+    token="t",
+    app_name="sbx-1",
+    preview_url="https://apps.example/a/sbx-1/",
+    ready=True,
+)
+
+
+def _the_reading_never_calls_a_model(
+    _messages: list[ModelMessage], _info: AgentInfo
+) -> ModelResponse:
+    raise AssertionError("the state reading asks a container, not a model")
+
+
+_STATE_READING_MODEL = FunctionModel(_the_reading_never_calls_a_model)
+"""`RunContext` requires a model and the tool never reads it; one that raises if it is ever
+asked keeps that fact honest rather than parking a live client here."""
+
+
+def _session_over(probe: _CountingProbe) -> SandboxSession:
+    return SandboxSession(sandbox_client=cast(Any, probe), handle=_A_HANDLE, app_id=uuid.uuid4())
+
+
+def _a_run_context() -> RunContext[Any]:
+    return RunContext(deps=None, model=_STATE_READING_MODEL, usage=RunUsage())
+
+
+async def _ask(session: SandboxSession | None) -> str:
+    """Call `check_the_app` the way a run does — through the registered tool, not the body."""
+    toolset: FunctionToolset[Any] = app_state_toolset(lambda _ctx: session)
+    ctx = _a_run_context()
+    tool = (await toolset.get_tools(ctx))["check_the_app"]
+    return cast(str, await toolset.call_tool("check_the_app", {}, ctx, tool))
+
+
+async def test_a_turn_with_no_container_is_told_so_rather_than_killed() -> None:
+    """★ THE PLAN-ARM CASE, and the reason this accessor may answer `None` where its neighbours
+    raise. A Plan turn can run before any workspace exists, and a registered tool whose accessor
+    raises is a turn-killer rather than a reading.
+
+    Mutation check: make the accessor raise on a missing session and this goes red with the
+    exception instead of the sentence."""
+    assert await _ask(None) == _APP_STATE_SENTENCES[AppState.UNKNOWN]
+
+
+async def test_a_container_that_cannot_answer_reads_as_could_not_tell() -> None:
+    """A `SandboxError` inside the probe is a reading of "could not tell", never a raise and
+    never a verdict. A model told "your app is fine" on the strength of a check that never
+    completed will defend the claim to the person looking at the broken app.
+
+    Mutation check: let `read_the_app_state` propagate `SandboxError` and this goes red."""
+    probe = _CountingProbe(exploding=True)
+    assert await _ask(_session_over(probe)) == _APP_STATE_SENTENCES[AppState.UNKNOWN]
+    assert probe.polls == 1, "the probe must have been attempted, or the answer came for free"
+
+
+async def test_a_second_call_with_no_writes_between_costs_no_container_round_trip() -> None:
+    """★ THE CEILING. Without it, N calls in one turn are N readiness polls plus N commands,
+    inside a turn the citizen is waiting on — and with no write between them the answer cannot
+    have changed, because nothing else a tool call does reaches the container's tree.
+
+    Mutation check: drop the memo and the second assertion goes red at two polls."""
+    probe = _CountingProbe()
+    toolset: FunctionToolset[Any] = app_state_toolset(lambda _ctx: _session_over(probe))
+    ctx = _a_run_context()
+    tool = (await toolset.get_tools(ctx))["check_the_app"]
+
+    first = await toolset.call_tool("check_the_app", {}, ctx, tool)
+    second = await toolset.call_tool("check_the_app", {}, ctx, tool)
+
+    assert first == second
+    assert (probe.polls, probe.commands) == (1, 1), (
+        f"the second call went back to the container: {probe.polls} polls, "
+        f"{probe.commands} commands"
+    )
+
+
+async def test_a_write_between_two_calls_makes_the_second_one_look_again() -> None:
+    """★ THE TOOL PROMISES "RIGHT NOW", AND A WRITE IS WHAT MAKES THAT A LIE.
+
+    A Build run holds the mutating tools and this one together for up to `MODEL_TURN_CEILING`
+    requests. The sequence this pins is the ordinary repair: the model reads NOT_SERVING, fixes
+    the bug, and checks again. Memoized for the whole run it is handed its own pre-fix answer
+    under a docstring promising the app's state right now — and says so to the citizen in prose
+    the platform streams live and never gates.
+
+    Mutation check: key the memo on anything but `session.writes` and the second reading comes
+    back STILL_THE_TEMPLATE at one poll."""
+    probe = _CountingProbe()
+    session = _session_over(probe)
+    toolset: FunctionToolset[Any] = app_state_toolset(lambda _ctx: session)
+    ctx = _a_run_context()
+    tool = (await toolset.get_tools(ctx))["check_the_app"]
+
+    await toolset.call_tool("check_the_app", {}, ctx, tool)
+    session.writes += 1  # what write_file / edit_file / run_command do
+    await toolset.call_tool("check_the_app", {}, ctx, tool)
+
+    assert probe.polls == 2, "the reading survived a write that could have changed it"
+    # And a third call that writes nothing is served from the refreshed memo, so invalidating
+    # on a write did not simply delete the ceiling.
+    await toolset.call_tool("check_the_app", {}, ctx, tool)
+    assert probe.polls == 2
+
+
+async def test_a_fresh_run_reads_the_app_again() -> None:
+    """The other half of the ceiling, and why it is per-toolset rather than per-process: a
+    self-heal iteration builds its toolsets afresh, and the app it is about to be asked about is
+    the one the previous iteration just repaired."""
+    probe = _CountingProbe()
+    await _ask(_session_over(probe))
+    await _ask(_session_over(probe))
+    assert probe.polls == 2
+
+
+def _baseline_probe_output(*, working: str) -> str:
+    """What the baseline probe prints: root, the baseline blob, the working blob, the subject.
+
+    Built here rather than hand-typed as one string so the two arms differ in exactly the field
+    the answer turns on — a fixture that also changed the subject would be testing the
+    unanswerable path twice."""
+    return f"root1@@blob-template@@{working}@@{BASELINE_COMMIT_SUBJECT}"
+
+
+@pytest.mark.parametrize(
+    ("ready", "running", "stdout", "expected"),
+    [
+        (False, False, "", AppState.NOT_SERVING),
+        (False, True, "", AppState.UNKNOWN),
+        (True, True, _baseline_probe_output(working="blob-template"), AppState.STILL_THE_TEMPLATE),
+        (True, True, _baseline_probe_output(working="blob-theirs"), AppState.LIVE),
+        (True, True, "", AppState.UNKNOWN),
+    ],
+    ids=["died", "still-starting", "starter-page", "built", "unreadable-baseline"],
+)
+async def test_the_ordering_rule_survives_the_move_to_a_tool(
+    ready: bool, running: bool, stdout: str, expected: AppState
+) -> None:
+    """★ THE RULE: could-not-tell > not-serving > whatever the page shows. Each arm is a
+    different answer, and collapsing any two is the defect.
+
+    "STILL STARTING UP" IS `UNKNOWN`, NOT `NOT_SERVING` — a reading taken inside the dev
+    server's compile window would otherwise call every cold app dead. An unreadable baseline on
+    a serving app is `UNKNOWN` too: the app is up, but what the citizen is looking at is not
+    established.
+
+    Mutation check: fold `STILL_TRYING` into `NOT_SERVING` and the still-starting case goes
+    red."""
+    probe = _CountingProbe(ready=ready, running=running, stdout=stdout)
+    state = await read_the_app_state(cast(Any, probe), _A_HANDLE, max_polls=1, poll_s=0)
+    assert state is expected
+
+
+async def test_the_reading_never_invites_the_agent_to_derive_its_own() -> None:
+    """★ THE TRAP THIS TOOL IS ONE STEP AWAY FROM. The harness has already offered the agent a
+    `tsc` it could run for itself and withdrawn the offer, because the model spent 20-40 s and a
+    context window per turn establishing what the platform already knew.
+
+    The description says the platform runs the check, and the four answers are verdicts rather
+    than signals. Nothing in it names a command to run."""
+    described = (await registered_tool_definitions(ChatKind.PLAN))["check_the_app"].description
+    assert described is not None
+    assert "The platform runs the check" in described
+    for invitation in ("tsc", "npm", "`run_command`", "check for yourself"):
+        assert invitation not in described
+
+
+@pytest.mark.parametrize("kind", list(ChatKind), ids=[k.value for k in ChatKind])
+async def test_when_to_call_it_survives_in_the_description(kind: ChatKind) -> None:
+    """★ WHEN TO CALL IT is the sentence that decides whether this tool is reached for at all,
+    and the registered description is the ONLY place the model is told it.
+
+    Pinned as a literal rather than derived from the docstring, so trimming the rule away cannot
+    quietly take the expectation with it. Mutation check: delete the sentence from
+    `check_the_app`'s docstring and this goes red while every other assertion about that
+    description stays green."""
+    definitions = await registered_tool_definitions(kind)
+    described = definitions["check_the_app"].description
+    assert described is not None
+    assert (
+        "Call this before you say anything about what the app does now, and whenever the user "
+        "tells you something is wrong."
+    ) in " ".join(described.split())
+
+
+@pytest.mark.parametrize("kind", list(ChatKind), ids=[k.value for k in ChatKind])
+async def test_every_registered_tool_reaches_the_model_with_a_description(kind: ChatKind) -> None:
+    """★ A tool's docstring is the only thing that tells the model what the tool is FOR, so one
+    registered without a description arrives as a bare name to guess at.
+
+    Asserted over the registry rather than over a list somebody keeps, so it covers a tool nobody
+    thought to write a test for."""
+    definitions = await registered_tool_definitions(kind)
+    assert definitions, f"{kind} registers nothing at all"
+    for name, definition in definitions.items():
+        assert definition.description, f"`{name}` is registered with no description"
+
+
+def test_the_toolset_module_imports_from_a_bare_interpreter() -> None:
+    """★ THE PACKAGE-CYCLE TRAP. `build_sessions.__init__` reaches `appdata` →
+    `services.projects` → `agent.agent` → `orchestrator.__init__`, so an `agent.*` module
+    importing `build_sessions.integrity` at module level fails at interpreter start — every
+    turn, before any test runs. The baseline probe is reached through the orchestrator instead,
+    which already defers that one import inside a function.
+
+    A subprocess rather than an in-process import, because by the time this file is collected
+    the package graph is warm and an import that would have failed at start succeeds."""
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", "import src.services.agent.toolsets"],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "build_sessions.integrity" not in inspect.getsource(toolsets_module)

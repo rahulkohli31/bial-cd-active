@@ -3,8 +3,21 @@
 ONE derivation, two consumers: the read API (reload) and the turn engine's catch-up
 snapshot (live). Reads raw ROWS, not validated dataclasses: validating would coerce a
 stored attachment-ref marker to `CachePoint` (the pinned 2.5.0 hazard) and force
-rehydration this read must never pay for; `payload`/`meta` are already redacted at the
-persistence seam, so the Details expander must not re-redact.
+rehydration this read must never pay for.
+
+THIS IS WHERE MASKING HAPPENS FOR EVERYTHING READ BACK FROM STORAGE. The persistence seam stores
+what was sent — it has to, or the replayed prefix is not the prefix — so a row's `payload` reaches
+this function with whatever credential-shaped text the model wrote in it. `_mask_for_display` is
+the one place that answer is given: it runs over the finished `DisplayItem` list, so both
+consumers inherit it and no future item type can be added on a path that skips it. Pinned by test,
+not by this sentence.
+
+IT IS NOT THE ONLY WAY PROSE REACHES A BROWSER, and reading that sentence as "no unmasked model
+text can reach a citizen" would be wrong. The live SSE text stream (`turns/engine.py::_push_text`)
+carries the model's words straight through as they are generated and has never been redacted —
+so a credential the model echoes is visible live, and masked only once the page is reloaded.
+Closing that is a separate piece of work: the stream emits deltas, and a secret can straddle two
+of them, so a per-delta pass would not see it.
 
 Hidden rows are excluded from RENDERING but still inform derived state: an unclosed
 `build_started` marker with no later same-session `build_outcome` projects the
@@ -24,6 +37,7 @@ from pydantic import Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL, ATTACHMENT_READ_TOOL
+from src.core.redaction import redact_secrets
 from src.db.models.attachment import Attachment
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.schemas import CamelModel
@@ -52,6 +66,14 @@ registered function's name (pydantic-ai registers a function under its `__name__
 prompt naming a tool that is registered under a different spelling is a citizen's turn spent
 discovering an unknown-tool rejection."""
 
+APP_STATE_TOOL: Final = "check_the_app"
+"""The state tool's wire name — the fourth thing that has to agree on a spelling.
+
+Named here for the same reason the three above are: this module labels the call, and the other
+holder of the string is `services/agent/toolsets.py`, where it IS the registered function's name
+(pydantic-ai registers a function under its `__name__`). Without a branch keyed on it the
+fallback below renders `Used check_the_app` into a citizen's feed."""
+
 PLATFORM_TEXT_KIND: Final = "platform_text"
 """`meta.kind` of a row whose sentence is the PLATFORM's, not the model's.
 
@@ -74,6 +96,25 @@ hold their own string literal are one typo away from a row nobody projects."""
 WORKSPACE_DISCARDED_KIND: Final = "workspace_discarded"
 """`meta.kind` of the row a discard writes into each conversation that spoke since the save. Its
 payload is the note the model reads; the citizen sees `WorkspaceDiscardedItem` instead."""
+
+APP_CHANGE_NOTICE_KIND: Final = "app_change_notice"
+"""`meta.kind` of the row the engine writes when the app crossed between serving and not serving
+during a turn. Same carrier as the discard note — a payload the model reads on its next turn —
+with the sentence repeated in `meta.text` so the citizen's feed can draw it without the model
+having to be told it in two voices.
+
+`meta.state` is the reading that row recorded, and it is what makes the notice EDGE-TRIGGERED:
+the newest reading is compared against the newest one already on record in this conversation, so
+an unchanged app produces nothing."""
+
+APP_STATE_META_KEY: Final = "appState"
+"""Where a turn writes down the reading it took, on its own terminal row.
+
+ON THE TERMINAL ROW rather than a table of its own, because the question it answers — "what was
+the last thing we knew about this app in this conversation" — is per-conversation and the
+terminal row is already written once per turn, hidden, with a payload nothing replays. A turn
+that took no reading, or one the probe could not answer, writes no key at all: not knowing is
+not a reading, and recording it would make the next known reading look like a change."""
 
 # THERE IS NO DETAILS-EXPANDER CAP HERE ANY MORE, because there is no expander material to
 # cap. A step used to carry the raw arguments and the raw result of its tool call, redacted and
@@ -152,6 +193,12 @@ _LBL_PREVIEW: Final = "Getting your preview ready"
 # commands, so a recognized-only allowlist that leaked argv on the long tail is the bug we refuse.
 _LBL_FALLBACK: Final = "Working on your app"
 
+# The state tool, in the two tenses one step passes through. Every other label in this module is
+# tense-invariant, so this is the one place a settled step reads differently from a running one —
+# `label_when_settled` is what both emitters call, so neither can hold only one of the pair.
+_LBL_CHECKING_APP: Final = "Checking on your app"
+_LBL_CHECKED_APP: Final = "Checked on your app"
+
 # WHAT A LONG OPERATION SAYS WHILE IT IS STILL RUNNING.
 #
 # EXTENDS the table above rather than adding a second one, and that is the whole design. Every
@@ -162,6 +209,18 @@ _LBL_FALLBACK: Final = "Working on your app"
 # second place to forget, and the first label anyone forgot would show a citizen raw argv.
 _LONG_OPERATION_TAIL: Final = " — this one takes a little longer."
 _STILL: Final = "Still "
+
+# WHAT A STEP THAT FAILED SAYS, extending the same table for the same reason `_STILL` does: a
+# short clause after a label already in the citizen's register turns any of them into a truthful
+# failure sentence, and a label added tomorrow is covered for free.
+#
+# `_LBL_FALLBACK` IS THE ONE LABEL THAT MUST NOT TAKE THE CLAUSE. It is what an unrecognised
+# command degrades to, and "Working on your app — this step did not finish" is the running label
+# with a failure pinned to it: it claims work that may never have started. A failed step nobody
+# could classify says only that something did not finish — no jargon, no command, no exit code,
+# which is the same fail-closed rule `_classify_command` holds to.
+_FAILED_TAIL: Final = " — this step did not finish"
+_LBL_FAILED_FALLBACK: Final = "A step didn't finish"
 
 # Friendly file-area copy (`_friendly_area`): the citizen sees an app AREA, never a filename.
 _AREA_MAIN_PAGE: Final = "your app's main page"
@@ -329,6 +388,51 @@ DisplayItem = (
     | TurnTerminalItem
     | WorkspaceDiscardedItem
 )
+
+DISPLAY_TEXT_CAP: Final = 64_000
+"""How much of one display field is scanned for credentials, in characters.
+
+THE CAP IS THE ReDoS DEFENCE, and `core/redaction.py` requires it of every synchronous caller
+that is not the durable record. This one runs on every conversation load and every catch-up
+snapshot, over a whole transcript, on the event loop.
+
+Sized at the platform's own per-message ceiling (`MAX_MESSAGE_TEXT_CHARS`), so no field a
+citizen or the model can legitimately produce is shortened by it — a longer one is a defect
+upstream, and truncating its tail beats stalling the loop over it.
+
+The number is restated rather than imported: `_shared` reaches this module through
+`services.messages`, so importing it back raises ImportError on a partly-built module.
+`tests/services/messages/test_projection.py` pins the two equal instead."""
+
+#: Which string field of each `DisplayItem` type reaches a browser as free text. `StepItem.label`
+#: is deliberately absent: every label is one of this module's own constants or a filename the
+#: citizen chose, and `_classify_command` fails closed so raw argv never becomes one.
+_MASKED_FIELDS: Final[dict[type[Any], str]] = {
+    UserTextItem: "text",
+    AssistantTextItem: "text",
+    BannerItem: "text",
+    TurnTerminalItem: "reason",
+}
+
+
+def _mask_for_display(items: list[DisplayItem]) -> list[DisplayItem]:
+    """`redact_secrets` over every free-text field on the way to a browser — ONE walk over the
+    finished list rather than a call at each of the nine sites that build one.
+
+    WHAT LEAKS IS THE MODEL REPEATING A VALUE IT READ — "I set DATABASE_URL=postgres://u:p@h/db
+    in your config" — which is prose, not a tool return, so masking the machinery would mask
+    nothing. `TurnTerminalItem.reason` is in the set even though it carries a machine token: it
+    is built from a HIDDEN row, and any "mask what is visible" shortcut is exactly what misses
+    it."""
+    masked: list[DisplayItem] = []
+    for item in items:
+        field = _MASKED_FIELDS.get(type(item))
+        value = getattr(item, field, None) if field is not None else None
+        if field is None or not isinstance(value, str) or not value:
+            masked.append(item)
+            continue
+        masked.append(item.model_copy(update={field: redact_secrets(value[:DISPLAY_TEXT_CAP])}))
+    return masked
 
 
 def _an_instant(value: object) -> datetime | None:
@@ -527,6 +631,11 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
         # no import from the connector registry. `checking` is already a `stepIconFor`
         # branch in the portal, so no portal file changes for this.
         return ("Checking what data is connected", False)
+    if tool_name == APP_STATE_TOOL:
+        # THE RUNNING TENSE, because a step is drawn the moment the call is made. `label_when_
+        # settled` turns it past once the result lands. Its own branch rather than the fallback
+        # below, which would print `Used check_the_app` into a citizen's feed.
+        return (_LBL_CHECKING_APP, False)
     if tool_name == "declare_done":
         return ("Wrapping up the build", False)
     if tool_name == "run_command":
@@ -534,14 +643,49 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
     return (f"Used {tool_name}", False)
 
 
+def failed_step_line(label: str) -> str:
+    """A step's friendly label, restated for a step whose result came back a failure.
+
+    FAILS CLOSED LIKE THE TABLE, and the input is always a label this module already produced, so
+    it carries no argv and no file path. An empty one, or the unrecognised-command fallback,
+    degrades to `_LBL_FAILED_FALLBACK` rather than borrowing a running step's words.
+
+    IDEMPOTENT, for the reason `long_operation_line` is: both emitters re-derive it from the same
+    stored label, and a line that grew a second clause on the second derivation would put the
+    live feed and a reload one clause apart."""
+    base = label.strip()
+    if not base or base == _LBL_FALLBACK:
+        return _LBL_FAILED_FALLBACK
+    if base.endswith(_FAILED_TAIL):
+        return base
+    return f"{base}{_FAILED_TAIL}"
+
+
+def label_when_settled(tool_name: str, label: str, *, failed: bool) -> str:
+    """One step's label once its result has landed: the failure wording when the call came back
+    a failure, "Checked on your app" for the state tool, and the label unchanged otherwise.
+
+    PUBLIC AND SHARED, like the three classifiers beside it: the live emitter resolves a step
+    when the return arrives and the reload projection derives the same step from the stored
+    return, so wording that only one of them applied would be a live/reload disagreement about
+    what the citizen is reading. `failed` is keyword-only and has NO DEFAULT — both callers
+    already know the step's state, and a default would let the next one forget the arm nobody
+    looks at until it matters.
+
+    A FAILED STATE-TOOL STEP STAYS IN THE PRESENT TENSE. "Checked on your app" is a claim the
+    check completed, which is the one thing a failed call did not do."""
+    if failed:
+        return failed_step_line(label)
+    return _LBL_CHECKED_APP if tool_name == APP_STATE_TOOL else label
+
+
 def classify_command(argv: list[str]) -> tuple[str, bool]:
     """Public entry to the run_command classifier — the LIVE emitter (`orchestrator/tools.py`)
     shares this exact logic with the reload projection: same friendly BASE label + `hidden`
     flag + step state, neither feed ever shows raw shell/argv, and a command classifies
-    identically on both. The ONE live-only affordance is a short human SUFFIX the live
-    emitter appends to a blocked/failed step; on reload the same reason rides the step's
-    Details expander instead. So parity is 'same friendly item, no raw shell', not
-    byte-identical labels on a failure."""
+    identically on both. Parity on a FAILURE is the same friendly base with both sides naming
+    the failure — through `failed_step_line`, or through the more specific suffix the live
+    emitter has for a command it refused to run — never byte-identical labels, and never argv."""
     return _classify_command(argv)
 
 
@@ -668,11 +812,9 @@ def _index_tool_results(rows: Sequence[Message]) -> dict[str, tuple[str, bool, i
 def _closed_sessions(rows: Sequence[Message]) -> set[str]:
     """Session ids that have a recorded `build_outcome` row.
 
-    Both halves of the pair it answers about are legacy now: `write_build_started` is deleted and
-    `write_build_outcome` only still runs on the `stop` path of a session nothing can create. The
-    two writers had to go or stay TOGETHER — deleting the start marker's writer alone would have
-    left every legacy build rendering as permanently in progress, and deleting the outcome
-    writer alone would have done the same to any build that did start."""
+    No path production takes appends one any more. The rows themselves are permanent, which is
+    why this reader stays — deleting it would leave every stored build rendering as permanently
+    in progress."""
     closed: set[str] = set()
     for row in rows:
         if (
@@ -1070,7 +1212,11 @@ def _project_response_parts(
                 StepItem(
                     seq=row.seq,
                     tool=tool_name,
-                    label=label,
+                    label=(
+                        label
+                        if state == "pending"
+                        else label_when_settled(tool_name, label, failed=state == "failed")
+                    ),
                     # NOTHING IS HIDDEN WHEN SOMETHING WENT WRONG, whatever class it belongs
                     # to. The group opens itself saying one thing went wrong and then counts
                     # the rows the citizen can see; a hidden failure makes that count name a
@@ -1132,10 +1278,17 @@ def measured_context_tokens(rows: Sequence[Message]) -> int | None:
     return max(measured, default=None)
 
 
-def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
+def project_rows(rows: Sequence[Message], *, tail: int | None = None) -> list[DisplayItem]:
     """The one history→display derivation. `rows` must be the `include_hidden=True` read —
     hidden rows render nothing directly, but unclosed `build_started` markers derive the
-    in-progress anchor."""
+    in-progress anchor.
+
+    `tail` KEEPS ONLY THE LAST N ITEMS, AND IT IS A COST CONTROL RATHER THAN A CONVENIENCE. The
+    whole transcript still has to be projected — an item's meaning depends on rows before it —
+    but masking does not: `_mask_for_display` runs `redact_secrets` over every text field, and a
+    caller that slices afterwards pays for a whole conversation's redaction on every SSE
+    reconnect to show eight items. Slicing here is safe because masking is per-item; slicing
+    the ROWS would not be."""
     closed = _closed_sessions(rows)
     first_steps = _first_step_rows(rows)
     synthetic = _synthetic_resolutions(rows)
@@ -1223,6 +1376,15 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
                 saved_at = _an_instant(meta.get("savedAt"))
                 items.append(WorkspaceDiscardedItem(seq=row.seq, saved_at=saved_at))
                 continue
+            if kind == APP_CHANGE_NOTICE_KIND:
+                # OUT OF `meta`, not out of the payload: the model-facing copy is a user-prompt
+                # part, which `_payload_text` does not read and should not — the sentence is the
+                # platform's, and reading it back off the payload would make the feed's copy
+                # depend on which part shape the writer happened to use.
+                spoken = meta.get("text")
+                if isinstance(spoken, str) and spoken:
+                    items.append(AssistantTextItem(seq=row.seq, text=spoken))
+                continue
             if kind == PLATFORM_TEXT_KIND:
                 # THE WORDS COME OUT OF `meta`, because the payload is empty on purpose — see
                 # the constant above. The citizen reads the sentence exactly as they always
@@ -1285,11 +1447,11 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
             elif message.get("kind") == "response":
                 _project_response_parts(row, message, results, items)
 
-    return items
+    return _mask_for_display(items if tail is None else items[-tail:])
 
 
 async def project_conversation(
-    db: AsyncSession, *, user_id: uuid.UUID, rows: Sequence[Message]
+    db: AsyncSession, *, user_id: uuid.UUID, rows: Sequence[Message], tail: int | None = None
 ) -> list[DisplayItem]:
     """`project_rows`, with every attachment chip filled in. THE ENTRY POINT ROUTES USE.
 
@@ -1307,11 +1469,15 @@ async def project_conversation(
     conversation with forty attachments costs one read rather than forty — the N+1 this
     codebase treats as a defect rather than a style note.
 
+    `tail` IS PASSED STRAIGHT THROUGH, and a caller that wants only the last N items must use it
+    rather than slicing the result: everything this function does — redaction and the attachment
+    read — is then paid for the whole transcript and thrown away.
+
     An id with no row is left with empty name and media type on purpose: the row is gone
     (reclaimed with its conversation) but the reference survives in the payload forever, and
     the browser draws "attachment unavailable" from exactly that state.
     """
-    items = project_rows(rows)
+    items = project_rows(rows, tail=tail)
     wanted = {
         ref.attachment_id
         for item in items

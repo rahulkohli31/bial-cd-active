@@ -11,8 +11,11 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
-from src.core.integrity_types import BaselineIdentity
+from src.core.integrity_types import BaselineIdentity, BaselineUnanswerable
+from src.db.models.harness_counter import HarnessCounter
+from src.services.build_sessions.counters import count
 from src.services.build_sessions.integrity import (
     _CHANGED_SINCE_GUARDED,
     BASELINE_COMMIT_SUBJECT,
@@ -21,10 +24,10 @@ from src.services.build_sessions.integrity import (
     baseline_identity,
     has_ever_been_built,
     parse_baseline_identity,
+    parse_why_unanswerable,
     stamp_the_watermark,
 )
 from src.services.sandbox import SandboxError
-from src.services.storage import StorageError, recovery_key
 from tests.services.orchestrator.fake_sandbox import (
     BASELINE_DIVERGED_STDOUT,
     BASELINE_ROOT_SHA,
@@ -181,29 +184,126 @@ async def test_stamping_reports_whether_it_landed() -> None:
 # =============================================================================
 
 
-async def test_storage_unconfigured_is_a_confirmed_absent() -> None:
-    """A fact about the DEPLOYMENT, not about anybody's work: with no store there can be no
-    recovery copy for anyone, so the content check is skipped rather than run against a fiction."""
+async def test_a_project_nobody_has_built_in_is_a_confirmed_absent(
+    empty_harness_counts: None,
+) -> None:
+    """A brand-new project is SUPPOSED to be showing the starter template, so asking the content
+    question about one would manufacture an accusation."""
     assert await has_ever_been_built(_APP) is False
 
 
-async def test_a_recovery_copy_means_a_turn_has_done_real_work(fake_storage) -> None:
+async def test_a_turn_that_wrote_the_workspace_means_it_has_been_built(
+    empty_harness_counts: None,
+) -> None:
+    """★ THE COUNTER ROW IS THE SOURCE, and it has to be: a container that factory-resets loses
+    everything it could be asked, and the row survives — which is exactly when the content check
+    most needs to run.
+    Mutation check: answer this from the container or the store and a reverted app stops being
+    checked."""
     assert await has_ever_been_built(_APP) is False  # liveness: the absent case is the default
-    await fake_storage.put(recovery_key(_APP), b"a bundle")
+    await count(HarnessCounter.WORKSPACE_WAS_WRITTEN, app_id=_APP)
     assert await has_ever_been_built(_APP) is True
 
 
-async def test_an_unreadable_store_fails_closed_toward_checking(
-    fake_storage, monkeypatch: pytest.MonkeyPatch
+async def test_a_row_for_another_app_is_never_read_as_this_ones(
+    empty_harness_counts: None,
+) -> None:
+    """The table is deployment-wide, so a predicate that dropped `app_id` would report every app
+    as built the moment anybody built anything."""
+    await count(HarnessCounter.WORKSPACE_WAS_WRITTEN, app_id=uuid.uuid4())
+
+    assert await has_ever_been_built(_APP) is False
+
+
+async def test_a_database_that_will_not_answer_fails_closed_toward_checking(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """★ THE TWO "NO"s FAIL IN OPPOSITE DIRECTIONS, on purpose: the worst case of checking an app
     that turns out to be brand-new is one honest sentence saying it is still the starter page;
     the worst case of NOT checking is a completion claim shipped over an untouched template,
     during an outage nobody would connect it to.
-    Mutation check: return False from the `StorageError` arm and this goes red."""
+    Mutation check: return False from the `except` arm and this goes red."""
+    import src.db.base as db_base
 
-    async def blows_up(_key: str) -> object:
-        raise StorageError("the store would not answer")
+    def explode() -> object:
+        raise OperationalError("SELECT 1", {}, Exception("the database is not answering"))
 
-    monkeypatch.setattr(fake_storage, "head", blows_up)
+    monkeypatch.setattr(db_base, "async_session_factory", explode)
+
     assert await has_ever_been_built(_APP) is True
+
+
+async def test_a_broken_query_is_raised_rather_than_read_as_never_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other side of the arm above, and the reason it is narrow. A renamed column is a defect
+    of ours, not an outage, and swallowing it would degrade this check permanently and silently —
+    every app would read as built, for as long as nobody happened to look at the warnings."""
+    import src.db.base as db_base
+
+    def explode() -> object:
+        raise AttributeError("HarnessCount has no column 'nam'")
+
+    monkeypatch.setattr(db_base, "async_session_factory", explode)
+
+    with pytest.raises(AttributeError):
+        await has_ever_been_built(_APP)
+
+
+# --- the cause beside the answer, pinned against it -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("@@@@", BaselineUnanswerable.NO_SINGLE_ROOT),
+        ("", BaselineUnanswerable.NO_SINGLE_ROOT),
+        (
+            f"{BASELINE_ROOT_SHA}\n{'b' * 40}@@{'c' * 40}@@{'d' * 40}@@{SEEDED_SUBJECT}",
+            BaselineUnanswerable.NO_SINGLE_ROOT,
+        ),
+        (
+            f"{BASELINE_ROOT_SHA}@@{'c' * 40}@@{'d' * 40}@@not our subject",
+            BaselineUnanswerable.ROOT_IS_NOT_OURS,
+        ),
+        (
+            f"{BASELINE_ROOT_SHA}@@@@{'d' * 40}@@{SEEDED_SUBJECT}",
+            BaselineUnanswerable.BASELINE_MISSING,
+        ),
+    ],
+)
+def test_each_unanswerable_body_names_its_own_cause(
+    stdout: str, expected: BaselineUnanswerable
+) -> None:
+    """One cause per body, and the distinction the health verdict turns on.
+
+    `ROOT_IS_NOT_OURS` is the only one that may be waved through when every other signal is green;
+    every other cause keeps its veto. A body that reported the wrong cause would either hand a
+    completion claim to a reverted container or keep failing builds the plan exists to stop
+    failing, so the mapping is asserted per body rather than in aggregate.
+    """
+    assert parse_why_unanswerable(stdout) is expected
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "@@@@",
+        "",
+        f"{BASELINE_ROOT_SHA}\n{'b' * 40}@@{'c' * 40}@@{'d' * 40}@@{SEEDED_SUBJECT}",
+        f"{BASELINE_ROOT_SHA}@@{'c' * 40}@@{'d' * 40}@@not our subject",
+        f"{BASELINE_ROOT_SHA}@@@@{'d' * 40}@@{SEEDED_SUBJECT}",
+        BASELINE_UNTOUCHED_STDOUT,
+        BASELINE_DIVERGED_STDOUT,
+    ],
+)
+def test_the_two_parses_never_disagree_about_whether_it_was_answered(stdout: str) -> None:
+    """THE PIN THAT EARNS THE SECOND PARSE. `parse_why_unanswerable` re-derives the branch chain
+    rather than sharing one, so that a change to the ANSWER cannot move the CAUSE silently — and
+    this is what makes that duplication safe rather than a second source of truth.
+
+    A cause reported for a body that was answered would make a healthy app advisory; an answered
+    body with no cause would crash the verdict arm that reads it.
+    """
+    unanswered = parse_baseline_identity(stdout) is BaselineIdentity.UNANSWERABLE
+    assert (parse_why_unanswerable(stdout) is not None) is unanswered

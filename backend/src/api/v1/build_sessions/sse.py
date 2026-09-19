@@ -87,16 +87,11 @@ def build_sse_response(session: BuildSession, last_event_id: int | None) -> Stre
                     if isinstance(env, EndedEvent):
                         yield _DONE
                         return
-                # Caught up to the buffer. Close only once the end sequence has FULLY run
-                # (finalize_task done) — so a still-pending synthesized terminal `ended` is
-                # not dropped, yet a synthesize that failed to buffer an `ended` still closes
-                # (never hangs). A buffered terminal already returned via the inner loop above.
-                ft = session.finalize_task
-                if session.terminal_committed and ft is not None and ft.done():
-                    yield _DONE
-                    return
-                # Wait for the next live push (instant on a normal frame); the timeout is a
-                # fallback that re-scans the buffer if the queue dropped an envelope.
+                # Caught up to the buffer. A buffered terminal `ended` is the ONLY thing that
+                # closes this feed, and the inner loop above returns on it; a client that goes
+                # away closes it from the other end. So: wait for the next live push (instant on
+                # a normal frame), with the timeout as a fallback that re-scans the buffer if the
+                # queue dropped an envelope.
                 try:
                     await asyncio.wait_for(queue.get(), timeout=_BUFFER_RESCAN_SECONDS)
                 except TimeoutError:

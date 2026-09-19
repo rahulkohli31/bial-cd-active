@@ -50,7 +50,7 @@ function reading(over: Partial<PreviewState> = {}): PreviewState {
   }
 }
 
-const SAVE: SaveState = { appId: 'app-1', dirty: false, containerHead: 'abc1234', savedHead: 'abc1234', recoveryAt: null, writeBackRefusedAt: null }
+const SAVE: SaveState = { appId: 'app-1', dirty: false, containerHead: 'abc1234', savedHead: 'abc1234' }
 
 /**
  * Put the document out of sight, or bring it back, and fire the event the browser would.
@@ -136,9 +136,9 @@ describe('the cadence — the timer two features depend on', () => {
   })
 
   it('notices the stay lapsing under a person who is still reading', async () => {
-    // `RELAUNCH_PREVIEW_STAY_SECONDS` is granted at relaunch and extended only by a turn's own
-    // deadline writers; start-then-read has no turn. The pane must return to "Your app is saved."
-    // with the start offered — one press to recover — rather than showing a dead frame.
+    // A stay lapses under a reader even though the poll renews it: the renewal cannot push past
+    // the absolute age ceiling, and one that fails reports nothing. The pane must return to
+    // "Your app is saved." with the start offered — one press to recover — not a dead frame.
     api.fetchPreviewState.mockResolvedValueOnce(reading({ state: 'alive', alive: true }))
     api.fetchPreviewState.mockResolvedValue(reading({ state: 'asleep', restorable: true }))
 
@@ -966,78 +966,6 @@ describe('presence renewal — what holds the container open', () => {
   })
 })
 
-
-/**
- * ★ THE CEILING INSTANT IS DROPPED WITH THE CONTAINER IT DESCRIBES.
- *
- * It is not an internal number: the pane column announces it ("This app closes at 4:15") on every
- * surface that frames the app. An instant held past the life of the container it came from is a
- * sentence about a closing that is not coming, said to the citizen on both surfaces at once.
- */
-describe('★ what retires the ceiling instant', () => {
-  const ALIVE = reading({ state: 'alive', alive: true, previewUrl: 'https://app.example/' })
-  const soon = () => new Date(Date.now() + 5 * 60_000).toISOString()
-
-  /** A mounted hook that has been told about a ceiling. */
-  const withACeiling = async () => {
-    api.fetchPreviewState.mockResolvedValue(ALIVE)
-    api.renewPresence.mockResolvedValue({ outcome: 'renewed', drainingAt: soon() })
-    const view = mountMovable('proj-1')
-    await waitFor(() => expect(view.result.current.drainingAt).not.toBeNull())
-    return view
-  }
-
-  it('★ drops it when the screen moves to another project', async () => {
-    // Nothing keys the surface on the project id, so the hook is not remounted — and the instant
-    // belongs to one container. Announced over the next project it would name a closing time for
-    // an app the citizen is not looking at.
-    const view = await withACeiling()
-
-    view.rerender({ id: 'proj-2' })
-
-    expect(view.result.current.drainingAt).toBeNull()
-  })
-
-  it('★ drops it when the reading says the container is no longer alive', async () => {
-    // The renewal goes on answering with the same ceiling, so only the teardown can clear it.
-    const view = await withACeiling()
-
-    api.fetchPreviewState.mockResolvedValue(reading({ state: 'asleep' }))
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS + 1)
-    })
-
-    await waitFor(() => expect(view.result.current.drainingAt).toBeNull())
-  })
-
-  it('★ drops it when a renewal reaches a container that is not the one on screen', async () => {
-    // The reading stays `alive`, so the teardown path cannot be what clears it. `nothing_running`
-    // and `not_this_container` each say the instant being held describes something else.
-    const view = await withACeiling()
-
-    api.renewPresence.mockResolvedValue({ outcome: 'not_this_container', drainingAt: soon() })
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS + 1)
-    })
-
-    await waitFor(() => expect(view.result.current.drainingAt).toBeNull())
-  })
-
-  it('keeps it when the renewal could not be made at all', async () => {
-    // `null` is a fact about the REQUEST — a 401, a 503, a dropped network — and says nothing
-    // about the container. Clearing on one would retract a true sentence on an outage.
-    const view = await withACeiling()
-    const held = view.result.current.drainingAt
-
-    api.renewPresence.mockResolvedValue(null)
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS + 1)
-    })
-
-    expect(view.result.current.drainingAt).toBe(held)
-  })
-
-})
 
 describe('★ what a project hop drops', () => {
   it('drops a press that was in flight on the project being left', async () => {

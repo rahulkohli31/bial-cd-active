@@ -1,26 +1,23 @@
 """The in-process build-session lifecycle: `SessionManager` + `BuildSession`.
 
-THIS FILE NO LONGER STARTS BUILDS. `start` / `_start_locked` / `_run_and_finalize` — the
-standalone build path behind the deleted start route — are gone, and with them the only place
-that ever assigned `BuildSession.task` or called a `run_build`. What allocates a workspace now is
-`ensure_sandbox`, on behalf of a Write chat turn whose agent runs in `services/turns/engine.py`.
-The end sequence below is unchanged and still live: `stop` (the take-back) and `force_end` both
-reach it, and it is the reader for build sessions the transcript still points at.
+THIS FILE NEITHER STARTS NOR ENDS BUILDS. `start` / `_start_locked` / `_run_and_finalize` — the
+standalone build path behind the deleted start route — are gone, and the end sequence they fed
+(`stop` / `force_end` / `_finalize`) went with the session-scoped route that was its last door.
+What allocates a workspace now is `ensure_sandbox`, on behalf of a Write chat turn whose agent
+runs in `services/turns/engine.py`, and what ends one is `finish_turn_sandbox`, on behalf of that
+turn. Build sessions the transcript still points at are readable through the surviving
+`{session_id}` GET routes.
 
 WHY THIS EXISTS. The non-serializable core of a session — the `SandboxHandle` holding the raw
 bearer, the progress `asyncio.Queue` subscribers, the in-process envelope buffer — lives in
 memory, NOT Postgres. On a single replica the whole session is in-process; the frozen Redis keys
 (lock/heartbeat/registry) are the durable cross-restart coordination.
 
-Teardown and lock-release belong to this module, SESSION-API-owned, not the build itself.
-`_finalize` runs the authoritative end sequence exactly once (guarded by `terminal_committed`):
-snapshot → teardown-or-pardon → holder release → emit THE terminal `ended`, always AFTER that
-snapshot step so `snapshot_committed` on it is the real post-commit value. A completed build's
-container is PARDONED, not executed: it stays up under the bounded stay-of-execution lease
-(registry kept, lock released) so the user can use what they just built; every other end path —
-quota / escalated / stop / force_end / idle-reap — still tears down and clears the registry.
-Every end path converges on this one emission, so the feed carries exactly one terminal, always
-truthful.
+Lock-release belongs to this module, SESSION-API-owned, not the turn itself. `finish_turn_sandbox`
+runs the end of a turn: the PARDON — the container stays up under the bounded stay-of-execution
+lease (registry kept, lock released) so the user can go on using the app they are looking at — and
+then the release of the one-per-user slot. Teardown is the reaper's and the shutdown routine's:
+nothing here executes a container.
 
 The sandbox client is threaded IN from the router's `Depends`, never resolved inline, so
 `app.dependency_overrides` reach it in tests.
@@ -48,7 +45,6 @@ from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
-    BuildResult,
     BuildSessionStatus,
     EndedEvent,
     PreviewLifeState,
@@ -71,9 +67,7 @@ from src.services.build_sessions.alarms import (
     APP_STOPPED_WHILE_IDLE_EVENT,
     BUILD_WORKSPACE_CLAIMED_EVENT,
     PREVIEW_STATE_REPORTED_UNKNOWN_EVENT,
-    RECOVERY_WRITE_DID_NOT_LAND_EVENT,
     SANDBOX_DEV_STARTED_EVENT,
-    SANDBOX_TORN_DOWN_EVENT,
     SERVING_PROOF_STAMP_REFUSED,
     WORKSPACE_LOST_WHILE_IDLE_EVENT,
 )
@@ -97,11 +91,9 @@ from src.services.build_sessions.locks import (
     clear_serving,
     clear_starting_marker,
     delete_registry,
-    delete_registry_if_it_still_names,
     elapsed_ms,
     grant_stay_of_execution,
     liveness_lease_is_held,
-    mark_registry_ending,
     mark_serving,
     read_registry,
     read_registry_and_starting_marker,
@@ -114,12 +106,7 @@ from src.services.build_sessions.locks import (
     write_heartbeat,
     write_starting_marker,
 )
-from src.services.build_sessions.outcome import (
-    FORCE_ENDED,
-    STOPPED_BY_USER,
-    newest_build_outcome_status,
-    write_build_outcome,
-)
+from src.services.build_sessions.outcome import newest_build_outcome_status
 from src.services.build_sessions.reaper import is_a_shared_sandbox_name, reap_user, reconcile_user
 from src.services.build_sessions.shutdown import (
     ShutdownReason,
@@ -131,11 +118,8 @@ from src.services.build_sessions.snapshot import (
     SNAPSHOT_EXEC_TIMEOUT_SECONDS,
     SNAPSHOT_EXECS,
     Destination,
-    RecoveryOutcome,
     SavedVersion,
-    consecutive_diverts,
     discard_back_to_saved,
-    write_recovery_copy,
     write_snapshot,
 )
 from src.services.lake.copy import schedule_window_copy
@@ -171,21 +155,10 @@ from src.services.storage import (
     StorageUnconfiguredError,
     get_storage,
     parse_bundle_head_sha,
-    recovery_key,
     snapshot_key,
 )
-from src.services.storage.base import ObjectMeta
 
 _log = structlog.get_logger()
-
-# `build_failed` is the only reason that maps to the terminal FAILED status; every other
-# end reason (stopped_by_user / idle_teardown / quota_exceeded / completed) is graceful.
-_BUILD_FAILED: str = "build_failed"
-
-# The one end reason that PARDONS the container instead of tearing it down: a
-# successful build's preview stays live under the idle lease so the user sees what they
-# just built. Matches BRAIN's success verdict and `_do_finalize`'s legacy fallback.
-_COMPLETED: str = "completed"
 
 # Bounded retry for the restore path's two fallible steps. Budgets differ because the
 # steps cost wildly different amounts: `head` is a single cheap metadata call, so retrying it
@@ -206,12 +179,12 @@ _HEAD_BACKOFF_SECONDS: float = 0.25
 async def head_presence(key: str) -> bool | None:
     """Does this KEY hold a restorable bundle? `True` = present, `False` = CONFIRMED absent,
     `None` = the store could not be reached. A blip is retried; an unanswered check reports
-    unknown rather than guessed, since treating it as absent would let finalize's later
-    snapshot overwrite real work with a freshly provisioned blank template (mirrors the
-    submit route's fail-closed read). Both readers share this one expression: the build path
-    aborts on `None` (`snapshot_exists_or_bust`), the projects read shows it as "we cannot
-    say". The store is resolved once, outside the retry loop — no-store-configured is
-    permanent, not transient."""
+    unknown rather than guessed, since treating it as absent provisions a blank template in
+    place of real work, and the next write of the saved copy makes that blank the newest
+    version (mirrors the submit route's fail-closed read). Both readers share this one
+    expression: the build path aborts on `None` (`snapshot_exists_or_bust`), the projects read
+    shows it as "we cannot say". The store is resolved once, outside the retry loop —
+    no-store-configured is permanent, not transient."""
     try:
         store = get_storage()
     except StorageUnconfiguredError:
@@ -249,25 +222,6 @@ async def snapshot_presence(app_id: uuid.UUID) -> bool | None:
     return await head_presence(snapshot_key(app_id))
 
 
-async def restorable_presence(app_id: uuid.UUID) -> bool | None:
-    """Could the platform put this app back, from anything? Checks `recovery_key` OR
-    `snapshot_key` — the pair `newest_restore_source` also consults, since offering a restore
-    means "would a restore find something". `snapshot_presence` alone under-reports a builder
-    who worked across turns but never pressed save: they have only the turn-boundary recovery
-    copy, and "no saved build" is the wrong thing to tell them while holding their workspace.
-    Container-independent on purpose (`SaveState.recovery_at` is null in exactly these
-    reclaimed cases). Tri-state: confirmed presence wins immediately, two confirmed absences
-    are a real `False`, an unreadable store returns `None`."""
-    recovery = await head_presence(recovery_key(app_id))
-    if recovery:
-        return True
-    saved = await snapshot_presence(app_id)
-    if saved:
-        return True
-    # Both are now False-or-unknown. One unknown is enough to disqualify a confident "no".
-    return False if recovery is False and saved is False else None
-
-
 async def snapshot_exists_or_bust(app_id: uuid.UUID) -> bool:
     """The build path's reading of `snapshot_presence`: an unknown state ABORTS the start
     rather than provisioning over work that may be restorable."""
@@ -287,14 +241,6 @@ async def _asleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
-def _terminal_status(reason: str) -> Literal[BuildSessionStatus.ENDED, BuildSessionStatus.FAILED]:
-    """The terminal status for a SESSION-API-originated end reason (stop / force_end /
-    idle-reap / a raised run_build). Only sound because those reasons are a closed, graceful
-    set plus `build_failed` — BRAIN's reasons are NOT derivable this way (`escalated` is FAILED
-    yet != `_BUILD_FAILED`), which is why its verdict carries an explicit `status`."""
-    return BuildSessionStatus.FAILED if reason == _BUILD_FAILED else BuildSessionStatus.ENDED
-
-
 # How long an ended session (with its envelope replay buffer) stays resident after its
 # terminal commit: long enough that a late SSE reconnect still replays + [DONE], short
 # enough that `_sessions` never grows unbounded. Evicted opportunistically at the top of
@@ -309,11 +255,9 @@ _ENDED_RETENTION_SECONDS: float = 300.0
 # teardown).
 _FINALIZE_GRACE_SECONDS: float = 30.0
 
-# How long the end sequence will wait for the outcome record before giving up and emitting the
-# terminal anyway. The write is a handful of indexed queries against a live connection —
-# seconds is already generous, and the terminal frame is worth more than the record: without it
-# every SSE feed hangs and the session is never evicted.
-_OUTCOME_WRITE_TIMEOUT_SECONDS: float = 10.0
+# Slack on top of the unwind's own bounds in `_STOP_ACTIVE_WORK_TIMEOUT_SECONDS` below, so a
+# turn finishing exactly on time is never reported as one that did not finish.
+_STOP_UNWIND_HEADROOM_SECONDS: float = 10.0
 
 # How long a relaunch waits for `dev/status.ready`, PER ARM. The two arms are asking genuinely
 # different questions, which is why one number could not serve both.
@@ -329,43 +273,20 @@ _OUTCOME_WRITE_TIMEOUT_SECONDS: float = 10.0
 # into a fast one; it only makes the citizen stare at a spinner before we hand back the very
 # same URL. 15s is comfortably above a warm attach (measured at ~380ms end to end) and low
 # enough that a slow app degrades promptly instead of two minutes later.
-# The autosave runs on a turn's exit path, so the whole SEQUENCE gets one bound. Each exec in it
-# is already capped individually, but five of them in a row is minutes, and a wedged container must
-# not hold the turn's ending open. Generous enough for a real bundle over the supervisor, short
-# enough that failing is quicker than hanging.
-#
-# AND IT IS THE TURN-BOUNDARY RECOVERY COPY'S ONLY BOUND. A separate 180 s budget used to wrap
-# that copy; the autosave reconciliation replaced its `asyncio.timeout` arm with this one and
-# left the constant behind, unread, contradicting the number actually enforced — so it has been
-# swept. The copy is bounded here, not unbounded, and `_STOP_ACTIVE_WORK_TIMEOUT_SECONDS` below
-# derives from THIS number. (The reaper's own copy is a different path and carries no wrapper.)
-_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS: float = 60.0
-
 # How long "stop the work so I can switch projects" waits for the turn to actually unwind.
 #
-# DERIVED FROM THE PATH IT WAITS ON, not chosen. The old 30 s was picked to bound a REQUEST the
-# citizen was sitting in front of — and it was BELOW the unwind's own bounds, so an ordinary,
+# IT MUST SIT ABOVE THE UNWIND, not below it. The old 30 s was picked to bound a REQUEST the
+# citizen was sitting in front of, and it was under the unwind's own bounds — so an ordinary,
 # healthy turn could outlast it and be reported as "still running" for doing exactly what it is
-# supposed to do. The two branches of `_stop_the_held_session` unwind differently, and the budget
-# is the LONGER of them because one number serves both:
+# supposed to do. What `_stop_the_held_session` waits on is the whole turn task unwinding after a
+# hard cancel: whatever the turn was mid-way through has to come back first.
 #
-#   * A WRITE TURN's workspace: `finish_turn_sandbox`'s recovery autosave
-#     (`_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS`, 60 s — the whole sequence under one bound), then
-#     `_OUTCOME_WRITE_TIMEOUT_SECONDS` (10 s) for the record.
-#   * A BUILD session: `_do_finalize` step 1 writes the SAVED snapshot, and a user stop reaches
-#     it with `force_ended` false and nothing committed, so it runs in full. That write carries
-#     no timeout of its own — bounding it is not an option, because cutting a snapshot short is
-#     how a citizen's unsaved work disappears — so what bounds it is its parts:
-#     `SNAPSHOT_EXECS` execs of `SNAPSHOT_EXEC_TIMEOUT_SECONDS` each, plus the same 10 s record.
-#     An earlier version of this derivation named only the record and missed the snapshot
-#     entirely, which put the budget an order of magnitude UNDER the branch it claimed to sit
-#     above — the exact defect the 30 s had, reintroduced for the branch it was meant to fix.
-#
-# WHAT IS STILL NOT COVERED, said plainly rather than papered over: `write_snapshot` also takes a
-# per-app lock and finishes with a blob PUT, and neither is bounded here. So this is the bound on
-# the WORK, not a guarantee about the wall clock, and expiring it is deliberately not a verdict —
-# `_stop_the_held_session` shields the end sequence and stops WAITING, and the status read goes on
-# reading the session map. A stop that outlives this budget is still reported honestly.
+# THE CEILING IS DELIBERATE HEADROOM, NOT A DERIVATION. A cancelled tool exec is not instant, and
+# the per-exec bound the snapshot layer applies (`SNAPSHOT_EXECS` × `SNAPSHOT_EXEC_TIMEOUT_
+# SECONDS`) is the widest single bound anything on a container carries — so the budget clears it
+# rather than guessing at which exec the cut landed in. Expiring it is deliberately NOT a verdict:
+# the caller stops WAITING, the status read goes on reading the session map, and a stop that
+# outlives this budget is still reported honestly.
 #
 # NOTHING HOLDS A REQUEST OPEN FOR THIS. Since the stop became an ask plus a status read
 # (`request_stop_of_active_work` / `stop_state_of_active_work`), this bounds a detached task,
@@ -373,8 +294,7 @@ _RECOVERY_SNAPSHOT_TIMEOUT_SECONDS: float = 60.0
 _SNAPSHOT_WRITE_BUDGET_SECONDS: float = SNAPSHOT_EXECS * SNAPSHOT_EXEC_TIMEOUT_SECONDS
 
 _STOP_ACTIVE_WORK_TIMEOUT_SECONDS: float = (
-    max(_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS, _SNAPSHOT_WRITE_BUDGET_SECONDS)
-    + _OUTCOME_WRITE_TIMEOUT_SECONDS
+    _SNAPSHOT_WRITE_BUDGET_SECONDS + _STOP_UNWIND_HEADROOM_SECONDS
 )
 
 # How long a settled stop record is kept so a status read can still tell "stopped" from "nothing
@@ -408,12 +328,10 @@ SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 
 class BuildSessionConflictError(Exception):
-    """The user already holds a live build session (the one-per-user lock is held).
-    Carries the existing `session_id` so the router can surface it in the 409."""
+    """The user already holds a live build session (the one-per-user lock is held)."""
 
-    def __init__(self, session_id: uuid.UUID | None) -> None:
+    def __init__(self) -> None:
         super().__init__("a build session is already active")
-        self.session_id = session_id
 
 
 class SnapshotUnavailableError(Exception):
@@ -421,8 +339,8 @@ class SnapshotUnavailableError(Exception):
     either the head-check never got an answer (a `StorageError` every attempt) or the bundle
     is known-present but its restore kept failing. Fail-closed by design (ambiguity denies):
     provisioning a fresh template here would be DESTRUCTIVE, not merely degraded, since
-    `_do_finalize`'s step-1 snapshot would write the blank workspace OVER the user's good
-    bundle, permanently. Aborting leaves the bundle byte-for-byte intact for the next start.
+    the citizen's next Save would write the blank workspace OVER their good bundle,
+    permanently. Aborting leaves the bundle byte-for-byte intact for the next start.
     Raised from `_resolve_sandbox`, landing inside `ensure_sandbox`'s compensation block (lock
     released, any container torn down); the router maps it to a 503."""
 
@@ -434,10 +352,6 @@ class SnapshotUnavailableError(Exception):
 #: How the integrity gate tells the turn what it found, BEFORE it acts on it. A coroutine rather
 #: than a return value because the sentence has to reach the citizen while the slow work runs.
 RecoveryAnnouncer = Callable[["RecoveryNews"], Awaitable[None]]
-
-#: Consecutive refusals after which the integrity gate stops trusting the recovery slot (see
-#: `_source_that_is_not_poisoned`).
-_POISONED_SLOT_REFUSALS: Final = 2
 
 
 async def _say(announce: RecoveryAnnouncer | None, news: RecoveryNews) -> None:
@@ -692,28 +606,6 @@ class SaveState:
     dirty: bool | None
     container_head: str | None
     saved_head: str | None
-    # When the platform last wrote this app's tree to the recovery slot, or None if it never
-    # has. Distinct from `saved_head`, which is the user's own save: this exists so a workspace
-    # that was reclaimed while dirty can be OFFERED back ("unsaved work from 14:32") rather than
-    # silently forgotten.
-    #
-    # AND IT IS ALSO THE ANSWER TO "CAN THE PLATFORM PUT THIS BACK?", which is a stronger fact
-    # than the clause that used to end this comment. It said the restore ladder still only ever
-    # restores the user's bundle; that stopped being true when `newest_restore_source` landed,
-    # 1,168 lines below in this same module. EVERY automatic restore goes through it now, and it
-    # hands back the RECOVERY bundle in preference to the saved one whenever the recovery copy is
-    # the newer of the two — deliberately, to close the data-loss bug its own docstring
-    # describes. Where it does hand back the saved bundle, that bundle is either newer or holds
-    # the same tree, so a non-null instant here means one thing either way: what a restore brings
-    # back is no older than this. `restorable_presence` counts this slot for the same reason, and
-    # `SaveStateResponse.recovery_at` carries the fact — and this reasoning — onto the wire, where
-    # the rail and the exit guard read it to stop calling a fresh build's `dirty=True` a warning.
-    #
-    # RESUMPTION, NOT PROMOTION — the half of the old comment that was true stands unchanged. A
-    # recovery copy is not a VERSION: `snapshot_key` is untouched, `dirty` stays True beside a
-    # non-null instant, and nothing on this path performs the citizen's Save for them. Save stays
-    # MANUAL, and only Save produces something they can ask to come back to by name.
-    recovery_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -752,7 +644,7 @@ class PreviewState:
     # slot.
     occupying_project_id: uuid.UUID | None = None
     occupying_project_name: str | None = None
-    # TRI-STATE (`restorable_presence`), and `None` is NO CLAIM rather than "no": either the
+    # TRI-STATE (`snapshot_presence`), and `None` is NO CLAIM rather than "no": either the
     # object store was unreachable, or nothing on screen for this state could use the answer
     # (the alive path, which declines to spend a Blob round trip per poll on a question about
     # an app that is currently running). Both readings are the same instruction to the client —
@@ -765,32 +657,6 @@ class PreviewState:
         tab loaded before this change is still reading it, and a tab that read a missing field
         as `false` would paint "gone" over a live preview. New clients read `state`."""
         return self.state is PreviewLifeState.ALIVE
-
-
-def _head_of(meta: ObjectMeta | None) -> str | None:
-    """The tree a stored bundle holds, from the metadata `write_snapshot` stamps on it.
-
-    None for a bundle written before that stamp existed, which is why every caller treats a
-    missing value as "cannot compare" and falls back to timestamps rather than to equality."""
-    if meta is None or not meta.metadata:
-        return None
-    value = meta.metadata.get("head_sha")
-    return value if isinstance(value, str) else None
-
-
-@dataclass(frozen=True)
-class RecoverableWork:
-    """A crash-recovery copy that is NEWER than the user's last saved version.
-
-    Returned only when a copy exists and post-dates the saved one, so a caller can offer it
-    rather than silently restoring the older saved bundle and presenting the app as healthy —
-    the failure mode that made losing a container invisible. `written_at` is the store's own
-    `last_modified`, which is what makes "newer" answerable at all: two bundle HEAD shas tell
-    you nothing about which came first. It is the value shown to the user ("your work from
-    14:47"), so it must be the write time, never `now`."""
-
-    app_id: uuid.UUID
-    written_at: datetime
 
 
 class NoLiveSandboxError(Exception):
@@ -882,10 +748,10 @@ async def _the_conversation_mid_reply_in(
     """The project's conversation that is generating a reply right now, or `None`.
 
     TWO HALVES OF ONE FACT, NEITHER SUFFICIENT ALONE. The session map knows a turn is holding
-    this project's container but not which thread it speaks in (`BuildSession.conversation_id`
-    is never set by the live producer), and the in-flight guard knows which threads are mid-reply
-    but not whose project they belong to. Intersecting them names one turn, and at most one can
-    match: a reply pins the one-per-user workspace, which is the very slot being taken.
+    this project's container but not which thread it speaks in, and the in-flight guard knows
+    which threads are mid-reply but not whose project they belong to. Intersecting them names
+    one turn, and at most one can match: a reply pins the one-per-user workspace, which is the
+    very slot being taken.
 
     The guard is imported here rather than at module scope because `src.services.turns` pulls in
     the engine, which imports this module."""
@@ -984,22 +850,9 @@ async def _saved_head(app_id: uuid.UUID) -> str | None:
     return head
 
 
-async def _recovery_written_at(app_id: uuid.UUID) -> datetime | None:
-    """When the platform last autosaved this app, or None if it never has / we cannot tell.
-
-    Unknown and never collapse into "there is nothing" — but here they are the same ANSWER,
-    because this only ever adds an offer. A recovery bundle we cannot see is one we do not
-    mention; nothing is claimed either way, and the user's saved version is untouched."""
-    try:
-        meta = await get_storage().head(recovery_key(app_id))
-    except StorageError, StorageUnconfiguredError:
-        return None
-    return meta.last_modified if meta else None
-
-
 async def _snapshot_written_at(app_id: uuid.UUID) -> datetime | None:
     """When the app's SAVED snapshot was last written (#198) — best-effort, for
-    `SharedPreview`'s "as of" line, `_recovery_written_at`'s own sibling. `None` on any failure
+    `SharedPreview`'s "as of" line. `None` on any failure
     to ask, including a confirmed-absent snapshot: by the time a caller wants this, the restore
     it feeds into has ALREADY confirmed presence via `snapshot_exists_or_bust`, so a `None`
     here is a missing DETAIL, never a missing snapshot."""
@@ -1403,17 +1256,6 @@ class BuildSession:
     # durable: the next message asks the question again.
     news: RecoveryNews | None = None
     restored: bool = False
-    # The thread this build belonged to, so `_do_finalize` could record the outcome in it.
-    # ALWAYS `None` NOW: `_start_locked` was the one place that ever set it, and it is
-    # deleted. `ensure_sandbox` builds its session without it, which is why
-    # `live_session_for_conversation` can no longer match anything — see that method.
-    conversation_id: uuid.UUID | None = None
-    # The thread's high-water seq the moment a build STARTED — recorded on the outcome row as
-    # `startedSeq` so the NEXT build could tell the turns that arrived while this one ran from
-    # the ones it already consumed. ALWAYS `None` NOW, for the same reason as
-    # `conversation_id`: only the deleted start path captured it. `_record_outcome` still reads
-    # it and still passes it on, so a row written today simply carries no marker.
-    started_seq: int | None = None
     #: WHICH ARM produced the container, forwarded from `_ResolvedSandbox`. `True` means it was
     #: already up and serving and this turn merely joined it; `False` means this turn BROUGHT
     #: ONE UP — a fresh provision or a restore. Without it, "did this turn start anything?" is
@@ -1426,46 +1268,30 @@ class BuildSession:
     preview_url: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-    task: asyncio.Task[None] | None = None
     # The replay buffer (every emitted envelope) + one queue per live SSE connection.
     envelopes: list[ProgressEnvelope] = field(default_factory=list)
     subscribers: set[asyncio.Queue[ProgressEnvelope]] = field(default_factory=set)
-    end_reason: str | None = None
-    force_ended: bool = False
-    terminal_committed: bool = False
     terminal_emitted: bool = False
-    snapshot_committed: bool = False
-    # The single shielded end-sequence task (created by the first _finalize caller); every
-    # caller awaits it, so a caller's own cancellation can't tear the sequence in half.
-    finalize_task: asyncio.Task[None] | None = None
-    # The TURN path's counterpart to `finalize_task`, and the reason it needs one: a turn's end
-    # runs `finish_turn_sandbox` inline in the turn that is unwinding, so there is no task for
-    # anyone else to await. Bound the moment that sequence starts and SET the moment it lets go
-    # of the one-per-user slot — which is what lets a message sent the instant a turn ends wait
-    # for the release instead of bouncing off the sender's own finished turn.
+    # What has to finish before this session lets go of the one-per-user slot. A turn's end runs
+    # `finish_turn_sandbox` inline in the turn that is unwinding, so there is no task for anyone
+    # else to await: this is bound the moment that sequence starts and SET the moment it lets go
+    # of the slot — which is what lets a message sent the instant a turn ends wait for the
+    # release instead of bouncing off the sender's own finished turn.
     turn_finish: asyncio.Event | None = None
     # Stamped when the end sequence completes — starts the retention window after which the
     # session (and its envelope buffer) is evicted from the manager.
     ended_at: datetime | None = None
 
 
-def _what_will_release_the_slot(
-    session: BuildSession | None,
-) -> asyncio.Task[None] | asyncio.Event | None:
+def _what_will_release_the_slot(session: BuildSession | None) -> asyncio.Event | None:
     """Whatever has to finish before this session lets go of the one-per-user slot — or None when
     the session is genuinely still working and a claimant must be refused. THE ONE DECISION
     behind both the turn gate's refusal and the slot claim's bounded wait.
 
-    TWO SHAPES, because the two end paths are built differently: a stop or a force-end runs the
-    end sequence in `finalize_task`, which anyone can await, and a turn's end runs
-    `finish_turn_sandbox` inline in the unwinding turn, which leaves only the event it sets.
-    Reading `terminal_committed` instead would answer False on every ordinary turn end — only
-    `_finalize` ever sets it — and a citizen's next message would be refused for as long as the
-    turn's recovery copy took to write."""
+    ONE SHAPE: a turn's end runs `finish_turn_sandbox` inline in the unwinding turn, so the event
+    that sequence sets is the only thing a claimant can wait on."""
     if session is None:
         return None
-    if session.finalize_task is not None:
-        return session.finalize_task
     return session.turn_finish
 
 
@@ -1573,41 +1399,6 @@ class SessionManager:
         """Users with a live in-proc session — never reaped by a sweep."""
         return set(self._active_by_user)
 
-    def live_session_for_conversation(self, conversation_id: uuid.UUID) -> BuildSession | None:
-        """The still-running build attached to THIS thread, or None — the "is the agent working
-        here right now?" question the turn/mode routes ask before they let a chat turn in.
-
-        PER-CONVERSATION, not per-user: the rule is "this chat's composer is shut while this
-        chat's agent works", so a planning chat in another thread of the same project stays
-        open (the per-user build lock already refuses a second build anywhere). Reads
-        `_active_by_user` rather than `_sessions` so an ended-but-retained session (kept 5
-        minutes for a late SSE reconnect) never reads as live. Inherits this registry's
-        single-replica invariant — see `_claim_the_one_build_slot` — and goes blind across a
-        restart, which is why it is a gate BESIDE the mode check, never a replacement for it.
-
-        IT CAN NO LONGER MATCH ANYTHING, AND THAT IS NOT NEW — the deletion only made it
-        provable. `BuildSession.conversation_id` was passed at exactly one construction site,
-        inside the deleted `_start_locked`; `ensure_sandbox`, the live producer, has never
-        passed it, so the field defaults to `None` and the comparison below is unconditionally
-        true for any real conversation id. The gate at `conversations/turns.py` that calls this
-        has therefore been inert in production since the start route lost its client. IT IS
-        LEFT IN PLACE DELIBERATELY, as a redesign seam rather than a deletion: `ensure_sandbox`
-        has the turn state in scope at its caller (`turns/engine.py`) and threading one argument
-        through would make the gate live for the first time. NOTHING IS UNGUARDED MEANWHILE —
-        `turns.py` also asks `conversation_is_mid_reply` (the same-conversation case) and
-        `active_session_for` (the cross-conversation case). Do not read the green tests around
-        that gate as evidence it works: `tests/api/v1/conftest.py`'s `building` fixture
-        hand-builds a session WITH a `conversation_id`, a shape production cannot produce, and
-        says so in its own docstring."""
-        for session_id in self._active_by_user.values():
-            session = self._sessions.get(session_id)
-            if session is None or session.conversation_id != conversation_id:
-                continue
-            if session.status in {BuildSessionStatus.ENDED, BuildSessionStatus.FAILED}:
-                continue
-            return session
-        return None
-
     # --- the shared acquire-with-conflict-check + compensated-release shape ---
 
     async def _compensate_lock_and_container(
@@ -1673,8 +1464,8 @@ class SessionManager:
 
         THE TWO WAYS THE LOCK CAN DENY, and why they leave here as different exceptions.
         `acquire_lock` returning `None` now means one thing only — the lock is genuinely
-        HELD — so `BuildSessionConflictError` (router 409, carrying the live session id) is
-        always a true statement about a real session. A Redis failure instead raises
+        HELD — so `BuildSessionConflictError` (router 409) is always a true statement about a
+        real session. A Redis failure instead raises
         `LockUnavailableError` (a `RedisError`), which passes straight through to the
         router's `build_coordination_or_503` and becomes a 503. Before that split, an outage
         was swallowed into the same `None` and every affected user was told a build session
@@ -1703,13 +1494,13 @@ class SessionManager:
         Failure-safe by construction:
         - Compensation runs on ANY body failure INCLUDING CancelledError — relaunch blocks for
           minutes, so a dropped request (uvicorn cancels the handler) must still tear down the
-          container and release the lock. It runs in its own task awaited under `shield`
-          (the `_finalize` pattern), so even a second cancel delivered mid-compensation lets
+          container and release the lock. It runs in its own task awaited under `shield`,
+          so even a second cancel delivered mid-compensation lets
           it complete.
-        - A clean exit releases the lock UNLESS the body adopted it (start's session owns the
-          token; `_do_finalize` releases). The release sits inside the protected region: if it
-          fails, compensation still tears the container down rather than leaving a live
-          preview behind a lock nobody can release.
+        - A clean exit releases the lock UNLESS the body adopted it (an adopting session owns
+          the token and releases it as its turn ends). The release sits inside the protected
+          region: if it fails, compensation still tears the container down rather than leaving
+          a live preview behind a lock nobody can release.
         - The `starting` marker is written the instant the lock is acquired (nothing before
           this may write it: an unacquired lock means this request is not the one starting
           anything) and cleared on the SAME clean exit that releases or adopts the lock,
@@ -1755,7 +1546,7 @@ class SessionManager:
             )
         token = await acquire_lock(redis, user_id)
         if token is None:
-            raise BuildSessionConflictError(self._active_by_user.get(user_id))
+            raise BuildSessionConflictError()
         lock_wait_ms = int((time.monotonic() - claim_started_at) * 1000)
         scope = _LockScope(token=token)
         try:
@@ -1831,9 +1622,8 @@ class SessionManager:
         self,
         user_id: uuid.UUID,
         blocking: BuildSession | None,
-        blocking_id: uuid.UUID | None,
-        db: AsyncSession | None,
-        requested_project_id: uuid.UUID | None,
+        db: AsyncSession,
+        requested_project_id: uuid.UUID,
     ) -> Exception:
         """WHICH refusal a held slot has earned — asked by the shared-view launch alone.
 
@@ -1848,21 +1638,21 @@ class SessionManager:
         incumbent to release. A DIFFERENT-project holder has a remedy, stop it, and
         `SandboxReclaimBlockedError` is how it is offered: `ReclaimWorkspaceDialog` already carries
         the copy and the stop-it-first handler for the `building` arm. Falls back to the bare
-        conflict whenever the richer refusal cannot be told truthfully — no `db` to name the
-        project with, no session to read, or a project row that has gone (`_occupying_project`) —
-        since a dialog naming the wrong project is worse than a plain refusal.
+        conflict whenever the richer refusal cannot be told truthfully — no session to read, or
+        a project row that has gone — since a dialog naming the wrong project is worse than a
+        plain refusal.
         """
-        if blocking is None or db is None or requested_project_id is None:
-            return BuildSessionConflictError(blocking_id)
+        if blocking is None:
+            return BuildSessionConflictError()
         if blocking.project_id == requested_project_id:
-            return BuildSessionConflictError(blocking_id)
+            return BuildSessionConflictError()
         name = await db.scalar(
             sa.select(Project.name).where(
                 Project.id == blocking.project_id, Project.user_id == user_id
             )
         )
         if name is None:
-            return BuildSessionConflictError(blocking_id)
+            return BuildSessionConflictError()
         # `dirty` is deliberately NOT probed: `SandboxReclaimBlockedError` states why — a
         # `git status` taken while the agent writes is true for no instant the citizen cares
         # about.
@@ -1923,17 +1713,14 @@ class SessionManager:
             return
         releasing = _what_will_release_the_slot(blocking)
         if releasing is None:
-            raise BuildSessionConflictError(blocking_id)
+            raise BuildSessionConflictError()
         # The blocking session has already COMMITTED its terminal — it is ended and only letting
         # go. Wait (bounded) for that instead of 409ing the user's own finished work, then fall
         # through to a fresh allocation; on a timeout or an error in there, keep the 409.
-        letting_go: Awaitable[object] = (
-            asyncio.shield(releasing) if isinstance(releasing, asyncio.Task) else releasing.wait()
-        )
         try:
-            await asyncio.wait_for(letting_go, timeout=_FINALIZE_GRACE_SECONDS)
+            await asyncio.wait_for(releasing.wait(), timeout=_FINALIZE_GRACE_SECONDS)
         except Exception:
-            raise BuildSessionConflictError(blocking_id) from None
+            raise BuildSessionConflictError() from None
 
     async def save_project_snapshot(
         self,
@@ -1943,7 +1730,8 @@ class SessionManager:
         *,
         sandbox_client: SandboxClient,
     ) -> SaveOutcome:
-        """THE SAVE — the user's click, and the only thing that writes their work to Blob.
+        """THE SAVE — the user's click, and the only CITIZEN-INITIATED write of their work to
+        Blob; a teardown writes the same slot back on its own.
         Requires a LIVE container (the tree only exists there); `NoLiveSandboxError` is the
         honest answer rather than a silent false success. Deliberately does NOT require an
         in-process session — the common Save has none, right after a turn ends and the
@@ -1962,13 +1750,12 @@ class SessionManager:
         # Ask/Plan attach too, and gating on "a session exists" would refuse the ordinary
         # Save button mid-chat.
         if self._writing_session_holds(user.id, app_id):
-            raise BuildSessionConflictError(self._active_by_user.get(user.id))
+            raise BuildSessionConflictError()
         handle = await self._attach_for_read(user.id, app_id, sandbox_client)
-        # THE SAVED VERSION — the user asked for this one. It drives `dirty` and it is what
-        # `submit` pins, so it is the one key a platform-initiated write must never touch.
-        # Commits inside the container before bundling, so a save captures the working tree
-        # whether or not the agent had committed it, and the bundle carries HEAD's whole
-        # history.
+        # THE SAVED VERSION — the default destination, the one `dirty` compares against and the
+        # one `submit` pins. Commits inside the container before bundling, so a save captures the
+        # working tree whether or not the agent had committed it, and the bundle carries HEAD's
+        # whole history.
         await write_snapshot(sandbox_client, handle, app_id)
         # Read the head AFTER the save: `write_snapshot` runs `git init` + commit itself, so on
         # a first save this is the commit it just created — the value the client needs to
@@ -1996,7 +1783,7 @@ class SessionManager:
             raise NoLiveSandboxError(project_id)
         async with self._start_lock_for(user.id):
             if self._live_session_holds(user.id, app_id):
-                raise BuildSessionConflictError(self._active_by_user.get(user.id))
+                raise BuildSessionConflictError()
             handle = await self._attach_for_read(user.id, app_id, sandbox_client)
             saved = await discard_back_to_saved(
                 sandbox_client, handle, app_id, taken_at=datetime.now(UTC)
@@ -2080,12 +1867,7 @@ class SessionManager:
             # running and empty — conflating them would retract a completion claim every time a
             # workspace merely went to sleep.
             return WorkspaceState.UNREADABLE
-        verdict = await workspace_integrity(
-            sandbox_client,
-            handle,
-            app_id,
-            restore_source_key=await self._restore_source_for_the_gate(app_id),
-        )
+        verdict = await workspace_integrity(sandbox_client, handle, app_id)
         _idle_checks[app_id] = _IdleCheck(asked_at=now, verdict=verdict.state)
         if verdict.state is WorkspaceState.REVERTED:
             _log.error(
@@ -2119,10 +1901,10 @@ class SessionManager:
         app READY. The second reading is taken under the lock, after those checks, so nothing can
         start between the last look and the put-away.
 
-        NEVER AT THE COST OF WORK. The reap passes `app_id`, which runs the durable-copy gate: a
-        copy is taken when the newest change postdates the newest copy, and a container whose work
-        cannot be proven preserved is SPARED — the citizen keeps the slow card, which is where they
-        were before this existed."""
+        NEVER AT THE COST OF WORK. The reap passes `app_id`, so the tree is written back to the
+        saved copy before anything is destroyed; a container whose tree could not be written back
+        is SPARED instead — the citizen keeps the slow card, which is where they were before this
+        existed."""
         if await _stopped_reading(sandbox_client, handle) is None:
             return
         await asyncio.sleep(_SECOND_LOOK_AFTER_S)
@@ -2190,7 +1972,6 @@ class SessionManager:
         if state is None:
             # Could not ask the container — the only honest unknown.
             return SaveState(app_id=app_id, dirty=None, container_head=None, saved_head=None)
-        recovery_at = await _recovery_written_at(app_id)
         saved_head = await _saved_head(app_id)
         # UNCOMMITTED WORK IS DIRTY regardless of what the commits say — see the docstring.
         # `saved_head` is still reported alongside it: the answer is "there is unsaved work on top
@@ -2207,7 +1988,6 @@ class SessionManager:
                 dirty=True,
                 container_head=state.head,
                 saved_head=saved_head,
-                recovery_at=recovery_at,
             )
         if state.head is None:
             # No commit yet. A fresh template has no `.git`, so this is every brand-new
@@ -2218,7 +1998,6 @@ class SessionManager:
                 dirty=saved_head is None,
                 container_head=None,
                 saved_head=saved_head,
-                recovery_at=recovery_at,
             )
         if saved_head is None:
             # Committed work, nothing ever saved.
@@ -2227,85 +2006,13 @@ class SessionManager:
                 dirty=True,
                 container_head=state.head,
                 saved_head=None,
-                recovery_at=recovery_at,
             )
         return SaveState(
             app_id=app_id,
             dirty=state.head != saved_head,
             container_head=state.head,
             saved_head=saved_head,
-            recovery_at=recovery_at,
         )
-
-    async def recoverable_work(self, app_id: uuid.UUID) -> RecoverableWork | None:
-        """Is there a crash-recovery copy strictly NEWER than the saved version? Answered from
-        the store's `last_modified`, not the bundles: two HEAD shas tell you which trees
-        differ, never which came first, and ancestry would cost a download plus real git. Two
-        kinds of "no": a store that answered and holds nothing newer returns `None`; a store
-        that would NOT answer RAISES — a display surface can treat that as "no offer", but a
-        caller about to RESTORE must not silently hand back an older tree instead.
-        Deliberately not part of `project_save_state`, asked precisely when the container is
-        gone."""
-        try:
-            store = get_storage()
-        except StorageUnconfiguredError:
-            return None
-        try:
-            recovery = await store.head(recovery_key(app_id))
-            saved = await store.head(snapshot_key(app_id))
-        except StorageError:
-            # An unreadable store is NOT "nothing to recover", and the difference matters to
-            # whoever is about to act on the answer. Callers that merely display the offer can
-            # treat it as absent; a caller about to RESTORE must not (see
-            # `_restore_source_or_bust`, which re-asks and refuses rather than silently
-            # handing back an older tree).
-            _log.warning("could not determine recoverable work", app_id=str(app_id))
-            raise
-        if recovery is None or recovery.last_modified is None:
-            return None
-        # No saved version at all, but a recovery copy exists: everything the user has ever
-        # done is in it, so it is unambiguously worth offering.
-        if saved is None or saved.last_modified is None:
-            return RecoverableWork(app_id=app_id, written_at=recovery.last_modified)
-        # SAME TREE, whatever the clocks say. `touched` means "a mutating tool ran", not "the
-        # tree changed", so a turn that only read files still rewrites the recovery bundle from
-        # an unchanged worktree. Comparing the stamped HEAD answers this exactly and stops a
-        # permanent, contradictory "you have unsaved work" against a `dirty=False` save state.
-        if _head_of(recovery) is not None and _head_of(recovery) == _head_of(saved):
-            return None
-        # ORDERING, with the tie broken TOWARD the newer work. Azure stamps `last_modified` in
-        # whole seconds, so a Save and a turn-boundary write inside one second compare EQUAL —
-        # and `<` alone resolved that to "the save wins", which restored the older tree over the
-        # user's newer work. That is the loss this whole mechanism exists to prevent, reappearing
-        # inside a one-second window; a live end-to-end run reproduced it. The shas above have
-        # already established the trees differ, so an equal stamp means "written together, and
-        # the recovery copy is the one written at the turn boundary" — resume it. Restoring a
-        # tree that turns out to be the same age costs nothing (it is still not a promotion:
-        # `dirty` stays true); restoring the older one costs the user their work.
-        if recovery.last_modified < saved.last_modified:
-            return None  # the save is genuinely newer — nothing extra to offer
-        return RecoverableWork(app_id=app_id, written_at=recovery.last_modified)
-
-    async def newest_restore_source(self, app_id: uuid.UUID) -> str | None:
-        """The key of the bundle holding the app's MOST RECENT tree, or None for the saved
-        one. Every automatic restore goes through here, closing a real data-loss bug: pulling
-        `snapshot_key` unconditionally used to rebuild a reclaimed container from the last
-        SAVED tree, and that turn's own recovery write then overwrote the recovery bundle —
-        work done after the last Save survived one turn and then existed nowhere. RESUMPTION,
-        NOT PROMOTION: `snapshot_key` is untouched and `dirty` stays true. FAILS CLOSED like
-        every read here — an unreadable store raises `SnapshotUnavailableError` rather than
-        silently restoring an older tree over newer work."""
-        presence = await head_presence(recovery_key(app_id))
-        if presence is None:
-            raise SnapshotUnavailableError("recovery state unknown after retries", app_id=app_id)
-        if not presence:
-            return None
-        try:
-            return recovery_key(app_id) if await self.recoverable_work(app_id) else None
-        except StorageError as exc:
-            raise SnapshotUnavailableError(
-                "recovery state unknown after retries", app_id=app_id
-            ) from exc
 
     async def _refuse_if_reclaim_would_destroy_work(
         self,
@@ -2545,11 +2252,9 @@ class SessionManager:
 
         ONE KIND OF LIVE NOW, and this used to branch on two. `_start_locked` registered a build
         session carrying a `run_build` task and the whole terminal-commit machinery, and that
-        branch cancelled the task through `self.stop(...)`; it is deleted with the start route.
-        `session.task` was assigned at exactly one place in this file, inside `_start_locked`, so
-        every session production can build now carries none — `ensure_sandbox` registers a Write
-        turn's workspace with no task at all, because the work is running in the turn engine
-        instead. What is left is that second arm, unconditionally.
+        branch cancelled the task through the session-scoped stop; both are deleted.
+        `ensure_sandbox` registers a Write turn's workspace with no task at all, because the work
+        is running in the turn engine instead. What is left is that second arm, unconditionally.
 
         WHERE THE DANGLING TOOL CALL COMES FROM, known and accepted. The stop cuts the run
         wherever it stands, which is routinely between a tool call and its result. The replay is
@@ -2728,12 +2433,12 @@ class SessionManager:
         # carries the project id). Only then do the existing arms run: never-built, asleep,
         # and the registry-sourced `slot_taken`.
         #
-        # THE RESTORE QUESTION IS ONLY ASKED WHEN ITS ANSWER CAN CHANGE THE SCREEN. This used
-        # to call `restorable_presence` before the registry read — one or two Blob round trips
-        # per tab per 45 seconds to answer "could we put this back?" about an app that is
-        # currently running. Every surface that renders the answer only exists when nothing is
-        # serving the project, so the alive and starting arms return `None` (no claim) and the
-        # client falls through to the answer the project route already gave it at load.
+        # THE RESTORE QUESTION IS ONLY ASKED WHEN ITS ANSWER CAN CHANGE THE SCREEN. Asking it
+        # before the registry read costs a Blob round trip per tab per 45 seconds to answer
+        # "could we put this back?" about an app that is currently running. Every surface that
+        # renders the answer only exists when nothing is serving the project, so the alive and
+        # starting arms return `None` (no claim) and the client falls through to the answer the
+        # project route already gave it at load.
         #
         # NOT BUILT ON `_refuse_if_reclaim_would_destroy_work`: it answers a different question
         # — whose container holds the slot — and letting a `RedisError` from it turn a poll into
@@ -2749,7 +2454,7 @@ class SessionManager:
             if app_id is None:
                 return PreviewState(state=PreviewLifeState.NEVER_BUILT, restorable=False)
             return PreviewState(
-                state=PreviewLifeState.ASLEEP, restorable=await restorable_presence(app_id)
+                state=PreviewLifeState.ASLEEP, restorable=await snapshot_presence(app_id)
             )
         except RedisError:
             # AMBIGUITY. The store exists and would not answer, so this decided nothing —
@@ -2773,7 +2478,7 @@ class SessionManager:
             self._say_the_preview_read_failed(user.id, project_id)
             return PreviewState(
                 state=PreviewLifeState.UNKNOWN,
-                restorable=await restorable_presence(app_id) if app_id is not None else None,
+                restorable=await snapshot_presence(app_id) if app_id is not None else None,
             )
         mine = app_name_for(app_id) if app_id is not None else None
         if mine is not None and reg is not None and _registry_serves_and_is_ready(reg, mine):
@@ -2785,7 +2490,7 @@ class SessionManager:
                 # right now" page while the live region announced the preview was live.
                 #
                 # WHY IT SITS HERE AND NOWHERE ELSE, three times over:
-                #  * ABOVE `restorable_presence`, so the whole pre-serve window — every 3s
+                #  * ABOVE `snapshot_presence`, so the whole pre-serve window — every 3s
                 #    accelerated poll of it — costs no object-store HEAD. Placing it after that
                 #    call would quietly move the build window onto the expensive path.
                 #  * INSIDE this block, so the app-name/state comparison happens exactly once.
@@ -2826,7 +2531,7 @@ class SessionManager:
                 state=PreviewLifeState.SLOT_TAKEN,
                 occupying_project_id=starting,
                 occupying_project_name=occupying_name,
-                restorable=(await restorable_presence(app_id) if app_id is not None else False),
+                restorable=(await snapshot_presence(app_id) if app_id is not None else False),
             )
         if app_id is None:
             # NEVER BUILT — BUT ONLY IF THE WORKSPACE IS NOT SOMEBODY ELSE'S, and that ordering is
@@ -2856,7 +2561,7 @@ class SessionManager:
         # Everything below is a workspace that is NOT serving this project and has no start in
         # flight — which is the only place the restore offer is rendered, so this is the one
         # place the answer earns its round trip.
-        restorable = await restorable_presence(app_id)
+        restorable = await snapshot_presence(app_id)
         if reg is None:
             return PreviewState(state=PreviewLifeState.ASLEEP, restorable=restorable)
         live_app = reg.get(REGISTRY_FIELD_APP_NAME)
@@ -2926,7 +2631,7 @@ class SessionManager:
             # project's container is no reason to refuse this one — giving up an idle project is
             # precisely how a citizen frees the slot the live one is occupying.
             if self._live_session_holds(user.id, app_id):
-                raise BuildSessionConflictError(self._active_by_user.get(user.id))
+                raise BuildSessionConflictError()
             redis = get_redis()
             reg = await read_registry(redis, user.id)
             if reg is None or reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_READY:
@@ -2934,7 +2639,10 @@ class SessionManager:
             occupied_by = reg.get(REGISTRY_FIELD_APP_NAME, "")
             if occupied_by != app_name_for(app_id) and not is_a_shared_sandbox_name(occupied_by):
                 return False
-            return await reap_user(redis, user.id, sandbox_client, strict=True)
+            # THE APP ID GOES WITH IT. Without it the reaper has no slot to write this
+            # container's tree back to, and this is the one control a citizen presses that
+            # destroys a container on purpose — with the Save beside it optional.
+            return await reap_user(redis, user.id, sandbox_client, strict=True, app_id=app_id)
 
     async def give_up_shared_view(
         self, user_id: uuid.UUID, *, sandbox_client: SandboxClient
@@ -2958,7 +2666,7 @@ class SessionManager:
         redis = get_redis()
         async with self._start_lock_for(user_id):
             if user_id in self._active_by_user:
-                raise BuildSessionConflictError(self._active_by_user.get(user_id))
+                raise BuildSessionConflictError()
             reg = await read_registry(redis, user_id)
             if reg is None or reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_READY:
                 return False
@@ -3276,19 +2984,9 @@ class SessionManager:
         user: User,
         project_id: uuid.UUID,
         sandbox_client: SandboxClient,
-        *,
-        prefer_saved: bool = False,
     ) -> RelaunchedPreview:
         """Put a READY sandbox in front of a project's saved app — for an app whose live build
         session has already been torn down.
-
-        Resumes the NEWEST tree by default; `prefer_saved` is the user's explicit "put my last
-        saved version back" and is the only way to get the older one. The default is inverted
-        from the obvious reading on purpose: the failure that costs a user their work is
-        restoring an older tree over a newer one, and the failure that costs them nothing is
-        showing them their own most recent workspace. Neither is a promotion — `snapshot_key`
-        is untouched either way, so `dirty` stays true and Save is still their click.
-        `save_state.recoverableWorkAt` is what lets the portal offer the choice.
 
         TWO ARMS, cheapest first. If the container serving this exact app is already up and
         healthy, ATTACH to it and drive the dev server; only otherwise restore the snapshot
@@ -3308,8 +3006,8 @@ class SessionManager:
         registers a READY handle in Redis (a side effect of `restore_from_snapshot` via
         `_write_registry`), seeds a heartbeat, then the scope RELEASES the per-user lock on
         exit. Nothing here re-snapshots: the workspace is served read-only (an edit is a new
-        build, which finalizes normally), so `_do_finalize` — the only writer of a snapshot —
-        is never on this path.
+        build, whose own turn ends normally), so `save_project_snapshot` — the only writer of a
+        saved snapshot — is never on this path.
 
         Because it holds no lock and renews no heartbeat, its container's lifetime is owned
         by an explicit STAY OF EXECUTION granted below: a bounded lease on the registry hash
@@ -3321,9 +3019,8 @@ class SessionManager:
         pre-check: it raises on a genuinely live session and otherwise returns having claimed
         nothing, so relaunch still occupies no slot. It also means relaunch waits out a session
         that has ended and is only letting go, which is the right answer here for the same
-        reason it is right for a message — the snapshot relaunch restores is the one that
-        session's finalize is writing, so waiting hands back the FRESH tree where refusing sent
-        the citizen away to press again.
+        reason it is right for a message: bouncing a citizen off their own just-finished turn
+        sends them away to press again, and letting go is usually sub-second.
 
         One divergence from the deleted `_start_locked` still holds:
         - It must NOT reuse `_restore_or_provision`, whose confirmed-absent arm provisions a
@@ -3376,9 +3073,7 @@ class SessionManager:
         with _one_relaunch_in_the_log(
             build_id=str(uuid.uuid7()), user_id=str(user.id), project_id=str(project_id)
         ):
-            return await self._relaunch_under_one_build_id(
-                db, user, project_id, sandbox_client, prefer_saved=prefer_saved
-            )
+            return await self._relaunch_under_one_build_id(db, user, project_id, sandbox_client)
 
     async def _relaunch_under_one_build_id(
         self,
@@ -3386,8 +3081,6 @@ class SessionManager:
         user: User,
         project_id: uuid.UUID,
         sandbox_client: SandboxClient,
-        *,
-        prefer_saved: bool,
     ) -> RelaunchedPreview:
         """The whole of `relaunch_preview` — go there for what it does and why it does it that
         way; this half is the same code, one indent level out.
@@ -3436,12 +3129,7 @@ class SessionManager:
                 # uncommitted insert back) nor provision blob storage for an app that was
                 # never built. No fresh-provision fallback: a confirmed-absent bundle is a
                 # dead end (404), never a blank template.
-                # Gate on EITHER bundle. Gating on the saved one alone told the user who
-                # built an app across several turns and never clicked Save — the expected
-                # behaviour for a non-developer, not an edge case — to "build the app first",
-                # while `save-state` was simultaneously reporting that their work existed.
-                relaunch_source = await self.newest_restore_source(app_id)
-                if relaunch_source is None and not await self._snapshot_exists_or_bust(app_id):
+                if not await self._snapshot_exists_or_bust(app_id):
                     raise NoSnapshotToRelaunchError(app_id)
                 # The "last saved version" signal: when the newest recorded outcome FAILED,
                 # the snapshot being restored is the last SAVED state, not that build's intent.
@@ -3539,18 +3227,13 @@ class SessionManager:
                     # `_restore_or_bust` re-raises `StorageNotFoundError` (a bundle that
                     # vanished between head-check and pull) — the same 404 bucket.
                     try:
-                        # `prefer_saved` is the user's explicit "put my last saved version
-                        # back" — the one case where the older tree is what they want. Absent
-                        # it, relaunch resumes the newest tree for the same reason every other
-                        # restore does.
-                        source_key = None if prefer_saved else relaunch_source
                         scope.handle = await self._restore_or_bust(
                             sandbox_client,
                             user_id,
                             app_name_for(app_id),
                             app_id,
                             env,
-                            source_key=source_key,
+                            source_key=None,
                         )
                     except StorageNotFoundError as exc:
                         raise NoSnapshotToRelaunchError(app_id) from exc
@@ -3815,10 +3498,11 @@ class SessionManager:
                 if ready:
                     await sandbox_client.someone_has_to_go_first(scope.handle)
                 preview_url = scope.handle.preview_url
-                # Seed the heartbeat INSIDE the protected region (never enter `_active_by_user`,
-                # never spawn a finalize task, by design): if it fails, the compensation still
-                # tears the container down + releases the lock instead of 500ing with a live
-                # container behind a held lock. The scope releases the lock on clean exit.
+                # Seed the heartbeat INSIDE the protected region (a relaunch never enters
+                # `_active_by_user`, so no turn-end sequence ever runs for it): if it fails,
+                # the compensation still tears the container down + releases the lock instead
+                # of 500ing with a live container behind a held lock. The scope releases the
+                # lock on clean exit.
                 await write_heartbeat(redis, user_id)
                 # …and hand the container's lifetime to the screen that asked for it. The long
                 # stay granted before the wait was there to survive a restore that can block for
@@ -3908,11 +3592,6 @@ class SessionManager:
         project (`resolve_project_access` returning SHARED); this trusts that and re-checks
         nothing about access — only about the container.
 
-        SNAPSHOT-ONLY, ALWAYS (requirement 21). Deliberately NEVER `newest_restore_source`,
-        which would prefer the OWNER's crash-recovery bundle over their last deliberate Save —
-        a shared view is restored from what the owner chose to publish to their colleagues, not
-        from whatever their build container happened to hold when it last crashed.
-
         `force_refresh=True` is Refresh (requirement 22): skip the attach-and-reuse arm even
         when a live container already answers for this exact (project, recipient) pair, and
         restore again from whatever is CURRENTLY saved — which may have moved since Launch.
@@ -3961,11 +3640,9 @@ class SessionManager:
                 # The recipient is mid-build on one of THEIR OWN projects — the identical
                 # refusal `relaunch_preview` gives a builder caught the same way. A shared view
                 # is never worth pre-empting a build the recipient is actively watching.
-                blocking_id = self._active_by_user.get(recipient.id)
                 raise await self._slot_conflict_for(
                     recipient.id,
-                    self._sessions.get(blocking_id) if blocking_id is not None else None,
-                    blocking_id,
+                    self._sessions.get(self._active_by_user[recipient.id]),
                     db,
                     project.id,
                 )
@@ -4006,8 +3683,7 @@ class SessionManager:
                 incumbent_is_leaving=incumbent_is_leaving,
                 spare_app=spare_app,
             ) as scope:
-                # THE SNAPSHOT GATE — the saved bundle ONLY, never the recovery/autosave copy
-                # (requirement 21). `newest_restore_source` is never called on this path.
+                # THE SNAPSHOT GATE — the OWNER's saved bundle (requirement 21).
                 if not await self._snapshot_exists_or_bust(owner_app_id):
                     raise NoSnapshotToRelaunchError(owner_app_id)
                 snapshot_taken_at = await _snapshot_written_at(owner_app_id)
@@ -4179,11 +3855,10 @@ class SessionManager:
 
         A Write turn is an ordinary chat turn that happens to hold the sandbox slot, so it
         needs the same container, the same one-per-user lock and the same registry entry a
-        build needed — but no `run_build` task, no `build_started` marker, no attachments and
-        no `started_seq`. Those belonged to the deleted build feed, which the turn engine
-        replaces: the turn's own frames are the narrative now, and the turn's own rows are the
-        record. This is now the ONLY allocator; `_start_locked`, whose skeleton this is, is
-        deleted.
+        build needed — but no `run_build` task, no `build_started` marker and no attachments.
+        Those belonged to the deleted build feed, which the turn engine replaces: the turn's
+        own frames are the narrative now, and the turn's own rows are the record. This is now
+        the ONLY allocator; `_start_locked`, whose skeleton this is, is deleted.
 
         That skeleton, deliberately and completely: slot claim → reconcile → lock → mint the app
         row → commit → env → resolve the sandbox → heartbeat → adopt. Every one of those steps
@@ -4386,10 +4061,7 @@ class SessionManager:
         REACHES A TEARDOWN — not defensive coding, the entire safety property: `REVERTED`
         requires three independent facts to agree, and the two unanswerable states leave the
         container running, attached and untouched."""
-        source = await self._restore_source_for_the_gate(app_id)
-        verdict = await workspace_integrity(
-            sandbox_client, handle, app_id, restore_source_key=source
-        )
+        verdict = await workspace_integrity(sandbox_client, handle, app_id)
         if verdict.state is WorkspaceState.INTACT:
             return _ResolvedSandbox(handle, attached=True)
         if verdict.state is WorkspaceState.UNREADABLE:
@@ -4435,7 +4107,7 @@ class SessionManager:
                 app_name,
                 app_id,
                 env,
-                source_key=self._source_that_is_not_poisoned(app_id, source),
+                source_key=None,
             )
         except StorageError, SandboxError, SnapshotUnavailableError:
             # `restore_from_snapshot` fetches BEFORE it destroys anything and self-cleans on the
@@ -4455,37 +4127,6 @@ class SessionManager:
         return _ResolvedSandbox(
             restored, attached=False, news=RecoveryNews.RESTORING, restored=True
         )
-
-    async def _restore_source_for_the_gate(self, app_id: uuid.UUID) -> str | None:
-        """Which bundle would a restore hand back? — asked so the verdict compares against it.
-
-        `newest_restore_source` RAISES when the store will not answer, and on this path that is
-        the same fact as a container that will not answer: we cannot tell, so we must not judge.
-        Mapped to `None` here and left for `workspace_integrity`'s own store read to surface as
-        `UNREADABLE`, rather than aborting the turn with a different error shape."""
-        try:
-            return await self.newest_restore_source(app_id)
-        except SnapshotUnavailableError:
-            return None
-
-    def _source_that_is_not_poisoned(self, app_id: uuid.UUID, source: str | None) -> str | None:
-        """Which bundle to actually restore, when the recovery slot may itself be the problem.
-
-        THE SLOT CAN BE POISONED, and `recoverable_work` cannot tell. It ranks the two bundles by
-        `last_modified`, never by ancestry, so a recovery copy that was overwritten with a bad
-        tree outranks a perfectly good saved one — and every restore afterwards hands back the
-        poison. Two consecutive refusals by the integrity guard signal that the slot, rather
-        than the turn, is the problem: fall back to the user's own Save, which no platform
-        write ever touches, and escalate."""
-        if source is None or consecutive_diverts(app_id) < _POISONED_SLOT_REFUSALS:
-            return source
-        _log.error(
-            "recovery_slot_looks_poisoned",
-            app_id=str(app_id),
-            consecutive_refusals=consecutive_diverts(app_id),
-            detail="restoring the user's saved bundle instead of the recovery slot",
-        )
-        return None
 
     async def _park_the_tree_aside(
         self,
@@ -4534,9 +4175,8 @@ class SessionManager:
         `StorageNotFoundError` — the store positively answered "no bundle" (a genuinely new
         app, or one that vanished between the head-check and the pull); no error path reaches
         it otherwise. An unknown head state, or a restore that keeps failing, raises
-        `SnapshotUnavailableError` and aborts the start instead, because a fresh template here
-        would be silently overwritten onto the user's saved work by finalize's step-1
-        snapshot."""
+        `SnapshotUnavailableError` and aborts the start instead, because the next write of the
+        saved copy would silently put that fresh template over the user's work."""
         # Ensure the app's Blob container + mint a fresh session SAS ONLY on this birth
         # (provision/restore) arm — never on attach, which reuses the live container's SAS.
         # A configured-store failure propagates: it fails the start before any sandbox handle
@@ -4544,19 +4184,10 @@ class SessionManager:
         # container is simply reused on the next start. Disabled storage (dev/test) yields {} — a
         # no-op merge.
         env = {**env, **await provision_app_storage(app_id)}
-        recovery_source = await self.newest_restore_source(app_id)
-        if recovery_source is not None or await self._snapshot_exists_or_bust(app_id):
+        if await self._snapshot_exists_or_bust(app_id):
             try:
-                # NEWEST, not the saved one. See `newest_restore_source`: pulling `snapshot_key`
-                # here is what used to discard everything the user did after their last Save,
-                # one turn after a container was reclaimed.
                 return await self._restore_or_bust(
-                    sandbox_client,
-                    user_id,
-                    app_name,
-                    app_id,
-                    env,
-                    source_key=recovery_source,
+                    sandbox_client, user_id, app_name, app_id, env, source_key=None
                 )
             except StorageNotFoundError:
                 # The ONLY error that may reach provision_new: the store positively answered
@@ -4581,11 +4212,12 @@ class SessionManager:
         shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
         """Pull the known-present snapshot into a fresh container, with bounded retry.
-        `source_key` selects WHICH bundle (default the saved snapshot; relaunch passes the
-        recovery key). A transient npm or storage blip is retried rather than falling back to
-        a fresh template — that fallback caused silent, permanent data loss, since the bundle
-        EXISTS here and finalize would overwrite it. A PERSISTENT failure deliberately strands
-        the session instead: a 503 with the user's work intact beats a start that silently
+        `source_key` selects WHICH bundle — `None` is this app's own saved snapshot, and
+        `launch_shared_preview` passes the OWNER's. A transient npm or storage blip is retried
+        rather than falling back to a fresh template — that fallback caused silent, permanent
+        data loss, since the bundle EXISTS here and the next write of the saved copy would put
+        the template over it. A PERSISTENT failure deliberately strands the session instead: a
+        503 with the user's work intact beats a start that silently
         destroys it. Self-cleans on every exception, so each attempt starts from no container;
         `StorageNotFoundError` must not retry — it is the caller's fresh-provision arm.
 
@@ -4654,10 +4286,10 @@ class SessionManager:
         and fan out to every live SSE subscriber (no Redis — this IS the transport).
 
         ONE PRODUCER LEFT. The build harness that emitted the six BRAIN members is deleted, so in
-        production the only envelope that reaches here is the terminal `ended` that `_do_finalize`
-        emits. The generic derivation below is kept deliberately: this is a SINK, and it has to
-        derive correct state from any envelope handed to it — including the ones tests push
-        directly — without reaching back into who emitted them."""
+        production nothing emits into it at all: a turn's narrative is the turn's own frames. The
+        generic derivation below is kept deliberately: this is a SINK, and it has to derive
+        correct state from any envelope handed to it — including the ones tests push directly —
+        without reaching back into who emitted them."""
         session.envelopes.append(env)
         session.last_seq = env.seq
         session.updated_at = datetime.now(UTC)
@@ -4678,12 +4310,6 @@ class SessionManager:
             if env.preview_url is not None:
                 session.preview_url = env.preview_url
             session.terminal_emitted = True
-            # In production this fold is an identity — `_do_finalize` builds the frame FROM
-            # `session.snapshot_committed`. It stays because `on_progress` is the generic
-            # progress sink: it must derive correct state from any envelope handed to it,
-            # including the ones tests push directly, without reaching back into who emitted
-            # them.
-            session.snapshot_committed = session.snapshot_committed or env.snapshot_committed
         elif session.status == BuildSessionStatus.PROVISIONING:
             session.status = BuildSessionStatus.BUILDING  # first sign of the loop running
 
@@ -4721,64 +4347,7 @@ class SessionManager:
 
     # --- completion + the single-owner end sequence --------------------------
 
-    async def _finalize(
-        self,
-        session: BuildSession,
-        reason: str | None,
-        sandbox_client: SandboxClient,
-        *,
-        result: BuildResult | None = None,
-    ) -> None:
-        """Single-owner dispatcher: the FIRST caller (synchronously, no await between the
-        check and the create) spawns ONE shielded end-sequence task; every caller then
-        awaits it under `asyncio.shield`, so a caller's own cancellation (a racing stop
-        cancelling the run_build task mid-finalize) can NEVER tear the sequence in half —
-        `_do_finalize` runs to completion in its own task regardless."""
-        if session.finalize_task is None:
-            session.terminal_committed = True
-            session.finalize_task = asyncio.ensure_future(
-                self._do_finalize(session, reason, sandbox_client, result=result)
-            )
-        await asyncio.shield(session.finalize_task)
-
-    async def _record_outcome(
-        self,
-        session: BuildSession,
-        *,
-        status: BuildSessionStatus,
-        preview_url: str | None,
-        reason: str | None,
-    ) -> None:
-        """Write the build-outcome message to the session's thread. The SERVER records this,
-        not the portal, since the portal is not reliably there: builds take minutes, users
-        close tabs, and an in-memory session is evicted 5 minutes after its terminal.
-        Best-effort and never raising: this runs inside the end sequence, where a raise would
-        skip the terminal frame and hang every SSE feed; a build with no thread is a no-op,
-        not an error. TIME-BOUNDED for the same reason: this is the only end-sequence step
-        that opens a DB session, and a wedged connection would block here forever — the
-        record is worth waiting seconds for, never the terminal."""
-        if session.conversation_id is None:
-            return
-        try:
-            async with asyncio.timeout(_OUTCOME_WRITE_TIMEOUT_SECONDS):
-                async with self._session_factory() as db:
-                    await write_build_outcome(
-                        db,
-                        user_id=session.user_id,
-                        conversation_id=session.conversation_id,
-                        session_id=session.session_id,
-                        status=status,
-                        preview_url=preview_url,
-                        snapshot_committed=session.snapshot_committed,
-                        reason=reason,
-                        started_seq=session.started_seq,
-                    )
-        except (Exception, TimeoutError):  # fmt: skip  # ruff py314 strips parens
-            _log.exception("build outcome write failed", session_id=str(session.session_id))
-
-    async def _pardon_the_container(
-        self, redis: aioredis.Redis, session: BuildSession, *, touched: bool
-    ) -> None:
+    async def _pardon_the_container(self, redis: aioredis.Redis, session: BuildSession) -> None:
         """The success-path alternative to teardown: the container outlives its build so the
         user can use what they just built. Mirrors `relaunch_preview`'s lifetime model: the
         registry entry STAYS, a bounded stay of execution owns the lifetime, and the per-user
@@ -4787,17 +4356,12 @@ class SessionManager:
         needs it). ORDER IS LOAD-BEARING: the stay is granted while the lock is STILL HELD, or
         a concurrent sweep could see lock-gone with no lease yet and destroy the container
         just pardoned. Best-effort, and both degraded modes below are safe."""
-        # `touched` is the only thing that changes here, and it is a fact about WHAT THIS RUN
-        # DID, never which kind of chat sent it: a run that wrote files earns the usual long
-        # stay, one that wrote nothing earns a shorter one, bounding the cost of a chat-only
-        # session that pins the workspace on every turn without ever producing anything worth
-        # a 30-minute reprieve. `grant_stay_of_execution`'s own monotonic guarantee
-        # (`max(existing, computed)`) keeps this safe on a MIXED session: a read-only turn
-        # arriving inside a write turn's still-standing stay leaves that longer deadline
-        # untouched.
-        writer = DeadlineWriter.TURN_IN_FLIGHT if touched else DeadlineWriter.TURN_ENDED_UNCHANGED
+        # WHAT THE TURN DID BUYS IT NOTHING EXTRA. A turn in flight is held by the wall-clock
+        # lease, not by a deadline, so this grant only ever covers the pause after one — and a
+        # pause is worth the same whether files were written or not. The screen that is still
+        # open renews it; a builder who has gone stops paying.
         try:
-            await grant_stay_of_execution(redis, session.user_id, writer=writer)
+            await grant_stay_of_execution(redis, session.user_id, writer=DeadlineWriter.TURN_ENDED)
         except Exception:
             # Degraded but safe: the sweep reaps at heartbeat lapse (~90s) instead, never an
             # orphan, because the registry is still there to find.
@@ -4812,218 +4376,6 @@ class SessionManager:
                 # Degraded but safe: the lock lingers to its TTL and the next start's
                 # `reap_lock` clears it.
                 _log.exception("lock release failed in pardon", session_id=str(session.session_id))
-
-    async def _do_finalize(
-        self,
-        session: BuildSession,
-        reason: str | None,
-        sandbox_client: SandboxClient,
-        *,
-        result: BuildResult | None = None,
-    ) -> None:
-        """The authoritative end sequence, run exactly once. Every step is best-effort:
-        a Redis blip on release/delete must NOT abort the sequence (which would leave the
-        session half-finalized with the SSE feed hung) — it is logged and the sequence
-        continues to the terminal synthesis (fixed ordering: snapshot → teardown-or-pardon
-        → release → synthesize)."""
-        redis = get_redis()
-        reason = reason or session.end_reason or _COMPLETED
-
-        # 1. Snapshot — only with live progress to persist; skipped for force_end / already done.
-        if (
-            session.handle is not None
-            and not session.force_ended
-            and not session.snapshot_committed
-        ):
-            try:
-                # A BUILD's finalize writes the saved version: the build was the user's act,
-                # and `submit` must be able to approve exactly what it produced.
-                await write_snapshot(sandbox_client, session.handle, session.app_id)
-                session.snapshot_committed = True
-            except Exception:
-                _log.exception("snapshot failed in finalize", session_id=str(session.session_id))
-
-        # 1b. The generation-time overpromise detector: while the container is still up, flag
-        #     an app whose copy promises live/shared data with no refetch anywhere in the
-        #     workspace. A structlog signal only — never a gate — and it swallows its own
-        #     failures, so it can never delay or break the end sequence beyond one exec.
-        if session.handle is not None and not session.force_ended:
-            await flag_liveness_overpromise(
-                sandbox_client,
-                session.handle,
-                app_id=session.app_id,
-                session_id=session.session_id,
-            )
-
-        # The terminal status/URL are computed BEFORE step 2 because the teardown-or-pardon
-        # decision needs them (see WHY at the emit below for the status derivation rules).
-        status = result.status if result is not None else _terminal_status(reason)
-        preview_url = (result.preview_url if result is not None else None) or session.preview_url
-
-        # The pardon decision: ONLY a genuinely successful build keeps its
-        # container. `status` (not just the reason string) is part of the test so a
-        # hypothetical FAILED verdict carrying a "completed" reason could never leave a
-        # broken container running as if it were a success.
-        pardoned = (
-            reason == _COMPLETED
-            and status is BuildSessionStatus.ENDED
-            and not session.force_ended
-            and session.handle is not None
-        )
-
-        # READ THE CONTAINER'S OWN RECORD BEFORE THE STEP THAT DELETES IT — the last chance
-        # anything has to answer "was this container ever any use to anybody". One HGETALL on a
-        # path that is already tearing down an ACA container; there is no budget to protect
-        # here, and it is guarded because a blip must not abort the end sequence.
-        reg_at_the_end: dict[str, str] | None = None
-        with suppress(RedisError):
-            reg_at_the_end = await read_registry(redis, session.user_id)
-
-        # 2. Teardown → 3. holder release (LAST) → clear registry — or, on the completed
-        #    path, PARDON: keep the container + registry, lease its lifetime, release the
-        #    lock (see `_pardon_the_container`). Release + registry-delete run ONLY on a
-        #    CLEAN teardown: a teardown SandboxError means the container may still be live,
-        #    so KEEP the Redis lock + registry (mirroring reaper.reap_user's
-        #    keep-state-on-failure) for the next reaper sweep to retry — clearing them now
-        #    would orphan a container the reaper's registry-only scan can never see again.
-        #    `_active_by_user` is popped regardless (guaranteed-run finally) so the SSE feed
-        #    always closes even on a kept-state teardown failure.
-        try:
-            if pardoned:
-                # `touched=True` unconditionally: this is the BRAIN-driven build path, and
-                # `pardoned` already required a genuinely successful build (status ENDED, not
-                # force-ended) — a build that reached that verdict wrote the app it built.
-                # There is no read-only arm here to distinguish (unlike `finish_turn_sandbox`,
-                # an ordinary chat turn's end, where a Plan-kind or a Q&A message may touch
-                # nothing at all).
-                await self._pardon_the_container(redis, session, touched=True)
-            else:
-                torn_down = True
-                if session.handle is not None:
-                    try:
-                        await sandbox_client.teardown(session.handle)
-                    except SandboxError:
-                        torn_down = False
-                        _log.exception(
-                            "teardown failed in finalize; keeping lock+registry for the reaper",
-                            session_id=str(session.session_id),
-                        )
-                if torn_down:
-                    if session.lock_token:
-                        try:
-                            await release_lock_as_holder(
-                                redis, session.user_id, session.lock_token
-                            )
-                        except Exception:
-                            _log.exception(
-                                "lock release failed in finalize",
-                                session_id=str(session.session_id),
-                            )
-                    try:
-                        # BY NAME, for the same reason `_release_the_slot_if_still_ours` below
-                        # exists. A switch hands the outgoing container over and starts the
-                        # incoming project at once, so this session reaches its ending well
-                        # after the incoming one has written its own record into the one
-                        # per-user key. Deleting by user id alone takes that record away and
-                        # leaves the incoming container running with nothing able to find it —
-                        # invisible to a sweep that walks the registry namespace.
-                        await delete_registry_if_it_still_names(
-                            redis, session.user_id, session.handle.app_name
-                        )
-                    except Exception:
-                        _log.exception(
-                            "registry delete failed in finalize",
-                            session_id=str(session.session_id),
-                        )
-        finally:
-            self._release_the_slot_if_still_ours(session)
-            self._maybe_prune_start_lock(session.user_id)
-
-        # 3a. A CONTAINER'S LIFE ENDED, said out loud. Until this line the clean finish was
-        #     completely silent, so the log held starts with no ends and no way to tell a tidy
-        #     shutdown from a process that simply vanished.
-        #
-        #     `reason` NAMES THE DOOR, not this session's end reason: one event, four values,
-        #     across the two files that end containers, so an external rule can key on it (THE
-        #     ONE RULE in `alarms.py`). The session's own end reason is already on the terminal
-        #     `ended` frame and on the outcome row below — spelling it here a third time is how
-        #     two spellings of one fact get written.
-        #
-        #     `served` IS READ STRAIGHT OFF THE STAMP and is deliberately NOT `stamp_is_proven`:
-        #     that predicate grandfathers a pre-cutover absence as proven so a live fleet stays
-        #     framed across the deploy, which is the right answer for the SCREEN and the wrong
-        #     one for a retrospective. Here an absent stamp means nobody ever watched this app
-        #     answer, and saying otherwise would put a lie in the one field that exists to count
-        #     containers that were never any use to anybody.
-        #
-        #     ON THE PARDON ARM the container is still up — `pardoned=True` says exactly that —
-        #     so `lifetime_ms` there is how long it had lived when its session ended, not how
-        #     long it lived in total. The reaper writes the closing line for that one.
-        _log.info(
-            SANDBOX_TORN_DOWN_EVENT,
-            reason="turn_finalize",
-            pardoned=pardoned,
-            lifetime_ms=elapsed_ms(
-                an_instant_on_the_hash(reg_at_the_end, REGISTRY_FIELD_CREATED_AT),
-                datetime.now(UTC),
-            ),
-            served=bool(reg_at_the_end and reg_at_the_end.get(REGISTRY_FIELD_SERVING_SINCE)),
-            user_id=str(session.user_id),
-            app_id=str(session.app_id),
-            session_id=str(session.session_id),
-        )
-
-        # 4. Emit THE terminal `ended` — the session's one and only terminal frame. It drives
-        #    the derived status AND lets every SSE generator emit `[DONE]` (a bare close
-        #    would leave status stuck at BUILDING/READY and hang the feed). Must run even if a
-        #    prior step raised, so status is always terminal.
-        #
-        #    WHY HERE, and nowhere else: this point is downstream of the step-1 snapshot, so
-        #    `session.snapshot_committed` is settled — true when the bundle actually pushed,
-        #    false when it failed/was skipped. BRAIN cannot emit this frame (no `ended` helper
-        #    exists on its emitter): anything it emitted would necessarily predate the snapshot
-        #    and could only ever report `snapshot_committed=false` — the exact lie this fixes.
-        #
-        #    `status` comes from BRAIN's verdict when there is one — the reason string alone
-        #    cannot decide it (an `escalated` end is FAILED, a `quota_exceeded` end is ENDED, and
-        #    neither equals `_BUILD_FAILED`). Only the verdict-less paths (stop / force_end /
-        #    idle-reap / a raised run_build) fall back to deriving it from the reason.
-        #    (`status`/`preview_url` are computed above step 2 — the pardon decision needs them.)
-
-        # 3b. Record the outcome in the thread — BEFORE the terminal frame, so the row is
-        #     already there when any client learns the build is over (the reverse order races every
-        #     reader). Best-effort like every other step here: a failed write must not abort the
-        #     sequence and hang the SSE feed. Same values as the frame below, by construction.
-        await self._record_outcome(session, status=status, preview_url=preview_url, reason=reason)
-
-        if not session.terminal_emitted:
-            ended = EndedEvent(
-                status=status,
-                # BRAIN's final URL wins; fall back to the last `preview_ready` we saw, so an
-                # escalation that carries no URL still reports a preview that genuinely came up.
-                preview_url=preview_url,
-                snapshot_committed=session.snapshot_committed,
-                reason=reason,
-                seq=session.last_seq + 1,  # continues BRAIN's stream — gap-free across the handoff
-            )
-            try:
-                await self.on_progress(session, ended)
-            except Exception:
-                _log.exception("terminal emit failed", session_id=str(session.session_id))
-                session.status = status  # guarantee a terminal status regardless
-        else:
-            # Unreachable: `_do_finalize` runs exactly once per session (the `finalize_task`
-            # single-owner guard) and is now the ONLY emitter of `ended`, so nothing can have
-            # set this flag before us. Kept as the last structural line of defense for "never
-            # two terminals" — but loud, because reaching it means the single-owner guard broke.
-            _log.warning(
-                "terminal ended already present at finalize; skipping a second emit",
-                session_id=str(session.session_id),
-            )
-
-        # 5. Start the retention window — the session (and its replay buffer) stays resident
-        #    for a late SSE reconnect, then `evict_ended_sessions` drops it.
-        session.ended_at = datetime.now(UTC)
 
     async def finish_turn_sandbox(
         self,
@@ -5040,19 +4392,13 @@ class SessionManager:
         lets the next message reuse it is `_the_live_sandbox_is_already_the_one_we_want`, not
         the pardon alone — an earlier version of this docstring claimed otherwise, and
         reconcile-on-start destroyed the pardoned container on every turn until fixed."""
-        # The consequence of "no save" is deliberate and belongs in the UI, not buried here:
-        # work that is never saved is lost when the container is reclaimed, and what earns
-        # that is the dirty indicator and the leave warning — a user who loses work must have
-        # been told, twice, that it was unsaved. The 1c autosave below only covers the endings
-        # nobody can warn about (a crash, a closed laptop, the idle reaper).
+        # NOTHING WARNS THE CITIZEN ON THE WAY OUT, and no leave prompt ships. What earns that
+        # is the write-back every teardown performs: the container that holds this tree is never
+        # destroyed without it being written to the saved copy first, whether the ending is a
+        # project switch, the idle reaper or the age ceiling.
         #
-        # SWITCHING PROJECTS IS NOT COVERED BY EITHER TELLING, and it is not meant to be: the
-        # shutdown routine writes that container's tree back over the saved copy before
-        # destroying it, so the work survives the switch without anybody being warned about it.
-        #
-        # Steps 1b, 2 and 3 of `_do_finalize`, in that order and for those reasons. Deliberately
-        # NOT here: the terminal `ended` frame (the turn's own `TurnEndedFrame` owns it),
-        # `_record_outcome` (the turn's own rows are the record now), any mode restore (Write
+        # Deliberately NOT here: the terminal `ended` frame (the turn's own `TurnEndedFrame` owns
+        # it), an outcome record (the turn's own rows are the record now), any mode restore (Write
         # is no longer a dead end the thread has to be rescued from), and the snapshot itself.
         redis = get_redis()
 
@@ -5077,70 +4423,16 @@ class SessionManager:
                 session_id=session.session_id,
             )
 
-        # 1c. AUTOSAVE to the recovery slot. NOT a save: `recovery_key` is a separate
-        #     namespace that `submit` never copies and a relaunch never restores in place of
-        #     the user's bundle — what becomes a saved VERSION is still their
-        #     click. This only stops the endings nobody can warn about (a crash, a closed
-        #     laptop, the idle reaper) from costing the whole session.
-        #
-        #     Best-effort and swallowed, deliberately: a safety net that can fail a turn is
-        #     not a safety net. The bounded timeout matters too: each exec inside the write is
-        #     already capped (120s in `snapshot.py`, 30s for the ancestry probe), but five in
-        #     sequence is minutes on a path whose job is to end.
-        if session.handle is not None and touched:
-            try:
-                async with asyncio.timeout(_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS):
-                    written = await write_recovery_copy(
-                        sandbox_client,
-                        session.handle,
-                        session.app_id,
-                        taken_at=datetime.now(UTC),
-                    )
-                if written.outcome is RecoveryOutcome.DIVERTED:
-                    # THE NUMBER THAT SETTLES A PAST INCIDENT the next time it happens: the
-                    # difference between "the platform failed to CHECK the workspace" and "the
-                    # platform failed to make it DURABLE" — a distinction nobody could answer
-                    # the day it actually mattered.
-                    await count(HarnessCounter.RECOVERY_WRITE_MISSED, app_id=session.app_id)
-                _log.info(
-                    "recovery copy",
-                    app_id=str(session.app_id),
-                    session_id=str(session.session_id),
-                    outcome=written.outcome.value,
-                    detail=written.reason,
-                )
-            except TimeoutError, Exception:  # fmt: skip  # ruff py314 strips the parens
-                # STILL SWALLOWED — a safety net that can fail a turn is not a safety net — but
-                # no longer SILENT. The swallow is exactly what once made a past reversion
-                # unfalsifiable: nobody could say afterwards whether the platform had failed to
-                # check the workspace or failed to make it durable, because a write that never
-                # landed left no trace an operator would ever look for.
-                _log.error(
-                    RECOVERY_WRITE_DID_NOT_LAND_EVENT,
-                    app_id=str(session.app_id),
-                    session_id=str(session.session_id),
-                    reason="failed",
-                    exc_info=True,
-                )
-                await count(HarnessCounter.RECOVERY_WRITE_MISSED, app_id=session.app_id)
-
         # 2/3. Pardon: grant the stay while the lock is STILL HELD, then release. The order
         #      is load-bearing (see `_pardon_the_container`) — releasing first opens a window
         #      where a concurrent sweep sees lock-gone with no lease yet and executes the
         #      container we just spared. The registry entry stays: it is the sweep's only map
         #      to the container, and deleting it would orphan a live sandbox.
-        #
-        #      `touched` THREADS STRAIGHT THROUGH from this method's own parameter —
-        #      the same fact steps 1b/1c above already key on. A turn that wrote nothing buys
-        #      the shorter stay; this is where a Plan-kind chat's ordinary Q&A turn (which can
-        #      never touch the tree — its toolset has no write tool) stops paying for a
-        #      30-minute reprieve it never earned, without this method ever asking what kind of
-        #      chat sent it.
         try:
-            await self._pardon_the_container(redis, session, touched=touched)
+            await self._pardon_the_container(redis, session)
         finally:
-            # Guaranteed-run, exactly as in `_do_finalize`: the slot must free even if the
-            # pardon raised, or this user can never send another Write message.
+            # Guaranteed-run: the slot must free even if the pardon raised, or this user can
+            # never send another Write message.
             #
             # ONLY IF THE SLOT IS STILL THIS SESSION'S. A switch stops this turn and starts the
             # citizen's next project without waiting for it to unwind, so by the time an
@@ -5153,81 +4445,6 @@ class SessionManager:
 
         session.status = BuildSessionStatus.ENDED
         session.ended_at = datetime.now(UTC)
-
-    # --- stop / force-end (graceful vs kill switch) --------------------------
-
-    async def stop(
-        self,
-        session: BuildSession,
-        sandbox_client: SandboxClient,
-        *,
-        reason: str = STOPPED_BY_USER,
-    ) -> BuildSession:
-        return await self._end(session, sandbox_client, reason=reason, force=False)
-
-    async def force_end(
-        self, session: BuildSession, sandbox_client: SandboxClient, *, reason: str = FORCE_ENDED
-    ) -> BuildSession:
-        return await self._end(session, sandbox_client, reason=reason, force=True)
-
-    async def _await_end_sequence(self, session: BuildSession) -> BuildSession:
-        """A terminal-committed session's end sequence, awaited to completion. The caller lost
-        the race to the end sequence's owner, so it touches NO session state — it only waits
-        for the shielded task and hands back the terminal session (a `stop`/`force_end` is
-        idempotent, so returning mid-teardown would report a state that isn't final yet)."""
-        if session.finalize_task is not None:
-            with suppress(Exception):
-                await asyncio.shield(session.finalize_task)
-        return session
-
-    async def _end(
-        self,
-        session: BuildSession,
-        sandbox_client: SandboxClient,
-        *,
-        reason: str,
-        force: bool,
-    ) -> BuildSession:
-        # Already ending/ended (a completion or a prior stop won the race): don't cancel —
-        # just await the in-flight shielded end sequence and return the terminal state.
-        if session.terminal_committed:
-            return await self._await_end_sequence(session)
-        # Mark-ending is best-effort and runs BEFORE the session flags are mutated: a Redis
-        # blip must neither 500 the kill switch (the build would keep burning tokens) nor
-        # leave a poisoned `force_ended` on a still-running session (a later natural
-        # completion would then silently skip its snapshot). Matches the file's other
-        # best-effort Redis paths (on_progress / _do_finalize) — logged, never swallowed.
-        try:
-            await mark_registry_ending(get_redis(), session.user_id)
-        except Exception:
-            _log.exception(
-                "mark-registry-ending failed in _end; proceeding to cancel + finalize",
-                session_id=str(session.session_id),
-            )
-        # Re-check AFTER that await — the entry check above is stale the moment we suspend.
-        # INVARIANT: `force_ended` may only be written while `terminal_committed` is False,
-        # checked with NO await in between. A completion landing inside the mark-ending await
-        # commits the terminal and starts finalize; writing the flags now would be a write
-        # BEHIND the commit — `force_ended=True` after finalize already passed its snapshot
-        # step tears the container down with no bundle while the terminal frame it already
-        # emitted still reports "completed". A silently lost snapshot is the worst outcome
-        # this file has, so a lost race means: mutate nothing, just await the sequence.
-        if session.terminal_committed:
-            return await self._await_end_sequence(session)
-        session.end_reason = reason
-        session.force_ended = force
-        task = session.task
-        if task is not None and not task.done():
-            task.cancel()
-            # Await the FULL unwind BEFORE finalize, so no late real on_progress envelope
-            # races the synthetic terminal seq (the feed's gap-free invariant). Cancelling the task
-            # cannot tear the end sequence: `_finalize` runs it in a SHIELDED task, so even a
-            # cancel delivered while the task is already mid-finalize lets `_do_finalize`
-            # complete; every caller awaits that same shielded task.
-            with suppress(asyncio.CancelledError):
-                await task
-        await self._finalize(session, reason, sandbox_client)
-        return session
 
 
 # --- accessor singleton (mirrors get_redis / get_sandbox) --------------------

@@ -34,22 +34,20 @@ def _aged(hours: float) -> SandboxIdentity:
     )
 
 
-def test_with_the_flag_off_nothing_ever_drains() -> None:
-    """The default posture everywhere. Long-session behaviour was never validated and the
-    longest observed live session is ~31 minutes, so this threshold targets a scenario nobody
-    has measured."""
+def test_with_no_sandbox_configured_nothing_ever_drains() -> None:
+    """The ceiling is not optional, but it is not INVENTABLE either: a deployment with no sandbox
+    configured has no container ages to reason about, and `the_ceiling_hours` answers `None`
+    there. Draining on that would be draining on a guess."""
     old = _aged(100)
 
-    assert draining_at(old, enabled=False, after_hours=24) is None
-    assert is_drained(old, now=NOW, enabled=False, after_hours=24, turn_in_flight=False) is False
+    assert draining_at(old, after_hours=None) is None
+    assert is_drained(old, now=NOW, after_hours=None, turn_in_flight=False) is False
 
 
 def test_a_turn_in_flight_is_never_interrupted() -> None:
     """A 24-hour-old container with an agent making tool calls inside it is doing precisely what
     the platform exists to do. The drain waits for the pause."""
-    assert (
-        is_drained(_aged(48), now=NOW, enabled=True, after_hours=24, turn_in_flight=True) is False
-    )
+    assert is_drained(_aged(48), now=NOW, after_hours=24, turn_in_flight=True) is False
 
 
 def test_a_builder_who_keeps_working_keeps_the_container() -> None:
@@ -57,19 +55,15 @@ def test_a_builder_who_keeps_working_keeps_the_container() -> None:
     drain never lands."""
     old = _aged(200)
     for _ in range(5):
-        assert is_drained(old, now=NOW, enabled=True, after_hours=24, turn_in_flight=True) is False
+        assert is_drained(old, now=NOW, after_hours=24, turn_in_flight=True) is False
 
 
 def test_past_the_mark_and_idle_the_container_drains() -> None:
-    assert (
-        is_drained(_aged(25), now=NOW, enabled=True, after_hours=24, turn_in_flight=False) is True
-    )
+    assert is_drained(_aged(25), now=NOW, after_hours=24, turn_in_flight=False) is True
 
 
 def test_before_the_mark_it_does_not() -> None:
-    assert (
-        is_drained(_aged(23), now=NOW, enabled=True, after_hours=24, turn_in_flight=False) is False
-    )
+    assert is_drained(_aged(23), now=NOW, after_hours=24, turn_in_flight=False) is False
 
 
 def test_a_container_with_no_trustworthy_age_is_never_drained() -> None:
@@ -77,17 +71,15 @@ def test_a_container_with_no_trustworthy_age_is_never_drained() -> None:
     is not trusted lives in `inventory.py`."""
     untagged = identity_from_tags({})
 
-    assert draining_at(untagged, enabled=True, after_hours=24) is None
-    assert (
-        is_drained(untagged, now=NOW, enabled=True, after_hours=24, turn_in_flight=False) is False
-    )
+    assert draining_at(untagged, after_hours=24) is None
+    assert is_drained(untagged, now=NOW, after_hours=24, turn_in_flight=False) is False
 
 
 def test_the_drain_time_is_answered_as_when_not_whether() -> None:
     """The value is rendered to a builder, so a boolean would leave the UI inventing the
     sentence. "Your workspace refreshes at 14:00" is a different message from "your workspace
     will be reclaimed", and only one of them is true."""
-    mark = draining_at(_aged(1), enabled=True, after_hours=24)
+    mark = draining_at(_aged(1), after_hours=24)
 
     assert mark == NOW + dt.timedelta(hours=23)
 
@@ -96,7 +88,7 @@ def test_the_drain_time_is_answered_as_when_not_whether() -> None:
 def test_the_threshold_is_configurable_rather_than_baked(hours: int) -> None:
     """Because the number is admittedly unvalidated, it must be movable without a code change —
     an operator who measures a real long session should be able to act on what they learned."""
-    mark = draining_at(_aged(0), enabled=True, after_hours=hours)
+    mark = draining_at(_aged(0), after_hours=hours)
 
     assert mark == NOW + dt.timedelta(hours=hours)
 
@@ -109,10 +101,7 @@ def test_a_turn_still_holds_the_container_just_past_the_ceiling() -> None:
     is entitled to finish. Only the sum of a whole run and one slow tool call is long enough to
     say, honestly, that nothing is working in there."""
     assert (
-        past_the_turn_bound(
-            _aged(2.4), now=NOW, enabled=True, after_hours=2, turn_grace_seconds=2400
-        )
-        is False
+        past_the_turn_bound(_aged(2.4), now=NOW, after_hours=2, turn_grace_seconds=2400) is False
     )
 
 
@@ -120,21 +109,14 @@ def test_a_lease_that_will_not_stop_renewing_runs_out_of_benefit_of_the_doubt() 
     """THE HOLE THIS CLOSES. A jammed lease is indistinguishable from an agent making tool calls,
     so the arm that spares a live turn spares a wedged one forever — and a wedged container is
     exactly the population a ceiling exists to collect."""
-    assert (
-        past_the_turn_bound(
-            _aged(5), now=NOW, enabled=True, after_hours=2, turn_grace_seconds=2400
-        )
-        is True
-    )
+    assert past_the_turn_bound(_aged(5), now=NOW, after_hours=2, turn_grace_seconds=2400) is True
 
 
-def test_the_outer_mark_is_still_a_flag() -> None:
-    """Off everywhere by default, like the mark it sits behind. A deployment that wants no
-    ceiling gets no ceiling, including this one."""
+def test_the_outer_mark_needs_a_configured_ceiling_too() -> None:
+    """The outer mark follows the mark it sits behind: with no sandbox configured there is no
+    ceiling to be past, including this one."""
     assert (
-        past_the_turn_bound(
-            _aged(500), now=NOW, enabled=False, after_hours=2, turn_grace_seconds=2400
-        )
+        past_the_turn_bound(_aged(500), now=NOW, after_hours=None, turn_grace_seconds=2400)
         is False
     )
 
@@ -144,10 +126,7 @@ def test_an_untagged_container_is_never_torn_out_from_under_an_agent() -> None:
     interrupt live work. A container whose birthday cannot be proved is reported, never cut."""
     ageless = identity_from_tags({TAG_KIND: KIND_BUILD_SANDBOX})
 
-    assert (
-        past_the_turn_bound(ageless, now=NOW, enabled=True, after_hours=2, turn_grace_seconds=2400)
-        is False
-    )
+    assert past_the_turn_bound(ageless, now=NOW, after_hours=2, turn_grace_seconds=2400) is False
 
 
 def test_the_outer_mark_is_strictly_later_than_the_ordinary_one() -> None:
@@ -155,12 +134,5 @@ def test_the_outer_mark_is_strictly_later_than_the_ordinary_one() -> None:
     must always reach the ordinary ceiling before it reaches the one that cuts a turn."""
     just_past = _aged(2.1)
 
-    assert (
-        is_drained(just_past, now=NOW, enabled=True, after_hours=2, turn_in_flight=False) is True
-    )
-    assert (
-        past_the_turn_bound(
-            just_past, now=NOW, enabled=True, after_hours=2, turn_grace_seconds=2400
-        )
-        is False
-    )
+    assert is_drained(just_past, now=NOW, after_hours=2, turn_in_flight=False) is True
+    assert past_the_turn_bound(just_past, now=NOW, after_hours=2, turn_grace_seconds=2400) is False

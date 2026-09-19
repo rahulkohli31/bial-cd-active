@@ -54,7 +54,7 @@ from src.api.v1.build_sessions.schemas import (
     SERVED_TRAFFIC_STAY_SECONDS,
     STARTING_MARKER_TTL_SECONDS,
     SURFACE_PRESENT_STAY_SECONDS,
-    TURN_ENDED_UNCHANGED_STAY_SECONDS,
+    TURN_ENDED_STAY_SECONDS,
     RenewalOutcome,
     SurfacePresence,
 )
@@ -378,11 +378,6 @@ class DeadlineWriter(enum.StrEnum):
     Weighted toward the CONTAINER over the keyboard: what's happening *inside* it and what its
     app is serving is direct evidence of use; keystrokes are only a proxy for presence."""
 
-    #: The wall-clock lease, published by the turn engine for the duration of a turn.
-    #: OUTRANKS EVERYTHING, and does it structurally rather than by comparing numbers: the lease
-    #: is its own key with its own TTL, and `liveness_lease_is_held` spares a container before any
-    #: deadline is consulted. A turn in flight cannot be out-voted by an expiring stay.
-    TURN_IN_FLIGHT = "turn_in_flight"
     #: Requests the generated app actually served, self-reported by the sandbox and excluding
     #: control-plane probes. Buys a BOUNDED extension — never indefinite life.
     APP_SERVED_TRAFFIC = "app_served_traffic"
@@ -392,13 +387,12 @@ class DeadlineWriter(enum.StrEnum):
     #: machinery. Save, Stop and Deploy do NOT write it: they act on a container whose lifetime is
     #: already held by the turn's lease or by the presence of a surface.
     BUILDER_ACTED = "builder_acted"
-    #: A turn ended having WRITTEN NOTHING (`workspace_touched` is False). The
-    #: weakest evidence in the set on purpose: it is pure keyboard, with nothing on the container
-    #: side to show for it — no file changed, no tool ran that could have. Bounds the cost of a
-    #: chat-only (Plan-kind) session that pins the workspace on every turn without ever
-    #: producing anything to keep it pinned for. Never chosen for a FAILED turn's write attempt —
-    #: `_pardon_the_container` keys on WHAT the turn did, not on how it ended.
-    TURN_ENDED_UNCHANGED = "turn_ended_unchanged"
+    #: A turn ended, whatever it did. A turn IN FLIGHT is not held by a deadline at all — the
+    #: wall-clock lease is its own key with its own TTL and spares a container before any
+    #: deadline is consulted — so what this buys is the pause AFTER one, and a pause is worth
+    #: the same whether the turn wrote a file or not. Long enough for the screen that is still
+    #: open to renew it, short enough that a builder who has gone does not keep paying.
+    TURN_ENDED = "turn_ended"
     #: A screen that can frame this project is open and polling. The only writer a BROWSER can
     #: reach, and the only one that keeps renewing while nobody types: presence is what holds a
     #: container, and silence is how leaving is spelled. Bounded twice over — by its own short
@@ -410,10 +404,9 @@ class DeadlineWriter(enum.StrEnum):
 #: How long each writer's evidence is worth. Traffic buys less than a deliberate action because it
 #: is weaker evidence of intent — a background poll from a left-open app tab is still traffic.
 DEADLINE_WRITER_TTL_SECONDS: Final[Mapping[DeadlineWriter, int]] = {
-    DeadlineWriter.TURN_IN_FLIGHT: RELAUNCH_PREVIEW_STAY_SECONDS,
     DeadlineWriter.APP_SERVED_TRAFFIC: SERVED_TRAFFIC_STAY_SECONDS,
     DeadlineWriter.BUILDER_ACTED: RELAUNCH_PREVIEW_STAY_SECONDS,
-    DeadlineWriter.TURN_ENDED_UNCHANGED: TURN_ENDED_UNCHANGED_STAY_SECONDS,
+    DeadlineWriter.TURN_ENDED: TURN_ENDED_STAY_SECONDS,
     DeadlineWriter.SURFACE_PRESENT: SURFACE_PRESENT_STAY_SECONDS,
 }
 

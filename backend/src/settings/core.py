@@ -4,9 +4,10 @@ WHY THIS EXISTS
 Split out of `src/config.py`. The old single `Settings` carried every field
 every subsystem might need, so a worker importing it had to satisfy the union of everything —
 and the natural operator response to that is to narrow `ENVIRONMENT=development` to dodge the
-production gates. That is the most dangerous misconfiguration this platform has: with object
-storage unconfigured, the durable-copy gate answers "confirmed absent" for every container, and
-a destroy path reads that as "nothing to preserve".
+production gates. That is the misconfiguration to fear here, because those gates are what decide
+whether containers are ever collected at all: `may_destroy_on_this_control_plane` reads the
+environment directly, so a control plane calling itself development reaps nothing and pays for
+every sandbox it has ever started.
 
 `CoreSettings` therefore holds ONLY what is universally required. Anything a role might not use
 belongs in that role's own manifest (`api.py`, `worker.py`) — because a field placed here is

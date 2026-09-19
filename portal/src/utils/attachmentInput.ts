@@ -28,19 +28,8 @@ export const ALLOWED_MEDIA_TYPES = [
   'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
   ...CODE_LANE_MEDIA_TYPES,
 ]
-// THE INLINE TEXT LANE IS GONE, AND SO IS ITS LAST TRACE. A CSV used to be read in the
-// browser and pushed into the prompt as a fenced text block; every attachment is now an uploaded
-// file with a stored identity, which is what lets a chip be rebuilt on reload for EVERY format by
-// one fix — the inline lane could never have produced an identity to rebuild from.
-//
-// A `TEXT_MEDIA_TYPES` set stood here, deliberately EMPTIED rather than deleted, so its three
-// call sites could move onto the uploaded path one at a time instead of all at once. They have
-// all moved. What was left was a set that answered `false` to everything, two byte caps only it
-// could reach, and a `textAttachmentBytes` helper that could only ever return 0 — dead code with
-// a live test asserting the zero, which is the residue this pass exists to remove.
-
 // WHAT CAN BE SHOWN AS TEXT, which is a different question from how a file travels, and
-// the reason the set above could not simply be reused for it: `AttachmentPreview` asks whether
+// the reason `ALLOWED_MEDIA_TYPES` cannot simply be reused for it: `AttachmentPreview` asks whether
 // pressing a chip can render the file in place. A CSV is still perfectly readable in a browser,
 // and losing that preview would be a real regression smuggled in by a transport change.
 //

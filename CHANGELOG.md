@@ -4,6 +4,61 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-09-19
+
+Work you have not saved is no longer lost when the platform tidies up. Every door that puts a
+container away now writes the app's files somewhere durable first, and there is one saved copy
+rather than a choice between two that could disagree. Alongside that, the agent stopped being
+handed a fresh note about your app on every message and now asks for it when it needs it — which
+is what lets the platform stop paying to re-read the same instructions on every single call.
+
+> **Before deploying:** remove `SANDBOX__DRAIN_ENABLED` from the application settings. It no
+> longer exists, and a deployment that still carries it will refuse to start. The two-hour limit
+> it used to switch on now always applies, and the hours remain configurable.
+
+### Added
+
+- **The agent asks about your app instead of being told.** It now has a way to look at the current
+  state of your app when it needs to, rather than receiving a written description at the top of
+  every message whether it was useful or not.
+- **A step that failed says so.** A step that did not work now reads as failed in the list, instead
+  of sitting there looking the same as one that succeeded.
+
+### Fixed
+
+- **Unsaved work survives the platform putting your app away.** Every route that destroys a
+  container now saves the files first. Previously several of them did not, and anything built
+  since the last Save went with the container.
+- **Leaving a project puts it away in five minutes, not thirty.** A turn that wrote a file used to
+  buy the container another half hour at the moment the turn ended, so closing a project you had
+  just worked in kept it running far longer than anyone was looking at it.
+- **Every app now has a real closing time.** The two-hour limit shipped behind a switch that was
+  never turned on, so an app left open in a tab renewed itself indefinitely.
+- **A Save that fails says so.** It used to fail quietly.
+- **One check that cannot answer no longer overrules six that did.** A single unreadable result
+  used to veto the whole verification.
+- **The count beside "Working on your app" survives a refresh.** It restarted from zero when the
+  page reloaded partway through a build, so a three-minute build could report four seconds.
+- **A container with no repository fails loudly** instead of inventing one.
+
+### Changed
+
+- **The applications list no longer marks apps as open.** The "Open now" badge read from a record
+  that nothing cleared when the app stopped being watched, so it could claim an app was open for
+  minutes after nobody was there. Opening the project answers the same question truthfully.
+- **The closing-time note is gone.** An app's remaining life is the platform's business, not
+  something to put in front of the person using it.
+- **The daily token meter charges the rate the platform actually pays.** It had been billing
+  cached work at a cheaper rate than the one being bought, so it under-reported. The meter reads
+  higher for identical work; what changed is its arithmetic, not the cost.
+
+### Removed
+
+- The recovery slot, the parked-work pile and the copy gate that sat between a container and its
+  saved files — replaced by a single saved copy written on the way out.
+- The build-session stop and finalize routes, which nothing could reach any more, and the
+  workspace-activity route that fed the retired "Open now" badge.
+
 ## [1.7.5] - 2026-09-18
 
 The picture of an app being put together moves again. On a machine with animations switched off

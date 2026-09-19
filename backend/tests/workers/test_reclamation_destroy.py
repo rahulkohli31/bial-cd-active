@@ -45,7 +45,7 @@ def copy_attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
     AUTOUSE for the same reason as in the reaper's own suite: `record_durable_copy_attempt` opens
     its own session and COMMITS, so any test here that reaches a real reap would leave a permanent
     row in the SHARED test database — and `test_reclamation_report_only.py` counts every row in
-    that table. The real writer is exercised in `test_durable_copy_gate.py`, against a connection
+    that table. The real writer is exercised in `test_write_back_before_reclaim.py`, against a
     that rolls back."""
     recorded: list[CopyAttempt] = []
 
@@ -479,7 +479,7 @@ async def test_the_janitor_destroys_the_container_it_judged_and_gates_it_on_app_
 
     Mutation-check: key `_teardown` off the registry (`reap_user`) and the name assertion goes
     red; drop `app_id=app_id` and the id assertion does — both live here because
-    `test_durable_copy_gate.py` stays green either way."""
+    `test_write_back_before_reclaim.py` stays green either way."""
     from src.workers import reclamation
 
     user_id, app_id = uuid.uuid4(), uuid.uuid4()
@@ -864,7 +864,7 @@ async def test_the_scheduled_sweep_hands_the_owning_app_ids_to_the_gate(
     monkeypatch: pytest.MonkeyPatch, fake_redis: aioredis.Redis
 ) -> None:
     """WITHOUT THE MAP THE GATE IS OFF ON THIS PATH. `reap_user` only consults
-    `confirm_durable_copy` when it is handed an `app_id`, and this sweep handed it nothing — so the
+    the write-back only when it is handed an `app_id`, and this sweep handed it nothing — so the
     durable-copy gate protected the rare orphan the janitor collects and not the
     claimed-but-expired population, which is where the deletions actually happen.
 

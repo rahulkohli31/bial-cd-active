@@ -499,10 +499,13 @@ async def test_plan_kind_model_sees_no_write_tools(
         "search_files",
         "run_command",
         "present_plan_options",
-        # tell_the_user / propose_first_slice are shared by BOTH kinds. Exact-set on purpose:
-        # a tool meant for both arms that reached only one is drift a subset check would miss.
+        # tell_the_user / propose_first_slice / check_the_app are shared by BOTH kinds. Exact-set
+        # on purpose: a tool meant for both arms that reached only one is drift a subset check
+        # would miss. A Plan turn has no other route to the app's current state, which is why the
+        # state tool is registered here and not only on the Build arm.
         "tell_the_user",
         "propose_first_slice",
+        "check_the_app",
     }
 
 
@@ -686,55 +689,57 @@ async def test_write_mode_accepts_a_send_like_every_other_mode(
     await _settle(_fresh_engine, conv.id)
 
 
-async def test_a_live_build_in_this_thread_refuses_the_turn(
-    client, db_session, set_chat_model, _fresh_engine, building
+async def test_a_reply_in_flight_in_this_thread_refuses_the_turn(
+    client, db_session, set_chat_model, _fresh_engine
 ) -> None:
-    """THE ONE GATE, server side. While the agent is building this app, this thread takes no
+    """THE ONE GATE, server side. While this thread's agent is mid-reply it takes no second
     chat turn — the portal shuts its composer for the same window, and this is what holds when
     the portal is stale, reloaded, or simply not the thing making the request.
 
-    It is a LIVENESS check, not the Write-mode check: the two genuinely disagree (a build's
-    first seconds run before the transition flips the mode, and `POST /build-sessions` never
-    flips it at all), so the mode check alone would let a turn straight in."""
+    Pure liveness: what the chat IS never enters it, so a Plan thread and a Build thread are
+    refused on exactly the same terms. Released, the very same send is accepted."""
+    from src.services.turns.guard import claim_conversation, release_conversation
+
     user, conv = await _auth_with_conversation(db_session)
     set_chat_model(_streaming_text("should never stream"))
 
-    with building(conv.id, user.id):
+    claim_conversation(conv.id)
+    try:
         refused = await _post_turn(client, _headers(user), conv)
+    finally:
+        release_conversation(conv.id)
 
     assert refused.status_code == 409
-    # Citizen copy: what is happening, and when they get the chat back. Nothing internal.
-    message = refused.json()["error"]["message"]
-    assert "building your app" in message
-    assert "as soon as it finishes" in message
+    assert refused.json()["error"]["message"] == "A turn is already running for this conversation."
     assert _fresh_engine.peek(conv.id) is None  # nothing started
 
     assert (await _post_turn(client, _headers(user), conv)).status_code == 202
     await _settle(_fresh_engine, conv.id)
 
 
-async def test_a_build_in_another_thread_now_refuses_this_one_by_name(
+async def test_the_one_workspace_being_committed_refuses_the_turn_by_name(
     client, db_session, set_chat_model, _fresh_engine, building
 ) -> None:
     """Two distinct questions, both gates: "is THIS chat's agent mid-reply?" is
-    per-conversation; "is this user's one workspace already committed elsewhere?" is
-    per-user. A planning turn reads the project's live workspace now, like every other turn,
-    so a send here while another of this user's chats holds that workspace is a second claim
-    on the one thing there is only one of — not incidental traffic. The refusal carries a
-    machine code distinct from the other 409 on this route, which has a different cause and
-    remedy."""
+    per-conversation; "is this user's one workspace already committed?" is per-user. A planning
+    turn reads the project's live workspace now, like every other turn, so a send while a live
+    session holds that workspace is a second claim on the one thing there is only one of — not
+    incidental traffic. The refusal carries a machine code distinct from the other 409 on this
+    route, which has a different cause and remedy."""
     from src.services.turns.copy import ALREADY_BUILDING_HERE_CODE
-    from tests.factories import ConversationFactory
 
     user, conv = await _auth_with_conversation(db_session)
-    other = await ConversationFactory.create(db_session, user.id)
     set_chat_model(_streaming_text("planning away"))
 
-    with building(other.id, user.id):
+    with building(user.id):
         resp = await _post_turn(client, _headers(user), conv)
 
     assert resp.status_code == 409, resp.text
     assert resp.json()["error"]["code"] == ALREADY_BUILDING_HERE_CODE
+    # Citizen copy: what is happening, and when they get the chat back. Nothing internal.
+    message = resp.json()["error"]["message"]
+    assert "building your app" in message
+    assert "as soon as it finishes" in message
     assert _fresh_engine.peek(conv.id) is None  # refused BEFORE anything was claimed
 
 
@@ -748,13 +753,11 @@ async def test_the_refused_send_is_not_stored_and_bills_nothing(
 
     from src.db.models.message import Message
     from src.db.models.token_usage import TokenUsage
-    from tests.factories import ConversationFactory
 
     user, conv = await _auth_with_conversation(db_session)
-    other = await ConversationFactory.create(db_session, user.id)
     set_chat_model(_streaming_text("planning away"))
 
-    with building(other.id, user.id):
+    with building(user.id):
         assert (await _post_turn(client, _headers(user), conv)).status_code == 409
 
     rows = await db_session.scalar(
@@ -1011,14 +1014,7 @@ async def test_a_refused_start_leaves_the_pending_plan_card_unresolved(
         release_conversation(conv.id)
     assert await _pending_card_state(db_session, user.id, conv.id) == "pending"
 
-    # (b) a build is live in this thread → 409, card still untouched. This gate sits ahead
-    # of every other check, so it is the one most able to burn a card by accident.
-    with building(conv.id, user.id):
-        gated = await _post_turn(client, headers, conv, text="hurry up")
-        assert gated.status_code == 409
-    assert await _pending_card_state(db_session, user.id, conv.id) == "pending"
-
-    # (c) the user's own sandbox is committed to ANOTHER thread → 409, card still untouched.
+    # (b) the user's one sandbox is already committed → 409, card still untouched.
     # `kind` is fixed at creation in real traffic (no route mutates it) — this direct row
     # mutation is a TEST-ONLY shortcut to exercise the guard against a Build-kind row without
     # driving a real transition.
@@ -1026,7 +1022,7 @@ async def test_a_refused_start_leaves_the_pending_plan_card_unresolved(
     assert conversation is not None
     conversation.kind = ChatKind.BUILD
     await db_session.flush()
-    with building(uuid.uuid4(), user.id):  # live, but on ANOTHER thread
+    with building(user.id):
         refused = await _post_turn(client, headers, conv, text="hurry up")
         assert refused.status_code == 409
     assert await _pending_card_state(db_session, user.id, conv.id) == "pending"
@@ -1887,9 +1883,7 @@ async def test_an_unknown_conversation_is_a_404_on_every_turn(
 
 @contextlib.contextmanager
 def _holding_the_workspace(app, user_id: uuid.UUID, *, still_letting_go: bool):
-    """A session of the shape production ACTUALLY makes — no `conversation_id`, because no
-    allocator has set one since `_start_locked` was deleted — which is what makes the per-user
-    gate, not the per-conversation one, the check these two tests reach.
+    """A session holding this user's one workspace, of the shape `ensure_sandbox` makes.
 
     `still_letting_go` is the whole difference under test: a turn that is over and writing its
     recovery copy carries the event `finish_turn_sandbox` binds on entry and sets when the slot

@@ -14,8 +14,8 @@ monkeypatched on `wire` rather than re-driving real sandbox mechanics."""
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,7 +26,8 @@ from src.services.build_sessions.manager import (
     SaveOutcome,
     SaveState,
 )
-from src.services.storage import divert_key
+from src.services.sandbox import SandboxError
+from src.services.storage import StorageError
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
 
@@ -131,7 +132,7 @@ async def test_save_while_a_build_is_running_is_409(
 
     async def _fake_save(db, user, project_id, *, sandbox_client) -> SaveOutcome:
         seen.append((user.id, project_id))
-        raise BuildSessionConflictError(uuid.uuid4())
+        raise BuildSessionConflictError()
 
     wire.manager.save_project_snapshot = _fake_save
 
@@ -140,6 +141,40 @@ async def test_save_while_a_build_is_running_is_409(
     assert resp.status_code == 409
     assert "still being built" in resp.json()["error"]["message"].lower()
     assert seen == [(user.id, project.id)]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [StorageError("blob is having a day"), SandboxError("exec timed out")],
+    ids=["store", "sandbox"],
+)
+async def test_a_save_that_could_not_finish_is_503_in_words_the_page_shows(
+    client: AsyncClient, db_session: AsyncSession, wire, failure: Exception
+) -> None:
+    """The write reaches two services that can blink, and neither is the citizen's problem.
+    Uncaught, both leave as a 500 with no message at all, and the toast has nothing to say.
+
+    The message is asserted whole, not by substring: the page shows this sentence verbatim, so
+    the words are the contract here and a status-only assertion would not hold them. `detail`
+    pins the envelope — a 503 raised as a bare `HTTPException` answers in FastAPI's own shape,
+    not the one every other error on this route uses."""
+    user, project = await _user_project(
+        db_session, f"save3b-{uuid.uuid4().hex[:6]}@rvaiglobal.com"
+    )
+
+    async def _fake_save(db, user, project_id, *, sandbox_client) -> SaveOutcome:
+        raise failure
+
+    wire.manager.save_project_snapshot = _fake_save
+
+    resp = await client.post(_save_url(project.id), headers=auth_headers(user))
+
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["error"]["message"] == (
+        "Your changes could not be saved just now. Try again in a moment."
+    )
+    assert "detail" not in body
 
 
 async def test_save_with_no_sandbox_configured_is_503(
@@ -211,11 +246,6 @@ async def test_save_state_happy_path_returns_every_field(
 ) -> None:
     user, project = await _user_project(db_session, "save8@rvaiglobal.com")
     app_id = uuid.uuid4()
-    # A FIXED sentinel, never `now()`: the mutant worth killing is `recovery_at=datetime.now(UTC)`
-    # — the exact substitution `manager.py`'s docstring forbids ("it is the value the caller
-    # shows the user... so it must be the write time, never `now`"). Binding this from `now()`
-    # would make that mutant a microsecond-margin race instead of a clean kill.
-    recovery_at = datetime(2026, 5, 4, 14, 47, tzinfo=UTC)
     seen: list[tuple[uuid.UUID, uuid.UUID]] = []
 
     async def _fake_state(db, user, project_id, *, sandbox_client) -> SaveState:
@@ -225,7 +255,6 @@ async def test_save_state_happy_path_returns_every_field(
             dirty=True,
             container_head="b" * 40,
             saved_head="c" * 40,
-            recovery_at=recovery_at,
         )
 
     wire.manager.project_save_state = _fake_state
@@ -238,59 +267,7 @@ async def test_save_state_happy_path_returns_every_field(
     assert body["dirty"] is True
     assert body["containerHead"] == "b" * 40
     assert body["savedHead"] == "c" * 40
-    # VALUE, not presence — a dropped field is already caught by the `None` default, so only a
-    # wrong non-null value survives. `fromisoformat` reads both `+00:00` and `Z`, staying
-    # serialization-agnostic.
-    assert datetime.fromisoformat(body["recoveryAt"]) == recovery_at
     assert seen == [(user.id, project.id)]
-
-
-async def test_save_state_reports_a_write_back_the_guard_refused(
-    client: AsyncClient, db_session: AsyncSession, fake_storage, wire
-) -> None:
-    """★ THE SENTENCE THAT MAKES REMOVING THE EXIT PROMPTS HONEST.
-
-    Shutdown writes a citizen's work back with nobody watching. When the tree does not descend
-    from what they themselves saved, the ancestry guard parks it and the app comes back from the
-    SAVED version — which, from the screen, is indistinguishable from an ordinary reopen. This is
-    the only place the platform ever says otherwise.
-
-    Mutation check: drop the divert read from the route and this goes red on its own; every other
-    assertion in this file passes an all-null body just as happily."""
-    user, project = await _user_project(db_session, "refused@rvaiglobal.com")
-    app_id = uuid.uuid4()
-
-    async def _fake_state(db, user, project_id, *, sandbox_client) -> SaveState:
-        return SaveState(app_id=app_id, dirty=True, container_head="b" * 40, saved_head="c" * 40)
-
-    wire.manager.project_save_state = _fake_state
-    await fake_storage.put(
-        divert_key(app_id, datetime(2026, 9, 17, 22, 14, tzinfo=UTC)), b"a refused tree"
-    )
-
-    resp = await client.get(_save_state_url(project.id), headers=auth_headers(user))
-
-    assert resp.status_code == 200
-    assert resp.json()["writeBackRefusedAt"] is not None
-
-
-async def test_save_state_claims_no_refusal_when_none_was_recorded(
-    client: AsyncClient, db_session: AsyncSession, fake_storage, wire
-) -> None:
-    """The other direction, and the dangerous one: claiming a refusal that did not happen sends
-    somebody looking for work that was never set aside."""
-    user, project = await _user_project(db_session, "unrefused@rvaiglobal.com")
-
-    async def _fake_state(db, user, project_id, *, sandbox_client) -> SaveState:
-        return SaveState(
-            app_id=uuid.uuid4(), dirty=False, container_head="b" * 40, saved_head="b" * 40
-        )
-
-    wire.manager.project_save_state = _fake_state
-
-    resp = await client.get(_save_state_url(project.id), headers=auth_headers(user))
-
-    assert resp.json()["writeBackRefusedAt"] is None
 
 
 async def test_save_state_passes_an_unknown_dirty_through_as_null(
@@ -324,8 +301,6 @@ async def test_save_state_passes_an_unknown_dirty_through_as_null(
         "dirty": None,
         "containerHead": None,
         "savedHead": None,
-        "recoveryAt": None,
-        "writeBackRefusedAt": None,
     }
     assert seen == [(user.id, project.id)]
 
@@ -384,8 +359,6 @@ async def test_save_state_with_no_sandbox_configured_degrades_to_all_null(
         "dirty": None,
         "containerHead": None,
         "savedHead": None,
-        "recoveryAt": None,
-        "writeBackRefusedAt": None,
     }
     assert called is False
 

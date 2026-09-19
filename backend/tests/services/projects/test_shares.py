@@ -75,20 +75,18 @@ async def test_sharing_a_project_with_nothing_saved_is_refused(db_session) -> No
     assert exc_info.value.code == "no_saved_snapshot"
 
 
-async def test_sharing_a_project_with_only_an_autosave_is_still_refused(
+async def test_sharing_a_project_whose_only_bundle_is_a_parked_tree_is_still_refused(
     db_session, bind_store
 ) -> None:
-    """R10 gates on `snapshot_presence` specifically, never `restorable_presence` — the shared
-    runtime only ever restores from the SAVED bundle (R21), so a share backed only by an
-    autosave would hand a recipient nothing launchable."""
-    from src.services.storage import recovery_key
-
+    """R10 gates on the SAVED bundle specifically (R21), so a share backed only by some other
+    object under this app's prefix would hand a recipient nothing launchable."""
     store = bind_store(FakeStorage())
     owner = await UserFactory.create(db_session)
     project = await ProjectFactory.create(db_session, owner.id, description="A project")
     app_id = await resolve_app_for_project(db_session, owner.id, project.id)
     await db_session.flush()
-    await store.put(recovery_key(app_id), b"AUTOSAVE ONLY")  # no snapshot_key put
+    # A parked tree, never a saved version.
+    await store.put(f"quarantine/{app_id}/20260826T110500000000Z.bundle", b"PARKED ONLY")
     colleague = await UserFactory.create(db_session, email="colleague@example.com")
 
     with pytest.raises(AppApiError) as exc_info:

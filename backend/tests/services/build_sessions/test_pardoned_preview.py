@@ -1,4 +1,4 @@
-"""What happens to a pardoned preview after its build ends.
+"""What happens to a pardoned preview after its turn ends.
 
 The pardon itself (no teardown, registry kept, stay granted, lock released) is asserted on the
 happy path in `test_manager.py`; this module covers what happens next: nothing renews liveness
@@ -7,16 +7,9 @@ honors an unexpired lease and reaps through it once it lapses, and reconcile-on-
 through even an unexpired one (covered in
 `test_manager.py::test_clean_end_then_start_restores_from_snapshot_not_fresh`).
 
-HOW THE SESSIONS GET HERE. `SessionManager.start` is deleted, so a session is allocated by
-`ensure_sandbox` — the door production uses — and driven into the end sequence by `_finalize`,
-the call the deleted `_run_and_finalize` made when a run ended. `_finalize` with `"completed"`
-reaches `_do_finalize` with the inputs a naturally-completed build reached it with (that reason,
-a derived status of ENDED, `force_ended=False`, a live handle) — precisely what the pardon
-decision reads; `"build_failed"` derives FAILED and takes the teardown arm.
-
-NOT `stop`: it goes through `_end`, which marks the registry `ending` first — right for a
-user-driven stop, wrong for a completion, since it would leave a pardoned container behind an
-`ending` registry, a pair production never produces.
+HOW THE SESSIONS GET HERE. A session is allocated by `ensure_sandbox` and ended by
+`finish_turn_sandbox` — the pair production uses, and the only pair left. `touched=True` is the
+arm that earns the full stay, which is what the lease assertions below are about.
 """
 
 from __future__ import annotations
@@ -29,7 +22,7 @@ import redis.asyncio as aioredis
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.build_sessions.schemas import BuildSessionStatus, EndedEvent
+from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.config import settings
 from src.db.models.user import User
 from src.services.build_sessions.locks import (
@@ -44,11 +37,6 @@ from src.services.redis.keys import REGISTRY_FIELD_PREVIEW_STAY_UNTIL
 from src.services.sandbox.config import SandboxConfig
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import FakeSandboxClient, FakeStorage
-
-# The end reasons `_do_finalize` branches on, spelled here because the manager's own constants
-# are private. "completed" is the ONLY one that earns a pardon; anything else tears down.
-COMPLETED = "completed"
-BUILD_FAILED = "build_failed"
 
 
 @pytest.fixture(autouse=True)
@@ -74,16 +62,17 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
 async def _completed_build(
     db: AsyncSession, email: str, client: FakeSandboxClient
 ) -> tuple[User, SessionManager, uuid.UUID]:
-    """Take one session all the way to a COMPLETED end, and hand back the pardoned state."""
+    """Take one session all the way to the end of a write turn, and hand back the pardoned
+    state. The assertion is the fixture's own liveness check: a session that never reached its
+    terminal would make every lease assertion below vacuous."""
     user = await UserFactory.create(db, email=email)
     project = await ProjectFactory.create(db, user.id)
     manager = SessionManager()
     session = await manager.ensure_sandbox(
         db, user, project.id, sandbox_client=client, may_write=True
     )
-    await manager._finalize(session, COMPLETED, client)
-    assert isinstance(session.envelopes[-1], EndedEvent)
-    assert session.envelopes[-1].reason == COMPLETED
+    await manager.finish_turn_sandbox(session, client, touched=True)
+    assert session.status is BuildSessionStatus.ENDED
     return user, manager, session.app_id
 
 
@@ -124,29 +113,6 @@ async def test_sweep_reaps_a_pardoned_preview_once_its_lease_lapses(
     assert await lock_is_held(fake_redis, user.id) is False
 
 
-async def test_failed_build_still_tears_down_immediately(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    # The pardon is for SUCCESS only: a failed verdict keeps the old end sequence —
-    # teardown, registry deleted, no lease. (Stop and force-end teardown are pinned in
-    # `test_manager.py`'s stop/force-end suites.)
-    user = await UserFactory.create(db_session, email="pardon3@rvaiglobal.com")
-    project = await ProjectFactory.create(db_session, user.id)
-    manager = SessionManager()
-    client = FakeSandboxClient()
-
-    session = await manager.ensure_sandbox(
-        db_session, user, project.id, sandbox_client=client, may_write=True
-    )
-    await manager._finalize(session, BUILD_FAILED, client)
-
-    assert session.status == BuildSessionStatus.FAILED
-    assert app_name_for(session.app_id) in client.torn_down
-    assert await read_registry(fake_redis, user.id) is None
-    assert await stay_of_execution_is_current(fake_redis, user.id) is False
-    assert await lock_is_held(fake_redis, user.id) is False
-
-
 async def test_pardon_survives_a_stay_grant_failure(
     db_session: AsyncSession,
     fake_redis: aioredis.Redis,
@@ -164,7 +130,7 @@ async def test_pardon_survives_a_stay_grant_failure(
     client = FakeSandboxClient()
     user, manager, app_id = await _completed_build(db_session, "pardon4@rvaiglobal.com", client)
 
-    # The end sequence completed: terminal emitted, lock released, session popped.
+    # The turn's ending completed: lock released, session popped.
     assert await lock_is_held(fake_redis, user.id) is False
     assert manager.active_session_for(user.id) is None
     # No lease landed — but the container is discoverable (registry kept), so the next

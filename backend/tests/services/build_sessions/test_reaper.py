@@ -30,7 +30,6 @@ from src.db.models.pending_teardown import PendingTeardown
 from src.services.build_sessions import app_name_for, locks, pass_history, reaper
 from src.services.build_sessions.alarms import SERVING_PROOF_ABSENT_AT_TEARDOWN
 from src.services.build_sessions.pass_history import CopyAttempt
-from src.services.build_sessions.snapshot import reset_divert_streaks_for_tests
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -80,7 +79,7 @@ def attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
     AUTOUSE, AND NOT FOR CONVENIENCE: `record_durable_copy_attempt` opens its own session and
     COMMITS, so an unspied reap here would leave a permanent row in the SHARED test database
     that `test_reclamation_report_only.py` counts. The real writer is exercised, against a
-    connection that rolls back, in `test_durable_copy_gate.py`."""
+    connection that rolls back, in `test_write_back_before_reclaim.py`."""
     recorded: list[CopyAttempt] = []
 
     async def _spy(attempt: CopyAttempt) -> None:
@@ -88,13 +87,6 @@ def attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
 
     monkeypatch.setattr(pass_history, "record_durable_copy_attempt", _spy)
     return recorded
-
-
-@pytest.fixture(autouse=True)
-def _forget_the_divert_streak() -> None:
-    """The refusal counter is PROCESS-LOCAL, so a divert driven here would otherwise ride into
-    whatever test runs next in this interpreter."""
-    reset_divert_streaks_for_tests()
 
 
 #: A name the platform could actually have MINTED — `sbx-` + 28 lowercase hex, the exact shape
@@ -226,18 +218,18 @@ async def test_reap_user_tears_down_a_shared_sandbox_in_the_slot(
     assert await locks.read_registry(fake_redis, USER) is None
 
 
-async def test_reap_user_skips_the_durable_copy_gate_for_a_shared_view_even_with_an_app_id(
+async def test_reap_user_skips_the_write_back_for_a_shared_view_even_with_an_app_id(
     fake_redis: aioredis.Redis,
 ) -> None:
     """The bug a live Azure run found: `sweep_all`'s own `_owning_app_id` resolves a `shr-`
     record to the OWNER's app id (`_app_names_to_owners` keys the name off the recipient but
     carries the shared app's id as the value), so the scheduled sweep always calls `reap_user`
-    with `app_id is not None` for a shared view. Gating on that id would run the durable-copy
-    check against a recovery slot this container never wrote to (R22: read-never-write for a
-    recipient) — and a diverted or unreachable verdict then REFUSES the reap outright, sparing
-    the container forever. No storage is bound in this test at all: if the gate ran, touching
-    it would fail loudly rather than silently pass, which is exactly the point — a shared view
-    must never reach the gate regardless of which app_id a caller resolved for it."""
+    with `app_id is not None` for a shared view. Acting on that id would write this RECIPIENT's
+    tree over the OWNER's saved copy (R22: read-never-write for a recipient), and a write-back
+    that could not land then REFUSES the reap outright, sparing the container forever. No storage
+    is bound in this test at all: if the write-back ran, touching it would fail loudly rather than
+    silently pass, which is exactly the point — a shared view must never reach it regardless of
+    which app_id a caller resolved for it."""
     shared_name = a_shared_sandbox_name("colleague")
     await _seed(fake_redis, USER, app_name=shared_name)
     client = FakeSandboxClient()
@@ -383,13 +375,13 @@ async def test_reaper_teardown_failure_keeps_state_when_nothing_can_own_the_debt
 async def test_the_scheduled_sweep_resolves_the_owning_app_id_and_the_operator_one_does_not(
     fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`reap_user` consults `confirm_durable_copy` only when handed an `app_id`. Reconcile-on-start
-    opts out (a builder is standing right there); the scheduled sweep has nobody watching and does
-    almost all of the deleting, so it resolves the id and is gated — the operator endpoint passes
-    no map and stays ungated.
+    """`reap_user` writes the tree back only when handed an `app_id`. Reconcile-on-start opts out
+    (a builder is standing right there); the scheduled sweep has nobody watching and does almost
+    all of the deleting, so it resolves the id — the operator endpoint passes no map and does not.
 
     Mutation-check: drop `app_ids_by_name=app_ids_by_name` from `sweep_all`'s `reconcile_user`
-    call and the first assertion goes red — the sweep reaps exactly as it did, ungated."""
+    call and the first assertion goes red — the sweep reaps exactly as it did, writing nothing
+    back."""
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
     app_id = uuid.uuid4()
     gated_with: list[uuid.UUID | None] = []
@@ -521,17 +513,14 @@ async def test_a_failed_teardown_is_not_reported_as_a_destruction(
     assert await locks.read_registry(fake_redis, USER) is not None
 
 
-# --- The janitor takes the copy too, and it is a SECOND call site -------------
+# --- The janitor writes the tree back too, and it is a SECOND call site -------------
 #
-# `reap_user` and `reap_the_container_we_judged` each had their own `confirm_durable_copy`
-# call, and each one only logged. A test suite that exercised only `reap_user` — the obvious
-# one, since that is where the gate tests live — would leave the janitor ungated: the caller
-# with nobody watching it, sparing the same containers pass after pass forever.
+# The two reaps share no code above `_take_the_copy_we_promised`. A suite that exercised only
+# `reap_user` — the obvious one — would leave the janitor's write-back unproven: the caller with
+# nobody watching it, deleting containers whose work reached nowhere.
 
 
-def _a_container_that_bundles(
-    *, head: str, bundles_to: str, name: str = SBX, ancestry: str = "0 0"
-) -> FakeSandboxClient:
+def _a_container_that_bundles(*, head: str, bundles_to: str, name: str = SBX) -> FakeSandboxClient:
     """A container that attaches AND answers the snapshot ladder — commit, bundle, base64.
 
     The bare `FakeSandboxClient` refuses to attach at all (no `attach_handle`), which is the right
@@ -549,8 +538,7 @@ def _a_container_that_bundles(
 
     def handler(cmd: list[str]) -> ExecResult:
         if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
-            answered = ancestry if "merge-base" in cmd[-1] else ""
-            return ExecResult(stdout=f"{head}@@@@4@@{answered}", stderr="", exit=0)
+            return ExecResult(stdout=f"{head}@@@@4@@", stderr="", exit=0)
         if cmd[0] == "base64":
             return ExecResult(stdout=bundle, stderr="", exit=0)
         return ExecResult(stdout="", stderr="", exit=0)
@@ -559,17 +547,15 @@ def _a_container_that_bundles(
     return client
 
 
-async def test_the_janitor_takes_the_copy_before_it_destroys_what_it_judged(
+async def test_the_janitor_writes_the_tree_back_before_it_destroys_what_it_judged(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
 ) -> None:
-    """★ THE SECOND CALL SITE. The saved copy is behind the container, so the durable-copy
-    policy says take one and then reclaim — this path used to just spare and log, unread.
+    """★ THE SECOND CALL SITE: the tree goes into the saved copy and then the container goes.
 
-    Deleting this test leaves the janitor's copy unproven: `test_durable_copy_gate.py` drives
-    `reap_user` only, and the two functions share no code above `_take_the_copy_we_promised`.
+    Deleting this test leaves the janitor's write-back unproven: `test_write_back_before_reclaim`
+    covers both, but only this file drives the janitor beside its own registry cases.
 
-    Mutation check: put `if not verdict.may_destroy: return False` back in
-    `reap_the_container_we_judged` and this goes red while every gate test stays green."""
+    Mutation check: skip the write-back in `reap_the_container_we_judged` and this goes red."""
     await _seed(fake_redis, USER, app_name=SBX)
     await _preserve(fake_storage, APP, head="b" * 40)  # the copy is BEHIND the container
     client = _a_container_that_bundles(head="a" * 40, bundles_to="c" * 40)
@@ -1913,14 +1899,12 @@ def test_thinning_never_reaches_the_arm_that_stamps_an_unproven_container() -> N
 
 @pytest.fixture
 def ceiling_on(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Two hours, switched on. Off everywhere by default, so every other test in this file goes
-    on exercising a platform with no ceiling at all."""
-    monkeypatch.setattr(
-        settings, "sandbox", _sandbox_config_with(drain_enabled=True, drain_after_hours=2)
-    )
+    """The two-hour ceiling, bound to `settings.sandbox` so the tests below can reach it. The
+    ceiling itself is not optional — this fixture supplies the CONFIG, not a switch."""
+    monkeypatch.setattr(settings, "sandbox", _sandbox_config_with(drain_after_hours=2))
 
 
-def _sandbox_config_with(*, drain_enabled: bool, drain_after_hours: int) -> SandboxConfig:
+def _sandbox_config_with(*, drain_after_hours: int) -> SandboxConfig:
     return SandboxConfig(
         subscription_id="s",
         resource_group="r",
@@ -1930,7 +1914,6 @@ def _sandbox_config_with(*, drain_enabled: bool, drain_after_hours: int) -> Sand
         acr_username="acr-user",
         acr_password=SecretStr("acr-pass"),
         image_ref="acr/img:latest",
-        drain_enabled=drain_enabled,
         drain_after_hours=drain_after_hours,
     )
 

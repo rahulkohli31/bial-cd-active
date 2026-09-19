@@ -108,20 +108,17 @@ READINESS_POLL_S = 1.0
 """Sleep between readiness polls. A construction-time knob on the orchestrator so tests can drive
 it to 0."""
 
-WORKSPACE_NOTE_MAX_POLLS = 5
-"""How long the per-turn workspace note waits for the dev server before answering.
+APP_CHECK_MAX_POLLS = 5
+"""How long `check_the_app` waits for the dev server before answering.
 
-MUCH SHORTER THAN `READINESS_MAX_POLLS`, because it is a different question asked at a different
-moment. The verify budget decides whether a build may claim it finished and can afford to wait 30
-seconds for a slow app; this one runs at the START of every turn in BOTH chat kinds — including a
-one-line Plan question, which is the cheapest turn the platform serves and the one this budget is
-sized against — and only has to tell the model what the user is looking at.
+MUCH SHORTER THAN `READINESS_MAX_POLLS`, because it is a different question. The verify budget
+decides whether a build may claim it finished, and can afford 30 seconds for a slow app; this one
+answers a model mid-turn in both chat kinds, and only has to say what the citizen is looking at.
 
 Its whole safety comes from the third answer: a budget that runs out here is `STILL_TRYING`, which
-the note reports as "could not tell", never as "the app is down". So the cost of choosing five is
-a vaguer note on a cold container, not a false one. Five covers the measured 5-7s first-route
-compile often enough to be worth having, and small enough that nobody notices it on a warm
-one."""
+reads as "could not tell", never as "the app is down". So the cost of choosing five is a vaguer
+answer on a cold container, not a false one — enough to cover the measured 5-7s first-route
+compile often enough to be worth having, small enough that nobody notices it on a warm one."""
 
 CRASH_EDGE_CONSECUTIVE_POLLS = 3
 """How many CONSECUTIVE `(ready=False, running=False)` polls a preview watcher needs before it
@@ -287,7 +284,12 @@ the next turn, so nothing fails — the reasoning is simply never there to store
 
 Asserted against the REAL provider model in test, never a double: the refusal lives in
 `AnthropicModel.prepare_request`, which a stub never executes, so a test that trusted a fake
-would go green on a combination the live gateway rejects."""
+would go green on a combination the live gateway rejects.
+
+DISABLING THINKING IS NOT AN OPTIMISATION, and this is the place someone tuning the effort
+levels below will be reading. With thinking off, this model occasionally writes a tool call into
+visible text instead of a `tool_use` block. In an agentic loop that is a silent failure: no
+error is raised, the call never runs, and the turn carries on as though it had."""
 
 PLAN_EFFORT: Final[AnthropicEffort] = "medium"
 """How hard the model thinks in a planning turn (owner's ruling)."""
@@ -315,7 +317,11 @@ cache-WRITE premium and read nothing back: a net cost INCREASE over not caching 
 
 Why 1h is the safe pick: a 1h write costs ~2× base input (vs ~1.25× for 5m) but reads at ~0.1×, and
 the whole build is bounded by `RUN_WALL_CLOCK_DEADLINE_S` (1800s / 30 min) — so every step of a
-single build lands inside ONE 1-hour window: one write, then reads for the rest of the run."""
+single build lands inside ONE 1-hour window: one write, then reads for the rest of the run.
+
+The citizen's meter charges the tier this constant names: `usage/gate.py` weighs a cache write by
+tier, and `tests/services/usage/test_gate.py` pins its tier against this one — so moving this
+value without repricing the meter is a red test, not a quiet mis-bill."""
 
 # --- the read ignore set ---------------------------------------------------------
 

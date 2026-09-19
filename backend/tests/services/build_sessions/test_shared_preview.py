@@ -38,7 +38,7 @@ from src.services.redis.keys import (
 )
 from src.services.sandbox import SandboxHandle
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import recovery_key, snapshot_key
+from src.services.storage import snapshot_key
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import FakeSandboxClient, FakeStorage
 
@@ -97,15 +97,17 @@ async def test_launch_cold_restores_and_returns_the_owners_app_id(
     assert await lock_is_held(fake_redis, recipient.id) is False  # lock released, slot free
 
 
-async def test_launch_never_restores_the_owners_recovery_bundle(
+async def test_launch_restores_the_owners_saved_bundle_and_nothing_beside_it(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
     """Requirement 21, pinned directly: a shared view is restored from the owner's last
-    deliberate Save, never their crash-recovery bundle — even when one exists and is newer."""
+    deliberate Save, never another object the store happens to hold for that app."""
     owner, project, app_id = await _owner_with_saved_app(
         db_session, fake_storage, email="owner2@example.com"
     )
-    await fake_storage.put(recovery_key(app_id), b"NEWER, BUT NEVER THE ANSWER")
+    await fake_storage.put(
+        f"quarantine/{app_id}/20260826T110500000000Z.bundle", b"NEWER, BUT NEVER THE ANSWER"
+    )
     recipient = await UserFactory.create(db_session, email="recipient2@example.com")
     manager = SessionManager()
     client = FakeSandboxClient()
@@ -404,7 +406,7 @@ async def test_revoke_never_touches_the_recipients_own_build(
     session = await manager.ensure_sandbox(
         db_session, recipient, recipient_project.id, sandbox_client=build_client, may_write=True
     )
-    await manager._finalize(session, "completed", build_client)  # noqa: SLF001 - pardons it
+    await manager.finish_turn_sandbox(session, build_client, touched=True)  # pardons it
 
     revoked = await manager.revoke_shared_preview(
         recipient.id, app_id, sandbox_client=build_client
@@ -465,7 +467,7 @@ async def test_give_up_shared_view_never_touches_the_recipients_own_build(
     session = await manager.ensure_sandbox(
         db_session, recipient, recipient_project.id, sandbox_client=build_client, may_write=True
     )
-    await manager._finalize(session, "completed", build_client)  # noqa: SLF001 - pardons it
+    await manager.finish_turn_sandbox(session, build_client, touched=True)  # pardons it
 
     gave_up = await manager.give_up_shared_view(recipient.id, sandbox_client=build_client)
 

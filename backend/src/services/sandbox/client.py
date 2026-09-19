@@ -195,12 +195,14 @@ _BUNDLE_B64_NAME: Final = "app.bundle.b64"
 # Docker would not carry a repo across even if the template had one. The RESTORE path creates
 # a repo itself (`git init` + fetch + checkout, below), so only a FRESH provision arrives
 # without one, and everything downstream assumes a repo exists: the save-state check reads
-# `git rev-parse HEAD` / `git status --porcelain`, and `write_snapshot` falls back to its own
-# `git init`, which works but folds the template and the first turn's work into one commit.
+# `git rev-parse HEAD` / `git status --porcelain`, the health verdict identifies the app by its
+# root commit, and the snapshot refuses to run at all without one.
 #
 # So a container is made a working repo at BIRTH, with one baseline commit for the template, and
-# every platform snapshot afterwards is a delta against a known starting point. Idempotent
-# (`rev-parse` short-circuits), and `git config --system` in the image supplies the identity.
+# every platform snapshot afterwards is a delta against a known starting point. THIS IS THE ONLY
+# WRITER OF A ROOT COMMIT in the system, which is what lets the health verdict read that root as
+# the template rather than as whatever a later commit happened to hold. Idempotent (`rev-parse`
+# short-circuits), and `git config --system` in the image supplies the identity.
 _INIT_REPO_SCRIPT: Final = (
     "git rev-parse --git-dir >/dev/null 2>&1 || "
     "{ git init -q && git add -A && git commit -q -m 'bial: golden template baseline'; }"
@@ -251,24 +253,17 @@ _DISCARD_SCRIPT: Final = (
 
 
 async def _make_it_a_repo(client: SandboxClient, handle: SandboxHandle) -> None:
-    """Give a freshly provisioned container a git repo.
+    """Give a freshly provisioned container a git repo, or fail the provision.
 
-    BEST-EFFORT, and broadly so — deliberately wider than the usual narrow-catch rule, because
-    the thing being protected is a container that has already come up and serves the user's
-    app. Failing the whole provision over one housekeeping exec would trade a working workspace
-    for none at all, and `write_snapshot` still carries its own `git init` fallback for exactly
-    this case. Logged rather than swallowed: a repo that never got created explains a later
-    snapshot commit failing, and that trail has to exist somewhere."""
+    NOT best-effort, and the trade is the deliberate one. A container whose seed failed is a
+    container whose every Save fails, because the snapshot will not create a repository for it —
+    so the only question is WHERE the citizen meets that failure. Here it is a provision that did
+    not happen, retried before they have typed anything; deferred to the first Save it is their
+    finished app with nowhere to go. The exec's own exceptions propagate for the same reason."""
     run_command = client.exec  # alias keeps the call off the JS-oriented exec guard
-    try:
-        await run_command(handle, ["sh", "-c", _INIT_REPO_SCRIPT], timeout_s=60)
-    except Exception:
-        _log.warning(
-            "could not initialise the workspace git repo; the agent's commits will fail until "
-            "the first save creates one",
-            app_name=handle.app_name,
-            exc_info=True,
-        )
+    result = await run_command(handle, ["sh", "-c", _INIT_REPO_SCRIPT], timeout_s=60)
+    if result.exit != 0:
+        raise SandboxError(f"could not seed the workspace git repo (exit {result.exit})")
 
 
 class SandboxNotConfiguredError(SandboxError):
@@ -439,9 +434,16 @@ class AcaSandboxClient(SandboxClient):
             # non-zero EXIT would have come back inside a 200 (handled below).
             raise SandboxError(f"command run failed with status {resp.status_code}")
         data: Any = resp.json()
-        return ExecResult(
-            stdout=str(data["stdout"]), stderr=str(data["stderr"]), exit=int(data["exit"])
-        )
+        try:
+            return ExecResult(
+                stdout=str(data["stdout"]), stderr=str(data["stderr"]), exit=int(data["exit"])
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            # A 200 whose body is not the exec shape. This has to be a SandboxError and not the
+            # raw `KeyError`: callers narrow on SandboxError, and an untyped one escaping here
+            # once already took down a provision that had otherwise succeeded. Failing is right —
+            # the seed did not happen — but it fails as the kind of error the seam declares.
+            raise SandboxError("the supervisor answered exec with an unrecognized body") from exc
 
     async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:
         # Serialize the validated variant back to the supervisor's flat `FilesBody` wire shape;
@@ -708,9 +710,9 @@ class AcaSandboxClient(SandboxClient):
                     )
                 return resp.status_code
         except Exception:  # noqa: BLE001 - nothing from here may ever reach the caller
-            # The blind `except` is required, not an oversight — narrowing it has bitten this
-            # file before (see `_make_it_a_repo`). `CancelledError` is a `BaseException`, so a
-            # cancelled turn still cancels; only the timeout's own expiry is swallowed here.
+            # The blind `except` is required, not an oversight: a warm request is decoration and
+            # must not fail a turn. `CancelledError` is a `BaseException`, so a cancelled turn
+            # still cancels; only the timeout's own expiry is swallowed here.
             # `exc_info` is not decoration: the whole detection story depends on this request
             # reaching the route, and a silent swallow makes restricted egress or a wedged
             # ingress look identical to a healthy build. Without the reason, the one telemetry
@@ -1132,13 +1134,52 @@ class AcaSandboxClient(SandboxClient):
             ready=False,
         )
 
+    async def _undo_a_container_whose_next_step_died(
+        self, user_uuid: uuid.UUID, handle: SandboxHandle, *, event: str, during: str
+    ) -> None:
+        """Take back a container created moments ago, for a caller about to re-raise.
+
+        THE REGISTRY DROP IS CONDITIONAL. `_safe_teardown` swallows an `AcaError`, so clearing
+        the record whatever happened would orphan a container that is probably still running.
+        A record left standing is what sends a later sweep back to retry the teardown.
+        """
+        if await self._safe_teardown(handle.app_name):
+            await self._delete_registry(user_uuid, handle.app_name)
+        else:
+            _log.error(
+                event,
+                app_name=handle.app_name,
+                detail=(
+                    f"ACA refused the delete during {during}, so the ownership record is "
+                    "deliberately kept: a later sweep retries the teardown instead of meeting "
+                    "an anonymous container."
+                ),
+            )
+        self._evict_token(handle.token)
+        self._app_owners.pop(handle.app_name, None)
+
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
-        handle = await self._provision_container(
-            uuid.UUID(user_id), app_name, app_env, arm="provision_new"
-        )
-        await _make_it_a_repo(self, handle)
+        user_uuid = uuid.UUID(user_id)
+        handle = await self._provision_container(user_uuid, app_name, app_env, arm="provision_new")
+        try:
+            await _make_it_a_repo(self, handle)
+        except Exception:
+            # SEEDING IS THE SECOND FALLIBLE STEP, AND IT RUNS AFTER THE RECORD SAYS READY.
+            # `_write_registry` stamps READY at container-create time, so a container left
+            # behind here is one `_the_live_sandbox_is_already_the_one_we_want` hands straight
+            # back to the next request — a container that builds fine and whose every Save
+            # raises `WorkspaceHasNoRepositoryError`, with no self-service way out. The caller
+            # cannot clean this up either: it never received a handle, so the compensation in
+            # `_holding_user_lock` has nothing to tear down.
+            await self._undo_a_container_whose_next_step_died(
+                user_uuid,
+                handle,
+                event="provision_cleanup_left_registry_for_the_reaper",
+                during="seed-failure cleanup",
+            )
+            raise
         return handle
 
     async def _probe_with_retry(self, handle: SandboxHandle) -> None:
@@ -1357,25 +1398,12 @@ class AcaSandboxClient(SandboxClient):
             # Mid-restore death runs MORE fallible steps than provision — self-clean the
             # just-created container, then clear its registry ONLY IF the container is
             # confirmed gone.
-            #
-            # The registry drop used to be unconditional. `_safe_teardown` swallows an
-            # `AcaError`, so a refused delete still dropped the record — orphaning a container
-            # that was probably still running. `teardown()` below has always had this right.
-            torn_down = await self._safe_teardown(app_name)
-            if torn_down:
-                await self._delete_registry(user_uuid, app_name)
-            else:
-                _log.error(
-                    "restore_cleanup_left_registry_for_the_reaper",
-                    app_name=app_name,
-                    detail=(
-                        "ACA refused the delete during restore cleanup, so the ownership "
-                        "record is deliberately kept: a later sweep retries the teardown "
-                        "instead of meeting an anonymous container."
-                    ),
-                )
-            self._evict_token(handle.token)
-            self._app_owners.pop(app_name, None)
+            await self._undo_a_container_whose_next_step_died(
+                user_uuid,
+                handle,
+                event="restore_cleanup_left_registry_for_the_reaper",
+                during="restore cleanup",
+            )
             raise
         return handle
 

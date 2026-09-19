@@ -1,11 +1,10 @@
 """Feedback HTTP endpoint — citizen feedback submission.
 
-`POST /v1/feedback` byte-matches the Express `POST /api/feedback` contract
-(`server/feedback.js`): a required `message` (trimmed, ≤4000 UTF-8 bytes) and an advisory
+`POST /v1/feedback` takes a required `message` (trimmed, ≤4000 UTF-8 bytes) and an advisory
 `page` (sanitized to a same-origin path or empty). The author is ALWAYS the authenticated
 caller — a body-supplied `username` is ignored. Success is `201 {"ok": true}`; validation
-failures return the Express `400 {"error":{"message"}}` shape the SPA reads (not FastAPI's
-default `422 {"detail"}`). Rate-limited per user (20 / 15 min) via the in-process limiter.
+failures return `400 {"error":{"message"}}`, the shape the SPA reads, NEVER FastAPI's default
+`422 {"detail"}`. Rate-limited per user (20 / 15 min) via the in-process limiter.
 
 Feedback *read* is an admin surface — not here.
 """

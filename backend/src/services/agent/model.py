@@ -9,11 +9,16 @@ base URL must be an `*.services.ai.azure.com` Foundry endpoint and must NOT be t
 
 Auth: `api_key` mode is the tested default. `entra` mode (managed identity) builds a
 bearer-token provider; the token SCOPE is an open question (the official docs disagree), so
-it is a documented constant to confirm against the resource's RBAC before go-live."""
+it is a documented constant to confirm against the resource's RBAC before go-live.
+
+This module also widens one library exclusion at import, so that a turn-scoped system message
+reaches Foundry as a `{'role': 'system'}` entry instead of being rewritten as `<system>`-tagged
+text inside the citizen's own message — see `_widen_foundry_inline_system_prompts`."""
 
 from __future__ import annotations
 
 from anthropic import AsyncAnthropicFoundry, Timeout
+from pydantic_ai.models import anthropic as anthropic_models
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.providers.anthropic import AnthropicProvider
 
@@ -24,6 +29,14 @@ from src.config import FoundryConfig
 _FOUNDRY_HOST_SUFFIX = ".services.ai.azure.com"
 _PUBLIC_ANTHROPIC_HOST = "api.anthropic.com"
 
+# The private exclusion this module widens, the profile flag derived from it, and a deployment
+# name Anthropic publishes as honouring a mid-conversation `system` entry. The probe name is
+# fixed rather than read from config: the check is about the LIBRARY's wiring, and a resource
+# whose deployment is named something the profile does not recognise would make it unanswerable.
+_INLINE_EXCLUSION_ATTR = "_INLINE_SYSTEM_PROMPT_UNSUPPORTED_CLIENTS"
+_INLINE_PROFILE_FLAG = "supports_inline_system_prompts"
+_INLINE_PROBE_DEPLOYMENT = "claude-opus-5"
+
 # Entra bearer-token scope for Foundry (managed identity). UNVERIFIED — the official docs
 # disagree between `ai.azure.com/.default` and `ai.cognitiveservices.com/.default`; confirm
 # against the resource's RBAC before go-live. API-key auth sidesteps this.
@@ -33,6 +46,69 @@ FOUNDRY_ENTRA_SCOPE = "https://ai.azure.com/.default"
 class FoundryOnlyError(RuntimeError):
     """Raised when the model wiring would reach anything other than Azure Foundry,
     or when the Foundry config is internally inconsistent."""
+
+
+class InlineSystemPromptShapeError(RuntimeError):
+    """Raised at import when the library's inline-system-prompt exclusion no longer has the
+    shape this module patches, so the patch would be inert rather than wrong."""
+
+
+def _foundry_probe_model() -> AnthropicModel:
+    """A throwaway Foundry-client model, built only to read a profile flag. No socket is opened
+    by construction, and the client is never used to make a request.
+
+    THE ADDRESS IS PASSED IN FULL RATHER THAN AS A `resource`, AND THAT IS NOT A STYLE CHOICE.
+    The client falls back to `ANTHROPIC_FOUNDRY_BASE_URL` whenever `base_url` is None, and then
+    refuses a `base_url` and a `resource` together — so a deployment that happens to export that
+    variable would make this probe raise. It runs at import, so the whole API would fail to boot,
+    with a traceback pointing at a helper that has nothing to do with that variable's purpose."""
+    probe_client = AsyncAnthropicFoundry(
+        base_url="https://inline-system-probe.services.ai.azure.com/anthropic/", api_key="probe"
+    )
+    return AnthropicModel(
+        _INLINE_PROBE_DEPLOYMENT, provider=AnthropicProvider(anthropic_client=probe_client)
+    )
+
+
+def _widen_foundry_inline_system_prompts() -> None:
+    """Let a turn-scoped system message reach Foundry as a `{'role': 'system'}` entry.
+
+    pydantic-ai excludes the Foundry client from mid-conversation system entries through a
+    private tuple, and `Model.prepare_messages` rewrites those parts as `<system>`-tagged text
+    inside the preceding USER message when the exclusion bites. That rewrite lands ephemeral
+    content inside a message the store persists — the one position this platform's cached prefix
+    cannot survive — so the exclusion is emptied here, at import, before any model is built.
+
+    THE ASSERTION IS IN TWO HALVES BECAUSE AN INERT PATCH IS SILENT. The first half is the
+    symbol: present, a tuple, and naming the Foundry client. The second half is the
+    consequence — a Foundry-client model reports the flag as `False` before the swap and `True`
+    after it — because the tuple could survive under its own name while the decision moved
+    somewhere else entirely, and a patch that changes nothing would leave the sentence riding
+    the channel it was written to avoid. The flag is read off a FRESH model each time: it is
+    memoized per instance, so an instance built before the swap keeps answering `False`.
+    """
+    excluded = getattr(anthropic_models, _INLINE_EXCLUSION_ATTR, None)
+    if not isinstance(excluded, tuple) or AsyncAnthropicFoundry not in excluded:
+        raise InlineSystemPromptShapeError(
+            f"pydantic_ai.models.anthropic.{_INLINE_EXCLUSION_ATTR} is no longer a tuple "
+            f"containing AsyncAnthropicFoundry (got {excluded!r}); the mid-conversation system "
+            "entry is not reachable the way this module reaches it."
+        )
+    if _foundry_probe_model().profile.get(_INLINE_PROFILE_FLAG) is not False:
+        raise InlineSystemPromptShapeError(
+            f"{_INLINE_PROFILE_FLAG} was already true for a Foundry client before the exclusion "
+            "was widened, so this patch no longer decides anything."
+        )
+    setattr(anthropic_models, _INLINE_EXCLUSION_ATTR, ())
+    if _foundry_probe_model().profile.get(_INLINE_PROFILE_FLAG) is not True:
+        setattr(anthropic_models, _INLINE_EXCLUSION_ATTR, excluded)
+        raise InlineSystemPromptShapeError(
+            f"widening {_INLINE_EXCLUSION_ATTR} did not turn {_INLINE_PROFILE_FLAG} on, so the "
+            "flag is derived somewhere else now and the patch is inert."
+        )
+
+
+_widen_foundry_inline_system_prompts()
 
 
 def _assert_foundry_only(base_url: str) -> None:

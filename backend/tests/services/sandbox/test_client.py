@@ -439,25 +439,45 @@ async def test_a_fresh_provision_leaves_the_workspace_a_git_repo() -> None:
     assert "git commit" in script
 
 
-async def test_the_repo_init_never_fails_a_container_that_otherwise_came_up() -> None:
-    """Best-effort on purpose: a container serving the app is worth having even if this one
-    exec failed, and `write_snapshot` still carries its `git init` fallback for that case."""
+async def test_a_repo_seed_that_fails_fails_the_provision() -> None:
+    """The trade, reversed deliberately. The snapshot no longer creates a repository for a
+    container that lacks one, so a container whose seed failed is a container whose every Save
+    fails — and the only question left is where the citizen meets that. Here it is a provision
+    that did not happen, before they have typed anything."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="supervisor is having a day")
 
-    await client_module._make_it_a_repo(_client(handler), _handle())
+    with pytest.raises(SandboxError):
+        await client_module._make_it_a_repo(_client(handler), _handle())
 
 
-async def test_a_malformed_supervisor_reply_does_not_fail_the_provision_either() -> None:
-    """A 200 whose body is not the exec shape. Narrowly catching `SandboxError` missed this and
-    a `KeyError` escaped, taking down a provision that had already succeeded — the exact trade
-    this best-effort step exists to avoid."""
+async def test_a_nonzero_seed_exit_fails_the_provision_too() -> None:
+    """A supervisor that answered fine about a command that did not work.
+
+    Separate from the transport failure above because they arrive by different routes — a 200
+    carrying a non-zero exit is the shape a `git init` refused by a read-only filesystem takes,
+    and reading only the status code would call it a success."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"stdout": "", "stderr": "read-only fs", "exit": 1})
+
+    with pytest.raises(SandboxError):
+        await client_module._make_it_a_repo(_client(handler), _handle())
+
+
+async def test_a_malformed_supervisor_reply_fails_as_a_sandbox_error_not_a_key_error() -> None:
+    """A 200 whose body is not the exec shape.
+
+    The provision fails now, which is the intended reversal — but it must fail as the error type
+    this seam declares. An untyped `KeyError` escaping this exact spot once took down a provision
+    that had otherwise succeeded, and callers that narrow on `SandboxError` would miss it again."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"unexpected": "shape"})
 
-    await client_module._make_it_a_repo(_client(handler), _handle())
+    with pytest.raises(SandboxError):
+        await client_module._make_it_a_repo(_client(handler), _handle())
 
 
 # --- the first-route warm request ----------------------------------------

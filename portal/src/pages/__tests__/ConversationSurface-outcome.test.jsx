@@ -20,7 +20,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(),
+  relaunchPreview: vi.fn(), getStatus: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -239,16 +239,14 @@ describe('showing the outcome', () => {
     // surface that `stopped` is not a failure must not teach it that NOTHING is: a build that
     // really did fall over has to say so, or the fix has simply moved the lie.
     //
-    // IT USED TO ASSERT THE REASON WAS PRINTED (`/tsc failed after 3 attempts/`), on a fixture
-    // whose reason was prose. No producer emits prose: every `reason` on this wire is a
-    // `_WriteEndedError` token or a session end reason (`self_heal_budget_exhausted`,
-    // `wall_clock_deadline_exceeded`, `sandbox_unavailable`…), so that assertion was pinning a
-    // shape the server cannot send while blessing the interpolation that printed tokens at
-    // citizens. The real token is used here, and the assertion is inverted.
-    const card = await buildEndingWith({ status: 'failed', reason: 'self_heal_budget_exhausted' })
+    // Every `reason` on this wire is a machine token, never prose, so the fallback must never
+    // interpolate one at a citizen. The example has to be a token the union does not name:
+    // every reason the server can store now carries its own sentence, which is what the
+    // closed union is for, so an unlisted one can only be invented.
+    const card = await buildEndingWith({ status: 'failed', reason: 'reaped_by_the_kraken' })
 
     expect(card.textContent).toContain(NEUTRAL_FAILED)
-    expect(card.textContent).not.toContain('self_heal_budget_exhausted')
+    expect(card.textContent).not.toContain('reaped_by_the_kraken')
     // The failure must not be dressed up as a stop by the widened status union.
     expect(card.textContent).not.toContain(NEUTRAL_STOPPED)
     expect(card.textContent).not.toContain(FINISHED)
@@ -313,7 +311,6 @@ describe('showing the outcome', () => {
     // meaning the same thing afterwards.
     fireEvent.click(await screen.findByTestId('stop-turn'))
     await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith('thread-1', 't1'))
-    expect(h.stop).not.toHaveBeenCalled() // never a session-level stop
 
     await turn.frame(T_BUILD_END({ turnId: 't1', status: 'stopped', reason: 'stopped_by_user' }))
     await turn.end('completed')
@@ -424,6 +421,53 @@ describe('the copy table', () => {
       'failed',
       'The assistant could not get an answer from its service, so this build stopped.',
     ],
+    // The closed union: every way a build can end carries copy, so adding a member
+    // without a sentence is a compile error on the server side and a red row here. The
+    // sentences are TYPED OUT rather than imported — importing them would let this table agree
+    // with whatever `OUTCOME_COPY` happens to say, which is the drift it exists to catch.
+    ['run_budget_reached', 'failed', 'This build stopped after doing as much as it does in one go.'],
+    [
+      'verdict_unanswerable',
+      'failed',
+      "Your app looks like it's running, but we couldn't confirm this change went in. " +
+        "Open the preview and see — and if something looks wrong, say so and we'll fix it.",
+    ],
+    [
+      'self_heal_budget_exhausted',
+      'failed',
+      'Your app is running — the assistant just ran out of steps before it finished tidying up.',
+    ],
+    ['build_wrote_nothing', 'failed', 'This build ended without changing anything in your app.'],
+    [
+      'attachment_unavailable',
+      'failed',
+      'This build stopped because one of your attached files could not be read.',
+    ],
+    [
+      'sandbox_unavailable',
+      'failed',
+      'This build stopped because your workspace was not reachable. Send your message again.',
+    ],
+    [
+      'workspace_unreadable',
+      'failed',
+      'This build stopped because your workspace could not be read. Send your message again.',
+    ],
+    [
+      'workspace_unrecoverable',
+      'failed',
+      'This build stopped because your workspace could not be brought back. Your last saved version is safe.',
+    ],
+    [
+      'context_hard_limit_exceeded',
+      'failed',
+      'This chat has got too long to carry on. Start a new chat to keep going — your app and everything you have built stays exactly as it is.',
+    ],
+    [
+      'DOCUMENT_TOO_MANY_PAGES',
+      'failed',
+      'That PDF has too many pages for the assistant to read, and it stays in this chat, so every message here will hit the same limit. Start a new chat and attach a shorter document — or split this one and attach just the part you need.',
+    ],
   ]
 
   it.each(TABLE)('%s says its own sentence, and says it whatever status carries it', (reason, status, sentence) => {
@@ -437,10 +481,11 @@ describe('the copy table', () => {
   })
 
   it('names every arm the server names, and the one it does not', () => {
-    // Mirrors `outcome.py::_summary`'s four reasons plus `workspace_restored`, plus the turn
-    // engine's three bounded endings (`request_limit`, `wall_clock_deadline_exceeded`,
-    // `model_unavailable` — none has a legacy row). An arm appearing in `OUTCOME_COPY` without a
-    // row in this table is the drift this pins.
+    // Mirrors every member of the closed `EndReason` union — the session-end producer's reasons,
+    // `workspace_restored`, and every ending the turn engine can store. An arm appearing in
+    // `OUTCOME_COPY` without a row in this table is the drift this pins, and it is the half the
+    // TypeScript exhaustiveness check cannot make: `tsc` catches a union member with no sentence,
+    // never a sentence this table forgot to describe.
     expect(Object.keys(OUTCOME_COPY).sort()).toEqual(TABLE.map(([reason]) => reason).sort())
   })
 

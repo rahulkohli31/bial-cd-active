@@ -64,30 +64,6 @@ add the new verb to whichever of the two it belongs in. Until that ships the pla
 screen — degraded, not broken."""
 
 
-RECOVERY_WRITE_DID_NOT_LAND_EVENT: Final = "recovery_write_did_not_land"
-"""A turn ended and its work did not reach the recovery slot.
-
-Fires on all THREE ways a turn's work fails to reach the slot, distinguished by `reason` rather
-than by three event names — one operational question, one event, filterable by field:
-
-* `refused` — the guard would not promote this tree (an unreadable lineage, a head_sha that is
-  not a sha). The existing copy is untouched.
-* `diverted` — same refusal, and the bundle was preserved under `divert_key` instead, so the tree
-  is recoverable by the operator promote procedure rather than thrown away.
-* `failed` — the bundle or the upload itself did not complete. This is the swallowed case, and it
-  is raised from the CALL SITE, which is the only place that knows the write raised. THE SWALLOW
-  STAYS — a safety net that can fail a turn is not a safety net — so this event is the whole of
-  the trace such a failure leaves, and without it nobody can tell a platform that failed to CHECK
-  the workspace from one that failed to make it DURABLE.
-
-Fields: `app_id`, `reason`, and — where the guard formed an opinion — `recorded_head` and
-`bundled_head`, which together say WHY a tree was refused.
-
-WHAT TO DO: read the app's `divert/{app_id}/` prefix. A `diverted` event means a real tree is
-sitting there; `services/build_sessions/snapshot.py::write_recovery_copy` documents the guard that
-put it there, and the operator promote endpoint is how it gets moved back."""
-
-
 WORKSPACE_LOST_WHILE_IDLE_EVENT: Final = "workspace_lost_while_idle"
 """A reversion was caught at the preview poll rather than at a turn.
 
@@ -134,8 +110,9 @@ that could not end.
 
 Fields: `app_id`, `app_name`, `exit_code` (the supervisor's post-mortem of its child, when it had
 one) and `put_away` — True when the container was put away, so the next reading offers the saved
-app and its start control; False when the durable-copy gate spared it, and the reaper's "not
-provably preserved" warning beside this line says why.
+app and its start control; False when the reap declined, and the reaper's own warning beside this
+line says which: "reap refused: this container's work could not be written back" is the common
+one, and the "no copy taken: ..." line under it names what stopped the write-back.
 
 READING `exit_code`: the supervisor reports `Popen.poll()`, so a signal death is the NEGATIVE
 signal number. `-9` is a SIGKILL that landed on the supervisor's own child; `137` is the same
@@ -255,8 +232,8 @@ SANDBOX_TORN_DOWN_EVENT: Final = "sandbox_torn_down"
 """A container's life ended cleanly. The clean finish is silent today, so the log holds starts
 with no ends and no way to tell a tidy shutdown from a process that simply vanished.
 
-Fields: `reason` (`turn_finalize` | `reap_idle` | `reclaim_for_other_project` | `operator` — one
-event, four reasons in a FIELD, per THE ONE RULE), `pardoned`, `lifetime_ms`, and `served: bool`
+Fields: `reason` (`reap_idle` | `reclaim_for_other_project` | `operator` — one event, three
+reasons in a FIELD, per THE ONE RULE), `pardoned`, `lifetime_ms`, and `served: bool`
 read off the serving stamp — the most useful retrospective field in the set, because it answers
 whether this container was ever any use to anybody at all."""
 

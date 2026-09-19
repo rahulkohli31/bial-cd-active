@@ -179,7 +179,7 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     paths = list(app.openapi().get("paths", {}))
     build_session_paths = [p for p in paths if "build-session" in p]
 
-    # 20 build-session paths. Beyond the CRUD/turn set, this counts `projects/{project_id}/
+    # 19 build-session paths. Beyond the CRUD/turn set, this counts `projects/{project_id}/
     # discard` (the saved version put back in the running container), `projects/{project_id}/
     # client-error` (the app's own in-browser error report), `projects/{project_id}/
     # compile-state` (the compile signal for a tab with no live turn — the turn stream's
@@ -189,11 +189,9 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     # immediately while a detached task does the waiting, so the outcome — three states, not
     # a boolean — needs a reader; holding the request open for the length of a stop was a
     # dependency nobody could satisfy, since the budget had to sit under the request timeout
-    # of a gateway owned by the client's network), the two superadmin operator routes for
-    # the parked/promoted trees (`internal/apps/{app_id}/parked` and `.../promote`) — without
-    # a reader those objects would be write-only, and in a false reversion they hold the only
-    # copy of somebody's work — and three routes for #198: `projects/{project_id}/
-    # shared-launch`/`shared-refresh`, a colleague's own door into a project shared with them,
+    # of a gateway owned by the client's network), and three routes for #198:
+    # `projects/{project_id}/shared-launch`/`shared-refresh`, a colleague's own door into a
+    # project shared with them,
     # restored into their own per-user slot rather than the owner's, and `shared-view/release`,
     # the self-service exit from a shared view that needs no project id to ask for.
     #
@@ -202,23 +200,24 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     # keeps that from being the retired keep-alive loop under a new name is the absolute age
     # ceiling, which no renewal can push past.
     #
-    # It also includes `activity` — the one user-scoped read the applications page polls for
-    # its three markers (starting / open / closing), answering for every project at once from
-    # the same registry-hash-plus-starting-marker pipeline `preview-state` reads for one,
-    # plus the citizen's owed `PendingTeardown` rows. Declared above the `{session_id}` routes,
-    # like `internal/reap` above it, or `session_id` parses "activity" as a UUID and 422s.
+    # It excludes `activity`, retired with the applications page's starting/open/closing
+    # markers: the pill reported the platform's own housekeeping rather than anything about the
+    # app, and it read a registry record nothing clears when a stay lapses — so it could assert
+    # an app was open for as long as it took a sweep to come round. Opening the project answers
+    # the same question truthfully, so the marker, its poll and this route went together.
     #
     # It excludes the lock ops (`lock/acquire`/`renew`/`release`/`heartbeat`/`force-end`):
     # nothing calls them any more. The portal's keep-alive loop, the only caller of the first
     # four, is gone, and the block banner's Force-end button, the only caller of the fifth, is
-    # gone too — the service method behind it, `SessionManager.force_end`, is untouched and
-    # still has its own tests, only the HTTP door closed. It also excludes the standalone
-    # build stack's bare collection `POST` on `/v1/build-sessions`, the old start route,
-    # removed together with the harness, the module-level build agent, and the run-build
-    # dependency it was the sole door into, once the workspace moved onto the chat turn and
-    # took away its only browser client.
-    assert len(build_session_paths) == 22, (
-        f"the C3 build-session route surface changed: expected 22 paths, found "
+    # gone too. It excludes the SESSION-SCOPED `{session_id}/stop`, retired with the end
+    # sequence behind it once nothing could hand a client a session id to name — the stop a
+    # citizen reaches is `projects/{project_id}/stop-active-build`, counted above. And it
+    # excludes the standalone build stack's bare collection `POST` on `/v1/build-sessions`, the
+    # old start route, removed together with the harness, the module-level build agent, and the
+    # run-build dependency it was the sole door into, once the workspace moved onto the chat
+    # turn and took away its only browser client.
+    assert len(build_session_paths) == 18, (
+        f"the C3 build-session route surface changed: expected 18 paths, found "
         f"{len(build_session_paths)}. If a route was deliberately added or removed, amend C3 "
         f"and update this number in the same change.\n{sorted(build_session_paths)}"
     )

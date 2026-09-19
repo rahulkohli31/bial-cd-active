@@ -1,7 +1,7 @@
 /**
- * Owns a build session's lifecycle: RE-ATTACHES to a session, stops it, subscribes to its SSE
- * feed, and derives `BuildSessionStatus`. Every cockpit surface (LivePreview, the conversation
- * surface's banners) reads from here.
+ * Owns a build session's lifecycle: RE-ATTACHES to a session, subscribes to its SSE feed, and
+ * derives `BuildSessionStatus`. Every cockpit surface (LivePreview, the conversation surface's
+ * banners) reads from here.
  *
  * It no longer STARTS or RELAUNCHES a session — a composer send is a TURN and the build
  * lives inside the turn's transaction; the live restore path is `relaunchPreview`, called
@@ -11,22 +11,21 @@
  * WHY THIS EXISTS: no client keep-alive extends a sandbox's deadline — no timer, heartbeat,
  * or lock renewal reaches from here into the container. The server renews the lock on every
  * non-terminal progress envelope, so a build in flight renews as fast as it produces frames;
- * save/stop/relaunch/deploy extend the lease as a side effect of the request they already
+ * save/relaunch/deploy extend the lease as a side effect of the request they already
  * make. Reading without acting for the full lease window loses the container — a bounded,
  * deliberate cost recovered on the next prompt behind a labelled wait.
  *
  * Status derives from the envelope stream (`provisioning → building → ready`; terminal read
  * off `ended.status`, never `reason`). `reattach` seeds `previewUrl` from the status response,
- * so a `preview_ready` fired before connecting still frames the app. There is no force-end here
- * any more — its one control was the block banner's Force-end button, which went with the
- * banner, so `stop()` is the surviving way to settle a live session from this hook. There is no
- * `reclaimed` state either — the frozen-tab case is `LivePreview`'s own `asleep` poll state —
+ * so a `preview_ready` fired before connecting still frames the app. This hook SETTLES a session
+ * but no longer ENDS one: the session-scoped stop and force-end were both retired with their
+ * routes, so a terminal reaches here only as an `ended` envelope. There is no `reclaimed` state
+ * either — the frozen-tab case is `LivePreview`'s own `asleep` poll state —
  * and `feedDisconnected` is a distinct, bounded reconnect-exhaustion flag with manual
  * `reconnect()`. `buildLock` is not consulted here: the composer pre-checks it; the 409 barrier
  * is server-side.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ApiError } from '../utils/apiError'
 import { buildSessionClient } from '../utils/buildSessionApi'
 import type { BuildSessionClient } from '../utils/buildSessionApi'
 import { subscribeBuildFeed } from '../utils/buildSessionEvents'
@@ -64,8 +63,6 @@ export interface UseBuildSessionResult {
   envelopes: FeedEnvelope[]
   /** True while a LIVE `ready` preview keeps receiving step/log activity (drives the overlay). */
   iterating: boolean
-  /** A graceful stop is in flight — the Stop control shows a pending state until terminal. */
-  stopping: boolean
   feedDisconnected: boolean
   /**
    * The dev-server PROCESS crashed after the preview was framed (a `preview_reconnecting`
@@ -76,12 +73,9 @@ export interface UseBuildSessionResult {
    */
   reconnecting: boolean
   quota: QuotaState | null
-  error: string | null
   /** ms epoch the current session started, read from its `createdAt` — for elapsed-time display. */
   startedAt: number | null
   reattach: (sessionId: string) => Promise<void>
-  /** Graceful stop. Resolves `false` when the stop FAILED and the session is still live (the caller must not start over it). */
-  stop: () => Promise<boolean>
   reconnect: () => void
   reset: () => void
 }
@@ -104,11 +98,9 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   const [endReason, setEndReason] = useState<string | null>(null)
   const [envelopes, setEnvelopes] = useState<FeedEnvelope[]>([])
   const [iterating, setIterating] = useState(false)
-  const [stopping, setStopping] = useState(false)
   const [feedDisconnected, setFeedDisconnected] = useState(false)
   const [reconnecting, setReconnecting] = useState(false)
   const [quota, setQuota] = useState<QuotaState | null>(null)
-  const [error, setError] = useState<string | null>(null)
   const [startedAt, setStartedAt] = useState<number | null>(null)
 
   // Refs mirror the state that async callbacks (timers, SSE handlers) must read WITHOUT a stale
@@ -140,7 +132,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     subRef.current = null
   }, [])
 
-  /** The single terminal transition. Idempotent: only the FIRST caller (SSE ended / reclaim / stop) wins — including its `reason`, so a late duplicate can never repaint WHY. */
+  /** The single terminal transition. Idempotent: only the FIRST caller (SSE ended / reclaim) wins — including its `reason`, so a late duplicate can never repaint WHY. */
   const finishSession = useCallback(
     (terminal: BuildSessionStatus, opts: { reason?: string } = {}) => {
       if (settledRef.current) return
@@ -150,7 +142,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       setPhase(terminal)
       setEndReason(opts.reason ?? null)
       setIterating(false)
-      setStopping(false)
       setFeedDisconnected(false) // a terminal session clears any lingering "Lost the feed" banner + dead Reconnect
     },
     [teardownTimers, closeFeed, setPhase],
@@ -237,11 +228,9 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     setEndReason(null)
     setEnvelopes([])
     setIterating(false)
-    setStopping(false)
     setFeedDisconnected(false)
     setReconnecting(false)
     setQuota(null)
-    setError(null)
     setStartedAt(null)
   }, [teardownTimers, closeFeed])
 
@@ -270,24 +259,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     },
     [client, reset, setPhase, subscribe],
   )
-
-  const stop = useCallback(async (): Promise<boolean> => {
-    const sid = sessionIdRef.current
-    if (!sid || settledRef.current) return true // nothing live to stop — safe to proceed
-    setStopping(true)
-    try {
-      await client.stop(sid, {})
-      // The reason is set locally (the SSE feed closes with the settle): a user stop TEARS the
-      // container down server-side, so this must never read as the pardoned 'completed' state.
-      finishSession('ended', { reason: 'stopped_by_user' })
-      return true
-    } catch (e) {
-      if (settledRef.current) return true // a concurrent SSE-ended / reclaim already finished it — don't paint a stale error
-      setError(e instanceof ApiError ? e.message : 'Could not stop the build.')
-      setStopping(false)
-      return false // the session is STILL LIVE — a caller must not start over it
-    }
-  }, [client, finishSession])
 
   const reconnect = useCallback(() => {
     const sid = sessionIdRef.current
@@ -337,14 +308,11 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     endReason,
     envelopes,
     iterating,
-    stopping,
     feedDisconnected,
     reconnecting,
     quota,
-    error,
     startedAt,
     reattach,
-    stop,
     reconnect,
     reset,
   }

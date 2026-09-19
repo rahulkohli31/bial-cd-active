@@ -143,7 +143,7 @@ SERVED_TRAFFIC_STAY_SECONDS = 900
 # (`RELAUNCH_PREVIEW_STAY_SECONDS`/`SERVED_TRAFFIC_STAY_SECONDS` above). Monotonic extension
 # (`grant_stay_of_execution`'s `max(existing, computed)`) is what keeps this from ever SHORTENING a
 # longer stay a prior write turn already bought — see `locks.py`.
-TURN_ENDED_UNCHANGED_STAY_SECONDS = 300  # 5 min
+TURN_ENDED_STAY_SECONDS = 300  # 5 min
 
 # --- The shared-runtime view's absolute session ceiling (#198) --------------
 # Independent of `DeadlineWriter.APP_SERVED_TRAFFIC`'s renewable stay above, so a wedged or
@@ -268,7 +268,7 @@ asserts every member is present). See `PreviewStateAction` for what each bucket 
 one rule this mapping exists to enforce: `UNKNOWN` never maps to `REMEDY`."""
 
 
-# --- Control operations: stop / status ---------------------------------------
+# --- Control operations: status ----------------------------------------------
 #
 # THE START ROUTE IS GONE and these two shapes outlive it. The bare `POST` on the build-sessions
 # collection was deleted with the whole harness behind it — it had had no browser client for a
@@ -300,9 +300,9 @@ class StartBuildResponse(CamelModel):
     """The 201 the deleted start route returned. NO ROUTE PRODUCES IT — and with it went the last
     live producer of a session id the browser could hold. What still reaches the portal is a
     `build_started` transcript row written before the deletion; those rows are permanent, which
-    is why `status`/`stop`/`events` survive as their reader."""
+    is why `status`/`events` survive as their reader."""
 
-    session_id: uuid.UUID  # the build-session id — path key for status/stop/SSE.
+    session_id: uuid.UUID  # the build-session id — path key for status/SSE.
     project_id: uuid.UUID
     app_id: uuid.UUID  # the app_registry row being built (== BIAL_APP_ID). Fresh per project.
     status: BuildSessionStatus  # always `provisioning` on a fresh start.
@@ -316,12 +316,6 @@ class RelaunchPreviewRequest(CamelModel):
     resolved from the project."""
 
     project_id: uuid.UUID  # REQUIRED — the owning project; the app is resolved from it.
-    # Put the LAST SAVED version back instead of resuming the newest workspace. Default False
-    # because the newest tree is what the user was looking at, and restoring an older one over
-    # it is the failure that costs them work. Neither choice promotes anything: the saved
-    # bundle is untouched either way, so `dirty` stays true and Save is still their click.
-    # Set from an explicit user action ("go back to my last saved version"), never inferred.
-    prefer_saved: bool = False
 
 
 class DiscardRequest(CamelModel):
@@ -350,9 +344,9 @@ class RelaunchPreviewResponse(CamelModel):
     preview_url: str
     status: BuildSessionStatus  # `ready`, or `provisioning` when the app is not serving yet.
     # The "last saved version" signal: True when the project's NEWEST recorded build
-    # outcome was FAILED — `_do_finalize` snapshots pass and fail alike, so the restored
-    # workspace is the last SAVED state, not that build's intent. The portal labels the
-    # relaunched preview accordingly instead of presenting an unqualified "ready".
+    # outcome was FAILED. Nothing about a failed verdict withheld the snapshot of the day, so
+    # the restored workspace is the last SAVED state, not that build's intent. The portal labels
+    # the relaunched preview accordingly instead of presenting an unqualified "ready".
     restored_from_failed_build: bool
     # Is the app SERVING the URL above yet? False only on the attach arm's fail-open path — the
     # container is alive and holds the user's work, the app is just slow to answer. The portal
@@ -391,19 +385,6 @@ class SharedPreviewResponse(CamelModel):
     snapshot_taken_at: datetime | None
 
 
-class StopBuildRequest(CamelModel):
-    """`POST /v1/build-sessions/{sessionId}/stop` body."""
-
-    reason: str | None = None  # optional free-text reason for the audit/activity feed.
-
-
-class StopBuildResponse(CamelModel):
-    """`POST /v1/build-sessions/{sessionId}/stop` → 200."""
-
-    session_id: uuid.UUID
-    status: BuildSessionStatus  # `ended` after a graceful stop.
-
-
 class BuildSessionStatusResponse(CamelModel):
     """`GET /v1/build-sessions/{sessionId}` → 200. The poll surface and the
     source of the framable `preview_url`."""
@@ -419,26 +400,6 @@ class BuildSessionStatusResponse(CamelModel):
     last_seq: int | None  # highest envelope `seq` so far; a client resumes SSE from it.
     created_at: datetime
     updated_at: datetime
-
-
-# --- Lock operations: none left ------------------------------------------------
-# `acquire` / `renew` / `release` / `heartbeat` were retired along with their response models
-# (`LockStateResponse`, `LockReleaseResponse`, `HeartbeatResponse`) — the portal's keep-alive
-# loop that was their only caller was itself deleted, and nothing else ever called these
-# routes. `force-end` was the sole survivor and its route is now gone too: it had had no
-# control on any surface since the block banner's Force-end button went, which both
-# `buildSessionApi.ts` and `useBuildSession.ts` said in their own comments.
-
-
-class ForceEndResponse(CamelModel):
-    """The 200 the deleted force-end lock op returned. NO ROUTE PRODUCES IT.
-    `SessionManager.force_end` itself survives — it is one of the two entry points into the
-    end sequence and carries the terminal-commit race invariant its service tests pin — but
-    nothing calls it any more, and retiring it is a separate change that reaches into
-    `_do_finalize`'s `force_ended` arms."""
-
-    session_id: uuid.UUID
-    status: BuildSessionStatus  # `ended`.
 
 
 # --- the app's own client-error report ----------------
@@ -568,57 +529,6 @@ class RenewPresenceResponse(CamelModel):
     #: When the stay now lapses, or `None` when nothing was renewed. The client does not display
     #: it; it is what makes a renewal auditable from a response body.
     stay_until: datetime | None = None
-    #: When this container reaches the absolute ceiling and is collected no matter who is
-    #: renewing it, or `None` when no ceiling applies.
-    #:
-    #: IT RIDES THE RENEWAL RATHER THAN A READ OF ITS OWN. The screen that needs to say this is
-    #: the screen already renewing every 45 seconds, and the instant is a fact about the very
-    #: container being renewed — a second endpoint call per tick would buy nothing. NULL IS NOT
-    #: "SOON": it means no ceiling applies, and a client that rendered it as imminent would be
-    #: announcing a collection that is not coming.
-    draining_at: datetime | None = None
-
-
-# --- What is starting, open, or closing down -----------------------------------
-
-
-class ActivityPhase(enum.StrEnum):
-    """What one project is doing to its container right now — the three markers the
-    applications page draws beside a project's name. A CLOSED set, like `PreviewLifeState`:
-    the client maps every member, so a phase added later with no client update fails loudly
-    instead of drawing nothing.
-
-    NO `unknown` MEMBER, unlike `PreviewLifeState` — a coordination-store read this route
-    cannot complete is a 503 on the whole response, never a member here standing in for one
-    project. An `unknown` phase in a list the client otherwise reads as "here is what's
-    happening" would still be taken as a claim."""
-
-    #: Provisioning is under way, or the container exists but has never yet answered a
-    #: request — the same two situations `PreviewLifeState.STARTING` names for one project.
-    STARTING = "starting"
-    #: The container is up and has been watched to serve a request.
-    OPEN = "open"
-    #: The platform still owes a deletion for this project's container. A `PendingTeardown`
-    #: row's existence is the whole of the state — there is no status to read instead.
-    CLOSING = "closing"
-
-
-class ProjectActivity(CamelModel):
-    """One project's entry in the activity read."""
-
-    project_id: uuid.UUID
-    phase: ActivityPhase
-
-
-class ActivityResponse(CamelModel):
-    """`GET /v1/build-sessions/activity` → 200.
-
-    ONE READ FOR EVERY PROJECT AT ONCE, which is what lets the applications page clear a
-    marker it drew a moment ago: an empty list is the positive claim that nothing is
-    starting, open or closing, so the route behind this runs inside `build_coordination_or_503`
-    and answers 503 rather than emptying the list when the coordination store cannot be read."""
-
-    projects: list[ProjectActivity]
 
 
 # =============================================================================
@@ -844,45 +754,3 @@ commit, and there is no request-scoped `get_db` on a background task. Tests bind
 the rolled-back test session — the same substitution the conversation suites make via
 `dependency_overrides` on `_shared.billing_session_factory`.
 """
-
-
-class ParkedTree(CamelModel):
-    """One tree set aside instead of promoted: a `quarantine` is what a restore was about to
-    write over, a `divert` is what the recovery guard refused to promote. Both live under
-    per-occurrence keys, so a later one never overwrites an earlier one."""
-
-    key: str
-    kind: Literal["quarantine", "divert"]
-    head_sha: str | None
-    size_bytes: int
-    taken_at: datetime | None
-
-
-class ParkedTreesResponse(CamelModel):
-    """`POST /v1/build-sessions/internal/apps/{app_id}/parked` → 200.
-
-    THE TREES WOULD OTHERWISE BE WRITE-ONLY: no reader, no retention, no runbook. In a
-    false-`REVERTED` case those objects hold the only copy of a citizen's newest work, so this
-    response must not reproduce that write-only shape. Newest first, because the useful one is
-    almost always the last one."""
-
-    trees: list[ParkedTree]
-
-
-class PromoteParkedRequest(CamelModel):
-    """`POST /v1/build-sessions/internal/apps/{app_id}/promote` — put one parked tree back.
-
-    The key is named explicitly rather than "the newest": an operator promoting the wrong tree
-    over somebody's recovery slot is the failure, and a request that
-    cannot name what it means is one that can be misread."""
-
-    key: str
-
-
-class PromoteParkedResponse(CamelModel):
-    """What the promotion did. `promoted` is False when the guard refused it — which is not an
-    error and must not read as one: it means the tree is not a descendant of what the slot holds,
-    and forcing it would be the data loss the guard exists to prevent."""
-
-    promoted: bool
-    detail: str

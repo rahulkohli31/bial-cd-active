@@ -21,7 +21,6 @@ function setup(overrides: Partial<React.ComponentProps<typeof StopTurnControl>> 
     running: true,
     resolveTarget: () => ({ conversationId: CHAT, turnId: TURN }),
     onStopTurn: vi.fn<(c: string, t: string) => Promise<void>>().mockResolvedValue(undefined),
-    onStopSession: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
     onStopFailed: vi.fn<(m: string) => void>(),
     ...overrides,
   }
@@ -40,22 +39,24 @@ const stopButton = () => screen.queryByTestId('stop-turn')
 
 describe('StopTurnControl', () => {
   it('stops the LIVE TURN with the active conversation id and that turn id', async () => {
-    const { onStopTurn, onStopSession } = setup()
+    const { onStopTurn } = setup()
 
     fireEvent.click(screen.getByTestId('stop-turn'))
 
     await waitFor(() => expect(onStopTurn).toHaveBeenCalledWith(CHAT, TURN))
-    expect(onStopSession).not.toHaveBeenCalled()
   })
 
-  it('stops a LEGACY BUILD SESSION when there is no turn id', async () => {
-    // The arm discriminates on whether a turn id exists — a transport fact, not a chat kind.
-    const { onStopTurn, onStopSession } = setup({ resolveTarget: () => null })
+  it('names no turn when there is none to name, and the control stays pressable', async () => {
+    // The control is turn-only: with no turn id there is nothing to stop, so the press must
+    // reach no handler and must still leave the button in its resting state.
+    const { onStopTurn, onStopFailed } = setup({ resolveTarget: () => null })
 
-    fireEvent.click(screen.getByTestId('stop-turn'))
+    const button = screen.getByTestId('stop-turn')
+    fireEvent.click(button)
 
-    await waitFor(() => expect(onStopSession).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(button.getAttribute('aria-disabled')).toBe('false'))
     expect(onStopTurn).not.toHaveBeenCalled()
+    expect(onStopFailed).not.toHaveBeenCalled()
   })
 
   it('is absent when no turn is running, and the composer is still there and typeable', () => {
@@ -176,7 +177,6 @@ describe('StopTurnControl reads its target at press time, not at render time', (
         running
         resolveTarget={() => ({ conversationId: CHAT, turnId: live })}
         onStopTurn={onStopTurn}
-        onStopSession={vi.fn<() => Promise<void>>().mockResolvedValue(undefined)}
         onStopFailed={vi.fn()}
       />,
     )

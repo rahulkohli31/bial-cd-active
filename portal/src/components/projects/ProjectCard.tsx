@@ -8,26 +8,22 @@
  * this renders trivially in a test with no router.
  */
 import type { Project } from '../../utils/projectApi'
-import type { ActivityPhase } from '../../utils/buildSessionApi'
 import { tileDateRange, tileDateTitle } from '../../utils/projectDates'
 import AppTile from './AppTile'
 import AppStatusBadge from './AppStatusBadge'
 import AppRowMenu from './AppRowMenu'
-import AppActivityMarker from './AppActivityMarker'
 
 export interface ProjectCardProps {
   project: Project
   onOpen: () => void
   onSettings: () => void
   /** Starting, open, or closing down right now — `undefined` draws no marker. See `ProjectRow`. */
-  activityPhase?: ActivityPhase
 }
 
 export default function ProjectCard({
   project,
   onOpen,
   onSettings,
-  activityPhase,
 }: ProjectCardProps): React.JSX.Element {
   const name = project.name || 'Untitled application'
 
@@ -38,7 +34,7 @@ export default function ProjectCard({
       description={project.description}
       onOpen={onOpen}
       marker={
-        activityPhase ? <AppActivityMarker phase={activityPhase} live={project.isServing} /> : undefined
+        undefined
       }
       trailing={
         <AppRowMenu

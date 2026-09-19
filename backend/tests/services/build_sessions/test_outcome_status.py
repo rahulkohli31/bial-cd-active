@@ -10,11 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.db.models.conversation import ChatKind
 from src.db.models.message import MessageEntryKind
-from src.services.build_sessions.outcome import (
-    newest_build_outcome_status,
-    write_build_outcome,
-)
+from src.services.build_sessions.outcome import newest_build_outcome_status
 from tests.factories import ConversationFactory, MessageFactory, ProjectFactory, UserFactory
+from tests.fakes import write_build_outcome
 
 
 async def _project_with_thread(db: AsyncSession, email: str):

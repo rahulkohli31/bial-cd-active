@@ -379,21 +379,15 @@ async def start_turn(
     # checks are re-made downstream (the engine owns the real, race-free claim) — these are
     # the early, cheap copies that keep the write from happening at all.
     #
-    # THE ONE GATE, server side: while the agent is working in this thread — a reply in flight
-    # OR a build running — no new turn starts. The build arm is a LIVENESS check, not the mode
-    # check below it: the two genuinely disagree (a build's first seconds run before the flip;
-    # `POST /build-sessions` never touches the mode at all), and only liveness answers "is the
-    # agent building THIS thread right now".
-    if manager.live_session_for_conversation(conversation_id) is not None:
-        raise AppApiError(409, BUILD_IN_FLIGHT_MSG)
+    # THE ONE GATE, server side: while this thread's agent is mid-reply, no new turn starts.
+    # Pure liveness — what the chat IS never enters it.
     if conversation_is_mid_reply(conversation_id):
         raise AppApiError(409, "A turn is already running for this conversation.")
     # UNCONDITIONAL, and BELOW the mid-reply guard on purpose: a send during a streaming
-    # reply must still 409 as a busy conversation, not as a taken workspace. This
-    # one asks a different question — is this user's single workspace already committed to a
-    # DIFFERENT conversation of their own? Cheap and synchronous; the expensive provision
-    # happens inside the detached turn, because blocking the POST on 30-60s recreates the dead
-    # end the composer contract exists to remove.
+    # reply must still 409 as a busy conversation, not as a taken workspace. This one asks a
+    # different question — is this user's single workspace already committed to a turn at all?
+    # Cheap and synchronous; the expensive provision happens inside the detached turn, because
+    # blocking the POST on 30-60s recreates the dead end the composer contract exists to remove.
     #
     # IT NO LONGER READS THE CHAT'S KIND: every turn takes the whole workspace
     # for as long as it runs, whatever kind of chat it was sent in. A Plan turn pins the live
@@ -409,11 +403,7 @@ async def start_turn(
     # of every four iteration messages in a measured campaign. The claim inside the turn is
     # where the (bounded) waiting happens, and it still refuses if the release never comes.
     active = manager.active_session_for(user.id)
-    if (
-        active is not None
-        and active.conversation_id != conversation_id
-        and not manager.is_letting_go_of_the_workspace(active)
-    ):
+    if active is not None and not manager.is_letting_go_of_the_workspace(active):
         raise AppApiError(409, BUILD_IN_FLIGHT_MSG, code=ALREADY_BUILDING_HERE_CODE)
 
     # BOTH KINDS, not just Build, and the guard above cannot answer this one.
@@ -682,8 +672,10 @@ async def turn_events(
             rows = await load_rows(
                 db, user_id=user.id, conversation_id=conversation.id, include_hidden=True
             )
-            projected = await project_conversation(db, user_id=user.id, rows=rows)
-            items = projected[-8:]  # the turn's own tail; full history is a separate GET
+            # The turn's own tail; full history is a separate GET. Asked for as a `tail` rather
+            # than sliced off the result so redaction and the attachment read are paid for eight
+            # items, not for the whole conversation on every reconnect.
+            items = await project_conversation(db, user_id=user.id, rows=rows, tail=8)
         snapshot = engine.build_snapshot(state, items=items)
 
     # Every DB read this route needs is done. Commit now so the pooled connection goes back

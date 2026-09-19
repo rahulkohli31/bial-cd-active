@@ -63,7 +63,6 @@ import type { StartSinks } from '../workspace/startApp'
 import {
   useAppPaneVisible,
   usePublishAddress,
-  usePublishLifecycle,
   usePublishPaneView,
   usePublishSave,
   usePublishWorkspaceReport,
@@ -232,6 +231,11 @@ const DIAGNOSTIC_FALLBACK = 'We hit a problem finishing that change.'
  * survived, and a next action invented here would be a guess presented as advice.
  */
 const BUILD_WAS_RUNNING = 'A build was running here when this chat was last open.'
+
+/** What a citizen is told when their Save did not land and the server gave no sentence of its
+ *  own. The effect first, then the one thing they can do about it — nobody to contact, because
+ *  there is no one who can put this right on their behalf. */
+const SAVE_DID_NOT_LAND = 'Your app was not saved. Try again.'
 
 /** The key a diagnostic row takes in the turn's parts.
  *
@@ -423,8 +427,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // belongs to the press-session, and the control that is pressed is the one that can hold it.
   const [livePlanOptions, setLivePlanOptions] = useState<PlanOptionsItem | null>(null)
   const [planOverrides, setPlanOverrides] = useState<Record<string, PlanOverrideValue>>({})
-  // `turnError` covers the chat half (429 daily cap, refused turn, in-band failure);
-  // `session.error` covers the build half. Distinct sources, both above the composer.
+  // `turnError` covers the chat half: 429 daily cap, refused turn, in-band failure.
   const [turnError, setTurnError] = useState<string | null>(null)
   // What the PLATFORM has to say about the workspace itself: it was reset and is being put
   // back, it was reset and cannot be, we could not check it. These arrive as `workspace` frames
@@ -480,11 +483,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   const [discarding, setDiscarding] = useState(false)
   const [hasSavedVersion, setHasSavedVersion] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
-  // WHAT THE PLATFORM OWES THIS CITIZEN ABOUT THEIR APP'S LIFE. The renewal below answers the
-  // first; the save read answers the second, which is durable and must be met on a later visit
-  // rather than only in the session the refusal happened in.
-  const [drainingAt, setDrainingAt] = useState<string | null>(null)
-  const [writeBackRefusedAt, setWriteBackRefusedAt] = useState<string | null>(null)
   // `projectHasSavedBuild` arrives as a PROP, read once when the route resolved, and nothing
   // refetches it. But a Save is precisely the act that writes the snapshot bundle that flag
   // reports — so saving, the one thing that makes a relaunch possible, left the Relaunch
@@ -563,7 +561,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       if (projectIdRef.current === activeProjectId && read === saveReadSeq.current) {
         setSaveDirty(state.dirty)
         setHasSavedVersion(state.savedHead !== null)
-        setWriteBackRefusedAt(state.writeBackRefusedAt)
       }
     } catch {
       // UNKNOWN, never "clean". A failed check must not report the work as safe.
@@ -595,10 +592,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
         setHasSavedVersion(true)
       }
     } catch (err) {
-      // Surfaced, never swallowed: a Save that silently fails leaves the user believing their
-      // work is stored. The 409 copy from the server already names the way out.
+      // ON THE ASSERTIVE SLOT, with every other failure this surface consolidates there: a Save
+      // that fails silently leaves the citizen believing their work is stored, and the small
+      // alert beside the control is not where somebody mid-conversation is looking. The server's
+      // own sentence when it has one — the 409 already names the way out.
       if (projectIdRef.current === activeProjectId) {
-        setSaveError(err instanceof Error ? err.message : 'Could not save your work. Try again.')
+        setUrgent(err instanceof Error ? err.message : SAVE_DID_NOT_LAND)
         // Same fail-toward-warning as the failed check above: a Save that threw leaves this
         // surface unable to say what the container holds.
         setSaveDirty(null)
@@ -779,22 +778,20 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // app was running, and then refused to point the pane at the very URL that read had handed it.
   //
   // WHY THE CLAIM IS HONEST, AND WHY THE GUARD IS THE WHOLE OF IT. One instance of this component
-  // survives a project switch, so an unconditional stamp would hand project A's live session, the
-  // error left by A's failed attempt, and the URL A's start produced to project B — `showSession`,
-  // `buildActive`, `urgentText` and the relaunched arm all read this ref. So the claim is made only
-  // while this surface holds NOTHING attributed to another project: no session id, no error from an
-  // attempt that failed, no URL from a start. In that state the stamp moves exactly one thing — the
-  // project arm, whose input is a read keyed on the open project by construction — because every
-  // other gate it opens has nothing to say.
+  // survives a project switch, so an unconditional stamp would hand project A's live session and
+  // the URL A's start produced to project B — `showSession`, `buildActive` and the relaunched arm
+  // all read this ref. So the claim is made only while this surface holds NOTHING attributed to
+  // another project: no session id, no URL from a start. In that state the stamp moves exactly one
+  // thing — the project arm, whose input is a read keyed on the open project by construction —
+  // because every other gate it opens has nothing to say.
   //
   // Assigned during render, like the refs above and for the reason the block below gives: a gate
   // that depends on declaration order is one reorder away from silently opening.
-  if (projectId && session.sessionId === null && session.error === null && startedPreviewUrl === null) {
+  if (projectId && session.sessionId === null && startedPreviewUrl === null) {
     sessionProjectRef.current = projectId
   }
-  // The session's surfaces render only while viewing a chat of ITS project (it is project-scoped).
-  // `error` comes from an attempt that FAILED (the reset leaves sessionId null), so it gates on the
-  // project stamp alone; the live surfaces also require a sessionId.
+  // The session's surfaces render only while viewing a chat of ITS project (it is project-scoped),
+  // so they require both the project stamp and a sessionId.
   //
   // Derived HERE, above every handler, and not down beside the JSX where the rest of the render
   // derivations live: `handleSend` reads `buildActive`, and a gate that depends on declaration
@@ -805,11 +802,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // terminal. PROJECT-SCOPED on purpose: one instance of this component survives a project
   // switch, so the project-agnostic form would let project A's build lock project B's composer.
   const buildActive = showSession && isActiveBuildStatus(session.status)
-  // The COMPOSER's half of that gate is per-CHAT, matching the server's own per-conversation
-  // 409 (`live_session_for_conversation`). A sibling builder chat in the same project is NOT
-  // the chat that is building: the server would accept its turn, so shutting its composer and
-  // telling its reader "building your app" is a lie about someone else's build. `buildActive`
-  // stays project-scoped — the cockpit, the live bubble and the delete gate all speak for the
+  // The COMPOSER's half of that gate is per-CHAT. A sibling builder chat in the same project is
+  // NOT the chat that is building, so shutting its composer and telling its reader "building
+  // your app" would be a sentence about someone else's build. `buildActive` stays
+  // project-scoped — the cockpit, the live bubble and the delete gate all speak for the
   // project's one session, and one instance of this component survives a project switch.
   const buildActiveHere = buildActive && sessionChatRef.current === buildId
   const generating = generatingChatId === buildId
@@ -865,11 +861,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     { dirty: saveDirty, saving, error: saveError, discarding, replying: turnRunningHere, hasSavedVersion },
     { save: handleSave, discard: handleDiscard, settings: null, share: null },
   )
-  // THE PANE COLUMN IS WHERE THESE ARE SAID, and it is a sibling of the `<Outlet/>` this surface
-  // fills — so a citizen mid-conversation is told their app is closing, on the same words the
-  // project screen uses.
-  usePublishLifecycle({ drainingAt, writeBackRefusedAt })
-
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
   // aborts it before resubscribing, but nothing did on unmount, leaking the reader (and its
   // fetch) past the component's life. The turn keeps running server-side; only the read stops.
@@ -1387,6 +1378,28 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   }, [])
 
   /**
+   * WHEN THE RUNNING TURN ACTUALLY BEGAN, read off the message that opened it.
+   *
+   * A reload has no memory of the turn it is rejoining, and the server reports only `{turnId,
+   * lastSeq}` — it records when a turn ENDS, never when one started. The newest user message in
+   * the transcript is the request the running turn is answering, so its stored instant is the
+   * closest thing to a start this client can obtain, accurate to the write that persisted it.
+   *
+   * FALLS FORWARD, NEVER BACK. No user row, or a stamp that will not parse, yields the present:
+   * a timer that starts at zero is merely uninformative, while one seeded from a guessed earlier
+   * instant states an elapsed time that never happened.
+   */
+  const openedTurnAt = (prior: ChatMessage[]): number => {
+    for (let i = prior.length - 1; i >= 0; i -= 1) {
+      const message = prior[i]
+      if (message.role !== 'user') continue
+      const stamped = Date.parse(message.createdAt ?? '')
+      return Number.isNaN(stamped) ? Date.now() : stamped
+    }
+    return Date.now()
+  }
+
+  /**
    * RE-ATTACH to a turn still running server-side. A reload mid-turn lands on a transcript
    * whose newest row is the user's message — the reply is generating, but this tab has no
    * socket, so the page would sit static and the next send would 409. Subscribes with NO
@@ -1400,7 +1413,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_r`
     const sink = newSink()
-    setTurnStartedAt(Date.now())
+    // THE TURN DID NOT START NOW. This path runs on a RELOAD into a turn that is already running,
+    // so stamping the present restarts the on-screen count from zero under somebody who has been
+    // watching it climb — the falling number this timer exists to remove. The message that opened
+    // the turn carries the only start instant a client can see; the server records when a turn
+    // ENDS but never when one began, so an unparseable or absent stamp falls back to the present
+    // rather than inventing an earlier one.
+    setTurnStartedAt(openedTurnAt(prior))
     setGeneratingChatId(activeId)
     // THE BOUNDARY IS LATCHED HERE, from the transcript this re-telling is about to sit on top of
     // (see `reToldFromSeq`). Read off `prior` rather than the `messages` state: this runs inside
@@ -1801,12 +1820,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       sessionId: sid,
       previewUrl: session.previewUrl ?? null,
       endedAt: new Date().toISOString(),
-      // UNKNOWN, not false. `finishSession('ended')` closes the feed the moment the stop HTTP call
-      // resolves, so the real `ended` frame — which for a graceful stop says snapshot_committed:
-      // true, because `_do_finalize` DID snapshot — may never be dispatched here. Collapsing that
-      // into `false` warned the user their code wasn't saved about a build that saved it. The card
-      // warns only on an explicit `false`, and the server's row (which always carries the real
-      // value) replaces this one on reload.
+      // UNKNOWN, not false. `finishSession` can settle before the real `ended` frame is
+      // dispatched here, and that frame is the only thing that knows whether a bundle was
+      // written. Collapsing the gap into `false` warned the user their code wasn't saved about a
+      // build that saved it. The card warns only on an explicit `false`, and the server's row
+      // (which always carries the real value) replaces this one on reload.
       snapshotCommitted: ended?.snapshot_committed ?? null,
       reason: ended?.reason ?? null,
     })
@@ -1967,16 +1985,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       if (sessionLive && sessionProjectRef.current !== projectId) {
         setUrgent('You already have a build running in another application. Stop it before starting one here.')
         return
-      }
-      if (sessionLive) {
-        // The refine loop: end THIS project's live session gracefully before the fresh
-        // build (the server would reap through it anyway; a courteous stop keeps its
-        // snapshot + terminal clean).
-        const stopped = await session.stop()
-        if (!stopped) {
-          setUrgent(session.error || 'Could not stop the running build — try again.')
-          return
-        }
       }
       const outcome = await buildFromPlan(activeBuildId, toolCallId, newChatId)
       setPlanOverrides((prev) => ({ ...prev, [toolCallId]: 'build' }))
@@ -2490,14 +2498,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       const hidden = document.visibilityState !== 'visible'
       const presence = presenceToRenew(accelerated, hidden)
       if (presence) {
-        // NOT AWAITED, and its answer is the only place a ceiling comes from. A renewal that
-        // reached a DIFFERENT container, or no container at all, is describing something other
-        // than the app on screen — so only a `renewed` outcome may move the instant.
-        void renewPresence(projectId, presence).then((renewal) => {
-          if (!live || projectIdRef.current !== projectId) return
-          if (renewal?.outcome === 'renewed') setDrainingAt(renewal.drainingAt)
-          else if (renewal !== null) setDrainingAt(null)
-        })
+        // NOT AWAITED. The renewal holds the container open; this surface reports it and never
+        // waits on it, so a slow renewal cannot delay the read the screen is rendering.
+        void renewPresence(projectId, presence)
       }
       const generation = ++latestProbe
       try {
@@ -2878,10 +2881,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     return conversationId && turnId ? { conversationId, turnId } : null
   }, [])
 
-  const handleStopSession = useCallback(async () => {
-    await sessionRef.current.stop()
-  }, [])
-
   /**
    * The thread's own cancel, which is what registers the runtime's `cancel` capability.
    *
@@ -2890,12 +2889,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
    */
   const handleCancel = useCallback(async () => {
     const target = stopTarget()
-    if (target) {
-      await stopTurn(target.conversationId, target.turnId)
-      return
-    }
-    await handleStopSession()
-  }, [stopTarget, handleStopSession])
+    if (target) await stopTurn(target.conversationId, target.turnId)
+  }, [stopTarget])
 
   /**
    * WHY SEND IS UNAVAILABLE, when the reason is not simply "a reply is in flight".
@@ -2948,7 +2943,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // Named once, because the region's presence test and its content have to be the same value —
   // written out twice they are two expressions that can be edited apart, and the failure mode is
   // an empty `role="alert"` box or a sentence with no box around it.
-  const urgentText = urgent ?? (sessionProjectMatches ? session.error : null)
+  const urgentText = urgent
 
   return (
     <div className="flex flex-1 min-h-0 overflow-hidden">
@@ -3094,16 +3089,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
             // `buildActiveHere` is a LEGACY build session adopted on a reload, which sets no
             // streaming flag at all. Gating on the turn alone left a reloaded mid-build tab with a
             // running build and no way to stop it — the exact hole the deleted bubble's own
-            // session-scoped condition used to cover. `resolveTarget` returns `null` when there is
-            // no turn id, which is precisely how the control reaches `onStopSession`.
+            // session-scoped condition used to cover.
             stop={
               isRunning || buildActiveHere
-                ? {
-                    running: true,
-                    resolveTarget: stopTarget,
-                    onStopTurn: stopTurn,
-                    onStopSession: handleStopSession,
-                  }
+                ? { running: true, resolveTarget: stopTarget, onStopTurn: stopTurn }
                 : undefined
             }
             offer={

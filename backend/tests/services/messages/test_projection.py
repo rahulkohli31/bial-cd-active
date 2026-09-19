@@ -1,6 +1,6 @@
 """The one history→display derivation (`services/messages/projection.py`).
 
-Rows are written through the REAL producers/store (`append_batch`, `write_build_outcome`) in the
+Rows are written through the real store (`append_batch`) and the outcome row factory in the
 exact shapes pinned by `test_producers.py`, so these tests break
 when the producer contract drifts — which is the point. The golden build test doubles as the
 parity fixture: the live stream must render THIS list for THIS transcript.
@@ -14,6 +14,7 @@ but rows it already wrote are permanent in production transcripts and the projec
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -35,14 +36,19 @@ from sqlalchemy import event
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus, ErrorSource
 from src.api.v1.conversations.schemas import DiagnosticFrame
+from src.core.redaction import redact_secrets
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
-from src.services.build_sessions.outcome import write_build_outcome
+from src.services.agent.toolsets import app_state_toolset
 from src.services.media.lanes import EXCEL_MEDIA_TYPE
 from src.services.media.magic import chip_kind_for
 from src.services.messages.projection import (
+    APP_STATE_TOOL,
     CONNECTOR_SCHEMA_TOOL,
+    DISPLAY_TEXT_CAP,
+    PLAN_OPTIONS_TOOL,
+    PLATFORM_TEXT_KIND,
     PROPOSE_SLICE_TOOL,
     TELL_THE_USER_TOOL,
     TURN_TERMINAL_KIND,
@@ -62,6 +68,8 @@ from src.services.messages.projection import (
     classify_file_step,
     classify_tool_call,
     command_only_inspects,
+    label_when_settled,
+    long_operation_line,
     project_conversation,
     project_rows,
 )
@@ -73,7 +81,7 @@ from src.services.messages.store import (
     load_rows,
 )
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import write_legacy_build_started
+from tests.fakes import write_build_outcome, write_legacy_build_started
 
 PREVIEW = "https://sbx-abc.westeurope.azurecontainerapps.io/"
 # Matches `test_store_roundtrip.py`'s fixture — a real PNG magic prefix, so the store's own
@@ -520,11 +528,11 @@ async def test_a_housekeeping_command_that_failed_is_never_hidden(db_session) ->
     # THE COUNT A GROUP ANNOUNCES IS A COUNT OF ROWS THE CITIZEN CAN OPEN, stated as the property
     # rather than as this fixture's arithmetic: nowhere in the projection is a failure hidden.
     assert not [step for step in steps if step.hidden and step.state == "failed"]
-    # …and the failed row still says nothing about what went wrong. The retry body is the
-    # harness explaining a refusal to the model; the citizen gets the state and the friendly
-    # label, exactly as they do for a refusal the guard raised.
+    # …and the failed row NAMES the failure while still saying nothing about what went wrong.
+    # The retry body is the harness explaining a refusal to the model; the citizen gets the
+    # friendly label plus the failure clause, exactly as they do for a refusal the guard raised.
     failed = steps[1]
-    assert failed.label == "Organized the app's files"
+    assert failed.label == "Organized the app's files — this step did not finish"
     assert "app/a.ts" not in _rendered(failed)
 
 
@@ -1099,6 +1107,120 @@ def test_classify_command_fails_closed_on_the_long_tail() -> None:
         assert hidden is False
         for leaked in ("npx", "bash", "-c", "python3", "$ ", "rm -rf", argv[-1]):
             assert leaked not in label
+
+
+# --- a step that failed says so ------------------------------------------------
+
+
+def test_a_failed_classified_step_keeps_its_label_and_names_the_failure() -> None:
+    """★ A failed step stops borrowing the RUNNING label. The class survives — a citizen who
+    watched "Setting up the tools your app needs" go past still recognises the row — and the
+    clause after it is the only new thing said."""
+    label, _ = classify_command(["npm", "install", "zod"])
+    assert label == "Setting up the tools your app needs"
+    assert label_when_settled("run_command", label, failed=True) == (
+        "Setting up the tools your app needs — this step did not finish"
+    )
+    # …and a step that succeeded is untouched by any of it.
+    assert label_when_settled("run_command", label, failed=False) == label
+
+
+def test_a_failed_unclassifiable_step_never_reads_as_one_still_working() -> None:
+    """★ "Working on your app — this step did not finish" is the running label with a failure
+    pinned to it, claiming work that may never have started. The fail-closed fallback gets its
+    own failure copy instead, and it still carries no argv.
+
+    Mutation check: return `f"{base}{_FAILED_TAIL}"` for `_LBL_FALLBACK` too and the first two
+    assertions go red."""
+    secret = "hunter2-not-a-real-token"  # noqa: S105 - a fixture, not a credential
+    argv = ["bash", "-c", f"curl -H 'Authorization: Bearer {secret}' https://example.invalid"]
+    label, hidden = classify_command(argv)
+    assert label == "Working on your app"
+    assert hidden is False
+    failed = label_when_settled("run_command", label, failed=True)
+    assert failed == "A step didn't finish"
+    assert "Working on your app" not in failed
+    for leaked in ("bash", "-c", "curl", "Bearer", secret, "example.invalid"):
+        assert leaked not in failed
+
+
+def test_a_running_unclassifiable_step_still_reads_as_the_fail_closed_fallback() -> None:
+    """The fail-closed path is UNCHANGED while a step is in flight: the generic line is true of
+    a command that has not come back yet, and it is the one thing that can be said without argv."""
+    assert classify_command(["python3", "-c", "print(1)"])[0] == "Working on your app"
+    assert classify_tool_call("run_command", '{"command": ["python3", "-c", "print(1)"]}') == (
+        "Working on your app",
+        False,
+    )
+
+
+def test_the_failure_clause_does_not_compound_when_the_line_is_re_derived() -> None:
+    """Both emitters derive this line from the same stored label. A clause that stacked on a
+    second derivation would leave the live feed and a reload one clause apart."""
+    once = label_when_settled("run_command", "Setting up the tools your app needs", failed=True)
+    assert label_when_settled("run_command", once, failed=True) == once
+
+
+def test_the_long_operation_tail_still_composes_on_a_running_step() -> None:
+    """The failure clause extends the same table `Still …` does, and neither reaches the other:
+    a step that is merely SLOW still says so in the running register."""
+    assert long_operation_line("Setting up the tools your app needs") == (
+        "Still setting up the tools your app needs — this one takes a little longer."
+    )
+    assert "did not finish" not in long_operation_line("Working on your app")
+
+
+async def test_a_failed_command_step_rebuilt_from_stored_rows_shows_no_argv(db_session) -> None:
+    """★ THE PROPERTY OVER THE WHOLE ITEM, not over the label alone: a reloaded transcript is
+    rebuilt from the stored call, whose args hold the raw argv, and nothing of it may reach the
+    wire in any state.
+
+    LIVENESS beside the absences — the step is drawn, and it names the failure — so a projection
+    that rendered nothing at all could not pass this by being empty."""
+    secret = "hunter2-not-a-real-token"  # noqa: S105 - a fixture, not a credential
+    user, _, conversation = await _thread(db_session)
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="run_command",
+                        args={
+                            "command": [
+                                "bash",
+                                "-c",
+                                f"curl -H 'Authorization: Bearer {secret}' https://example.invalid",
+                            ]
+                        },
+                        tool_call_id="c1",
+                    )
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content="that command could not run",
+                        tool_name="run_command",
+                        tool_call_id="c1",
+                    )
+                ]
+            ),
+        ],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.BUILD,
+    )
+    steps = [
+        i
+        for i in project_rows(await _rows(db_session, user, conversation))
+        if isinstance(i, StepItem)
+    ]
+    assert [(s.label, s.state) for s in steps] == [("A step didn't finish", "failed")]
+    whole = _rendered(steps[0])
+    for leaked in ("bash", "curl", "Bearer", secret, "example.invalid", "Working on your app"):
+        assert leaked not in whole
 
 
 def test_friendly_area_maps_paths_to_areas_never_the_raw_path() -> None:
@@ -2424,3 +2546,409 @@ async def test_the_whole_transcript_costs_one_attachment_read(db_session) -> Non
         event.remove(db_session.sync_session, "do_orm_execute", _count)
 
     assert len(reads) == 1, f"expected one attachment read for the transcript, got {len(reads)}"
+
+
+# --- the state tool's step, in both tenses -------------------------------------------------
+
+
+def test_the_state_tools_wire_name_is_the_registered_functions_name() -> None:
+    """Two modules hold this string and only one of them registers the tool. A branch keyed on a
+    spelling the runtime does not use renders `Used check_the_app` into a citizen's feed, which
+    is the raw-machinery leak the whole label table exists to prevent."""
+    registered = app_state_toolset(lambda _ctx: None).tools
+    assert list(registered) == [APP_STATE_TOOL]
+
+
+async def test_a_state_reading_reads_as_checking_then_checked(db_session) -> None:
+    """★ THE FEED COPY, in the two tenses one step passes through: present participle while the
+    call is out, past once its result has landed.
+
+    Asserted on BOTH emitters in one test, because a tense applied on one side only is a live
+    feed and a reloaded transcript disagreeing about what the citizen just read."""
+    user, _, conversation = await _thread(db_session)
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[
+            ModelRequest(parts=[UserPromptPart(content="is my app up?")]),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name=APP_STATE_TOOL, args={}, tool_call_id="s1")]
+            ),
+        ],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.PLAN,
+    )
+    in_flight = [
+        i
+        for i in project_rows(await _rows(db_session, user, conversation))
+        if isinstance(i, StepItem)
+    ]
+    assert [i.label for i in in_flight] == ["Checking on your app"]
+    assert in_flight[0].state == "pending"
+
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name=APP_STATE_TOOL,
+                        content="The app is serving, and its home page is no longer the "
+                        "starter template.",
+                        tool_call_id="s1",
+                    )
+                ]
+            )
+        ],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.PLAN,
+    )
+    settled = [
+        i
+        for i in project_rows(await _rows(db_session, user, conversation))
+        if isinstance(i, StepItem)
+    ]
+    assert [i.label for i in settled] == ["Checked on your app"]
+    assert settled[0].state == "ok"
+    # The live emitter derives the same pair from the same helpers.
+    assert classify_tool_call(APP_STATE_TOOL, "{}") == ("Checking on your app", False)
+    assert (
+        label_when_settled(APP_STATE_TOOL, "Checking on your app", failed=False)
+        == "Checked on your app"
+    )
+    # And nothing else is re-tensed by the shared helper.
+    assert label_when_settled("read_file", "Looking at your app's main page", failed=False) == (
+        "Looking at your app's main page"
+    )
+    # A reading that FAILED never reads as one that completed — the past tense would be the
+    # claim the failed call did not earn.
+    assert (
+        label_when_settled(APP_STATE_TOOL, "Checking on your app", failed=True)
+        == "Checking on your app — this step did not finish"
+    )
+
+
+async def test_the_reading_itself_never_reaches_the_feed(db_session) -> None:
+    """The verdict rides a tool RESULT, and neither emitter renders one — so the platform's own
+    sentences stay between the platform and the model, with no instruction asking them to."""
+    user, _, conversation = await _thread(db_session)
+    verdict = "The app is not currently serving. Something it needs at startup is failing."
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[
+            ModelResponse(
+                parts=[ToolCallPart(tool_name=APP_STATE_TOOL, args={}, tool_call_id="s1")]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(tool_name=APP_STATE_TOOL, content=verdict, tool_call_id="s1")
+                ]
+            ),
+            ModelResponse(parts=[TextPart(content="Let me look at the logs.")]),
+        ],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.PLAN,
+    )
+    items = project_rows(await _rows(db_session, user, conversation))
+    whole = json.dumps([i.model_dump(mode="json") for i in items], ensure_ascii=False)
+    assert verdict not in whole
+    # LIVENESS: the row projected at all — the step and the prose beside it are both drawn.
+    assert [i.label for i in items if isinstance(i, StepItem)] == ["Checked on your app"]
+    assert [i.text for i in items if isinstance(i, AssistantTextItem)] == [
+        "Let me look at the logs."
+    ]
+
+
+# --- masking, moved off the persistence seam and onto this one -----------------------------
+
+
+_CREDENTIAL = "DATABASE_URL=postgres://u:p@h/db"
+"""A value shaped like the thing the masker rewrites.
+
+FIXTURE DISCIPLINE, stated because it is the way these tests go quietly useless: plain text
+passes every assertion below for the wrong reason. If this stops being credential-shaped, the
+suite proves nothing."""
+
+
+async def test_a_tail_masks_only_the_items_it_returns(db_session) -> None:
+    """★ THE CATCH-UP PATH PAYS FOR WHAT IT SHOWS, NOT FOR THE WHOLE CONVERSATION.
+
+    `redact_secrets` is six linear passes per text field, synchronously on the event loop. The
+    SSE reconnect keeps eight items; without `tail` it masked every item in the transcript and
+    threw the rest away — on every reconnect, of which a backgrounded tab makes many. This is
+    the same "resolve everything, keep eight" shape this module already removed once for
+    attachment enrichment.
+
+    Mutation check: slice after `_mask_for_display` instead of before and the call count jumps
+    to the full item count."""
+    user, _, conversation = await _thread(db_session)
+    for index in range(6):
+        await append_batch(
+            db_session,
+            user_id=user.id,
+            conversation_id=conversation.id,
+            messages=[ModelRequest(parts=[UserPromptPart(content=f"message {index}")])],
+            entry_kind=MessageEntryKind.TURN,
+            kind=ChatKind.BUILD,
+        )
+    rows = await load_rows(
+        db_session, user_id=user.id, conversation_id=conversation.id, include_hidden=True
+    )
+
+    whole = project_rows(rows)
+    tailed = project_rows(rows, tail=2)
+
+    assert len(whole) == 6, "the fixture must have more items than the tail asks for"
+    assert tailed == whole[-2:], (
+        "a tail must return exactly what slicing the full projection would have"
+    )
+
+
+async def test_every_display_item_that_carries_free_text_is_masked(db_session) -> None:
+    """★ ONE FIXTURE THROUGH EVERY ITEM TYPE THAT REACHES A BROWSER AS PROSE.
+
+    The realistic leak is the model repeating a value it read — "I set
+    DATABASE_URL=postgres://u:p@h/db in your config" — which is prose, not a tool return, so a
+    guard over the machinery would cover none of it. The turn-terminal reason is in here even
+    though it is a machine token: it is built from a HIDDEN row, so any "mask the visible items"
+    shortcut misses it.
+
+    Mutation check: drop the `_mask_for_display` call at the end of `project_rows` and every one
+    of these goes red."""
+    assert redact_secrets(_CREDENTIAL) != _CREDENTIAL, "the fixture is no longer credential-shaped"
+    user, _, conversation = await _thread(db_session)
+    session_id = uuid.uuid4()
+    said = f"I set {_CREDENTIAL} in your config."
+
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[
+            ModelRequest(parts=[UserPromptPart(content=f"use {_CREDENTIAL} for the app")]),
+            ModelResponse(
+                parts=[
+                    TextPart(content=said),
+                    ToolCallPart(
+                        tool_name=PLAN_OPTIONS_TOOL,
+                        args={"plan": f"Step one: {_CREDENTIAL}"},
+                        tool_call_id="p1",
+                    ),
+                    ToolCallPart(
+                        tool_name=PROPOSE_SLICE_TOOL,
+                        args={
+                            "found": ["a visitor list", "a gate filter"],
+                            "first": ["a visitor list"],
+                            "why": f"It needs {_CREDENTIAL} either way.",
+                            "question": "Shall I start there?",
+                        },
+                        tool_call_id="s1",
+                    ),
+                    ToolCallPart(
+                        tool_name=TELL_THE_USER_TOOL,
+                        args={"update": f"Wiring {_CREDENTIAL} in now."},
+                        tool_call_id="v1",
+                    ),
+                ]
+            ),
+        ],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.BUILD,
+    )
+    # The platform's own sentence, off `meta`…
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[],
+        entry_kind=MessageEntryKind.SYSTEM_EVENT,
+        kind=ChatKind.BUILD,
+        meta={"kind": PLATFORM_TEXT_KIND, "text": said},
+    )
+    # …the payload-text arm of a visible system row of an unrecognised kind…
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[ModelResponse(parts=[TextPart(content=said)])],
+        entry_kind=MessageEntryKind.SYSTEM_EVENT,
+        kind=ChatKind.BUILD,
+        meta={"kind": "a_lifecycle_entry_from_the_future"},
+    )
+    # …the build banner…
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[ModelResponse(parts=[TextPart(content=said)])],
+        entry_kind=MessageEntryKind.SYSTEM_EVENT,
+        kind=ChatKind.BUILD,
+        meta={
+            "kind": "build_outcome",
+            "sessionId": str(session_id),
+            "status": BuildSessionStatus.ENDED.value,
+            "reason": "completed",
+        },
+    )
+    # …and the turn terminal, built from a hidden row.
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[],
+        entry_kind=MessageEntryKind.SYSTEM_EVENT,
+        kind=ChatKind.BUILD,
+        visibility=MessageVisibility.HIDDEN,
+        meta={
+            "kind": TURN_TERMINAL_KIND,
+            "turnId": "01a0587c-0000-7000-8000-000000000003",
+            "status": "failed",
+            "reason": _CREDENTIAL,
+        },
+    )
+
+    items = project_rows(await _rows(db_session, user, conversation))
+    # LIVENESS BY TYPE, so an item that stopped being rendered cannot pass by being absent.
+    rendered = {type(item) for item in items}
+    assert {UserTextItem, AssistantTextItem, BannerItem, TurnTerminalItem} <= rendered
+    # SIX assistant texts: model prose, the plan, the slice, the spoken line, the platform
+    # sentence off `meta`, and the payload-text arm.
+    assert len([i for i in items if isinstance(i, AssistantTextItem)]) == 6
+
+    whole = json.dumps([i.model_dump(mode="json") for i in items], ensure_ascii=False)
+    assert _CREDENTIAL not in whole, f"a credential reached the browser: {whole}"
+    # Masked, not deleted: the sentence still reads as a sentence and the host survives, which
+    # is what says a diagnostic is still legible after the secret is gone.
+    assert "I set DATABASE_URL=postgres://***:***@h/db in your config." in whole
+
+
+async def test_the_model_reads_the_row_unmasked_and_the_browser_reads_it_masked(
+    db_session,
+) -> None:
+    """★ THE TWO CONSUMERS, ASSERTED ON THE SAME ROW, because conflating them is exactly how
+    this defect was introduced: the store masked for the browser's benefit and the model's
+    replay diverged from what it had been sent.
+
+    Mutation check: re-apply `_redact_tree` over the payload in `dump_for_row` and the history
+    assertion goes red; drop the projection's masking call and the display assertion does."""
+
+    async def _no_refs(ids):
+        raise AssertionError(f"unexpected rehydration of {list(ids)!r}")
+
+    user, _, conversation = await _thread(db_session)
+    said = f"I set {_CREDENTIAL} in your config."
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[ModelResponse(parts=[TextPart(content=said)])],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.BUILD,
+    )
+
+    replayed = await load_history(
+        db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
+    )
+    assert said in str(replayed), "the model's replay was rewritten, so the prefix is broken"
+
+    items = project_rows(await _rows(db_session, user, conversation))
+    assert [i.text for i in items if isinstance(i, AssistantTextItem)] == [
+        "I set DATABASE_URL=postgres://***:***@h/db in your config."
+    ]
+
+
+def test_the_display_cap_still_matches_the_per_message_ceiling() -> None:
+    """`projection.py` cannot import the ceiling — `_shared` reaches it through
+    `services.messages` — so the number is restated, and drift is caught here instead.
+
+    Raise one without the other and a message a citizen legitimately sent is silently cut
+    short on reload. Mutation check: change either constant alone and this goes red."""
+    from src.api.v1.conversations._shared import MAX_MESSAGE_TEXT_CHARS
+
+    assert DISPLAY_TEXT_CAP == MAX_MESSAGE_TEXT_CHARS
+
+
+async def test_projecting_a_long_transcript_stays_inside_a_stated_bound(db_session) -> None:
+    """The cap is the ReDoS defence this seam is required to carry, and the bound is asserted
+    rather than assumed: this runs on every conversation load and every catch-up, on the loop.
+
+    Two claims: a field longer than the cap is read only up to it, and one such field costs a
+    bounded amount of time to mask."""
+    user, _, conversation = await _thread(db_session)
+    long_tail = "x" * (DISPLAY_TEXT_CAP + 500)
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[
+            ModelRequest(parts=[UserPromptPart(content=f"{_CREDENTIAL} {long_tail}")]),
+            ModelResponse(parts=[TextPart(content=f"{_CREDENTIAL} {long_tail}")]),
+        ],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.BUILD,
+    )
+    rows = await _rows(db_session, user, conversation)
+    started = time.perf_counter()
+    items = project_rows(rows)
+    elapsed = time.perf_counter() - started
+
+    assert len(items) == 2
+    # The SCAN is what the cap bounds, so the claim is about how much of the field was read —
+    # not about the masked result's length, which the mask itself can grow.
+    assert all(
+        item.text.count("x") <= DISPLAY_TEXT_CAP
+        for item in items
+        if isinstance(item, UserTextItem | AssistantTextItem)
+    ), "more than the cap's worth of a field was scanned"
+    assert all(
+        len(item.text) < len(long_tail)
+        for item in items
+        if isinstance(item, UserTextItem | AssistantTextItem)
+    ), "nothing was capped at all"
+    assert _CREDENTIAL not in json.dumps([i.model_dump(mode="json") for i in items])
+    assert elapsed < 5.0, (
+        f"two fields at the cap took {elapsed:.2f}s. This is the WORST-case SHAPE by "
+        "construction — an unbroken run of word characters is what the masker is slowest on, "
+        "roughly 13x an ordinary sentence — so the cap is what keeps one field bounded; the "
+        "test below is what bounds a whole transcript."
+    )
+
+
+async def test_projecting_an_ordinary_long_transcript_stays_inside_a_stated_bound(
+    db_session,
+) -> None:
+    """The cost that actually runs on a request: two hundred messages of ordinary prose, which
+    is what a long conversation is, projected on every reload and every catch-up snapshot.
+
+    Asserted rather than assumed, because moving masking onto this path is what put a scan here
+    at all — and the two consumers this derivation feeds are both request-time."""
+    user, _, conversation = await _thread(db_session)
+    prose = f"The visitor log shows arrival times and a gate filter. {_CREDENTIAL} " * 30
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[
+            message
+            for _ in range(100)
+            for message in (
+                ModelRequest(parts=[UserPromptPart(content=prose)]),
+                ModelResponse(parts=[TextPart(content=prose)]),
+            )
+        ],
+        entry_kind=MessageEntryKind.TURN,
+        kind=ChatKind.BUILD,
+    )
+    rows = await _rows(db_session, user, conversation)
+    started = time.perf_counter()
+    items = project_rows(rows)
+    elapsed = time.perf_counter() - started
+
+    assert len(items) == 200
+    assert _CREDENTIAL not in json.dumps([i.model_dump(mode="json") for i in items])
+    assert elapsed < 5.0, f"projecting a 200-message transcript took {elapsed:.2f}s"

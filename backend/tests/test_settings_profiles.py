@@ -135,9 +135,10 @@ def test_the_profile_kept_its_env_config_through_the_mro_merge(
 
 
 def test_the_worker_refuses_to_boot_without_object_storage() -> None:
-    """THE test of this unit. Mutation-check: make `object_store` optional on WorkerSettings and
-    this must go red — because that reversion is what lets a misconfigured worker answer the
-    durable-copy gate with "confirmed absent" for every container and delete the fleet."""
+    """THE test of this unit. A worker with nowhere to put a tree cannot do the one thing the
+    sweep exists for — write a dying container's work back before destroying it — and it would
+    discover that one container at a time, sparing each and collecting nothing.
+    Mutation-check: make `object_store` optional on WorkerSettings and this goes red."""
     env = {k: v for k, v in _WORKER_ENV.items() if not k.startswith("OBJECT_STORE__")}
     with pytest.raises(ValidationError) as excinfo:
         _boot(WorkerSettings, env)

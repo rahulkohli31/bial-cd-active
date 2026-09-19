@@ -1,17 +1,15 @@
 """In-process rate-limit substrate.
 
 WHY THIS EXISTS
-A small fixed-window limiter mirroring the Express `express-rate-limit` wiring
-(`portal/server/{feedback,attachments,app-parse}.js`): a per-key request counter
-that resets every window, a 429 whose body matches the ported `{"error":{"message"}}`
-contract, and the SAME ordering rule — the limiter runs AFTER the key it keys on is
-resolved. `rate_limit(...)` takes the key as a FastAPI dependency, so FastAPI
-resolves it (and any `current_user` / app id it needs) before the gate body runs.
+A small fixed-window limiter: a per-key request counter that resets every window, a 429
+whose body is the `{"error":{"message"}}` shape the SPA reads, and one ordering rule —
+the limiter runs AFTER the key it keys on is resolved. `rate_limit(...)` takes the key as
+a FastAPI dependency, so FastAPI resolves it (and any `current_user` / app id it needs)
+before the gate body runs.
 
-Store caveat (parity with express-rate-limit's default MemoryStore): the counter
-lives in THIS worker's memory, so the ceiling is PER-REPLICA. Correct under a
-single replica; a multi-replica deployment needs a shared (Redis) store, which is
-deferred until the platform scales out. Redis itself is a live dependency (sandbox
+Store caveat: the counter lives in THIS worker's memory, so the ceiling is PER-REPLICA.
+Correct under a single replica; a multi-replica deployment needs a shared (Redis) store,
+which is deferred until the platform scales out. Redis itself is a live dependency (sandbox
 lock/heartbeat/registry) and is probed at startup and on `/v1/health`. `install_rate_limiting`
 logs this assumption at startup.
 

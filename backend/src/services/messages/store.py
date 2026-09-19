@@ -1,13 +1,13 @@
 """The native message store — append, load, repair, mark.
 
 The `messages` table holds NATIVE pydantic-ai batches (one row per persisted batch). Files
-are the only transcript transformation; everything else round-trips byte-faithfully between
+are the only transcript transformation; the payload round-trips byte-faithfully between
 JSONB and `list[ModelMessage]` via `ModelMessagesTypeAdapter`.
 
 * PERSIST (`append_batch`): dump → externalize `BinaryContent` to an attachment reference
   marker (bytes never land in a row; Foundry has no Files API, so bytes re-enter as base64 at
-  send time) → `redact_secrets` over every string → insert with a server-owned, gap-free
-  `seq` under the two-writer retry discipline.
+  send time) → insert with a server-owned, gap-free `seq` under the two-writer retry
+  discipline.
 * LOAD (`load_history`): rows → concatenate in seq order → swap reference markers back to
   binary dicts (rehydrated from attachments + object store) → validate → repair dangling
   `ToolCallPart`s (a crash mid-step leaves a call with no result; a synthesized "interrupted"
@@ -19,9 +19,11 @@ an unswapped marker validates *silently* as a cache hint instead of raising, and
 attachment vanishes. `_swap_refs` walks every dict; `load_history` fail-firsts if a marker
 survives.
 
-Redaction here is not length-capped: truncating would corrupt the durable record, and every
-producer already bounds its own output. The ReDoS "cap before scanning" rule is for
-synchronous relay paths, not this persistence seam.
+THE PAYLOAD IS NOT A REDACTION POINT, and that is what makes the byte-faithful claim above
+true. A store that rewrites what it holds cannot replay what was sent, and the replayed
+prefix is what every cache read depends on. Masking belongs to the one consumer that renders
+to a browser — `messages/projection.py`. A row's `meta` is the exception and is still masked
+here: `load_history` never selects it, so no `meta` byte reaches the model or the prefix.
 """
 
 from __future__ import annotations
@@ -211,32 +213,20 @@ def _assert_binaries_attributed(node: Any) -> None:
             _assert_binaries_attributed(getattr(node, field.name))
 
 
-THINKING_PART_KIND: Final = "thinking"
-"""The dumped part kind of a reasoning block — the one thing the redactor must not touch."""
-
-_THINKING_VERBATIM: Final = frozenset({"content", "signature"})
-"""The two fields of a reasoning block that are replayed to the provider and checked."""
-
-
 def _redact_tree(node: Any) -> Any:
-    """`redact_secrets` over every string VALUE in the tree — one uniform rule instead of a
-    per-part allowlist. Keys are structural, never redacted.
+    """`redact_secrets` over every string VALUE in a row's `meta` — one uniform rule instead of a
+    per-key allowlist. Keys are structural, never redacted.
 
-    EXEMPT: a `ThinkingPart`'s `content`/`signature`, by kind AND field (never blanket — a future
-    user-facing field on that part would inherit it silently). A reasoning block replays to the
-    SAME provider, which verifies signature against content, so redacting either gets the turn
-    rejected — and nothing egresses either way: it is never projected, never framed, never sent
-    to the browser. The provider is the only thing that ever reads it."""
+    `meta` ONLY. The payload is the record of what was sent to the model and is stored as it was
+    sent; masking it would make the replayed prefix differ from the prefix, which is a cache miss
+    on every turn of every conversation that ever held a credential-shaped string. System-event
+    metadata is written by the platform, never replayed to anybody, and keeping the control over
+    it costs nothing."""
     if isinstance(node, str):
         return redact_secrets(node)
     if isinstance(node, list):
         return [_redact_tree(item) for item in node]
     if isinstance(node, dict):
-        if node.get("part_kind") == THINKING_PART_KIND:
-            return {
-                key: value if key in _THINKING_VERBATIM else _redact_tree(value)
-                for key, value in node.items()
-            }
         return {key: _redact_tree(value) for key, value in node.items()}
     return node
 
@@ -292,18 +282,24 @@ def dump_for_row(
     messages: Sequence[ModelMessage], *, file_attachment_ids: Sequence[str] = ()
 ) -> list[Any]:
     """A native batch → the JSONB payload: verify binaries are attributed (fail-first) → dump
-    (json mode) → strip instructions → externalize binaries → redact. Externalize FIRST so the
-    redactor never scans base64 blobs.
+    (json mode) → strip instructions → externalize binaries.
+
+    NOTHING IS MASKED HERE. What goes in is what was sent, so what `load_history` gives back is
+    byte-identical to the prefix the model already read — the property every cache read on the
+    next turn rests on. The browser-facing masking lives in `messages/projection.py`, the one
+    consumer that renders to a screen.
 
     Instructions are stripped HERE because prompts are per-run, never persisted — each new run
     re-injects its own composition, so a stored copy would only bloat rows and fossilize stale
-    text. Payload-level only: the live in-memory history keeps whatever upstream put there."""
+    text. It does not reach the wire either way: the agent's instructions come off
+    `ModelRequestParameters`, never off a historical request's `instructions` field.
+    Payload-level only: the live in-memory history keeps whatever upstream put there."""
     _assert_binaries_attributed(list(messages))
     dumped = ModelMessagesTypeAdapter.dump_python(list(messages), mode="json")
     for message in dumped:
         if isinstance(message, dict) and "instructions" in message:
             message["instructions"] = None
-    payload = [_redact_tree(_externalize_binaries(message)) for message in dumped]
+    payload = [_externalize_binaries(message) for message in dumped]
     # The code lane's own reference, appended once the tree is plain JSON (see above).
     _append_file_refs(payload, file_attachment_ids)
     return payload

@@ -89,13 +89,12 @@ back at the copy it already holds.
 THE CONVERSATION'S OWN HISTORY IS THE STATE. Every turn reloads the whole conversation and sends it
 to the model, and pydantic-ai hands that same list to this tool as `ctx.messages`, so "was it
 already delivered?" is a count over what is already in memory: no table, no Redis, nothing to keep
-in step. A new conversation starts empty and gets the schema again, which is the case the
-description's "every time" is written for.
+in step. A new conversation starts empty and gets the schema again.
 
-TWO, NOT ONE — owner ruling, 2026-09-11. Across the connected-data E2E campaign the model never
-asked twice in one conversation, so this is a ceiling on a failure not yet seen rather than a fix
-for one. Past it, each further call would append another full copy (~8,700 tokens) to a history
-every later turn replays."""
+TWO, NOT ONE. Across the connected-data E2E campaign the model never asked twice in one
+conversation, so this is a ceiling on a failure not yet seen rather than a fix for one. Past it,
+each further call would append another full copy (~8,700 tokens) to a history every later turn
+replays."""
 
 _ALREADY_LOADED: Final = (
     "This schema is already in this conversation: earlier `connector_schema` calls returned it in "
@@ -103,6 +102,21 @@ _ALREADY_LOADED: Final = (
 )
 """What the model reads instead of another copy. A plain string, not a `ModelRetry`: calling again
 is exactly what it should not do."""
+
+_THE_WHOLE_SCHEMA: Final = (
+    "That is the whole schema for this system, not a sample of it: calling again returns the same "
+    "text, and only a change to the connected system itself would change it. For a worked example "
+    "of reading this data from app code — the packages to install, the environment variables that "
+    "address the store, and the traps — read `lib/flight-data.reference.ts` in the workspace."
+)
+"""Delivered with the artefact, and the ONE place the worked-example file is named.
+
+The completeness half is what the description no longer demands: the answer says it is whole,
+rather than the tool asking to be called again per column.
+
+THE POINTER HAS NO SECOND COPY. The catalogue is generated and must not be hand-edited, and the
+composed prompt names no template file — so deleting this clause leaves an agent that knows the
+column names and cannot reach the packages or the environment variables that read them."""
 
 
 @cache
@@ -132,19 +146,19 @@ def _match(system: str, on: tuple[ConnectedSystem, ...]) -> ConnectedSystem | No
     return None
 
 
-def _deliveries(messages: Sequence[ModelMessage], artefact: str) -> int:
-    """How many earlier tool results in this conversation carried exactly this artefact.
+def _deliveries(messages: Sequence[ModelMessage], answer: str) -> int:
+    """How many earlier tool results in this conversation carried exactly this answer.
 
     EXACT CONTENT, NOT THE TOOL NAME. The unreadable-file answer and the not-switched-on refusal
     come back under the same tool name, and counting them would spend the ceiling on calls that
-    handed over nothing. Matching the artefact itself also keeps one system's deliveries from
-    counting against another's."""
+    handed over nothing. Matching the delivered text itself also keeps one system's deliveries
+    from counting against another's."""
     return sum(
         1
         for message in messages
         if isinstance(message, ModelRequest)
         for part in message.parts
-        if isinstance(part, ToolReturnPart) and part.content == artefact
+        if isinstance(part, ToolReturnPart) and part.content == answer
     )
 
 
@@ -156,10 +170,9 @@ async def connector_schema(ctx: RunContext[Any], system: str) -> str:
     column to filter dates on, how to collapse repeated rows to one per flight, and which text
     needs trimming. Pass the connected system's name exactly as your instructions list it.
 
-    Call this BEFORE writing any code that reads the connected data, every time, including when
-    the app already reads it and you are only adding a column: the file in front of you shows what
-    a previous turn used, not what exists. Column names cannot be guessed from ordinary ones, and
-    a wrong one is a query that runs and reports the wrong number.
+    Call this BEFORE writing any code that reads the connected data. Column names cannot be
+    guessed from ordinary ones, and a wrong one is a query that runs and reports the wrong
+    number.
 
     Use what you learn to write correct queries. Do NOT copy KPI formulas, SLA targets or
     threshold numbers into the app's source or its on-screen text — a published app is listed to
@@ -211,7 +224,8 @@ async def connector_schema(ctx: RunContext[Any], system: str) -> str:
         )
         return _UNAVAILABLE
 
-    delivered = _deliveries(ctx.messages, artefact)
+    answer = f"{artefact}\n\n{_THE_WHOLE_SCHEMA}"
+    delivered = _deliveries(ctx.messages, answer)
     if delivered >= MAX_DELIVERIES_PER_CONVERSATION:
         # A WARNING, NOT AN INFO LINE. A model asking again for something its context already holds
         # twice is either a model regression or history that did not reach the model the way this
@@ -222,7 +236,7 @@ async def connector_schema(ctx: RunContext[Any], system: str) -> str:
             deliveries=delivered,
         )
         return _ALREADY_LOADED
-    return artefact
+    return answer
 
 
 CONNECTOR_TOOLSET: FunctionToolset[Any] = FunctionToolset[Any]([connector_schema], id="connector")
@@ -242,6 +256,5 @@ registers a function under its `__name__`, and `projection.CONNECTOR_SCHEMA_TOOL
 CONNECTED DATA block interpolates, so the two are only equal by agreement — there is no place to
 write the function's name down. `test_mode_prompts.py` holds them equal, off the REGISTERED
 definition rather than off `__name__`, so a rename that pydantic-ai would honour goes red there. A
-module-level `assert` was the obvious alternative and is exactly what `.claude/rules/
-fail-first-python.md` forbids: `python -O` strips it, so the guard would be absent from the one
-environment where a missing tool is a citizen's problem."""
+module-level `assert` is not the alternative: `python -O` strips it, so the guard would be absent
+from the one environment where a missing tool is a citizen's problem."""

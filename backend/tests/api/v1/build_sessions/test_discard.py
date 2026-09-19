@@ -99,7 +99,7 @@ async def test_a_discard_from_outside_a_conversation_carries_no_notice(
             "Your workspace is not running, so there is nothing to discard. "
             "Your saved version is intact.",
         ),
-        (BuildSessionConflictError(None), "Wait for the reply to finish, then discard."),
+        (BuildSessionConflictError(), "Wait for the reply to finish, then discard."),
         (
             NothingSavedToGoBackToError(uuid.uuid4()),
             "There is no saved version to go back to yet.",

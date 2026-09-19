@@ -221,7 +221,7 @@ describe('★ no refusal opens a question — the 409s are sentences, not dialog
 
   it('your own running build keeps its own sentence, not the server`s wire words', async () => {
     // Different cause, different remedy — finish or stop that build.
-    api.relaunchPreview.mockRejectedValue(new BuildSessionAlreadyActiveError('already', 's-1'))
+    api.relaunchPreview.mockRejectedValue(new BuildSessionAlreadyActiveError('already'))
     const report = reportSpy()
     renderControl(START, report)
     fireEvent.click(button())

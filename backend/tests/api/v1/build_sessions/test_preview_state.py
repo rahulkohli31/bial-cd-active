@@ -41,7 +41,7 @@ from src.services.redis.keys import (
     starting_key,
 )
 from src.services.sandbox import DevStatus, SandboxError, SandboxHandle, SandboxNotReadyError
-from src.services.storage import StorageError, recovery_key, snapshot_key
+from src.services.storage import StorageError, snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
 
@@ -162,13 +162,12 @@ async def test_a_project_nobody_ever_built_says_so(
 async def test_a_reclaimed_workspace_is_asleep_and_offers_the_work_back(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
-    # Mutation-check: point `restorable_presence` at `snapshot_key` alone (its shipped predecessor)
-    # and `restorable` comes back False, which is the sentence this test exists to stop the product
-    # saying.
+    # The reap wrote this container's tree back on its way out, which is the only reason there is
+    # anything here to offer. Mutation-check: answer `restorable` from the registry instead and
+    # this goes red.
     user, project = await _user_project(db_session, "ps-asleep@rvaiglobal.com")
     app_id = await _built(db_session, user, project)
-    await fake_storage.put(recovery_key(app_id), b"RECOVERY-BUNDLE")
-    assert snapshot_key(app_id) not in fake_storage.objects, "the user never pressed Save"
+    await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
 
     body = await _probe(client, user, project)
 
@@ -443,17 +442,17 @@ async def test_the_unproven_arm_spends_nothing_on_the_object_store_either(
     """The budget the ALIVE arm has always kept, now held across the WHOLE pre-serve window —
     which is the interval the client polls every 3 seconds. BUILDING used to be a few seconds of
     marker; it now spans every second from container-create to first serve, so an arm placed
-    below `restorable_presence` would have moved a cold build's entire wait onto a Blob HEAD per
+    below `snapshot_presence` would have moved a cold build's entire wait onto a Blob HEAD per
     poll without anyone noticing.
 
-    A recovery copy EXISTS, so the empty `heads` proves the question was SKIPPED rather than
+    A saved bundle EXISTS, so the empty `heads` proves the question was SKIPPED rather than
     that it had nothing to find.
 
-    Mutation-check: move the unproven arm below `restorable_presence` and `heads` comes back
-    with the recovery key in it."""
+    Mutation-check: move the unproven arm below `snapshot_presence` and `heads` comes back with
+    the saved key in it."""
     user, project = await _user_project(db_session, "ps-unproven-budget@rvaiglobal.com")
     app_id = await _built(db_session, user, project)
-    await fake_storage.put(recovery_key(app_id), b"RECOVERY-BUNDLE")
+    await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
     await _register_container(
         fake_redis,
         user.id,
@@ -605,7 +604,7 @@ async def test_restorable_is_null_when_the_object_store_is_unreachable(
     instant_backoff: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Mutation-check: make `restorable_presence` return `False` on an unreadable store and this
+    # Mutation-check: make `snapshot_presence` return `False` on an unreadable store and this
     # goes red — which is precisely the coercion the tri-state exists to prevent.
     user, project = await _user_project(db_session, "ps-storeblip@rvaiglobal.com")
     await _built(db_session, user, project)
@@ -619,33 +618,6 @@ async def test_restorable_is_null_when_the_object_store_is_unreachable(
 
     assert body["restorable"] is None
     assert body["state"] == "asleep"
-
-
-async def test_one_readable_key_is_enough_to_answer_even_when_the_other_is_not(
-    client: AsyncClient,
-    db_session: AsyncSession,
-    fake_redis,
-    fake_storage,
-    wire,
-    instant_backoff: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    user, project = await _user_project(db_session, "ps-halfblind@rvaiglobal.com")
-    app_id = await _built(db_session, user, project)
-    await fake_storage.put(recovery_key(app_id), b"RECOVERY-BUNDLE")
-
-    readable = fake_storage.head
-
-    async def only_the_saved_key_is_unreadable(key: str):
-        if key == snapshot_key(app_id):
-            raise StorageError("azure said no", provider="fake")
-        return await readable(key)
-
-    monkeypatch.setattr(fake_storage, "head", only_the_saved_key_is_unreadable)
-
-    body = await _probe(client, user, project)
-
-    assert body["restorable"] is True
 
 
 # --------------------------------------------------------------------------------------
@@ -779,7 +751,7 @@ async def test_a_poll_runs_no_command_in_the_container_and_never_attaches(
     # `attaches`.
     user, project = await _user_project(db_session, "ps-cheap@rvaiglobal.com")
     app_id = await _built(db_session, user, project)
-    await fake_storage.put(recovery_key(app_id), b"RECOVERY-BUNDLE")
+    await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
     await _register_container(
         fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY, serving_since=SERVED
     )
@@ -816,13 +788,13 @@ async def test_the_alive_path_spends_nothing_on_the_object_store(
     wire,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Mutation-check: hoist `restorable_presence` back above the registry read (its shipped
-    # position) and `heads` comes back with the recovery key in it — this goes red immediately.
+    # Mutation-check: hoist `snapshot_presence` back above the registry read and `heads` comes
+    # back with the saved key in it — this goes red immediately.
     user, project = await _user_project(db_session, "ps-hotpath@rvaiglobal.com")
     app_id = await _built(db_session, user, project)
-    # A recovery copy EXISTS, so the empty `heads` below proves the question was skipped rather
+    # A saved bundle EXISTS, so the empty `heads` below proves the question was skipped rather
     # than that it had no answer to find.
-    await fake_storage.put(recovery_key(app_id), b"RECOVERY-BUNDLE")
+    await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
     await _register_container(
         fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY, serving_since=SERVED
     )
@@ -846,7 +818,7 @@ async def test_the_alive_path_spends_nothing_on_the_object_store(
     body = await _probe(client, user, project)
 
     assert (body["state"], body["restorable"]) == ("asleep", True)
-    assert heads == [recovery_key(app_id)], "one HEAD, and only where the answer is rendered"
+    assert heads == [snapshot_key(app_id)], "one HEAD, and only where the answer is rendered"
 
 
 async def test_every_state_is_reachable_and_they_are_all_different(

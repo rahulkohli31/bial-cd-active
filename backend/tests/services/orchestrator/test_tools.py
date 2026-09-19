@@ -456,7 +456,8 @@ async def test_run_command_unrecognized_fails_closed_in_the_live_label(
 async def test_run_command_failed_transport_emits_a_friendly_failed_label(
     sink: CollectingSink,
 ) -> None:
-    # Emit site 253 (SandboxError → failed): still friendly, still no `$ argv`.
+    # A transport failure → failed: still friendly, still no `$ argv`, and the failure wording is
+    # the one shared clause rather than a second spelling of it.
     fake = FakeSandbox()
     fake.queue_exec_errors(SandboxError("exec timed out after 600s"))
     await _run(
@@ -469,7 +470,7 @@ async def test_run_command_failed_transport_emits_a_friendly_failed_label(
     )
     rc = next(e for e in _steps(sink) if e.name == "run_command")
     assert rc.state == "failed"
-    assert rc.label == "Setting up the tools your app needs — couldn't finish"
+    assert rc.label == "Setting up the tools your app needs — this step did not finish"
     assert "$ " not in rc.label
 
 
