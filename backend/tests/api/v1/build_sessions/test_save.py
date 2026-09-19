@@ -132,7 +132,7 @@ async def test_save_while_a_build_is_running_is_409(
 
     async def _fake_save(db, user, project_id, *, sandbox_client) -> SaveOutcome:
         seen.append((user.id, project_id))
-        raise BuildSessionConflictError(uuid.uuid4())
+        raise BuildSessionConflictError()
 
     wire.manager.save_project_snapshot = _fake_save
 

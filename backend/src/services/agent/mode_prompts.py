@@ -160,9 +160,8 @@ is ready — call `present_plan_options` with it, which puts the \
 calling it, wait for their choice; `{BUILD_THIS_PLAN_LABEL}` is the only signal that \
 building starts. If they choose `{KEEP_PLANNING_LABEL}`, revise the plan and present again."""
 
-# NO COMMIT BLOCK LIVES HERE ANY MORE, and re-adding one is a regression with two
-# separate costs. `_COMMIT_DISCIPLINE` used to sit at the end of this segment teaching the agent
-# to stage and commit each coherent slice.
+# NO COMMIT BLOCK BELONGS HERE. Teaching the agent to stage and commit each coherent slice is a
+# regression with two separate costs.
 #
 # 1. THE PLATFORM ALREADY DOES IT. `snapshot._COMMIT_SCRIPT` runs `git add -A && git commit` as
 #    step ONE of every turn-boundary bundle, so the agent's commits bought the user nothing and
@@ -173,9 +172,6 @@ building starts. If they choose `{KEEP_PLANNING_LABEL}`, revise the plan and pre
 #    a workspace REVERTED. That verdict closes the hazard on its own (it requires the CONTENT to
 #    disagree as well as the lineage), but nothing should be feeding it self-inflicted
 #    non-descendant HEADs. `test_neither_write_prompt_instructs_the_agent_in_git` is the guard.
-#
-# The reminder that enforced the deleted instruction went with it —
-# `orchestrator/tools._note_write_and_maybe_remind` and `SandboxSession.uncommitted_writes`.
 
 _RECONCILE_WITH_REALITY = """\
 A message may describe a plan that was written some time ago. Where the code on disk differs \

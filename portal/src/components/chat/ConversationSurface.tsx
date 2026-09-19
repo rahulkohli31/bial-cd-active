@@ -805,11 +805,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   // terminal. PROJECT-SCOPED on purpose: one instance of this component survives a project
   // switch, so the project-agnostic form would let project A's build lock project B's composer.
   const buildActive = showSession && isActiveBuildStatus(session.status)
-  // The COMPOSER's half of that gate is per-CHAT, matching the server's own per-conversation
-  // 409 (`live_session_for_conversation`). A sibling builder chat in the same project is NOT
-  // the chat that is building: the server would accept its turn, so shutting its composer and
-  // telling its reader "building your app" is a lie about someone else's build. `buildActive`
-  // stays project-scoped — the cockpit, the live bubble and the delete gate all speak for the
+  // The COMPOSER's half of that gate is per-CHAT. A sibling builder chat in the same project is
+  // NOT the chat that is building, so shutting its composer and telling its reader "building
+  // your app" would be a sentence about someone else's build. `buildActive` stays
+  // project-scoped — the cockpit, the live bubble and the delete gate all speak for the
   // project's one session, and one instance of this component survives a project switch.
   const buildActiveHere = buildActive && sessionChatRef.current === buildId
   const generating = generatingChatId === buildId

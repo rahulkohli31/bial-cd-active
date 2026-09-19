@@ -1045,13 +1045,14 @@ async def _reap_the_project_sandbox_or_shrug(
     later sweep". `strict=False` does keep the registry entry so a sweep COULD retry, and in
     production one does; everywhere else the entry sits there and the container runs on.)
 
-    `app_id=None` INTO THE DURABLE-COPY GATE IS DELIBERATE, and is the one place this diverges
-    from the janitor. The gate spares a container whose work is not provably preserved by
-    reading the snapshot — and by the time this runs, `salt_the_earth` and the blob sweep above
-    have already destroyed that snapshot. Passing the real id would therefore make the gate
-    refuse EVERY container on this path, which is the exact leak the unit exists to close. The
-    work is not being abandoned: the user asked for the project and everything in it to be
-    deleted, and stated why.
+    `app_id=None` OPTS THIS REAP OUT OF THE WRITE-BACK, deliberately, and is the one place this
+    diverges from the janitor. Every other teardown writes the container's tree to the saved copy
+    first and spares the container when it cannot. Here both halves of that are wrong: the blob
+    sweep above has just destroyed that key, so a write-back would put the tree straight back
+    under a project the user asked to have deleted, and a container that cannot be reached would
+    find no saved bundle and be SPARED — leaking every container on this path, which is the exact
+    leak the unit exists to close. The work is not being abandoned: the user asked for the
+    project and everything in it to be deleted, and stated why.
     """
     if app_id is None:
         return None  # a project that never built owns no container
@@ -1513,8 +1514,8 @@ async def delete_project(
         )
     )
     # ...and LAST, the sandbox container, if the registry still says one of this project's is
-    # up. After the sweeps deliberately: the durable-copy gate reads the snapshot they have
-    # just destroyed, which is why the reap is opted OUT of that gate (see the helper).
+    # up. After the sweeps deliberately, which is why the reap is opted OUT of the write-back:
+    # it would put the snapshot they have just destroyed straight back (see the helper).
     standing = await _reap_the_project_sandbox_or_shrug(
         manager, sandbox, user_id=user.id, app_id=app_id
     )

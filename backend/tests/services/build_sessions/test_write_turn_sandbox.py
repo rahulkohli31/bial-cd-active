@@ -167,12 +167,8 @@ async def test_ensure_sandbox_allocates_a_build_worth_of_state_without_the_build
     assert await heartbeat_is_alive(fake_redis, user.id) is True
     assert await read_registry(fake_redis, user.id) is not None
 
-    # And nothing a build would run. `attachments` used to be one of these, and `task` another;
-    # both fields are gone from `BuildSession` now that nothing can populate them, so their
-    # absence is structural rather than something a test has to keep watching.
+    # And nothing a build would run.
     assert session.prompt == ""
-    assert session.started_seq is None
-    assert session.conversation_id is None
 
 
 async def test_ensure_sandbox_mints_the_app_row_a_fresh_project_lacks(
@@ -209,15 +205,14 @@ async def test_a_second_write_attach_while_one_is_live_is_a_conflict(
     user, project_id = await _mk(db_session, "w3@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    first = await manager.ensure_sandbox(
+    await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
 
-    with pytest.raises(BuildSessionConflictError) as caught:
+    with pytest.raises(BuildSessionConflictError):
         await manager.ensure_sandbox(
             db_session, user, project_id, sandbox_client=client, may_write=True
         )
-    assert caught.value.session_id == first.session_id
 
 
 def _with_head(client: FakeSandboxClient, sha: str) -> FakeSandboxClient:

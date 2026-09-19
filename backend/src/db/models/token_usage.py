@@ -1,15 +1,15 @@
 """The `token_usage` table — per-user daily token accounting.
 
 One row per (user, IST calendar day, kind); the server-authoritative daily gate reconciles
-each turn's spend against this ledger, mirroring Express `server/usage-repo.js`'s per-day
-`$inc`. The four token classes stay in SEPARATE columns so the gate can COST-WEIGHT them:
-`input_tokens` already includes the two cache classes, so billable is fresh input + output at
-face value, cache reads at ~10%, writes at ~125% (`gate.py:billable_spend`) — never a re-add
+each turn's spend against this ledger. The four token classes stay in SEPARATE columns so the
+gate can COST-WEIGHT them: `input_tokens` already includes the two cache classes, so billable
+is fresh input + output at face value, cache reads at ~10%, writes at ~125%
+(`gate.py:billable_spend`) — never a re-add
 of the cache columns on top (that double-counts the cached prefix).
 
-The `(user_id, usage_date, kind)` uniqueness is the atomic upsert's conflict target (parity
-with Express's `$inc`, no lost-update). It does NOT close concurrent overspend — that window
-is open by design; Redis token-bucket hardening is deferred."""
+The `(user_id, usage_date, kind)` uniqueness is the atomic upsert's conflict target, so
+concurrent increments never lose an update. It does NOT close concurrent overspend — that
+window is open by design; Redis token-bucket hardening is deferred."""
 
 from __future__ import annotations
 

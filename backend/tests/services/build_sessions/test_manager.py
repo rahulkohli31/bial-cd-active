@@ -64,7 +64,6 @@ from src.services.build_sessions.manager import (
     SnapshotUnavailableError,
     app_name_for,
 )
-from src.services.build_sessions.outcome import write_build_outcome
 from src.services.build_sessions.reaper import sweep_all
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
@@ -100,7 +99,7 @@ from tests.factories import (
     ProjectFactory,
     UserFactory,
 )
-from tests.fakes import FakeSandboxClient, FakeStorage, a_sandbox_name
+from tests.fakes import FakeSandboxClient, FakeStorage, a_sandbox_name, write_build_outcome
 
 
 @pytest.fixture(autouse=True)
@@ -1252,7 +1251,7 @@ async def test_relaunch_restores_launches_ready_and_releases_the_lock(
     assert relaunched.restored_from_failed_build is False  # no outcome recorded → no label
     assert client.provisioned == []  # never a blank template
     assert await lock_is_held(fake_redis, user.id) is False  # lock released — slot not held
-    assert manager._active_by_user == {}  # never registered as a live session (Decision 6)
+    assert manager._active_by_user == {}  # never registered as a live session
 
 
 async def test_relaunch_does_not_occupy_the_build_slot(
@@ -1451,13 +1450,12 @@ async def test_relaunch_while_a_build_is_live_is_409(
 
     # Allocated and NOT ended — the session holds the slot for as long as the test wants it,
     # which is what the blocking agent used to buy.
-    session = await manager.ensure_sandbox(
+    await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
 
-    with pytest.raises(BuildSessionConflictError) as caught:
+    with pytest.raises(BuildSessionConflictError):
         await manager.relaunch_preview(db_session, user, project_id, FakeSandboxClient())
-    assert caught.value.session_id == session.session_id
 
 
 async def test_a_relaunch_while_a_turn_is_still_letting_go_waits_like_a_message_does(
@@ -1678,7 +1676,7 @@ async def test_a_sweep_during_the_relaunch_provision_window_does_not_reap_it(
     #
     # because the guard is an AND (`lock_is_held AND heartbeat_is_alive`), so lock-held-
     # without-a-beat falls straight through. `live_users` does not save it either: a
-    # relaunch never enters `_active_by_user` by design (Decision 6). So a sweep landing
+    # relaunch never enters `_active_by_user` by design. So a sweep landing
     # here tore down the container the relaunch was still building — and the request still
     # returned 200, handing the user a preview URL pointing at nothing.
     #
@@ -1820,7 +1818,7 @@ async def test_relaunch_attaches_the_live_container_instead_of_rebuilding_it(
     assert relaunched.preview_url == live.preview_url
     assert client.dev_started == [live.app_name]  # the dev server was still driven
     assert client.waited == [live.app_name]
-    assert await lock_is_held(fake_redis, user.id) is False  # Decision 6 unchanged
+    assert await lock_is_held(fake_redis, user.id) is False
     assert manager._active_by_user == {}
 
 
@@ -2277,9 +2275,9 @@ async def test_save_still_succeeds_while_the_app_is_switched_off(
     """★ SAVE IS NOT GATED, AND THIS TEST IS HERE TO STOP SOMEONE "FINISHING THE JOB".
 
     If you are reading this because the switched-off enforcement looks incomplete: it is not.
-    Save is deliberately outside it. `save_project_snapshot` is the only thing that writes a
-    citizen's work to durable storage and containers are ephemeral — the reaper destroys idle
-    ones — so refusing a save in the one window where it matters (an administrator flips the
+    Save is deliberately outside it. `save_project_snapshot` is the only write of a citizen's
+    work to durable storage they can ask for, and containers are ephemeral — the reaper destroys
+    idle ones — so refusing a save in the one window where it matters (an administrator flips the
     switch while the owner holds unsaved work in a live container) does not contain anything.
     It PERMANENTLY DESTROYS that work. That is the same harm
     `_refuse_if_reclaim_would_destroy_work` exists to prevent.
@@ -2577,14 +2575,13 @@ async def test_releasing_the_project_whose_container_is_live_is_still_refused(
     manager = SessionManager()
     client = FakeSandboxClient()
 
-    live = await manager.ensure_sandbox(
+    await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
 
-    with pytest.raises(BuildSessionConflictError) as refusal:
+    with pytest.raises(BuildSessionConflictError):
         await manager.release_project_sandbox(db_session, user, project_id, sandbox_client=client)
 
-    assert refusal.value.session_id == live.session_id
     assert client.torn_down == []  # refused BEFORE the teardown, so the work is still there
 
 

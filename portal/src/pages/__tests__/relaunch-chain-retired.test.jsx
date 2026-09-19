@@ -146,7 +146,7 @@ describe('the block banner cannot reach the tree — from EITHER producer', () =
   it('arm 1, start’s 409: a send is a TURN, so the start that raised `blocked` never fires', async () => {
     // The 409 is armed on the start the injected client exposes. If any path on this surface still
     // provisioned a session, this would raise the banner — which is exactly the point: none does.
-    h.start.mockRejectedValue(new BuildSessionAlreadyActiveError('You already have a build running.', 'sess-9'))
+    h.start.mockRejectedValue(new BuildSessionAlreadyActiveError('You already have a build running.'))
     h.readTurnStream.mockImplementation(turnStreaming(planReply()))
 
     renderBuilder({ deps: deps() })
@@ -163,9 +163,7 @@ describe('the block banner cannot reach the tree — from EITHER producer', () =
     // `relaunchPreview` genuinely runs here — `StartAppControl` calls the module function — so the
     // 409 arrives on a reachable path. What it must NOT do is raise the banner, because the hook's
     // `relaunch()` (the half that mapped it onto `blocked`) has no caller.
-    h.relaunchPreview.mockRejectedValue(
-      new BuildSessionAlreadyActiveError('You already have a build running.', 'sess-9'),
-    )
+    h.relaunchPreview.mockRejectedValue(new BuildSessionAlreadyActiveError('You already have a build running.'))
     const standby = primeStandbyReattach(h, { chatId: CHAT_ID, projectId: 'p1' })
     renderBuilder({ deps: deps(), hasSavedBuild: true })
     await waitFor(() => expect(h.getStatus).toHaveBeenCalled())

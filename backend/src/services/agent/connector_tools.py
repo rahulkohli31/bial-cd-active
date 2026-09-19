@@ -91,10 +91,10 @@ to the model, and pydantic-ai hands that same list to this tool as `ctx.messages
 already delivered?" is a count over what is already in memory: no table, no Redis, nothing to keep
 in step. A new conversation starts empty and gets the schema again.
 
-TWO, NOT ONE — owner ruling, 2026-09-11. Across the connected-data E2E campaign the model never
-asked twice in one conversation, so this is a ceiling on a failure not yet seen rather than a fix
-for one. Past it, each further call would append another full copy (~8,700 tokens) to a history
-every later turn replays."""
+TWO, NOT ONE. Across the connected-data E2E campaign the model never asked twice in one
+conversation, so this is a ceiling on a failure not yet seen rather than a fix for one. Past it,
+each further call would append another full copy (~8,700 tokens) to a history every later turn
+replays."""
 
 _ALREADY_LOADED: Final = (
     "This schema is already in this conversation: earlier `connector_schema` calls returned it in "
@@ -256,6 +256,5 @@ registers a function under its `__name__`, and `projection.CONNECTOR_SCHEMA_TOOL
 CONNECTED DATA block interpolates, so the two are only equal by agreement — there is no place to
 write the function's name down. `test_mode_prompts.py` holds them equal, off the REGISTERED
 definition rather than off `__name__`, so a rename that pydantic-ai would honour goes red there. A
-module-level `assert` was the obvious alternative and is exactly what `.claude/rules/
-fail-first-python.md` forbids: `python -O` strips it, so the guard would be absent from the one
-environment where a missing tool is a citizen's problem."""
+module-level `assert` is not the alternative: `python -O` strips it, so the guard would be absent
+from the one environment where a missing tool is a citizen's problem."""

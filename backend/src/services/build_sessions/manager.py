@@ -179,12 +179,12 @@ _HEAD_BACKOFF_SECONDS: float = 0.25
 async def head_presence(key: str) -> bool | None:
     """Does this KEY hold a restorable bundle? `True` = present, `False` = CONFIRMED absent,
     `None` = the store could not be reached. A blip is retried; an unanswered check reports
-    unknown rather than guessed, since treating it as absent would let finalize's later
-    snapshot overwrite real work with a freshly provisioned blank template (mirrors the
-    submit route's fail-closed read). Both readers share this one expression: the build path
-    aborts on `None` (`snapshot_exists_or_bust`), the projects read shows it as "we cannot
-    say". The store is resolved once, outside the retry loop — no-store-configured is
-    permanent, not transient."""
+    unknown rather than guessed, since treating it as absent provisions a blank template in
+    place of real work, and the next write of the saved copy makes that blank the newest
+    version (mirrors the submit route's fail-closed read). Both readers share this one
+    expression: the build path aborts on `None` (`snapshot_exists_or_bust`), the projects read
+    shows it as "we cannot say". The store is resolved once, outside the retry loop —
+    no-store-configured is permanent, not transient."""
     try:
         store = get_storage()
     except StorageUnconfiguredError:
@@ -328,12 +328,10 @@ SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 
 class BuildSessionConflictError(Exception):
-    """The user already holds a live build session (the one-per-user lock is held).
-    Carries the existing `session_id` so the router can surface it in the 409."""
+    """The user already holds a live build session (the one-per-user lock is held)."""
 
-    def __init__(self, session_id: uuid.UUID | None) -> None:
+    def __init__(self) -> None:
         super().__init__("a build session is already active")
-        self.session_id = session_id
 
 
 class SnapshotUnavailableError(Exception):
@@ -750,10 +748,10 @@ async def _the_conversation_mid_reply_in(
     """The project's conversation that is generating a reply right now, or `None`.
 
     TWO HALVES OF ONE FACT, NEITHER SUFFICIENT ALONE. The session map knows a turn is holding
-    this project's container but not which thread it speaks in (`BuildSession.conversation_id`
-    is never set by the live producer), and the in-flight guard knows which threads are mid-reply
-    but not whose project they belong to. Intersecting them names one turn, and at most one can
-    match: a reply pins the one-per-user workspace, which is the very slot being taken.
+    this project's container but not which thread it speaks in, and the in-flight guard knows
+    which threads are mid-reply but not whose project they belong to. Intersecting them names
+    one turn, and at most one can match: a reply pins the one-per-user workspace, which is the
+    very slot being taken.
 
     The guard is imported here rather than at module scope because `src.services.turns` pulls in
     the engine, which imports this module."""
@@ -1258,14 +1256,6 @@ class BuildSession:
     # durable: the next message asks the question again.
     news: RecoveryNews | None = None
     restored: bool = False
-    # The thread this build belonged to. ALWAYS `None` NOW: `_start_locked` was the one place
-    # that ever set it, and it is deleted. `ensure_sandbox` builds its session without it, which
-    # is why `live_session_for_conversation` can no longer match anything — see that method.
-    conversation_id: uuid.UUID | None = None
-    # The thread's high-water seq the moment a build STARTED, so the NEXT build could tell the
-    # turns that arrived while this one ran from the ones it already consumed. ALWAYS `None`
-    # NOW, for the same reason as `conversation_id`: only the deleted start path captured it.
-    started_seq: int | None = None
     #: WHICH ARM produced the container, forwarded from `_ResolvedSandbox`. `True` means it was
     #: already up and serving and this turn merely joined it; `False` means this turn BROUGHT
     #: ONE UP — a fresh provision or a restore. Without it, "did this turn start anything?" is
@@ -1409,41 +1399,6 @@ class SessionManager:
         """Users with a live in-proc session — never reaped by a sweep."""
         return set(self._active_by_user)
 
-    def live_session_for_conversation(self, conversation_id: uuid.UUID) -> BuildSession | None:
-        """The still-running build attached to THIS thread, or None — the "is the agent working
-        here right now?" question the turn/mode routes ask before they let a chat turn in.
-
-        PER-CONVERSATION, not per-user: the rule is "this chat's composer is shut while this
-        chat's agent works", so a planning chat in another thread of the same project stays
-        open (the per-user build lock already refuses a second build anywhere). Reads
-        `_active_by_user` rather than `_sessions` so an ended-but-retained session (kept 5
-        minutes for a late SSE reconnect) never reads as live. Inherits this registry's
-        single-replica invariant — see `_claim_the_one_build_slot` — and goes blind across a
-        restart, which is why it is a gate BESIDE the mode check, never a replacement for it.
-
-        IT CAN NO LONGER MATCH ANYTHING, AND THAT IS NOT NEW — the deletion only made it
-        provable. `BuildSession.conversation_id` was passed at exactly one construction site,
-        inside the deleted `_start_locked`; `ensure_sandbox`, the live producer, has never
-        passed it, so the field defaults to `None` and the comparison below is unconditionally
-        true for any real conversation id. The gate at `conversations/turns.py` that calls this
-        has therefore been inert in production since the start route lost its client. IT IS
-        LEFT IN PLACE DELIBERATELY, as a redesign seam rather than a deletion: `ensure_sandbox`
-        has the turn state in scope at its caller (`turns/engine.py`) and threading one argument
-        through would make the gate live for the first time. NOTHING IS UNGUARDED MEANWHILE —
-        `turns.py` also asks `conversation_is_mid_reply` (the same-conversation case) and
-        `active_session_for` (the cross-conversation case). Do not read the green tests around
-        that gate as evidence it works: `tests/api/v1/conftest.py`'s `building` fixture
-        hand-builds a session WITH a `conversation_id`, a shape production cannot produce, and
-        says so in its own docstring."""
-        for session_id in self._active_by_user.values():
-            session = self._sessions.get(session_id)
-            if session is None or session.conversation_id != conversation_id:
-                continue
-            if session.status in {BuildSessionStatus.ENDED, BuildSessionStatus.FAILED}:
-                continue
-            return session
-        return None
-
     # --- the shared acquire-with-conflict-check + compensated-release shape ---
 
     async def _compensate_lock_and_container(
@@ -1509,8 +1464,8 @@ class SessionManager:
 
         THE TWO WAYS THE LOCK CAN DENY, and why they leave here as different exceptions.
         `acquire_lock` returning `None` now means one thing only — the lock is genuinely
-        HELD — so `BuildSessionConflictError` (router 409, carrying the live session id) is
-        always a true statement about a real session. A Redis failure instead raises
+        HELD — so `BuildSessionConflictError` (router 409) is always a true statement about a
+        real session. A Redis failure instead raises
         `LockUnavailableError` (a `RedisError`), which passes straight through to the
         router's `build_coordination_or_503` and becomes a 503. Before that split, an outage
         was swallowed into the same `None` and every affected user was told a build session
@@ -1591,7 +1546,7 @@ class SessionManager:
             )
         token = await acquire_lock(redis, user_id)
         if token is None:
-            raise BuildSessionConflictError(self._active_by_user.get(user_id))
+            raise BuildSessionConflictError()
         lock_wait_ms = int((time.monotonic() - claim_started_at) * 1000)
         scope = _LockScope(token=token)
         try:
@@ -1689,16 +1644,16 @@ class SessionManager:
         since a dialog naming the wrong project is worse than a plain refusal.
         """
         if blocking is None or db is None or requested_project_id is None:
-            return BuildSessionConflictError(blocking_id)
+            return BuildSessionConflictError()
         if blocking.project_id == requested_project_id:
-            return BuildSessionConflictError(blocking_id)
+            return BuildSessionConflictError()
         name = await db.scalar(
             sa.select(Project.name).where(
                 Project.id == blocking.project_id, Project.user_id == user_id
             )
         )
         if name is None:
-            return BuildSessionConflictError(blocking_id)
+            return BuildSessionConflictError()
         # `dirty` is deliberately NOT probed: `SandboxReclaimBlockedError` states why — a
         # `git status` taken while the agent writes is true for no instant the citizen cares
         # about.
@@ -1759,14 +1714,14 @@ class SessionManager:
             return
         releasing = _what_will_release_the_slot(blocking)
         if releasing is None:
-            raise BuildSessionConflictError(blocking_id)
+            raise BuildSessionConflictError()
         # The blocking session has already COMMITTED its terminal — it is ended and only letting
         # go. Wait (bounded) for that instead of 409ing the user's own finished work, then fall
         # through to a fresh allocation; on a timeout or an error in there, keep the 409.
         try:
             await asyncio.wait_for(releasing.wait(), timeout=_FINALIZE_GRACE_SECONDS)
         except Exception:
-            raise BuildSessionConflictError(blocking_id) from None
+            raise BuildSessionConflictError() from None
 
     async def save_project_snapshot(
         self,
@@ -1776,7 +1731,8 @@ class SessionManager:
         *,
         sandbox_client: SandboxClient,
     ) -> SaveOutcome:
-        """THE SAVE — the user's click, and the only thing that writes their work to Blob.
+        """THE SAVE — the user's click, and the only CITIZEN-INITIATED write of their work to
+        Blob; a teardown writes the same slot back on its own.
         Requires a LIVE container (the tree only exists there); `NoLiveSandboxError` is the
         honest answer rather than a silent false success. Deliberately does NOT require an
         in-process session — the common Save has none, right after a turn ends and the
@@ -1795,13 +1751,12 @@ class SessionManager:
         # Ask/Plan attach too, and gating on "a session exists" would refuse the ordinary
         # Save button mid-chat.
         if self._writing_session_holds(user.id, app_id):
-            raise BuildSessionConflictError(self._active_by_user.get(user.id))
+            raise BuildSessionConflictError()
         handle = await self._attach_for_read(user.id, app_id, sandbox_client)
-        # THE SAVED VERSION — the user asked for this one. It drives `dirty` and it is what
-        # `submit` pins, so it is the one key a platform-initiated write must never touch.
-        # Commits inside the container before bundling, so a save captures the working tree
-        # whether or not the agent had committed it, and the bundle carries HEAD's whole
-        # history.
+        # THE SAVED VERSION — the default destination, the one `dirty` compares against and the
+        # one `submit` pins. Commits inside the container before bundling, so a save captures the
+        # working tree whether or not the agent had committed it, and the bundle carries HEAD's
+        # whole history.
         await write_snapshot(sandbox_client, handle, app_id)
         # Read the head AFTER the save: `write_snapshot` runs `git init` + commit itself, so on
         # a first save this is the commit it just created — the value the client needs to
@@ -1829,7 +1784,7 @@ class SessionManager:
             raise NoLiveSandboxError(project_id)
         async with self._start_lock_for(user.id):
             if self._live_session_holds(user.id, app_id):
-                raise BuildSessionConflictError(self._active_by_user.get(user.id))
+                raise BuildSessionConflictError()
             handle = await self._attach_for_read(user.id, app_id, sandbox_client)
             saved = await discard_back_to_saved(
                 sandbox_client, handle, app_id, taken_at=datetime.now(UTC)
@@ -1947,10 +1902,10 @@ class SessionManager:
         app READY. The second reading is taken under the lock, after those checks, so nothing can
         start between the last look and the put-away.
 
-        NEVER AT THE COST OF WORK. The reap passes `app_id`, which runs the durable-copy gate: a
-        copy is taken when the newest change postdates the newest copy, and a container whose work
-        cannot be proven preserved is SPARED — the citizen keeps the slow card, which is where they
-        were before this existed."""
+        NEVER AT THE COST OF WORK. The reap passes `app_id`, so the tree is written back to the
+        saved copy before anything is destroyed; a container whose tree could not be written back
+        is SPARED instead — the citizen keeps the slow card, which is where they were before this
+        existed."""
         if await _stopped_reading(sandbox_client, handle) is None:
             return
         await asyncio.sleep(_SECOND_LOOK_AFTER_S)
@@ -2677,7 +2632,7 @@ class SessionManager:
             # project's container is no reason to refuse this one — giving up an idle project is
             # precisely how a citizen frees the slot the live one is occupying.
             if self._live_session_holds(user.id, app_id):
-                raise BuildSessionConflictError(self._active_by_user.get(user.id))
+                raise BuildSessionConflictError()
             redis = get_redis()
             reg = await read_registry(redis, user.id)
             if reg is None or reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_READY:
@@ -2712,7 +2667,7 @@ class SessionManager:
         redis = get_redis()
         async with self._start_lock_for(user_id):
             if user_id in self._active_by_user:
-                raise BuildSessionConflictError(self._active_by_user.get(user_id))
+                raise BuildSessionConflictError()
             reg = await read_registry(redis, user_id)
             if reg is None or reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_READY:
                 return False
@@ -3065,9 +3020,8 @@ class SessionManager:
         pre-check: it raises on a genuinely live session and otherwise returns having claimed
         nothing, so relaunch still occupies no slot. It also means relaunch waits out a session
         that has ended and is only letting go, which is the right answer here for the same
-        reason it is right for a message — the snapshot relaunch restores is the one that
-        session's finalize is writing, so waiting hands back the FRESH tree where refusing sent
-        the citizen away to press again.
+        reason it is right for a message: bouncing a citizen off their own just-finished turn
+        sends them away to press again, and letting go is usually sub-second.
 
         One divergence from the deleted `_start_locked` still holds:
         - It must NOT reuse `_restore_or_provision`, whose confirmed-absent arm provisions a
@@ -3545,10 +3499,11 @@ class SessionManager:
                 if ready:
                     await sandbox_client.someone_has_to_go_first(scope.handle)
                 preview_url = scope.handle.preview_url
-                # Seed the heartbeat INSIDE the protected region (never enter `_active_by_user`,
-                # never spawn a finalize task, by design): if it fails, the compensation still
-                # tears the container down + releases the lock instead of 500ing with a live
-                # container behind a held lock. The scope releases the lock on clean exit.
+                # Seed the heartbeat INSIDE the protected region (a relaunch never enters
+                # `_active_by_user`, so no turn-end sequence ever runs for it): if it fails,
+                # the compensation still tears the container down + releases the lock instead
+                # of 500ing with a live container behind a held lock. The scope releases the
+                # lock on clean exit.
                 await write_heartbeat(redis, user_id)
                 # …and hand the container's lifetime to the screen that asked for it. The long
                 # stay granted before the wait was there to survive a restore that can block for
@@ -3903,11 +3858,10 @@ class SessionManager:
 
         A Write turn is an ordinary chat turn that happens to hold the sandbox slot, so it
         needs the same container, the same one-per-user lock and the same registry entry a
-        build needed — but no `run_build` task, no `build_started` marker, no attachments and
-        no `started_seq`. Those belonged to the deleted build feed, which the turn engine
-        replaces: the turn's own frames are the narrative now, and the turn's own rows are the
-        record. This is now the ONLY allocator; `_start_locked`, whose skeleton this is, is
-        deleted.
+        build needed — but no `run_build` task, no `build_started` marker and no attachments.
+        Those belonged to the deleted build feed, which the turn engine replaces: the turn's
+        own frames are the narrative now, and the turn's own rows are the record. This is now
+        the ONLY allocator; `_start_locked`, whose skeleton this is, is deleted.
 
         That skeleton, deliberately and completely: slot claim → reconcile → lock → mint the app
         row → commit → env → resolve the sandbox → heartbeat → adopt. Every one of those steps
@@ -4224,9 +4178,8 @@ class SessionManager:
         `StorageNotFoundError` — the store positively answered "no bundle" (a genuinely new
         app, or one that vanished between the head-check and the pull); no error path reaches
         it otherwise. An unknown head state, or a restore that keeps failing, raises
-        `SnapshotUnavailableError` and aborts the start instead, because a fresh template here
-        would be silently overwritten onto the user's saved work by finalize's step-1
-        snapshot."""
+        `SnapshotUnavailableError` and aborts the start instead, because the next write of the
+        saved copy would silently put that fresh template over the user's work."""
         # Ensure the app's Blob container + mint a fresh session SAS ONLY on this birth
         # (provision/restore) arm — never on attach, which reuses the live container's SAS.
         # A configured-store failure propagates: it fails the start before any sandbox handle
@@ -4264,10 +4217,10 @@ class SessionManager:
         """Pull the known-present snapshot into a fresh container, with bounded retry.
         `source_key` selects WHICH bundle — `None` is this app's own saved snapshot, and
         `launch_shared_preview` passes the OWNER's. A transient npm or storage blip is retried
-        rather than falling back to
-        a fresh template — that fallback caused silent, permanent data loss, since the bundle
-        EXISTS here and finalize would overwrite it. A PERSISTENT failure deliberately strands
-        the session instead: a 503 with the user's work intact beats a start that silently
+        rather than falling back to a fresh template — that fallback caused silent, permanent
+        data loss, since the bundle EXISTS here and the next write of the saved copy would put
+        the template over it. A PERSISTENT failure deliberately strands the session instead: a
+        503 with the user's work intact beats a start that silently
         destroys it. Self-cleans on every exception, so each attempt starts from no container;
         `StorageNotFoundError` must not retry — it is the caller's fresh-provision arm.
 
@@ -4478,13 +4431,6 @@ class SessionManager:
         #      where a concurrent sweep sees lock-gone with no lease yet and executes the
         #      container we just spared. The registry entry stays: it is the sweep's only map
         #      to the container, and deleting it would orphan a live sandbox.
-        #
-        #      `touched` THREADS STRAIGHT THROUGH from this method's own parameter —
-        #      the same fact step 1b above already keys on. A turn that wrote nothing buys
-        #      the shorter stay; this is where a Plan-kind chat's ordinary Q&A turn (which can
-        #      never touch the tree — its toolset has no write tool) stops paying for a
-        #      30-minute reprieve it never earned, without this method ever asking what kind of
-        #      chat sent it.
         try:
             await self._pardon_the_container(redis, session)
         finally:

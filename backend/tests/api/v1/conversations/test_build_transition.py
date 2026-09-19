@@ -788,7 +788,7 @@ async def test_the_daily_cap_is_a_429_and_leaves_the_offer_pressable(
     )
 
 
-async def test_a_workspace_busy_in_another_chat_is_a_coded_409(
+async def test_a_workspace_already_claimed_is_a_coded_409(
     client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
 ) -> None:
     """The workspace-busy refusal carries a code distinct from the route's other 409 — same
@@ -796,14 +796,11 @@ async def test_a_workspace_busy_in_another_chat_is_a_coded_409(
     user, plan_chat, headers = await _plan_chat_with_offer(
         client, db_session, set_chat_model, _fresh_engine
     )
-    elsewhere = await ConversationFactory.create(db_session, user.id, kind=ChatKind.BUILD)
     # Plants the in-process claim the way the manager itself records one — an id in the
     # per-user index and the session it points at — reached via `active_session_for`.
     session_id = uuid.uuid4()
     wire.manager._active_by_user[user.id] = session_id  # noqa: SLF001
-    wire.manager._sessions[session_id] = SimpleNamespace(  # noqa: SLF001
-        conversation_id=elsewhere.id
-    )
+    wire.manager._sessions[session_id] = SimpleNamespace()  # noqa: SLF001
     minted = uuid.uuid4()
 
     resp = await client.post(_build_url(plan_chat), headers=headers, json={"chatId": str(minted)})
@@ -820,10 +817,10 @@ async def test_a_retry_after_the_build_attached_its_sandbox_is_still_answered_id
     client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
 ) -> None:
     """★ The late retry (a reload, or a resend after the first response was dropped): by now
-    the first press's turn has attached its own sandbox, so the busy check's comparison against
-    the PLAN chat is true for every such retry forever, once wrongly refusing citizens their
-    own build. The fix is ORDERING — idempotency must be read before any capacity check — so
-    this plants the live session rather than mocking the refusal directly."""
+    the first press's turn holds the workspace, so the busy check refuses every such retry
+    forever, once wrongly costing citizens their own build. The fix is ORDERING — idempotency
+    must be read before any capacity check — so this plants the live session rather than
+    mocking the refusal directly."""
     user, plan_chat, headers = await _plan_chat_with_offer(
         client, db_session, set_chat_model, _fresh_engine
     )
@@ -833,11 +830,9 @@ async def test_a_retry_after_the_build_attached_its_sandbox_is_still_answered_id
     first = await client.post(_build_url(plan_chat), headers=headers, json={"chatId": str(minted)})
     assert first.status_code == 200, first.text
 
-    # `ensure_sandbox` never threads a conversation id through, so this is `None` in
-    # production — either way it is not the plan chat's id, which is the whole point.
     session_id = uuid.uuid4()
     wire.manager._active_by_user[user.id] = session_id  # noqa: SLF001
-    wire.manager._sessions[session_id] = SimpleNamespace(conversation_id=None)  # noqa: SLF001
+    wire.manager._sessions[session_id] = SimpleNamespace()  # noqa: SLF001
 
     second = await client.post(
         _build_url(plan_chat), headers=headers, json={"chatId": str(minted)}

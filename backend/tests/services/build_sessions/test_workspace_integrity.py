@@ -314,7 +314,7 @@ async def test_a_reference_the_repository_does_not_contain_is_unverifiable(
 ) -> None:
     """`--is-ancestor` never ran, so the lineage question was answered by a missing object,
     not by git — which has innocent explanations. The conservative arm still protects the
-    user: no restore, and the recovery write is refused, so the good bundle survives."""
+    user: no restore, so the good bundle is never written over."""
     await _seed_saved(store)
     client = _client(_stdout(head="abc", commits=1, ancestry="1 128"))
 

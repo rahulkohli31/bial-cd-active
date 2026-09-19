@@ -63,11 +63,10 @@ describe('buildSessionApi — buildSessionClient member set (inertness guard)', 
 })
 
 describe('buildSessionApi — control operations', () => {
-  // `start` is gone — a composer send is a TURN, so the wrapper had no caller — but the typed
-  // 409 mapping these two cases pin lives in the shared `postJson`, not in `start` itself. They
-  // are re-pointed onto `relaunchPreview`, now the only live caller that can raise this error.
-  it('a 409 build_session_already_active surfaces the existing sessionId as a typed error', async () => {
-    const fetchImpl = jsonFetch(409, { error: { code: 'build_session_already_active', message: 'You already have a build running.' }, sessionId: 'existing-9' })
+  // The typed 409 mapping lives in the shared `postJson`, and `relaunchPreview` is the only
+  // live caller that can raise it.
+  it('a 409 build_session_already_active arrives as a typed error carrying the server sentence', async () => {
+    const fetchImpl = jsonFetch(409, { error: { code: 'build_session_already_active', message: 'You already have a build running.' } })
     const err = await relaunchPreview({ projectId: 'p1' }, { fetchImpl }).catch((e: unknown) => e)
 
     expect(err).toBeInstanceOf(BuildSessionAlreadyActiveError)
@@ -75,13 +74,7 @@ describe('buildSessionApi — control operations', () => {
     const active = err as BuildSessionAlreadyActiveError
     expect(active.status).toBe(409)
     expect(active.code).toBe('build_session_already_active')
-    expect(active.existingSessionId).toBe('existing-9')
-  })
-
-  it('reads the existing sessionId whether it sits at top-level or under error{}', async () => {
-    const fetchImpl = jsonFetch(409, { error: { code: 'build_session_already_active', message: 'busy', sessionId: 'nested-42' } })
-    const err = await relaunchPreview({ projectId: 'p1' }, { fetchImpl }).catch((e: unknown) => e)
-    expect((err as BuildSessionAlreadyActiveError).existingSessionId).toBe('nested-42')
+    expect(active.message).toBe('You already have a build running.')
   })
 
   it('relaunchPreview: 200 maps {appId, previewUrl, status} — no sessionId/createdAt on this shape', async () => {

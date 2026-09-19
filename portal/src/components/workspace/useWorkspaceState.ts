@@ -35,10 +35,11 @@
  * `fetchSaveState` still waits for `alive`, since a seconds-old container is still booting — so the save
  * state lands within one accelerated interval of when it would have arrived unaccelerated.
  *
- * A thirty-minute stay can lapse unnoticed too: `RELAUNCH_PREVIEW_STAY_SECONDS` renews only via a turn's
- * own deadline writers, so the start-then-read shape (no turn) can let it lapse under someone still
- * reading. The next read then returns `asleep`, offering the start again with nothing lost — renewing the
- * stay on a plain read would be a new way to hold a container claimed, which nobody has built.
+ * THIS READ ALSO HOLDS THE CONTAINER OPEN. Every unaccelerated tick renews the preview's stay as a side
+ * effect (`SURFACE_PRESENT`, the only deadline writer a browser can reach), so a screen left framing a
+ * project keeps it alive and a screen that is closed stops paying. The renewal cannot push past the
+ * absolute age ceiling and never reports a failure of its own, so a stay can still lapse under someone
+ * reading: the next read returns `asleep`, offering the start again with nothing lost.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { checkWorkspace, fetchPreviewState, fetchSaveState, renewPresence, samePreviewState, sameSaveState } from '../../utils/buildSessionApi'

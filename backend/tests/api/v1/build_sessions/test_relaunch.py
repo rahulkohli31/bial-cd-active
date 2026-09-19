@@ -36,7 +36,6 @@ from src.db.models.harness_counter import HarnessCount, HarnessCounter
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
 from src.services.build_sessions.manager import SessionManager, app_name_for
-from src.services.build_sessions.outcome import write_build_outcome
 from src.services.redis import (
     BUILD_COORDINATION_UNAVAILABLE_MSG,
     REGISTRY_STATE_ENDING,
@@ -64,7 +63,7 @@ from tests.api.v1.build_sessions.conftest import (
 )
 from tests.conftest import forget_every_harness_count
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import a_git_bundle
+from tests.fakes import a_git_bundle, write_build_outcome
 
 
 async def _user_project(db: AsyncSession, email: str):
@@ -201,7 +200,7 @@ async def test_relaunch_without_snapshot_is_404(
 async def test_relaunch_while_a_build_is_running_is_409(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
-    """A live session owns the one-per-user slot; relaunch 409s and carries its session id.
+    """A live session owns the one-per-user slot; relaunch 409s rather than pre-empting it.
 
     Re-fixtured onto `a_live_session`. The slot has to be genuinely OCCUPIED for this to prove
     anything, and relaunch provably cannot occupy it itself — asserted directly by
@@ -212,7 +211,7 @@ async def test_relaunch_while_a_build_is_running_is_409(
     user, project = await _user_project(db_session, "rl3@rvaiglobal.com")
     await _seed_snapshot(db_session, user, project, fake_storage)
 
-    session = await a_live_session(wire, db_session, user, project.id)
+    await a_live_session(wire, db_session, user, project.id)
 
     conflict = await client.post(
         "/v1/build-sessions/relaunch",
@@ -222,7 +221,7 @@ async def test_relaunch_while_a_build_is_running_is_409(
     assert conflict.status_code == 409
     err = conflict.json()["error"]
     assert err["code"] == "build_session_already_active"
-    assert err["sessionId"] == str(session.session_id)
+    assert set(err) == {"message", "code"}
 
 
 async def test_relaunch_another_users_project_is_404(

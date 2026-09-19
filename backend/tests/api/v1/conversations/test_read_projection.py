@@ -18,9 +18,9 @@ from src.config import settings
 from src.db.models.conversation import ChatKind
 from src.db.models.message import MessageEntryKind
 from src.services.auth.session_jwt import mint_session_jwt
-from src.services.build_sessions.outcome import write_build_outcome
 from src.services.messages.store import append_batch
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
+from tests.fakes import write_build_outcome
 
 _TTL = settings.auth.access_ttl_seconds
 PREVIEW = "https://sbx-abc.westeurope.azurecontainerapps.io/"

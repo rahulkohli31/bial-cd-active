@@ -19,8 +19,11 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from typing import Literal
+from typing import Annotated, Any, Final, Literal
 
+import sqlalchemy as sa
+from pydantic import AnyUrl, TypeAdapter, UrlConstraints, ValidationError
+from pydantic_ai.messages import ModelResponse, TextPart
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
@@ -31,9 +34,15 @@ from src.api.v1.build_sessions.schemas import (
     StepEvent,
 )
 from src.core.connectors import CONNECTORS, ConnectedSystem, ResolvedWindow
-from src.db.models.conversation import ChatKind
-from src.db.models.message import MessageEntryKind, MessageVisibility
+from src.db.models.conversation import ChatKind, Conversation
+from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.project_connector import ConnectorWindowKind
+from src.services.build_sessions.outcome import (
+    FORCE_ENDED,
+    IDLE_TEARDOWN,
+    QUOTA_EXCEEDED,
+    STOPPED_BY_USER,
+)
 from src.services.messages.store import SeqContentionError, append_batch
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
@@ -617,12 +626,13 @@ class FakeBrain:
         )
 
 
-# ── The deleted harness's leftovers, re-hosted in the test tree ───────────────
+# ── Writers re-hosted from `src/`, where nothing calls them any more ──────────
 #
-# `BuildDeps` and `write_build_started` lived in `src/` until the standalone build stack was
-# deleted. Both were harness-only in production, and both were the DRIVER for tests of code that
-# is still live — the sandbox toolset and the transcript projection respectively. Re-homed here
-# rather than deleted with their production twins, so that coverage does not quietly go with them.
+# `BuildDeps`, `write_build_started` and `write_build_outcome` were all in `src/` until their
+# production callers were deleted. Each is the DRIVER for tests of code that is still live — the
+# sandbox toolset, and the transcript projection's two lifecycle arms — and the rows the two
+# writers append are permanent in the production database, so their readers must stay tested
+# against a faithful row rather than a hand-built dict.
 
 
 @dataclass
@@ -676,6 +686,159 @@ async def write_legacy_build_started(
     except SeqContentionError:
         return False
     return True
+
+
+# The preview link is PARSED, not pattern-checked, and https-only — the same parse the deployed
+# URL gets at the admin boundary. It is the fail-closed floor under "we only write URLs we
+# minted": the constraint is scheme plus length and never host or shape, so an app address that
+# carries a path still passes.
+_PREVIEW_URL_MAX_CHARS: Final = 2048
+_PREVIEW_URL: Final[TypeAdapter[AnyUrl]] = TypeAdapter(
+    Annotated[AnyUrl, UrlConstraints(max_length=_PREVIEW_URL_MAX_CHARS, allowed_schemes=["https"])]
+)
+
+
+def _safe_preview_url(preview_url: str | None) -> str | None:
+    """The preview link when it parses as https, else None — never the raw string.
+
+    The recorded link is rendered straight into an `<a href>` in the portal's outcome card,
+    same-origin with the user's session, so `javascript:` and `data:` must not survive. Fails
+    closed to None — the record's own "no preview" state — rather than raising: losing a whole
+    outcome row over a cosmetic link is the worse trade. The ORIGINAL string is returned rather
+    than the parse's output, because pydantic normalizes (a path-less URL gains a trailing `/`)
+    and the recorded link should be the address the sandbox actually served."""
+    if preview_url is None:
+        return None
+    try:
+        _PREVIEW_URL.validate_python(preview_url)
+    except ValidationError:
+        return None
+    return preview_url
+
+
+def _summary(status: BuildSessionStatus, reason: str | None) -> str:
+    """The outcome's prose. This is the payload's TEXT, so it is both what a reader sees and what
+    the model is replayed as history on the user's next turn — hence plain, factual wording.
+
+    Every arm under the FAILED one keys on the REASON, because the STATUS cannot tell these
+    apart: a natural finish, a Stop, a force-end and an idle reap all carry ENDED. Reading the
+    status alone recorded a build stopped at minute two as "Build finished." — permanently, and
+    then replayed that back to the model as history on the user's next turn."""
+    if status is BuildSessionStatus.FAILED:
+        return f"The build failed: {reason}" if reason else "The build failed."
+    if reason == QUOTA_EXCEEDED:
+        return "The build stopped: you reached your daily limit."
+    if reason == STOPPED_BY_USER:
+        return "You stopped this build before it finished."
+    if reason == FORCE_ENDED:
+        # The one graceful end that DISCARDED its work — the kill switch skipped the snapshot —
+        # so any summary implying otherwise is a lie about the user's code.
+        return "This build was force-stopped before it finished, and its work was discarded."
+    if reason == IDLE_TEARDOWN:
+        return "This build was stopped because it sat idle."
+    return "Build finished."
+
+
+def build_outcome_meta(
+    *,
+    status: BuildSessionStatus,
+    session_id: uuid.UUID,
+    preview_url: str | None,
+    snapshot_committed: bool,
+    reason: str | None,
+    started_seq: int | None,
+) -> dict[str, Any]:
+    """The outcome row's `meta` — the build's structured record, OUTSIDE the native payload.
+
+    `startedSeq` is the transcript's high-water seq at the moment a build began, and it is what
+    made the attachment boundary TEMPORAL rather than positional. It is absent from every row
+    written now; the parameter stays because rows already in the database carry it and because
+    the trap it names is the one any re-introduction has to avoid — a row allocated at build END
+    can land AFTER a turn recorded while the build ran, so a reader keying on this row's POSITION
+    drops those turns permanently and silently."""
+    meta: dict[str, Any] = {
+        "kind": "build_outcome",
+        "status": status.value,
+        "sessionId": str(session_id),
+        "previewUrl": _safe_preview_url(preview_url),
+        "snapshotCommitted": snapshot_committed,
+        "reason": reason,
+    }
+    if started_seq is not None:
+        meta["startedSeq"] = started_seq
+    return meta
+
+
+async def write_build_outcome(
+    db: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    session_id: uuid.UUID,
+    status: BuildSessionStatus,
+    preview_url: str | None,
+    snapshot_committed: bool,
+    reason: str | None,
+    started_seq: int | None = None,
+) -> bool:
+    """Append a build-outcome `system_event` row. Returns True if written.
+
+    Owner-scoped: the conversation must be the caller's, else this is a no-op, never a
+    cross-user write. Idempotent on `session_id` — one outcome per build; an exhausted seq
+    retry budget (`append_batch`) returns False rather than raising."""
+    conversation = await db.scalar(
+        sa.select(Conversation).where(
+            Conversation.id == conversation_id, Conversation.user_id == user_id
+        )
+    )
+    if conversation is None:
+        return False  # deleted mid-build, or never ours — nothing to record it in
+
+    if await _outcome_already_recorded(db, conversation_id, session_id):
+        return False
+
+    payload = ModelResponse(parts=[TextPart(content=_summary(status, reason))])
+    meta = build_outcome_meta(
+        status=status,
+        session_id=session_id,
+        preview_url=preview_url,
+        snapshot_committed=snapshot_committed,
+        reason=reason,
+        started_seq=started_seq,
+    )
+    try:
+        await append_batch(
+            db,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            messages=[payload],
+            entry_kind=MessageEntryKind.SYSTEM_EVENT,
+            kind=ChatKind.BUILD,
+            meta=meta,
+        )
+    except SeqContentionError:
+        return False
+    return True
+
+
+async def _outcome_already_recorded(
+    db: AsyncSession, conversation_id: uuid.UUID, session_id: uuid.UUID
+) -> bool:
+    """True if this session's outcome is already in the thread — keyed on `meta->>'sessionId'`,
+    the only field that identifies the BUILD (a fresh row id/seq says nothing about which build
+    it was)."""
+    row = await db.scalar(
+        sa.select(Message.id).where(
+            Message.conversation_id == conversation_id,
+            Message.entry_kind == MessageEntryKind.SYSTEM_EVENT,
+            # `kind` disambiguates: the `build_started` lifecycle row carries this
+            # session's id too, and without this predicate it would satisfy the idempotency
+            # probe and silently suppress the real outcome.
+            Message.meta["kind"].astext == "build_outcome",
+            Message.meta["sessionId"].astext == str(session_id),
+        )
+    )
+    return row is not None
 
 
 # --- The connected-data surface's one input ---------------------------------------------------

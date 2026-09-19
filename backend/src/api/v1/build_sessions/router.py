@@ -139,24 +139,16 @@ class ReapResponse(CamelModel):
 
 
 class _ConflictError(CamelModel):
-    """The inner error object of a build-session 409 (`relaunch` already-active): the plain
-    `{message, code}` envelope PLUS the existing session's id, which `_conflict_response`
-    carries but `ErrorEnvelope` omits.
-
-    NOTHING READS `sessionId`. It was the start route's contribution to this shape and it
-    survives only because `relaunch_preview` raises the same error; the portal's
-    `existingSessionIdOf` has no consumer and its one catch site branches on the error CODE.
-    Retiring the field is a contract change and is deliberately left for one."""
+    """The inner error object of a build-session 409: `{message, code}`. A client branches on
+    the CODE — the status alone cannot tell these conflicts apart."""
 
     message: str
     code: str
-    session_id: str | None = None  # → `sessionId`; present when the live session is known.
 
 
 class ConflictEnvelope(CamelModel):
-    """`{"error": {message, code, sessionId?}}` — a build-session 409 body
-    (`_conflict_response`), documenting the `sessionId` the plain `ErrorEnvelope` omits.
-    `sessionId` is optional, so this also describes the `lock_lost` 409 (which carries none)."""
+    """`{"error": {message, code}}` — a build-session 409 body (`_conflict_response`), and the
+    `lock_lost` 409 too."""
 
     error: _ConflictError
 
@@ -173,7 +165,7 @@ def _owned_or_404(
 
 class BuildConflictEnvelope(CamelModel):
     """The 409 for a route that can conflict two ways: this very project's own work already
-    running (`sessionId`), or a COLLEAGUE'S SHARED VIEW holding the one workspace
+    running, or a COLLEAGUE'S SHARED VIEW holding the one workspace
     (`projectId`/`projectName`/`isSharedView`). `code` discriminates —
     `build_session_already_active` vs `sandbox_reclaim_blocked` — and a client must branch on
     it, since only the second names a project.
@@ -191,9 +183,7 @@ _PROJECT_IS_HOLDING_IT = (
 )
 
 
-def _conflict_response(
-    exc: BuildSessionConflictError, *, project_name: str | None = None
-) -> JSONResponse:
+def _conflict_response(*, project_name: str | None = None) -> JSONResponse:
     """The one 409 both conflicting routes answer with — same code, same shape, two sentences.
 
     NAMING THE PROJECT IS THE RELEASE ROUTE'S ALONE. Its gate compares the app the live session
@@ -209,8 +199,6 @@ def _conflict_response(
         ),
         "code": "build_session_already_active",
     }
-    if exc.session_id is not None:
-        error["sessionId"] = str(exc.session_id)
     return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"error": error})
 
 
@@ -317,7 +305,7 @@ async def relaunch_preview(
 ) -> RelaunchPreviewResponse | JSONResponse:
     """Restore a torn-down app from its snapshot into a fresh, READY sandbox.
 
-    Not a build (Decision 6): it runs no agent at all, and the manager path never occupies the
+    Not a build: it runs no agent at all, and the manager path never occupies the
     one-per-user build slot — it registers a ready handle in Redis, releases the lock, and
     returns the live preview synchronously (`wait_ready` blocks until the dev server is up).
     """
@@ -329,10 +317,10 @@ async def relaunch_preview(
     with build_coordination_or_503():
         try:
             relaunched = await manager.relaunch_preview(db, user, body.project_id, sandbox)
-        except BuildSessionConflictError as exc:
+        except BuildSessionConflictError:
             # This project's own work is running — relaunch never pre-empts it (409). A
             # DIFFERENT project of theirs never reaches here: that is a switch, and it starts.
-            return _conflict_response(exc)
+            return _conflict_response()
         except SandboxReclaimBlockedError as exc:
             # A colleague's shared view holds the one slot, and it has no hand-over.
             return reclaim_blocked_response(exc)
@@ -515,25 +503,12 @@ async def build_events(
     return build_sse_response(session, _parse_last_event_id(request.headers.get("last-event-id")))
 
 
-# --- THERE ARE NO LOCK OPS LEFT ----------------------------------------------
-#
-# `acquire` / `renew` / `release` / `heartbeat` were retired along with their shared
-# `_renew_and_state` helper: the portal's keep-alive loop that was their only caller was
-# itself deleted, and a route with no caller is not neutral — it reads as a supported way to
-# hold the lock, and the next person needing one would have wired the loop straight back.
-# What holds a TURN open is the wall-clock lease the SERVER renews, legible to a sweep in
-# another process, which a browser timer never was.
-#
-# What holds a CONTAINER open, between turns, is a browser timer again — `projects/{project_id}/
-# renew` below. The difference that makes it safe is the absolute age ceiling: the retired lock
-# ops had no bound at all, so a tab that would not stop renewing made a container unreclaimable,
-# and the renewal here cannot push past the ceiling `reaper.py` evaluates in both sparing arms.
-# It renews the preview's stay and nothing else — never the lock, never the heartbeat.
-#
-# `force-end` was the last one standing and it has now gone the same way, its client exports
-# with it. The kill switch a citizen actually reaches is
-# `projects/{project_id}/stop-active-build` (the take-back dialog), which is project-scoped
-# and needs no session id.
+# A turn is held open by the wall-clock lease the SERVER renews, legible to a sweep in another
+# process. A CONTAINER between turns is held by a browser timer — `projects/{project_id}/renew`
+# below — and what makes that safe is the absolute age ceiling: the renewal cannot push past the
+# ceiling `reaper.py` evaluates in both sparing arms, so a tab that will not stop renewing can
+# never make a container unreclaimable. It renews the preview's stay and nothing else — never the
+# lock, never the heartbeat.
 
 
 # --- the save model ---------------------------------------------------------
@@ -680,8 +655,9 @@ async def save_project(
     manager: SessionManagerDep,
     sandbox: OptionalSandbox,
 ) -> SaveResponse:
-    """THE SAVE. The agent commits inside the container as it works; this is the only thing
-    that pushes the result to durable storage, and it happens because the user asked.
+    """THE SAVE. The agent commits inside the container as it works; this is the only thing that
+    pushes the result to durable storage BECAUSE THE USER ASKED — the platform writes the same
+    slot itself when it destroys a container, so this is the citizen's write, not the only one.
 
     409, not 200, when there is no live workspace: a Save that reports success having stored
     nothing is the single worst outcome available here — the user walks away believing their
@@ -917,8 +893,8 @@ async def release_project(
             released = await manager.release_project_sandbox(
                 db, user, project_id, sandbox_client=sandbox
             )
-        except BuildSessionConflictError as exc:
-            return _conflict_response(exc, project_name=project_name)
+        except BuildSessionConflictError:
+            return _conflict_response(project_name=project_name)
         except SandboxError as exc:
             # The container would not go away. Say so rather than reporting a release that did
             # not happen — the caller is about to start something that needs the slot.
@@ -960,10 +936,10 @@ async def _shared_preview_or_refuse(
             preview = await manager.launch_shared_preview(
                 db, user, resolved.project, sandbox, force_refresh=force_refresh
             )
-        except BuildSessionConflictError as exc:
+        except BuildSessionConflictError:
             # The recipient is mid-build on a project of their OWN — a shared view never
             # pre-empts that (409, same shape `relaunch_preview` answers with).
-            return _conflict_response(exc)
+            return _conflict_response()
         except SandboxReclaimBlockedError as exc:
             return reclaim_blocked_response(exc)
         except SharedProjectHasNoAppError as exc:
@@ -1087,8 +1063,8 @@ async def release_shared_view(
     with build_coordination_or_503():
         try:
             released = await manager.give_up_shared_view(user.id, sandbox_client=sandbox)
-        except BuildSessionConflictError as exc:
-            return _conflict_response(exc)
+        except BuildSessionConflictError:
+            return _conflict_response()
         except SandboxError as exc:
             raise AppApiError(
                 status.HTTP_503_SERVICE_UNAVAILABLE,

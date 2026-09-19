@@ -68,8 +68,8 @@ async def resolve_app_for_project(
     SAVE IS DELIBERATELY NOT GATED, and that omission is load-bearing rather than an
     oversight. `save_project_snapshot` reads its app id through `existing_app_id`, never
     through this function, so it is structurally out of reach of this refusal — and it must
-    stay that way. Save is the only thing that writes a citizen's work to durable storage
-    and containers are ephemeral (the reaper destroys idle ones), so refusing it in the one
+    stay that way. Save is the only write of a citizen's work to durable storage they can ask
+    for, and containers are ephemeral (the reaper destroys idle ones), so refusing it in the one
     window where it matters — an administrator flips the switch while the owner holds
     unsaved work in a live container — permanently destroys that work. The accepted trade is
     that a disabled app's snapshot may advance by one commit: nothing consumes it, because

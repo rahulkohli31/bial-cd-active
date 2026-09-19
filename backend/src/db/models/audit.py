@@ -2,8 +2,8 @@
 state-changing action.
 
 WHY THIS EXISTS
-Mirrors the Express audit trail (`portal/server/audit-repo.js`): record WHO did WHAT to
-WHICH resource — never the record CONTENTS. One row per gated mutation / admin action.
+Record WHO did WHAT to WHICH resource — never the record CONTENTS. One row per gated
+mutation / admin action.
 The action vocabulary is an OPEN string (create/update/delete, approve/reject/disable,
 clear-data, …) that grows per domain, so `action` is a plain `String`, not a native PG
 enum — a new gated action must not need an `ALTER TYPE`.

@@ -40,19 +40,16 @@ const BASE = '/api/build-sessions'
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
 /**
- * Thrown by `relaunchPreview` on a `409 build_session_already_active`, carrying the EXISTING
- * session's id — the `409` alone is not a self-describing discriminator.
+ * Thrown by `relaunchPreview` on a `409 build_session_already_active` — a typed discriminator,
+ * because the `409` alone is not a self-describing one.
  *
  * Its one live handler is `StartAppControl`, which reports "a build is already running in this
  * project" through the workspace state.
  */
 export class BuildSessionAlreadyActiveError extends ApiError {
-  readonly existingSessionId: string | null
-
-  constructor(message: string, existingSessionId: string | null) {
+  constructor(message: string) {
     super(message, 409, 'build_session_already_active')
     this.name = 'BuildSessionAlreadyActiveError'
-    this.existingSessionId = existingSessionId
   }
 }
 
@@ -106,7 +103,7 @@ function requireProjectId(value: Record<string, unknown>): string {
 
 function toRelaunchPreviewResponse(value: unknown): RelaunchPreviewResponse {
   if (!isRecord(value)) throw new ApiError('The server returned a preview we could not read.', 500)
-  // No sessionId/createdAt on this shape (Decision 6) — do NOT reuse requireSessionId here.
+  // No sessionId/createdAt on this shape — do NOT reuse requireSessionId here.
   return {
     appId: asString(value.appId),
     previewUrl: asString(value.previewUrl),
@@ -142,15 +139,6 @@ function csrfHeaders(): Record<string, string> {
   return csrf ? { 'X-CSRF-Token': csrf } : {}
 }
 
-/** The session id a `build_session_already_active` body carries (top-level or under `error`), or null. */
-function existingSessionIdOf(body: unknown): string | null {
-  if (!isRecord(body)) return null
-  if (typeof body.sessionId === 'string') return body.sessionId
-  const err = body.error
-  if (isRecord(err) && typeof err.sessionId === 'string') return err.sessionId
-  return null
-}
-
 /**
  * A plain GET with the same error handling. Separate from `postJson` rather than a flag on it,
  * because a GET carries no CSRF header and no body — and a helper that took "is this a mutation"
@@ -174,8 +162,8 @@ async function getJson(
  * A mutating POST with CSRF. `body === undefined` sends no JSON body — the project-scoped
  * commands (`saveProject` / `releaseProject` / `stopActiveBuild`) name the target in the path
  * and carry nothing else. A non-2xx becomes an `ApiError`, EXCEPT a
- * `409 build_session_already_active` which becomes the richer
- * `BuildSessionAlreadyActiveError` carrying the existing session id.
+ * `409 build_session_already_active` which becomes the typed
+ * `BuildSessionAlreadyActiveError`.
  */
 async function postJson(url: string, body: unknown, fallback: string, deps: AuthFetchDeps): Promise<unknown> {
   const hasBody = body !== undefined
@@ -193,7 +181,7 @@ async function postJson(url: string, body: unknown, fallback: string, deps: Auth
     const code = extractApiCode(errBody)
     const message = extractApiMessage(errBody, res.status, fallback)
     if (res.status === 409 && code === 'build_session_already_active') {
-      throw new BuildSessionAlreadyActiveError(message, existingSessionIdOf(errBody))
+      throw new BuildSessionAlreadyActiveError(message)
     }
     // CARRY THE WHOLE ERROR OBJECT. This built its own ApiError and dropped everything but
     // the message and code, so `sandbox_reclaim_blocked` arrived with no projectId — and
@@ -293,8 +281,8 @@ export const sameSaveState = (a: SaveState | null, b: SaveState | null): boolean
     a.containerHead === b.containerHead &&
     a.savedHead === b.savedHead)
 
-/** Push the project's current tree to durable storage. THE USER'S CLICK — nothing else writes
- *  the bundle. A 409 means the workspace is no longer running, and is surfaced, never
+/** Push the project's current tree to durable storage. THE USER'S CLICK — the one write of the
+ *  bundle anybody asks for. A 409 means the workspace is no longer running, and is surfaced, never
  *  swallowed: a Save that reports success having stored nothing is the worst outcome here. */
 export async function saveProject(projectId: string, deps: AuthFetchDeps = {}): Promise<SaveResult> {
   const body = await postJson(
@@ -350,7 +338,7 @@ function toSharedPreviewResponse(value: unknown): SharedPreviewResponse {
  * `409 sandbox_reclaim_blocked` here means exactly what it means on a relaunch, and the caller
  * has to handle it the same way (see `asReclaimBlocked` / `ReclaimBlocked.isSharedView`).
  *
- * NOT "READ-ONLY" EITHER, for the same Key Decision 3 reason the product copy already gets
+ * NOT "READ-ONLY" EITHER, for the same reason the product copy already gets
  * right: the recipient can create, update and delete the owner's records through the app's own
  * UI. "Can use", never "view only" — these two functions open the door, nothing more.
  */

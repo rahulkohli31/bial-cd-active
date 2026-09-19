@@ -21,12 +21,8 @@ from sqlalchemy import select
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
-from src.services.build_sessions.outcome import (
-    _summary,
-    build_outcome_meta,
-    write_build_outcome,
-)
 from tests.factories import ConversationFactory, MessageFactory, ProjectFactory, UserFactory
+from tests.fakes import _summary, build_outcome_meta, write_build_outcome
 
 _SESSION = uuid.UUID("01931f7a-0000-7000-8000-000000000001")
 

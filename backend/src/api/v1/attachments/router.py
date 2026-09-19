@@ -175,10 +175,10 @@ def _validate_attachment_bytes(media_type: str, b64: Any) -> str | None:
     """Validate a MODEL-LANE upload (image/PDF) against the allowlist + magic bytes.
 
     THE CODE LANE IS NOT CHECKED HERE, and that is the point rather than a gap. `ALLOWED_MEDIA` is
-    the magic-byte gate, and it is applied on both paths that end at the
-    model — this route, the store's rehydrator and `build_sessions/attachments.py`. Widening it to
-    admit Office would make every one of them answer True for a deck, and a spreadsheet would reach
-    the model as raw ZIP bytes on whichever path lost its refusal first. Office, CSV and TSV are
+    the magic-byte gate, and it is applied on both paths that end at the model — this route and the
+    store's rehydrator. Widening it to admit Office would make both of them answer True for a deck,
+    and a spreadsheet would reach the model as raw ZIP bytes on whichever path lost its refusal
+    first. Office, CSV and TSV are
     admitted by `code_lane_refusal` instead, which runs only where an attachment is stored, so the
     model-facing consumers keep refusing them without a line changing in either of them.
     """
@@ -279,8 +279,8 @@ async def _store_attachment_bytes(
 ) -> dict[str, Any]:
     """Enforce the per-conversation COUNT and store the bytes owner-scoped; return the file-part
     ref. Idempotent on a repeated id (reuses the row + key). Raises `AppApiError(413)` when the
-    conversation is full. NOTE: the check-then-store has a concurrent-overspend window (as in the
-    daily gate) — hardening deferred.
+    conversation is full. The check-then-store leaves a concurrent-overspend window, as the daily
+    gate does — hardening deferred.
 
     `conversation_id` is stamped on the CREATE branch and refreshed on a re-upload — it is
     required now, so there is no absence for either branch to preserve."""

@@ -402,14 +402,6 @@ class BuildSessionStatusResponse(CamelModel):
     updated_at: datetime
 
 
-# --- Lock operations: none left ------------------------------------------------
-# `acquire` / `renew` / `release` / `heartbeat` were retired along with their response models
-# (`LockStateResponse`, `LockReleaseResponse`, `HeartbeatResponse`) — the portal's keep-alive
-# loop that was their only caller was itself deleted, and nothing else ever called these
-# routes. `force-end` was the last of them to go, and its `ForceEndResponse` went with the end
-# sequence the lock op drove.
-
-
 # --- the app's own client-error report ----------------
 #
 # The generated app relays its `window.onerror` / `unhandledrejection` / `console.*` captures to

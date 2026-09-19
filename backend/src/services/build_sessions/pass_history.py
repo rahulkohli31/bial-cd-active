@@ -27,9 +27,10 @@ from src.workers.reclamation import RECLAMATION_CRON, RECLAMATION_TASK_NAME
 _log = structlog.get_logger()
 
 #: How many scheduled intervals may pass before silence counts as a fault. Three, matching the
-#: head-room every other liveness signal in this system uses (`HEARTBEAT_TTL` over
-#: `HEARTBEAT_CADENCE`, `LIVENESS_LEASE_TTL` over its renewal cadence): two missed passes are a
-#: slow ARM enumeration or a revision roll, three is a worker that has stopped.
+#: head-room every other liveness signal in this system uses (`HEARTBEAT_TTL_SECONDS` over
+#: `HEARTBEAT_CADENCE_SECONDS`, `LIVENESS_LEASE_TTL_SECONDS` over its renewal cadence): two
+#: missed passes are a slow ARM enumeration or a revision roll, three is a worker that has
+#: stopped.
 STALE_AFTER_INTERVALS = 3
 
 

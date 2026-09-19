@@ -110,8 +110,9 @@ that could not end.
 
 Fields: `app_id`, `app_name`, `exit_code` (the supervisor's post-mortem of its child, when it had
 one) and `put_away` — True when the container was put away, so the next reading offers the saved
-app and its start control; False when the durable-copy gate spared it, and the reaper's "not
-provably preserved" warning beside this line says why.
+app and its start control; False when the reap declined, and the reaper's own warning beside this
+line says which: "reap refused: this container's work could not be written back" is the common
+one, and the "no copy taken: ..." line under it names what stopped the write-back.
 
 READING `exit_code`: the supervisor reports `Popen.poll()`, so a signal death is the NEGATIVE
 signal number. `-9` is a SIGKILL that landed on the supervisor's own child; `137` is the same

@@ -175,12 +175,12 @@ async def _step_up(
 ) -> Response:
     """Send a session Conditional Access refused back to Entra ONCE, with `prompt=login`.
 
-    PRODUCTION, 2026-09-11 (refs b005f1e8, d172da84): Entra minted a code from a browser session
-    whose MFA had expired (AADSTS50078), the redemption failed, and every press of "Sign in with
-    Microsoft" re-minted a code from the same session — the retry the banner asked for could never
-    succeed. A fresh interactive sign-in is the only thing that clears it, so the callback asks
-    for one. BOUNDED: a rejection arriving after a forced sign-in bounces to the `reauth_required`
-    banner instead of looping, and so does a step-up that cannot reach Entra."""
+    WHY THIS EXISTS: Entra will mint a code from a browser session whose MFA has expired
+    (AADSTS50078); the redemption then fails, and every press of "Sign in with Microsoft" re-mints
+    a code from that same session, so the retry the banner asks for can never succeed. A fresh
+    interactive sign-in is the only thing that clears it, so the callback asks for one. BOUNDED: a
+    rejection arriving after a forced sign-in bounces to the `reauth_required` banner instead of
+    looping, and so does a step-up that cannot reach Entra."""
     if not already_forced:
         request.session[_STEP_UP_MARKER] = True
         try:

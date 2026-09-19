@@ -51,7 +51,7 @@ def image_exists(tag: str) -> bool:
 
 def build_image(tag: str = DEFAULT_IMAGE) -> str:
     """Build the sandbox base image from `sandbox/`. Slow (bakes node_modules) — callers build
-    once per session. NOTE: this is the local dev-loop build; the SHIPPED artifact is the Windows
+    once per session. This is the local dev-loop build; the SHIPPED artifact is the Windows
     `az acr build`, which this does not stand in for."""
     proc = subprocess.run(
         ["docker", "build", "-f", "Dockerfile.sandbox", "-t", tag, "."],

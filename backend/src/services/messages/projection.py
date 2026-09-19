@@ -808,10 +808,9 @@ def _index_tool_results(rows: Sequence[Message]) -> dict[str, tuple[str, bool, i
 def _closed_sessions(rows: Sequence[Message]) -> set[str]:
     """Session ids that have a recorded `build_outcome` row.
 
-    Both halves of the pair it answers about are legacy now: `write_build_started` is deleted and
-    `write_build_outcome` no longer runs on any path production takes. The rows themselves are
-    permanent, which is why this reader stays — deleting it would leave every legacy build
-    rendering as permanently in progress."""
+    No path production takes appends one any more. The rows themselves are permanent, which is
+    why this reader stays — deleting it would leave every stored build rendering as permanently
+    in progress."""
     closed: set[str] = set()
     for row in rows:
         if (

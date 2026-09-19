@@ -1,5 +1,5 @@
 """Shared media allowlist + magic-byte gate — the SINGLE source of truth for the binary media
-types an attachment may carry (Express `ALLOWED_MEDIA` / `validateAttachmentBytes`).
+types an attachment may carry.
 
 Every path that can put bytes in front of the model applies it, so a block at upload cannot
 slip in through another:

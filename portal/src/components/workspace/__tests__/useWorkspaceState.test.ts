@@ -136,9 +136,9 @@ describe('the cadence — the timer two features depend on', () => {
   })
 
   it('notices the stay lapsing under a person who is still reading', async () => {
-    // `RELAUNCH_PREVIEW_STAY_SECONDS` is granted at relaunch and extended only by a turn's own
-    // deadline writers; start-then-read has no turn. The pane must return to "Your app is saved."
-    // with the start offered — one press to recover — rather than showing a dead frame.
+    // A stay lapses under a reader even though the poll renews it: the renewal cannot push past
+    // the absolute age ceiling, and one that fails reports nothing. The pane must return to
+    // "Your app is saved." with the start offered — one press to recover — not a dead frame.
     api.fetchPreviewState.mockResolvedValueOnce(reading({ state: 'alive', alive: true }))
     api.fetchPreviewState.mockResolvedValue(reading({ state: 'asleep', restorable: true }))
 

@@ -163,36 +163,16 @@ def clean_stated_reason(value: str, *, say_why: str) -> str:
     with a character paste backstop. `say_why` is the one sentence the caller supplies: what
     the surface asks for, echoed back when the field is blank.
 
-    The same shared rule as the title cap: `count_words` here,
-    `portal/src/utils/words.ts` in the browser, both pinned against the same inputs. The
-    client keeps the person inside the limit and the server enforces it independently.
+    The lower bound is the unusual half, and it is deliberate: the reason exists so whoever
+    reads it later learns something, and a field that can be dismissed in one word will be.
 
-    A lower bound is unusual and deliberate. The reason exists so the person reading it
-    later learns something; "no" and "done" satisfy a required field without satisfying
-    that, and a field that can be dismissed in one word is a field that will be.
-
-    ONE RULE, THREE SURFACES. The citizen deleting their own project, the administrator
-    destroying somebody else's app, and the citizen asking an administrator for access to a
-    connector all answer the same kind of question under the same bounds, and all three
-    dialogs share `words.ts`'s counter — so they share this validator too. A second copy of
-    these four checks is how two surfaces end up disagreeing about what a word is.
-
-    RENAMED FROM `clean_deletion_reason`, AND WIDENED, on 2026-09-08 (owner decision D1: the
-    connector access request uses the shipped delete-reason rule, not a 20/1000-character
-    note of its own). Three of the four sentences below already read correctly for a request;
-    only the empty-field one named deleting, so it became the `say_why` parameter rather than
-    a `subject` word slotted into a fixed deletion template — "Say what you need the data
-    for." is not `f"Say why you are ...ing this {subject}."` under any wording. The rename
-    came with it: a function called `clean_deletion_reason` that validates an access request
-    misdescribes itself at every call site, and the alternative — keeping the name and
-    explaining it here — asks every future reader to find this paragraph first. The two
-    delete callers pass their previous sentences verbatim, so no message changed on the wire
-    (`tests/api/v1/projects/test_delete_remark.py` passes unedited).
-
-    THE BOUNDS KEEP THEIR DELETE-FLAVOURED CONSTANT NAMES on purpose. `MIN_DELETE_REMARK_*`
-    are the deleted-project table's own numbers, and D1's ruling is precisely "use the rule
-    already shipped for a deletion reason" — a parallel set of aliases would be two names for
-    one number, which is the drift this function exists to prevent.
+    ONE RULE, THREE SURFACES — deleting your own project, destroying somebody else's app, and
+    asking an administrator for connector access. All three dialogs count with
+    `portal/src/utils/words.ts` and this counts with `count_words`, both pinned against the
+    same inputs; a second copy of these four checks is how two surfaces end up disagreeing
+    about what a word is. The bounds keep their delete-flavoured names on purpose —
+    `MIN_DELETE_REMARK_*` are the deleted-project table's own numbers, and a parallel set of
+    aliases would be two names for one number.
     """
     value = value.strip()
     if not value:
@@ -277,9 +257,8 @@ class ProjectResponse(CamelModel):
     # ONLY the single-project GET computes it: the list endpoint would need one HEAD per row,
     # and nothing on that surface offers Relaunch. It stays `null` there and no caller reads it.
     has_relaunchable_snapshot: bool | None = None
-    # WHETHER THE OWNER HAS EVER SAVED (#198 R10's second sentence). Computed by the same
-    # `snapshot_presence` check `create_share` (R10's first sentence) already refuses a share
-    # creation on, so the two surfaces agree.
+    # WHETHER THE OWNER HAS EVER SAVED. Computed by the same `snapshot_presence` check that
+    # `create_share` already refuses a share creation on, so the two surfaces agree.
     #
     # `null` for an owner's own view (irrelevant there — an owner uses Relaunch, which reads
     # `has_relaunchable_snapshot` instead) and for a shared view with no app at all. `false`

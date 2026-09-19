@@ -3,14 +3,14 @@
 The single source of truth the SPA cannot bypass. Three responsibilities:
 
 * `enforce_daily_limit` — pre-request check: raise `DailyTokenLimitExceededError` (429
-  `daily_token_limit_exceeded`) BEFORE any stream byte when `used >= limit` (Express parity).
+  `daily_token_limit_exceeded`) BEFORE any stream byte when `used >= limit`.
 * `record_usage` — post-response atomic upsert (`INSERT … ON CONFLICT … DO UPDATE`), so
   concurrent increments never lose an update. Does NOT close concurrent overspend — that
   window is open by design (Redis token-bucket hardening deferred).
 * `usage_today` — the read behind `GET /v1/usage/today`.
 
-IST day math (`Asia/Kolkata`, fixed +05:30, no DST) mirrors Express `server/usage-repo.js`: the day
-key is the IST calendar date, reset is the next IST midnight as a UTC ISO string. `used`
+IST day math (`Asia/Kolkata`, fixed +05:30, no DST): the day key is the IST calendar date,
+reset is the next IST midnight as a UTC ISO string. `used`
 counts `build` rows ONLY — the pre-publish classification review is metered under `review`
 for attribution, never against the citizen's cap.
 
@@ -58,8 +58,8 @@ class DailyTokenLimitExceededError(Exception):
         self.used = used
 
     def as_response(self) -> JSONResponse:
-        # Byte-stable with Express `server.js` (message uses en-US thousands grouping via
-        # `{:,}`; code/limit/used/remaining keys are what the SPA reads).
+        # The wording and the keys are what the SPA renders: en-US thousands grouping via
+        # `{:,}`, and `code` / `limit` / `used` / `remaining` by name.
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             content={

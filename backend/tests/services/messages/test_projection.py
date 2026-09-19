@@ -1,6 +1,6 @@
 """The one history→display derivation (`services/messages/projection.py`).
 
-Rows are written through the REAL producers/store (`append_batch`, `write_build_outcome`) in the
+Rows are written through the real store (`append_batch`) and the outcome row factory in the
 exact shapes pinned by `test_producers.py`, so these tests break
 when the producer contract drifts — which is the point. The golden build test doubles as the
 parity fixture: the live stream must render THIS list for THIS transcript.
@@ -41,7 +41,6 @@ from src.db.models.attachment import Attachment
 from src.db.models.conversation import ChatKind
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.agent.toolsets import app_state_toolset
-from src.services.build_sessions.outcome import write_build_outcome
 from src.services.media.lanes import EXCEL_MEDIA_TYPE
 from src.services.media.magic import chip_kind_for
 from src.services.messages.projection import (
@@ -82,7 +81,7 @@ from src.services.messages.store import (
     load_rows,
 )
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import write_legacy_build_started
+from tests.fakes import write_build_outcome, write_legacy_build_started
 
 PREVIEW = "https://sbx-abc.westeurope.azurecontainerapps.io/"
 # Matches `test_store_roundtrip.py`'s fixture — a real PNG magic prefix, so the store's own

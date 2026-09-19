@@ -126,14 +126,6 @@ def test_start_response_requires_its_fields() -> None:
         StartBuildResponse.model_validate({"session_id": str(uuid.uuid4())})
 
 
-# --- lock-op response models: none left -----------------------------------------
-# `LockStateResponse` / `LockReleaseResponse` / `HeartbeatResponse` were retired along with the
-# `acquire` / `renew` / `release` / `heartbeat` routes they served — nothing called them (the
-# portal's keep-alive loop that was their only caller was itself deleted). `ForceEndResponse`
-# outlived them, then went with the end sequence its route drove; `StopBuildRequest` /
-# `StopBuildResponse` went the same way with `POST /{session_id}/stop`.
-
-
 # --- the tagged-union progress envelope ---------------------------------------
 
 _ENVELOPE: TypeAdapter[ProgressEnvelope] = TypeAdapter(ProgressEnvelope)

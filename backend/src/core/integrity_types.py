@@ -81,7 +81,7 @@ class WorkspaceState(enum.StrEnum):
     #: consecutive unreadable answers for one app the third is `UNVERIFIABLE`, so no run of bad
     #: luck can wedge a user out of their project.
     UNREADABLE = "unreadable"
-    #: Structural — retrying cannot help. Proceed under alarm with one plain sentence, never
-    #: restore, and this state refuses this turn's recovery write so an unexplained tree cannot
-    #: become the newest copy of the user's work.
+    #: Structural — retrying cannot help. Proceed under alarm with one plain sentence, and never
+    #: restore: an unexplained tree must not be written over the copy it cannot be checked
+    #: against.
     UNVERIFIABLE = "unverifiable"

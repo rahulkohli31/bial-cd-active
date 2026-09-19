@@ -246,10 +246,9 @@ async def build_it(
         )
 
     # The two refusals below, in the same order and carrying the same codes the send route uses:
-    # one workspace per user, and it is not this press's to take if another of the user's own
+    # one workspace per user, and it is not this press's to take while any of the user's own
     # chats holds it — or if unsaved work in a different project is in the way.
-    active = manager.active_session_for(user.id)
-    if active is not None and active.conversation_id != plan_chat.id:
+    if manager.active_session_for(user.id) is not None:
         raise AppApiError(409, BUILD_IN_FLIGHT_MSG, code=ALREADY_BUILDING_HERE_CODE)
     with build_coordination_or_503():
         try:
