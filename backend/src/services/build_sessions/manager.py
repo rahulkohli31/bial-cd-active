@@ -4397,9 +4397,7 @@ class SessionManager:
 
     # --- completion + the single-owner end sequence --------------------------
 
-    async def _pardon_the_container(
-        self, redis: aioredis.Redis, session: BuildSession, *, touched: bool
-    ) -> None:
+    async def _pardon_the_container(self, redis: aioredis.Redis, session: BuildSession) -> None:
         """The success-path alternative to teardown: the container outlives its build so the
         user can use what they just built. Mirrors `relaunch_preview`'s lifetime model: the
         registry entry STAYS, a bounded stay of execution owns the lifetime, and the per-user
@@ -4408,17 +4406,12 @@ class SessionManager:
         needs it). ORDER IS LOAD-BEARING: the stay is granted while the lock is STILL HELD, or
         a concurrent sweep could see lock-gone with no lease yet and destroy the container
         just pardoned. Best-effort, and both degraded modes below are safe."""
-        # `touched` is the only thing that changes here, and it is a fact about WHAT THIS RUN
-        # DID, never which kind of chat sent it: a run that wrote files earns the usual long
-        # stay, one that wrote nothing earns a shorter one, bounding the cost of a chat-only
-        # session that pins the workspace on every turn without ever producing anything worth
-        # a 30-minute reprieve. `grant_stay_of_execution`'s own monotonic guarantee
-        # (`max(existing, computed)`) keeps this safe on a MIXED session: a read-only turn
-        # arriving inside a write turn's still-standing stay leaves that longer deadline
-        # untouched.
-        writer = DeadlineWriter.TURN_IN_FLIGHT if touched else DeadlineWriter.TURN_ENDED_UNCHANGED
+        # WHAT THE TURN DID BUYS IT NOTHING EXTRA. A turn in flight is held by the wall-clock
+        # lease, not by a deadline, so this grant only ever covers the pause after one — and a
+        # pause is worth the same whether files were written or not. The screen that is still
+        # open renews it; a builder who has gone stops paying.
         try:
-            await grant_stay_of_execution(redis, session.user_id, writer=writer)
+            await grant_stay_of_execution(redis, session.user_id, writer=DeadlineWriter.TURN_ENDED)
         except Exception:
             # Degraded but safe: the sweep reaps at heartbeat lapse (~90s) instead, never an
             # orphan, because the registry is still there to find.
@@ -4493,7 +4486,7 @@ class SessionManager:
         #      30-minute reprieve it never earned, without this method ever asking what kind of
         #      chat sent it.
         try:
-            await self._pardon_the_container(redis, session, touched=touched)
+            await self._pardon_the_container(redis, session)
         finally:
             # Guaranteed-run: the slot must free even if the pardon raised, or this user can
             # never send another Write message.

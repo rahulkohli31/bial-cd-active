@@ -46,7 +46,7 @@ from src.services.build_sessions.alarms import (
 from src.services.build_sessions.drain import (
     is_drained,
     past_the_turn_bound,
-    the_ceiling_switch,
+    the_ceiling_hours,
 )
 from src.services.build_sessions.locks import (
     DeadlineWriter,
@@ -863,7 +863,7 @@ async def _renew_shared_view_from_traffic(
     """#198's ONLY liveness signal for a shared-runtime view: real traffic through the app,
     self-reported by the supervisor (`SandboxClient.served_count`, excluding every
     control-plane probe — see `sandbox/Caddyfile`). A no-op for every OTHER kind of record: a
-    build sandbox has `TURN_IN_FLIGHT`/`BUILDER_ACTED`/its own heartbeat instead, and this must
+    build sandbox has its lease, `BUILDER_ACTED` and its own heartbeat instead, and this must
     never compete with those or run an extra supervisor round trip on their behalf.
 
     OBSERVATION, NOT AN INPUT, same posture as `_observe_the_serving_proof` and for the same
@@ -971,10 +971,8 @@ async def _past_the_ceiling(
     turn in flight would outrank, or the outer one, which nothing does. The caller knows which
     arm it is standing in; this does not guess.
 
-    Costs one ARM tag read, and only while the flag is on and something is about to be spared."""
-    enabled, after_hours = the_ceiling_switch()
-    if not enabled:
-        return False
+    Costs one ARM tag read, and only when something is about to be spared."""
+    after_hours = the_ceiling_hours()
     app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
     if not app_name:
         return False
@@ -983,13 +981,10 @@ async def _past_the_ceiling(
         return past_the_turn_bound(
             identity,
             now=now,
-            enabled=True,
             after_hours=after_hours,
             turn_grace_seconds=_the_jammed_turn_grace(),
         )
-    return is_drained(
-        identity, now=now, enabled=True, after_hours=after_hours, turn_in_flight=False
-    )
+    return is_drained(identity, now=now, after_hours=after_hours, turn_in_flight=False)
 
 
 async def reconcile_user(

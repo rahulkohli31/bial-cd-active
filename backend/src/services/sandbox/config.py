@@ -107,9 +107,9 @@ class SandboxConfig(BaseModel):
     # to collect. `reaper.py` reads the ARM tag and falls back to the registry only when ARM
     # cannot answer — one tag read per spared user per pass, and only while this flag is on.
     #
-    # OFF BY DEFAULT, like the reclamation flags above. Two hours is the screen ceiling the
-    # platform commits to; a deployment that wants none sets nothing.
-    drain_enabled: bool = False
+    # ALWAYS ON, and deliberately not a flag. Two hours is the screen ceiling the platform
+    # commits to, and a deployment that switched it off would have no bound on a left-open tab
+    # at all — which is the one population this exists for.
     drain_after_hours: PositiveInt = 2
 
     # ACA sizing (the POC single-sandbox-per-user shape). vCPU cores + memory string.

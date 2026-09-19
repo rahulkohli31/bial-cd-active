@@ -87,7 +87,7 @@ from src.services.build_sessions import (
     app_name_for,
     sweep_all,
 )
-from src.services.build_sessions.drain import draining_at, the_ceiling_switch
+from src.services.build_sessions.drain import draining_at, the_ceiling_hours
 from src.services.build_sessions.inventory import owning_app_ids
 from src.services.build_sessions.locks import (
     read_registry,
@@ -401,11 +401,9 @@ def _when_this_one_closes(reg: dict[str, str]) -> datetime | None:
     This route has no container-call budget, so the created-at stamp on the hash is the only
     field worth reading — the same fallback the sweep's own age source lands on when ARM
     cannot be asked."""
-    enabled, after_hours = the_ceiling_switch()
     return draining_at(
         identity_from_tags({TAG_CREATED_AT: reg.get(REGISTRY_FIELD_CREATED_AT, "")}),
-        enabled=enabled,
-        after_hours=after_hours,
+        after_hours=the_ceiling_hours(),
     )
 
 

@@ -30,7 +30,7 @@ from src.api.v1.build_sessions.schemas import (
     RELAUNCH_PREVIEW_STAY_SECONDS,
     SERVED_TRAFFIC_STAY_SECONDS,
     SURFACE_PRESENT_STAY_SECONDS,
-    TURN_ENDED_UNCHANGED_STAY_SECONDS,
+    TURN_ENDED_STAY_SECONDS,
     BuildSessionStatus,
 )
 from src.services.build_sessions import locks
@@ -86,16 +86,18 @@ async def _stay(redis: aioredis.Redis) -> tuple[datetime | None, str | None]:
 # --- the writer set is closed, and named ------------------------------------------
 
 
-def test_the_writer_set_is_exactly_five() -> None:
+def test_the_writer_set_is_exactly_four() -> None:
     """A CLOSED SET is the requirement, not a side effect: adding a way to keep a container alive
-    should be a deliberate, reviewed act, never an anonymous extension. `turn_ended_unchanged`
-    covers a turn that held the workspace but wrote nothing to it; `surface_present` is the only
-    member a BROWSER can reach, and it is what makes leaving a screen mean something."""
+    should be a deliberate, reviewed act, never an anonymous extension. `turn_ended` covers the
+    pause after any turn, whatever it did; `surface_present` is the only member a BROWSER can
+    reach, and it is what makes leaving a screen mean something.
+
+    A turn IN FLIGHT is not in this set, and deliberately: it is held by the wall-clock lease,
+    which is its own key with its own TTL and is consulted before any deadline."""
     assert {w.value for w in DeadlineWriter} == {
-        "turn_in_flight",
         "app_served_traffic",
         "builder_acted",
-        "turn_ended_unchanged",
+        "turn_ended",
         "surface_present",
     }
 
@@ -122,11 +124,14 @@ def test_a_hidden_surface_earns_the_longer_budget() -> None:
     assert HIDDEN_SURFACE_PRESENT_STAY_SECONDS > SURFACE_PRESENT_STAY_SECONDS
 
 
-def test_a_turn_that_changed_nothing_buys_the_least_of_the_four() -> None:
-    """Stated as an ordering, not a single number: a turn that produced nothing is the weakest
-    evidence and must buy strictly less than either real-activity writer above it."""
-    assert TURN_ENDED_UNCHANGED_STAY_SECONDS < SERVED_TRAFFIC_STAY_SECONDS
-    assert TURN_ENDED_UNCHANGED_STAY_SECONDS < RELAUNCH_PREVIEW_STAY_SECONDS
+def test_a_turn_ending_buys_the_least_of_the_three() -> None:
+    """Stated as an ordering, not a single number: a turn that has ENDED is the weakest evidence
+    in the set — nothing is running and nobody has asked for anything — so it must buy strictly
+    less than either real-activity writer above it.
+    Mutation check: point the pardon back at `RELAUNCH_PREVIEW_STAY_SECONDS` and the second
+    assertion goes red."""
+    assert TURN_ENDED_STAY_SECONDS < SERVED_TRAFFIC_STAY_SECONDS
+    assert TURN_ENDED_STAY_SECONDS < RELAUNCH_PREVIEW_STAY_SECONDS
 
 
 async def test_a_grant_records_which_writer_made_it(fake_redis: aioredis.Redis) -> None:
@@ -263,90 +268,72 @@ def _pardoned_session(*, user_id: uuid.UUID) -> BuildSession:
     )
 
 
-async def test_a_turn_that_wrote_files_grants_the_long_stay_under_the_existing_writer(
+async def test_a_turn_ending_buys_the_short_stay_whatever_it_did(
     fake_redis: aioredis.Redis,
 ) -> None:
-    """Happy path. `touched=True` changes NOTHING about today's behaviour — the same writer,
-    the same TTL a build or a writing turn has always earned."""
+    """★ WHAT THE TURN DID BUYS IT NOTHING EXTRA, and the pardon takes no argument saying so.
+
+    A turn in flight is held by the wall-clock LEASE — its own key, its own TTL, consulted before
+    any deadline — so this grant only ever covers the PAUSE after a turn, and a pause costs the
+    same whether files were written or not.
+
+    Mutation check: point the writer back at `RELAUNCH_PREVIEW_STAY_SECONDS` and the deadline
+    assertion goes red."""
     user_id = uuid.uuid4()
     await _register_as(fake_redis, user_id)
     manager = SessionManager()
     session = _pardoned_session(user_id=user_id)
 
-    await manager._pardon_the_container(fake_redis, session, touched=True)
+    await manager._pardon_the_container(fake_redis, session)
 
     deadline, writer = await _stay_for(fake_redis, user_id)
-    assert writer == DeadlineWriter.TURN_IN_FLIGHT.value
+    assert writer == DeadlineWriter.TURN_ENDED.value
     assert deadline is not None
-    assert deadline - datetime.now(UTC) <= timedelta(seconds=RELAUNCH_PREVIEW_STAY_SECONDS + 5)
-    assert deadline - datetime.now(UTC) > timedelta(seconds=TURN_ENDED_UNCHANGED_STAY_SECONDS)
+    assert deadline - datetime.now(UTC) <= timedelta(seconds=TURN_ENDED_STAY_SECONDS + 5)
 
 
-async def test_a_turn_that_wrote_nothing_against_a_fresh_container_grants_the_short_stay(
+async def test_a_turn_ending_inside_a_relaunchs_stay_leaves_it_untouched(
     fake_redis: aioredis.Redis,
 ) -> None:
-    """The "fresh container" qualifier in the test name is load-bearing (see the next test):
-    with NO STANDING STAY the short stay actually lands, and the registry records the new
-    writer, not a guess."""
+    """The edge case the monotonic guarantee exists for. A relaunch stamps the long stay — a
+    citizen has just asked for their app back and earned a window to work in — and a turn ends
+    moments later, inside it. `grant_stay_of_execution`'s own `max(existing, computed)` is what
+    stops the shorter grant truncating it, pinned through the exact call the pardon makes."""
     user_id = uuid.uuid4()
     await _register_as(fake_redis, user_id)
-    manager = SessionManager()
-    session = _pardoned_session(user_id=user_id)
-
-    await manager._pardon_the_container(fake_redis, session, touched=False)
-
-    deadline, writer = await _stay_for(fake_redis, user_id)
-    assert writer == DeadlineWriter.TURN_ENDED_UNCHANGED.value
-    assert deadline is not None
-    assert deadline - datetime.now(UTC) <= timedelta(seconds=TURN_ENDED_UNCHANGED_STAY_SECONDS + 5)
-
-
-async def test_a_read_only_turn_inside_a_write_turns_stay_leaves_it_untouched(
-    fake_redis: aioredis.Redis,
-) -> None:
-    """The edge case the monotonic guarantee exists for: a write turn stamps the long stay, then
-    a read-only turn ends moments later, INSIDE it. `grant_stay_of_execution`'s own
-    `max(existing, computed)` is what this pins, through the exact call `_pardon_the_container`
-    makes rather than assumed."""
-    user_id = uuid.uuid4()
-    await _register_as(fake_redis, user_id)
-    manager = SessionManager()
-    write_session = _pardoned_session(user_id=user_id)
-    await manager._pardon_the_container(fake_redis, write_session, touched=True)
+    await grant_stay_of_execution(fake_redis, user_id, writer=DeadlineWriter.BUILDER_ACTED)
     long_deadline, _ = await _stay_for(fake_redis, user_id)
 
-    read_only_session = _pardoned_session(user_id=user_id)
-    await manager._pardon_the_container(fake_redis, read_only_session, touched=False)
+    manager = SessionManager()
+    await manager._pardon_the_container(fake_redis, _pardoned_session(user_id=user_id))
 
     deadline, writer = await _stay_for(fake_redis, user_id)
     assert deadline == long_deadline, "the longer deadline must not be truncated"
-    assert writer == DeadlineWriter.TURN_IN_FLIGHT.value, "provenance still names who bought it"
+    assert writer == DeadlineWriter.BUILDER_ACTED.value, "provenance still names who bought it"
 
 
-async def test_a_turn_that_failed_after_writing_files_still_grants_the_long_stay(
-    fake_redis: aioredis.Redis,
-) -> None:
-    """WHAT was done, not how the turn ended: `_pardon_the_container` reads only `touched`, so a
-    session left in a FAILED-looking state that nonetheless wrote to the tree still earns the
-    long stay."""
+async def test_a_turn_that_failed_is_still_pardoned(fake_redis: aioredis.Redis) -> None:
+    """HOW the turn ended buys it nothing either. A session left in a FAILED state still earns
+    the pause: the citizen is still sitting in front of the app, and the screen that is open
+    renews from here."""
     user_id = uuid.uuid4()
     await _register_as(fake_redis, user_id)
     manager = SessionManager()
     session = _pardoned_session(user_id=user_id)
-    session.status = BuildSessionStatus.FAILED  # the turn did not end cleanly...
+    session.status = BuildSessionStatus.FAILED
 
-    await manager._pardon_the_container(fake_redis, session, touched=True)  # ...but it wrote.
+    await manager._pardon_the_container(fake_redis, session)
 
     _, writer = await _stay_for(fake_redis, user_id)
-    assert writer == DeadlineWriter.TURN_IN_FLIGHT.value
+    assert writer == DeadlineWriter.TURN_ENDED.value
 
 
 async def test_the_sweep_spares_a_container_inside_the_short_stay_and_reaps_through_it_after(
     fake_redis: aioredis.Redis,
 ) -> None:
     """Integration: the short stay is honoured by the SAME sweep predicate as any other writer's,
-    no special-casing — this pins that `TURN_ENDED_UNCHANGED` is a value in an existing
-    mechanism, not a second one."""
+    no special-casing — this pins that `TURN_ENDED` is a value in an existing mechanism, not a
+    second one."""
     user_id = uuid.uuid4()
     app_name = a_sandbox_name("unchanged")
     await fake_redis.hset(registry_key(user_id), REGISTRY_FIELD_APP_NAME, app_name)
@@ -354,7 +341,7 @@ async def test_the_sweep_spares_a_container_inside_the_short_stay_and_reaps_thro
     session = _pardoned_session(user_id=user_id)
     sandbox = FakeSandboxClient()
 
-    await manager._pardon_the_container(fake_redis, session, touched=False)
+    await manager._pardon_the_container(fake_redis, session)
 
     # Inside the short stay the background sweep (`honor_stay=True`) spares it. No lock,
     # heartbeat, or lease is held after a pardon, so the stay is the ONLY thing standing between

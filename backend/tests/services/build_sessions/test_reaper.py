@@ -1899,14 +1899,12 @@ def test_thinning_never_reaches_the_arm_that_stamps_an_unproven_container() -> N
 
 @pytest.fixture
 def ceiling_on(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Two hours, switched on. Off everywhere by default, so every other test in this file goes
-    on exercising a platform with no ceiling at all."""
-    monkeypatch.setattr(
-        settings, "sandbox", _sandbox_config_with(drain_enabled=True, drain_after_hours=2)
-    )
+    """The two-hour ceiling, bound to `settings.sandbox` so the tests below can reach it. The
+    ceiling itself is not optional — this fixture supplies the CONFIG, not a switch."""
+    monkeypatch.setattr(settings, "sandbox", _sandbox_config_with(drain_after_hours=2))
 
 
-def _sandbox_config_with(*, drain_enabled: bool, drain_after_hours: int) -> SandboxConfig:
+def _sandbox_config_with(*, drain_after_hours: int) -> SandboxConfig:
     return SandboxConfig(
         subscription_id="s",
         resource_group="r",
@@ -1916,7 +1914,6 @@ def _sandbox_config_with(*, drain_enabled: bool, drain_after_hours: int) -> Sand
         acr_username="acr-user",
         acr_password=SecretStr("acr-pass"),
         image_ref="acr/img:latest",
-        drain_enabled=drain_enabled,
         drain_after_hours=drain_after_hours,
     )
 

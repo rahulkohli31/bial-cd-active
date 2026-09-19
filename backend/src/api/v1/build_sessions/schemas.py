@@ -143,7 +143,7 @@ SERVED_TRAFFIC_STAY_SECONDS = 900
 # (`RELAUNCH_PREVIEW_STAY_SECONDS`/`SERVED_TRAFFIC_STAY_SECONDS` above). Monotonic extension
 # (`grant_stay_of_execution`'s `max(existing, computed)`) is what keeps this from ever SHORTENING a
 # longer stay a prior write turn already bought — see `locks.py`.
-TURN_ENDED_UNCHANGED_STAY_SECONDS = 300  # 5 min
+TURN_ENDED_STAY_SECONDS = 300  # 5 min
 
 # --- The shared-runtime view's absolute session ceiling (#198) --------------
 # Independent of `DeadlineWriter.APP_SERVED_TRAFFIC`'s renewable stay above, so a wedged or

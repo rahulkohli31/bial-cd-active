@@ -49,7 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models.app_registry import AppRegistry
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.pending_teardown import PendingTeardown
-from src.services.build_sessions.drain import is_drained, the_ceiling_switch
+from src.services.build_sessions.drain import is_drained, the_ceiling_hours
 from src.services.build_sessions.locks import (
     an_instant_on_the_hash,
     delete_registry_if_it_still_names,
@@ -666,9 +666,7 @@ async def _past_the_age_ceiling(sandbox_client: SandboxClient, app_name: str) ->
     else, and a record re-stamped at every registration would hand a container whose delete
     failed a whole fresh ceiling. No age means no ceiling — the attempt count is the other bound,
     and it needs nothing from ARM."""
-    enabled, after_hours = the_ceiling_switch()
-    if not enabled:
-        return False
+    after_hours = the_ceiling_hours()
     try:
         tags = await sandbox_client.get_app_tags(name=app_name)
     except SandboxError:
@@ -676,7 +674,6 @@ async def _past_the_age_ceiling(sandbox_client: SandboxClient, app_name: str) ->
     return is_drained(
         identity_from_tags(tags),
         now=datetime.now(UTC),
-        enabled=True,
         after_hours=after_hours,
         turn_in_flight=False,
     )

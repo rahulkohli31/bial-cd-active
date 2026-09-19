@@ -780,7 +780,7 @@ async def test_the_ceiling_outranks_the_strike_budget(
     record that is re-stamped at every registration and dropped when a teardown fails. A
     container whose delete failed would otherwise come back looking newborn and earn another
     whole ceiling."""
-    monkeypatch.setattr(shutdown_module, "the_ceiling_switch", lambda: (True, 2))
+    monkeypatch.setattr(shutdown_module, "the_ceiling_hours", lambda: 2)
     born = _born_at(60 * 5)
     client = _wont_answer(scene.app_name)
     client.tags_by_name[scene.app_name] = {TAG_CREATED_AT: born.isoformat()}
