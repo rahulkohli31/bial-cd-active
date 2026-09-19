@@ -74,12 +74,6 @@ export interface WorkspaceReading {
   /** The save model — non-null only while the workspace is `alive`. See the cost note above. */
   save: SaveState | null
   /**
-   * When this container is collected no matter who is renewing it, or `null` when no ceiling
-   * applies. Reported by the renewal, which is the only call that reaches the container this
-   * screen is holding open.
-   */
-  drainingAt: string | null
-  /**
    * HOW MANY TIMES THE POLL HAS ANSWERED — a heartbeat, not a value.
    *
    * It exists because `setPreview` deliberately keeps the OLD object when the reading has not
@@ -142,17 +136,11 @@ export function useWorkspaceState({
   // on your app" — a platform-failure card on the first painted frame of every cold open, before
   // anything has been asked.
   const [settled, setSettled] = useState(false)
-  // WHEN THIS CONTAINER REACHES THE CEILING, reported by the renewal that reaches it. Held as
-  // state rather than derived, because only a renewal can answer it and the poll's own read
-  // carries nothing about it. `null` means no ceiling applies — never "soon".
-  const [drainingAt, setDrainingAt] = useState<string | null>(null)
-
-  // A CEILING AND A PRESS BOTH BELONG TO ONE CONTAINER, and this hook is not remounted when the
-  // screen moves to another project — so both are dropped with the project they described. A
-  // press left standing tells the map the incoming app is starting when nobody has touched it.
-  // Keyed on the project alone, never on `epoch`: a retry press is not news about the container.
+  // A PRESS BELONGS TO ONE CONTAINER, and this hook is not remounted when the screen moves to
+  // another project — so it is dropped with the project it described. A press left standing tells
+  // the map the incoming app is starting when nobody has touched it. Keyed on the project alone,
+  // never on `epoch`: a retry press is not news about the container.
   useEffect(() => {
-    setDrainingAt(null)
     setStartInFlight(false)
   }, [projectId])
 
@@ -251,14 +239,7 @@ export function useWorkspaceState({
         // NOT AWAITED. The renewal is a fact this surface reports, not one the read waits on: a
         // slow renewal must never delay the answer the screen is rendering. Its own result is
         // recorded when it lands, and a failure records nothing at all.
-        void renewPresence(projectId, presence).then((renewal) => {
-          if (!live || projectRef.current !== projectId) return
-          if (renewal?.outcome === 'renewed') setDrainingAt(renewal.drainingAt)
-          // THE OTHER TWO OUTCOMES RETIRE IT. Both say the instant being held describes a
-          // container that is gone, or was never the one on screen. A `null` renewal says
-          // nothing at all — it is a fact about the request — so it clears nothing.
-          else if (renewal !== null) setDrainingAt(null)
-        })
+        void renewPresence(projectId, presence)
       }
       const generation = ++latest
       try {
@@ -319,9 +300,6 @@ export function useWorkspaceState({
           // state from a container that has since stopped would arm the unsaved-work guard against
           // work that is no longer reachable.
           setSave(null)
-          // AND THE CEILING GOES WITH IT: an instant naming when a container will be collected is
-          // nonsense about one that already has been.
-          setDrainingAt(null)
         }
 
         // HAS THE APP STOPPED? `mayHaveStopped` says which readings ask. A reading that takes the
@@ -418,7 +396,6 @@ export function useWorkspaceState({
     }),
     preview,
     save,
-    drainingAt,
     readTick,
     settled,
     reportStartOutcome,

@@ -7,9 +7,8 @@
  * which is why each scenario below asserts the thing that was missing.
  *
  * THE FIRST DESCRIBE IS INVERTED, NOT DELETED. It used to pin a dialog that asked before an exit
- * discarded unsaved work. Shutdown now writes the work back automatically under an ancestry guard
- * before a container is destroyed — `WorkspaceLifecycleNotes` states the one case that write-back
- * can fail — so there is nothing left to lose by asking, and the prompt is gone. The exits it
+ * discarded unsaved work. Shutdown now writes the work back automatically before a container is
+ * destroyed, so there is nothing left to lose by asking, and the prompt is gone. The exits it
  * enumerated (sign-out, the back control) still exist and still have to complete cleanly; only the
  * question changes.
  */

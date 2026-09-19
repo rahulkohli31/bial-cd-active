@@ -962,15 +962,9 @@ export type SurfacePresence = 'visible' | 'hidden'
  */
 export type RenewalOutcome = 'renewed' | 'not_this_container' | 'nothing_running'
 
-/** What a renewal answered, and when the container it reached hits its absolute ceiling. */
+/** What a renewal answered. */
 export interface Renewal {
   outcome: RenewalOutcome
-  /**
-   * When this container is collected no matter who is renewing it, or `null` when no ceiling
-   * applies. NULL IS NOT "SOON" — a screen that read it as imminent would announce a collection
-   * that is not coming.
-   */
-  drainingAt: string | null
 }
 
 /**
@@ -1010,46 +1004,9 @@ export async function renewPresence(
     if (outcome !== 'renewed' && outcome !== 'not_this_container' && outcome !== 'nothing_running') {
       return null
     }
-    return {
-      outcome,
-      drainingAt: typeof body.drainingAt === 'string' ? body.drainingAt : null,
-    }
+    return { outcome }
   } catch {
     return null
   }
 }
 
-/** One app's activity, as the applications page reads it. */
-export type ActivityPhase = 'starting' | 'open' | 'closing'
-
-export interface ProjectActivity {
-  projectId: string
-  phase: ActivityPhase
-}
-
-const ACTIVITY_PHASES: ReadonlySet<string> = new Set(['starting', 'open', 'closing'])
-
-/**
- * Which of this citizen's apps are starting, open right now, or closing down.
- *
- * IT THROWS RATHER THAN ANSWERING EMPTY. An empty list is a positive statement that nothing is
- * happening, and the page clears every marker on it — so a read that could not be made must reach
- * the caller as a failure, where the existing markers are held, rather than as an answer.
- */
-export async function fetchActivity(deps: AuthFetchDeps = {}): Promise<ProjectActivity[]> {
-  const res = await authFetch(`${BASE}/activity`, {}, deps)
-  if (!res.ok) throw await readApiError(res, 'Could not check what is running')
-  const body: unknown = await res.json().catch(() => null)
-  if (!isRecord(body) || !Array.isArray(body.projects)) {
-    throw new ApiError('Could not check what is running', res.status)
-  }
-  const rows: ProjectActivity[] = []
-  for (const raw of body.projects) {
-    if (!isRecord(raw)) continue
-    const { projectId, phase } = raw
-    if (typeof projectId !== 'string' || typeof phase !== 'string') continue
-    if (!ACTIVITY_PHASES.has(phase)) continue
-    rows.push({ projectId, phase: phase as ActivityPhase })
-  }
-  return rows
-}

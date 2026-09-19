@@ -63,7 +63,6 @@ import type { StartSinks } from '../workspace/startApp'
 import {
   useAppPaneVisible,
   usePublishAddress,
-  usePublishLifecycle,
   usePublishPaneView,
   usePublishSave,
   usePublishWorkspaceReport,
@@ -484,8 +483,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   const [discarding, setDiscarding] = useState(false)
   const [hasSavedVersion, setHasSavedVersion] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
-  // WHAT THE PLATFORM OWES THIS CITIZEN ABOUT THEIR APP'S LIFE — answered by the renewal below.
-  const [drainingAt, setDrainingAt] = useState<string | null>(null)
   // `projectHasSavedBuild` arrives as a PROP, read once when the route resolved, and nothing
   // refetches it. But a Save is precisely the act that writes the snapshot bundle that flag
   // reports — so saving, the one thing that makes a relaunch possible, left the Relaunch
@@ -864,11 +861,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     { dirty: saveDirty, saving, error: saveError, discarding, replying: turnRunningHere, hasSavedVersion },
     { save: handleSave, discard: handleDiscard, settings: null, share: null },
   )
-  // THE PANE COLUMN IS WHERE THESE ARE SAID, and it is a sibling of the `<Outlet/>` this surface
-  // fills — so a citizen mid-conversation is told their app is closing, on the same words the
-  // project screen uses.
-  usePublishLifecycle({ drainingAt })
-
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
   // aborts it before resubscribing, but nothing did on unmount, leaking the reader (and its
   // fetch) past the component's life. The turn keeps running server-side; only the read stops.
@@ -1386,6 +1378,28 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
   }, [])
 
   /**
+   * WHEN THE RUNNING TURN ACTUALLY BEGAN, read off the message that opened it.
+   *
+   * A reload has no memory of the turn it is rejoining, and the server reports only `{turnId,
+   * lastSeq}` — it records when a turn ENDS, never when one started. The newest user message in
+   * the transcript is the request the running turn is answering, so its stored instant is the
+   * closest thing to a start this client can obtain, accurate to the write that persisted it.
+   *
+   * FALLS FORWARD, NEVER BACK. No user row, or a stamp that will not parse, yields the present:
+   * a timer that starts at zero is merely uninformative, while one seeded from a guessed earlier
+   * instant states an elapsed time that never happened.
+   */
+  const openedTurnAt = (prior: ChatMessage[]): number => {
+    for (let i = prior.length - 1; i >= 0; i -= 1) {
+      const message = prior[i]
+      if (message.role !== 'user') continue
+      const stamped = Date.parse(message.createdAt ?? '')
+      return Number.isNaN(stamped) ? Date.now() : stamped
+    }
+    return Date.now()
+  }
+
+  /**
    * RE-ATTACH to a turn still running server-side. A reload mid-turn lands on a transcript
    * whose newest row is the user's message — the reply is generating, but this tab has no
    * socket, so the page would sit static and the next send would 409. Subscribes with NO
@@ -1399,7 +1413,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_r`
     const sink = newSink()
-    setTurnStartedAt(Date.now())
+    // THE TURN DID NOT START NOW. This path runs on a RELOAD into a turn that is already running,
+    // so stamping the present restarts the on-screen count from zero under somebody who has been
+    // watching it climb — the falling number this timer exists to remove. The message that opened
+    // the turn carries the only start instant a client can see; the server records when a turn
+    // ENDS but never when one began, so an unparseable or absent stamp falls back to the present
+    // rather than inventing an earlier one.
+    setTurnStartedAt(openedTurnAt(prior))
     setGeneratingChatId(activeId)
     // THE BOUNDARY IS LATCHED HERE, from the transcript this re-telling is about to sit on top of
     // (see `reToldFromSeq`). Read off `prior` rather than the `messages` state: this runs inside
@@ -2478,14 +2498,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind = 'build'
       const hidden = document.visibilityState !== 'visible'
       const presence = presenceToRenew(accelerated, hidden)
       if (presence) {
-        // NOT AWAITED, and its answer is the only place a ceiling comes from. A renewal that
-        // reached a DIFFERENT container, or no container at all, is describing something other
-        // than the app on screen — so only a `renewed` outcome may move the instant.
-        void renewPresence(projectId, presence).then((renewal) => {
-          if (!live || projectIdRef.current !== projectId) return
-          if (renewal?.outcome === 'renewed') setDrainingAt(renewal.drainingAt)
-          else if (renewal !== null) setDrainingAt(null)
-        })
+        // NOT AWAITED. The renewal holds the container open; this surface reports it and never
+        // waits on it, so a slow renewal cannot delay the read the screen is rendering.
+        void renewPresence(projectId, presence)
       }
       const generation = ++latestProbe
       try {
