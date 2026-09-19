@@ -447,6 +447,36 @@ async def test_the_marker_sits_after_the_last_static_instruction(
     )
 
 
+async def test_no_block_up_to_the_marker_names_this_citizen_or_their_project(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """The property the index arithmetic only stands in for.
+
+    `test_the_marker_sits_after_the_last_static_instruction` compares the marker's index to a
+    COUNT of static parts, which agrees with position only while the library orders static
+    parts first — an assumption about someone else's library, checked nowhere. Asked directly
+    here instead: the citizen's name and their project's name are what differ between two
+    people on the same kind, so finding either at or before the marker means the cached prefix
+    is theirs alone and no second citizen can ever hit it.
+
+    Mutation check: order the dynamic tail ahead of the contract and this goes red on block 0
+    while the count-based test above can still agree with itself."""
+    blocks = await _system_blocks_our_agent_builds(_fresh_engine, db_session, session_factory)
+    marked = [index for index, block in enumerate(blocks) if "cache_control" in block]
+    assert marked, "no marker, so there is no prefix to make claims about"
+
+    cached = [str(block.get("text", "")) for block in blocks[: marked[0] + 1]]
+    for index, text in enumerate(cached):
+        assert _CTX.user_name not in text, f"block {index} names the citizen: {text[:120]!r}"
+        assert _CTX.project_name not in text, f"block {index} names the project: {text[:120]!r}"
+
+    tail = "\n".join(str(block.get("text", "")) for block in blocks[marked[0] + 1 :])
+    assert _CTX.user_name in tail and _CTX.project_name in tail, (
+        "this conversation's own facts are not behind the marker at all — either they went "
+        "missing from the prompt, or they were folded into the cached prefix"
+    )
+
+
 # --- layer 3: the round trip through the store, not two in-memory histories -----------------
 
 
