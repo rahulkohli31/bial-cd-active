@@ -25,9 +25,8 @@ from src.db.models.conversation import Conversation
 from src.db.models.message import Message
 from src.services.messages.store import ATTACHMENT_FILE_REF_KIND, ATTACHMENT_REF_KIND
 
-# NOTE: a deck part's internal Files-API `pdfFileId` release is deferred with the Foundry
-# hosting-mode decision (Azure-hosted Foundry has no Files API to release against; wire it
-# here if Anthropic-hosted mode is confirmed).
+# A deck part's internal Files-API `pdfFileId` is deliberately not released here: Azure-hosted
+# Foundry has no Files API to release it against. Wire it here if an Anthropic-hosted mode ships.
 
 
 def _collect_ref_ids(node: Any, ids: set[str]) -> None:
@@ -68,10 +67,6 @@ def _blob_keys_for(attachments: Iterable[Attachment]) -> list[str]:
     derived `{key}.pdf` stored beside the original, so a sweep had to know to remove both. Nothing
     derives anything from an attachment now — a deck is stored as itself and read in the sandbox —
     so there is one key per row again.
-
-    Stripped BEFORE `office.py` is deleted, deliberately: this function has three consumers (the
-    cascade, the reclaimer and the storage reconciler) and all three would break at import if the
-    media-type constant vanished under them first.
     """
     return [attachment.storage_key for attachment in attachments]
 

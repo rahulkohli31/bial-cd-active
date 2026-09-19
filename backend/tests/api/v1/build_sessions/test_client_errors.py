@@ -23,6 +23,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.v1.build_sessions.schemas import (
     CLIENT_ERROR_STACK_MAX_CHARS,
     BuildError,
+    BuildSessionStatus,
+    EndedEvent,
     ErrorSource,
 )
 from src.api.v1.conversations.schemas import DiagnosticFrame
@@ -288,8 +290,9 @@ async def test_a_late_report_does_not_resurrect_a_finished_turn(
     finished turn: this store is drained by the NEXT verify, and never pushes into anything.
 
     Re-fixtured onto `a_live_session` (the `ensure_sandbox` door) now that the start route is
-    gone; `manager.stop` drives the same end sequence a completion drove, so what this asserts
-    against is still a genuinely terminal session rather than a hand-built one."""
+    gone; the terminal is the `ended` frame the feed carries, pushed through the manager's own
+    progress sink, so what this asserts against is a genuinely terminal session rather than a
+    hand-built one."""
     from tests.api.v1.build_sessions.conftest import a_live_session
     from tests.factories import ProjectFactory
 
@@ -299,7 +302,16 @@ async def test_a_late_report_does_not_resurrect_a_finished_turn(
 
     session = await a_live_session(wire, db_session, user, project.id)
     assert session.app_id == app.id  # the session really is holding THIS app's container
-    await wire.manager.stop(session, wire.sbx, reason="completed")
+    await wire.manager.on_progress(
+        session,
+        EndedEvent(
+            seq=1,
+            status=BuildSessionStatus.ENDED,
+            preview_url=None,
+            snapshot_committed=True,
+            reason="completed",
+        ),
+    )
     session_id = session.session_id
 
     finished = await client.get(f"/v1/build-sessions/{session_id}", headers=auth_headers(user))

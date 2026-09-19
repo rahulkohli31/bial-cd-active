@@ -55,10 +55,8 @@ PASS_CADENCE = dt.timedelta(minutes=15)
 #: Two independent reads, a full interval apart. One pass's opinion is not evidence;
 #: the `bial-reclaim-staged-at` tag is how the second pass learns the first one happened.
 #:
-#: ONE CONSTANT, NOT TWO. This was `MINIMUM_STAGING_AGE = PASS_CADENCE` (5m) sitting beside a
-#: `STAGING_INTERVAL` of 15m that nothing in `src/` ever read — so the protocol documented one
-#: interval and enforced a third of it, and the only reader of the 15 was the test suite. The
-#: enforced number is the real one; the other is deleted rather than reconciled.
+#: ONE CONSTANT, NOT TWO: a staging interval with a number of its own is how this protocol ends
+#: up documenting one wait and enforcing another.
 MINIMUM_STAGING_AGE = PASS_CADENCE
 
 #: Every signal concurs — ours, unclaimed, no app record, already staged.

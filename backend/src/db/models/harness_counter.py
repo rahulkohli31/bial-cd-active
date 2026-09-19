@@ -50,10 +50,6 @@ class HarnessCounter(enum.StrEnum):
     HOLDING_SHOWN_MS = "holding_shown_ms"
     #: A workspace was restored after a confirmed reversion.
     RESTORE_PERFORMED = "restore_performed"
-    #: A turn's work did not reach the recovery slot. This is the distinction between "the
-    #: platform failed to CHECK the workspace" and "the platform failed to make it DURABLE" —
-    #: otherwise unanswerable after the fact.
-    RECOVERY_WRITE_MISSED = "recovery_write_missed"
     #: Words in a completed build's agent-facing traffic, and tokens for the same build.
     BUILD_WORDS = "build_words"
     BUILD_TOKENS = "build_tokens"
@@ -151,6 +147,32 @@ class HarnessCounter(enum.StrEnum):
     #: visit to END, which no browser reports reliably.
     PROJECT_OPENED = "project_opened"
     PROJECT_OPENED_CHAT = "project_opened_chat"
+    #: ── Did the turn look at the app, or answer from memory? ────────────────────────────────
+    #: The pair that says whether pulling the app's state is actually happening, now that the
+    #: platform no longer pushes it. One row per turn that reached a terminal, on exactly one of
+    #: the two names, so the ratio needs no correction factor.
+    #:
+    #: BOTH SIDES ARE TOOL-CALL FACTS — a `check_the_app` answer, or a build action's own health
+    #: verdict, which is a turn that built and looked at what it built. There is no term on either
+    #: side that reads what anybody SAID: a counter that decided from prose whether the model
+    #: "meant" to check would be measuring the classifier.
+    #:
+    #: A TUNING INSTRUMENT, NOT A GATE. If the ratio stays bad, the next levers are the tool
+    #: description's call-timing sentence and the reminder's cooldown; these numbers say which.
+    APP_READING_TAKEN = "app_reading_taken"
+    APP_READING_MISSING = "app_reading_missing"
+    #: ── The platform's own memory that somebody BUILT here ───────────────────────────────────
+    #: One row per terminal turn that actually MUTATED the tree, so a project's whole history of
+    #: real building is answerable when no container survives to be asked.
+    #:
+    #: IT IS NOT THE READING PAIR, AND THE DISTINCTION IS THE WHOLE POINT. Those two are written
+    #: for every terminal turn that held a workspace — a Plan turn, a turn that stopped before
+    #: writing anything, a turn that only looked. Answering "has anybody built here?" out of them
+    #: credits a project nobody has built in.
+    #:
+    #: The write is gated on `workspace_touched` — the platform's own evidence, set by the
+    #: mutating tools and never reset — rather than on anything the model said.
+    WORKSPACE_WAS_WRITTEN = "workspace_was_written"
 
 
 class HarnessCount(Base, UUIDv7PrimaryKeyMixin, TimestampMixin):

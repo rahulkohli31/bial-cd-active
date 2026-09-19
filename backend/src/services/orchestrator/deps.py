@@ -65,17 +65,22 @@ class SandboxSession:
     # ── Mutable per-run signals the tools set and the loop reads ──────────────────────────────
     done_requested: bool = False
     done_summary: str = ""
-    # `uncommitted_writes` LIVED HERE and is gone. It counted file mutations since the model's
-    # last `git commit` so `tools._note_write_and_maybe_remind` could nag at a cadence — and the
-    # instruction it nagged about (the Write segment's COMMIT AS YOU WORK block) has been
-    # deleted, because the platform commits the tree itself at every turn boundary. A counter
-    # enforcing an instruction nobody gives is worse than no counter: it appends a reminder to
-    # tool results for a discipline the prompt no longer teaches.
-    # Did this turn MUTATE the tree? Set by `write_file` / `edit_file` / `insert_lines` and by
-    # `declare_done`, never reset mid-turn — "did anything change in this whole turn" is the
-    # question. A Write turn that only read files is an ordinary chat turn and must not pay for a
-    # verify pass or a self-heal nudge.
-    workspace_touched: bool = False
+    # HOW MANY TIMES this turn mutated the tree. Bumped by `write_file` / `edit_file` /
+    # `insert_lines` / `apply_schema_change` / `run_command`, never reset mid-turn.
+    #
+    # A COUNT RATHER THAN A FLAG, because two readers ask different questions of it. Most ask
+    # `workspace_touched` — "did anything change in this whole turn" — since a Write turn that
+    # only read files is an ordinary chat turn and must not pay for a verify pass or a self-heal
+    # nudge. `app_state_toolset` instead asks "has the tree moved since I last looked", which a
+    # flag cannot answer once it has latched: a model that edits, checks, edits and checks again
+    # would be handed its pre-edit reading under a tool that promises the app's state right now.
+    writes: int = 0
+
+    @property
+    def workspace_touched(self) -> bool:
+        """Did this turn mutate the tree at all?"""
+        return self.writes > 0
+
     # ── The per-turn output buffer and the repeat-run memory ──────────────────────────────────
     # NEITHER IS PERSISTED. Both die with the session the harness rebuilds at the start of each
     # run, which is exactly the stated lifetime of a slice handle: a handle from a previous run

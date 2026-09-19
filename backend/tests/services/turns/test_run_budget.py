@@ -23,7 +23,8 @@ from src.services.orchestrator.constants import (
     RUN_TOKEN_BUDGET,
     RUN_WALL_CLOCK_DEADLINE_S,
 )
-from src.services.turns.copy import KEPT_A_COPY, SPENT_ENOUGH_TEXT
+from src.services.turns import copy as copy_module
+from src.services.turns.copy import SPENT_ENOUGH_TEXT
 
 
 def test_the_bound_is_a_number_the_platform_holds() -> None:
@@ -48,24 +49,23 @@ def test_the_ending_names_no_bound_and_no_limit_the_citizen_did_not_set() -> Non
     by `copy.py`'s register rule; it stays in the record and logs instead. It must also not read
     as the DAILY budget, whose ending says "carry on after midnight" — wrong advice here, since
     the citizen can carry on immediately, and the easy mistake once two endings share a function.
-    Mutation check: pass `AT_LIMIT_TEXT` as the spend bound's sentence and this goes red on
-    `midnight`."""
-    rendered = SPENT_ENOUGH_TEXT.format(kept=KEPT_A_COPY)
-
+    Mutation check: use `AT_LIMIT_TEXT` for the spend bound and this goes red on `midnight`."""
     for platform_word in ("token", "budget for today", "midnight", "limit", "ceiling", "quota"):
-        assert platform_word not in rendered.lower(), f"the ending names {platform_word!r}"
+        assert platform_word not in SPENT_ENOUGH_TEXT.lower(), (
+            f"the ending names {platform_word!r}"
+        )
     # What it DOES say: the app works, and what to do next.
-    assert "working" in rendered
-    assert "next bit" in rendered
+    assert "working" in SPENT_ENOUGH_TEXT
+    assert "next bit" in SPENT_ENOUGH_TEXT
 
 
-def test_the_ending_carries_the_conditional_reassurance_rather_than_asserting_it() -> None:
-    """`{kept}` is the same field the daily-budget sentence uses, filled by the same securing
-    function — so "your work is safe" is said only where a copy actually landed. A sentence
-    that asserted it unconditionally would be a false reassurance the citizen acts on by
-    closing the tab."""
-    assert "{kept}" in SPENT_ENOUGH_TEXT
-    assert KEPT_A_COPY in SPENT_ENOUGH_TEXT.format(kept=KEPT_A_COPY)
+def test_the_ending_promises_nothing_about_whether_the_work_was_kept() -> None:
+    """★ NO CLAIM ABOUT DURABILITY. The container survives a bounded run — nothing on this path
+    stores anything — and a reassurance the platform did not earn is the one a citizen acts on by
+    closing the tab.
+    Mutation check: fold a "we've kept a copy of your app" clause back in and this goes red."""
+    assert "kept a copy" not in SPENT_ENOUGH_TEXT.lower()
+    assert "{" not in SPENT_ENOUGH_TEXT, "every field is filled by the time a citizen reads it"
 
 
 # --- three bounds, one ending ---------------------------------------------------------------
@@ -83,8 +83,26 @@ def _engine_source() -> str:
     return pathlib.Path(inspect.getfile(engine_module)).read_text()
 
 
+def _reason_of(call: ast.Call) -> str | None:
+    """The end reason a `_WriteEndedError(...)` carries, whether written as a literal or named.
+
+    The reasons are centralised constants now, so a scraper that only reads `ast.Constant` sees
+    none of the seventeen raise sites and every assertion over them passes vacuously. Resolving
+    the name against the module that owns it keeps this reading the code rather than a spelling.
+    """
+    if not call.args:
+        return None
+    first = call.args[0]
+    if isinstance(first, ast.Constant):
+        return first.value if isinstance(first.value, str) else None
+    if isinstance(first, ast.Name):
+        value = getattr(copy_module, first.id, None)
+        return value if isinstance(value, str) else None
+    return None
+
+
 def _bounded_raises() -> dict[str, ast.Raise]:
-    """Every `raise _WriteEndedError("<a bounded reason>", ...)` in the write loop, by reason."""
+    """Every `raise _WriteEndedError(<a bounded reason>, ...)` in the write loop, by reason."""
     found: dict[str, ast.Raise] = {}
     for node in ast.walk(ast.parse(_engine_source())):
         if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
@@ -92,23 +110,19 @@ def _bounded_raises() -> dict[str, ast.Raise]:
         callee = node.exc.func
         if not (isinstance(callee, ast.Name) and callee.id == "_WriteEndedError"):
             continue
-        if not node.exc.args:
-            continue
-        reason = node.exc.args[0]
-        if not isinstance(reason, ast.Constant) or not isinstance(reason.value, str):
-            continue
-        if reason.value in _BOUNDED_REASONS:
-            found[reason.value] = node
+        reason = _reason_of(node.exc)
+        if reason in _BOUNDED_REASONS:
+            assert reason is not None
+            found[reason] = node
     return found
 
 
-def test_all_three_internal_bounds_end_through_the_one_securing_function() -> None:
+def test_all_three_internal_bounds_end_through_the_one_function() -> None:
     """★ The "three bounds, one ending" rule, asserted structurally rather than by reading copy.
 
-    Each ceiling must hand its message to `_bounded_run_ending`, the only thing here that
-    secures the tree before composing a word — a second call site means a divergent
-    snapshot-then-teardown order that loses someone's work. All three render the same sentence
-    now, so a test reading only the message couldn't tell a securing arm from one that doesn't.
+    Each ceiling must hand its message to `_bounded_run_ending`. All three render the same
+    sentence, so a test reading only the message could not tell one arm from another — and a
+    second composition site is how one of them drifts into naming the bound that fired.
     Mutation check: restore any one arm to a bare string literal and this goes red naming it."""
     raises = _bounded_raises()
     assert set(raises) == _BOUNDED_REASONS, (
@@ -117,15 +131,13 @@ def test_all_three_internal_bounds_end_through_the_one_securing_function() -> No
 
     for reason, node in sorted(raises.items()):
         assert isinstance(node.exc, ast.Call)
-        message = node.exc.args[1]
-        assert isinstance(message, ast.Await), f"{reason} does not await its ending"
-        call = message.value
-        assert isinstance(call, ast.Call), f"{reason} awaits something other than a call"
+        call = node.exc.args[1]
+        assert isinstance(call, ast.Call), f"{reason} composes its ending inline"
         attribute = call.func
         assert isinstance(attribute, ast.Attribute), f"{reason} does not call a method"
         assert attribute.attr == "_bounded_run_ending", (
             f"{reason} composes its own ending ({attribute.attr}) instead of going through the "
-            "one function that secures the tree first"
+            "one function all three share"
         )
 
 
@@ -152,8 +164,7 @@ def test_the_click_save_sentence_survives_only_where_it_is_still_true() -> None:
         and isinstance(node.exc.func, ast.Name)
         and node.exc.func.id == "_WriteEndedError"
         and len(node.exc.args) > 1
-        and isinstance(node.exc.args[0], ast.Constant)
-        and node.exc.args[0].value == "self_heal_budget_exhausted"
+        and _reason_of(node.exc) == "self_heal_budget_exhausted"
         and isinstance(node.exc.args[1], ast.Constant)
         and isinstance(node.exc.args[1].value, str)
     }
@@ -184,7 +195,7 @@ def test_which_bound_fired_stays_in_the_record_while_the_citizen_reads_one_sente
     message either way."""
     raises = _bounded_raises()
     assert len(set(raises)) == 3, "the three bounds collapsed into one record value"
-    rendered = SPENT_ENOUGH_TEXT.format(kept=KEPT_A_COPY).lower()
+    rendered = SPENT_ENOUGH_TEXT.lower()
     for reason in _BOUNDED_REASONS:
         for word in reason.split("_"):
             assert word not in rendered, f"the shared ending leaks {reason!r} at {word!r}"
@@ -259,25 +270,22 @@ def test_the_platform_s_thinking_is_not_charged_to_the_citizen() -> None:
 def test_the_run_bound_and_the_daily_meter_weigh_a_token_identically() -> None:
     """ONE POLICY, TWO READERS. The daily meter is a SQL column expression and the run bound is
     an in-process scalar, so they cannot share an implementation — but they must not drift into
-    two numbers the citizen hears the same word for. Both spell the weighting from the same two
-    divisors, and this pins that they agree on real arithmetic rather than merely importing the
-    same constants.
+    two numbers the citizen hears the same word for. Both spell the weighting from the same read
+    divisor and the same tier-derived write multiplier, and this pins that they agree on real
+    arithmetic rather than merely importing the same constants.
 
-    Mutation check: change either divisor in `weighted_spend` alone and this goes red."""
+    The write side is a MULTIPLIER now, not a surcharge divisor, because a cache write is priced
+    by the TTL tier its breakpoint bought rather than at one fixed ratio.
+
+    Mutation check: change either weight in `weighted_spend` alone and this goes red."""
     from src.services.usage.gate import (
         _CACHE_READ_DIVISOR,
-        _CACHE_WRITE_SURCHARGE_DIVISOR,
+        _CACHE_WRITE_MULTIPLIER,
         weighted_spend,
     )
 
     fresh, output, read, write = 1_000, 500, 40_000, 8_000
-    expected = (
-        fresh
-        + output
-        + read / _CACHE_READ_DIVISOR
-        + write
-        + write / _CACHE_WRITE_SURCHARGE_DIVISOR
-    )
+    expected = fresh + output + read / _CACHE_READ_DIVISOR + write * float(_CACHE_WRITE_MULTIPLIER)
     assert weighted_spend(
         input_tokens=fresh + read + write,  # the grand total, as pydantic-ai reports it
         output_tokens=output,

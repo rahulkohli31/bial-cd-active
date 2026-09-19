@@ -42,7 +42,7 @@ import pytest
 _SANDBOX = Path(__file__).resolve().parent.parent
 GENERATOR = _SANDBOX / "seed" / "generate-reference.mjs"
 SOURCE = _SANDBOX / "seed" / "flight-data.ts"
-#: The path the golden-template manifest in the agent's prompt blocks names.
+#: The path the agent is pointed at when it asks for the connected system's schema.
 REFERENCE = _SANDBOX / "template" / "lib" / "flight-data.reference.ts"
 
 #: The seven defects the file exists to name. Each produces an app that builds green and is wrong.
@@ -184,11 +184,20 @@ def test_the_shipped_file_is_a_current_generation_of_its_source() -> None:
     )
 
 
-def test_the_agents_template_manifest_names_the_file() -> None:
-    """Without this line the agent is never told the file exists and every other cost in this
-    unit buys nothing. The manifest is hard-coded to mirror `sandbox/template/`, so a file added
-    here and not there is a file nobody reads. Imported through the read-only `sys.path` bridge
-    `conftest.py` sets up; `prompt_blocks` is a leaf module and pulls in no Settings or DB."""
-    from src.core.prompt_blocks import _GOLDEN_TEMPLATE_MANIFEST
+def test_the_agent_is_pointed_at_the_file_when_it_asks_for_the_schema() -> None:
+    """Without this pointer the agent is never told the file exists and every other cost in this
+    unit buys nothing: it would know the column names and have no way to reach the packages or
+    the environment variables that read them.
 
-    assert REFERENCE.name in _GOLDEN_TEMPLATE_MANIFEST
+    The pointer rides `connector_schema`'s RETURN, so it is paid for by the projects that ask
+    rather than by every build request. Read as SOURCE TEXT rather than imported, because
+    importing that module constructs `Settings` and this lane has no environment — the read-only
+    `sys.path` bridge in `conftest.py` deliberately reaches leaf modules only.
+    """
+    connector_tools = (
+        _SANDBOX.parent / "backend" / "src" / "services" / "agent" / "connector_tools.py"
+    )
+    assert REFERENCE.name in connector_tools.read_text(), (
+        f"{REFERENCE.name} is named nowhere in connector_tools.py, so nothing tells the agent "
+        "the worked example exists"
+    )

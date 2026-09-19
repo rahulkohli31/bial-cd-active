@@ -49,7 +49,6 @@ from src.services.build_sessions.manager import (
 from src.services.build_sessions.manager import SaveOutcome as SaveOutcome
 from src.services.build_sessions.manager import SaveState as SaveState
 from src.services.build_sessions.manager import SessionManager as SessionManager
-from src.services.build_sessions.manager import SharedPreview as SharedPreview
 from src.services.build_sessions.manager import (
     SharedProjectHasNoAppError as SharedProjectHasNoAppError,
 )

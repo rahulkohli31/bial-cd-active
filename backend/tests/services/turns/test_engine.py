@@ -62,6 +62,7 @@ from src.services.orchestrator.constants import (
     MAX_OUTPUT_TOKENS,
     PLAN_EFFORT,
 )
+from src.services.orchestrator.selfheal import AppState
 from src.services.sandbox.config import SandboxConfig
 from src.services.turns import engine as engine_module
 from src.services.turns.copy import WRITING_UP_THE_PLAN_LABEL
@@ -1840,3 +1841,41 @@ async def test_the_step_cap_never_evicts_a_call_that_is_still_out() -> None:
     assert len(state.steps) == engine_module._STEPS_CAP
     assert "quick-0" not in state.steps
     assert "quick-1" in state.steps
+
+
+def test_a_probe_that_blinks_cannot_erase_the_reading_the_turn_already_got() -> None:
+    """★ `UNKNOWN` IS THE PROBE FAILING, NOT THE APP CHANGING — and both readers of this field
+    treat it as no reading at all.
+
+    Within one turn the app can be read twice: `check_the_app` and the build loop's own health
+    verdict. If the second one blinks, "latest wins" throws away a real reading — the terminal
+    row goes unstamped, the citizen loses the "your app is working again" sentence, and the NEXT
+    turn compares against a record this turn should have moved.
+
+    Mutation check: drop the `UNKNOWN` guard in `read_the_app` and the second assertion reads
+    `AppState.UNKNOWN`."""
+    state = _TurnState(
+        turn_id=uuid.uuid4(),
+        conversation_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        kind=ChatKind.BUILD,
+    )
+
+    # Read into a local before each assertion: asserting on the attribute narrows its declared
+    # type for the rest of the function, and the next assertion then reads as impossible.
+    #
+    # A first UNKNOWN still lands: it is what tells the reminder this turn DID consult the
+    # platform, so the turn is not nudged for a lapse that did not happen.
+    state.read_the_app(AppState.UNKNOWN)
+    first: AppState | None = state.app_reading
+    assert first is AppState.UNKNOWN
+
+    state.read_the_app(AppState.LIVE)
+    state.read_the_app(AppState.UNKNOWN)
+    after_the_blink: AppState | None = state.app_reading
+    assert after_the_blink is AppState.LIVE
+
+    # A real reading still displaces a real reading — the guard narrows nothing else.
+    state.read_the_app(AppState.NOT_SERVING)
+    after_a_real_one: AppState | None = state.app_reading
+    assert after_a_real_one is AppState.NOT_SERVING

@@ -5,15 +5,10 @@ WHY THIS EXISTS
 concrete channel by which an observed error re-enters the model's context. Its consumer is
 the live turn engine's self-heal loop (`turns/engine.py`).
 
-`BUILD_SYSTEM_PROMPT` used to live here and is deleted along with the standalone build
-harness that was its only consumer. Nothing is lost from the model's context: the prompt was
-assembled from exactly the `core/prompt_blocks.py` pieces that `mode_prompts._WRITE_SEGMENT`
-and `_base()` compose for a Build chat turn, which is the surviving — and now only — Write
-prompt. The open-sandbox reality it described — a real shell, a fully editable workspace,
-the always-running dev server, the injected app ENV, the real-data-only rule, the tool
-surface, the golden-template manifest — is all still stated, from the same single sources, by
-`compose_kind_prompt(ChatKind.BUILD, ...)`. The guards that pinned this copy moved to that
-prompt with it.
+NO SYSTEM PROMPT IS BUILT HERE. The Write prompt is composed by `mode_prompts`, from the
+`core/prompt_blocks.py` pieces, and this module contributes nothing to it — a repair prompt
+rides the USER channel, so anything stated here would be a second voice in a turn the
+standing contract already speaks for.
 
 The unconditional rule that the user must see their own write without a manual reload is
 UNENFORCEABLE at generation time. The shipped static detector `flag_liveness_overpromise`

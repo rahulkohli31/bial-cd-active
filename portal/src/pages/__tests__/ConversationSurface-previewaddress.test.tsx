@@ -44,7 +44,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(),
+  relaunchPreview: vi.fn(), getStatus: vi.fn(),
   fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
   // THE TWO PROBES THAT RIDE THE PREVIEW TICK, mocked only so they cannot reach a real `fetch`.
   // Neither was needed while every scenario here answered the read `unknown`: both are gated on a

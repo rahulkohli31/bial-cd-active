@@ -24,7 +24,7 @@ const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), resolvePlanOptions: vi.fn(),
-  stop: vi.fn(), getStatus: vi.fn(),
+  getStatus: vi.fn(),
   relaunchPreview: vi.fn(), fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
 }))
 
@@ -98,7 +98,7 @@ beforeEach(() => {
   ])
   h.buildUserParts.mockImplementation(async (text: string) => [{ type: 'text', text }])
   h.startTurn.mockResolvedValue({ turnId: 't1' })
-  h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: false, savedHead: null, containerHead: null, recoveryAt: null })
+  h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: false, savedHead: null, containerHead: null })
   h.fetchPreviewState.mockResolvedValue(HELD)
 })
 afterEach(() => cleanup())

@@ -4,7 +4,9 @@ fresh, READY sandbox (cookie auth + CSRF, owner-scoping, no build slot taken).""
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -34,7 +36,6 @@ from src.db.models.harness_counter import HarnessCount, HarnessCounter
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
 from src.services.build_sessions.manager import SessionManager, app_name_for
-from src.services.build_sessions.outcome import write_build_outcome
 from src.services.redis import (
     BUILD_COORDINATION_UNAVAILABLE_MSG,
     REGISTRY_STATE_ENDING,
@@ -54,7 +55,7 @@ from src.services.sandbox.base import (
 )
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import recovery_key, snapshot_key
+from src.services.storage import snapshot_key
 from tests.api.v1.build_sessions.conftest import (
     a_live_session,
     auth_headers,
@@ -62,6 +63,7 @@ from tests.api.v1.build_sessions.conftest import (
 )
 from tests.conftest import forget_every_harness_count
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
+from tests.fakes import a_git_bundle, write_build_outcome
 
 
 async def _user_project(db: AsyncSession, email: str):
@@ -78,12 +80,12 @@ async def _seed_snapshot(db: AsyncSession, user, project, store) -> uuid.UUID:
 
 
 async def _seed_worked_on(store, app_id: uuid.UUID) -> None:
-    """Mark this app as holding real work: the reclaim guard reads a recovery bundle as proof
-    that a turn touched files."""
-    key = recovery_key(app_id)
-    await store.put(key, b"RECOVERY-BUNDLE")
+    """Mark this app as holding real work: the reclaim guard reads a saved bundle as proof that
+    something was built here."""
+    key = snapshot_key(app_id)
+    await store.put(key, b"SAVED-BUNDLE")
     # `FakeStorage.head` reads `last_modified` off `mtimes`, and the guard keys on that
-    # timestamp — a bundle with no mtime reads as "no recovery bundle".
+    # timestamp — a bundle with no mtime reads as "no bundle".
     store.mtimes[key] = datetime.now(UTC)
 
 
@@ -198,7 +200,7 @@ async def test_relaunch_without_snapshot_is_404(
 async def test_relaunch_while_a_build_is_running_is_409(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
-    """A live session owns the one-per-user slot; relaunch 409s and carries its session id.
+    """A live session owns the one-per-user slot; relaunch 409s rather than pre-empting it.
 
     Re-fixtured onto `a_live_session`. The slot has to be genuinely OCCUPIED for this to prove
     anything, and relaunch provably cannot occupy it itself — asserted directly by
@@ -209,7 +211,7 @@ async def test_relaunch_while_a_build_is_running_is_409(
     user, project = await _user_project(db_session, "rl3@rvaiglobal.com")
     await _seed_snapshot(db_session, user, project, fake_storage)
 
-    session = await a_live_session(wire, db_session, user, project.id)
+    await a_live_session(wire, db_session, user, project.id)
 
     conflict = await client.post(
         "/v1/build-sessions/relaunch",
@@ -219,7 +221,7 @@ async def test_relaunch_while_a_build_is_running_is_409(
     assert conflict.status_code == 409
     err = conflict.json()["error"]
     assert err["code"] == "build_session_already_active"
-    assert err["sessionId"] == str(session.session_id)
+    assert set(err) == {"message", "code"}
 
 
 async def test_relaunch_another_users_project_is_404(
@@ -448,6 +450,14 @@ class SupervisorScript:
         if path == "/files":
             return httpx.Response(200, json={"ok": True})
         if path == "/exec":
+            # A BUNDLE READ MUST ANSWER WITH A PARSEABLE BUNDLE. Every door that destroys a
+            # container writes its tree back first, and a container that answers the read with
+            # nothing is one whose write-back raises — so a supervisor double that stayed silent
+            # here would make every release in this file spare the container it means to give up.
+            cmd = json.loads(request.content).get("cmd") or []
+            if cmd[:1] == ["base64"]:
+                stdout = base64.b64encode(a_git_bundle()).decode()
+                return httpx.Response(200, json={"stdout": stdout, "stderr": "", "exit": 0})
             return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
         if path == "/dev/start":
             if self.dev_start_status != 200:

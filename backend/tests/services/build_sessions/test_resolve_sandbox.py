@@ -29,7 +29,6 @@ from src.config import settings
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions import pass_history
-from src.services.build_sessions import snapshot as snapshot_module
 from src.services.build_sessions.alarms import (
     APP_FIRST_SERVED_EVENT,
     APP_STOPPED_WHILE_IDLE_EVENT,
@@ -47,11 +46,10 @@ from src.services.build_sessions.manager import (
     reset_idle_checks_for_tests,
 )
 from src.services.build_sessions.pass_history import CopyAttempt
-from src.services.build_sessions.snapshot import reset_divert_streaks_for_tests
 from src.services.sandbox import SandboxError
 from src.services.sandbox.base import DevStatus, ExecResult, SandboxHandle
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import quarantine_prefix, recovery_key, snapshot_key
+from src.services.storage import quarantine_prefix, snapshot_key
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import DevServerDownUntilStarted, FakeSandboxClient, FakeStorage, a_git_bundle
 
@@ -88,7 +86,6 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def _no_leaked_streaks() -> None:
     reset_integrity_streaks_for_tests()
-    reset_divert_streaks_for_tests()
     reset_idle_checks_for_tests()
 
 
@@ -98,8 +95,8 @@ def attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
 
     AUTOUSE, AND NOT FOR CONVENIENCE: `record_durable_copy_attempt` opens its own session and
     COMMITS, so an unspied put-away here leaves a permanent row in the SHARED test database that
-    `test_reclamation_report_only.py` and `test_durable_copy_gate.py` count. The real writer is
-    exercised, against a connection that rolls back, in `test_durable_copy_gate.py`."""
+    `test_reclamation_report_only.py` counts. The real writer is exercised, against a connection
+    that rolls back, in `test_write_back_before_reclaim.py`."""
     recorded: list[CopyAttempt] = []
 
     async def _spy(attempt: CopyAttempt) -> None:
@@ -173,10 +170,6 @@ async def _attached(
     return client, session.app_id
 
 
-async def _seed_recovery(store: FakeStorage, app_id: uuid.UUID, sha: str = RECORDED) -> None:
-    await store.put(recovery_key(app_id), a_git_bundle(sha), metadata={"head_sha": sha})
-
-
 async def _seed_saved(store: FakeStorage, app_id: uuid.UUID, sha: str = RECORDED) -> None:
     await store.put(snapshot_key(app_id), a_git_bundle(sha), metadata={"head_sha": sha})
 
@@ -192,7 +185,7 @@ async def test_an_intact_workspace_is_attached_exactly_as_before(
     user, project_id = await _mk(db_session, "u2a@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     client.exec_handler = _answers("b" * 40)
     heard = _Heard()
 
@@ -220,7 +213,7 @@ async def test_a_seeded_bundle_alone_does_not_make_a_container_look_reverted(
     user, project_id = await _mk(db_session, "u2b@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     heard = _Heard()
 
     session = await manager.ensure_sandbox(
@@ -269,7 +262,7 @@ async def test_the_sentence_arrives_before_the_restore_runs(
     user, project_id = await _mk(db_session, "u2d@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     client.exec_handler = _answers(None, commits=0, ancestry="")
     order: list[str] = []
     heard = _Heard()
@@ -330,7 +323,7 @@ async def test_a_restore_inside_a_turn_starts_the_dev_server_and_stamps_its_firs
     manager = SessionManager()
     client = DevServerDownUntilStarted()
     _, app_id = await _attached(db_session, manager, user, project_id, client=client)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     client.exec_handler = _answers(None, commits=0, ancestry="")
 
     with capture_logs() as logs:
@@ -359,7 +352,7 @@ async def test_the_reverted_tree_is_parked_before_it_is_replaced(
     user, project_id = await _mk(db_session, "u2e@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     client.exec_handler = _answers(None, commits=0, ancestry="")
 
     await manager.ensure_sandbox(
@@ -381,7 +374,7 @@ async def test_a_tree_we_can_see_is_the_template_is_not_bundled_just_to_throw_it
     user, project_id = await _mk(db_session, "u2f@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     client.exec_handler = _answers("reseeded", commits=1, ancestry="0 1")
 
     session = await manager.ensure_sandbox(
@@ -400,7 +393,7 @@ async def test_a_quarantine_that_fails_stops_the_restore(
     user, project_id = await _mk(db_session, "u2g@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     inner = _answers(None, commits=0, porcelain="M  app/page.tsx", ancestry="")
 
     def refuse_to_bundle(cmd: list[str]) -> ExecResult:
@@ -431,7 +424,7 @@ async def test_a_restore_that_fails_still_tells_the_citizen(
     user, project_id = await _mk(db_session, "u2h@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     client.exec_handler = _answers(None, commits=0, ancestry="")
 
     async def refuse(
@@ -499,31 +492,6 @@ async def test_a_saved_bundle_is_restored_when_the_recovery_slot_is_empty(
     assert client.restored_from == [None]  # `None` is the saved bundle
 
 
-async def test_a_poisoned_recovery_slot_is_stepped_over(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """★ THE REFUSAL LOOP, BOUNDED. `recoverable_work` ranks the two bundles by `last_modified`,
-    never by ancestry, so a recovery copy that was overwritten with a bad tree outranks a
-    perfectly good saved one — and every restore afterwards hands back the poison. Two consecutive
-    refusals by the integrity guard are the signal that the slot, rather than the turn, is the
-    problem.
-
-    Mutation check: raise `_POISONED_SLOT_REFUSALS` and this goes red."""
-    user, project_id = await _mk(db_session, "u2k@rvaiglobal.com")
-    manager = SessionManager()
-    client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_saved(fake_storage, app_id)
-    await _seed_recovery(fake_storage, app_id, sha="f" * 40)  # newer, and poisoned
-    snapshot_module._consecutive_diverts[app_id] = 2
-    client.exec_handler = _answers(None, commits=0, ancestry="")
-
-    await manager.ensure_sandbox(
-        db_session, user, project_id, sandbox_client=client, may_write=True
-    )
-
-    assert client.restored_from == [None], "the saved bundle, not the poisoned recovery slot"
-
-
 # =============================================================================
 # The two ways of not knowing, which fail in opposite directions
 # =============================================================================
@@ -538,7 +506,7 @@ async def test_a_check_that_times_out_touches_nothing(
     user, project_id = await _mk(db_session, "u2l@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
 
     def times_out(cmd: list[str]) -> ExecResult:
         raise SandboxError("the supervisor did not answer")
@@ -563,7 +531,7 @@ async def test_a_structurally_unanswerable_check_lets_the_turn_through(
     user, project_id = await _mk(db_session, "u2m@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     # A lineage that moved over a tree that still holds content — `git reset --hard`'s shape.
     client.exec_handler = _answers("rewound", commits=12, ancestry="0 1")
     heard = _Heard()
@@ -586,7 +554,7 @@ async def test_the_slot_is_freed_even_when_the_gate_refuses(
     user, project_id = await _mk(db_session, "u2n@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
 
     def times_out(cmd: list[str]) -> ExecResult:
         raise SandboxError("the supervisor did not answer")
@@ -626,7 +594,7 @@ async def test_an_idle_reversion_is_caught_at_the_poll_and_alarmed(
     user, project_id = await _mk(db_session, "u4a@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     client.exec_handler = _answers(None, commits=0, ancestry="")
     raised: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(
@@ -665,7 +633,7 @@ async def test_the_idle_check_restores_nothing_and_destroys_nothing(
     user, project_id = await _mk(db_session, "u4b@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     client.exec_handler = _answers(None, commits=0, ancestry="")
     _script_dev(monkeypatch, client, dev)
 
@@ -719,8 +687,6 @@ async def test_an_intact_app_whose_dev_server_stopped_is_put_away_so_it_can_be_l
     user, project_id = await _mk(db_session, "u4-stopped@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    # Both slots: the restore offer reads the recovery copy, the durable-copy gate the saved one.
-    await _seed_recovery(fake_storage, app_id)
     await _seed_saved(fake_storage, app_id)
     _script_dev(monkeypatch, client, _STOPPED)
     raised: list[tuple[str, dict[str, object]]] = []
@@ -738,9 +704,7 @@ async def test_an_intact_app_whose_dev_server_stopped_is_put_away_so_it_can_be_l
     assert [event for event, _ in raised] == [APP_STOPPED_WHILE_IDLE_EVENT]
     assert raised[0][1]["exit_code"] == 137
     assert raised[0][1]["put_away"] is True
-    assert attempts == [CopyAttempt.NOTHING_TO_COPY], (
-        "the durable-copy gate ran and found it current"
-    )
+    assert attempts == [CopyAttempt.COPIED], "the tree was written back before it was put away"
 
 
 async def test_an_app_the_agent_restarted_itself_is_left_running(
@@ -757,7 +721,7 @@ async def test_an_app_the_agent_restarted_itself_is_left_running(
     user, project_id = await _mk(db_session, "u4-restarted@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     _script_dev(monkeypatch, client, _RESTARTED_BY_THE_AGENT)
 
     await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
@@ -779,7 +743,7 @@ async def test_a_dev_server_that_answers_the_second_look_is_left_running(
     user, project_id = await _mk(db_session, "u4-blip@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     _script_dev(monkeypatch, client, _STOPPED, _SERVING)
 
     await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
@@ -799,7 +763,7 @@ async def test_a_supervisor_that_cannot_answer_puts_nothing_away(
     user, project_id = await _mk(db_session, "u4-blind@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
 
     async def _boom(handle: SandboxHandle) -> DevStatus:
         raise SandboxError("dev/status failed with status 502")
@@ -814,31 +778,30 @@ async def test_a_supervisor_that_cannot_answer_puts_nothing_away(
     assert client.torn_down == []
 
 
-async def test_a_stopped_app_whose_work_is_not_provably_saved_is_left_standing(
+async def test_a_stopped_app_that_was_never_saved_still_has_its_tree_written_back(
     db_session: AsyncSession,
     fake_redis: aioredis.Redis,
     fake_storage: FakeStorage,
     monkeypatch: pytest.MonkeyPatch,
     attempts: list[CopyAttempt],
 ) -> None:
-    """★ NEVER AT THE COST OF WORK. The reap runs the durable-copy gate, and a container whose work
-    cannot be proven preserved is spared: the citizen keeps the slow card, which is where they were
-    before this existed, rather than losing work to end a wait.
+    """★ NEVER AT THE COST OF WORK — and an empty slot is exactly the population that proves it.
+    A citizen who built across several turns and never pressed Save has their whole app in this
+    container and nothing in the store, so putting it away has to write the tree back first.
 
-    Mutation check: reap without `app_id` and this container is torn down with no copy behind
+    Mutation check: reap without `app_id` and this container is torn down with nothing behind
     it."""
     user, project_id = await _mk(db_session, "u4-unsaved@rvaiglobal.com")
     manager = SessionManager()
-    client, _app_id = await _attached(db_session, manager, user, project_id)
+    client, app_id = await _attached(db_session, manager, user, project_id)
     _script_dev(monkeypatch, client, _STOPPED)
+    assert await fake_storage.head(snapshot_key(app_id)) is None, "nothing was ever saved"
 
     await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
 
-    assert client.torn_down == []
-    assert await read_registry(fake_redis, user.id) is not None
-    # LIVENESS FOR THE ABSENCE ABOVE: the gate really was asked, and it is what said no.
-    assert attempts, "the durable-copy gate ran"
-    assert CopyAttempt.NOTHING_TO_COPY not in attempts
+    assert client.torn_down == [_sandbox_name(client)]
+    assert await fake_storage.head(snapshot_key(app_id)) is not None, "the work is durable now"
+    assert attempts == [CopyAttempt.COPIED]
 
 
 async def test_a_stopped_app_is_never_put_away_under_a_live_turn(
@@ -859,7 +822,7 @@ async def test_a_stopped_app_is_never_put_away_under_a_live_turn(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
     client.attach_handle = session.handle
-    await _seed_recovery(fake_storage, session.app_id)
+    await _seed_saved(fake_storage, session.app_id)
     _script_dev(monkeypatch, client, _STOPPED)
 
     await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
@@ -883,7 +846,7 @@ async def test_a_stopped_app_is_never_put_away_while_a_start_holds_the_workspace
     user, project_id = await _mk(db_session, "u4-stopped-start@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     _script_dev(monkeypatch, client, _STOPPED)
     start = manager._start_lock_for(user.id)
 
@@ -910,7 +873,7 @@ async def test_repeated_polls_inside_the_window_make_one_container_call(
     user, project_id = await _mk(db_session, "u4c@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     asked: list[list[str]] = []
     inner = _answers("b" * 40)
 
@@ -956,7 +919,7 @@ async def test_an_unanswerable_check_does_not_retract_a_standing_claim(
     user, project_id = await _mk(db_session, f"u4d-{expected.value}@rvaiglobal.com")
     manager = SessionManager()
     client, app_id = await _attached(db_session, manager, user, project_id)
-    await _seed_recovery(fake_storage, app_id)
+    await _seed_saved(fake_storage, app_id)
     client.exec_handler = _answers(head, commits=commits, ancestry=ancestry)
     raised: list[str] = []
     monkeypatch.setattr(manager_module._log, "error", lambda event, **kw: raised.append(event))

@@ -25,6 +25,7 @@ from src.services.orchestrator.client_errors import forget_all_client_errors, pa
 from src.services.orchestrator.selfheal import (
     HealthState,
     Readiness,
+    Unanswered,
     VerifyOutcome,
     detect_server_crash,
     verify,
@@ -37,7 +38,13 @@ from src.services.sandbox import (
     SandboxHandle,
     ServedPage,
 )
-from tests.services.orchestrator.fake_sandbox import BASELINE_UNTOUCHED_STDOUT, FakeSandbox
+from tests.services.orchestrator.fake_sandbox import (
+    BASELINE_ROOT_SHA,
+    BASELINE_TEMPLATE_BLOB,
+    BASELINE_UNTOUCHED_STDOUT,
+    SEEDED_SUBJECT,
+    FakeSandbox,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -586,11 +593,21 @@ async def test_a_baseline_the_repository_cannot_answer_for_is_indeterminate() ->
     cannot be convicted of showing the template by a check that could not find the template —
     and it cannot be cleared by one either.
 
+    EVERY CAUSE HERE KEEPS ITS VETO. The one cause that is waved through — a root carrying a
+    subject that is not ours — has its own test below, and each fixture here sets the SEEDED
+    SUBJECT deliberately so it cannot fall into that arm and pass for the wrong reason.
+
     Mutation check: collapse UNANSWERABLE into either of the other two arms and this goes red."""
     for stdout, why in [
         ("@@@@", "no root commit at all"),
-        (f"{'a' * 40}\n{'b' * 40}@@{'c' * 40}@@{'d' * 40}", "two root commits"),
-        (f"{'a' * 40}@@@@{'d' * 40}", "the root commit never held the file"),
+        (
+            f"{BASELINE_ROOT_SHA}\n{'b' * 40}@@{'c' * 40}@@{'d' * 40}@@{SEEDED_SUBJECT}",
+            "two root commits",
+        ),
+        (
+            f"{BASELINE_ROOT_SHA}@@@@{'d' * 40}@@{SEEDED_SUBJECT}",
+            "the root commit never held the file",
+        ),
         ("", "unparseable output"),
     ]:
         fake = FakeSandbox()
@@ -671,7 +688,7 @@ async def test_patience_is_bounded_and_an_unanswerable_verdict_is_returned_as_on
 
 
 async def test_may_never_be_green_is_true_for_exactly_one_state() -> None:
-    """`green` is a property, not a field, for the reason `CopyVerdict.may_destroy` is one:
+    """`green` is a property, not a field, for the reason `IntegrityVerdict.may_restore` is one:
     `state is HEALTHY` spelled out at every call site is a chance at each one to write `is not
     UNHEALTHY` instead — which reads an unanswerable verdict as a completion claim."""
     greens = [
@@ -946,3 +963,71 @@ async def test_the_re_check_does_not_carry_a_browser_crash_out_of_the_verdict() 
     assert fake.command_calls.count(["npx", "tsc", "--noEmit"]) == 2, "the re-check really ran"
     assert outcome.state is HealthState.UNHEALTHY, "the browser crash survived the re-check"
     assert outcome.error is not None and outcome.error.source is ErrorSource.CLIENT
+
+
+# --- U8: one check that cannot answer stops vetoing six that did ---------------------------
+
+
+async def test_a_root_that_is_not_ours_is_advisory_when_every_other_signal_is_green() -> None:
+    """The verdict that put "The build failed." in front of a client over a working dashboard.
+
+    Six signals came back green on all fifteen runs of the incident: the type-check compiled, the
+    dev server was ready, the container reported ready, the app served 200, nothing crashed, the
+    browser reported nothing. The seventh could not answer, and one unanswerable check collapsed
+    the whole verdict to INDETERMINATE, which after a retry budget ended the build as `failed`.
+
+    A root carrying someone else's subject is a fact about the REPOSITORY, not about the app.
+    There is no birth certificate to compare against, so the check has nothing to say either way —
+    and having nothing to say is not grounds to overrule six checks that did.
+    """
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.baseline_stdout = (
+        f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{BASELINE_TEMPLATE_BLOB}@@"
+        "a subject that is not ours"
+    )
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3, had_prior_building_turns=True)
+
+    assert outcome.state is HealthState.HEALTHY
+    assert outcome.error is None
+    assert outcome.unanswered is None
+
+
+async def test_no_root_commit_at_all_still_fails_even_with_six_green_signals() -> None:
+    """The assertion that stops an advisory rule turning a revert into a completion claim.
+
+    "No root commit" is indistinguishable from a container reverted to its baked image — and a
+    reverted container serving the untouched template compiles, serves 200, logs no crash and
+    reports no browser error. All six other signals are green EXACTLY when the app is most broken,
+    so waving this cause through would print a completion claim over a blank starter page: a false
+    SUCCESS, which is worse than the false failure the unit above removes.
+
+    Mutation check: widen the advisory branch to every cause and this goes red while the test
+    above stays green — which is the pair that proves the branch is narrow rather than absent.
+    """
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.baseline_stdout = "@@@@"
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3, had_prior_building_turns=True)
+
+    assert outcome.state is HealthState.INDETERMINATE
+    assert outcome.unanswered is Unanswered.BASELINE
+
+
+async def test_a_probe_that_did_not_come_back_is_still_retried_rather_than_waved_through() -> None:
+    """The transport half keeps today's behaviour, and that is the point of naming the causes.
+
+    A supervisor blip is not a fact about the app and a retry can change the answer, so it must
+    not reach the advisory branch — an exec that never returned is not evidence that the
+    repository is unreadable.
+    """
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.baseline_probe_fails = True
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3, had_prior_building_turns=True)
+
+    assert outcome.state is HealthState.INDETERMINATE
+    assert outcome.unanswered is Unanswered.BASELINE

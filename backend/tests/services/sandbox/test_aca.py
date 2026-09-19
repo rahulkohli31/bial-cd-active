@@ -28,7 +28,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_TOKEN_REF,
 )
 from src.services.sandbox import client as client_module
-from src.services.sandbox.aca import AcaControlPlane, AcaTransientError
+from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError
 from src.services.sandbox.base import (
     FleetMember,
     SandboxError,
@@ -65,6 +65,10 @@ class FakeAca(AcaControlPlane):
         self.create_calls = 0
         self.transient_before_success = 0
         self.get_returns_none = False
+        # A delete ARM refuses. The distinction is load-bearing for cleanup paths: a container
+        # that could not be deleted must keep its ownership record, or the sweep that would
+        # retry the teardown meets an anonymous container instead.
+        self.delete_error: Exception | None = None
         self.fqdn = "app-xyz.westeurope.azurecontainerapps.io"
         # Which connector identity, if any, each container was born with.
         self.identities: dict[str, str | None] = {}
@@ -94,6 +98,8 @@ class FakeAca(AcaControlPlane):
 
     async def delete_app(self, *, name: str) -> None:
         self.deleted.append(name)
+        if self.delete_error is not None:
+            raise self.delete_error
         self.created.pop(name, None)
         self.tags.pop(name, None)
 
@@ -127,8 +133,33 @@ def _app_env() -> dict[str, str]:
     }
 
 
+def _seed_reply() -> httpx.Response:
+    """The provision's one git-repo seed exec, answered.
+
+    A provision seeds the workspace repo or fails, so every handler that a `provision_new` runs
+    through has to speak for `/_sup/exec` — a generic 200 carrying no `exit` reads as a seed that
+    did not work. Tests whose subject IS an exec answer it themselves and never reach this.
+    """
+    return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
+
+
+def _answering_supervisor(request: httpx.Request) -> httpx.Response:
+    """A supervisor that is simply up, for the tests whose subject is the control plane.
+
+    A provision now seeds the workspace repo or fails, so reaching the supervisor is part of
+    provisioning rather than housekeeping beside it. Without this default those tests would
+    exercise an unreachable host and fail on the connection, which says nothing about the ARM
+    seam they exist to check. Tests whose subject IS the supervisor pass their own handler.
+    """
+    if request.url.path == "/_sup/exec":
+        return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
+    if request.url.path == "/_sup/files":
+        return httpx.Response(200, json={"ok": True, "created": "app.bundle.b64"})
+    return httpx.Response(404)
+
+
 def _client(aca: FakeAca, handler: Handler | None = None) -> AcaSandboxClient:
-    transport = httpx.MockTransport(handler) if handler is not None else None
+    transport = httpx.MockTransport(handler or _answering_supervisor)
     return AcaSandboxClient(_config(), transport=transport, aca=aca)
 
 
@@ -286,6 +317,8 @@ async def test_attach_existing_reconnects_without_a_new_create(fake_redis: aiore
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         if request.url.path.endswith("/dev/status"):
             return httpx.Response(200, json={"running": True, "ready": True, "port": 3000})
         return httpx.Response(200, json={"ok": True})  # /_sup/health probe
@@ -309,6 +342,8 @@ async def test_attach_existing_dev_status_blip_falls_back_to_not_ready(
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         if request.url.path.endswith("/dev/status"):
             return httpx.Response(500)
         return httpx.Response(200, json={"ok": True})
@@ -328,6 +363,8 @@ async def test_attach_unreachable_and_confirmed_gone_raises_gone(
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         raise httpx.ConnectError("supervisor down")
 
     client = _client(aca, handler)
@@ -347,6 +384,8 @@ async def test_attach_unreachable_but_exists_raises_not_ready(
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         raise httpx.ConnectError("transient blip")
 
     client = _client(aca, handler)
@@ -362,6 +401,8 @@ async def test_attach_ending_state_raises_gone_without_probing(fake_redis: aiore
     probes = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         probes["n"] += 1
         return httpx.Response(200, json={"ok": True})
 
@@ -413,6 +454,8 @@ async def test_restore_with_no_snapshot_never_creates_a_container_to_clean_up(
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         return httpx.Response(200, json={"ok": True})
 
     client = _client(aca, handler)
@@ -589,6 +632,60 @@ async def test_provision_persistent_transient_raises_and_self_cleans(
     await client.aclose()
 
 
+async def test_a_failed_repo_seed_leaves_no_registered_container_behind(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ THE SECOND FALLIBLE STEP, AND THE ONE THAT RUNS AFTER THE RECORD SAYS READY.
+
+    The container is created and the registry stamped before the repo is seeded, so a seed that
+    fails without self-cleaning leaves a container the next request is handed straight back —
+    one that builds fine and whose every Save raises `WorkspaceHasNoRepositoryError`. The
+    caller cannot clean it up: it never received a handle.
+
+    Mutation check: drop the `except` around `_make_it_a_repo` and both assertions go red."""
+
+    def _refuses_to_seed(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return httpx.Response(200, json={"stdout": "", "stderr": "no git", "exit": 1})
+        return httpx.Response(404)
+
+    aca = FakeAca()
+    client = _client(aca, _refuses_to_seed)
+
+    with pytest.raises(SandboxError):
+        await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+
+    assert APP_NAME in aca.deleted, "the half-provisioned container was left running"
+    assert await fake_redis.hgetall(registry_key(USER)) == {}, (
+        "the registry still points at a container with no repository, so the next request "
+        "attaches to it instead of provisioning a clean one"
+    )
+    await client.aclose()
+
+
+async def test_a_container_aca_refuses_to_delete_keeps_its_registry_for_the_reaper(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The other half: clearing the record unconditionally would orphan a container that is
+    probably still running, leaving nothing that knows its name. A refused delete therefore
+    KEEPS the ownership record so a later sweep retries the teardown."""
+
+    def _refuses_to_seed(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return httpx.Response(200, json={"stdout": "", "stderr": "no git", "exit": 1})
+        return httpx.Response(404)
+
+    aca = FakeAca()
+    aca.delete_error = AcaError("ARM refused the delete")
+    client = _client(aca, _refuses_to_seed)
+
+    with pytest.raises(SandboxError):
+        await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+
+    assert await fake_redis.hgetall(registry_key(USER)) != {}
+    await client.aclose()
+
+
 def test_snapshot_key_is_byte_stable() -> None:
     aid = uuid.UUID("00000000-0000-0000-0000-0000000000ab")
     assert snapshot_key(aid) == "snapshots/00000000-0000-0000-0000-0000000000ab/app.bundle"
@@ -604,6 +701,8 @@ async def test_attach_transient_during_confirm_gone_maps_to_not_ready(
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         raise httpx.ConnectError("supervisor unreachable")
 
     client = _client(aca, handler)
@@ -816,6 +915,8 @@ async def test_attach_agrees_with_provision_about_where_a_person_goes(
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
         if request.url.path.endswith("/dev/status"):
             return httpx.Response(200, json={"running": True, "ready": True, "port": 3000})
         return httpx.Response(200, json={"ok": True})  # /_sup/health probe

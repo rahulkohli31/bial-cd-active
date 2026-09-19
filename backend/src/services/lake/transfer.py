@@ -73,9 +73,8 @@ def _digest(blob_name: str) -> str:
 # ZADD then EXPIRE, as ONE step. A Redis Lua script runs single-threaded, so nothing interleaves
 # and nothing can die in between — which as two round trips it could, leaving the index with no
 # expiry until some later write happened to refresh it. That is the ONE key in this feature able
-# to outlive the seven-day promise `C5-redis-key-namespace.md` makes about every key here, and a
-# promise with a hole in it is worth three lines to close. `locks.py` sets the precedent for
-# reaching for `eval` in this tree.
+# to outlive the seven-day life every key here is promised, and a promise with a hole in it is
+# worth three lines to close. `locks.py` sets the precedent for reaching for `eval` in this tree.
 #
 # ONE KEY, which is what keeps it legal on production's sharded EnterpriseCluster: the file's own
 # `SET` stays a separate command below precisely because it lives on a different key and a

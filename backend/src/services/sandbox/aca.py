@@ -362,9 +362,9 @@ class AcaControlPlane:
         """Create (or update) the container app; return its public ingress FQDN
         (host-only, no scheme). Retryable failures raise `AcaTransientError`.
 
-        `tags` is REQUIRED, not defaulted (`fail-first.md`). There is no deployment in which an
-        untagged sandbox is correct — an untagged container is an anonymous container — and a
-        default would let a new call site create one silently."""
+        `tags` is REQUIRED and has no default: there is no deployment in which an untagged
+        sandbox is correct — an untagged container is an anonymous container — and a default
+        would let a new call site create one silently."""
         envelope = self._envelope(env, tags, identity_resource_id=identity_resource_id)
 
         def _run() -> str:

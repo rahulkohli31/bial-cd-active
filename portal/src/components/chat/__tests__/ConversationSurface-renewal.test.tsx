@@ -16,7 +16,7 @@ const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), resolvePlanOptions: vi.fn(),
-  stop: vi.fn(), getStatus: vi.fn(),
+  getStatus: vi.fn(),
   relaunchPreview: vi.fn(), fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
   fetchCompileState: vi.fn(), checkWorkspace: vi.fn(), renewPresence: vi.fn(),
 }))
@@ -97,7 +97,7 @@ beforeEach(() => {
     { id: 'build-X', kind: 'build', title: 'My build', updatedAt: new Date().toISOString() },
   ])
   h.buildUserParts.mockImplementation(async (text: string) => [{ type: 'text', text }])
-  h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: false, savedHead: null, containerHead: null, recoveryAt: null })
+  h.fetchSaveState.mockResolvedValue({ appId: 'a1', dirty: false, savedHead: null, containerHead: null })
   h.fetchCompileState.mockResolvedValue({ state: 'unknown' })
   h.checkWorkspace.mockResolvedValue(false)
   h.fetchPreviewState.mockResolvedValue(LIVE)

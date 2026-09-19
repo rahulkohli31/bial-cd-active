@@ -22,7 +22,7 @@ from typing import Final
 import structlog
 
 from src.api.v1.build_sessions.schemas import BuildError
-from src.core.integrity_types import BaselineIdentity
+from src.core.integrity_types import BaselineIdentity, BaselineUnanswerable
 from src.services.orchestrator.client_errors import ClientErrorReport, drain_client_errors
 from src.services.orchestrator.constants import (
     EXEC_TIMEOUT_S,
@@ -295,9 +295,9 @@ class VerifyOutcome:
         """tsc clean AND dev ready AND a clean log tail AND no browser crash AND the app serves
         AND it is no longer the starter page.
 
-        A PROPERTY rather than a field, for the reason `durable_copy.CopyVerdict.may_destroy`
-        exists: `state is HealthState.HEALTHY` spelled out at every call site is a chance at each
-        one to write `is not UNHEALTHY` instead — which would read an INDETERMINATE verdict as a
+        A PROPERTY rather than a field, for the reason `IntegrityVerdict.may_restore` exists:
+        `state is HealthState.HEALTHY` spelled out at every call site is a chance at each one to
+        write `is not UNHEALTHY` instead — which would read an INDETERMINATE verdict as a
         completion claim."""
         return self.state is HealthState.HEALTHY
 
@@ -377,6 +377,52 @@ async def where_are_we(
         if attempt < max_polls - 1:
             await asyncio.sleep(poll_s)
     return Readiness.STILL_TRYING
+
+
+class AppState(enum.StrEnum):
+    """What this app's workspace is doing right now, RESOLVED — one answer, not the two signals
+    it was read from.
+
+    `UNKNOWN` is a member rather than a `None`: a caller told "it's fine" on an incomplete check
+    is worse off than one told nothing, because it will defend the claim."""
+
+    UNKNOWN = "unknown"
+    NOT_SERVING = "not_serving"
+    STILL_THE_TEMPLATE = "still_the_template"
+    LIVE = "live"
+
+
+async def read_the_app_state(
+    sandbox_client: SandboxClient, handle: SandboxHandle, *, max_polls: int, poll_s: float
+) -> AppState:
+    """THE CHEAP HALF OF THE HEALTH VERDICT, resolved to one answer: a bounded readiness poll
+    plus one exec, no `tsc`. It must not cost what `verify` costs, because it runs whenever the
+    agent asks rather than once at the end of a build.
+
+    "STILL STARTING UP" RESOLVES TO `UNKNOWN`, NEVER `NOT_SERVING`: a read taken inside
+    `dev_start`'s compile window would otherwise call every cold app dead.
+
+    ORDER: could-not-tell > not-serving > whatever the page shows. An unanswered check is not a
+    finding, and a down app has no home page worth discussing.
+
+    NEVER RAISES — a failure's value is not knowing, and the caller is a tool the model is
+    holding mid-turn."""
+    try:
+        readiness = await where_are_we(sandbox_client, handle, max_polls=max_polls, poll_s=poll_s)
+    except SandboxError:
+        return AppState.UNKNOWN
+    if readiness is Readiness.STILL_TRYING:
+        return AppState.UNKNOWN
+    if readiness is Readiness.DIED:
+        return AppState.NOT_SERVING
+    baseline = await _ask_the_container_what_it_is_showing(sandbox_client, handle)
+    match baseline:
+        case BaselineIdentity.UNANSWERABLE:
+            return AppState.UNKNOWN
+        case BaselineIdentity.STILL_THE_BASELINE:
+            return AppState.STILL_THE_TEMPLATE
+        case BaselineIdentity.DIVERGED:
+            return AppState.LIVE
 
 
 async def verify(
@@ -505,6 +551,15 @@ async def _ask_the_container_what_it_is_showing(
     return await baseline_identity(sandbox_client, handle)
 
 
+async def _ask_the_container_why_it_could_not_say(
+    sandbox_client: SandboxClient, handle: SandboxHandle
+) -> BaselineUnanswerable | None:
+    """`integrity.why_unanswerable`, reached the same deferred way and for the same reason."""
+    from src.services.build_sessions.integrity import why_unanswerable
+
+    return await why_unanswerable(sandbox_client, handle)
+
+
 async def _verify_once(
     sandbox_client: SandboxClient,
     handle: SandboxHandle,
@@ -584,6 +639,9 @@ async def _verify_once(
     # opposite case: ready is TRUE, `tsc` is clean, and the page is still blank.
     served: ServedPage | None = None
     baseline: BaselineIdentity | None = None
+    # Only read when the baseline question came back unanswerable, because only then does the
+    # reason change what the verdict does — it costs a second exec and buys nothing otherwise.
+    why_unanswerable: BaselineUnanswerable | None = None
     if dev_ready:
         # ONE request does both jobs. It is the same GET at the same URL `someone_has_to_go_first`
         # used to make from here — so the route still gets requested and Next still emits its `⨯`
@@ -610,6 +668,12 @@ async def _verify_once(
         # the attach path already holds (see `integrity.has_ever_been_built`).
         if had_prior_building_turns:
             baseline = await _ask_the_container_what_it_is_showing(sandbox_client, handle)
+            if baseline is BaselineIdentity.UNANSWERABLE:
+                # ASKED ONLY WHEN IT COULD NOT ANSWER, so the ordinary verdict still costs one
+                # exec. Which cause it was decides whether this check keeps its veto.
+                why_unanswerable = await _ask_the_container_why_it_could_not_say(
+                    sandbox_client, handle
+                )
 
     logs = await _try_try_again(lambda: sandbox_client.dev_logs(handle, since=log_cursor))
     # Bound the tail fed to crash detection + redaction: a single unbounded dev-log blob must not
@@ -720,11 +784,20 @@ async def _verify_once(
             else served_badly_error(served.status)
         )
     elif baseline is BaselineIdentity.UNANSWERABLE:
-        # No root commit, more than one, or a baseline the repository never held. Never UNHEALTHY
-        # and never HEALTHY: an app cannot be convicted of showing the template by a check that
-        # could not find the template, and it cannot be cleared by one either.
-        state = HealthState.INDETERMINATE
-        unanswered = Unanswered.BASELINE
+        if why_unanswerable is BaselineUnanswerable.ROOT_IS_NOT_OURS:
+            # ADVISORY, AND ONLY THIS CAUSE. A root carrying someone else's subject is a fact
+            # about the repository, not about the app: there is no birth certificate to compare
+            # against, so this check has nothing to say either way. Every other signal above has
+            # already spoken, and one that cannot answer does not get to overrule six that did.
+            pass
+        else:
+            # Every other cause keeps its veto. `NO_SINGLE_ROOT` is the one that matters: it is
+            # indistinguishable from a container reverted to its baked image, and a reverted
+            # container serving the untouched template is green on all six other signals exactly
+            # when the app is most broken. Waving it through would print a completion claim over
+            # a blank starter page.
+            state = HealthState.INDETERMINATE
+            unanswered = Unanswered.BASELINE
     elif baseline is BaselineIdentity.STILL_THE_BASELINE:
         # The content half. Every server-side check above came back clean and the citizen is
         # looking at the golden template.

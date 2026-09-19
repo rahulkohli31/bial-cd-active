@@ -43,7 +43,7 @@ logger = structlog.get_logger()
 _FOUNDRY_HOST_SUFFIX = ".services.ai.azure.com"
 _PUBLIC_OPENAI_HOST = "api.openai.com"
 
-# Measured against the live resource on 2026-09-08 (see the issue's Dependencies section).
+# The newest API version the live Foundry resource answers on; measured, not chosen.
 _EMBEDDING_API_VERSION = "2024-10-21"
 
 

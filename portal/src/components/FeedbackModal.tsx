@@ -5,10 +5,9 @@ import { MessageSquare, X, AlertCircle } from 'lucide-react'
 import { BusyGlyph } from './ui/Waiting'
 import { submitFeedback } from '../utils/feedback'
 
-// Mirrors the server's MAX_FEEDBACK_CHARS (server/feedback.js). The counter and
-// the Submit gate both measure UTF-8 BYTES (TextEncoder), exactly matching the
-// server's Buffer.byteLength check — a char-count cap would let multibyte text
-// pass here and 400 on the server.
+// The server's cap, in UTF-8 BYTES. The counter and the Submit gate both measure
+// bytes (TextEncoder) because the server does — a char-count cap would let
+// multibyte text pass here and 400 on the server.
 const MAX_FEEDBACK_BYTES = 4000
 
 const byteLength = (s: string): number => new TextEncoder().encode(s).length

@@ -281,25 +281,6 @@ export const NO_SAVE: SaveSlot = {
 }
 
 /**
- * WHAT THE PLATFORM OWES THE CITIZEN ABOUT THEIR APP'S LIFE — the container's ceiling, and a
- * write-back that was refused. `WorkspaceLifecycleNotes` states both, and it is mounted in the
- * pane column, which is a sibling of the `<Outlet/>`: the surface that READS these facts is never
- * the one that renders them, which is why they travel.
- *
- * ONE CELL FOR THE PAIR, because one note states both and both come from the same surface's reads.
- * `null` ON EITHER HALF IS A POSITIVE CLAIM — no ceiling applies, no write-back was refused — so a
- * surface that has not asked yet publishes two nulls and the note says nothing until it can.
- */
-export interface WorkspaceLifecycle {
-  /** When this app's container reaches its ceiling, or `null` when no ceiling applies. */
-  drainingAt: string | null
-  /** When a platform write-back for this app was last refused, or `null` if none ever was. */
-  writeBackRefusedAt: string | null
-}
-
-export const NO_LIFECYCLE: WorkspaceLifecycle = { drainingAt: null, writeBackRefusedAt: null }
-
-/**
  * THE ROW'S HANDLERS, held apart from every compared value on purpose.
  *
  * Every one is something a citizen PRESSES, so none is needed at render time — which is what lets
@@ -352,8 +333,6 @@ const sameSave = (a: SaveSlot, b: SaveSlot) =>
   a.canSave === b.canSave &&
   a.canDiscard === b.canDiscard
 
-const sameLifecycle = (a: WorkspaceLifecycle, b: WorkspaceLifecycle) =>
-  a.drainingAt === b.drainingAt && a.writeBackRefusedAt === b.writeBackRefusedAt
 
 /**
  * WHAT THE PANE NEEDS IN ORDER TO SAY WHAT THE WORKSPACE IS DOING. The `state` is the one computed
@@ -426,8 +405,6 @@ export interface WorkspaceChannel {
   heading: Cell<WorkspaceHeading>
   /** The save control's values. Its ACTION is the next cell, deliberately. */
   save: Cell<SaveSlot>
-  /** The ceiling and the refused write-back — see `WorkspaceLifecycle`. */
-  lifecycle: Cell<WorkspaceLifecycle>
   /**
    * THE ROW'S ACTIONS, AND NOTHING SUBSCRIBES TO THEM. Republished on every render of whichever
    * surface owns them, compared by identity, and read imperatively by the row at press time. That
@@ -459,7 +436,6 @@ export function createWorkspaceChannel(): WorkspaceChannel {
     rail: createCell<RailSlot>(NO_RAIL, sameRail),
     heading: createCell<WorkspaceHeading>(NO_HEADING, sameHeading),
     save: createCell<SaveSlot>(NO_SAVE, sameSave),
-    lifecycle: createCell<WorkspaceLifecycle>(NO_LIFECYCLE, sameLifecycle),
     actions: createCell<WorkspaceActions>(NO_ACTIONS),
     workspace: createCell<WorkspaceReport | null>(null, sameReport),
   }
@@ -535,10 +511,6 @@ export function useWorkspaceSave(): SaveSlot {
 }
 
 /** The ceiling and the refused write-back, as the mounted surface last read them. */
-export function useWorkspaceLifecycle(): WorkspaceLifecycle {
-  return useCell(useWorkspaceChannel()?.lifecycle, NO_LIFECYCLE)
-}
-
 /**
  * A READER, NOT A VALUE — and that is the whole design of this pair.
  *
@@ -575,10 +547,6 @@ export function useWorkspaceActions(): () => WorkspaceActions {
 //                         only the address to keep running, so dropping these costs nothing and
 //                         keeping them would render a departed conversation's toolbar.
 //   visible    CLEARED  — a surface that is gone is not asking for anything to be shown.
-//   lifecycle  CLEARED  — both halves are READINGS, and the column that renders them outlives
-//                         every surface that makes one. A reading left standing would go on
-//                         naming a closing time nobody is still checking; two nulls say nothing,
-//                         which is the honest answer until the next surface's first read lands.
 
 function usePublish<T>(cell: Cell<T> | undefined, value: T, onUnmount?: T, abstain = false): void {
   // LAYOUT effect, not a passive one. The host is a sibling that re-renders from the store, so a
@@ -673,14 +641,6 @@ export function usePublishPaneView(view: PaneView): void {
  */
 export function useAppPaneVisible(visible: boolean): void {
   usePublish(useWorkspaceChannel()?.visible, visible, false)
-}
-
-/**
- * Publish what the platform owes the citizen about their app's life. CLEARED ON UNMOUNT — see the
- * table above.
- */
-export function usePublishLifecycle(lifecycle: WorkspaceLifecycle): void {
-  usePublish(useWorkspaceChannel()?.lifecycle, lifecycle, NO_LIFECYCLE)
 }
 
 /**

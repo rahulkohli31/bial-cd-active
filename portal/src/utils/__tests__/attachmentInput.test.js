@@ -126,9 +126,8 @@ describe('resolveMediaType', () => {
   })
 })
 
-// `officeFormat` and the two deck suites are GONE, along with the media types they described.
-// Their inertness is asserted in `attachmentInput-deck-disabled.test.js`, which stopped
-// mocking the flag when the flag stopped existing — a removal's tests become guards, not gaps.
+// WHAT MUST STAY UNREACHABLE — anything needing a converter this platform cannot host — is
+// asserted in `attachmentInput-no-converter.test.js`, against the real module, not here.
 
 describe('ACCEPT_ATTR', () => {
   it('offers both lanes and their extension tokens, and nothing needing conversion', () => {

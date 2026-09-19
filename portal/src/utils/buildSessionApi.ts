@@ -6,8 +6,8 @@
  * Wire format is camelCase; bodies are untrusted `unknown`, narrowed with `toX()` guards — never
  * cast, never `any`. Every non-2xx becomes an `ApiError`, so callers branch on `.status`/`.code`.
  *
- * CSRF: `relaunchPreview` / `stop` (and the project-scoped save / release / stop-active
- * calls below) are mutating POSTs and carry the signed double-submit token (`X-CSRF-Token`,
+ * CSRF: `relaunchPreview` (and the project-scoped save / release / stop-active calls below)
+ * are mutating POSTs and carry the signed double-submit token (`X-CSRF-Token`,
  * reusing `auth.ts` `getCsrfToken()`); `getStatus` GET and the SSE GET (a separate transport,
  * `buildSessionEvents.ts`) are safe methods and carry NO token. This is net-new: no prior
  * business route in the portal enforces CSRF.
@@ -23,8 +23,6 @@ import type {
   RelaunchPreviewRequest,
   RelaunchPreviewResponse,
   SharedPreviewResponse,
-  StopBuildRequest,
-  StopBuildResponse,
 } from './buildSessionTypes'
 
 /**
@@ -42,19 +40,16 @@ const BASE = '/api/build-sessions'
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
 /**
- * Thrown by `relaunchPreview` on a `409 build_session_already_active`, carrying the EXISTING
- * session's id — the `409` alone is not a self-describing discriminator.
+ * Thrown by `relaunchPreview` on a `409 build_session_already_active` — a typed discriminator,
+ * because the `409` alone is not a self-describing one.
  *
  * Its one live handler is `StartAppControl`, which reports "a build is already running in this
  * project" through the workspace state.
  */
 export class BuildSessionAlreadyActiveError extends ApiError {
-  readonly existingSessionId: string | null
-
-  constructor(message: string, existingSessionId: string | null) {
+  constructor(message: string) {
     super(message, 409, 'build_session_already_active')
     this.name = 'BuildSessionAlreadyActiveError'
-    this.existingSessionId = existingSessionId
   }
 }
 
@@ -108,7 +103,7 @@ function requireProjectId(value: Record<string, unknown>): string {
 
 function toRelaunchPreviewResponse(value: unknown): RelaunchPreviewResponse {
   if (!isRecord(value)) throw new ApiError('The server returned a preview we could not read.', 500)
-  // No sessionId/createdAt on this shape (Decision 6) — do NOT reuse requireSessionId here.
+  // No sessionId/createdAt on this shape — do NOT reuse requireSessionId here.
   return {
     appId: asString(value.appId),
     previewUrl: asString(value.previewUrl),
@@ -136,26 +131,12 @@ function toBuildSessionStatusResponse(value: unknown): BuildSessionStatusRespons
   }
 }
 
-function toStopBuildResponse(value: unknown): StopBuildResponse {
-  if (!isRecord(value)) throw new ApiError('The server returned a build session we could not read.', 500)
-  return { sessionId: requireSessionId(value), status: toBuildSessionStatus(value.status) }
-}
-
 // ─── request plumbing ────────────────────────────────────────────────────────
 
 /** The double-submit CSRF header for a mutating POST, or `{}` when no csrf cookie is readable (parity with `auth.ts`). */
 function csrfHeaders(): Record<string, string> {
   const csrf = getCsrfToken()
   return csrf ? { 'X-CSRF-Token': csrf } : {}
-}
-
-/** The session id a `build_session_already_active` body carries (top-level or under `error`), or null. */
-function existingSessionIdOf(body: unknown): string | null {
-  if (!isRecord(body)) return null
-  if (typeof body.sessionId === 'string') return body.sessionId
-  const err = body.error
-  if (isRecord(err) && typeof err.sessionId === 'string') return err.sessionId
-  return null
 }
 
 /**
@@ -181,8 +162,8 @@ async function getJson(
  * A mutating POST with CSRF. `body === undefined` sends no JSON body — the project-scoped
  * commands (`saveProject` / `releaseProject` / `stopActiveBuild`) name the target in the path
  * and carry nothing else. A non-2xx becomes an `ApiError`, EXCEPT a
- * `409 build_session_already_active` which becomes the richer
- * `BuildSessionAlreadyActiveError` carrying the existing session id.
+ * `409 build_session_already_active` which becomes the typed
+ * `BuildSessionAlreadyActiveError`.
  */
 async function postJson(url: string, body: unknown, fallback: string, deps: AuthFetchDeps): Promise<unknown> {
   const hasBody = body !== undefined
@@ -200,7 +181,7 @@ async function postJson(url: string, body: unknown, fallback: string, deps: Auth
     const code = extractApiCode(errBody)
     const message = extractApiMessage(errBody, res.status, fallback)
     if (res.status === 409 && code === 'build_session_already_active') {
-      throw new BuildSessionAlreadyActiveError(message, existingSessionIdOf(errBody))
+      throw new BuildSessionAlreadyActiveError(message)
     }
     // CARRY THE WHOLE ERROR OBJECT. This built its own ApiError and dropped everything but
     // the message and code, so `sandbox_reclaim_blocked` arrived with no projectId — and
@@ -231,13 +212,6 @@ export async function relaunchPreview(
   return toRelaunchPreviewResponse(body)
 }
 
-/** `stop` — graceful stop (snapshot → teardown → release). Idempotent. `reason` is only sent when supplied. */
-export async function stop(sessionId: string, args: StopBuildRequest = {}, deps: AuthFetchDeps = {}): Promise<StopBuildResponse> {
-  const body = args.reason !== undefined ? { reason: args.reason } : {}
-  const res = await postJson(`${BASE}/${encodeURIComponent(sessionId)}/stop`, body, 'Failed to stop build session', deps)
-  return toStopBuildResponse(res)
-}
-
 /** `getStatus` — the poll surface and the source of the framable `previewUrl` + `lastSeq`. A safe GET: no CSRF. */
 export async function getStatus(sessionId: string, deps: AuthFetchDeps = {}): Promise<BuildSessionStatusResponse> {
   const res = await authFetch(`${BASE}/${encodeURIComponent(sessionId)}`, {}, deps)
@@ -251,12 +225,9 @@ export async function getStatus(sessionId: string, deps: AuthFetchDeps = {}): Pr
 // keep-alive loop that was their only caller was itself deleted, same as `renewLock` and
 // `heartbeat` before them (see the note above).
 //
-// `forceEnd` is gone too, and so is the ROUTE it spoke to. It was the owner-only kill switch
-// for a session stuck mid-`building` that never emits a terminal `ended`, but its one control
-// was the block banner's Force-end button, deleted with the banner — so no surface could reach
-// it any more, and keeping a client for it only advertised a way to end a build that a citizen
-// could not actually take. What a live build offers now is `stop` (graceful, the whole
-// interrupt vocabulary of a turn) and, project-scoped, `stopActiveBuild`.
+// `forceEnd` is gone too, and so is the ROUTE it spoke to; the session-scoped `stop` that
+// replaced it in this comment has since been retired the same way, route and all. What a live
+// build offers now is the turn's own stop and, project-scoped, `stopActiveBuild`.
 
 /**
  * The dependency bag the client + event feed accept, so a hook and a page
@@ -266,14 +237,12 @@ export async function getStatus(sessionId: string, deps: AuthFetchDeps = {}): Pr
  */
 export interface BuildSessionClient {
   relaunchPreview: typeof relaunchPreview
-  stop: typeof stop
   getStatus: typeof getStatus
 }
 
 /** The real, wired-by-default client — already the final implementation, so no later swap between mock and real is needed. */
 export const buildSessionClient: BuildSessionClient = {
   relaunchPreview,
-  stop,
   getStatus,
 }
 
@@ -292,23 +261,6 @@ export interface SaveState {
   dirty: boolean | null
   containerHead: string | null
   savedHead: string | null
-  /** WHEN THE PLATFORM LAST PUT THIS APP'S NEWEST TREE SOMEWHERE IT CAN BE BROUGHT BACK FROM —
-   *  an ISO instant, or `null` if it never has. Kept as the string it arrived as: the only
-   *  question anything asks of it is null-vs-not, and no surface here does date arithmetic.
-   *
-   *  IT IS NOT A SECOND `savedHead` AND MAY NEVER BE READ AS ONE. A recovery copy is the
-   *  platform's own doing; a saved version is the citizen's, Save stays MANUAL, and `dirty`
-   *  stays true while this is set. What it licenses is a truer WARNING, never a claim of
-   *  safety-by-saving — the rail's `saveSentence` is where that reasoning is written down. */
-  recoveryAt: string | null
-  /** WHEN A PLATFORM WRITE-BACK FOR THIS APP WAS LAST REFUSED, or `null` if none ever was.
-   *
-   *  Shutdown writes the citizen's work back with nobody watching. When the tree does not descend
-   *  from what they themselves saved, the guard sets it aside and the app comes back from the
-   *  SAVED version instead — which, from the screen, looks exactly like an ordinary reopen. This
-   *  is what lets the project screen say so, and saying so is what makes removing the exit
-   *  prompts honest rather than merely quieter. */
-  writeBackRefusedAt: string | null
 }
 
 /** Two readings that say the same thing. Every field is a primitive, so this is exact rather
@@ -319,8 +271,7 @@ export interface SaveState {
  *  THE NEW VALUE. The caller keeps the PREVIOUS object whenever this answers "same"
  *  (`useWorkspaceState`: `sameSaveState(prev, state) ? prev : state`), so a field this cannot
  *  see never reaches the screen at all: the reading that changed is thrown away and the rail
- *  goes on saying the sentence that belonged to the old one. `recoveryAt` is polled like the
- *  rest of them, and it decides which sentence the rail says. */
+ *  goes on saying the sentence that belonged to the old one. */
 export const sameSaveState = (a: SaveState | null, b: SaveState | null): boolean =>
   a === b ||
   (a !== null &&
@@ -328,12 +279,10 @@ export const sameSaveState = (a: SaveState | null, b: SaveState | null): boolean
     a.appId === b.appId &&
     a.dirty === b.dirty &&
     a.containerHead === b.containerHead &&
-    a.savedHead === b.savedHead &&
-    a.recoveryAt === b.recoveryAt &&
-    a.writeBackRefusedAt === b.writeBackRefusedAt)
+    a.savedHead === b.savedHead)
 
-/** Push the project's current tree to durable storage. THE USER'S CLICK — nothing else writes
- *  the bundle. A 409 means the workspace is no longer running, and is surfaced, never
+/** Push the project's current tree to durable storage. THE USER'S CLICK — the one write of the
+ *  bundle anybody asks for. A 409 means the workspace is no longer running, and is surfaced, never
  *  swallowed: a Save that reports success having stored nothing is the worst outcome here. */
 export async function saveProject(projectId: string, deps: AuthFetchDeps = {}): Promise<SaveResult> {
   const body = await postJson(
@@ -389,7 +338,7 @@ function toSharedPreviewResponse(value: unknown): SharedPreviewResponse {
  * `409 sandbox_reclaim_blocked` here means exactly what it means on a relaunch, and the caller
  * has to handle it the same way (see `asReclaimBlocked` / `ReclaimBlocked.isSharedView`).
  *
- * NOT "READ-ONLY" EITHER, for the same Key Decision 3 reason the product copy already gets
+ * NOT "READ-ONLY" EITHER, for the same reason the product copy already gets
  * right: the recipient can create, update and delete the owner's records through the app's own
  * UI. "Can use", never "view only" — these two functions open the door, nothing more.
  */
@@ -944,9 +893,6 @@ function toSaveState(body: unknown): SaveState {
     dirty: typeof body.dirty === 'boolean' ? body.dirty : null,
     containerHead: typeof body.containerHead === 'string' ? body.containerHead : null,
     savedHead: typeof body.savedHead === 'string' ? body.savedHead : null,
-    recoveryAt: typeof body.recoveryAt === 'string' ? body.recoveryAt : null,
-    writeBackRefusedAt:
-      typeof body.writeBackRefusedAt === 'string' ? body.writeBackRefusedAt : null,
   }
 }
 
@@ -1016,15 +962,9 @@ export type SurfacePresence = 'visible' | 'hidden'
  */
 export type RenewalOutcome = 'renewed' | 'not_this_container' | 'nothing_running'
 
-/** What a renewal answered, and when the container it reached hits its absolute ceiling. */
+/** What a renewal answered. */
 export interface Renewal {
   outcome: RenewalOutcome
-  /**
-   * When this container is collected no matter who is renewing it, or `null` when no ceiling
-   * applies. NULL IS NOT "SOON" — a screen that read it as imminent would announce a collection
-   * that is not coming.
-   */
-  drainingAt: string | null
 }
 
 /**
@@ -1064,46 +1004,9 @@ export async function renewPresence(
     if (outcome !== 'renewed' && outcome !== 'not_this_container' && outcome !== 'nothing_running') {
       return null
     }
-    return {
-      outcome,
-      drainingAt: typeof body.drainingAt === 'string' ? body.drainingAt : null,
-    }
+    return { outcome }
   } catch {
     return null
   }
 }
 
-/** One app's activity, as the applications page reads it. */
-export type ActivityPhase = 'starting' | 'open' | 'closing'
-
-export interface ProjectActivity {
-  projectId: string
-  phase: ActivityPhase
-}
-
-const ACTIVITY_PHASES: ReadonlySet<string> = new Set(['starting', 'open', 'closing'])
-
-/**
- * Which of this citizen's apps are starting, open right now, or closing down.
- *
- * IT THROWS RATHER THAN ANSWERING EMPTY. An empty list is a positive statement that nothing is
- * happening, and the page clears every marker on it — so a read that could not be made must reach
- * the caller as a failure, where the existing markers are held, rather than as an answer.
- */
-export async function fetchActivity(deps: AuthFetchDeps = {}): Promise<ProjectActivity[]> {
-  const res = await authFetch(`${BASE}/activity`, {}, deps)
-  if (!res.ok) throw await readApiError(res, 'Could not check what is running')
-  const body: unknown = await res.json().catch(() => null)
-  if (!isRecord(body) || !Array.isArray(body.projects)) {
-    throw new ApiError('Could not check what is running', res.status)
-  }
-  const rows: ProjectActivity[] = []
-  for (const raw of body.projects) {
-    if (!isRecord(raw)) continue
-    const { projectId, phase } = raw
-    if (typeof projectId !== 'string' || typeof phase !== 'string') continue
-    if (!ACTIVITY_PHASES.has(phase)) continue
-    rows.push({ projectId, phase: phase as ActivityPhase })
-  }
-  return rows
-}

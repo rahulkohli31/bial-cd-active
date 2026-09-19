@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import {
   relaunchPreview,
-  stop,
   getStatus,
   buildSessionClient,
   BuildSessionAlreadyActiveError,
@@ -53,22 +52,21 @@ function headerOf(m: ReturnType<typeof jsonFetch>, name: string, call = 0): stri
 // `renewLock` / `releaseLock` / `heartbeat` after they were gone, unnoticed because nothing
 // forced its stale keys to be read against the real surface. This test fails LOUDLY the
 // moment `buildSessionClient` gains or loses a member, so the next removal cannot leave the
-// same kind of residue behind unnoticed — it did its job again for `forceEnd`'s removal,
-// which is why the set is DOWN to three and not quietly still four.
-const _CLIENT_MEMBERS = new Set(['relaunchPreview', 'stop', 'getStatus'])
+// same kind of residue behind unnoticed — it did its job again for `forceEnd`'s removal and
+// again for the session-scoped `stop`'s, which is why the set is DOWN to two.
+const _CLIENT_MEMBERS = new Set(['relaunchPreview', 'getStatus'])
 
 describe('buildSessionApi — buildSessionClient member set (inertness guard)', () => {
-  it('exposes exactly the three surviving client operations', () => {
+  it('exposes exactly the two surviving client operations', () => {
     expect(new Set(Object.keys(buildSessionClient))).toEqual(_CLIENT_MEMBERS)
   })
 })
 
 describe('buildSessionApi — control operations', () => {
-  // `start` is gone — a composer send is a TURN, so the wrapper had no caller — but the typed
-  // 409 mapping these two cases pin lives in the shared `postJson`, not in `start` itself. They
-  // are re-pointed onto `relaunchPreview`, now the only live caller that can raise this error.
-  it('a 409 build_session_already_active surfaces the existing sessionId as a typed error', async () => {
-    const fetchImpl = jsonFetch(409, { error: { code: 'build_session_already_active', message: 'You already have a build running.' }, sessionId: 'existing-9' })
+  // The typed 409 mapping lives in the shared `postJson`, and `relaunchPreview` is the only
+  // live caller that can raise it.
+  it('a 409 build_session_already_active arrives as a typed error carrying the server sentence', async () => {
+    const fetchImpl = jsonFetch(409, { error: { code: 'build_session_already_active', message: 'You already have a build running.' } })
     const err = await relaunchPreview({ projectId: 'p1' }, { fetchImpl }).catch((e: unknown) => e)
 
     expect(err).toBeInstanceOf(BuildSessionAlreadyActiveError)
@@ -76,13 +74,7 @@ describe('buildSessionApi — control operations', () => {
     const active = err as BuildSessionAlreadyActiveError
     expect(active.status).toBe(409)
     expect(active.code).toBe('build_session_already_active')
-    expect(active.existingSessionId).toBe('existing-9')
-  })
-
-  it('reads the existing sessionId whether it sits at top-level or under error{}', async () => {
-    const fetchImpl = jsonFetch(409, { error: { code: 'build_session_already_active', message: 'busy', sessionId: 'nested-42' } })
-    const err = await relaunchPreview({ projectId: 'p1' }, { fetchImpl }).catch((e: unknown) => e)
-    expect((err as BuildSessionAlreadyActiveError).existingSessionId).toBe('nested-42')
+    expect(active.message).toBe('You already have a build running.')
   })
 
   it('relaunchPreview: 200 maps {appId, previewUrl, status} — no sessionId/createdAt on this shape', async () => {
@@ -169,16 +161,10 @@ describe('buildSessionApi — control operations', () => {
 })
 
 describe('buildSessionApi — CSRF discipline', () => {
-  // RE-POINTED OFF THE DELETED LOCK OPS. This ran a `cases` loop over `acquireLock` /
-  // `releaseLock`, then over the lone surviving `forceEnd`; with the kill switch gone the loop
-  // had nothing to iterate. `relaunchPreview` and `stop` are the mutating session POSTs the
-  // portal still makes, and the contract — every one of them carries the token — is unchanged.
-  it('attaches X-CSRF-Token on every mutating POST (relaunchPreview / stop)', async () => {
-    const stopImpl = jsonFetch(200, { sessionId: 's', status: 'ended' })
-    await stop('s', {}, { fetchImpl: stopImpl })
-    expect(headerOf(stopImpl, 'X-CSRF-Token')).toBe(CSRF)
-    expect(optsOf(stopImpl).method).toBe('POST')
-
+  // RE-POINTED OFF THE DELETED LOCK OPS, and again off the session-scoped `stop`.
+  // `relaunchPreview` is the one session-namespace mutating POST the portal still makes, and
+  // the contract — every mutating POST carries the token — is unchanged.
+  it('attaches X-CSRF-Token on the mutating POST (relaunchPreview)', async () => {
     const relaunchImpl = jsonFetch(200, { appId: 'a1', previewUrl: null, status: 'ready', ready: true, restoredFromFailedBuild: false })
     await relaunchPreview({ projectId: 'p1' }, { fetchImpl: relaunchImpl })
     expect(headerOf(relaunchImpl, 'X-CSRF-Token')).toBe(CSRF)
@@ -187,26 +173,13 @@ describe('buildSessionApi — CSRF discipline', () => {
 
   it('omits the CSRF header when no csrf cookie is readable (parity with auth.js)', async () => {
     document.cookie = 'csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT'
-    const impl = jsonFetch(200, { sessionId: 's', status: 'ended' })
-    await stop('s', {}, { fetchImpl: impl })
+    const impl = jsonFetch(200, { appId: 'a1', previewUrl: null, status: 'ready', ready: true, restoredFromFailedBuild: false })
+    await relaunchPreview({ projectId: 'p1' }, { fetchImpl: impl })
     expect(headerOf(impl, 'X-CSRF-Token')).toBeUndefined()
   })
 })
 
 describe('buildSessionApi — lock ops + fail-closed errors', () => {
-  it('stop: sends {reason} when supplied, and a valid empty StopBuildRequest {} otherwise', async () => {
-    const withReason = jsonFetch(200, { sessionId: 's', status: 'ended' })
-    await stop('s', { reason: 'user cancelled' }, { fetchImpl: withReason })
-    expect(JSON.parse(optsOf(withReason).body as string)).toEqual({ reason: 'user cancelled' })
-
-    // A bare stop still carries a body — {} is a complete StopBuildRequest (reason
-    // defaults to None), so it always satisfies the body model. The bodyless
-    // POSTs, by contrast, send NO body (asserted below via the absent Content-Type).
-    const noReason = jsonFetch(200, { sessionId: 's', status: 'ended' })
-    await stop('s', {}, { fetchImpl: noReason })
-    expect(JSON.parse(optsOf(noReason).body as string)).toEqual({})
-  })
-
   // RE-POINTED OFF `forceEnd`, the same way it was once re-pointed onto it off
   // `acquireLock` / `releaseLock`. The CONTRACT is `postJson`'s `body === undefined` branch — send
   // no JSON body and therefore no Content-Type — and the kill switch was only ever its vehicle.
@@ -820,40 +793,38 @@ describe('fetchPreviewState — the wire mirror', () => {
 })
 
 /**
- * ★ THE SAVE-STATE WIRE, AND THE ONE FIELD THE PORTAL USED TO THROW AWAY.
+ * ★ THE SAVE-STATE WIRE, FIELD BY FIELD.
  *
- * `recoveryAt` says whether the platform is holding a copy of this app's tree it can put back, and
- * three surfaces decide what to SAY and whether to STOP somebody from it. It arrived on the wire
- * long before anything here parsed it: the reported bug was a freshly built app announcing unsaved
- * changes and blocking its owner's exit while the answer sat unread in the response body.
+ * `savedHead` is what the rail's sentence and the Discard control both read, so a body the parse
+ * mis-narrows is a screen making a claim about somebody's work that nobody checked.
  */
-describe('fetchSaveState — the recovery instant, parsed like its siblings', () => {
+describe('fetchSaveState — the saved head, whitelisted and narrowed', () => {
   const saveFetch = (body: unknown) => ({ fetchImpl: async () => res(200, body) })
 
-  it('★ keeps a string instant exactly as it arrived', async () => {
+  it('★ keeps a string head exactly as it arrived', async () => {
     const state = await fetchSaveState(
       'p1',
-      saveFetch({ appId: 'a1', dirty: true, containerHead: '059d936', savedHead: null, recoveryAt: '2026-09-10T10:38:43Z' }),
+      saveFetch({ appId: 'a1', dirty: true, containerHead: '059d936', savedHead: 'aaa1111' }),
     )
-    expect(state.recoveryAt).toBe('2026-09-10T10:38:43Z')
-    // …and the rest of the reading is untouched by the addition — `dirty` STAYS TRUE beside it,
-    // because a recovery copy is not a saved version and nothing here promotes one into one.
+    expect(state.savedHead).toBe('aaa1111')
+    // …and the rest of the reading is untouched — `dirty` STAYS TRUE beside it, because a saved
+    // head older than the container's is exactly the state the indicator exists to report.
     expect(state.dirty).toBe(true)
-    expect(state.savedHead).toBeNull()
+    expect(state.containerHead).toBe('059d936')
   })
 
-  it('★ reads an ABSENT field as no copy at all, rather than inventing one', async () => {
-    // The direction this fact is allowed to fail in. Every consumer uses a non-null instant to
-    // STOP warning somebody, so a field the server did not send must never arrive as one.
+  it('★ reads an ABSENT field as nothing saved, rather than inventing one', async () => {
+    // The direction this fact is allowed to fail in: a field the server did not send must never
+    // arrive as a version somebody can be told they have.
     const state = await fetchSaveState('p1', saveFetch({ appId: 'a1', dirty: true }))
-    expect(state.recoveryAt).toBeNull()
+    expect(state.savedHead).toBeNull()
     // …and the reading is otherwise alive, so this is not a null from a body that failed to parse.
     expect(state.dirty).toBe(true)
   })
 
-  it('refuses a non-string instant instead of coercing it', async () => {
-    const state = await fetchSaveState('p1', saveFetch({ appId: 'a1', dirty: true, recoveryAt: 1757500723 }))
-    expect(state.recoveryAt).toBeNull()
+  it('refuses a non-string head instead of coercing it', async () => {
+    const state = await fetchSaveState('p1', saveFetch({ appId: 'a1', dirty: true, savedHead: 1757500723 }))
+    expect(state.savedHead).toBeNull()
     expect(state.dirty).toBe(true)
   })
 })
@@ -864,8 +835,6 @@ describe('discardUnsavedChanges — the Discard button', () => {
     dirty: false,
     containerHead: 'aaa',
     savedHead: 'aaa',
-    recoveryAt: null,
-    writeBackRefusedAt: null,
   }
 
   it('POSTs to the discard route with the CSRF header and the conversationId body', async () => {
@@ -924,34 +893,27 @@ describe('sameSaveState — what a poll is allowed to call "no change"', () => {
     dirty: true,
     containerHead: '059d936',
     savedHead: null,
-    recoveryAt: null,
-    writeBackRefusedAt: null,
     ...over,
   })
 
-  it('★ sees a change in `recoveryAt` and nothing else', () => {
+  it('★ sees a change in `savedHead` and nothing else', () => {
     // THE MUTANT THAT MATTERS. `useWorkspaceState` keeps the PREVIOUS object whenever this says
-    // "same", so a comparator blind to this field discards the reading that changed: the rail
-    // freezes on the first poll's sentence and the exit guard on the first poll's verdict, with
-    // no other test in the repo going red. Drop the `a.recoveryAt === b.recoveryAt` conjunct and
-    // this is the assertion that catches it.
-    expect(sameSaveState(reading(), reading({ recoveryAt: '2026-09-10T10:38:43Z' }))).toBe(false)
+    // "same", so a comparator blind to a field discards the reading that changed: the rail
+    // freezes on the first poll's sentence, with no other test in the repo going red. Drop the
+    // `a.savedHead === b.savedHead` conjunct and this is the assertion that catches it.
+    expect(sameSaveState(reading(), reading({ savedHead: 'aaa1111' }))).toBe(false)
   })
 
-  it('★ sees a change in `writeBackRefusedAt` too', () => {
-    // The same mutant, one field along, and this one is a SAFETY sentence: the project screen
-    // says a platform write-back was refused, and that notice is the whole of what makes removing
-    // the exit prompts honest. A comparator blind to it would keep the previous reading and the
-    // sentence would never appear.
-    expect(
-      sameSaveState(reading(), reading({ writeBackRefusedAt: '2026-09-17T22:14:00Z' })),
-    ).toBe(false)
+  it('★ sees a change in `containerHead` too', () => {
+    // The same mutant, one field along: the container's head is half of the comparison the dirty
+    // indicator is, so a comparator blind to it would keep reporting the previous answer while
+    // the workspace moved underneath it.
+    expect(sameSaveState(reading(), reading({ containerHead: 'bbb2222' }))).toBe(false)
   })
 
-  it('still calls two identical readings the same, recovery instant included', () => {
+  it('still calls two identical readings the same', () => {
     // The other half: this exists to stop a poll re-rendering on an unchanged answer, and a
-    // comparator that answered `false` for everything would pass the test above by doing nothing.
-    const instant = '2026-09-10T10:38:43Z'
-    expect(sameSaveState(reading({ recoveryAt: instant }), reading({ recoveryAt: instant }))).toBe(true)
+    // comparator that answered `false` for everything would pass the tests above by doing nothing.
+    expect(sameSaveState(reading({ savedHead: 'aaa1111' }), reading({ savedHead: 'aaa1111' }))).toBe(true)
   })
 })

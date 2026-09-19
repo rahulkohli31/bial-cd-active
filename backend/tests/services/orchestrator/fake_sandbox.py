@@ -128,6 +128,10 @@ class FakeSandbox(SandboxClient):
         # Defaults to a BUILT app (rewritten root route), not the empty/UNANSWERABLE default, so
         # tests that turn the content check on don't land in the retry path.
         self.baseline_stdout = BASELINE_DIVERGED_STDOUT
+        #: Model a probe that could not be RUN, as distinct from one that ran and found
+        #: nothing to compare against. The probe's `|| true` arms mean a non-zero exit can
+        #: only be a transport failure, and that is the one cause a retry can change.
+        self.baseline_probe_fails = False
         # Has anything changed since the watermark was stamped? Defaults FALSE so tests written
         # before this check existed don't silently start paying for a re-check pass.
         self.changed_since_watermark = False
@@ -290,6 +294,8 @@ class FakeSandbox(SandboxClient):
             printed = "./app/page.tsx\n" if self.changed_since_watermark else ""
             return ExecResult(stdout=printed, stderr="", exit=0)
         if _BASELINE_MARKER in script:  # is the root route still the seeded baseline?
+            if self.baseline_probe_fails:
+                return ExecResult(stdout="", stderr="", exit=1)
             return ExecResult(stdout=self.baseline_stdout, stderr="", exit=0)
         return None
 

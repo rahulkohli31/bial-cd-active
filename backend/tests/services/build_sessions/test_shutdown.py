@@ -157,8 +157,8 @@ def _answers_by_name[Client: _Sandbox](
     *,
     head: str = LIVE_HEAD,
     bundles_to: str = BUNDLED,
-    ancestry: str = "0 0",
     porcelain: str = " M page.tsx",
+    commits: int = 4,
     born: datetime | None = None,
 ) -> Client:
     """A container reachable ONLY by name, answering the whole snapshot ladder.
@@ -181,8 +181,7 @@ def _answers_by_name[Client: _Sandbox](
 
     def handler(cmd: list[str]) -> ExecResult:
         if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
-            answered = ancestry if "merge-base" in cmd[-1] else ""
-            return ExecResult(stdout=f"{head}@@{porcelain}@@4@@{answered}", stderr="", exit=0)
+            return ExecResult(stdout=f"{head}@@{porcelain}@@{commits}@@", stderr="", exit=0)
         if cmd[0] == "base64":
             return ExecResult(stdout=bundle, stderr="", exit=0)
         return ExecResult(stdout="", stderr="", exit=0)
@@ -415,15 +414,16 @@ async def test_the_lapse_and_the_ceiling_differ_only_in_the_reason_they_record(
     assert await fake_redis.exists(cooperative_stop_key(scene.project_id)) == 0
 
 
-async def test_a_clean_tree_is_destroyed_without_rewriting_the_saved_copy(
+async def test_a_built_container_writes_its_tree_back_before_it_is_destroyed(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage, scene: _Scene
 ) -> None:
-    """Most departures have nothing to store. Re-stamping the copy anyway would make its own
-    timestamp lie about when the citizen last did any work."""
+    """The ordinary departure: whatever the citizen has in this container is all there is, and
+    the delete is one line away.
+
+    Mutation check: destroy without the write-back and this goes red on the saved head."""
     born = _born_at(30)
     await _seed_registry(fake_redis, scene.user_id, app_name=scene.app_name, created_at=born)
     await _saved_copy(fake_storage, scene.app_id, sha=LIVE_HEAD)
-    written_at = fake_storage.mtimes[snapshot_key(scene.app_id)]
     client = _answers_by_name(_Sandbox(), scene.app_name, porcelain="")
     owed = await _owe(scene, instance_ref=born)
 
@@ -437,7 +437,8 @@ async def test_a_clean_tree_is_destroyed_without_rewriting_the_saved_copy(
         )
         is ShutdownOutcome.DESTROYED
     )
-    assert fake_storage.mtimes[snapshot_key(scene.app_id)] == written_at
+    meta = await fake_storage.head(snapshot_key(scene.app_id))
+    assert meta is not None and (meta.metadata or {})["head_sha"] == BUNDLED
     assert client.torn_down == [scene.app_name]
 
 
@@ -642,20 +643,20 @@ def test_the_routine_never_reaches_a_container_through_the_per_user_registry() -
 # =============================================================================
 
 
-async def test_a_diverted_tree_still_loses_its_container(
+async def test_a_container_still_holding_the_starter_template_loses_it_without_a_write(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage, scene: _Scene
 ) -> None:
-    """★ The guard refused to promote this tree and PARKED it under the divert key before saying
-    so, which means the bytes are already safe. Sparing here would hold a container open for work
-    that is already stored.
+    """★ A container that reverted to its baked image presents as one commit and a clean tree —
+    exactly like a project nobody has built. Writing that blank tree back would stamp the template
+    in as the citizen's app; sparing instead would make it immortal, which is one of the
+    populations the ceiling exists to bound. It goes, and the saved copy stands.
 
-    Mutation check: spare on `DIVERTED` and this goes red — a container that reverted to its baked
-    image becomes immortal, which is one of the populations the ceiling exists to bound."""
+    Mutation check: drop the starter arm from `write_the_tree_back` and this goes red on the
+    saved head."""
     born = _born_at(40)
     await _seed_registry(fake_redis, scene.user_id, app_name=scene.app_name, created_at=born)
     await _saved_copy(fake_storage, scene.app_id)
-    # `0 1`: the reference exists and this tree is NOT descended from it.
-    client = _answers_by_name(_Sandbox(), scene.app_name, ancestry="0 1")
+    client = _answers_by_name(_Sandbox(), scene.app_name, porcelain="", commits=1)
     owed = await _owe(scene, instance_ref=born)
 
     outcome = await run_the_shutdown(
@@ -668,10 +669,8 @@ async def test_a_diverted_tree_still_loses_its_container(
 
     assert outcome is ShutdownOutcome.DESTROYED
     assert client.torn_down == [scene.app_name]
-    # The saved copy is untouched, and the refused tree is parked under a key of its own.
     meta = await fake_storage.head(snapshot_key(scene.app_id))
     assert meta is not None and (meta.metadata or {})["head_sha"] == SAVED
-    assert any(key != snapshot_key(scene.app_id) for key in fake_storage.objects)
 
 
 async def test_a_container_that_will_not_answer_is_spared_inside_its_budget(
@@ -725,7 +724,7 @@ async def test_a_store_that_will_not_take_the_copy_lands_in_the_same_budget(
     async def _the_store_is_down(*_args: object, **_kwargs: object) -> None:
         raise StorageError("the object store is unreachable")
 
-    monkeypatch.setattr(shutdown_module, "write_saved_copy_under_guard", _the_store_is_down)
+    monkeypatch.setattr(shutdown_module, "write_the_tree_back", _the_store_is_down)
 
     outcome = await run_the_shutdown(
         owed,
@@ -781,7 +780,7 @@ async def test_the_ceiling_outranks_the_strike_budget(
     record that is re-stamped at every registration and dropped when a teardown fails. A
     container whose delete failed would otherwise come back looking newborn and earn another
     whole ceiling."""
-    monkeypatch.setattr(shutdown_module, "the_ceiling_switch", lambda: (True, 2))
+    monkeypatch.setattr(shutdown_module, "the_ceiling_hours", lambda: 2)
     born = _born_at(60 * 5)
     client = _wont_answer(scene.app_name)
     client.tags_by_name[scene.app_name] = {TAG_CREATED_AT: born.isoformat()}

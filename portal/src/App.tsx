@@ -156,7 +156,7 @@ export default function App() {
             workspace rather than one per address re-running its effect on every move between
             them.
 
-            NOTE: `/apps/:appId` is deliberately NOT a route here, and deliberately not part of
+            `/apps/:appId` is deliberately NOT a route here, and deliberately not part of
             this layout. BOTH edges send `/apps/` to the control plane — nginx (`portal/nginx.conf`)
             and the Vite dev proxy (`vite.config.js`) — so a route declared here would be shadowed
             before React Router ever saw it, in dev and in the container alike. A deployed app is

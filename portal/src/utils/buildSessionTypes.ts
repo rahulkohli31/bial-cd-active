@@ -65,7 +65,7 @@ export interface RelaunchPreviewResponse {
 /**
  * `POST …/projects/{id}/shared-launch` and `.../shared-refresh` → 200 (#198).
  * `RelaunchPreviewResponse`'s sibling for a project a colleague shares with the viewer — "Can
- * use", never "view only" (Key Decision 3): the viewer can create, update and delete the
+ * use", never "view only": the viewer can create, update and delete the
  * owner's records through the app's own UI. No `status`/`restoredFromFailedBuild`: this view
  * registers no build session and has no build-outcome history of its own to qualify.
  */
@@ -79,17 +79,6 @@ export interface SharedPreviewResponse {
    *  ask the store for the timestamp; the restore itself already confirmed the snapshot
    *  exists. Refresh's whole point is moving this forward. */
   snapshotTakenAt: string | null
-}
-
-/** `POST …/stop` body — an optional free-text reason for the audit / activity feed. */
-export interface StopBuildRequest {
-  reason?: string | null
-}
-
-/** `POST …/stop` → 200. `status` is `ended` after a graceful stop (idempotent). */
-export interface StopBuildResponse {
-  sessionId: string
-  status: BuildSessionStatus
 }
 
 /**
@@ -110,14 +99,6 @@ export interface BuildSessionStatusResponse {
   createdAt: string
   updatedAt: string
 }
-
-// ─── Lock operations — the whole response surface is gone ───────────────────
-//
-// `LockStateResponse` / `LockReleaseResponse` / `HeartbeatResponse` typed `acquire` / `renew` /
-// `release` / `heartbeat`, and nothing called those routes — the portal's keep-alive loop that
-// was their only caller was itself deleted. `ForceEndResponse` was the last one standing, and
-// it went with the `force-end` route itself, which had had no UI call site since the block
-// banner's Force-end button was deleted with the banner.
 
 // ─── The tagged-union progress envelope (snake_case surface) ─────────────────
 

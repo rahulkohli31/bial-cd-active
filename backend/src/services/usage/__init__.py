@@ -3,7 +3,6 @@
 from src.db.models.token_usage import TokenUsageKind as TokenUsageKind
 from src.services.usage.gate import DAILY_LIMIT_EXCEEDED_CODE as DAILY_LIMIT_EXCEEDED_CODE
 from src.services.usage.gate import DailyTokenLimitExceededError as DailyTokenLimitExceededError
-from src.services.usage.gate import UsageSnapshot as UsageSnapshot
 from src.services.usage.gate import effective_daily_limit as effective_daily_limit
 from src.services.usage.gate import enforce_daily_limit as enforce_daily_limit
 from src.services.usage.gate import ist_today as ist_today

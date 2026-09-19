@@ -21,12 +21,8 @@ from sqlalchemy import select
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
-from src.services.build_sessions.outcome import (
-    _summary,
-    build_outcome_meta,
-    write_build_outcome,
-)
 from tests.factories import ConversationFactory, MessageFactory, ProjectFactory, UserFactory
+from tests.fakes import _summary, build_outcome_meta, write_build_outcome
 
 _SESSION = uuid.UUID("01931f7a-0000-7000-8000-000000000001")
 
@@ -213,8 +209,8 @@ async def test_a_deleted_thread_is_a_no_op_not_a_crash(db_session) -> None:
 
 # --- the prose tells the truth about how the build ended -----------------------
 #
-# `_terminal_status` maps a natural finish, a Stop, a force-end and an idle reap ALL onto ENDED, so
-# a summary keyed on status alone cannot tell them apart — and this text is not just chrome: the
+# A natural finish, a Stop, a force-end and an idle reap ALL carry ENDED, so a summary keyed on
+# status alone cannot tell them apart — and this text is not just chrome: the
 # thread IS the model's history, so whatever it says is replayed to the model on the user's next
 # turn. "Build finished." on a build the user stopped at minute two is a lie told twice.
 
@@ -224,8 +220,8 @@ async def test_a_deleted_thread_is_a_no_op_not_a_crash(db_session) -> None:
     [
         ("completed", "Build finished."),
         ("stopped_by_user", "You stopped this build before it finished."),
-        # force_end is the one graceful end that DISCARDS its work (`_do_finalize` skips the
-        # snapshot when `force_ended` is set), so this is the summary that must say so.
+        # A force-end was the one graceful end that DISCARDED its work — it skipped the
+        # snapshot — so this is the summary that must say so.
         (
             "force_ended",
             "This build was force-stopped before it finished, and its work was discarded.",

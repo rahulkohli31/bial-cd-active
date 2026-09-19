@@ -15,7 +15,6 @@ const PREVIEW_URL = 'https://app.example.azurecontainerapps.io/'
 function makeClient(over: Partial<BuildSessionClient> = {}): BuildSessionClient {
   return {
     relaunchPreview: vi.fn(async () => ({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' as const, restoredFromFailedBuild: false, ready: true })),
-    stop: vi.fn(async () => ({ sessionId: 's1', status: 'ended' as const })),
     getStatus: vi.fn(async () => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning' as const, previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u' })),
     ...over,
   }
@@ -34,6 +33,7 @@ const ESCALATION: ProgressEnvelope = { type: 'escalation', seq: 3, reason: 'exha
 const ENDED_FAIL: ProgressEnvelope = { type: 'ended', seq: 4, status: 'failed', preview_url: null, snapshot_committed: false, reason: 'escalated' }
 const QUOTA: ProgressEnvelope = { type: 'quota_exceeded', seq: 3, limit: 1_000_000, used: 1_000_000, resets_at: '2026-07-15T18:30:00Z' }
 const ENDED_QUOTA: ProgressEnvelope = { type: 'ended', seq: 4, status: 'ended', preview_url: null, snapshot_committed: true, reason: 'quota_exceeded' }
+const ENDED_STOPPED: ProgressEnvelope = { type: 'ended', seq: 6, status: 'ended', preview_url: null, snapshot_committed: true, reason: 'stopped_by_user' }
 
 /**
  * `start` and `relaunch` are gone from this hook — useBuildSession.ts carries why — and so are the
@@ -48,7 +48,7 @@ const ENDED_QUOTA: ProgressEnvelope = { type: 'ended', seq: 4, status: 'ended', 
  *     identical `mountedRef` bail.
  */
 describe('useBuildSession — status derivation across the lifecycle', () => {
-  it('derives status at EACH hop: provisioning →(first step)→ building → preview_ready → ready → stop → ended', async () => {
+  it('derives status at EACH hop: provisioning →(first step)→ building → preview_ready → ready → ended', async () => {
     const { result, fake } = setup()
     await act(async () => { await result.current.reattach('s1') })
     expect(result.current.status).toBe('provisioning')
@@ -61,10 +61,10 @@ describe('useBuildSession — status derivation across the lifecycle', () => {
     expect(result.current.status).toBe('ready')
     expect(result.current.previewUrl).toBe(PREVIEW_URL)
 
-    await act(async () => { await result.current.stop() })
+    act(() => { fake.emitEnvelope(ENDED_STOPPED) })
     expect(result.current.status).toBe('ended')
-    // preview_ready is NEVER a feed row; only the step is in the store.
-    expect(result.current.envelopes.map((e) => e.type)).toEqual(['step'])
+    // preview_ready is NEVER a feed row; the step and the terminal are.
+    expect(result.current.envelopes.map((e) => e.type)).toEqual(['step', 'ended'])
   })
 
   it('preview_reconnecting raises a DISTINCT reconnecting flag (not a feed row, not feedDisconnected), cleared by the re-frame', async () => {
@@ -144,16 +144,6 @@ describe('useBuildSession — endReason: the pardoned preview signal', () => {
     expect(result.current.previewUrl).toBe(PREVIEW_URL) // the server pardoned the container: still live
   })
 
-  it("a user stop settles with reason 'stopped_by_user' — NEVER the pardoned 'completed' (the server tore down)", async () => {
-    const { result, fake } = setup()
-    await act(async () => { await result.current.reattach('s1') })
-    act(() => { fake.open() })
-    act(() => { fake.emitEnvelope(READY) })
-    await act(async () => { await result.current.stop() })
-    expect(result.current.status).toBe('ended')
-    expect(result.current.endReason).toBe('stopped_by_user')
-  })
-
   it('a FAILED terminal carries its own reason (no pardon on failure)', async () => {
     const { result, fake } = setup()
     await act(async () => { await result.current.reattach('s1') })
@@ -190,16 +180,13 @@ describe('useBuildSession — endReason: the pardoned preview signal', () => {
 })
 
 /*
- * THE FORCE-END SUITE IS GONE — two tests, and both died WITH their subject rather than
- * losing coverage. One pinned the control-plane override (a stuck-mid-`building` session settles
- * from `ForceEndResponse.status`, never from the stream); the other pinned the non-owner 403
- * surfacing fail-closed. There is nothing left for either to describe: the hook wrapper, the
- * client function and the backend route were deleted together, the kill switch having had no UI
- * call site since the block banner took its Force-end button with it.
+ * THE FORCE-END AND STOP SUITES ARE GONE — both died WITH their subject rather than losing
+ * coverage. The force-end pair pinned a control-plane override and a non-owner 403; the stop
+ * test pinned a locally-set end reason. The hook wrappers, the client functions and the backend
+ * routes were deleted together, neither having a UI call site left.
  *
- * What still settles a live session from this hook is `stop`, and it keeps its own coverage — the
- * full lifecycle hop above ends on one, and `endReason` pins that a user stop reads as
- * 'stopped_by_user' and never as the pardoned 'completed'.
+ * What settles a live session from this hook now is the feed: an `ended` envelope carries the
+ * terminal AND the reason, which the lifecycle hop above and the `endReason` suite both pin.
  */
 
 describe('useBuildSession — an open tab is NOT a keep-alive writer', () => {
@@ -299,15 +286,30 @@ describe('useBuildSession — feed disconnection + teardown', () => {
   })
 
   it('a terminal end clears a lingering feed-disconnected banner (FIX 3 — no dead Reconnect button)', async () => {
-    const { result, fake } = setup()
+    const client = makeClient()
+    const { result, fake } = setup(client)
     await act(async () => { await result.current.reattach('s1') })
     act(() => { fake.open() })
     // Exhaust the bounded reconnect so the "Lost the feed" banner is showing.
     act(() => { for (let i = 0; i < 7; i += 1) fake.dropAfterOpen() })
     expect(result.current.feedDisconnected).toBe(true)
 
-    // The session then reaches a terminal `ended` (a graceful stop) — the stale banner must clear.
-    await act(async () => { await result.current.stop() })
+    // Reconnect reseeds from the status read; hold that read open so the banner's second life
+    // can be staged underneath it. An exhausted feed delivers nothing, so this reseed is the
+    // ONLY way a terminal still reaches the hook once the banner is up.
+    let landStatus!: (v: BuildSessionStatusResponse) => void
+    client.getStatus = vi.fn(() => new Promise<BuildSessionStatusResponse>((res) => { landStatus = res }))
+    act(() => { result.current.reconnect() })
+    expect(result.current.feedDisconnected).toBe(false) // the resubscribe cleared it…
+
+    // …and the fresh feed dies too, so the banner is showing again when the terminal lands.
+    act(() => { for (let i = 0; i < 7; i += 1) fake.dropAfterOpen() })
+    expect(result.current.feedDisconnected).toBe(true)
+
+    await act(async () => {
+      landStatus({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'ended', previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u' })
+      await Promise.resolve()
+    })
     expect(result.current.status).toBe('ended')
     expect(result.current.feedDisconnected).toBe(false)
   })

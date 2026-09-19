@@ -1,5 +1,6 @@
-"""The surviving lifecycle producer around the native store, `write_build_outcome`, and its
-non-interference with the legacy `build_started` marker's rows.
+"""The build-outcome row factory, `write_build_outcome`, and its non-interference with the
+legacy `build_started` marker's rows. It is a test fake: the live readers it feeds are what
+these tests are really about.
 
 `write_build_started` ITSELF IS DELETED — the build-start path it belonged to is gone. Rows of
 its shape are permanent in production transcripts, though, so both of the readers covered here
@@ -22,13 +23,10 @@ import sqlalchemy as sa
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
-from src.services.build_sessions.outcome import (
-    newest_build_outcome_status,
-    write_build_outcome,
-)
+from src.services.build_sessions.outcome import newest_build_outcome_status
 from src.services.messages.store import load_history, load_rows
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import write_legacy_build_started
+from tests.fakes import write_build_outcome, write_legacy_build_started
 
 
 async def _thread(db_session):

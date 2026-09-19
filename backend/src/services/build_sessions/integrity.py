@@ -25,9 +25,11 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Final
 
+import sqlalchemy as sa
 import structlog
+from sqlalchemy.exc import SQLAlchemyError
 
-from src.core.integrity_types import BaselineIdentity
+from src.core.integrity_types import BaselineIdentity, BaselineUnanswerable
 from src.core.integrity_types import WorkspaceState as WorkspaceState
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
 from src.services.storage import (
@@ -35,7 +37,6 @@ from src.services.storage import (
     StorageUnconfiguredError,
     get_storage,
     head_sha_from_metadata,
-    recovery_key,
     snapshot_key,
 )
 
@@ -71,12 +72,12 @@ BASELINE_COMMIT_SUBJECT: Final = "bial: golden template baseline"
 
 MATCHED, NOT ASSUMED, and this is the difference between a check and an accusation. The whole
 comparison rests on "the root commit IS the golden template", and that is only true when the root
-was written by `client._INIT_REPO_SCRIPT` — which is BEST-EFFORT: it logs and carries on when it
-fails. The documented fallback is `snapshot._COMMIT_SCRIPT`, whose `git init && git add -A &&
-git commit -m bial-snapshot` creates the repository at the END of a turn, so its root commit holds
-the FINISHED APP. Comparing against that root would find `app/page.tsx` identical forever, and the
-app would be permanently and irreversibly accused of serving the starter page — a completion claim
-that can never be earned again, which is worse than the false claim this check exists to stop.
+was written by `client._INIT_REPO_SCRIPT`, which is the system's only writer of a root commit — a
+provision that cannot seed the repository fails outright rather than leaving one to be forged
+later. A root written at the END of a turn would hold the FINISHED APP, and comparing against it
+would find `app/page.tsx` identical forever: the app would be permanently and irreversibly accused
+of serving the starter page, a completion claim that can never be earned again, which is worse
+than the false claim this check exists to stop.
 
 Spelled here rather than imported from `services/sandbox/client.py` for the reason `reaper.py`
 documents about that direction of import: this module must stay importable by the worker. The two
@@ -114,11 +115,10 @@ def parse_baseline_identity(stdout: str) -> BaselineIdentity:
         # probe will keep saying so.
         return BaselineIdentity.UNANSWERABLE
     if subject_text.strip() != BASELINE_COMMIT_SUBJECT:
-        # THE ROOT IS NOT THE SEEDED TEMPLATE. Either the provision-time `git init` did not run
-        # and a later snapshot created the repository from a tree that already held the app, or
-        # the agent re-initialised it in its own shell. Either way there is no birth certificate
-        # to compare against — and answering "still the template" on a root that IS the app is
-        # how a working app gets locked out of ever completing again.
+        # THE ROOT IS NOT THE SEEDED TEMPLATE — the agent re-initialised the repository in its
+        # own shell, or fetched an unrelated history over it. Either way there is no birth
+        # certificate to compare against, and answering "still the template" on a root that IS
+        # the app is how a working app gets locked out of ever completing again.
         return BaselineIdentity.UNANSWERABLE
     baseline_blob = baseline_text.strip()
     if not baseline_blob:
@@ -137,6 +137,32 @@ def parse_baseline_identity(stdout: str) -> BaselineIdentity:
     return BaselineIdentity.DIVERGED
 
 
+def parse_why_unanswerable(stdout: str) -> BaselineUnanswerable | None:
+    """WHICH of the structural causes made the serving question unanswerable, or `None` when it
+    was answered.
+
+    A sibling parse rather than a second return value from `parse_baseline_identity`, for the same
+    reason the history question is parsed beside it: that function answers one thing and returns a
+    three-value enum, and a caller that only wants the answer should not have to unpack a cause it
+    will not read. One exec, two pure parses over the same body.
+
+    It deliberately re-derives rather than sharing a branch chain with its sibling: the two are
+    pinned against each other by test, and a shared chain would let a change to the answer move
+    the cause silently.
+    """
+    roots_text, _, rest = stdout.partition("@@")
+    baseline_text, _, rest = rest.partition("@@")
+    _, _, rest = rest.partition("@@")
+    subject_text, _, _ = rest.partition("@@")
+    if len([line for line in roots_text.split() if line]) != 1:
+        return BaselineUnanswerable.NO_SINGLE_ROOT
+    if subject_text.strip() != BASELINE_COMMIT_SUBJECT:
+        return BaselineUnanswerable.ROOT_IS_NOT_OURS
+    if not baseline_text.strip():
+        return BaselineUnanswerable.BASELINE_MISSING
+    return None
+
+
 async def baseline_identity(
     sandbox_client: SandboxClient, handle: SandboxHandle
 ) -> BaselineIdentity:
@@ -144,16 +170,41 @@ async def baseline_identity(
 
     One exec, bounded, and it never raises: every failure is `UNANSWERABLE`, because a probe that
     could throw would make the health verdict fail a build for a supervisor blip."""
+    stdout = await _run_the_baseline_probe(sandbox_client, handle)
+    if stdout is None:
+        return BaselineIdentity.UNANSWERABLE
+    return parse_baseline_identity(stdout)
+
+
+async def why_unanswerable(
+    sandbox_client: SandboxClient, handle: SandboxHandle
+) -> BaselineUnanswerable | None:
+    """The same question as `baseline_identity`, asked for its CAUSE rather than its answer.
+
+    `PROBE_FAILED` is the transport half and is the one cause a retry can change - it is produced
+    here rather than in the parse because the parse never sees a body at all in that case.
+    """
+    stdout = await _run_the_baseline_probe(sandbox_client, handle)
+    if stdout is None:
+        return BaselineUnanswerable.PROBE_FAILED
+    return parse_why_unanswerable(stdout)
+
+
+async def _run_the_baseline_probe(
+    sandbox_client: SandboxClient, handle: SandboxHandle
+) -> str | None:
+    """One bounded exec of `_BASELINE_SCRIPT`. `None` when it could not be run or came back
+    non-zero, which both parses read as "this container cannot answer"."""
     run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
     try:
         result = await run_command(handle, ["sh", "-c", _BASELINE_SCRIPT], timeout_s=30)
     except SandboxError:
         _log.warning("baseline_identity_probe_failed", app=handle.app_name, exc_info=True)
-        return BaselineIdentity.UNANSWERABLE
+        return None
     if result.exit != 0:
         _log.warning("baseline_identity_probe_nonzero", app=handle.app_name, exit_code=result.exit)
-        return BaselineIdentity.UNANSWERABLE
-    return parse_baseline_identity(result.stdout)
+        return None
+    return result.stdout
 
 
 # THE AGENT'S LAST CHANGE, as the container sees it.
@@ -166,9 +217,9 @@ async def baseline_identity(
 # POSIX, so this cannot quietly stop working on a different base image.
 #
 # THE MARKER LIVES IN `/tmp`, NEVER IN THE WORKSPACE. A file under `/workspace/app` would show up
-# in `git status --porcelain`, which means it would make the tree look dirty to `_nothing_to_lose`,
-# to the save-state indicator and to the recovery-write gate — a watermark that changes the answer
-# to the question it exists to help ask.
+# in `git status --porcelain`, which means it would make the tree look dirty to `_nothing_to_lose`
+# and to the save-state indicator — a watermark that changes the answer to the question it exists
+# to help ask.
 #
 # The heavy trees are pruned, and not only for speed: `next dev` rewrites `.next` on every compile,
 # so including it would make "the agent changed something" true forever.
@@ -239,17 +290,33 @@ async def has_ever_been_built(app_id: uuid.UUID) -> bool:
     """Has any turn on this app ever done real work? Meaningless pre-build — a fresh project is
     *supposed* to show the starter page.
 
-    Answered by RECOVERY-COPY presence (no `turns` model; `finish_turn_sandbox` writes one per
-    file-touching turn), not `newest_restore_source(...) is not None` (answers "newer than saved?",
-    a different question, and can raise). Unconfigured storage -> `False`; unreadable -> `True`,
-    fail-closed: a false "not built" beats a completion claim over an untouched template."""
+    Answered from the counter row the turn engine writes for every terminal turn that mutated
+    the tree. That row is permanent and survives a factory reset, which is the property this
+    needs: a reverted container of a previously-built app SHOULD still have the starter-page
+    check run against it. Unreadable -> `True`, fail-closed: a false "not built" beats a
+    completion claim over an untouched template.
+
+    Imports its session factory INSIDE the function — this module is imported cold by the
+    reaper's standalone-import test, and `src.db.base` builds the ORM engine at import."""
+    from src.db.base import async_session_factory
+    from src.db.models.harness_counter import HarnessCount, HarnessCounter
+
     try:
-        store = get_storage()
-    except StorageUnconfiguredError:
-        return False
-    try:
-        return await store.head(recovery_key(app_id)) is not None
-    except StorageError:
+        async with async_session_factory() as db:
+            row = await db.execute(
+                sa.select(HarnessCount.id)
+                .where(
+                    HarnessCount.name == HarnessCounter.WORKSPACE_WAS_WRITTEN.value,
+                    HarnessCount.app_id == app_id,
+                )
+                .limit(1)
+            )
+            return row.scalar_one_or_none() is not None
+    except SQLAlchemyError:
+        # NARROW ON PURPOSE. A database that will not answer is the case this handles, and
+        # answering `True` costs a starter-page check that was going to pass anyway. A renamed
+        # column or a bad enum value is a defect, not a blip, and swallowing it here would
+        # degrade the check permanently while reporting nothing.
         _log.warning("prior_building_turns_unreadable", app_id=str(app_id), exc_info=True)
         return True
 
@@ -325,16 +392,26 @@ _SHA_RE: Final = re.compile(r"^[0-9a-f]{7,40}$")
 def is_a_commit_sha(value: str | None) -> bool:
     """May this value be interpolated into the probe's shell string? (See `_SHA_RE`.)
 
-    Exposed rather than kept private because the guarded recovery write asks the same question
-    of the same metadata before composing the same script — and a second, subtly different
-    spelling of "is this a sha" is how one of the two would eventually let something else
-    through."""
+    Exposed rather than kept private because callers ask the same question of the same metadata
+    before composing the same script — and a second, subtly different spelling of "is this a sha"
+    is how one of the two would eventually let something else through."""
     return value is not None and _SHA_RE.match(value) is not None
 
 
+#: Printed instead of the porcelain when `git status` could not run. An empty porcelain because
+#: git FAILED is otherwise byte-identical to an empty porcelain because the tree is CLEAN, and on
+#: the reap side "clean" is permission to destroy a container without writing its tree back — so
+#: the probe has to say which of the two it saw.
+#:
+#: MARKS THE FAILURE, NOT THE SUCCESS, so it cannot be lost to the output cap: it is the only
+#: thing printed on the arm that prints it, where a success marker would ride behind up to
+#: `PORCELAIN_CAP_BYTES` of porcelain and be the first thing cut.
+PORCELAIN_FAILED_MARK: Final = "#porcelain-unreadable"
+
 _STATE_FIELDS: Final = (
     'git rev-parse HEAD 2>/dev/null || true; echo "@@"; '
-    f'git status --porcelain 2>/dev/null | head -c {PORCELAIN_CAP_BYTES}; echo "@@"; '
+    f"{{ git status --porcelain 2>/dev/null || printf '{PORCELAIN_FAILED_MARK}'; }}"
+    f' | head -c {PORCELAIN_CAP_BYTES}; echo "@@"; '
     'git rev-list --count HEAD 2>/dev/null || true; echo "@@"'
 )
 
@@ -402,6 +479,9 @@ class ContainerState:
     commits: int
     # Where HEAD sits relative to the reference sha the probe was given, or `NOT_ASKED`.
     ancestry: Ancestry = Ancestry.NOT_ASKED
+    # Did `git status` run at all? False means the tree is UNKNOWN, not clean. Defaults True so
+    # a hand-built state means what it says; only the parse below ever answers False.
+    porcelain_answered: bool = True
 
 
 def parse_state(stdout: str) -> ContainerState:
@@ -437,13 +517,17 @@ def parse_state(stdout: str) -> ContainerState:
     # indistinguishable from output that was cut there, and "assume truncated" is the arm that
     # refuses a reclaim rather than the one that permits it.
     trimmed = porcelain.strip()
+    answered = PORCELAIN_FAILED_MARK not in trimmed
     return ContainerState(
         head=head_text.strip() or None,
-        uncommitted=bool(trimmed),
+        # AN UNREADABLE TREE IS A DIRTY ONE. The save side asks `uncommitted` and a `False` here
+        # would tell a citizen their unread work is safely saved.
+        uncommitted=bool(trimmed) or not answered,
         changed_paths=tuple(paths),
         commits=commits,
         porcelain_truncated=len(trimmed.encode("utf-8", "surrogateescape")) >= PORCELAIN_CAP_BYTES,
         ancestry=_parse_ancestry(ancestry_text),
+        porcelain_answered=answered,
     )
 
 
@@ -487,13 +571,19 @@ async def container_state(
     only would report "all changes saved" over a tree the agent had written and not committed,
     and the porcelain is the only thing here that can see it.
 
-    None means we could not ask at all, which is the only honest "unknown"."""
+    None means we could not ask at all, which is the only honest "unknown" — and both arms that
+    produce it are logged, because the teardown write-back spares a container on exactly this
+    answer, and a container spared pass after pass has to leave a record of why."""
     run_command = sandbox_client.exec  # alias keeps the call off the JS-oriented exec guard
     try:
         result = await run_command(handle, ["sh", "-c", state_script(reference_sha)], timeout_s=30)
     except SandboxError:
+        _log.warning("container_state_probe_failed", app=handle.app_name, exc_info=True)
         return None
     if result.exit != 0:
+        # The exit code alone, never the output: what the script prints is the citizen's own tree
+        # — a sha and their filenames — and none of it says why the shell did not finish.
+        _log.warning("container_state_probe_nonzero", app=handle.app_name, exit_code=result.exit)
         return None
     return parse_state(result.stdout)
 
@@ -543,20 +633,17 @@ class IntegrityVerdict:
     provably_bare: bool = False
     #: The container's HEAD at the moment of the verdict, for the alarm payload.
     head: str | None = None
-    #: The bundle this verdict compared against — the one a restore would hand back.
-    reference_key: str | None = None
-    #: Whether ANY durable copy exists for this app (recovery OR saved). `False` under
-    #: `REVERTED` is the no-source arm: tell the user plainly, restore nothing.
+    #: Whether a saved copy exists for this app. `False` under `REVERTED` is the no-source arm:
+    #: tell the user plainly, restore nothing.
     durable_copy_exists: bool = False
 
     @property
     def may_restore(self) -> bool:
         """The single question every caller actually asks.
 
-        A property rather than a comparison at each call site, for the reason
-        `CopyVerdict.may_destroy` documents: `state is REVERTED` spelled out at four call sites
-        is four chances to write `is not INTACT` and quietly authorise the two states that mean
-        "we could not tell"."""
+        A property rather than a comparison at each call site, because `state is REVERTED`
+        spelled out at four call sites is four chances to write `is not INTACT` and quietly
+        authorise the two states that mean "we could not tell"."""
         return self.state is WorkspaceState.REVERTED
 
 
@@ -564,18 +651,12 @@ class IntegrityVerdict:
 class _DurableFacts:
     """What the object store says, gathered once so the judgement below stays pure."""
 
-    recovery_present: bool
     saved_present: bool
-    reference_key: str
-    #: The `head_sha` stamped on the reference bundle. `None` is NO CLAIM — an object written
+    #: The `head_sha` stamped on the saved bundle. `None` is NO CLAIM — an object written
     #: before the stamp existed, or one carrying an empty one.
     reference_sha: str | None
     #: The stamp is present but is not a sha. Structural: metadata does not heal on a retry.
     reference_sha_malformed: bool
-
-    @property
-    def any_copy(self) -> bool:
-        return self.recovery_present or self.saved_present
 
 
 # THE CAP THAT KEEPS AN UNANSWERABLE CHECK FROM BECOMING A LOCKOUT.
@@ -584,7 +665,7 @@ class _DurableFacts:
 # whose exec endpoint has genuinely stopped answering would refuse the user their project on
 # every message, with a retry prompt that can never succeed. After this many consecutive
 # unreadable answers for one app, the next is `UNVERIFIABLE` instead — proceed, alarm, restore
-# nothing, refuse the recovery write. Degraded, not locked out.
+# nothing. Degraded, not locked out.
 #
 # Process-local, which matches the single-replica deploy contract `reaper.py` already depends
 # on, and self-pruning: any verdict that is not `UNREADABLE` drops the entry.
@@ -603,7 +684,7 @@ def judge_workspace(container: ContainerState, facts: _DurableFacts) -> Integrit
 
     Split out for the reason `parse_state` was: this is the part with the edge cases, and every
     one of them is testable without a container or a store."""
-    empty_tree = container.commits == 1 and clean_but_for_churn(container)
+    empty_tree = is_the_untouched_starter(container)
     content_empty = container.head is None or empty_tree
 
     def verdict(state: WorkspaceState, reason: str) -> IntegrityVerdict:
@@ -614,8 +695,7 @@ def judge_workspace(container: ContainerState, facts: _DurableFacts) -> Integrit
             content_empty=content_empty,
             provably_bare=empty_tree,
             head=container.head,
-            reference_key=facts.reference_key,
-            durable_copy_exists=facts.any_copy,
+            durable_copy_exists=facts.saved_present,
         )
 
     # NEVER-BUILT COMES FIRST, and it is `_nothing_to_lose`'s four conditions rather than
@@ -624,7 +704,7 @@ def judge_workspace(container: ContainerState, facts: _DurableFacts) -> Integrit
     #
     # `commits == 1`, not `<= 1`: a count of 0 means the probe could not answer, and unknown is
     # not permission — exactly as `_nothing_to_lose` already refuses it.
-    if not facts.any_copy and empty_tree:
+    if not facts.saved_present and empty_tree:
         return verdict(WorkspaceState.INTACT, "this project has never been built")
 
     if container.head is None:
@@ -638,20 +718,12 @@ def judge_workspace(container: ContainerState, facts: _DurableFacts) -> Integrit
         # silently failed — a live state, not a hypothetical — and which then factory-resets has
         # NO durable copy at all, so an ordering that reached the "nothing to compare against,
         # carry on" arm first would let the agent build on the wiped tree.
-        #
-        # THE FALSE POSITIVE THIS ACCEPTS, stated rather than hidden. `_INIT_REPO_SCRIPT` is
-        # best-effort: it logs and carries on when it fails. A BRAND-NEW project whose seed
-        # failed is also repo-less with no durable copy, and it will be told its workspace was
-        # reset and could not be recovered — on its first message. That is wrong, and it is a
-        # knowing trade: nothing is destroyed on this arm (there is nothing to restore FROM, and
-        # the tree being set aside is a bare template), so the cost is one false sentence,
-        # against a silent, permanent loss of somebody's finished app.
         return verdict(WorkspaceState.REVERTED, "the workspace has no repository at all")
 
-    if not facts.any_copy:
+    if not facts.saved_present:
         # A repository exists and holds work, and there is nothing durable to compare it
         # against. No loss to report and nothing to restore from — the turn proceeds, and the
-        # turn-end recovery write makes this app's first copy.
+        # container's own teardown write-back makes this app's first copy.
         return verdict(WorkspaceState.INTACT, "no durable copy exists to compare against")
 
     if facts.reference_sha_malformed:
@@ -678,8 +750,8 @@ def judge_workspace(container: ContainerState, facts: _DurableFacts) -> Integrit
         # and NOT `REVERTED`, deliberately, even though this reads like strong evidence of loss.
         # `--is-ancestor` never ran, so the "is the lineage broken" question was not answered by
         # git; it was answered by the object being missing, which has innocent explanations.
-        # The conservative arm still protects the user: no restore, an alarm, and the recovery
-        # write is refused, so the good bundle survives for an operator to promote.
+        # The conservative arm still protects the user: no restore, and an alarm, so the good
+        # bundle survives untouched.
         return verdict(
             WorkspaceState.UNVERIFIABLE, "the durable copy's tree is not in this repository"
         )
@@ -700,6 +772,21 @@ def judge_workspace(container: ContainerState, facts: _DurableFacts) -> Integrit
     )
 
 
+def is_the_untouched_starter(container: ContainerState) -> bool:
+    """Is this container still holding the seeded template, with nothing built on it?
+
+    `commits` is the container's OWN history: a provision seeds exactly one root commit, and the
+    platform's bundle step adds one per write-back — so more than one is positive proof this
+    container's tree has been bundled at least once, and a factory-reset container is back at 1.
+    `commits == 0` means the probe could not count, which is never permission to skip a write.
+
+    THE FORGIVING CHURN SET, not `REGENERATED_ONLY`, and the asymmetry is load-bearing: `next dev`
+    normalises `tsconfig.json` on every boot, so under the strict set a factory-reset container
+    that merely started would read as "not the starter" and its blank tree would be written over
+    the citizen's saved app. The price is a lost `tsconfig.json`-only edit."""
+    return container.commits == 1 and clean_but_for_churn(container)
+
+
 def clean_but_for_churn(container: ContainerState) -> bool:
     """Is the tree empty of anything a person or the agent would have written?
 
@@ -708,6 +795,8 @@ def clean_but_for_churn(container: ContainerState) -> bool:
     about whether a container may be destroyed."""
     if container.porcelain_truncated:
         return False  # too much changed to enumerate, which is itself evidence of real work
+    if not container.porcelain_answered:
+        return False  # git never answered, so there is no empty tree here — only an unread one
     return all(path in FRAMEWORK_CHURN for path in container.changed_paths)
 
 
@@ -745,16 +834,11 @@ async def workspace_integrity(
     sandbox_client: SandboxClient,
     handle: SandboxHandle,
     app_id: uuid.UUID,
-    *,
-    restore_source_key: str | None,
 ) -> IntegrityVerdict:
     """Does this container still hold this app's work?
 
-    `restore_source_key` names the bundle to compare against — the one the caller would actually
-    restore, so the verdict's answer matches the tree the user would get back. `None` means the
-    saved bundle (matches `newest_restore_source`'s convention, so its result passes straight
-    in); Save-between-turns can make the two bundles disagree, which is why this is the caller's
-    choice. Never raises: every failure is unanswerable, so a blip can't fail a turn."""
+    Compared against the saved bundle, which is the one and only tree a restore hands back.
+    Never raises: every failure is unanswerable, so a blip can't fail a turn."""
     try:
         store = get_storage()
     except StorageUnconfiguredError:
@@ -764,20 +848,15 @@ async def workspace_integrity(
         return IntegrityVerdict(WorkspaceState.INTACT, "the object store is not configured")
 
     try:
-        recovery = await store.head(recovery_key(app_id))
         saved = await store.head(snapshot_key(app_id))
     except StorageError:
         _log.warning("workspace_integrity_store_unreadable", app_id=str(app_id), exc_info=True)
         return _remember_unreadable(app_id, "the object store could not be read")
 
-    reference_key = restore_source_key if restore_source_key is not None else snapshot_key(app_id)
-    reference_meta = recovery if reference_key == recovery_key(app_id) else saved
-    stamped = head_sha_from_metadata(reference_meta.metadata if reference_meta else None)
+    stamped = head_sha_from_metadata(saved.metadata if saved else None)
     malformed = stamped is not None and _SHA_RE.match(stamped) is None
     facts = _DurableFacts(
-        recovery_present=recovery is not None,
         saved_present=saved is not None,
-        reference_key=reference_key,
         reference_sha=None if malformed else stamped,
         reference_sha_malformed=malformed,
     )

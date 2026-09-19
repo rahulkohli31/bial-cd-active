@@ -87,7 +87,7 @@ describe('nothing is ever `disabled` — swept in every state', () => {
     ['a turn running', { isRunning: true }],
     ['a surface gate closed', { gate: { blocked: true, reason: 'Building your app.' } }],
     ['an offer pending', { offer: { toolCallId: 'c1', conversationId: 'chat-1', spent: false, onBuild: vi.fn(), onKeepPlanning: vi.fn() } }],
-    ['a stop control mounted', { isRunning: true, stop: { running: true, resolveTarget: () => null, onStopTurn: vi.fn(), onStopSession: vi.fn() } }],
+    ['a stop control mounted', { isRunning: true, stop: { running: true, resolveTarget: (): null => null, onStopTurn: vi.fn() } }],
   ])('%s', (_name, over) => {
     const { container } = draw(over)
     noRealDisabled(container)
@@ -265,7 +265,7 @@ describe('the relocated stop', () => {
   it('renders when a turn is running, with a stable accessible name', () => {
     draw({
       isRunning: true,
-      stop: { running: true, resolveTarget: () => ({ conversationId: 'chat-1', turnId: 't1' }), onStopTurn: vi.fn().mockResolvedValue(undefined), onStopSession: vi.fn() },
+      stop: { running: true, resolveTarget: () => ({ conversationId: 'chat-1', turnId: 't1' }), onStopTurn: vi.fn().mockResolvedValue(undefined) },
     })
     expect(screen.getByTestId('stop-turn')).toBeTruthy()
   })
@@ -274,7 +274,7 @@ describe('the relocated stop', () => {
     const onStopTurn = vi.fn().mockResolvedValue(undefined)
     draw({
       isRunning: true,
-      stop: { running: true, resolveTarget: () => ({ conversationId: 'chat-1', turnId: 't7' }), onStopTurn, onStopSession: vi.fn() },
+      stop: { running: true, resolveTarget: () => ({ conversationId: 'chat-1', turnId: 't7' }), onStopTurn },
     })
     fireEvent.click(screen.getByTestId('stop-turn'))
     await waitFor(() => expect(onStopTurn).toHaveBeenCalledWith('chat-1', 't7'))

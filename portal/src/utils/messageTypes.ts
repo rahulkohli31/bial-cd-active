@@ -23,6 +23,7 @@
  * producers of that part need it — a util cannot import a component, so a leaf both already
  * depend on is the only place one copy of that sentence can live.
  */
+import { assertNever } from './assertNever'
 import type { PlanOptionsItem, StepItem } from './turnStreamApi'
 
 /** Prose part — optionally an inline csv/txt attachment (content lives in `text`,
@@ -111,7 +112,45 @@ export type FilePart = FilePartImageOrDocument | FilePartOffice | FilePartDeck
 export type BuildOutcomeStatus = 'ended' | 'failed' | 'stopped'
 
 /**
+ * EVERY REASON A STORED ROW CAN CARRY — the closed union, and the whole point of closing it.
+ *
+ * The server has five producers of an ending across three modules. Closing the union is what
+ * makes the table below TOTAL over it: a reason the server can send but this bundle has no
+ * sentence for is a compile error here, rather than a generic "The build failed." shown over a
+ * working app.
+ *
+ * It mirrors `backend/src/services/turns/copy.py::END_REASONS`, and
+ * `backend/tests/services/turns/test_end_reasons.py` is what keeps the two equal — nothing else
+ * can, because a backend author adding a reason has no compiler pointing here.
+ *
+ * `DOCUMENT_TOO_MANY_PAGES` is uppercase because the provider's own token is, and stored rows
+ * already carry it; normalising it here would orphan every one of those rows.
+ */
+export type EndReason =
+  | 'quota_exceeded'
+  | 'stopped_by_user'
+  | 'force_ended'
+  | 'idle_teardown'
+  | 'workspace_restored'
+  | 'request_limit'
+  | 'wall_clock_deadline_exceeded'
+  | 'run_budget_reached'
+  | 'model_unavailable'
+  | 'verdict_unanswerable'
+  | 'self_heal_budget_exhausted'
+  | 'build_wrote_nothing'
+  | 'attachment_unavailable'
+  | 'sandbox_unavailable'
+  | 'workspace_unreadable'
+  | 'workspace_unrecoverable'
+  | 'context_hard_limit_exceeded'
+  | 'DOCUMENT_TOO_MANY_PAGES'
+
+/**
  * REASON → THE SENTENCE A CITIZEN READS. The one table; there is no second copy of it.
+ *
+ * TOTAL OVER `EndReason`, which is the TypeScript half of this fix: adding an ending with no
+ * citizen-facing copy is a compile error right here rather than a sentence nobody wrote.
  *
  * IT LIVES IN THIS MODULE, not on the surface that renders it, because BOTH paths need it and
  * only a leaf can serve both: the live terminal is drawn by `ConversationSurface` and the reloaded
@@ -119,35 +158,66 @@ export type BuildOutcomeStatus = 'ended' | 'failed' | 'stopped'
  * "Two authors for one sentence" is the documented failure this arrangement exists to prevent —
  * fixing one emitter alone only ever changed WHEN the wrong text appeared, never whether it did.
  *
- * IT MIRRORS `backend/src/services/build_sessions/outcome.py::_summary` — its four reasons, same
- * wording — because that emitter writes the durable row for legacy build sessions while this one
- * renders the turn terminal, and a transcript must not say different things about the same build
- * depending on when you looked at it. The turn engine's own endings (`request_limit`,
- * `wall_clock_deadline_exceeded`, `model_unavailable`) have no legacy row and are listed here only.
+ * THE FOUR ARMS `outcome.py::_summary` ALSO RENDERS are word-for-word the same here, because that
+ * emitter writes the durable row for legacy build sessions while this one renders the turn
+ * terminal, and a transcript must not say different things about the same build depending on when
+ * you looked at it.
  *
- * PLUS ONE ARM THE SERVER TABLE LACKS: `workspace_restored`. It is raised at
- * `engine.py`'s `_WriteEndedError("workspace_restored", …)` — a turn that ends because the
- * citizen's workspace
- * had to be put back from the last saved copy, which is a SUCCESSFUL restore and not a broken
- * build, once wrongly announced as "The build failed: workspace_restored".
+ * WHERE ONE SENTENCE SERVES SEVERAL REASONS, that is deliberate: `request_limit`,
+ * `wall_clock_deadline_exceeded` and `run_budget_reached` are three internal ceilings a citizen
+ * cannot act on differently.
  */
-export const OUTCOME_COPY: Readonly<Record<string, string | undefined>> = {
+export const OUTCOME_COPY: Readonly<Record<EndReason, string>> = {
   quota_exceeded: 'The build stopped: you reached your daily limit.',
   stopped_by_user: 'You stopped this build before it finished.',
   force_ended: 'This build was force-stopped before it finished, and its work was discarded.',
   idle_teardown: 'This build was stopped because it sat idle.',
   workspace_restored:
     'This build stopped so your workspace could be put back from the last saved copy. Send your message again once your workspace is back.',
-  // THE TURN ENGINE'S OWN BOUNDED ENDINGS (2026-09-11). `request_limit` and
-  // `wall_clock_deadline_exceeded` end through `_bounded_run_ending`, whose banner tells the
-  // citizen their app is working — a transcript row reading "The build failed." over that banner
-  // was the contradiction a citizen photographed. One sentence for both, because which bound
-  // fired is not something they can act on differently. `model_unavailable` is the named ending
-  // for a model service that stayed down past every retry (`engine.py::_end_model_unavailable`).
   request_limit: 'This build stopped after doing as much as it does in one go.',
   wall_clock_deadline_exceeded: 'This build stopped after doing as much as it does in one go.',
+  run_budget_reached: 'This build stopped after doing as much as it does in one go.',
   model_unavailable:
     'The assistant could not get an answer from its service, so this build stopped.',
+  // WORD FOR WORD WHAT THE LIVE FRAME SAID (`turns/copy.py::COULD_NOT_CONFIRM_TEXT`). That
+  // sentence is emitted as a live-only error frame and never persisted, so on reload this table
+  // is the ONLY thing the citizen sees for this ending. Rendering the neutral "Build finished."
+  // here made the portal assert a completion the backend deliberately refuses to confirm: the
+  // verdict is unanswerable precisely because a reverted container serving the starter page
+  // compiles, serves 200 and logs no crash. TYPED OUT rather than imported, like every other
+  // entry — importing the server's constant is what would let the two agree by construction and
+  // stop catching the drift this table exists to catch.
+  verdict_unanswerable:
+    "Your app looks like it's running, but we couldn't confirm this change went in. " +
+    'Open the preview and see — and if something looks wrong, say so and we\'ll fix it.',
+  self_heal_budget_exhausted:
+    'Your app is running — the assistant just ran out of steps before it finished tidying up.',
+  build_wrote_nothing: 'This build ended without changing anything in your app.',
+  attachment_unavailable:
+    'This build stopped because one of your attached files could not be read.',
+  sandbox_unavailable:
+    'This build stopped because your workspace was not reachable. Send your message again.',
+  workspace_unreadable:
+    'This build stopped because your workspace could not be read. Send your message again.',
+  workspace_unrecoverable:
+    'This build stopped because your workspace could not be brought back. Your last saved version is safe.',
+  context_hard_limit_exceeded:
+    'This chat has got too long to carry on. Start a new chat to keep going — your app and everything you have built stays exactly as it is.',
+  DOCUMENT_TOO_MANY_PAGES:
+    'That PDF has too many pages for the assistant to read, and it stays in this chat, so every message here will hit the same limit. Start a new chat and attach a shorter document — or split this one and attach just the part you need.',
+}
+
+const NAMED_ENDINGS: ReadonlySet<string> = new Set(Object.keys(OUTCOME_COPY))
+
+/**
+ * Is this wire value one of the endings this client knows?
+ *
+ * THE UNION IS CLOSED AND THE WIRE IS NOT. A server one deploy ahead can send a reason this
+ * bundle has never heard of, so the narrowing happens once, here, at the boundary — which is what
+ * lets the lookup below be total instead of open.
+ */
+function isEndReason(reason: string): reason is EndReason {
+  return NAMED_ENDINGS.has(reason)
 }
 
 /**
@@ -156,19 +226,22 @@ export const OUTCOME_COPY: Readonly<Record<string, string | undefined>> = {
  * states the outcome plainly rather than decoratively.
  *
  * THE REASON IS CONSULTED BEFORE THE STATUS, and that is the one ordering difference from
- * `outcome.py::_summary` — do not "restore" it to match. On the SERVER, `_terminal_status` maps a
- * Stop, a force-end and an idle reap all onto ENDED, so a FAILED status there really does mean
+ * `outcome.py::_summary` — do not "restore" it to match. On the SERVER, a Stop, a force-end and
+ * an idle reap all carried ENDED, so a FAILED status there really does mean
  * something broke and can be answered first. On the turn stream it does not: `_WriteEndedError`
  * finishes as `failed` for every named graceful end there is, quota and workspace-restore
  * included. Answering the status first is exactly what printed "The build failed: quota_exceeded"
  * at someone who had merely used up their day.
  *
- * AN UNKNOWN REASON IS NEVER INTERPOLATED. Every `reason` that reaches here is a machine token —
- * a `_WriteEndedError` reason or a session end reason, `self_heal_budget_exhausted`,
- * `wall_clock_deadline_exceeded`, `sandbox_unavailable` and the rest — and not one of them is
- * prose. So an unlisted reason gets the neutral fallback, and the human-readable detail arrives on
- * its own `error` frame (the engine emits one beside every named end), written for a citizen
- * rather than for a log. Printing the token is the defect; the fallback is the fix.
+ * A MISSING REASON IS A DELIBERATE ARM, NOT A FALLTHROUGH. A generic failure — the shape that
+ * records nothing about what broke — stores `NULL`, so there is no key to look up and the
+ * status-shaped sentence below is the right and only answer for it. That is the one case the
+ * neutral text is FOR; a named ending reaching it is the bug this union closes.
+ *
+ * AN UNKNOWN REASON IS NEVER INTERPOLATED. Every `reason` on this wire is a machine token, so a
+ * value this bundle does not know takes the same status-shaped sentence rather than being printed
+ * at a citizen. The human-readable detail arrives on its own `error` frame (the engine emits one
+ * beside every named end), written for a citizen rather than for a log.
  */
 export function outcomeSummary({
   status,
@@ -177,11 +250,22 @@ export function outcomeSummary({
   status: BuildOutcomeStatus
   reason: string | null
 }): string {
-  const named = reason ? OUTCOME_COPY[reason] : undefined
-  if (named) return named
-  if (status === 'failed') return 'The build failed.'
-  if (status === 'stopped') return 'This build was stopped before it finished.'
-  return NEUTRAL_BUILD_SUMMARY
+  if (reason === null || !isEndReason(reason)) return genericEnding(status)
+  return OUTCOME_COPY[reason]
+}
+
+/** The sentence for an ending that recorded no reason, shaped by how the turn finished. */
+function genericEnding(status: BuildOutcomeStatus): string {
+  switch (status) {
+    case 'failed':
+      return 'The build failed.'
+    case 'stopped':
+      return 'This build was stopped before it finished.'
+    case 'ended':
+      return NEUTRAL_BUILD_SUMMARY
+    default:
+      return assertNever(status)
+  }
 }
 
 /**

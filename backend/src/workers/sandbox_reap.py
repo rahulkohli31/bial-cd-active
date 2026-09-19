@@ -6,10 +6,10 @@ owed has had its registry record cleared — that is what hands the citizen thei
 after a failure of ours — so the scan reaches everything except exactly the containers that
 already went wrong once. The owed row is the only thing that still names one.
 
-TWO GATES BIND THIS PATH AND NEITHER IS OPTIONAL, because passing no `app_id` is how the
-durable-copy precondition is opted out of and this is where almost all of the deleting happens:
-`_owning_app_ids` resolves the owner so the gate binds, and `may_destroy_on_this_control_plane`
-keeps the unattended timer off every non-production control plane.
+TWO GUARDS BIND THIS PATH AND NEITHER IS OPTIONAL, because this is where almost all of the
+deleting happens: `_owning_app_ids` names the slot each container's tree is written back to, and
+without it a sweep destroys unsaved work; `may_destroy_on_this_control_plane` keeps the unattended
+timer off every non-production control plane.
 
 THE PER-PASS CEILING IS THE ONE GUARD THIS PATH DELIBERATELY DOES NOT TAKE. A bounded sweep that
 never finishes its list would leave the same users unreconciled on every tick.
@@ -110,15 +110,10 @@ async def reap_abandoned_sandboxes() -> None:
 
 
 async def _owning_app_ids() -> dict[str, uuid.UUID]:
-    """Container name → the app that owns it, which is what binds this sweep's durable-copy gate.
-
-    A DATABASE THAT WILL NOT ANSWER FAILS THE PASS rather than returning an empty map. Empty
-    resolves every container to `None`, which is indistinguishable from "the caller opted out"
-    and would silently un-gate the whole sweep at exactly the moment nothing can be verified.
-    The raise is logged by the receiver and the next tick, five minutes out, retries."""
+    """`owning_app_ids` on a session of this pass's own, since a scheduled task has no request
+    to borrow one from. A raise here fails the pass; the next tick, five minutes out, retries."""
     from src.db.base import async_session_factory
-    from src.services.build_sessions.inventory import _app_names_to_owners
+    from src.services.build_sessions.inventory import owning_app_ids
 
     async with async_session_factory() as db:
-        owners = await _app_names_to_owners(db)
-    return {name: known.app_id for name, known in owners.items()}
+        return await owning_app_ids(db)

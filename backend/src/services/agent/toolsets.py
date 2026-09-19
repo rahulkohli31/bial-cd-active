@@ -1,5 +1,6 @@
-# `present_plan_options` below is a registered tool: its docstring is sent to the model
-# verbatim as that tool's description. Edit it as prompt text, not as an internal note.
+# `present_plan_options` and `check_the_app` below are registered tools: their docstrings are
+# sent to the model verbatim as those tools' descriptions. Edit them as prompt text, not as
+# internal notes.
 """The chat-kind → toolset registry: tool gating AT THE SERVER.
 
 WHY THIS EXISTS. The registry keys on the server-owned `conversation.kind` — NEVER anything
@@ -13,16 +14,17 @@ gets the runtime's unknown-tool rejection, never a policy check that could be by
 | Plan  | yes (live workspace) | allowlisted, read    | —      | yes                   |
 | Build | yes (live workspace) | full (+SQL guard)    | yes    | —                     |
 
-Both arms also carry `CONVERSATION_TOOLSET` (registered once, so the two lists can't drift).
+Both arms also carry `CONVERSATION_TOOLSET` and `app_state_toolset` (each registered once, so
+the two lists can't drift).
 `toolsets_for_kind` is the ONLY place permitted to read the chat kind to decide capability —
 see its own docstring. Two more things live here, not the registry: the citizen-facing chat-kind
-CATALOGUE (served on `GET /v1/auth/me`) and the TOOL SURFACE prompt-block renderer — each has its
-own banner below, kept beside the registry so a change to one puts the other under your cursor.
+CATALOGUE (served on `GET /v1/auth/me`) and the registry read the gating guards ask their
+questions through — each has its own banner below, kept beside the registry so a change to one
+puts the other under your cursor.
 """
 
 from __future__ import annotations
 
-import re
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -43,7 +45,9 @@ from src.services.agent.attachment_tools import AttachmentReader, attachment_too
 from src.services.agent.connector_tools import CONNECTOR_TOOLSET
 from src.services.agent.conversation_tools import CONVERSATION_TOOLSET
 from src.services.agent.read_tools import ReadOnlyWorkspace, read_only_toolset
+from src.services.orchestrator.constants import APP_CHECK_MAX_POLLS, READINESS_POLL_S
 from src.services.orchestrator.deps import SandboxSession
+from src.services.orchestrator.selfheal import AppState, read_the_app_state
 from src.services.orchestrator.tools import sandbox_toolset
 
 
@@ -113,6 +117,115 @@ _PLAN_OPTIONS_TOOLSET: FunctionToolset[Any] = FunctionToolset[Any](
 )
 
 
+# --- What the app is doing, ASKED FOR rather than pushed ------------------------------------
+#
+# A PULL, AND THE POSITION IS THE REASON. A tool result lands at the absolute tail of the run's
+# own messages and `_persistable_messages` keeps it, so what the model was sent is what the store
+# replays. Anything the platform PUSHES instead lands ahead of the citizen's persisted prompt,
+# where its bytes are gone next turn and every message after them shifts.
+#
+# THE SENTENCES ARE THE VERDICT, NOT THE SIGNALS. `read_the_app_state` applies the ordering rule
+# (could-not-tell > not-serving > the page) and the tool hands over the sentence for the answer
+# it reached. Nothing here invites the model to re-derive a diagnostic: the harness has already
+# offered the agent a `tsc` it could run for itself and withdrawn it, because the model spent
+# 20-40 s and a context window per turn establishing what the platform already knew.
+
+_APP_STATE_SENTENCES: Final[dict[AppState, str]] = {
+    AppState.UNKNOWN: (
+        "The platform could not tell what state this app is in this time. If the user says "
+        "something is wrong, look at the app's files and check for yourself rather than "
+        "assuming it still works."
+    ),
+    AppState.NOT_SERVING: (
+        "The app is not currently serving. Something it needs at startup is most likely "
+        "failing, so treat any question about what the app does today as a question about a "
+        "broken app."
+    ),
+    AppState.STILL_THE_TEMPLATE: (
+        "The app is serving, and its home page is still byte-for-byte the starter template the "
+        "workspace was created with — nothing the user asked for is on the page they actually "
+        "look at. Whatever else exists in the files, the app they see has not been built yet."
+    ),
+    AppState.LIVE: "The app is serving, and its home page is no longer the starter template.",
+}
+
+
+def _no_pinned_sandbox(_ctx: RunContext[Any]) -> SandboxSession | None:
+    """The default app-state accessor: this run has no container.
+
+    A real answer rather than a raise. A Plan turn can run before any workspace exists, and the
+    agent-level surfaces (`ReadDeps`) have no container at all — so `check_the_app` is registered
+    on every run and answers `unknown` where there is nothing to ask."""
+    return None
+
+
+def app_state_toolset[DepsT](
+    sandbox_of: Callable[[RunContext[DepsT]], SandboxSession | None],
+    *,
+    noticed: Callable[[AppState], None] | None = None,
+) -> FunctionToolset[DepsT]:
+    """`check_the_app`, over whatever deps `sandbox_of` resolves the container from.
+
+    ONE PROBE PER UNCHANGED TREE, MEMOIZED IN THE CLOSURE. Repeated calls that the model makes
+    without editing anything in between return the first answer with no container round-trip —
+    the same ceiling `connector_schema` puts on re-delivering its artefact, for the same reason:
+    without it N calls become N readiness polls plus N execs.
+
+    THE MEMO IS KEYED ON `session.writes`, NOT ON THE RUN, and that is what keeps the tool's
+    promise honest. A Build run holds the mutating tools and this one together for up to
+    `MODEL_TURN_CEILING` requests, so "memoize for the whole run" means a model that reads
+    NOT_SERVING, fixes the bug, and checks again is handed its own pre-fix answer under a
+    docstring that says "right now" — and then tells the citizen so in prose the platform streams
+    live and never gates. Any write invalidates the reading; a run that never writes still pays
+    for exactly one probe.
+
+    `noticed` IS HANDED THE READING AS THE TOOL ANSWERS, so the turn can act on the same fact the
+    model was given rather than re-deriving it from the sentence that carried it. It fires on
+    every call including the memoized one: a second call in the same run is still a turn in which
+    the model consulted the platform, which is the fact the detection counters count.
+
+    The inner tool annotates `RunContext[Any]` rather than the enclosing PEP-695 type param, for
+    the reason `sandbox_toolset` states: pydantic-ai resolves tool annotations with
+    `get_type_hints` at registration, where that param is out of scope under deferred
+    annotations. The factory signature carries the real typing; the `cast` at the return narrows
+    back to it."""
+    memo: list[tuple[int, AppState]] = []
+
+    async def check_the_app(ctx: RunContext[Any]) -> str:
+        """Call this before you say anything about what the app does now, and whenever the user
+        tells you something is wrong.
+
+        It tells you what this app is doing right now — whether it is serving, and whether the
+        page the user actually looks at is still the starter template. Earlier messages in this
+        conversation describe how the app WAS; this is how it is. The platform runs the check and
+        hands you its answer, so you do not need to run a type-check or start a server to find
+        out.
+        """
+        session = sandbox_of(ctx)
+        # No session means no container to read and no writes to invalidate against, so the
+        # one UNKNOWN it produces is cached under a count that can never move.
+        writes = session.writes if session is not None else 0
+        if not memo or memo[0][0] != writes:
+            memo[:] = [
+                (
+                    writes,
+                    AppState.UNKNOWN
+                    if session is None
+                    else await read_the_app_state(
+                        session.sandbox_client,
+                        session.handle,
+                        max_polls=APP_CHECK_MAX_POLLS,
+                        poll_s=READINESS_POLL_S,
+                    ),
+                )
+            ]
+        if noticed is not None:
+            noticed(memo[0][1])
+        return _APP_STATE_SENTENCES[memo[0][1]]
+
+    return cast(FunctionToolset[DepsT], FunctionToolset[Any]([check_the_app], id="app-state"))
+
+
 # THERE IS NO OPTIONS-ONLY TOOLSET. It existed for exactly one caller: the forced retry that
 # re-issued a Plan run with `present_plan_options` as the only tool the model could reach, after
 # a prose heuristic decided a plan had been written. Both are gone (see the note in
@@ -157,6 +270,8 @@ def toolsets_for_kind[DepsT](
     reader_of: Callable[[RunContext[DepsT]], AttachmentReader] | None = None,
     *,
     connected_systems: Sequence[ConnectedSystem] = (),
+    app_state_of: Callable[[RunContext[DepsT]], SandboxSession | None] = _no_pinned_sandbox,
+    app_state_noticed: Callable[[AppState], None] | None = None,
 ) -> ToolSurface[DepsT]:
     """The per-run tool surface for a chat kind, over whatever deps type the caller's accessors
     resolve the workspace (and, for Build, the sandbox) from.
@@ -170,8 +285,7 @@ def toolsets_for_kind[DepsT](
     actually read from outside the platform, resolved once at the router off
     `resolve_window(...).effectively_on` — the project's switch AND the owner's approval. Empty is
     the ordinary case and adds nothing, so a project with no connector pays nothing for this
-    feature on any turn and the checked-in `WRITE_TOOL_SURFACE` snapshot still renders at twelve
-    tools.
+    feature on any turn.
 
     THE GATE IS REGISTRATION, NOT REFUSAL, and that is the whole reason it lives here rather than
     inside the tool. The platform already has a flow whose purpose is to say no to a project — an
@@ -179,13 +293,19 @@ def toolsets_for_kind[DepsT](
     surface that ignored it would leave the model to discover the refusal by spending a round
     trip. Absent instead: a forged call meets the runtime's unknown-tool rejection, exactly as a
     Build tool does in a Plan chat. Toolsets are built per run, so a revoked approval takes the
-    tool away on the citizen's next turn with no invalidation step anywhere."""
+    tool away on the citizen's next turn with no invalidation step anywhere.
+
+    `app_state_of` IS THE ONE ACCESSOR THAT MAY ANSWER `None`, and `check_the_app` is registered
+    on BOTH arms off it. Plan has no other route to the answer — it cannot run a command that
+    starts a server — and a run with no container still gets the tool, answering `unknown`.
+    `app_state_noticed` rides beside it so the caller hears what the tool answered."""
     match kind:
         case ChatKind.PLAN:
             plan_toolsets: list[AbstractToolset[DepsT]] = [
                 read_only_toolset(workspace_of),
                 cast(AbstractToolset[DepsT], CONVERSATION_TOOLSET),
                 cast(AbstractToolset[DepsT], _PLAN_OPTIONS_TOOLSET),
+                app_state_toolset(app_state_of, noticed=app_state_noticed),
             ]
             # THE ATTACHMENT CAPABILITY, ON THIS ARM ALONE. Plan already executes in
             # the container, but only the eight read-only binaries on `check_the_guest_list` —
@@ -219,6 +339,7 @@ def toolsets_for_kind[DepsT](
                         sandbox_toolset(sandbox_of),
                         read_only_toolset(workspace_of).filtered(_structured_reads_only),
                         cast(AbstractToolset[DepsT], CONVERSATION_TOOLSET),
+                        app_state_toolset(app_state_of, noticed=app_state_noticed),
                     ],
                     connected_systems,
                 ),
@@ -292,71 +413,27 @@ fetches before first paint — and read on the client by the single module `chat
 from. No second endpoint, no second wording."""
 
 
-# --- The prompt's TOOL SURFACE block is GENERATED, never hand-written ----------------------
+# --- Reading the registry back, without running any of it ----------------------------------
 #
-# WHY. Prose drifts in two directions and a name list only catches one of them. The
-# hand-written block named SIX tools while the Write arm registered eight (`list_files` and
-# `search_files` were simply missing), and — the class a name comparison is blind to — a later
-# change to what `declare_done` DOES left the sentence describing it still promising a
-# follow-up round-trip. Rendering the block from the registry closes both: a tool the mode
-# does not register cannot be named, one it does register cannot be missed, and no line can
-# describe a tool differently from how the model is told it behaves, because the line and
-# the tool schema are the same string.
-#
-# WHERE IT LANDS. `core/prompt_blocks.py` is a LEAF module by construction (see its
-# docstring): a `services.*` import from there closes a real cycle, and this module is on
-# it — toolsets → orchestrator.tools → orchestrator.sql_guard → core.prompt_blocks. So the
-# prompt carries a checked-in SNAPSHOT of this renderer's output (`WRITE_TOOL_SURFACE`) and
-# `tests/services/orchestrator/test_prompt.py` goes red the moment the two disagree.
-# Regenerate the snapshot with:
-#
-#   uv run python -c "import asyncio;from src.db.models.conversation import ChatKind\
-# ;from src.services.agent.toolsets import render_tool_surface as r\
-# ;print(asyncio.run(r(ChatKind.BUILD)))"
-#
-# THE FIRST SENTENCE, NOT THE WHOLE DOCSTRING — the one decision this unit left to
-# implementation. pydantic-ai already sends every description IN FULL on the tool schema of
-# every request, so rendering the whole docstring here would put each one in front of the
-# model TWICE per turn: ~350 extra words on a request whose token budget is already tight.
-# The first sentence is a roll-call — "these are the tools you have, this is
-# what each is for" — and the registration carries the detail. Both are slices of the one
-# string, so the two can restate each other but can never contradict each other, which is
-# the property this check actually asks for.
+# The gating rules above are only as good as something that can ask what a kind actually
+# registers: that Plan is offered no write tool, that a project with no approved connector is
+# offered no connector tool. Those guards read this, and they have to be able to run with no
+# workspace, no sandbox and no model — so every accessor here raises if it is ever called.
 
 
-def _the_renderer_never_calls_a_model(
+def _reading_the_registry_never_calls_a_model(
     _messages: list[ModelMessage], _info: AgentInfo
 ) -> ModelResponse:
-    raise AssertionError("the tool-surface renderer enumerates registrations; it runs nothing")
+    raise AssertionError("reading the registry enumerates registrations; it runs nothing")
 
 
-_RENDER_ONLY_MODEL: Final = FunctionModel(_the_renderer_never_calls_a_model)
+_REGISTRY_ONLY_MODEL: Final = FunctionModel(_reading_the_registry_never_calls_a_model)
 """`RunContext` requires a model; `get_tools` never reads it. A model that raises if it is
 ever asked for a response keeps that fact honest rather than parking a live client here."""
 
 
-def _the_renderer_never_calls_a_tool(_ctx: RunContext[Any]) -> Any:
-    raise AssertionError("the tool-surface renderer reads tool definitions; it calls no tool")
-
-
-_SENTENCE_END: Final = re.compile(r"\.(?=\s|$)")
-"""A period that ends a sentence: one followed by whitespace or the end of the text. Linear,
-unbounded-quantifier-free (the ReDoS constraint every regex in this repo holds to)."""
-
-_ABBREVIATIONS: Final = ("e.g.", "i.e.", "etc.", "vs.")
-"""Periods that end a WORD, not a sentence. `read_tools.run_command`'s description opens
-`… pass argv tokens, e.g. …` and would otherwise be cut off mid-example."""
-
-
-def first_sentence(description: str) -> str:
-    """The first sentence of a tool description, with its docstring line breaks flattened."""
-    flattened = " ".join(description.split())
-    for match in _SENTENCE_END.finditer(flattened):
-        candidate = flattened[: match.end()]
-        if candidate.endswith(_ABBREVIATIONS):
-            continue
-        return candidate
-    return flattened
+def _reading_the_registry_never_calls_a_tool(_ctx: RunContext[Any]) -> Any:
+    raise AssertionError("reading the registry reads tool definitions; it calls no tool")
 
 
 async def registered_tool_definitions(
@@ -367,43 +444,22 @@ async def registered_tool_definitions(
 
     The accessors are the ones that raise: resolving a workspace or a sandbox is what a tool
     CALL needs, and nothing here calls a tool. That is deliberate rather than convenient — a
-    renderer that needed a live sandbox to describe the surface could not run in a test, and
-    a drift check that cannot run is not a check.
+    reader that needed a live sandbox to describe the surface could not run in a test, and a
+    gating guard that cannot run is not a guard.
 
     `connected_systems` MIRRORS `toolsets_for_kind`'s, DEFAULT AND ALL. It has to: without it the
-    connector-on registration is not expressible from a test, and with a different default the
-    checked-in `WRITE_TOOL_SURFACE` snapshot would render a tool that most projects never see."""
-    sandbox_of = _the_renderer_never_calls_a_tool if kind is ChatKind.BUILD else None
-    ctx: RunContext[Any] = RunContext(deps=None, model=_RENDER_ONLY_MODEL, usage=RunUsage())
+    connector-on registration is not expressible from a test, and a different default here would
+    let the guard pass over a surface no ordinary project is ever given."""
+    sandbox_of = _reading_the_registry_never_calls_a_tool if kind is ChatKind.BUILD else None
+    ctx: RunContext[Any] = RunContext(deps=None, model=_REGISTRY_ONLY_MODEL, usage=RunUsage())
     definitions: dict[str, ToolDefinition] = {}
     surface = toolsets_for_kind(
-        kind, _the_renderer_never_calls_a_tool, sandbox_of, connected_systems=connected_systems
+        kind,
+        _reading_the_registry_never_calls_a_tool,
+        sandbox_of,
+        connected_systems=connected_systems,
     )
     for toolset in surface.toolsets:
         for name, tool in (await toolset.get_tools(ctx)).items():
             definitions[name] = tool.tool_def
     return definitions
-
-
-async def render_tool_surface(
-    kind: ChatKind, *, connected_systems: Sequence[ConnectedSystem] = ()
-) -> str:
-    """The prompt's TOOL SURFACE block for `kind`, generated from the tools it registers.
-
-    THE DEFAULT IS WHAT `WRITE_TOOL_SURFACE` IS A SNAPSHOT OF, and regenerating that snapshot with
-    a connector passed here would bake the connected-data tool into the Build prompt of every
-    project on the platform — including one whose administrator refused the connector, which is
-    the case registration-gating exists to serve. The block is a fact about the PLATFORM's
-    surface; what a particular project adds to it is described in its own CONNECTED DATA stub,
-    beside the data it reads, so the description appears exactly when the tool does."""
-    lines = ["TOOL SURFACE:"]
-    for name, definition in (
-        await registered_tool_definitions(kind, connected_systems=connected_systems)
-    ).items():
-        if not definition.description:
-            raise ValueError(
-                f"`{name}` is registered with no description, so the prompt has nothing "
-                "truthful to say about it. Give the tool a docstring — it is prompt copy."
-            )
-        lines.append(f"- `{name}` — {first_sentence(definition.description)}")
-    return "\n".join(lines)

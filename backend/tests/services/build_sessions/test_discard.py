@@ -1,8 +1,8 @@
 """Discard: the app goes back to the version its owner saved, inside the container it runs in.
 
-What the discard replaces is parked rather than deleted, the recovery slot takes the saved tree
-so a later restart cannot bring the discarded work back, and every conversation of the project
-that spoke since the save gets a note its next reply reads."""
+What the discard replaces is parked rather than deleted, the saved copy is left exactly as its
+owner wrote it, and every conversation of the project that spoke since the save gets a note its
+next reply reads."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import contextlib
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 import pytest
 import redis.asyncio as aioredis
@@ -32,7 +32,7 @@ from src.services.build_sessions.manager import (
     SessionManager,
     app_name_for,
 )
-from src.services.build_sessions.snapshot import NothingSavedToGoBackToError, write_recovery_copy
+from src.services.build_sessions.snapshot import NothingSavedToGoBackToError
 from src.services.messages.projection import UserTextItem, WorkspaceDiscardedItem, project_rows
 from src.services.messages.store import append_batch, load_history, load_rows
 from src.services.sandbox import ExecResult, SandboxHandle
@@ -41,7 +41,6 @@ from src.services.storage import (
     StorageError,
     head_sha_from_metadata,
     quarantine_prefix,
-    recovery_key,
     snapshot_key,
 )
 from src.services.storage.bundle import parse_bundle_head_sha
@@ -107,7 +106,7 @@ class _Workspace(DevServerDownUntilStarted):
 async def _a_saved_app_with_later_work(
     db: AsyncSession, manager: SessionManager, email: str
 ) -> tuple[User, uuid.UUID, uuid.UUID, _Workspace]:
-    """Saved at SAVED, then a turn moved the tree to LATER and autosaved it, and ended."""
+    """Saved at SAVED, then a turn moved the tree to LATER and ended without saving it."""
     user = await UserFactory.create(db, email=email)
     project = await ProjectFactory.create(db, user.id)
     client = _Workspace(SAVED)
@@ -119,7 +118,6 @@ async def _a_saved_app_with_later_work(
     await manager.save_project_snapshot(db, user, project.id, sandbox_client=client)
     client.head = LATER
     assert session.handle is not None
-    await write_recovery_copy(client, session.handle, session.app_id, taken_at=datetime.now(UTC))
     return user, project.id, session.app_id, client
 
 
@@ -213,7 +211,10 @@ async def test_the_discarded_work_is_parked_and_a_restart_cannot_bring_it_back(
     fake_storage: FakeStorage,
     manager: SessionManager,
 ) -> None:
-    """Mutation check: skip the recovery-slot write and a restart restores the discarded work."""
+    """The one durable slot still holds what its owner saved, so the only tree a restart can
+    bring back is the discarded-TO one.
+    Mutation check: write the live tree to `snapshot_key` here and a restart restores the work
+    the citizen just asked to throw away."""
     user, project_id, app_id, client = await _a_saved_app_with_later_work(
         db_session, manager, "discard2@rvaiglobal.com"
     )
@@ -223,9 +224,7 @@ async def test_the_discarded_work_is_parked_and_a_restart_cannot_bring_it_back(
     )
 
     assert _parked(fake_storage, app_id) == [a_git_bundle(LATER)]
-    assert head_sha_from_metadata(fake_storage.meta[recovery_key(app_id)]) == SAVED
-    assert await manager.recoverable_work(app_id) is None
-    assert await manager.newest_restore_source(app_id) is None
+    assert head_sha_from_metadata(fake_storage.meta[snapshot_key(app_id)]) == SAVED
 
 
 async def test_the_next_turn_after_a_discard_finds_its_workspace_intact(
@@ -308,18 +307,18 @@ async def test_a_store_that_fails_before_the_reset_leaves_the_work_in_the_contai
     manager: SessionManager,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Mutation check: reset the container before writing the slot and the work is gone."""
+    """Mutation check: reset the container before parking the tree and the work is gone."""
     user, project_id, app_id, client = await _a_saved_app_with_later_work(
         db_session, manager, "discard6@rvaiglobal.com"
     )
     real_put = fake_storage.put
 
-    async def refuse_the_slot(key, data, **kwargs):
-        if key == recovery_key(app_id):
+    async def refuse_the_park(key, data, **kwargs):
+        if key.startswith(quarantine_prefix(app_id)):
             raise StorageError("blob is having a day")
         return await real_put(key, data, **kwargs)
 
-    monkeypatch.setattr(fake_storage, "put", refuse_the_slot)
+    monkeypatch.setattr(fake_storage, "put", refuse_the_park)
 
     with pytest.raises(StorageError):
         await manager.discard_unsaved_changes(

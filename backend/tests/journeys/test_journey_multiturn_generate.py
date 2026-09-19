@@ -220,20 +220,15 @@ async def test_stateless_multiturn_journey_with_reload_parity(
         "add dark mode",
     ):
         assert expected in final_run
-    # And in ORDER: the user prompts appear exactly as the questions were asked.
-    #
-    # `<system-note>` parts are filtered out, and that is not a fudge — the turn engine
-    # injects an ephemeral workspace reminder as a user-role part on the wire and
-    # NEVER persists it. Keeping it out of this assertion is what lets the assertion say
-    # what it means ("the citizen's questions, in order"); step 3 below then proves the
-    # note stayed out of the durable transcript too.
+    # And in ORDER: the user prompts on the wire are the citizen's questions, and nothing else.
+    # Unfiltered — the platform splices nothing onto the tail of `message_history`, so a note
+    # that came back would fail this rather than be excluded from it.
     prompts = [
         part.content
         for message in runs[-1]
         if isinstance(message, ModelRequest)
         for part in message.parts
         if isinstance(part, UserPromptPart)
-        if not (isinstance(part.content, str) and part.content.startswith("<system-note>"))
     ]
     assert prompts == questions
 
@@ -243,9 +238,7 @@ async def test_stateless_multiturn_journey_with_reload_parity(
     body = detail.json()
     assert body["activeTurn"] is None  # settled — nothing in flight
     # The FULL shape first, so the prose filter below cannot hide a lost or doubled row:
-    # each turn projects question → answer → its durable terminal, three times over. The
-    # ephemeral `<system-note>` the model saw on the wire appears nowhere — it was never
-    # persisted, which is the whole point of injecting it as an instruction-time part.
+    # each turn projects question → answer → its durable terminal, three times over.
     assert [item["type"] for item in body["projection"]] == [
         "user_text",
         "assistant_text",

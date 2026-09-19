@@ -17,8 +17,11 @@ set -eu
 WORKSPACE="${1:-/workspace/app}"
 cd "$WORKSPACE"
 
-# The baked workspace is NOT a git repo; `git init` is idempotent (a re-snapshot re-runs it safely).
-git init -q
+# NEVER CREATE A REPOSITORY HERE. The repo is seeded at provision, so a workspace that reaches this
+# script without one has LOST it — and a root commit written here would hold the finished app, which
+# makes "is this still the starter page?" compare the app against itself forever. Exit 64 says "no
+# repository" and nothing else; a full disk or a locked index keeps its own non-zero exit.
+git rev-parse --git-dir >/dev/null 2>&1 || exit 64
 
 git add -A
 

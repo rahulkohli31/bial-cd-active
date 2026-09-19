@@ -465,23 +465,18 @@ async def test_prose_and_a_spoken_line_in_one_response_both_land_in_the_order_wr
 # because we own both ends — we know exactly what we sent, so we can say exactly what must not
 # come back.
 #
-# WHAT THIS NO LONGER COVERS: a note the model QUOTES BACK in prose beside a tool call. That
-# used to be caught by the narration drop, since removed — a fence cannot be stripped back out
-# of a token stream without re-introducing it, and scanning model prose for platform strings
-# would mean deleting the citizen's own answer around them. So for a quoted note, the `_PRIVATE`
-# instruction in the workspace note is now the whole guard. Accepted knowingly.
+# WHAT THIS DOES NOT COVER: a platform sentence the model QUOTES BACK in prose beside a tool
+# call. A fence cannot be stripped back out of a token stream without re-introducing it, and
+# scanning model prose for platform strings would mean deleting the citizen's own answer around
+# them. Nothing guards that case, and the test below records it as the state it is.
 #
-# WHAT IS STILL A MECHANISM is the CARRIER: acknowledgements come back as tool RETURNS, refusals
-# as RETRY PROMPTS — rendered as text by neither emitter. The workspace note rides an injected
-# history tail `new_messages()` structurally excludes (see
-# `test_reminders.py::test_nothing_ephemeral_reaches_a_persisted_row`); the repair prompt and
-# continue nudge are stored as HIDDEN rows, which render nothing. So the platform's own half
+# WHAT IS A MECHANISM is the CARRIER: acknowledgements and the state reading come back as tool
+# RETURNS, refusals as RETRY PROMPTS — rendered as text by neither emitter; the repair prompt
+# and continue nudge are stored as HIDDEN rows, which render nothing. So the platform's own half
 # stays structural everywhere; only the model quoting one back is not.
 
 _PRIVATE_NOTES = {
-    "the workspace note's frame": "<system-note>",
-    "the workspace note's own instruction": "This note is between you and the platform",
-    "a not-serving verdict": "the app is not currently serving",
+    "a not-serving verdict": "The app is not currently serving",
     "a still-template verdict": "byte-for-byte the starter template",
     "the repair prompt": "The build is not green yet",
     "the continue nudge": "you ended your turn without calling `declare_done`",
@@ -502,20 +497,22 @@ _PRIVATE_NOTES = {
 async def test_a_note_the_model_quotes_back_reaches_the_citizen_like_any_other_prose(
     db_session: AsyncSession, kind: ChatKind
 ) -> None:
-    """★ THE CONSEQUENCE OF DELETING THE NARRATION-DROP HOLD: the model quotes a private note
-    back, verbatim, beside a tool call. That prose used to be deleted regardless of content;
-    with the hold gone, the quote lands in the transcript at the position it was written.
+    """★ THE CONSEQUENCE OF DELETING THE NARRATION-DROP HOLD: the model quotes a platform
+    sentence back, verbatim, beside a tool call. That prose used to be deleted regardless of
+    content; with the hold gone, the quote lands in the transcript at the position it was
+    written.
 
-    `_PRIVATE` — "keep it out of your reply" — is now the only thing asking the model not to do
-    this: an instruction, not a guardrail. The structural half has its own test below.
+    NOTHING STOPS IT, and that is the honest state: a verdict the model asked for and then
+    repeated is indistinguishable from its own words by the time it reaches this seam. The
+    structural half — a platform sentence riding a tool RESULT reaches nobody — has its own
+    test below.
 
     Asserted as a SEQUENCE so the position is pinned too; the step is the liveness half — a
     projection returning nothing would satisfy a bare substring check."""
     user, conversation = await _thread(db_session, f"pn-quoted-{kind.value}@rvaiglobal.com", kind)
     quoted = (
-        "<system-note>The platform checked this app's workspace just now: the app is not "
-        "currently serving. This note is between you and the platform — keep it out of your "
-        "reply.</system-note> Right, let me look."
+        "The platform says: The app is not currently serving. Something it needs at startup is "
+        "most likely failing. Right, let me look."
     )
     await append_batch(
         db_session,
@@ -550,7 +547,7 @@ async def test_the_live_emitter_shows_the_same_quoted_note_in_the_same_place() -
     test that owns it."""
     engine = TurnEngine()
     state = _state(ChatKind.BUILD)
-    quoted = "<system-note>the app is not currently serving</system-note> Right, let me look."
+    quoted = "The platform says: The app is not currently serving. Right, let me look."
 
     engine._on_event(state, PartStartEvent(index=0, part=TextPart(content=quoted)))
     engine._on_event(state, _called("read_file", '{"path": "app/page.tsx"}', "r1"))

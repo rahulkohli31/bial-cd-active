@@ -36,7 +36,7 @@ const h = vi.hoisted(() => ({
   // it shadowed was deleted. It is handed to the injected client below and armed with the 409 that
   // used to raise the block banner; the assertion is that nothing on this surface reaches it —
   // which was true while the hook still consumed a `start`, and is true structurally now.
-  start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), relaunchPreview: vi.fn(),
+  start: vi.fn(), getStatus: vi.fn(), relaunchPreview: vi.fn(),
   fetchSaveState: vi.fn(), fetchPreviewState: vi.fn(),
 }))
 
@@ -69,7 +69,7 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
 
 import {
   FakeEventSource, primeTurn, renderBuilder, send, statusResp,
-  primeStandbyReattach, findStartAppControl, planReply, turnStreaming, ENDED_RESP,
+  primeStandbyReattach, findStartAppControl, planReply, turnStreaming,
 } from './_builderSession.jsx'
 import { BuildSessionAlreadyActiveError } from '../../utils/buildSessionApi'
 
@@ -87,7 +87,7 @@ const CHAT_ID = 'build-X'
  * calls what it names.
  */
 const client = () => ({
-  start: h.start, relaunchPreview: h.relaunchPreview, stop: h.stop, getStatus: h.getStatus,
+  start: h.start, relaunchPreview: h.relaunchPreview, getStatus: h.getStatus,
 })
 const deps = () => ({ client: client(), eventSourceFactory: () => new FakeEventSource('x') })
 
@@ -126,7 +126,6 @@ beforeEach(() => {
   vi.clearAllMocks()
   sessionStorage.clear()
   primeTurn(h)
-  h.stop.mockResolvedValue(ENDED_RESP)
   h.getStatus.mockResolvedValue(statusResp())
   h.getBuild.mockResolvedValue({ id: CHAT_ID, kind: 'build', messages: [] })
   h.loadBuilds.mockResolvedValue([])
@@ -147,7 +146,7 @@ describe('the block banner cannot reach the tree — from EITHER producer', () =
   it('arm 1, start’s 409: a send is a TURN, so the start that raised `blocked` never fires', async () => {
     // The 409 is armed on the start the injected client exposes. If any path on this surface still
     // provisioned a session, this would raise the banner — which is exactly the point: none does.
-    h.start.mockRejectedValue(new BuildSessionAlreadyActiveError('You already have a build running.', 'sess-9'))
+    h.start.mockRejectedValue(new BuildSessionAlreadyActiveError('You already have a build running.'))
     h.readTurnStream.mockImplementation(turnStreaming(planReply()))
 
     renderBuilder({ deps: deps() })
@@ -164,9 +163,7 @@ describe('the block banner cannot reach the tree — from EITHER producer', () =
     // `relaunchPreview` genuinely runs here — `StartAppControl` calls the module function — so the
     // 409 arrives on a reachable path. What it must NOT do is raise the banner, because the hook's
     // `relaunch()` (the half that mapped it onto `blocked`) has no caller.
-    h.relaunchPreview.mockRejectedValue(
-      new BuildSessionAlreadyActiveError('You already have a build running.', 'sess-9'),
-    )
+    h.relaunchPreview.mockRejectedValue(new BuildSessionAlreadyActiveError('You already have a build running.'))
     const standby = primeStandbyReattach(h, { chatId: CHAT_ID, projectId: 'p1' })
     renderBuilder({ deps: deps(), hasSavedBuild: true })
     await waitFor(() => expect(h.getStatus).toHaveBeenCalled())

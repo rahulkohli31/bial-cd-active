@@ -77,7 +77,7 @@ async def test_each_counter_increments_on_its_own_event_and_no_other(
 
     assert len(await _rows(db_session, HarnessCounter.CLAIM_BLOCKED.value)) == 1
     assert len(await _rows(db_session, HarnessCounter.RESTORE_PERFORMED.value)) == 1
-    assert await _rows(db_session, HarnessCounter.RECOVERY_WRITE_MISSED.value) == []
+    assert await _rows(db_session, HarnessCounter.WORKSPACE_WAS_WRITTEN.value) == []
 
 
 async def test_a_counter_that_did_not_exist_at_migration_time_still_writes(
@@ -147,9 +147,9 @@ async def test_a_broken_counter_never_fails_the_thing_it_is_counting(
 async def test_a_count_outlives_its_app(db_session: AsyncSession) -> None:
     """NO FOREIGN KEY on `app_id`, deliberately: a count is a historical fact, and the moment an
     operator most wants to read it back is after the app is gone."""
-    await count(HarnessCounter.RECOVERY_WRITE_MISSED, app_id=uuid.uuid4())
+    await count(HarnessCounter.RESTORE_PERFORMED, app_id=uuid.uuid4())
 
-    rows = await _rows(db_session, HarnessCounter.RECOVERY_WRITE_MISSED.value)
+    rows = await _rows(db_session, HarnessCounter.RESTORE_PERFORMED.value)
     assert len(rows) == 1
 
 

@@ -922,17 +922,6 @@ async def _saved_version_for_publish_state(
     if storage is None:
         return _NO_STORE
     try:
-        # THE KEY CHOICE, AND IT IS THE CITIZEN'S SAVE — `snapshot_key`, which
-        # `snapshot.Destination.saved` names "the user's explicit Save; the one key a
-        # platform-initiated write must never touch". NOT `recovery_key`, the platform's
-        # own turn-boundary autosave, and NOT any helper that picks between the two:
-        # `manager.restore_presence` PREFERS the recovery key, and
-        # `manager.newest_restore_source` returns whichever bundle is newer. Both are
-        # right for what they do (resuming a workspace), and both would be wrong here —
-        # the rail's row says "YOUR LATEST", so it must name the version the citizen
-        # chose to keep, never one the platform wrote on their behalf. Reading the newer
-        # of the two would report work as SAVED that they never saved, which is the same
-        # promotion-by-the-back-door this rule exists to prevent.
         meta = await storage.head(snapshot_key(app_id))
     except StorageError:
         _log.warning("publish_state_saved_head_unavailable", app_id=str(app_id))

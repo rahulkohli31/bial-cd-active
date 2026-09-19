@@ -46,27 +46,23 @@ export const PREVIEW_URL = 'https://app-xyz.example.azurecontainerapps.io/'
 // Build-session response builders (camelCase). `over` lets a test tweak one field. `startResp`
 // is GONE with the `start` it answered — nothing on this harness can post one any more.
 export const statusResp = (over = {}) => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u', ...over })
-export const ENDED_RESP = { sessionId: 's1', status: 'ended' }
 
 /** Assemble a BuildSessionClient from a per-file `h` bag of vi.fn()s.
  *
- *  THREE MEMBERS NOW: `acquireLock`/`releaseLock` went with the keep-alive loop that was their
+ *  TWO MEMBERS NOW: `acquireLock`/`releaseLock` went with the keep-alive loop that was their
  *  only caller; `start` went the same way, because the build lives inside the turn's own
- *  transaction and nothing provisions a session from the browser; and `forceEnd` went with the
- *  route it spoke to — its one control was the block banner's button, deleted with the banner, so
- *  no surface can reach the kill switch any more. Pinned against the real client in
- *  `utils/__tests__/buildSessionApi.test.ts`. */
+ *  transaction and nothing provisions a session from the browser; `forceEnd` and then the
+ *  session-scoped `stop` each went with the route they spoke to. Pinned against the real client
+ *  in `utils/__tests__/buildSessionApi.test.ts`. */
 export function makeClient(h) {
   return {
     relaunchPreview: h.relaunchPreview,
-    stop: h.stop,
     getStatus: h.getStatus,
   }
 }
 
 /** Give the per-file `h` bag its default happy resolutions (call inside beforeEach). */
 export function primeClient(h) {
-  h.stop.mockResolvedValue(ENDED_RESP)
   h.getStatus.mockResolvedValue(statusResp())
 }
 

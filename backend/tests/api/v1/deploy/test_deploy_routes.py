@@ -32,7 +32,7 @@ from src.services.build_sessions.manager import SaveOutcome, SessionManager
 from src.services.classification import store as review_store
 from src.services.deploy.classification import CLASSIFICATION_KEYS
 from src.services.deploy.service import DeployNotPossibleError, StartedDeploy
-from src.services.storage import StorageError, recovery_key, snapshot_key
+from src.services.storage import StorageError, snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
@@ -965,31 +965,30 @@ async def test_a_bundle_with_no_stamped_head_reports_null_rather_than_a_guess(
     assert body["savedAt"] == "2026-08-25T14:20:00Z"
 
 
-async def test_the_saved_row_reads_the_citizens_save_not_the_platforms_autosave(
+async def test_the_saved_row_names_the_bundle_rather_than_a_newer_object_beside_it(
     wire, client, db_session
 ) -> None:
-    """`manager.restore_presence` PREFERS `recovery_key` — the platform's autosave — over
-    the citizen's `snapshot_key`. Both are right for resuming a workspace and wrong here:
-    the row says "YOUR LATEST", so it must name the version the citizen chose to keep.
-    Seeded so the wrong read is unmistakable — the autosave is a DIFFERENT, NEWER object.
+    """The row says "YOUR LATEST", so it reads the one key a Save writes and nothing else — a
+    key-agnostic "newest object for this app" read would name whatever else the store happens
+    to hold. Seeded so a wrong read is unmistakable: the decoy is a DIFFERENT, NEWER object.
 
-    Mutation receipt: change `snapshot_key` to `recovery_key` in
+    Mutation receipt: read the newest object under the app's prefix in
     `_saved_version_for_publish_state` and both assertions below go red."""
     user, app_row = await _owner_with_app(db_session, wire)
     saved = snapshot_key(app_row.id)
     wire.store.objects[saved] = a_git_bundle(_SAVED_SHA)
     wire.store.meta[saved] = {"head_sha": _SAVED_SHA}
     wire.store.mtimes[saved] = _SAVED_AT
-    autosaved = recovery_key(app_row.id)
-    wire.store.objects[autosaved] = a_git_bundle(_AUTOSAVED_SHA)
-    wire.store.meta[autosaved] = {"head_sha": _AUTOSAVED_SHA}
-    wire.store.mtimes[autosaved] = datetime(2026, 8, 26, 11, 5, tzinfo=UTC)
+    decoy = f"quarantine/{app_row.id}/20260826T110500000000Z.bundle"
+    wire.store.objects[decoy] = a_git_bundle(_AUTOSAVED_SHA)
+    wire.store.meta[decoy] = {"head_sha": _AUTOSAVED_SHA}
+    wire.store.mtimes[decoy] = datetime(2026, 8, 26, 11, 5, tzinfo=UTC)
 
     resp = await client.get(_STATUS.format(pid=app_row.project_id), headers=auth_headers(user))
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["savedHead"] == _SAVED_SHA, "the autosave is not the citizen's save"
+    assert body["savedHead"] == _SAVED_SHA, "a parked tree is not the citizen's save"
     assert body["savedAt"] == "2026-08-25T14:20:00Z"
 
 

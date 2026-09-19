@@ -170,6 +170,28 @@ async def test_the_fresh_provision_arm_injects_the_dsn_alongside_the_base_env(
     assert all(name in client.provision_env for name in _BASE_ENV)
 
 
+async def _end_save_and_release(
+    manager: SessionManager,
+    db: AsyncSession,
+    user,
+    project_id: uuid.UUID,
+    session,
+    client: FakeSandboxClient,
+) -> None:
+    """Leave a saved bundle behind and a free slot — the citizen's own three steps, in order.
+
+    The turn's ending frees the slot and PARDONS the container (no bundle: `finish_turn_sandbox`
+    writes only the recovery copy). So the Save is what puts a bundle in the saved slot, and the
+    release is what takes the pardoned container away — without it the next `ensure_sandbox`
+    reattaches to a live container instead of taking the restore arm this file is about."""
+    await manager.finish_turn_sandbox(session, client, touched=True)
+    # The Save attaches through the registry rather than through a session — it is the
+    # BETWEEN-turns click — so the fake needs a container to answer with.
+    client.attach_handle = session.handle
+    await manager.save_project_snapshot(db, user, project_id, sandbox_client=client)
+    await manager.release_project_sandbox(db, user, project_id, sandbox_client=client)
+
+
 async def test_the_restore_arm_reinjects_the_dsn(
     db_session: AsyncSession,
     fake_redis: aioredis.Redis,
@@ -185,8 +207,8 @@ async def test_the_restore_arm_reinjects_the_dsn(
     first = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
-    await manager.stop(first, client)
-    assert snapshot_key(first.app_id) in fake_storage.objects  # finalize wrote the bundle
+    await _end_save_and_release(manager, db_session, user, project_id, first, client)
+    assert snapshot_key(first.app_id) in fake_storage.objects  # the Save wrote the bundle
 
     second_client = FakeSandboxClient()
     second = await manager.ensure_sandbox(
@@ -214,7 +236,7 @@ async def test_relaunch_preview_reinjects_the_dsn(
     built = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=first_client, may_write=True
     )
-    await manager.stop(built, first_client)
+    await _end_save_and_release(manager, db_session, user, project_id, built, first_client)
 
     client = FakeSandboxClient()
     await manager.relaunch_preview(db_session, user, project_id, client)
@@ -258,7 +280,7 @@ async def test_a_legacy_project_is_provisioned_lazily_and_exactly_once(
         session = await manager.ensure_sandbox(
             db_session, user, project_id, sandbox_client=client, may_write=True
         )
-        await manager.stop(session, client)
+        await _end_save_and_release(manager, db_session, user, project_id, session, client)
 
     assert role_creations == [role_name(project_id)]  # the external sequence ran ONCE
     row = await db_session.scalar(

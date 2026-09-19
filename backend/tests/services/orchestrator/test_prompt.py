@@ -12,8 +12,8 @@ the one live carrier of every rule they pinned — so the file asserts against `
 
 `tests/services/agent/test_mode_prompts.py` owns the COMPOSITION properties (BASE + one segment,
 each block emitted exactly once, what Plan may not carry). This file owns what the Write blocks
-must SAY: the golden-template manifest, the Drizzle/migration discipline, the DATABASE /
-COMPLETION / TOOL SURFACE blocks, and the template filesystem those blocks describe."""
+must SAY: the Drizzle/migration discipline, the DATABASE block, and the template filesystem
+those blocks describe."""
 
 from __future__ import annotations
 
@@ -22,28 +22,17 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import pytest
-from pydantic_ai import RunContext
-from pydantic_ai.toolsets.function import FunctionToolset
 
 from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
-from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL, WRITE_TOOL_SURFACE
+from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL
 from src.db.models.conversation import ChatKind
 from src.services.agent.mode_prompts import PromptContext, compose_kind_prompt
-from src.services.agent.toolsets import (
-    first_sentence,
-    registered_tool_definitions,
-    render_tool_surface,
-)
+from src.services.agent.toolsets import registered_tool_definitions
 from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
-from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.prompt import build_repair_prompt
-from src.services.orchestrator.tools import sandbox_toolset
-from tests.fakes import a_connected_system
 
 _BUILD_PROMPT = compose_kind_prompt(
     ChatKind.BUILD,
@@ -60,16 +49,7 @@ fixture would re-run the same string builder ~45 times and let a reader think th
 per test."""
 
 
-_THE_SANDBOX_FACTORY = "src.services.agent.toolsets.sandbox_toolset"
-"""The name `toolsets_for_kind` reaches the sandbox six through — the seam the two
-deliberate mutations below swap out. Patched by dotted path so the test never has to
-reach through the registry module for a name it only re-imports."""
-
-_SandboxOf = Callable[[RunContext[Any]], SandboxSession]
-"""The accessor shape `sandbox_toolset` takes — spelled once so the mutation wrappers below
-can wrap the real factory without a type suppression."""
-
-# Repo-root/sandbox/template — the hand-maintained golden template the manifest mirrors.
+# Repo-root/sandbox/template — the golden template every generated app starts from.
 # test file: backend/tests/services/orchestrator/test_prompt.py → parents[4] is the repo root.
 _TEMPLATE_ROOT = Path(__file__).resolve().parents[4] / "sandbox" / "template"
 
@@ -99,7 +79,6 @@ def test_system_prompt_reflects_the_open_sandbox_model() -> None:
     assert "already running" in lowered and "restart" in lowered
     # The write-capable SAS is flagged server-side-only.
     assert "server-side" in lowered
-    assert "declare_done" in prompt
 
 
 def test_system_prompt_forbids_seeded_dummy_data() -> None:
@@ -161,61 +140,6 @@ def test_system_prompt_carries_the_generated_app_quality_rules() -> None:
     assert "390px" in lowered
 
 
-def _completion_block(prompt: str) -> str:
-    """The COMPLETION paragraph, sliced out of the composed prompt.
-
-    SLICED RATHER THAN SEARCHED WHOLE-PROMPT, because the retired phrasing this unit removes
-    ("type-check the app") is legitimate copy elsewhere: `BUILD_WORKING_RULES_HEAD` still tells
-    the model the harness type-checks after every turn, which is TRUE and must stay. A
-    prompt-wide `not in` would either go permanently red on that true sentence or have to be
-    weakened until it proved nothing."""
-    return prompt[prompt.index("COMPLETION \u2014") :].split("\n\n", 1)[0]
-
-
-def test_completion_promises_no_round_trip_after_declare_done() -> None:
-    """★ THE PROMPT MOVED WITH THE BEHAVIOUR, WHICH IS THE WHOLE POINT. `declare_done` is
-    terminal on a passing check now; the old wording ("...you will receive the diagnostic")
-    invited the model to write its closing message in a follow-up reply this unit no longer
-    buys — the good message was thrown away with the round-trip.
-
-    TWO HALVES, DELIBERATELY. The inertness half searches for the retired phrasing and requires
-    zero hits. The liveness half requires the repair arm's promise to still be there, because it
-    is still TRUE — and an inertness guard alone would pass just as happily against a
-    COMPLETION block someone had deleted outright.
-
-    Asserted on the COMPOSED prompt rather than on `prompt_blocks`, so a composition site that
-    stopped including the block would be caught here too. The Write mode segment composes the
-    same single source (`BUILD_WORKING_RULES_TAIL`), which is what makes one assertion enough."""
-    completion = _completion_block(_BUILD_PROMPT)
-
-    # INERTNESS — the retired round-trip promise, gone.
-    for retired in (
-        "The harness then verifies",
-        "if it is not green yet",
-        "type-check",
-    ):
-        assert retired not in completion, f"{retired!r} still promises a follow-up round-trip"
-
-    # THE TERMINAL CONDITION, said out loud and said conditionally (the verdict still decides).
-    assert "ENDS THE TURN" in completion
-    assert "passing check" in completion
-
-    # And what the summary must BE, since it is now the last thing the user reads.
-    assert "the last thing the user reads" in completion
-    assert "what they can now do" in completion
-    # THE VOCABULARY CLAUSE IS GONE, and its absence is asserted rather than merely unmentioned.
-    # "with no file names, commands, libraries or frameworks in it" told the agent which WORDS
-    # its closing message could not contain — a restriction on what it may say rather than on
-    # who it is saying it to. What replaced it is the audience: an account of what the person
-    # can now do with their app, written to the person who asked for it.
-    assert "no file names, commands, libraries or frameworks" not in completion
-    assert "written to the person who asked for it" in completion
-
-    # LIVENESS — the repair arm's promise is unchanged and still made.
-    assert "does NOT check out you will receive the diagnostic" in completion
-    assert "Do not declare done prematurely" in completion
-
-
 def test_the_type_check_is_prohibited_not_merely_unnecessary() -> None:
     """★ THE INVITATION IS NOW A PROHIBITION.
 
@@ -245,23 +169,6 @@ def test_the_type_check_is_prohibited_not_merely_unnecessary() -> None:
     assert "the harness type-checks the app (`tsc --noemit`)" in lowered
 
 
-def test_completion_never_makes_type_checking_the_agents_job() -> None:
-    """The other half of the same rule: the closing guidance must not hand the
-    verification back to the model at the last moment.
-
-    Sliced to the COMPLETION block on purpose (see `_completion_block`): "type-check" is
-    legitimate copy elsewhere in this prompt — DATA INTEGRITY prescribes verifying by
-    type-checking and rendering rather than by mutating rows, and ENVIRONMENT describes what the
-    harness does — so a prompt-wide search would either be permanently red or have to be watered
-    down until it proved nothing."""
-    completion = _completion_block(_BUILD_PROMPT).lower()
-    assert "type-check" not in completion
-    assert "tsc" not in completion
-    # LIVENESS beside it — the block still says what ends the turn and what the summary must be.
-    assert "declare_done" in completion
-    assert "ends the turn" in completion
-
-
 def test_prompt_has_no_stale_app_records_demo_reference() -> None:
     """The `app/records` demo route was removed from the template, so the prompt must
     no longer tell the model to hunt for and delete it. Only the stale REMOVE SCAFFOLDING
@@ -286,17 +193,6 @@ def test_prompt_names_no_demonstration_data_model_or_example_component() -> None
     assert re.search(r"\bitems\b", lowered) is None
     assert "audit_events" not in lowered
     assert "item_status" not in lowered
-
-
-def test_the_golden_template_manifest_names_no_removed_path() -> None:
-    """The other half of the manifest tripwire.
-    `test_every_golden_template_manifest_file_exists` proves every path the manifest names still
-    exists; it says nothing about a path the template used to ship staying named after it is
-    deleted. Pinned separately so reverting only the manifest edit (and not the file deletions)
-    still trips something."""
-    manifest = _BUILD_PROMPT[_BUILD_PROMPT.index("The app starts from a minimal") :]
-    for removed in ("0000_baseline.sql", "0000_snapshot.json", "example-request-board.tsx"):
-        assert removed not in manifest, f"the manifest still names the removed path {removed!r}"
 
 
 def test_responsive_advice_survives_the_deleted_reference_component() -> None:
@@ -446,30 +342,6 @@ def test_honest_ui_keeps_its_claim_matching_argument() -> None:
     assert "interval" in honest_ui
     assert "focus" in honest_ui
     assert "real-time" in honest_ui
-
-
-def test_every_golden_template_manifest_file_exists() -> None:
-    """Durable guard: every path the manifest advertises as an editable starting point must
-    exist under `sandbox/template/`, so a template change that drops or renames a file cannot
-    leave the prompt pointing at a phantom. Walks the manifest text in the rendered prompt and
-    stats each path — the `components/ui/*.tsx` glob and the comma-list line included.
-
-    `sql` is in the extension set on purpose: the generated migrations under `drizzle/` are the
-    one manifest entry that is BUILT rather than hand-written, so it is the entry most likely to
-    go missing (an over-eager `.gitignore` line, a fresh clone). Without `sql` here the manifest
-    could advertise a migrations directory that does not exist and nothing would notice."""
-    manifest = _BUILD_PROMPT[_BUILD_PROMPT.index("The app starts from a minimal") :]
-    tokens = re.findall(r"[\w./*-]+\.(?:tsx|ts|css|json|mjs|sql)", manifest)
-    assert tokens, "manifest path extraction found nothing — the regex drifted from the manifest"
-    for token in tokens:
-        if "*" in token:
-            assert list(_TEMPLATE_ROOT.glob(token)), (
-                f"manifest glob {token!r} matched no file under {_TEMPLATE_ROOT}"
-            )
-        else:
-            assert (_TEMPLATE_ROOT / token).is_file(), (
-                f"manifest lists {token!r} but it is missing from {_TEMPLATE_ROOT}"
-            )
 
 
 def test_system_prompt_never_instructs_the_app_to_authenticate() -> None:
@@ -660,182 +532,36 @@ def test_the_two_step_sequence_is_no_longer_the_taught_path_but_the_tty_defences
     assert "_refuse_a_manufactured_tty(body.cmd)" in supervisor
 
 
-async def test_the_composite_is_offered_and_its_line_is_its_own_first_sentence() -> None:
-    """★ The composite reaches the model as a REGISTERED TOOL, and the sentence the prompt
-    spends on it is the same string its registration carries.
-
-    The generic drift check covers every tool at once; this names the one this unit adds, so a
-    failure reads as "the composite fell out of the prompt" rather than as a snapshot mismatch."""
+async def test_the_composite_is_described_to_the_model_with_its_reason() -> None:
+    """★ The composite reaches the model as a REGISTERED TOOL, and its description is the only
+    place the model is told about it — so that description has to carry the REASON to prefer it.
+    A line that only says "applies a schema change" leaves the model with no cause to reach for
+    it over the two commands it already knows."""
     definitions = await registered_tool_definitions(ChatKind.BUILD)
     assert APPLY_SCHEMA_CHANGE_TOOL in definitions, "the composite is not registered for Write"
     described = definitions[APPLY_SCHEMA_CHANGE_TOOL].description or ""
-    line = f"- `{APPLY_SCHEMA_CHANGE_TOOL}` \u2014 {first_sentence(described)}"
-    assert line in _tool_surface_block(_BUILD_PROMPT)
-    # The sentence has to carry the tool's REASON, not just its name — a roll-call line that only
-    # says "applies a schema change" leaves the model with no cause to prefer it over the two
-    # commands it already knows.
-    assert "truthfully" in line and "failed" in line
+    assert "truthfully" in described
+    assert "failed" in described
 
 
-# --- The TOOL SURFACE block is GENERATED, and this is the check that keeps it so --------------
-#
-# The goal is a check that fails when a DESCRIBED behaviour and the actual behaviour diverge.
-# A name-set comparison cannot make that promise: the `declare_done` fix above is the proof — it
-# changed what `declare_done` does while the sentence describing it still promised a follow-up
-# round-trip, and every name-based assertion in this repo stayed green. So the block is
-# rendered from the tool definitions pydantic-ai hands the model at registration, and the drift
-# check is a snapshot assertion over that rendering plus a per-mode membership assertion against
-# `toolsets_for_kind`.
+def test_the_prompt_states_no_tool_surface_of_its_own() -> None:
+    """★ Every tool's description reaches the model on the tool schema of the same request, so a
+    block in the prompt restating them is the identical instruction twice.
+
+    LIVENESS BESIDE THE ABSENCE: the blocks that sat around it are asserted present, so a prompt
+    that failed to compose cannot pass this by being empty."""
+    assert "TOOL SURFACE:" not in _BUILD_PROMPT
+    assert "REMOVE SCAFFOLDING" in _BUILD_PROMPT
+    assert "RESPONSIVE" in _BUILD_PROMPT
 
 
-def _tool_surface_block(prompt: str) -> str:
-    """The TOOL SURFACE block, sliced out of the composed prompt."""
-    return prompt[prompt.index("TOOL SURFACE:") :].split("\n\n", 1)[0]
-
-
-async def _the_drift_check() -> None:
-    """THE DRIFT CHECK ITSELF, factored out so the mutation tests can require it to go RED.
-
-    An equality assertion proves the snapshot is right today; it does not prove the assertion
-    would notice if it stopped being — which is exactly the property that failed. The
-    two mutation tests below run THIS function against a deliberately-mutated registry."""
-    generated = await render_tool_surface(ChatKind.BUILD)
-    assert WRITE_TOOL_SURFACE == generated, (
-        "the TOOL SURFACE block in `core/prompt_blocks.py` no longer matches the tools the Write "
-        "arm registers. Regenerate it with the one-liner under `Regenerate the snapshot with:` "
-        "in `services/agent/toolsets.py` and paste the result over `WRITE_TOOL_SURFACE`."
-        f"\n\ngenerated:\n{generated}"
-    )
-
-
-async def test_the_tool_surface_is_generated_from_the_tools_the_write_arm_registers() -> None:
-    """★ The snapshot half. Counted in the composed prompt as well, because a block that reached
-    zero composition sites would satisfy the equality assertion perfectly well."""
-    await _the_drift_check()
-    assert _BUILD_PROMPT.count(WRITE_TOOL_SURFACE) == 1
-
-
-async def test_the_snapshot_stays_the_platforms_surface_not_one_projects() -> None:
-    """★ ADDED, NOT CHANGED — and if this gate makes you regenerate the snapshot, it is being read
-    wrong.
-
-    `WRITE_TOOL_SURFACE` is a snapshot of what EVERY project's Build prompt carries. The
-    connected-data tool is registered only for a project whose connector an administrator has
-    approved and whose owner has switched it on, so rendering the snapshot with a connector passed
-    would bake that tool into the Build prompt of every project on the platform — including one
-    whose administrator refused it. That is precisely what registration-gating exists to prevent,
-    and the checked-in block is where it would leak silently: the prompt would promise a tool the
-    runtime then rejects as unknown.
-
-    So: the default render is the snapshot (the drift check above), the connected render is one
-    tool larger, and the tool's own description reaches the model through the tool schema and the
-    project's CONNECTED DATA stub — beside the data it reads, exactly when the tool exists."""
-    default = await render_tool_surface(ChatKind.BUILD)
-    connected = await render_tool_surface(
-        ChatKind.BUILD, connected_systems=(a_connected_system(),)
-    )
-    assert default == WRITE_TOOL_SURFACE
-    assert CONNECTOR_SCHEMA_TOOL not in default
-    assert f"- `{CONNECTOR_SCHEMA_TOOL}` \u2014 " in connected
-    assert len(connected.splitlines()) == len(default.splitlines()) + 1
-    # The composed Build prompt of an ordinary project names it nowhere — not in the tool surface
-    # block, not anywhere else.
+def test_an_ordinary_projects_prompt_names_the_connected_data_tool_nowhere() -> None:
+    """★ The connected-data tool is registered only for a project whose connector an
+    administrator approved and whose owner switched on. A prompt that named it for every project
+    would promise a tool the runtime then rejects as unknown — the leak registration-gating
+    exists to prevent, on the one surface every project shares."""
     assert CONNECTOR_SCHEMA_TOOL not in _BUILD_PROMPT
-
-
-async def test_the_prompts_tool_list_is_exactly_what_the_write_arm_registers() -> None:
-    """★ THE MEMBERSHIP HALF, asserted against `toolsets_for_kind` rather than a hand-kept list.
-
-    The hand-written block named six tools while the Write arm handed the model eight: the two
-    structured reads it borrows off `read_only_toolset` (`_WRITE_STRUCTURED_READS`) were absent
-    from the prompt for their entire life, so the model was never told it could list or search
-    the tree and paid for that in `run_command` round-trips."""
-    registered = set(await registered_tool_definitions(ChatKind.BUILD))
-    named = set(re.findall(r"^- `(\w+)` \u2014 ", _tool_surface_block(_BUILD_PROMPT), re.M))
-    assert named == registered
-    # The two the old prose omitted, named explicitly so the failure reads as itself.
-    assert {"list_files", "search_files"} <= named
-    # …and nothing from a mode Write is not: Plan's confirmation tool is uncallable here.
-    assert "present_plan_options" not in named
-
-
-async def test_every_tool_line_is_its_registered_descriptions_first_sentence() -> None:
-    """★ THE DESCRIPTION HALF — the one a name-set comparison cannot make.
-
-    Each line must be the tool's OWN words, not a paraphrase of them, so the prompt and the tool
-    schema cannot say different things about the same tool."""
-    for name, definition in (await registered_tool_definitions(ChatKind.BUILD)).items():
-        assert definition.description, f"`{name}` reaches the model with no description"
-        line = f"- `{name}` \u2014 {first_sentence(definition.description)}"
-        assert line in _BUILD_PROMPT, f"the prompt paraphrases `{name}`; expected {line!r}"
-
-
-async def test_the_drift_check_fails_when_a_tool_joins_a_mode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """★ DELIBERATE MUTATION 1 — a tool is added to Write and nobody regenerates the block.
-
-    Verified by mutating, not by reading: the check has to be shown failing, or "it would catch
-    that" is a claim about code nobody ran."""
-    registers_the_six = sandbox_toolset
-
-    def registers_a_seventh(sandbox_of: _SandboxOf) -> FunctionToolset[Any]:
-        toolset = registers_the_six(sandbox_of)
-
-        async def summon_a_pony(_ctx: RunContext[Any]) -> str:
-            """Summon a pony into the workspace."""
-            return "neigh"
-
-        toolset.add_function(summon_a_pony)
-        return toolset
-
-    monkeypatch.setattr(_THE_SANDBOX_FACTORY, registers_a_seventh)
-    assert "summon_a_pony" in await render_tool_surface(ChatKind.BUILD)
-    with pytest.raises(AssertionError, match="no longer matches the tools"):
-        await _the_drift_check()
-
-
-async def test_the_drift_check_fails_when_a_tools_docstring_is_reworded(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """★ DELIBERATE MUTATION 2 — the same tools, one of them described differently. THIS is the
-    assertion the `declare_done` fix above proves is necessary, so the mutation reintroduces that
-    exact regression: a `declare_done` that promises the follow-up round-trip the harness stopped
-    buying. Every name-based check in this repo is green against it; this one is not."""
-    registers_the_six = sandbox_toolset
-
-    def describes_declare_done_the_old_way(sandbox_of: _SandboxOf) -> FunctionToolset[Any]:
-        toolset = registers_the_six(sandbox_of)
-        toolset.tools["declare_done"].description = (
-            "Declare the build finished. The harness then verifies the app, and if it is not "
-            "green yet you will receive the diagnostic and can carry on."
-        )
-        return toolset
-
-    monkeypatch.setattr(_THE_SANDBOX_FACTORY, describes_declare_done_the_old_way)
-    reworded = await render_tool_surface(ChatKind.BUILD)
-    # Same eight tools — a membership check sees nothing at all here.
-    assert set(re.findall(r"^- `(\w+)`", reworded, re.M)) == set(
-        re.findall(r"^- `(\w+)`", WRITE_TOOL_SURFACE, re.M)
-    )
-    with pytest.raises(AssertionError, match="no longer matches the tools"):
-        await _the_drift_check()
-
-
-async def test_a_tool_without_a_docstring_fails_the_render_rather_than_shipping_blank() -> None:
-    """Fail-first: a tool registered with no description would otherwise reach the prompt as
-    `- \u0060thing\u0060 \u2014 ` and reach the model with no explanation either."""
-    registers_the_six = sandbox_toolset
-
-    def registers_a_mute_tool(sandbox_of: _SandboxOf) -> FunctionToolset[Any]:
-        toolset = registers_the_six(sandbox_of)
-        toolset.tools["declare_done"].description = None
-        return toolset
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(_THE_SANDBOX_FACTORY, registers_a_mute_tool)
-        with pytest.raises(ValueError, match="registered with no description"):
-            await render_tool_surface(ChatKind.BUILD)
+    assert "REMOVE SCAFFOLDING" in _BUILD_PROMPT
 
 
 async def test_run_commands_dev_server_rule_is_registered_copy_as_well_as_prompt_copy() -> None:
@@ -855,40 +581,30 @@ async def test_run_commands_dev_server_rule_is_registered_copy_as_well_as_prompt
 
 
 def test_the_prompt_never_grants_edit_permission_over_the_platform_config() -> None:
-    """★ THE MUTANT THAT MUST FAIL, and it must fail for ALL THREE statements.
+    """★ THE MUTANT THAT MUST FAIL.
 
     `next.config.ts` carries the path the app is served under: lose it and the preview answers
     at `/` while the router asks for `/a/<key>/` and loads blank, while every automated check
     still reports healthy. The file stays technically writable by decision, so this prompt text
     IS the control.
 
-    Three separate statements grant edit permission, they all ship in the SAME composed prompt,
-    and correcting fewer than three leaves a contradiction the model can resolve either way:
-
-      1. the manifest header's categorical "no file is frozen"
-      2. the manifest's own line for the file
-      3. the WRITE SURFACE paragraph's categorical "the WHOLE workspace is editable"
-
-    A test that only checked one would go green against a half-fix, which is exactly how the
-    original review missed the third.
+    WRITE SURFACE is the one statement that grants and excepts, so both halves are asserted: no
+    categorical grant survives anywhere in the composed prompt, and the paragraph names both
+    platform-owned files among its exceptions. An inertness assertion alone would pass just as
+    happily against a paragraph someone had gutted.
     """
     prompt = _BUILD_PROMPT
 
-    # 1 — the categorical grant in the manifest header is gone.
+    # 1 — no categorical grant survives anywhere in the prompt.
     assert "no file is frozen" not in prompt
 
-    # 2 — the file is named as platform-owned rather than listed among the editable ones.
-    assert "next.config.ts" in prompt, "the manifest must still NAME the file"
-    assert "package.json, next.config.ts" not in prompt, (
-        "the file must not sit in the editable comma-list"
-    )
-    assert "PLATFORM-OWNED" in prompt
-
-    # 3 — the WRITE SURFACE paragraph excepts it alongside `.git/`.
+    # 2 — the WRITE SURFACE paragraph excepts both of them alongside `.git/`.
     write_surface = prompt.split("WRITE SURFACE")[1].split("DATA & STORAGE")[0]
     assert "next.config.ts" in write_surface, (
         "the categorical write grant must except the platform config by name"
     )
+    assert "instrumentation-client.ts" in write_surface
+    assert "platform-owned" in write_surface
     assert "the WHOLE workspace is editable" not in write_surface
 
     # And the SAME correction must reach the Write-turn prompt, which is a different composition

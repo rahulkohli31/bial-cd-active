@@ -1,125 +1,28 @@
-"""The at-limit experience: secure the work, then say so in the citizen's own words.
+"""The at-limit experience, said in the citizen's own words.
 
-The refusal this replaced asserted the work was still in the workspace having checked nothing,
-and left the citizen to keep it by clicking Save.
-
-The tests here pin the ORDER (the copy is taken and confirmed before the citizen is told and
-before the turn's `finally` hands the container to the reclamation path), the HONESTY (the
-reassurance is said only when a copy actually landed), and the REGISTER (no file path, command,
-library or framework term reaches the reader). The last of those is checked over the RENDERED
-sentence rather than the template, because the configured support address is substituted in at
-render time and is the one part of this message that comes from outside the copy module.
+The refusal this replaced named a ROLE to contact and told the citizen to click Save. The tests
+here pin the REGISTER (no file path, command, library or framework term reaches the reader) and
+the three facts the sentence has to carry. The register check runs over the RENDERED sentence
+rather than the template, because the configured support address is substituted in at render time
+and is the one part of this message that comes from outside the copy module.
 """
 
 from __future__ import annotations
-
-import base64
-import uuid
-from dataclasses import dataclass
 
 import pytest
 
 from src.config import settings
 from src.db.models.user_limit import UserLimit
-from src.services.build_sessions import snapshot as snapshot_module
-from src.services.build_sessions.alarms import RECOVERY_WRITE_DID_NOT_LAND_EVENT
-from src.services.sandbox import SandboxClient, SandboxError
-from src.services.sandbox.base import ExecResult, SandboxHandle
-from src.services.storage import recovery_key
-from src.services.turns import copy as copy_module
-from src.services.turns.copy import (
-    AT_LIMIT_TEXT,
-    COULD_NOT_KEEP_A_COPY,
-    KEPT_A_COPY,
-    SPENT_ENOUGH_TEXT,
-)
-from src.services.usage import gate as gate_module
-from src.services.usage.gate import (
-    DailyTokenLimitExceededError,
-    at_limit_ending,
-    record_usage,
-)
+from src.services.turns.copy import AT_LIMIT_TEXT, SPENT_ENOUGH_TEXT
+from src.services.usage.gate import DailyTokenLimitExceededError, record_usage
 from tests.factories import ConversationFactory, UserFactory
-from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
-
-APP = uuid.UUID("0198f2c0-2424-7000-8000-0000000a71b1")
-ON_RECORD = "a" * 40
-THIS_TURN = "b" * 40
-UNRELATED = "c" * 40
 
 # Long enough that a slow suite cannot expire a session mid-request.
 _TTL_SECONDS = 300
 
-_HANDLE = SandboxHandle(
-    fqdn="app-x.centralindia.azurecontainerapps.io",
-    token="t",
-    app_name="app-x",
-    preview_url="https://app-x.centralindia.azurecontainerapps.io/",
-    ready=True,
-)
 
-
-@dataclass
-class _Workspace:
-    """A stand-in for the orchestrator's `SandboxSession`, satisfying `SecurableWorkspace`.
-    Structural, exactly as the production seam is: if `SandboxSession` ever renames one of
-    these three attributes, the type gates catch it at the engine's call site rather than here.
-
-    `sandbox_client` is annotated as the ABC, not the fake — a protocol member declared as a
-    mutable attribute is checked INVARIANTLY, so narrowing it here would stop this class
-    satisfying `SecurableWorkspace`, exercising a shape production could never hand in."""
-
-    sandbox_client: SandboxClient
-    handle: SandboxHandle
-    app_id: uuid.UUID
-
-
-@pytest.fixture
-def store(monkeypatch: pytest.MonkeyPatch) -> FakeStorage:
-    fake = FakeStorage()
-    monkeypatch.setattr(snapshot_module, "get_storage", lambda: fake)
-    return fake
-
-
-@pytest.fixture
-def alarms(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, object]]]:
-    """Every structlog error the gate raises during a test, in order.
-
-    Captured on the GATE's logger rather than the snapshot module's, because the `failed` arm is
-    raised from the call site — it is the only place that knows the write threw."""
-    raised: list[tuple[str, dict[str, object]]] = []
-    monkeypatch.setattr(gate_module._log, "error", lambda event, **kw: raised.append((event, kw)))
-    return raised
-
-
-def _container(*, bundles: str, head: str, ancestry: str = "0 0") -> FakeSandboxClient:
-    """A container that commits, bundles `bundles`, and answers the ancestry probe.
-
-    `bundles` and `head` are separate because the commit step runs FIRST inside the write: a dirty
-    tree becomes a new commit before anything is bundled, so what lands is not necessarily where
-    HEAD was when the turn started."""
-    client = FakeSandboxClient()
-    payload = base64.b64encode(a_git_bundle(bundles)).decode()
-
-    def handler(cmd: list[str]) -> ExecResult:
-        if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
-            answered = ancestry if "merge-base" in cmd[-1] else ""
-            return ExecResult(stdout=f"{head}@@@@4@@{answered}", stderr="", exit=0)
-        if cmd[0] == "base64":
-            return ExecResult(stdout=payload, stderr="", exit=0)
-        return ExecResult(stdout="", stderr="", exit=0)
-
-    client.exec_handler = handler
-    return client
-
-
-async def _seed_recovery(store: FakeStorage, sha: str = ON_RECORD) -> None:
-    await store.put(recovery_key(APP), a_git_bundle(sha), metadata={"head_sha": sha})
-
-
-async def _head_in_recovery_slot(store: FakeStorage) -> str | None:
-    meta = await store.head(recovery_key(APP))
-    return (meta.metadata or {}).get("head_sha") if meta else None
+def _at_limit_sentence() -> str:
+    return AT_LIMIT_TEXT.format(contact=settings.SUPPORT_CONTACT_EMAIL)
 
 
 # =============================================================================
@@ -127,47 +30,43 @@ async def _head_in_recovery_slot(store: FakeStorage) -> str | None:
 # =============================================================================
 
 
-async def test_the_at_limit_sentence_says_what_happened_when_it_comes_back_and_who_to_ask(
-    store: FakeStorage,
-) -> None:
+def test_the_at_limit_sentence_says_what_happened_when_it_comes_back_and_who_to_ask() -> None:
     """The three facts a citizen needs, and the platform used to supply none properly: what
     happened, when they can carry on, and a real address to ask for more — "contact your
     administrator" named a ROLE, a dead end at exactly the moment they most needed a way out.
 
-    Deleted, the message could lose any one of the three and still ship: every other test here
-    is about the securing, not the words.
-
     Mutation check: drop `{contact}` from `AT_LIMIT_TEXT` and this goes red."""
-    await _seed_recovery(store)
-    workspace = _Workspace(_container(bundles=THIS_TURN, head=ON_RECORD), _HANDLE, APP)
+    message = _at_limit_sentence()
 
-    ending = await at_limit_ending(workspace)
-
-    assert "budget" in ending.message, "what happened, in the reader's own vocabulary"
-    assert "midnight" in ending.message, "when they can carry on"
-    assert settings.SUPPORT_CONTACT_EMAIL in ending.message, "a real address, not a role"
+    assert "budget" in message, "what happened, in the reader's own vocabulary"
+    assert "midnight" in message, "when they can carry on"
+    assert settings.SUPPORT_CONTACT_EMAIL in message, "a real address, not a role"
     # The address is CONFIGURED, never hardcoded — a baked-in fallback would still pass the
     # assertion above.
     assert settings.SUPPORT_CONTACT_EMAIL not in AT_LIMIT_TEXT
 
 
-async def test_the_message_carries_no_file_path_command_library_or_framework_term(
-    store: FakeStorage,
-) -> None:
+def test_the_ending_promises_nothing_about_whether_the_work_was_kept() -> None:
+    """★ NO CLAIM ABOUT DURABILITY, on either ending. The container survives an at-limit turn,
+    so nothing here has stored anything — and a reassurance the platform did not earn is the one
+    a citizen acts on by closing the tab.
+
+    Mutation check: fold a "we've kept a copy of your app" clause back into either sentence and
+    this goes red."""
+    for sentence in (_at_limit_sentence(), SPENT_ENOUGH_TEXT):
+        lowered = sentence.lower()
+        assert "kept a copy" not in lowered
+        assert "nothing you did today is lost" not in lowered
+        assert "{" not in sentence, "every field is filled by the time a citizen reads it"
+
+
+def test_the_message_carries_no_file_path_command_library_or_framework_term() -> None:
     """The half of the no-developer-jargon rule that checks the RENDERED sentence, not the
     template: `test_no_sentence_this_plan_shows_a_citizen_carries_developer_jargon` already
     sweeps the copy module, but only the template — the one substitution here comes from
     deployment configuration, which nobody reviews as prose (e.g. `ops@…/srv/logs`).
 
     Mutation check: put any of the terms below into `AT_LIMIT_TEXT` and this goes red."""
-    await _seed_recovery(store)
-    workspace = _Workspace(_container(bundles=THIS_TURN, head=ON_RECORD), _HANDLE, APP)
-
-    both_halves = [
-        (await at_limit_ending(workspace)).message,
-        AT_LIMIT_TEXT.format(kept=COULD_NOT_KEEP_A_COPY, contact=settings.SUPPORT_CONTACT_EMAIL),
-    ]
-
     forbidden = (
         ".tsx",
         ".ts",
@@ -194,128 +93,17 @@ async def test_the_message_carries_no_file_path_command_library_or_framework_ter
         "console",
         "compile",
     )
-    for sentence in both_halves:
+    for sentence in (_at_limit_sentence(), SPENT_ENOUGH_TEXT):
         for term in forbidden:
             assert term not in sentence, f"{term!r} reached a citizen in {sentence!r}"
 
 
-def test_the_two_halves_of_the_promise_are_separate_constants() -> None:
-    """The reassurance is conditional, so it cannot live inside the sentence that always renders.
-
-    A single string carrying "your app is safe" would make the platform assert it on the one path
-    where it might not be true, and a citizen acts on that reassurance by closing the tab.
-
-    Mutation check: fold `KEPT_A_COPY` into `AT_LIMIT_TEXT` and this goes red."""
-    assert "{kept}" in AT_LIMIT_TEXT
-    # Exposed as module-level SENTENCES on purpose: the copy module's jargon sweep iterates
-    # `vars(copy)` for strings with a space, so a half inlined at its call site would escape it.
-    sentences = {
-        name: value
-        for name, value in vars(copy_module).items()
-        if not name.startswith("_") and isinstance(value, str) and " " in value
-    }
-    assert sentences["KEPT_A_COPY"] == KEPT_A_COPY
-    assert sentences["COULD_NOT_KEEP_A_COPY"] == COULD_NOT_KEEP_A_COPY
-
-
-# =============================================================================
-# The securing, which happens BEFORE the citizen is told
-# =============================================================================
-
-
-async def test_the_work_is_stored_before_the_citizen_is_told_they_are_at_the_limit(
-    store: FakeStorage, alarms: list[tuple[str, dict[str, object]]]
-) -> None:
-    """★ THE POINT OF THE UNIT. The recovery slot holds THIS turn's tree by the time the
-    message exists — not by the exit path's best-effort autosave, and not by the time the
-    citizen notices "Save". It matters because of what comes next: the `finally` pardons the
-    container and frees the slot, after which the reclamation path may take it — anything not
-    stored by then is stored on a machine somebody else is entitled to reclaim.
-
-    Mutation check: make `at_limit_ending` return the sentence without calling
-    `write_recovery_copy` and this goes red — the slot still holds the older tree."""
-    await _seed_recovery(store)
-    workspace = _Workspace(_container(bundles=THIS_TURN, head=ON_RECORD), _HANDLE, APP)
-
-    ending = await at_limit_ending(workspace)
-
-    assert await _head_in_recovery_slot(store) == THIS_TURN
-    assert ending.work_is_secured is True
-    assert KEPT_A_COPY in ending.message
-    assert alarms == [], "a copy that landed must not alarm"
-
-
-async def test_a_recovery_write_that_fails_still_tells_the_citizen_and_alarms_it(
-    store: FakeStorage, alarms: list[tuple[str, dict[str, object]]]
-) -> None:
-    """★ The write can fail, and neither of the two easy answers is acceptable. Raising would turn
-    "you have used your budget" into a crash for a citizen who did nothing wrong; a silent swallow
-    leaves an operator nothing to look for. `RECOVERY_WRITE_DID_NOT_LAND_EVENT` carries the trade.
-
-    So: the citizen is told, the sentence stops claiming their work is safe, and the failure gets
-    the pinned event with `reason="failed"` — the arm only a call site can raise, because only
-    the call site knows the write threw. Mutation check: swap the `except Exception` arm for a
-    bare `raise` (or delete the `_log.error`) and this goes red."""
-    await _seed_recovery(store)
-    client = FakeSandboxClient()
-
-    def wedged(cmd: list[str]) -> ExecResult:
-        raise SandboxError("the container stopped answering")
-
-    client.exec_handler = wedged
-    workspace = _Workspace(client, _HANDLE, APP)
-
-    ending = await at_limit_ending(workspace)
-
-    assert ending.work_is_secured is False
-    assert COULD_NOT_KEEP_A_COPY in ending.message
-    assert "budget" in ending.message, "the citizen is still told what happened"
-    assert [event for event, _ in alarms] == [RECOVERY_WRITE_DID_NOT_LAND_EVENT]
-    assert alarms[0][1]["reason"] == "failed"
-    assert alarms[0][1]["app_id"] == str(APP)
-    # Untouched: a failed write must never be the thing that destroys the copy on record.
-    assert await _head_in_recovery_slot(store) == ON_RECORD
-
-
-async def test_a_refused_promotion_never_claims_the_work_is_safe(
-    store: FakeStorage, alarms: list[tuple[str, dict[str, object]]]
-) -> None:
-    """A tree with no ancestry to the copy on record is DIVERTED by the guard, not promoted. The
-    bytes survive under the divert prefix, but a restore would still hand this citizen the older
-    tree — so "nothing you did today is lost" would be false in exactly the case that matters.
-
-    The alarm is NOT re-raised here: `write_recovery_copy` already fired it on the way past, and
-    re-raising would double-count every diverted turn.
-
-    Mutation check: treat `DIVERTED` as secured and this goes red."""
-    await _seed_recovery(store)
-    workspace = _Workspace(
-        _container(bundles=UNRELATED, head=UNRELATED, ancestry="0 1"), _HANDLE, APP
-    )
-
-    ending = await at_limit_ending(workspace)
-
-    assert ending.work_is_secured is False
-    assert COULD_NOT_KEEP_A_COPY in ending.message
-    assert await _head_in_recovery_slot(store) == ON_RECORD
-    assert alarms == [], "the guard already alarmed; the call site must not double-count it"
-
-
-async def test_a_turn_that_never_took_a_container_is_told_the_same_thing_without_alarming(
-    store: FakeStorage, alarms: list[tuple[str, dict[str, object]]]
-) -> None:
-    """An Ask or Plan turn can reach the cap too, and it has nothing to secure.
-
-    Nothing went wrong here, which is why `COULD_NOT_KEEP_A_COPY` is worded as a request to save
-    rather than as an announcement of a fault — and why this path must not raise the operator
-    alarm, whose whole value is that it only fires when a write genuinely did not land.
-
-    Mutation check: raise the alarm on the `workspace is None` branch and this goes red."""
-    ending = await at_limit_ending(None)
-
-    assert ending.work_is_secured is False
-    assert "budget" in ending.message
-    assert alarms == [], "nothing was attempted, so nothing failed"
+def test_the_spend_bound_and_the_daily_budget_are_different_sentences() -> None:
+    """The daily budget resets at midnight; the spend bound does not stop the citizen at all. A
+    shared sentence would tell somebody who can carry on right now to wait until tomorrow."""
+    assert "working" in SPENT_ENOUGH_TEXT
+    assert "midnight" not in SPENT_ENOUGH_TEXT
+    assert "midnight" in _at_limit_sentence()
 
 
 # =============================================================================
@@ -499,97 +287,3 @@ def test_a_configured_address_is_stripped_rather_than_trusted_verbatim() -> None
     env = _api_env()
     env["SUPPORT_CONTACT_EMAIL"] = "  help@bial.com  "
     assert _boot(env).SUPPORT_CONTACT_EMAIL == "help@bial.com"
-
-
-# =============================================================================
-# The same securing path, carrying a second sentence
-# =============================================================================
-#
-# The per-run spend bound ends a turn exactly like the daily budget does, so `at_limit_ending`
-# takes the sentence as a parameter rather than gaining a sibling function — a second copy of
-# this snapshot→teardown ordering is the one place in this codebase where getting it wrong
-# loses a citizen's tree.
-
-
-async def test_the_daily_budget_endings_bytes_are_unchanged_by_the_parameterisation(
-    store: FakeStorage,
-) -> None:
-    """★★ THE REGRESSION THAT PROTECTS THE INCIDENT PATH.
-
-    The daily-budget caller passes no sentence and must come out BYTE-IDENTICAL — not "still
-    contains the right words", byte-identical — so that adding a parameter to this function is
-    provably a no-op for the path that already shipped.
-
-    Mutation check: make the `sentence is None` arm fall through to any other template and this
-    goes red on an exact comparison, which no later edit can quietly weaken into a substring."""
-    await _seed_recovery(store)
-    workspace = _Workspace(_container(bundles=THIS_TURN, head=ON_RECORD), _HANDLE, APP)
-
-    ending = await at_limit_ending(workspace)
-
-    assert ending.message == AT_LIMIT_TEXT.format(
-        kept=KEPT_A_COPY, contact=settings.SUPPORT_CONTACT_EMAIL
-    )
-
-
-async def test_the_spend_bound_secures_the_tree_before_its_sentence_exists(
-    store: FakeStorage, alarms: list[tuple[str, dict[str, object]]]
-) -> None:
-    """★ THE ORDERING, asserted for the NEW caller rather than inherited from the old one: the
-    recovery slot holds THIS turn's tree by the time the message exists, because the turn's
-    `finally` pardons the container and frees the slot right after — anything not stored by
-    then is stored on a machine somebody else is entitled to reclaim.
-
-    Mutation check: give the spend bound its own securing function that composes the sentence
-    first, and this goes red on the slot's head — precisely why `at_limit_ending` took a
-    parameter instead of gaining a sibling."""
-    await _seed_recovery(store)
-    workspace = _Workspace(_container(bundles=THIS_TURN, head=ON_RECORD), _HANDLE, APP)
-
-    ending = await at_limit_ending(workspace, sentence=SPENT_ENOUGH_TEXT)
-
-    assert await _head_in_recovery_slot(store) == THIS_TURN
-    assert ending.work_is_secured is True
-    assert KEPT_A_COPY in ending.message
-    # It really is the spend sentence — a shared function makes passing the wrong one easy.
-    assert "working" in ending.message
-    assert "midnight" not in ending.message
-    assert alarms == [], "a copy that landed must not alarm"
-
-
-async def test_a_failed_copy_changes_the_spend_sentence_and_alarms_it_too(
-    store: FakeStorage, alarms: list[tuple[str, dict[str, object]]]
-) -> None:
-    """The failure trade is the same on both endings, and it has to be: the citizen is told
-    either way, the reassurance stops being made, and an operator gets the pinned event.
-
-    Raising instead would turn a bounded run into a crash for a citizen who did nothing wrong,
-    and a silent swallow would leave an operator nothing to count."""
-    await _seed_recovery(store)
-    client = FakeSandboxClient()
-
-    def wedged(cmd: list[str]) -> ExecResult:
-        raise SandboxError("the container stopped answering")
-
-    client.exec_handler = wedged
-    workspace = _Workspace(client, _HANDLE, APP)
-
-    ending = await at_limit_ending(workspace, sentence=SPENT_ENOUGH_TEXT)
-
-    assert ending.work_is_secured is False
-    assert COULD_NOT_KEEP_A_COPY in ending.message
-    assert KEPT_A_COPY not in ending.message
-    assert [event for event, _ in alarms] == [RECOVERY_WRITE_DID_NOT_LAND_EVENT]
-
-
-async def test_a_turn_with_no_container_reaches_the_spend_bound_without_a_fault(
-    alarms: list[tuple[str, dict[str, object]]],
-) -> None:
-    """A planning turn can reach a bound too, and it has nothing to secure. That is the one case
-    where the reassurance is withheld without anything having gone wrong — which is why the
-    wording asks the reader to save rather than announcing a fault, and why it must not alarm."""
-    ending = await at_limit_ending(None, sentence=SPENT_ENOUGH_TEXT)
-
-    assert ending.work_is_secured is False
-    assert COULD_NOT_KEEP_A_COPY in ending.message
-    assert alarms == [], "no container is not a missed recovery write"

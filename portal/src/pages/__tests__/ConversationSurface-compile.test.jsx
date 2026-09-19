@@ -24,7 +24,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(),
+  relaunchPreview: vi.fn(), getStatus: vi.fn(),
   fetchPreviewState: vi.fn(), fetchCompileState: vi.fn(), fetchSaveState: vi.fn(),
   checkWorkspace: vi.fn(),
 }))
@@ -162,7 +162,7 @@ beforeEach(() => {
   h.startTurn.mockResolvedValue({ turnId: 't1' })
   h.fetchCompileState.mockResolvedValue('unknown')
   h.checkWorkspace.mockResolvedValue(false)
-  h.fetchSaveState.mockResolvedValue({ appId: null, dirty: null, containerHead: null, savedHead: null, recoveryAt: null })
+  h.fetchSaveState.mockResolvedValue({ appId: null, dirty: null, containerHead: null, savedHead: null })
   h.fetchPreviewState.mockResolvedValue({
     state: 'unknown', alive: false, previewUrl: null, occupyingProjectName: null, restorable: null,
   })

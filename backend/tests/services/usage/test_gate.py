@@ -6,21 +6,28 @@ per-test transaction.
 from __future__ import annotations
 
 import datetime
+from decimal import Decimal
 
+import pytest
 import sqlalchemy as sa
 
 from src.config import settings
 from src.db.models.token_usage import TokenUsage, TokenUsageKind
 from src.db.models.user_limit import UserLimit
+from src.services.classification.constants import CACHE_TTL as REVIEW_CACHE_TTL
+from src.services.orchestrator.constants import CACHE_TTL
+from src.services.usage import gate
 from src.services.usage.gate import (
     DAILY_LIMIT_EXCEEDED_CODE,
     DailyTokenLimitExceededError,
+    billable_spend,
     effective_daily_limit,
     enforce_daily_limit,
     ist_today,
     next_ist_midnight_iso,
     record_usage,
     usage_today,
+    weighted_spend,
 )
 from tests.factories import UserFactory
 
@@ -103,9 +110,10 @@ async def test_enforce_raises_at_limit(db_session) -> None:
 
 async def test_used_is_cost_weighted_across_token_classes(db_session) -> None:
     # The cap bills each class at its cost weight: fresh input + output at face value, cache
-    # reads at 1/10, cache writes at 125%. input=1000 is the pydantic-ai GRAND TOTAL with
-    # cr=800 + cw=100 inside it → fresh=100. used = 100 + 50 + 800/10 + 100*1.25 = 355 — not
-    # the 1050 face-value fold that let one cached-prefix build book ~956k on 68 fresh tokens.
+    # reads at 1/10, cache writes at the 1h tier's 200%. input=1000 is the pydantic-ai GRAND
+    # TOTAL with cr=800 + cw=100 inside it → fresh=100. used = 100 + 50 + 800/10 + 100*2 = 430
+    # — not the 1050 face-value fold that let one cached-prefix build book ~956k on 68 fresh
+    # tokens.
     user = await UserFactory.create(db_session)
     db_session.add(UserLimit(user_id=user.id, daily_token_limit=1_000))
     await record_usage(
@@ -117,15 +125,15 @@ async def test_used_is_cost_weighted_across_token_classes(db_session) -> None:
         cache_write_tokens=100,
     )
     snapshot = await usage_today(db_session, user.id)
-    assert snapshot.used == 355
-    # 355 < 1000, so the gate does not raise (the face-value fold would have booked 1050).
+    assert snapshot.used == 430
+    # 430 < 1000, so the gate does not raise (the face-value fold would have booked 1050).
     await enforce_daily_limit(db_session, user.id)
 
 
 async def test_cap_boundary_uses_the_weighted_total(db_session) -> None:
     # The `>=` gate fires on the WEIGHTED total. input=100 (incl. cr=30, cw=20) + output=50:
-    # fresh=50, used = 50 + 50 + 30/10 + 20*1.25 = 128. Limit 130 passes, 128 blocks
-    # (at-or-over), and the 429 carries used=128 — the same number the header meter shows.
+    # fresh=50, used = 50 + 50 + 30/10 + 20*2 = 143. Limit 145 passes, 143 blocks
+    # (at-or-over), and the 429 carries used=143 — the same number the header meter shows.
     user = await UserFactory.create(db_session)
     await record_usage(
         db_session,
@@ -135,17 +143,17 @@ async def test_cap_boundary_uses_the_weighted_total(db_session) -> None:
         cache_read_tokens=30,
         cache_write_tokens=20,
     )
-    limit = UserLimit(user_id=user.id, daily_token_limit=130)
+    limit = UserLimit(user_id=user.id, daily_token_limit=145)
     db_session.add(limit)
     await db_session.flush()
-    await enforce_daily_limit(db_session, user.id)  # 128 < 130 — no raise
+    await enforce_daily_limit(db_session, user.id)  # 143 < 145 — no raise
 
-    limit.daily_token_limit = 128
+    limit.daily_token_limit = 143
     await db_session.flush()
     try:
         await enforce_daily_limit(db_session, user.id)
     except DailyTokenLimitExceededError as exc:
-        assert exc.used == 128  # the weighted total, same as usage_today
+        assert exc.used == 143  # the weighted total, same as usage_today
     else:
         raise AssertionError("expected a raise at used == limit (>=)")
 
@@ -154,7 +162,7 @@ async def test_malformed_cache_totals_clamp_fresh_at_zero(db_session) -> None:
     # Defensive: a row where cr+cw > input (impossible under pydantic-ai semantics, but the
     # columns are independent) must not go NEGATIVE on fresh — GREATEST clamps it to 0 and the
     # weighted shares still count. input=40, cr=30, cw=25 → fresh=max(40-55,0)=0;
-    # used = 0 + 10 + 3 + 25*1.25 = 44.25 → rounds to 44.
+    # used = 0 + 10 + 30/10 + 25*2 = 63.
     user = await UserFactory.create(db_session)
     await record_usage(
         db_session,
@@ -165,7 +173,7 @@ async def test_malformed_cache_totals_clamp_fresh_at_zero(db_session) -> None:
         cache_write_tokens=25,
     )
     snapshot = await usage_today(db_session, user.id)
-    assert snapshot.used == 44
+    assert snapshot.used == 63
 
 
 async def test_used_is_input_plus_output_when_no_cache(db_session) -> None:
@@ -204,6 +212,95 @@ async def test_record_usage_stores_all_four_columns_raw(db_session) -> None:
         row.cache_read_tokens,
         row.cache_write_tokens,
     ) == (100, 50, 30, 20)
+
+
+# --- the cache-write weight follows the tier the platform buys ----------------
+
+
+def test_the_write_weight_table_states_both_of_anthropics_prices() -> None:
+    # Anthropic prices a cache WRITE by the TTL bought at the breakpoint: 1.25x base input at
+    # the 5-minute tier, 2x at the 1-hour one. A read is a tenth at either tier, which is why
+    # only the write needs a table. Literal on both sides — a weight recomputed from the code
+    # under test cannot fail.
+    assert gate._CACHE_WRITE_MULTIPLIER_BY_TTL == {"5m": Decimal("1.25"), "1h": Decimal("2")}
+    assert gate._CACHE_READ_DIVISOR == 10
+
+
+def test_the_meter_charges_the_tier_the_platform_actually_buys() -> None:
+    # The defect this closes: the meter weighed cache writes at 1.25x — the 5-minute rate —
+    # while every breakpoint bought the 1-hour tier. The meter restates its tier rather than
+    # importing it (`orchestrator.constants` drags the API layer in behind it), so THIS is the
+    # joint: the tier the meter bills must be the tier both agents buy.
+    assert gate._BILLED_CACHE_TIER == CACHE_TTL  # the build loop's breakpoints
+    assert gate._BILLED_CACHE_TIER == REVIEW_CACHE_TTL  # the pre-publish review's
+    assert gate._CACHE_WRITE_MULTIPLIER == Decimal("2")
+
+
+@pytest.mark.parametrize(("ttl", "expected"), [("1h", 1_137), ("5m", 987)])
+async def test_one_fixed_row_weights_to_the_stated_total_at_each_tier(
+    db_session, monkeypatch, ttl: str, expected: int
+) -> None:
+    # One row, both tiers, every expectation a literal. input=1000 is the pydantic-ai GRAND
+    # TOTAL with cr=403 + cw=200 inside it → fresh=397; output 300; reads 403/10 = 40.3.
+    #   1h: 397 + 300 + 40.3 + 200*2    = 1137.3 → 1137
+    #   5m: 397 + 300 + 40.3 + 200*1.25 =  987.3 →  987
+    # The fractional read is deliberate: both readers must round ONCE, at the very end.
+    monkeypatch.setattr(gate, "_CACHE_WRITE_MULTIPLIER", gate._CACHE_WRITE_MULTIPLIER_BY_TTL[ttl])
+    user = await UserFactory.create(db_session)
+    await record_usage(
+        db_session,
+        user.id,
+        input_tokens=1_000,
+        output_tokens=300,
+        cache_read_tokens=403,
+        cache_write_tokens=200,
+    )
+    assert (await usage_today(db_session, user.id)).used == expected
+    # The in-process reader the run bound uses spells the same arithmetic against the same row.
+    assert (
+        weighted_spend(
+            input_tokens=1_000,
+            output_tokens=300,
+            cache_read_tokens=403,
+            cache_write_tokens=200,
+        )
+        == expected
+    )
+
+
+async def test_the_daily_gate_and_the_admin_roster_read_the_same_number(db_session) -> None:
+    # Two screens, one expression. The roster (`api/v1/admin/router.py`) sums `billable_spend()`
+    # grouped by kind over the IST day; the gate reads the same expression for the build row.
+    # Spelled here the way the roster spells it, so a weight that moved for one reader and not
+    # the other surfaces as a disagreement rather than as two plausible numbers on two screens.
+    # Build: fresh=100 + output 50 + 800/10 + 100*2 = 430.
+    # Review: fresh=50 + output 10 + 100/10 + 50*2 = 170 — reported beside it, never folded in.
+    user = await UserFactory.create(db_session)
+    await record_usage(
+        db_session,
+        user.id,
+        input_tokens=1_000,
+        output_tokens=50,
+        cache_read_tokens=800,
+        cache_write_tokens=100,
+    )
+    await record_usage(
+        db_session,
+        user.id,
+        input_tokens=200,
+        output_tokens=10,
+        cache_read_tokens=100,
+        cache_write_tokens=50,
+        kind=TokenUsageKind.REVIEW,
+    )
+    rows = await db_session.execute(
+        sa.select(TokenUsage.kind, sa.func.sum(billable_spend()).label("used"))
+        .where(TokenUsage.usage_date == ist_today(), TokenUsage.user_id == user.id)
+        .group_by(TokenUsage.kind)
+    )
+    roster = {row.kind: int(row.used) for row in rows}
+    assert roster == {TokenUsageKind.BUILD: 430, TokenUsageKind.REVIEW: 170}
+    assert (await usage_today(db_session, user.id)).used == 430
 
 
 # --- atomic accounting --------------------------------------------------------

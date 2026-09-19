@@ -692,24 +692,28 @@ describe('messagesFromProjection — a stopped turn still looks stopped after a 
     // what the reload renders is asserted directly.
     const rendered = Object.keys(OUTCOME_COPY).map((reason) => reloaded('stopped', reason))
     // ONE pair shares a sentence on purpose: `request_limit` and `wall_clock_deadline_exceeded`
-    // are two internal bounds the citizen cannot act on differently (2026-09-11). So the
-    // distinct count is the key count less exactly that pair — anything less is a collapse.
+    // are internal bounds the citizen cannot act on differently, and `run_budget_reached` is
+    // the third of them. So the distinct count is the key count less exactly those two
+    // duplicates — anything less is a collapse.
     expect(reloaded('stopped', 'request_limit')).toBe(
       reloaded('stopped', 'wall_clock_deadline_exceeded'),
     )
-    expect(new Set(rendered).size).toBe(rendered.length - 1)
+    expect(reloaded('stopped', 'request_limit')).toBe(
+      reloaded('stopped', 'run_budget_reached'),
+    )
+    expect(new Set(rendered).size).toBe(rendered.length - 2)
     expect(rendered.every((text) => typeof text === 'string' && text.length > 0)).toBe(true)
   })
 
   it('falls back to the neutral sentence rather than printing the machine token', () => {
-    // Every `reason` on this wire is a machine token — `sandbox_unavailable`,
-    // `self_heal_budget_exhausted` — and none of them is prose. An unlisted one gets the
-    // neutral line for its terminal; interpolating it is the defect this replaced.
-    // (`wall_clock_deadline_exceeded` used to be the example here; it has had its own sentence
-    // since 2026-09-11, so the example is now a token the table still does not name.)
-    const text = reloaded('failed', 'sandbox_unavailable')
+    // Every `reason` on this wire is a machine token and none of them is prose. An unlisted
+    // one gets the neutral line for its terminal; interpolating it is the defect this
+    // replaced. The example has to be a token the union genuinely does not name — every
+    // reason the server can store now carries its own sentence, which is the point of the
+    // closed union, so an unlisted example can only be an invented one.
+    const text = reloaded('failed', 'reaped_by_the_kraken')
     expect(text).toBe('The build failed.')
-    expect(text).not.toMatch(/sandbox_unavailable/)
+    expect(text).not.toMatch(/reaped_by_the_kraken/)
   })
 
   it('preserves the absence signal: a turn with no terminal row says nothing about how it ended', () => {

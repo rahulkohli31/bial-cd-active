@@ -360,10 +360,6 @@ describe('ProjectPage — nothing points back to a past chat', () => {
 })
 
 describe('ProjectPage — identity + guard rails carried over', () => {
-  /* The rename pencil and its dialog live in the shell/`ProjectWorkspace`, unreachable from a lone
-     render of this page — pinned instead in `ProjectRenameDialog.test.tsx` (the empty/whitespace
-     guard) and `WorkspaceToolbar.test.tsx` (the press that opens it). */
-
   it('redirects to /projects when the project 404s (deleted elsewhere)', async () => {
     h.getProject.mockRejectedValue(new ApiError('Project not found.', 404))
     renderProjectPage()

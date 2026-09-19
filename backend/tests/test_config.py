@@ -217,25 +217,28 @@ def test_the_sweep_ships_on_and_the_new_reclamation_ships_off() -> None:
     assert s.sandbox.reclaim_destroy is False
 
 
-def test_the_ceiling_has_a_switch_and_it_is_off() -> None:
-    """The absolute age ceiling is an operator switch, and it ships OFF like its reclamation
-    neighbours — a deployment that wants no ceiling sets nothing.
+def test_the_ceiling_is_two_hours_and_has_no_off_switch() -> None:
+    """The absolute age ceiling is a decision, not an operator switch. A screen left open renews
+    its container forever, so a deployment that could turn the ceiling off would be a deployment
+    with no bound on that population at all — which is the one thing it exists for.
 
-    Both knobs are real: `reaper.py` reads them in the stay arm and again in the liveness-lease
-    arm, which is what stops a screen renewing on a timer from making a container immortal.
+    The HOURS stay configurable; the existence of the ceiling does not.
 
-    Mutation-check: delete `drain_enabled` from `SandboxConfig` and the flag assertion below
-    raises `ValidationError` under `extra="forbid"`."""
-    assert _settings(sandbox=_SANDBOX).sandbox is not None
+    Mutation-check: add a `drain_enabled` field back to `SandboxConfig` and the second block
+    below stops proving anything, because a config carrying the flag would accept it."""
     default = _settings(sandbox=_SANDBOX).sandbox
     assert default is not None
-    assert default.drain_enabled is False
     assert default.drain_after_hours == 2
 
-    switched = _settings(sandbox={**_SANDBOX, "drain_enabled": True, "drain_after_hours": 6})
-    assert switched.sandbox is not None
-    assert switched.sandbox.drain_enabled is True
-    assert switched.sandbox.drain_after_hours == 6
+    retuned = _settings(sandbox={**_SANDBOX, "drain_after_hours": 6})
+    assert retuned.sandbox is not None
+    assert retuned.sandbox.drain_after_hours == 6
+
+    # `extra="forbid"` is what makes this an assertion rather than a hope: a deployment still
+    # carrying `SANDBOX__DRAIN_ENABLED` fails at startup instead of booting with a flag nothing
+    # reads any more.
+    with pytest.raises(ValidationError):
+        _settings(sandbox={**_SANDBOX, "drain_enabled": False})
 
 
 def test_the_ceiling_refuses_a_zero_or_negative_span() -> None:
