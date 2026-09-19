@@ -32,7 +32,6 @@ import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_rbac import CurrentSuperadmin
@@ -43,8 +42,6 @@ from src.api.v1.build_sessions.deps import (
     SessionManagerDep,
 )
 from src.api.v1.build_sessions.schemas import (
-    ActivityPhase,
-    ActivityResponse,
     BuildSessionStatus,
     BuildSessionStatusResponse,
     ClientErrorReportRequest,
@@ -52,7 +49,6 @@ from src.api.v1.build_sessions.schemas import (
     CompileStateResponse,
     DiscardRequest,
     PreviewLifeState,
-    ProjectActivity,
     RelaunchPreviewRequest,
     RelaunchPreviewResponse,
     RenewalOutcome,
@@ -67,8 +63,6 @@ from src.core.errors import AppApiError
 from src.core.integrity_types import WorkspaceState
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation
-from src.db.models.pending_teardown import PendingTeardown
-from src.db.models.project import Project
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
 from src.services.build_sessions import (
@@ -87,13 +81,9 @@ from src.services.build_sessions import (
     app_name_for,
     sweep_all,
 )
-from src.services.build_sessions.drain import draining_at, the_ceiling_hours
 from src.services.build_sessions.inventory import owning_app_ids
 from src.services.build_sessions.locks import (
-    read_registry,
-    read_registry_and_starting_marker,
     renew_presence_stay,
-    stamp_is_proven,
 )
 from src.services.orchestrator.client_errors import (
     park_client_error,
@@ -104,18 +94,12 @@ from src.services.projects.resolve import (
     resolve_project_access,
 )
 from src.services.redis import (
-    REGISTRY_STATE_READY,
     build_coordination_or_503,
     coordination_is_gone,
     get_redis,
 )
-from src.services.redis.keys import (
-    REGISTRY_FIELD_APP_NAME,
-    REGISTRY_FIELD_CREATED_AT,
-    REGISTRY_FIELD_STATE,
-)
 from src.services.sandbox import SandboxError
-from src.services.sandbox.base import TAG_CREATED_AT, CompileState, identity_from_tags
+from src.services.sandbox.base import CompileState
 from src.services.storage import StorageError
 
 router = APIRouter(prefix="/build-sessions", tags=["build_sessions"])
@@ -365,95 +349,6 @@ async def relaunch_preview(
             ),
             restored_from_failed_build=relaunched.restored_from_failed_build,
             ready=relaunched.ready,
-        )
-    raise _coordination_is_gone()
-
-
-async def _project_owning_app_name(
-    db: AsyncSession, user_id: uuid.UUID, app_name: str
-) -> uuid.UUID | None:
-    """The citizen's project whose `app_name_for(app_id)` hashes forward to `app_name`, or
-    `None` when none of their apps do. FORWARD ONLY, matching `app_name_for`'s own contract
-    (`redis/keys.py`, `manager.py`) — nothing here reverse-parses a project out of a name."""
-    apps = (
-        await db.execute(
-            sa.select(AppRegistry.id, AppRegistry.project_id).where(AppRegistry.user_id == user_id)
-        )
-    ).all()
-    return next((app.project_id for app in apps if app_name_for(app.id) == app_name), None)
-
-
-def _when_this_one_closes(reg: dict[str, str]) -> datetime | None:
-    """The ceiling instant for the container this registry record names, or `None`.
-
-    This route has no container-call budget, so the created-at stamp on the hash is the only
-    field worth reading — the same fallback the sweep's own age source lands on when ARM
-    cannot be asked."""
-    return draining_at(
-        identity_from_tags({TAG_CREATED_AT: reg.get(REGISTRY_FIELD_CREATED_AT, "")}),
-        after_hours=the_ceiling_hours(),
-    )
-
-
-@router.get(
-    "/activity",
-    response_model=ActivityResponse,
-    responses=error_responses(
-        AUTH_401, (503, ErrorEnvelope, "Build coordination is temporarily unavailable")
-    ),
-)
-async def build_session_activity(user: CurrentUser, db: DbSession) -> ActivityResponse:
-    """Which of the citizen's projects are starting, open, or closing down right now — the
-    three markers the applications page draws beside each project's name.
-
-    DECLARED ABOVE `GET /{session_id}` ON PURPOSE: that route's `{session_id}` is a single
-    path segment and would otherwise swallow `/activity` as an unparseable session id, 422ing
-    every call.
-
-    THE SAME BUDGET `preview-state` HOLDS, FOR EVERY PROJECT AT ONCE rather than one: the
-    pipelined registry-hash-plus-starting-marker read, the citizen's owed `PendingTeardown`
-    rows, and no container call of any kind.
-
-    AN EMPTY LIST IS A POSITIVE CLAIM that nothing is starting, open or closing, so this runs
-    inside `build_coordination_or_503` like `renew_presence` beside it: a store that cannot
-    be read answers 503, never a list the client would read as "nothing is happening" and use
-    to clear every marker it is currently showing."""
-    with build_coordination_or_503():
-        reg, starting_project_id = await read_registry_and_starting_marker(get_redis(), user.id)
-
-        phases: dict[uuid.UUID, ActivityPhase] = {}
-
-        if reg is not None:
-            app_name = reg.get(REGISTRY_FIELD_APP_NAME)
-            if app_name and reg.get(REGISTRY_FIELD_STATE) == REGISTRY_STATE_READY:
-                project_id = await _project_owning_app_name(db, user.id, app_name)
-                if project_id is not None:
-                    phases[project_id] = (
-                        ActivityPhase.OPEN if stamp_is_proven(reg) else ActivityPhase.STARTING
-                    )
-
-        if starting_project_id is not None and starting_project_id not in phases:
-            phases[starting_project_id] = ActivityPhase.STARTING
-
-        owed_project_ids = (
-            (
-                await db.execute(
-                    sa.select(PendingTeardown.project_id)
-                    .join(Project, Project.id == PendingTeardown.project_id)
-                    .where(PendingTeardown.user_id == user.id, Project.user_id == user.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for owed_project_id in owed_project_ids:
-            phases.setdefault(owed_project_id, ActivityPhase.CLOSING)
-
-        return ActivityResponse(
-            projects=[
-                ProjectActivity(project_id=project_id, phase=phase)
-                for project_id, phase in phases.items()
-            ]
         )
     raise _coordination_is_gone()
 
@@ -1231,14 +1126,7 @@ async def renew_presence(
             app_name=app_name_for(app_id),
             presence=body.presence,
         )
-        # Only for the container this renewal actually reached. A ceiling instant reported
-        # alongside `not_this_container` would be another project's, wearing this one's name.
-        mark: datetime | None = None
-        if outcome is RenewalOutcome.RENEWED:
-            reg = await read_registry(redis, user.id)
-            if reg is not None:
-                mark = _when_this_one_closes(reg)
-        return RenewPresenceResponse(outcome=outcome, stay_until=stay_until, draining_at=mark)
+        return RenewPresenceResponse(outcome=outcome, stay_until=stay_until)
     raise _coordination_is_gone()
 
 

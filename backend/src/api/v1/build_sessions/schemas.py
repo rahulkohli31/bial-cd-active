@@ -529,57 +529,6 @@ class RenewPresenceResponse(CamelModel):
     #: When the stay now lapses, or `None` when nothing was renewed. The client does not display
     #: it; it is what makes a renewal auditable from a response body.
     stay_until: datetime | None = None
-    #: When this container reaches the absolute ceiling and is collected no matter who is
-    #: renewing it, or `None` when no ceiling applies.
-    #:
-    #: IT RIDES THE RENEWAL RATHER THAN A READ OF ITS OWN. The screen that needs to say this is
-    #: the screen already renewing every 45 seconds, and the instant is a fact about the very
-    #: container being renewed — a second endpoint call per tick would buy nothing. NULL IS NOT
-    #: "SOON": it means no ceiling applies, and a client that rendered it as imminent would be
-    #: announcing a collection that is not coming.
-    draining_at: datetime | None = None
-
-
-# --- What is starting, open, or closing down -----------------------------------
-
-
-class ActivityPhase(enum.StrEnum):
-    """What one project is doing to its container right now — the three markers the
-    applications page draws beside a project's name. A CLOSED set, like `PreviewLifeState`:
-    the client maps every member, so a phase added later with no client update fails loudly
-    instead of drawing nothing.
-
-    NO `unknown` MEMBER, unlike `PreviewLifeState` — a coordination-store read this route
-    cannot complete is a 503 on the whole response, never a member here standing in for one
-    project. An `unknown` phase in a list the client otherwise reads as "here is what's
-    happening" would still be taken as a claim."""
-
-    #: Provisioning is under way, or the container exists but has never yet answered a
-    #: request — the same two situations `PreviewLifeState.STARTING` names for one project.
-    STARTING = "starting"
-    #: The container is up and has been watched to serve a request.
-    OPEN = "open"
-    #: The platform still owes a deletion for this project's container. A `PendingTeardown`
-    #: row's existence is the whole of the state — there is no status to read instead.
-    CLOSING = "closing"
-
-
-class ProjectActivity(CamelModel):
-    """One project's entry in the activity read."""
-
-    project_id: uuid.UUID
-    phase: ActivityPhase
-
-
-class ActivityResponse(CamelModel):
-    """`GET /v1/build-sessions/activity` → 200.
-
-    ONE READ FOR EVERY PROJECT AT ONCE, which is what lets the applications page clear a
-    marker it drew a moment ago: an empty list is the positive claim that nothing is
-    starting, open or closing, so the route behind this runs inside `build_coordination_or_503`
-    and answers 503 rather than emptying the list when the coordination store cannot be read."""
-
-    projects: list[ProjectActivity]
 
 
 # =============================================================================
