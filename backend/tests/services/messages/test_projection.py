@@ -2862,6 +2862,17 @@ async def test_the_model_reads_the_row_unmasked_and_the_browser_reads_it_masked(
     ]
 
 
+def test_the_display_cap_still_matches_the_per_message_ceiling() -> None:
+    """`projection.py` cannot import the ceiling — `_shared` reaches it through
+    `services.messages` — so the number is restated, and drift is caught here instead.
+
+    Raise one without the other and a message a citizen legitimately sent is silently cut
+    short on reload. Mutation check: change either constant alone and this goes red."""
+    from src.api.v1.conversations._shared import MAX_MESSAGE_TEXT_CHARS
+
+    assert DISPLAY_TEXT_CAP == MAX_MESSAGE_TEXT_CHARS
+
+
 async def test_projecting_a_long_transcript_stays_inside_a_stated_bound(db_session) -> None:
     """The cap is the ReDoS defence this seam is required to carry, and the bound is asserted
     rather than assumed: this runs on every conversation load and every catch-up, on the loop.

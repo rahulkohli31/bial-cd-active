@@ -88,7 +88,7 @@ STOPPED_BY_USER: Final = "stopped_by_user"
 
 FORCE_ENDED: Final = "force_ended"
 """The one graceful end that DISCARDS its work — any sentence implying otherwise is a lie about
-the citizen's code."""
+the citizen's code. Carried by rows already written; nothing in `src` raises it today."""
 
 IDLE_TEARDOWN: Final = "idle_teardown"
 """The idle reaper's reason. Carried by rows the reaper already wrote; nothing in `src` raises

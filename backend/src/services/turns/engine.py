@@ -2271,22 +2271,19 @@ class TurnEngine:
                 app_name=session.handle.app_name,
                 discarded=discarded,
             )
-        # HAS THIS APP EVER BEEN BUILT? One HEAD on the recovery slot, resolved here because
-        # this is where the turn already holds the app id and because the answer cannot change
-        # while the turn runs. It gates the content half of the health verdict: a brand-new
+        # HAS THIS APP EVER BEEN BUILT? One row read, resolved here because this is where the
+        # turn already holds the app id and because the answer cannot change while the turn
+        # runs. It gates the content half of the health verdict: a brand-new
         # project is legitimately showing the starter template, and the whole point of the check
         # is to catch an app that is showing it AFTER someone asked for something else.
         state.had_prior_building_turns = await has_ever_been_built(session.app_id)
         state.workspace_state = "ready"
         self._emit(state, lambda seq: WorkspaceFrame(seq=seq, state="ready"))
         # BOOT THE DEV SERVER THE MOMENT WE HOLD THE CONTAINER, not after the whole model run
-        # plus a `tsc`. Next's first route compile is 5-7s, and until now the only thing that
-        # ever called `dev_start` on this path was `selfheal.verify` — so the compile ran
-        # strictly AFTER the agent had finished, instead of alongside its first request. Worse
-        # for a turn the model only READS in: the mutation guard returns before verify, so the
-        # server was never started at all and no preview ever appeared. The legacy harness has
-        # always done this at attach (it called `dev_start` right after attaching);
-        # this brings unified chat to parity.
+        # plus a `tsc`. Next's first route compile is 5-7s, so starting it here puts that
+        # compile alongside the agent's first request instead of after it. It matters most on a
+        # turn the model only READS in: the mutation guard returns before `verify`, so anything
+        # that waits for verify to start the server never starts it at all.
         #
         # Best-effort BY DESIGN. This is an optimization, never a gate: `verify`'s dead-child
         # rescue is the backstop, so a supervisor blip costs the preview a few seconds and not

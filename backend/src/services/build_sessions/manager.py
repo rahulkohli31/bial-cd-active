@@ -644,7 +644,7 @@ class PreviewState:
     # slot.
     occupying_project_id: uuid.UUID | None = None
     occupying_project_name: str | None = None
-    # TRI-STATE (`restorable_presence`), and `None` is NO CLAIM rather than "no": either the
+    # TRI-STATE (`snapshot_presence`), and `None` is NO CLAIM rather than "no": either the
     # object store was unreachable, or nothing on screen for this state could use the answer
     # (the alive path, which declines to spend a Blob round trip per poll on a question about
     # an app that is currently running). Both readings are the same instruction to the client —
@@ -1622,9 +1622,8 @@ class SessionManager:
         self,
         user_id: uuid.UUID,
         blocking: BuildSession | None,
-        blocking_id: uuid.UUID | None,
-        db: AsyncSession | None,
-        requested_project_id: uuid.UUID | None,
+        db: AsyncSession,
+        requested_project_id: uuid.UUID,
     ) -> Exception:
         """WHICH refusal a held slot has earned — asked by the shared-view launch alone.
 
@@ -1639,11 +1638,11 @@ class SessionManager:
         incumbent to release. A DIFFERENT-project holder has a remedy, stop it, and
         `SandboxReclaimBlockedError` is how it is offered: `ReclaimWorkspaceDialog` already carries
         the copy and the stop-it-first handler for the `building` arm. Falls back to the bare
-        conflict whenever the richer refusal cannot be told truthfully — no `db` to name the
-        project with, no session to read, or a project row that has gone (`_occupying_project`) —
-        since a dialog naming the wrong project is worse than a plain refusal.
+        conflict whenever the richer refusal cannot be told truthfully — no session to read, or
+        a project row that has gone — since a dialog naming the wrong project is worse than a
+        plain refusal.
         """
-        if blocking is None or db is None or requested_project_id is None:
+        if blocking is None:
             return BuildSessionConflictError()
         if blocking.project_id == requested_project_id:
             return BuildSessionConflictError()
@@ -3641,11 +3640,9 @@ class SessionManager:
                 # The recipient is mid-build on one of THEIR OWN projects — the identical
                 # refusal `relaunch_preview` gives a builder caught the same way. A shared view
                 # is never worth pre-empting a build the recipient is actively watching.
-                blocking_id = self._active_by_user.get(recipient.id)
                 raise await self._slot_conflict_for(
                     recipient.id,
-                    self._sessions.get(blocking_id) if blocking_id is not None else None,
-                    blocking_id,
+                    self._sessions.get(self._active_by_user[recipient.id]),
                     db,
                     project.id,
                 )

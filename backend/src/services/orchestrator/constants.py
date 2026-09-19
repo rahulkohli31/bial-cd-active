@@ -108,20 +108,17 @@ READINESS_POLL_S = 1.0
 """Sleep between readiness polls. A construction-time knob on the orchestrator so tests can drive
 it to 0."""
 
-WORKSPACE_NOTE_MAX_POLLS = 5
-"""How long the per-turn workspace note waits for the dev server before answering.
+APP_CHECK_MAX_POLLS = 5
+"""How long `check_the_app` waits for the dev server before answering.
 
-MUCH SHORTER THAN `READINESS_MAX_POLLS`, because it is a different question asked at a different
-moment. The verify budget decides whether a build may claim it finished and can afford to wait 30
-seconds for a slow app; this one runs at the START of every turn in BOTH chat kinds — including a
-one-line Plan question, which is the cheapest turn the platform serves and the one this budget is
-sized against — and only has to tell the model what the user is looking at.
+MUCH SHORTER THAN `READINESS_MAX_POLLS`, because it is a different question. The verify budget
+decides whether a build may claim it finished, and can afford 30 seconds for a slow app; this one
+answers a model mid-turn in both chat kinds, and only has to say what the citizen is looking at.
 
 Its whole safety comes from the third answer: a budget that runs out here is `STILL_TRYING`, which
-the note reports as "could not tell", never as "the app is down". So the cost of choosing five is
-a vaguer note on a cold container, not a false one. Five covers the measured 5-7s first-route
-compile often enough to be worth having, and small enough that nobody notices it on a warm
-one."""
+reads as "could not tell", never as "the app is down". So the cost of choosing five is a vaguer
+answer on a cold container, not a false one — enough to cover the measured 5-7s first-route
+compile often enough to be worth having, small enough that nobody notices it on a warm one."""
 
 CRASH_EDGE_CONSECUTIVE_POLLS = 3
 """How many CONSECUTIVE `(ready=False, running=False)` polls a preview watcher needs before it

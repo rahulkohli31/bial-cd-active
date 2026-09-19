@@ -276,7 +276,7 @@ async def internal_reap(
     raise _coordination_is_gone()
 
 
-# --- control ops: relaunch / stop / status ------------------------------------
+# --- control ops: relaunch / status -------------------------------------------
 
 
 @router.post(

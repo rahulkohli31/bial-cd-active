@@ -45,7 +45,7 @@ from src.services.agent.attachment_tools import AttachmentReader, attachment_too
 from src.services.agent.connector_tools import CONNECTOR_TOOLSET
 from src.services.agent.conversation_tools import CONVERSATION_TOOLSET
 from src.services.agent.read_tools import ReadOnlyWorkspace, read_only_toolset
-from src.services.orchestrator.constants import READINESS_POLL_S, WORKSPACE_NOTE_MAX_POLLS
+from src.services.orchestrator.constants import APP_CHECK_MAX_POLLS, READINESS_POLL_S
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.selfheal import AppState, read_the_app_state
 from src.services.orchestrator.tools import sandbox_toolset
@@ -214,7 +214,7 @@ def app_state_toolset[DepsT](
                     else await read_the_app_state(
                         session.sandbox_client,
                         session.handle,
-                        max_polls=WORKSPACE_NOTE_MAX_POLLS,
+                        max_polls=APP_CHECK_MAX_POLLS,
                         poll_s=READINESS_POLL_S,
                     ),
                 )

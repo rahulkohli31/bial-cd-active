@@ -1134,6 +1134,30 @@ class AcaSandboxClient(SandboxClient):
             ready=False,
         )
 
+    async def _undo_a_container_whose_next_step_died(
+        self, user_uuid: uuid.UUID, handle: SandboxHandle, *, event: str, during: str
+    ) -> None:
+        """Take back a container created moments ago, for a caller about to re-raise.
+
+        THE REGISTRY DROP IS CONDITIONAL. `_safe_teardown` swallows an `AcaError`, so clearing
+        the record whatever happened would orphan a container that is probably still running.
+        A record left standing is what sends a later sweep back to retry the teardown.
+        """
+        if await self._safe_teardown(handle.app_name):
+            await self._delete_registry(user_uuid, handle.app_name)
+        else:
+            _log.error(
+                event,
+                app_name=handle.app_name,
+                detail=(
+                    f"ACA refused the delete during {during}, so the ownership record is "
+                    "deliberately kept: a later sweep retries the teardown instead of meeting "
+                    "an anonymous container."
+                ),
+            )
+        self._evict_token(handle.token)
+        self._app_owners.pop(handle.app_name, None)
+
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
@@ -1149,25 +1173,12 @@ class AcaSandboxClient(SandboxClient):
             # raises `WorkspaceHasNoRepositoryError`, with no self-service way out. The caller
             # cannot clean this up either: it never received a handle, so the compensation in
             # `_holding_user_lock` has nothing to tear down.
-            #
-            # Same shape as the restore arm below, including the conditional registry drop:
-            # `_safe_teardown` swallows an `AcaError`, so clearing the record unconditionally
-            # would orphan a container that is probably still running.
-            torn_down = await self._safe_teardown(app_name)
-            if torn_down:
-                await self._delete_registry(user_uuid, app_name)
-            else:
-                _log.error(
-                    "provision_cleanup_left_registry_for_the_reaper",
-                    app_name=app_name,
-                    detail=(
-                        "ACA refused the delete during seed-failure cleanup, so the ownership "
-                        "record is deliberately kept: a later sweep retries the teardown "
-                        "instead of meeting an anonymous container."
-                    ),
-                )
-            self._evict_token(handle.token)
-            self._app_owners.pop(app_name, None)
+            await self._undo_a_container_whose_next_step_died(
+                user_uuid,
+                handle,
+                event="provision_cleanup_left_registry_for_the_reaper",
+                during="seed-failure cleanup",
+            )
             raise
         return handle
 
@@ -1387,25 +1398,12 @@ class AcaSandboxClient(SandboxClient):
             # Mid-restore death runs MORE fallible steps than provision — self-clean the
             # just-created container, then clear its registry ONLY IF the container is
             # confirmed gone.
-            #
-            # The registry drop used to be unconditional. `_safe_teardown` swallows an
-            # `AcaError`, so a refused delete still dropped the record — orphaning a container
-            # that was probably still running. `teardown()` below has always had this right.
-            torn_down = await self._safe_teardown(app_name)
-            if torn_down:
-                await self._delete_registry(user_uuid, app_name)
-            else:
-                _log.error(
-                    "restore_cleanup_left_registry_for_the_reaper",
-                    app_name=app_name,
-                    detail=(
-                        "ACA refused the delete during restore cleanup, so the ownership "
-                        "record is deliberately kept: a later sweep retries the teardown "
-                        "instead of meeting an anonymous container."
-                    ),
-                )
-            self._evict_token(handle.token)
-            self._app_owners.pop(app_name, None)
+            await self._undo_a_container_whose_next_step_died(
+                user_uuid,
+                handle,
+                event="restore_cleanup_left_registry_for_the_reaper",
+                during="restore cleanup",
+            )
             raise
         return handle
 

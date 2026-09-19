@@ -268,7 +268,7 @@ asserts every member is present). See `PreviewStateAction` for what each bucket 
 one rule this mapping exists to enforce: `UNKNOWN` never maps to `REMEDY`."""
 
 
-# --- Control operations: stop / status ---------------------------------------
+# --- Control operations: status ----------------------------------------------
 #
 # THE START ROUTE IS GONE and these two shapes outlive it. The bare `POST` on the build-sessions
 # collection was deleted with the whole harness behind it — it had had no browser client for a
@@ -300,9 +300,9 @@ class StartBuildResponse(CamelModel):
     """The 201 the deleted start route returned. NO ROUTE PRODUCES IT — and with it went the last
     live producer of a session id the browser could hold. What still reaches the portal is a
     `build_started` transcript row written before the deletion; those rows are permanent, which
-    is why `status`/`stop`/`events` survive as their reader."""
+    is why `status`/`events` survive as their reader."""
 
-    session_id: uuid.UUID  # the build-session id — path key for status/stop/SSE.
+    session_id: uuid.UUID  # the build-session id — path key for status/SSE.
     project_id: uuid.UUID
     app_id: uuid.UUID  # the app_registry row being built (== BIAL_APP_ID). Fresh per project.
     status: BuildSessionStatus  # always `provisioning` on a fresh start.

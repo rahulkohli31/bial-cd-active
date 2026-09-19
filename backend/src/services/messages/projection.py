@@ -398,7 +398,11 @@ snapshot, over a whole transcript, on the event loop.
 
 Sized at the platform's own per-message ceiling (`MAX_MESSAGE_TEXT_CHARS`), so no field a
 citizen or the model can legitimately produce is shortened by it — a longer one is a defect
-upstream, and truncating its tail beats stalling the loop over it."""
+upstream, and truncating its tail beats stalling the loop over it.
+
+The number is restated rather than imported: `_shared` reaches this module through
+`services.messages`, so importing it back raises ImportError on a partly-built module.
+`tests/services/messages/test_projection.py` pins the two equal instead."""
 
 #: Which string field of each `DisplayItem` type reaches a browser as free text. `StepItem.label`
 #: is deliberately absent: every label is one of this module's own constants or a filename the

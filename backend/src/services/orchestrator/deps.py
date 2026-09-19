@@ -65,12 +65,6 @@ class SandboxSession:
     # ── Mutable per-run signals the tools set and the loop reads ──────────────────────────────
     done_requested: bool = False
     done_summary: str = ""
-    # `uncommitted_writes` LIVED HERE and is gone. It counted file mutations since the model's
-    # last `git commit` so `tools._note_write_and_maybe_remind` could nag at a cadence — and the
-    # instruction it nagged about (the Write segment's COMMIT AS YOU WORK block) has been
-    # deleted, because the platform commits the tree itself at every turn boundary. A counter
-    # enforcing an instruction nobody gives is worse than no counter: it appends a reminder to
-    # tool results for a discipline the prompt no longer teaches.
     # HOW MANY TIMES this turn mutated the tree. Bumped by `write_file` / `edit_file` /
     # `insert_lines` / `apply_schema_change` / `run_command`, never reset mid-turn.
     #
@@ -80,10 +74,6 @@ class SandboxSession:
     # nudge. `app_state_toolset` instead asks "has the tree moved since I last looked", which a
     # flag cannot answer once it has latched: a model that edits, checks, edits and checks again
     # would be handed its pre-edit reading under a tool that promises the app's state right now.
-    #
-    # This is NOT the deleted `uncommitted_writes`. That one counted writes since the model's
-    # last commit in order to nag about a commit discipline the prompt no longer teaches; this
-    # one is read only to decide whether a cached reading is still true.
     writes: int = 0
 
     @property
