@@ -571,13 +571,19 @@ async def container_state(
     only would report "all changes saved" over a tree the agent had written and not committed,
     and the porcelain is the only thing here that can see it.
 
-    None means we could not ask at all, which is the only honest "unknown"."""
+    None means we could not ask at all, which is the only honest "unknown" — and both arms that
+    produce it are logged, because the teardown write-back spares a container on exactly this
+    answer, and a container spared pass after pass has to leave a record of why."""
     run_command = sandbox_client.exec  # alias keeps the call off the JS-oriented exec guard
     try:
         result = await run_command(handle, ["sh", "-c", state_script(reference_sha)], timeout_s=30)
     except SandboxError:
+        _log.warning("container_state_probe_failed", app=handle.app_name, exc_info=True)
         return None
     if result.exit != 0:
+        # The exit code alone, never the output: what the script prints is the citizen's own tree
+        # — a sha and their filenames — and none of it says why the shell did not finish.
+        _log.warning("container_state_probe_nonzero", app=handle.app_name, exit_code=result.exit)
         return None
     return parse_state(result.stdout)
 

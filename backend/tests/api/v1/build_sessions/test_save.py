@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +26,8 @@ from src.services.build_sessions.manager import (
     SaveOutcome,
     SaveState,
 )
+from src.services.sandbox import SandboxError
+from src.services.storage import StorageError
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
 
@@ -138,6 +141,40 @@ async def test_save_while_a_build_is_running_is_409(
     assert resp.status_code == 409
     assert "still being built" in resp.json()["error"]["message"].lower()
     assert seen == [(user.id, project.id)]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [StorageError("blob is having a day"), SandboxError("exec timed out")],
+    ids=["store", "sandbox"],
+)
+async def test_a_save_that_could_not_finish_is_503_in_words_the_page_shows(
+    client: AsyncClient, db_session: AsyncSession, wire, failure: Exception
+) -> None:
+    """The write reaches two services that can blink, and neither is the citizen's problem.
+    Uncaught, both leave as a 500 with no message at all, and the toast has nothing to say.
+
+    The message is asserted whole, not by substring: the page shows this sentence verbatim, so
+    the words are the contract here and a status-only assertion would not hold them. `detail`
+    pins the envelope — a 503 raised as a bare `HTTPException` answers in FastAPI's own shape,
+    not the one every other error on this route uses."""
+    user, project = await _user_project(
+        db_session, f"save3b-{uuid.uuid4().hex[:6]}@rvaiglobal.com"
+    )
+
+    async def _fake_save(db, user, project_id, *, sandbox_client) -> SaveOutcome:
+        raise failure
+
+    wire.manager.save_project_snapshot = _fake_save
+
+    resp = await client.post(_save_url(project.id), headers=auth_headers(user))
+
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["error"]["message"] == (
+        "Your changes could not be saved just now. Try again in a moment."
+    )
+    assert "detail" not in body
 
 
 async def test_save_with_no_sandbox_configured_is_503(

@@ -14,6 +14,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+import structlog.testing
 
 from src.services.build_sessions import integrity
 from src.services.build_sessions.integrity import (
@@ -552,6 +553,41 @@ async def test_the_probe_never_raises_on_a_container_that_cannot_answer() -> Non
     client.exec_handler = boom
 
     assert await container_state(client, _HANDLE, reference_sha=REFERENCE) is None
+
+
+async def test_a_container_that_cannot_answer_says_which_way_it_could_not() -> None:
+    """★ The teardown write-back spares a container on exactly this `None`, so a container
+    spared pass after pass is invisible unless both arms leave a line, and the two causes need
+    different answers: an unreachable supervisor is a transport problem, a non-zero exit is a
+    container that answered and refused.
+
+    The exit code is on the record; the OUTPUT is not. What the script prints is the citizen's
+    own tree — a sha and their filenames — and none of it says why the shell did not finish."""
+    unreachable = FakeSandboxClient()
+
+    def boom(cmd: list[str]) -> ExecResult:
+        raise SandboxError("gone")
+
+    unreachable.exec_handler = boom
+    refused = FakeSandboxClient()
+    refused.exec_handler = lambda cmd: ExecResult(stdout="sh: not found", stderr="", exit=127)
+
+    with structlog.testing.capture_logs() as captured:
+        assert await container_state(unreachable, _HANDLE) is None
+        assert await container_state(refused, _HANDLE) is None
+
+    # Filtered into lists rather than `next(...)`: a bare `next` on an empty generator inside an
+    # async test surfaces as `RuntimeError: coroutine raised StopIteration`, which says nothing
+    # about the arm that went quiet.
+    blips = [e for e in captured if e["event"] == "container_state_probe_failed"]
+    refusals = [e for e in captured if e["event"] == "container_state_probe_nonzero"]
+
+    assert [e["log_level"] for e in blips] == ["warning"]
+    assert blips[0]["app"] == "app-x"
+    assert [e["log_level"] for e in refusals] == ["warning"]
+    assert refusals[0]["app"] == "app-x"
+    assert refusals[0]["exit_code"] == 127
+    assert "sh: not found" not in str(refusals[0])
 
 
 def test_a_container_state_defaults_to_not_asked() -> None:

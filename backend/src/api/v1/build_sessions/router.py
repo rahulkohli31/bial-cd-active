@@ -670,7 +670,7 @@ def _save_state_fields(state: SaveState) -> dict[str, Any]:
         AUTH_401,
         (404, ErrorEnvelope, "Project not found"),
         (409, ErrorEnvelope, "There is no live workspace to save"),
-        (503, ErrorEnvelope, "The sandbox service is unavailable"),
+        (503, ErrorEnvelope, "The sandbox or the file store is unavailable"),
     ),
 )
 async def save_project(
@@ -686,7 +686,10 @@ async def save_project(
     409, not 200, when there is no live workspace: a Save that reports success having stored
     nothing is the single worst outcome available here — the user walks away believing their
     work is kept. 409 as well while the agent is still writing, which is the SECOND worst: that
-    save succeeded, and stored a tree caught mid-edit as the version a Relaunch would restore."""
+    save succeeded, and stored a tree caught mid-edit as the version a Relaunch would restore.
+
+    A container blip or a store that will not answer is a 503 in the same words Discard uses:
+    nothing was written, and trying again is the whole of what the citizen can do."""
     if sandbox is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
     await owned_project_or_404(db, user.id, project_id)
@@ -703,6 +706,12 @@ async def save_project(
             status.HTTP_409_CONFLICT,
             "Your app is still being built. Saving now would store a half-finished version — "
             "wait for it to finish, or stop it first.",
+        ) from None
+    except (StorageError, SandboxError) as exc:
+        _log.warning("workspace_save_failed", project_id=str(project_id), exc_info=exc)
+        raise AppApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Your changes could not be saved just now. Try again in a moment.",
         ) from None
     return SaveResponse(app_id=str(outcome.app_id), head_sha=outcome.head_sha)
 
