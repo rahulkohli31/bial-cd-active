@@ -376,15 +376,14 @@ class AttachmentDelivery:
         concludes the file was never uploaded; the rules about HOW to read one are standing text
         and live in `agent/mode_prompts.ATTACHMENT_RULES`, emitted beside this.
 
-        ★ EVERY FILE IS GIVEN TWO ADDRESSES, AND THE RULES' RUN LINE USES THE ON-DISK ONE. The
-        listing used to offer only `.attachments/<name>`, which only a TOOL can resolve — the read
-        tools and `read_attachment` translate it. Build has no `read_attachment`: it runs,
-        and may edit, the reader through `run_command` instead. And a
-        command executes inside the app folder, where `.attachments/` does not exist: Build ran
-        the reader on the path it was given and got `missing` for a file that was there. This
-        module may not branch on the chat's kind, so rather than one address per kind it
-        gives both and says which is for what — correct on every arm, with nothing to keep in
-        step.
+        ★ EVERY FILE IS GIVEN TWO ADDRESSES, AND THE RULES' RUN LINE USES THE ON-DISK ONE.
+        `.attachments/<name>` is resolvable only by a TOOL — the read tools and
+        `read_attachment` translate it. Build has no `read_attachment`: it runs, and may edit,
+        the reader through `run_command`, and a command executes inside the app folder, where
+        `.attachments/` does not exist — so that address alone answers `missing` for a file
+        that is there. This module may not branch on the chat's kind, so rather than one
+        address per kind it gives both and says which is for what — correct on every arm, with
+        nothing to keep in step.
         """
         lines = [
             "The person you are talking to attached these files to this conversation. They are "

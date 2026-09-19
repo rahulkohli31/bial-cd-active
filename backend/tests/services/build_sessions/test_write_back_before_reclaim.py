@@ -371,6 +371,35 @@ async def test_a_container_that_will_not_attach_with_no_bundle_is_spared_not_sil
     assert attempts == [CopyAttempt.UNREACHABLE]
 
 
+async def test_a_store_that_raises_spares_the_container_instead_of_escaping(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    attempts: list[CopyAttempt],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The container will not attach AND the store will not answer — the one combination where
+    the question "is there a copy to destroy this against?" cannot be answered at all.
+
+    A STORE THAT RAISES IS A FACT ABOUT THE DEPLOYMENT, NEVER ABOUT ANYBODY'S WORK, so it takes
+    the sparing arm exactly as a missing bundle does. This call sits outside the broad `except`
+    that guards the write-back below it, so an escaping error would not merely mis-handle this
+    container — it would leave `sweep_all`'s per-user handler and end the whole of this
+    citizen's reap.
+    Mutation check: delete the `except` arm in `_a_saved_bundle_stands_in` and this goes red."""
+    await _register(fake_redis)
+    client = FakeSandboxClient()  # no `attach_handle`: `attach_existing` raises SandboxGoneError
+
+    async def _the_store_will_not_answer(*_a: object, **_k: object) -> None:
+        raise StorageError("blob unreachable", provider="fake", key=snapshot_key(APP))
+
+    monkeypatch.setattr(fake_storage, "head", _the_store_will_not_answer)
+
+    assert await reap_user(fake_redis, USER, client, app_id=APP) is False
+    assert client.torn_down == []
+    assert await fake_redis.exists(registry_key(USER)) == 1, "state stays for a later pass"
+    assert attempts == [CopyAttempt.UNREACHABLE]
+
+
 async def test_a_tree_is_never_bundled_from_a_container_the_record_no_longer_names(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
 ) -> None:
