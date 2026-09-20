@@ -1,23 +1,14 @@
 /**
- * NOTHING REACHABLE HERE NEEDS A CONVERTER — the inertness guard, inverted.
+ * What may be attached is decided by what code here can read, never by a conversion step. The
+ * OOXML formats are offered because a shipped reader opens them in the project's sandbox: no
+ * conversion, no hosted service, no extra deployed component. The pre-2007 binary formats
+ * (`.doc`, `.xls`, `.ppt`) stay refused for the same reason inverted — they are not ZIP-based,
+ * no library in the reader opens one, and admitting one would mean hosting a converter. That is
+ * a standing scope boundary, not a deferral.
  *
- * This file used to assert that presentations, spreadsheets and documents were UNREACHABLE, and
- * it was right for as long as the only way to read one was to convert it: docx and xlsx were
- * extracted to Markdown on the server, and a deck was rendered to PDF by a Gotenberg service that
- * was never deployed. Those formats were refused because the mechanism behind them did not exist.
- *
- * They are reachable now, by a different mechanism: the file is placed in the project's sandbox
- * and a shipped reader opens it there. No conversion, no hosted service, no new deployed
- * component — which is the guarantee this file was really protecting, and the one it still holds.
- *
- * SO THE FORMAT LISTS FLIP AND THE INVARIANT DOES NOT. What must stay unreachable is anything
- * that would need a converter we are not allowed to host: the legacy pre-2007 binary formats
- * (`.doc`, `.xls`, `.ppt`), which are not ZIP-based and which no library in the reader can open.
- * A one-way test is what let `.pptx` survive in the copy after the composer stopped taking it, so
- * both directions are checked here.
- *
- * IT STILL DOES NOT MOCK. A mocked flag is what let the old suite pass in both positions while a
- * citizen met a third behaviour; every assertion below runs against the real module.
+ * Both directions are asserted: a one-way test lets a format linger in the copy after the
+ * composer stops offering it. Nothing here is mocked — a mocked flag passes in both positions
+ * while a citizen meets a third behaviour.
  */
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -51,10 +42,8 @@ describe('formats are admitted by what code can read, never by a conversion step
   })
 
   it('still refuses the legacy binary formats, which no reader here can open', () => {
-    // ★ THE INVARIANT THAT SURVIVED. `.doc`, `.xls` and `.ppt` are pre-2007 compound documents,
-    // not the ZIP-based OOXML the reader handles — admitting one would mean hosting a converter,
-    // which is a standing scope boundary rather than a deferral. The advice must not send a
-    // citizen to a format that is also refused, so it is read separately from the echoed name.
+    // The advice must not send a citizen to a format that is also refused, so it is read
+    // separately from the echoed name.
     for (const f of [
       file('old.ppt', 'application/vnd.ms-powerpoint'),
       file('legacy.doc', 'application/msword'),
@@ -69,9 +58,8 @@ describe('formats are admitted by what code can read, never by a conversion step
   })
 
   it('the deck flag is not exported from config/features, and nothing imports it', () => {
-    // The constant, its docblock and every branch reading it went together — a flag left behind
-    // with no arms is read by the next person as a capability that still exists somewhere. It
-    // stays gone: the formats came back by a route that needs no flag.
+    // A flag with no arms reads as a capability that still exists somewhere. Deck attachments
+    // need none: the reader opens the file wherever it lands.
     const src = path.resolve(__dirname, '../../..')
     const features = readFileSync(path.join(src, 'src/config/features.ts'), 'utf8')
     expect(features).not.toMatch(/DECK_ATTACHMENTS_ENABLED/)

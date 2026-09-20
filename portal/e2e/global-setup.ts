@@ -3,8 +3,8 @@ import type { FullConfig } from '@playwright/test'
 // Health-gate the target before any spec runs. GET /api/health proxies to the backend's
 // unauthenticated /v1/health probe — a bare /v1/health from the portal origin would
 // false-green on the SPA history-fallback, so it MUST go through /api. Budget ~120s for
-// container boot + LibreOffice warmup: a never-ready target fails fast here with a clear
-// message instead of every spec failing on an auth redirect that masquerades as a packaging bug.
+// container boot: a never-ready target fails fast here with a clear message instead of every
+// spec failing on an auth redirect that masquerades as a packaging bug.
 async function globalSetup(_config: FullConfig) {
   const baseURL = process.env.E2E_BASE_URL || 'http://localhost:5173'
   const target = `${baseURL.replace(/\/$/, '')}/api/health`
