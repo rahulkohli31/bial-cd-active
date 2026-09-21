@@ -134,7 +134,7 @@ def test_the_ceiling_leaves_headroom_inside_the_window_the_deployment_serves() -
 
     `MODEL_CONTEXT_WINDOW` is what the provider itself named when it refused an oversized
     prompt (`prompt is too long: 1963668 tokens > 1000000 maximum`, measured through the
-    production chain by `.vulcan/token-usage-probe/probe_overflow_refusal_shape.py`). The
+    production chain). The
     default ceiling has to stay inside it, or `effective_context` clamps the default down and
     the number an administrator reads in the panel is not the number they get. The warning has
     to stay under the ceiling, or a citizen is warned for the first time in the same breath as

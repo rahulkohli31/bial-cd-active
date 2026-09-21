@@ -1,8 +1,8 @@
 """The lake's coordinates — three values, none of them optional, parsed once at construction.
 
 WHY THIS FILE IS WRITTEN FIRST. A settings group whose required fields carry defaults is the
-failure this repository has a rule about (`.claude/rules/fail-first-python.md`): it boots, it
-looks configured, and it fails at the first read against an account nobody chose. The test that
+failure this repository refuses by rule: it boots, it looks configured, and it fails at the
+first read against an account nobody chose. The test that
 proves the opposite is three lines, and it is worth more than the three lines suggest because the
 group is `| None` on `ApiSettings` — so "unconfigured" is a supported posture and a HALF
 -configured group is the one state that must not exist.

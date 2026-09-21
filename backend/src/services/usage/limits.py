@@ -28,8 +28,7 @@ from src.services.usage.gate import effective_daily_limit
 # named when it refused an oversized prompt through the exact production chain
 # (`AsyncAnthropicFoundry` → `AnthropicProvider` → `AnthropicModel` → pydantic-ai `Agent`)
 # against `claude-opus-4-7` on `bial-genai-vibecoding2`: `prompt is too long: 1963668 tokens >
-# 1000000 maximum`, reproduced twice by
-# `.vulcan/token-usage-probe/probe_overflow_refusal_shape.py`.
+# 1000000 maximum`, reproduced twice.
 # The `200_000` it replaces was inherited from the Express prototype and was never checked
 # against this deployment — it made the per-chat ceiling five times smaller than what the
 # platform actually serves.
