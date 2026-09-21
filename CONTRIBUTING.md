@@ -29,19 +29,28 @@ startup error, not a silent fallback.
 
 ## Running the gates, and what each one proves
 
-**Backend — static.** All five must pass. They need no database, no Redis and no secrets.
+**Backend — static.** All six must pass. They need no database, no Redis and no secrets.
 
 ```sh
 cd backend
-uv run ruff check .            # lint
-uv run ruff format --check .   # formatting, including inside docstrings
-uv run ty check                # type check
-uv run mypy src tests          # type check, strict on src
-uv run pyright src tests       # type check, third opinion
+uv run ruff check .                     # lint
+uv run ruff format --check .            # formatting, including inside docstrings
+uv run ty check                         # type check
+uv run mypy src tests                   # type check, strict on src
+uv run pyright src tests                # type check, third opinion
+uv run python scripts/openapi.py --check  # the published API reference still matches the code
 ```
 
 Three type checkers is not belt-and-braces for its own sake — they disagree, and the
 disagreements are where the real bugs sit. Fix rather than suppress.
+
+The last one compares `documentation/reference/openapi.json` against the surface this tree
+actually serves. It proves the published API reference has not gone stale — production disables
+the schema endpoint, so that committed file is the only reference a reader has, and nothing else
+would notice it drifting. On a mismatch it names the operations that moved and prints the
+regenerate command; it never repairs anything itself. **Route and Pydantic model docstrings
+publish as the descriptions in that document**, so this gate can fail on a change that touched
+nothing but prose — see "Some prose is load-bearing" below.
 
 **Backend — tests.** These need a `citizen_one_test` database built to the test-database
 runbook, including a `REVOKE CONNECT` on the control-plane database that several per-app
