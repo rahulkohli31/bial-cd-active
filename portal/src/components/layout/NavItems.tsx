@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { motion } from 'motion/react'
-import { LayoutGrid, Users, Store, Database, ShieldCheck } from 'lucide-react'
+import { Bot, LayoutGrid, Users, Store, Database, ShieldCheck } from 'lucide-react'
 import { getStoredUser, isAuthenticated } from '../../utils/auth'
 import { fetchAppStatusCounts } from '../../utils/appRegistryApi'
 import { projectsListHref } from '../../utils/projectsListMemory'
@@ -9,7 +9,7 @@ import WaitingCountBadge from '../admin/WaitingCountBadge'
 import { highlightTransition } from '../../lib/motion'
 
 /**
- * The five destinations.
+ * The six destinations.
  *
  * THE LIST LINK CARRIES THE LIST BACK. `projectsListHref()` is read at CLICK time, not memoised
  * at render, so a search typed a moment ago on the list is what this lands on rather than a
@@ -37,6 +37,10 @@ export interface NavDestination {
 
 export const NAV_DESTINATIONS: readonly NavDestination[] = [
   { label: 'My Applications', to: '/projects', Icon: LayoutGrid, owns: ['/chat/'] },
+  // BIAL CHAT IS SECOND, AND IT OWNS NOTHING. `/chat/<id>` is a conversation about an
+  // application and belongs to the list above it; this assistant lives at its own address with
+  // nothing underneath it, so the plain path test is the whole of its active state.
+  { label: 'BIAL Chat', to: '/assistant', Icon: Bot },
   { label: 'Shared Applications', to: '/shared-applications', Icon: Users, owns: ['/shared/'] },
   { label: 'App Marketplace', to: '/marketplace', Icon: Store },
   { label: 'Integrations', to: '/integrations', Icon: Database },
@@ -114,8 +118,13 @@ export default function NavItems({ onNavigate, onItemFocus, collapsed = false }:
             // FOCUS MUST NOT LOOK LIKE ACTIVE. The active item carries a tinted ground; focus
             // carries a ring. Without the distinction a keyboard user on a non-active item sees
             // two highlighted rows and cannot tell which one Enter will open.
-            className={`relative flex items-center gap-2.5 rounded-lg py-2.5 text-left text-[13.5px] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 ${
-              collapsed ? 'justify-center px-0' : 'px-2.5'
+            // THE GAP BELONGS TO THE LABEL, SO IT GOES WHEN THE LABEL DOES. The row still holds
+            // the folded label as a zero-width flex item, and a gap applies between flex items
+            // whatever their size — so at rail width the row centred an 18px icon plus 10px of
+            // space before nothing, and every glyph sat 5px left of the column it lives in.
+            // `ProfileCluster` already spells the gap this way.
+            className={`relative flex items-center rounded-lg py-2.5 text-left text-[13.5px] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 ${
+              collapsed ? 'justify-center px-0' : 'gap-2.5 px-2.5'
             } ${
               active ? 'font-semibold text-primary' : 'font-medium text-neutral hover:text-primary-900'
             }`}
@@ -141,7 +150,7 @@ export default function NavItems({ onNavigate, onItemFocus, collapsed = false }:
             )}
             <Icon size={18} className="relative shrink-0" />
             {/* FOLDED, NOT UNMOUNTED. Removing the text would take the button's accessible name
-                with it, so a screen reader on the rail would read five unnamed buttons. It is
+                with it, so a screen reader on the rail would read six unnamed buttons. It is
                 clipped to zero width instead, and the name survives the collapse. */}
             <span
               className={`relative overflow-hidden whitespace-nowrap transition-[opacity,max-width] duration-200 ${

@@ -186,6 +186,99 @@ body {
   .starter-stage { --m: 0.5; transform: scale(0.86); margin: -14px 0; }
 }
 
+/* THE SKY ON BIAL CHAT — a corner wash, a drifting mote field and two aircraft, drawn by
+ * `components/assistant/Backdrop.tsx`. Decoration only: the layer is `aria-hidden` and takes no
+ * pointer, so every click on that screen belongs to the composer.
+ *
+ * THE LAYER'S OWN BOX IS TAILWIND, NOT A RULE HERE — a unit test can read a class list and can
+ * read nothing jsdom never evaluates, and "it catches no pointer" is worth being able to assert.
+ *
+ * IT SITS ABOVE THE REDUCE BLOCK BELOW ON PURPOSE — that block settles the mote field and the
+ * three elements an aircraft is made of, and source order at equal specificity is what lets it. */
+
+/* THE ONLY SHADING ON THE SCREEN, AND IT RUNS OFF ONE CORNER. A bright pool in the middle of a
+   blue-grey ground gives a near-white centre against blue corners with a ring between them — a
+   halo. Off a corner there is no centre-to-edge transition left to read. `#E2E8F0` is the portal's
+   own hairline, so the ground underneath stays the `#F0F4F8` of every other page. */
+.chat-sky-corner {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse 72% 82% at 100% 100%, rgba(226, 232, 240, 0.62), rgba(226, 232, 240, 0) 58%);
+}
+
+.chat-mote {
+  position: absolute;
+  border-radius: 50%;
+  background: rgba(26, 43, 52, var(--mote-ink));
+  animation-name: chat-drift;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+.chat-mote-far { filter: blur(0.4px); }
+.chat-mote-haze { background: rgba(26, 43, 52, 0.05); filter: blur(7px); }
+
+/* The rise is viewport-relative, so one field serves every window without being measured. The fade
+   at both ends is what stops a mote blinking out of existence at the top of its travel. */
+@keyframes chat-drift {
+  0% { transform: translate3d(0, 0, 0); opacity: 0; }
+  9%, 82% { opacity: 1; }
+  100% { transform: translate3d(var(--mote-drift), -130vh, 0); opacity: 0; }
+}
+
+/* AN AIRCRAFT IS TWO COMPOSED TRANSFORMS sharing one duration and one delay — across, and up —
+   over a glyph held at a fixed heading. `offset-path` would say it in one declaration but takes
+   absolute pixels, and this screen has no fixed size; vw/vh need no measurement and no script.
+   The heading is static because the turn along one of these arcs is four degrees, which on a 19px
+   silhouette moves its outline by less than a pixel — an animation nobody can see.
+
+   THE TWO LANES ARE SEPARATED SO NEITHER CROSSES THE WORDS: one stays under the composer, the
+   other above the heading. A 19px silhouette at 26% ink is quiet on the ground and nowhere near
+   quiet passing through a headline. */
+.chat-plane {
+  position: absolute;
+  left: 0;
+  top: 0;
+  opacity: 0;
+  animation: chat-plane-cross var(--plane-time) linear infinite;
+  animation-delay: var(--plane-offset);
+}
+.chat-plane-lift {
+  display: block;
+  animation: chat-plane-climb var(--plane-time) ease-in-out infinite;
+  animation-delay: var(--plane-offset);
+}
+.chat-plane-glyph {
+  display: block;
+  fill: rgba(26, 43, 52, 0.26);
+  transform: rotate(var(--plane-heading));
+}
+.chat-plane-a {
+  --plane-time: 92s; --plane-offset: -25s;
+  --plane-from: -12vw; --plane-to: 106vw;
+  --plane-low: 96vh; --plane-high: 66vh;
+  --plane-heading: 81deg;
+}
+.chat-plane-b {
+  --plane-time: 118s; --plane-offset: -100s;
+  --plane-from: 106vw; --plane-to: -12vw;
+  --plane-low: 44vh; --plane-high: 6vh;
+  --plane-heading: -79deg;
+}
+
+/* Each crosses in the first half of its cycle and waits off screen for the second, on two periods
+   that do not divide into one another. That is why the sky is sometimes empty rather than busy.
+   THE NEGATIVE DELAYS ARE WHERE EACH ONE STARTS IN ITS OWN CYCLE, and they are chosen so the first
+   aircraft is already mid-crossing when the screen opens and the second arrives shortly after it
+   leaves — an empty sky on arrival is the one moment this backdrop cannot afford to be subtle. */
+@keyframes chat-plane-cross {
+  0% { transform: translateX(var(--plane-from)); opacity: 0; }
+  3%, 46% { opacity: 1; }
+  50%, 100% { transform: translateX(var(--plane-to)); opacity: 0; }
+}
+@keyframes chat-plane-climb {
+  0% { transform: translateY(var(--plane-low)); }
+  50%, 100% { transform: translateY(var(--plane-high)); }
+}
 @media (prefers-reduced-motion: reduce) {
   /* THE PORTAL'S REDUCED-MOTION GUARANTEE. Three mechanisms carry it, and these are all of them.
    *
@@ -233,7 +326,15 @@ body {
      invitation, not a wait, so it makes no claim that stops being true when the picture stops
      moving. The sandbox's BUILDING screen is the opposite case and is deliberately never
      suppressed — a settled assembly reads as a finished app. */
-  .starter-piece {
+  .starter-piece,
+  /* BIAL Chat's sky. The motes keep their resting opacity and simply stop drifting, so the field
+     is still there and still has depth — a settled backdrop makes no claim that stops being true.
+     The aircraft are the opposite case: they rest at opacity 0 and are gone, because an aeroplane
+     pinned mid-air reads as a rendering fault rather than as an accommodation. Two selectors for
+     one aircraft, because the arc is two composed transforms; its glyph only holds a heading. */
+  .chat-mote,
+  .chat-plane,
+  .chat-plane-lift {
     animation: none;
   }
 }

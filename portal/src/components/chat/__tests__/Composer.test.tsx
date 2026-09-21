@@ -15,6 +15,7 @@ import { ComposerHarness } from './_composerHarness'
 import Composer, { type ComposerProps } from '../Composer'
 import { OFFER_GATE_NOTE, OFFER_LOCKED_NOTE } from '../OfferStrip'
 import { readDraft, writeDraft } from '../../../utils/composerDraft'
+import { MAX_COMPOSER_CHARS } from '../../../utils/composerCap'
 
 afterEach(() => {
   cleanup()
@@ -460,5 +461,32 @@ describe('the send-unavailable cascade, with more than one arm true', () => {
     type(OVER_CAP)
     expect(screen.getAllByTestId('composer-gate-note')).toHaveLength(1)
     noRealDisabled(container)
+  })
+})
+
+describe('the grey the notes under the box are painted in', () => {
+  it('defaults to the chat surface’s, which sits the composer on white', () => {
+    draw({ isRunning: true })
+    expect(gateNote()?.className).toContain('text-neutral')
+  })
+
+  it('★ a caller on the platform ground passes a darker one, because the default fails AA there', () => {
+    // #6B7280 on #F0F4F8 measures 4.37:1, under the 4.5:1 floor for body text. It passes
+    // everywhere else only because this composer almost always sits on white, where it is 4.83:1.
+    draw({ isRunning: true, noteClassName: 'text-status-grey-fg' })
+    expect(gateNote()?.className).toContain('text-status-grey-fg')
+    expect(gateNote()?.className).not.toContain('text-neutral')
+  })
+
+  it('★ reaches all three notes, not only the one the first caller happened to render', () => {
+    // The prop threads through the gate sentence, the context line and the counter. Pinning one of
+    // the three leaves the other two free to keep the grey that fails contrast on that ground.
+    draw({ isRunning: true, contextWarning: 'This chat is getting long.', noteClassName: 'text-status-grey-fg' })
+    type('x'.repeat(MAX_COMPOSER_CHARS - 10))
+    for (const id of ['composer-gate-note', 'composer-context-warning', 'composer-counter']) {
+      const node = screen.getByTestId(id)
+      expect(node.className, id).toContain('text-status-grey-fg')
+      expect(node.className, id).not.toContain('text-neutral')
+    }
   })
 })
