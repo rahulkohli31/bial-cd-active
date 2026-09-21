@@ -2,8 +2,9 @@
 
 WHY THIS FILE EXISTS SEPARATELY FROM THE ROUTE TESTS. `current_access` earns its own module
 partly on reuse and partly on a REALIZED testing benefit — the two ways a service function
-justifies itself here — and this is that benefit realized: the rule is "the most recent NON-cancelled row", and the cases that tell it
-apart from a naive `ORDER BY created_at DESC LIMIT 1` are ledger shapes, not user journeys.
+justifies itself here — and this is that benefit realized: the rule is "the most recent
+NON-cancelled row", and the cases that tell it apart from a naive
+`ORDER BY created_at DESC LIMIT 1` are ledger shapes, not user journeys.
 Reaching them through HTTP would prove the rule only for the one surface that happens to call
 it, and the switch-on refusal U4 builds calls it too.
 
