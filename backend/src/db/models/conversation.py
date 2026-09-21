@@ -5,8 +5,12 @@ APP'S ID: a builder conversation's id was once the deployed `appId`; that identi
 Apps are PROJECT-scoped with their own id, and `app_registry.conversation_id` is now a soft HEAD
 POINTER at the last build session touching the app — never reassigned (SPA-routed), never a name.
 
-`kind` is a native PG enum, the WHOLE classification (`plan`/`build`, fixed at creation; no `mode`
-column since migration 0035) — tool gating derives from this column alone, never the client.
+`kind` is a native PG enum, the WHOLE classification (`plan`/`build`/`chatbot`, fixed at creation;
+no `mode` column since migration 0035) — tool gating derives from this column alone, never the
+client. PLAN and BUILD run on the turn engine (`services/turns/engine.py`), which pins a live
+project sandbox on EVERY turn of both kinds; CHATBOT deliberately never reaches that engine (see
+`api/v1/chatbot/router.py`) — it runs `services/agent/agent.py`'s `chat_agent` directly, with no
+project, no workspace, no tools, which is exactly why it is the one kind allowed no project.
 `title`/`context` are SPA-owned mutable fields; legacy `code` JSONB was dropped in migration 0024
 (truth: the build snapshots — `app_registry.current_code` followed it in migration 0039, once
 its one remaining reader was deleted). Ownership is `user_id` — every read scoped by it.
@@ -38,6 +42,7 @@ class ChatKind(StrEnum):
 
     PLAN = "plan"
     BUILD = "build"
+    CHATBOT = "chatbot"
 
 
 # Native PG enum, shared by the model columns and the Alembic migrations. `create_type=False`:
@@ -54,21 +59,31 @@ chat_kind_enum = sa.Enum(
 class Conversation(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     __tablename__ = "conversations"
 
-    # The parent project. Every conversation — every kind — is a *session*
-    # under exactly one project. NOT NULL FK; the DB cascade is a row backstop only
-    # (blob-aware cleanup runs through the conversation-delete service's project-cascade
-    # path). `user_id` remains the isolation predicate; `project_id` is organizational,
-    # not tenancy, and a project and its children always share the same `user_id`.
-    project_id: Mapped[uuid.UUID] = mapped_column(
+    # The parent project. A PLAN/BUILD conversation is a *session* under exactly one
+    # project; a CHATBOT conversation has none (it never touches the turn engine, the
+    # sandbox, or any project-scoped tool). NULLABLE FK; the DB cascade is a row backstop
+    # only for the project-scoped kinds (blob-aware cleanup runs through the
+    # conversation-delete service's project-cascade path). `user_id` remains the isolation
+    # predicate; `project_id` is organizational, not tenancy, and a project and its
+    # non-CHATBOT children always share the same `user_id`. The CHECK constraint below
+    # makes "CHATBOT iff no project" a DB-level invariant, not just an API convention.
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.Uuid,
         sa.ForeignKey("projects.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     # Fixed at creation and never changed: there is no route that mutates it, and
     # no server default — a chat whose kind the creator did not choose is a programming error,
     # not a chat that quietly becomes one of them (fail-first).
     kind: Mapped[ChatKind] = mapped_column(chat_kind_enum, nullable=False)
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            "(project_id IS NULL) = (kind = 'chatbot')",
+            name="ck_conversations_chatbot_projectless",
+        ),
+    )
     # Derived client-side from the first message; mutable via PATCH. TEXT (short in
     # practice — the SPA caps it ~40 chars — but unbounded here).
     title: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
