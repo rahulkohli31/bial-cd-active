@@ -4,6 +4,43 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.1] - 2026-09-21
+
+Nothing in the platform behaves differently. What changed is that the repository now explains
+itself: someone who clones it finds an architecture document, a deployment guide, the decisions
+in force, runbooks for operating and recovering the platform, and a generated API reference —
+where before they found code and a one-line README.
+
+The API reference is the one part that cannot quietly go stale. It is generated from the code and
+compared against it by a check that runs with no database, no cache and no configuration, so a
+route that moves without the reference moving fails before it lands.
+
+### Added
+
+- **The repository explains itself.** A tracked `documentation/` directory covering how the system
+  is built and why, what it needs from its host, the decisions in force, six operating procedures,
+  and the API surface.
+- **A test-database setup procedure that exists.** Contributors were pointed at a document that had
+  never been written. It has been, and following it end to end is how two under-specified steps in
+  it were found.
+- **The API reference is checked, not trusted.** A sixth static gate compares the committed
+  reference against the code and names the operations that moved along with the command that
+  repairs them.
+
+### Changed
+
+- **The README says what this is.** It was an empty file. It now describes the platform, maps the
+  documentation, lists the toolchains, and is plain about the three things a clone cannot provide
+  for itself.
+- **Contributing carries the rules that keep the edition true**, along with three conventions whose
+  decision records were retired and five practices drawn from the project's own solved problems.
+
+### Removed
+
+- **The `ops/` directory.** Its deployment guidance was rewritten into `documentation/deployment.md`
+  without the tenant-specific names it carried, and the permission definitions it held are published
+  alongside the API reference with their scope left to be chosen at assignment time.
+
 ## [1.8.0] - 2026-09-19
 
 Work you have not saved is no longer lost when the platform tidies up. Every door that puts a
