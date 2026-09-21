@@ -28,9 +28,8 @@
 # platform does not ship. Rebasing replaces the glibc/Debian package set outright rather than
 # waiting on fixes that are not coming.
 #
-# INDEX digest, not the amd64 child (sha256:0ad7f98a…): the index resolves per host, so this
-# one string builds arm64 on a developer machine and amd64 in the registry. Resolved
-# 2026-08-13 — ops/CVE-REMEDIATION-ROLLBACK-ANCHOR.md §1.2 records what this moved from.
+# INDEX digest, not a per-architecture child: the index resolves per host, so this one string
+# builds arm64 on a developer machine and amd64 in the registry.
 FROM python:3.14-alpine@sha256:05b2b8b732ecd268fee8727a369f936f022d1321b59befd13c30ede22769dcdc
 
 # RUNTIME git — not a build convenience. The control plane SHELLS OUT to git to restore an

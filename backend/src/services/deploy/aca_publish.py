@@ -323,8 +323,8 @@ class AcaPublishedApps:
             # withdrawn owner produces no coordinates, which produces an explicit `type: "None"`
             # identity block, which is ARM's documented detach. An app that never had one never
             # gains one. NOT YET OBSERVED END TO END — ARM writes are blocked on the development
-            # subscription — so `ops/ONE-CLICK-DEPLOY-PROD.md` §4 carries it as a pre-flight to
-            # confirm once, rather than this comment asserting it as settled fact.
+            # subscription — so this is read off ARM's contract rather than confirmed by a run,
+            # and it is worth confirming once somewhere the write is permitted.
             identity=_user_assigned(identity_resource_id_for_env(env)),
             # ARM identity tags. THIS CALL IS A FULL `PUT` ON EVERY REDEPLOY, so a tag missing
             # from this envelope is not merely un-written — it is STRIPPED from a resource that

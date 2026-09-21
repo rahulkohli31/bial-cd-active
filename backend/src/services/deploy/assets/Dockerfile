@@ -23,9 +23,8 @@
 #
 # DIGEST-PINNED, and it is the INDEX digest, not a per-architecture child. The index resolves
 # per host, so this same string builds arm64 locally and amd64 on the registry; pinning the
-# amd64 child would build fine in ACR and break every local build. Resolved 2026-08-13 — see
-# ops/CVE-REMEDIATION-ROLLBACK-ANCHOR.md §1.2, which is the record of what this moved from and
-# how to reproduce it. Do not record a competing digest here.
+# amd64 child would build fine in the registry and break every local build. Do not record a
+# competing digest here.
 #
 # This default alone ships NOTHING: services/deploy/config.py's `node_base_image` becomes the
 # NODE_IMAGE build arg on every platform build, so it always wins. This line is the hand-build
