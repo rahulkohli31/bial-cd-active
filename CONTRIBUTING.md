@@ -8,7 +8,8 @@ Three trees, three toolchains:
 | `portal/` | React + Vite single-page app | Node >=20 (the image builds on 24), `npm` |
 | `sandbox/` | The build supervisor and the template every generated app starts from | Python 3.14 (via `backend/`), Node 24 in the image |
 
-`README.md` is a stub, so this is the document to read first.
+`README.md` introduces the platform and maps `documentation/`. This document covers the
+toolchains, the checks, and the conventions the code is written to.
 
 ## Getting set up
 
@@ -27,25 +28,41 @@ Copy `backend/.env.example` to `backend/.env` and fill it in. Required settings 
 defaults: the app refuses to boot rather than start half-configured, so an empty value is a
 startup error, not a silent fallback.
 
+Python dependencies change through `uv add` and `uv remove`, never by hand-editing the manifest,
+so the lockfile moves with them. There is one `backend/pyproject.toml` and the dependencies sit in
+four tiers: the shared runtime set, then `api`, `worker` and `dev` groups. The distinction earns
+its keep at the image — a container that syncs without naming the group it needs ships without the
+code it needs and dies at start, which is the most expensive moment to find out.
+
 ## Running the gates, and what each one proves
 
-**Backend — static.** All five must pass. They need no database, no Redis and no secrets.
+**Backend — static.** All six must pass. They need no database, no Redis and no secrets.
 
 ```sh
 cd backend
-uv run ruff check .            # lint
-uv run ruff format --check .   # formatting, including inside docstrings
-uv run ty check                # type check
-uv run mypy src tests          # type check, strict on src
-uv run pyright src tests       # type check, third opinion
+uv run ruff check .                     # lint
+uv run ruff format --check .            # formatting, including inside docstrings
+uv run ty check                         # type check
+uv run mypy src tests                   # type check, strict on src
+uv run pyright src tests                # type check, third opinion
+uv run python scripts/openapi.py --check  # the published API reference still matches the code
 ```
 
 Three type checkers is not belt-and-braces for its own sake — they disagree, and the
 disagreements are where the real bugs sit. Fix rather than suppress.
 
-**Backend — tests.** These need a `citizen_one_test` database built to the test-database
-runbook, including a `REVOKE CONNECT` on the control-plane database that several per-app
-database tests assert against. Build it out of band before your first run.
+The last one compares `documentation/reference/openapi.json` against the surface this tree
+actually serves. It proves the published API reference has not gone stale — production disables
+the schema endpoint, so that committed file is the only reference a reader has, and nothing else
+would notice it drifting. On a mismatch it names the operations that moved and prints the
+regenerate command; it never repairs anything itself. **Route and Pydantic model docstrings
+publish as the descriptions in that document**, so this gate can fail on a change that touched
+nothing but prose — see "Some prose is load-bearing" below.
+
+**Backend — tests.** These need a PostgreSQL database built to
+[`documentation/runbooks/test-database-setup.md`](documentation/runbooks/test-database-setup.md),
+including a `REVOKE CONNECT` on the control-plane database that several per-app database tests
+assert against. Build it out of band before your first run.
 
 ```sh
 cd backend && uv run pytest -q      # ~8 minutes
@@ -67,6 +84,56 @@ cd sandbox
 uv run --project ../backend pytest -q
 uv run --project ../backend ruff check .
 ```
+
+## How the backend is written
+
+**A service-layer function earns a separate existence, or the query is inlined into the endpoint
+that owns it.** It earns it in one of two ways: present-tense reuse — two or more call sites that
+exist *now*, not a second caller somebody expects later — or a realized testing benefit, meaning a
+direct unit test that pins behaviour below the HTTP layer because the behaviour warrants it, and
+that has actually been written. A one-to-one wrapper around a single scoped query concentrates
+nothing and costs a file, an import and a jump for every reader.
+
+**Dependencies resolve before the route body runs.** A `Depends(...)` is evaluated eagerly, so a
+dependency that raises produces its error *before* request-body validation, and a route that means
+to report a missing dependency in its own words never gets the chance. Where a dependency may
+legitimately be absent, the seam is split: one provider that raises and one that yields `None`, and
+the route decides. This has been needed for three unrelated dependencies now, which is what makes
+it a rule rather than a quirk of one of them. Splitting a provider in two also forks the key that
+test overrides are registered under — a fake bound to one seam does not apply to the other, so both
+get bound.
+
+**Prefer `.returning(...)` over refreshing an object after commit.** Sessions here are configured
+not to expire objects on commit, and server-side defaults mean the values a row was written with
+are not always the values it now holds. Asking the database to hand back what it wrote, in the same
+statement, avoids a second round trip and avoids the class of failure where a refresh is attempted
+outside the context that can perform it.
+
+**A partial index needs its predicate as a literal, not a bound parameter.** Connections are pooled
+and long-lived, so prepared statements persist and the planner switches to a generic plan after a
+handful of executions. Once it does, a partial index whose predicate pins a column value is
+invisible to it — the parameter could be anything, so the index cannot be assumed to apply. Render
+that predicate as a literal and the planner can see it. This has been applied three times; a fourth
+partial index needs the same treatment.
+
+## Writing tests
+
+**A test must not compute its expected value with the code that produces the actual value.** When
+both sides of an assertion run through the same function, a change to that function moves both
+together and the assertion cannot fail — the test is green by construction and proves nothing. Pin
+the expectation against an independent literal instead.
+
+**Global styles carry an accessibility consequence that is easy to miss.** Styling scrollbars
+suppresses the platform's own scrollbar rendering, and with it the exemption the platform's
+defaults carry from contrast requirements. Once the repository styles them, meeting contrast is the
+repository's job, and the values are asserted by a test rather than left to inspection.
+
+## Branching and commits
+
+Trunk-based, on short-lived branches off `main` that live a day or two. Prefixes: `feat/`, `fix/`,
+`chore/`, `docs/`, `refactor/`. Conventional commit messages. Small pull requests, squash-merged.
+
+Release automation that would commit generated artefacts into the repository is deliberately absent.
 
 ## The comment convention
 
@@ -171,3 +238,36 @@ prose at runtime:
 
 None of this is caught by lint or by the type checkers. **Run the suites before landing a
 comment-only change.**
+
+## How this repository is documented
+
+`documentation/` is the published edition, and each document holds one kind of fact:
+
+| Document | Holds |
+|---|---|
+| `documentation/architecture.md` | Why the system has the shape it has. Explanation only. |
+| `documentation/deployment.md` | What the platform needs from its host, and how to prove a deployment worked. |
+| `documentation/adr/` | Decisions in force, each with the reasoning that produced it. |
+| `documentation/runbooks/` | Procedures — operating, recovering, and building the test database. |
+| `documentation/reference/` | Generated and machine-readable material. |
+
+**The architecture document carries no countable detail.** No resource names, no configuration
+values, no version numbers, no route tables. Renaming a resource or adding a setting should require
+no edit to it. Where a perishable fact matters, the prose names the file that owns it instead of
+restating the value — that file is then the single place it can go stale.
+
+**Diagrams are Mermaid fences.** No images, no external diagram formats. A diagram that cannot be
+read as text in a review cannot be reviewed.
+
+**The API reference is generated, never edited.** `documentation/reference/openapi.json` is produced
+by `backend/scripts/openapi.py`, and the static gate sequence compares it against the code. A hand
+edit is reverted by the next regeneration.
+
+**A documentation change ships in the same commit as the code change that invalidated it.** Not in
+a follow-up. The published edition is only true between commits if it is never left behind by one.
+
+**Records keep their number for the life of the repository.** A decision that is no longer in force
+keeps its file and its number and gains a first line naming what replaced it — no status table, no
+date, no directory changelog. Gaps in the numbering are just gaps; they are not placeholders, and
+nothing is backfilled. There is no index under `documentation/adr/`: a directory listing is the
+index, and an index that has to be maintained is one more thing that goes quietly stale.

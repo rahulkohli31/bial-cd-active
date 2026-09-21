@@ -62,3 +62,14 @@ backend/src/services/deploy/assets/**   text eol=lf
 # parsed as JSON, never byte-compared, and Python's universal-newline decoding hides a CRLF
 # checkout from the generator entirely.
 backend/src/services/agent/connector_catalogue/**   text eol=lf
+
+# --- the published API reference -------------------------------------------------------------
+# `documentation/reference/openapi.json` is a GENERATED artefact: `backend/scripts/openapi.py`
+# renders it and `--check` compares it BYTE FOR BYTE. A Windows checkout with core.autocrlf=true
+# would rewrite every one of its line endings, so the check would fail on the build host and pass
+# here — the worst shape a guard can have. The generator writes through `newline=""`; this is the
+# other half of the same rule.
+#
+# A DIRECTORY GLOB, not a per-file rule, so the role definitions published beside it inherit the
+# same treatment without anyone remembering.
+documentation/reference/**   text eol=lf

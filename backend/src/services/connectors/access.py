@@ -13,7 +13,8 @@ and both ways are reachable from the shipped UI:
 `tests/services/connectors/test_access_state.py` drives this function directly for exactly that
 case, and `tests/api/v1/connectors/test_person_state.py` drives it again through the route.
 
-WHY THIS IS A MODULE AND NOT AN INLINE QUERY (ADR-0010 wants a reason). Present-tense reuse:
+WHY THIS IS A MODULE AND NOT AN INLINE QUERY. A service function earns a separate existence here
+only through present-tense reuse or a realized testing benefit; this one has both. Reuse:
 `GET /v1/connectors` reads it, `POST /v1/connectors/{key}/request` refuses a second ask on it,
 `POST /v1/connectors/{key}/cancel` reports the resulting state with it, and the per-project
 switch-on refuses on it as well. The realized testing benefit is the direct test named above —

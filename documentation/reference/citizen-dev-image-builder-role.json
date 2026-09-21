@@ -13,6 +13,6 @@
   "DataActions": [],
   "NotDataActions": [],
   "AssignableScopes": [
-    "/subscriptions/5aa185fd-1f15-4769-94c9-b7dae72cadd5/resourceGroups/BIAL-GENAI-AIML-RG/providers/Microsoft.ContainerRegistry/registries/bialgenaicr"
+    "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.ContainerRegistry/registries/{registryName}"
   ]
 }

@@ -97,11 +97,9 @@ class DeployConfig(BaseModel):
     # string; they are only allowed to drift on purpose.
     #
     # Digest-pinned to the INDEX (not a per-architecture child), so it resolves per host: the
-    # same string builds arm64 on a developer machine and amd64 in the registry. Moved off
-    # Debian 12, which left regular security support on 12 July 2026; matches the sandbox base
-    # deliberately, so the environment citizens build in and the one their apps run in do not
-    # diverge. ops/CVE-REMEDIATION-ROLLBACK-ANCHOR.md §1.2 records what this moved from and
-    # the commands to reproduce it.
+    # same string builds arm64 on a developer machine and amd64 in the registry. Matches the
+    # sandbox base deliberately, so the environment citizens build in and the one their apps run
+    # in do not diverge.
     #
     # As an env var this is DEPLOY__NODE_BASE_IMAGE; a value set on the deployed backend wins
     # over this default, so a code change alone does not reach a running environment.

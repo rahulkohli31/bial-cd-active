@@ -2712,8 +2712,8 @@ class SessionManager:
         session is the one fact about a container that Redis cannot be asked, because a lapsed
         lock or a stale registry hash says nothing about whether a task is running in this
         process. Single-replica is the deploy invariant that makes it sufficient (see
-        `_claim_the_one_build_slot`); a second replica needs the shared lease the idle-suspend
-        spike calls a prerequisite, not a second guard bolted on here.
+        `_claim_the_one_build_slot`); a second replica needs a shared lease first, not a second
+        guard bolted on here.
 
         ASKS ABOUT THE APP RATHER THAN THE TASK, which is what let it cover both kinds of
         session while there were two: `_start_locked` registered a build carrying a `run_build`
