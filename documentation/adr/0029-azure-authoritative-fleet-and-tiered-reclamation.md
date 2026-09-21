@@ -221,7 +221,11 @@ container no claim signal ever disqualifies — a builder who leaves a tab open 
 that long loses the container and gets it back transparently on the next prompt; accepted as a
 bounded, designed-for cost against an unbounded one, and measured from the container's own age
 specifically so a stale coordination-store record cannot hand it a fresh ceiling it does not
-deserve.
+deserve. The pass-staleness alarm and the fleet-size alarm are, today, only distinguishable log
+events — pull-mode signals that still require a human to already be watching, close to the
+original incident's own failure mode. This is accepted only as a stated partial: it is not met
+until an actual alerting rule and a named recipient exist for each, and must not be read as met on
+the strength of the log line alone.
 
 ## Related
 
