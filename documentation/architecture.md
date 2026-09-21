@@ -115,6 +115,33 @@ first would let the next build start before the previous workspace was safely st
 restore from a snapshot that was either stale or absent. The slot is what makes storing and
 destroying look atomic to the person waiting.
 
+## Publishing
+
+Asking to publish does not publish. The request runs a gate that merges two independent judgements
+about the exact commit being shipped — the platform's own review of it, and the author's answers to
+what they are asked to declare — taking the stricter of the two wherever they disagree. It produces
+one of four outcomes: refuse, publish, wait for a re-check that is already running, or route the
+application into an administrator's queue. A request that is routed publishes nothing and leaves the
+application queued at exactly the version that was examined.
+
+**An approval is pinned to a commit, not to an application.** Approving a version approves that
+version. Work continued afterwards is unapproved until it is submitted and cleared in its own right,
+which is what stops an approval becoming a standing permission to ship anything later.
+
+A deploy takes minutes, far longer than an HTTP request may wait, so the request returns as soon as
+the work is accepted and the interface polls for the result.
+
+There are two publishing lineages in the system: an older one where an administrator ran a
+procedure by hand, and the current one where the author publishes and the gate above is what stands
+in their way. The older lineage still governs applications that entered through it and takes no new
+entrants.
+
+**Deployed applications carry no authentication of their own.** Anyone who can reach the address of
+a deployed application can open it. Whether that address is reachable beyond the corporate network
+depends on how the container environment's networking is configured, which is a deployment-time
+property rather than something the platform asserts. This is a known gap rather than a design
+conclusion, and it is the thing to check first when deciding what an application may hold.
+
 ## Trust boundaries
 
 The generated application is the untrusted party. Everything here follows from that.
