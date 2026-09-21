@@ -60,7 +60,7 @@ describe('the heading is a greeting, and it is the only colour on the screen', (
     expect(text).not.toContain('*')
   })
 
-  it('paints exactly one word, and it is a real element rather than markup', () => {
+  it('paints exactly one run, and it is a real element rather than markup', () => {
     render(<AssistantPage />)
     const accents = heading().querySelectorAll('em')
     expect(accents).toHaveLength(1)
@@ -94,15 +94,19 @@ describe('the heading is a greeting, and it is the only colour on the screen', (
   })
 
   it('★ does not repeat itself on the next visit in the same sitting', () => {
-    render(<AssistantPage />)
-    const first = heading().textContent
-    cleanup()
-
-    render(<AssistantPage />)
-    expect(heading().textContent).not.toBe(first)
-    // Liveness: the second render drew a real heading rather than nothing at all, which would
-    // also satisfy "not the same".
-    expect(rendered('Asha')).toContain(heading().textContent ?? '')
+    // SIX MOUNTS, NOT TWO. With nine candidates a single pair agrees by chance eight times in
+    // nine even with the exclusion deleted, so a two-mount version of this test passes on the
+    // broken code almost always — it was checking nothing.
+    let previous: string | null = null
+    for (let visit = 0; visit < 6; visit += 1) {
+      render(<AssistantPage />)
+      const current = heading().textContent ?? ''
+      expect(current, `visit ${visit} repeated the previous line`).not.toBe(previous)
+      // Liveness: each mount drew a real heading, which "not the same" alone would not prove.
+      expect(rendered('Asha')).toContain(current)
+      previous = current
+      cleanup()
+    }
   })
 })
 
@@ -124,13 +128,27 @@ describe('the composer is the library own, and it will not send', () => {
   })
 
   it('★ the note is painted in the grey that passes contrast on this page ground', () => {
-    // `text-neutral` is 4.44:1 on #F0F4F8 and fails AA; it passes everywhere else because the
+    // `text-neutral` is 4.37:1 on #F0F4F8 and fails AA; it passes everywhere else because the
     // composer almost always sits on white. This screen is the first to put it on the platform
     // ground, and the swap is the whole reason `noteClassName` exists.
     render(<AssistantPage />)
     const note = screen.getByTestId('composer-gate-note')
     expect(note.className).toContain('text-status-grey-fg')
     expect(note.className).not.toContain('text-neutral')
+  })
+
+  it('★ keeps its urgent region mounted and empty, rather than inserting it with its text', () => {
+    // A live region added to the DOM together with its first message is missed outright by several
+    // reader-and-browser combinations — three places in this project already record it. The region
+    // has to be sitting in the accessibility tree before there is anything to announce, so it is
+    // present and blank on a screen where nothing has gone wrong.
+    render(<AssistantPage />)
+    const region = screen.getByTestId('assistant-urgent')
+    expect(region.getAttribute('role')).toBe('alert')
+    expect(region.textContent).toBe('')
+    // #EF4444 is 3.40:1 on this page's ground and fails AA; #B91C1C is 5.85:1.
+    expect(region.className).toContain('text-status-red-fg')
+    expect(region.className).not.toContain('text-danger')
   })
 
   it('★ takes what is typed, refuses to send it, and loses none of it', () => {
@@ -150,6 +168,19 @@ describe('the composer is the library own, and it will not send', () => {
 })
 
 describe('the sky behind it is decoration and nothing else', () => {
+  it('★ never traps its own content — the page grows rather than clipping it', () => {
+    // jsdom lays nothing out, so this is asserted on the class list. A fixed height plus an
+    // overflow clip here centred the stack in a box it could outgrow: measured at 1024x300 with a
+    // full composer, the greeting was cut off above and the gate note below, with no scrollbar to
+    // reach either. The shell above this element is what scrolls, and it can only do that if this
+    // one is free to grow.
+    render(<AssistantPage />)
+    const page = screen.getByTestId('assistant-page')
+    expect(page.className).toContain('min-h-full')
+    expect(page.className).not.toMatch(/(^|\s)h-full(\s|$)/)
+    expect(page.className).not.toContain('overflow-hidden')
+  })
+
   it('says nothing to a screen reader and catches no pointer', () => {
     render(<AssistantPage />)
     expect(sky().getAttribute('aria-hidden')).toBe('true')
@@ -163,9 +194,7 @@ describe('the sky behind it is decoration and nothing else', () => {
     expect(sky().querySelectorAll('.chat-plane')).toHaveLength(2)
   })
 
-  it('★ is the same field on every mount, not a reshuffle', () => {
-    // `Math.random` here would move every speck whenever a sibling set state — a backdrop that
-    // twitches under a keystroke, which only ever shows up in front of an audience.
+  it('is the same field on every mount, not a reshuffle', () => {
     const positions = () =>
       [...sky().querySelectorAll('.chat-mote')].map((node) => (node as HTMLElement).style.left)
 
@@ -177,5 +206,18 @@ describe('the sky behind it is decoration and nothing else', () => {
     expect(positions()).toEqual(first)
     // Liveness: a generator that returned one value for everything would also be "identical".
     expect(new Set(first).size).toBeGreaterThan(40)
+  })
+
+  it('★ never reaches for Math.random — which is the only mutation the test above cannot see', () => {
+    // The field is built ONCE at module scope, so swapping the seeded generator for `Math.random`
+    // still yields one field per bundle and every mount-to-mount comparison keeps passing. The
+    // defect it would let through is real — a reshuffle on any re-render once that call moved into
+    // the component — so the guard has to watch the import itself.
+    const spy = vi.spyOn(Math, 'random')
+    vi.resetModules()
+    return import('../../components/assistant/Backdrop').then((mod) => {
+      expect(typeof mod.default, 'the module really did re-execute').toBe('function')
+      expect(spy).not.toHaveBeenCalled()
+    })
   })
 })

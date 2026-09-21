@@ -225,15 +225,15 @@ body {
   100% { transform: translate3d(var(--mote-drift), -130vh, 0); opacity: 0; }
 }
 
-/* AN AIRCRAFT IS THREE ELEMENTS AND THREE KEYFRAMES sharing one duration and one delay: across, up,
-   and turned to face the way it is going. Composed, they trace one long shallow climb.
+/* AN AIRCRAFT IS TWO COMPOSED TRANSFORMS sharing one duration and one delay — across, and up —
+   over a glyph held at a fixed heading. `offset-path` would say it in one declaration but takes
+   absolute pixels, and this screen has no fixed size; vw/vh need no measurement and no script.
+   The heading is static because the turn along one of these arcs is four degrees, which on a 19px
+   silhouette moves its outline by less than a pixel — an animation nobody can see.
 
-   THE TWO LANES ARE SEPARATED SO NEITHER CROSSES THE WORDS — one stays under the composer, the
-   other above the heading. A 19px silhouette at 26% ink is quiet enough anywhere on the ground and
-   nowhere near quiet enough passing through a headline.
-   `offset-path` says the same thing in a single declaration and was the first attempt, but it takes
-   absolute pixels — a path drawn for one window is wrong in every other, and this screen has no
-   fixed size. Transforms in vw/vh need no measurement and no script. */
+   THE TWO LANES ARE SEPARATED SO NEITHER CROSSES THE WORDS: one stays under the composer, the
+   other above the heading. A 19px silhouette at 26% ink is quiet on the ground and nowhere near
+   quiet passing through a headline. */
 .chat-plane {
   position: absolute;
   left: 0;
@@ -250,20 +250,19 @@ body {
 .chat-plane-glyph {
   display: block;
   fill: rgba(26, 43, 52, 0.26);
-  animation: chat-plane-turn var(--plane-time) ease-in-out infinite;
-  animation-delay: var(--plane-offset);
+  transform: rotate(var(--plane-heading));
 }
 .chat-plane-a {
   --plane-time: 92s; --plane-offset: -25s;
   --plane-from: -12vw; --plane-to: 106vw;
   --plane-low: 96vh; --plane-high: 66vh;
-  --plane-heading: 83deg; --plane-heading-end: 79deg;
+  --plane-heading: 81deg;
 }
 .chat-plane-b {
   --plane-time: 118s; --plane-offset: -100s;
   --plane-from: 106vw; --plane-to: -12vw;
   --plane-low: 44vh; --plane-high: 6vh;
-  --plane-heading: -82deg; --plane-heading-end: -76deg;
+  --plane-heading: -79deg;
 }
 
 /* Each crosses in the first half of its cycle and waits off screen for the second, on two periods
@@ -280,11 +279,6 @@ body {
   0% { transform: translateY(var(--plane-low)); }
   50%, 100% { transform: translateY(var(--plane-high)); }
 }
-@keyframes chat-plane-turn {
-  0% { transform: rotate(var(--plane-heading)); }
-  50%, 100% { transform: rotate(var(--plane-heading-end)); }
-}
-
 @media (prefers-reduced-motion: reduce) {
   /* THE PORTAL'S REDUCED-MOTION GUARANTEE. Three mechanisms carry it, and these are all of them.
    *
@@ -336,12 +330,11 @@ body {
   /* BIAL Chat's sky. The motes keep their resting opacity and simply stop drifting, so the field
      is still there and still has depth — a settled backdrop makes no claim that stops being true.
      The aircraft are the opposite case: they rest at opacity 0 and are gone, because an aeroplane
-     pinned mid-air reads as a rendering fault rather than as an accommodation. Three selectors for
-     one aircraft, because the arc is three composed transforms on three elements. */
+     pinned mid-air reads as a rendering fault rather than as an accommodation. Two selectors for
+     one aircraft, because the arc is two composed transforms; its glyph only holds a heading. */
   .chat-mote,
   .chat-plane,
-  .chat-plane-lift,
-  .chat-plane-glyph {
+  .chat-plane-lift {
     animation: none;
   }
 }

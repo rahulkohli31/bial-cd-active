@@ -1,14 +1,16 @@
 /**
  * THE HEADING ON BIAL CHAT IS A GREETING, AND IT CHANGES.
  *
- * Thirty lines across four bands of the citizen's own clock, one picked on mount. `*word*` marks
- * the single word set italic in the brand teal — the only colour on that screen — and `{name}` is
- * filled from the signed-in profile.
+ * Thirty lines across four bands of the citizen's own clock, one picked on mount. `*…*` marks the
+ * one run set italic in the brand teal — usually a word, sometimes a short phrase, and the only
+ * colour on that screen — and `{name}` is filled from the signed-in profile.
  *
- * NINE OF THE THIRTY CARRY NO NAME, and that is two jobs in one list: it is the fallback for a
- * profile with no display name, and it is what stops the personalisation becoming a tic. A surface
- * that says "Rohith" every single time reads as a product performing familiarity rather than one
- * that knows who is signed in.
+ * NINE OF THE THIRTY CARRY NO NAME, and that is two jobs in one list: it is the whole of what a
+ * profile without a display name can be shown, and for everyone else it is what stops the
+ * personalisation becoming a tic. A surface that says "Asha" every single time reads as a product
+ * performing familiarity rather than one that knows who is signed in. Nameless is the thinner
+ * case — two or three lines per band rather than nine — which is why `candidates` guarantees a
+ * floor there and a test holds it to that.
  *
  * EVERYTHING HERE IS A PURE FUNCTION OVER ITS ARGUMENTS — the hour, the name and the previous pick
  * all arrive as parameters rather than being read from a clock, a profile or storage. That is what
@@ -23,7 +25,7 @@ export type Band = 'morning' | 'afternoon' | 'evening' | 'night'
 export interface Greeting {
   /** The band this line belongs to, or `any` for the two that fit whatever the hour is. */
   band: Band | 'any'
-  /** `*word*` wraps the accented word; `{name}` is optional and absent from nine of the thirty. */
+  /** `*…*` wraps the accented run; `{name}` is optional and absent from nine of the thirty. */
   headline: string
   /** One short line under it. Never a second sentence — the heading carries the screen. */
   sub: string
@@ -87,7 +89,8 @@ export function candidates(hour: number, name: string | null): readonly Greeting
 export interface GreetingRequest {
   /** The hour on the citizen's own clock, 0–23. */
   hour: number
-  /** Their first name, or `null` when the profile carries none — which narrows the set to nine. */
+  /** Their first name, or `null` when the profile carries none — which narrows the band to the
+   *  two or three lines in it that need no name. */
   name: string | null
   /** The headline shown last time, so a refresh never repeats it. */
   exclude?: string | null
@@ -107,7 +110,7 @@ export function pickGreeting({ hour, name, exclude = null, random = Math.random 
 
 export interface HeadlineSegment {
   text: string
-  /** True for the one word the screen paints teal and italic. */
+  /** True for the one run the screen paints teal and italic — a word, or a short phrase. */
   accent: boolean
 }
 

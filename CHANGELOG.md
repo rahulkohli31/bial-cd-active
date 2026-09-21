@@ -6,10 +6,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.8.1] - 2026-09-21
 
-Nothing in the platform behaves differently. What changed is that the repository now explains
-itself: someone who clones it finds an architecture document, a deployment guide, the decisions
-in force, runbooks for operating and recovering the platform, and a generated API reference —
-where before they found code and a one-line README.
+There is a new screen. **BIAL Chat** is a general assistant beside the app builder — you open it,
+it greets you, and you can type into it. It does not send yet, and it says so rather than
+pretending: this release is the screen, not the conversation behind it.
+
+Alongside it, the repository now explains itself: someone who clones it finds an architecture
+document, a deployment guide, the decisions in force, runbooks for operating and recovering the
+platform, and a generated API reference — where before they found code and a one-line README.
 
 The API reference is the one part that cannot quietly go stale. It is generated from the code and
 compared against it by a check that runs with no database, no cache and no configuration, so a
@@ -17,6 +20,10 @@ route that moves without the reference moving fails before it lands.
 
 ### Added
 
+- **BIAL Chat.** A second place to ask for things, reached from the left navigation. It opens on a
+  greeting that knows the time of day and your name, and a message box you can type in. Sending is
+  switched off for now and the screen says when it arrives, so nothing you write disappears into
+  silence. Behind it the sky drifts and the odd aircraft crosses — it is an airport.
 - **The repository explains itself.** A tracked `documentation/` directory covering how the system
   is built and why, what it needs from its host, the decisions in force, six operating procedures,
   and the API surface.
@@ -34,6 +41,13 @@ route that moves without the reference moving fails before it lands.
   for itself.
 - **Contributing carries the rules that keep the edition true**, along with three conventions whose
   decision records were retired and five practices drawn from the project's own solved problems.
+
+### Fixed
+
+- **The icons in the collapsed left rail sit in the middle of it.** Every one of them was five
+  pixels left of centre, because the row still held space for the label it had folded away.
+- **Text on the new screen meets the contrast floor.** The grey the message box uses for its notes
+  is readable against the page behind it, and so is the line that reports a file it cannot take.
 
 ### Removed
 

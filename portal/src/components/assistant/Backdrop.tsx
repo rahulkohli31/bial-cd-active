@@ -6,21 +6,16 @@
  * says nothing and it catches nothing, so the composer keeps every click on the screen.
  *
  * THE WASH IS IN ONE CORNER AND NOT IN THE MIDDLE, which is the difference between depth and a
- * halo. A bright pool at the centre of a blue-grey ground gives a near-white middle against blue
- * corners with a visible ring between them; a wash running off one corner has no centre-to-edge
- * transition to read at all. Its colour is `#E2E8F0`, the hairline the portal already draws on
- * every card and panel, so the ground stays exactly the `#F0F4F8` of every other page and nothing
- * new enters the palette.
+ * halo: a bright pool at the centre of a blue-grey ground leaves a near-white middle against blue
+ * corners with a visible ring between the two. Its colour is `#E2E8F0`, the hairline the portal
+ * already draws on every card, so nothing new enters the palette.
  *
  * THE GEOMETRY IS RANDOM BUT NOT RANDOMISED. A seeded generator run once at module scope gives one
- * field for the life of the bundle: the same specks in the same places on every render, every
- * mount and every reload. `Math.random` here would reshuffle the sky under a re-render, and a
- * backdrop that twitches when a sibling sets state is a bug that only shows up in front of an
- * audience.
+ * field for the life of the bundle: `Math.random` here would reshuffle the sky under any re-render,
+ * and a backdrop that twitches when a sibling sets state only shows itself in front of an audience.
  *
- * EVERYTHING THAT MOVES IS A CSS ANIMATION, and that is load-bearing rather than incidental: it
- * puts all of it behind the stylesheet's reduce-motion block — see the guarantee docblock in
- * `index.css` — with no branch in this file and no new mechanism anywhere.
+ * EVERYTHING THAT MOVES IS A CSS ANIMATION, which is load-bearing rather than incidental: it puts
+ * all of it behind the stylesheet's reduce-motion block with no branch in this file.
  */
 import type { CSSProperties } from 'react'
 
@@ -112,13 +107,9 @@ function field(): Mote[] {
 const MOTES = field()
 
 /**
- * One aircraft. THREE NESTED ELEMENTS BECAUSE THE ARC IS THREE COMPOSED TRANSFORMS — across, up,
- * and turned to face the way it is going. They share one duration and one delay, so the three
- * keyframes stay in step and the composition traces a single curve.
- *
- * `offset-path` would say this in one declaration and was the first attempt, but it takes absolute
- * pixels: a path drawn for one window is wrong in every other, and this screen has no fixed size.
- * Transforms in `vw`/`vh` are responsive with no measurement and no JavaScript.
+ * One aircraft: an element for the crossing, one for the climb, and the glyph at a fixed heading.
+ * The two animations share a duration and a delay so the composition traces a single arc; the
+ * geometry and the reason it is built this way are in `index.css`.
  */
 function Aircraft({ lane }: { lane: 'a' | 'b' }) {
   return (

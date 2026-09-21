@@ -66,9 +66,10 @@ export interface ComposerProps {
    * The grey the notes under the box are painted in — the gate sentence, the context line and the
    * counter. A COLOUR RATHER THAN A FREE CLASS SLOT, and it exists because of a measured contrast
    * failure rather than taste: the default suits the white the chat surface sits the composer on,
-   * where `text-neutral` is 4.83:1, and fails on `bial-bg`, where the same grey is 4.44:1 — under
+   * where `text-neutral` is 4.83:1, and fails on `bial-bg`, where the same grey is 4.37:1 — under
    * the 4.5:1 floor for body text. A screen that puts this composer on the platform ground must
-   * pass a darker one.
+   * pass a darker one. It takes any class string, so a caller can reach the counter and the
+   * context line with it too; a colour is what it is for.
    */
   noteClassName?: string
 }

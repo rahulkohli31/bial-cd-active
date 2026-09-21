@@ -17,7 +17,7 @@
  * composer dropping to the bottom of the screen — is a separate design, not a hidden half of this
  * one.
  */
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { motion } from 'motion/react'
 
 import Backdrop from '../components/assistant/Backdrop'
@@ -54,13 +54,15 @@ const doesNothing = () => Promise.resolve()
 export default function AssistantPage() {
   const [urgent, setUrgent] = useState<string | null>(null)
 
-  // PICKED ONCE, ON MOUNT. A greeting chosen during render would change under any re-render — a
-  // keystroke in the composer is enough — and a heading that rewrites itself while someone is
-  // typing under it reads as a glitch rather than as a welcome.
-  const greeting = useMemo(() => {
+  // PICKED ONCE, ON MOUNT, AND `useState` RATHER THAN `useMemo` IS THE WHOLE POINT. A greeting
+  // chosen during render would change under any re-render — a keystroke in the composer is
+  // enough — and a heading that rewrites itself while someone is typing under it reads as a
+  // glitch. `useMemo` is a performance hint React is allowed to discard and recompute; a state
+  // initialiser is the only hook that promises to run exactly once for the life of the mount.
+  const [greeting] = useState(() => {
     const name = firstName(getStoredUser()?.display_name)
     return { name, ...pickGreeting({ hour: new Date().getHours(), name, exclude: lastGreeting() }) }
-  }, [])
+  })
 
   // Remembered after the pick rather than inside it, so choosing a greeting stays a pure function
   // of its arguments and the one thing here that can throw sits on its own.
@@ -69,10 +71,16 @@ export default function AssistantPage() {
   const parts = headlineParts(greeting.headline, greeting.name)
 
   return (
-    <div className="relative h-full overflow-hidden bg-bial-bg font-manrope" data-testid="assistant-page">
+    // `min-h-full`, NEVER `h-full`, AND NOTHING CLIPS HERE. A fixed height plus `overflow-hidden`
+    // centred the stack in a box it could outgrow: at 1024x300 with a full composer the greeting
+    // was cut off above and the gate note below, with no scrollbar to reach either, because the
+    // clip was on this element rather than on the shell that scrolls. A minimum height fills the
+    // screen when the content is short and grows past it when it is not, which leaves the shell's
+    // own `overflow-y-auto` free to do its job. The backdrop clips itself.
+    <div className="relative min-h-full bg-bial-bg font-manrope" data-testid="assistant-page">
       <Backdrop />
 
-      <div className="relative flex h-full flex-col items-center justify-center px-6">
+      <div className="relative flex min-h-full flex-col items-center justify-center px-6 py-12">
         {/* ONE MOTION ON THE WHOLE STACK, not a stagger across its three parts. `lib/motion.ts`
             allows two curves and nothing longer than 260ms; a three-step entrance runs past 400ms
             and puts this screen outside the vocabulary every other surface keeps to. */}
@@ -119,18 +127,27 @@ export default function AssistantPage() {
                 // No ground and no gutter of its own: the box sits directly on the platform's,
                 // which is what the board draws.
                 frameClassName="flex w-full flex-col gap-1.5"
-                // `text-neutral` is 4.44:1 on this page's ground and fails AA. See the prop.
+                // `text-neutral` is 4.37:1 on this page's ground and fails AA. See the prop.
                 noteClassName="text-status-grey-fg"
               />
             </ChatRuntimeProvider>
           </div>
 
-          {/* A refused file is the only urgent thing this screen can produce — nothing sends. */}
-          {urgent && (
-            <p role="alert" className="mt-1.5 text-xs text-danger">
-              {urgent}
-            </p>
-          )}
+          {/* MOUNTED ALWAYS, USUALLY EMPTY. A live region inserted together with its text is
+              missed outright by several reader-and-browser combinations — `Announcer.tsx` records
+              the three places this project already learned that — so the region has to be sitting
+              in the accessibility tree before there is anything to put in it. A refused file is
+              the only urgent thing this screen can produce, since nothing sends.
+
+              `status.red-fg`, not `text-danger`: #EF4444 measures 3.40:1 on this page's ground and
+              fails AA for body text, where #B91C1C measures 5.85:1. */}
+          <p
+            role="alert"
+            data-testid="assistant-urgent"
+            className={`text-xs text-status-red-fg ${urgent ? 'mt-1.5' : ''}`}
+          >
+            {urgent ?? ''}
+          </p>
         </motion.div>
       </div>
     </div>

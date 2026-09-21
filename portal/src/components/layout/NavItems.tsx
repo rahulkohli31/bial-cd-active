@@ -118,8 +118,13 @@ export default function NavItems({ onNavigate, onItemFocus, collapsed = false }:
             // FOCUS MUST NOT LOOK LIKE ACTIVE. The active item carries a tinted ground; focus
             // carries a ring. Without the distinction a keyboard user on a non-active item sees
             // two highlighted rows and cannot tell which one Enter will open.
-            className={`relative flex items-center gap-2.5 rounded-lg py-2.5 text-left text-[13.5px] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 ${
-              collapsed ? 'justify-center px-0' : 'px-2.5'
+            // THE GAP BELONGS TO THE LABEL, SO IT GOES WHEN THE LABEL DOES. The row still holds
+            // the folded label as a zero-width flex item, and a gap applies between flex items
+            // whatever their size — so at rail width the row centred an 18px icon plus 10px of
+            // space before nothing, and every glyph sat 5px left of the column it lives in.
+            // `ProfileCluster` already spells the gap this way.
+            className={`relative flex items-center rounded-lg py-2.5 text-left text-[13.5px] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 ${
+              collapsed ? 'justify-center px-0' : 'gap-2.5 px-2.5'
             } ${
               active ? 'font-semibold text-primary' : 'font-medium text-neutral hover:text-primary-900'
             }`}

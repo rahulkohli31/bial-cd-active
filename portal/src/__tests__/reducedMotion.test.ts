@@ -191,7 +191,7 @@ const FIXTURE_BLOCK_BEFORE_UTILITIES = `@tailwind base;\n\n${BLOCK}\n\n@tailwind
 const FIXTURE_BLOCK_INSIDE_A_LAYER = `@tailwind base;\n@tailwind utilities;\n\n@layer utilities {\n${BLOCK}\n}\n`
 
 describe('the reduce-motion block suppresses every animation utility the portal waits with', () => {
-  it('names all five selectors and sets `animation: none` on each', () => {
+  it('names every required selector and sets `animation: none` on each', () => {
     expect(missingSelectors(CSS)).toEqual([])
   })
 
@@ -226,7 +226,7 @@ describe('source order is the mechanism, so it is asserted', () => {
 
     const moved = reduceMotionBlock(FIXTURE_BLOCK_BEFORE_UTILITIES)
     expect(moved.startsAt).toBeLessThan(moved.utilitiesAt)
-    // The five selectors survive the move untouched — which is exactly why the order assertion
+    // The selectors survive the move untouched — which is exactly why the order assertion
     // has to exist separately.
     expect(missingSelectors(FIXTURE_BLOCK_BEFORE_UTILITIES)).toEqual([])
   })

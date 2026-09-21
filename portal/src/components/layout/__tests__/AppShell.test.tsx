@@ -53,12 +53,10 @@ const ADMIN = { email: 'priya@bial.aero', display_name: 'Priya Nair', isAdmin: t
 const USAGE = { used: 537_102, limit: 1_000_000, remaining: 462_898, resetsAt: '' }
 const counts = (pending: number) => ({ draft: 0, pending, approved: 0, rejected: 0, disabled: 0 })
 
-/** The six destinations, in the order `NavStates.dc.html` draws them, with BIAL Chat second
- *  as `NavExpanded.dc.html` draws it.
+/** The six destinations, in the order `NavStates.dc.html` draws them.
  *
- *  THE ORDER TEST FILTERS THE RENDERED BUTTONS *BY* THIS LIST, so a destination missing from
- *  here is not a failure — it is silently dropped, and the test goes on claiming it checks the
- *  order of everything in the rail while covering one row less. */
+ *  THE ORDER TEST FILTERS THE RENDERED BUTTONS *BY* THIS LIST, so a destination missing from here
+ *  is not a failure — it is dropped, and the test goes on claiming it checks the whole rail. */
 const BOARD_ORDER = [
   'My Applications',
   'BIAL Chat',
