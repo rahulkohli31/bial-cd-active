@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-route
 import LoginPage from './pages/LoginPage'
 import AdminPage from './pages/AdminPage'
 import ChatRoute from './pages/ChatRoute'
+import AssistantPage from './pages/AssistantPage'
 import MarketplacePage from './pages/MarketplacePage'
 import SharedApplicationsPage from './pages/SharedApplicationsPage'
 import IntegrationsPage from './pages/IntegrationsPage'
@@ -138,6 +139,11 @@ export default function App() {
             out of the URL because a link a colleague pasted around would have promised them
             someone else's "shared with me"; this address lands every reader on their own. */}
         <Route path="/shared-applications" element={<Shell><SharedApplicationsPage /></Shell>} />
+        {/* THE ASSISTANT GETS ITS OWN ADDRESS, not `/chat`. That prefix already means a
+            conversation about one application (`/chat/:chatId` below), and a product where
+            `/chat` and `/chat/<id>` are two unrelated surfaces is the trap reclaiming the
+            route was meant to end. A later `/assistant/<id>` extends cleanly from here. */}
+        <Route path="/assistant" element={<Shell><AssistantPage /></Shell>} />
         {/* Cross-user by design: every signed-in BIAL user sees the same catalog. */}
         <Route path="/marketplace" element={<Shell><MarketplacePage /></Shell>} />
         {/* ONE ROUTE REACHES INTEGRATIONS. It was a dialog with two doors and no address, so

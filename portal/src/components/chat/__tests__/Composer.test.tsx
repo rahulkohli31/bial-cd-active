@@ -462,3 +462,18 @@ describe('the send-unavailable cascade, with more than one arm true', () => {
     noRealDisabled(container)
   })
 })
+
+describe('the grey the notes under the box are painted in', () => {
+  it('defaults to the chat surface’s, which sits the composer on white', () => {
+    draw({ isRunning: true })
+    expect(gateNote()?.className).toContain('text-neutral')
+  })
+
+  it('★ a caller on the platform ground passes a darker one, because the default fails AA there', () => {
+    // #6B7280 on #F0F4F8 measures 4.44:1, under the 4.5:1 floor for body text. It passes
+    // everywhere else only because this composer almost always sits on white, where it is 4.83:1.
+    draw({ isRunning: true, noteClassName: 'text-status-grey-fg' })
+    expect(gateNote()?.className).toContain('text-status-grey-fg')
+    expect(gateNote()?.className).not.toContain('text-neutral')
+  })
+})

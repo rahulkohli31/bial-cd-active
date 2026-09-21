@@ -62,6 +62,15 @@ export interface ComposerProps {
    * composer inside a section that already owns its padding and ground.
    */
   frameClassName?: string
+  /**
+   * The grey the notes under the box are painted in — the gate sentence, the context line and the
+   * counter. A COLOUR RATHER THAN A FREE CLASS SLOT, and it exists because of a measured contrast
+   * failure rather than taste: the default suits the white the chat surface sits the composer on,
+   * where `text-neutral` is 4.83:1, and fails on `bial-bg`, where the same grey is 4.44:1 — under
+   * the 4.5:1 floor for body text. A screen that puts this composer on the platform ground must
+   * pass a darker one.
+   */
+  noteClassName?: string
 }
 
 const Composer: FC<ComposerProps> = ({
@@ -76,6 +85,7 @@ const Composer: FC<ComposerProps> = ({
   footerNote,
   onUrgent,
   frameClassName = 'flex flex-col gap-1.5 bg-bial-surface px-3 py-2.5',
+  noteClassName = 'text-neutral',
 }) => {
   const aui = useAui()
   const text = useAuiState((s) => s.composer.text)
@@ -218,7 +228,7 @@ const Composer: FC<ComposerProps> = ({
                 className={
                   offerLocked
                     ? 'text-center text-[11px] leading-relaxed text-canvas-offerink'
-                    : 'text-xs text-neutral'
+                    : `text-xs ${noteClassName}`
                 }
               >
                 {offerLocked ? OFFER_LOCKED_NOTE : unavailableReason}
@@ -231,7 +241,7 @@ const Composer: FC<ComposerProps> = ({
               <p
                 role="status"
                 data-testid="composer-context-warning"
-                className="text-xs leading-relaxed text-neutral"
+                className={`text-xs leading-relaxed ${noteClassName}`}
               >
                 {contextWarning}
               </p>
@@ -248,7 +258,7 @@ const Composer: FC<ComposerProps> = ({
             {cap.showCounter && (
               <p
                 data-testid="composer-counter"
-                className={`self-end text-xs tabular-nums ${cap.over ? 'font-semibold text-danger' : 'text-neutral'}`}
+                className={`self-end text-xs tabular-nums ${cap.over ? 'font-semibold text-danger' : noteClassName}`}
               >
                 {cap.count.toLocaleString()} / {MAX_COMPOSER_CHARS.toLocaleString()}
               </p>

@@ -25,6 +25,9 @@ const h = vi.hoisted(() => ({
 vi.mock('./utils/auth', () => ({
   isAuthenticated: () => h.authed,
   bootstrapSession: (...a) => h.bootstrap(...a),
+  // BIAL Chat renders for real here, like every other list page, and it reads the cached
+  // profile to decide whether its greeting may use a name. No profile is the nameless branch.
+  getStoredUser: () => null,
 }))
 
 // `vi.mock` factories are hoisted above every top-level binding, so the stub helper has
@@ -276,6 +279,15 @@ describe('App — addresses outside a project get no workspace frame', () => {
     // pathname — so the two cannot come to disagree about what a row offers.
     renderAt('/shared-applications')
     expect(screen.getByTestId('shared-applications')).toBeTruthy()
+    expect(screen.queryByTestId('projects')).toBeNull()
+    expect(shell()).toBeNull()
+  })
+
+  it('★ /assistant is the assistant own address, and it is deliberately not /chat', () => {
+    // `/chat/<id>` means a conversation about one application. An assistant sharing that prefix
+    // would put two unrelated surfaces under one address — the trap reclaiming `/chat` ended.
+    renderAt('/assistant')
+    expect(screen.getByTestId('assistant-page')).toBeTruthy()
     expect(screen.queryByTestId('projects')).toBeNull()
     expect(shell()).toBeNull()
   })

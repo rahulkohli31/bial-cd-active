@@ -53,9 +53,15 @@ const ADMIN = { email: 'priya@bial.aero', display_name: 'Priya Nair', isAdmin: t
 const USAGE = { used: 537_102, limit: 1_000_000, remaining: 462_898, resetsAt: '' }
 const counts = (pending: number) => ({ draft: 0, pending, approved: 0, rejected: 0, disabled: 0 })
 
-/** The five destinations, in the order `NavStates.dc.html` draws them. */
+/** The six destinations, in the order `NavStates.dc.html` draws them, with BIAL Chat second
+ *  as `NavExpanded.dc.html` draws it.
+ *
+ *  THE ORDER TEST FILTERS THE RENDERED BUTTONS *BY* THIS LIST, so a destination missing from
+ *  here is not a failure — it is silently dropped, and the test goes on claiming it checks the
+ *  order of everything in the rail while covering one row less. */
 const BOARD_ORDER = [
   'My Applications',
+  'BIAL Chat',
   'Shared Applications',
   'App Marketplace',
   'Integrations',
@@ -129,7 +135,7 @@ function renderAt(path: string) {
 }
 
 describe('the navigation the boards draw', () => {
-  it('renders all five entries in board order for an administrator', async () => {
+  it('renders all six entries in board order for an administrator', async () => {
     h.getStoredUser.mockReturnValue(ADMIN)
     renderAt('/projects')
     const labels = (await screen.findAllByRole('button'))
@@ -175,7 +181,7 @@ describe('the navigation the boards draw', () => {
   it('hides the Admin entry entirely from a citizen, and asks for no count on their behalf', async () => {
     renderAt('/projects')
     await screen.findByTestId('nav-panel')
-    // Absence, PAIRED WITH LIVENESS: the other four rendered, so this is a gate rather than a
+    // Absence, PAIRED WITH LIVENESS: the other five rendered, so this is a gate rather than a
     // crash that happened to leave the page blank.
     expect(screen.queryByTestId('nav-admin')).toBeNull()
     expect(screen.getByTestId('nav-projects')).not.toBeNull()
@@ -213,6 +219,7 @@ describe('the navigation the boards draw', () => {
 describe('every destination navigates directly — no exit routine in the way', () => {
   it.each([
     ['nav-projects', '/projects'],
+    ['nav-assistant', '/assistant'],
     ['nav-shared-applications', '/shared-applications'],
     ['nav-marketplace', '/marketplace'],
     ['nav-integrations', '/integrations'],

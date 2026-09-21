@@ -40,14 +40,18 @@ const CSS = readFileSync(path.resolve(ROOT, CSS_FILE), 'utf8')
 const CONFIG = readFileSync(path.resolve(ROOT, CONFIG_FILE), 'utf8')
 const ENTRY = readFileSync(path.resolve(ROOT, ENTRY_FILE), 'utf8')
 
-/** The five utilities the block must neutralise. The first two are the app pane;
- *  the last three are every perpetual wait in the product, the bug named above. */
+/** The seven selectors the block must neutralise. The first two are the app pane; the next three
+ *  are every perpetual wait in the product, the bug named above; the last two are BIAL Chat's
+ *  backdrop, which drifts and flies for as long as that screen is open — the same class of
+ *  never-ending motion, arriving as a decoration rather than as a wait. */
 const REQUIRED_SELECTORS = [
   '.animate-pane-leave',
   '.animate-pane-return',
   '.animate-spin',
   '.animate-pulse',
   '.animate-bounce',
+  '.chat-mote',
+  '.chat-plane',
 ] as const
 
 /** The other mechanism: a subscribed `matchMedia` boolean, for the places that swap the ELEMENT
