@@ -22,8 +22,8 @@ not lose anyone's work. Treat a Redis incident as a cache-loss drill, not a data
 
 There is no publish/subscribe channel here — build progress is delivered in-process on the
 control-plane instance that is handling that build. That only works because the control plane
-runs as a single instance; see `architecture.md` and `deployment.md` for why that constraint
-holds and what it would take to change it.
+runs as a single instance; see `deployment.md` for why that constraint holds and what it would
+take to change it.
 
 ## Provisioning
 

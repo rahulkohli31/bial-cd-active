@@ -3,30 +3,22 @@
     uv run python scripts/openapi.py --write    # regenerate the committed file
     uv run python scripts/openapi.py --check    # compare, and fail naming what moved
 
-WHY THE FILE IS COMMITTED. Production serves no schema endpoint — `create_app()` sets
-`openapi_url=None` there, because an unauthenticated caller would otherwise be handed the whole
-surface. So a reader holding this repository has nothing to ask, and the reference has to travel
-with the code. That only works while the committed copy is true, which is what `--check` is for.
+WHY THIS EXISTS. Production serves no schema endpoint — `create_app()` sets `openapi_url=None`
+there, because an unauthenticated caller would otherwise be handed the whole surface. A reader
+holding this repository has nothing to ask, so the reference travels with the code, and that only
+works while the committed copy is true. One script both writes and checks it: a separate checker
+would be a second opinion that drifts from the first, and a drift checker that drifts is worse
+than none.
 
-WHY ONE SCRIPT AND NOT TWO. A checker that re-implements "what the spec should look like" is a
-second opinion that drifts from the first, and a drift checker that drifts is worse than none.
-`--write` and `--check` share one serialiser, so they cannot disagree about formatting.
+The schema comes from route signatures and Pydantic models, so nothing here opens a connection —
+which is what lets the check sit beside the linters rather than behind a provisioned database.
+Keys are sorted and the environment is pinned to the sample file, so the bytes cannot depend on
+iteration order or on whatever the caller happens to have configured. The write goes through
+`newline=""` so the LF survives a Windows checkout, where line-ending translation would otherwise
+fail this check there while passing here — the worst shape a guard can have.
 
-WHY IT RUNS WITHOUT A DATABASE. The schema is built from route signatures and Pydantic models,
-none of which open a connection. The generator constructs the application and asks it for the
-schema object; nothing in that path dials Postgres or Redis. That is what lets the check sit in
-the static gate list beside the linters rather than behind a provisioned database, and it is
-asserted by the suite rather than assumed.
-
-DETERMINISM IS A REQUIREMENT, NOT A NICETY. Keys are sorted and the trailing newline is fixed, so
-set iteration order cannot reach the file and produce a fresh diff on every run. The write goes
-through `newline=""` so the LF survives on the Windows build host, where a checkout with line-
-ending translation would otherwise rewrite every line and fail this check there while passing
-here — the worst shape a guard can have. The `.gitattributes` entry covering the published
-reference is the other half of that.
-
-THE CHECK NEVER REPAIRS. A self-healing drift check hides the drift it exists to surface, so
-`--check` only ever reports and exits non-zero. Repair is `--write`, run deliberately.
+`--check` only ever reports and exits non-zero. A self-healing drift check hides the drift it
+exists to surface; repair is `--write`, run deliberately.
 """
 
 from __future__ import annotations
@@ -50,7 +42,7 @@ from typing import Any, Final  # noqa: E402
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 TARGET: Final = REPO_ROOT / "documentation" / "reference" / "openapi.json"
 REGENERATE_COMMAND: Final = "uv run python scripts/openapi.py --write"
-SAMPLE_ENVIRONMENT: Final = ".env.example"
+SAMPLE_ENVIRONMENT: Final = REPO_ROOT / "backend" / ".env.example"
 
 _HTTP_METHODS: Final = frozenset(
     {"get", "put", "post", "delete", "options", "head", "patch", "trace"}
@@ -78,7 +70,7 @@ def build_spec() -> dict[str, Any]:
     # configured locally — otherwise two people regenerate two different files and the byte
     # comparison starts reporting each other's configuration as drift. The sample environment is
     # also the only one a fresh clone has.
-    os.environ["ENV_FILE"] = SAMPLE_ENVIRONMENT
+    os.environ["ENV_FILE"] = str(SAMPLE_ENVIRONMENT)
 
     noise = io.StringIO()
     try:
@@ -96,24 +88,12 @@ def serialise(spec: Mapping[str, Any]) -> str:
     return json.dumps(spec, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
 
-def operations(spec: Mapping[str, Any]) -> frozenset[str]:
-    """Every operation as `METHOD /path`.
+def _operation_bodies(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """Every operation as `METHOD /path` mapped to its body.
 
     Path items also carry non-operation keys such as `parameters` and `summary`, so the method
     names are matched against a closed set rather than assumed.
     """
-    found: set[str] = set()
-    paths = spec.get("paths") or {}
-    for path, item in paths.items():
-        if not isinstance(item, Mapping):
-            continue
-        for method, operation in item.items():
-            if method.lower() in _HTTP_METHODS and isinstance(operation, Mapping):
-                found.add(f"{method.upper()} {path}")
-    return frozenset(found)
-
-
-def _operation_bodies(spec: Mapping[str, Any]) -> dict[str, Any]:
     bodies: dict[str, Any] = {}
     paths = spec.get("paths") or {}
     for path, item in paths.items():
@@ -123,6 +103,21 @@ def _operation_bodies(spec: Mapping[str, Any]) -> dict[str, Any]:
             if method.lower() in _HTTP_METHODS and isinstance(operation, Mapping):
                 bodies[f"{method.upper()} {path}"] = operation
     return bodies
+
+
+def operations(spec: Mapping[str, Any]) -> frozenset[str]:
+    """Every operation as `METHOD /path`, derived from one traversal rather than a second one."""
+    return frozenset(_operation_bodies(spec))
+
+
+def _rendered(value: Any) -> str:
+    """Compare documents the way the file stores them.
+
+    Python equality is the wrong instrument here: `0 == False` and `1 == 1.0` are true, so two
+    documents that serialise to different bytes can compare equal and a real change reports as
+    none. Everything compared here is rendered first.
+    """
+    return json.dumps(value, sort_keys=True, default=str)
 
 
 def _listed(label: str, names: list[str]) -> list[str]:
@@ -154,14 +149,21 @@ def describe_drift(committed: Mapping[str, Any], current: Mapping[str, Any]) -> 
     changed = sorted(
         name
         for name in committed_ops & current_ops
-        if committed_bodies[name] != current_bodies[name]
+        if _rendered(committed_bodies[name]) != _rendered(current_bodies[name])
     )
 
     elsewhere = sorted(
         key
         for key in set(committed) | set(current)
-        if key != "paths" and committed.get(key) != current.get(key)
+        if key != "paths" and _rendered(committed.get(key)) != _rendered(current.get(key))
     )
+
+    # A path item carries keys that are not operations. Compare what the operation walk did not
+    # cover, or a change to one is reported as a formatting difference.
+    if not (added or removed or changed or elsewhere) and _rendered(
+        committed.get("paths")
+    ) != _rendered(current.get("paths")):
+        elsewhere = ["paths (outside any operation)"]
 
     if not (added or removed or changed or elsewhere):
         return ""
@@ -186,6 +188,18 @@ def _write(text: str) -> None:
         handle.write(text)
 
 
+def _display(path: Path) -> str:
+    """The path as a reader recognises it — repo-relative when it is inside the repository.
+
+    `relative_to` raises rather than falling back, so a target outside the tree would turn a
+    diagnostic into a second, unrelated failure.
+    """
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
 def _read() -> str:
     # `newline=""` so a CRLF checkout is visible here rather than being decoded away — hiding it
     # is exactly how this guard would pass locally and fail on the build host.
@@ -206,16 +220,14 @@ def main(argv: list[str] | None = None) -> int:
         _write(rendered)
         operation_count = len(operations(current))
         print(
-            f"wrote {TARGET.relative_to(REPO_ROOT)} "
-            f"({len(rendered):,} bytes, {operation_count:,} operations)",
+            f"wrote {_display(TARGET)} ({len(rendered):,} bytes, {operation_count:,} operations)",
             file=sys.stderr,
         )
         return 0
 
     if not TARGET.exists():
         print(
-            f"{TARGET.relative_to(REPO_ROOT)} does not exist.\n\n"
-            f"Generate it with:  {REGENERATE_COMMAND}",
+            f"{_display(TARGET)} does not exist.\n\nGenerate it with:  {REGENERATE_COMMAND}",
             file=sys.stderr,
         )
         return 1
@@ -224,7 +236,18 @@ def main(argv: list[str] | None = None) -> int:
     if committed_text == rendered:
         return 0
 
-    message = describe_drift(json.loads(committed_text), current)
+    try:
+        committed = json.loads(committed_text)
+    except json.JSONDecodeError as exc:
+        print(
+            f"{_display(TARGET)} is not valid JSON ({exc}).\n"
+            "A conflict marker in the generated document reads this way.\n\n"
+            f"Regenerate with:  {REGENERATE_COMMAND}",
+            file=sys.stderr,
+        )
+        return 1
+
+    message = describe_drift(committed, current)
     if not message:
         # Same document, different bytes: someone reformatted the file by hand.
         message = (

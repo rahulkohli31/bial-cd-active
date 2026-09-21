@@ -1,27 +1,20 @@
 """The committed API reference must describe the surface this tree actually serves.
 
-WHAT THIS GUARDS. `documentation/reference/openapi.json` is the published API reference. It is
-committed because production disables the served schema route, so a reader holding the clone has
-no endpoint to ask — and a committed artefact nobody regenerates is worse than none, because it
-reads as authoritative while describing a surface that has moved. This is the only executable
-guard the published documentation has; every other document in it is prose that nothing checks.
+WHY THIS EXISTS. `documentation/reference/openapi.json` is published because production disables
+the served schema route, so a reader holding the clone has no endpoint to ask — and a committed
+artefact nobody regenerates is worse than none, because it reads as authoritative while describing
+a surface that has moved. This is the only executable guard the published documentation has;
+everything else in it is prose that nothing checks.
 
-WHY THE GUARD ITSELF IS A SCRIPT AND NOT A TEST. `tests/conftest.py` raises at collection when the
-configured database is not a test database, so everything in this package is database-bound. The
-guard has to run on a fresh clone with nothing provisioned, which is why it is a command beside
-the linters. Running the guard and testing the guard are different jobs with different
-constraints, and this file is the second one.
+The guard itself is a script rather than a test because `tests/conftest.py` raises at collection
+when the configured database is not a test database, and the guard has to run on a fresh clone with
+nothing provisioned. Running the guard and testing the guard are different jobs; this file is the
+second one, so anything here that touches the committed bytes spawns the script in a child process
+with a stripped environment — which is also what proves it needs no database, no cache and no
+configuration.
 
-WHY THE MESSAGE IS PINNED AND NOT JUST THE EXIT CODE. A check that fails with "files differ"
-teaches nothing and trains people to regenerate blindly, which is the opposite of noticing. The
-failure names the operations that moved and the command that repairs them, and both are asserted
-below.
-
-WHY THE COMPARISONS RUN IN A CHILD. The committed file is generated against the sample
-environment; this suite runs against the test environment. Comparing an in-process generation
-against the committed bytes would be comparing two different configurations, so anything that
-touches those bytes spawns an interpreter with `ENV_FILE=.env.example` — which is also what
-proves the generator needs no database and no Redis.
+The failure message is asserted, not just the exit code: a check that fails with "files differ"
+teaches nothing and trains people to regenerate blindly, which is the opposite of noticing.
 """
 
 from __future__ import annotations
@@ -39,6 +32,7 @@ from scripts.openapi import (
     TARGET,
     describe_drift,
     operations,
+    serialise,
 )
 from tests.subprocess_env import child_env
 
@@ -222,33 +216,60 @@ def test_an_identical_spec_reports_no_drift() -> None:
 # --- the production gate suppresses the served route, not the schema object ------------------
 
 
-def test_the_production_gate_removes_the_route_and_not_the_schema() -> None:
-    """The assumption that makes committing this file both safe and necessary.
+def test_the_served_surface_does_not_depend_on_configuration() -> None:
+    """The assumption that makes one committed document honest for every deployment.
 
-    Production sets `openapi_url=None`, which is why a reader holding the clone has no endpoint
-    to ask and needs the committed copy. The generator does not fetch that endpoint — it asks the
-    application object for its schema — so the gate cannot change what gets published. This pins
-    that independence directly.
-
-    Deliberately NOT written by booting a production-configured application. Production turns on
-    a chain of settings validators — TLS, HTTPS origins, the registry builder and its
-    coordinates, object storage — none of which have anything to do with the claim, and
-    reconstructing them here would make the test fail the next time one is added while proving
-    nothing more than it does now.
+    The document is generated from the sample environment. If any route were registered
+    conditionally on settings, that file would describe one configuration while claiming to be
+    the contract. This suite runs under a different environment from the one that generated it,
+    so comparing the two operation sets is a real cross-configuration check.
     """
     from src.main import create_app
 
+    assert operations(create_app().openapi()) == operations(shipped_spec())
+
+
+def test_the_production_gate_removes_the_route_and_not_the_schema() -> None:
+    """Production sets `openapi_url=None`, which is why the committed copy is the only reference a
+    reader has. The generator asks the application object for its schema rather than fetching that
+    route, so the gate cannot change what gets published."""
+    from src.main import create_app
+
     app = create_app()
-    assert app.openapi_url is not None, "the sample environment is a development one"
-    served = app.openapi()
+    assert app.openapi_url is not None, "the test environment serves the schema route"
+    assert operations(app.openapi()), "the schema object is built regardless of the served route"
 
-    # The whole of what the production branch does to the schema surface.
-    app.openapi_url = None
-    app.docs_url = None
-    app.redoc_url = None
-    app.openapi_schema = None
 
-    assert app.openapi() == served
+def test_any_byte_difference_is_reported_as_drift() -> None:
+    """The invariant the checker exists to hold, stated directly.
+
+    Python equality is not byte equality — `0 == False` and `1 == 1.0` — so a document that
+    serialises differently can compare equal and report nothing. Each mutation below changes the
+    bytes, so each one must produce a message.
+    """
+    committed = shipped_spec()
+    mutations: list[tuple[str, dict[str, Any]]] = []
+
+    zero_to_false = json.loads(shipped_text())
+    for schema in (zero_to_false.get("components", {}).get("schemas") or {}).values():
+        for prop in (schema.get("properties") or {}).values():
+            if prop.get("default") == 0 and not isinstance(prop.get("default"), bool):
+                prop["default"] = False
+                mutations.append(("an integer default becomes a boolean", zero_to_false))
+                break
+        if mutations:
+            break
+
+    reshaped = json.loads(shipped_text())
+    reshaped["openapi"] = [reshaped["openapi"]]
+    mutations.append(("a top-level value changes shape", reshaped))
+
+    assert mutations, "the shipped spec no longer carries the shape this test mutates"
+    for description, mutated in mutations:
+        assert serialise(committed) != serialise(mutated), description
+        assert describe_drift(committed, mutated), (
+            f"bytes differ but no drift was reported: {description}"
+        )
 
 
 # --- disclosure: nothing from the sample environment may reach the published file -------------
@@ -282,3 +303,49 @@ def test_no_configured_value_reaches_the_published_spec(variable: str) -> None:
     assert value not in shipped_text(), (
         f"the value configured for {variable} appears in the published spec"
     )
+
+
+# --- the guard's own failure surface ------------------------------------------------------
+
+
+def test_a_missing_reference_is_reported_with_the_command_that_creates_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A fresh clone that has not generated the file yet is told how, not shown a traceback."""
+    import scripts.openapi as script
+
+    monkeypatch.setattr(script, "TARGET", tmp_path / "absent.json")
+
+    assert script.main(["--check"]) == 1
+    assert script.REGENERATE_COMMAND in capsys.readouterr().err
+
+
+def test_an_unparseable_reference_is_reported_rather_than_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A conflict marker in a large generated document reads exactly this way, and this guard runs
+    in a gate sequence — so it has to fail with something actionable rather than a decoder
+    traceback."""
+    import scripts.openapi as script
+
+    broken = tmp_path / "openapi.json"
+    broken.write_text('{"openapi": "3.1.0", <<<<<<< HEAD\n', encoding="utf-8")
+    monkeypatch.setattr(script, "TARGET", broken)
+
+    assert script.main(["--check"]) == 1
+    assert script.REGENERATE_COMMAND in capsys.readouterr().err
+
+
+def test_write_produces_a_file_that_check_then_accepts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The repair path — what people run when the gate fails, so not the one to leave untested."""
+    import scripts.openapi as script
+
+    target = tmp_path / "nested" / "openapi.json"
+    monkeypatch.setattr(script, "TARGET", target)
+
+    assert script.main(["--write"]) == 0
+    assert target.exists()
+    assert b"\r" not in target.read_bytes()
+    assert script.main(["--check"]) == 0

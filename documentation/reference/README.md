@@ -26,6 +26,12 @@ It is a single large JSON document, which most code-hosting web views will not r
 as documentation rather than as text, open it in any OpenAPI viewer — the format is OpenAPI 3.1,
 and a viewer needs no access to a running system, only this file.
 
+**The paths in this document are the ones the API serves, not the ones a browser calls.** The
+portal's web edge sits in front of the control plane and rewrites the prefix, so a caller reaching
+the platform from outside uses `/api/` where this document says `/v1/` — with authentication the
+one exception, where the external path keeps the version segment. The document carries no server
+address for the same reason it carries no configuration: the address differs per deployment.
+
 ### Regenerating it
 
 From `backend/`:

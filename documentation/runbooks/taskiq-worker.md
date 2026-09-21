@@ -106,8 +106,10 @@ fires — start there before relying on this in production.
 
 ## 7. Sizing
 
-Run the worker as a single replica, always. This is a correctness constraint, not a cost
-decision: a second replica means a second scheduler, and every scheduled tick would fire twice.
+Run the worker as a single replica. Correctness does not rest on that number — two schedulers
+briefly coexist on every deploy, and the passes are built to tolerate it: each is idempotent, and
+the reclamation pass additionally takes a database advisory lock so only one instance of it runs at
+a time. What a second replica costs is duplicated work and doubled load, not a corrupted fleet.
 A container platform's scale-to-zero behavior is equally wrong here for the opposite reason — the
 worker has no inbound traffic to scale back up on, so once it scales to zero it never restarts
 itself. After the worker has run for a week in a given environment, check its memory headroom and

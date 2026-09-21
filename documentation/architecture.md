@@ -25,14 +25,19 @@ stuck operation, or know that something needs cleaning up. Work that a developer
 to the user — recovering a session, reclaiming abandoned resources, deciding whether a build
 actually succeeded — the platform has to do on its own.
 
-## The four deployable units
+## The deployable units
 
 | Unit | What it does | Where it runs |
 |---|---|---|
 | **Control plane** | The HTTP API. Authentication, projects and conversations, quota, the approval workflow, and the orchestration of everything below. | App Service for Containers |
 | **Portal** | The single-page application people actually use, served by a small web edge that also forwards API calls to the control plane. | App Service for Containers |
+| **Background worker** | The scheduled passes nobody triggers: reconciling deployments, sweeping idle sandboxes, reclaiming the fleet. Same image as the control plane, started with a different command and no inbound traffic. | Container Apps |
 | **Build sandbox** | One disposable container per project, holding a live workspace and running the generated application so its author can see it. | Container Apps |
 | **Deployed application** | An approved application, built from a durable snapshot and published for its audience. | Container Apps |
+
+The worker shares the control plane's image deliberately — the task definitions have to be
+importable by whichever process runs them, and one image means the two can never be built from
+different code. What separates them is the start command and the absence of an ingress.
 
 The control plane serves the API and nothing else — it holds no user interface and runs no
 JavaScript runtime. The portal edge serves the built interface and forwards API traffic; it runs

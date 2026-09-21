@@ -23,8 +23,13 @@ building the image and creating the container are done directly against the clou
 
 Open the admin app registry's approved queue. Each row (and its API projection) carries
 everything this procedure consumes: the application's identity, its owner, the submission under
-review, the **pinned, approved submission** (the one to actually deploy), whether the platform's
-own session gate applies to it, and whether the current pin has already been deployed.
+review, the **pinned, approved submission** (the one to actually deploy), and whether the current
+pin has already been deployed.
+
+> **The row's "login required" flag is recorded, not enforced.** Nothing reads it, and a deployed
+> application authenticates nobody — anyone who can reach its address can open it. Only network
+> posture stands in front of a published application, so treat that flag as a note about intent
+> and decide reachability deliberately. `architecture.md` states the same gap.
 
 > **Deploy the pin, not "the latest."** The bundle-download endpoint mints a URL for the
 > application's *source* submission — the one currently under review. Immediately after an

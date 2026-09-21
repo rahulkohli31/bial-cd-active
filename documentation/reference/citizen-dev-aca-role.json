@@ -1,11 +1,12 @@
 {
   "Name": "Citizen Dev Container Apps Operator",
   "IsCustom": true,
-  "Description": "Lets the citizen-developer platform backend create, read, update, and delete Container Apps in this resource group only. No access to any other resource type (database, Redis, storage, etc.).",
+  "Description": "Lets the citizen-developer platform backend create, read, update, and delete Container Apps in this resource group only, and read their revisions to tell whether a deployment has become ready. No access to any other resource type (database, Redis, storage, etc.).",
   "Actions": [
     "Microsoft.App/containerApps/read",
     "Microsoft.App/containerApps/write",
     "Microsoft.App/containerApps/delete",
+    "Microsoft.App/containerApps/revisions/read",
     "Microsoft.App/managedEnvironments/read",
     "Microsoft.App/managedEnvironments/join/action"
   ],
