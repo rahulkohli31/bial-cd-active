@@ -3,10 +3,10 @@
 ## Context
 
 Some work has to run on a schedule, independent of any request: reconciling a deploy
-that never finished, sweeping idle sandboxes, and periodically checking the running
-fleet against a tiered reclamation policy. That work also has to be able to delete cloud
-resources safely, which rules out the easiest place to put it — inside the
-request-serving process itself.
+that never finished, sweeping idle sandboxes, periodically checking the running fleet
+against a tiered reclamation policy, and removing conversations nobody has come back to.
+That work also has to be able to delete cloud resources and stored records safely, which
+rules out the easiest place to put it — inside the request-serving process itself.
 
 Running scheduled work inline within the request process, rather than as a separate
 worker, has several problems for exactly this kind of work:
@@ -23,8 +23,9 @@ worker, has several problems for exactly this kind of work:
 ## Decision
 
 **Taskiq is adopted, with a Redis broker**, to run scheduled reconciliation work. The
-queue's passengers are scheduled reconcilers — deploy reconciliation, the sandbox sweep,
-and the fleet reclamation pass — not request work moved off the hot path. Long-running
+queue's passengers are scheduled reconcilers and retention passes — deploy
+reconciliation, the sandbox sweep, the fleet reclamation pass, and the conversation
+retention pass — not request work moved off the hot path. Long-running
 work that a request cannot finish in time follows a different pattern instead: claim a
 database row, run the work as a detached task that owns its own database session, and
 have the client poll for the result.

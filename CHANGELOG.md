@@ -4,6 +4,80 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.2] - 2026-09-22
+
+BIAL Chat is a conversation now. The screen that arrived last release could only greet you; this
+one sends, answers, keeps what was said, and comes back to it at an address of its own. There is no
+project behind it and no container to wait for — it is there to answer a question, and you can put
+a picture or a PDF in front of it while you ask.
+
+One smaller thing reaches every chat rather than only the new one: your own messages are rendered
+the way the assistant's are, so a list you paste is a list.
+
+This release also adds the first thing on the platform that deletes a conversation. It ships
+switched off and stays off until somebody deliberately turns it on. Read the deploy note before
+doing that.
+
+### Deploying this release
+
+- **Run migration `0044_chat_kind_generic`, then `0045_conversation_touch`, before the new images
+  go live.** In that order, and nothing here applies them for you. The first rebuilds the chat-kind
+  type and rewrites both columns that use it under an exclusive lock; that rewrite is proportional
+  to the number of stored messages, so at a history of a few thousand it finishes in well under a
+  second, and it is the message table that governs — count its rows before choosing a slot if the
+  history has grown. An image that knows the third kind of chat cannot create one until this has
+  landed. The second adds the trigger that records when a conversation was last used: it is
+  invisible to the previous image and safe to run early, and it must be in place well before the
+  retention setting below is ever switched on, because a conversation used while the trigger is
+  missing records no activity and a later pass would judge it by a stale timestamp. Rolling the
+  schema back past `0044` deletes the BIAL Chat conversations — they have no project to be
+  returned to.
+- **Set `CONVERSATION_RETENTION_ENABLED` on the worker.** It is required and has no default, so a
+  worker that does not carry it refuses to start rather than guessing. Set it off unless you have
+  read the next point. `CONVERSATION_RETENTION_DAYS` and `CONVERSATION_RETENTION_PER_PASS` are
+  optional and ship with working values.
+- **The first enabled retention run is not a week's tidying.** Nothing has ever deleted a
+  conversation on this platform, so the first pass after the flag is turned on removes *every*
+  conversation of *every* kind whose newest message is older than the window — Plan and Build
+  conversations included, some of which have existed since launch — along with their messages and
+  the files attached to them. It removes a bounded number per run and records how many candidates
+  it left behind, so a long backlog drains across several runs rather than in one. It cannot be
+  undone.
+
+### Added
+
+- **BIAL Chat answers.** The send control that shipped switched off is gone. Your first message
+  creates the conversation, the reply streams in, and the screen takes an address you can bookmark
+  and return to with the whole conversation still there. A load that does not come back keeps you
+  at that address with a retry; only a conversation that really is not there says so.
+- **You can attach a picture or a PDF to a question.** It goes to the assistant alongside your
+  message, under the same size and count limits the other chats already had. Every such file now
+  reaches the assistant carrying its own filename, so a follow-up about one of several documents
+  has something to name it by — in all three chats.
+- **A weekly pass removes conversations nobody has come back to.** Off by default and described in
+  the deploy note above. When it does run it removes the conversation, its messages, its attachment
+  records and the stored files behind them — including a file that was uploaded to that chat and
+  never sent.
+
+### Changed
+
+- **Your own messages render the way the assistant's do.** One renderer for both sides: a list you
+  paste is a list, a table is a table, and a pasted heading stays at reading size inside your
+  bubble instead of shouting. This reaches the Plan and Build chats too.
+- **A spreadsheet, a document or a slide deck is turned away in BIAL Chat, and says why.** Those
+  are opened by code running in your app's workspace, and this chat has no workspace — so it
+  refuses the file as you attach it rather than accepting something it could never read. The two
+  chats that do have a workspace are unchanged.
+- **A conversation's last-used time moves when a message is sent**, not only when its title is
+  edited.
+
+### Fixed
+
+- **A link to a BIAL Chat opens BIAL Chat.** Pasting or bookmarking one used to draw the app
+  builder's screen around it, with a breadcrumb for a project that does not exist.
+- **The greeting sits in the middle of the screen.** It was pinned to the top with the rest of the
+  page empty below it, on every window size.
+
 ## [1.8.1] - 2026-09-21
 
 There is a new screen. **BIAL Chat** is a general assistant beside the app builder — you open it,

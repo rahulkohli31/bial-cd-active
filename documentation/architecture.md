@@ -31,7 +31,7 @@ actually succeeded — the platform has to do on its own.
 |---|---|---|
 | **Control plane** | The HTTP API. Authentication, projects and conversations, quota, the approval workflow, and the orchestration of everything below. | App Service for Containers |
 | **Portal** | The single-page application people actually use, served by a small web edge that also forwards API calls to the control plane. | App Service for Containers |
-| **Background worker** | The scheduled passes nobody triggers: reconciling deployments, sweeping idle sandboxes, reclaiming the fleet. Same image as the control plane, started with a different command and no inbound traffic. | Container Apps |
+| **Background worker** | The scheduled passes nobody triggers: reconciling deployments, sweeping idle sandboxes, reclaiming the fleet, removing conversations nobody has come back to. Same image as the control plane, started with a different command and no inbound traffic. | Container Apps |
 | **Build sandbox** | One disposable container per project, holding a live workspace and running the generated application so its author can see it. | Container Apps |
 | **Deployed application** | An approved application, built from a durable snapshot and published for its audience. | Container Apps |
 
@@ -243,7 +243,11 @@ data that a confused-deputy bug could be tricked into exercising.
 Three stores, with distinct jobs, and the distinction matters:
 
 - **The platform database** is the record: people, projects, conversations, applications, approval
-  state, audit. Anything that must survive is here.
+  state, audit. If a fact has to outlive the process that produced it, this is where it goes.
+  Durable is not the same as kept forever, though, and the distinction is deliberate: a conversation
+  survives while somebody is still using it and is removed once it has been left alone long enough,
+  taking its messages and the files attached to it with it. Everything else here stays until a
+  person deletes it.
 - **Object storage** holds the large immutable things — workspace snapshots and uploaded files —
   behind a single interface the rest of the code uses. The platform talks to that interface rather
   than to a specific vendor's client, which is what keeps the storage decision a decision rather
