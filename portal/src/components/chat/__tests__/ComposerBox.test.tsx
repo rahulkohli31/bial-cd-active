@@ -70,6 +70,19 @@ const dropAll = (...files: File[]) =>
   fireEvent.drop(screen.getByTestId('composer-dropzone'), {
     dataTransfer: { types: ['Files'], files },
   })
+/** THE OS PICKER PATH: the library answers a click on the attach control by creating its own
+ *  `<input type="file">`, appending it to `document.body` and clicking it — never part of this
+ *  render, so it has to be found rather than rendered. */
+const pick = (file: File) => {
+  fireEvent.click(screen.getByTestId('composer-attach'))
+  const input = document.body.querySelector('input[type="file"]')
+  if (!(input instanceof HTMLInputElement)) throw new Error('The picker input was not created.')
+  Object.defineProperty(input, 'files', { value: [file], configurable: true })
+  fireEvent.change(input)
+}
+/** THE PASTE PATH: `ComposerPrimitive.Input` reads `clipboardData.files` straight off the event. */
+const paste = (file: File) =>
+  fireEvent.paste(box(), { clipboardData: { types: ['Files'], files: [file] } })
 /** The staged chips, counted by the one control each chip owns. */
 const chips = () => screen.queryAllByLabelText(/^Remove /)
 
@@ -450,9 +463,11 @@ describe('★ the attachment pipeline stays ours', () => {
   })
 
   it('★ says a refused file out loud, which the library would swallow', async () => {
-    // Both the dropzone and the paste handler wrap `addAttachment` in `try { … } catch {}`. Without
-    // the adapter reporting, a file over the cap is dropped in silence and the citizen believes
-    // the model can see it. Mutation receipt: drop `onRefused` from the adapter and this goes red.
+    // Both the dropzone and the paste handler wrap `addAttachment` in `try { … } catch {}`, so the
+    // adapter's own throw never reaches them — this box hears it instead through the library's
+    // `attachmentAddError` event, which fires from inside `composer.addAttachment` regardless of
+    // who called it. Mutation receipt: return before `onUrgent` on the `adapter-error` arm in
+    // `ComposerBox.tsx` and this goes red.
     const onUrgent = vi.fn()
     draw({ onUrgent })
     drop(new File([new Uint8Array(MAX_FILE_SIZE + 1)], 'huge.png', { type: 'image/png' }))
@@ -471,6 +486,56 @@ describe('★ the attachment pipeline stays ours', () => {
     drop(new File(['x'], 'slides.ppt', { type: 'application/vnd.ms-powerpoint' }))
     await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
     expect(onUrgent.mock.calls[0]?.[0]).toMatch(/isn't supported|is not supported/i)
+  })
+
+  describe('★ every refusal reaches the citizen on every path', () => {
+    // ONE WIRE CARRIES ALL OF THIS NOW, which is why all six combinations are pinned rather than a
+    // representative one. `composer.addAttachment` is where the picker, a paste and a drop all
+    // converge, and it emits `attachmentAddError` from inside itself — before the throw that the
+    // dropzone's and the paste handler's own `try {} catch {}` discard. Two reasons arrive that
+    // way and they are refused in different places: the library's accept-string filter rejects a
+    // FORMAT before the adapter is called at all (`not-accepted`, carrying no file name), while
+    // our own adapter throws on SIZE and on the per-message cap (`adapter-error`, carrying our
+    // sentence). A switch that handles one and returns on the other is silent for half of what a
+    // citizen can do, and that silence is indistinguishable from the file having been accepted.
+    const badFormat = () => new File(['x'], 'slides.ppt', { type: 'application/vnd.ms-powerpoint' })
+    const tooBig = () =>
+      new File([new Uint8Array(MAX_FILE_SIZE + 1)], 'huge.png', { type: 'image/png' })
+
+    const PATHS = [
+      ['the file picker', pick],
+      ['paste', paste],
+      ['drag-and-drop', drop],
+    ] as const
+
+    describe.each(PATHS)('added by %s', (_name, add) => {
+      it('a refused FORMAT is said out loud and nothing is staged', async () => {
+        // Mutation receipt: delete the `not-accepted` arm and all three of these go red together,
+        // while the three below stay green.
+        const onUrgent = vi.fn()
+        draw({ onUrgent })
+        add(badFormat())
+        await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
+        expect(onUrgent.mock.calls[0]?.[0]).toMatch(/isn't supported|is not supported/i)
+        expect(screen.queryByTestId('composer-chips')).toBeNull()
+      })
+
+      it('a refused SIZE is said out loud and nothing is staged', async () => {
+        // THE HALF WITH NO SECOND WIRE BEHIND IT. The adapter used to report this through a
+        // callback of its own as well; the event is now the only way it reaches a screen, so the
+        // path coverage that was redundant is now the whole proof.
+        // Mutation receipt: delete the `adapter-error` arm and all three of these go red together,
+        // while the three above stay green.
+        const onUrgent = vi.fn()
+        draw({ onUrgent })
+        add(tooBig())
+        await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
+        expect(onUrgent.mock.calls[0]?.[0]).toMatch(
+          new RegExp(`exceeds the ${MAX_FILE_SIZE_MB} MB`, 'i'),
+        )
+        expect(screen.queryByTestId('composer-chips')).toBeNull()
+      })
+    })
   })
 
   it('★ holds the cap when EIGHT files arrive in ONE gesture, which is how the library adds them', async () => {

@@ -116,8 +116,8 @@ describe('★ the rail holds Send while a file is still being read', () => {
     // context default 0 and Send went straight through. A workbook dropped here and sent before its
     // read finished started the chat from the sentence alone, and the file landed nowhere.
     //
-    // Mutation receipt: mount `RefusalSinkProvider` + `StagedAttachmentsBinding` by hand again,
-    // without `PendingReadsProvider`, and this navigates.
+    // Mutation receipt: mount `StagedAttachmentsBinding` by hand again, without
+    // `PendingReadsProvider`, and this navigates.
     reads.fileToBase64.mockImplementation(() => new Promise<string>(() => {}))
     renderComposer()
 
