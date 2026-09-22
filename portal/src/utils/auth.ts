@@ -82,6 +82,10 @@ export type SignoutReason = (typeof SIGNOUT_REASONS)[keyof typeof SIGNOUT_REASON
 // banner off this exact `?authError` value (LoginPage AUTH_ERROR_BANNERS).
 const SUSPENDED_LOGIN_URL = '/login?authError=account_suspended'
 
+// Where an EXPIRED session lands, and it carries no query of its own: the login
+// screen reads that banner from the one-time reason `clearSession` records.
+const LOGIN_PATH = '/login'
+
 let legacyPurged = false
 function purgeLegacyTokensOnce(): void {
   if (legacyPurged) return
@@ -208,25 +212,53 @@ function hardRedirect(url: string): void {
   window.location.assign(url)
 }
 
-// A suspended user's page usually has several requests in flight; each one 403s
-// and calls handleSuspendedSession. This latch makes the teardown single-flight
+// A page whose session has died usually has several requests in flight; each one
+// 401s or 403s and asks for the same teardown. This latch makes it single-flight
 // so they produce exactly ONE navigation. It never resets — once we're bouncing
 // to /login the whole page is being discarded anyway.
 let alreadyBouncing = false
 
+// Already on the login screen? Its own bootstrap call 401s for every signed-out
+// visitor, which is the ordinary state of that page — and a hard navigation to
+// the page you are already on is a reload, which asks again and reloads again.
+// `startsWith`, not equality: `/login?authError=…` is still the login screen.
+function alreadyAtTheLoginScreen(): boolean {
+  try {
+    return window.location.pathname.startsWith(LOGIN_PATH)
+  } catch {
+    // A location object with no pathname is a test stub, never a real browser. False means "bounce
+    // anyway", so a stub cannot silently switch the teardown off in the suites that assert it.
+    return false
+  }
+}
+
 /**
- * Mid-session suspension teardown: drop the cached session, record why, and
- * hard-navigate to the login screen's suspension banner — an admin
- * deactivating this user mid-session makes every authed request 403.
- * Idempotent/single-flight so concurrent 403s produce exactly one
- * navigation. Lives here, not api.ts, so `authFetch` and the turn-stream
- * reader (which bypasses it) share one path.
+ * THE TEARDOWN FOR A SESSION THAT IS DEFINITIVELY GONE: drop the cached session,
+ * record why for the login banner, and hard-navigate ONCE.
+ *
+ * A hard navigation rather than a router push, for the reason `hardRedirect`
+ * gives: every in-flight page is torn down, which is the point. Polls, presence
+ * renewals and stream readers stop because the page they live on is discarded —
+ * none of them learns to interpret a status code, and none of them needs to.
+ *
+ * The latch is set only when we really are leaving, so a call from the login
+ * screen itself cannot silently disarm a later bounce.
+ */
+function bounceToLogin(reason: SignoutReason, url: string): void {
+  if (alreadyBouncing) return
+  clearSession(reason)
+  if (alreadyAtTheLoginScreen()) return
+  alreadyBouncing = true
+  hardRedirect(url)
+}
+
+/**
+ * Mid-session suspension teardown — an admin deactivating this user mid-session
+ * makes every authed request 403. Lives here, not api.ts, so `authFetch` and the
+ * turn-stream reader (which bypasses it) share one path.
  */
 export function handleSuspendedSession(): void {
-  if (alreadyBouncing) return
-  alreadyBouncing = true
-  clearSession(SIGNOUT_REASONS.SUSPENDED)
-  hardRedirect(SUSPENDED_LOGIN_URL)
+  bounceToLogin(SIGNOUT_REASONS.SUSPENDED, SUSPENDED_LOGIN_URL)
 }
 
 // --- silent refresh (cookie-based, cross-tab single-flight) ------------------
@@ -267,10 +299,22 @@ async function doRefresh(): Promise<true | null> {
     })
     if (res.ok) return true
     if (res.status === 401 || res.status === 403) {
-      // The refresh cookie is dead. Show the "expired" banner only if we HAD a
-      // session (a csrf cookie was present) — a first-time visitor hitting a
-      // guarded route shouldn't see "your session expired".
-      clearSession(csrf ? SIGNOUT_REASONS.EXPIRED : undefined)
+      // THE REFRESH COOKIE IS DEAD, AND THAT IS THE ONE 401 THAT MEANS SOMETHING.
+      // A 401 on any single business request is a fact about that request; a 401
+      // HERE says the session itself cannot be revived, so the page is over.
+      //
+      // Clearing two module variables used to be the whole response, and it
+      // stopped nothing: the tab went on polling `preview-state` and `renew`
+      // every two minutes behind a screen that still looked alive, writing no
+      // heartbeat, until the lease lapsed and the container was collected under
+      // somebody who was looking right at it. `RequireAuth` re-evaluates on
+      // navigation, so a tab parked on one route never re-runs the guard.
+      //
+      // ONLY IF WE HAD A SESSION. A csrf cookie was present means there was one
+      // to lose — a first-time visitor hitting a guarded route is not "expired",
+      // and must be left to the ordinary signed-out path rather than hard-bounced.
+      if (csrf) bounceToLogin(SIGNOUT_REASONS.EXPIRED, LOGIN_PATH)
+      else clearSession()
       return null
     }
     return null // 5xx / transient — keep the session, let the next call retry

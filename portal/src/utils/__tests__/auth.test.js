@@ -15,16 +15,33 @@ function res({ ok = true, status = 200, json = {} }) {
   return { ok, status, json: async () => json }
 }
 
+// `window.location.assign` throws "Not implemented: navigation" in jsdom, so the whole object is
+// swapped for a stub exposing the `assign` spy `hardRedirect` drives — and a `pathname`, which the
+// login-screen guard reads. It is stubbed for EVERY test rather than only the ones asserting a
+// navigation: a dead session now tears the page down, so any test that 401s would otherwise drive a
+// real jsdom navigation while asserting something else entirely.
+let assign
+let originalLocation
+
+/** Put the stubbed browser on a page. */
+function standOn(pathname) {
+  Object.defineProperty(window, 'location', { configurable: true, value: { assign, pathname } })
+}
+
 beforeEach(async () => {
   vi.resetModules()
   localStorage.clear()
   clearCookies()
   global.fetch = vi.fn()
   delete navigator.locks
+  originalLocation = window.location
+  assign = vi.fn()
+  standOn('/projects/p1')
   auth = await import('../auth')
 })
 
 afterEach(() => {
+  Object.defineProperty(window, 'location', { configurable: true, value: originalLocation })
   vi.restoreAllMocks()
 })
 
@@ -64,7 +81,7 @@ describe('bootstrapSession (once-cached /auth/me session context)', () => {
     expect(global.fetch.mock.calls[1][0]).toContain('/api/v1/auth/refresh')
   })
 
-  it('resolves null (redirect) and records EXPIRED when refresh also fails', async () => {
+  it('resolves null, records EXPIRED and bounces when refresh also fails', async () => {
     document.cookie = 'csrf=tok' // we HAD a session
     global.fetch
       .mockResolvedValueOnce(res({ ok: false, status: 401 })) // /me
@@ -73,6 +90,10 @@ describe('bootstrapSession (once-cached /auth/me session context)', () => {
     expect(user).toBeNull()
     expect(auth.isAuthenticated()).toBe(false)
     expect(auth.consumeSignoutReason()).toBe('session_expired')
+    // ONE ANSWER TO "THE SESSION IS DEAD", not two. The route guard would also have routed this
+    // cold load to the login screen, but a dead session gets the same teardown wherever it is
+    // discovered — and the guard is exactly what does NOT run for a tab parked on one route.
+    expect(assign).toHaveBeenCalledWith('/login')
   })
 })
 
@@ -117,6 +138,122 @@ describe('refreshAccessToken (cookie-based, single-flight)', () => {
   })
 })
 
+/**
+ * ★ A DEAD SESSION STOPS THE PAGE INSTEAD OF STRANDING IT.
+ *
+ * Clearing two module variables used to be the whole response to a refresh that 401s, and it
+ * stopped nothing: the tab went on polling `preview-state` and `renew` behind a screen that still
+ * looked alive, writing no heartbeat, until the lease lapsed and the container was collected under
+ * somebody who was looking right at it. Fifty unbroken minutes of exactly that are in the capture
+ * this branch came from. `RequireAuth` re-evaluates on navigation, so a tab parked on one route
+ * never re-runs the guard and a reload is the only thing that rescues it.
+ *
+ * The remedy is the bounce that was already built for a SUSPENDED session, reached by a second
+ * caller. Nothing downstream learns to interpret a status code: the pollers stop because the page
+ * they live on is discarded.
+ */
+describe('★ an expired session bounces, once, and only when there was one to lose', () => {
+  it('hard-navigates to the login screen and leaves the expired banner behind it', async () => {
+    document.cookie = 'csrf=tok'
+    global.fetch.mockResolvedValue(res({ ok: false, status: 401 }))
+
+    await auth.refreshAccessToken()
+
+    expect(assign).toHaveBeenCalledWith('/login')
+    expect(auth.isAuthenticated()).toBe(false)
+    // NO QUERY OF ITS OWN: the login screen reads this banner from the one-time reason, which is
+    // the path `clearSession` has always written and `LoginPage` has always consumed.
+    expect(auth.consumeSignoutReason()).toBe('session_expired')
+  })
+
+  it('leaves a first-time visitor alone — there was no session to expire', async () => {
+    // No csrf cookie means no session was ever established. Hard-navigating somebody who simply
+    // opened a guarded URL would replace the ordinary signed-out path with a bounce and a banner
+    // about an expiry that never happened.
+    global.fetch.mockResolvedValue(res({ ok: false, status: 401 }))
+
+    await auth.refreshAccessToken()
+
+    expect(assign).not.toHaveBeenCalled()
+    expect(auth.consumeSignoutReason()).toBeNull()
+  })
+
+  it('is single-flight: several dead requests produce ONE navigation', async () => {
+    // A page whose session has died usually has several requests in flight, and each one reaches
+    // here. Three navigations would be three page loads racing each other.
+    document.cookie = 'csrf=tok'
+    global.fetch.mockResolvedValue(res({ ok: false, status: 401 }))
+
+    await auth.refreshAccessToken()
+    await auth.refreshAccessToken()
+    await auth.refreshAccessToken()
+
+    expect(assign).toHaveBeenCalledTimes(1)
+  })
+
+  it('★ does not bounce on a 5xx or a network blip — that is the fail-open arm', async () => {
+    // THE ARM THAT MUST NOT CHANGE. A refresh that could not be COMPLETED says nothing about the
+    // session; bouncing on it would sign people out of a working app every time the auth service
+    // hiccuped. Only a definitive 401/403 is evidence.
+    document.cookie = 'csrf=tok'
+    global.fetch.mockResolvedValue(res({ ok: false, status: 503 }))
+    await auth.refreshAccessToken()
+    expect(assign).not.toHaveBeenCalled()
+
+    global.fetch.mockRejectedValue(new Error('network is down'))
+    await auth.refreshAccessToken()
+    expect(assign).not.toHaveBeenCalled()
+    expect(auth.consumeSignoutReason()).toBeNull()
+  })
+
+  it('★ the login screen does not bounce itself', async () => {
+    // Its own bootstrap 401s for every signed-out visitor — the ordinary state of that page — and
+    // a hard navigation to the page you are on is a reload, which asks again and reloads again.
+    standOn('/login')
+    document.cookie = 'csrf=tok'
+    global.fetch.mockResolvedValue(res({ ok: false, status: 401 }))
+
+    await auth.refreshAccessToken()
+
+    expect(assign).not.toHaveBeenCalled()
+    // The session is still dropped — only the navigation is skipped.
+    expect(auth.isAuthenticated()).toBe(false)
+    expect(auth.consumeSignoutReason()).toBe('session_expired')
+  })
+
+  it('a login screen carrying a banner is still the login screen', async () => {
+    // `/login?authError=…` is where `handleSuspendedSession` lands, and an equality check on the
+    // path would read it as somewhere else and bounce it into itself.
+    standOn('/login')
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: { assign, pathname: '/login', search: '?authError=account_suspended' },
+    })
+    document.cookie = 'csrf=tok'
+    global.fetch.mockResolvedValue(res({ ok: false, status: 401 }))
+
+    await auth.refreshAccessToken()
+
+    expect(assign).not.toHaveBeenCalled()
+  })
+
+  it('does not disarm a later bounce by being called from the login screen first', async () => {
+    // The latch means "we are navigating". Setting it on a call that deliberately does NOT
+    // navigate would make the login screen's own 401 silently switch the teardown off for the
+    // rest of the session.
+    standOn('/login')
+    document.cookie = 'csrf=tok'
+    global.fetch.mockResolvedValue(res({ ok: false, status: 401 }))
+    await auth.refreshAccessToken()
+    expect(assign).not.toHaveBeenCalled()
+
+    standOn('/projects/p1')
+    await auth.refreshAccessToken()
+
+    expect(assign).toHaveBeenCalledWith('/login')
+  })
+})
+
 describe('logout', () => {
   it('POSTs /auth/logout, records LOGGED_OUT, returns true on success', async () => {
     document.cookie = 'csrf=tok'
@@ -157,22 +294,6 @@ describe('legacy shims + signout reason', () => {
 })
 
 describe('handleSuspendedSession (mid-session suspension bounce)', () => {
-  // window.location.assign throws "Not implemented: navigation" in jsdom, so we
-  // swap window.location for a stub exposing only the `assign` spy — the seam
-  // hardRedirect() drives. Restored after each test so nothing leaks.
-  let assign
-  let originalLocation
-
-  beforeEach(() => {
-    originalLocation = window.location
-    assign = vi.fn()
-    Object.defineProperty(window, 'location', { configurable: true, value: { assign } })
-  })
-
-  afterEach(() => {
-    Object.defineProperty(window, 'location', { configurable: true, value: originalLocation })
-  })
-
   it('clears the session (SUSPENDED reason) and hard-redirects to the suspension login URL', () => {
     // Prime a cached session so we can prove it is dropped.
     auth.clearSession()
@@ -189,5 +310,15 @@ describe('handleSuspendedSession (mid-session suspension bounce)', () => {
     auth.handleSuspendedSession()
     auth.handleSuspendedSession()
     expect(assign).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not bounce the login screen into itself either', () => {
+    // `/login?authError=account_suspended` is where this very function lands, and the page it
+    // lands on makes its own authed calls. Both dead-session paths share one guard, so proving it
+    // on one of them is not proof for the other.
+    standOn('/login')
+    auth.handleSuspendedSession()
+    expect(assign).not.toHaveBeenCalled()
+    expect(auth.consumeSignoutReason()).toBe('account_suspended')
   })
 })
