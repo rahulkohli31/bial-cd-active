@@ -24,6 +24,7 @@ from src.core.prompt_blocks import NARRATION_EXAMPLES
 from src.db.models.conversation import ChatKind
 from src.services.agent.agent import ChatDeps, chat_agent, static_instruction_parts
 from src.services.agent.mode_prompts import (
+    _GENERIC_SEGMENT,
     _PLAN_SEGMENT,
     _WRITE_SEGMENT,
     PromptContext,
@@ -38,7 +39,11 @@ _ADA = PromptContext(
 )
 _BO = PromptContext(user_name="Bo", project_name="Stand board")
 
-_CONTRACT_TAIL = {ChatKind.PLAN: _PLAN_SEGMENT, ChatKind.BUILD: _WRITE_SEGMENT}
+_CONTRACT_TAIL = {
+    ChatKind.PLAN: _PLAN_SEGMENT,
+    ChatKind.BUILD: _WRITE_SEGMENT,
+    ChatKind.GENERIC: _GENERIC_SEGMENT,
+}
 
 
 async def test_agent_runs_under_test_model(db_session) -> None:

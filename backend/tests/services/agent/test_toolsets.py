@@ -63,6 +63,10 @@ waiting rather than about what the run can do, and `app_state_toolset`, because 
 doing is a reading rather than a capability and Plan has no other route to it. Named once here so
 the exact-set assertions below stay exact: a shared tool has to appear in both, and a test that
 quietly dropped one side would pass while the two arms drifted."""
+_TOOL_BEARING_KINDS = [ChatKind.PLAN, ChatKind.BUILD]
+"""The kinds that register anything at all. `ChatKind.GENERIC` is handed no toolset by design —
+its emptiness is asserted by `test_the_generic_surface_is_empty_and_needs_no_sandbox_accessor`
+rather than skipped past here, so the absence is a claim rather than a gap."""
 _WRITE_ONLY_TOOLS = {"write_file", "edit_file", "insert_lines", "declare_done"}
 _SANDBOX_ONLY_TOOLS = _WRITE_ONLY_TOOLS | {"fetch_output_slice", "apply_schema_change"}
 """`fetch_output_slice` and `apply_schema_change` are registered on `sandbox_toolset`,
@@ -337,16 +341,53 @@ async def test_fetch_output_slice_reaches_the_only_kind_that_runs_commands() -> 
 
 
 async def test_the_registry_is_exhaustive_over_the_enum() -> None:
-    """Every kind the enum can hold has a surface, and the two surfaces are different.
+    """Every kind the enum can hold has a surface, and no two surfaces are the same.
 
     A `match` with no fallback arm already makes an unhandled member a `NameError` at run
     time rather than a silent empty toolset — but only on the path that reaches it. This
-    walks the enum, so a third member added without a surface fails here, loudly, instead of
-    on whichever request first carries it."""
+    walks the enum, so a fourth member added without a surface fails here, loudly, instead of
+    on whichever request first carries it.
+
+    THE GENERIC SURFACE IS EMPTY BY DESIGN, and that is asserted rather than excused: it is the
+    one kind that answers from its transcript alone. Emptiness is therefore not evidence of a
+    missing arm here, which is why the arm's existence is checked by naming the member."""
     surfaces = {kind: set(await registered_tool_definitions(kind)) for kind in ChatKind}
-    assert set(surfaces) == {ChatKind.PLAN, ChatKind.BUILD}
-    assert all(names for names in surfaces.values())
+    assert set(surfaces) == {ChatKind.PLAN, ChatKind.BUILD, ChatKind.GENERIC}
+    assert surfaces[ChatKind.GENERIC] == set()
+    assert all(names for kind, names in surfaces.items() if kind is not ChatKind.GENERIC)
     assert surfaces[ChatKind.PLAN] != surfaces[ChatKind.BUILD]
+
+
+def _never_called_workspace(_ctx: RunContext[Any]) -> ExtractedSnapshotWorkspace:
+    """The generic arm must not touch its accessors — building its surface resolves nothing."""
+    raise AssertionError("the generic surface resolves no workspace")
+
+
+async def test_the_generic_surface_is_empty_and_needs_no_sandbox_accessor() -> None:
+    """★ THE ARM THAT MUST BE REACHABLE FROM A CALLER HOLDING NOTHING. The Build arm raises when
+    handed no sandbox accessor, deliberately; a generic turn has no sandbox at all, so an arm that
+    touched one would make the whole kind unservable.
+
+    Mutation receipt: give the generic arm the read-only toolset and the first assertion goes red;
+    make it require `sandbox_of` and composing below raises instead."""
+    surface = toolsets_for_kind(
+        ChatKind.GENERIC,
+        workspace_of=_never_called_workspace,
+        sandbox_of=None,
+        reader_of=None,
+    )
+    assert surface.toolsets == []
+    assert surface.may_write is False
+    # …and a connected system cannot smuggle one in either: the gate is the project's, and this
+    # kind has no project.
+    assert (
+        toolsets_for_kind(
+            ChatKind.GENERIC,
+            workspace_of=_never_called_workspace,
+            connected_systems=(a_connected_system(),),
+        ).toolsets
+        == []
+    )
 
 
 async def test_the_kinds_differ_by_which_toolsets_they_are_handed_and_by_nothing_else() -> None:
@@ -835,7 +876,7 @@ async def test_the_reading_never_invites_the_agent_to_derive_its_own() -> None:
         assert invitation not in described
 
 
-@pytest.mark.parametrize("kind", list(ChatKind), ids=[k.value for k in ChatKind])
+@pytest.mark.parametrize("kind", _TOOL_BEARING_KINDS, ids=[k.value for k in _TOOL_BEARING_KINDS])
 async def test_when_to_call_it_survives_in_the_description(kind: ChatKind) -> None:
     """★ WHEN TO CALL IT is the sentence that decides whether this tool is reached for at all,
     and the registered description is the ONLY place the model is told it.
@@ -853,13 +894,14 @@ async def test_when_to_call_it_survives_in_the_description(kind: ChatKind) -> No
     ) in " ".join(described.split())
 
 
-@pytest.mark.parametrize("kind", list(ChatKind), ids=[k.value for k in ChatKind])
+@pytest.mark.parametrize("kind", _TOOL_BEARING_KINDS, ids=[k.value for k in _TOOL_BEARING_KINDS])
 async def test_every_registered_tool_reaches_the_model_with_a_description(kind: ChatKind) -> None:
     """★ A tool's docstring is the only thing that tells the model what the tool is FOR, so one
     registered without a description arrives as a bare name to guess at.
 
     Asserted over the registry rather than over a list somebody keeps, so it covers a tool nobody
-    thought to write a test for."""
+    thought to write a test for. Over the kinds that register anything — the generic kind's
+    emptiness is the subject of its own test rather than an exception swallowed here."""
     definitions = await registered_tool_definitions(kind)
     assert definitions, f"{kind} registers nothing at all"
     for name, definition in definitions.items():

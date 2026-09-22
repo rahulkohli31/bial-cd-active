@@ -409,9 +409,13 @@ async def test_the_proposal_reads_the_same_live_and_after_reload_in_either_kind(
     tool and no write tools, a build chat the reverse — and that difference is the toolset's,
     with no conditional anywhere to assert against."""
     user = await UserFactory.create(db_session, email=f"sn-{kind.value}@rvaiglobal.com")
-    project = await ProjectFactory.create(db_session, user.id)
+    # The kind that has no project is built without one — `ck_conversations_parentage` refuses
+    # the other combination, and the property under test is the toolset's, not the parentage's.
+    project_id = (
+        None if kind is ChatKind.GENERIC else (await ProjectFactory.create(db_session, user.id)).id
+    )
     conversation = await ConversationFactory.create(
-        db_session, user.id, project_id=project.id, kind=kind
+        db_session, user.id, project_id=project_id, kind=kind
     )
     engine, state = TurnEngine(), _state(kind)
     event = _proposed(_NINE, _THREE)

@@ -62,6 +62,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModelSettings
+from pydantic_ai.profiles.anthropic import AnthropicEffort
 from pydantic_ai.result import FinalResult
 from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
@@ -172,6 +173,7 @@ from src.services.orchestrator.constants import (
     BUILD_EFFORT,
     CACHE_TTL,
     CRASH_EDGE_CONSECUTIVE_POLLS,
+    GENERIC_EFFORT,
     MAX_OUTPUT_TOKENS,
     MODEL_TURN_CEILING,
     PLAN_EFFORT,
@@ -214,8 +216,8 @@ from src.services.turns.copy import (
     COULD_NOT_CONFIRM_TEXT,
     DID_NOT_COME_TOGETHER_TEXT,
     MODEL_UNAVAILABLE_CODE,
-    MODEL_UNAVAILABLE_PLAN_TEXT,
     MODEL_UNAVAILABLE_TEXT,
+    MODEL_UNAVAILABLE_WITHOUT_A_WORKSPACE_TEXT,
     NOT_RECOVERED_TEXT,
     PLAN_NOT_KEPT_TEXT,
     QUOTA_EXCEEDED_REASON,
@@ -1190,6 +1192,22 @@ def _reader_of(ctx: RunContext[ChatDeps]) -> AttachmentReader:
     return AttachmentReader(session=session)
 
 
+def _effort_for(kind: ChatKind) -> AnthropicEffort:
+    """How hard the model thinks in a turn of this kind.
+
+    EXHAUSTIVE OVER THE ENUM: a fourth kind chooses its own level rather than inheriting one by
+    landing on whichever branch happened to be the fallback. The Build arm below does not come
+    through here — it is a different run shape with its own settings block — so this answers for
+    the single-request arm only, which is where the two non-writing kinds meet."""
+    match kind:
+        case ChatKind.PLAN:
+            return PLAN_EFFORT
+        case ChatKind.BUILD:
+            return BUILD_EFFORT
+        case ChatKind.GENERIC:
+            return GENERIC_EFFORT
+
+
 class TurnEngine:
     """The in-process turn registry + lifecycle (single-replica: this process is the sole
     writer, exactly the `SessionManager._active_by_user` invariant)."""
@@ -1235,7 +1253,7 @@ class TurnEngine:
         model: Model,
         session_factory: SessionFactory,
         persist_user_turn: PersistUserTurn,
-        project_id: uuid.UUID,
+        project_id: uuid.UUID | None,
         manager: SessionManager,
         sandbox_client: SandboxClient | None = None,
         expects_mutation: bool = False,
@@ -1372,7 +1390,7 @@ class TurnEngine:
         history: list[ModelMessage],
         prompt_context: PromptContext,
         app_id: uuid.UUID | None,
-        project_id: uuid.UUID,
+        project_id: uuid.UUID | None,
         model: Model,
         session_factory: SessionFactory,
         manager: SessionManager,
@@ -1509,11 +1527,15 @@ class TurnEngine:
             )
             if not await _bill_before_ending():
                 return
-            message = (
-                MODEL_UNAVAILABLE_TEXT
-                if state.kind is ChatKind.BUILD
-                else MODEL_UNAVAILABLE_PLAN_TEXT
-            )
+            # EXHAUSTIVE, NOT BINARY. This read used to be `is BUILD` with everything else
+            # falling to the plan sentence, which is the shape that makes a third kind inherit
+            # a sentence nobody chose for it. Plan and BIAL Chat share an arm because they share
+            # the reason — neither holds a workspace — and a fourth kind has to say which it is.
+            match state.kind:
+                case ChatKind.BUILD:
+                    message = MODEL_UNAVAILABLE_TEXT
+                case ChatKind.PLAN | ChatKind.GENERIC:
+                    message = MODEL_UNAVAILABLE_WITHOUT_A_WORKSPACE_TEXT
             state.end_reason = MODEL_UNAVAILABLE_CODE
             state.error_message = message
             self._emit(state, lambda seq: TurnErrorFrame(seq=seq, message=message))
@@ -1541,13 +1563,21 @@ class TurnEngine:
             self._finish(state, "failed")
 
         try:
-            workspace = await self._pin_workspace(
-                state,
-                app_id,
-                project_id=project_id,
-                session_factory=session_factory,
-                manager=manager,
-                sandbox_client=sandbox_client,
+            # ★ NO PIN FOR A TURN WITH NO PROJECT. `_pin_workspace` attaches the project's live
+            # container and takes this citizen's one workspace slot for as long as the turn runs.
+            # A generic turn has neither a project nor anything to do with a container, so it must
+            # not acquire — and nothing downstream releases what was never acquired.
+            workspace = (
+                None
+                if project_id is None
+                else await self._pin_workspace(
+                    state,
+                    app_id,
+                    project_id=project_id,
+                    session_factory=session_factory,
+                    manager=manager,
+                    sandbox_client=sandbox_client,
+                )
             )
             # NOTHING MAY BE SPLICED ONTO `history` HERE, and the absence is load-bearing.
             #
@@ -1589,8 +1619,14 @@ class TurnEngine:
                 # A READER OF THE KIND, AND IT ASKS WHICH HARNESS RUNS THE TURN — the node loop
                 # with its per-step billing fold versus a single `chat_agent.run`. That is the
                 # whole of what the kind decides here. Unifying the two loops would mean giving
-                # a Plan run the streaming node loop and the per-step billing it has no steps
-                # for, so the fork is a shape, not a behaviour.
+                # a run with no write tools the streaming node loop and the per-step billing it
+                # has no steps for, so the fork is a shape, not a behaviour.
+                #
+                # THE OTHER ARM IS PLAN AND BIAL CHAT, and they belong there for the same reason:
+                # one model request, no node walk. It stays a binary rather than a three-way
+                # because the question is "does this turn walk nodes", and only Build does —
+                # `_effort_for` and the model-unavailable match above are where the three kinds
+                # genuinely differ, and both are exhaustive.
                 #
                 # What the model CAN DO and what it is TOLD are decided in `agent/toolsets.py`
                 # and `agent/mode_prompts.py`, and nothing downstream of either asks again.
@@ -1601,6 +1637,8 @@ class TurnEngine:
                 # tokens a second time at the terminal and doubling every build's daily
                 # spend. (`turn_usage` stays untouched: no `usage=` is passed to the run.)
                 billed = True
+                if workspace is None:  # a Build turn always has a project; belt for the impossible
+                    raise RuntimeError("a build turn reached the write run with no workspace")
                 await self._run_write(
                     state,
                     prompt=prompt,
@@ -1710,7 +1748,7 @@ class TurnEngine:
                         model_settings=AnthropicModelSettings(
                             max_tokens=MAX_OUTPUT_TOKENS,
                             anthropic_thinking=ADAPTIVE_THINKING,
-                            anthropic_effort=PLAN_EFFORT,
+                            anthropic_effort=_effort_for(state.kind),
                             anthropic_cache_instructions=CACHE_TTL,
                             anthropic_cache_tool_definitions=CACHE_TTL,
                             anthropic_cache=CACHE_TTL,
@@ -3545,10 +3583,11 @@ class TurnEngine:
             # process, routinely — so the turn has to go and find it; this loop is the only
             # thing a turn runs on a cadence for its whole life.
             #
-            # BUILD ONLY, AND EXPLICITLY SO. A Plan turn is a single `chat_agent.run` with no
-            # node walk, so it has no tool-result boundary to end at and would carry the ask
-            # forever without acting on it — consuming a one-shot nothing can honour. Whoever
-            # wants a Plan turn stopped cancels it; there is nothing to wait for.
+            # BUILD ONLY, AND EXPLICITLY SO. Plan and BIAL Chat are each a single
+            # `chat_agent.run` with no node walk, so neither has a tool-result boundary to end at
+            # and either would carry the ask forever without acting on it — consuming a one-shot
+            # nothing can honour. Whoever wants one of those turns stopped cancels it; there is
+            # nothing to wait for.
             #
             # Its own arm rather than the lease's: a store error reading the ask must not cost
             # the renewal below it, which is what keeps the container alive.

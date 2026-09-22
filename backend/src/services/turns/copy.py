@@ -359,11 +359,18 @@ NOT A CLAIM ABOUT 2026-09-11. That incident's generic failure is still unexplain
 metrics for the minute show only status 200, no errors and no client-closed requests. The terminal
 row's `error` field (`core.error_signature`) is what records the real cause next time."""
 
-MODEL_UNAVAILABLE_PLAN_TEXT: Final = (
+MODEL_UNAVAILABLE_WITHOUT_A_WORKSPACE_TEXT: Final = (
     "The assistant's service stopped responding partway through. "
     "Send your message again in a minute."
 )
-"""The same ending in a Plan chat, where there is no workspace at all."""
+"""The same ending in a chat that changes no app — a Plan chat, or BIAL Chat.
+
+WHAT IT DROPS is the clause above it: "it will carry on from here" is a promise about the state
+of a workspace, and neither of these kinds has one to promise anything about. What is left says
+the same thing to both, because there is nothing else to say: the service is down, and sending
+again in a minute is the whole of the remedy. Two arms sharing one sentence is the honest shape
+here — inventing a third wording so that each kind has its own would be a difference written for
+the sake of being written."""
 
 
 DEPENDENCY_DRIFT_TEXT: Final = (

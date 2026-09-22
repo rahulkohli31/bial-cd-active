@@ -291,6 +291,15 @@ levels below will be reading. With thinking off, this model occasionally writes 
 visible text instead of a `tool_use` block. In an agentic loop that is a silent failure: no
 error is raised, the call never runs, and the turn carries on as though it had."""
 
+GENERIC_EFFORT: Final[AnthropicEffort] = "low"
+"""How hard the model thinks in a BIAL Chat turn — the lowest level available.
+
+THINKING STAYS ON, and that is a decision rather than an oversight. Switching it off is legal at
+this level, unlike the two above, and it would be cheaper again — but a question about a document
+is exactly the shape that benefits from some reasoning, the quality cost has not been measured,
+and the paragraph above names what goes wrong silently when thinking is off. A measurable change
+follows a measurement; it does not precede one."""
+
 PLAN_EFFORT: Final[AnthropicEffort] = "medium"
 """How hard the model thinks in a planning turn (owner's ruling)."""
 

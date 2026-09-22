@@ -186,6 +186,14 @@ async def build_it(
         message, code = _refusal_for(call)
         raise AppApiError(400, message, code=code)
 
+    # A generic chat has no project to create a build in — and it cannot reach this line, because
+    # it is handed no toolset, so `present_plan_options` was never called in it and the card
+    # refusal above already turned it away. Stated rather than inferred: every read below needs a
+    # project, and the same refusal is the right answer if that reasoning ever stops holding.
+    project_id = plan_chat.project_id
+    if project_id is None:
+        raise AppApiError(400, "No such plan options card.")
+
     # --- THE IDEMPOTENCY READ, AND IT HAS TO SIT HERE -----------------------------------------
     #
     # A press that already succeeded is answered with ITS OWN ANSWER, before anything asks
@@ -206,7 +214,7 @@ async def build_it(
     # STILL SIDE-EFFECT FREE, so it does not disturb the "nothing is written until every refusal
     # has passed" property the block above rests on: `_already_started` is two SELECTs.
     if await db.get(Conversation, body.chat_id) is not None:
-        return await _already_started(db, user.id, body.chat_id, plan_chat.project_id)
+        return await _already_started(db, user.id, body.chat_id, project_id)
 
     # 429 with its byte-stable body, and the card STAYS PRESSABLE — nothing has been written, so
     # there is no half-started build and the citizen can simply press again tomorrow.
@@ -252,14 +260,14 @@ async def build_it(
         raise AppApiError(409, BUILD_IN_FLIGHT_MSG, code=ALREADY_BUILDING_HERE_CODE)
     with build_coordination_or_503():
         try:
-            await manager.reclaim_preflight(db, user, plan_chat.project_id)
+            await manager.reclaim_preflight(db, user, project_id)
         except SandboxReclaimBlockedError as exc:
             return reclaim_blocked_response(exc)
 
-    project = await db.get(Project, plan_chat.project_id)
+    project = await db.get(Project, project_id)
     if project is None:  # the FK guarantees this; fail loudly if it ever breaks
         raise AppApiError(404, "Conversation not found.")
-    app_id = await _app_id_for_project(db, user.id, plan_chat.project_id)
+    app_id = await _app_id_for_project(db, user.id, project_id)
 
     # --- the new chat: FLUSHED, deliberately not committed ----------------------------------
     #
@@ -271,7 +279,7 @@ async def build_it(
     build_chat = Conversation(
         id=body.chat_id,
         user_id=user.id,
-        project_id=plan_chat.project_id,
+        project_id=project_id,
         kind=ChatKind.BUILD,
     )
     db.add(build_chat)
@@ -282,7 +290,7 @@ async def build_it(
         # where the session is holding an object the database refused: it has to go, and nothing
         # this request has done so far is a write, so there is nothing else to lose.
         await db.rollback()
-        return await _already_started(db, user.id, body.chat_id, plan_chat.project_id)
+        return await _already_started(db, user.id, body.chat_id, project_id)
 
     # --- the turn: its first durable write is what commits the conversation row -------------
     turn_id = await start_conversation_turn(
@@ -307,7 +315,7 @@ async def build_it(
             # resolved at the router for the same reason (`turns.py`), and from the PLAN chat's
             # project, which is the project the new Build chat is created in two blocks above.
             connected_systems=await connected_systems_for_project(
-                db, user_id=user.id, project_id=plan_chat.project_id
+                db, user_id=user.id, project_id=project_id
             ),
         ),
         app_id=app_id,

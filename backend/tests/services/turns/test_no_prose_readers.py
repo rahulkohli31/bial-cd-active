@@ -47,6 +47,22 @@ ALLOWED: dict[str, str] = {
         "single `chat_agent.run`. A shape, not a behaviour: unifying the two would give a Plan "
         "run the streaming node loop and the per-step billing it has no steps for."
     ),
+    "api/v1/conversations/turns.py": (
+        "WHETHER THIS TURN RESOLVES A CONTAINER AT ALL, which is the one question the route has "
+        "to answer before it can ask any of the four workspace refusals. A generic chat has no "
+        "project and starts no container, so those refusals would each be asking about "
+        "something that does not exist — and the first of them would refuse the turn outright "
+        "on a deployment with no sandbox service. The read answers a PROJECT, so the branch is "
+        "made once and everything below it narrows; nothing about what the model may do or is "
+        "told follows from it."
+    ),
+    "api/v1/conversations/schemas.py": (
+        "PARENTAGE, NOT BEHAVIOUR. The create request refuses the two combinations the database "
+        "constraint also refuses — a generic chat naming a project, or either other kind naming "
+        "none — so a caller is answered with a sentence rather than an integrity error. A "
+        "cross-field validator cannot be spelled as a field rule, and it decides nothing about "
+        "the run."
+    ),
     "api/v1/conversations/transition.py": (
         "IDENTITY, NOT BEHAVIOUR, and the honest reason this list is four entries rather than "
         "the two the plan expected. The handoff's idempotency predicate is 'same owner, same "

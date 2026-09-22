@@ -38,7 +38,7 @@ from src.services.approvals.submit import submit_app_for_review
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.storage import snapshot_key, submission_key
-from tests.factories import ConversationFactory, UserFactory
+from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeStorage
 
 _TTL = settings.auth.access_ttl_seconds
@@ -64,11 +64,12 @@ async def test_provisioned_app_is_addressable_at_its_returned_id(client, db_sess
     `/apps/{appId}/*`. The row is minted by `resolve_app_for_project` (the build session's
     path) — there is no client-callable provision endpoint."""
     owner, headers = await _auth_user(db_session, email="owner@rvaiglobal.com")
+    project = await ProjectFactory.create(db_session, owner.id)
     conv = await ConversationFactory.create(
-        db_session, owner.id, kind=ChatKind.BUILD, title="My builder app"
+        db_session, owner.id, kind=ChatKind.BUILD, project_id=project.id, title="My builder app"
     )
 
-    app_id = str(await resolve_app_for_project(db_session, owner.id, conv.project_id))
+    app_id = str(await resolve_app_for_project(db_session, owner.id, project.id))
     await db_session.commit()
     # The app has its OWN fresh id — one app per project, NOT the conversation id.
     assert app_id != str(conv.id)
@@ -98,12 +99,13 @@ async def test_build_submit_approve_pipeline(client, app, db_session) -> None:
     # this journey blind to which seam each route it walks happens to sit on.
     app.dependency_overrides[storage_or_none_dependency] = lambda: store
     owner, owner_headers = await _auth_user(db_session, email="owner@rvaiglobal.com")
-    conv = await ConversationFactory.create(
-        db_session, owner.id, kind=ChatKind.BUILD, title="My builder app"
+    project = await ProjectFactory.create(db_session, owner.id)
+    await ConversationFactory.create(
+        db_session, owner.id, kind=ChatKind.BUILD, project_id=project.id, title="My builder app"
     )
 
     # (a) mint the project's app the way a build session does — take the appId it resolves on.
-    app_id = str(await resolve_app_for_project(db_session, owner.id, conv.project_id))
+    app_id = str(await resolve_app_for_project(db_session, owner.id, project.id))
     await db_session.commit()
 
     # (b) the build session finalized a snapshot bundle (SESSION-API's job — seeded

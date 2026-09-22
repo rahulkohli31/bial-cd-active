@@ -39,8 +39,8 @@ from src.services.turns import engine as engine_module
 from src.services.turns.copy import (
     CHAT_TOO_LONG_CODE,
     MODEL_UNAVAILABLE_CODE,
-    MODEL_UNAVAILABLE_PLAN_TEXT,
     MODEL_UNAVAILABLE_TEXT,
+    MODEL_UNAVAILABLE_WITHOUT_A_WORKSPACE_TEXT,
 )
 from src.services.turns.engine import (
     TurnEngine,
@@ -224,7 +224,7 @@ async def test_a_model_service_failure_ends_with_a_named_reason_and_a_way_forwar
 
     assert state.status == "failed"
     assert _terminal(state).reason == MODEL_UNAVAILABLE_CODE
-    assert _last_error(state) == MODEL_UNAVAILABLE_PLAN_TEXT
+    assert _last_error(state) == MODEL_UNAVAILABLE_WITHOUT_A_WORKSPACE_TEXT
     assert _last_error(state) != engine_module._TURN_FAILED_MESSAGE
     assert conv_id not in _mid_reply
 

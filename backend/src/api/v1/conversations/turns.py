@@ -49,7 +49,7 @@ from src.api.v1.conversations.schemas import (
 from src.api.v1.live_build import ReclaimBlockedEnvelope, reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus
-from src.db.models.conversation import Conversation
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.project import Project
 from src.db.models.user import User
@@ -281,6 +281,29 @@ async def start_conversation_turn(
         ) from None
 
 
+def _project_needing_a_workspace(conversation: Conversation) -> uuid.UUID | None:
+    """The project whose container this turn must resolve, or `None` for the kind that has none.
+
+    ONE READ OF THE KIND, answered as the value every workspace preflight below needs — so the
+    route branches once, and on the arm that has a project the type checker can see it. A kind
+    test alone cannot say that: `ck_conversations_parentage` is what makes "not generic" and "has
+    a project" the same answer, and only the second of the two narrows.
+
+    EXHAUSTIVE OVER THE ENUM, no wildcard arm: a fourth kind must decide here whether it resolves
+    a container, rather than inheriting whichever answer happened to be the fallback.
+
+    The raise is for a row that contradicts the constraint — structurally unreachable while the
+    constraint exists, and a 404 rather than a 500 because a conversation the platform cannot
+    make sense of is not one this caller can be told about (ADR-0004)."""
+    match conversation.kind:
+        case ChatKind.PLAN | ChatKind.BUILD:
+            if conversation.project_id is None:
+                raise AppApiError(404, "Conversation not found.")
+            return conversation.project_id
+        case ChatKind.GENERIC:
+            return None
+
+
 @router.post(
     "/{conversation_id}/turns",
     status_code=202,
@@ -340,7 +363,18 @@ async def start_turn(
         # An unknown id is a client bug on every turn now, first or hundredth — and a cross-user
         # id is indistinguishable from it, which is one non-leaking 404 (ADR-0004).
         raise AppApiError(404, "Conversation not found.")
-    project_id = conversation.project_id
+    # ★ THE KIND IS READ HERE, AT THE TOP, AND THE ROUTE BRANCHES ONCE ON WHAT IT ANSWERS.
+    #
+    # Nothing used to consult the kind until inside the engine, because until a third kind existed
+    # every turn wanted the same workspace. A generic chat has no project and no container, so the
+    # block of refusals below that assume one cannot run for it — not because they would be
+    # unkind, but because each would be asking about something that does not exist.
+    #
+    # ONE BRANCH RATHER THAN FOUR. Three of the four refusals were already contiguous; the
+    # mid-reply check that sat among them is documented as pure liveness with no dependency on
+    # what precedes it, so it moved up to the quota and model checks. The route's one stated
+    # ordering constraint — the busy-workspace refusal stays BELOW mid-reply — survives the move.
+    project_id = _project_needing_a_workspace(conversation)
 
     # Daily-token gate BEFORE anything persists — a capped user's message is refused
     # whole, never half-recorded. The error carries its own byte-stable body (limit/used/
@@ -352,106 +386,119 @@ async def start_turn(
         return exc.as_response()
     if model is None:
         raise AppApiError(503, "Claude client not configured.")
-    # NO WORKSPACE SERVICE, SAID HERE RATHER THAN DEGRADED SILENTLY. Both kinds read the
-    # project's live app and only that, so a deployment with no sandbox service has nothing for
-    # either of them to read. The same shape as the refusal above it, with a machine-readable
-    # code so the browser can tell it from the workspace CONFLICTS that share its status family
-    # — different cause, different remedy, and a client reading only the status cannot tell.
-    #
-    # AT THE MOMENT OF SENDING, and before anything is claimed or written: the message is not
-    # consumed, no turn exists, and there is no half-started reply to explain afterwards.
-    if sandbox is None:
-        raise AppApiError(503, WORKSPACE_UNAVAILABLE_TEXT, code=WORKSPACE_UNAVAILABLE_CODE)
-
-    # A MESSAGE, NOT A GATE. The refusal itself lives in one place —
-    # `resolve_app_for_project`, which every door into a container comes through — and it
-    # holds whether or not this line exists. What this buys is WORDS: that refusal is raised
-    # inside the detached turn, where the engine's attach arm catches it as an unexpected
-    # failure and says "the workspace service is not available", which is both wrong and
-    # retryable-sounding for an app an administrator deliberately switched off. Said here,
-    # at the moment of sending and above the first write, the citizen gets the true sentence
-    # and no turn is spent. Same string, same code, one source (`appdata`).
-    if await _app_is_switched_off(db, user.id, project_id):
-        raise AppApiError(409, APP_SWITCHED_OFF, code=APP_SWITCHED_OFF_CODE)
-
     # Every side-effect-free rejection lands BEFORE `resolve_pending_as_refine`, which is a
     # WRITE: a refused start must never burn the user's pending plan-options card. Both
     # checks are re-made downstream (the engine owns the real, race-free claim) — these are
     # the early, cheap copies that keep the write from happening at all.
     #
     # THE ONE GATE, server side: while this thread's agent is mid-reply, no new turn starts.
-    # Pure liveness — what the chat IS never enters it.
+    # Pure liveness — what the chat IS never enters it, which is why it applies to every kind
+    # and why it could be lifted out of the workspace block below without changing an answer.
     if conversation_is_mid_reply(conversation_id):
         raise AppApiError(409, "A turn is already running for this conversation.")
-    # UNCONDITIONAL, and BELOW the mid-reply guard on purpose: a send during a streaming
-    # reply must still 409 as a busy conversation, not as a taken workspace. This one asks a
-    # different question — is this user's single workspace already committed to a turn at all?
-    # Cheap and synchronous; the expensive provision happens inside the detached turn, because
-    # blocking the POST on 30-60s recreates the dead end the composer contract exists to remove.
-    #
-    # IT NO LONGER READS THE CHAT'S KIND: every turn takes the whole workspace
-    # for as long as it runs, whatever kind of chat it was sent in. A Plan turn pins the live
-    # container exactly as a Build turn does, by design, so a Plan send that
-    # slipped past this gate would take a workspace another of the user's chats was mid-build
-    # in, which is the one thing this check exists to prevent.
-    #
-    # A SESSION THAT IS ONLY LETTING GO IS NOT WORKING, and asking that is what keeps this gate
-    # from pre-empting the wait built for exactly this case. A turn's terminal is written a
-    # moment BEFORE the slot is freed — the recovery copy is written in between, deliberately,
-    # since losing it is worse than a wait — so a message sent the instant the turn ends arrives
-    # while an ended session still holds the workspace. Refusing it here answered 409 to three
-    # of every four iteration messages in a measured campaign. The claim inside the turn is
-    # where the (bounded) waiting happens, and it still refuses if the release never comes.
-    active = manager.active_session_for(user.id)
-    if active is not None and not manager.is_letting_go_of_the_workspace(active):
-        raise AppApiError(409, BUILD_IN_FLIGHT_MSG, code=ALREADY_BUILDING_HERE_CODE)
-
-    # BOTH KINDS, not just Build, and the guard above cannot answer this one.
-    #
-    # Two reasons it sits outside that block. `active_session_for` only sees in-process
-    # sessions, so a finished build's pardoned container — warm, holding no session, no lock
-    # and no heartbeat — is invisible to it, and that is the state a user is most often in.
-    # And `_pin_workspace` attaches the project's LIVE container for a Plan turn as well
-    # ("Resolve the turn-pinned read surface ONCE, for BOTH KINDS"), so a Plan turn in
-    # another project reclaims the incumbent's workspace exactly as a Build turn does.
-    #
-    # Gating this on the chat's kind meant a Plan send still destroyed the other project's
-    # unsaved work, and did it inside the detached turn where the only thing the user saw was
-    # "Your workspace could not be started right now" — no dialog, no named project, no way
-    # to save. Asked here so the refusal is an HTTP 409 the client turns into a choice.
-    #
-    # THE SECOND OF TWO REFUSALS, and it carries `sandbox_reclaim_blocked` where the one
-    # above carries `already_building_here`. Same status, different cause, different remedy:
-    # one is "your own other chat is using it", the other is "somebody's unsaved work in
-    # another project is in the way". A client that could only read the status told the citizen
-    # the wrong thing about half the time.
-    if sandbox is not None:
-        # The seam wraps the preflight because the guard reads the registry through the
-        # deliberately-unguarded `read_registry` (`locks.py`'s policy: an answer-bearing
-        # primitive must not swallow a `RedisError` and manufacture a certain-looking "no
-        # sandbox"). So an unreadable store arrives here as a `RedisError` and has to become
-        # the same 503 every other coordination route gives, not a 500. An UNCONFIGURED Redis
-        # skips the block and proceeds, which is right: with no coordination subsystem there is
-        # no registry, no slot, and nothing a reclaim could destroy.
+    # ★ THE WHOLE WORKSPACE BLOCK, BEHIND ONE GUARD. Each refusal inside asks about the
+    # project's live container: whether the service exists, whether an administrator switched the
+    # app off, whether this citizen's one workspace is already committed, and whether somebody
+    # else's unsaved work is in the slot. A generic chat has no project and starts no container,
+    # so every one of them would be asking about something that does not exist — and the first
+    # would refuse the turn outright on a deployment with no sandbox service at all.
+    if project_id is not None:
+        # NO WORKSPACE SERVICE, SAID HERE RATHER THAN DEGRADED SILENTLY. Both kinds read the
+        # project's live app and only that, so a deployment with no sandbox service has nothing for
+        # either of them to read. The same shape as the refusal above it, with a machine-readable
+        # code so the browser can tell it from the workspace CONFLICTS that share its status family
+        # — different cause, different remedy, and a client reading only the status cannot tell.
         #
-        # AND IT IS ALSO THE HAND-OVER'S PREFLIGHT, which is why the body it returns carries
-        # more than the status. The browser asks the one-workspace question BY SENDING — every
-        # refusal above this line leaves no turn row and no spent card (it no longer leaves no
-        # CHAT: the row is created a round trip earlier now, see the block above the daily gate)
-        # — and draws its dialog from what comes back:
-        # `projectName` for which project holds the workspace, and `agentWorking` for whether
-        # that project's agent is mid-thought, of ANY kind (`building` stays narrow, and only
-        # marks a turn that can write — see `SandboxReclaimBlockedError`). Neither fact is
-        # obtainable from the cheap state poll, which reads only this citizen's own registry
-        # record and cannot say whose project is sitting in the slot.
-        with build_coordination_or_503():
-            try:
-                await manager.reclaim_preflight(db, user, project_id)
-            except SandboxReclaimBlockedError as exc:
-                return reclaim_blocked_response(exc)
+        # AT THE MOMENT OF SENDING, and before anything is claimed or written: the message is not
+        # consumed, no turn exists, and there is no half-started reply to explain afterwards.
+        if sandbox is None:
+            raise AppApiError(503, WORKSPACE_UNAVAILABLE_TEXT, code=WORKSPACE_UNAVAILABLE_CODE)
 
-    project = await db.get(Project, project_id)
-    if project is None:  # ownership was checked above; fail loudly if it ever breaks
+        # A MESSAGE, NOT A GATE. The refusal itself lives in one place —
+        # `resolve_app_for_project`, which every door into a container comes through — and it
+        # holds whether or not this line exists. What this buys is WORDS: that refusal is raised
+        # inside the detached turn, where the engine's attach arm catches it as an unexpected
+        # failure and says "the workspace service is not available", which is both wrong and
+        # retryable-sounding for an app an administrator deliberately switched off. Said here,
+        # at the moment of sending and above the first write, the citizen gets the true sentence
+        # and no turn is spent. Same string, same code, one source (`appdata`).
+        if await _app_is_switched_off(db, user.id, project_id):
+            raise AppApiError(409, APP_SWITCHED_OFF, code=APP_SWITCHED_OFF_CODE)
+
+        # BELOW the mid-reply guard on purpose: a send during a streaming reply must still 409
+        # as a busy conversation, not as a taken workspace. This one asks a different question —
+        # is this user's single workspace already committed to a turn at all? Cheap and
+        # synchronous; the expensive provision happens inside the detached turn, because blocking
+        # the POST on 30-60s recreates the dead end the composer contract exists to remove.
+        #
+        # IT DOES NOT ASK WHICH KIND, and inside this block it does not need to: every turn that
+        # reaches here takes the whole workspace for as long as it runs. A Plan turn pins the live
+        # container exactly as a Build turn does, by design, so a Plan send that slipped past this
+        # gate would take a workspace another of the user's chats was mid-build in, which is the
+        # one thing this check exists to prevent.
+        #
+        # A SESSION THAT IS ONLY LETTING GO IS NOT WORKING, and asking that is what keeps this
+        # gate from pre-empting the wait built for exactly this case. A turn's terminal is written
+        # a moment BEFORE the slot is freed — the recovery copy is written in between,
+        # deliberately, since losing it is worse than a wait — so a message sent the instant the
+        # turn ends arrives while an ended session still holds the workspace. Refusing it here
+        # answered 409 to three of every four iteration messages in a measured campaign. The claim
+        # inside the turn is where the (bounded) waiting happens, and it still refuses if the
+        # release never comes.
+        active = manager.active_session_for(user.id)
+        if active is not None and not manager.is_letting_go_of_the_workspace(active):
+            raise AppApiError(409, BUILD_IN_FLIGHT_MSG, code=ALREADY_BUILDING_HERE_CODE)
+
+        # BOTH KINDS, not just Build, and the guard above cannot answer this one.
+        #
+        # Two reasons it sits outside that block. `active_session_for` only sees in-process
+        # sessions, so a finished build's pardoned container — warm, holding no session, no lock
+        # and no heartbeat — is invisible to it, and that is the state a user is most often in.
+        # And `_pin_workspace` attaches the project's LIVE container for a Plan turn as well
+        # ("Resolve the turn-pinned read surface ONCE, for BOTH KINDS"), so a Plan turn in
+        # another project reclaims the incumbent's workspace exactly as a Build turn does.
+        #
+        # Gating this on the chat's kind meant a Plan send still destroyed the other project's
+        # unsaved work, and did it inside the detached turn where the only thing the user saw was
+        # "Your workspace could not be started right now" — no dialog, no named project, no way
+        # to save. Asked here so the refusal is an HTTP 409 the client turns into a choice.
+        #
+        # THE SECOND OF TWO REFUSALS, and it carries `sandbox_reclaim_blocked` where the one
+        # above carries `already_building_here`. Same status, different cause, different remedy:
+        # one is "your own other chat is using it", the other is "somebody's unsaved work in
+        # another project is in the way". A client that could only read the status told the citizen
+        # the wrong thing about half the time.
+        if sandbox is not None:
+            # The seam wraps the preflight because the guard reads the registry through the
+            # deliberately-unguarded `read_registry` (`locks.py`'s policy: an answer-bearing
+            # primitive must not swallow a `RedisError` and manufacture a certain-looking "no
+            # sandbox"). So an unreadable store arrives here as a `RedisError` and has to become
+            # the same 503 every other coordination route gives, not a 500. An UNCONFIGURED Redis
+            # skips the block and proceeds, which is right: with no coordination subsystem there is
+            # no registry, no slot, and nothing a reclaim could destroy.
+            #
+            # AND IT IS ALSO THE HAND-OVER'S PREFLIGHT, which is why the body it returns carries
+            # more than the status. The browser asks the one-workspace question BY SENDING —
+            # every refusal above this line leaves no turn row and no spent card (it does leave a
+            # CHAT: the row is created a round trip earlier, see the block above the daily gate)
+            # — and draws its dialog from what comes back:
+            # `projectName` for which project holds the workspace, and `agentWorking` for whether
+            # that project's agent is mid-thought, of ANY kind (`building` stays narrow, and only
+            # marks a turn that can write — see `SandboxReclaimBlockedError`). Neither fact is
+            # obtainable from the cheap state poll, which reads only this citizen's own registry
+            # record and cannot say whose project is sitting in the slot.
+            with build_coordination_or_503():
+                try:
+                    await manager.reclaim_preflight(db, user, project_id)
+                except SandboxReclaimBlockedError as exc:
+                    return reclaim_blocked_response(exc)
+
+    # SKIPPED FOR A CHAT WITH NO PROJECT, along with the two lookups further down that read
+    # from it. There is nothing to load, and nothing downstream needs it: the prompt's tail
+    # names a project only when there is one to name.
+    project = None if project_id is None else await db.get(Project, project_id)
+    if project_id is not None and project is None:
+        # ownership was checked above; fail loudly if it ever breaks
         raise AppApiError(404, "Conversation not found.")
 
     rehydrate = history_rehydrator(db, storage, user.id)
@@ -560,20 +607,28 @@ async def start_turn(
         history = await _history()
 
     display_name = user.display_name or user.email
-    prompt_context = PromptContext(
-        user_name=display_name,
-        project_name=project.name,
-        project_description=project.description or None,
-        # RESOLVED HERE, ONCE, BECAUSE THIS IS WHERE THE SESSION IS. The turn engine passes a
-        # live session on the Plan arm and `None` on the Build arm (holding a pooled connection
-        # across a minutes-long build would pin it idle-in-transaction), so anything downstream
-        # that needed the database would work on one arm and fail on the other. Resolving at the
-        # router is what lets one value serve the prompt's stub and the turn's tool surface.
-        connected_systems=await connected_systems_for_project(
-            db, user_id=user.id, project_id=project_id
-        ),
-    )
-    app_id = await _app_id_for_project(db, user.id, project_id)
+    if project is None or project_id is None:
+        # THE GENERIC SHAPE: the citizen's name and nothing about a project. A connector belongs
+        # to a project's approved window and an app identity to a project's app, so neither
+        # lookup has a question to ask here — they are skipped rather than answered empty.
+        prompt_context = PromptContext(user_name=display_name)
+        app_id = None
+    else:
+        prompt_context = PromptContext(
+            user_name=display_name,
+            project_name=project.name,
+            project_description=project.description or None,
+            # RESOLVED HERE, ONCE, BECAUSE THIS IS WHERE THE SESSION IS. The turn engine passes a
+            # live session on the Plan arm and `None` on the Build arm (holding a pooled
+            # connection across a minutes-long build would pin it idle-in-transaction), so
+            # anything downstream that needed the database would work on one arm and fail on the
+            # other. Resolving at the router is what lets one value serve the prompt's stub and
+            # the turn's tool surface.
+            connected_systems=await connected_systems_for_project(
+                db, user_id=user.id, project_id=project_id
+            ),
+        )
+        app_id = await _app_id_for_project(db, user.id, project_id)
     sent_ids = set(body.message.attachment_ids)
 
     turn_id = await start_conversation_turn(
