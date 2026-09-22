@@ -164,18 +164,24 @@ describe('the chat route holds its container open', () => {
     expect(h.renewPresence).toHaveBeenCalledWith(expect.any(String), 'hidden')
   })
 
-  it('never renews on the accelerated starting tick', async () => {
+  it('★ renews throughout a watched start, exactly as the project surface does', async () => {
+    // THE SHARED DECISION, PINNED ON BOTH SIDES. `presenceToRenew` is one function precisely so a
+    // container held open on one surface cannot be quietly abandoned on the other — and the window
+    // it used to skip is the one where the marker and the lock lapse together.
     h.fetchPreviewState.mockResolvedValue({ ...LIVE, state: 'starting' as PreviewLifeState, alive: false, previewUrl: null })
     renderBuilder({ deps: deps() })
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
     await settle()
     h.renewPresence.mockClear()
 
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
-    })
+    for (let tick = 0; tick < 3; tick += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
+      })
+    }
 
-    expect(h.renewPresence).not.toHaveBeenCalled()
+    expect(h.renewPresence).toHaveBeenCalledTimes(3)
+    expect(h.renewPresence).toHaveBeenCalledWith(expect.any(String), 'visible')
   })
 
   it('sends nothing on unmount — leaving is silence', async () => {

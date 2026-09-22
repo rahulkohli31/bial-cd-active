@@ -933,20 +933,31 @@ describe('presence renewal — what holds the container open', () => {
     expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'hidden')
   })
 
-  it('never renews on the accelerated starting tick', async () => {
-    // A container in `starting` is held by the start-in-flight marker and the lock, not by a stay,
-    // so a renewal there writes a deadline onto a record nothing is judging it by.
+  it('★ renews throughout a watched start — the window where nothing else holds the container', async () => {
+    // THE GAP THIS CLOSES. Accelerated ticks used to renew nothing, on the grounds that a starting
+    // container is held by the marker and the lock rather than by a stay. But the marker is written
+    // ONCE with a five-minute TTL and the accelerated window is five minutes, so a citizen watching
+    // a start sent zero renewals across exactly the window in which both of those lapse — and the
+    // sweep runs every five minutes.
+    //
+    // Renewing here is a no-op when there is no record to renew: the server's write is a
+    // compare-and-set on the registry's own `app_name`, and its deadline is a monotonic max, so it
+    // can neither conjure a lease nor truncate the longer one a start already granted itself.
     api.fetchPreviewState.mockResolvedValue(reading({ state: 'starting' }))
     mount()
     await settle()
     api.renewPresence.mockClear()
 
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
-    })
+    // Three accelerated ticks, three renewals — not one at the start and silence after it.
+    for (let tick = 0; tick < 3; tick += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
+      })
+    }
 
     expect(api.fetchPreviewState).toHaveBeenCalled()
-    expect(api.renewPresence).not.toHaveBeenCalled()
+    expect(api.renewPresence).toHaveBeenCalledTimes(3)
+    expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'visible')
   })
 
   it('renders nothing and assumes nothing when a renewal cannot be made', async () => {

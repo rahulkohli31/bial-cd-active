@@ -190,17 +190,23 @@ export const HIDDEN_PROBE_MS = 120_000
  * hook is precisely how the chat route would be missed, so it lives here where neither can drift
  * from the other and neither can forget it.
  *
- * `null` means this tick does not renew.
+ * EVERY TICK RENEWS, INCLUDING THROUGHOUT A START, and that is the half this used to get wrong.
+ * Accelerated ticks were exempt on the grounds that a starting container is held by the marker and
+ * the lock rather than by a stay — but the marker is written ONCE, with a five-minute TTL, and the
+ * accelerated window is five minutes too. A citizen watching a start therefore sent zero renewals
+ * across exactly the window where the two things holding their container both lapse, and the sweep
+ * runs every five minutes.
  *
- * NEVER ON AN ACCELERATED TICK. A container in `starting` is held by the start-in-flight marker
- * and the lock, not by a stay, so a renewal there writes a deadline onto a record that is not
- * being judged by it — the same reason the save read sits behind the same gate.
+ * RENEWING THERE IS STRUCTURALLY SAFE, which is what the old reasoning missed. `renew_presence_stay`
+ * is a compare-and-set on the registry's own `app_name`: with no record, or a record naming another
+ * container, it writes nothing and answers `nothing_running` / `not_this_container`. And the deadline
+ * it writes is a monotonic `max`, so a five-minute visible renewal cannot truncate the long stay a
+ * start already granted itself. The absolute age ceiling bounds all of it regardless.
+ *
+ * `null` means this tick does not renew — nothing returns it today, and the type keeps the door
+ * open for a caller that genuinely should not.
  */
-export function presenceToRenew(
-  accelerated: boolean,
-  documentHidden: boolean,
-): SurfacePresence | null {
-  if (accelerated) return null
+export function presenceToRenew(documentHidden: boolean): SurfacePresence | null {
   return documentHidden ? 'hidden' : 'visible'
 }
 

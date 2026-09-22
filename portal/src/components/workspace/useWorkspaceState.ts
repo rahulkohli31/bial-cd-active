@@ -238,7 +238,7 @@ export function useWorkspaceState({
       // background tab that could reach either would be spending a container call, or ending a
       // workspace, with nobody looking.
       const hidden = document.visibilityState !== 'visible'
-      const presence = presenceToRenew(accelerated, hidden)
+      const presence = presenceToRenew(hidden)
       if (presence) {
         // NOT AWAITED. The renewal is a fact this surface reports, not one the read waits on: a
         // slow renewal must never delay the answer the screen is rendering. Its own result is
