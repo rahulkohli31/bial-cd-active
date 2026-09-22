@@ -10,15 +10,21 @@ surviving conversations of both are still there afterwards.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import datetime as dt
 import uuid
+from collections.abc import AsyncIterator
+from typing import Any, Final, cast
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message
+from src.db.models.user import User
 from src.services.conversations.retention import (
     condemned_conversations,
     gather_and_delete,
@@ -82,9 +88,8 @@ async def test_a_conversation_idle_past_the_window_is_condemned(db_session) -> N
 
 
 async def test_a_chat_created_nine_days_ago_and_used_this_morning_survives(db_session) -> None:
-    """★ AE7. The signal is LAST TOUCHED, not created — a long-running conversation somebody is
-    still using is the case this predicate exists to spare, and the one a naive column gets
-    wrong."""
+    """★ The signal is LAST TOUCHED, not created — a long-running conversation somebody is still
+    using is the case this predicate exists to spare, and the one a naive column gets wrong."""
     user = await UserFactory.create(db_session)
     fresh = await _chat_last_touched(db_session, user.id, days_ago=0.2)
     stale = await _chat_last_touched(db_session, user.id, days_ago=8)
@@ -226,14 +231,14 @@ async def test_two_owners_are_swept_in_one_pass_and_their_live_chats_survive(
         assert await db_session.get(Conversation, survivor.id) is not None
 
 
-async def test_a_conversation_touched_between_selection_and_deletion_survives(
+async def test_a_conversation_touched_before_the_verdict_is_retaken_survives(
     db_session,
 ) -> None:
-    """★ The race the re-check exists for. Selection and deletion are separated by the attachment
-    read, and a citizen who sends a message in that window must keep their conversation.
+    """★ The half of the race the re-check closes: a send that lands after the candidates are
+    chosen and before the verdict is retaken. That citizen must keep their conversation.
 
-    Mutation receipt: drop the `updated_at` predicate from the delete and this goes red while
-    every other test in this file stays green."""
+    Mutation receipt: drop the `updated_at` predicate from the re-check select and this goes red
+    while every other test in this file stays green."""
     user = await UserFactory.create(db_session)
     doomed = await _chat_last_touched(db_session, user.id, days_ago=9)
 
@@ -259,3 +264,120 @@ async def test_nothing_condemned_deletes_nothing(db_session) -> None:
     sweep = await gather_and_delete(db_session, conversation_ids=(), cutoff=_CUTOFF)
     assert sweep.removed == 0
     assert sweep.blob_keys == ()
+
+
+# --- the window between the verdict and the deletes ---------------------------------------
+
+#: How long the send is watched before the test concludes it really is blocked. Far longer than
+#: an unblocked one-row UPDATE takes, and short enough to cost the suite nothing.
+_LOCK_WAIT_S: Final = 0.5
+
+
+@contextlib.asynccontextmanager
+async def _its_own_connection(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+    """A session that really commits, on a connection of its own.
+
+    A row lock is only observable ACROSS connections, and a second connection cannot see rows the
+    per-test transaction has never committed — so the lock test seeds real rows and reaps them
+    itself instead of riding `db_session`.
+    """
+    session = AsyncSession(bind=engine, expire_on_commit=False)
+    try:
+        yield session
+    finally:
+        await session.close()
+
+
+class _PausesInsideTheWindow:
+    """The real session, stopped once: after the verdict is retaken, before the deletes run.
+
+    `gather_and_delete` offers no hook into that window, and the window is the whole subject —
+    this is what puts another connection inside it.
+    """
+
+    def __init__(
+        self, inner: AsyncSession, *, inside: asyncio.Event, leave: asyncio.Event
+    ) -> None:
+        self._inner = inner
+        self._inside = inside
+        self._leave = leave
+        self._stopped = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def scalars(self, *args: Any, **kwargs: Any) -> Any:
+        result = await self._inner.scalars(*args, **kwargs)
+        if not self._stopped:
+            self._stopped = True
+            self._inside.set()
+            await self._leave.wait()
+        return result
+
+
+async def test_a_message_sent_inside_the_delete_window_waits_and_takes_nothing(
+    test_engine,
+) -> None:
+    """★ The half of the race the re-check alone does not close. Retaking the verdict and running
+    the deletes are separate statements, and at READ COMMITTED a send landing between them would
+    be overwritten by a delete already decided. The verdict is taken FOR UPDATE, so the send
+    waits — and finds nothing left to update.
+
+    Mutation receipt: drop `.with_for_update()` from the re-check and the send lands at once
+    instead of waiting, which turns the timeout below red."""
+    async with _its_own_connection(test_engine) as seed:
+        user = await UserFactory.create(seed)
+        await seed.commit()
+
+    inside = asyncio.Event()
+    leave = asyncio.Event()
+    try:
+        async with _its_own_connection(test_engine) as seed:
+            doomed = await _chat_last_touched(seed, user.id, days_ago=9, kind=ChatKind.GENERIC)
+            await _an_attachment(seed, user.id, doomed.id, key="att/locked")
+            await seed.commit()
+
+        async with (
+            _its_own_connection(test_engine) as deleter,
+            _its_own_connection(test_engine) as sender,
+        ):
+            deleting = asyncio.ensure_future(
+                gather_and_delete(
+                    cast(
+                        AsyncSession,
+                        _PausesInsideTheWindow(deleter, inside=inside, leave=leave),
+                    ),
+                    conversation_ids=(doomed.id,),
+                    cutoff=_CUTOFF,
+                )
+            )
+            await inside.wait()
+
+            sending = asyncio.ensure_future(
+                sender.scalars(
+                    sa.update(Conversation)
+                    .where(Conversation.id == doomed.id)
+                    .values(updated_at=_NOW)
+                    .returning(Conversation.id)
+                )
+            )
+            # `shield` so the timeout gives up on waiting without cancelling the send itself:
+            # the send is what has to be still there afterwards, blocked on the lock.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(sending), timeout=_LOCK_WAIT_S)
+
+            leave.set()
+            sweep = await deleting
+            await deleter.commit()
+
+            assert (await sending).all() == []
+            await sender.rollback()
+
+        assert sweep.removed == 1
+        assert sweep.blob_keys == ("att/locked",)
+        async with _its_own_connection(test_engine) as reader:
+            assert await reader.get(Conversation, doomed.id) is None
+    finally:
+        async with _its_own_connection(test_engine) as reaper:
+            await reaper.execute(sa.delete(User).where(User.id == user.id))
+            await reaper.commit()

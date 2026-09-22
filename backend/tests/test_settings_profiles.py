@@ -168,6 +168,33 @@ def test_the_worker_refuses_without_the_capabilities_it_uses(missing: str) -> No
         _boot(WorkerSettings, env)
 
 
+def test_the_worker_refuses_to_boot_without_a_retention_decision() -> None:
+    """A flat switch rather than a nested block, and required for the same reason as the three
+    above it: this process is the one that deletes citizens' conversations, and a deployment
+    that has not decided whether it does that must not have an answer picked for it.
+    Mutation-check: give `conversation_retention_enabled` a default and this goes red."""
+    env = {k: v for k, v in _WORKER_ENV.items() if k != "CONVERSATION_RETENTION_ENABLED"}
+    with pytest.raises(ValidationError) as excinfo:
+        _boot(WorkerSettings, env)
+    assert "conversation_retention_enabled" in str(excinfo.value)
+
+
+def test_a_worker_told_to_retain_still_reports_rather_than_destroys() -> None:
+    """The asymmetry between the two flags is the guarantee: the switch above turns the pass on
+    to select, count and report; a second flag is what lets it act. An unset destroy flag has
+    exactly one correct meaning, so it is the one retention field that carries a default."""
+    settings = _boot(WorkerSettings, {**_WORKER_ENV, "CONVERSATION_RETENTION_ENABLED": "true"})
+    assert settings.conversation_retention_destroy is False
+
+
+@pytest.mark.parametrize("window", ["0", "-1"])
+def test_a_retention_window_that_condemns_every_conversation_is_refused(window: str) -> None:
+    """A window of zero or less puts the cutoff at or ahead of now, so the pass selects the
+    whole platform. Nothing downstream questions the number — the count reads as the backlog."""
+    with pytest.raises(ValidationError):
+        _boot(WorkerSettings, {**_WORKER_ENV, "CONVERSATION_RETENTION_DAYS": window})
+
+
 def test_the_worker_boots_on_its_own_block_alone() -> None:
     """No auth, no superadmin allowlist, no frontend URL — the worker has no RBAC surface and
     serves no browser, so requiring them would be the union-of-everything problem again."""

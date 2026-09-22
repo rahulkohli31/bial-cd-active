@@ -15,6 +15,8 @@ and the pass deletes nothing forever while writing healthy-looking rows.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import datetime as dt
 from typing import Final
 
@@ -35,14 +37,18 @@ RETENTION_SCHEDULE_ID: Final = "conversation-retention-daily"
 #: declines six times out of seven costs one SELECT each time and cannot be missed by a deploy.
 RETENTION_CRON: Final = "17 3 * * *"
 
-#: How long a SUCCESSFUL pass suppresses the next one. Shorter than the retention window on
-#: purpose: the window decides what is condemned, this decides how often the question is asked.
+#: How long a SUCCESSFUL pass suppresses the next one. It equals the retention window at the
+#: shipped defaults and answers a different question — the window decides what is condemned, this
+#: decides how often the question is asked — so an operator may widen either one alone.
 RETENTION_INTERVAL: Final = dt.timedelta(days=7)
 
 PASS_COMPLETED_EVENT: Final = "conversation_retention_pass_completed"
 
 #: `WorkerPass.detail` is `String(512)`.
 _DETAIL_LIMIT: Final = 512
+
+#: The advisory-lock key. A constant, because the lock protects "a retention pass", not a row.
+_LOCK_KEY: Final = 0x43_4F_4E_56_01  # "CONV" + 01, an arbitrary but stable 64-bit constant
 
 
 def _worker_settings() -> WorkerSettings:
@@ -78,8 +84,8 @@ async def sweep_idle_conversations() -> None:
     SETTINGS ARE READ INSIDE THE FUNCTION, never at module scope: the settings object resolves its
     role lazily and an eager read at import breaks the worker.
 
-    NOTHING IS SWALLOWED: a raise is recorded as a failed pass and re-raised, so a broken pass is
-    distinguishable from an absent one.
+    NOTHING IS SWALLOWED: a raise is recorded as a failed pass and re-raised, and a cancellation
+    records itself before it propagates, so neither is mistaken for a pass that never ran.
     """
     off_duty = _off_duty_because()
     if off_duty is not None:
@@ -104,16 +110,14 @@ async def sweep_idle_conversations() -> None:
             return
         try:
             await _run_one_pass()
+        except asyncio.CancelledError:
+            raise
         except Exception:
             _log.exception("conversation_retention_pass_failed")
             await _record_pass(
                 outcome="failed", counts={}, detail="the pass raised; see the traceback"
             )
             raise
-
-
-#: The advisory-lock key. A constant, because the lock protects "a retention pass", not a row.
-_LOCK_KEY: Final = 0x43_4F_4E_56_01  # "CONV" + 01, an arbitrary but stable 64-bit constant
 
 
 async def _due_since() -> dt.datetime | None:
@@ -141,14 +145,18 @@ async def _due_since() -> dt.datetime | None:
 
 async def _run_one_pass() -> None:
     """Select, delete, commit, sweep — in that order, which is the order that cannot strand a
-    blob whose row survived."""
+    blob whose row survived.
+
+    THE COMMIT IS THE POINT OF NO RETURN, so both sides of it hold against cancellation: before
+    it the transaction rolls back and the pass records that it was interrupted; after it the
+    sweep and the record run shielded, because that record is the only thing holding the next
+    tick back and a batch deleted without one is condemned a second time."""
     from src.db.base import async_session_factory
     from src.services.conversations.retention import (
         condemned_conversations,
         gather_and_delete,
         idle_before,
     )
-    from src.services.storage import get_storage, sweep_blobs
 
     profile = _worker_settings()
     cutoff = idle_before(
@@ -156,34 +164,84 @@ async def _run_one_pass() -> None:
     )
     limit = profile.conversation_retention_per_pass
 
-    async with async_session_factory() as db:
-        candidates, outstanding = await condemned_conversations(db, cutoff=cutoff, limit=limit)
-        sweep = await gather_and_delete(db, conversation_ids=candidates, cutoff=cutoff)
-        await db.commit()
+    try:
+        async with async_session_factory() as db:
+            candidates, outstanding = await condemned_conversations(db, cutoff=cutoff, limit=limit)
+            sweep = await gather_and_delete(db, conversation_ids=candidates, cutoff=cutoff)
+            await db.commit()
+    except asyncio.CancelledError:
+        _log.warning("conversation_retention_pass_cancelled")
+        await _record_pass(
+            outcome="failed", counts={}, detail="cancelled before the delete committed"
+        )
+        raise
 
-    # AFTER THE COMMIT, and best effort. A key whose delete fails is recorded on the pass so the
-    # next run can take it again — the only blob this pass can strand is one whose delete call
-    # failed, and those keys are known, which is why there is no container-wide orphan diff here.
-    survived = await sweep_blobs(get_storage(), list(sweep.blob_keys), concurrency=_SWEEP_WIDTH)
+    tail = asyncio.ensure_future(
+        _sweep_and_record(
+            sweep.blob_keys,
+            condemned=len(candidates),
+            removed=sweep.removed,
+            outstanding=outstanding,
+        )
+    )
+    try:
+        await asyncio.shield(tail)
+    except asyncio.CancelledError:
+        # The shield leaves the tail running; this waits it out instead of handing an unwritten
+        # record to a task the loop is about to tear down.
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait({tail}, timeout=_TAIL_GRACE_S)
+        if not tail.done():
+            _log.error("conversation_retention_pass_record_owed", removed=sweep.removed)
+        raise
+
+
+#: How long a cancelled pass waits for its shielded tail. Well inside the worker's own shutdown
+#: grace, so the record lands before the container goes.
+_TAIL_GRACE_S: Final = 10.0
+
+
+async def _sweep_and_record(
+    blob_keys: tuple[str, ...], *, condemned: int, removed: int, outstanding: int
+) -> None:
+    """Everything the pass owes after its commit: drop the blobs, then write the pass record.
+
+    IT DOES NOT RAISE. The rows are already gone, so a store that is unreachable must still leave
+    an `ok` row naming what it could not delete — without one the gate sees no successful run and
+    the next tick condemns a second batch."""
+    from src.services.storage import get_storage, sweep_blobs
+
+    try:
+        survived = await sweep_blobs(get_storage(), list(blob_keys), concurrency=_SWEEP_WIDTH)
+    except Exception:
+        _log.exception("conversation_retention_blob_sweep_failed")
+        survived = list(blob_keys)
 
     counts = {
-        "condemned": len(candidates),
-        "removed": sweep.removed,
-        "blobs": len(sweep.blob_keys),
+        "condemned": condemned,
+        "removed": removed,
+        "blobs": len(blob_keys),
         "blobs_failed": len(survived),
         "outstanding": outstanding,
     }
     _log.info(PASS_COMPLETED_EVENT, **counts)
-    await _record_pass(
-        outcome="ok",
-        counts=counts,
-        detail=f"blob keys still out there: {', '.join(survived)}" if survived else None,
-    )
+    await _record_pass(outcome="ok", counts=counts, detail=_stranded_blobs_detail(survived))
 
 
 #: Wider than the interactive delete's, which is tuned for one citizen pressing one button. This
 #: sweep is bulk and post-commit: raising it only shortens the pass, never changes its outcome.
 _SWEEP_WIDTH: Final = 24
+
+
+def _stranded_blobs_detail(survived: list[str]) -> str | None:
+    """What the record says about blobs the store would not delete.
+
+    NOTHING RETAKES THESE. No code reads `detail` back, so the line is a report for a human, not a
+    queue — and the count leads it because `_DETAIL_LIMIT` truncates the key list, and a truncated
+    list that hid its own length would read as a smaller leak than it is."""
+    if not survived:
+        return None
+    return f"{len(survived)} blobs left in the store, never retried: {', '.join(survived)}"
 
 
 async def _record_pass(*, outcome: str, counts: dict[str, int], detail: str | None) -> None:

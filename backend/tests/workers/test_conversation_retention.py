@@ -1,21 +1,28 @@
 """The scheduled half: when the pass runs, when it stands down, and what it leaves on record.
 
-THE GATE IS THE SUBJECT OF THIS FILE, not the deletion — `tests/services/conversations/
-test_retention.py` owns what a pass condemns. What is asserted here is that the pass is REACHABLE:
-that its own declines cannot seal it shut, that a second worker cannot run it concurrently, and
-that an operator reading the pass table can tell a disabled worker from a dead one.
+`tests/services/conversations/test_retention.py` owns what a pass condemns. What is asserted here
+is that the pass is REACHABLE — that its own declines cannot seal it shut, that a second worker
+cannot run it concurrently, and that an operator reading the pass table can tell a disabled worker
+from a dead one — and, in one test, that the whole select-delete-commit-sweep-record pipeline runs
+with nothing stubbed between its ends, since every other test here replaces it.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import datetime as dt
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 import sqlalchemy as sa
 
+from src.db import base as db_base
+from src.db.models.attachment import Attachment
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.worker_pass import PassOutcome, WorkerPass
 from src.workers import conversation_retention as retention
 from src.workers.conversation_retention import (
@@ -24,8 +31,38 @@ from src.workers.conversation_retention import (
     RETENTION_SCHEDULE_ID,
     RETENTION_TASK_NAME,
 )
+from tests.factories import ConversationFactory, UserFactory
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+class _NoCommitSession:
+    """The test's own session, handed to code that opens one of its own.
+
+    `refuses_bookkeeping` fails the pass-record write while leaving the deletion's own session
+    working, which is the only way in to that branch from outside the module.
+    """
+
+    def __init__(self, inner, *, refuses_bookkeeping: bool = False) -> None:
+        self._inner = inner
+        self._refuses_bookkeeping = refuses_bookkeeping
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def add(self, instance: Any, *args: Any, **kwargs: Any) -> None:
+        if self._refuses_bookkeeping and isinstance(instance, WorkerPass):
+            raise RuntimeError("the pass record would not write")
+        self._inner.add(instance, *args, **kwargs)
+
+    async def commit(self) -> None:
+        await self._inner.flush()
 
 
 @pytest.fixture
@@ -35,24 +72,6 @@ def records_land_here(db_session, monkeypatch: pytest.MonkeyPatch):
     The pass writes its record on a session of its own — it must land even when the pass it
     describes has just failed — so a test that wants to read one back has to bind that factory.
     """
-    from src.db import base as db_base
-
-    class _NoCommitSession:
-        def __init__(self, inner) -> None:
-            self._inner = inner
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_exc: object) -> None:
-            return None
-
-        def __getattr__(self, name: str):
-            return getattr(self._inner, name)
-
-        async def commit(self) -> None:
-            await self._inner.flush()
-
     monkeypatch.setattr(db_base, "async_session_factory", lambda: _NoCommitSession(db_session))
     return db_session
 
@@ -69,16 +88,50 @@ async def _passes(db) -> list[WorkerPass]:
     )
 
 
-def _switch(monkeypatch: pytest.MonkeyPatch, *, on: bool) -> None:
-    """Answer the worker profile's flag without building a worker profile."""
+async def _an_idle_chat_holding(db, *blob_keys: str) -> uuid.UUID:
+    """A conversation nobody has touched for a month, holding one uploaded file per key.
+
+    The backdate follows the inserts, and has to: the row is created carrying `now()`, so a
+    column written before that is simply overwritten.
+    """
+    user = await UserFactory.create(db)
+    conversation = await ConversationFactory.create(db, user.id, kind=ChatKind.GENERIC)
+    for key in blob_keys:
+        db.add(
+            Attachment(
+                user_id=user.id,
+                conversation_id=conversation.id,
+                attachment_id=f"att-{uuid.uuid4().hex[:12]}",
+                name="roster.pdf",
+                media_type="application/pdf",
+                size=512,
+                storage_key=key,
+            )
+        )
+    await db.execute(
+        sa.update(Conversation)
+        .where(Conversation.id == conversation.id)
+        .values(updated_at=dt.datetime.now(dt.UTC) - dt.timedelta(days=30))
+    )
+    await db.flush()
+    return conversation.id
+
+
+def _switch(monkeypatch: pytest.MonkeyPatch, *, on: bool, destroy: bool = True) -> None:
+    """Answer the worker profile's retention fields without building a worker profile."""
     monkeypatch.setattr(
-        retention, "_worker_settings", lambda: _Profile(enabled=on, days=7, per_pass=500)
+        retention,
+        "_worker_settings",
+        lambda: _Profile(enabled=on, destroy=destroy, days=7, per_pass=500),
     )
 
 
 class _Profile:
-    def __init__(self, *, enabled: bool, days: int, per_pass: int) -> None:
+    """Stands in for the retention fields of a worker profile."""
+
+    def __init__(self, *, enabled: bool, destroy: bool, days: int, per_pass: int) -> None:
         self.conversation_retention_enabled = enabled
+        self.conversation_retention_destroy = destroy
         self.conversation_retention_days = days
         self.conversation_retention_per_pass = per_pass
 
@@ -86,6 +139,18 @@ class _Profile:
 @contextlib.asynccontextmanager
 async def _lock(taken: bool) -> AsyncIterator[bool]:
     yield taken
+
+
+def _the_store_refuses(monkeypatch: pytest.MonkeyPatch, store, key: str) -> None:
+    """Fail one key's delete, leaving the rest of the sweep to succeed."""
+    deletes = store.delete
+
+    async def _delete(refused: str) -> None:
+        if refused == key:
+            raise RuntimeError("the store would not delete it")
+        await deletes(refused)
+
+    monkeypatch.setattr(store, "delete", _delete)
 
 
 # --- the flag -----------------------------------------------------------------------------
@@ -268,6 +333,110 @@ async def test_a_failure_mid_pass_is_recorded_before_it_propagates(
     assert rows[-1].outcome is PassOutcome.FAILED
 
 
+# --- the pipeline itself --------------------------------------------------------------------
+
+
+async def test_a_pass_run_end_to_end_records_the_counts_and_the_blob_it_could_not_delete(
+    records_land_here, fake_storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Every other test here replaces the pass, so this is the one that runs it: select,
+    delete, commit, sweep, record. A store that drops one key is the case the record exists for —
+    the rows are already gone, so the pass owes an `ok` row naming what is still out there rather
+    than a failure that would condemn the same batch again.
+
+    Mutation receipt: let the blob sweep's failure escape `_sweep_and_record` and this goes red —
+    the pass raises and records `failed` for work that succeeded."""
+    _switch(monkeypatch, on=True)
+    monkeypatch.setattr(
+        "src.services.build_sessions.destroy.single_flight_lock", lambda _key: _lock(True)
+    )
+    doomed = await _an_idle_chat_holding(records_land_here, "att/goes", "att/stays")
+    await fake_storage.put("att/goes", b"one")
+    await fake_storage.put("att/stays", b"two")
+    _the_store_refuses(monkeypatch, fake_storage, "att/stays")
+
+    await retention.sweep_idle_conversations()
+
+    records_land_here.expunge_all()
+    assert await records_land_here.get(Conversation, doomed) is None
+    assert fake_storage.objects == {"att/stays": b"two"}
+    rows = await _passes(records_land_here)
+    assert [row.outcome for row in rows] == [PassOutcome.OK]
+    assert rows[0].counts == {
+        "condemned": 1,
+        "removed": 1,
+        "blobs": 2,
+        "blobs_failed": 1,
+        "outstanding": 0,
+    }
+    assert "att/stays" in (rows[0].detail or "")
+
+
+async def test_a_pass_cancelled_after_its_commit_still_leaves_its_record(
+    records_land_here, fake_storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The commit is the point of no return, and the record is the only thing holding the next
+    tick back — so a cancellation arriving after it must still leave a row. Without one the run
+    reads as one that never happened and the batch that is already gone is condemned again.
+
+    Mutation receipt: drop the `asyncio.shield` around the tail and this goes red — the record is
+    never written."""
+    _switch(monkeypatch, on=True)
+    monkeypatch.setattr(
+        "src.services.build_sessions.destroy.single_flight_lock", lambda _key: _lock(True)
+    )
+    doomed = await _an_idle_chat_holding(records_land_here, "att/one")
+    in_the_tail = asyncio.Event()
+    carry_on = asyncio.Event()
+    real_tail = retention._sweep_and_record
+
+    async def _waits_to_be_cancelled(blob_keys: Any, **counts: int) -> None:
+        in_the_tail.set()
+        await carry_on.wait()
+        await real_tail(blob_keys, **counts)
+
+    monkeypatch.setattr(retention, "_sweep_and_record", _waits_to_be_cancelled)
+
+    running = asyncio.ensure_future(retention.sweep_idle_conversations())
+    await in_the_tail.wait()
+    running.cancel()
+    carry_on.set()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    records_land_here.expunge_all()
+    assert await records_land_here.get(Conversation, doomed) is None
+    rows = await _passes(records_land_here)
+    assert [row.outcome for row in rows] == [PassOutcome.OK]
+
+
+async def test_a_pass_whose_record_cannot_be_written_keeps_its_deletion_and_does_not_raise(
+    records_land_here, fake_storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The rows are committed gone before the record is written, so a pass whose bookkeeping
+    fails did its work and must not report otherwise. The cost is real and deliberate: with no
+    row the gate sees no successful run, which is why the branch logs rather than passes quietly.
+
+    Mutation receipt: let `_record_pass` propagate and this goes red — the pass raises, and the
+    caller above it writes a `failed` row for a deletion that happened."""
+    _switch(monkeypatch, on=True)
+    monkeypatch.setattr(
+        "src.services.build_sessions.destroy.single_flight_lock", lambda _key: _lock(True)
+    )
+    doomed = await _an_idle_chat_holding(records_land_here, "att/one")
+    monkeypatch.setattr(
+        db_base,
+        "async_session_factory",
+        lambda: _NoCommitSession(records_land_here, refuses_bookkeeping=True),
+    )
+
+    await retention.sweep_idle_conversations()
+
+    records_land_here.expunge_all()
+    assert await records_land_here.get(Conversation, doomed) is None
+    assert await _passes(records_land_here) == []
+
+
 # --- the wiring -----------------------------------------------------------------------------
 
 
@@ -295,9 +464,11 @@ def test_the_cron_ticks_more_often_than_the_window_it_enforces() -> None:
 
 
 def test_the_example_environment_file_carries_the_new_settings() -> None:
-    """The flag is REQUIRED, so a deployment that does not carry it refuses to boot — and the
-    sample is where an operator finds out before that happens."""
+    """The enabling flag is REQUIRED, so a deployment that does not carry it refuses to boot —
+    and the sample is where an operator finds out before that happens. The destroy switch
+    defaults off instead, which makes the sample the only place an operator meets it at all."""
     sample = (_BACKEND_ROOT / ".env.worker.example").read_text(encoding="utf-8")
     assert "CONVERSATION_RETENTION_ENABLED=false" in sample
+    assert "CONVERSATION_RETENTION_DESTROY=false" in sample
     assert "CONVERSATION_RETENTION_DAYS=" in sample
     assert "CONVERSATION_RETENTION_PER_PASS=" in sample

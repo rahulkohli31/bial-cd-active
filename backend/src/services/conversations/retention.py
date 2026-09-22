@@ -1,22 +1,16 @@
 """Removing a conversation nobody has added to in a while — the policy's half, set-based.
 
-IT DOES NOT REUSE THE INTERACTIVE DELETE, and the duplication is honest rather than an oversight.
-`delete.py` answers "this person asked to delete this chat": it is scoped to one owner because an
-attachment's client-minted token is unique only per owner, and it discovers attachments by scanning
-what the stored messages REFERENCE. This answers "a policy condemns these chats, whoever they
-belong to" — every owner in one set of statements, and attachments found by the foreign key the
-upload door stamps. That second difference is not a shortcut: the key is stamped whether or not the
-file is ever sent, so this finds a file uploaded to a chat and never sent, which a payload scan
-structurally cannot see.
+IT DOES NOT REUSE THE INTERACTIVE DELETE. `delete.py` answers "this person asked to delete this
+chat": it is scoped to one owner because an attachment's client-minted token is unique only per
+owner, and it discovers attachments by scanning what the stored messages REFERENCE. This answers
+"a policy condemns these chats, whoever they belong to" — every owner in one set of statements,
+and attachments reached by `attachments.conversation_id`, the foreign key the upload door stamps
+whether or not the file is ever sent. So this finds a file uploaded to a chat and never sent,
+which a payload scan structurally cannot see, and it needs no owner predicate to do it.
 
-OWNER SCOPING SURVIVES WITHOUT A LOOP. It is needed in exactly one place — resolving a
-client-minted identifier out of a message payload — and there is no such resolution here: every
-attachment is reached by `attachments.conversation_id`, a real indexed foreign key, so the
-predicate that makes the interactive path safe has nothing to be unsafe about.
-
-THE ORDER IS THE ESTABLISHED ONE: rows deleted inside the caller's transaction, the caller commits,
-then blobs are swept best-effort. Inverting it destroys blobs that a rolled-back delete would have
-kept.
+THE ORDER IS DELETE, COMMIT, SWEEP: rows deleted inside the caller's transaction, the caller
+commits, then blobs swept best-effort. Inverting it destroys blobs a rolled-back delete would
+have kept.
 """
 
 from __future__ import annotations
@@ -34,16 +28,10 @@ from src.db.models.conversation import Conversation
 
 @dataclass(frozen=True)
 class RetentionSweep:
-    """What one pass condemned, and what it could not finish.
-
-    `outstanding` is the candidates the cap left behind, reported rather than dropped: the first
-    enabled run's candidate set is the whole historical backlog, not a weekly increment, so a
-    number here is the difference between "the backlog is draining" and "the pass is stuck".
-    """
+    """What one pass removed: the conversations that are gone, and the blobs they left behind."""
 
     conversation_ids: tuple[uuid.UUID, ...] = ()
     blob_keys: tuple[str, ...] = ()
-    outstanding: int = 0
 
     @property
     def removed(self) -> int:
@@ -91,10 +79,10 @@ async def gather_and_delete(
 ) -> RetentionSweep:
     """Delete the condemned rows inside the caller's transaction; return the keys to sweep.
 
-    THE IDLENESS IS RE-ASKED AT DELETE TIME, in the delete's own predicate rather than trusting the
-    id list. Selection and deletion are separated by the attachment read, and a citizen who sends a
-    message in that window must keep their conversation — so the `updated_at` test travels with the
-    ids and the trigger's write is what takes a live chat back out of the set.
+    THE VERDICT IS RE-TAKEN HERE AND HELD UNDER A ROW LOCK, which is what makes both deletes safe:
+    at READ COMMITTED a citizen who sends a message between the verdict and the deletes must keep
+    their conversation, and locking — rather than re-testing inside each delete — is also what
+    stops the attachment delete from stripping a spared conversation's rows.
 
     MESSAGES CASCADE in the database; attachment ROWS do not — their foreign key is
     `ON DELETE SET NULL`, which is right for the interactive path and would leave this one's rows
@@ -104,7 +92,9 @@ async def gather_and_delete(
         return RetentionSweep()
 
     still_idle = sa.and_(Conversation.id.in_(conversation_ids), Conversation.updated_at < cutoff)
-    doomed = (await db.scalars(sa.select(Conversation.id).where(still_idle))).all()
+    doomed = (
+        await db.scalars(sa.select(Conversation.id).where(still_idle).with_for_update())
+    ).all()
     if not doomed:
         return RetentionSweep()
 
@@ -115,5 +105,9 @@ async def gather_and_delete(
     ).all()
 
     await db.execute(sa.delete(Attachment).where(Attachment.conversation_id.in_(doomed)))
-    await db.execute(sa.delete(Conversation).where(Conversation.id.in_(doomed)))
-    return RetentionSweep(conversation_ids=tuple(doomed), blob_keys=tuple(keys))
+    removed = (
+        await db.scalars(
+            sa.delete(Conversation).where(Conversation.id.in_(doomed)).returning(Conversation.id)
+        )
+    ).all()
+    return RetentionSweep(conversation_ids=tuple(removed), blob_keys=tuple(keys))
