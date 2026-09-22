@@ -706,10 +706,9 @@ async def test_a_cold_relaunch_whose_root_shows_no_page_deletes_nothing_from_aca
 
     The shape: a cold relaunch restores the citizen's tree, the dev server comes up, and the app
     root answers 404 because the agent has not written `app/page.tsx` yet. The container is up and
-    holds the work. The first version of the page check answered that by raising
-    `SandboxNotReadyError` into the readiness handler, which re-raises on the cold arm — the raise
-    escaped the lock scope before `scope.spare()`, compensation tore down the container that had
-    just been built, and the citizen got a 503 over their own workspace.
+    holds the work. Answering that with a raise escapes the lock scope before `scope.spare()`, so
+    compensation tears down the container that has just been built and the citizen gets a 503 over
+    their own workspace.
 
     Mutation-check: raise `SandboxNotReadyError` from the page-less arm instead of retracting, and
     this goes red on the status code with a delete recorded against the app it just created."""

@@ -1212,10 +1212,9 @@ async def test_a_confirmed_absent_container_still_restores(
 # 404s, genuinely ready with nothing to show. Measured on 2026-09-10: the platform framed exactly
 # that, and the citizen got a blank white pane with no words on it.
 #
-# AND THE REMEDY IS NEVER DESTRUCTION. The first attempt at this check raised
-# `SandboxNotReadyError` into the readiness handler above it, whose opening line re-raises on a
-# cold relaunch — so a container that had just been restored was torn down, and the citizen got a
-# 503 over their own workspace. That is the regression these tests exist to keep out.
+# AND THE REMEDY IS NEVER DESTRUCTION. A root with nothing to show is a container that is up
+# and holds the citizen's tree; answering it with a raise escapes the lock scope before
+# `scope.spare()` and lets compensation tear that container down. These tests keep that out.
 
 
 @pytest.fixture
@@ -1282,11 +1281,9 @@ async def test_a_cold_relaunch_whose_root_shows_no_page_keeps_the_container_it_j
     """★ THE REGRESSION THAT SHIPPED. A cold relaunch restores the citizen's tree into a fresh
     container, the dev server comes up, and the app root answers 404 because the agent has not
     written `app/page.tsx` yet. That container is up, holds the work, and becomes framable the
-    moment a page exists — and the first version of the page check answered it by raising
-    `SandboxNotReadyError` into the readiness handler, whose `if not attached: raise` re-raises
-    on exactly this arm. The raise escaped `_holding_user_lock` before `scope.spare()`, so
-    compensation tore down the container `_restore_or_bust` had just built, and the citizen got a
-    503 with their workspace gone.
+    moment a page exists — so the page check answers it by retracting the serving proof and
+    watching, never by raising: a raise here escapes `_holding_user_lock` before `scope.spare()`,
+    and compensation tears down the container `_restore_or_bust` has just built.
 
     Mutation-check: revert the gate to `something_watched_it_paint = dev.ready` and this goes red
     on `ready` — the fail-open readiness flag counts the 404 as a serve."""

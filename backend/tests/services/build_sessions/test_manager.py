@@ -1332,11 +1332,17 @@ async def test_relaunch_restore_failure_releases_the_lock_and_leaves_no_orphan(
     assert manager._active_by_user == {}
 
 
-async def test_relaunch_tears_down_the_container_if_the_dev_server_never_readies(
+async def test_relaunch_keeps_a_restored_container_whose_dev_server_never_readies(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    # Restore succeeds but the dev server never comes ready: the freshly-restored container is
-    # torn down (no orphan) and the lock released, so the user isn't billed a stuck container.
+    """The COLD arm fails open, exactly as the attach arm does. A readiness timeout says the
+    generated app did not answer inside the budget; it says nothing about the container, which
+    is up and holds the tree just restored into it.
+
+    Destroying it here is what made a slow app unstartable: the pane drops to "Your app is
+    saved.", the auto-start effect presses Launch, and the next press pays for another container
+    that dies the same way. Mutation check: restore `if not attached: raise` and this goes red on
+    `torn_down`."""
     user, project_id = await _mk(db_session, "r5@rvaiglobal.com")
     manager = SessionManager()
 
@@ -1347,11 +1353,17 @@ async def test_relaunch_tears_down_the_container_if_the_dev_server_never_readies
     client = DevNeverReady()
     app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
 
-    with pytest.raises(SandboxNotReadyError):
-        await manager.relaunch_preview(db_session, user, project_id, client)
+    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
 
+    assert relaunched.ready is False, "an app that never served must not be reported as ready"
+    assert relaunched.preview_url, "…but the URL still ships — the pane owns the labelled wait"
     assert client.restored == [app_name_for(app_id)]  # a container WAS created...
-    assert client.torn_down == [app_name_for(app_id)]  # ...and torn down on the failure
+    assert client.torn_down == []  # ...and it survives the app being slow
+    registry = await read_registry(fake_redis, user.id)
+    assert registry is not None and registry[REGISTRY_FIELD_STATE] == REGISTRY_STATE_READY, (
+        "the record must survive too: deleting it sends the next press down the restore arm, "
+        "which tears this container down before pulling the last saved bundle"
+    )
     assert await lock_is_held(fake_redis, user.id) is False
     assert manager._active_by_user == {}
 
@@ -1862,7 +1874,6 @@ async def test_a_post_attach_readiness_failure_spares_the_attached_container(
     app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
     await _the_container_is_already_up(client, fake_redis, user.id, app_id)
 
-    # No longer raises: the attach arm fails open.
     relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
 
     assert relaunched.ready is False, "an app that never served must not be reported as ready"
@@ -1870,29 +1881,6 @@ async def test_a_post_attach_readiness_failure_spares_the_attached_container(
     assert client.torn_down == []  # the container we attached to is STILL RUNNING
     assert await lock_is_held(fake_redis, user.id) is False  # the lock IS ours to give back
     assert manager._active_by_user == {}
-
-
-async def test_a_restored_container_that_never_readies_is_still_torn_down(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    # The other half of the same decision, kept honest: `attached` must not become a blanket
-    # amnesty. A container this request DID create and could not bring up is still ours to
-    # clean up — the same assertion `test_relaunch_tears_down_the_container_if_the_dev_server_
-    # never_readies` makes, restated here as the mutation guard on the new flag.
-    user, project_id = await _mk(db_session, "r16@rvaiglobal.com")
-    manager = SessionManager()
-
-    class DevNeverReadies(_RelaunchRecorder):
-        async def wait_ready(self, handle, *, timeout_s=120.0):
-            raise SandboxNotReadyError("dev server not ready within 120s")
-
-    client = DevNeverReadies()  # no registry seeded → nothing to attach to
-    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
-
-    with pytest.raises(SandboxNotReadyError):
-        await manager.relaunch_preview(db_session, user, project_id, client)
-
-    assert client.torn_down == [app_name_for(app_id)]
 
 
 async def test_dev_start_refused_on_an_attached_container_is_logged_and_ignored(

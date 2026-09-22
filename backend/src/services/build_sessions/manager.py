@@ -3316,82 +3316,47 @@ class SessionManager:
                 # time on that path, and a give-up line quoting it would overstate how long the
                 # citizen actually waited.
                 readiness_started_at = time.monotonic()
-                # THE WAIT AND NOTHING ELSE INSIDE THE TRY. The page check lives in the `else`
-                # arm, where a `SandboxError` from it cannot reach this handler and this handler
-                # cannot be reached by anything but a readiness TIMEOUT — the one condition its
-                # `if not attached: raise` was written for. The first version of that check
-                # raised `SandboxNotReadyError` from inside this try to reuse the handler below:
-                # `SandboxNotReadyError` SUBCLASSES `SandboxError`, so the raise had to dodge its
-                # own transport handler, and the handler it landed in re-raises on a cold
-                # relaunch — escaping `_holding_user_lock` before `scope.spare()` and letting
-                # compensation TEAR DOWN the container `_restore_or_bust` had just built. A blank
-                # pane costs the citizen a card; that cost them the restored workspace and a 503.
+                ready_budget_s = (
+                    _ATTACHED_READY_BUDGET_SECONDS if attached else _COLD_READY_BUDGET_SECONDS
+                )
+                # THE WAIT AND NOTHING ELSE INSIDE THE TRY, so this handler can only be reached
+                # by a readiness TIMEOUT. `SandboxNotReadyError` SUBCLASSES `SandboxError`, so
+                # the page check below would have to dodge its own transport handler to raise
+                # into here; it reaches the same remedy directly instead.
                 try:
                     scope.handle = await sandbox_client.wait_ready(
-                        scope.handle,
-                        timeout_s=(
-                            _ATTACHED_READY_BUDGET_SECONDS
-                            if attached
-                            else _COLD_READY_BUDGET_SECONDS
-                        ),
+                        scope.handle, timeout_s=ready_budget_s
                     )
                 except SandboxNotReadyError:
-                    # AMBIGUITY DENIES, AND WE PAID FOR THIS ONE IN LOST WORK.
+                    # A READINESS TIMEOUT IS A STATEMENT ABOUT THE GENERATED APP, NOT THE
+                    # CONTAINER. `ready` means a request was actually served, so any root route
+                    # slower than the supervisor's read timeout reports un-ready forever — a
+                    # heavy dashboard query or a cold compile under 1.0 vCPU is enough.
                     #
-                    # This handler used to `mark_registry_ending` here and re-raise. A run
-                    # against real Azure showed what that costs: `attach_existing` refuses an
-                    # `ending` sandbox BEFORE it probes (`services/sandbox/client.py`), so the very
-                    # next press took the RESTORE arm — and restore tears the live container down
-                    # (`_safe_teardown`) before pulling the last SAVED bundle. Two clicks, and a
-                    # citizen's unsaved edits were gone with nothing on screen to say so. The 503
-                    # this used to raise is the copy that invited the second click.
-                    #
-                    # The mistake was reading a readiness timeout as a statement about the
-                    # CONTAINER. It is a statement about the generated APP: `ready` means
-                    # a request was actually served, so any root route slower than the supervisor's
-                    # read timeout reports un-ready forever. A heavy dashboard query or a cold
-                    # compile under 1.0 vCPU is enough. Condemning the container for that condemns
-                    # the user's work for the sin of rendering slowly.
-                    #
-                    # So the ATTACH arm fails open: keep the container, leave the registry `ready`,
-                    # and hand back the framable URL with `ready=False`. The pane already owns a
-                    # labelled wait; this destroys nothing and forecloses nothing — the next press
-                    # attaches again rather than restoring. The wedge the `ending` mark was added
-                    # to break is still broken, by the lease we declined to grant before the wait:
-                    # that lapses on its own and covers EVERY way this wait can end, not just the
-                    # one shape this handler could name.
-                    #
-                    # The COLD arm still raises. A container we just provisioned that never came up
-                    # holds no unsaved work and has nothing framable to offer, so an error is the
-                    # honest answer there.
-                    #
-                    # AND THAT SENTENCE IS THE WHOLE SCOPE OF THIS ARM: "never came up". A
-                    # container that DID come up and answers the root with a 404 is a different
-                    # condition entirely — it is up, it holds the tree just restored into it, and
-                    # its URL becomes framable the moment the agent writes a page. Routing that
-                    # through here destroys it. It never reaches this handler now; it is answered
-                    # in the `else` arm below, with the same remedy on both arms.
-                    if not attached:
-                        raise
+                    # So BOTH arms fail open: keep the container, leave the registry `ready`,
+                    # hand back the framable URL with `ready=False`, and let the pane's labelled
+                    # wait carry the seconds. Condemning the cold arm instead destroys the tree
+                    # just restored into it and leaves an app too slow to answer in time unable
+                    # to start at all — the pane falls back to Launch, the auto-start effect
+                    # presses it, and every press costs another container.
                     ready = False
                     _log.warning(
-                        "relaunch_attached_container_not_serving_degraded_to_unready",
+                        "relaunch_container_not_serving_degraded_to_unready",
                         user_id=str(user_id),
                         app_id=str(app_id),
-                        budget_s=_ATTACHED_READY_BUDGET_SECONDS,
+                        budget_s=ready_budget_s,
+                        cold=not attached,
                     )
                     # THE REMEDY IS SHARED WITH THE PAGE CHECK BELOW, and it is one function
                     # so that the two arms cannot drift: retract the standing proof, keep the
-                    # container, keep watching. Every "why" behind those three lives in
-                    # `_retract_the_proof_and_keep_watching`, including the run against real
-                    # Azure that proved the alternative costs unsaved work.
+                    # container, keep watching.
                     await self._retract_the_proof_and_keep_watching(
                         sandbox_client,
                         scope.handle,
                         redis,
                         user_id,
                         app_name=app_name_for(app_id),
-                        already_waited_s=_ATTACHED_READY_BUDGET_SECONDS,
+                        already_waited_s=ready_budget_s,
                         cold=not attached,
                     )
                 else:
@@ -3747,32 +3712,25 @@ class SessionManager:
                         exc_info=True,
                     )
                 ready = True
+                ready_budget_s = (
+                    _ATTACHED_READY_BUDGET_SECONDS if attached else _COLD_READY_BUDGET_SECONDS
+                )
                 try:
-                    handle = await sandbox_client.wait_ready(
-                        handle,
-                        timeout_s=(
-                            _ATTACHED_READY_BUDGET_SECONDS
-                            if attached
-                            else _COLD_READY_BUDGET_SECONDS
-                        ),
-                    )
+                    handle = await sandbox_client.wait_ready(handle, timeout_s=ready_budget_s)
                     scope.handle = handle
                 except SandboxNotReadyError:
-                    # THE SAME ASYMMETRY `_relaunch_under_one_build_id` draws, and for the same
+                    # THE SAME READING `_relaunch_under_one_build_id` takes, and for the same
                     # reason: a readiness timeout is a statement about the APP, not the
-                    # container. The ATTACH arm fails OPEN — keep the container, hand back the
-                    # framable URL with `ready=False`, let the next Launch/Refresh attach again
-                    # rather than restore over a container that may simply be rendering slowly.
-                    # The COLD arm still raises: a container just provisioned that never came up
-                    # holds no work worth preserving and has nothing framable to offer.
-                    if not attached:
-                        raise
+                    # container. Both arms fail OPEN — keep the container, hand back the framable
+                    # URL with `ready=False`, let the next Launch/Refresh attach again rather
+                    # than restore over a container that may simply be rendering slowly.
                     ready = False
                     _log.warning(
-                        "shared_launch_attached_container_not_serving_degraded_to_unready",
+                        "shared_launch_container_not_serving_degraded_to_unready",
                         user_id=str(recipient.id),
                         app_id=str(owner_app_id),
-                        budget_s=_ATTACHED_READY_BUDGET_SECONDS,
+                        budget_s=ready_budget_s,
+                        cold=not attached,
                     )
                 # Past here the container is up and registered — the same state a SUCCESSFUL
                 # launch leaves behind — so a later blip destroying it is no longer a rollback.
