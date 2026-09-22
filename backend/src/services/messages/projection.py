@@ -752,17 +752,20 @@ def classify_tool_call(tool_name: str, args_json: str) -> tuple[str, bool]:
 
 
 def _is_attachment_fence(text: str) -> bool:
-    """A client-built `<attachment …>…</attachment>` content block: DATA riding in the prompt,
-    not prose. The bubble must show what the user TYPED — a 200 KB inlined CSV in the bubble
-    would bury it, and chips are what represent attachments."""
+    """A client-built attachment marker: the fenced `<attachment …>…</attachment>` block carrying
+    a file's own text, or the self-closing `<attachment …/>` label that names a binary beside it.
+
+    BOTH SHAPES ARE MACHINE MARKUP RIDING IN THE PROMPT, not prose. The bubble must show what the
+    user TYPED — a 200 KB inlined CSV in the bubble would bury it, a label is a tag nobody wrote,
+    and chips are what represent attachments."""
     stripped = text.strip()
-    return stripped.startswith("<attachment ") and stripped.endswith("</attachment>")
+    return stripped.startswith("<attachment ") and stripped.endswith(("</attachment>", "/>"))
 
 
 def _user_text_and_refs(content: Any) -> tuple[str, list[str]]:
     """A stored user-prompt content value → (typed prose, attachment reference ids).
-    Attachment fence blocks are excluded from the prose (they are attachment CONTENT — the
-    wire shape carries them as their own string items, typed prose last)."""
+    Attachment markers are excluded from the prose (they carry the attachment's content or name
+    it — the wire shape carries them as their own string items, typed prose last)."""
     if isinstance(content, str):
         return (content, [])
     texts: list[str] = []

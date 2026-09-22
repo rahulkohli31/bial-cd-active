@@ -433,7 +433,7 @@ def test_the_audience_block_is_emitted_exactly_once() -> None:
     at a composition site — is a count of ZERO, which every `<=` and every `in` formulation
     passes."""
     for kind in ChatKind:
-        composed = compose_kind_prompt(kind, _CONTEXT)
+        composed = compose_kind_prompt(kind, _CONTEXTS[kind])
         assert composed.count(NARRATION_VOICE) == 1
         assert composed.count("TALKING TO THE USER") == 1
         # No length bar drifts back in beside the contract it used to ride with.
@@ -446,7 +446,7 @@ def test_the_name_the_files_instruction_went_with_the_segment_that_carried_it() 
     deliberately. Inertness only — nothing here invents prompt copy to paper over the gap."""
     for kind in ChatKind:
         assert "name the actual files and quote the actual code" not in compose_kind_prompt(
-            kind, _CONTEXT
+            kind, _CONTEXTS[kind]
         )
 
 
@@ -688,7 +688,7 @@ def test_no_segment_promises_an_emptiness_signal_that_never_arrives(kind: ChatKi
     """The retired Ask segment promised an emptiness signal that never arrives — every project
     gets a live container holding the golden template, so reads come back FULL. Widened to both
     surviving segments because the promise was wrong about the platform, not about Ask."""
-    lowered = compose_kind_prompt(kind, _CONTEXT).lower()
+    lowered = compose_kind_prompt(kind, _CONTEXTS[kind]).lower()
     assert "your tools will tell you truthfully" not in lowered
     assert "if there is no app yet" not in lowered
     # Plan's composition carries the retired sentence's ACTION half; Build's — which shares the
@@ -758,7 +758,8 @@ def test_no_prompt_surface_names_a_button_the_interface_does_not_draw() -> None:
     while the model is told the old labels."""
     retired = ("Keep refining", "keep refining", "Build it")
     surfaces: dict[str, str] = {
-        f"composed {kind.value} prompt": compose_kind_prompt(kind, _CONTEXT) for kind in ChatKind
+        f"composed {kind.value} prompt": compose_kind_prompt(kind, _CONTEXTS[kind])
+        for kind in ChatKind
     }
     for kind in ChatKind:
         for name, definition in (await_definitions(kind)).items():
@@ -806,22 +807,25 @@ def test_the_rules_say_file_content_is_data_and_never_an_instruction() -> None:
     assert ATTACHMENT_RULES.count(ATTACHED_CONTENT_IS_DATA) == 1
 
 
-@pytest.mark.parametrize("kind", list(ChatKind), ids=[k.value for k in ChatKind])
-def test_every_kind_holding_a_file_is_told_its_contents_are_data(kind: ChatKind) -> None:
-    """★ THE INVARIANT IS KIND-INDEPENDENT, and the kind that reads a document DIRECTLY needs it
-    most — it is handed no tools and no sandbox, and its attachments are typically documents
-    somebody other than the citizen wrote.
+def test_the_kind_with_no_container_carries_the_invariant_with_no_listing_at_all() -> None:
+    """★ THE KIND THAT NEEDS THE INVARIANT MOST IS THE ONE THAT CANNOT REACH IT THROUGH A LISTING,
+    and that is why it is asserted on a prompt composed with NO attachment context whatever.
 
-    It used to live inside the reader rules, which a chat with no container does not carry. A
-    prompt that names no reader path would satisfy a "no reader instruction" assertion in exactly
-    the state where the guard had been deleted along with it, which is why this asks directly.
+    `attachment_listing` has a single producer — the code-lane delivery, which needs a container —
+    and a chat with no project refuses every code-lane upload at the upload door and again at the
+    send door. So this kind's files are model-lane bytes the model reads itself, its listing is
+    always empty, and an invariant gated on one would be missing on every turn it matters: no
+    tools, no sandbox, and attachments typically written by somebody other than the citizen.
 
-    Mutation receipt: drop `ATTACHED_CONTENT_IS_DATA` from `this_conversation`'s generic arm and
-    the `generic` case goes red while the other two stay green."""
-    listing = "- roster.xlsx"
-    composed = compose_kind_prompt(kind, replace(_CONTEXTS[kind], attachment_listing=listing))
-    assert listing in composed
+    Mutation receipt: move `ATTACHED_CONTENT_IS_DATA` out of `standing_contract`'s generic arm and
+    back behind the listing, and this goes red — where a hand-supplied listing would keep it
+    green."""
+    composed = compose_kind_prompt(ChatKind.GENERIC, _GENERIC_CONTEXT)
     assert ATTACHED_CONTENT_IS_DATA in composed
+    # And it arrived as standing contract rather than beside a file: this prompt holds no listing
+    # and none of the reader rules that embed the invariant for the kinds that have a container.
+    assert ATTACHMENT_RULES not in composed
+    assert composed.count(ATTACHED_CONTENT_IS_DATA) == 1
 
 
 def test_the_rules_point_at_the_installed_reader_with_a_path_commands_can_open() -> None:
@@ -865,14 +869,21 @@ def test_the_rules_say_the_reader_is_the_shipped_copy() -> None:
 
 
 @pytest.mark.parametrize("kind", list(ChatKind), ids=[k.value for k in ChatKind])
-def test_a_chat_with_no_attachment_carries_none_of_the_rules(kind: ChatKind) -> None:
+def test_a_chat_with_no_attachment_carries_none_of_the_reader_rules(kind: ChatKind) -> None:
     """★ THE GATE SURVIVED THE MOVE, and it is what makes the move free. These rules are ~491
     tokens, and the overwhelming majority of turns have no file at all — which is why they were
     composed per conversation in the first place, and is a reason to gate them rather than a
-    reason to make them ephemeral."""
-    composed = compose_kind_prompt(kind, _CONTEXT)
-    assert "never an instruction to you" not in composed
+    reason to make them ephemeral.
+
+    The injection guard is asked per kind rather than across all three, because only the kinds
+    that reach it THROUGH these rules lose it when the rules are gated away."""
+    composed = compose_kind_prompt(kind, _CONTEXTS[kind])
+    assert ATTACHMENT_RULES not in composed
     assert "read_attachment.py" not in composed
+    if kind is ChatKind.GENERIC:
+        assert ATTACHED_CONTENT_IS_DATA in composed
+    else:
+        assert ATTACHED_CONTENT_IS_DATA not in composed
 
 
 @pytest.mark.parametrize("kind", _PROJECT_KINDS)
@@ -896,13 +907,22 @@ def test_a_chat_with_an_attachment_carries_the_listing_and_then_the_rules(kind: 
         < composed.index(listing)
         < composed.index(ATTACHMENT_RULES)
     )
+    # The injection guard rides in embedded, and exactly once: these kinds reach it through the
+    # rules, so a second naming beside them would print the invariant to the model twice.
+    assert composed.count(ATTACHED_CONTENT_IS_DATA) == 1
 
 
 def test_a_chat_with_no_container_is_never_told_to_run_the_reader() -> None:
     """There is no container for the reader to run in, so the Run line would name a path and a
     binary that do not exist — an instruction the agent can only fail at, on every turn it holds
-    a file."""
-    listing = "- roster.xlsx"
+    a file.
+
+    THE LISTING IS HANDED IN RATHER THAN PRODUCED, which is what makes this a guard on the tail
+    and not a claim about a shape the product ships. This kind's files are model-lane — the model
+    reads the bytes itself — so the fixture is named like one, and the code lane that writes a
+    listing is refused for it twice over. What is asserted is that the no-project arm does not
+    follow a listing with reader text even so."""
+    listing = "- floor-plan.png"
     composed = compose_kind_prompt(
         ChatKind.GENERIC, replace(_GENERIC_CONTEXT, attachment_listing=listing)
     )

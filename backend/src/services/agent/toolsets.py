@@ -9,13 +9,14 @@ NO tools, and each run passes exactly its kind's toolsets (pydantic-ai toolsets 
 A wrong-kind tool is therefore absent from the model's tool list AND uncallable — a forged call
 gets the runtime's unknown-tool rejection, never a policy check that could be bypassed.
 
-| Kind  | reads                | run_command         | writes | present_plan_options |
-|-------|----------------------|----------------------|--------|-----------------------|
-| Plan  | yes (live workspace) | allowlisted, read    | —      | yes                   |
-| Build | yes (live workspace) | full (+SQL guard)    | yes    | —                     |
+| Kind    | reads                | run_command       | writes | present_plan_options |
+|---------|----------------------|-------------------|--------|----------------------|
+| Plan    | yes (live workspace) | allowlisted, read | —      | yes                  |
+| Build   | yes (live workspace) | full (+SQL guard) | yes    | —                    |
+| Generic | —                    | —                 | —      | —                    |
 
-Both arms also carry `CONVERSATION_TOOLSET` and `app_state_toolset` (each registered once, so
-the two lists can't drift).
+Plan and Build also carry `CONVERSATION_TOOLSET` and `app_state_toolset` (each registered once,
+so the two lists can't drift); a Generic run is handed no toolset at all.
 `toolsets_for_kind` is the ONLY place permitted to read the chat kind to decide capability —
 see its own docstring. Two more things live here, not the registry: the citizen-facing chat-kind
 CATALOGUE (served on `GET /v1/auth/me`) and the registry read the gating guards ask their

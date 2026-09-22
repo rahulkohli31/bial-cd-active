@@ -1422,7 +1422,7 @@ class TurnEngine:
         log_context = structlog.contextvars.bind_contextvars(
             build_id=str(state.turn_id),
             user_id=str(state.user_id),
-            project_id=str(project_id),
+            project_id=str(project_id) if project_id is not None else None,
             app_id=str(app_id) if app_id is not None else None,
             app_name=app_name_for(app_id) if app_id is not None else None,
             conversation_id=str(state.conversation_id),
@@ -1527,10 +1527,9 @@ class TurnEngine:
             )
             if not await _bill_before_ending():
                 return
-            # EXHAUSTIVE, NOT BINARY. This read used to be `is BUILD` with everything else
-            # falling to the plan sentence, which is the shape that makes a third kind inherit
-            # a sentence nobody chose for it. Plan and BIAL Chat share an arm because they share
-            # the reason — neither holds a workspace — and a fourth kind has to say which it is.
+            # EXHAUSTIVE, NOT BINARY. Plan and BIAL Chat share an arm because they share the
+            # reason — neither holds a workspace — and a fourth kind has to say which sentence
+            # it gets rather than inherit one by landing on a fallback.
             match state.kind:
                 case ChatKind.BUILD:
                     message = MODEL_UNAVAILABLE_TEXT

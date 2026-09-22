@@ -91,8 +91,8 @@ async def test_a_generic_turn_is_answered_with_no_workspace_service_at_all(
 async def test_the_reply_names_neither_a_project_nor_an_application(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
-    """★ AE4. The prompt the run is actually handed carries the citizen's name and nothing about
-    a project — so a generic turn cannot open by grounding itself in an app that does not exist."""
+    """★ The prompt the run is actually handed carries the citizen's name and nothing about a
+    project — so a generic turn cannot open by grounding itself in an app that does not exist."""
     user, conversation = await _generic_chat(db_session)
     seen: dict[str, str] = {}
 
@@ -122,8 +122,8 @@ async def test_the_reply_names_neither_a_project_nor_an_application(
 async def test_a_generic_turn_holds_no_workspace_while_another_project_is_using_it(
     client, db_session, set_chat_model, _fresh_engine, building
 ) -> None:
-    """★ AE4's other half: the citizen's one workspace is already committed to another project,
-    and a generic turn is answered anyway because it never asks for one."""
+    """★ The citizen's one workspace is already committed to another project, and a generic turn
+    is answered anyway because it never asks for one."""
     user, conversation = await _generic_chat(db_session)
     set_chat_model(_streaming_text("Answered."))
 
@@ -246,8 +246,8 @@ async def test_a_generic_run_is_handed_no_tools_at_all(
 async def test_reasoning_is_never_projected_into_the_transcript(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
-    """R19's display half. The projection is kind-blind and already drops reasoning for the other
-    two kinds; this asks the question of the kind that has just joined them."""
+    """The projection is kind-blind and already drops reasoning for the other two kinds; this
+    asks the question of the kind that has just joined them."""
     user, conversation = await _generic_chat(db_session)
     set_chat_model(_streaming_text("The schedule covers June."))
 

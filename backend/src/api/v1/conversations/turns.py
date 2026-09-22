@@ -29,6 +29,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
+
+# The generic chat's code-lane refusal, imported rather than re-spelled: the upload door and the
+# send door turn the same file away in the same words.
+from src.api.v1.attachments.router import (
+    GENERIC_ATTACHMENT_LANES_SENTENCE,
+    GENERIC_LANE_REFUSED_CODE,
+)
 from src.api.v1.build_sessions.deps import OptionalSandbox, SessionManagerDep
 from src.api.v1.conversations._shared import (
     BUILD_IN_FLIGHT_MSG,
@@ -364,16 +371,13 @@ async def start_turn(
         # id is indistinguishable from it, which is one non-leaking 404 (ADR-0004).
         raise AppApiError(404, "Conversation not found.")
     # ★ THE KIND IS READ HERE, AT THE TOP, AND THE ROUTE BRANCHES ONCE ON WHAT IT ANSWERS.
+    # A generic chat has no project and no container, so the workspace refusals below sit behind
+    # one guard rather than carrying four kind tests — each would otherwise be asking about
+    # something that does not exist.
     #
-    # Nothing used to consult the kind until inside the engine, because until a third kind existed
-    # every turn wanted the same workspace. A generic chat has no project and no container, so the
-    # block of refusals below that assume one cannot run for it — not because they would be
-    # unkind, but because each would be asking about something that does not exist.
-    #
-    # ONE BRANCH RATHER THAN FOUR. Three of the four refusals were already contiguous; the
-    # mid-reply check that sat among them is documented as pure liveness with no dependency on
-    # what precedes it, so it moved up to the quota and model checks. The route's one stated
-    # ordering constraint — the busy-workspace refusal stays BELOW mid-reply — survives the move.
+    # THE ONE ORDERING THE REFUSALS BELOW MUST KEEP: the busy-workspace check stays BELOW the
+    # mid-reply guard, so a send during a streaming reply is refused as a busy conversation
+    # rather than as a taken workspace.
     project_id = _project_needing_a_workspace(conversation)
 
     # Daily-token gate BEFORE anything persists — a capped user's message is refused
@@ -479,14 +483,13 @@ async def start_turn(
             #
             # AND IT IS ALSO THE HAND-OVER'S PREFLIGHT, which is why the body it returns carries
             # more than the status. The browser asks the one-workspace question BY SENDING —
-            # every refusal above this line leaves no turn row and no spent card (it does leave a
-            # CHAT: the row is created a round trip earlier, see the block above the daily gate)
-            # — and draws its dialog from what comes back:
-            # `projectName` for which project holds the workspace, and `agentWorking` for whether
-            # that project's agent is mid-thought, of ANY kind (`building` stays narrow, and only
-            # marks a turn that can write — see `SandboxReclaimBlockedError`). Neither fact is
-            # obtainable from the cheap state poll, which reads only this citizen's own registry
-            # record and cannot say whose project is sitting in the slot.
+            # every refusal above this line leaves no turn row and no spent card — and draws its
+            # dialog from what comes back: `projectName` for which project holds the workspace,
+            # and `agentWorking` for whether that project's agent is mid-thought, of ANY kind
+            # (`building` stays narrow, and only marks a turn that can write — see
+            # `SandboxReclaimBlockedError`). Neither fact is obtainable from the cheap state poll,
+            # which reads only this citizen's own registry record and cannot say whose project is
+            # sitting in the slot.
             with build_coordination_or_503():
                 try:
                     await manager.reclaim_preflight(db, user, project_id)
@@ -533,6 +536,12 @@ async def start_turn(
         conversation_id=conversation_id,
         attachment_ids=body.message.attachment_ids,
     )
+    # THE SEND DOOR ASKS AGAIN WHAT THE UPLOAD DOOR ASKED. An id uploaded against a plan or
+    # build chat can still be named in a generic turn, so admission at upload does not settle
+    # admission at send — and a chat with no container has nothing to open a spreadsheet with.
+    # Same sentence, same code, one source.
+    if project_id is None and code_lane:
+        raise AppApiError(400, GENERIC_ATTACHMENT_LANES_SENTENCE, code=GENERIC_LANE_REFUSED_CODE)
     delivery = (
         AttachmentDelivery(files=tuple(code_lane), storage=storage)
         if code_lane and storage is not None

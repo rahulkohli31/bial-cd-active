@@ -121,8 +121,9 @@ ATTACHMENT_LANES_SENTENCE: Final = (
 )
 """ONE SENTENCE, EVERYWHERE. The composer, the help page and every unsupported-format
 refusal carry these exact words — three sentences that drift is how the removed rule failed. Its
-portal twin is `ATTACHMENT_LANES_SENTENCE` in `portal/src/utils/attachmentInput.ts`, and a test
-holds the two byte-identical.
+portal twin is `ATTACHMENT_LANES_SENTENCE` in `portal/src/utils/attachmentInput.ts`, and the two
+are required to stay byte-identical — a citizen reads one of them in the composer and the other
+in the refusal, often in the same minute.
 
 IT DESCRIBES WHAT HAPPENS TO A FILE, not which extensions are on a list. A list of ten formats
 goes stale the moment the allowlist moves, and tells a citizen nothing about why a spreadsheet
@@ -136,7 +137,8 @@ GENERIC_ATTACHMENT_LANES_SENTENCE: Final = (
 """THE GENERIC CHAT'S OWN REFUSAL. `ATTACHMENT_LANES_SENTENCE` promises to open a spreadsheet,
 document or deck with code, and a generic conversation has no sandbox to keep that promise — so
 it gets a sentence that never makes it. Its portal twin is `GENERIC_ATTACHMENT_LANES_SENTENCE` in
-`portal/src/utils/attachmentInput.ts`, held to the same value the way its sibling sentence is."""
+`portal/src/utils/attachmentInput.ts`, under the same byte-identical requirement as its sibling
+sentence above."""
 
 GENERIC_LANE_REFUSED_CODE: Final = "GENERIC_CHAT_ATTACHMENT_REFUSED"
 

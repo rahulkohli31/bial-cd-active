@@ -151,8 +151,8 @@ async def test_re_posting_a_generic_id_as_a_plan_chat_is_a_conflict(client, db_s
 async def test_another_citizen_is_told_the_generic_conversation_does_not_exist(
     client, db_session
 ) -> None:
-    """★ AE2. A cross-user id resolves as ABSENT, never as forbidden — the same single
-    non-leaking answer every other conversation read gives (ADR-0004)."""
+    """★ A cross-user id resolves as ABSENT, never as forbidden — the same single non-leaking
+    answer every other conversation read gives (ADR-0004)."""
     owner = await UserFactory.create(db_session)
     stranger = await UserFactory.create(db_session)
     conversation_id = str(uuid.uuid4())

@@ -13,6 +13,7 @@ import re
 import uuid
 from collections.abc import Container, Sequence
 from typing import Annotated
+from xml.sax.saxutils import quoteattr
 
 import sqlalchemy as sa
 from fastapi import Depends
@@ -28,6 +29,7 @@ from src.db.models.attachment import Attachment
 from src.db.models.conversation import Conversation
 from src.schemas import CamelModel
 from src.services.agent.model import build_foundry_model
+from src.services.attachments.materialize import one_line_name
 from src.services.messages.store import (
     AttachmentRehydrationError,
     Rehydrator,
@@ -237,8 +239,11 @@ def _attachment_label(name: str) -> str:
     for a user part — so without this, a follow-up question naming one of several attached
     documents has nothing to tie back to the right file. Self-closing, so it is unambiguously a
     label rather than a fenced block carrying content (the `<attachment name="…" type="…">…
-    </attachment>` shape `attachment_texts` already uses)."""
-    return f'<attachment name="{name}"/>'
+    </attachment>` shape `attachment_texts` already uses).
+
+    The name is citizen-controlled: flattened and XML-quoted, or a quote, an angle bracket or a
+    newline in it closes this marker and forges markup in the prompt, right ahead of the binary."""
+    return f"<attachment name={quoteattr(one_line_name(name))}/>"
 
 
 async def resolve_binaries(

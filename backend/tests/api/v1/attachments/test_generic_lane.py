@@ -1,4 +1,4 @@
-"""U6 — the generic chat's own lane: model-only, refused in wording it can honour, and every
+"""The generic chat's own lane: model-only, refused in wording it can honour, and every
 model-lane binary reaches the model with its own name.
 
 The upload route already resolves the conversation before admitting a file, so the refusal below
@@ -182,8 +182,8 @@ async def test_a_pdf_and_an_image_are_accepted_on_a_generic_conversation(
 async def test_a_spreadsheet_is_refused_on_a_generic_conversation_with_honest_wording(
     client, db_session, fake_storage
 ) -> None:
-    """AE3. Refused with wording that names what this chat accepts and does not offer to open it
-    with code, and nothing is stored — the store and the database, not just the status.
+    """Refused with wording that names what this chat accepts and does not offer to open it with
+    code, and nothing is stored — the store and the database, not just the status.
 
     Mutation receipt: drop the `is_code_lane(media_type)` half of the guard in
     `upload_attachment` (refuse every kind on a generic conversation) and
@@ -220,9 +220,8 @@ async def test_a_spreadsheet_is_refused_on_a_generic_conversation_with_honest_wo
 async def test_an_oversize_pdf_on_a_generic_conversation_is_refused_for_size_before_storage(
     client, db_session, fake_storage
 ) -> None:
-    """AE3's other half: a file over the ceiling is refused for size before any upload begins —
-    the generic kind narrows FORMATS, not the number, so this is unchanged behaviour proven again
-    under the new kind."""
+    """A file over the ceiling is refused for size before any upload begins: the generic kind
+    narrows which FORMATS are accepted, never the number of bytes."""
     user, conversation = await _conversation(db_session, ChatKind.GENERIC)
     oversized = b"%PDF" + b"\x00" * (ATTACHMENT_MAX_BYTES - 4 + 1)
 
@@ -259,9 +258,9 @@ async def test_a_code_lane_file_is_still_accepted_on_a_plan_or_build_conversatio
 async def test_two_pdfs_each_reach_the_model_with_their_own_name(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
-    """R9's substance: a follow-up naming one of several attached documents must be tied to the
-    right file. Proven by pairing each label with the binary that follows it, keyed on the exact
-    bytes — a swapped pairing would fail this even though both files still reached the model.
+    """A follow-up naming one of several attached documents must be tied to the right file.
+    Proven by pairing each label with the binary that follows it, keyed on the exact bytes — a
+    swapped pairing would fail this even though both files still reached the model.
 
     Mutation receipt: stop emitting `_attachment_label` in `resolve_binaries` and the content
     list holds two `BinaryContent`s with no preceding label, so `pairs` below comes back with
