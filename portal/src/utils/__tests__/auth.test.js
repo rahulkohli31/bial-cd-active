@@ -237,6 +237,20 @@ describe('★ an expired session bounces, once, and only when there was one to l
     expect(assign).not.toHaveBeenCalled()
   })
 
+  it('bounces anyway when the location cannot say where it is', async () => {
+    // The guard reads `window.location.pathname`, and the fallback when that cannot be read is
+    // "not the login screen" — bounce. Asserted rather than assumed: a silent `true` there would
+    // switch the whole teardown off, and every other test in this file supplies a pathname, so
+    // nothing else can reach this branch.
+    Object.defineProperty(window, 'location', { configurable: true, value: { assign } })
+    document.cookie = 'csrf=tok'
+    global.fetch.mockResolvedValue(res({ ok: false, status: 401 }))
+
+    await auth.refreshAccessToken()
+
+    expect(assign).toHaveBeenCalledWith('/login')
+  })
+
   it('does not disarm a later bounce by being called from the login screen first', async () => {
     // The latch means "we are navigating". Setting it on a call that deliberately does NOT
     // navigate would make the login screen's own 401 silently switch the teardown off for the

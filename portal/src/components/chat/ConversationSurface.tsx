@@ -2506,12 +2506,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       // PUT THE CONTAINER AWAY, and doing that with nobody looking is the opposite of what this
       // change is for.
       const hidden = document.visibilityState !== 'visible'
-      const presence = presenceToRenew(hidden)
-      if (presence) {
-        // NOT AWAITED. The renewal holds the container open; this surface reports it and never
-        // waits on it, so a slow renewal cannot delay the read the screen is rendering.
-        void renewPresence(projectId, presence)
-      }
+      // NOT AWAITED. The renewal holds the container open; this surface reports it and never
+      // waits on it, so a slow renewal cannot delay the read the screen is rendering.
+      void renewPresence(projectId, presenceToRenew(hidden))
       const generation = ++latestProbe
       try {
         const state = await fetchPreviewState(projectId)

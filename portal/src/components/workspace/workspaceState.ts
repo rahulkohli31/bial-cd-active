@@ -203,10 +203,13 @@ export const HIDDEN_PROBE_MS = 120_000
  * it writes is a monotonic `max`, so a five-minute visible renewal cannot truncate the long stay a
  * start already granted itself. The absolute age ceiling bounds all of it regardless.
  *
- * `null` means this tick does not renew — nothing returns it today, and the type keeps the door
- * open for a caller that genuinely should not.
+ * EVERY TICK RENEWS, so this answers WHICH BUDGET and never whether. It is still one exported
+ * function rather than a ternary at each call site: the two surfaces framing a project must not be
+ * able to disagree about this, and a surface that quietly stopped renewing is a silent
+ * container-killer — the citizen is looking right at their app while the platform counts it
+ * abandoned.
  */
-export function presenceToRenew(documentHidden: boolean): SurfacePresence | null {
+export function presenceToRenew(documentHidden: boolean): SurfacePresence {
   return documentHidden ? 'hidden' : 'visible'
 }
 
