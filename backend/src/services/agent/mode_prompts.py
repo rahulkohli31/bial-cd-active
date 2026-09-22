@@ -345,7 +345,6 @@ def this_conversation(context: PromptContext) -> str:
     command that do not exist. The injection guard those rules embed is not dropped with them:
     `standing_contract` hands that kind `ATTACHED_CONTENT_IS_DATA` on every turn."""
     listing = context.attachment_listing
-    stub = _connected_data_stub(context.connected_systems)
 
     if context.project_name is None:
         identity = (
@@ -356,6 +355,7 @@ def this_conversation(context: PromptContext) -> str:
         )
         return identity + (f"\n\n{listing}" if listing else "")
 
+    stub = _connected_data_stub(context.connected_systems)
     described = f" — {context.project_description}" if context.project_description else ""
     identity = (
         f"You are the Citizen Developer assistant for BIAL, working with "

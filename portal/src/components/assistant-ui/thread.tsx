@@ -168,7 +168,7 @@ const MessageError: FC = () => (
 const AssistantMessage: FC = () => {
   const { TextPart, ToolGroup, ReasoningGroup, ToolPart } = useThreadComponents()
   // A MESSAGE WITH NOTHING IN IT RENDERS NOTHING — the message-level twin of the empty-text-part
-  // rule in `AssistantText` below, and reachable for the same reason it was: the seam drops
+  // rule in `ThreadText` below, and reachable for the same reason it was: the seam drops
   // `build` / `build_in_progress` / `plan_options` outright, so "a message whose parts all drop
   // still exists, empty, unrendered" (`convertMessage`'s own words).
   //
@@ -206,7 +206,7 @@ const AssistantMessage: FC = () => {
               case 'group-reasoning':
                 return <ReasoningGroup group={part}>{children}</ReasoningGroup>
               case 'text':
-                return <AssistantText Component={TextPart} />
+                return <ThreadText Component={TextPart} />
               case 'tool-call':
                 return <ToolPart {...part} />
               // `reasoning` deliberately renders NOTHING. The decision is status-only: the
@@ -232,7 +232,7 @@ const AssistantMessage: FC = () => {
 }
 
 /** Bridges the library's text-part state into `MessageContent`, which is where prose is rendered. */
-const AssistantText: FC<{ Component: ThreadComponents['TextPart'] }> = ({ Component }) => {
+const ThreadText: FC<{ Component: ThreadComponents['TextPart'] }> = ({ Component }) => {
   // `useMessagePartText`, not `useAuiState(s => s.part.text)`: `PartState` is a union across every
   // part kind and `text` is not on all of them, so the state selector is untyped guesswork here.
   const { text } = useMessagePartText()
@@ -319,16 +319,10 @@ const UserMessage: FC = () => {
           the library default; on a white transcript it read as a second surface rather than as a
           quoted line, and on the plan chat's edge-to-edge white it was the only grey on screen. */}
       <div className="max-w-full break-words rounded-xl border border-bial-border bg-white px-4 py-2 text-foreground empty:hidden prose-headings:my-1 prose-headings:text-sm prose-headings:font-semibold">
-        <MessagePrimitive.Parts components={{ Text: () => <UserText Component={TextPart} /> }} />
+        <MessagePrimitive.Parts components={{ Text: () => <ThreadText Component={TextPart} /> }} />
       </div>
     </MessagePrimitive.Root>
   )
-}
-
-const UserText: FC<{ Component: ThreadComponents['TextPart'] }> = ({ Component }) => {
-  const { text } = useMessagePartText()
-  if (!text) return null
-  return <Component text={text} />
 }
 
 export { cn }

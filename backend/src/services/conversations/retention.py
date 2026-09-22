@@ -63,14 +63,7 @@ async def condemned_conversations(
     """
     idle = sa.select(Conversation.id).where(Conversation.updated_at < cutoff)
     remaining = (await db.scalar(sa.select(sa.func.count()).select_from(idle.subquery()))) or 0
-    rows = (
-        await db.scalars(
-            sa.select(Conversation.id)
-            .where(Conversation.updated_at < cutoff)
-            .order_by(Conversation.updated_at.asc())
-            .limit(limit)
-        )
-    ).all()
+    rows = (await db.scalars(idle.order_by(Conversation.updated_at.asc()).limit(limit))).all()
     return tuple(rows), max(remaining - len(rows), 0)
 
 
@@ -100,11 +93,11 @@ async def gather_and_delete(
 
     keys = (
         await db.scalars(
-            sa.select(Attachment.storage_key).where(Attachment.conversation_id.in_(doomed))
+            sa.delete(Attachment)
+            .where(Attachment.conversation_id.in_(doomed))
+            .returning(Attachment.storage_key)
         )
     ).all()
-
-    await db.execute(sa.delete(Attachment).where(Attachment.conversation_id.in_(doomed)))
     removed = (
         await db.scalars(
             sa.delete(Conversation).where(Conversation.id.in_(doomed)).returning(Conversation.id)

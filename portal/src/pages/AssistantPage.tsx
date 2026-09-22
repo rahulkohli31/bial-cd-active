@@ -39,7 +39,11 @@ import { SendRefusal } from '../components/chat/sendRefusal'
 import TurnBanner from '../components/chat/TurnBanner'
 import { DURATION, LAYOUT_EASE } from '../lib/motion'
 import { getStoredUser } from '../utils/auth'
-import { buildUserParts, releaseUploadedAttachments } from '../utils/attachmentStore'
+import {
+  buildUserParts,
+  releaseUploadedAttachments,
+  wireMessageFromParts,
+} from '../utils/attachmentStore'
 import {
   createConversation,
   getConversation,
@@ -73,10 +77,13 @@ type Phase = 'greeting' | 'loading' | 'ready' | 'failed' | 'gone'
 const GONE_TEXT = 'This conversation is no longer here.'
 const LOAD_FAILED_TEXT = 'This conversation could not be loaded.'
 const TURN_LOST_TEXT = 'The connection dropped. Reload to catch up.'
-const SENDING_BLOCKED_WHILE_LOADING = 'Loading this conversation…'
-const SENDING_BLOCKED_AFTER_FAILURE = 'Load this conversation before sending.'
-/** The `gone` state has nothing to load, so it cannot be told to load it. */
-const SENDING_BLOCKED_WHEN_GONE = 'Start a new chat to send a message.'
+/** Why sending is refused, per phase. A phase absent from this table may send. */
+const SENDING_BLOCKED: Partial<Record<Phase, string>> = {
+  loading: 'Loading this conversation…',
+  failed: 'Load this conversation before sending.',
+  /** The `gone` state has nothing to load, so it cannot be told to load it. */
+  gone: 'Start a new chat to send a message.',
+}
 
 const ANNOUNCE = {
   started: 'Reply started.',
@@ -493,19 +500,7 @@ export default function AssistantPage() {
       const userId = `user-${id}-${userSeq}`
       seqRef.current += 1
       setMessages((held) => [...held, { id: userId, role: 'user', parts, seq: userSeq }])
-      // BOTH SHAPES AN UPLOADED FILE TAKES. `buildUserParts` emits a `file` part for a binary
-      // and a `text` part carrying an `attachment` descriptor for a file whose bytes travel as
-      // text — reading only one of the two sends the turn without the ids of half the files
-      // the citizen attached.
-      const attachmentIds = parts
-        .map((part) =>
-          part.type === 'file'
-            ? part.attachmentId
-            : part.type === 'text'
-              ? part.attachment?.attachmentId
-              : undefined,
-        )
-        .filter((value): value is string => typeof value === 'string')
+      const attachmentIds = wireMessageFromParts(parts).attachmentIds ?? []
 
       let refused = false
       await runTurn(id, text, attachmentIds, () => {
@@ -581,15 +576,8 @@ export default function AssistantPage() {
 
   const contextWarning = useMemo(() => contextState(contextTokens).message, [contextTokens])
   const showGreeting = phase === 'greeting'
-  const gate = showGreeting
-    ? undefined
-    : phase === 'loading'
-      ? { blocked: true, reason: SENDING_BLOCKED_WHILE_LOADING }
-      : phase === 'failed'
-        ? { blocked: true, reason: SENDING_BLOCKED_AFTER_FAILURE }
-        : phase === 'gone'
-          ? { blocked: true, reason: SENDING_BLOCKED_WHEN_GONE }
-          : undefined
+  const blockedReason = SENDING_BLOCKED[phase]
+  const gate = blockedReason !== undefined ? { blocked: true, reason: blockedReason } : undefined
 
   const parts = headlineParts(greeting.headline, greeting.name)
 

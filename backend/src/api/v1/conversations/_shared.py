@@ -30,6 +30,7 @@ from src.db.models.conversation import Conversation
 from src.schemas import CamelModel
 from src.services.agent.model import build_foundry_model
 from src.services.attachments.materialize import one_line_name
+from src.services.media.lanes import MODEL_LANE_MEDIA
 from src.services.messages.store import (
     AttachmentRehydrationError,
     Rehydrator,
@@ -96,9 +97,8 @@ BUILD_IN_FLIGHT_MSG = (
     "The assistant is building your app right now. Chat opens back up as soon as it finishes."
 )
 
-# What may enter the prompt as a BINARY: vision content only. Everything else travels as
-# `attachment_texts`.
-VISION_MEDIA_PREFIX = "image/"
+# The one model-lane format that is not an image: scanned for damage and for a password at the
+# upload door, where an image has no trailer to look in.
 PDF_MEDIA_TYPE = "application/pdf"
 
 # --- the per-document limit, and why it is gone -------------------------------------------
@@ -303,7 +303,7 @@ async def resolve_binaries(
     content: list[str | BinaryContent] = []
     for attachment_id in attachment_ids:
         data_b64, media_type = resolved[attachment_id]
-        if not (media_type.startswith(VISION_MEDIA_PREFIX) or media_type == PDF_MEDIA_TYPE):
+        if media_type not in MODEL_LANE_MEDIA:
             raise AppApiError(
                 400,
                 "an attached file of this type cannot be sent to the assistant as a file",
