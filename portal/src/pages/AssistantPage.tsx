@@ -400,6 +400,13 @@ export default function AssistantPage() {
   return (
     // `min-h-full`, NEVER `h-full`, AND NOTHING CLIPS HERE. A fixed height plus `overflow-hidden`
     // centred the stack in a box it could outgrow. The backdrop clips itself.
+    //
+    // THIS IS A FLEX COLUMN SO ITS CHILD CAN GROW, and that is what makes the greeting sit in the
+    // middle of the screen. `min-h-full` gives this box a used height of the whole scroll pane;
+    // the child's `flex-1` then grows into that. A child asking for `min-h-full` instead gets
+    // nothing — a percentage minimum resolves against a parent's HEIGHT, which is `auto` here —
+    // so it collapses to its own content and `justify-center` centres within a box the exact size
+    // of what it holds. That was the shipped bug: the greeting sat at the top of a full-height page.
     <div
       className="relative flex min-h-full flex-col bg-bial-bg font-manrope"
       data-testid="assistant-page"
@@ -421,8 +428,11 @@ export default function AssistantPage() {
         onNew={async () => undefined}
         onCancel={handleCancel}
       >
+        {/* `flex-1` — NOT `min-h-full` — is what holds this box open to the full pane, and the
+            centring below is worthless without it. See the parent's note. */}
         <div
-          className={`relative flex min-h-full flex-1 flex-col items-center px-6 ${
+          data-testid="assistant-column"
+          className={`relative flex flex-1 flex-col items-center px-6 ${
             showGreeting ? 'justify-center py-12' : 'justify-end pb-6 pt-4'
           }`}
         >

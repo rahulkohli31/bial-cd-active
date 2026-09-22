@@ -250,6 +250,32 @@ describe('the sky behind it is decoration and nothing else', () => {
     expect(page.className).not.toContain('overflow-hidden')
   })
 
+  it('★ the greeting column can grow, which is the whole of why it sits in the middle', () => {
+    // jsdom lays nothing out, so this pins the MECHANISM and `e2e/assistant-geometry.spec.ts`
+    // measures the pixels.
+    //
+    // A percentage minimum resolves against the parent's HEIGHT, and this page's height is `auto`
+    // — so a column asking for `min-h-full` gets nothing, shrinks to its own content, and centres
+    // inside a box exactly the size of what it holds. That is not a subtle miss: measured at
+    // 1440x900 the column came out 299px tall in a 900px pane, putting the greeting 48px from the
+    // top of an otherwise empty screen. What actually holds it open is `flex-1` against a parent
+    // that is a flex column, so both halves are pinned here and neither is load-bearing alone.
+    mount()
+    const page = screen.getByTestId('assistant-page')
+    expect(page.className).toMatch(/(^|\s)flex(\s|$)/)
+    expect(page.className).toContain('flex-col')
+
+    const column = screen.getByTestId('assistant-column')
+    expect(column.className).toContain('flex-1')
+    expect(column.className).toContain('justify-center')
+    // The dead class, kept out on purpose: it resolves to zero here and reads as if it were
+    // holding the box open, which is how the collapse hid in plain sight.
+    expect(column.className).not.toContain('min-h-full')
+    // Liveness: the column is the one that actually holds the greeting, so a page that rendered
+    // an empty shell cannot satisfy the three assertions above.
+    expect(column.contains(screen.getByTestId('assistant-greeting'))).toBe(true)
+  })
+
   it('says nothing to a screen reader and catches no pointer', () => {
     mount()
     expect(sky().getAttribute('aria-hidden')).toBe('true')
