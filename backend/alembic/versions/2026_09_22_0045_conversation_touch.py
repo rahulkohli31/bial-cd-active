@@ -30,6 +30,15 @@ scan of the largest table in the schema. The `LATERAL` join is also what leaves 
 with no messages alone: it has nothing to join against, so it keeps reading at its creation
 time — the fallback the retention pass needs.
 
+THE BACKFILL RUNS OUTSIDE THIS REVISION'S TRANSACTION, and the split is forced. `CREATE
+TRIGGER` takes SHARE ROW EXCLUSIVE on `messages`, which conflicts with the ROW EXCLUSIVE every
+INSERT needs, and a transaction holds a lock until it commits — so a backfill sharing that
+transaction would block every message send on the platform for as long as the scan ran.
+`autocommit_block()` commits the trigger first and runs the backfill on its own. The price is
+that the two halves land separately: a run that dies in the backfill leaves the trigger
+installed and the revision unstamped, so the DDL is written to be re-runnable and a repeated
+`alembic upgrade` finishes the job.
+
 `downgrade` DROPS THE TRIGGER AND FUNCTION ONLY; it restores no data. The trigger's writes are
 ordinary UPDATEs with no prior value recorded to undo, and the backfill has no inverse worth
 running — going back to "every conversation reads as last-touched at creation" would be
@@ -55,7 +64,7 @@ _TRIGGER_NAME = "trg_touch_conversation_on_message_insert"
 # N-row INSERT rather than N row-level firings; `SELECT DISTINCT` is what keeps a batch that
 # touches one conversation many times to a single UPDATE against it.
 _CREATE_FUNCTION = f"""
-CREATE FUNCTION {_FUNCTION_NAME}() RETURNS trigger
+CREATE OR REPLACE FUNCTION {_FUNCTION_NAME}() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
     UPDATE conversations
@@ -95,9 +104,19 @@ WHERE EXISTS (SELECT 1 FROM messages AS m WHERE m.conversation_id = c.id);
 
 
 def upgrade() -> None:
+    # RE-RUNNABLE, because the backfill below commits separately from this DDL: a run that dies
+    # in the backfill leaves the trigger installed and the revision unstamped, and the retry
+    # starts again here.
     op.execute(sa.text(_CREATE_FUNCTION))
+    op.execute(sa.text(f"DROP TRIGGER IF EXISTS {_TRIGGER_NAME} ON messages"))
     op.execute(sa.text(_CREATE_TRIGGER))
-    op.execute(sa.text(_BACKFILL))
+
+    # The trigger is committed before the scan starts, which is what releases its SHARE ROW
+    # EXCLUSIVE lock on `messages` — the lock every INSERT's ROW EXCLUSIVE conflicts with.
+    # Creating the trigger FIRST is still the ordering that matters: a message appended while
+    # the backfill runs is recorded by the trigger, so nothing falls between the two halves.
+    with op.get_context().autocommit_block():
+        op.execute(sa.text(_BACKFILL))
 
 
 def downgrade() -> None:

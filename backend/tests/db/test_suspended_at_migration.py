@@ -77,7 +77,8 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # and `conversations.project_id` made nullable under a CHECK constraint that keeps the two
     # kinds which must have a project from losing one. 0045_conversation_touch follows it with
     # the repo's first database trigger, which advances a conversation's `updated_at` when a
-    # message is appended to it.
+    # message is appended to it. 0046_conversation_updated_at indexes that column, which the
+    # retention pass filters and orders by on every tick.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0045_conversation_touch"]
+    assert heads == ["0046_conversation_updated_at"]

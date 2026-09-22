@@ -15,7 +15,9 @@ which would push the CHECK constraint below into a second revision. Rebuilding m
 `chat_kind` itself was built (0035) and downgrades cleanly. The cost is the cast: both kind
 columns are rewritten under ACCESS EXCLUSIVE, and `messages` is the largest table, so the lock
 window scales with accumulated history. `alembic/env.py` runs a transaction per migration, so
-that rewrite commits on its own rather than inside a longer run.
+that rewrite commits on its own rather than inside a longer run, and `_rebuild` bounds the WAIT
+for those locks with a `lock_timeout` — the migration fails fast instead of parking every reader
+and writer of both tables behind it.
 
 `ck_conversations_parentage` IS ONE CONSTRAINT OVER BOTH DIRECTIONS, spelled as a biconditional
 so a violation names the shape that is wrong rather than half of it. `kind` carries its own NOT
@@ -60,6 +62,12 @@ def _rebuild(target: postgresql.ENUM) -> None:
     The old type is renamed out of the way rather than dropped first: a type in use cannot be
     dropped, and the columns can only be moved once the new type exists under the real name.
     """
+    # THE SWAPS BELOW TAKE ACCESS EXCLUSIVE on `conversations` and `messages`. With no ceiling
+    # on the wait, this migration queues behind whatever transaction already holds either table
+    # and every reader and writer of both then queues behind it, FIFO, for as long as that runs.
+    # Failing fast is the better half of that trade. `SET LOCAL` is scoped to the transaction,
+    # which `alembic/env.py` makes this one revision.
+    op.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
     op.execute(sa.text("ALTER TYPE chat_kind RENAME TO chat_kind_old"))
     target.create(op.get_bind(), checkfirst=False)
     for table in ("conversations", "messages"):
@@ -73,6 +81,9 @@ def upgrade() -> None:
     op.alter_column("conversations", "project_id", existing_type=sa.Uuid(), nullable=True)
     op.create_check_constraint("ck_conversations_parentage", "conversations", PARENTAGE_SHAPE)
 
+    # Hand the rest of the revision back its ordinary lock behaviour.
+    op.execute(sa.text("SET LOCAL lock_timeout = DEFAULT"))
+
 
 def downgrade() -> None:
     op.drop_constraint("ck_conversations_parentage", "conversations", type_="check")
@@ -84,3 +95,4 @@ def downgrade() -> None:
 
     op.alter_column("conversations", "project_id", existing_type=sa.Uuid(), nullable=False)
     _rebuild(chat_kind_prev)
+    op.execute(sa.text("SET LOCAL lock_timeout = DEFAULT"))
