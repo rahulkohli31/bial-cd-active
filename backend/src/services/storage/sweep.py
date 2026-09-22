@@ -35,7 +35,9 @@ _log = structlog.get_logger()
 _SWEEP_CONCURRENCY = 8
 
 
-async def sweep_blobs(storage: ObjectStorage, blob_keys: list[str]) -> list[str]:
+async def sweep_blobs(
+    storage: ObjectStorage, blob_keys: list[str], *, concurrency: int = _SWEEP_CONCURRENCY
+) -> list[str]:
     """Best-effort post-commit delete of every key, run concurrently behind a bounded
     semaphore; log-and-continue on ANY failure. Each delete swallows its own error, so one
     dropped key never cancels a sibling and nothing surfaces to 500 an already-committed
@@ -44,10 +46,14 @@ async def sweep_blobs(storage: ObjectStorage, blob_keys: list[str]) -> list[str]
     RETURNS THE KEYS THAT SURVIVED. The return is additive — a caller that only wants
     the sweep can still ignore it — and it exists because the delete path owes the record a
     list of what is still out there, which a log line the record cannot read does not give
-    it."""
+    it.
+
+    `concurrency` DEFAULTS TO THE INTERACTIVE FIGURE, which is tuned for one citizen pressing one
+    button. A bulk unattended caller may raise it; because the rows are already committed-deleted,
+    doing so only shortens the sweep and can never change its outcome."""
     if not blob_keys:
         return []
-    limiter = asyncio.Semaphore(_SWEEP_CONCURRENCY)
+    limiter = asyncio.Semaphore(concurrency)
     survived: list[str] = []
 
     async def _sweep_one(key: str) -> None:

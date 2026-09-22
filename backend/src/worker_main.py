@@ -56,6 +56,7 @@ _SHUTDOWN_GRACE_S: float = 25.0
 # never consumed. Each module keeps its own heavy imports inside the task body, after the flag
 # gate, so listing one here costs an import of structlog and the broker and nothing else.
 _TASK_MODULES: tuple[str, ...] = (
+    "src.workers.conversation_retention",
     "src.workers.deploy_reconcile",
     "src.workers.reclamation",
     "src.workers.sandbox_reap",

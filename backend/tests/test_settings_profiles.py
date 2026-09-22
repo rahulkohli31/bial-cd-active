@@ -76,7 +76,12 @@ _APP_DB: dict[str, str] = {
     "APP_DB__ENCRYPTION_KEY": "dGVzdC1lbmNyeXB0aW9uLWtleS0zMi1ieXRlcy1sb25nISE=",
 }
 
-_WORKER_ENV = {**_CORE, **_STORE, **_REDIS, **_SANDBOX}
+# Required of the WORKER with no default, for the same reason as the three blocks above it: this
+# process is the one that deletes citizens' conversations, so a deployment that has not decided
+# whether it does that refuses to boot rather than have an answer picked for it.
+_RETENTION: dict[str, str] = {"CONVERSATION_RETENTION_ENABLED": "false"}
+
+_WORKER_ENV = {**_CORE, **_STORE, **_REDIS, **_SANDBOX, **_RETENTION}
 _API_ENV = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT}
 
 

@@ -122,20 +122,25 @@ def _the_lock_engine() -> AsyncEngine:
 
 
 @asynccontextmanager
-async def _single_flight() -> AsyncIterator[bool]:
-    """Hold the pass lock for the body, on a connection of its own. Yields whether we took it.
+async def single_flight_lock(key: int) -> AsyncIterator[bool]:
+    """Hold `key`'s advisory lock for the body, on a connection of its own. Yields whether we
+    took it.
+
+    THE KEY IS THE CALLER'S, because more than one scheduled pass needs this shape and they must
+    not share a lock: two passes doing unrelated destructive work would otherwise stand each other
+    down for no reason. What is shared is the ENGINE — one AUTOCOMMIT `NullPool` connection source
+    for every lock, because the hazard it answers (a pooled connection recycled mid-pass, silently
+    dropping the lock) is the same one whatever the pass.
 
     The explicit unlock is belt-and-braces over the connection close — with `NullPool` the
     close alone would free it, and saying so twice costs one statement."""
     async with _the_lock_engine().connect() as conn:
-        took = bool(
-            (await conn.execute(sa.select(sa.func.pg_try_advisory_lock(_PASS_LOCK_KEY)))).scalar()
-        )
+        took = bool((await conn.execute(sa.select(sa.func.pg_try_advisory_lock(key)))).scalar())
         try:
             yield took
         finally:
             if took:
-                await conn.execute(sa.select(sa.func.pg_advisory_unlock(_PASS_LOCK_KEY)))
+                await conn.execute(sa.select(sa.func.pg_advisory_unlock(key)))
 
 
 def may_destroy_on_this_control_plane(environment: str) -> bool:
@@ -172,7 +177,7 @@ async def destroy_candidates(
         )
         return DestroyOutcome((), len(candidates), (), (), False)
 
-    async with _single_flight() as took_the_lock:
+    async with single_flight_lock(_PASS_LOCK_KEY) as took_the_lock:
         if not took_the_lock:
             _log.warning(PASS_SKIPPED_LOCKED_EVENT, candidates=len(candidates))
             return DestroyOutcome((), len(candidates), (), (), True)

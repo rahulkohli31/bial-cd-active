@@ -49,6 +49,17 @@ class WorkerSettings(CoreSettings):
     # `region`, which is not incidental — the ARM tag PATCH body requires `location`.
     sandbox: SandboxConfig
 
+    # ============================================================ REQUIRED, AND A SWITCH
+    # A PLAIN FIELD RATHER THAN A NESTED BLOCK. The nested blocks above are subsystems with
+    # credentials and connections; this is a policy the operator turns on. It has NO DEFAULT for
+    # the same reason the three above do not: a deployment that has not decided whether it deletes
+    # its citizens' conversations must refuse to boot rather than pick an answer for them.
+    #
+    # It ships OFF. Nothing has ever deleted a conversation here, so the first enabled pass is not
+    # a weekly increment — its candidate set is the whole historical backlog, Plan and Build chats
+    # included. Turning it on is a decision somebody makes once, having read that.
+    conversation_retention_enabled: bool
+
     # ============================================================ FEATURE SWITCH
     # Unset means the feature is OFF, legitimately, in every environment including production.
 
@@ -56,6 +67,20 @@ class WorkerSettings(CoreSettings):
     # block. Shape must match `ApiSettings.deploy` — pinned by a test, since the two are now
     # declared separately and could otherwise drift.
     deploy: DeployConfig | None = None
+
+    # ============================================================ KNOBS
+    # Defaults that are correct answers rather than placeholders — each says what it means.
+
+    #: How long a conversation may sit untouched before the pass condemns it. Seven days, which
+    #: is the policy; it is a field rather than a constant so an operator can widen it without a
+    #: deploy while the backlog drains.
+    conversation_retention_days: int = 7
+
+    #: How many conversations ONE pass may remove. The whole pass is one transaction, so a run
+    #: cancelled by a deploy drain rolls back entirely and starts from zero on the next tick —
+    #: without a ceiling, a first pass over the historical backlog could do that indefinitely and
+    #: never commit anything. What the cap leaves behind is counted and recorded, not dropped.
+    conversation_retention_per_pass: int = 500
 
     # ============================================================ VALIDATORS
 
