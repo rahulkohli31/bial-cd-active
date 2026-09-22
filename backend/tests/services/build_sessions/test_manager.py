@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
     RELAUNCH_PREVIEW_STAY_SECONDS,
+    SURFACE_PRESENT_STAY_SECONDS,
     BuildSessionStatus,
     PreviewReadyEvent,
     PreviewReconnectingEvent,
@@ -1364,6 +1365,20 @@ async def test_relaunch_keeps_a_restored_container_whose_dev_server_never_readie
         "the record must survive too: deleting it sends the next press down the restore arm, "
         "which tears this container down before pulling the last saved bundle"
     )
+    # AND IT LEAVES ON THE SURFACE'S GRACE, NOT THE BUILDER'S. Sparing the container newly
+    # carries this arm into `settle_stay_once_the_app_is_serving`, which cuts the 30-minute
+    # provisioning stay down to the 5 minutes a watching screen owns. That is right for a start
+    # nobody came back to, and survivable for a watched one only because the poll renews on every
+    # tick — including throughout a start.
+    #
+    # Asserted as a CEILING rather than as "a stay exists": the restore arm already granted one
+    # before the wait, so presence alone is true whether this line runs or not.
+    stay = datetime.fromisoformat(registry[REGISTRY_FIELD_PREVIEW_STAY_UNTIL])
+    assert (
+        datetime.now(UTC)
+        < stay
+        <= datetime.now(UTC) + timedelta(seconds=SURFACE_PRESENT_STAY_SECONDS + 5)
+    ), "a degraded start kept the builder's long stay instead of handing it to the screen"
     assert await lock_is_held(fake_redis, user.id) is False
     assert manager._active_by_user == {}
 

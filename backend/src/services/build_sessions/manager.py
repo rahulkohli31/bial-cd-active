@@ -3490,9 +3490,16 @@ class SessionManager:
                 await write_heartbeat(redis, user_id)
                 # …and hand the container's lifetime to the screen that asked for it. The long
                 # stay granted before the wait was there to survive a restore that can block for
-                # the better part of twenty minutes; the app has now answered a request, so that
-                # reason is spent. From here the surface framing it renews on its own poll, and
-                # what the platform owes is the gap until the first renewal arrives.
+                # the better part of twenty minutes, and provisioning is over either way by the
+                # time this line runs. From here the surface framing it renews on its own poll,
+                # and what the platform owes is the gap until the first renewal arrives.
+                #
+                # THIS RUNS ON THE DEGRADED ARM TOO, where the app has NOT answered a request, and
+                # it SHORTENS the stay there — right for an abandoned start, survivable for a
+                # watched one only because the poll renews on every tick, including throughout a
+                # start. A poll that skipped those ticks would leave a slow start holding a
+                # five-minute grace nothing refreshes, and the sweep would collect it with the
+                # citizen looking at the wait card.
                 #
                 # SETTLED, NOT RE-GRANTED. `grant_stay_of_execution` never moves a deadline
                 # backward, so a second grant here could only ever be a no-op behind the long one
