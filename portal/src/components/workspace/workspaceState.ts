@@ -415,6 +415,25 @@ export function waitBeganAt(preview: Pick<PreviewState, 'state' | 'startingSince
   return Number.isNaN(began) ? null : began
 }
 
+/**
+ * HOW LONG A WAIT HAS BEEN RUNNING, in milliseconds — `0` when nothing dates it.
+ *
+ * ONE SPELLING, because two things read it and they must agree: the number the pane draws, and the
+ * boundary {@link START_PATIENCE_MS} is compared against. A counter saying "1m 58s" beside a
+ * sentence that had already given up would be two clocks disagreeing in front of the citizen.
+ *
+ * NEVER NEGATIVE. The instant comes off another machine's clock, and a server a little ahead of
+ * this browser would otherwise read as a wait that has not started — a counter running up from a
+ * number in the future, and a boundary that never arrives.
+ *
+ * `now` IS A PARAMETER, NOT A DEFAULT, and that is this module's rule rather than this function's
+ * taste: nothing here may read a clock, so a timed affordance cannot be derived inside the map.
+ * The test below asserts it against the source text.
+ */
+export function msSpentSince(began: number | null, now: number): number {
+  return began === null ? 0 : Math.max(0, now - began)
+}
+
 /** The person's word for the thing is their app. "Preview" is the developer's word. */
 export const LAUNCH_LABEL = 'Launch Application'
 const RETRY_LABEL = 'Try again'

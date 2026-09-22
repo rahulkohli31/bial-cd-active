@@ -217,39 +217,55 @@ describe('★ BUILDING absorbed three cards, and it still has no verb', () => {
     })
   }
 
-  it('★ carries NO action under ANY combination of inputs that reaches it — decision D2', () => {
-    // THERE IS NO PATIENCE BUTTON, and this is where that decision is kept honest.
+  it('★ carries NO action under ANY combination of inputs, until the budget is spent', () => {
+    // INSIDE THE BUDGET THERE IS NOTHING TO PRESS, and this is where that is kept honest.
     //
-    // The obvious kindness is a "Launch Application" appearing after a long enough wait so the
-    // wait is never a dead end. It is not offered because of WHERE that press would land:
-    // `relaunch_preview`'s cold arm tears the live container down before restoring the last saved
-    // bundle, and the situation such a button exists for — a start whose observer was lost — is
-    // exactly the situation that takes the cold arm. The button would be most dangerous at the
-    // precise moment it appeared. The escape is server-side instead.
-    //
-    // ASSERTED EXHAUSTIVELY OVER THE PRODUCT rather than on one input, because a patience escape
-    // would arrive as a condition — "…unless a reason came back", "…unless there is a saved copy"
-    // — and a single-input assertion is exactly what such a condition slips past.
+    // The escape a wait eventually offers is a function of ONE input — `waitHasGoneOnTooLong` —
+    // and of nothing else. A patience button that grew out of any other condition ("…unless a
+    // reason came back", "…unless there is a saved copy") would be a second author for the same
+    // affordance, and a single-input assertion is exactly what such a condition slips past. So
+    // the sweep is over the product, and the boundary is swept as a dimension of it rather than
+    // left at its default — which is what made this vacuous for the arm it now covers.
     for (const startOutcome of EVERY_ENDING) {
       for (const projectHasSavedBuild of [true, false, null]) {
         for (const [how, inputs] of everyWayIn) {
-          const state = resolve({ ...inputs, startOutcome, projectHasSavedBuild })
-          expect(state.name, how).toBe('starting')
-          expect(state.action, `${how} / ${startOutcome?.kind ?? 'no ending'}`).toBeNull()
+          const where = `${how} / ${startOutcome?.kind ?? 'no ending'}`
+          const inside = resolve({
+            ...inputs,
+            startOutcome,
+            projectHasSavedBuild,
+            waitHasGoneOnTooLong: false,
+          })
+          expect(inside.name, how).toBe('starting')
+          expect(inside.action, where).toBeNull()
           // LIVENESS. Every absence above would pass just as happily against an arm that returned
           // an empty husk, so the sentence has to be there too — a withheld verb, not a blank card.
-          expect(state.headline).toBe('Getting your app ready.')
-          expect(state.busy).toBe(true)
+          expect(inside.headline).toBe('Getting your app ready.')
+          expect(inside.busy).toBe(true)
+
+          // PAST IT, ONE VERB AND ONLY THAT ONE. `start` is the press that reaches the restoring
+          // arm; the wait must never offer it, however the wait was arrived at.
+          const spent = resolve({
+            ...inputs,
+            startOutcome,
+            projectHasSavedBuild,
+            waitHasGoneOnTooLong: true,
+          })
+          expect(spent.name, where).toBe('starting')
+          expect(spent.busy, where).toBe(true)
+          expect(spent.action?.kind, where).toBe('retry')
+          expect(spent.headline, where).not.toBe('Getting your app ready.')
         }
       }
     }
   })
 
-  it('★ and the map is handed no clock, so a TIMED action cannot exist here at all', () => {
-    // The behavioural sweep above proves no action for any INPUT. This closes the other half: a
-    // patience button is a function of elapsed TIME, and time is not an input to this module. A
-    // map that read a clock could satisfy every assertion above on the first call and grow a
-    // button on the hundredth, and no pure-function test would ever see it.
+  it('★ and the map is handed no clock, so time cannot reach it except as an input', () => {
+    // The sweep above proves the escape is a function of ONE input. This closes the other half:
+    // the map must not be able to consult a clock ITSELF. A map that read one could satisfy every
+    // assertion above on the first call and grow a different button on the hundredth, and no
+    // pure-function test would ever see it — the boundary has to arrive as
+    // `waitHasGoneOnTooLong`, decided by a caller with a timer and testable as a value.
     //
     // Asserted against the SOURCE because that is where a clock would have to appear, and because
     // the module is deliberately pure: there is no seam to observe one through. The two duration

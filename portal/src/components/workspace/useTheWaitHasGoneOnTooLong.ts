@@ -18,7 +18,7 @@
  * budget from now, which is the honest fallback: nothing knows better.
  */
 import { useEffect, useState } from 'react'
-import { START_PATIENCE_MS, waitBeganAt } from './workspaceState'
+import { START_PATIENCE_MS, msSpentSince, waitBeganAt } from './workspaceState'
 import type { PreviewState } from '../../utils/buildSessionApi'
 
 export function useTheWaitHasGoneOnTooLong(preview: PreviewState | null): boolean {
@@ -30,12 +30,12 @@ export function useTheWaitHasGoneOnTooLong(preview: PreviewState | null): boolea
       setTooLong(false)
       return
     }
-    // `Date.now()` rather than `performance.now()` HERE ONLY, and the asymmetry with the pane's
-    // counter is deliberate: this compares against an instant another machine stamped, which a
-    // monotonic clock has no common origin with. The cost of a system-clock jump is that the
-    // second sentence arrives early or late once — the counter's cost would be a number that runs
-    // backwards, which is why that one stays monotonic.
-    const spent = startedAt === null ? 0 : Math.max(0, Date.now() - startedAt)
+    // A WALL CLOCK HERE ONLY, and the asymmetry with the pane's counter is deliberate: this
+    // compares against an instant another machine stamped, which a monotonic clock has no common
+    // origin with. The cost of a system-clock jump is that the second sentence arrives early or
+    // late once — the counter's cost would be a number that runs backwards, which is why that one
+    // reads the wall clock exactly once and counts monotonically from there.
+    const spent = msSpentSince(startedAt, Date.now())
     if (spent >= START_PATIENCE_MS) {
       setTooLong(true)
       return

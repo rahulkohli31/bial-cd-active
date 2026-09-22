@@ -35,6 +35,7 @@ import {
   useWorkspacePaneVisible,
   useWorkspaceReport,
 } from './workspaceChannel'
+import { msSpentSince } from './workspaceState'
 import type { WorkspaceStateName } from './workspaceState'
 
 /**
@@ -395,12 +396,11 @@ function ElapsedSinceTheWaitBegan({ since }: { since: number | null }) {
   )
 }
 
-/** Whole seconds spent since a wall-clock instant, or `0` when nothing dates the wait. Never
- *  negative: a server a little ahead of this browser must not read as a wait that has not
- *  started, which would draw a counter running up from a number in the future. */
+/** Whole seconds spent since a wall-clock instant — the pane's reading of the one span
+ *  `msSpentSince` defines, so the number drawn here and the boundary the shell compares against
+ *  cannot come from two different clamps. */
 function secondsSpentSince(since: number | null): number {
-  if (since === null) return 0
-  return Math.max(0, Math.floor((Date.now() - since) / 1_000))
+  return Math.floor(msSpentSince(since, Date.now()) / 1_000)
 }
 
 /** `0s`, `45s`, `1m 05s`. Seconds stay two-digit past the minute so the line does not jitter. */
