@@ -68,6 +68,10 @@ PARENTAGE_SHAPE = "(kind = 'generic') = (project_id IS NULL)"
 class Conversation(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     __tablename__ = "conversations"
 
+    # `updated_at` (from `TimestampMixin`) reads as "last touched by a person" and is kept by
+    # TWO writers, not one: the ORM `onupdate` here covers a title/context PATCH, and migration
+    # 0045's statement-level trigger on `messages` covers a new message — the trigger writes
+    # behind SQLAlchemy, so a session already holding this row is stale until refreshed.
     __table_args__ = (sa.CheckConstraint(PARENTAGE_SHAPE, name="ck_conversations_parentage"),)
 
     # The parent project — present for a plan or build chat, absent for a generic one, and
