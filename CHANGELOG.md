@@ -20,8 +20,9 @@ doing that.
 
 ### Deploying this release
 
-- **Run migration `0044_chat_kind_generic`, then `0045_conversation_touch`, before the new images
-  go live.** In that order, and nothing here applies them for you. The first rebuilds the chat-kind
+- **Run migrations `0044_chat_kind_generic`, `0045_conversation_touch` and
+  `0046_conversation_updated_at`, in that order, before the new images go live.** Nothing here
+  applies them for you. The first rebuilds the chat-kind
   type and rewrites both columns that use it under an exclusive lock; that rewrite is proportional
   to the number of stored messages, so at a history of a few thousand it finishes in well under a
   second, and it is the message table that governs — count its rows before choosing a slot if the
@@ -29,9 +30,10 @@ doing that.
   landed. The second adds the trigger that records when a conversation was last used: it is
   invisible to the previous image and safe to run early, and it must be in place well before the
   retention setting below is ever switched on, because a conversation used while the trigger is
-  missing records no activity and a later pass would judge it by a stale timestamp. Rolling the
-  schema back past `0044` deletes the BIAL Chat conversations — they have no project to be
-  returned to.
+  missing records no activity and a later pass would judge it by a stale timestamp. The third indexes the column that trigger
+  maintains, which the retention pass filters and orders by on every run; it is invisible to the
+  previous image and safe to run early. Rolling the schema back past `0044` deletes the BIAL Chat
+  conversations — they have no project to be returned to.
 - **Set `CONVERSATION_RETENTION_ENABLED` on the worker.** It is required and has no default, so a
   worker that does not carry it refuses to start rather than guessing. Set it off unless you have
   read the next point. `CONVERSATION_RETENTION_DAYS` and `CONVERSATION_RETENTION_PER_PASS` are
@@ -77,6 +79,27 @@ doing that.
   builder's screen around it, with a breadcrumb for a project that does not exist.
 - **The greeting sits in the middle of the screen.** It was pinned to the top with the rest of the
   page empty below it, on every window size.
+- **The transcript sits on the page rather than in a box of its own.** BIAL Chat drew a white panel
+  around the conversation that no other chat on the platform draws, and that nothing about reading a
+  conversation needs.
+- **The message box stays where you left it.** In a long conversation it slid below the bottom of
+  the screen and you had to scroll the page down to reach the box you were typing in. The
+  conversation scrolls now; the box does not move.
+- **A refused attachment stops being refused.** "You can attach at most 5 files per message" stayed
+  on screen in red after you had sent the message and read the reply — a complaint about something
+  that was no longer true.
+- **A reply that does not finish says so in the right words.** BIAL Chat reported it as a failed
+  build, in a chat that builds nothing.
+- **A file the assistant is handed is read as a document, never as an instruction.** A PDF or
+  picture that contains wording aimed at an assistant is reported as part of the file's contents
+  and not acted on. This applies to every chat that takes an attachment; in BIAL Chat, where the
+  files usually come from somebody else, the guard had not been reaching the assistant at all.
+- **Two people deleting the same conversation at once no longer leaves files behind.** The pass
+  that removes old conversations now settles which one owns the deletion before removing anything,
+  and when a stored file cannot be removed it reports how many were left rather than implying the
+  next run will collect them.
+- **Muted text passes the contrast floor** on the conversation screens, rather than sitting just
+  under it.
 
 ## [1.8.1] - 2026-09-21
 
