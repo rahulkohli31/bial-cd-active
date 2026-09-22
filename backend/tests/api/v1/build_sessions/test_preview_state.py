@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import src.services.build_sessions.manager as manager_mod
 from src.api.v1.build_sessions.schemas import (
     PREVIEW_STATE_ACTION,
+    STARTING_MARKER_TTL_SECONDS,
     PreviewLifeState,
     PreviewStateAction,
 )
@@ -638,6 +639,83 @@ async def test_a_start_in_flight_reads_as_starting_from_a_different_request_and_
     assert second["state"] == "starting"
     assert first["previewUrl"] is None
     assert first["restorable"] is None
+
+
+async def test_the_wait_is_dated_from_the_start_and_not_from_the_read(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """★ THE CLOCK THAT USED TO LIE. The pane counted elapsed time from its own mount, so a
+    reload two minutes into a start told the citizen — and told us — that the wait was one
+    second old. Six reloads looked identical to one.
+
+    The marker is written once per start and never renewed, so what is left of its TTL dates
+    the wait, and it answers the same however many times the page is reloaded over it.
+    Ninety seconds spent is simulated by shortening the key's expiry, which is what a TTL
+    decaying looks like from this route's side.
+
+    Mutation check: date the wait from `datetime.now(UTC)` and the span below collapses to
+    zero."""
+    user, project = await _user_project(db_session, "ps-start-clock@rvaiglobal.com")
+    await write_starting_marker(fake_redis, user.id, project.id)
+    await fake_redis.expire(starting_key(user.id), STARTING_MARKER_TTL_SECONDS - 90)
+
+    body = await _probe(client, user, project)
+
+    assert body["state"] == "starting"
+    began = datetime.fromisoformat(body["startingSince"])
+    assert 85 < (datetime.now(UTC) - began).total_seconds() < 95
+
+
+async def test_a_wait_for_somebody_elses_project_is_not_this_panes_to_count(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """THE MARKER IS PER USER, NOT PER PROJECT, and this arm is where that bites: this
+    project's container is up and has never served, so the pane reads `starting` — while a
+    start for ANOTHER of this citizen's projects is in flight and holds the only marker.
+    Counting from that marker would tell this citizen their app has been starting for a minute
+    and a half when it was created seconds ago.
+
+    Mutation check: drop the `starting == project_id` guard and this goes red — the instant
+    slides back to the other project's start."""
+    user, project = await _user_project(db_session, "ps-other-clock@rvaiglobal.com")
+    app_id = await _built(db_session, user, project)
+    other = await ProjectFactory.create(db_session, user.id, name="Stand Allocation")
+    await db_session.commit()
+    # Ours, up, and never yet a serve — the registry arm that reads `starting`. `created_at` is
+    # written as now, which is what this pane's clock must report.
+    await _register_container(
+        fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY, serving_since=""
+    )
+    # …and the other project's start, ninety seconds old, holding the only marker there is.
+    await write_starting_marker(fake_redis, user.id, other.id)
+    await fake_redis.expire(starting_key(user.id), STARTING_MARKER_TTL_SECONDS - 90)
+
+    body = await _probe(client, user, project)
+
+    assert body["state"] == "starting"
+    began = datetime.fromisoformat(body["startingSince"])
+    assert (datetime.now(UTC) - began).total_seconds() < 5, (
+        "this pane was handed another project's clock"
+    )
+
+
+async def test_a_container_outliving_its_marker_is_dated_from_the_registry(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """A start slower than the marker's own 300 seconds still reads as a wait — that arm is
+    what takes the marker TTL off the screen — and past the marker the registry's `created_at`
+    is the only thing left to date it by. Silence there would restart the citizen's clock at
+    exactly the moment the wait got interesting."""
+    user, project = await _user_project(db_session, "ps-outlived-clock@rvaiglobal.com")
+    app_id = await _built(db_session, user, project)
+    await _register_container(
+        fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY, serving_since=""
+    )
+
+    body = await _probe(client, user, project)
+
+    assert body["state"] == "starting"
+    assert body["startingSince"] is not None
 
 
 async def test_a_completed_start_clears_the_marker_and_the_next_read_answers_alive(

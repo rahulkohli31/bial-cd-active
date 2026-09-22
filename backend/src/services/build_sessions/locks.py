@@ -342,12 +342,37 @@ async def clear_starting_marker(redis: aioredis.Redis, user_uuid: uuid.UUID) -> 
     await redis.delete(starting_key(user_uuid))
 
 
+def _when_this_start_began(raw_pttl: object, user_uuid: uuid.UUID) -> datetime | None:
+    """The instant the starting marker was written, read off WHAT IS LEFT of its TTL.
+
+    The marker is written once per start and never renewed, so its decay IS the wait's clock —
+    and it is the only anchor that survives a page reload. A counter started when a pane mounts
+    tells a citizen who has been waiting five minutes that they have been waiting one second.
+
+    `PTTL` answers -1 (key with no expiry) and -2 (no key); both are "cannot say", as is a
+    remaining span longer than the TTL itself, which could only come from a clock nobody can
+    trust. `None` in every one of those cases, never a guessed instant."""
+    remaining_ms = raw_pttl if isinstance(raw_pttl, int) else None
+    if remaining_ms is None or remaining_ms <= 0:
+        return None
+    elapsed = timedelta(seconds=STARTING_MARKER_TTL_SECONDS) - timedelta(milliseconds=remaining_ms)
+    if elapsed < timedelta(0):
+        _log.warning("starting marker outlives its own TTL", user_id=str(user_uuid))
+        return None
+    # TO THE SECOND, so the same wait reads as the same instant on every poll. The arithmetic
+    # recovers the write time exactly, but `now` and Redis's own clock differ by a few
+    # milliseconds — and a field that jitters is a field every reading comparator sees change,
+    # which wakes both surfaces every three seconds for a number that has not moved.
+    return (datetime.now(UTC) - elapsed).replace(microsecond=0)
+
+
 async def read_registry_and_starting_marker(
     redis: aioredis.Redis, user_uuid: uuid.UUID
-) -> tuple[dict[str, str] | None, uuid.UUID | None]:
+) -> tuple[dict[str, str] | None, uuid.UUID | None, datetime | None]:
     """The one round trip `project_preview_state` spends on Redis: registry hash + starting
-    marker as ONE PIPELINE (two commands), not two sequential round trips — keeps the frozen
-    cost budget ("one registry hash read") honest instead of doubling it on every poll.
+    marker + how much of that marker's life is left, as ONE PIPELINE, not three sequential
+    round trips — keeps the frozen cost budget ("one registry hash read") honest instead of
+    tripling it on every poll.
 
     Falls back to `read_registry`'s legacy-prefix adoption ONLY when the pipelined `HGETALL`
     comes back empty — that migration is itself a second round trip, so it stays off the hot
@@ -356,11 +381,16 @@ async def read_registry_and_starting_marker(
     pipe = redis.pipeline(transaction=False)
     pipe.hgetall(registry_key(user_uuid))
     pipe.get(starting_key(user_uuid))
-    raw_registry, raw_starting = await pipe.execute()
+    pipe.pttl(starting_key(user_uuid))
+    raw_registry, raw_starting, raw_pttl = await pipe.execute()
     registry = {str(k): str(v) for k, v in raw_registry.items()} if raw_registry else None
     if registry is None:
         registry = await _adopt_a_pre_cutover_record(redis, user_uuid)
-    return registry, _parse_starting_marker(raw_starting, user_uuid)
+    return (
+        registry,
+        _parse_starting_marker(raw_starting, user_uuid),
+        _when_this_start_began(raw_pttl, user_uuid),
+    )
 
 
 # --- the lingering preview's stay of execution -------------------------------

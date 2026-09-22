@@ -515,26 +515,62 @@ async def test_an_abandoned_marker_expires_on_its_own(fake_redis: aioredis.Redis
     assert await locks.read_starting_marker(fake_redis, USER) is None
 
 
-async def test_the_pipelined_read_returns_both_the_registry_and_the_marker_in_one_round_trip(
+async def test_the_pipelined_read_returns_the_registry_the_marker_and_the_clock_in_one_trip(
     fake_redis: aioredis.Redis,
 ) -> None:
-    """The exact pairing `project_preview_state` spends its one Redis round trip on: two
-    commands, not two round trips."""
+    """The exact reading `project_preview_state` spends its one Redis round trip on: three
+    commands, not three round trips."""
     await fake_redis.hset(registry_key(USER), mapping={REGISTRY_FIELD_APP_NAME: "sbx-x"})
     await locks.write_starting_marker(fake_redis, USER, PROJECT)
 
-    reg, starting = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    reg, starting, began_at = await locks.read_registry_and_starting_marker(fake_redis, USER)
 
     assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == "sbx-x"
     assert starting == PROJECT
+    assert began_at is not None
+    # Written a moment ago, so its full TTL is still ahead of it and the derived instant is now.
+    assert abs((datetime.now(UTC) - began_at).total_seconds()) < 5
+
+
+async def test_the_marker_clock_reads_the_wait_a_reload_would_have_forgotten(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """THE DEFECT THIS FIELD EXISTS FOR. The pane used to count from its own mount, so a reload
+    two minutes into a start reported one second. The marker is written once per start and
+    never renewed, so what is left of its TTL is the wait — and it is the same answer however
+    many times the page has been reloaded on top of it.
+
+    Ninety seconds spent is simulated by shortening the key's expiry, which is what a TTL
+    decaying looks like from a reader's side."""
+    await locks.write_starting_marker(fake_redis, USER, PROJECT)
+    await fake_redis.expire(starting_key(USER), STARTING_MARKER_TTL_SECONDS - 90)
+
+    _, _, began_at = await locks.read_registry_and_starting_marker(fake_redis, USER)
+
+    assert began_at is not None
+    assert 85 < (datetime.now(UTC) - began_at).total_seconds() < 95
+
+
+async def test_the_marker_clock_says_nothing_when_there_is_no_marker(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """`PTTL` answers -2 for a key that is not there and -1 for one with no expiry. Neither is
+    an instant, and inventing one would date a wait that is not happening."""
+    await fake_redis.set(starting_key(USER), str(PROJECT))  # no expiry: PTTL answers -1
+
+    _, starting, began_at = await locks.read_registry_and_starting_marker(fake_redis, USER)
+
+    assert starting == PROJECT  # the marker is still a claim...
+    assert began_at is None  # ...it just cannot date itself
 
 
 async def test_the_pipelined_read_answers_both_absent_with_no_registry_or_marker(
     fake_redis: aioredis.Redis,
 ) -> None:
-    reg, starting = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    reg, starting, began_at = await locks.read_registry_and_starting_marker(fake_redis, USER)
     assert reg is None
     assert starting is None
+    assert began_at is None
 
 
 async def test_the_pipelined_read_still_migrates_a_legacy_registry_record(
@@ -546,7 +582,7 @@ async def test_the_pipelined_read_still_migrates_a_legacy_registry_record(
 
     await fake_redis.hset(legacy_registry_key(USER), mapping={REGISTRY_FIELD_APP_NAME: "sbx-x"})
 
-    reg, starting = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    reg, starting, _ = await locks.read_registry_and_starting_marker(fake_redis, USER)
 
     assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == "sbx-x"
     assert starting is None
@@ -562,6 +598,9 @@ class _BoomPipeline:
         return self
 
     def get(self, *_args: object, **_kwargs: object) -> _BoomPipeline:
+        return self
+
+    def pttl(self, *_args: object, **_kwargs: object) -> _BoomPipeline:
         return self
 
     async def execute(self) -> object:

@@ -638,6 +638,11 @@ class PreviewState:
     # question nobody could answer about 2026-09-10. `None` on a pre-cutover hash: proven, with
     # no instant to name. `PreviewStateResponse.serving_since` carries the same rule.
     serving_since: datetime | None = None
+    # STARTING only — the instant THIS project's wait began, so an elapsed figure survives a
+    # reload. The pane counted from its own mount before this, which made a five-minute wait and
+    # a one-second wait look identical to the citizen and to us. `None` is NO CLAIM: the client
+    # falls back to counting from mount, which is what it did before.
+    starting_since: datetime | None = None
     # SLOT_TAKEN only — whose work is in the container standing where this project's was. Also
     # populated directly from the starting marker's own payload (no registry round trip needed
     # to name the occupier) when a start, rather than a live container, is what is holding the
@@ -2445,7 +2450,9 @@ class SessionManager:
         # a 503 would break a read that every framed preview makes every 45 seconds.
         app_id = await existing_app_id(db, user.id, project_id)
         try:
-            reg, starting = await read_registry_and_starting_marker(get_redis(), user.id)
+            reg, starting, start_began_at = await read_registry_and_starting_marker(
+                get_redis(), user.id
+            )
         except RedisNotConfiguredError:
             # A CERTAIN answer, not an ambiguous one (`services/redis/errors.py`): Redis is
             # genuinely optional outside production, and with no coordination store there is no
@@ -2481,6 +2488,10 @@ class SessionManager:
                 restorable=await snapshot_presence(app_id) if app_id is not None else None,
             )
         mine = app_name_for(app_id) if app_id is not None else None
+        # WHEN THIS PROJECT'S WAIT BEGAN, and only this project's: the marker is per USER, so a
+        # start in flight for a DIFFERENT project of theirs names an instant that is not this
+        # pane's to count from.
+        waiting_since = start_began_at if starting == project_id else None
         if mine is not None and reg is not None and _registry_serves_and_is_ready(reg, mine):
             if not stamp_is_proven(reg):
                 # THE CONTAINER EXISTS AND HAS NEVER ANSWERED A REQUEST. This is the whole
@@ -2503,7 +2514,15 @@ class SessionManager:
                 #
                 # No `preview_url` and no `restorable`: STARTING's existing defaults are already
                 # the honest answer (nothing to frame, no restore offered mid-start).
-                return PreviewState(state=PreviewLifeState.STARTING)
+                #
+                # `created_at` is the fallback anchor, and it is the one this arm needs: a
+                # container that outlives its 300s marker without ever serving reaches here with
+                # nothing else left to date the wait by.
+                return PreviewState(
+                    state=PreviewLifeState.STARTING,
+                    starting_since=waiting_since
+                    or an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT),
+                )
             fqdn = reg.get(REGISTRY_FIELD_FQDN)
             # THE HOT PATH, AND IT SPENDS NOTHING ON THE STORE. `restorable` stays `None` —
             # "no claim" — because a running app renders no restore affordance for the answer
@@ -2525,7 +2544,7 @@ class SessionManager:
             # SLOT_TAKEN arm below: no app-name inversion, no ghost, because the marker already
             # says which project it is.
             if starting == project_id:
-                return PreviewState(state=PreviewLifeState.STARTING)
+                return PreviewState(state=PreviewLifeState.STARTING, starting_since=waiting_since)
             occupying_name = await _project_name_owned_by(db, user.id, starting)
             return PreviewState(
                 state=PreviewLifeState.SLOT_TAKEN,

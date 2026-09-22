@@ -455,6 +455,16 @@ class PreviewStateResponse(CamelModel):
     # Additive and defaulted, so emitters and readers written before it stay wire-valid — the
     # same rule `StepEvent.hidden` carries in `schemas.py`.
     serving_since: datetime | None = None
+    # STARTING only: the ISO-8601 instant this project's wait began, so the pane's elapsed
+    # figure is the real wait rather than the life of the current page. Null is NO CLAIM — the
+    # client falls back to counting from its own mount.
+    #
+    # THE CLIENT MAY BRANCH ON THIS ONE, unlike `serving_since` above, and the difference is
+    # that it is not `state` spelled twice: `state == starting` says a wait is under way and
+    # this says how long it has been under way, which is a fact no other field carries.
+    #
+    # Additive and defaulted, so emitters and readers written before it stay wire-valid.
+    starting_since: datetime | None = None
     # SLOT_TAKEN only. Null when the live container matches no app this user owns (a ghost) —
     # naming the wrong project in a sentence about someone's work is worse than naming none.
     occupying_project_id: uuid.UUID | None = None
@@ -1012,6 +1022,7 @@ async def preview_state(
         alive=state.alive,
         preview_url=state.preview_url,
         serving_since=state.serving_since,
+        starting_since=state.starting_since,
         occupying_project_id=state.occupying_project_id,
         occupying_project_name=state.occupying_project_name,
         restorable=state.restorable,

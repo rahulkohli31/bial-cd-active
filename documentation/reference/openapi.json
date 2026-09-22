@@ -3360,6 +3360,18 @@
             ],
             "title": "Servingsince"
           },
+          "startingSince": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startingsince"
+          },
           "state": {
             "$ref": "#/components/schemas/PreviewLifeState"
           }
