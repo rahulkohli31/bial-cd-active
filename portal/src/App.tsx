@@ -141,8 +141,13 @@ export default function App() {
         <Route path="/shared-applications" element={<Shell><SharedApplicationsPage /></Shell>} />
         {/* THE ASSISTANT GETS ITS OWN ADDRESS, not `/chat`. That prefix means a conversation
             about one application (`/chat/:chatId` below), so `/chat` and `/chat/<id>` would be
-            two unrelated surfaces under one prefix. A later `/assistant/<id>` extends from here. */}
+            two unrelated surfaces under one prefix.
+
+            BOTH ADDRESSES RENDER THE SAME ELEMENT, and that is what keeps the surface's backdrop
+            running when the first message takes an address: a second route component would
+            unmount this one and restart the animation underneath a reply that had just begun. */}
         <Route path="/assistant" element={<Shell><AssistantPage /></Shell>} />
+        <Route path="/assistant/:chatId" element={<Shell><AssistantPage /></Shell>} />
         {/* Cross-user by design: every signed-in BIAL user sees the same catalog. */}
         <Route path="/marketplace" element={<Shell><MarketplacePage /></Shell>} />
         {/* ONE ROUTE REACHES INTEGRATIONS. It was a dialog with two doors and no address, so
