@@ -65,7 +65,15 @@ from tests.fakes import FakeSandboxClient
 # while this stays credential-shaped; plain text would pass it for the wrong reason.
 _CREDENTIAL = "DATABASE_URL=postgres://u:p@h/db"
 
-_CTX = PromptContext(user_name="Ada", project_name="Visitors", project_description=None)
+_CITIZEN = "Ada"
+_PROJECT = "Visitors"
+"""The two per-conversation facts this file hunts for on the wrong side of the marker.
+
+Named rather than read back off `_CTX`: `project_name` is optional on the context now — a
+chat with no project has none — so the substring searches below would be asking whether a
+possible absence appears in a string."""
+
+_CTX = PromptContext(user_name=_CITIZEN, project_name=_PROJECT, project_description=None)
 
 
 async def _no_refs(attachment_ids) -> dict[str, tuple[str, str]]:
@@ -467,11 +475,11 @@ async def test_no_block_up_to_the_marker_names_this_citizen_or_their_project(
 
     cached = [str(block.get("text", "")) for block in blocks[: marked[0] + 1]]
     for index, text in enumerate(cached):
-        assert _CTX.user_name not in text, f"block {index} names the citizen: {text[:120]!r}"
-        assert _CTX.project_name not in text, f"block {index} names the project: {text[:120]!r}"
+        assert _CITIZEN not in text, f"block {index} names the citizen: {text[:120]!r}"
+        assert _PROJECT not in text, f"block {index} names the project: {text[:120]!r}"
 
     tail = "\n".join(str(block.get("text", "")) for block in blocks[marked[0] + 1 :])
-    assert _CTX.user_name in tail and _CTX.project_name in tail, (
+    assert _CITIZEN in tail and _PROJECT in tail, (
         "this conversation's own facts are not behind the marker at all — either they went "
         "missing from the prompt, or they were folded into the cached prefix"
     )

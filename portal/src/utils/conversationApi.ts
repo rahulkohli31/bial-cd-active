@@ -25,7 +25,11 @@ import { formatStamp, isUsableInstant } from './publishPresentation'
 export interface ConversationHeader {
   id: string
   kind: string
-  projectId: string
+  /**
+   * The parent project, or `null` for a chat that belongs to a citizen rather than to a
+   * project. The server sends a real `null` for that kind, never the string `"None"`.
+   */
+  projectId: string | null
   title: string
   createdAt: string
   updatedAt: string
@@ -37,7 +41,10 @@ export interface ConversationHeader {
  *
  * `projectId` is load-bearing, not decoration: it is how `ChatRoute` resolves a
  * chat's breadcrumb and how a chat re-parents its writes after a cold open. Drop
- * it here and `conversation.projectId` is silently `undefined` everywhere.
+ * it here and `conversation.projectId` is silently `undefined` everywhere. An ABSENCE
+ * passes through as `null` rather than being coerced: a chat with no project is a real
+ * state, and a breadcrumb resolved from a falsy string would name a project that does
+ * not exist.
  */
 function normalizeHeader(doc: unknown): ConversationHeader | null {
   if (!doc) return null
@@ -46,7 +53,7 @@ function normalizeHeader(doc: unknown): ConversationHeader | null {
   const d = doc as {
     _id: string
     kind: string
-    projectId: string
+    projectId: string | null
     title?: string
     createdAt: string
     updatedAt: string
@@ -55,7 +62,7 @@ function normalizeHeader(doc: unknown): ConversationHeader | null {
   return {
     id: d._id,
     kind: d.kind,
-    projectId: d.projectId,
+    projectId: typeof d.projectId === 'string' ? d.projectId : null,
     title: d.title || '',
     createdAt: d.createdAt,
     updatedAt: d.updatedAt,
@@ -186,6 +193,8 @@ export function discardNoticeText(savedAt: string | null): string {
 export function messagesFromProjection(
   projection: RawProjectionItem[] | undefined,
   onUnknown: (item: RawProjectionItem) => void = reportUnknownProjectionItem,
+  // Defaulted to the workspace kinds, so every existing caller keeps the wording it had.
+  buildless = false,
 ): ChatMessage[] {
   const messages: ChatMessage[] = []
 
@@ -366,6 +375,7 @@ export function messagesFromProjection(
               text: outcomeSummary({
                 status: bannerStatus(terminal),
                 reason: typeof item.reason === 'string' ? item.reason : null,
+                buildless,
               }),
             },
           ],
@@ -475,9 +485,12 @@ export async function getConversation(id: string, deps: AuthFetchDeps = {}): Pro
   if (!res.ok) throw await readApiError(res, 'Failed to load conversation')
   // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
   const data = (await res.json()) as { conversation: unknown; projection?: RawProjectionItem[]; activeTurn?: ActiveTurn | null; contextTokens?: number | null }
+  const header = normalizeHeader(data.conversation) as ConversationHeader
   return {
-    ...(normalizeHeader(data.conversation) as ConversationHeader),
-    messages: messagesFromProjection(data.projection),
+    ...header,
+    // THE KIND DECIDES THE NOUN. A generic chat owns no workspace, so a turn that failed there
+    // must not be reported as a build that failed.
+    messages: messagesFromProjection(data.projection, undefined, header.kind === 'generic'),
     activeTurn: data.activeTurn ?? null,
     // NARROWED, not coerced: a server that has not learned this field yet, or one answering
     // `null` for an unmeasured chat, both mean "no measurement" — and neither may be read as
@@ -553,7 +566,7 @@ export function deriveTitle(text: string): string {
  * must not refuse its own second attempt.
  */
 export async function createConversation(
-  { id, projectId, kind }: { id: string; projectId: string; kind: string },
+  { id, projectId, kind }: { id: string; projectId?: string | undefined; kind: string },
   deps: AuthFetchDeps = {},
 ): Promise<ConversationHeader | null> {
   const res = await authFetch(
@@ -561,7 +574,11 @@ export async function createConversation(
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, projectId, kind }),
+      // THE KEY IS OMITTED, NEVER SENT AS AN ABSENCE. The server refuses a project on the kind
+      // that may not have one, and it refuses it by the key being present — `projectId: null`
+      // and no `projectId` are the same value to the validator but not to a reader, and the
+      // omission is what says this chat has no parent rather than an unknown one.
+      body: JSON.stringify(projectId === undefined ? { id, kind } : { id, projectId, kind }),
     },
     deps,
   )

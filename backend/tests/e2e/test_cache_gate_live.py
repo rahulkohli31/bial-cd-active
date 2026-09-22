@@ -52,7 +52,7 @@ from src.services.agent.mode_prompts import PromptContext
 from src.services.agent.model import build_foundry_model
 from src.services.build_sessions.manager import SessionManager
 from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
-from tests.factories import ConversationFactory, UserFactory
+from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
 pytestmark = pytest.mark.integration
 
@@ -187,7 +187,10 @@ async def test_a_real_conversation_writes_then_reads_its_cache(
 ) -> None:
     """★ THE GATE. Three consecutive turns on one conversation, against the real deployment."""
     user = await UserFactory.create(db_session, email="cache-gate@rvaiglobal.com")
-    conversation = await ConversationFactory.create(db_session, user.id, kind=ChatKind.BUILD)
+    project = await ProjectFactory.create(db_session, user.id)
+    conversation = await ConversationFactory.create(
+        db_session, user.id, kind=ChatKind.BUILD, project_id=project.id
+    )
 
     per_turn: list[list[dict[str, Any]]] = []
     for prompt in _TURNS:
@@ -198,7 +201,7 @@ async def test_a_real_conversation_writes_then_reads_its_cache(
                 session_factory,
                 conversation,
                 user.id,
-                conversation.project_id,
+                project.id,
                 prompt,
                 foundry_model,
                 sandbox,

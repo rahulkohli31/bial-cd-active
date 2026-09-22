@@ -48,14 +48,11 @@ def upgrade() -> None:
     # most needs that protection is the one least likely to be reading this file at the time
     # — hence SET rather than recommended.
     #
-    # AND IT IS RESET AT THE END OF `upgrade()`, which is not optional. `SET LOCAL` is scoped
-    # to the TRANSACTION, not to the revision, and `alembic/env.py` leaves
-    # `transaction_per_migration` at its default of False — so one `alembic upgrade` runs
-    # every pending revision inside a SINGLE transaction. Without the reset below this
-    # timeout would leak into every migration applied after this one in the same run, and a
-    # later revision that legitimately waits more than 5s on a lock would abort with
-    # `lock_not_available` and roll back the WHOLE upgrade. An earlier version of this
-    # comment claimed the scoping was automatic; it is not.
+    # AND IT IS RESET AT THE END OF `upgrade()`. `SET LOCAL` is scoped to the TRANSACTION,
+    # and `alembic/env.py` runs one transaction PER MIGRATION — so the timeout dies with this
+    # revision and cannot reach a later one. What the reset buys is inside the revision: any
+    # statement added after it waits on locks the way it otherwise would, rather than
+    # inheriting a 5s ceiling and aborting with `lock_not_available`.
     #
     # The two-arg `to_tsvector('english', ...)` is required, not stylistic: the one-arg form
     # is rejected outright with `ERROR: generation expression is not immutable`.
@@ -104,8 +101,7 @@ def downgrade() -> None:
     # below takes ACCESS EXCLUSIVE on `projects` and queues behind any open reader, blocking
     # every request for that table while it waits. A rollback is exactly when someone is in a
     # hurry on a busy database, so the half that runs under pressure should not be the half
-    # without the timeout. Reset at the end for the same
-    # `transaction_per_migration = False` reason.
+    # without the timeout. Reset at the end for the same reason `upgrade()` resets.
     op.execute("SET LOCAL lock_timeout = '5s'")
     op.execute(f"DROP INDEX IF EXISTS {_UNPUBLISHED_IDX}")
     op.execute(f"DROP INDEX IF EXISTS {_SUCCESS_IDX}")

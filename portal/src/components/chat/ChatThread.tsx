@@ -46,15 +46,11 @@ export interface ChatThreadProps {
 const TurnStartedAtContext = createContext<number | null>(null)
 
 /**
- * The text part, rendered by the portal's own renderer.
- *
- * `isUser` keeps user prose VERBATIM — markdown is never parsed in a user message, so a citizen
- * who types `**` sees `**`. That is a safety guarantee, not a style choice, and it is one of the
- * 21 parity cases.
+ * The text part, rendered by the portal's own renderer — one Streamdown pipeline for every
+ * message, with no branch on who wrote it. The remote-image block and the rest of the
+ * parse/sanitise pipeline apply to a citizen's own prose exactly as they do to a model's.
  */
-const TextPart: ThreadComponents['TextPart'] = ({ text, isUser }) => (
-  <MessageContent parts={text} isUser={isUser} />
-)
+const TextPart: ThreadComponents['TextPart'] = ({ text }) => <MessageContent parts={text} />
 
 /**
  * THE WORKING STATUS — status only, never the reasoning content (too technical here;
@@ -80,7 +76,7 @@ const TextPart: ThreadComponents['TextPart'] = ({ text, isUser }) => (
 const ReasoningGroup: ThreadComponents['ReasoningGroup'] = () => {
   const turnStartedAt = useContext(TurnStartedAtContext)
   return (
-    <p data-testid="working-status" className="my-1 text-xs text-neutral">
+    <p data-testid="working-status" className="my-1 text-xs text-status-grey-fg">
       <WaitingLine label="Working on your app" active since={turnStartedAt} />
     </p>
   )

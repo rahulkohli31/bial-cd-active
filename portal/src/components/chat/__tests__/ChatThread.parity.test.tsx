@@ -7,7 +7,8 @@
  * host does that the old one could not:
  *   - a model-authored `<img>` still cannot reach the DOM (no `img-src` CSP anywhere in this
  *     repo, so `disallowedElements` is the ONLY thing holding that refusal);
- *   - user prose is still verbatim through the thread's own user-message path;
+ *   - a citizen's own prose renders as markdown through the thread's user-message path, and
+ *     the bubble's own overrides keep a pasted heading at body size;
  *   - the thread introduces exactly one scroll container, where the old surface nested five.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
@@ -64,13 +65,29 @@ describe('ChatThread — what the new host must still guarantee', () => {
     expect(screen.getByTestId('assistant-message')).toBeTruthy()
   })
 
-  it('renders user prose VERBATIM — markdown is never parsed in a user message', () => {
+  it('renders citizen prose as MARKDOWN — one renderer, no branch on who wrote it', () => {
     const { container } = mount([
-      { id: 'u1', role: 'user', parts: [{ type: 'text', text: '**not bold**' }], seq: 1 },
+      { id: 'u1', role: 'user', parts: [{ type: 'text', text: '**bold**\n- one\n- two' }], seq: 1 },
     ])
 
-    expect(container.querySelector('strong')).toBeNull()
-    expect(screen.getByTestId('user-message').textContent).toContain('**not bold**')
+    const bubble = screen.getByTestId('user-message')
+    expect(within(bubble).getByText('bold').tagName).toBe('STRONG')
+    expect(within(bubble).getAllByRole('listitem')).toHaveLength(2)
+    // The liveness half: a crashed user-message render would satisfy an absence assertion by
+    // rendering nothing at all.
+    expect(container.querySelector('[data-role="user"]')).toBeTruthy()
+  })
+
+  it('a heading a citizen pasted renders at body size — the bubble overrides the prose scale', () => {
+    mount([
+      { id: 'u1', role: 'user', parts: [{ type: 'text', text: '# Gate 4 is down' }], seq: 1 },
+    ])
+
+    const bubble = screen.getByTestId('user-message')
+    const heading = within(bubble).getByRole('heading', { level: 1, name: 'Gate 4 is down' })
+    // The override lives on the bubble, not in the renderer — that is what keeps `MessageContent`
+    // free of an authorship branch while a display-size H1 still reads as body text here.
+    expect(heading.closest('[class*="prose-headings:text-sm"]')).toBeTruthy()
   })
 
   it('renders assistant markdown through the same pipeline as before', () => {

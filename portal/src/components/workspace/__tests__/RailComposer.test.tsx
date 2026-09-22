@@ -37,14 +37,19 @@ vi.mock('../../../utils/buildSessionApi', async (importOriginal) => ({
 // The words a citizen reads come from the bootstrap catalogue, not from this file — so a suite that
 // does not stand one up gets the honest "Chat" fallback on every option and every label assertion
 // fails for a reason that has nothing to do with this component.
+//
+// A `vi.fn()`, not a plain arrow, so ONE test below can stand up a THIRD catalogue entry without
+// every other test in this file doing the same — see "still offers exactly two kinds…".
+const TWO_KIND_CATALOGUE = {
+  chat_kinds: [
+    { value: 'plan', name: 'Plan', description: 'Shape a plan first.' },
+    { value: 'build', name: 'Build', description: 'Change the live app.' },
+  ],
+}
+const auth = vi.hoisted(() => ({ getStoredUser: vi.fn() }))
 vi.mock('../../../utils/auth', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../utils/auth')>()),
-  getStoredUser: () => ({
-    chat_kinds: [
-      { value: 'plan', name: 'Plan', description: 'Shape a plan first.' },
-      { value: 'build', name: 'Build', description: 'Change the live app.' },
-    ],
-  }),
+  getStoredUser: auth.getStoredUser,
 }))
 
 /** Where a navigation actually landed, plus the router state it carried. */
@@ -84,6 +89,7 @@ const send = (text = 'a visitor log') => {
 beforeEach(() => {
   // Radix needs these in jsdom; the toggle group's items are focusable roving-tabindex controls.
   Element.prototype.scrollIntoView = vi.fn()
+  auth.getStoredUser.mockReturnValue(TWO_KIND_CATALOGUE)
 })
 
 afterEach(() => {
@@ -110,8 +116,8 @@ describe('★ the rail holds Send while a file is still being read', () => {
     // context default 0 and Send went straight through. A workbook dropped here and sent before its
     // read finished started the chat from the sentence alone, and the file landed nowhere.
     //
-    // Mutation receipt: mount `RefusalSinkProvider` + `StagedAttachmentsBinding` by hand again,
-    // without `PendingReadsProvider`, and this navigates.
+    // Mutation receipt: mount `StagedAttachmentsBinding` by hand again, without
+    // `PendingReadsProvider`, and this navigates.
     reads.fileToBase64.mockImplementation(() => new Promise<string>(() => {}))
     renderComposer()
 
@@ -308,6 +314,29 @@ describe('the kind picker — the control that makes the other half of the produ
   it('offers both kinds, with the words from the shared catalogue', () => {
     renderComposer()
 
+    expect(screen.getByRole('radio', { name: 'Build' })).toBeTruthy()
+    expect(screen.getByRole('radio', { name: 'Plan' })).toBeTruthy()
+  })
+
+  // A GUARD, NOT A FEATURE TEST: this rail mints only project-scoped chats, so a third catalogue
+  // entry (the standalone kind) has nothing to do here — the picker's two options come from the
+  // portal's own `KINDS` union, never from `chat_kinds`, and this is what keeps a served label the
+  // catalogue does not filter from ever becoming a third radio.
+  //
+  // Mutation receipt: change `KINDS.map(...)` to
+  // `(getStoredUser()?.chat_kinds ?? []).map((entry) => entry.value).map(...)` and this goes red —
+  // three radios, not two — while "offers both kinds" above stays green (it never proves the
+  // catalogue was ignored, only that plan and build are both present).
+  it('still offers exactly two kinds once the served catalogue carries a third', () => {
+    auth.getStoredUser.mockReturnValue({
+      chat_kinds: [
+        ...TWO_KIND_CATALOGUE.chat_kinds,
+        { value: 'generic', name: 'Chat', description: 'A standalone conversation.' },
+      ],
+    })
+    renderComposer()
+
+    expect(screen.getAllByRole('radio')).toHaveLength(2)
     expect(screen.getByRole('radio', { name: 'Build' })).toBeTruthy()
     expect(screen.getByRole('radio', { name: 'Plan' })).toBeTruthy()
   })

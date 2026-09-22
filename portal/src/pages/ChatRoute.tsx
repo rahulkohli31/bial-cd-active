@@ -1,13 +1,18 @@
 /**
- * `/chat/:chatId` — one flat URL for both chat kinds. The project is a breadcrumb, resolved
- * from the chat's own `projectId`, never a path segment — so a chat keeps one stable address
- * for its whole life.
+ * `/chat/:chatId` — one flat URL for the two PROJECT-SCOPED chat kinds. The project is a
+ * breadcrumb, resolved from the chat's own `projectId`, never a path segment — so a chat keeps
+ * one stable address for its whole life. A generic conversation has no project and no business
+ * at this address at all — see arm 1a.
  *
  * WHY THIS EXISTS — resolution order, and why each arm matters:
  *  1. Conversation exists → server's `kind`/`projectId` win over `?kind=`, always: a stale or
  *     hand-edited query must never render a build chat over a planning transcript. Kind no
  *     longer picks a PAGE — one surface renders both, and `kind` is a single declaration inside
  *     it (`ConversationSlot`) — resolved here only because the surface needs it.
+ *  1a. Conversation exists and its kind is `generic` → this address redirects to
+ *     `/assistant/{chatId}` instead, before anything below runs — so a bookmarked or pasted
+ *     builder link to a generic chat never renders the builder surface, and never enters the
+ *     workspace shell carrying a breadcrumb for a project that does not exist.
  *  2. 404 + `?projectId=` → a brand-new chat: its row is written inside the FIRST TURN's own
  *     transaction (no separate create round-trip), so it opens at
  *     `/chat/{clientId}?projectId=…&kind=…` and rewrites to the bare path once that turn commits.
@@ -21,6 +26,15 @@
  *
  * The one skipped request is the one guaranteed to fail: a freshly minted chat has no row yet.
  * See `freshlyMinted` below for why the skip is keyed on router state, not the query.
+ *
+ * TWO THINGS THIS FILE DELIBERATELY DOES NOT DO, so neither gets re-proposed once a third kind
+ * exists: it does not filter the bootstrap's `chat_kinds` catalogue down to two entries — that
+ * catalogue feeds LABELS for a kind already in hand (`utils/chatKind.ts`'s `chatKindFor`), and
+ * nothing walks it to build a list of choices; the rail's kind picker enumerates the portal's
+ * own two-valued `ChatKind` union, so a third backend label never reaches it. And it adds no
+ * presentation entry for `generic` anywhere a kind is looked up for display — both lookups live
+ * inside the workspace shell (the toolbar pill, the rail's picker), which a generic conversation
+ * never enters; arm 1a above is what keeps it out.
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Navigate, useLocation, useParams, useSearchParams } from 'react-router-dom'
@@ -41,6 +55,15 @@ function kindFromQuery(raw: string | null): ChatKind {
   return raw === 'build' ? 'build' : 'plan'
 }
 
+/**
+ * THE ONE PLACE AN UNRECOGNISED KIND BECOMES SOMETHING — `plan`, the least-privileged surface,
+ * for the same reason `kindFromQuery` picks it: the value is wire data, not a checked union.
+ * `ConversationSurface`'s `kind` prop is required, so resolving a kind lives here alone and no
+ * caller can fall back to one of its own and land on the more capable surface by accident.
+ * (A value of `generic` reaches here in principle — the server's `ChatKind` enum has a third
+ * member — but never in practice: `chatId` resolves to `redirectToAssistant` below before this
+ * function is ever called on it.)
+ */
 function kindFromServer(raw: unknown): ChatKind {
   return raw === 'build' ? 'build' : 'plan'
 }
@@ -53,6 +76,9 @@ type Resolution =
   // `goneNoticeFor`. Carried on the resolution instead of decided at the redirect, because the
   // redirect cannot see which of the three failures got it here.
   | { status: 'gone'; notice: string | null }
+  // A generic conversation opened at this builder address — see the mount effect's `generic`
+  // arm. Carries only `chatId`: no project, no title, nothing this address is about to leave.
+  | { status: 'redirectToAssistant'; chatId: string }
 
 /**
  * THE FAILURE THAT EARNS THE SENTENCE, AND THE TWO THAT DO NOT.
@@ -176,6 +202,17 @@ export default function ChatRoute() {
         const conversation = await getConversation(chatId)
         if (!alive) return
         if (conversation) {
+          // THE SERVER-RESOLVED KIND, CHECKED BEFORE `ready()` EVER RUNS — never `?kind=`, which
+          // a citizen controls and which this route already refuses to trust for anything else.
+          // A generic conversation has no project and no toolset this address's surface
+          // understands, so it belongs at `/assistant/{chatId}` and never reaches `ready()`: no
+          // heading is published, `resolution.projectId` never exists to feed the `getProject`
+          // effect below, and `ConversationSlot` — the workspace shell's one child here — never
+          // mounts for it.
+          if (conversation.kind === 'generic') {
+            setResolution({ status: 'redirectToAssistant', chatId })
+            return
+          }
           ready(
             kindFromServer(conversation.kind),
             typeof conversation.projectId === 'string' ? conversation.projectId : queryProjectId,
@@ -250,6 +287,13 @@ export default function ChatRoute() {
       alive = false
     }
   }, [projectId])
+
+  // REPLACED, NOT PUSHED, so Back from `/assistant/{chatId}` lands wherever opened THIS address,
+  // never bounces back here. Nothing below this ever runs for a generic chat: no wait board, no
+  // `ConversationSlot`.
+  if (resolution.status === 'redirectToAssistant') {
+    return <Navigate to={`/assistant/${resolution.chatId}`} replace />
+  }
 
   // The bounce is unconditional; only the sentence it carries is not. `undefined` leaves the
   // history entry stateless, which is what a silent arrival looks like on the other side.

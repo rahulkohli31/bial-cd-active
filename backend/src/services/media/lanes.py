@@ -43,6 +43,15 @@ PPTX_MEDIA_TYPE: Final = (
 CSV_MEDIA_TYPE: Final = "text/csv"
 TSV_MEDIA_TYPE: Final = "text/tab-separated-values"
 
+MODEL_LANE_MEDIA: Final[frozenset[str]] = frozenset(
+    {"image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"}
+)
+"""THE MODEL LANE, NAMED FOR REUSE — the same five formats as `magic.ALLOWED_MEDIA`'s keys,
+spelled here as a lane-membership set so a caller that only needs "is this the model's own lane"
+is not left reconstructing it from `CODE_LANE_MEDIA`'s negation. Cannot import `ALLOWED_MEDIA`
+directly: `magic.py` already imports `is_code_lane` from this module, and the reverse import
+would cycle. `test_the_model_lane_constant_agrees_with_the_byte_gate` keeps the two sets equal."""
+
 # The OPC part each OOXML format must carry. All three share the ZIP signature, so the part name is
 # the only discriminator there is — without it a `.pptx` and a plain `.zip` are the same bytes, and
 # a renamed archive would be admitted as a deck.

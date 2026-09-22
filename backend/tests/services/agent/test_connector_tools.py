@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -60,6 +61,15 @@ DELIVERED = f"{SHIPPED}\n\n{_THE_WHOLE_SCHEMA}"
 is the whole schema and where the worked example lives."""
 
 
+def _deps_without_a_prompt_context(db: Any) -> Any:
+    """Deps with the field the dataclass now requires left off, built past the type checker.
+
+    `SimpleNamespace` rather than a broken `ChatDeps`: the tool reads the field through `getattr`
+    with a default, so what it has to survive is an object that does not carry one — which is
+    what this is, and what a `ChatDeps` could never be again."""
+    return SimpleNamespace(user_id=uuid.uuid4(), db=db, kind=ChatKind.PLAN)
+
+
 def _ctx(
     *,
     connected: tuple[Any, ...] | None = (),
@@ -68,22 +78,23 @@ def _ctx(
 ) -> RunContext[Any]:
     """A run context over the deps shape a real turn builds.
 
-    `connected=None` builds the KINDLESS run — `describe.py` composes its own prompt and passes no
-    `PromptContext` at all — which is a different absence from "a turn whose project reads
-    nothing", and the tool has to survive both. `messages` is the replayed conversation, which the
-    tool reads as `ctx.messages`."""
-    prompt_context = (
-        None
+    `connected=None` builds deps with NO `PromptContext` AT ALL, which the dataclass no longer
+    admits — the field is required now — so it is constructed through an `Any` hop, the same way
+    this repo pins every other shape it has stopped being able to build. That is exactly what the
+    case is for: the tool's guard against an absent context is unreachable by construction, and a
+    guard nothing can reach is one somebody deletes. `messages` is the replayed conversation,
+    which the tool reads as `ctx.messages`."""
+    deps: Any = (
+        _deps_without_a_prompt_context(db)
         if connected is None
-        else PromptContext(
-            user_name="Asha", project_name="Stand board", connected_systems=connected
+        else ChatDeps(
+            user_id=uuid.uuid4(),
+            db=db,
+            kind=ChatKind.PLAN,
+            prompt_context=PromptContext(
+                user_name="Asha", project_name="Stand board", connected_systems=connected
+            ),
         )
-    )
-    deps = ChatDeps(
-        user_id=uuid.uuid4(),
-        db=db,
-        kind=ChatKind.PLAN,
-        prompt_context=prompt_context,
     )
     return RunContext(
         deps=deps,
@@ -169,10 +180,11 @@ async def test_an_unknown_name_is_a_teaching_retry_that_says_what_is_connected()
 # --------------------------------------------------------------------------------------------
 
 
-async def test_a_kindless_run_with_no_prompt_context_is_refused_not_raised() -> None:
-    """`describe.py` composes its own prompt and passes no `PromptContext`. It registers no
-    toolsets either, so this is unreachable — but a tool that RAISED on a shape the platform
-    itself creates would be a 500 in a citizen's turn for something the citizen did not do."""
+async def test_deps_carrying_no_prompt_context_are_refused_rather_than_raised_on() -> None:
+    """The tool reads the context through `getattr` with a default, so an object that carries
+    none reaches it as `None` — and a tool that RAISED there would be a 500 in a citizen's turn
+    for something the citizen did not do. No construction the platform makes produces that shape
+    any more; the guard is kept because the loose read is what makes it reachable at all."""
     answer = await connector_schema(_ctx(connected=None), SYSTEM.key)
     assert "no connected systems resolved" in answer
 

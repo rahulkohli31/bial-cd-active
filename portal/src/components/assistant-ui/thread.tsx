@@ -74,7 +74,7 @@ export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart
  */
 export type ThreadComponents = {
   /** Renders one text part. Receives the already-assembled text of that part. */
-  TextPart: ComponentType<{ text: string; isUser: boolean }>
+  TextPart: ComponentType<{ text: string }>
   /** The activity group. Given the group part and its rendered children. */
   ToolGroup: ComponentType<PropsWithChildren<{ group: ThreadGroupPart }>>
   /** The working status: status only, never reasoning content. */
@@ -239,7 +239,7 @@ const AssistantText: FC<{ Component: ThreadComponents['TextPart'] }> = ({ Compon
   // An empty text part renders NO element rather than an empty box — a defect this surface shipped
   // once and fixed, re-established here because the renderer changed underneath it.
   if (!text) return null
-  return <Component text={text} isUser={false} />
+  return <Component text={text} />
 }
 
 /**
@@ -291,9 +291,9 @@ const AssistantActionBar: FC = () => (
 /**
  * The user's own message — the one place a fill is correct.
  *
- * `MessageContent` renders it with `isUser`, which is what keeps user prose VERBATIM: markdown is
- * never parsed in a user message, so a citizen who types `**` sees `**`. That is a safety
- * guarantee pinned by the parity checklist, not a branch on state.
+ * `MessageContent` renders it through the same markdown pipeline as every other message. The
+ * bubble below carries its own `prose-headings`/width overrides so a pasted heading or table
+ * reads as body content here, rather than the renderer branching on who wrote it.
  */
 const UserMessage: FC = () => {
   const { TextPart, UserAttachments } = useThreadComponents()
@@ -318,7 +318,7 @@ const UserMessage: FC = () => {
           `BuildChat`, `PlanChat`, `PlainAnswer`, `PlanReady`. The grey fill it shipped with was
           the library default; on a white transcript it read as a second surface rather than as a
           quoted line, and on the plan chat's edge-to-edge white it was the only grey on screen. */}
-      <div className="max-w-[85%] break-words rounded-xl border border-bial-border bg-white px-4 py-2 text-foreground empty:hidden">
+      <div className="max-w-full break-words rounded-xl border border-bial-border bg-white px-4 py-2 text-foreground empty:hidden prose-headings:my-1 prose-headings:text-sm prose-headings:font-semibold">
         <MessagePrimitive.Parts components={{ Text: () => <UserText Component={TextPart} /> }} />
       </div>
     </MessagePrimitive.Root>
@@ -328,7 +328,7 @@ const UserMessage: FC = () => {
 const UserText: FC<{ Component: ThreadComponents['TextPart'] }> = ({ Component }) => {
   const { text } = useMessagePartText()
   if (!text) return null
-  return <Component text={text} isUser />
+  return <Component text={text} />
 }
 
 export { cn }

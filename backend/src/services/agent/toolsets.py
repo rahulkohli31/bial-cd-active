@@ -9,13 +9,14 @@ NO tools, and each run passes exactly its kind's toolsets (pydantic-ai toolsets 
 A wrong-kind tool is therefore absent from the model's tool list AND uncallable — a forged call
 gets the runtime's unknown-tool rejection, never a policy check that could be bypassed.
 
-| Kind  | reads                | run_command         | writes | present_plan_options |
-|-------|----------------------|----------------------|--------|-----------------------|
-| Plan  | yes (live workspace) | allowlisted, read    | —      | yes                   |
-| Build | yes (live workspace) | full (+SQL guard)    | yes    | —                     |
+| Kind    | reads                | run_command       | writes | present_plan_options |
+|---------|----------------------|-------------------|--------|----------------------|
+| Plan    | yes (live workspace) | allowlisted, read | —      | yes                  |
+| Build   | yes (live workspace) | full (+SQL guard) | yes    | —                    |
+| Generic | —                    | —                 | —      | —                    |
 
-Both arms also carry `CONVERSATION_TOOLSET` and `app_state_toolset` (each registered once, so
-the two lists can't drift).
+Plan and Build also carry `CONVERSATION_TOOLSET` and `app_state_toolset` (each registered once,
+so the two lists can't drift); a Generic run is handed no toolset at all.
 `toolsets_for_kind` is the ONLY place permitted to read the chat kind to decide capability —
 see its own docstring. Two more things live here, not the registry: the citizen-facing chat-kind
 CATALOGUE (served on `GET /v1/auth/me`) and the registry read the gating guards ask their
@@ -345,9 +346,15 @@ def toolsets_for_kind[DepsT](
                 ),
                 may_write=True,
             )
+        case ChatKind.GENERIC:
+            # NO TOOLSET AT ALL, and no accessor is touched to build it — not the workspace, not
+            # the sandbox, not the reader. That is what makes this arm reachable from a caller
+            # holding none of them, where the Build arm above deliberately raises. A generic run
+            # answers from its transcript and its attachments; there is nothing for it to call.
+            return ToolSurface(toolsets=[], may_write=False)
 
 
-# --- One catalogue of what the two kinds ARE, beside the registry of what they -------------
+# --- One catalogue of what the kinds ARE, beside the registry of what they -------------
 # --- CAN DO ---------------------------------------------------------------------------------
 #
 # WHY IT LIVES HERE, NEXT TO `toolsets_for_kind`, RATHER THAN IN THE API SCHEMA IT IS SERVED
@@ -400,6 +407,15 @@ def _describe(kind: ChatKind) -> ChatKindDescription:
                 description=(
                     "Ask for changes and watch your app update as you go. This is where your "
                     "live app actually changes."
+                ),
+            )
+        case ChatKind.GENERIC:
+            return ChatKindDescription(
+                value=kind.value,
+                name="BIAL Chat",
+                description=(
+                    "Ask a question, or attach a document or a picture and ask about it. This "
+                    "chat is yours rather than an app's, so nothing you do here changes an app."
                 ),
             )
 

@@ -1202,10 +1202,11 @@
         "type": "object"
       },
       "ChatKind": {
-        "description": "What a chat IS — chosen at creation, never changed.\n\nNamed by ROLE, not count, for what may read it: `toolsets.py` decides what the model CAN DO — a\nPlan chat can't touch the app because every mutating tool (`write_file`, `edit_file`,\n`run_command`, `declare_done`) is omitted from its list, never gated downstream.\n`mode_prompts.py` decides what the model is TOLD; `turns/engine.py` picks the HARNESS SHAPE\n(node loop vs `chat_agent.run`). Those three are the whole permitted set — anything else\nholding a kind is stamping a row.",
+        "description": "What a chat IS — chosen at creation, never changed.\n\nNamed by ROLE, not count, for what may read it: `toolsets.py` decides what the model CAN DO — a\nPlan chat can't touch the app because every mutating tool (`write_file`, `edit_file`,\n`run_command`, `declare_done`) is omitted from its list, never gated downstream.\n`mode_prompts.py` decides what the model is TOLD; `turns/engine.py` picks the HARNESS SHAPE\n(node loop vs `chat_agent.run`). Those three are the whole permitted set — anything else\nholding a kind is stamping a row.\n\n`GENERIC` is the one kind with no project and no container: its turn resolves no workspace, is\nhanded no toolset, and answers from the transcript and its attachments alone. A reader that\nasks \"is this build?\" and treats every other answer as plan is wrong for it — every site that\ndecides on a kind names all three.",
         "enum": [
           "plan",
-          "build"
+          "build",
+          "generic"
         ],
         "title": "ChatKind",
         "type": "string"
@@ -1933,7 +1934,7 @@
         "type": "object"
       },
       "ConversationCreateRequest": {
-        "description": "`POST /conversations` — create the row BEFORE the first turn. The id stays\nclient-minted (`crypto.randomUUID`); the server validates ownership of the\nparent project and makes the call idempotent per owner, so the SPA's synchronous\nmint-then-navigate flow needs no extra round trip on a retry.",
+        "description": "`POST /conversations` — create the row BEFORE the first turn. The id stays\nclient-minted (`crypto.randomUUID`); the server validates ownership of the parent project\nwhen there is one and makes the call idempotent per owner, so the SPA's synchronous\nmint-then-navigate flow needs no extra round trip on a retry.",
         "properties": {
           "context": {
             "title": "Context"
@@ -1947,9 +1948,16 @@
             "$ref": "#/components/schemas/ChatKind"
           },
           "projectId": {
-            "format": "uuid",
-            "title": "Projectid",
-            "type": "string"
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Projectid"
           },
           "title": {
             "anyOf": [
@@ -1965,7 +1973,6 @@
         },
         "required": [
           "id",
-          "projectId",
           "kind"
         ],
         "title": "ConversationCreateRequest",
@@ -2878,8 +2885,15 @@
             "type": "string"
           },
           "projectId": {
-            "title": "Projectid",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Projectid"
           },
           "title": {
             "anyOf": [

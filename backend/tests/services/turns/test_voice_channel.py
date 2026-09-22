@@ -122,7 +122,14 @@ def _called(tool: str, args: str, call_id: str) -> FunctionToolCallEvent:
 
 
 async def _thread(db: AsyncSession, email: str, kind: ChatKind):
+    """A conversation of `kind`, with the parentage that kind is allowed to have.
+
+    A generic chat has no project, and `ck_conversations_parentage` refuses one — so the project
+    is created only for the kinds that own one rather than for every case of a kind walk."""
     user = await UserFactory.create(db, email=email)
+    if kind is ChatKind.GENERIC:
+        conversation = await ConversationFactory.create(db, user.id, kind=kind, project_id=None)
+        return user, conversation
     project = await ProjectFactory.create(db, user.id)
     conversation = await ConversationFactory.create(db, user.id, project_id=project.id, kind=kind)
     return user, conversation

@@ -133,7 +133,11 @@ class ConversationFactory:
 
     The default kind is BUILD, matching what every migrated conversation became and what a
     test that does not care about the kind almost always wants: the surface with tools. A test
-    about a Plan chat passes `kind=ChatKind.PLAN` and says so."""
+    about a Plan chat passes `kind=ChatKind.PLAN` and says so.
+
+    A GENERIC CHAT IS BUILT WITH NO PROJECT, and `create` makes none for it —
+    `ck_conversations_parentage` refuses the combination, so a factory that made one anyway would
+    turn every kind-walking test into an integrity error rather than a test of the kind."""
 
     @staticmethod
     def build(user_id: uuid.UUID, **overrides: Any) -> Conversation:
@@ -148,8 +152,11 @@ class ConversationFactory:
     @classmethod
     async def create(cls, db: AsyncSession, user_id: uuid.UUID, **overrides: Any) -> Conversation:
         if "project_id" not in overrides:
-            project = await ProjectFactory.create(db, user_id)
-            overrides["project_id"] = project.id
+            if overrides.get("kind") is ChatKind.GENERIC:
+                overrides["project_id"] = None
+            else:
+                project = await ProjectFactory.create(db, user_id)
+                overrides["project_id"] = project.id
         conv = cls.build(user_id, **overrides)
         db.add(conv)
         await db.flush()

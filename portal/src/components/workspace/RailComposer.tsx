@@ -71,10 +71,10 @@ export default function RailComposer({ projectId }: RailComposerProps) {
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      {/* ★ ALL THREE ATTACHMENT PROVIDERS, NOT TWO. This used to mount the
-          refusal sink and the staged binding by hand and miss the pending-read count, so the
-          rail's Send never waited for a file still being read: a spreadsheet dropped here and sent
-          mid-read landed nowhere, and the chat started from the sentence alone. */}
+      {/* ★ EVERY ATTACHMENT PROVIDER, MOUNTED AS ONE. Assembling them by hand here is what
+          dropped the pending-read count, so the rail's Send never waited for a file still being
+          read: a spreadsheet dropped here and sent mid-read landed nowhere, and the chat started
+          from the sentence alone. */}
       <AttachmentAdapterProviders bound={bound}>
         <RailComposerBody projectId={projectId} />
       </AttachmentAdapterProviders>

@@ -39,8 +39,8 @@ from src.services.turns import engine as engine_module
 from src.services.turns.copy import (
     CHAT_TOO_LONG_CODE,
     MODEL_UNAVAILABLE_CODE,
-    MODEL_UNAVAILABLE_PLAN_TEXT,
     MODEL_UNAVAILABLE_TEXT,
+    MODEL_UNAVAILABLE_WITHOUT_A_WORKSPACE_TEXT,
 )
 from src.services.turns.engine import (
     TurnEngine,
@@ -224,7 +224,7 @@ async def test_a_model_service_failure_ends_with_a_named_reason_and_a_way_forwar
 
     assert state.status == "failed"
     assert _terminal(state).reason == MODEL_UNAVAILABLE_CODE
-    assert _last_error(state) == MODEL_UNAVAILABLE_PLAN_TEXT
+    assert _last_error(state) == MODEL_UNAVAILABLE_WITHOUT_A_WORKSPACE_TEXT
     assert _last_error(state) != engine_module._TURN_FAILED_MESSAGE
     assert conv_id not in _mid_reply
 
@@ -350,3 +350,36 @@ async def test_a_build_turn_is_told_in_its_own_words_rather_than_the_generic_one
     assert meta["reason"] == MODEL_UNAVAILABLE_CODE
     assert str(meta["error"]).startswith("ModelAPIError")
     assert "5521" not in str(meta["error"])
+
+
+# --- one arm per kind ------------------------------------------------------------------------
+
+_SENTENCE_BY_KIND = {
+    ChatKind.PLAN: MODEL_UNAVAILABLE_WITHOUT_A_WORKSPACE_TEXT,
+    ChatKind.GENERIC: MODEL_UNAVAILABLE_WITHOUT_A_WORKSPACE_TEXT,
+    ChatKind.BUILD: MODEL_UNAVAILABLE_TEXT,
+}
+
+
+@pytest.mark.parametrize("kind", list(ChatKind), ids=[k.value for k in ChatKind])
+async def test_every_kind_is_told_the_sentence_its_own_arm_names(
+    _fresh_engine, db_session, session_factory, kind: ChatKind
+) -> None:
+    """★ Walked over the enum rather than checked as a pair. Two kinds share the no-workspace
+    sentence because neither holds a workspace, not because one of them is the fallback — and a
+    kind added to `ChatKind` fails here on the lookup rather than inheriting a promise about a
+    workspace it does not have.
+
+    Mutation check: group `ChatKind.GENERIC` with `ChatKind.BUILD` in `_end_model_unavailable`
+    and BIAL Chat goes red on "it will carry on from here"."""
+    _conv_id, state = await _run_until_settled(
+        _fresh_engine,
+        db_session,
+        session_factory,
+        _refusing_model(ModelHTTPError(status_code=503, model_name="opus", body="unavailable")),
+        kind=kind,
+    )
+
+    assert state.status == "failed"
+    assert _terminal(state).reason == MODEL_UNAVAILABLE_CODE
+    assert _last_error(state) == _SENTENCE_BY_KIND[kind]

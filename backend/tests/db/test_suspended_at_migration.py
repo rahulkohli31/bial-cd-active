@@ -72,6 +72,13 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # goes red locally while CI stays green. That is the change's own failure, not a
     # pre-existing one. If you're here because it failed, check that your revision's
     # `down_revision` really is the head you expected to build on.
+    #
+    # 0044_chat_kind_generic sits on top of 0043: the chat-kind enum rebuilt with a third label,
+    # and `conversations.project_id` made nullable under a CHECK constraint that keeps the two
+    # kinds which must have a project from losing one. 0045_conversation_touch follows it with
+    # the repo's first database trigger, which advances a conversation's `updated_at` when a
+    # message is appended to it. 0046_conversation_updated_at indexes that column, which the
+    # retention pass filters and orders by on every tick.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0043_pending_teardown"]
+    assert heads == ["0046_conversation_updated_at"]

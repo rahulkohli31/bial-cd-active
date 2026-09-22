@@ -40,7 +40,10 @@ class HeaderOut(CamelModel):
     the `= None` defaults are what document those fields as non-required."""
 
     id: str = Field(alias="_id")
-    project_id: str
+    # `null` FOR A GENERIC CHAT, and a real null rather than an omission or a stringified
+    # absence: the SPA resolves this into the breadcrumb, so a five-character `"None"` would
+    # read as a project name and route to one that does not exist.
+    project_id: str | None
     kind: str
     created_at: str
     updated_at: str
@@ -54,23 +57,35 @@ class ConversationListResponse(CamelModel):
 
 class ConversationCreateRequest(CamelModel):
     """`POST /conversations` — create the row BEFORE the first turn. The id stays
-    client-minted (`crypto.randomUUID`); the server validates ownership of the
-    parent project and makes the call idempotent per owner, so the SPA's synchronous
+    client-minted (`crypto.randomUUID`); the server validates ownership of the parent project
+    when there is one and makes the call idempotent per owner, so the SPA's synchronous
     mint-then-navigate flow needs no extra round trip on a retry."""
 
     id: uuid.UUID
-    project_id: uuid.UUID
-    # THE ONE PLACE A CHAT'S KIND IS EVER SET. `ChatKind` is two-valued and fixed at creation:
-    # no route changes it, no in-composer switcher exists, and no hidden marker row tells the
-    # model that its toolset just changed — a three-valued conversation kind and the three-valued
-    # mode that used to switch beside it collapsed into this single field. Building from a plan
-    # does not change the plan chat either; the handoff creates a SECOND chat and starts the turn
-    # there. The kind decides what a turn is handed — its toolset and its prompt — and whether the
-    # surface shows the app pane; nothing else branches on it. A value outside the enum is refused
-    # here rather than coerced to a default.
+    # Absent for a generic chat, required for the other two — `_parentage_matches_kind` below
+    # is what enforces that, because no per-field rule can express a cross-field biconditional.
+    project_id: uuid.UUID | None = None
+    # THE ONE PLACE A CHAT'S KIND IS EVER SET. It is fixed at creation: no route changes it, no
+    # in-composer switcher exists, and no hidden marker row tells the model that its toolset just
+    # changed. Building from a plan does not change the plan chat either; the handoff creates a
+    # SECOND chat and starts the turn there. The kind decides what a turn is handed — its toolset
+    # and its prompt — whether it resolves a container at all, and whether the surface shows the
+    # app pane. A value outside the enum is refused here rather than coerced to a default.
     kind: ChatKind
     title: str | None = None
     context: Any = None
+
+    @model_validator(mode="after")
+    def _parentage_matches_kind(self) -> ConversationCreateRequest:
+        """A generic chat has no project; a plan or build chat always has one.
+
+        The same biconditional `ck_conversations_parentage` carries at the database, stated here
+        so the caller is refused with a sentence instead of an integrity error. It is a
+        cross-field invariant, so it cannot be spelled as a field requirement — and it must fail
+        in every environment, which is why it is a validator and not an assertion."""
+        if (self.kind is ChatKind.GENERIC) != (self.project_id is None):
+            raise ValueError("A generic chat takes no project; a plan or build chat requires one.")
+        return self
 
 
 class ConversationCreateResponse(CamelModel):

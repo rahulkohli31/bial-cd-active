@@ -88,7 +88,11 @@ def _header_dict(conv: Conversation) -> dict[str, Any]:
         "_id": str(conv.id),
         # The parent project — the SPA resolves it to the breadcrumb
         # ("ProjectName / chat title"); the chat itself stays addressed flat by its own id.
-        "projectId": str(conv.project_id),
+        # `null` for a generic chat, which has none. Stringifying unconditionally would emit the
+        # five-character `"None"`, and nothing downstream would raise on it: the response model
+        # takes a string and so does the SPA's type, so the breadcrumb would resolve a project
+        # named None.
+        "projectId": str(conv.project_id) if conv.project_id is not None else None,
         "kind": conv.kind.value,
         "createdAt": _iso(conv.created_at),
         "updatedAt": _iso(conv.updated_at),
@@ -157,11 +161,17 @@ async def create_conversation(
     conflict, matching the platform's single-tenant, owner-scoped isolation rule."""
     existing = await db.get(Conversation, body.id)
     if existing is None:
-        project = await owned_project_or_404(db, user.id, body.project_id)
+        # A generic chat has no project to own or to look up; the request schema already refused
+        # the two combinations that would make this branch ambiguous.
+        project_id = (
+            None
+            if body.project_id is None
+            else (await owned_project_or_404(db, user.id, body.project_id)).id
+        )
         row = Conversation(
             id=body.id,
             user_id=user.id,
-            project_id=project.id,
+            project_id=project_id,
             kind=body.kind,
             title=body.title,
             context=body.context,

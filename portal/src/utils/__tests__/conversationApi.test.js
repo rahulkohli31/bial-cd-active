@@ -23,7 +23,10 @@ describe('listConversations', () => {
     const fetchImpl = vi.fn(async () => ok({ conversations: [{ _id: 'c1', kind: 'plan', title: 'T', updatedAt: '2026-06-20T00:00:00Z' }] }))
     const list = await listConversations('plan', deps(fetchImpl))
     expect(fetchImpl.mock.calls[0][0]).toBe('/api/conversations?kind=plan')
-    expect(list).toEqual([{ id: 'c1', kind: 'plan', title: 'T', createdAt: undefined, updatedAt: '2026-06-20T00:00:00Z' }])
+    // `projectId: null` IS A REAL ANSWER, not a missing key. A header doc that names no project —
+    // a chat that belongs to a citizen rather than a project — normalises to an absence the
+    // breadcrumb can test, where `undefined` would read as a field nobody had thought about.
+    expect(list).toEqual([{ id: 'c1', kind: 'plan', projectId: null, title: 'T', createdAt: undefined, updatedAt: '2026-06-20T00:00:00Z' }])
   })
   it('throws the server message on failure', async () => {
     const fetchImpl = vi.fn(async () => ({ ok: false, status: 500, json: async () => ({ error: { message: 'boom' } }) }))

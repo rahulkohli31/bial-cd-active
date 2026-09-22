@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 
 from src.config import settings
+from src.db.models.conversation import ChatKind
 from src.db.models.user_limit import UserLimit
 from src.services.auth.session_jwt import mint_session_jwt
 from tests.factories import UserFactory
@@ -105,19 +106,21 @@ async def test_me_limits_reflect_per_user_override(client, db_session) -> None:
     assert limits["contextHardLimit"] == 180_000
 
 
-async def test_me_carries_exactly_two_chat_kinds_each_with_a_value_name_and_description(
+async def test_me_carries_every_chat_kind_each_with_a_value_name_and_description(
     client, db_session
 ) -> None:
     """The happy path: the once-cached bootstrap the portal already fetches before first
     paint carries the WHOLE chat-kind catalogue, so `chatKind.ts` never needs a second fetch —
-    and never needs a second, hand-written copy of the wording — to know what Plan and Build
-    chats are."""
+    and never needs a second, hand-written copy of the wording — to know what each kind of chat
+    is."""
     user = await UserFactory.create(db_session)
     jwt = mint_session_jwt(user.id, user.token_version, _TTL)
     resp = await client.get("/v1/auth/me", headers=_cookie(jwt))
     kinds = resp.json()["chat_kinds"]
-    assert len(kinds) == 2
-    assert {kind["value"] for kind in kinds} == {"plan", "build"}
+    # Against the enum rather than a hand-kept list, so a kind added without wording fails at
+    # the catalogue's own guard instead of silently shipping a blank label here.
+    assert {kind["value"] for kind in kinds} == {member.value for member in ChatKind}
+    assert len(kinds) == len(ChatKind)
     for kind in kinds:
         # Non-empty on every field: a blank name or description would render as a gap in the
         # composer, not an error anyone would see in a log.

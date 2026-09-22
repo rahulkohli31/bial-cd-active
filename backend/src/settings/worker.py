@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Self
 
-from pydantic import model_validator
+from pydantic import PositiveInt, model_validator
 
 from src.services.deploy.config import DeployConfig
 from src.services.redis.config import RedisConfig
@@ -49,6 +49,27 @@ class WorkerSettings(CoreSettings):
     # `region`, which is not incidental — the ARM tag PATCH body requires `location`.
     sandbox: SandboxConfig
 
+    # ================================================ RETENTION: REQUIRED, AND A SWITCH THAT ACTS
+    # A PLAIN FIELD RATHER THAN A NESTED BLOCK. The nested blocks above are subsystems with
+    # credentials and connections; this is a policy the operator turns on. It has NO DEFAULT for
+    # the same reason the three above do not: a deployment that has not decided whether it deletes
+    # its citizens' conversations must refuse to boot rather than pick an answer for them.
+    #
+    # It ships OFF. Nothing has ever deleted a conversation here, so the first enabled pass is not
+    # a weekly increment — its candidate set is the whole historical backlog, Plan and Build chats
+    # included. Turning it on is a decision somebody makes once, having read that.
+    conversation_retention_enabled: bool
+
+    # TWO FLAGS, NOT ONE, the same split the fleet-reclamation pass runs on. The flag above turns
+    # the pass ON: it selects, counts and reports what it would remove. This one is what lets it
+    # ACT. Collapsed into a single switch, the only way to see which conversations retention would
+    # take is to let it take them.
+    #
+    # A plain default rather than a required field, and the asymmetry is deliberate: the flag
+    # above is where a deployment states its policy, and until it says yes there is nothing to
+    # destroy, so an unset destroy flag has one correct meaning — report, do not act.
+    conversation_retention_destroy: bool = False
+
     # ============================================================ FEATURE SWITCH
     # Unset means the feature is OFF, legitimately, in every environment including production.
 
@@ -56,6 +77,21 @@ class WorkerSettings(CoreSettings):
     # block. Shape must match `ApiSettings.deploy` — pinned by a test, since the two are now
     # declared separately and could otherwise drift.
     deploy: DeployConfig | None = None
+
+    # ============================================================ KNOBS
+    # Defaults that are correct answers rather than placeholders — each says what it means.
+
+    #: How long a conversation may sit untouched before the pass condemns it. Seven days, which
+    #: is the policy; it is a field rather than a constant so an operator can widen it without a
+    #: deploy while the backlog drains. A floor of one day, because a window of zero or less puts
+    #: the cutoff at or ahead of now and condemns every conversation on the platform.
+    conversation_retention_days: PositiveInt = 7
+
+    #: How many conversations ONE pass may remove. The whole pass is one transaction, so a run
+    #: cancelled by a deploy drain rolls back entirely and starts from zero on the next tick —
+    #: without a ceiling, a first pass over the historical backlog could do that indefinitely and
+    #: never commit anything. What the cap leaves behind is counted and recorded, not dropped.
+    conversation_retention_per_pass: int = 500
 
     # ============================================================ VALIDATORS
 

@@ -5,8 +5,10 @@ APP'S ID: a builder conversation's id was once the deployed `appId`; that identi
 Apps are PROJECT-scoped with their own id, and `app_registry.conversation_id` is now a soft HEAD
 POINTER at the last build session touching the app — never reassigned (SPA-routed), never a name.
 
-`kind` is a native PG enum, the WHOLE classification (`plan`/`build`, fixed at creation; no `mode`
-column since migration 0035) — tool gating derives from this column alone, never the client.
+`kind` is a native PG enum, the WHOLE classification (`plan`/`build`/`generic`, fixed at
+creation) — tool gating derives from this column alone, never the client. `project_id` is present
+for exactly the two kinds that build an application; a `generic` chat is the citizen's, not a
+project's, and a CHECK constraint holds that biconditional at the database.
 `title`/`context` are SPA-owned mutable fields; legacy `code` JSONB was dropped in migration 0024
 (truth: the build snapshots — `app_registry.current_code` followed it in migration 0039, once
 its one remaining reader was deleted). Ownership is `user_id` — every read scoped by it.
@@ -34,10 +36,16 @@ class ChatKind(StrEnum):
     `run_command`, `declare_done`) is omitted from its list, never gated downstream.
     `mode_prompts.py` decides what the model is TOLD; `turns/engine.py` picks the HARNESS SHAPE
     (node loop vs `chat_agent.run`). Those three are the whole permitted set — anything else
-    holding a kind is stamping a row."""
+    holding a kind is stamping a row.
+
+    `GENERIC` is the one kind with no project and no container: its turn resolves no workspace, is
+    handed no toolset, and answers from the transcript and its attachments alone. A reader that
+    asks "is this build?" and treats every other answer as plan is wrong for it — every site that
+    decides on a kind names all three."""
 
     PLAN = "plan"
     BUILD = "build"
+    GENERIC = "generic"
 
 
 # Native PG enum, shared by the model columns and the Alembic migrations. `create_type=False`:
@@ -51,18 +59,30 @@ chat_kind_enum = sa.Enum(
 )
 
 
+# The parentage rule, as one expression, kept as a module constant so the DDL in the migration
+# and any future reader see exactly the string the constraint carries. A biconditional, not two
+# checks: a generic chat has no project AND a project-bearing chat is never generic.
+PARENTAGE_SHAPE = "(kind = 'generic') = (project_id IS NULL)"
+
+
 class Conversation(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     __tablename__ = "conversations"
 
-    # The parent project. Every conversation — every kind — is a *session*
-    # under exactly one project. NOT NULL FK; the DB cascade is a row backstop only
-    # (blob-aware cleanup runs through the conversation-delete service's project-cascade
-    # path). `user_id` remains the isolation predicate; `project_id` is organizational,
-    # not tenancy, and a project and its children always share the same `user_id`.
-    project_id: Mapped[uuid.UUID] = mapped_column(
+    # `updated_at` (from `TimestampMixin`) reads as "last touched by a person" and is kept by
+    # TWO writers, not one: the ORM `onupdate` here covers a title/context PATCH, and migration
+    # 0045's statement-level trigger on `messages` covers a new message — the trigger writes
+    # behind SQLAlchemy, so a session already holding this row is stale until refreshed.
+    __table_args__ = (sa.CheckConstraint(PARENTAGE_SHAPE, name="ck_conversations_parentage"),)
+
+    # The parent project — present for a plan or build chat, absent for a generic one, and
+    # `ck_conversations_parentage` above admits no third combination. The DB cascade is a row
+    # backstop only (blob-aware cleanup runs through the conversation-delete service's
+    # project-cascade path). `user_id` remains the isolation predicate; `project_id` is
+    # organizational, not tenancy, and a project and its children always share the same `user_id`.
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.Uuid,
         sa.ForeignKey("projects.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     # Fixed at creation and never changed: there is no route that mutates it, and

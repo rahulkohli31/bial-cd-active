@@ -13,6 +13,7 @@ import re
 import uuid
 from collections.abc import Container, Sequence
 from typing import Annotated
+from xml.sax.saxutils import quoteattr
 
 import sqlalchemy as sa
 from fastapi import Depends
@@ -24,9 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.base import async_session_factory
+from src.db.models.attachment import Attachment
 from src.db.models.conversation import Conversation
 from src.schemas import CamelModel
 from src.services.agent.model import build_foundry_model
+from src.services.attachments.materialize import one_line_name
 from src.services.messages.store import (
     AttachmentRehydrationError,
     Rehydrator,
@@ -229,6 +232,20 @@ def history_rehydrator(
     return unconfigured
 
 
+def _attachment_label(name: str) -> str:
+    """The one-line marker placed immediately before its binary in the turn's user content.
+
+    A `BinaryContent`'s `identifier` is the attachment id, and that id is never sent to the model
+    for a user part — so without this, a follow-up question naming one of several attached
+    documents has nothing to tie back to the right file. Self-closing, so it is unambiguously a
+    label rather than a fenced block carrying content (the `<attachment name="…" type="…">…
+    </attachment>` shape `attachment_texts` already uses).
+
+    The name is citizen-controlled: flattened and XML-quoted, or a quote, an angle bracket or a
+    newline in it closes this marker and forges markup in the prompt, right ahead of the binary."""
+    return f"<attachment name={quoteattr(one_line_name(name))}/>"
+
+
 async def resolve_binaries(
     db: AsyncSession,
     storage: ObjectStorage | None,
@@ -236,12 +253,17 @@ async def resolve_binaries(
     attachment_ids: list[str],
     *,
     skip: Container[str] = frozenset(),
-) -> list[BinaryContent]:
-    """Owned attachment refs → base64-backed `BinaryContent` for the model prompt. Rides the
-    store's own rehydrator — owner-scoped row, magic re-check, authoritative media type — then
-    gates on WHAT may enter the prompt: only image/PDF vision content. Office originals and
-    anything else are a 400 (their content travels as `attachmentTexts`), and an unknown/foreign
-    id fails the same typed way the rehydrator words it.
+) -> list[str | BinaryContent]:
+    """Owned attachment refs → a name label (`_attachment_label`) plus base64-backed
+    `BinaryContent`, for the model prompt. Rides the store's own rehydrator — owner-scoped row,
+    magic re-check, authoritative media type — then gates on WHAT may enter the prompt: only
+    image/PDF vision content. Office originals and anything else are a 400 (their content
+    travels as `attachmentTexts`), and an unknown/foreign id fails the same typed way the
+    rehydrator words it.
+
+    The label's name comes from the same owner-scoped rows, read once for the whole batch rather
+    than once per id — falling back to the opaque attachment id for the rare row with no display
+    name, so a binary is never labeled with nothing at all.
 
     It no longer counts documents. One file count governs every format at the upload door, and a
     document too long for the provider is refused by the provider, in a sentence of ours.
@@ -270,7 +292,15 @@ async def resolve_binaries(
         resolved = await rehydrate(attachment_ids)
     except AttachmentRehydrationError as exc:
         raise AppApiError(400, str(exc)) from None
-    binaries: list[BinaryContent] = []
+    name_rows = (
+        await db.execute(
+            sa.select(Attachment.attachment_id, Attachment.name).where(
+                Attachment.user_id == user_id, Attachment.attachment_id.in_(attachment_ids)
+            )
+        )
+    ).all()
+    names: dict[str, str] = {row.attachment_id: row.name for row in name_rows}
+    content: list[str | BinaryContent] = []
     for attachment_id in attachment_ids:
         data_b64, media_type = resolved[attachment_id]
         if not (media_type.startswith(VISION_MEDIA_PREFIX) or media_type == PDF_MEDIA_TYPE):
@@ -278,19 +308,20 @@ async def resolve_binaries(
                 400,
                 "an attached file of this type cannot be sent to the assistant as a file",
             )
-        binaries.append(
+        content.append(_attachment_label(names.get(attachment_id) or attachment_id))
+        content.append(
             BinaryContent(
                 data=base64.b64decode(data_b64), media_type=media_type, identifier=attachment_id
             )
         )
-    return binaries
+    return content
 
 
 def prompt_content(
-    message: TurnMessage, binaries: list[BinaryContent]
+    message: TurnMessage, binaries: list[str | BinaryContent]
 ) -> str | list[str | BinaryContent]:
-    """The turn's user content: binaries first, fenced attachment text next, the typed prose
-    LAST (Anthropic's documented files-before-text vision ordering — the shape the deleted
+    """The turn's user content: labeled binaries first, fenced attachment text next, the typed
+    prose LAST (Anthropic's documented files-before-text vision ordering — the shape the deleted
     `BuildSpec` also pinned). A plain text-only message stays a bare string (the historical
     single-string shape)."""
     if not binaries and not message.attachment_texts:

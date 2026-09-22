@@ -10,12 +10,20 @@
  *   3. THE ATTACHMENT PIPELINE STAYS OURS — the library renders a chip; it does not decide what
  *      is re-sent, inlined, or refused.
  */
+import type { ReactNode } from 'react'
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import { ComposerHarness } from './_composerHarness'
 import ComposerBox from '../ComposerBox'
+import ChatRuntimeProvider from '../runtime/ChatRuntimeProvider'
 import { SendRefusal } from '../sendRefusal'
-import { MAX_FILE_SIZE, MAX_FILE_SIZE_MB } from '../../../utils/attachmentInput'
+import {
+  GENERIC_ATTACHMENT_LANES_SENTENCE,
+  MAX_FILE_SIZE,
+  MAX_FILE_SIZE_MB,
+  MODEL_LANE_ONLY,
+  type AttachmentLanes,
+} from '../../../utils/attachmentInput'
 import type { ComposerSubmission } from '../ComposerBox'
 
 afterEach(cleanup)
@@ -36,12 +44,41 @@ interface DrawOptions {
   /** What the box reports it KEPT once an accepted send has been reconciled. */
   onAccepted?: (conversationId: string, keptText: string) => void
   locked?: boolean
+  /** Narrow the conversation to one lane. Absent is the shared harness, which is both. */
+  lanes?: AttachmentLanes
 }
 
-function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn(), onAccepted, locked = false }: DrawOptions = {}) {
+/**
+ * The provider every composer suite mounts through, or the same runtime narrowed to one lane —
+ * `ComposerHarness` takes no lanes, and a chat with no workspace is only itself under a narrowed
+ * one.
+ */
+function Harness({ lanes, children }: { lanes: AttachmentLanes | undefined; children: ReactNode }) {
+  if (!lanes) return <ComposerHarness>{children}</ComposerHarness>
+  return (
+    <ChatRuntimeProvider
+      messages={[]}
+      isRunning={false}
+      onNew={vi.fn().mockResolvedValue(undefined)}
+      onCancel={vi.fn().mockResolvedValue(undefined)}
+      attachmentLanes={lanes}
+    >
+      {children}
+    </ChatRuntimeProvider>
+  )
+}
+
+function draw({
+  onSubmit,
+  unavailableReason = null,
+  onUrgent = vi.fn(),
+  onAccepted,
+  locked = false,
+  lanes,
+}: DrawOptions = {}) {
   const submit = onSubmit ?? vi.fn().mockResolvedValue(undefined)
   const mount = (conversationId: string) => (
-    <ComposerHarness>
+    <Harness lanes={lanes}>
       <ComposerBox
         conversationId={conversationId}
         placeholder="Describe the change you need…"
@@ -51,7 +88,7 @@ function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn(), onAccept
         onUrgent={onUrgent}
         {...(onAccepted ? { onAccepted } : {})}
       />
-    </ComposerHarness>
+    </Harness>
   )
   const view = render(mount('chat-1'))
   /** Step to a sibling chat. A PROP CHANGE, not a remount — flat routing keeps one box for every
@@ -70,6 +107,19 @@ const dropAll = (...files: File[]) =>
   fireEvent.drop(screen.getByTestId('composer-dropzone'), {
     dataTransfer: { types: ['Files'], files },
   })
+/** THE OS PICKER PATH: the library answers a click on the attach control by creating its own
+ *  `<input type="file">`, appending it to `document.body` and clicking it — never part of this
+ *  render, so it has to be found rather than rendered. */
+const pick = (file: File) => {
+  fireEvent.click(screen.getByTestId('composer-attach'))
+  const input = document.body.querySelector('input[type="file"]')
+  if (!(input instanceof HTMLInputElement)) throw new Error('The picker input was not created.')
+  Object.defineProperty(input, 'files', { value: [file], configurable: true })
+  fireEvent.change(input)
+}
+/** THE PASTE PATH: `ComposerPrimitive.Input` reads `clipboardData.files` straight off the event. */
+const paste = (file: File) =>
+  fireEvent.paste(box(), { clipboardData: { types: ['Files'], files: [file] } })
 /** The staged chips, counted by the one control each chip owns. */
 const chips = () => screen.queryAllByLabelText(/^Remove /)
 
@@ -450,9 +500,11 @@ describe('★ the attachment pipeline stays ours', () => {
   })
 
   it('★ says a refused file out loud, which the library would swallow', async () => {
-    // Both the dropzone and the paste handler wrap `addAttachment` in `try { … } catch {}`. Without
-    // the adapter reporting, a file over the cap is dropped in silence and the citizen believes
-    // the model can see it. Mutation receipt: drop `onRefused` from the adapter and this goes red.
+    // Both the dropzone and the paste handler wrap `addAttachment` in `try { … } catch {}`, so the
+    // adapter's own throw never reaches them — this box hears it instead through the library's
+    // `attachmentAddError` event, which fires from inside `composer.addAttachment` regardless of
+    // who called it. Mutation receipt: return before `onUrgent` on the `adapter-error` arm in
+    // `ComposerBox.tsx` and this goes red.
     const onUrgent = vi.fn()
     draw({ onUrgent })
     drop(new File([new Uint8Array(MAX_FILE_SIZE + 1)], 'huge.png', { type: 'image/png' }))
@@ -471,6 +523,55 @@ describe('★ the attachment pipeline stays ours', () => {
     drop(new File(['x'], 'slides.ppt', { type: 'application/vnd.ms-powerpoint' }))
     await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
     expect(onUrgent.mock.calls[0]?.[0]).toMatch(/isn't supported|is not supported/i)
+  })
+
+  describe('★ every refusal reaches the citizen on every path', () => {
+    // ONE WIRE CARRIES ALL OF THIS NOW, which is why all six combinations are pinned rather than a
+    // representative one. `composer.addAttachment` is where the picker, a paste and a drop all
+    // converge, and it emits `attachmentAddError` from inside itself — before the throw that the
+    // dropzone's and the paste handler's own `try {} catch {}` discard. Two reasons arrive that
+    // way and they are refused in different places: the library's accept-string filter rejects a
+    // FORMAT before the adapter is called at all (`not-accepted`, carrying no file name), while
+    // our own adapter throws on SIZE and on the per-message cap (`adapter-error`, carrying our
+    // sentence). A switch that handles one and returns on the other is silent for half of what a
+    // citizen can do, and that silence is indistinguishable from the file having been accepted.
+    const badFormat = () => new File(['x'], 'slides.ppt', { type: 'application/vnd.ms-powerpoint' })
+    const tooBig = () =>
+      new File([new Uint8Array(MAX_FILE_SIZE + 1)], 'huge.png', { type: 'image/png' })
+
+    const PATHS = [
+      ['the file picker', pick],
+      ['paste', paste],
+      ['drag-and-drop', drop],
+    ] as const
+
+    describe.each(PATHS)('added by %s', (_name, add) => {
+      it('a refused FORMAT is said out loud and nothing is staged', async () => {
+        // Mutation receipt: delete the `not-accepted` arm and all three of these go red together,
+        // while the three below stay green.
+        const onUrgent = vi.fn()
+        draw({ onUrgent })
+        add(badFormat())
+        await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
+        expect(onUrgent.mock.calls[0]?.[0]).toMatch(/isn't supported|is not supported/i)
+        expect(screen.queryByTestId('composer-chips')).toBeNull()
+      })
+
+      it('a refused SIZE is said out loud and nothing is staged', async () => {
+        // THE HALF WITH NO SECOND WIRE BEHIND IT. The event is the only way a refused size
+        // reaches a screen, so these three are the whole proof rather than one of two paths.
+        // Mutation receipt: delete the `adapter-error` arm and all three of these go red together,
+        // while the three above stay green.
+        const onUrgent = vi.fn()
+        draw({ onUrgent })
+        add(tooBig())
+        await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
+        expect(onUrgent.mock.calls[0]?.[0]).toMatch(
+          new RegExp(`exceeds the ${MAX_FILE_SIZE_MB} MB`, 'i'),
+        )
+        expect(screen.queryByTestId('composer-chips')).toBeNull()
+      })
+    })
   })
 
   it('★ holds the cap when EIGHT files arrive in ONE gesture, which is how the library adds them', async () => {
@@ -573,5 +674,67 @@ describe('★ the attachment pipeline stays ours', () => {
     await waitFor(() => expect(onUrgent).toHaveBeenCalled())
     expect(onUrgent.mock.calls.at(-1)?.[0]).toMatch(/at most 5 files/i)
     expect(screen.getByTestId('composer-chips').textContent).not.toContain('sixth.png')
+  })
+})
+
+describe('★ a chat with no workspace offers only the lane it can honour', () => {
+  // The two-lane promise belongs to a workspace: a reader in the project's sandbox is what opens
+  // a spreadsheet. A generic conversation has none, and its server refuses a code-lane file
+  // outright — so the picker never offers one, and the refusal is the server's own sentence
+  // rather than an upload round trip's.
+  const workbook = () =>
+    new File(['x'], 'payroll.xlsx', {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    })
+
+  it('refuses a spreadsheet at pick time, in the words the server would use', async () => {
+    // Mutation receipt: build the adapter with `ACCEPT_ATTR` regardless of the lanes and this
+    // goes red — the workbook stages as an ordinary chip.
+    const onUrgent = vi.fn()
+    draw({ onUrgent, lanes: MODEL_LANE_ONLY })
+    pick(workbook())
+    await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
+    expect(onUrgent.mock.calls[0]?.[0]).toContain(GENERIC_ATTACHMENT_LANES_SENTENCE)
+    expect(screen.queryByTestId('composer-chips')).toBeNull()
+  })
+
+  it('still takes a picture, which it can honour on its own', async () => {
+    const onUrgent = vi.fn()
+    draw({ onUrgent, lanes: MODEL_LANE_ONLY })
+    pick(new File(['x'], 'screenshot.png', { type: 'image/png' }))
+    await waitFor(() =>
+      expect(screen.getByTestId('composer-chips').textContent).toContain('screenshot.png'),
+    )
+    expect(onUrgent).not.toHaveBeenCalled()
+  })
+
+  it('leaves that same spreadsheet accepted in a chat that HAS a workspace', async () => {
+    // The half that keeps the narrowing honest: plan and build chats are untouched, so a fix
+    // that simply refused Office everywhere would go red here.
+    const onUrgent = vi.fn()
+    draw({ onUrgent })
+    pick(workbook())
+    await waitFor(() =>
+      expect(screen.getByTestId('composer-chips').textContent).toContain('payroll.xlsx'),
+    )
+    expect(onUrgent).not.toHaveBeenCalled()
+  })
+
+  it('promises no more than that on the attach control itself', () => {
+    draw({ lanes: MODEL_LANE_ONLY })
+    const title = screen.getByTestId('composer-attach').getAttribute('title')
+    expect(title).toContain(GENERIC_ATTACHMENT_LANES_SENTENCE)
+    expect(title).not.toMatch(/with code/i)
+  })
+
+  it('still measures size, which the library has no notion of', async () => {
+    // The lane narrowing runs BEFORE our own adapter, so the checks only it can make — the size
+    // cap and the per-message count — have to survive being fronted by the library's filter.
+    const onUrgent = vi.fn()
+    draw({ onUrgent, lanes: MODEL_LANE_ONLY })
+    pick(new File([new Uint8Array(MAX_FILE_SIZE + 1)], 'huge.png', { type: 'image/png' }))
+    await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
+    expect(onUrgent.mock.calls[0]?.[0]).toMatch(new RegExp(`exceeds the ${MAX_FILE_SIZE_MB} MB`, 'i'))
+    expect(screen.queryByTestId('composer-chips')).toBeNull()
   })
 })

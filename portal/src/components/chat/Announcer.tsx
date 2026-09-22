@@ -22,6 +22,10 @@
  * TWO ANNOUNCEMENTS, NO MORE: the agent started working, and what a group amounted to when it
  * sealed — not every step. The old mirror throttled to one change per ten seconds with a flush
  * branch; that solved the wrong problem, so this hook removes the problem instead of tuning it.
+ *
+ * NOT A DUPLICATE OF ANYTHING THE LIBRARY SHIPS: the installed `@assistant-ui/react` and
+ * `@assistant-ui/core` source trees carry no `aria-live` region at all, in a primitive or in the
+ * component registry — this region is filling a genuine gap, not shadowing one already there.
  */
 import { useEffect, useRef, useState, type FC } from 'react'
 

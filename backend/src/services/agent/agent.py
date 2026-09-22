@@ -5,22 +5,16 @@ ONE module-level `Agent`, built without a bound model — the Foundry model is p
 `ChatDeps` is built per request and scopes any tool to the caller's `user_id` (a dropped scope
 predicate is a cross-user leak).
 
-The per-run system prompt has two sources, selected by `deps.kind` (U9/D4):
+Every run carries a `kind`, and its prompt is built in TWO pieces: the kind's standing contract,
+passed per run as static instruction parts by `static_instruction_parts`, and this conversation's
+own facts, returned by the callable below from `deps.prompt_context`. Both fields are required —
+there is no shape that skips either. All three kinds take this path: a Build turn is an ordinary
+turn with more tools, so it composes here like a Plan or a BIAL Chat turn and carries a
+`SandboxSession` in `deps.sandbox`.
 
-- `kind is None` — a server-composed prompt applied verbatim. Its last caller,
-  `services/projects/describe.py` (`POST /{project_id}/description:generate`), was deleted in
-  #191 along with the rest of the Generate Description feature — as of that change nothing
-  constructs `ChatDeps` with `kind=None`. The branch is left in place rather than pulled with
-  its caller (removing it is a separate cleanup, not part of #191's stated scope).
-- `kind` set — a turn on the turn engine (which always sets it), in TWO pieces: the kind's
-  standing contract, passed per run as static parts by `static_instruction_parts`, and this
-  conversation's own facts, returned by the callable below from `deps.prompt_context`. BOTH
-  kinds: a Build turn is an ordinary turn with more tools, so it composes here like a Plan turn
-  and carries a `SandboxSession` in `deps.sandbox`.
-
-Either way the text is applied through `instructions`, NOT `system_prompt`: instructions are
-never baked into stored message history, so prompts evolve without rewriting history — the
-same boundary that keeps ephemeral reminders out of the DB.
+The text is applied through `instructions`, NOT `system_prompt`: instructions are never baked into
+stored message history, so prompts evolve without rewriting history — the same boundary that keeps
+ephemeral reminders out of the DB.
 """
 
 from __future__ import annotations
@@ -44,9 +38,9 @@ from src.services.orchestrator.deps import SandboxSession
 
 @dataclass
 class ChatDeps:
-    """Per-request agent dependencies. `user_id` scopes any tool to the caller. `system` is
-    the kindless run's prompt (`describe.py`); a turn-engine run sets `kind` + `prompt_context`
-    instead — a kind without context is a fail-first error, never a silent empty prompt. `db`
+    """Per-request agent dependencies. `user_id` scopes any tool to the caller. `kind` and
+    `prompt_context` are required: every run composes its prompt from the kind's standing
+    contract plus this conversation's own facts, and there is no shape that omits either. `db`
     is OPTIONAL (no tool reads it) since holding a pooled connection across a minutes-long
     Write turn would pin it idle-in-transaction, what short-lived harness sessions avoid.
     `workspace` and BUILD-only `sandbox` are `None` off their paths; both accessors fail-first
@@ -54,10 +48,9 @@ class ChatDeps:
     """
 
     user_id: uuid.UUID
+    kind: ChatKind
+    prompt_context: PromptContext
     db: AsyncSession | None = None
-    system: str = ""
-    kind: ChatKind | None = None
-    prompt_context: PromptContext | None = None
     workspace: ReadOnlyWorkspace | None = None
     sandbox: SandboxSession | None = None
 
@@ -82,14 +75,5 @@ def static_instruction_parts(kind: ChatKind) -> list[InstructionPart]:
 
 @chat_agent.instructions
 def _system_instructions(ctx: RunContext[ChatDeps]) -> str:
-    """This conversation's own facts — the dynamic tail, sorted behind every static part.
-
-    A kindless run is the exception: it has no contract to stand on, so its whole prompt is
-    this one dynamic part."""
-    deps = ctx.deps
-    if deps.kind is None:
-        # Server-composed prompt, verbatim (the `describe.py` one-shot path).
-        return deps.system
-    if deps.prompt_context is None:
-        raise ValueError(f"kind={deps.kind.value} turn composed without a PromptContext.")
-    return this_conversation(deps.prompt_context)
+    """This conversation's own facts — the dynamic tail, sorted behind every static part."""
+    return this_conversation(ctx.deps.prompt_context)

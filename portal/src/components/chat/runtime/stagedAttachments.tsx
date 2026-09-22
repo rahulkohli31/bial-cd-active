@@ -25,35 +25,37 @@
  */
 import { createContext, useContext, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from 'react'
 import { useAui, type Attachment, type AttachmentAdapter } from '@assistant-ui/react'
-import { ACCEPT_ATTR } from '../../../utils/attachmentInput'
+import { BOTH_ATTACHMENT_LANES, type AttachmentLanes } from '../../../utils/attachmentInput'
 import { createAttachmentAdapter } from './attachmentAdapter'
 
 export interface BoundAdapter {
   adapter: AttachmentAdapter
+  /** The lanes this adapter was built with — published so the composer's words and the picker's
+   *  filter cannot disagree about which formats this surface takes. */
+  lanes: AttachmentLanes
   /** Render `StagedAttachmentsBinding` with this. It publishes a live READER of the staged list
    *  into the adapter — see the docblock for why a reader rather than the list itself. */
   stagedRef: MutableRefObject<() => readonly Attachment[]>
-  /** Where a refused file's sentence goes. The mounted composer fills it — see `useRefusalSink`. */
-  refusalRef: MutableRefObject<(message: string) => void>
   /**
    * HOW MANY FILES ARE STILL BEING READ. STATE, not a ref, and that is the whole
-   * reason it is here rather than beside the two refs above: the composer has to RE-RENDER when
+   * reason it is here rather than beside the ref above: the composer has to RE-RENDER when
    * this changes — Send goes unavailable and a pending row appears — and a ref cannot ask for a
    * render. It is the one thing the adapter publishes that the screen has to react to.
    */
   pendingReads: number
 }
 
-export function useBoundAttachmentAdapter(): BoundAdapter {
+/**
+ * `lanes` IS WHERE A CONVERSATION'S KIND ARRIVES, narrowed to the only thing an adapter can act
+ * on. A surface with no workspace passes `MODEL_LANE_ONLY`, and the library's accept filter then
+ * refuses a spreadsheet at pick, paste and drop — every path into `add` runs through it — instead
+ * of staging a chip and learning the same thing from the server a full upload later.
+ */
+export function useBoundAttachmentAdapter(lanes: AttachmentLanes = BOTH_ATTACHMENT_LANES): BoundAdapter {
   // NOTHING STAGED UNTIL THE BINDING MOUNTS, which is the honest reading for a composer whose
   // runtime does not exist yet — and it is a function so that the day it does exist, nothing here
   // has to be told.
   const stagedRef = useRef<() => readonly Attachment[]>(() => [])
-  // THE REFUSAL SINK IS A REF FOR THE SAME REASON THE STAGED LIST IS: `add` runs at pick time,
-  // and the adapter is built once. A composer mounted under this provider registers its own
-  // `onUrgent` here; until one does, a refusal has nowhere to go and is dropped rather than
-  // thrown at the console.
-  const refusalRef = useRef<(message: string) => void>(() => {})
   // A file is not staged until its base64 read has finished, and Send is pressable throughout that
   // window — so a citizen who attaches a workbook and presses Enter sends their question without
   // it. `useState` because the composer must re-render; the setter is stable, so the adapter is
@@ -62,23 +64,25 @@ export function useBoundAttachmentAdapter(): BoundAdapter {
   const adapter = useMemo(
     () =>
       createAttachmentAdapter({
-        accept: ACCEPT_ATTR,
+        accept: lanes.accept,
         staged: () => stagedRef.current(),
-        onRefused: (message) => refusalRef.current(message),
+        // A REFUSAL REACHES THE COMPOSER THROUGH THE LIBRARY'S OWN `composer.attachmentAddError`
+        // event now (see `ComposerBox.tsx`), which carries the same message this hook would have
+        // relayed. The adapter still requires one; nothing needs to listen here.
+        onRefused: () => {},
         onReadingChanged: setPendingReads,
       }),
-    [],
+    [lanes],
   )
-  return { adapter, stagedRef, refusalRef, pendingReads }
+  return { adapter, lanes, stagedRef, pendingReads }
 }
 
 /**
  * HOW MANY FILES THE COMPOSER IS STILL READING, as context.
  *
- * The same shape as the refusal sink and for the same reason: the provider that owns the count is
- * mounted above the composer and does not know which of its children has the send control. `0`
- * outside a provider is the honest default — a composer with no runtime can stage nothing, so
- * nothing can be in flight.
+ * The provider that owns the count is mounted above the composer and does not know which of its
+ * children has the send control. `0` outside a provider is the honest default — a composer with
+ * no runtime can stage nothing, so nothing can be in flight.
  */
 const PendingReadsContext = createContext(0)
 
@@ -91,31 +95,15 @@ export function usePendingAttachmentReads(): number {
 }
 
 /**
- * THE REFUSAL SINK, AS CONTEXT rather than a prop chain: the provider is mounted ABOVE the
- * composer and does not know which child has the voice — on the chat surface the composer sits
- * several levels down, beside a transcript and banners — so threading a ref through would be a
- * prop nobody in between has business carrying. `null` outside a provider is the honest default:
- * a composer with no runtime cannot stage a file, so there is nothing for a refusal to be about.
+ * WHICH LANES THE COMPOSER BELOW IS SPEAKING FOR. The adapter's `accept` decides what is refused
+ * and the composer decides what the refusal says; they are one decision, so the composer reads it
+ * from the same value the adapter was built with rather than being handed it a second time. Both
+ * lanes outside a provider, which is what a composer with no runtime could only be.
  */
-const RefusalSinkContext = createContext<MutableRefObject<(message: string) => void> | null>(null)
+const AttachmentLanesContext = createContext(BOTH_ATTACHMENT_LANES)
 
-export function RefusalSinkProvider({
-  value,
-  children,
-}: {
-  value: MutableRefObject<(message: string) => void>
-  children: ReactNode
-}) {
-  return <RefusalSinkContext.Provider value={value}>{children}</RefusalSinkContext.Provider>
-}
-
-/**
- * REGISTER THE COMPOSER'S OWN URGENT SINK, so a refused file is spoken where that surface speaks.
- * Called BY the composer, because it is the composer that has the voice.
- */
-export function useRefusalSink(onUrgent: (message: string) => void): void {
-  const sink = useContext(RefusalSinkContext)
-  if (sink) sink.current = onUrgent
+export function useAttachmentLanes(): AttachmentLanes {
+  return useContext(AttachmentLanesContext)
 }
 
 /**
@@ -138,15 +126,11 @@ export function StagedAttachmentsBinding({
 /**
  * EVERY PROVIDER A COMPOSER'S ATTACHMENTS NEED, MOUNTED AS ONE.
  *
- * ★ THIS EXISTS BECAUSE THE SEND GATE WAS HALF-SHIPPED. The pending-read count reached the chat
- * composer through `PendingReadsProvider` in `ChatRuntimeProvider` — and the rail composer, which
- * binds the same adapter, stages the same files and renders the same box, mounted the refusal sink
- * and the staged binding but never that provider. `usePendingAttachmentReads()` read the context
- * default `0`, Send's guard never fired, and a file dropped on the rail and sent mid-read landed
- * nowhere while the chat started from the sentence alone.
- *
- * Three pieces wired by hand at each call site is how one gets forgotten, so they are one
- * component: a composer that binds an adapter mounts this, and gets all three or none.
+ * Pieces wired by hand at each call site is how one gets forgotten: a composer that mounts
+ * the staged binding but not `PendingReadsProvider` reads the context default `0`, and Send's
+ * "a file is still arriving" guard never fires; one that skips the lanes says the two-lane
+ * sentence over an adapter that takes one. So a composer that binds an adapter mounts this, and
+ * gets all of them or none.
  */
 export function AttachmentAdapterProviders({
   bound,
@@ -156,11 +140,11 @@ export function AttachmentAdapterProviders({
   children: ReactNode
 }) {
   return (
-    <RefusalSinkProvider value={bound.refusalRef}>
+    <AttachmentLanesContext.Provider value={bound.lanes}>
       <PendingReadsProvider value={bound.pendingReads}>
         <StagedAttachmentsBinding target={bound.stagedRef} />
         {children}
       </PendingReadsProvider>
-    </RefusalSinkProvider>
+    </AttachmentLanesContext.Provider>
   )
 }

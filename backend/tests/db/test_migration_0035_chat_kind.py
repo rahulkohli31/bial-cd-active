@@ -47,13 +47,22 @@ _TYPE_LABELS_SQL = (
 # --- the shape the fresh upgrade left -------------------------------------------------
 
 
-async def test_chat_kind_exists_with_exactly_two_labels(db_session) -> None:
+async def test_chat_kind_exists_and_still_leads_with_the_two_labels_this_revision_created(
+    db_session,
+) -> None:
+    """What 0035 still owns at head: the type exists, and the two labels it collapsed six
+    values into are its first two, in that order.
+
+    THE WHOLE LABEL SET BELONGS TO THE NEWEST REVISION THAT TOUCHED THE TYPE — 0044 rebuilt it
+    with a third label, and `tests/db/test_chat_kind_generic.py` asserts the full list there. A
+    fresh-schema read here can only ever see head, so pinning the complete set in this file
+    would make every later label change fail in two places and be fixed in one."""
     labels = (
         (await db_session.execute(sa.text(_TYPE_LABELS_SQL), {"name": "chat_kind"}))
         .scalars()
         .all()
     )
-    assert list(labels) == ["plan", "build"]
+    assert list(labels)[:2] == ["plan", "build"]
     # …and the Python enum agrees, so a value the database accepts is one the code can name.
     assert [member.value for member in ChatKind] == list(labels)
 

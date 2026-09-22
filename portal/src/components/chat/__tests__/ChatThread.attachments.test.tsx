@@ -63,9 +63,7 @@ const withImage = (): ChatMessage => ({
   seq: 2,
 })
 
-const TextPart: ThreadComponents['TextPart'] = ({ text, isUser }) => (
-  <MessageContent parts={text} isUser={isUser} />
-)
+const TextPart: ThreadComponents['TextPart'] = ({ text }) => <MessageContent parts={text} />
 const ToolGroup: ThreadComponents['ToolGroup'] = ({ children }) => <div>{children}</div>
 const ToolPart: ThreadComponents['ToolPart'] = () => null
 

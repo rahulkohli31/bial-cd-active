@@ -7,7 +7,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { useLayoutEffect, type ReactNode } from 'react'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
-import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useLocation, useNavigate, useParams } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
   getConversation: vi.fn(),
@@ -51,7 +51,7 @@ vi.mock('../../components/workspace/ConversationSlot', () => ({
     conversation: { chatId: string; kind: string; projectId: string | null; projectName: string | null }
     // The surface derives a title from the first message of a chat whose row had none, and hands
     // it BACK to this route — see `onTitleDerived` in `ChatRoute`. Accepted here so the merge is
-    // reachable from a test at all; the stub used to drop it silently.
+    // reachable from a test at all; a stub that omits it drops the call silently.
     onTitleDerived?: (title: string) => void
   }) {
     const navigate = useNavigate()
@@ -106,6 +106,16 @@ function ProjectsIndexProbe() {
       <span data-testid="arrival-notice">{typeof carried === 'string' ? carried : ''}</span>
     </div>
   )
+}
+
+/**
+ * WHERE A GENERIC CONVERSATION'S REDIRECT LANDS. The real `AssistantPage` is not mounted here —
+ * it belongs to a different suite — so this stands in for its address only, the one thing this
+ * route is answerable for: DID it send the citizen there, not what that page then shows.
+ */
+function AssistantAddressProbe() {
+  const { chatId } = useParams()
+  return <div data-testid="assistant-address">{chatId}</div>
 }
 
 /** What the wait board looked like on some commit — see `FirstCommitSpy`. */
@@ -163,6 +173,7 @@ function renderRoute(entry: string, state?: unknown, spy?: ReactNode) {
         <Routes>
           <Route path="/chat/:chatId" element={<ChatRoute />} />
           <Route path="/projects" element={<ProjectsIndexProbe />} />
+          <Route path="/assistant/:chatId" element={<AssistantAddressProbe />} />
         </Routes>
         {/* LAST, so its layout effect runs after the route's own subtree has been committed. */}
         {spy}
@@ -226,6 +237,56 @@ describe('ChatRoute — kind RESOLUTION (it no longer dispatches)', () => {
     renderRoute('/chat/c1')
     await screen.findByTestId('conversation-slot')
     expect(h.getConversation).toHaveBeenCalledTimes(1)
+  })
+
+  // THERE IS ONE FALLBACK SITE, NOT TWO. `ConversationSurface`'s `kind` prop is required, so
+  // `kindFromServer`'s `plan` is the only answer a caller can ever receive for a value it does
+  // not recognise — proven here by reading it straight off what the slot was actually handed,
+  // not by re-deriving it.
+  //
+  // Mutation receipt: swap `kindFromServer`'s `raw === 'build' ? 'build' : 'plan'` for `raw ===
+  // 'build' ? 'build' : 'generic' as ChatKind` and this goes red on the `data-kind` assertion —
+  // 'plan' vs 'generic' — while every other test in this describe block stays green.
+  it('resolves a kind the server does not recognise to plan, the one remaining safe default', async () => {
+    h.getConversation.mockResolvedValue(conversation({ kind: 'a-future-kind' }))
+    renderRoute('/chat/c1')
+    expect((await screen.findByTestId('conversation-slot')).getAttribute('data-kind')).toBe('plan')
+  })
+})
+
+describe('ChatRoute — a generic conversation belongs at its assistant address', () => {
+  // What this route is answerable for is whether a generic conversation is sent to its assistant
+  // address at all; the generic SURFACE itself is `AssistantPage`'s own suite to pin.
+  it('a generic conversation opened at the builder address lands on its assistant address', async () => {
+    h.getConversation.mockResolvedValue(conversation({ id: 'g1', kind: 'generic', projectId: null }))
+    renderRoute('/chat/g1')
+    expect((await screen.findByTestId('assistant-address')).textContent).toBe('g1')
+  })
+
+  // THE ROW CARRIES A `projectId` ON PURPOSE, even though a real generic conversation's is
+  // always `null` (the server-side invariant this row's own factory otherwise pins) — this
+  // fixture is what proves the guard fires BEFORE anything downstream ever reads `projectId`,
+  // rather than proving something already true of an all-null row for an unrelated reason.
+  //
+  // Mutation receipt, two mutations for the three assertions:
+  //  1. Delete the `conversation.kind === 'generic'` guard entirely (or keep it but drop its
+  //     `return`, letting `ready()` also run — `setResolution` does not merge, so the LATER call
+  //     wins either way). The LIVENESS assertion is what goes red:
+  //     `findByTestId('assistant-address')` times out because the slot renders instead — exactly
+  //     the failure liveness-first ordering exists to catch, since the two absences below would
+  //     otherwise read as a pass on a page that never arrived.
+  //  2. Keep the guard and its `return`, but add a stray `getProject(...)` call inside it (the
+  //     shape a "prefetch it anyway" regression would take). Liveness and the slot assertion stay
+  //     green; only the last line goes red.
+  it('never mounts the workspace shell or attempts a project lookup on the way', async () => {
+    h.getConversation.mockResolvedValue(conversation({ id: 'g1', kind: 'generic' }))
+    renderRoute('/chat/g1')
+
+    // LIVENESS FIRST: the redirect really did land, so the absences below describe a route that
+    // went straight there rather than one that crashed before reaching either.
+    expect(await screen.findByTestId('assistant-address')).toBeTruthy()
+    expect(screen.queryByTestId('conversation-slot')).toBeNull()
+    expect(h.getProject).not.toHaveBeenCalled()
   })
 })
 

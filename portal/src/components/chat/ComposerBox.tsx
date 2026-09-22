@@ -28,11 +28,12 @@ import { ComposerPrimitive, useAui, useAuiState } from '@assistant-ui/react'
 import { Paperclip, Send, X } from 'lucide-react'
 
 import { payloadsOf } from './runtime/attachmentAdapter'
-import { usePendingAttachmentReads, useRefusalSink } from './runtime/stagedAttachments'
-import { ATTACHMENT_LANES_SENTENCE, unsupportedFormatMessage } from '../../utils/attachmentInput'
+import { useAttachmentLanes, usePendingAttachmentReads } from './runtime/stagedAttachments'
+import { unsupportedFormatMessage } from '../../utils/attachmentInput'
 import type { PendingAttachment } from '../../utils/attachmentInput'
 import AttachmentPreview, { type PreviewTarget } from './AttachmentPreview'
 import { SendRefusal } from './sendRefusal'
+import { assertNever } from '../../utils/assertNever'
 
 /** What one send carries. The box assembles it; the surface performs it. */
 export interface ComposerSubmission {
@@ -96,6 +97,9 @@ export default function ComposerBox({
   onUrgent,
 }: ComposerBoxProps) {
   const aui = useAui()
+  // WHAT THIS SURFACE CAN HONOUR, read from the adapter's own binding — the tooltip below
+  // promises exactly what the picker will take, on a chat with a workspace and on one without.
+  const lanes = useAttachmentLanes()
   const [preview, setPreview] = useState<PreviewTarget | null>(null)
   const [sending, setSending] = useState(false)
 
@@ -267,23 +271,33 @@ export default function ComposerBox({
   )
 
   /**
-   * A REFUSED FILE IS SAID OUT LOUD — TWO wires, since the library refuses in two places.
-   * Our validator (size/limit caps) runs inside the adapter's `add`, but the library
-   * SWALLOWS that throw (dropzone + paste wrap `addAttachment` in `try {} catch {}`), so
-   * the adapter reports via `useRefusalSink` first. THE FORMAT CHECK NEVER REACHES US: the
-   * library filters on `accept` before `add` and emits its own MIME-type sentence,
-   * intercepted here and answered in `attachmentInput.ts`'s words instead.
+   * A REFUSED FILE IS SAID OUT LOUD, on every path — the picker, a paste and a drop all reach
+   * `composer.addAttachment` (dropzone and paste wrap it in `try {} catch {}`, which is what used
+   * to swallow this), and the runtime emits `attachmentAddError` from inside that call regardless
+   * of who reached it, before the throw the caller's own `catch` discards.
+   *
+   * `not-accepted` is the library's own MIME-type filter, running on the adapter's `accept`
+   * string before `add` is even called — no file name on this arm, so `attachmentInput.ts`'s
+   * words stand in for the library's raw MIME-list sentence. Every other reason carries OUR
+   * message already: `adapter-error` is a thrown `AttachmentRefusal` (the size and per-message
+   * caps), and `no-adapter` cannot occur here — this box always registers one.
    */
-  useRefusalSink(onUrgent)
   useEffect(
     () =>
       aui.on('composer.attachmentAddError', (event) => {
-        // NO FILE NAME IS AVAILABLE on this arm — the library filters before the adapter is
-        // called and its event carries a reason, not the file. The advice is the part that
-        // matters, and it is the same advice, from the same author.
-        if (event.reason === 'not-accepted') onUrgent(`That file ${unsupportedFormatMessage()}`)
+        switch (event.reason) {
+          case 'not-accepted':
+            onUrgent(`That file ${unsupportedFormatMessage(lanes)}`)
+            return
+          case 'adapter-error':
+          case 'no-adapter':
+            onUrgent(event.message)
+            return
+          default:
+            assertNever(event.reason)
+        }
       }),
-    [aui, onUrgent],
+    [aui, lanes, onUrgent],
   )
 
   return (
@@ -379,7 +393,7 @@ export default function ComposerBox({
             <ComposerPrimitive.AddAttachment
               data-testid="composer-attach"
               aria-label="Attach a file"
-              title={`${ATTACHMENT_LANES_SENTENCE} Or drop files anywhere in the composer.`}
+              title={`${lanes.sentence} Or drop files anywhere in the composer.`}
               // DIMMED WITH THE BOX, never unavailable. The board draws it at 40% while an offer
               // waits, and it stays pressable at 40%: staging a file is composing, not answering.
               className={`ms-auto inline-flex text-neutral transition hover:text-primary${locked ? ' opacity-40' : ''}`}

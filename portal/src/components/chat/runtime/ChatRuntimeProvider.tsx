@@ -14,6 +14,7 @@ import type { ReactNode } from 'react'
 import { AssistantRuntimeProvider, type AppendMessage } from '@assistant-ui/react'
 import { useChatRuntime } from './useChatRuntime'
 import { AttachmentAdapterProviders, useBoundAttachmentAdapter } from './stagedAttachments'
+import { BOTH_ATTACHMENT_LANES, type AttachmentLanes } from '../../../utils/attachmentInput'
 import type { ChatMessage } from '../../../utils/messageTypes'
 
 export interface ChatRuntimeProviderProps {
@@ -23,6 +24,12 @@ export interface ChatRuntimeProviderProps {
   onNew: (message: AppendMessage) => Promise<void>
   /** The relocated stop control, as the runtime sees it. Passing it is what registers `cancel`. */
   onCancel: () => Promise<void>
+  /**
+   * WHICH ATTACHMENT LANES THIS CONVERSATION CAN HONOUR. Defaulted, because a chat with a
+   * workspace can honour both and that is what a surface says by saying nothing; a surface with
+   * no workspace passes `MODEL_LANE_ONLY` so the picker never offers a file its server refuses.
+   */
+  attachmentLanes?: AttachmentLanes
   children: ReactNode
 }
 
@@ -31,9 +38,10 @@ export default function ChatRuntimeProvider({
   isRunning,
   onNew,
   onCancel,
+  attachmentLanes = BOTH_ATTACHMENT_LANES,
   children,
 }: ChatRuntimeProviderProps) {
-  const bound = useBoundAttachmentAdapter()
+  const bound = useBoundAttachmentAdapter(attachmentLanes)
   const runtime = useChatRuntime({
     messages,
     isRunning,
@@ -43,8 +51,8 @@ export default function ChatRuntimeProvider({
   })
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      {/* The refusal sink, the pending-read count and the staged binding, mounted as
-          one so no composer can take two of the three — see `AttachmentAdapterProviders`. */}
+      {/* The pending-read count and the staged binding, mounted as one so no composer can take
+          one without the other — see `AttachmentAdapterProviders`. */}
       <AttachmentAdapterProviders bound={bound}>{children}</AttachmentAdapterProviders>
     </AssistantRuntimeProvider>
   )

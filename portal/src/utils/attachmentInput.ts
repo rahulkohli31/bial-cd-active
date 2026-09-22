@@ -19,13 +19,20 @@ export const CODE_LANE_MEDIA_TYPES = [
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 ]
 /**
+ * The MODEL lane — it reads these bytes itself, with no reader and no workspace involved.
+ * Named as its own export because a generic conversation narrows to exactly this lane; the
+ * backend mirror is `MODEL_LANE_MEDIA` in `media/lanes.py`.
+ */
+export const MODEL_LANE_MEDIA_TYPES = [
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
+]
+/**
  * THE LINE IS A RULE, NOT A LIST: every attachment uploads as itself, and its media type
  * decides which lane reads it. Nothing is converted here and nothing rides inline in the
  * prompt.
  */
 export const ALLOWED_MEDIA_TYPES = [
-  // The MODEL lane — it reads these bytes itself.
-  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
+  ...MODEL_LANE_MEDIA_TYPES,
   ...CODE_LANE_MEDIA_TYPES,
 ]
 // WHAT CAN BE SHOWN AS TEXT, which is a different question from how a file travels, and
@@ -55,8 +62,7 @@ export const MAX_FILE_SIZE = 10 * 1024 * 1024
 export const MAX_FILE_SIZE_MB = MAX_FILE_SIZE / (1024 * 1024)
 export const MAX_FILES_PER_MESSAGE = 5
 // Cumulative cap across a whole conversation (all turns). Distinct from the
-// per-message cap above and the per-user 50 MB object-store cap (enforced
-// server-side); checked at send time where the full conversation is visible.
+// per-message cap above; checked at send time where the full conversation is visible.
 export const MAX_ATTACHMENTS_PER_CONVERSATION = 20
 
 /**
@@ -82,15 +88,54 @@ export const ATTACHMENT_LANES_SENTENCE =
   "and I'll open it with code."
 
 /**
- * ONE SENTENCE, EVERYWHERE. The composer, the help page and every unsupported-format
- * refusal say this and nothing else — three sentences that drift is how the removed rule failed.
+ * ONE SENTENCE PER SURFACE, EVERYWHERE ON IT. The composer, the help page and every
+ * unsupported-format refusal carry that surface's lane sentence and nothing else — three
+ * sentences that drift is how the removed rule failed.
  *
  * IT DESCRIBES WHAT HAPPENS, NOT WHICH EXTENSIONS ARE ON A LIST. A list of ten formats is the
  * shape the old copy failed as: it goes stale the moment the allowlist moves, and it tells a
  * citizen nothing about why a spreadsheet behaves differently from a photograph.
  */
-export function unsupportedFormatMessage(): string {
-  return `isn't supported. ${ATTACHMENT_LANES_SENTENCE}`
+export function unsupportedFormatMessage(lanes: AttachmentLanes = BOTH_ATTACHMENT_LANES): string {
+  return `isn't supported. ${lanes.sentence}`
+}
+
+/**
+ * THE GENERIC CHAT'S OWN REFUSAL. `ATTACHMENT_LANES_SENTENCE` promises to open a spreadsheet,
+ * document or deck with code, and a generic conversation has no sandbox to keep that promise —
+ * so it gets a sentence that never makes it. Byte-identical to
+ * `GENERIC_ATTACHMENT_LANES_SENTENCE` in `backend/src/api/v1/attachments/router.py`.
+ */
+export const GENERIC_ATTACHMENT_LANES_SENTENCE =
+  "Attach a picture or a PDF and I'll look at it — a spreadsheet, document or slide deck " +
+  "isn't accepted in this chat."
+
+/**
+ * WHAT ONE SURFACE OFFERS, as a single value. The picker's filter and the sentence a refusal
+ * carries are the same decision, and passing them side by side is how they drift apart — a
+ * picker that offers a spreadsheet under a refusal saying spreadsheets are not accepted.
+ */
+export interface AttachmentLanes {
+  /** What the OS picker offers, and what the library's own filter admits before `add` runs. */
+  accept: string
+  /** What every unsupported-format refusal on this surface says. */
+  sentence: string
+}
+
+/** Both lanes: the model reads the pictures and PDFs itself, a workspace reader opens the rest. */
+export const BOTH_ATTACHMENT_LANES: AttachmentLanes = {
+  accept: ACCEPT_ATTR,
+  sentence: ATTACHMENT_LANES_SENTENCE,
+}
+
+/**
+ * THE MODEL LANE ALONE, for a conversation with no workspace to open a spreadsheet in. No
+ * extension tokens ride here, unlike `ACCEPT_ATTR`: their whole job is to get Office and
+ * delimited files past an OS that mislabels them, and those are exactly what this surface refuses.
+ */
+export const MODEL_LANE_ONLY: AttachmentLanes = {
+  accept: MODEL_LANE_MEDIA_TYPES.join(','),
+  sentence: GENERIC_ATTACHMENT_LANES_SENTENCE,
 }
 
 /**

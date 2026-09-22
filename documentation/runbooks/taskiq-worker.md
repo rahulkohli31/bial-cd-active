@@ -2,9 +2,9 @@
 
 The Taskiq worker is the platform's background process. It runs the recurring reconciliation and
 cleanup passes the control plane does not run inline — settling stalled deployments, sweeping
-abandoned sandboxes, and evaluating whether any container has drifted from the platform's own
-records. Reach for this document to start the worker, confirm it is actually alive, or size and
-troubleshoot it.
+abandoned sandboxes, evaluating whether any container has drifted from the platform's own records,
+and removing conversations nobody has come back to. Reach for this document to start the worker,
+confirm it is actually alive, or size and troubleshoot it.
 
 ## 1. It will not boot from the control plane's own environment file — check this first
 
@@ -57,12 +57,15 @@ scheduled task's first tick. A task that is present but not configured for this 
 that plainly as disabled — a distinct, expected outcome that must not be read as the same thing as
 a failure to reach its target.
 
-Of the worker's scheduled passes, only the fleet-reclamation pass (section 4) records a durable
-outcome row in the product database on every tick — success, decline, or failure alike — which is
-what makes its staleness a reliable, queryable signal that the whole worker process has stopped,
-independent of whether anyone was watching logs at the time. The other scheduled passes —
-deployment reconciliation and the routine sandbox sweep — only log their outcome; confirm those
-are still running from their own log lines, since neither leaves a queryable record behind.
+Two of the worker's scheduled passes record a durable outcome row in the product database on every
+tick — success, decline, or failure alike: the fleet-reclamation pass (section 4) and the
+conversation-retention pass (section 5). That is what makes their staleness a reliable, queryable
+signal that the whole worker process has stopped, independent of whether anyone was watching logs
+at the time. Lean on reclamation for liveness rather than retention: reclamation runs on a short
+cycle, while retention declines most of its own ticks by design and says so in the record it
+writes. The other scheduled passes — deployment reconciliation and the routine sandbox sweep —
+only log their outcome; confirm those are still running from their own log lines, since neither
+leaves a queryable record behind.
 
 ## 4. The reclamation pass is report-only by default, everywhere
 
@@ -79,7 +82,32 @@ container it cannot judge, and when it is safe to arm the destructive setting, s
 `reconcile-and-reclamation.md` and `reclamation-escalation.md` — this document covers only the
 worker process that runs it.
 
-## 5. Redis provisioning gates
+## 5. The conversation-retention pass ships switched off
+
+This pass removes any conversation — a Plan chat, a Build chat or a BIAL Chat alike — that nobody
+has added to for longer than the retention window, along with its messages, its attachment records
+and the files behind them. It is gated by a single setting that the worker **requires**: a
+deployment that does not carry it refuses to start rather than guessing, and the template in
+`backend/.env.worker.example` ships it set to off.
+
+**Read this before switching it on.** Nothing has ever deleted a conversation on this platform, so
+the first enabled pass is not a week's worth of tidying — its candidate set is the entire history,
+which is every conversation of every kind whose newest message is older than the window, including
+Plan and Build conversations that have existed since launch. That is the intended behaviour, and it
+is irreversible.
+
+Three properties make it safe to leave running once it is on. It removes a bounded number of
+conversations per run, recording how many candidates it left behind, so the first pass over the
+historical backlog drains across several runs rather than attempting one transaction that a deploy
+would roll back. It re-checks idleness at the moment of deletion, so a conversation somebody
+returns to between selection and deletion is spared. And it takes a database advisory lock, so the
+two scheduler instances that briefly coexist across a deploy cannot both run it.
+
+The window and the per-run ceiling are worker settings too, both with working defaults; the
+template from step 1 names all three and says what each one means. Reading this pass's own history
+is the same query as for reclamation — the outcome rows in section 3, under its own task name.
+
+## 6. Redis provisioning gates
 
 Confirm three things about the Redis instance directly with whoever provisions it, and record the
 answers — the worker's own logs cannot tell you any of this on their own:
@@ -96,7 +124,7 @@ Confirm which Redis product and connection port the target subscription actually
 before go-live rather than assuming a value from an earlier environment or an older copy of this
 document — managed Redis offerings and their defaults change over time.
 
-## 6. Alerting on a dead worker
+## 7. Alerting on a dead worker
 
 The reclamation pass's own staleness (sections 3–4) is the primitive to alert on. A fleet-size
 alert alone is not sufficient: it is emitted *by the pass itself*, so it goes silent at exactly
@@ -104,19 +132,20 @@ the moment the pass dies, and a dead worker then reads identically to a healthy,
 `reclamation-escalation.md` names the exact signals to wire into an alert, and what to do once one
 fires — start there before relying on this in production.
 
-## 7. Sizing
+## 8. Sizing
 
 Run the worker as a single replica. Correctness does not rest on that number — two schedulers
 briefly coexist on every deploy, and the passes are built to tolerate it: each is idempotent, and
-the reclamation pass additionally takes a database advisory lock so only one instance of it runs at
-a time. What a second replica costs is duplicated work and doubled load, not a corrupted fleet.
-A container platform's scale-to-zero behavior is equally wrong here for the opposite reason — the
-worker has no inbound traffic to scale back up on, so once it scales to zero it never restarts
-itself. After the worker has run for a week in a given environment, check its memory headroom and
-resize if it is running close to its limit. Under-provisioning memory here is recoverable rather
-than dangerous: a crash mid-pass leaves the fleet in a state the next pass reconciles cleanly.
+the reclamation and retention passes each additionally take a database advisory lock, on separate
+keys, so only one instance of either runs at a time. What a second replica costs is duplicated
+work and doubled load, not a corrupted fleet. A container platform's scale-to-zero behavior is
+equally wrong here for the opposite reason — the worker has no inbound traffic to scale back up
+on, so once it scales to zero it never restarts itself. After the worker has run for a week in a
+given environment, check its memory headroom and resize if it is running close to its limit.
+Under-provisioning memory here is recoverable rather than dangerous: a crash mid-pass leaves the
+fleet in a state the next pass reconciles cleanly.
 
-## 8. What this process may never do
+## 9. What this process may never do
 
 No code in the worker may assert that a build session is certainly, unrecoverably dead and act on
 that alone — that assertion is only ever true if the platform is certain it is the only replica
