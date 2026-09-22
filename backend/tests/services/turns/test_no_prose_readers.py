@@ -47,6 +47,13 @@ ALLOWED: dict[str, str] = {
         "single `chat_agent.run`. A shape, not a behaviour: unifying the two would give a Plan "
         "run the streaming node loop and the per-step billing it has no steps for."
     ),
+    "api/v1/attachments/router.py": (
+        "WHICH LANES THIS CHAT'S DOOR ADMITS, asked before any bytes are stored. A generic chat "
+        "has no sandbox, so a file whose only reader is a script running in one cannot be "
+        "accepted there — and the refusal has to name what this chat CAN take, which the "
+        "code-lane sentence's offer to open it with code cannot. It decides nothing about what "
+        "the model may do or is told; the toolset and the prompt are untouched by it."
+    ),
     "api/v1/conversations/turns.py": (
         "WHETHER THIS TURN RESOLVES A CONTAINER AT ALL, which is the one question the route has "
         "to answer before it can ask any of the four workspace refusals. A generic chat has no "

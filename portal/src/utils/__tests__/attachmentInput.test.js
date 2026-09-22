@@ -9,6 +9,10 @@ import {
   MAX_FILE_SIZE_MB,
   MAX_FILES_PER_MESSAGE,
   MAX_ATTACHMENTS_PER_CONVERSATION,
+  MODEL_LANE_MEDIA_TYPES,
+  CODE_LANE_MEDIA_TYPES,
+  ALLOWED_MEDIA_TYPES,
+  GENERIC_ATTACHMENT_LANES_SENTENCE,
 } from '../attachmentInput'
 
 const XLSX = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -182,6 +186,34 @@ describe('validateConversationAttachmentCap', () => {
   })
 })
 
+
+describe('MODEL_LANE_MEDIA_TYPES', () => {
+  it('is exactly the five formats the model reads itself, and nothing the code lane reads', () => {
+    // The generic conversation narrows to this exact set — a drift here is a drift in what a
+    // generic chat accepts, so the two directions are both worth asserting.
+    expect(MODEL_LANE_MEDIA_TYPES).toEqual([
+      'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
+    ])
+    for (const type of MODEL_LANE_MEDIA_TYPES) {
+      expect(CODE_LANE_MEDIA_TYPES).not.toContain(type)
+    }
+  })
+
+  it('is the first half of ALLOWED_MEDIA_TYPES, with the code lane completing it', () => {
+    expect(ALLOWED_MEDIA_TYPES).toEqual([...MODEL_LANE_MEDIA_TYPES, ...CODE_LANE_MEDIA_TYPES])
+  })
+})
+
+describe('GENERIC_ATTACHMENT_LANES_SENTENCE', () => {
+  it('names what a generic chat accepts and never offers to open a file with code', () => {
+    expect(GENERIC_ATTACHMENT_LANES_SENTENCE).toMatch(/picture|PDF/i)
+    expect(GENERIC_ATTACHMENT_LANES_SENTENCE).not.toMatch(/code/i)
+  })
+
+  it('is a real sentence, not an empty string every negative assertion would pass against', () => {
+    expect(GENERIC_ATTACHMENT_LANES_SENTENCE.length).toBeGreaterThan(40)
+  })
+})
 
 describe('fileToBase64', () => {
   it('reads a Blob as raw base64 (data: prefix stripped)', async () => {

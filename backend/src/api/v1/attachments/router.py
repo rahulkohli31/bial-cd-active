@@ -44,7 +44,7 @@ from src.api.v1.attachments.schemas import UploadResponse
 from src.api.v1.conversations._shared import PDF_MEDIA_TYPE
 from src.core.errors import AppApiError
 from src.db.models.attachment import MAX_ATTACHMENT_NAME, Attachment
-from src.db.models.conversation import Conversation
+from src.db.models.conversation import ChatKind, Conversation
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.extract.zip_safety import FileParseError, assert_zip_not_bomb
 from src.services.media import (
@@ -128,6 +128,17 @@ IT DESCRIBES WHAT HAPPENS TO A FILE, not which extensions are on a list. A list 
 goes stale the moment the allowlist moves, and tells a citizen nothing about why a spreadsheet
 behaves differently from a photograph."""
 
+
+GENERIC_ATTACHMENT_LANES_SENTENCE: Final = (
+    "Attach a picture or a PDF and I'll look at it — a spreadsheet, document or slide deck "
+    "isn't accepted in this chat."
+)
+"""THE GENERIC CHAT'S OWN REFUSAL. `ATTACHMENT_LANES_SENTENCE` promises to open a spreadsheet,
+document or deck with code, and a generic conversation has no sandbox to keep that promise — so
+it gets a sentence that never makes it. Its portal twin is `GENERIC_ATTACHMENT_LANES_SENTENCE` in
+`portal/src/utils/attachmentInput.ts`, held to the same value the way its sibling sentence is."""
+
+GENERIC_LANE_REFUSED_CODE: Final = "GENERIC_CHAT_ATTACHMENT_REFUSED"
 
 PDF_LOCKED_CODE: Final = "PDF_ENCRYPTED"
 """The machine-readable code beside the shared locked-file sentence, so a client can branch on
@@ -236,8 +247,12 @@ the data-plane `{"error":{"message","code"}}` envelope, which is what `uploadAtt
 FastAPI 422 would render a different shape and the browser would show its fallback sentence."""
 
 
-async def _resolve_conversation_link(db: DbSession, user_id: uuid.UUID, raw: Any) -> uuid.UUID:
-    """Resolve the client-supplied `conversationId` to an OWNED, EXISTING conversation's id.
+async def _resolve_conversation_link(
+    db: DbSession, user_id: uuid.UUID, raw: Any
+) -> tuple[uuid.UUID, ChatKind]:
+    """Resolve the client-supplied `conversationId` to an OWNED, EXISTING conversation's id AND
+    its kind — the kind decides which lane below may be stored, and the caller needs it before
+    the bytes are even looked at, so it rides out of the same row read rather than a second query.
 
     ★ REQUIRED, AND THE ROW MUST ALREADY BE THERE. Neither an absent field nor a well-formed id
     whose row is unwritten is admitted, and linking at insert is what that buys: the count cap
@@ -261,10 +276,14 @@ async def _resolve_conversation_link(db: DbSession, user_id: uuid.UUID, raw: Any
     except ValueError:
         # An ID_RE-valid token that isn't a UUID can key no stored conversation.
         raise AppApiError(404, "Conversation not found.") from None
-    owner = await db.scalar(sa.select(Conversation.user_id).where(Conversation.id == cid))
-    if owner != user_id:
+    row = (
+        await db.execute(
+            sa.select(Conversation.user_id, Conversation.kind).where(Conversation.id == cid)
+        )
+    ).first()
+    if row is None or row.user_id != user_id:
         raise AppApiError(404, "Conversation not found.")
-    return cid
+    return cid, row.kind
 
 
 async def _store_attachment_bytes(
@@ -447,7 +466,13 @@ async def upload_attachment(
     # optional conversation link is resolved owner-scoped here too (a bad conversationId 404s
     # before any bytes are parsed or stored — no orphaned object on the reject path).
     name = _attachment_name(body.get("name"))
-    conversation_id = await _resolve_conversation_link(db, user.id, body.get("conversationId"))
+    conversation_id, conversation_kind = await _resolve_conversation_link(
+        db, user.id, body.get("conversationId")
+    )
+    # A code-lane file is refused for a GENERIC conversation before a single byte is decoded —
+    # the conversation's kind and the declared media type are enough to answer this.
+    if conversation_kind == ChatKind.GENERIC and is_code_lane(media_type):
+        raise AppApiError(400, GENERIC_ATTACHMENT_LANES_SENTENCE, code=GENERIC_LANE_REFUSED_CODE)
     # THE THREE ADMISSION ARMS COLLAPSE INTO TWO. Office and deck each had their own,
     # because each ran a different server-side conversion before storing: docx/xlsx were extracted
     # to Markdown, and a deck was rendered to PDF by a converter that was never deployed. Both are

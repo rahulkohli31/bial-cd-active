@@ -19,13 +19,20 @@ export const CODE_LANE_MEDIA_TYPES = [
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 ]
 /**
+ * The MODEL lane — it reads these bytes itself, with no reader and no workspace involved.
+ * Named as its own export because a generic conversation narrows to exactly this lane; the
+ * backend mirror is `MODEL_LANE_MEDIA` in `media/lanes.py`.
+ */
+export const MODEL_LANE_MEDIA_TYPES = [
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
+]
+/**
  * THE LINE IS A RULE, NOT A LIST: every attachment uploads as itself, and its media type
  * decides which lane reads it. Nothing is converted here and nothing rides inline in the
  * prompt.
  */
 export const ALLOWED_MEDIA_TYPES = [
-  // The MODEL lane — it reads these bytes itself.
-  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
+  ...MODEL_LANE_MEDIA_TYPES,
   ...CODE_LANE_MEDIA_TYPES,
 ]
 // WHAT CAN BE SHOWN AS TEXT, which is a different question from how a file travels, and
@@ -55,8 +62,7 @@ export const MAX_FILE_SIZE = 10 * 1024 * 1024
 export const MAX_FILE_SIZE_MB = MAX_FILE_SIZE / (1024 * 1024)
 export const MAX_FILES_PER_MESSAGE = 5
 // Cumulative cap across a whole conversation (all turns). Distinct from the
-// per-message cap above and the per-user 50 MB object-store cap (enforced
-// server-side); checked at send time where the full conversation is visible.
+// per-message cap above; checked at send time where the full conversation is visible.
 export const MAX_ATTACHMENTS_PER_CONVERSATION = 20
 
 /**
@@ -92,6 +98,16 @@ export const ATTACHMENT_LANES_SENTENCE =
 export function unsupportedFormatMessage(): string {
   return `isn't supported. ${ATTACHMENT_LANES_SENTENCE}`
 }
+
+/**
+ * THE GENERIC CHAT'S OWN REFUSAL. `ATTACHMENT_LANES_SENTENCE` promises to open a spreadsheet,
+ * document or deck with code, and a generic conversation has no sandbox to keep that promise —
+ * so it gets a sentence that never makes it. Byte-identical to
+ * `GENERIC_ATTACHMENT_LANES_SENTENCE` in `backend/src/api/v1/attachments/router.py`.
+ */
+export const GENERIC_ATTACHMENT_LANES_SENTENCE =
+  "Attach a picture or a PDF and I'll look at it — a spreadsheet, document or slide deck " +
+  "isn't accepted in this chat."
 
 /**
  * Canonicalize a file's media type by extension first. Browsers/OSes report
