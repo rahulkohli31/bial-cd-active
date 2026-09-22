@@ -426,6 +426,7 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
     occupyingProjectName: null,
     occupyingProjectId: null,
     restorable: true,
+    startingSince: null,
   }
 
   /**
@@ -446,6 +447,7 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
         projectHasSavedBuild: null,
         startOutcome: null,
         startInFlight,
+        waitHasGoneOnTooLong: false,
       })
     const sinks = {
       projectId: 'p1',

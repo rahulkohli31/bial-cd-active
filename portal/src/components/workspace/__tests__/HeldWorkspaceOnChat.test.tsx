@@ -71,6 +71,7 @@ const HELD: PreviewState = {
   occupyingProjectName: 'Car pool',
   occupyingProjectId: 'pA',
   restorable: true,
+  startingSince: null,
 }
 
 /** The one refusal `POST /relaunch` can still raise: a colleague's shared view in the slot. */

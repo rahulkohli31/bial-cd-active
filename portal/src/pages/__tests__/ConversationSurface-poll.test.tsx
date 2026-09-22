@@ -131,6 +131,7 @@ const answer = (state: PreviewLifeState, restorable: boolean | null = null): Pre
   state,
   alive: state === 'alive',
   previewUrl: state === 'alive' ? PREVIEW_URL : null,
+  startingSince: null,
   occupyingProjectName: null,
   occupyingProjectId: null,
   restorable,

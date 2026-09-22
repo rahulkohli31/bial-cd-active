@@ -440,6 +440,7 @@ describe('BuilderPage — the project arm, and the hard load it exists for', () 
     state,
     alive: state === 'alive',
     previewUrl: state === 'alive' ? PROJECT_URL : null,
+    startingSince: null,
     occupyingProjectName: null,
     occupyingProjectId: null,
     restorable,

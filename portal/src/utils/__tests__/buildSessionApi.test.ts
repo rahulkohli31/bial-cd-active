@@ -788,6 +788,7 @@ describe('fetchPreviewState — the wire mirror', () => {
       occupyingProjectName: null,
       occupyingProjectId: null,
       restorable: null,
+      startingSince: null,
     })
   })
 })

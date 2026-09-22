@@ -379,6 +379,33 @@ export type WorkspaceAction =
   | { readonly kind: 'start'; readonly label: string }
   | { readonly kind: 'retry'; readonly label: string }
 
+/**
+ * HOW LONG THE PANE SAYS ONLY "getting your app ready" BEFORE IT SAYS SOMETHING ELSE.
+ *
+ * Two minutes because that is the platform's own readiness budget: past it the start has either
+ * degraded or been handed to a detached watcher, so the wait is no longer the ordinary one the
+ * opening sentence describes. Before this, that sentence had no end at all — it stayed on screen
+ * for as long as the tab did, with no error, no second sentence and nothing to press.
+ *
+ * IT IS A CLAIM ABOUT WHAT TO SAY, NEVER ABOUT THE CONTAINER. Nothing here stops a start,
+ * condemns one, or reports one as failed; the wait goes on and the pane goes on being busy.
+ */
+export const START_PATIENCE_MS = 120_000
+
+/**
+ * WHEN THIS WAIT BEGAN, as epoch milliseconds, or `null` when nothing can date it.
+ *
+ * ONE READING OF THE FIELD, shared by the map below and by the hook that arms the patience
+ * timer — two spellings of "is this wait old" would be two answers to it. `null` on any reading
+ * that is not a wait, and on a wait the server declined to date: the surface then counts from its
+ * own mount, which is what it did before the field existed.
+ */
+export function waitBeganAt(preview: Pick<PreviewState, 'state' | 'startingSince'> | null): number | null {
+  if (preview?.state !== 'starting' || preview.startingSince === null) return null
+  const began = Date.parse(preview.startingSince)
+  return Number.isNaN(began) ? null : began
+}
+
 /** The person's word for the thing is their app. "Preview" is the developer's word. */
 export const LAUNCH_LABEL = 'Launch Application'
 const RETRY_LABEL = 'Try again'
@@ -463,6 +490,17 @@ export interface WorkspaceState {
    * comparator cannot see is a pane that never re-renders, with nothing red anywhere.
    */
   readonly busy?: boolean
+  /**
+   * WHEN THE WAIT BEGAN, as epoch milliseconds — the anchor the pane's elapsed figure counts
+   * from. `null` on every arm that is not a wait, and on a wait the server could not date.
+   *
+   * IT IS THE SERVER'S INSTANT, WHICH IS THE WHOLE POINT. A counter started when a pane mounts
+   * restarts on every reload, so a citizen five minutes into a start was told one second and so
+   * were we. This is constant for the length of one wait, which is what lets it be compared by
+   * {@link sameWorkspaceState} at all — a value that moved every render would defeat that
+   * comparator rather than feed it.
+   */
+  readonly startedAt?: number | null
 }
 
 /**
@@ -495,6 +533,7 @@ const STATE_FIELD_EQ: {
   detail: (a, b) => a === b,
   note: (a, b) => (a ?? null) === (b ?? null),
   busy: (a, b) => (a ?? false) === (b ?? false),
+  startedAt: (a, b) => (a ?? null) === (b ?? null),
   action: (a, b) => sameAction(a, b),
 }
 
@@ -567,6 +606,17 @@ export interface WorkspaceInputs {
    * the sentence still has one author.
    */
   readonly startInFlight: boolean
+  /**
+   * THIS WAIT HAS OUTLIVED {@link START_PATIENCE_MS} — threaded in rather than computed here,
+   * because the map is a pure function of its inputs and this one is a fact about the clock.
+   *
+   * The surfaces arm ONE timer for it (`useTheWaitHasGoneOnTooLong`) rather than ticking: the
+   * pane already counts seconds for its own number, and re-deriving the whole shell's state once
+   * a second to discover a boundary that is crossed once would be the expensive way to learn it.
+   *
+   * `false` is the ordinary answer, including on every arm that is not a wait at all.
+   */
+  readonly waitHasGoneOnTooLong: boolean
 }
 
 // ─── the map ──────────────────────────────────────────────────────────────────────────────────
@@ -606,7 +656,14 @@ export interface WorkspaceInputs {
  * "gone". The `assertNever` at the bottom is what keeps that true when the union grows.
  */
 export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
-  const { preview, lastDecidedPreview, projectHasSavedBuild, startOutcome, startInFlight } = inputs
+  const {
+    preview,
+    lastDecidedPreview,
+    projectHasSavedBuild,
+    startOutcome,
+    startInFlight,
+    waitHasGoneOnTooLong,
+  } = inputs
   // WHAT THE LAST PRESS ENDED AS, in the server's own words — carried onto whichever arm the
   // reading selects rather than selecting one of its own. Computed once, here, so the two arms
   // that can carry it cannot come to disagree about what it says.
@@ -615,7 +672,10 @@ export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
   // about `unknown` at all — and none of them can accidentally treat it as a verdict.
   const reading = asDecidedReading(preview) ?? lastDecidedPreview
 
-  if (startInFlight && reading?.state !== 'alive') return gettingReady(note)
+  const startedAt = waitBeganAt(reading)
+
+  if (startInFlight && reading?.state !== 'alive')
+    return gettingReady(note, startedAt, waitHasGoneOnTooLong)
 
   if (reading === null) return couldNotRead()
 
@@ -630,9 +690,10 @@ export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
         action: null,
         note: null,
         busy: false,
+        startedAt: null,
       }
     case 'starting':
-      return gettingReady(note)
+      return gettingReady(note, startedAt, waitHasGoneOnTooLong)
     // ANOTHER OF THIS CITIZEN'S PROJECTS HOLDS THE SLOT, AND THAT IS NOT A QUESTION FOR THEM.
     // Pressing start takes the workspace: the server starts the project that was asked for and
     // tears the outgoing one down behind it. So this reads exactly as a saved, stopped app does —
@@ -710,6 +771,7 @@ function atRest(
       action: START,
       note,
       busy: false,
+      startedAt: null,
     }
   }
   return {
@@ -721,6 +783,7 @@ function atRest(
     action: null,
     note,
     busy: false,
+    startedAt: null,
   }
 }
 
@@ -736,14 +799,22 @@ function atRest(
  * keeps them from drifting into four slightly different waits. Three of the four had cards of
  * their own until the platform could prove a serve.
  *
- * NO ESCAPE BUTTON, DELIBERATELY, AND IT IS NOT AN OVERSIGHT. The obvious kindness is a "Launch
- * Application" that appears after a long enough wait so the wait is never a dead end. It is not
- * offered, because of where that press would land: `relaunch_preview`'s cold arm tears the live
- * container down before restoring the last saved bundle, and the situation such a button exists
- * for — a start whose observer was lost — is exactly the situation that takes the cold arm. So the
- * button would be most dangerous at the precise moment it appeared. The escape is server-side
- * instead: a reconciler that un-sticks a stranded container with no gesture from the citizen,
- * which also reaches tabs that were loaded before it shipped and can destroy nothing.
+ * TWO SENTENCES, AND THE SECOND ONE HAS A BUTTON. Past {@link START_PATIENCE_MS} the wait is no
+ * longer the ordinary one the first sentence describes, and a sentence with no end and nothing to
+ * press is how "Getting your app ready." stayed on a screen for fourteen minutes.
+ *
+ * THE ARGUMENT AGAINST THE BUTTON WAS ABOUT WHERE THE PRESS LANDS, and it no longer holds. It used
+ * to land on a readiness arm that re-raised on a cold start, which escaped the lock scope and let
+ * compensation destroy the container — so a press was most dangerous at the moment a stuck wait
+ * would have produced it. That arm now fails open on both sides: the container and its registry
+ * record survive, so the next press ATTACHES to what the start left standing rather than restoring
+ * over it. The per-user start lock is the other half — a second press cannot run beside the first,
+ * only after it, by which time the registry says which arm is correct.
+ *
+ * IT DOES NOT REPLACE THE SERVER-SIDE ESCAPE. The reconciler still un-sticks a stranded container
+ * with no gesture from the citizen, and still reaches tabs loaded before any of this shipped. What
+ * the button adds is an answer for the person watching, who otherwise has only the reload that
+ * restarts the clock.
  *
  * THE SECOND SENTENCE, AND THE CLAUSE IT SHIPS WITHOUT. The board draws this state as a still
  * glyph, a headline and a second sentence, and this arm used to carry only the first two — a
@@ -753,20 +824,31 @@ function atRest(
  *
  * ITS DURATION CLAUSE IS STILL DROPPED, on the rule the docblock above states: the canvas pairs
  * this sentence with "about thirty seconds" and nothing in this tree has ever measured a cold
- * start. What replaces it is not a smaller guess but ELAPSED TIME, which `AppPane` counts from the
- * moment this state arrives — a fact rather than an estimate.
+ * start. What replaces it is not a smaller guess but ELAPSED TIME, counted from
+ * {@link WorkspaceState.startedAt} — the instant the SERVER dates this wait from, so a reload does
+ * not restart it. A fact rather than an estimate, and the same fact after six reloads.
  *
  * AND NO PROGRESS BAR. A step-determinate one would advance on the workspace claim, the container
  * start and the first document served, but the wire carries a single opaque `starting`/`alive`
  * field, so a bar here could only be time-determinate, and a bar that sits at 80% for two minutes
  * is worse than the honest still card.
  */
-function gettingReady(note: string | null): WorkspaceState {
+function gettingReady(
+  note: string | null,
+  startedAt: number | null,
+  tooLong: boolean,
+): WorkspaceState {
   return {
     name: 'starting',
-    headline: 'Getting your app ready.',
-    detail: 'Setting up somewhere for it to run.',
-    action: null,
+    headline: tooLong ? 'Your app is taking longer than usual.' : 'Getting your app ready.',
+    detail: tooLong
+      ? 'It is still starting. You can wait, or ask for it again.'
+      : 'Setting up somewhere for it to run.',
+    // THE SECOND SENTENCE COMES WITH SOMETHING TO PRESS, and it is the verb that already exists
+    // rather than a third one. A press lands on the same door the start went through, which
+    // attaches to the container that start left standing instead of building over it — see the
+    // readiness arm in `relaunch_preview`, which is what makes asking again safe.
+    action: tooLong ? RETRY : null,
     // WHY A WAIT MAY CARRY A REFUSAL. A press refused while a start really was in flight — the
     // server answering `BUILD_ALREADY_RUNNING` to somebody pressing Launch during a build — is a
     // question the citizen asked and is owed an answer to, and the honest answer does not change
@@ -774,9 +856,11 @@ function gettingReady(note: string | null): WorkspaceState {
     // other piece of server prose is one: this map does not put words it did not write where the
     // negative-copy sweep asserts.
     note,
-    // THE ONE ARM THAT IS BUSY. See `WorkspaceState.busy` — this is the state with a wait in it and
-    // no action row, so before this field the pane had no way to say a wait was under way at all.
+    // THE ONE ARM THAT IS BUSY, in both of its sentences. A wait that has gone on too long is
+    // still a wait: nothing here stops it, and saying otherwise would be this pane claiming
+    // something about the container that nobody has checked.
     busy: true,
+    startedAt,
   }
 }
 
@@ -803,5 +887,6 @@ function couldNotRead(): WorkspaceState {
     action: RETRY,
     note: null,
     busy: false,
+    startedAt: null,
   }
 }

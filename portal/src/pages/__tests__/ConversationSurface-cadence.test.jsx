@@ -279,8 +279,15 @@ describe('the chat surface asks faster while a workspace is starting', () => {
     expect(h.fetchPreviewState.mock.calls.length).toBe(spent)
 
     // NOTHING WAS RECLASSIFIED ON THE WAY. Forty failures say nothing about a container, so the
-    // pane still says a start is happening — no "we could not check", no "gone", no retry verb.
-    expect(screen.getByText('Getting your app ready.')).toBeTruthy()
+    // pane still says a start is happening — no "we could not check", no "gone".
+    //
+    // READ OFF THE STATE HANDLE, NOT THE SENTENCE. This window is longer than the pane's own
+    // patience, so by now the wait is on its second sentence; which words it is wearing is not
+    // what this test is about, and pinning them here would fail on a copy change that means
+    // nothing to the cadence.
+    expect(screen.getByTestId('app-pane-empty').getAttribute('data-workspace-state')).toBe(
+      'starting',
+    )
     expect(screen.queryByText(/we could not check/i)).toBeNull()
 
     // ABSENCE PAIRED WITH LIVENESS: quiet because it is slow, not because it died.

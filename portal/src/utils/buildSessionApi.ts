@@ -748,6 +748,12 @@ export interface PreviewState {
    *  affordance, so the answer could not change the screen and is not worth a Blob round trip
    *  every 45 seconds). This is why `hasSavedBuild` reads it with `??` and not `||`. */
   restorable: boolean | null
+  /** `starting` only: the ISO-8601 instant THIS project's wait began, so an elapsed figure is
+   *  the real wait rather than the life of the current page. `null` is NO CLAIM — a surface
+   *  counting from its own mount is what the pane did before this field existed, and it stays
+   *  the fallback. The server answers it to the second, so the same wait reads as the same
+   *  instant on every poll and this can be compared like any other field. */
+  startingSince: string | null
 }
 
 /** Two readings that say the same thing — see `sameSaveState`. `alive` is omitted deliberately:
@@ -761,7 +767,8 @@ export const samePreviewState = (a: PreviewState | null, b: PreviewState | null)
     a.previewUrl === b.previewUrl &&
     a.occupyingProjectName === b.occupyingProjectName &&
     a.occupyingProjectId === b.occupyingProjectId &&
-    a.restorable === b.restorable)
+    a.restorable === b.restorable &&
+    a.startingSince === b.startingSince)
 
 function asPreviewLifeState(value: unknown, alive: boolean): PreviewLifeState {
   // An unrecognised (or absent) state falls back to what `alive` can prove and NO further:
@@ -800,6 +807,7 @@ export async function fetchPreviewState(
       occupyingProjectName: null,
       occupyingProjectId: null,
       restorable: null,
+      startingSince: null,
     }
   }
   const alive = body.alive === true
@@ -817,6 +825,12 @@ export async function fetchPreviewState(
     // Anything that is not literally a boolean stays UNKNOWN — the same rule `dirty` follows,
     // and for the same reason: coercing here is how a missing field becomes a false promise.
     restorable: typeof body.restorable === 'boolean' ? body.restorable : null,
+    // Same discipline again: a non-string is NO CLAIM, and so is a string no clock can read.
+    // Dating a wait from garbage would put the lying counter back wearing a server's face.
+    startingSince:
+      typeof body.startingSince === 'string' && !Number.isNaN(Date.parse(body.startingSince))
+        ? body.startingSince
+        : null,
   }
 }
 

@@ -47,6 +47,7 @@ const reading = (over: Partial<PreviewState> = {}): PreviewState => ({
   occupyingProjectName: null,
   occupyingProjectId: null,
   restorable: null,
+  startingSince: null,
   ...over,
 })
 
@@ -65,6 +66,10 @@ function reportFor(
   // caller that does not care about the memory gets the cold-load answer rather than a smuggled
   // one. Every test that exercises decision D3 passes it explicitly.
   lastDecidedPreview: DecidedPreview | null = null,
+  // THE WAIT HAS OUTLIVED ITS BUDGET. A boolean here rather than a fake clock: the timer that
+  // decides it belongs to `useTheWaitHasGoneOnTooLong`, which has its own tests, and this file
+  // is about what the pane DRAWS once the answer is in.
+  waitHasGoneOnTooLong = false,
 ): WorkspaceReport {
   // THE REAL CLAIM, over this report's own sinks — the production starter, stood up by hand
   // because there is no surface here to hold one. A stub would let the control's press reach
@@ -84,6 +89,7 @@ function reportFor(
       projectHasSavedBuild: null,
       startOutcome,
       startInFlight,
+      waitHasGoneOnTooLong,
     }),
     onRefresh: vi.fn(),
     start: createStarter(() => sinks),
@@ -587,19 +593,23 @@ describe('★ the frame mounts if and only if the state is RUNNING', () => {
 })
 
 /**
- * ★ DECISION D2 — THERE IS NO PATIENCE BUTTON, AND TIME DOES NOT GROW ONE.
+ * ★ THE WAIT HAS TWO SENTENCES AND EXACTLY ONE OF THEM HAS A BUTTON.
  *
- * The design wanted a "Launch Application" to appear after 150 seconds of waiting so the wait was
- * never a dead end. It is not shipped, because of where that press would land: `relaunch_preview`'s
- * cold arm tears the live container down before restoring the last saved bundle, and the situation
- * such a button exists for — a start whose observer was lost — is exactly the situation that takes
- * the cold arm. The button would be most dangerous at the precise moment it appeared.
+ * The button used to be refused outright, because of where the press would land: the readiness arm
+ * re-raised on a cold start, so compensation destroyed the container, and the button would have
+ * been most dangerous at the precise moment a stuck wait produced it. Both arms fail open now — the
+ * container and its registry record survive a slow app — so the press attaches to what the start
+ * left standing instead of building over it.
  *
- * The map's own sweep proves no action for any INPUT. This proves the other half, at the one
- * surface that has a clock: the pane counts elapsed time from the moment the wait begins, so this
- * is where a timed affordance would have to be built.
+ * WHAT DID NOT CHANGE, AND IS ASSERTED HERE. The verb is never `start`: the one that restores is
+ * the one that was dangerous, and the wait is never reclassified out of `starting` by a clock. No
+ * sentence here names a duration.
+ *
+ * THE BOUNDARY IS A BOOLEAN AT THIS SURFACE, not a timer — the timer belongs to
+ * `useTheWaitHasGoneOnTooLong` and is tested there. This file is about what the pane DRAWS on each
+ * side of it, which is why both sides are rendered explicitly rather than waited for.
  */
-describe('★ no timed action ever appears in the wait — decision D2', () => {
+describe('★ the wait`s two sentences, and the one control', () => {
   let clock = 0
   beforeEach(() => {
     clock = 0
@@ -611,17 +621,20 @@ describe('★ no timed action ever appears in the wait — decision D2', () => {
     vi.useRealTimers()
   })
 
-  it('★ five minutes into a build there is still nothing to press', () => {
-    renderPane((c) => c.workspace.set(reportFor(reading({ state: 'starting' }))))
-    expect(screen.queryByRole('button', { name: /launch application|try again|open |^stop /i })).toBeNull()
+  const ANY_CONTROL = /launch application|try again|open |^stop /i
 
-    // Well past the 150s the design proposed, and past the 300-second accelerated window too.
+  it('★ inside the budget there is nothing to press, however long the clock runs', () => {
+    renderPane((c) => c.workspace.set(reportFor(reading({ state: 'starting' }))))
+    expect(screen.queryByRole('button', { name: ANY_CONTROL })).toBeNull()
+
+    // Five minutes of clock with the boundary NOT crossed — which is the state a wait the platform
+    // has not given up on is in, and it must not grow a control out of the passage of time alone.
     act(() => {
       clock += 300_000
       vi.advanceTimersByTime(300_000)
     })
 
-    expect(screen.queryByRole('button', { name: /launch application|try again|open |^stop /i })).toBeNull()
+    expect(screen.queryByRole('button', { name: ANY_CONTROL })).toBeNull()
     // ★ LIVENESS, AND IT IS THE WHOLE VALUE OF THIS TEST. An absence assertion after a clock
     // advance passes just as happily when the clock never moved, when the board unmounted, or when
     // the component crashed inside a boundary. The counter proves all three: it is rendered, it is
@@ -631,24 +644,54 @@ describe('★ no timed action ever appears in the wait — decision D2', () => {
     expect(screen.getByTestId('app-pane-empty').textContent).toContain('Getting your app ready.')
   })
 
-  it('★ and the wait`s wording never changes either, however long it runs', () => {
-    // A patience button would arrive with a sentence beside it. The rule is that the headline and
-    // the detail are chosen once and never named a duration, so a wait that starts saying something
-    // new is the same defect wearing different clothes.
-    renderPane((c) => c.workspace.set(reportFor(reading({ state: 'starting' }))))
+  it('★ past the budget it says something else and offers exactly one thing — never a start', () => {
+    renderPane((c) =>
+      c.workspace.set(reportFor(reading({ state: 'starting' }), null, false, null, true)),
+    )
+
+    // STILL A WAIT. The sentence changed; the state did not, and neither did the spinner-less
+    // honesty of it — nothing here claims the container is gone.
+    expect(screen.getByTestId('app-pane-empty').getAttribute('data-workspace-state')).toBe('starting')
+    expect(screen.getByTestId('app-pane-empty').getAttribute('aria-busy')).toBe('true')
+    expect(screen.getByTestId('app-pane-elapsed')).toBeTruthy()
+
+    // ONE CONTROL, AND IT IS THE ONE THAT ASKS RATHER THAN THE ONE THAT RESTORES. "Launch
+    // Application" is the verb that reaches the cold arm; this arm must never offer it.
+    const controls = screen.queryAllByRole('button', { name: ANY_CONTROL })
+    expect(controls.length).toBe(1)
+    expect(controls[0]?.textContent ?? '').toMatch(/try again/i)
+    expect(screen.queryByRole('button', { name: /launch application/i })).toBeNull()
+  })
+
+  it('★ neither sentence names a duration, and the wording changes exactly once', () => {
+    // The rule that survived: a duration arrives from a measured constant or not at all, and the
+    // canvas's "about thirty seconds" is not one. What replaced the old rule — that the wording
+    // NEVER changes — is that it changes once, at a boundary, and not on a timer the copy invents.
+    const { channel } = renderPane((c) =>
+      c.workspace.set(reportFor(reading({ state: 'starting' }))),
+    )
     const opening = screen.getByTestId('app-pane-empty').textContent ?? ''
 
     act(() => {
       clock += 300_000
       vi.advanceTimersByTime(300_000)
     })
+    expect(screen.getByTestId('app-pane-empty').textContent).toContain(
+      'Getting your app ready.Setting up somewhere for it to run.',
+    )
 
+    act(() => {
+      channel.workspace.set(reportFor(reading({ state: 'starting' }), null, false, null, true))
+    })
     const later = screen.getByTestId('app-pane-empty').textContent ?? ''
+
     expect(opening).toContain('Getting your app ready.Setting up somewhere for it to run.')
-    expect(later).toContain('Getting your app ready.Setting up somewhere for it to run.')
-    // The ONLY thing that moved is the elapsed count, which is a measured fact rather than a claim.
-    expect(opening).toContain('0s so far')
-    expect(later).toContain('5m 00s so far')
+    expect(later).not.toContain('Getting your app ready.')
+    // NO NUMBER IN EITHER SENTENCE. The only digits on this board belong to the elapsed count,
+    // which is measured rather than promised — so the assertion strips it before looking.
+    const wordsOnly = (text: string) => text.replace(/\d+m? ?\d*s so far/, '')
+    expect(wordsOnly(opening)).not.toMatch(/\d/)
+    expect(wordsOnly(later)).not.toMatch(/\d/)
   })
 })
 
@@ -1018,6 +1061,40 @@ describe('★ the wait counter measures the wait, it does not count its own tick
 
     act(() => { tick(3_000) })
     expect(screen.getByTestId('app-pane-elapsed').textContent).toBe('3s so far')
+  })
+
+  it('★ counts from the wait`s own instant, so a reload does not restart the clock', () => {
+    // THE DEFECT THIS FIELD EXISTS FOR, at the surface that showed it. A reload discards this
+    // component, so a counter anchored on mount told a citizen ninety seconds into a start that
+    // they had been waiting no time at all — and six reloads looked exactly like one press.
+    //
+    // A REMOUNT IS WHAT A RELOAD IS, here: the server's instant is the same one the previous page
+    // was handed, because it is dated from a marker written once per start.
+    vi.setSystemTime(new Date('2026-09-22T07:20:00.000Z'))
+    const ninetySecondsAgo = Date.parse('2026-09-22T07:18:30.000Z')
+    renderPane((c) =>
+      c.workspace.set(
+        reportFor(reading({ state: 'starting', startingSince: '2026-09-22T07:18:30.000Z' })),
+      ),
+    )
+
+    expect(Date.now() - ninetySecondsAgo).toBe(90_000) // guard the premise
+    expect(screen.getByTestId('app-pane-elapsed').textContent).toBe('1m 30s so far')
+
+    // AND IT KEEPS COUNTING MONOTONICALLY FROM THERE. The origin came off the wall clock once;
+    // every second after it is `performance.now()`, which nothing can wind back.
+    act(() => { tick(30_000) })
+    expect(screen.getByTestId('app-pane-elapsed').textContent).toBe('2m 00s so far')
+  })
+
+  it('an undated wait still counts from mount — the old behaviour, kept as the fallback', () => {
+    // `startingSince` is NO CLAIM rather than zero: a server that cannot date the wait must not
+    // make this pane draw a counter starting in 1970.
+    renderPane((c) => c.workspace.set(reportFor(reading({ state: 'starting' }))))
+    expect(screen.getByTestId('app-pane-elapsed').textContent).toBe('0s so far')
+
+    act(() => { tick(5_000) })
+    expect(screen.getByTestId('app-pane-elapsed').textContent).toBe('5s so far')
   })
 
   it('★ tells the truth after a throttled tab has swallowed most of the ticks', () => {

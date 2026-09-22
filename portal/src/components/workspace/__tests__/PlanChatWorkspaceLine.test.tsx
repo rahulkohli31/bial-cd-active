@@ -34,6 +34,7 @@ const reading = (over: Partial<PreviewState> = {}): PreviewState => ({
   occupyingProjectName: null,
   occupyingProjectId: null,
   restorable: null,
+  startingSince: null,
   ...over,
 })
 
@@ -57,6 +58,7 @@ const reportFor = (preview: PreviewState): WorkspaceReport => {
       projectHasSavedBuild: null,
       startOutcome: null,
       startInFlight: false,
+      waitHasGoneOnTooLong: false,
     }),
     onRefresh: vi.fn(),
     start: createStarter(() => sinks),

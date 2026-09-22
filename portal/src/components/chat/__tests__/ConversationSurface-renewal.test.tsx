@@ -66,6 +66,7 @@ const LIVE: PreviewState = {
   occupyingProjectName: null,
   occupyingProjectId: null,
   restorable: true,
+  startingSince: null,
 }
 
 /**

@@ -47,6 +47,7 @@ function reading(over: Partial<PreviewState> = {}): PreviewState {
     occupyingProjectName: null,
     occupyingProjectId: null,
     restorable: null,
+    startingSince: null,
     ...over,
   }
 }
@@ -72,6 +73,7 @@ function resolve(over: Partial<WorkspaceInputs> = {}) {
     projectHasSavedBuild: null,
     startOutcome: null,
     startInFlight: false,
+    waitHasGoneOnTooLong: false,
     ...over,
   })
 }
@@ -697,12 +699,14 @@ describe('the properties that hold across every input', () => {
         for (const startOutcome of EVERY_ENDING) {
           for (const projectHasSavedBuild of [true, false, null]) {
             for (const startInFlight of [true, false]) {
+              for (const waitHasGoneOnTooLong of [true, false]) {
               const state = resolveWorkspaceState({
                 preview,
                 lastDecidedPreview,
                 projectHasSavedBuild,
                 startOutcome,
                 startInFlight,
+                waitHasGoneOnTooLong,
               })
               const text = `${state.headline} ${state.detail ?? ''} ${state.note ?? ''} ${state.action?.label ?? ''}`
               expect(`${state.name}: ${text}`).not.toMatch(destructive)
@@ -712,6 +716,7 @@ describe('the properties that hold across every input', () => {
               // AND NOTHING IT OFFERS ACTS ON ANOTHER PERSON'S APP: both verbs ask this project's
               // own start, which `registry:{user_id}` scopes to this citizen's one slot.
               expect(Object.keys(state)).not.toContain('secondAction')
+              }
             }
           }
         }

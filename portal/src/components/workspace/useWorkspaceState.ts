@@ -60,6 +60,7 @@ import {
   type StartOutcome,
   type WorkspaceState,
 } from './workspaceState'
+import { useTheWaitHasGoneOnTooLong } from './useTheWaitHasGoneOnTooLong'
 
 export interface WorkspaceReading {
   /** WHAT TO SAY. The single value the pane and the Plan-chat line both render. */
@@ -121,6 +122,9 @@ export function useWorkspaceState({
   // A press is in flight. See `WorkspaceInputs.startInFlight` for why the map needs to know: the
   // server's own `starting` arrives on the next read, and this covers the gap until it does.
   const [startInFlight, setStartInFlight] = useState(false)
+  // ONE TIMER, NOT A TICK — see the hook. It reads the wait's own instant off `preview`, so a tab
+  // reloaded well into a start crosses the boundary at once instead of starting its patience over.
+  const waitHasGoneOnTooLong = useTheWaitHasGoneOnTooLong(preview)
   // NOT DERIVED FROM ANYTHING, and it cannot be. A retry press is a synchronous fact whose only
   // observable state change can be collapsed into one commit by React's batching, so an
   // invalidation spelled as "something changed" is one a fast enough server erases. A counter
@@ -393,6 +397,7 @@ export function useWorkspaceState({
       projectHasSavedBuild,
       startOutcome,
       startInFlight,
+      waitHasGoneOnTooLong,
     }),
     preview,
     save,

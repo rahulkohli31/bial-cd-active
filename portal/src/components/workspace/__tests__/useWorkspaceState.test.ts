@@ -46,6 +46,7 @@ function reading(over: Partial<PreviewState> = {}): PreviewState {
     occupyingProjectName: null,
     occupyingProjectId: null,
     restorable: null,
+    startingSince: null,
     ...over,
   }
 }
@@ -273,10 +274,14 @@ describe('the accelerated cadence while a start is in flight', () => {
     })
     expect(api.fetchPreviewState.mock.calls.length).toBe(spent)
 
-    // …and the sentence is UNCHANGED. A budget elapsing is a fact about our waiting, not about the
-    // container: no "gone", no "try again", no verb that assumes the workspace is dead.
+    // …and the wait is NOT RECLASSIFIED. The poll's budget elapsing is a fact about our asking,
+    // not about the container: still `starting`, still busy, and no verb that assumes the
+    // workspace is dead. What the citizen may be offered by now is one that assumes nothing —
+    // asking again, which attaches to whatever the start left standing — and the clock that
+    // decides when to offer it is the wait's own, not this poll's.
     expect(result.current.state.name).toBe('starting')
-    expect(result.current.state.action).toBeNull()
+    expect(result.current.state.busy).toBe(true)
+    expect(result.current.state.action?.kind ?? null).not.toBe('start')
 
     // And the background poll is still there to correct the pane if the app lands two minutes late.
     await act(async () => {
@@ -550,11 +555,14 @@ describe('what an unreadable answer may and may not do', () => {
     })
     expect(reads).toBe(spent)
 
-    // …AND NOTHING WAS RECLASSIFIED ON THE WAY. Not `could-not-read`, not gone, not a retry verb: a
-    // string of failures is not evidence about a container, and the last thing anybody actually
-    // told us is that a start is happening. The reading underneath is untouched too.
+    // …AND NOTHING WAS RECLASSIFIED ON THE WAY. Not `could-not-read`, not gone, not a verb that
+    // assumes the workspace is dead: a string of failures is not evidence about a container, and
+    // the last thing anybody actually told us is that a start is happening. The reading underneath
+    // is untouched too. (A wait this long may by now offer to ask again — that is the wait's own
+    // clock, not these failures, and it assumes nothing about the container either.)
     expect(result.current.state.name).toBe('starting')
-    expect(result.current.state.action).toBeNull()
+    expect(result.current.state.busy).toBe(true)
+    expect(result.current.state.action?.kind ?? null).not.toBe('start')
     expect(result.current.preview?.state).toBe('starting')
 
     // ABSENCE PAIRED WITH LIVENESS: quiet because it is slow, not because it died. The background

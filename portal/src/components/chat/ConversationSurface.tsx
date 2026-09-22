@@ -58,6 +58,7 @@ import {
   spendProbeCadence,
 } from '../workspace/workspaceState'
 import type { ProbeCadence, StartOutcome } from '../workspace/workspaceState'
+import { useTheWaitHasGoneOnTooLong } from '../workspace/useTheWaitHasGoneOnTooLong'
 import { useStartApp } from '../workspace/startApp'
 import type { StartSinks } from '../workspace/startApp'
 import {
@@ -2221,6 +2222,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   // relaunch or a restore, none of which ends a turn. Only a move INTO `alive` asks; the first
   // reading of a page is the mount read's job.
   const previewLife = previewState?.state ?? null
+  // ONE TIMER, NOT A TICK — see the hook. Read from the SAME label-guarded reading as everything
+  // else here, so a wait belonging to the project that just left the screen cannot arm this one.
+  const waitHasGoneOnTooLong = useTheWaitHasGoneOnTooLong(previewState)
   const lastPreviewLife = useRef<typeof previewLife>(null)
   useEffect(() => {
     const before = lastPreviewLife.current
@@ -2799,6 +2803,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
             projectHasSavedBuild: hasSavedBuild,
             startOutcome,
             startInFlight: startPending,
+            waitHasGoneOnTooLong,
           }),
           onRefresh: () => setPreviewProbeEpoch((n) => n + 1),
           start: startTheApp,
