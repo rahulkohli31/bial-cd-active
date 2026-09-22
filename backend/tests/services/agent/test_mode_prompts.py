@@ -16,6 +16,7 @@ import asyncio
 import inspect
 import uuid
 from dataclasses import replace
+from typing import Any
 
 import pytest
 from pydantic_ai.messages import (
@@ -648,14 +649,6 @@ def _capturing_model(captured: dict[str, str]) -> FunctionModel:
     return FunctionModel(respond)
 
 
-async def test_relay_path_stays_verbatim_deps_system(db_session) -> None:
-    captured: dict[str, str] = {}
-    deps = ChatDeps(db=db_session, user_id=uuid.uuid4(), system="RELAY-PROMPT")
-    result = await chat_agent.run("hi", deps=deps, model=_capturing_model(captured))
-    assert captured["instructions"] == "RELAY-PROMPT"  # mode=None → byte-identical path
-    assert result.output == "ok"
-
-
 async def test_mode_run_composes_and_never_persists_instructions(db_session) -> None:
     """Delivery: the model RECEIVES the composition; the store's dump seam keeps it out
     of any persisted payload (the JSONB half is pinned in test_store_roundtrip)."""
@@ -682,10 +675,12 @@ async def test_mode_run_composes_and_never_persists_instructions(db_session) -> 
         assert message.get("instructions") is None  # the composed prompt never lands in a row
 
 
-async def test_a_kind_without_context_fails_first(db_session) -> None:
-    deps = ChatDeps(db=db_session, user_id=uuid.uuid4(), kind=ChatKind.PLAN)
-    with pytest.raises(ValueError, match="composed without a PromptContext"):
-        await chat_agent.run("hi", deps=deps, model=_capturing_model({}))
+def test_a_kind_without_context_is_no_longer_constructible() -> None:
+    """`prompt_context` is required now, so a kind composed without one fails at construction
+    rather than on the run's first instruction callback."""
+    smuggler: Any = ChatDeps
+    with pytest.raises(TypeError):
+        smuggler(user_id=uuid.uuid4(), kind=ChatKind.PLAN)
 
 
 @pytest.mark.parametrize("kind", list(ChatKind))

@@ -12,7 +12,9 @@ gives it to mark.
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
+from typing import Any
 
 import pytest
 from pydantic_ai import Agent, RunContext
@@ -50,7 +52,9 @@ async def test_agent_runs_under_test_model(db_session) -> None:
     # No live call (conftest sets ALLOW_MODEL_REQUESTS=False); the model is injected per-run.
     result = await chat_agent.run(
         "hello",
-        deps=ChatDeps(db=db_session, user_id=uuid.uuid7(), system="be terse"),
+        deps=ChatDeps(
+            db=db_session, user_id=uuid.uuid7(), kind=ChatKind.PLAN, prompt_context=_ADA
+        ),
         model=TestModel(custom_output_text="hi there"),
     )
     assert result.output == "hi there"
@@ -69,7 +73,9 @@ async def test_deps_scope_a_tool_to_the_caller(db_session) -> None:
     caller = uuid.uuid7()
     # TestModel calls each available tool once, so the tool observes the scoped deps.
     await scoped.run(
-        "go", deps=ChatDeps(db=db_session, user_id=caller, system=""), model=TestModel()
+        "go",
+        deps=ChatDeps(db=db_session, user_id=caller, kind=ChatKind.PLAN, prompt_context=_ADA),
+        model=TestModel(),
     )
     assert seen["user_id"] == caller
 
@@ -172,20 +178,21 @@ async def test_compose_kind_prompt_renders_exactly_what_the_run_sends(kind, db_s
     assert info.instructions == compose_kind_prompt(kind, _ADA)
 
 
-async def test_a_kindless_run_still_ships_its_prompt_verbatim(db_session) -> None:
-    """The `describe.py` one-shot path has no contract to stand on, so its whole prompt is the
-    single dynamic part — and no static part is invented for it."""
-    seen: list[AgentInfo] = []
+def test_the_kindless_run_can_no_longer_be_constructed() -> None:
+    """GUARD: `kind` and `prompt_context` are both required now, and `system` is gone — no shape
+    is left that skips either or falls back to a verbatim prompt.
 
-    def respond(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        seen.append(info)
-        return ModelResponse(parts=[TextPart(content="ok")])
+    The `Any` hop dodges the type checkers' own rejection of the call below so the runtime
+    behaviour stays testable — the field inspection after it is not dodgeable."""
+    smuggler: Any = ChatDeps
+    with pytest.raises(TypeError):
+        smuggler(user_id=uuid.uuid7())
 
-    await chat_agent.run(
-        "hi",
-        deps=ChatDeps(db=db_session, user_id=uuid.uuid7(), system="RELAY-PROMPT"),
-        model=FunctionModel(respond),
-    )
-    static, dynamic = _blocks(seen[0])
-    assert static == []
-    assert dynamic == ["RELAY-PROMPT"]
+    names = {field.name for field in dataclasses.fields(ChatDeps)}
+    assert "system" not in names
+    required = {
+        field.name
+        for field in dataclasses.fields(ChatDeps)
+        if field.default is dataclasses.MISSING
+    }
+    assert required == {"user_id", "kind", "prompt_context"}
