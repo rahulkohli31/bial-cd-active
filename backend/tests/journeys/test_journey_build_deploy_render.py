@@ -67,6 +67,7 @@ async def test_provisioned_app_is_addressable_at_its_returned_id(client, db_sess
     conv = await ConversationFactory.create(
         db_session, owner.id, kind=ChatKind.BUILD, title="My builder app"
     )
+    assert conv.project_id is not None  # BUILD always has one
 
     app_id = str(await resolve_app_for_project(db_session, owner.id, conv.project_id))
     await db_session.commit()
@@ -101,6 +102,7 @@ async def test_build_submit_approve_pipeline(client, app, db_session) -> None:
     conv = await ConversationFactory.create(
         db_session, owner.id, kind=ChatKind.BUILD, title="My builder app"
     )
+    assert conv.project_id is not None  # BUILD always has one
 
     # (a) mint the project's app the way a build session does — take the appId it resolves on.
     app_id = str(await resolve_app_for_project(db_session, owner.id, conv.project_id))

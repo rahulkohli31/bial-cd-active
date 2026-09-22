@@ -125,6 +125,7 @@ def _answering_model() -> FunctionModel:
 async def _start(engine: TurnEngine, db_session, session_factory, model, *, kind=ChatKind.PLAN):
     user = await UserFactory.create(db_session)
     conv = await ConversationFactory.create(db_session, user.id, kind=kind)
+    assert conv.project_id is not None  # PLAN/BUILD (this helper's only callers) always have one
 
     async def _noop_persist() -> None:
         return None

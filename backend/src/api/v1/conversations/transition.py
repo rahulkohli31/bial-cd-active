@@ -162,6 +162,11 @@ async def build_it(
     factory: SessionFactoryDep,
 ) -> BuildHandoffResponse | JSONResponse:
     plan_chat = await resolve_conversation_or_404(db, user.id, conversation_id)
+    # This handoff only ever fires off a `present_plan_options` card, a PLAN-only tool
+    # (`toolsets.py`'s PLAN arm) — ChatBot has no toolsets at all, so `plan_chat` is always a
+    # PLAN conversation, which always carries a project per the CHECK constraint on
+    # `conversations.project_id`.
+    assert plan_chat.project_id is not None
     rows = list(
         await load_rows(db, user_id=user.id, conversation_id=plan_chat.id, include_hidden=True)
     )

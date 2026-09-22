@@ -345,6 +345,18 @@ def toolsets_for_kind[DepsT](
                 ),
                 may_write=True,
             )
+        case ChatKind.CHATBOT:
+            # ChatBot never resolves a tool surface through this registry — it runs
+            # `services/agent/agent.py`'s `chat_agent` directly (the "kindless" prompt path,
+            # `ChatDeps(kind=None, ...)`), with no toolsets at all, entirely outside the turn
+            # engine this registry serves. A call here with `CHATBOT` means something wired a
+            # ChatBot conversation into the wrong machinery — that must fail loudly, never
+            # silently hand back an empty (or worse, a borrowed) tool surface.
+            raise ValueError(
+                "ChatBot never resolves a tool surface through toolsets_for_kind — it runs "
+                "chat_agent directly with no toolsets. Reaching this arm means a ChatBot "
+                "conversation was wired into the turn engine by mistake."
+            )
 
 
 # --- One catalogue of what the two kinds ARE, beside the registry of what they -------------
@@ -401,6 +413,12 @@ def _describe(kind: ChatKind) -> ChatKindDescription:
                     "Ask for changes and watch your app update as you go. This is where your "
                     "live app actually changes."
                 ),
+            )
+        case ChatKind.CHATBOT:
+            return ChatKindDescription(
+                value=kind.value,
+                name="ChatBot",
+                description=("Ask anything — a general assistant, separate from your projects."),
             )
 
 

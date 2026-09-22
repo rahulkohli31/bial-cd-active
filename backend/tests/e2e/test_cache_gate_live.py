@@ -188,6 +188,7 @@ async def test_a_real_conversation_writes_then_reads_its_cache(
     """★ THE GATE. Three consecutive turns on one conversation, against the real deployment."""
     user = await UserFactory.create(db_session, email="cache-gate@rvaiglobal.com")
     conversation = await ConversationFactory.create(db_session, user.id, kind=ChatKind.BUILD)
+    assert conversation.project_id is not None  # BUILD always has one
 
     per_turn: list[list[dict[str, Any]]] = []
     for prompt in _TURNS:

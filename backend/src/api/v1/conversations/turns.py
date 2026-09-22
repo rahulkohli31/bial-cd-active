@@ -49,7 +49,7 @@ from src.api.v1.conversations.schemas import (
 from src.api.v1.live_build import ReclaimBlockedEnvelope, reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus
-from src.db.models.conversation import Conversation
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.project import Project
 from src.db.models.user import User
@@ -256,6 +256,10 @@ async def start_conversation_turn(
         )
 
     engine = get_turn_engine()
+    # The turn engine only ever runs PLAN/BUILD conversations (ChatBot has its own,
+    # non-turn-engine path — see `api/v1/chatbot/router.py`), both of which always carry a
+    # project per the CHECK constraint on `conversations.project_id`.
+    assert conversation.project_id is not None
     try:
         return await engine.start_turn(
             conversation=conversation,
@@ -340,6 +344,15 @@ async def start_turn(
         # An unknown id is a client bug on every turn now, first or hundredth — and a cross-user
         # id is indistinguishable from it, which is one non-leaking 404 (ADR-0004).
         raise AppApiError(404, "Conversation not found.")
+    if conversation.kind == ChatKind.CHATBOT:
+        # ChatBot never reaches the turn engine (see `api/v1/chatbot/router.py`) — it has no
+        # project for `_pin_workspace` to attach a sandbox to. Cheap insurance against a
+        # ChatBot conversation id reaching the sandbox-provisioning path by mistake.
+        raise AppApiError(400, "This conversation does not use the turn engine.")
+    # PLAN/BUILD always have a project — the CHECK constraint on `conversations.project_id`
+    # guarantees it — so this narrows the type for everything below, which is genuinely
+    # project-scoped code that has no meaning for the (already-rejected) project-less kind.
+    assert conversation.project_id is not None
     project_id = conversation.project_id
 
     # Daily-token gate BEFORE anything persists — a capped user's message is refused

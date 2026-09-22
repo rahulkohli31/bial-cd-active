@@ -162,6 +162,7 @@ async def _run_until_settled(engine: TurnEngine, db_session, session_factory, mo
     """Start one Plan turn on a fresh conversation and wait for its detached task to finish."""
     user = await UserFactory.create(db_session)
     conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.PLAN)
+    assert conv.project_id is not None  # PLAN always has one
 
     async def _noop_persist() -> None:
         return None

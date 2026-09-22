@@ -261,6 +261,16 @@ def standing_contract(kind: ChatKind) -> tuple[str, ...]:
         case ChatKind.BUILD:
             integrity = DATA_INTEGRITY_RULES
             segment = _WRITE_SEGMENT
+        case ChatKind.CHATBOT:
+            # ChatBot never composes a prompt through this module — it uses `agent.py`'s
+            # "kindless" path (`ChatDeps(kind=None, system=...)`), entirely outside the turn
+            # engine this standing contract serves. Reaching this arm means a ChatBot
+            # conversation was wired into PLAN/BUILD prompt composition by mistake.
+            raise ValueError(
+                "ChatBot never composes a prompt through standing_contract — it runs on "
+                "agent.py's kindless path. Reaching this arm means a ChatBot conversation "
+                "was wired into PLAN/BUILD prompt machinery by mistake."
+            )
     return (
         NARRATION_EXAMPLES,
         PORTAL_SURFACES,

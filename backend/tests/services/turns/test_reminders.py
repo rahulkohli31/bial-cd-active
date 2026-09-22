@@ -202,6 +202,7 @@ async def _run_with_history(
 
     user = await UserFactory.create(db_session)
     conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.PLAN)
+    assert conv.project_id is not None  # PLAN always has one
     await engine.start_turn(
         conversation=conv,
         user_id=user.id,
@@ -352,6 +353,7 @@ async def _run_scripted(
     """One real Plan turn against a fresh conversation, driven by a scripted model."""
     user = await UserFactory.create(db_session)
     conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.PLAN)
+    assert conv.project_id is not None  # PLAN always has one
     await engine.start_turn(
         conversation=conv,
         user_id=user.id,

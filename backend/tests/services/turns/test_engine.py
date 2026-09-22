@@ -145,6 +145,7 @@ def _streaming_text(*chunks: str):
 
 async def _start(engine: TurnEngine, db_session, session_factory, model, *, kind=ChatKind.PLAN):
     user, conv = await _conversation(db_session, kind)
+    assert conv.project_id is not None  # PLAN/BUILD (this helper's only callers) always have one
     turn_id = await engine.start_turn(
         conversation=conv,
         user_id=user.id,
