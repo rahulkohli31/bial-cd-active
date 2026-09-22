@@ -88,15 +88,16 @@ export const ATTACHMENT_LANES_SENTENCE =
   "and I'll open it with code."
 
 /**
- * ONE SENTENCE, EVERYWHERE. The composer, the help page and every unsupported-format
- * refusal say this and nothing else — three sentences that drift is how the removed rule failed.
+ * ONE SENTENCE PER SURFACE, EVERYWHERE ON IT. The composer, the help page and every
+ * unsupported-format refusal carry that surface's lane sentence and nothing else — three
+ * sentences that drift is how the removed rule failed.
  *
  * IT DESCRIBES WHAT HAPPENS, NOT WHICH EXTENSIONS ARE ON A LIST. A list of ten formats is the
  * shape the old copy failed as: it goes stale the moment the allowlist moves, and it tells a
  * citizen nothing about why a spreadsheet behaves differently from a photograph.
  */
-export function unsupportedFormatMessage(): string {
-  return `isn't supported. ${ATTACHMENT_LANES_SENTENCE}`
+export function unsupportedFormatMessage(lanes: AttachmentLanes = BOTH_ATTACHMENT_LANES): string {
+  return `isn't supported. ${lanes.sentence}`
 }
 
 /**
@@ -108,6 +109,34 @@ export function unsupportedFormatMessage(): string {
 export const GENERIC_ATTACHMENT_LANES_SENTENCE =
   "Attach a picture or a PDF and I'll look at it — a spreadsheet, document or slide deck " +
   "isn't accepted in this chat."
+
+/**
+ * WHAT ONE SURFACE OFFERS, as a single value. The picker's filter and the sentence a refusal
+ * carries are the same decision, and passing them side by side is how they drift apart — a
+ * picker that offers a spreadsheet under a refusal saying spreadsheets are not accepted.
+ */
+export interface AttachmentLanes {
+  /** What the OS picker offers, and what the library's own filter admits before `add` runs. */
+  accept: string
+  /** What every unsupported-format refusal on this surface says. */
+  sentence: string
+}
+
+/** Both lanes: the model reads the pictures and PDFs itself, a workspace reader opens the rest. */
+export const BOTH_ATTACHMENT_LANES: AttachmentLanes = {
+  accept: ACCEPT_ATTR,
+  sentence: ATTACHMENT_LANES_SENTENCE,
+}
+
+/**
+ * THE MODEL LANE ALONE, for a conversation with no workspace to open a spreadsheet in. No
+ * extension tokens ride here, unlike `ACCEPT_ATTR`: their whole job is to get Office and
+ * delimited files past an OS that mislabels them, and those are exactly what this surface refuses.
+ */
+export const MODEL_LANE_ONLY: AttachmentLanes = {
+  accept: MODEL_LANE_MEDIA_TYPES.join(','),
+  sentence: GENERIC_ATTACHMENT_LANES_SENTENCE,
+}
 
 /**
  * Canonicalize a file's media type by extension first. Browsers/OSes report

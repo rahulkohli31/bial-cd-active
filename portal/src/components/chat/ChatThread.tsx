@@ -76,7 +76,7 @@ const TextPart: ThreadComponents['TextPart'] = ({ text }) => <MessageContent par
 const ReasoningGroup: ThreadComponents['ReasoningGroup'] = () => {
   const turnStartedAt = useContext(TurnStartedAtContext)
   return (
-    <p data-testid="working-status" className="my-1 text-xs text-neutral">
+    <p data-testid="working-status" className="my-1 text-xs text-status-grey-fg">
       <WaitingLine label="Working on your app" active since={turnStartedAt} />
     </p>
   )

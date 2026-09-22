@@ -4,8 +4,8 @@
  * THE COMPOSER AND THE RUNTIME UNDER TEST ARE THE REAL ONES. Nothing about the library, the
  * runtime or the box is doubled here, because the claim this page makes is precisely that it is a
  * second consumer of the builder's own chat stack rather than a parallel one. A test against a
- * stub would pass on a drawing. What IS doubled is the network: the four calls this surface
- * makes, so that a create, a turn, a load and their failures can each be driven.
+ * stub would pass on a drawing. What IS doubled is the network: the calls this surface makes, so
+ * that a create, an upload, a turn, a load and their failures can each be driven.
  *
  * ONE COMPONENT SERVES BOTH ADDRESSES, so `mount()` takes the address rather than a page.
  *
@@ -15,7 +15,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
-import { MemoryRouter, Route, Routes } from 'react-router-dom'
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom'
 import { MotionGlobalConfig } from 'motion/react'
 
 const h = vi.hoisted(() => ({
@@ -25,6 +25,8 @@ const h = vi.hoisted(() => ({
   startTurn: vi.fn(),
   readTurnStream: vi.fn(),
   stopTurn: vi.fn(),
+  buildUserParts: vi.fn(),
+  releaseUploadedAttachments: vi.fn(),
 }))
 vi.mock('../../utils/auth', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -41,13 +43,35 @@ vi.mock('../../utils/turnStreamApi', async (importOriginal) => ({
   readTurnStream: h.readTurnStream,
   stopTurn: h.stopTurn,
 }))
+// The upload half is doubled for the same reason the network is: a refused turn has to be shown
+// releasing what it uploaded, and a real upload cannot be made to have happened here.
+vi.mock('../../utils/attachmentStore', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  buildUserParts: h.buildUserParts,
+  releaseUploadedAttachments: h.releaseUploadedAttachments,
+}))
 
 import AssistantPage from '../AssistantPage'
 import { GREETINGS, headlineParts } from '../../components/assistant/greetings'
+import { TurnStartError } from '../../utils/turnStreamApi'
 
 MotionGlobalConfig.skipAnimations = true
 
 const CITIZEN = { email: 'asha@bial.aero', display_name: 'Asha Rao', isAdmin: false }
+
+/**
+ * The navigation entry, exactly as the sidebar draws it: a bare navigation to `/assistant` and
+ * nothing else. It is mounted OUTSIDE the routes because that is where it lives — a link that
+ * cannot reach the page's own reset is the whole of what makes leaving a conversation hard.
+ */
+function SidebarEntry() {
+  const navigate = useNavigate()
+  return (
+    <button type="button" data-testid="nav-bial-chat" onClick={() => navigate('/assistant')}>
+      BIAL Chat
+    </button>
+  )
+}
 
 /** Both addresses, through the real router, because the page reads its own.
  *
@@ -57,6 +81,7 @@ const CITIZEN = { email: 'asha@bial.aero', display_name: 'Asha Rao', isAdmin: fa
 function mount(at = '/assistant') {
   return render(
     <MemoryRouter initialEntries={[at]}>
+      <SidebarEntry />
       <Routes>
         <Route path="/assistant" element={<AssistantPage />} />
         <Route path="/assistant/:chatId" element={<AssistantPage />} />
@@ -107,6 +132,8 @@ beforeEach(() => {
   h.startTurn.mockResolvedValue({ turnId: 't1', contextTokens: null })
   h.readTurnStream.mockResolvedValue('completed')
   h.stopTurn.mockResolvedValue('stopping')
+  // The shape the real one returns for a message with nothing attached: the prose, last.
+  h.buildUserParts.mockImplementation(async (text: string) => [{ type: 'text', text }])
   sessionStorage.clear()
 })
 afterEach(() => {
@@ -575,5 +602,298 @@ describe('a chat that belongs to a project does not belong at this address', () 
 
     expect(await screen.findByTestId('assistant-transcript')).toBeTruthy()
     expect(screen.queryByTestId('builder-address')).toBeNull()
+  })
+})
+
+describe('a turn the server refuses leaves nothing behind that says it was sent', () => {
+  const refused = () =>
+    new TurnStartError(429, 'You have used your daily allowance.', 'quota_exceeded', null)
+
+  it('★ takes the bubble back, because the database is holding nothing', async () => {
+    h.startTurn.mockRejectedValue(refused())
+    mount()
+    type('how many stands are free tonight')
+
+    await waitFor(() =>
+      expect(screen.getByTestId('turn-banner').textContent).toMatch(/daily allowance/i),
+    )
+    // It looked sent and would have vanished at the next reload — a transcript disagreeing with
+    // the database about a message nobody ever received. Asserted on the BUBBLE rather than on
+    // the words: the composer is still holding them, which is the next assertion.
+    //
+    // AWAITED, even though the banner above has already settled. The rollback and the banner are
+    // two separate state updates, and whether React lands them in ONE commit or two is a
+    // scheduling detail that differs by runtime — so a synchronous assertion here passes on the
+    // runtime that batches them and fails on the one that does not. The invariant is that the
+    // bubble goes, not that it goes in the same paint as the banner. Safe as an absence check
+    // because the banner above and the composer below are this test's liveness: a screen that
+    // failed to render at all cannot satisfy either.
+    await waitFor(() => expect(screen.queryAllByTestId('user-message')).toHaveLength(0))
+    // AND THE WORDS ARE NOT LOST WITH IT. The bubble that was holding them is gone, so the
+    // composer has to still be holding them instead.
+    expect(box().value).toBe('how many stands are free tonight')
+  })
+
+  it('★ an accepted turn keeps its bubble, which is what makes the rollback a branch', async () => {
+    mount()
+    type('how many stands are free tonight')
+
+    expect(await screen.findByText('how many stands are free tonight')).toBeTruthy()
+    expect(screen.queryByTestId('turn-banner')).toBeNull()
+  })
+
+  it('★ releases the files it uploaded, so three refusals do not leave three orphans', async () => {
+    const parts = [
+      {
+        type: 'file',
+        attachmentId: 'att-1',
+        key: 'k1',
+        kind: 'document',
+        name: 'roster.pdf',
+        mediaType: 'application/pdf',
+        size: 8,
+      },
+      { type: 'text', text: 'what is in this' },
+    ]
+    h.buildUserParts.mockResolvedValue(parts)
+    h.startTurn.mockRejectedValue(refused())
+    mount()
+    type('what is in this')
+
+    await waitFor(() => expect(h.releaseUploadedAttachments).toHaveBeenCalledTimes(1))
+    // The very parts the refused turn named: nothing will ever reference them, and unreleased
+    // they still count against this conversation's attachment allowance.
+    expect(h.releaseUploadedAttachments.mock.calls[0][0]).toBe(parts)
+  })
+
+  it('★ releases nothing when the server takes the turn', async () => {
+    h.buildUserParts.mockResolvedValue([
+      {
+        type: 'file',
+        attachmentId: 'att-1',
+        key: 'k1',
+        kind: 'document',
+        name: 'roster.pdf',
+        mediaType: 'application/pdf',
+        size: 8,
+      },
+      { type: 'text', text: 'what is in this' },
+    ])
+    mount()
+    type('what is in this')
+
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
+    expect(h.releaseUploadedAttachments).not.toHaveBeenCalled()
+  })
+
+  it('★ offers no retry for a message the server never took', async () => {
+    // The composer is still holding the words, so a second way to send them would send them twice.
+    h.startTurn.mockRejectedValue(refused())
+    mount()
+    type('how many stands are free tonight')
+
+    await waitFor(() => expect(screen.getByTestId('turn-banner')).toBeTruthy())
+    expect(screen.queryByTestId('assistant-turn-retry')).toBeNull()
+  })
+})
+
+describe('the sentence a refusal was written with is the sentence the citizen reads', () => {
+  it('★ a failed create is not overwritten by the composer own generic line', async () => {
+    // The composer keeps `err.message` only for a refusal and overwrites anything else — so a
+    // page-limit or a cap arrives as "that message did not send", and trying again cannot work.
+    h.createConversation.mockRejectedValue(
+      new Error('That file runs to 61 pages; the limit is 40.'),
+    )
+    mount()
+    type('what is in this')
+
+    await waitFor(() =>
+      expect(screen.getByTestId('assistant-urgent').textContent).toMatch(/61 pages/i),
+    )
+    expect(screen.getByTestId('assistant-urgent').textContent).not.toMatch(/did not send/i)
+  })
+
+  it('★ and a failed upload keeps its own, at an address already taken', async () => {
+    h.buildUserParts.mockRejectedValue(new Error('That file type cannot be attached.'))
+    mount()
+    type('what is in this')
+
+    await waitFor(() =>
+      expect(screen.getByTestId('assistant-urgent').textContent).toMatch(/cannot be attached/i),
+    )
+    expect(screen.getByTestId('assistant-urgent').textContent).not.toMatch(/did not send/i)
+    expect(box().value).toBe('what is in this')
+  })
+})
+
+describe('a reload while the reply is still being written', () => {
+  const withEarlier = (over: Record<string, unknown> = {}) =>
+    aConversation({
+      messages: [
+        { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'earlier question' }], seq: 0 },
+      ],
+      ...over,
+    })
+
+  it('★ rejoins the running turn instead of sitting on a frozen transcript', async () => {
+    h.getConversation.mockResolvedValue(withEarlier({ activeTurn: { turnId: 't9', lastSeq: 4 } }))
+    let releaseStream: (value: unknown) => void = () => {}
+    h.readTurnStream.mockImplementation(async ({ onFrame }: { onFrame: (f: unknown) => void }) => {
+      onFrame({
+        type: 'snapshot',
+        seq: 4,
+        turnId: 't9',
+        turnStatus: 'running',
+        items: [],
+        parts: [{ type: 'text', text: 'half of the answer' }],
+        working: false,
+        errorMessage: null,
+      })
+      await new Promise((resolve) => (releaseStream = resolve))
+      return 'completed'
+    })
+    mount('/assistant/c1')
+
+    expect(await screen.findByText('half of the answer')).toBeTruthy()
+    expect(h.readTurnStream.mock.calls[0][0].turnId).toBe('t9')
+    // NO CURSOR: the catch-up snapshot IS the turn so far, and a cursor counts frames this tab
+    // never received — passing it would tail past everything already written.
+    expect(h.readTurnStream.mock.calls[0][0].cursor).toBeUndefined()
+    // The reply is running HERE, so it can be stopped — the control a frozen transcript lacked.
+    expect(await screen.findByTestId('stop-turn')).toBeTruthy()
+    releaseStream('completed')
+  })
+
+  it('★ opens no stream at all for a conversation with nothing running', async () => {
+    h.getConversation.mockResolvedValue(withEarlier())
+    mount('/assistant/c1')
+
+    expect(await screen.findByText('earlier question')).toBeTruthy()
+    expect(h.readTurnStream).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('stop-turn')).toBeNull()
+  })
+})
+
+describe('leaving a conversation by the navigation entry', () => {
+  const withEarlier = () =>
+    aConversation({
+      messages: [
+        { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'earlier question' }], seq: 0 },
+      ],
+    })
+
+  it('★ the address dropping its conversation returns the surface to the greeting', async () => {
+    h.getConversation.mockResolvedValue(withEarlier())
+    mount('/assistant/c1')
+    expect(await screen.findByText('earlier question')).toBeTruthy()
+
+    fireEvent.click(screen.getByTestId('nav-bial-chat'))
+
+    await waitFor(() => expect(screen.getByTestId('assistant-greeting')).toBeTruthy())
+    expect(screen.queryByText('earlier question')).toBeNull()
+  })
+
+  it('★ and the next message starts a new chat rather than appending to the one just left', async () => {
+    // REACHED BY SENDING, which is the case that goes wrong: the address is claimed by the
+    // minted id, so leaving without a reset leaves that id in hand and the next send lands in
+    // the conversation the citizen thought they had left.
+    mount()
+    type('the first question')
+    await waitFor(() => expect(h.createConversation).toHaveBeenCalledTimes(1))
+    const firstId = h.createConversation.mock.calls[0][0].id
+
+    fireEvent.click(screen.getByTestId('nav-bial-chat'))
+    await waitFor(() => expect(screen.getByTestId('assistant-greeting')).toBeTruthy())
+    type('a second, unrelated question')
+
+    await waitFor(() => expect(h.createConversation).toHaveBeenCalledTimes(2))
+    expect(h.createConversation.mock.calls[1][0].id).not.toBe(firstId)
+    expect(h.startTurn.mock.calls[1][0]).not.toBe(firstId)
+  })
+
+  it('★ a conversation that is gone is left behind too', async () => {
+    h.getConversation.mockResolvedValue(null)
+    mount('/assistant/c1')
+    expect(await screen.findByTestId('assistant-gone')).toBeTruthy()
+
+    fireEvent.click(screen.getByTestId('nav-bial-chat'))
+
+    await waitFor(() => expect(screen.getByTestId('assistant-greeting')).toBeTruthy())
+    expect(screen.queryByTestId('assistant-gone')).toBeNull()
+  })
+})
+
+describe('what the composer is told while a conversation cannot be sent to', () => {
+  it('★ a gone conversation is not told to load itself — there is nothing to load', async () => {
+    h.getConversation.mockResolvedValue(null)
+    mount('/assistant/c1')
+    await screen.findByTestId('assistant-gone')
+
+    const note = screen.getByTestId('composer-gate-note')
+    expect(note.textContent).toMatch(/start a new chat/i)
+    expect(note.textContent).not.toMatch(/load this conversation/i)
+  })
+
+  it('★ a failed load still is, because that one genuinely can be', async () => {
+    h.getConversation.mockRejectedValue(new TypeError('Failed to fetch'))
+    mount('/assistant/c1')
+    await screen.findByTestId('assistant-load-retry')
+
+    expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/load this conversation/i)
+  })
+})
+
+describe('the thinking-versus-hung status', () => {
+  it('★ says the agent has the floor before the first word, and stops saying it at the terminal', async () => {
+    let releaseStream: (value: unknown) => void = () => {}
+    h.readTurnStream.mockImplementation(async ({ onFrame }: { onFrame: (f: unknown) => void }) => {
+      onFrame({ type: 'working', seq: 1, working: true })
+      await new Promise((resolve) => (releaseStream = resolve))
+      onFrame({ type: 'text_delta', seq: 2, text: 'Six stands are free.', newBlock: true })
+      onFrame({ type: 'turn_ended', seq: 3, turnId: 't1', status: 'completed' })
+      return 'completed'
+    })
+    mount()
+    type('how many stands are free tonight')
+
+    // BEFORE ANY PROSE — the moment the question "is this thinking or hung?" is asked hardest.
+    expect(await screen.findByTestId('working-status')).toBeTruthy()
+
+    releaseStream('go on')
+    expect(await screen.findByText('Six stands are free.')).toBeTruthy()
+    // The flag is edge-triggered, so a turn whose last act was thinking sends no falling edge:
+    // the terminal is what brings the status down.
+    await waitFor(() => expect(screen.queryByTestId('working-status')).toBeNull())
+  })
+
+  it('★ carries the status across a reload, so a tab that rejoined mid-thought is not still', async () => {
+    h.getConversation.mockResolvedValue(
+      aConversation({
+        messages: [
+          { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'earlier question' }], seq: 0 },
+        ],
+        activeTurn: { turnId: 't9', lastSeq: 4 },
+      }),
+    )
+    let releaseStream: (value: unknown) => void = () => {}
+    h.readTurnStream.mockImplementation(async ({ onFrame }: { onFrame: (f: unknown) => void }) => {
+      onFrame({
+        type: 'snapshot',
+        seq: 4,
+        turnId: 't9',
+        turnStatus: 'running',
+        items: [],
+        parts: [],
+        working: true,
+        errorMessage: null,
+      })
+      await new Promise((resolve) => (releaseStream = resolve))
+      return 'completed'
+    })
+    mount('/assistant/c1')
+
+    expect(await screen.findByTestId('working-status')).toBeTruthy()
+    releaseStream('completed')
+    await waitFor(() => expect(screen.queryByTestId('working-status')).toBeNull())
   })
 })

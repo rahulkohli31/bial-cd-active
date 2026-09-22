@@ -25,11 +25,14 @@
  */
 import { createContext, useContext, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from 'react'
 import { useAui, type Attachment, type AttachmentAdapter } from '@assistant-ui/react'
-import { ACCEPT_ATTR } from '../../../utils/attachmentInput'
+import { BOTH_ATTACHMENT_LANES, type AttachmentLanes } from '../../../utils/attachmentInput'
 import { createAttachmentAdapter } from './attachmentAdapter'
 
 export interface BoundAdapter {
   adapter: AttachmentAdapter
+  /** The lanes this adapter was built with — published so the composer's words and the picker's
+   *  filter cannot disagree about which formats this surface takes. */
+  lanes: AttachmentLanes
   /** Render `StagedAttachmentsBinding` with this. It publishes a live READER of the staged list
    *  into the adapter — see the docblock for why a reader rather than the list itself. */
   stagedRef: MutableRefObject<() => readonly Attachment[]>
@@ -42,7 +45,13 @@ export interface BoundAdapter {
   pendingReads: number
 }
 
-export function useBoundAttachmentAdapter(): BoundAdapter {
+/**
+ * `lanes` IS WHERE A CONVERSATION'S KIND ARRIVES, narrowed to the only thing an adapter can act
+ * on. A surface with no workspace passes `MODEL_LANE_ONLY`, and the library's accept filter then
+ * refuses a spreadsheet at pick, paste and drop — every path into `add` runs through it — instead
+ * of staging a chip and learning the same thing from the server a full upload later.
+ */
+export function useBoundAttachmentAdapter(lanes: AttachmentLanes = BOTH_ATTACHMENT_LANES): BoundAdapter {
   // NOTHING STAGED UNTIL THE BINDING MOUNTS, which is the honest reading for a composer whose
   // runtime does not exist yet — and it is a function so that the day it does exist, nothing here
   // has to be told.
@@ -55,7 +64,7 @@ export function useBoundAttachmentAdapter(): BoundAdapter {
   const adapter = useMemo(
     () =>
       createAttachmentAdapter({
-        accept: ACCEPT_ATTR,
+        accept: lanes.accept,
         staged: () => stagedRef.current(),
         // A REFUSAL REACHES THE COMPOSER THROUGH THE LIBRARY'S OWN `composer.attachmentAddError`
         // event now (see `ComposerBox.tsx`), which carries the same message this hook would have
@@ -63,9 +72,9 @@ export function useBoundAttachmentAdapter(): BoundAdapter {
         onRefused: () => {},
         onReadingChanged: setPendingReads,
       }),
-    [],
+    [lanes],
   )
-  return { adapter, stagedRef, pendingReads }
+  return { adapter, lanes, stagedRef, pendingReads }
 }
 
 /**
@@ -83,6 +92,18 @@ export function PendingReadsProvider({ value, children }: { value: number; child
 
 export function usePendingAttachmentReads(): number {
   return useContext(PendingReadsContext)
+}
+
+/**
+ * WHICH LANES THE COMPOSER BELOW IS SPEAKING FOR. The adapter's `accept` decides what is refused
+ * and the composer decides what the refusal says; they are one decision, so the composer reads it
+ * from the same value the adapter was built with rather than being handed it a second time. Both
+ * lanes outside a provider, which is what a composer with no runtime could only be.
+ */
+const AttachmentLanesContext = createContext(BOTH_ATTACHMENT_LANES)
+
+export function useAttachmentLanes(): AttachmentLanes {
+  return useContext(AttachmentLanesContext)
 }
 
 /**
@@ -105,10 +126,11 @@ export function StagedAttachmentsBinding({
 /**
  * EVERY PROVIDER A COMPOSER'S ATTACHMENTS NEED, MOUNTED AS ONE.
  *
- * Two pieces wired by hand at each call site is how one gets forgotten: a composer that mounts
+ * Pieces wired by hand at each call site is how one gets forgotten: a composer that mounts
  * the staged binding but not `PendingReadsProvider` reads the context default `0`, and Send's
- * "a file is still arriving" guard never fires. So a composer that binds an adapter mounts this,
- * and gets both or neither.
+ * "a file is still arriving" guard never fires; one that skips the lanes says the two-lane
+ * sentence over an adapter that takes one. So a composer that binds an adapter mounts this, and
+ * gets all of them or none.
  */
 export function AttachmentAdapterProviders({
   bound,
@@ -118,9 +140,11 @@ export function AttachmentAdapterProviders({
   children: ReactNode
 }) {
   return (
-    <PendingReadsProvider value={bound.pendingReads}>
-      <StagedAttachmentsBinding target={bound.stagedRef} />
-      {children}
-    </PendingReadsProvider>
+    <AttachmentLanesContext.Provider value={bound.lanes}>
+      <PendingReadsProvider value={bound.pendingReads}>
+        <StagedAttachmentsBinding target={bound.stagedRef} />
+        {children}
+      </PendingReadsProvider>
+    </AttachmentLanesContext.Provider>
   )
 }

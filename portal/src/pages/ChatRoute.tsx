@@ -10,9 +10,9 @@
  *     longer picks a PAGE — one surface renders both, and `kind` is a single declaration inside
  *     it (`ConversationSlot`) — resolved here only because the surface needs it.
  *  1a. Conversation exists and its kind is `generic` → this address redirects to
- *     `/assistant/{chatId}` instead, before anything below runs. A bookmarked or pasted builder
- *     link to a generic chat used to render the builder surface anyway, inside the workspace
- *     shell, with a breadcrumb for a project that does not exist.
+ *     `/assistant/{chatId}` instead, before anything below runs — so a bookmarked or pasted
+ *     builder link to a generic chat never renders the builder surface, and never enters the
+ *     workspace shell carrying a breadcrumb for a project that does not exist.
  *  2. 404 + `?projectId=` → a brand-new chat: its row is written inside the FIRST TURN's own
  *     transaction (no separate create round-trip), so it opens at
  *     `/chat/{clientId}?projectId=…&kind=…` and rewrites to the bare path once that turn commits.
@@ -58,12 +58,11 @@ function kindFromQuery(raw: string | null): ChatKind {
 /**
  * THE ONE PLACE AN UNRECOGNISED KIND BECOMES SOMETHING — `plan`, the least-privileged surface,
  * for the same reason `kindFromQuery` picks it: the value is wire data, not a checked union.
- * `ConversationSurface`'s `kind` prop used to carry its OWN, disagreeing fallback (`build`) for
- * whichever caller omitted it, so a mount that skipped this resolution landed on the more
- * capable surface by accident. That prop is now required — resolving a kind lives here alone,
- * so there is nothing left to disagree with it. (A value of `generic` reaches here in principle
- * — the server's `ChatKind` enum has a third member — but never in practice: `chatId` resolves
- * to `redirectToAssistant` below before this function is ever called on it.)
+ * `ConversationSurface`'s `kind` prop is required, so resolving a kind lives here alone and no
+ * caller can fall back to one of its own and land on the more capable surface by accident.
+ * (A value of `generic` reaches here in principle — the server's `ChatKind` enum has a third
+ * member — but never in practice: `chatId` resolves to `redirectToAssistant` below before this
+ * function is ever called on it.)
  */
 function kindFromServer(raw: unknown): ChatKind {
   return raw === 'build' ? 'build' : 'plan'

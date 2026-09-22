@@ -193,6 +193,8 @@ export function discardNoticeText(savedAt: string | null): string {
 export function messagesFromProjection(
   projection: RawProjectionItem[] | undefined,
   onUnknown: (item: RawProjectionItem) => void = reportUnknownProjectionItem,
+  // Defaulted to the workspace kinds, so every existing caller keeps the wording it had.
+  buildless = false,
 ): ChatMessage[] {
   const messages: ChatMessage[] = []
 
@@ -373,6 +375,7 @@ export function messagesFromProjection(
               text: outcomeSummary({
                 status: bannerStatus(terminal),
                 reason: typeof item.reason === 'string' ? item.reason : null,
+                buildless,
               }),
             },
           ],
@@ -482,9 +485,12 @@ export async function getConversation(id: string, deps: AuthFetchDeps = {}): Pro
   if (!res.ok) throw await readApiError(res, 'Failed to load conversation')
   // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
   const data = (await res.json()) as { conversation: unknown; projection?: RawProjectionItem[]; activeTurn?: ActiveTurn | null; contextTokens?: number | null }
+  const header = normalizeHeader(data.conversation) as ConversationHeader
   return {
-    ...(normalizeHeader(data.conversation) as ConversationHeader),
-    messages: messagesFromProjection(data.projection),
+    ...header,
+    // THE KIND DECIDES THE NOUN. A generic chat owns no workspace, so a turn that failed there
+    // must not be reported as a build that failed.
+    messages: messagesFromProjection(data.projection, undefined, header.kind === 'generic'),
     activeTurn: data.activeTurn ?? null,
     // NARROWED, not coerced: a server that has not learned this field yet, or one answering
     // `null` for an unmeasured chat, both mean "no measurement" — and neither may be read as

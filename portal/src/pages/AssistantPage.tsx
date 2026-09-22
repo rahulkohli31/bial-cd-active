@@ -35,14 +35,16 @@ import Announcer from '../components/chat/Announcer'
 import ChatThread from '../components/chat/ChatThread'
 import Composer from '../components/chat/Composer'
 import ChatRuntimeProvider from '../components/chat/runtime/ChatRuntimeProvider'
+import { SendRefusal } from '../components/chat/sendRefusal'
 import TurnBanner from '../components/chat/TurnBanner'
 import { DURATION, LAYOUT_EASE } from '../lib/motion'
 import { getStoredUser } from '../utils/auth'
-import { buildUserParts } from '../utils/attachmentStore'
+import { buildUserParts, releaseUploadedAttachments } from '../utils/attachmentStore'
 import {
   createConversation,
   getConversation,
   uuidv7,
+  type ActiveTurn,
   type ConversationWithMessages,
 } from '../utils/conversationApi'
 import { contextState } from '../utils/contextLimits'
@@ -70,8 +72,11 @@ type Phase = 'greeting' | 'loading' | 'ready' | 'failed' | 'gone'
 
 const GONE_TEXT = 'This conversation is no longer here.'
 const LOAD_FAILED_TEXT = 'This conversation could not be loaded.'
+const TURN_LOST_TEXT = 'The connection dropped. Reload to catch up.'
 const SENDING_BLOCKED_WHILE_LOADING = 'Loading this conversation…'
 const SENDING_BLOCKED_AFTER_FAILURE = 'Load this conversation before sending.'
+/** The `gone` state has nothing to load, so it cannot be told to load it. */
+const SENDING_BLOCKED_WHEN_GONE = 'Start a new chat to send a message.'
 
 const ANNOUNCE = {
   started: 'Reply started.',
@@ -80,10 +85,23 @@ const ANNOUNCE = {
   loadFailed: 'This conversation could not be loaded. A retry is available.',
 } as const
 
-/** An assistant message built live from the stream — one per reply, matching the reload shape. */
-function replyMessage(id: string, seq: number, text: string): ChatMessage {
+/**
+ * An assistant message built live from the stream — one per reply, matching the reload shape.
+ *
+ * THE STATUS IS A PART AND NOT A FLAG, because the thread draws one only for a message that
+ * carries it, and it rides at the TAIL: the model is thinking after what it has written so far,
+ * and a row pinned above the prose pushes read paragraphs down the screen on every burst. It
+ * carries no text — the shape has no field for any — so the reasoning itself cannot reach here.
+ */
+function replyMessage(id: string, seq: number, text: string, working: boolean): ChatMessage {
   const parts: MessagePart[] = [{ type: 'text', text }]
+  if (working) parts.push({ type: 'reasoning' })
   return { id, role: 'assistant', parts, seq }
+}
+
+/** The prose of a message, which is the whole of what a reply on this surface accumulates. */
+function textOf(message: ChatMessage): string {
+  return message.parts.map((part) => (part.type === 'text' ? part.text : '')).join('')
 }
 
 export default function AssistantPage() {
@@ -101,6 +119,10 @@ export default function AssistantPage() {
   const [messages, setMessages] = useState<readonly ChatMessage[]>([])
   const [isRunning, setIsRunning] = useState(false)
   const [turnId, setTurnId] = useState<string | null>(null)
+  // WHEN THE RUNNING TURN OPENED, so the working line counts the turn rather than itself. The
+  // status row is torn down and rebuilt on every burst, so a row timing its own mount reports the
+  // burst and the count a citizen is watching falls back to zero.
+  const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null)
   const [banner, setBanner] = useState<string | null>(null)
   const [urgent, setUrgent] = useState<string | null>(null)
   const [announcement, setAnnouncement] = useState<string | null>(null)
@@ -122,6 +144,9 @@ export default function AssistantPage() {
   const transcriptRef = useRef<HTMLDivElement | null>(null)
   const retryRef = useRef<HTMLButtonElement | null>(null)
   const seqRef = useRef(0)
+  // Does the model have the floor? A ref because the frame handler is built once per turn and
+  // cannot see state changing under it, and every delta has to be rebuilt carrying the answer.
+  const workingRef = useRef(false)
 
   useEffect(() => {
     aliveRef.current = true
@@ -152,6 +177,142 @@ export default function AssistantPage() {
   // of its arguments and the one thing here that can throw sits on its own.
   useEffect(() => rememberGreeting(greeting.headline), [greeting])
 
+  /**
+   * Raise or lower the model's status on the live reply.
+   *
+   * A turn that has said nothing yet gets an empty message to carry it: the whole point of the
+   * status is telling a thinking agent from a hung one, and that question is asked hardest before
+   * the first word arrives.
+   */
+  const showWorking = useCallback((replyId: string, working: boolean) => {
+    workingRef.current = working
+    setMessages((held) => {
+      const last = held[held.length - 1]
+      if (!last || last.id !== replyId) {
+        return working ? [...held, replyMessage(replyId, seqRef.current++, '', true)] : held
+      }
+      return [...held.slice(0, -1), replyMessage(replyId, last.seq ?? 0, textOf(last), working)]
+    })
+  }, [])
+
+  const pushFrame = useCallback(
+    (frame: TurnFrame, replyId: string) => {
+      // A FRAME THIS PARSER DOES NOT KNOW IS NOT AN ERROR — the stream has to stay
+      // forward-extensible — but neither is it something to read fields off.
+      if (!isKnownFrame(frame)) return
+      if (frame.type === 'text_delta') {
+        setMessages((held) => {
+          const last = held[held.length - 1]
+          if (last && last.id === replyId) {
+            const text = textOf(last) + frame.text
+            return [
+              ...held.slice(0, -1),
+              replyMessage(replyId, last.seq ?? 0, text, workingRef.current),
+            ]
+          }
+          return [
+            ...held,
+            replyMessage(replyId, seqRef.current++, frame.text, workingRef.current),
+          ]
+        })
+        return
+      }
+      if (frame.type === 'working') {
+        showWorking(replyId, frame.working)
+        return
+      }
+      if (frame.type === 'turn_ended') {
+        // THE TERMINAL IS WHERE THE STATUS COMES DOWN. The flag is edge-triggered, so a turn
+        // whose last act was thinking sends no falling edge of its own and the row would spin
+        // over a finished reply. Nothing else on this frame has a reader here: what a turn ended
+        // as is already told by the reply itself, by the banner an `error` frame wrote, or by the
+        // stream simply ending.
+        showWorking(replyId, false)
+        return
+      }
+      if (frame.type === 'error') {
+        setBanner(frame.message)
+        return
+      }
+      if (frame.type === 'quota') {
+        setBanner(
+          `You have used your daily allowance. It resets at ${new Date(frame.resetsAt).toLocaleTimeString()}.`,
+        )
+        return
+      }
+      if (frame.type === 'snapshot') {
+        // A REATTACH, not a fresh turn: the catch-up snapshot carries what the turn has produced
+        // so far, and the deltas that follow continue from it — the status it was taken in
+        // included, or a tab that rejoined mid-thought sits on a still screen until the next
+        // frame happens to change something.
+        workingRef.current = frame.working
+        const text = frame.parts.map((part) => (part.type === 'text' ? part.text : '')).join('')
+        if (text) {
+          setMessages((held) => [
+            ...held,
+            replyMessage(replyId, seqRef.current++, text, frame.working),
+          ])
+        } else {
+          showWorking(replyId, frame.working)
+        }
+        if (frame.errorMessage) setBanner(frame.errorMessage)
+        return
+      }
+      // EVERY REMAINING FRAME NARRATES WORK ON AN APP, and this surface builds none: `step`,
+      // `plan_options`, `workspace`, `preview`, `diagnostic` and `compile` describe a sandbox and
+      // a build a generic chat never has. They are dropped deliberately rather than by falling
+      // off the end of the list.
+    },
+    [showWorking],
+  )
+
+  /**
+   * RE-ATTACH to a turn that is still running server-side.
+   *
+   * A reload mid-reply lands on a transcript whose newest row is the citizen's own message: the
+   * reply is being produced, but this tab holds no socket — so the screen would sit frozen with
+   * no way to stop it, and the next send would be refused as busy. Subscribed with NO cursor even
+   * though the server reports one, because the catch-up snapshot carries the turn so far and a
+   * cursor would tail past everything already written.
+   */
+  const reattachToTurn = useCallback(
+    async (id: string, activeTurn: ActiveTurn) => {
+      const controller = new AbortController()
+      abortRef.current = controller
+      workingRef.current = false
+      setTurnId(activeTurn.turnId)
+      setIsRunning(true)
+      setBanner(null)
+      // Nothing this tab holds records when the turn opened, so the count starts at the rejoin
+      // rather than at an earlier instant nobody measured.
+      setTurnStartedAt(Date.now())
+      setAnnouncement(ANNOUNCE.started)
+      const replyId = `live-${id}-${activeTurn.turnId}`
+      try {
+        await readTurnStream({
+          conversationId: id,
+          turnId: activeTurn.turnId,
+          signal: controller.signal,
+          onFrame: (frame) => pushFrame(frame, replyId),
+        })
+        if (!aliveRef.current) return
+        setAnnouncement(ANNOUNCE.finished)
+      } catch {
+        if (!aliveRef.current) return
+        setBanner(TURN_LOST_TEXT)
+        setAnnouncement(ANNOUNCE.turnFailed)
+      } finally {
+        if (aliveRef.current) {
+          showWorking(replyId, false)
+          setIsRunning(false)
+          setTurnId(null)
+        }
+        abortRef.current = null
+      }
+    },
+    [pushFrame, showWorking],
+  )
+
   const applyLoaded = useCallback(
     (loaded: ConversationWithMessages) => {
       // A CHAT THAT BELONGS TO A PROJECT DOES NOT BELONG HERE. This address is mounted for any
@@ -171,8 +332,12 @@ export default function AssistantPage() {
       setContextTokens(loaded.contextTokens)
       seqRef.current = loaded.messages.length
       setPhase('ready')
+      // A REPLY STILL BEING WRITTEN IS REJOINED RATHER THAN WAITED OUT. The server reports the
+      // running turn on every kind of conversation, and a transcript that ignored it would freeze
+      // mid-reply, offer no Stop, and have its next send refused as busy.
+      if (loaded.activeTurn) void reattachToTurn(loaded.id, loaded.activeTurn)
     },
-    [navigate],
+    [navigate, reattachToTurn],
   )
 
   const load = useCallback(
@@ -212,58 +377,39 @@ export default function AssistantPage() {
     if (phase === 'failed') retryRef.current?.focus()
   }, [phase])
 
-  const pushFrame = useCallback((frame: TurnFrame, replyId: string) => {
-    // A FRAME THIS PARSER DOES NOT KNOW IS NOT AN ERROR — the stream has to stay
-    // forward-extensible — but neither is it something to read fields off.
-    if (!isKnownFrame(frame)) return
-    if (frame.type === 'text_delta') {
-      setMessages((held) => {
-        const last = held[held.length - 1]
-        if (last && last.id === replyId) {
-          const text =
-            last.parts.map((p) => (p.type === 'text' ? p.text : '')).join('') + frame.text
-          return [...held.slice(0, -1), replyMessage(replyId, last.seq ?? 0, text)]
-        }
-        return [...held, replyMessage(replyId, seqRef.current++, frame.text)]
-      })
-      return
-    }
-    if (frame.type === 'error') {
-      setBanner(frame.message)
-      return
-    }
-    if (frame.type === 'quota') {
-      setBanner(
-        `You have used your daily allowance. It resets at ${new Date(frame.resetsAt).toLocaleTimeString()}.`,
-      )
-      return
-    }
-    if (frame.type === 'snapshot') {
-      // A REATTACH, not a fresh turn: the catch-up snapshot carries what the turn has produced
-      // so far, and the deltas that follow continue from it.
-      const text = frame.parts.map((part) => (part.type === 'text' ? part.text : '')).join('')
-      if (text) setMessages((held) => [...held, replyMessage(replyId, seqRef.current++, text)])
-      if (frame.errorMessage) setBanner(frame.errorMessage)
-    }
-  }, [])
-
   const runTurn = useCallback(
-    async (id: string, text: string, attachmentIds: string[]) => {
+    async (
+      id: string,
+      text: string,
+      attachmentIds: string[],
+      /** What to undo if the server refuses the turn at the door — see the catch below. */
+      onRefused?: () => void,
+    ) => {
       const controller = new AbortController()
       abortRef.current = controller
+      workingRef.current = false
       setIsRunning(true)
       setBanner(null)
+      setTurnStartedAt(Date.now())
       setAnnouncement(ANNOUNCE.started)
       const replyId = `live-${id}-${Date.now()}`
+      // DID THE SERVER ACCEPT THE TURN? A 202 means the citizen's message is persisted and the
+      // reply runs detached whatever this tab does next, so everything past it is subscription
+      // plumbing — and a subscription that breaks must not take back a message the database holds.
+      let posted = false
       try {
         const started = await startTurn(id, {
           text,
           attachmentTexts: [],
           attachmentIds,
         })
+        posted = true
         if (!aliveRef.current) return
         setTurnId(started.turnId)
         setContextTokens(started.contextTokens)
+        // THE RETRY CONTROL ONLY EVER RE-RUNS A TURN THE SERVER TOOK. A refused turn leaves the
+        // citizen's words in the composer, so a second way to send them would send them twice.
+        setLastSend({ text, attachmentIds })
         await readTurnStream({
           conversationId: id,
           turnId: started.turnId,
@@ -273,6 +419,9 @@ export default function AssistantPage() {
         if (!aliveRef.current) return
         setAnnouncement(ANNOUNCE.finished)
       } catch (err) {
+        // BEFORE THE LIVENESS GUARD, because taking back what a refusal orphaned is not a paint
+        // decision: the uploads are on the server whether or not this screen is still here.
+        if (!posted) onRefused?.()
         if (!aliveRef.current) return
         // THE PARTIAL REPLY STAYS IN THE TRANSCRIPT, and the banner carries the fact. Removing
         // what the model had already written would make a failure look like a turn that never
@@ -281,13 +430,14 @@ export default function AssistantPage() {
         setAnnouncement(ANNOUNCE.turnFailed)
       } finally {
         if (aliveRef.current) {
+          showWorking(replyId, false)
           setIsRunning(false)
           setTurnId(null)
         }
         abortRef.current = null
       }
     },
-    [pushFrame],
+    [pushFrame, showWorking],
   )
 
   const handleSubmit = useCallback(
@@ -295,6 +445,10 @@ export default function AssistantPage() {
       const text =
         rawText.trim() || (attachments.length ? 'Please review the attached file(s).' : '')
       if (!text) return
+      // THE PREVIOUS COMPLAINT IS RETIRED BY THE ATTEMPT THAT ANSWERS IT. Nothing else clears this
+      // region, so a refused seventh file left "You can attach at most 5 files per message." sitting
+      // in red above a composer that had since sent those five and been answered.
+      setUrgent(null)
       const isFirstMessage = routedId === undefined
       const id = chatId
 
@@ -311,16 +465,19 @@ export default function AssistantPage() {
         // fails leaves the citizen on the greeting with their typed text; an upload that fails
         // after the create leaves them at the new address with the staged file, which is why
         // the address is taken below rather than here.
-        if (isFirstMessage) {
-          setUrgent(
-            err instanceof Error ? err.message : 'The chat could not be started. Try again.',
-          )
-          throw err
-        }
-        setUrgent(
-          err instanceof Error ? err.message : 'Could not upload the attachment. Try again.',
-        )
-        throw err
+        //
+        // AS A REFUSAL, AND A SILENT ONE. The composer keeps `err.message` only for a refusal and
+        // paints its own generic sentence over anything else — which is the server's real reason
+        // lost, on the one failure where "try again" can be advice that cannot work. Silent
+        // because the sentence is already in the urgent region a line above.
+        const message =
+          err instanceof Error
+            ? err.message
+            : isFirstMessage
+              ? 'The chat could not be started. Try again.'
+              : 'Could not upload the attachment. Try again.'
+        setUrgent(message)
+        throw new SendRefusal(message, { silent: true })
       }
 
       // THE ADDRESS IS TAKEN ONCE THE ROW EXISTS, and `replace` rather than `push`: the greeting
@@ -332,15 +489,10 @@ export default function AssistantPage() {
         navigate(`/assistant/${id}`, { replace: true })
       }
       setPhase('ready')
-      setMessages((held) => [
-        ...held,
-        {
-          id: `user-${id}-${seqRef.current}`,
-          role: 'user',
-          parts,
-          seq: seqRef.current++,
-        },
-      ])
+      const userSeq = seqRef.current
+      const userId = `user-${id}-${userSeq}`
+      seqRef.current += 1
+      setMessages((held) => [...held, { id: userId, role: 'user', parts, seq: userSeq }])
       // BOTH SHAPES AN UPLOADED FILE TAKES. `buildUserParts` emits a `file` part for a binary
       // and a `text` part carrying an `attachment` descriptor for a file whose bytes travel as
       // text — reading only one of the two sends the turn without the ids of half the files
@@ -354,8 +506,24 @@ export default function AssistantPage() {
               : undefined,
         )
         .filter((value): value is string => typeof value === 'string')
-      setLastSend({ text, attachmentIds })
-      await runTurn(id, text, attachmentIds)
+
+      let refused = false
+      await runTurn(id, text, attachmentIds, () => {
+        // THE SERVER PERSISTED NOTHING. A turn refused at the door — the daily cap, a
+        // conversation already busy, a model that is not configured — leaves a bubble on screen
+        // that the database disagrees with: it looks sent, and it disappears at the next reload.
+        // So the optimistic message goes back and the seq with it, and the files it named are
+        // released, because no message will ever reference them and they still count against
+        // this conversation's attachment allowance.
+        refused = true
+        setMessages((held) => held.filter((m) => m.id !== userId))
+        seqRef.current = userSeq
+        releaseUploadedAttachments(parts)
+      })
+      // AND THE COMPOSER KEEPS THE WORDS, because the bubble that was holding them is gone.
+      // Silent: the banner runTurn wrote is the account of this, and a second sentence about
+      // one refusal is a contradiction rather than more information.
+      if (refused) throw new SendRefusal('', { silent: true })
     },
     [chatId, navigate, routedId, runTurn],
   )
@@ -370,10 +538,15 @@ export default function AssistantPage() {
     abortRef.current?.abort()
   }, [chatId, turnId])
 
-  // THE NAVIGATION ENTRY IS THE ONLY WAY TO START A NEW CONVERSATION, and this is what it
-  // reaches: a fresh id, an empty transcript, and nothing carried over.
-  const toGreeting = useCallback(() => {
+  // WHAT A NEW CONVERSATION STARTS FROM: a fresh id, an empty transcript, nothing carried over.
+  // Two ways in reach it — the control in the gone state, and the address itself dropping back to
+  // `/assistant` — so the reset is its own function and only one of them navigates.
+  const wipeTheSlate = useCallback(() => {
+    // THIS TAB STOPS READING whatever reply it was watching. The turn keeps running server-side;
+    // what must not happen is its deltas landing in the transcript that replaced it.
+    abortRef.current?.abort()
     resolvedIdRef.current = null
+    workingRef.current = false
     setMintedId(uuidv7())
     setMessages([])
     setBanner(null)
@@ -382,8 +555,29 @@ export default function AssistantPage() {
     seqRef.current = 0
     setContextTokens(null)
     setPhase('greeting')
+  }, [])
+
+  const toGreeting = useCallback(() => {
+    wipeTheSlate()
     navigate('/assistant')
-  }, [navigate])
+  }, [navigate, wipeTheSlate])
+
+  // THE NAVIGATION ENTRY LEAVES BY THE ADDRESS ALONE, and both addresses render this same
+  // element — so a link back to `/assistant` unmounts nothing and resets nothing by itself. The
+  // conversation just left would stay on screen, and the next send would append to it, because
+  // `chatId` falls back to the id it was first sent under. The address going FROM a conversation
+  // TO none is the reset.
+  //
+  // THE TRANSITION, NOT THE STATE: the first send claims its address while this surface is
+  // already holding the conversation, so a rule reading "no address and something on screen"
+  // could wipe the send that is taking the address.
+  const lastAddressRef = useRef(routedId)
+  useEffect(() => {
+    const left = lastAddressRef.current !== undefined && routedId === undefined
+    lastAddressRef.current = routedId
+    if (!left || phase === 'greeting') return
+    wipeTheSlate()
+  }, [routedId, phase, wipeTheSlate])
 
   const contextWarning = useMemo(() => contextState(contextTokens).message, [contextTokens])
   const showGreeting = phase === 'greeting'
@@ -391,24 +585,32 @@ export default function AssistantPage() {
     ? undefined
     : phase === 'loading'
       ? { blocked: true, reason: SENDING_BLOCKED_WHILE_LOADING }
-      : phase === 'failed' || phase === 'gone'
+      : phase === 'failed'
         ? { blocked: true, reason: SENDING_BLOCKED_AFTER_FAILURE }
-        : undefined
+        : phase === 'gone'
+          ? { blocked: true, reason: SENDING_BLOCKED_WHEN_GONE }
+          : undefined
 
   const parts = headlineParts(greeting.headline, greeting.name)
 
   return (
-    // `min-h-full`, NEVER `h-full`, AND NOTHING CLIPS HERE. A fixed height plus `overflow-hidden`
-    // centred the stack in a box it could outgrow. The backdrop clips itself.
+    // THE TWO STATES WANT OPPOSITE HEIGHTS, and one rule cannot serve both.
     //
-    // THIS IS A FLEX COLUMN SO ITS CHILD CAN GROW, and that is what makes the greeting sit in the
-    // middle of the screen. `min-h-full` gives this box a used height of the whole scroll pane;
-    // the child's `flex-1` then grows into that. A child asking for `min-h-full` instead gets
-    // nothing — a percentage minimum resolves against a parent's HEIGHT, which is `auto` here —
-    // so it collapses to its own content and `justify-center` centres within a box the exact size
-    // of what it holds. That was the shipped bug: the greeting sat at the top of a full-height page.
+    // GREETING — `min-h-full`, never `h-full`. This box must be free to outgrow the pane, because
+    // `justify-center` centres within whatever height it ends up with: `min-h-full` gives it the
+    // pane's height to centre in, while a child asking for `min-h-full` gets nothing (a percentage
+    // minimum resolves against a parent whose height is `auto`) and collapses onto its own content.
+    // That was the shipped bug — the greeting sitting at the top of a full-height page.
+    //
+    // TRANSCRIPT — `h-full`, and it has to be DEFINITE. `flex-1` divides a known height; against a
+    // growable one it divides nothing, so the thread rendered at its full content height and pushed
+    // the composer past the fold, leaving the citizen to scroll the page to reach the box they were
+    // typing in. Definite here plus `min-h-0` below is what pins the composer and puts the
+    // scrolling inside the transcript, where the build chat already keeps it.
     <div
-      className="relative flex min-h-full flex-col bg-bial-bg font-manrope"
+      className={`relative flex flex-col bg-bial-bg font-manrope ${
+        showGreeting ? 'min-h-full' : 'h-full'
+      }`}
       data-testid="assistant-page"
     >
       {/* THE BACKDROP KEEPS RUNNING once a conversation starts — the motes and the aircraft
@@ -432,7 +634,7 @@ export default function AssistantPage() {
             centring below is worthless without it. See the parent's note. */}
         <div
           data-testid="assistant-column"
-          className={`relative flex flex-1 flex-col items-center px-6 ${
+          className={`relative flex min-h-0 flex-1 flex-col items-center px-6 ${
             showGreeting ? 'justify-center py-12' : 'justify-end pb-6 pt-4'
           }`}
         >
@@ -464,15 +666,23 @@ export default function AssistantPage() {
               </p>
             </motion.div>
           ) : (
-            // THE TRANSCRIPT COLUMN SITS ON WHITE, not on the page's shaded ground. The portal's
-            // muted grey measures 4.44:1 against that ground — under the contrast floor — and this
-            // is the page the prior design's finding was written for.
+            // THE TRANSCRIPT SITS DIRECTLY ON THE PAGE GROUND, with no card, border or fill of its
+            // own — the same as the build chat's thread, and the same as every assistant people
+            // already use. Contrast is a question about the TEXT: `text-neutral` is 4.37:1 on this
+            // ground and fails, `text-status-grey-fg` is 6.84:1 and passes, so the muted lines below
+            // carry that token. Drawing a white panel to rescue a grey would buy one AA pass and a
+            // container on every screen.
             <div
               data-testid="assistant-transcript"
               ref={transcriptRef}
               tabIndex={-1}
               aria-label="Conversation"
-              className="mb-3 w-full max-w-thread flex-1 overflow-hidden rounded-2xl border border-bial-border bg-white"
+              // `focus:outline-none` because the focus here is PROGRAMMATIC and the target is not a
+              // control. Sending with Enter puts the browser in keyboard modality, so `:focus-visible`
+              // matches on the `tabIndex={-1}` container and Chromium paints its own 1px ring right
+              // round the transcript — in its blue, not the portal's. The move exists to carry a
+              // screen reader to the reply, and that is unaffected by dropping the ring.
+              className="mb-3 w-full max-w-thread min-h-0 flex-1 overflow-hidden focus:outline-none"
             >
               {phase === 'loading' ? (
                 <div
@@ -482,7 +692,7 @@ export default function AssistantPage() {
                   aria-busy="true"
                   className="flex h-full items-center justify-center p-8"
                 >
-                  <p className="text-sm font-medium text-neutral">Loading this conversation…</p>
+                  <p className="text-sm font-medium text-status-grey-fg">Loading this conversation…</p>
                 </div>
               ) : phase === 'gone' ? (
                 <div
@@ -520,7 +730,9 @@ export default function AssistantPage() {
                 </div>
               ) : (
                 <div className="h-full">
-                  <ChatThread />
+                  {/* The turn's own start, so the working line's count measures the reply rather
+                      than the row drawing it — the row is rebuilt on every burst. */}
+                  <ChatThread turnStartedAt={turnStartedAt} />
                 </div>
               )}
             </div>

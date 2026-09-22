@@ -246,10 +246,19 @@ function isEndReason(reason: string): reason is EndReason {
 export function outcomeSummary({
   status,
   reason,
+  buildless = false,
 }: {
   status: BuildOutcomeStatus
   reason: string | null
+  /**
+   * A CHAT THAT NEVER BUILDS ANYTHING. Every sentence in `OUTCOME_COPY` and every arm of
+   * `genericEnding` says "build", which is true of the two kinds that own a workspace and false
+   * of BIAL Chat — where a filtered or dropped reply rendered "The build failed." at somebody who
+   * had asked a question. The ENDINGS are shared; only the noun is not.
+   */
+  buildless?: boolean
 }): string {
+  if (buildless) return buildlessEnding(status, reason)
   if (reason === null || !isEndReason(reason)) return genericEnding(status)
   return OUTCOME_COPY[reason]
 }
@@ -263,6 +272,30 @@ function genericEnding(status: BuildOutcomeStatus): string {
       return 'This build was stopped before it finished.'
     case 'ended':
       return NEUTRAL_BUILD_SUMMARY
+    default:
+      return assertNever(status)
+  }
+}
+
+/**
+ * The same endings for a chat with no workspace. Only the handful of reasons a buildless chat can
+ * actually reach are named; every workspace-shaped one (`workspace_restored`, `idle_teardown`,
+ * `build_wrote_nothing`, …) cannot occur here and falls to the status sentence rather than being
+ * given copy that would never print.
+ */
+function buildlessEnding(status: BuildOutcomeStatus, reason: string | null): string {
+  if (reason === 'quota_exceeded') return 'This reply stopped: you reached your daily limit.'
+  if (reason === 'stopped_by_user') return 'You stopped this reply before it finished.'
+  if (reason === 'model_unavailable') {
+    return 'The assistant could not get an answer from its service, so this reply stopped.'
+  }
+  switch (status) {
+    case 'failed':
+      return 'That reply did not finish.'
+    case 'stopped':
+      return 'This reply was stopped before it finished.'
+    case 'ended':
+      return ''
     default:
       return assertNever(status)
   }

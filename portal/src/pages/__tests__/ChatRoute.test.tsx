@@ -51,7 +51,7 @@ vi.mock('../../components/workspace/ConversationSlot', () => ({
     conversation: { chatId: string; kind: string; projectId: string | null; projectName: string | null }
     // The surface derives a title from the first message of a chat whose row had none, and hands
     // it BACK to this route — see `onTitleDerived` in `ChatRoute`. Accepted here so the merge is
-    // reachable from a test at all; the stub used to drop it silently.
+    // reachable from a test at all; a stub that omits it drops the call silently.
     onTitleDerived?: (title: string) => void
   }) {
     const navigate = useNavigate()
@@ -239,11 +239,10 @@ describe('ChatRoute — kind RESOLUTION (it no longer dispatches)', () => {
     expect(h.getConversation).toHaveBeenCalledTimes(1)
   })
 
-  // THE TWO FALLBACK SITES NOW AGREE, because there is only one left. `ConversationSurface`'s
-  // `kind` prop used to carry its own default (`build`) for whatever this route did not resolve;
-  // it is required now, so `kindFromServer`'s `plan` is the only answer a caller can ever receive
-  // for a value it does not recognise — proven here by reading it straight off what the slot
-  // was actually handed, not by re-deriving it.
+  // THERE IS ONE FALLBACK SITE, NOT TWO. `ConversationSurface`'s `kind` prop is required, so
+  // `kindFromServer`'s `plan` is the only answer a caller can ever receive for a value it does
+  // not recognise — proven here by reading it straight off what the slot was actually handed,
+  // not by re-deriving it.
   //
   // Mutation receipt: swap `kindFromServer`'s `raw === 'build' ? 'build' : 'plan'` for `raw ===
   // 'build' ? 'build' : 'generic' as ChatKind` and this goes red on the `data-kind` assertion —
@@ -256,9 +255,8 @@ describe('ChatRoute — kind RESOLUTION (it no longer dispatches)', () => {
 })
 
 describe('ChatRoute — a generic conversation belongs at its assistant address', () => {
-  // Covers AE8, reframed at the route level per the plan: the generic SURFACE is `AssistantPage`'s
-  // own suite to pin; what this route is answerable for is whether it sends a generic conversation
-  // there at all.
+  // What this route is answerable for is whether a generic conversation is sent to its assistant
+  // address at all; the generic SURFACE itself is `AssistantPage`'s own suite to pin.
   it('a generic conversation opened at the builder address lands on its assistant address', async () => {
     h.getConversation.mockResolvedValue(conversation({ id: 'g1', kind: 'generic', projectId: null }))
     renderRoute('/chat/g1')

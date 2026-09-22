@@ -10,12 +10,20 @@
  *   3. THE ATTACHMENT PIPELINE STAYS OURS — the library renders a chip; it does not decide what
  *      is re-sent, inlined, or refused.
  */
+import type { ReactNode } from 'react'
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import { ComposerHarness } from './_composerHarness'
 import ComposerBox from '../ComposerBox'
+import ChatRuntimeProvider from '../runtime/ChatRuntimeProvider'
 import { SendRefusal } from '../sendRefusal'
-import { MAX_FILE_SIZE, MAX_FILE_SIZE_MB } from '../../../utils/attachmentInput'
+import {
+  GENERIC_ATTACHMENT_LANES_SENTENCE,
+  MAX_FILE_SIZE,
+  MAX_FILE_SIZE_MB,
+  MODEL_LANE_ONLY,
+  type AttachmentLanes,
+} from '../../../utils/attachmentInput'
 import type { ComposerSubmission } from '../ComposerBox'
 
 afterEach(cleanup)
@@ -36,12 +44,41 @@ interface DrawOptions {
   /** What the box reports it KEPT once an accepted send has been reconciled. */
   onAccepted?: (conversationId: string, keptText: string) => void
   locked?: boolean
+  /** Narrow the conversation to one lane. Absent is the shared harness, which is both. */
+  lanes?: AttachmentLanes
 }
 
-function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn(), onAccepted, locked = false }: DrawOptions = {}) {
+/**
+ * The provider every composer suite mounts through, or the same runtime narrowed to one lane —
+ * `ComposerHarness` takes no lanes, and a chat with no workspace is only itself under a narrowed
+ * one.
+ */
+function Harness({ lanes, children }: { lanes: AttachmentLanes | undefined; children: ReactNode }) {
+  if (!lanes) return <ComposerHarness>{children}</ComposerHarness>
+  return (
+    <ChatRuntimeProvider
+      messages={[]}
+      isRunning={false}
+      onNew={vi.fn().mockResolvedValue(undefined)}
+      onCancel={vi.fn().mockResolvedValue(undefined)}
+      attachmentLanes={lanes}
+    >
+      {children}
+    </ChatRuntimeProvider>
+  )
+}
+
+function draw({
+  onSubmit,
+  unavailableReason = null,
+  onUrgent = vi.fn(),
+  onAccepted,
+  locked = false,
+  lanes,
+}: DrawOptions = {}) {
   const submit = onSubmit ?? vi.fn().mockResolvedValue(undefined)
   const mount = (conversationId: string) => (
-    <ComposerHarness>
+    <Harness lanes={lanes}>
       <ComposerBox
         conversationId={conversationId}
         placeholder="Describe the change you need…"
@@ -51,7 +88,7 @@ function draw({ onSubmit, unavailableReason = null, onUrgent = vi.fn(), onAccept
         onUrgent={onUrgent}
         {...(onAccepted ? { onAccepted } : {})}
       />
-    </ComposerHarness>
+    </Harness>
   )
   const view = render(mount('chat-1'))
   /** Step to a sibling chat. A PROP CHANGE, not a remount — flat routing keeps one box for every
@@ -521,9 +558,8 @@ describe('★ the attachment pipeline stays ours', () => {
       })
 
       it('a refused SIZE is said out loud and nothing is staged', async () => {
-        // THE HALF WITH NO SECOND WIRE BEHIND IT. The adapter used to report this through a
-        // callback of its own as well; the event is now the only way it reaches a screen, so the
-        // path coverage that was redundant is now the whole proof.
+        // THE HALF WITH NO SECOND WIRE BEHIND IT. The event is the only way a refused size
+        // reaches a screen, so these three are the whole proof rather than one of two paths.
         // Mutation receipt: delete the `adapter-error` arm and all three of these go red together,
         // while the three above stay green.
         const onUrgent = vi.fn()
@@ -638,5 +674,67 @@ describe('★ the attachment pipeline stays ours', () => {
     await waitFor(() => expect(onUrgent).toHaveBeenCalled())
     expect(onUrgent.mock.calls.at(-1)?.[0]).toMatch(/at most 5 files/i)
     expect(screen.getByTestId('composer-chips').textContent).not.toContain('sixth.png')
+  })
+})
+
+describe('★ a chat with no workspace offers only the lane it can honour', () => {
+  // The two-lane promise belongs to a workspace: a reader in the project's sandbox is what opens
+  // a spreadsheet. A generic conversation has none, and its server refuses a code-lane file
+  // outright — so the picker never offers one, and the refusal is the server's own sentence
+  // rather than an upload round trip's.
+  const workbook = () =>
+    new File(['x'], 'payroll.xlsx', {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    })
+
+  it('refuses a spreadsheet at pick time, in the words the server would use', async () => {
+    // Mutation receipt: build the adapter with `ACCEPT_ATTR` regardless of the lanes and this
+    // goes red — the workbook stages as an ordinary chip.
+    const onUrgent = vi.fn()
+    draw({ onUrgent, lanes: MODEL_LANE_ONLY })
+    pick(workbook())
+    await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
+    expect(onUrgent.mock.calls[0]?.[0]).toContain(GENERIC_ATTACHMENT_LANES_SENTENCE)
+    expect(screen.queryByTestId('composer-chips')).toBeNull()
+  })
+
+  it('still takes a picture, which it can honour on its own', async () => {
+    const onUrgent = vi.fn()
+    draw({ onUrgent, lanes: MODEL_LANE_ONLY })
+    pick(new File(['x'], 'screenshot.png', { type: 'image/png' }))
+    await waitFor(() =>
+      expect(screen.getByTestId('composer-chips').textContent).toContain('screenshot.png'),
+    )
+    expect(onUrgent).not.toHaveBeenCalled()
+  })
+
+  it('leaves that same spreadsheet accepted in a chat that HAS a workspace', async () => {
+    // The half that keeps the narrowing honest: plan and build chats are untouched, so a fix
+    // that simply refused Office everywhere would go red here.
+    const onUrgent = vi.fn()
+    draw({ onUrgent })
+    pick(workbook())
+    await waitFor(() =>
+      expect(screen.getByTestId('composer-chips').textContent).toContain('payroll.xlsx'),
+    )
+    expect(onUrgent).not.toHaveBeenCalled()
+  })
+
+  it('promises no more than that on the attach control itself', () => {
+    draw({ lanes: MODEL_LANE_ONLY })
+    const title = screen.getByTestId('composer-attach').getAttribute('title')
+    expect(title).toContain(GENERIC_ATTACHMENT_LANES_SENTENCE)
+    expect(title).not.toMatch(/with code/i)
+  })
+
+  it('still measures size, which the library has no notion of', async () => {
+    // The lane narrowing runs BEFORE our own adapter, so the checks only it can make — the size
+    // cap and the per-message count — have to survive being fronted by the library's filter.
+    const onUrgent = vi.fn()
+    draw({ onUrgent, lanes: MODEL_LANE_ONLY })
+    pick(new File([new Uint8Array(MAX_FILE_SIZE + 1)], 'huge.png', { type: 'image/png' }))
+    await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
+    expect(onUrgent.mock.calls[0]?.[0]).toMatch(new RegExp(`exceeds the ${MAX_FILE_SIZE_MB} MB`, 'i'))
+    expect(screen.queryByTestId('composer-chips')).toBeNull()
   })
 })

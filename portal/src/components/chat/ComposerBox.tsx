@@ -28,8 +28,8 @@ import { ComposerPrimitive, useAui, useAuiState } from '@assistant-ui/react'
 import { Paperclip, Send, X } from 'lucide-react'
 
 import { payloadsOf } from './runtime/attachmentAdapter'
-import { usePendingAttachmentReads } from './runtime/stagedAttachments'
-import { ATTACHMENT_LANES_SENTENCE, unsupportedFormatMessage } from '../../utils/attachmentInput'
+import { useAttachmentLanes, usePendingAttachmentReads } from './runtime/stagedAttachments'
+import { unsupportedFormatMessage } from '../../utils/attachmentInput'
 import type { PendingAttachment } from '../../utils/attachmentInput'
 import AttachmentPreview, { type PreviewTarget } from './AttachmentPreview'
 import { SendRefusal } from './sendRefusal'
@@ -97,6 +97,9 @@ export default function ComposerBox({
   onUrgent,
 }: ComposerBoxProps) {
   const aui = useAui()
+  // WHAT THIS SURFACE CAN HONOUR, read from the adapter's own binding — the tooltip below
+  // promises exactly what the picker will take, on a chat with a workspace and on one without.
+  const lanes = useAttachmentLanes()
   const [preview, setPreview] = useState<PreviewTarget | null>(null)
   const [sending, setSending] = useState(false)
 
@@ -284,7 +287,7 @@ export default function ComposerBox({
       aui.on('composer.attachmentAddError', (event) => {
         switch (event.reason) {
           case 'not-accepted':
-            onUrgent(`That file ${unsupportedFormatMessage()}`)
+            onUrgent(`That file ${unsupportedFormatMessage(lanes)}`)
             return
           case 'adapter-error':
           case 'no-adapter':
@@ -294,7 +297,7 @@ export default function ComposerBox({
             assertNever(event.reason)
         }
       }),
-    [aui, onUrgent],
+    [aui, lanes, onUrgent],
   )
 
   return (
@@ -390,7 +393,7 @@ export default function ComposerBox({
             <ComposerPrimitive.AddAttachment
               data-testid="composer-attach"
               aria-label="Attach a file"
-              title={`${ATTACHMENT_LANES_SENTENCE} Or drop files anywhere in the composer.`}
+              title={`${lanes.sentence} Or drop files anywhere in the composer.`}
               // DIMMED WITH THE BOX, never unavailable. The board draws it at 40% while an offer
               // waits, and it stays pressable at 40%: staging a file is composing, not answering.
               className={`ms-auto inline-flex text-neutral transition hover:text-primary${locked ? ' opacity-40' : ''}`}
