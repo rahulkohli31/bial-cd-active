@@ -6,6 +6,10 @@
  *
  * `isStreaming`'s exact rendering behaviour is a deliberately open decision — to be settled
  * with a measurement on a long reply rather than from principle. Do not firm it up without one.
+ *
+ * NOTHING HERE CAN ASK WHO WROTE THE MESSAGE, because the renderer is not told: one pipeline
+ * serves every message. The citizen's own path is asserted where authorship exists —
+ * `ChatThread.parity.test.tsx`, through the thread's user-message bubble.
  */
 import { describe, it, expect, afterEach } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -26,10 +30,10 @@ describe('MessageContent — markdown rendering', () => {
     expect(screen.getAllByRole('listitem')).toHaveLength(2)
   })
 
-  it('renders user prose verbatim — never as markdown', () => {
-    render(<MessageContent parts={textPart('**not bold**')} isUser />)
-    expect(screen.getByText('**not bold**')).toBeTruthy()
-    expect(document.querySelector('strong')).toBeNull()
+  it('a build chat\'s first message, stored before this change, renders its heading and list on read — nothing is backfilled', () => {
+    render(<MessageContent parts={textPart('# Welcome\n- first\n- second')} />)
+    expect(screen.getByRole('heading', { level: 1, name: 'Welcome' })).toBeTruthy()
+    expect(screen.getAllByRole('listitem')).toHaveLength(2)
   })
 
   it('a single newline still renders as two visual lines (remark-breaks)', () => {
@@ -56,7 +60,15 @@ describe('MessageContent — markdown rendering', () => {
     expect(table?.parentElement?.className).toContain('overflow-x-auto')
   })
 
-  it('an image in assistant markdown never renders an <img> (zero-click GET prevention)', () => {
+  it('a fenced code block pasted by a citizen stays within the bubble\'s width — Streamdown wraps its body in overflow-x-auto', () => {
+    const text = ['```js', 'const line = "long enough to need a horizontal scroll, not a bubble overflow"', '```'].join('\n')
+    const { container } = render(<MessageContent parts={textPart(text)} />)
+    const body = container.querySelector('[data-streamdown="code-block-body"]')
+    expect(body).toBeTruthy()
+    expect(body?.className).toContain('overflow-x-auto')
+  })
+
+  it('an image in any message never renders an <img> (zero-click GET prevention)', () => {
     const { container } = render(
       <MessageContent parts={textPart('before ![alt text](https://attacker.example/x.png) after')} />,
     )
@@ -97,7 +109,7 @@ describe('MessageContent — markdown rendering', () => {
     expect(link?.getAttribute('rel')).toBeNull()
   })
 
-  it('isStreaming renders plain text, never markdown, even for an assistant message', () => {
+  it('isStreaming renders plain text, never markdown — the branch is author-blind, so one case covers a still-arriving message from either author', () => {
     const { container } = render(<MessageContent parts={textPart('**bold**')} isStreaming />)
     expect(container.querySelector('strong')).toBeNull()
     expect(screen.getByText('**bold**')).toBeTruthy()

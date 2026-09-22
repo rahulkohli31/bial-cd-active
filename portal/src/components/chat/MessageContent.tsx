@@ -6,12 +6,11 @@ import type { MessagePart } from '../../utils/messageTypes'
 
 export interface MessageContentProps {
   parts: MessagePart[] | string
-  isUser?: boolean
   /** True only while THIS message is the one actively streaming in. An incomplete
    *  markdown document re-parses per token — bold popping in when the closing `**`
    *  lands, an unterminated code fence rendering the growing tail as a code block —
-   *  so a streaming assistant message renders as plain text (same treatment as the
-   *  user branch) until it settles, then switches to the real markdown render. */
+   *  so a streaming message renders as plain text until it settles, then switches to
+   *  the real markdown render. */
   isStreaming?: boolean
 }
 
@@ -84,10 +83,9 @@ function MarkdownStrong({ node: _node, ...props }: HTMLAttributes<HTMLElement> &
  * `<div>`/`<span>`/`<details>`/`<b>` pass through. `MessageContent.test.tsx` pins the
  * discriminating case against the actually-installed package, not assumed from docs.
  */
-export default function MessageContent({ parts, isUser, isStreaming }: MessageContentProps) {
+export default function MessageContent({ parts, isStreaming }: MessageContentProps) {
   const text = partsToText(parts)
-  const renderAsPlainText = isUser || isStreaming
-  return renderAsPlainText ? (
+  return isStreaming ? (
     <div className="whitespace-pre-wrap break-words">{text}</div>
   ) : (
     <div className="prose prose-sm max-w-none prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0.5 prose-strong:text-tertiary prose-ul:pl-4 prose-ol:pl-4">
