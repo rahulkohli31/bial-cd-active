@@ -151,8 +151,16 @@ export interface ConversationSurfaceProps {
    * informs, the route decides, so the heading keeps one author.
    */
   onTitleDerived?: (title: string) => void
-  /** Which kind of conversation this is. Read for ONE thing: whether the app pane is seen. */
-  kind?: ChatKind
+  /**
+   * Which kind of conversation this is. Read for ONE thing: whether the app pane is seen.
+   *
+   * REQUIRED, NOT DEFAULTED. `ChatRoute`'s `kindFromServer`/`kindFromQuery` are the one place an
+   * unrecognised or absent kind resolves to something — a plan chat, the least-privileged
+   * surface, since `?kind=` is user-controllable. A second, disagreeing default here (this used
+   * to fall back to `build`) let a caller that skipped that resolution land on the wrong surface
+   * silently. Requiring the prop turns that into a compile error instead of a second guess.
+   */
+  kind: ChatKind
   projectHasSavedBuild?: boolean | null
   buildSessionDeps?: UseBuildSessionDeps
 }
@@ -337,11 +345,9 @@ function putStep(sink: TurnSink, toolCallId: string, step: StepItem): void {
   else sink.parts[at] = { kind: 'step', toolCallId, step }
 }
 
-export default function ConversationSurface({ chatId: chatIdProp, kind = 'build', projectId = null, projectHasSavedBuild = null, onTitleDerived, buildSessionDeps }: ConversationSurfaceProps = {}) {
+export default function ConversationSurface({ chatId: chatIdProp, kind, projectId = null, projectHasSavedBuild = null, onTitleDerived, buildSessionDeps }: ConversationSurfaceProps) {
   // THE ONE THING THE KIND DECIDES ON THIS SURFACE. A Plan chat shows no app pane; a
-  // Build chat shows it. `build` is the default because fifteen existing suites mount this surface
-  // with no kind at all and every one of them is about the build surface — defaulting to `plan`
-  // would silently retire the pane from all of them.
+  // Build chat shows it.
   const isPlanChat = kind === 'plan'
   const navigate = useNavigate()
   const location = useLocation()
