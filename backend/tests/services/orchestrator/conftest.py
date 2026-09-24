@@ -4,9 +4,6 @@ The autouse `_no_live_model` guard forbids any live model request for the whole 
 (mirrors `tests/services/agent/conftest.py`): the `FunctionModel` never hits the network, but an
 accidental real call fails loudly instead of billing Foundry.
 
-`CollectingSink` is the in-process `on_progress` double (every emitted envelope lands in
-`.events`); `tests/services/agent/test_toolsets.py` takes it from here too.
-
 `build_tool_agent` is the LOCAL driver for the sandbox toolset — see its docstring for why the
 driver is local now. The harness fixtures once defined here — `make_orchestrator`,
 `make_provider`, `billing_factory` — were deleted along with
@@ -18,7 +15,6 @@ from __future__ import annotations
 import pytest
 from pydantic_ai import Agent, RunContext, models
 
-from src.api.v1.build_sessions.schemas import ProgressEnvelope
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.tools import sandbox_toolset
 from tests.fakes import ToolDeps
@@ -30,21 +26,6 @@ def _no_live_model():
     models.ALLOW_MODEL_REQUESTS = False
     yield
     models.ALLOW_MODEL_REQUESTS = previous
-
-
-class CollectingSink:
-    """A `ProgressSink` double: every emitted envelope is appended to `events`."""
-
-    def __init__(self) -> None:
-        self.events: list[ProgressEnvelope] = []
-
-    async def __call__(self, env: ProgressEnvelope) -> None:
-        self.events.append(env)
-
-
-@pytest.fixture
-def sink() -> CollectingSink:
-    return CollectingSink()
 
 
 def _sandbox_of(ctx: RunContext[ToolDeps]) -> SandboxSession:

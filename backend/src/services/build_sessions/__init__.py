@@ -3,7 +3,7 @@
 The one-per-user Redis lock + heartbeat + registry-state helpers (`locks`), the reaper
 ordering + reconciliation sweep (`reaper`), the app-data credential mint + injection
 (`appdata`) and the per-project database half of that env (`appdb_env`), the snapshot
-write (`snapshot`), and the in-process session lifecycle + progress channel (`manager`).
+write (`snapshot`), and the in-process session lifecycle (`manager`).
 
 `attachments` is GONE. It materialized a conversation's file parts into the standalone build
 agent's prompt, and its one caller was `SessionManager.start` — deleted with the start route. A

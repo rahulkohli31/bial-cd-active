@@ -27,7 +27,6 @@ from src.api.v1.build_sessions.schemas import (
     SERVED_TRAFFIC_STAY_SECONDS,
     SURFACE_PRESENT_STAY_SECONDS,
     TURN_ENDED_STAY_SECONDS,
-    BuildSessionStatus,
 )
 from src.services.build_sessions import locks
 from src.services.build_sessions.locks import (
@@ -252,7 +251,6 @@ def _pardoned_session(*, user_id: uuid.UUID) -> BuildSession:
         user_id=user_id,
         project_id=uuid.uuid4(),
         app_id=uuid.uuid4(),
-        prompt="",
         lock_token="tok",
         handle=SandboxHandle(
             fqdn="x.example",
@@ -306,22 +304,6 @@ async def test_a_turn_ending_inside_a_relaunchs_stay_leaves_it_untouched(
     deadline, writer = await _stay_for(fake_redis, user_id)
     assert deadline == long_deadline, "the longer deadline must not be truncated"
     assert writer == DeadlineWriter.BUILDER_ACTED.value, "provenance still names who bought it"
-
-
-async def test_a_turn_that_failed_is_still_pardoned(fake_redis: aioredis.Redis) -> None:
-    """HOW the turn ended buys it nothing either. A session left in a FAILED state still earns
-    the pause: the citizen is still sitting in front of the app, and the screen that is open
-    renews from here."""
-    user_id = uuid.uuid4()
-    await _register_as(fake_redis, user_id)
-    manager = SessionManager()
-    session = _pardoned_session(user_id=user_id)
-    session.status = BuildSessionStatus.FAILED
-
-    await manager._pardon_the_container(fake_redis, session)
-
-    _, writer = await _stay_for(fake_redis, user_id)
-    assert writer == DeadlineWriter.TURN_ENDED.value
 
 
 async def test_the_sweep_spares_a_container_inside_the_short_stay_and_reaps_through_it_after(

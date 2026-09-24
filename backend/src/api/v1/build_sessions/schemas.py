@@ -1,30 +1,26 @@
-"""Build-session schemas — the frozen control surface plus the brain interface.
+"""Build-session schemas — the frozen control surface, plus the self-heal error shape.
 
 The portal↔session-API control API (`BuildSessionStatus` and the request/response bodies)
 crosses the JSON wire, so it subclasses `CamelModel` (snake_case ⇄ camelCase). The
 status is an API `StrEnum`, not a native PG enum — no durable row is persisted.
 
-The brain seam is the tagged-union progress envelope, `BuildResult`, and the `run_build`
-protocol. It keeps snake_case fields AND `type` literals — a frame whose keys must stay
-byte-stable — so these subclass plain `BaseModel` with no alias generator, discriminating on
-`type` like `FileOp` on `action`. Freezing them here as shared
-read-only code stops both sides inventing the shape separately.
+`BuildError` is the self-heal error shape, classed by `ErrorSource`: read in-process by the
+repair prompt and the deploy failure path, so it subclasses plain `BaseModel` with no alias
+generator rather than `CamelModel`.
 """
 
 from __future__ import annotations
 
 import enum
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Annotated, Final, Literal, Protocol
+from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.integrity_types import WorkspaceState
 from src.schemas import CamelModel
-from src.services.sandbox import SandboxClient
 from src.services.sandbox.base import CompileState
 
 # =============================================================================
@@ -42,29 +38,25 @@ class BuildSessionStatus(enum.StrEnum):
     """
 
     PROVISIONING = "provisioning"  # session created; sandbox provisioning/attaching. No preview.
-    BUILDING = "building"  # run_build's agentic loop is executing model steps + self-heal.
-    READY = "ready"  # dev server up: a `preview_ready` envelope fired and `preview_url` is set.
+    BUILDING = "building"  # the agentic build loop is executing model steps + self-heal.
+    READY = "ready"  # dev server serving; set on `RelaunchPreviewResponse.status`.
     ENDED = "ended"  # terminal, GRACEFUL: user stop / idle-teardown / quota. Not a failure.
     FAILED = "failed"  # terminal, UNRECOVERABLE: self-heal exhausted / unrecoverable error.
 
 
 # --- Frozen lock TTL + cadence constants -------------------------------------
 # The lock and the heartbeat have no browser renewal surface: they are renewed in-process, by
-# `locks.py`/`manager.py`/`turns/engine.py`/`reaper.py`. A browser renews ONE thing and one only
+# `locks.py` and `turns/engine.py`. A browser renews ONE thing and one only
 # — the preview's stay of execution, through `projects/{project_id}/renew`, bounded by the
 # absolute ceiling below so a tab left open cannot make a container immortal.
 
 LOCK_TTL_SECONDS = 900  # 15 min — lock auto-expires if not renewed (the reaper reconciles).
 # THE TWO CADENCES BELOW HAVE NO RUNTIME READER LEFT, and saying so is the point: they were
-# written for the browser that renewed on a timer, and that caller is gone. TWO server-side
-# renewers replaced it, and neither reads these numbers. `manager.on_progress` calls
-# `renew_lock` + `write_heartbeat` on every non-terminal progress envelope — frame-driven, so a
-# build renews as fast as it produces frames. That is not enough on its own: a build that spends
-# longer than `HEARTBEAT_TTL_SECONDS` inside one tool call emits no frame, so the frame-driven
-# renewer alone lets the heartbeat expire under a live build. So the turn engine's
-# liveness-lease loop (`turns/engine.py::_hold_liveness_lease`) calls the same pair once per
-# `LIVENESS_LEASE_RENEW_CADENCE_SECONDS` — 30 s, comfortably inside the 90 s heartbeat TTL below,
-# and that is where the real wall-clock cadence lives.
+# written for the browser that renewed on a timer, and that caller is gone. The turn engine's
+# liveness-lease loop (`turns/engine.py::_hold_liveness_lease`) is the only renewer left: it
+# calls `renew_lock` + `write_heartbeat` once per `LIVENESS_LEASE_RENEW_CADENCE_SECONDS` — 30 s,
+# comfortably inside the 90 s heartbeat TTL below — and that is where the real wall-clock
+# cadence lives.
 # They stay as the frozen HEAD-ROOM RATIOS the live TTLs are sized against — each is ⅓ of
 # the TTL beside it, so two renewals may be missed before anything lapses. `test_locks.py::
 # test_lock_ttl_has_renew_headroom` pins the lock half of that inequality; the seconds
@@ -266,46 +258,6 @@ added later with no entry here raises `KeyError` on lookup rather than silently 
 whose meaning nobody chose (`tests/api/v1/build_sessions/test_preview_state.py`
 asserts every member is present). See `PreviewStateAction` for what each bucket may do, and for the
 one rule this mapping exists to enforce: `UNKNOWN` never maps to `REMEDY`."""
-
-
-# --- Control operations ------------------------------------------------------
-#
-# THE START ROUTE IS GONE and these two shapes outlive it. The bare `POST` on the build-sessions
-# collection was deleted with the whole harness behind it — it had had no browser client for a
-# long time before the deletion. `StartBuildRequest` stays because `test_import_graph.py` freezes
-# this package's schema re-export set at this location and imports it by name; `StartBuildResponse`
-# stays beside it so the pair documents the wire shape the transcript's surviving `build_started`
-# rows were written against. Neither is served by any route, and neither should grow a field.
-
-
-class StartBuildRequest(CamelModel):
-    """The body the deleted start route took. NO ROUTE ACCEPTS IT — kept as the frozen schema
-    re-export `test_import_graph.py` pins."""
-
-    project_id: uuid.UUID  # REQUIRED — project-first; no lazy Default project (never reintroduce).
-    prompt: str  # the citizen-dev's natural-language build instruction for this turn (non-empty).
-    # OPTIONAL, back-compat: the thread whose attachments ground this build (`conversationId`
-    # on the wire). Present → the server materializes that conversation's file parts into the
-    # agent's prompt (images/PDF as vision, office/csv as fenced extracted text); absent → a
-    # text-only build, byte-identical to the behaviour before this field existed. Attachments
-    # travel by REFERENCE, not payload: the portal already persisted the parts before calling
-    # start, so the bytes need no second trip through the browser. Amends a frozen request
-    # body — additive and optional. Owner- AND project-scoped at resolution: a conversation that is
-    # not the caller's, or belongs to a different project than `project_id`, is a non-leaking 404
-    # (a build must never be grounded in another project's files).
-    conversation_id: uuid.UUID | None = None
-
-
-class StartBuildResponse(CamelModel):
-    """The 201 the deleted start route returned. NO ROUTE PRODUCES IT — and with it went the last
-    producer of a session id the browser could hold."""
-
-    session_id: uuid.UUID
-    project_id: uuid.UUID
-    app_id: uuid.UUID  # the app_registry row being built (== BIAL_APP_ID). Fresh per project.
-    status: BuildSessionStatus  # always `provisioning` on a fresh start.
-    preview_url: str | None = None  # always null here (dev server not up yet); set once `ready`.
-    created_at: datetime
 
 
 class RelaunchPreviewRequest(CamelModel):
@@ -513,17 +465,13 @@ class RenewPresenceResponse(CamelModel):
 
 
 # =============================================================================
-# Brain interface + tagged-union progress envelope
+# Self-heal error shape
 # =============================================================================
-#
-# Snake_case field names + snake_case `type` literals, NO camelCase alias generator
-# on purpose: the envelope is a frame whose keys must be byte-stable between the
-# emitter and the pinned schema test.
 
 
 class ErrorSource(enum.StrEnum):
-    """The self-heal error origin. Shared by `ErrorEvent`,
-    `EscalationEvent.last_error`, and `BuildResult.error`."""
+    """The self-heal error origin, carried on `BuildError.source` and the turn stream's
+    `DiagnosticFrame.source`."""
 
     TSC = "tsc"  # `tsc` typecheck failure, read over the supervisor's /exec.
     NEXT_BUILD = "next_build"  # `next build` failure, read over the supervisor's /exec.
@@ -540,7 +488,7 @@ class ErrorSource(enum.StrEnum):
 
 class BuildError(BaseModel):
     """The structured, self-heal-relevant error shape — `{source, title, cleaned_stack}`,
-    reused by the `error` envelope, `escalation.last_error`, and `BuildResult.error`.
+    read by the self-heal repair prompt and the deploy failure path.
 
     THIS SHAPE IS THE MODEL'S — deliberately left alone. `title` is the compiler's own first
     line, which made rendering it the most developer-looking thing a citizen read; the fix
@@ -554,179 +502,16 @@ class BuildError(BaseModel):
     title: str  # short human summary (first meaningful error line).
     cleaned_stack: str  # de-noised diagnostic BRAIN feeds back into the self-heal prompt.
     # The AGENT-ONLY half of a deliberately dual-purpose object. `BuildError` is read by two
-    # audiences with opposite needs: it becomes the portal's `error` envelope / `diagnostic` frame
-    # AND the next run's repair prompt. For a `client`-class report those two must diverge — the
+    # audiences with opposite needs: the model, through `build_repair_prompt`, and the citizen,
+    # through the diagnostic it renders. For a `client`-class report those two must diverge — the
     # text was written by code inside the generated app, so it may reach the model (which can act
     # on it) and must not reach the user (for whom a JS stack trace is not a product surface).
     #
     # `exclude=True` is what makes that structural instead of a convention: the field is dropped
-    # from EVERY serialization, so `BuildResult.error` and `EscalationEvent.last_error` cannot
-    # carry it out to the portal by simply forgetting about it. `build_repair_prompt` reads the
-    # attribute in-process, which is the only path that sees it at all.
+    # from EVERY serialization, so nothing built from this shape can carry it out by simply
+    # forgetting about it. `build_repair_prompt` reads the attribute in-process, which is the
+    # only path that sees it at all.
     #
     # Absent (None) on every other source, where `cleaned_stack` is already safe to render and the
     # repair prompt uses it unchanged — so nothing about the tsc / server / next_build arms moves.
     agent_only_detail: str | None = Field(default=None, exclude=True)
-
-
-class _ProgressEventBase(BaseModel):
-    """Shared envelope base: every progress event carries the monotonic `seq`. Extra
-    keys are forbidden so a mis-shaped payload fails discrimination loudly."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    seq: int  # per-session, starts at 1, strictly +1, gap-free.
-
-
-class StepEvent(_ProgressEventBase):
-    """`step` — a high-level phase marker for the activity feed."""
-
-    type: Literal["step"] = "step"
-    name: str  # stable-ish step id, e.g. "scaffold" | "install_deps" | "dev_start" | "self_heal".
-    label: str  # human one-liner, e.g. "Installing dependencies…".
-    state: Literal["started", "ok", "failed"]  # drives the UI spinner → check/cross.
-    # Read-only + housekeeping steps are dropped from the VISIBLE feed (the raw command
-    # still reaches the model). Additive + defaulted, so emitters written before this field
-    # existed stay wire-valid.
-    hidden: bool = False
-
-
-class ErrorEvent(_ProgressEventBase):
-    """`error` — the structured error BRAIN reacts to; carries `{source, title,
-    cleaned_stack}`. Currently only tsc | next_build | server are emitted."""
-
-    type: Literal["error"] = "error"
-    source: ErrorSource
-    title: str
-    cleaned_stack: str
-
-
-class PreviewReadyEvent(_ProgressEventBase):
-    """`preview_ready` — the dev server is live and framable; carries `preview_url`.
-    Flips the session status → `ready`."""
-
-    type: Literal["preview_ready"] = "preview_ready"
-    # The PUBLIC address — `https://<apps-host>/a/<app-name>/`, never the container's.
-    preview_url: str
-
-
-class PreviewReconnectingEvent(_ProgressEventBase):
-    """`preview_reconnecting` — the dev-server PROCESS exited (the port closed) AFTER the preview
-    was already framed. A status SIGNAL, not a lifecycle transition: the `BuildSessionStatus`
-    enum is frozen at five members with no "reconnecting" state, so this never changes the session
-    status (a completed build stays `ended`, a live one stays `ready`). The FRONTEND cannot
-    originate this: `/dev/status` is supervisor-internal + bearer-guarded, so crash
-    detection is backend-only (the early readiness watcher owns it)."""
-
-    type: Literal["preview_reconnecting"] = "preview_reconnecting"
-
-
-class EscalationEvent(_ProgressEventBase):
-    """`escalation` — the self-heal loop gave up; a human or next turn must intervene.
-    Informational; the terminal boundary is the following `ended`."""
-
-    type: Literal["escalation"] = "escalation"
-    reason: str  # machine-ish code, e.g. "self_heal_budget_exhausted".
-    detail: str  # human explanation for the activity feed.
-    last_error: BuildError | None = None  # the final error that triggered escalation, or null.
-
-
-class QuotaExceededEvent(_ProgressEventBase):
-    """`quota_exceeded` — the per-user daily token cap was hit at a model step.
-    BRAIN emits this, then gracefully ends."""
-
-    type: Literal["quota_exceeded"] = "quota_exceeded"
-    limit: int  # the effective daily cap (from DailyTokenLimitExceededError.limit).
-    used: int  # tokens used today (from .used).
-    resets_at: str  # next IST-midnight, UTC ISO-8601 (gate.next_ist_midnight_iso).
-
-
-class EndedEvent(_ProgressEventBase):
-    """`ended` — the terminal envelope. `status` equals `BuildResult.status`, and exactly one is
-    emitted per session."""
-
-    type: Literal["ended"] = "ended"
-    # Narrowed to the two terminal members: a terminal frame carrying a non-terminal status
-    # (e.g. `building`) must fail validation, not slip through.
-    status: Literal[BuildSessionStatus.ENDED, BuildSessionStatus.FAILED]
-    preview_url: str | None = None  # the final live preview URL, or null if it never came up.
-    snapshot_committed: bool  # True if the snapshot pushed before end.
-    reason: str  # "completed" | "stopped_by_user" | "idle_teardown" | "quota_exceeded" | …
-
-
-ProgressEnvelope = Annotated[
-    StepEvent
-    | ErrorEvent
-    | PreviewReadyEvent
-    | PreviewReconnectingEvent
-    | EscalationEvent
-    | QuotaExceededEvent
-    | EndedEvent,
-    Field(discriminator="type"),
-]
-"""The tagged-union progress envelope — seven members, discriminated on `type`.
-BRAIN emits one per `await on_progress(env)`.
-
-A later cleanup retired the `log` member: no production BRAIN path had ever called the
-emitter's `log` helper (a dead-code audit finding, not a behavior change), so removing it
-drops the portal's unreachable raw-output consumer arm along with it."""
-
-
-class BuildResult(BaseModel):
-    """BRAIN's structured terminal verdict, returned to SESSION-API
-    **in-process** (never serialized to the wire).
-
-    This — NOT an envelope — is how BRAIN's completion travels back, so `status` / `reason` /
-    `preview_url` here are the source the terminal frame's fields are built from."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    # Terminal state, narrowed to the two absorbing members — becomes the `ended` envelope's
-    # `status`; a non-terminal value (e.g. `building`) fails validation.
-    status: Literal[BuildSessionStatus.ENDED, BuildSessionStatus.FAILED]
-    reason: str  # becomes the `ended` envelope's `reason`: "completed" | "quota_exceeded" | …
-    app_id: uuid.UUID  # the built app (app_registry.id == BIAL_APP_ID).
-    preview_url: str | None = None  # the live preview URL if the dev server came up, else None.
-    last_seq: int  # the final envelope `seq` emitted.
-    # ALWAYS False by construction — this value is taken before the snapshot runs. NEVER read it
-    # as the answer to "was the work saved?": only the terminal `ended` frame carries that. Kept
-    # solely so the frozen verdict shape keeps its field.
-    snapshot_committed: bool
-    error: BuildError | None = None  # populated on `failed`; None on a clean end.
-
-
-# --- The run_build interface -----------------------------------------
-
-ProgressSink = Callable[[ProgressEnvelope], Awaitable[None]]
-"""The in-process async sink SESSION-API supplies. BRAIN `await`s it for every
-envelope it emits — this IS the transport (an `asyncio.Queue` put), never Redis."""
-
-
-class RunBuild(Protocol):
-    """The frozen BRAIN entry point — a callable Protocol BRAIN's orchestrator
-    implements; imported READ-ONLY here. Exactly four parameters; the
-    `prompt` is intentionally NOT one of them (how BRAIN obtains the instruction is a
-    SESSION-API↔BRAIN internal, outside this frozen surface).
-
-    `sandbox_client` is the `SandboxClient` ABC (BRAIN calls the exec/files/dev
-    subset through it); `on_progress` is the `ProgressSink`.
-    """
-
-    async def __call__(
-        self,
-        session_id: uuid.UUID,  # the build session. Identifies the run.
-        user_id: uuid.UUID,  # the session OWNER — all metering is charged here
-        sandbox_client: SandboxClient,  # the client ABC instance. Imported READ-ONLY.
-        on_progress: ProgressSink,  # the in-process sink for every emitted envelope.
-    ) -> BuildResult: ...
-
-
-BillingSessionFactory = async_sessionmaker[AsyncSession]
-"""BRAIN's per-model-step metering session factory. Because `run_build`'s
-signature is frozen at four params, the factory is a **construction-time dependency**
-of BRAIN's orchestrator (not a `run_build` argument): BRAIN opens its own
-`AsyncSession` per model step from it and OWNS the commit — `record_usage` does not
-commit, and there is no request-scoped `get_db` on a background task. Tests bind it to
-the rolled-back test session — the same substitution the conversation suites make via
-`dependency_overrides` on `_shared.billing_session_factory`.
-"""

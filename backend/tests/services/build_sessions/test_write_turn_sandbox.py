@@ -1,10 +1,9 @@
 """The WRITE turn's sandbox lifecycle: `ensure_sandbox` / `finish_turn_sandbox`.
 
-A Write turn allocates everything a build allocates (container, lock, registry, heartbeat) and
-none of what a build runs (`run_build`, `build_started`, attachments). These tests pin both
-halves, plus the save model: `write_snapshot` is the only path that pushes the tree to Blob
-storage, and a Write turn with no reachable save point would report success while silently
-losing every edit to the next reaper sweep.
+A Write turn allocates everything a build allocates (container, lock, registry, heartbeat).
+These tests pin that, plus the save model: `write_snapshot` is the only path that pushes the
+tree to Blob storage, and a Write turn with no reachable save point would report success while
+silently losing every edit to the next reaper sweep.
 
 `may_write` mirrors the turn's toolset (`toolsets_for_kind` gives the mutating `sandbox_toolset`
 only to `ChatKind.BUILD`), so `may_write=False` implies `touched=False` in production — a test
@@ -28,7 +27,6 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.config import settings
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import ChatKind
@@ -166,9 +164,6 @@ async def test_ensure_sandbox_allocates_a_build_worth_of_state_without_the_build
     assert await lock_is_held(fake_redis, user.id) is True
     assert await heartbeat_is_alive(fake_redis, user.id) is True
     assert await read_registry(fake_redis, user.id) is not None
-
-    # And nothing a build would run.
-    assert session.prompt == ""
 
 
 async def test_ensure_sandbox_mints_the_app_row_a_fresh_project_lacks(
@@ -418,7 +413,6 @@ async def test_the_terminal_pardons_the_container_so_the_preview_outlives_the_tu
     assert await stay_of_execution_is_current(fake_redis, user.id) is True  # lease owns it now
     assert await lock_is_held(fake_redis, user.id) is False  # the slot is free
     assert manager.active_session_for(user.id) is None
-    assert session.status == BuildSessionStatus.ENDED
 
 
 async def test_a_second_message_attaches_instead_of_rebuilding_the_container(
@@ -812,12 +806,10 @@ async def test_a_confirmed_gone_container_still_reclaims_silently(
 class _Blocking:
     """Holds a live WRITE TURN open so the switch lands mid-write.
 
-    THE ONLY KIND OF WORK LEFT TO CATCH MID-FLIGHT. This used to hold a build session open by
-    parking a `FakeBrain` the manager had spawned and could cancel itself; that whole path went
-    with `SessionManager.start`. A turn on the real `TurnEngine` is what holds the workspace
-    now, so the hold lives where production's does — inside the streaming model. `stepped` says
-    the turn is genuinely under way, `gate` is the test's hand on the tap, and a stop cancels
-    the `gate.wait()`, which is the shape a real agent mid-write takes."""
+    THE ONLY KIND OF WORK LEFT TO CATCH MID-FLIGHT. A turn on the real `TurnEngine` is what
+    holds the workspace, so the hold lives where production's does — inside the streaming
+    model. `stepped` says the turn is genuinely under way, `gate` is the test's hand on the tap,
+    and a stop cancels the `gate.wait()`, which is the shape a real agent mid-write takes."""
 
     def __init__(self) -> None:
         self.gate = asyncio.Event()

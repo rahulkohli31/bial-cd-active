@@ -146,21 +146,8 @@ def test_the_package_does_not_drag_in_the_route_tree() -> None:
     assert "LOADED:" in result.stdout, result.stdout
     dragged_in = result.stdout.split("LOADED:")[1].strip()
     assert dragged_in == "", (
-        "the build-sessions package re-exports the route tree again — a worker importing a C7 "
-        f"schema now pulls in {dragged_in}. Keep the schemas re-exports; drop deps/router."
-    )
-
-
-def test_the_build_session_schema_re_exports_survive() -> None:
-    """The other half of the `deps`/`router` cleanup: these schemas (`ProgressEnvelope`,
-    `RunBuild`, `StartBuildRequest`) are frozen AT THIS LOCATION, so that cleanup must not
-    have taken them with it."""
-    result = _import_in_fresh_interpreter(
-        "from src.api.v1.build_sessions import ProgressEnvelope, RunBuild, StartBuildRequest;"
-        " print('ok')"
-    )
-    assert result.returncode == 0, (
-        f"a C7 schema re-export was lost.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        "the build-sessions package re-exports the route tree again — a worker importing this "
+        f"package now pulls in {dragged_in}. The package must not re-export deps/router."
     )
 
 

@@ -466,14 +466,14 @@ async def test_the_closing_marker_carries_a_value_the_report_cannot_predict() ->
 
 
 async def test_no_user_facing_frame_carries_any_part_of_the_report() -> None:
-    """THE INERTNESS GUARD. `BuildError` is dual-purpose — a portal envelope AND a model
-    prompt — and a JS stack trace under a file-path title in a citizen's chat is exactly what
-    this guard exists to prevent.
+    """THE INERTNESS GUARD. `BuildError` serves two audiences — a model prompt, and anything that
+    serializes it — and a JS stack trace under a file-path title in a citizen's chat is exactly
+    what this guard exists to prevent.
 
     DEFENCE IN DEPTH: the turn engine already skips emitting a diagnostic frame for this class,
     pinned in `test_write_turn.py::test_a_client_class_error_repairs_the_app_without_narrating_it`.
-    This guards the layer beneath — even a rendering surface could not leak it, since the legacy
-    `escalation.last_error` and `BuildResult.error` envelopes still serialize it."""
+    This guards the layer beneath — even `BuildError`'s own wire form must not leak it, so the
+    assertions below dump the error itself, not just the frame that wraps it."""
     secret_ish = "at RecordsTable (app/records/page.tsx:41:19)"
     error = await _client_error_from_a_report(
         source="window.onerror", title="Cannot read properties of undefined", stack=secret_ish

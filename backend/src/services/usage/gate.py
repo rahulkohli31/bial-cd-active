@@ -140,7 +140,7 @@ _CACHE_WRITE_MULTIPLIER_BY_TTL: Final[dict[str, Decimal]] = {
 
 # The tier every breakpoint in the platform buys. Restated rather than imported from
 # `orchestrator.constants`, which cannot be reached from a service without dragging the API layer
-# in behind it (`orchestrator/progress.py`); `tests/services/usage/test_gate.py` pins this against
+# in behind it (`orchestrator/errors.py`); `tests/services/usage/test_gate.py` pins this against
 # the TTL constants that actually set the breakpoints. A `TokenUsage` row carries no per-row TTL,
 # so one weight is only correct while the whole codebase buys one tier — which that test also pins.
 _BILLED_CACHE_TIER: Final = "1h"

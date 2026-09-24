@@ -25,7 +25,7 @@ import { readApiError } from './apiError'
  * its emitted field set in a test) because nothing rendered it — a platform internal that
  * crossed to the browser and sat there, one refactor from an expander. Re-adding it here
  * would rebuild that seam's client half, which is why this comment names the omission
- * rather than leaving it silent (the progress-envelope egress rule).
+ * rather than leaving it silent.
  */
 export interface StepItem {
   type: 'step'

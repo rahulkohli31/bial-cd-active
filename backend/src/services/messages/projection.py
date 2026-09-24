@@ -662,7 +662,7 @@ def label_when_settled(tool_name: str, label: str, *, failed: bool) -> str:
     """One step's label once its result has landed: the failure wording when the call came back
     a failure, "Checked on your app" for the state tool, and the label unchanged otherwise.
 
-    PUBLIC AND SHARED, like the three classifiers beside it: the live emitter resolves a step
+    PUBLIC AND SHARED, like `classify_tool_call` beside it: the turn engine resolves a step
     when the return arrives and the reload projection derives the same step from the stored
     return, so wording that only one of them applied would be a live/reload disagreement about
     what the citizen is reading. `failed` is keyword-only and has NO DEFAULT — both callers
@@ -674,16 +674,6 @@ def label_when_settled(tool_name: str, label: str, *, failed: bool) -> str:
     if failed:
         return failed_step_line(label)
     return _LBL_CHECKED_APP if tool_name == APP_STATE_TOOL else label
-
-
-def classify_command(argv: list[str]) -> tuple[str, bool]:
-    """Public entry to the run_command classifier — the LIVE emitter (`orchestrator/tools.py`)
-    shares this exact logic with the reload projection: same friendly BASE label + `hidden`
-    flag + step state, neither feed ever shows raw shell/argv, and a command classifies
-    identically on both. Parity on a FAILURE is the same friendly base with both sides naming
-    the failure — through `failed_step_line`, or through the more specific suffix the live
-    emitter has for a command it refused to run — never byte-identical labels, and never argv."""
-    return _classify_command(argv)
 
 
 def command_needs_the_long_timeout(argv: list[str]) -> bool:
@@ -729,12 +719,6 @@ def long_operation_line(label: str) -> str:
         return base
     opener = base if base.startswith(_STILL) else f"{_STILL}{base[0].lower()}{base[1:]}"
     return f"{opener}{_LONG_OPERATION_TAIL}"
-
-
-def classify_file_step(tool_name: str, path: str | None) -> tuple[str, bool]:
-    """Public entry to the file-tool friendly-area mapping — shared by the live emitter and the
-    reload projection (one translator, one source of truth)."""
-    return _file_step_label(tool_name, path)
 
 
 def classify_tool_call(tool_name: str, args_json: str) -> tuple[str, bool]:

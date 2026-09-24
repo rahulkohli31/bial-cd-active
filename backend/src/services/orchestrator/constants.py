@@ -214,8 +214,8 @@ LOG_TAIL_MAX_LINES = 200
 """Cap on how many `dev_logs` tail lines feed the de-noiser."""
 
 CLEANED_STACK_MAX_CHARS = 4_000
-"""Truncation cap for `BuildError.cleaned_stack` (the diagnostic egresses twice — portal
-envelope + next-run prompt — so it stays bounded)."""
+"""Truncation cap for `BuildError.cleaned_stack` (the diagnostic egresses twice — the portal and
+the next run's prompt — so it stays bounded)."""
 
 RUN_COMMAND_OUTPUT_MAX_CHARS = 16_000
 """Truncation cap on the redacted `run_command` stdout/stderr fed back to the model. Larger

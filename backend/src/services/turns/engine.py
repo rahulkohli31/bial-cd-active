@@ -499,12 +499,9 @@ PENDING_META_KIND = META_PENDING
 # string that exists in two spellings. The reason is a field, not part of the event name.
 LEASE_RENEW_FAILED_EVENT = "liveness_lease_renew_failed"
 
-# The lock + heartbeat half of the same loop, spelled with the SAME two log events
-# `SessionManager.on_progress` already writes for this exact pair of calls. Identical strings on
-# purpose: the lock now has two renewers, and "did a live build lose its lock?" is one
-# operational question that must not need two alerts to answer. Named here rather than inlined
-# for the reason `LEASE_RENEW_FAILED_EVENT` is — an alert cannot be written against a string
-# that exists in two spellings.
+# The lock + heartbeat half of the liveness lease loop (`_hold_liveness_lease`, below). Named
+# here rather than inlined for the reason `LEASE_RENEW_FAILED_EVENT` is — an alert cannot be
+# written against a string that exists in two spellings.
 LOCK_LOST_EVENT = "build session lock lost during an active build"
 LOCK_RENEW_FAILED_EVENT = "liveness renew/heartbeat failed during build"
 
@@ -2249,9 +2246,6 @@ class TurnEngine:
             sandbox_client=sandbox_client,
             handle=session.handle,
             app_id=session.app_id,
-            # No emitter: the turn engine renders the run's own tool events as step frames,
-            # and a second feed would draw every step twice.
-            emitter=None,
         )
         # THE ATTACHED FILES GO IN NOW — BEFORE THE AGENT'S FIRST READ.
         #
@@ -3563,9 +3557,9 @@ class TurnEngine:
         it — empty in every other process — so nothing that can destroy a container may run outside
         the API process until this exists. Wall clock, never `time.monotonic()`: cross-process
         readable, and its TTL expires an abandoned lease rather than pinning the container. ALSO
-        RENEWS THE LOCK AND HEARTBEAT, their only clock: `on_progress` renews both per frame, so a
-        tool call past the TTL silently drops the lock. Best-effort, never silent: both failures
-        logged, lock arm caught apart from lease so one store error costs only its own renewal."""
+        RENEWS THE LOCK AND HEARTBEAT — this loop is their only clock, so a tool call past the TTL
+        would otherwise silently drop the lock. Best-effort, never silent: both failures logged,
+        lock arm caught apart from lease so one store error costs only its own renewal."""
         if state.sandbox is None:
             # NO CONTAINER, NOTHING TO VOUCH FOR — the same guard, for the same reason, as
             # `_watch_preview`'s. The lease is keyed by USER, not by turn, so a turn that
@@ -3632,7 +3626,7 @@ class TurnEngine:
                         # The lock lapsed under an active build (reaped / expired / taken), so
                         # the slot may now be double-allocated. Best-effort still — ending the
                         # turn here would destroy the work the lock was protecting — but never
-                        # invisible. Same sentence `on_progress` logs, for one alert.
+                        # invisible.
                         _log.warning(
                             LOCK_LOST_EVENT,
                             session_id=str(write_session.session_id),

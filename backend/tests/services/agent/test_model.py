@@ -134,10 +134,10 @@ def test_entra_client_also_applies_timeout_and_retries(monkeypatch: pytest.Monke
 # The wiring tests above prove the config LANDS on the client; these prove the SDK machinery it
 # configures actually behaves: a transient connection failure is retried through to success, a
 # dead endpoint surfaces a catchable timeout instead of a hang, and a slow-but-alive stream is
-# never falsely aborted (the false-BuildResult(FAILED) scenario). Retry BACKOFF is zeroed via
-# `INITIAL_RETRY_DELAY` so no test ever sleeps a real backoff; the two timeout tests run against
-# a REAL localhost socket because a MockTransport ignores timeouts entirely — a MockTransport
-# timeout test would pass no matter how broken the timeout wiring was.
+# never mistaken for a failed one. Retry BACKOFF is zeroed via `INITIAL_RETRY_DELAY` so no test
+# ever sleeps a real backoff; the two timeout tests run against a REAL localhost socket because a
+# MockTransport ignores timeouts entirely — a MockTransport timeout test would pass no matter how
+# broken the timeout wiring was.
 
 _A_COMPLETED_MESSAGE: dict[str, Any] = {
     "id": "msg_test",

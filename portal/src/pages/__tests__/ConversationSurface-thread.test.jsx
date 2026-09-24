@@ -352,7 +352,7 @@ describe('a reload MID-TURN re-attaches to the running reply', () => {
     // LIVENESS: the running turn was re-attached, which is what puts Stop on the composer.
     await waitFor(() => expect(screen.getByTestId('stop-turn')).toBeTruthy())
     expect(h.readTurnStream.mock.calls[0][0].turnId).toBe('t-live')
-    expect(screen.getByText('add a page')).toBeTruthy()
+    expect(await screen.findByText('add a page')).toBeTruthy()
     expect(screen.queryByText(/a build was running here/i)).toBeNull()
 
     await send('another change')

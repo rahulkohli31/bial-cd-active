@@ -402,13 +402,10 @@ async def test_a_renewal_with_nothing_to_protect_is_loud_in_its_own_words(
 
 # --- the lock + heartbeat that ride the same loop -----------------------------
 #
-# WHY THEY LIVE HERE AT ALL. `manager.on_progress` renews the one-sandbox-per-user lock and the
-# heartbeat once per non-terminal progress envelope, which is FRAME-driven. A build that spends
-# longer than the 90-second heartbeat TTL inside one tool call emits no frame, so it renews
-# nothing and drops the lock out from under its own container — observed as a build past fifteen
-# minutes losing its slot with the heartbeat key simply gone. The lease loop is the only
-# wall-clock tick a turn has, so the renewal rides it. These tests are about the CLOCK, not the
-# primitives: `test_locks.py` already pins what `renew_lock` and `write_heartbeat` do.
+# WHY THEY LIVE HERE AT ALL. `TurnEngine._hold_liveness_lease` is the only renewer of the
+# one-sandbox-per-user lock and the heartbeat during a turn: a wall-clock tick, so a turn that
+# spends long stretches inside one tool call still gets renewed. These tests are about the CLOCK,
+# not the primitives: `test_locks.py` already pins what `renew_lock` and `write_heartbeat` do.
 
 
 def _write_session(user: uuid.UUID, lock_token: str) -> BuildSession:
@@ -420,7 +417,6 @@ def _write_session(user: uuid.UUID, lock_token: str) -> BuildSession:
         user_id=user,
         project_id=uuid.uuid4(),
         app_id=uuid.uuid4(),
-        prompt="",
         lock_token=lock_token,
         handle=SandboxHandle(
             fqdn="x.example",

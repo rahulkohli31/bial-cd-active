@@ -30,7 +30,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import Final, Literal
@@ -44,11 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
     BuildSessionStatus,
-    EndedEvent,
     PreviewLifeState,
-    PreviewReadyEvent,
-    PreviewReconnectingEvent,
-    ProgressEnvelope,
 )
 from src.config import settings
 from src.db.base import async_session_factory
@@ -97,7 +93,6 @@ from src.services.build_sessions.locks import (
     read_registry_and_starting_marker,
     reap_lock,
     release_lock_as_holder,
-    renew_lock,
     settle_stay_once_the_app_is_serving,
     shared_view_stamp,
     stamp_is_proven,
@@ -1226,7 +1221,6 @@ class BuildSession:
     user_id: uuid.UUID
     project_id: uuid.UUID
     app_id: uuid.UUID
-    prompt: str
     lock_token: str
     handle: SandboxHandle
     # MAY THIS SESSION'S TURN MUTATE THE TREE? Structural, not observational: it comes from the
@@ -1255,11 +1249,6 @@ class BuildSession:
     #: attach, and counting every attach as a start would make a start-ratio metric's
     #: denominator "turns" rather than "starts", reading flatteringly close to 1.
     attached: bool = False
-    status: BuildSessionStatus = BuildSessionStatus.PROVISIONING
-    last_seq: int = 0
-    preview_url: str | None = None
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     # What has to finish before this session lets go of the one-per-user slot. A turn's end runs
     # `finish_turn_sandbox` inline in the turn that is unwinding, so there is no task for anyone
     # else to await: this is bound the moment that sequence starts and SET the moment it lets go
@@ -3811,10 +3800,9 @@ class SessionManager:
         id WITHOUT minting, so the row is created only once a Write turn actually commits to
         running.
 
-        Returns a `BuildSession` with `prompt=""` — the dataclass is
-        reused rather than forked because the reaper, the registry sweep and
-        `active_session_for` must see this exactly as they see a build's session. The two
-        empty fields are the honest answer: there is no build prompt and no mode to restore.
+        Returns a `BuildSession` — the same dataclass a build uses, reused rather than forked,
+        because the reaper, the registry sweep and `active_session_for` must see this exactly
+        as they see a build's session.
         """
         async with self._start_lock_for(user.id):
             redis = get_redis()
@@ -3886,7 +3874,6 @@ class SessionManager:
             user_id=user_id,
             project_id=project_id,
             app_id=app_id,
-            prompt="",
             lock_token=scope.token,
             handle=handle,
             may_write=may_write,
@@ -4217,59 +4204,6 @@ class SessionManager:
         """The BUILD path's fail-closed read of the shared head-check below."""
         return await snapshot_exists_or_bust(app_id)
 
-    # --- progress channel ----------------------------------------------------
-
-    async def on_progress(self, session: BuildSession, env: ProgressEnvelope) -> None:
-        """The `ProgressSink`: derive status and refresh liveness.
-
-        ONE PRODUCER LEFT. The build harness that emitted the six BRAIN members is deleted, so in
-        production nothing emits into it at all: a turn's narrative is the turn's own frames. The
-        generic derivation below is kept deliberately: this is a SINK, and it has to derive
-        correct state from any envelope handed to it — including the ones tests push directly —
-        without reaching back into who emitted them."""
-        session.last_seq = env.seq
-        session.updated_at = datetime.now(UTC)
-        if isinstance(env, PreviewReadyEvent):
-            session.status = BuildSessionStatus.READY
-            session.preview_url = env.preview_url
-        elif isinstance(env, PreviewReconnectingEvent):
-            # The dev-server PROCESS crashed after the preview was framed. The status enum is
-            # frozen at five members with no "reconnecting" state, so the lifecycle status is
-            # deliberately LEFT UNCHANGED (a completed build stays `ended`, a live one stays
-            # `ready`). Explicit branch so it never falls into the provisioning bump below (a
-            # reconnecting frame is never the first sign of the loop running).
-            pass
-        elif isinstance(env, EndedEvent):
-            session.status = env.status
-            if env.preview_url is not None:
-                session.preview_url = env.preview_url
-        elif session.status == BuildSessionStatus.PROVISIONING:
-            session.status = BuildSessionStatus.BUILDING  # first sign of the loop running
-
-        # Build activity = liveness: renew the lock + heartbeat SERVER-side so an active
-        # build whose tab is closed keeps its lock and is never reaped as idle. Skipped for
-        # a terminal frame (the lock is about to be released) and best-effort (a redis blip
-        # must not break the sink).
-        if not isinstance(env, EndedEvent) and session.lock_token:
-            try:
-                redis = get_redis()
-                if not await renew_lock(redis, session.user_id, session.lock_token):
-                    # The lock lapsed under an active build (reaped / expired) — the reaper
-                    # may now double-allocate. Best-effort still, but no longer invisible.
-                    _log.warning(
-                        "build session lock lost during an active build",
-                        session_id=str(session.session_id),
-                        user_id=str(session.user_id),
-                    )
-                await write_heartbeat(redis, session.user_id)
-            except Exception:
-                # A Redis blip must not break the progress relay, but — like the other
-                # best-effort Redis paths in this file — it is logged, never swallowed.
-                _log.exception(
-                    "liveness renew/heartbeat failed during build",
-                    session_id=str(session.session_id),
-                )
-
     # --- completion + the single-owner end sequence --------------------------
 
     async def _pardon_the_container(self, redis: aioredis.Redis, session: BuildSession) -> None:
@@ -4368,8 +4302,6 @@ class SessionManager:
             self._maybe_prune_start_lock(session.user_id)
             # AFTER the pop, so whoever this wakes finds the slot already free.
             finishing.set()
-
-        session.status = BuildSessionStatus.ENDED
 
 
 # --- accessor singleton (mirrors get_redis / get_sandbox) --------------------

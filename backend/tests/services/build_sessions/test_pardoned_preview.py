@@ -22,7 +22,6 @@ import redis.asyncio as aioredis
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.config import settings
 from src.db.models.user import User
 from src.services.build_sessions.locks import (
@@ -72,7 +71,7 @@ async def _completed_build(
         db, user, project.id, sandbox_client=client, may_write=True
     )
     await manager.finish_turn_sandbox(session, client, touched=True)
-    assert session.status is BuildSessionStatus.ENDED
+    assert session.turn_finish is not None and session.turn_finish.is_set()
     return user, manager, session.app_id
 
 

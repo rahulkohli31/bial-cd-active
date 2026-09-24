@@ -64,8 +64,6 @@ from src.services.messages.projection import (
     WorkspaceDiscardedItem,
     _friendly_area,
     _user_text_and_refs,
-    classify_command,
-    classify_file_step,
     classify_tool_call,
     command_only_inspects,
     label_when_settled,
@@ -925,37 +923,46 @@ async def test_a_call_with_no_plan_renders_no_text_and_still_renders_its_card(db
 # --- the friendly classifier (one source of truth, live == reload) -------------
 
 
+def _classify_argv(argv: list[str]) -> tuple[str, bool]:
+    """`classify_tool_call`, through the one tool whose label depends on argv."""
+    return classify_tool_call("run_command", json.dumps({"command": argv}))
+
+
+def _classify_file_call(tool_name: str, path: str) -> tuple[str, bool]:
+    """`classify_tool_call`, through a file-mutator tool whose label depends on `path`."""
+    return classify_tool_call(tool_name, json.dumps({"path": path}))
+
+
 def test_classify_command_maps_the_pinned_commands() -> None:
-    """This is the SAME translator the live emitter (`tools.py`) calls."""
-    assert classify_command(["npm", "install", "zod"]) == (
+    """This is the SAME translator the turn engine calls for a live `run_command` step."""
+    assert _classify_argv(["npm", "install", "zod"]) == (
         "Setting up the tools your app needs",
         False,
     )
     assert (
-        classify_command(["pnpm", "add", "drizzle-orm"])[0]
-        == "Setting up the tools your app needs"
+        _classify_argv(["pnpm", "add", "drizzle-orm"])[0] == "Setting up the tools your app needs"
     )
     # drizzle generate is DATA-SETUP; migrate is DATA-READY — distinct citizen copy.
-    assert classify_command(["npx", "drizzle-kit", "generate"]) == (
+    assert _classify_argv(["npx", "drizzle-kit", "generate"]) == (
         "Setting up where your app stores information",
         False,
     )
-    assert classify_command(["npm", "run", "db:migrate"])[0] == "Getting your app's data ready"
-    assert classify_command(["node", "db-migrate.mjs"])[0] == "Getting your app's data ready"
-    assert classify_command(["tsc", "--noEmit"])[0] == "Making sure everything fits together"
-    assert classify_command(["npm", "run", "build"])[0] == "Making sure everything fits together"
-    assert classify_command(["npm", "run", "lint"])[0] == "Tidying things up"
+    assert _classify_argv(["npm", "run", "db:migrate"])[0] == "Getting your app's data ready"
+    assert _classify_argv(["node", "db-migrate.mjs"])[0] == "Getting your app's data ready"
+    assert _classify_argv(["tsc", "--noEmit"])[0] == "Making sure everything fits together"
+    assert _classify_argv(["npm", "run", "build"])[0] == "Making sure everything fits together"
+    assert _classify_argv(["npm", "run", "lint"])[0] == "Tidying things up"
 
 
 def test_classify_command_shows_reads_and_hides_only_housekeeping() -> None:
     """The LABEL is asserted beside the hidden flag on both groups, so a classifier that
     returned an empty string could not satisfy the flags alone."""
     for read_only in (["ls", "-la"], ["grep", "-rn", "x", "app/"], ["cat", "app/page.tsx"]):
-        label, hidden = classify_command(read_only)
+        label, hidden = _classify_argv(read_only)
         assert hidden is False
         assert label == "Inspected the app's files"
     for housekeeping in (["mkdir", "-p", "app/lib"], ["mv", "a", "b"], ["touch", "x.ts"]):
-        label, hidden = classify_command(housekeeping)
+        label, hidden = _classify_argv(housekeeping)
         assert hidden is True
         assert label == "Organized the app's files"
 
@@ -1080,7 +1087,7 @@ def test_a_read_binary_asked_to_write_is_never_drawn_as_an_inspection() -> None:
         ["find", "app", "-name", "*.tmp", "-delete"],
         ["find", "app", "-name", "*.tsx", "-exec", "sed", "-i", "s/a/b/", "{}", ";"],
     ):
-        label, hidden = classify_command(writing)
+        label, hidden = _classify_argv(writing)
         assert label == "Working on your app", writing
         assert hidden is False, writing
         assert command_only_inspects(writing) is False, writing
@@ -1092,7 +1099,7 @@ def test_a_read_binary_asked_to_write_is_never_drawn_as_an_inspection() -> None:
         ["find", "app", "-name", "*.tsx"],
         ["grep", "-i", "visitors", "app/page.tsx"],
     ):
-        label, hidden = classify_command(reading)
+        label, hidden = _classify_argv(reading)
         assert label == "Inspected the app's files", reading
         assert hidden is False, reading
         assert command_only_inspects(reading) is True, reading
@@ -1106,7 +1113,7 @@ def test_classify_command_fails_closed_on_the_long_tail() -> None:
         ["bash", "-c", "rm -rf /tmp/x"],
         ["python3", "-c", "print(1)"],
     ):
-        label, hidden = classify_command(argv)
+        label, hidden = _classify_argv(argv)
         assert label == "Working on your app"
         assert hidden is False
         for leaked in ("npx", "bash", "-c", "python3", "$ ", "rm -rf", argv[-1]):
@@ -1120,7 +1127,7 @@ def test_a_failed_classified_step_keeps_its_label_and_names_the_failure() -> Non
     """★ A failed step stops borrowing the RUNNING label. The class survives — a citizen who
     watched "Setting up the tools your app needs" go past still recognises the row — and the
     clause after it is the only new thing said."""
-    label, _ = classify_command(["npm", "install", "zod"])
+    label, _ = _classify_argv(["npm", "install", "zod"])
     assert label == "Setting up the tools your app needs"
     assert label_when_settled("run_command", label, failed=True) == (
         "Setting up the tools your app needs — this step did not finish"
@@ -1138,7 +1145,7 @@ def test_a_failed_unclassifiable_step_never_reads_as_one_still_working() -> None
     assertions go red."""
     secret = "hunter2-not-a-real-token"  # noqa: S105 - a fixture, not a credential
     argv = ["bash", "-c", f"curl -H 'Authorization: Bearer {secret}' https://example.invalid"]
-    label, hidden = classify_command(argv)
+    label, hidden = _classify_argv(argv)
     assert label == "Working on your app"
     assert hidden is False
     failed = label_when_settled("run_command", label, failed=True)
@@ -1151,7 +1158,6 @@ def test_a_failed_unclassifiable_step_never_reads_as_one_still_working() -> None
 def test_a_running_unclassifiable_step_still_reads_as_the_fail_closed_fallback() -> None:
     """The fail-closed path is UNCHANGED while a step is in flight: the generic line is true of
     a command that has not come back yet, and it is the one thing that can be said without argv."""
-    assert classify_command(["python3", "-c", "print(1)"])[0] == "Working on your app"
     assert classify_tool_call("run_command", '{"command": ["python3", "-c", "print(1)"]}') == (
         "Working on your app",
         False,
@@ -1251,15 +1257,15 @@ def test_friendly_area_maps_paths_to_areas_never_the_raw_path() -> None:
 
 
 def test_classify_file_step_carries_the_verb_and_area() -> None:
-    assert classify_file_step("write_file", "app/page.tsx") == (
+    assert _classify_file_call("write_file", "app/page.tsx") == (
         "Building your app's main page",
         False,
     )
-    assert classify_file_step("edit_file", "app/api/x/route.ts") == (
+    assert _classify_file_call("edit_file", "app/api/x/route.ts") == (
         "Updating how your app saves and loads information",
         False,
     )
-    assert classify_file_step("write_file", "package.json")[1] is True
+    assert _classify_file_call("write_file", "package.json")[1] is True
 
 
 # --- the complete set of messages a citizen sees -----------------------------------------

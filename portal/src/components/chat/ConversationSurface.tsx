@@ -74,7 +74,7 @@ import type { CompileState } from '../../utils/compileState'
 import { makeClientErrorRelay } from '../../utils/clientErrorRelay'
 import type { TurnFrame, PlanOptionsItem, StepItem, DiagnosticFrame, StreamOutcome } from '../../utils/turnStreamApi'
 import { contextState } from '../../utils/contextLimits'
-import { atLimitSendState, narrativeEnvelopes, turnPhase } from '../../utils/turnNarrative'
+import { atLimitSendState, turnPhase } from '../../utils/turnNarrative'
 import type { TurnNarrative } from '../../utils/turnNarrative'
 import { discardUnsavedChanges, fetchSaveState, saveProject, fetchPreviewState, fetchCompileState, checkWorkspace, renewPresence, samePreviewState } from '../../utils/buildSessionApi'
 import type { PreviewState } from '../../utils/buildSessionApi'
@@ -170,7 +170,7 @@ interface TurnSink {
    * order — the two only agreed because prose beside a tool call was thrown away. Steps live
    * HERE, not only in `turnSteps` state, because the TRANSCRIPT renders them now and the frame
    * handler (empty dep list) can't read state changing under it; `turnSteps` still exists
-   * alongside for a different question (pane phase, today's budget).
+   * alongside for a different question (the pane phase).
    */
   parts: SinkPart[]
   /** Does the model HAVE THE FLOOR right now (the server's `working` flag)?
@@ -454,7 +454,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   // Read inside async callbacks that outlive their render (the build watcher's terminal),
   // where the closed-over state value would be whatever it was when the build STARTED.
   const turnPreviewRef = useRef<TurnNarrative['preview']>({ url: null, state: null })
-  const [turnQuota, setTurnQuota] = useState<TurnNarrative['quota']>(null)
+  const [turnQuota, setTurnQuota] = useState<{ resetsAt: string } | null>(null)
   // TRI-STATE — `null` is UNKNOWN, not clean. A citizen who described an app, watched it build
   // and touched nothing has genuinely unsaved work, so this must never default toward `false`.
   const [saveDirty, setSaveDirty] = useState<boolean | null>(null)
@@ -495,16 +495,14 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     () => ({
       steps: turnSteps,
       diagnostics: turnDiagnostics,
-      quota: turnQuota,
       workspace: turnWorkspace,
       preview: turnPreview,
     }),
-    [turnSteps, turnDiagnostics, turnQuota, turnWorkspace, turnPreview],
+    [turnSteps, turnDiagnostics, turnWorkspace, turnPreview],
   )
 
-  const turnEnvelopes = useMemo(() => narrativeEnvelopes(turnNarrative), [turnNarrative])
   // `null` unless today's budget is spent, in which case it carries the reset time.
-  const atLimit = useMemo(() => atLimitSendState(turnEnvelopes), [turnEnvelopes])
+  const atLimit = useMemo(() => atLimitSendState(turnQuota), [turnQuota])
 
   const turnNarrativeIsThisChat = turnNarrativeChatRef.current === buildId
   const turnBuildStatus = useMemo(
@@ -1191,7 +1189,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       } else if (frame.type === 'compile') {
         setTurnCompile(frame.state)
       } else if (frame.type === 'quota') {
-        setTurnQuota({ limit: frame.limit, used: frame.used, resetsAt: frame.resetsAt })
+        setTurnQuota({ resetsAt: frame.resetsAt })
       } else if (frame.type === 'turn_ended') {
         // A turn that ended while its last act was thinking would otherwise leave the status
         // under a finished turn. The server clears the flag at its own terminal too; this is

@@ -1,14 +1,13 @@
-"""The SessionManager lifecycle: allocation (provision/attach/restore), the progress channel, the
-end of a turn, and allocation compensation. Driven by FakeSandboxClient + fakeredis + fake
-storage + the `:5432` test DB.
+"""The SessionManager lifecycle: allocation (provision/attach/restore), the end of a turn, and
+allocation compensation. Driven by FakeSandboxClient + fakeredis + fake storage + the `:5432`
+test DB.
 
 HOW A LIVE SESSION IS CONJURED HERE, because it used to be one call and is now two.
 `SessionManager.start` was deleted with the build-start route, and with it went the `run_build`
-task, the in-process build feed, and the `FakeBrain` that drove them; the end sequence those fed
-— `stop` / `force_end` / `_finalize` — is deleted too. What is left is the pair production uses:
-`ensure_sandbox` allocates (the identical skeleton — slot claim, reconcile, lock, app row, env,
-resolve, heartbeat, adopt) and `finish_turn_sandbox` ends, and `on_progress` is the same sink the
-feed always went through.
+task and the in-process build feed; the end sequence those fed — `stop` / `force_end` /
+`_finalize` — is deleted too. What is left is the pair production uses: `ensure_sandbox`
+allocates (the identical skeleton — slot claim, reconcile, lock, app row, env, resolve,
+heartbeat, adopt) and `finish_turn_sandbox` ends.
 """
 
 from __future__ import annotations
@@ -29,9 +28,6 @@ from src.api.v1.build_sessions.schemas import (
     RELAUNCH_PREVIEW_STAY_SECONDS,
     SURFACE_PRESENT_STAY_SECONDS,
     BuildSessionStatus,
-    PreviewReadyEvent,
-    PreviewReconnectingEvent,
-    StepEvent,
 )
 from src.config import settings
 from src.core.errors import AppApiError
@@ -354,7 +350,6 @@ async def test_start_compensates_a_provision_failure_no_leaked_lock(
     session = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=good, may_write=True
     )
-    assert session.status == BuildSessionStatus.PROVISIONING
     assert good.provisioned == [app_name_for(session.app_id)]
 
 
@@ -388,64 +383,6 @@ async def test_a_failed_starting_marker_write_leaks_no_lock(
     assert manager.active_session_for(user.id) is None
 
 
-async def test_on_progress_derives_status(fake_redis: aioredis.Redis) -> None:
-    manager = SessionManager()
-    session = BuildSession(
-        session_id=uuid.uuid7(),
-        user_id=uuid.uuid4(),
-        project_id=uuid.uuid4(),
-        app_id=uuid.uuid4(),
-        prompt="p",
-        lock_token="tok",
-        handle=SandboxHandle(
-            fqdn="x.example",
-            token="t",
-            app_name=a_sandbox_name("x"),
-            preview_url="https://x.example/",
-            ready=False,
-        ),
-    )
-    await manager.on_progress(session, StepEvent(seq=1, name="s", label="l", state="started"))
-    assert session.status.value == "building"  # provisioning -> building
-    await manager.on_progress(session, PreviewReadyEvent(seq=2, preview_url="https://p/"))
-    assert session.status == BuildSessionStatus.READY
-    assert session.preview_url == "https://p/"
-    assert session.last_seq == 2
-
-
-async def test_on_progress_reconnecting_leaves_the_status_unchanged(
-    fake_redis: aioredis.Redis,
-) -> None:
-    """A `preview_reconnecting` envelope bumps `last_seq` but does NOT change the lifecycle status
-    (the status enum is frozen at five, with no reconnecting member): a framed session stays
-    `ready`."""
-    manager = SessionManager()
-    session = BuildSession(
-        session_id=uuid.uuid7(),
-        user_id=uuid.uuid4(),
-        project_id=uuid.uuid4(),
-        app_id=uuid.uuid4(),
-        prompt="p",
-        lock_token="tok",
-        handle=SandboxHandle(
-            fqdn="x.example",
-            token="t",
-            app_name=a_sandbox_name("x"),
-            preview_url="https://x.example/",
-            ready=False,
-        ),
-    )
-    await manager.on_progress(session, PreviewReadyEvent(seq=1, preview_url="https://p/"))
-    assert session.status == BuildSessionStatus.READY
-    await manager.on_progress(session, PreviewReconnectingEvent(seq=2))
-    assert session.status == BuildSessionStatus.READY  # NOT a 6th status; still ready
-    assert session.last_seq == 2
-    # A following preview_ready re-frames — the gap-free stream continues.
-    await manager.on_progress(session, PreviewReadyEvent(seq=3, preview_url="https://p/"))
-    assert session.status == BuildSessionStatus.READY
-    assert session.last_seq == 3
-
-
 async def test_reconcile_on_start_unblocks_a_crashed_user(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
@@ -470,7 +407,6 @@ async def test_reconcile_on_start_unblocks_a_crashed_user(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
     assert a_sandbox_name("stale") in client.torn_down  # the orphan was reaped on the way in
-    assert session.status == BuildSessionStatus.PROVISIONING  # the fresh allocation acquired
     assert client.provisioned == [app_name_for(session.app_id)]
 
 
@@ -849,7 +785,8 @@ async def test_start_with_object_storage_unconfigured_provisions_fresh_instead_o
     assert no_sleep == []  # never retried what is a permanent config fact, not a blip
     # ...and the turn still ends cleanly with no store: the recovery copy is a no-op here.
     await _end_the_turn(manager, session, client)
-    assert session.status == BuildSessionStatus.ENDED
+    assert manager.active_session_for(user.id) is None
+    assert session.turn_finish is not None and session.turn_finish.is_set()
 
 
 # --- an ended session leaves the map ------------------------------------------------

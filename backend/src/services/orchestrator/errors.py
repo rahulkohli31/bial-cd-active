@@ -1,11 +1,10 @@
 """Raw exec/dev output → the frozen `BuildError{source, title, cleaned_stack}`.
 
 `declutter` turns a raw `tsc` blob or dev-server stderr tail into the structured error the repair
-prompt and the progress envelope carry. It **redacts first**: the diagnostic egresses twice, to the
-portal and the next run's prompt, and the app can `console.log(process.env)`, so every
-credential-shaped substring MUST be masked before anything else touches it. `redact_secrets` is
-that single masker, reused by `progress.py`'s raw `log` path; treat all sandbox output as
-untrusted and parse defensively. It lives in
+prompt carries. It **redacts first**: the diagnostic egresses twice, to the portal and the next
+run's prompt, and the app can `console.log(process.env)`, so every credential-shaped substring
+MUST be masked before anything else touches it. `redact_secrets` is that single masker; treat all
+sandbox output as untrusted and parse defensively. It lives in
 `src/core/redaction.py` so the message store's persistence seam can reuse it without importing
 the orchestrator, and this module re-exports it: one implementation, two import paths, never a
 fork.
@@ -366,12 +365,13 @@ def _frame_as_data(text: str) -> str:
 def from_client(raw: str) -> BuildError:
     """A browser-side crash report → `BuildError(source=client)`.
 
-    `BuildError` is dual-purpose — a portal envelope AND the next run's repair prompt — the one
-    source that splits its audience. `title`/`cleaned_stack` are what EGRESS: only the platform's
-    own sentence and an empty stack, so no byte of the app-authored report is ever rendered to
-    anybody. `agent_only_detail` is what the model reads; `exclude=True` means it never leaves this
-    process. `declutter` still runs for redaction (the app can `console.log(process.env)`), but its
-    computed title — the app's own first line — is discarded: it must never become user-facing."""
+    `BuildError` serves two audiences — the next run's repair prompt, and anything that serializes
+    it — and this is the one source that splits them. `title`/`cleaned_stack` are what EGRESS:
+    only the platform's own sentence and an empty stack, so no byte of the app-authored report is
+    ever rendered to anybody. `agent_only_detail` is what the model reads; `exclude=True` means it
+    never leaves this process. `declutter` still runs for redaction (the app can
+    `console.log(process.env)`), but its computed title — the app's own first line — is discarded:
+    it must never become user-facing."""
     reported = declutter(raw, ErrorSource.CLIENT)
     return BuildError(
         source=ErrorSource.CLIENT,

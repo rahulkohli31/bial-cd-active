@@ -54,7 +54,7 @@ import re
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, cast
 
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
@@ -67,12 +67,8 @@ from src.core.redaction import (
 )
 from src.db.models.harness_counter import HarnessCounter
 from src.services.messages.projection import (
-    classify_command,
-    classify_file_step,
-    classify_tool_call,
     command_needs_the_long_timeout,
     command_only_inspects,
-    failed_step_line,
 )
 from src.services.orchestrator.constants import (
     OUTPUT_SLICE_MAX_LINES,
@@ -622,29 +618,6 @@ async def _render_the_schema_change_report(
     return "\n\n".join(sections)
 
 
-async def _step(
-    session: SandboxSession,
-    *,
-    name: str,
-    label: str,
-    state: Literal["started", "ok", "failed"],
-    hidden: bool = False,
-) -> None:
-    """The legacy build-progress feed. `emitter is None` on the chat-turn path, where the ENGINE
-    emits a StepFrame per tool call itself — emitting both here too would render every step twice.
-
-    NOTHING IS HIDDEN WHEN SOMETHING WENT WRONG (same rule as `_resolve_step` and the reload
-    projection): a housekeeping command is plumbing while it works, the whole story the moment
-    it doesn't. Enforced HERE, not at each call site — `hidden` and the step's state are decided
-    in different places, and a caller left to combine them will eventually forget on the failing
-    arm, which is the one nobody looks at until it matters."""
-    if session.emitter is None:
-        return
-    await session.emitter.step(
-        name=name, label=label, state=state, hidden=hidden and state != "failed"
-    )
-
-
 def _require_writable(path: str) -> None:
     """Fail-closed write gate. Raises `ModelRetry` — never touching `files()` — for the two
     remaining denials in the open-sandbox model: a path that escapes the workspace (absolute or
@@ -757,8 +730,6 @@ def sandbox_toolset[DepsT](
         except SandboxError as exc:
             raise ModelRetry(f"Could not write `{path}`: {exc}.") from exc
         session.writes += 1
-        label, hidden = classify_file_step("write_file", path)
-        await _step(session, name="edit", label=label, state="ok", hidden=hidden)
         return f"Wrote `{path}`."
 
     async def edit_file(ctx: RunContext[Any], path: str, old_str: str, new_str: str) -> str:
@@ -778,8 +749,6 @@ def sandbox_toolset[DepsT](
             # in-run.
             raise ModelRetry(await _reanchor(session, path)) from exc
         session.writes += 1
-        label, hidden = classify_file_step("edit_file", path)
-        await _step(session, name="edit", label=label, state="ok", hidden=hidden)
         return f"Edited `{path}`."
 
     async def insert_lines(
@@ -799,8 +768,6 @@ def sandbox_toolset[DepsT](
         except SandboxError as exc:
             raise ModelRetry(f"Could not insert into `{path}`: {exc}.") from exc
         session.writes += 1
-        label, hidden = classify_file_step("insert_lines", path)
-        await _step(session, name="edit", label=label, state="ok", hidden=hidden)
         return f"Inserted into `{path}`."
 
     async def declare_done(ctx: RunContext[Any], summary: str) -> str:
@@ -819,7 +786,6 @@ def sandbox_toolset[DepsT](
         # is the turn engine's only evidence that anything was actually built: setting it here let
         # a model that wrote nothing declare itself done and collect "Build complete — your app is
         # live below" over an untouched template. The write tools above set it when they write.
-        await _step(session, name="declare_done", label="Verifying the build…", state="started")
         return (
             "Acknowledged — that summary is now the closing message the user reads. The harness "
             "is checking the app: if it checks out, this turn ends here and nothing further is "
@@ -838,28 +804,12 @@ def sandbox_toolset[DepsT](
         session = sandbox_of(ctx)
         # alias keeps the call off the JS-oriented exec guard
         transport = session.sandbox_client.exec
-        # The FRIENDLY label is the only thing the browser ever sees for this command: the
-        # classifier maps argv → citizen-plain copy (or a fail-closed "Working on your app"), so
-        # the raw command / `$ argv` never reaches a visible step. `redacted_cmd` stays MODEL-only
-        # — it rides the retry messages the model reads, never a StepEvent.
-        friendly, hidden = classify_command(command)
+        # `redacted_cmd` is MODEL-only: it rides the retry messages the model reads.
         redacted_cmd = redact_secrets(" ".join(command)[:REDACT_INPUT_MAX_CHARS])
-        # The data-safety sentinel runs BEFORE the transport: improvised destructive
-        # SQL never reaches the sandbox. The blocked attempt is emitted as a failed step so
-        # route-around behaviour stays observable in BRAIN traces.
+        # The data-safety sentinel runs BEFORE the transport: improvised destructive SQL never
+        # reaches the sandbox.
         refusal = you_shall_not_pass(command)
         if refusal is not None:
-            # THE ONE FAILURE SUFFIX THAT IS NOT `failed_step_line`'s, because it says something
-            # the generic clause cannot: the command was refused before it ran. It names the
-            # reason and still shows no argv, which is the whole parity rule (see
-            # classify_command).
-            await _step(
-                session,
-                name="run_command",
-                label=f"{friendly} — blocked to protect your data",
-                state="failed",
-                hidden=hidden,
-            )
             raise ModelRetry(refusal)
         # The adoption question this counts, where it is observable: did the slice handle actually
         # replace the re-run it exists to save? An identical command run a second time inside ONE
@@ -877,10 +827,6 @@ def sandbox_toolset[DepsT](
         # composite is being used" from "nobody is changing the schema at all".
         if _still_doing_it_the_hard_way(command):
             await _count_at_the_tool_boundary(HarnessCounter.SCHEMA_CHANGE_BY_HAND, session)
-        # No `started` emit: run_command collapses to ONE terminal row per command. The
-        # build headline spinner already conveys "working", and two emits sharing a friendly label
-        # would otherwise render as two identical rows — this matches the reload projection's
-        # one-row shape.
         try:
             # The bound depends on WHAT the command is. A wedged command used to get the
             # full 600s, and the 1800s wall-clock deadline is only evaluated BETWEEN self-heal
@@ -892,26 +838,12 @@ def sandbox_toolset[DepsT](
             )
             result = await transport(session.handle, command, timeout_s=timeout_s)
         except SandboxGoneError:
-            await _step(
-                session,
-                name="run_command",
-                label=failed_step_line(friendly),
-                state="failed",
-                hidden=hidden,
-            )
             raise  # terminal infra failure — propagate to the sandbox_gone escalation
         except SandboxError as exc:
             # A transport failure (supervisor 504 incl. an install timeout, or a blip) → enrich
             # into a ModelRetry so a command/install failure re-enters the loop instead of
             # hard-crashing the build. Only SandboxGoneError escalates. The message is
             # redacted defensively.
-            await _step(
-                session,
-                name="run_command",
-                label=failed_step_line(friendly),
-                state="failed",
-                hidden=hidden,
-            )
             # `denoise=False`: a transport exception is not a dependency-manager log, and the
             # only thing a noise filter could do to one is delete a line of it.
             detail = _redact_command_output(
@@ -921,13 +853,6 @@ def sandbox_toolset[DepsT](
                 f"`{redacted_cmd}` could not run: {detail}. The sandbox may be busy or the "
                 "command may have timed out — retry, or adjust the command."
             ) from exc
-        await _step(
-            session,
-            name="run_command",
-            label=friendly,
-            state="ok" if result.exit == 0 else "failed",
-            hidden=hidden,
-        )
         # A command that RAN counts as touching the workspace, and it has to: the open-sandbox
         # pivot made this a first-class write surface (`npm install`, scaffolding, codegen, `git`),
         # so a build can legitimately do all of its work here and never call a file tool. That was
@@ -1015,7 +940,6 @@ def sandbox_toolset[DepsT](
                 f"`{redact_secrets(what_changed[:REDACT_INPUT_MAX_CHARS])}` leaves nothing to "
                 "name the migration file with. Try something like `add visitors table`."
             )
-        friendly, hidden = classify_tool_call(APPLY_SCHEMA_CHANGE_TOOL, "")
         # alias keeps the call off the JS-oriented exec guard
         transport = session.sandbox_client.exec
         outcomes: list[_StepOutcome] = []
@@ -1040,22 +964,8 @@ def sandbox_toolset[DepsT](
             try:
                 result = await transport(session.handle, argv, timeout_s=timeout_s)
             except SandboxGoneError:
-                await _step(
-                    session,
-                    name=APPLY_SCHEMA_CHANGE_TOOL,
-                    label=failed_step_line(friendly),
-                    state="failed",
-                    hidden=hidden,
-                )
                 raise  # terminal infra failure — propagate to the sandbox_gone escalation
             except SandboxError as exc:
-                await _step(
-                    session,
-                    name=APPLY_SCHEMA_CHANGE_TOOL,
-                    label=failed_step_line(friendly),
-                    state="failed",
-                    hidden=hidden,
-                )
                 # A transport failure is not a step verdict — the step never returned one — so it
                 # goes back as a `ModelRetry` like `run_command`'s, and still names the state.
                 detail = _redact_command_output(
@@ -1076,13 +986,6 @@ def sandbox_toolset[DepsT](
                 )
             )
         succeeded = all(outcome.ok for outcome in outcomes)
-        await _step(
-            session,
-            name=APPLY_SCHEMA_CHANGE_TOOL,
-            label=friendly,
-            state="ok" if succeeded else "failed",
-            hidden=hidden,
-        )
         # THE OVERRIDE REACHES THE CAP TOO, not just the wording. `output_budget_for_exit` is
         # asked about the OPERATION's verdict rather than any command's exit code, so a step that
         # failed while exiting 0 is DUMPED like the failure it is — sizing it from the underlying

@@ -383,7 +383,7 @@ class PreviewStateResponse(CamelModel):
     # this docstring and in review.
     #
     # Additive and defaulted, so emitters and readers written before it stay wire-valid — the
-    # same rule `StepEvent.hidden` carries in `schemas.py`.
+    # same rule `RelaunchPreviewResponse.ready` carries in `schemas.py`.
     serving_since: datetime | None = None
     # STARTING only: the ISO-8601 instant this project's wait began, so the pane's elapsed
     # figure is the real wait rather than the life of the current page. Null is NO CLAIM — the
