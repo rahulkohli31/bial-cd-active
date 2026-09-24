@@ -107,9 +107,10 @@ class CopyAttempt(enum.StrEnum):
     them would produce a row that says a container was spared and nothing about what to do next.
     """
 
-    #: Nothing was written back, and nothing needed to be: the container still held the untouched
-    #: starter template, or it could not be attached at all but a saved bundle already stands for
-    #: this app. Recorded for the same reason a zero-candidate pass is: a quiet fleet and a dead
+    #: Nothing was written back, and nothing could or needed to be: the container still held the
+    #: untouched starter template; or it could not be attached at all but a saved bundle already
+    #: stands for this app; or its workspace had lost its repository, which no write-back can
+    #: save. Recorded for the same reason a zero-candidate pass is: a quiet fleet and a dead
     #: process are otherwise one observation.
     NOTHING_TO_COPY = "nothing_to_copy"
     #: The tree landed in the saved copy, and the container may go.
@@ -135,7 +136,8 @@ class CopyAttempt(enum.StrEnum):
 _ATTEMPT_MEANING: Final[dict[CopyAttempt, tuple[PassOutcome, str]]] = {
     CopyAttempt.NOTHING_TO_COPY: (
         PassOutcome.OK,
-        "there was nothing to write back before reclaiming",
+        "there was nothing to write back before reclaiming, or the workspace had lost its "
+        "repository",
     ),
     CopyAttempt.COPIED: (
         PassOutcome.OK,

@@ -275,7 +275,9 @@ where the consequence of being wrong is higher. A container that clearly nothing
 sooner than one that might still belong to someone.
 
 **Nothing is destroyed until a durable copy exists.** The snapshot precedes the delete, always.
-This is the same ordering the build flow follows, for the same reason.
+This is the same ordering the build flow follows, for the same reason. The one exception is a
+workspace whose repository is already gone: no snapshot can be taken of it, now or later, so it is
+reclaimed and counted rather than kept billing forever.
 
 **A pass records that it ran, whatever the outcome.** Including when it decided to do nothing. A
 job that only writes a record when it acts is indistinguishable, from the outside, from a job that

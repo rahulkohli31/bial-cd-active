@@ -263,9 +263,10 @@ async def write_the_tree_back(
     loss this skip exists to prevent, and it is the reason the probe reads the CONTAINER rather
     than the store — a reverted container and a first write are indistinguishable from the store.
 
-    Raises `SandboxError` when the container will not answer, and
-    `WorkspaceHasNoRepositoryError` out of the bundle: an unestablished fact on a path that ends
-    in an ARM delete is not an outcome to return, and both callers spare the container on it."""
+    Raises `SandboxError` when the container will not answer: an unestablished fact on a path
+    that ends in an ARM delete is not an outcome to return, and both callers spare the container
+    on it. Raises `WorkspaceHasNoRepositoryError` out of the bundle when the workspace has lost its
+    repository, and the reaper reclaims the container on that: no later attempt could save it."""
     timings = _SaveStepTimings()
     lock_wait_started = time.monotonic()
     try:

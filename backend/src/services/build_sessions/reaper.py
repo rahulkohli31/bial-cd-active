@@ -40,6 +40,7 @@ from src.api.v1.build_sessions.schemas import SHARED_PREVIEW_ABSOLUTE_CEILING_SE
 from src.services.build_sessions.alarms import (
     APP_FIRST_SERVED_EVENT,
     APP_SERVING_LOST_EVENT,
+    REAP_FOUND_NO_REPOSITORY_EVENT,
     SERVING_PROOF_ABSENT_AT_TEARDOWN,
     SERVING_PROOF_STAMP_REFUSED,
 )
@@ -67,7 +68,11 @@ from src.services.build_sessions.locks import (
     stamp_is_proven,
     stay_of_execution_is_current,
 )
-from src.services.build_sessions.snapshot import SavedCopyOutcome, write_the_tree_back
+from src.services.build_sessions.snapshot import (
+    SavedCopyOutcome,
+    WorkspaceHasNoRepositoryError,
+    write_the_tree_back,
+)
 from src.services.redis import REGISTRY_STATE_READY, registry_key, registry_scan_patterns
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
@@ -555,7 +560,8 @@ async def _take_the_copy_we_promised(
     WRITE THE TREE BACK, THEN DESTROY. Both call sites once spared instead, so a failed copy
     billed forever behind a log line repeating every fifteen minutes and looked, to anyone
     reading it, like the guard working correctly. This really happened. Every failing arm SPARES
-    and RECORDS, so the next pass retries.
+    and RECORDS, so the next pass retries — except a workspace with no repository, which no pass
+    could ever save.
 
     THE UNREACHABLE ARM STILL COLLECTS, and that is what stops a wedged container being spared
     forever: nothing can be bundled from a container that will not attach, so the question
@@ -590,6 +596,12 @@ async def _take_the_copy_we_promised(
         return False
     try:
         written = await write_the_tree_back(sandbox_client, reached, app_id)
+    except WorkspaceHasNoRepositoryError:
+        # NO LATER PASS COULD SAVE THIS TREE, so sparing it would only bill forever: see
+        # `REAP_FOUND_NO_REPOSITORY_EVENT`. The saved copy is untouched.
+        _log.warning(REAP_FOUND_NO_REPOSITORY_EVENT, app_id=str(app_id), app_name=expected_name)
+        await record_durable_copy_attempt(CopyAttempt.NOTHING_TO_COPY)
+        return True
     except Exception:
         # BROAD ON PURPOSE, and it is the fail-CLOSED direction. Every way this can fail — the
         # exec, the bundle, the base64 read-back, the store, bytes that will not parse as a

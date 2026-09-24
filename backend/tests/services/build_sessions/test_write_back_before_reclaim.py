@@ -18,9 +18,12 @@ import pytest
 import redis.asyncio as aioredis
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from src.db.models.worker_pass import PassOutcome, WorkerPass
 from src.services.build_sessions import pass_history
+from src.services.build_sessions.alarms import REAP_FOUND_NO_REPOSITORY_EVENT
+from src.services.build_sessions.integrity import PORCELAIN_FAILED_MARK
 from src.services.build_sessions.pass_history import (
     _ATTEMPT_MEANING,
     CopyAttempt,
@@ -29,6 +32,7 @@ from src.services.build_sessions.pass_history import (
 )
 from src.services.build_sessions.reaper import reap_the_container_we_judged, reap_user
 from src.services.build_sessions.snapshot import (
+    _NO_REPOSITORY_EXIT,
     SavedCopyOutcome,
     SavedCopyWrite,
     write_the_tree_back,
@@ -129,6 +133,29 @@ def _bundles[Client: FakeSandboxClient](
 
     client.exec_handler = handler
     return client
+
+
+def _the_commit_exits[Client: FakeSandboxClient](client: Client, code: int) -> Client:
+    """`client`, except that the save's commit step exits with `code`."""
+    answer_the_rest = client.exec_handler
+    assert answer_the_rest is not None
+
+    def handler(cmd: list[str]) -> ExecResult:
+        if cmd[0] == "sh" and "git add -A" in cmd[-1]:
+            return ExecResult(stdout="", stderr="", exit=code)
+        return answer_the_rest(cmd)
+
+    client.exec_handler = handler
+    return client
+
+
+def _lost_its_repository[Client: FakeSandboxClient](client: Client) -> Client:
+    """A container a restart wiped: it attaches, its state probe finds no HEAD and no readable
+    tree, and the save's commit step refuses with the no-repository exit."""
+    return _the_commit_exits(
+        _bundles(client, head="", bundles_to=BUNDLED, porcelain=PORCELAIN_FAILED_MARK, commits=0),
+        _NO_REPOSITORY_EXIT,
+    )
 
 
 class _ReadsTheSlotAtTeardown(FakeSandboxClient):
@@ -439,6 +466,66 @@ async def test_a_caller_that_passes_no_app_id_writes_nothing_back(
     assert await fake_storage.head(snapshot_key(APP)) is None
 
 
+@pytest.mark.parametrize("saved", [OLDER, None], ids=["saved-before", "never-saved"])
+async def test_a_container_that_lost_its_repository_is_reclaimed_not_spared_forever(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    attempts: list[CopyAttempt],
+    monkeypatch: pytest.MonkeyPatch,
+    saved: str | None,
+) -> None:
+    """★ NO LATER PASS COULD SAVE IT. A restart that discards the container's disk takes `.git`
+    with it, and nothing on the platform can save a tree without one: Save, this write-back and
+    the quarantine all refuse it the same way. Spared, it is retried on every pass and billed
+    forever. Whatever copy is on record stands untouched for the next relaunch to restore, and an
+    app that was never saved loses nothing a later pass could have kept.
+    Mutation check: let `WorkspaceHasNoRepositoryError` fall into the broad `except` and this
+    goes red."""
+    await _register(fake_redis)
+    if saved is not None:
+        await _put_saved(fake_storage, saved)
+    on_record = dict(fake_storage.objects)
+    stored: list[str] = []
+
+    async def _no_store(key: str, *_a: object, **_k: object) -> None:
+        stored.append(key)
+
+    monkeypatch.setattr(fake_storage, "put", _no_store)
+    client = _lost_its_repository(FakeSandboxClient())
+
+    with capture_logs() as logs:
+        assert await reap_user(fake_redis, USER, client, app_id=APP) is True
+
+    assert client.torn_down == [a_sandbox_name("x")]
+    assert await fake_redis.exists(registry_key(USER)) == 0
+    assert attempts == [CopyAttempt.NOTHING_TO_COPY]
+    assert stored == [], "nothing may be written over the copy on record"
+    assert fake_storage.objects == on_record
+    found = [log for log in logs if log["event"] == REAP_FOUND_NO_REPOSITORY_EVENT]
+    assert [(log["log_level"], log["app_id"], log["app_name"]) for log in found] == [
+        ("warning", str(APP), a_sandbox_name("x"))
+    ]
+
+
+async def test_a_commit_that_fails_for_any_other_reason_still_spares(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
+) -> None:
+    """Only the missing repository reclaims. A full disk or a locked index fails the same commit
+    step, and that tree is still there to be written back on a later pass.
+    Mutation check: catch `SandboxError` where the reaper catches `WorkspaceHasNoRepositoryError`
+    and this goes red."""
+    await _register(fake_redis)
+    await _put_saved(fake_storage, OLDER)
+    client = _the_commit_exits(
+        _bundles(FakeSandboxClient(), head=HEAD, bundles_to=BUNDLED, porcelain=" M page.tsx"), 1
+    )
+
+    assert await reap_user(fake_redis, USER, client, app_id=APP) is False
+    assert client.torn_down == []
+    assert await fake_redis.exists(registry_key(USER)) == 1, "state stays for a later pass"
+    assert attempts == [CopyAttempt.FAILED]
+
+
 # --- and the janitor's call site does the same ---------------------------------------
 
 
@@ -480,6 +567,21 @@ async def test_the_janitor_spares_the_container_it_cannot_write_back_from(
     assert client.torn_down == []
     assert await fake_storage.head(snapshot_key(APP)) is None
     assert attempts == [CopyAttempt.UNREACHABLE]
+
+
+async def test_the_janitor_reclaims_a_container_that_lost_its_repository(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
+) -> None:
+    """The same arm, reached from the call site nobody is watching."""
+    await _register(fake_redis)
+    await _put_saved(fake_storage, OLDER)
+    client = _lost_its_repository(FakeSandboxClient())
+
+    assert await reap_the_container_we_judged(
+        fake_redis, client, app_name=a_sandbox_name("x"), user_uuid=USER, app_id=APP
+    )
+    assert client.torn_down == [a_sandbox_name("x")]
+    assert attempts == [CopyAttempt.NOTHING_TO_COPY]
 
 
 # --- the record an operator reads ----------------------------------------------------

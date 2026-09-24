@@ -91,6 +91,21 @@ fires more than rarely, the containers are being reclaimed or reset out from und
 and the reclamation policy is what wants looking at, not this code."""
 
 
+REAP_FOUND_NO_REPOSITORY_EVENT: Final = "reap_found_no_repository"
+"""A container due to be reclaimed had no git repository, so nothing was written back, and it was
+reclaimed anyway.
+
+A workspace loses `.git` when the container's disk is discarded under it, most often by a
+restart. Nothing on the platform can save a tree without one: Save, the teardown write-back and
+the quarantine all refuse it the same way, so sparing it would retry on every pass and bill
+forever. The app's saved copy is untouched, and the next relaunch restores it.
+
+Fields: `app_id`, `app_name`.
+
+WHAT TO DO: count it beside `restore_performed`. Each firing is a container that lost its disk
+under a citizen, and a rising count is the signal to find out why sandboxes restart."""
+
+
 # --- the sandbox build lifecycle, in order ------------------------------------------------
 # The nine notices. structlog ONLY — a bare `logging.getLogger` line is dropped on the floor in
 # this process — at `info` unless the constant says otherwise, and each one carries its fields IN
