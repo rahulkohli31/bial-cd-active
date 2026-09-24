@@ -1,10 +1,37 @@
-# Git excludes the SANDBOX IMAGE applies to every workspace repository it hosts, installed as the
-# system-wide `core.excludesFile` by Dockerfile.sandbox. Anything listed here never enters a
-# workspace snapshot, whichever `.gitignore` the workspace itself carries — so a platform-owned
-# file baked into the image is never overlaid by a restore, and a fix shipped in a new image
-# reaches every app on its next launch. (The template's own `.gitignore` cannot do this job: it is
-# tracked in the snapshot, so a restore of an older bundle brings back an older copy of it.)
+# THE ONLY IGNORE LIST A WORKSPACE HAS. The sandbox image installs it as the system-wide
+# `core.excludesFile` (Dockerfile.sandbox), so it applies to every workspace repository whichever
+# `.gitignore` the workspace carries, and a restore of an older bundle cannot bring back an older
+# copy of it. A file named `.gitignore` cannot do this job: `az acr build` drops every one from the
+# build context, so none reaches the image.
 #
-# Do NOT list files the app's deploy pipeline needs from the snapshot (`backend/src/services/deploy`
-# collects the bundle) — only files the platform bakes and serves itself.
+# A save also UNTRACKS whatever this list matches (`_COMMIT_SCRIPT`,
+# `backend/src/services/build_sessions/snapshot.py`), so an entry added here leaves every
+# workspace's history on its next commit. Never list app code, and never list a file the app's
+# deploy pipeline needs from the snapshot (`backend/src/services/deploy` collects the bundle).
+
+# Installed into the image, or written by the toolchain on every run. `next dev` and `next build`
+# both regenerate `next-env.d.ts`.
+/node_modules
+/.next
+/out
+/build
+/next-env.d.ts
+npm-debug.log*
+*.tsbuildinfo
+
+# Values files. The platform injects the app's configuration as container environment variables;
+# a values file an agent writes must never enter a saved bundle.
+.env
+.env.local
+.env*.local
+
+# The restore's transport file, written into the worktree and removed as the restore's last step.
+/app.bundle*
+
+# Served by the platform itself.
 /instrumentation-client.ts
+
+# NOT ignored, on purpose: /drizzle. The generated migration SQL (and its meta/ journal) is a
+# versioned artifact, not build output: it is the only record of how the database reached its
+# current shape. Ignoring it would make a snapshot restore come back with code that expects tables
+# and a database that has none. Never add a `drizzle/` entry here.

@@ -53,6 +53,22 @@ A DISCRIMINATOR, not a guess: a full disk and a locked `.git/index` also fail th
 `WorkspaceHasNoRepositoryError` is raised on this code alone. Every other non-zero exit stays the
 generic snapshot failure. Sized out of the way of git's own 1/128."""
 
+# Drops from the index every tracked file the IMAGE's exclude file ignores (`core.excludesFile`,
+# baked from `sandbox/platform-owned.gitignore`). The files stay on disk. Tracked, the dev server's
+# output makes a save of unchanged code a new commit on every boot, and a new commit cancels the
+# approval pinned to the old one.
+#
+# Only that file decides: `--exclude-standard` would also obey a `.gitignore` the agent wrote, and
+# untrack the code it lists. `update-index --force-remove`, not `git rm --cached`, which refuses a
+# file whose index matches neither HEAD nor the disk and would then fail every Save. The listing
+# goes through a file because `sh` has no `pipefail`: a listing that fails, as it does when the
+# exclude file is missing, untracks nothing. An image that sets no exclude file skips the step.
+_UNTRACK_WHAT_THE_IMAGE_IGNORES: Final = (
+    "excludes=$(git config --path --get core.excludesFile) && listing=$(mktemp) && { "
+    'git ls-files -ci -z --exclude-from="$excludes" > "$listing" '
+    '&& git update-index --force-remove -z --stdin < "$listing"; rm -f "$listing"; }; '
+)
+
 # THIS SCRIPT NEVER CREATES A REPOSITORY. The repo is seeded at provision
 # (`sandbox/client._INIT_REPO_SCRIPT`), so a workspace that reaches here without one has LOST it —
 # and a root commit written here would hold the finished app, which makes "is this still the
@@ -60,10 +76,11 @@ generic snapshot failure. Sized out of the way of git's own 1/128."""
 # verdict routes a repo-less container into quarantine-and-restore.
 #
 # Commit only when something is staged (`git commit` exits non-zero on a clean tree); a no-change
-# re-snapshot still bundles the existing HEAD below. Mirrors sandbox/scripts/snapshot.sh.
+# re-snapshot still bundles the existing HEAD below.
 _COMMIT_SCRIPT = (
     f"git rev-parse --git-dir >/dev/null 2>&1 || exit {_NO_REPOSITORY_EXIT}; "
-    "git add -A && { git diff --cached --quiet || git commit -q -m bial-snapshot; }"
+    + _UNTRACK_WHAT_THE_IMAGE_IGNORES
+    + "git add -A && { git diff --cached --quiet || git commit -q -m bial-snapshot; }"
 )
 # The on-disk bundle path is PER-CALL, never the fixed `app.bundle` it used to be. Two snapshots
 # can run against one container at the same time — the commonest pair being a user clicking Save
@@ -74,14 +91,9 @@ _COMMIT_SCRIPT = (
 # versioning nor soft delete — so a truncated bundle landed on top of the only copy of the user's
 # work. `secrets.token_hex` (not a counter) so the name cannot collide across replicas either.
 #
-# WRITTEN OUTSIDE THE WORKTREE, under /tmp, and that is the load-bearing half. A bundle inside
-# `/workspace/app` is only kept out of the user's repo by the template's `.gitignore` — and a
-# RESTORED container carries the `.gitignore` committed in its own bundle, which for every app
-# created before this change lists the literal `/app.bundle`, not the randomized names above. So
-# the ignore would silently stop matching exactly where it was needed, and the next snapshot's
-# `git add -A` would commit multi-MB of binary into the user's tree, permanently, compounding
-# into every later bundle. /tmp is outside the repo, so no ignore rule has to be right.
-# Mirrors what `sandbox/scripts/snapshot.sh` already does with `mktemp`.
+# WRITTEN OUTSIDE THE WORKTREE, under /tmp, so no ignore rule has to be right: a bundle left in
+# `/workspace/app` and missed by one would be committed by the next save's `git add -A`, multi-MB
+# of binary compounding into every later bundle.
 _BUNDLE_PREFIX = "/tmp/bial-snapshot"
 
 # Every exec here is bounded. The client default is 900 s per call (`sandbox/client.py`), and
@@ -376,10 +388,7 @@ async def _bundle_the_tree(
         # for "which of these is the newer tree" without downloading both.
         return _BundledTree(head_sha=parse_bundle_head_sha(data), data=data)
     finally:
-        # Cleanup runs on the FAILURE path too, which the success-only version did not: a bundle
-        # left behind is multi-MB of binary sitting in the worktree that the next snapshot's
-        # `git add -A` would commit into the user's tree. `/app.bundle*` in the template's
-        # .gitignore is the backstop for a call killed before it reaches here; this is the fix.
+        # On the failure path too: each bundle is multi-MB, and the container outlives the save.
         cleanup_started = time.monotonic()
         with suppress(SandboxError):
             await run_command(

@@ -21,8 +21,7 @@ from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
 APP_ID = uuid.uuid4()
 
 #: Spelled out rather than imported from the module under test, so a changed constant moves the
-#: script and the assertion apart instead of moving them together. It is a shell exit code and
-#: `sandbox/scripts/snapshot.sh` carries the same literal.
+#: script and the assertion apart instead of moving them together.
 NO_REPO_EXIT = 64
 
 

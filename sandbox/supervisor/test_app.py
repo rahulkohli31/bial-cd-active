@@ -1278,13 +1278,15 @@ def test_overlay_kill_switch_reaches_no_tracked_template_file() -> None:
 
 
 def test_next_cache_stays_gitignored_and_untracked() -> None:
-    """The persistent build cache (`.next/cache`) is on by default from 16.3 — verified, not
-    assumed, that the template's existing `/.next` .gitignore entry already covers it and that
-    nothing under `.next/` has ever been tracked, so the bump does not newly leak a multi-MB cache
-    into a future git-bundle snapshot."""
+    """The persistent build cache (`.next/cache`) is on by default from 16.3, and nothing under
+    `.next/` may enter a git-bundle snapshot: the image's exclude file ignores it, and nothing
+    under the template's `.next/` is tracked.
+
+    The rule lives in `platform-owned.gitignore` because no file named `.gitignore` reaches the
+    image. One under `template/` works in a local build and does nothing in production."""
     repo_root = Path(__file__).resolve().parents[2]
-    gitignore = (repo_root / "sandbox" / "template" / ".gitignore").read_text(encoding="utf-8")
-    assert "/.next" in gitignore.splitlines()
+    excludes = (repo_root / "sandbox" / "platform-owned.gitignore").read_text(encoding="utf-8")
+    assert "/.next" in excludes.splitlines()
 
     tracked = subprocess.run(
         ["git", "ls-files", "sandbox/template"],
@@ -1294,6 +1296,11 @@ def test_next_cache_stays_gitignored_and_untracked() -> None:
         check=True,
     ).stdout.splitlines()
     assert [p for p in tracked if p.startswith("sandbox/template/.next/")] == []
+    stray = [p for p in tracked if Path(p).name == ".gitignore"]
+    assert stray == [], (
+        f"{stray}: `az acr build` drops every file named .gitignore from the build context, so "
+        "this never reaches the image. Put the rule in sandbox/platform-owned.gitignore."
+    )
 
 
 def test_dev_start_refuses_a_bound_but_silent_port_without_spawning(
