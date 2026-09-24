@@ -446,8 +446,8 @@ export interface LivePreviewProps {
   //
   // A STALLED FRAME IS THE ONLY SIGN THIS PANE GETS OF A STOPPED APP. `preview-state` answers from
   // the registry and goes on saying `alive` over a dev server that has died, so the caller asks the
-  // server to look at the process instead — and a stopped app with its work saved is put away and
-  // offered back with its start control, rather than this card waiting for a load that cannot come.
+  // server to look at the process instead — and a stopped app has its dev server started again in
+  // its container, rather than this card waiting for a load that cannot come.
   onStallChange?: (stalled: boolean) => void
 }
 

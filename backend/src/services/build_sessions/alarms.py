@@ -115,7 +115,8 @@ under a citizen, and a rising count is the signal to find out why sandboxes rest
 
 
 APP_STOPPED_WHILE_IDLE_EVENT: Final = "app_stopped_while_idle"
-"""An idle tab's check found an intact app whose dev server is not running, and acted on it.
+"""An idle tab's check found an intact app whose dev server is not running, and started it again
+in the same container.
 
 A DIFFERENT FAULT FROM `WORKSPACE_LOST_WHILE_IDLE_EVENT`: the files are fine and the process is
 gone — exited, killed, or never brought back after a restart. Nothing else reports it:
@@ -124,19 +125,18 @@ verdict reads the git tree, which a dead process does not change. The citizen wa
 that could not end.
 
 Fields: `app_id`, `app_name`, `exit_code` (the supervisor's post-mortem of its child, when it had
-one) and `put_away` — True when the container was put away, so the next reading offers the saved
-app and its start control; False when the reap declined, and the reaper's own warning beside this
-line says which: "reap refused: this container's work could not be written back" is the common
-one, and the "no copy taken: ..." line under it names what stopped the write-back.
+one) and `restarted` — True when the supervisor accepted the start; False when it refused, and the
+`put_back_tree_dev_start_failed` warning beside this line says why. Either way the container, its
+unsaved work and its commit are left exactly as they were.
 
 READING `exit_code`: the supervisor reports `Popen.poll()`, so a signal death is the NEGATIVE
 signal number. `-9` is a SIGKILL that landed on the supervisor's own child; `137` is the same
 SIGKILL reported by a shell in between. Both are the out-of-memory killer's usual signature — and
 an agent's `pkill -9` looks identical, which is why this names no cause.
 
-WHAT TO DO: nothing for a one-off — the citizen presses Launch and the app comes back running.
-Repeats for the same app mean its dev server keeps dying under it: suspect memory first, and the
-app's own build is where to look."""
+WHAT TO DO: nothing for a one-off — the app comes back in the same container. Repeats for the
+same app mean its dev server keeps dying under it, restarted at most once a minute and only while a
+tab asks: suspect memory first, and the app's own build is where to look."""
 
 
 BUILD_WORKSPACE_CLAIMED_EVENT: Final = "build_workspace_claimed"
@@ -191,8 +191,9 @@ Fields: `app_name`, `serving_since`, `ms_since_container_created` (computed from
 hash's own `created_at`, so nobody has to subtract two timestamps by hand — this is the number
 the 2026-09-10 measurement had to be reconstructed from a screen recording to get), `observer`
 (`turn_watcher` | `turn_verify` | `relaunch_wait` | `relaunch_continuation` |
-`restore_continuation` | `discard_continuation` | `reconciler` — WHICH watcher won, the only way
-to tell a normal build from one the five-minute backstop rescued), `cold`.
+`restore_continuation` | `discard_continuation` | `idle_continuation` | `reconciler` — WHICH
+watcher won, the only way to tell a normal build from one the five-minute backstop rescued),
+`cold`.
 
 THE VOCABULARY IS WHAT THE CODE EMITS, and it has already drifted once. An `attach_snapshot`
 stood here for an observer that was designed and then deliberately NOT built: the attach seam's
@@ -201,8 +202,10 @@ affirmative is too weak to be a permanent first-serve stamp. `turn_verify` was b
 missing from this list. A value named here that nothing emits sends an operator hunting for a
 watcher that does not exist; one emitted but unnamed makes their filter silently drop rows.
 
-Emitted at most once per container by construction: the stamp is first-serve-wins, so a second
-observer's refusal raises `SERVING_PROOF_STAMP_REFUSED` and never a second line here."""
+Emitted at most once per standing proof by construction: the stamp is first-serve-wins, so a
+second observer's refusal raises `SERVING_PROOF_STAMP_REFUSED` and never a second line here. A
+retraction clears the proof — a stopped dev server restarted in place is one — and the restarted
+app's first page is stamped again."""
 
 
 APP_FIRST_SERVE_NOT_OBSERVED_EVENT: Final = "app_first_serve_not_observed"

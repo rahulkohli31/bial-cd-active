@@ -97,7 +97,6 @@ from src.services.build_sessions.locks import (
     mark_serving,
     read_registry,
     read_registry_and_starting_marker,
-    read_starting_marker,
     reap_lock,
     release_lock_as_holder,
     renew_lock,
@@ -386,14 +385,6 @@ def reset_idle_checks_for_tests() -> None:
     """Drop the per-app idle-check memo. Process-local, so a remembered answer must not leak into
     the next test and silently make its container call disappear."""
     _idle_checks.clear()
-
-
-# THE PAUSE BEFORE THE SECOND LOOK at a dev server that did not answer. Reporting takes one
-# reading; putting a container away is an action, so it takes two. Nothing restarts a dev server
-# between turns on its own — the supervisor has no restart loop — so the pause is for a blip in the
-# reading, not a recovery in progress, and a couple of seconds is all that needs. Short, because a
-# tab's poll is waiting on this call.
-_SECOND_LOOK_AFTER_S: Final = 2.0
 
 
 async def _stopped_reading(
@@ -986,8 +977,20 @@ def _registry_serves_and_is_ready(reg: dict[str, str], app_name: str) -> bool:
 # belongs to the turn watcher and the reconciler. A closed Literal so a typo cannot mint an
 # observer that never existed.
 _ServingObserver = Literal[
-    "relaunch_wait", "relaunch_continuation", "restore_continuation", "discard_continuation"
+    "relaunch_wait",
+    "relaunch_continuation",
+    "restore_continuation",
+    "discard_continuation",
+    "idle_continuation",
 ]
+
+# The three ways a tree already in a container gets its dev server started again.
+_BootArm = Literal["restore", "discard", "idle"]
+_OBSERVER_FOR_THE_BOOT: Final[dict[_BootArm, _ServingObserver]] = {
+    "restore": "restore_continuation",
+    "discard": "discard_continuation",
+    "idle": "idle_continuation",
+}
 
 
 async def _record_the_first_serve(
@@ -1852,11 +1855,10 @@ class SessionManager:
         every 45 seconds forever.
 
         IT RESTORES NOTHING: the restore belongs to the next turn, where the citizen can confirm
-        it. IT PUTS ONE THING AWAY — an INTACT app whose dev server has stopped
-        (`_put_away_if_stopped`), because nothing else ends that wait. `preview-state` answers from
+        it. IT RESTARTS ONE THING — the dev server of an INTACT app that has stopped
+        (`_restart_if_stopped`), because nothing else ends that wait. `preview-state` answers from
         the registry, so over an exited process it goes on saying `alive`, or `starting` once the
-        reaper retracts the serving proof, and the pane waits for a load that cannot come. Put
-        away, the next reading is `asleep` with the work restorable."""
+        reaper retracts the serving proof, and the pane waits for a load that cannot come."""
         app_id = await existing_app_id(db, user.id, project_id)
         if app_id is None:
             return WorkspaceState.INTACT  # nothing built yet: nothing to have lost
@@ -1884,35 +1886,30 @@ class SessionManager:
                 verdict=verdict.state.value,
             )
         if verdict.state is WorkspaceState.INTACT:
-            await self._put_away_if_stopped(user.id, app_id, handle, sandbox_client)
+            await self._restart_if_stopped(user.id, app_id, handle, sandbox_client)
         return verdict.state
 
-    async def _put_away_if_stopped(
+    async def _restart_if_stopped(
         self,
         user_id: uuid.UUID,
         app_id: uuid.UUID,
         handle: SandboxHandle,
         sandbox_client: SandboxClient,
     ) -> None:
-        """Put an INTACT app whose dev server has stopped away, so the wait over it ends on the
-        saved app and its start control instead of on nothing.
+        """Start an INTACT app's dev server again in the container it stopped in, so the wait
+        over it ends on the app. The container, its unsaved tree and the commit an approval pins
+        all stay; nothing is written back. `_IDLE_CHECK_WINDOW` bounds a server that keeps dying
+        to one restart a minute, and only while a tab is asking.
 
-        TWO READINGS, `_SECOND_LOOK_AFTER_S` apart: one is enough to report, and this acts.
-
-        NEVER UNDER ANYTHING USING THE CONTAINER. Refused — not waited for — while a start holds
-        this user's start lock: a start brings its own dev server, and the tab asking is polling
-        for the app to arrive. Refused while a turn is live in this process, while the liveness
-        lease or the start-in-flight marker stands, and once the registry names anything but this
-        app READY. The second reading is taken under the lock, after those checks, so nothing can
-        start between the last look and the put-away.
-
-        NEVER AT THE COST OF WORK. The reap passes `app_id`, so the tree is written back to the
-        saved copy before anything is destroyed; a container whose tree could not be written back
-        is SPARED instead — the citizen keeps the slow card, which is where they were before this
-        existed."""
-        if await _stopped_reading(sandbox_client, handle) is None:
+        NEVER UNDER ANYTHING USING THE CONTAINER. Refused — not waited for — while this user's
+        start lock is held: a start, a restore or a Discard brings its own dev server, and the
+        supervisor's "already running" check cannot stop a second `next dev` in a container
+        already short of memory. Refused while a turn is live in this process or the liveness
+        lease stands, since an agent may have stopped the server on purpose, and once the registry
+        names anything but this app READY."""
+        stopped = await _stopped_reading(sandbox_client, handle)
+        if stopped is None:
             return
-        await asyncio.sleep(_SECOND_LOOK_AFTER_S)
         start = self._start_lock_for(user_id)
         if start.locked():
             return
@@ -1921,22 +1918,24 @@ class SessionManager:
             if (
                 user_id in self._active_by_user
                 or await liveness_lease_is_held(redis, user_id)
-                or await read_starting_marker(redis, user_id) is not None
                 or not await _the_live_sandbox_is_already_the_one_we_want(
                     redis, user_id, app_name_for(app_id)
                 )
             ):
                 return
-            stopped = await _stopped_reading(sandbox_client, handle)
-            if stopped is None:
-                return
-            put_away = await reap_user(redis, user_id, sandbox_client, app_id=app_id)
+            # Retracted first, so the pane waits for the restarted server's first page instead
+            # of framing the dead one.
+            with suppress(RedisError):
+                await clear_serving(redis, user_id, app_name=handle.app_name)
+            restarted = await self._boot_the_tree_we_put_back(
+                sandbox_client, handle, user_id, arm="idle"
+            )
         _log.error(
             APP_STOPPED_WHILE_IDLE_EVENT,
             app_id=str(app_id),
             app_name=handle.app_name,
             exit_code=stopped.exit_code,
-            put_away=put_away,
+            restarted=restarted,
         )
 
     async def project_save_state(
@@ -3959,23 +3958,27 @@ class SessionManager:
         handle: SandboxHandle,
         user_id: uuid.UUID,
         *,
-        arm: Literal["restore", "discard"],
-    ) -> None:
-        """Start the app a restore or a discard just put back, then watch for its first page.
+        arm: _BootArm,
+    ) -> bool:
+        """Start the app a restore, a discard or the idle check just put back, then watch for its
+        first page. True when the supervisor accepted the start.
 
-        A restore's turn ends before the engine starts anything, and a discard can put back a tree
-        whose server the discarded work had crashed; either way nothing else starts it, and the
-        preview waits for a page that never comes. `dev_start` is idempotent over a running
-        server. A refused start is logged rather than raised: the detached watcher, and the
-        reconciler under it, still report whatever the container does next."""
+        A restore's turn ends before the engine starts anything, a discard can put back a tree
+        whose server the discarded work had crashed, and the idle check finds a server that died
+        on its own; in each case nothing else starts it, and the preview waits for a page that
+        never comes. `dev_start` is idempotent over a running server. A refused start is logged
+        rather than raised: the detached watcher, and the reconciler under it, still report
+        whatever the container does next."""
         try:
             await sandbox_client.dev_start(handle)
         except SandboxError:
             _log.warning(
                 "put_back_tree_dev_start_failed", arm=arm, app_name=handle.app_name, exc_info=True
             )
+            started = False
         else:
             _log.info(SANDBOX_DEV_STARTED_EVENT, arm=arm, already_running=handle.ready)
+            started = True
         self._keep_watching_for_a_first_serve(
             sandbox_client,
             handle,
@@ -3984,8 +3987,9 @@ class SessionManager:
             app_name=handle.app_name,
             already_waited_s=0.0,
             cold=True,
-            observer="restore_continuation" if arm == "restore" else "discard_continuation",
+            observer=_OBSERVER_FOR_THE_BOOT[arm],
         )
+        return started
 
     async def _resolve_sandbox(
         self,

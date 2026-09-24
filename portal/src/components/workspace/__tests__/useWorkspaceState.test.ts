@@ -764,8 +764,8 @@ describe('a wait that looks stuck asks whether the app has stopped', () => {
   }
 
   it('★ a stalled frame on a running app asks at once, then reads again for the answer', async () => {
-    // The reading that prompted the question predates the put-away, so the check is followed by one
-    // more read — which is what lands the pane on the saved app instead of on the slow card.
+    // The reading that prompted the question predates whatever the server did about it, so the
+    // check is followed by one more read — which is what moves the pane off the slow card.
     aServerThatPutsTheAppAway(reading({ state: 'alive', alive: true }))
     const { result } = mount()
     await waitFor(() => expect(result.current.state.name).toBe('running'))
@@ -804,8 +804,8 @@ describe('a wait that looks stuck asks whether the app has stopped', () => {
   })
 
   it('★ a stall does not outlive the app it was about — launched again, a running app is not asked', async () => {
-    // Put away, the pane unmounts with no chance to take its stall back, so the reading that takes
-    // the frame away has to. Mutation check: drop that reset and the relaunched app is asked about
+    // A reading that takes the frame away unmounts the pane with no chance to take its stall back,
+    // so that reading has to. Mutation check: drop that reset and the relaunched app is asked about
     // on every background read, for as long as the tab stays open.
     let putAway = false
     let launched = false

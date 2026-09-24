@@ -306,8 +306,8 @@ export function useWorkspaceState({
         // HAS THE APP STOPPED? `mayHaveStopped` says which readings ask. A reading that takes the
         // frame away clears the pane's last stall first, since no pane is left to clear it.
         //
-        // THE SERVER ACTS ON THE ANSWER — a process found dead with the work provably saved has its
-        // container put away — and this reading predates that. So a check is followed at once by
+        // THE SERVER ACTS ON THE ANSWER — a process found dead is started again in its container —
+        // and this reading predates that. So a check is followed at once by
         // one more read, made as an accelerated one so it cannot ask again, and this read leaves
         // its cadence decision to that one. Never on an accelerated tick: that timer is watching a
         // start land, and a check there is a container call about a dev server still booting.

@@ -2591,8 +2591,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // …AND HAS THE APP STOPPED? The same check, asked about a stuck wait rather than a claim —
         // `mayHaveStopped` says which readings ask, and a reading that takes the frame away clears
         // the pane's last stall first, since no pane is left to clear it. THE SERVER ACTS ON THIS
-        // ONE: a process found dead with the work provably saved has its container put away, and
-        // this reading predates that. So a check asked for this reason is followed at once by one
+        // ONE: a process found dead is started again in its container, and this reading predates
+        // that. So a check asked for this reason is followed at once by one
         // more probe, made as an accelerated one so it cannot ask again, and this probe leaves its
         // cadence decision to that one.
         if (state.state !== 'alive' && state.state !== 'unknown') frameStalledRef.current = false

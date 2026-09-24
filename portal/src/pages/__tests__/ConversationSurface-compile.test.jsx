@@ -418,8 +418,8 @@ describe('BuilderPage — a stalled frame asks whether the app has stopped', () 
     expect(h.checkWorkspace).toHaveBeenCalledTimes(1)
   })
 
-  // Put away, the pane unmounts without taking its stall back, so the reading that takes the frame
-  // away has to. Mutation check: drop that reset and the relaunched app is asked about on the next look.
+  // A reading that takes the frame away unmounts the pane without taking its stall back, so that
+  // reading has to. Mutation check: drop that reset and the relaunched app is asked about on the next look.
   it('★ a stall does not outlive the app it was about — launched again, a running app is not asked', async () => {
     let putAway = false
     let launched = false

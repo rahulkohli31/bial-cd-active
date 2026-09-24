@@ -10216,7 +10216,7 @@
     },
     "/v1/build-sessions/projects/{project_id}/workspace-check": {
       "post": {
-        "description": "Is the app this tab is framing still the citizen's app?\n\nA POST, WITH CSRF, because it is not a free read: it costs a container exec and it can\nraise an operational alarm. IT RESTORES NOTHING — the restore belongs to the next turn, where\nthe citizen is present, has been told, and can confirm. The one thing it may put away is an\nINTACT app whose dev server has stopped, because nothing else ever ends that wait; see\n`SessionManager.project_workspace_check` for the guards.",
+        "description": "Is the app this tab is framing still the citizen's app?\n\nA POST, WITH CSRF, because it is not a free read: it costs a container exec and it can\nraise an operational alarm. IT RESTORES NOTHING — the restore belongs to the next turn, where\nthe citizen is present, has been told, and can confirm. The one thing it may restart is the\ndev server of an INTACT app that has stopped, in the same container, because nothing else ever\nends that wait; see `SessionManager.project_workspace_check` for the guards.",
         "operationId": "workspace_check_v1_build_sessions_projects__project_id__workspace_check_post",
         "parameters": [
           {

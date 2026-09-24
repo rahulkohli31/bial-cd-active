@@ -1046,9 +1046,9 @@ async def workspace_check(
 
     A POST, WITH CSRF, because it is not a free read: it costs a container exec and it can
     raise an operational alarm. IT RESTORES NOTHING — the restore belongs to the next turn, where
-    the citizen is present, has been told, and can confirm. The one thing it may put away is an
-    INTACT app whose dev server has stopped, because nothing else ever ends that wait; see
-    `SessionManager.project_workspace_check` for the guards."""
+    the citizen is present, has been told, and can confirm. The one thing it may restart is the
+    dev server of an INTACT app that has stopped, in the same container, because nothing else ever
+    ends that wait; see `SessionManager.project_workspace_check` for the guards."""
     # THE TURN MAY NEVER COME. Every other integrity check in this system runs at the start of a
     # turn, which catches every reversion between one message and the next — and catches nothing
     # at all for someone who is reading, or in another tab, or at lunch. A standing completion
