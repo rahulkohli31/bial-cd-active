@@ -38,7 +38,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Final
+from typing import Final, NamedTuple
 
 import redis.asyncio as aioredis
 import structlog
@@ -73,6 +73,8 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_SERVING_SINCE,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_STAY_WRITER,
     starting_key,
@@ -803,6 +805,24 @@ def an_instant_on_the_hash(reg: Mapping[str, str] | None, field: str) -> datetim
     if not raw:
         return None
     return an_instant_in_utc(raw)
+
+
+class SharedViewStamp(NamedTuple):
+    """Whose project a shared view in this slot shows: stamped on the record at Launch, because
+    neither can be read back out of a `shr-` name."""
+
+    owner_id: uuid.UUID
+    project_id: uuid.UUID
+
+
+def shared_view_stamp(reg: Mapping[str, str]) -> SharedViewStamp | None:
+    """The owner and project a shared view's launch stamped on this record, or `None` on any other
+    record. A stamp that will not parse raises: it is not a record this platform wrote."""
+    project_id = reg.get(REGISTRY_FIELD_SHARED_PROJECT_ID)
+    owner_id = reg.get(REGISTRY_FIELD_SHARED_OWNER_ID)
+    if not project_id or not owner_id:
+        return None
+    return SharedViewStamp(owner_id=uuid.UUID(owner_id), project_id=uuid.UUID(project_id))
 
 
 def elapsed_ms(since: datetime | None, until: datetime) -> int | None:

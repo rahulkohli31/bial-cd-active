@@ -26,8 +26,9 @@ from src.api.v1.build_sessions.schemas import (
     RELAUNCH_PREVIEW_STAY_SECONDS,
 )
 from src.config import settings
+from src.db.models.app_registry import AppRegistry
 from src.db.models.pending_teardown import PendingTeardown
-from src.services.build_sessions import app_name_for, locks, pass_history, reaper
+from src.services.build_sessions import app_name_for, locks, pass_history, reaper, shr_name_for
 from src.services.build_sessions.alarms import SERVING_PROOF_ABSENT_AT_TEARDOWN
 from src.services.build_sessions.pass_history import CopyAttempt
 from src.services.redis import (
@@ -44,6 +45,8 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_SERVING_SINCE,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_SHARED_SERVED_COUNT,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
@@ -874,6 +877,44 @@ async def test_the_ceiling_never_touches_an_ordinary_build_preview(
     assert client.torn_down == []
 
 
+@pytest.mark.parametrize("registry_birthday", ["restamped", "dropped"])
+async def test_a_shared_views_ceiling_is_measured_from_its_container(
+    fake_redis: aioredis.Redis, registry_birthday: str
+) -> None:
+    """★ THE RECORD'S BIRTHDAY IS NOT THE CONTAINER'S. It is re-stamped at every registration —
+    every Launch that attaches to the standing view — and dropped when a teardown fails, so a view
+    relaunched every day, or one whose delete once failed, would never reach its ceiling. The ARM
+    tag is stamped once, at create.
+
+    Mutation check: measure from the registry's `created_at` and this view is spared."""
+    from src.api.v1.build_sessions.schemas import SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS
+
+    name = a_shared_sandbox_name("colleague")
+    await _seed_shared_view(fake_redis, USER, app_name=name, stay=_in(600))
+    if registry_birthday == "dropped":
+        await fake_redis.hdel(registry_key(USER), REGISTRY_FIELD_CREATED_AT)
+    client = _ArmKnowsItsAge(
+        created_at=(
+            datetime.now(UTC) - timedelta(seconds=SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS + 60)
+        ).isoformat()
+    )
+
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 1
+    assert name in client.torn_down
+
+
+async def test_a_shared_view_its_container_says_is_young_is_spared(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The other direction, so the case above cannot pass on a sweep that reaps every view."""
+    name = a_shared_sandbox_name("colleague")
+    await _seed_shared_view(fake_redis, USER, app_name=name, stay=_in(600))
+    client = _ArmKnowsItsAge(created_at=(datetime.now(UTC) - timedelta(minutes=5)).isoformat())
+
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 0
+    assert client.torn_down == []
+
+
 async def test_a_malformed_stay_is_lapsed_not_a_reprieve(fake_redis: aioredis.Redis) -> None:
     # FAIL CLOSED: garbage or an empty stay buys NOTHING. An un-reaped container is a real
     # resource leak, so an unreadable lease must never grant an unbounded reprieve.
@@ -1254,6 +1295,117 @@ async def test_a_name_and_an_app_id_describing_different_containers_are_refused(
 
     async with _the_test_session(db_session, monkeypatch):
         assert await reaper.reap_user(fake_redis, user.id, client, app_id=app.id) is False
+
+    assert (await db_session.scalar(sa.select(sa.func.count()).select_from(PendingTeardown))) == 0
+
+
+async def _a_colleagues_view_in_the_slot(
+    db_session: AsyncSession, redis: aioredis.Redis, *, stamped: bool = True
+) -> tuple[uuid.UUID, AppRegistry, str, str]:
+    """A recipient's slot holding a colleague's shared view, as its launch registers it: the
+    record is keyed by the RECIPIENT and stamped with the OWNER and their project."""
+    owner = await UserFactory.create(db_session)
+    recipient = await UserFactory.create(db_session)
+    app = await AppRegistryFactory.create(db_session, user_id=owner.id)
+    name = shr_name_for(app.id, recipient.id)
+    born = "2026-07-14T00:00:00+00:00"
+    await _seed(redis, recipient.id, app_name=name, with_heartbeat=False, created_at=born)
+    if stamped:
+        await redis.hset(
+            registry_key(recipient.id),
+            mapping={
+                REGISTRY_FIELD_SHARED_PROJECT_ID: str(app.project_id),
+                REGISTRY_FIELD_SHARED_OWNER_ID: str(owner.id),
+            },
+        )
+    return recipient.id, app, name, born
+
+
+@pytest.mark.parametrize("the_owners_app_is_named", [False, True], ids=["released", "swept"])
+async def test_a_shared_view_whose_delete_fails_is_owed_against_its_owners_app(
+    fake_redis: aioredis.Redis,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    the_owners_app_is_named: bool,
+) -> None:
+    """★ A FAILED DELETE NEVER FORGETS A SHARED VIEW. Giving the view up, a revoke and the
+    reconcile before a start reap it with no app id; the sweep names its owner's. Either way the
+    app is the OWNER's, never the slot holder's, so the ledger reads the owner and project the
+    launch stamped on the record and owes the delete against them. Without the row, the next
+    container registered in this slot overwrites the only record naming the view, and it runs and
+    bills forever.
+
+    Mutation check: refuse a shared name in the ledger and no row is written, and the slot stays
+    taken."""
+    recipient, app, name, born = await _a_colleagues_view_in_the_slot(db_session, fake_redis)
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert (
+            await reaper.reap_user(
+                fake_redis, recipient, client, app_id=app.id if the_owners_app_is_named else None
+            )
+            is False
+        )
+
+    assert await locks.read_registry(fake_redis, recipient) is None, "the slot is given back"
+    owed = (
+        (
+            await db_session.execute(
+                sa.select(PendingTeardown).where(PendingTeardown.user_id == recipient)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [(row.app_name, row.app_id, row.project_id) for row in owed] == [
+        (name, app.id, app.project_id)
+    ]
+    assert owed[0].instance_ref == datetime.fromisoformat(born)
+
+
+async def test_a_shared_view_with_no_stamp_keeps_its_state_for_a_later_pass(
+    fake_redis: aioredis.Redis,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the stamp nothing says whose app the view is, so the ledger cannot describe it and
+    the old retry stands: the record stays for a later pass. Sparing, never forgetting."""
+    recipient, _app, _name, _born = await _a_colleagues_view_in_the_slot(
+        db_session, fake_redis, stamped=False
+    )
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert await reaper.reap_user(fake_redis, recipient, client) is False
+
+    assert await locks.read_registry(fake_redis, recipient) is not None
+    assert (await db_session.scalar(sa.select(sa.func.count()).select_from(PendingTeardown))) == 0
+
+
+async def test_a_shared_view_whose_stamp_names_another_app_is_refused(
+    fake_redis: aioredis.Redis,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stamp and the name are read together but written apart, so the ledger holds them to
+    each other: a stamp whose project's app cannot produce this name describes a different
+    container, and the delete is not owed against it.
+
+    Mutation check: skip the name check on the shared arm and a row is written for a name the
+    stamped app cannot produce."""
+    recipient, app, _name, _born = await _a_colleagues_view_in_the_slot(db_session, fake_redis)
+    other = await AppRegistryFactory.create(db_session, user_id=app.user_id)
+    await fake_redis.hset(
+        registry_key(recipient), REGISTRY_FIELD_SHARED_PROJECT_ID, str(other.project_id)
+    )
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert await reaper.reap_user(fake_redis, recipient, client) is False
 
     assert (await db_session.scalar(sa.select(sa.func.count()).select_from(PendingTeardown))) == 0
 

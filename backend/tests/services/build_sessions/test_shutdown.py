@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.user import User
-from src.services.build_sessions import app_name_for
+from src.services.build_sessions import app_name_for, shr_name_for
 from src.services.build_sessions import shutdown as shutdown_module
 from src.services.build_sessions.manager import SessionManager
 from src.services.build_sessions.shutdown import (
@@ -797,6 +797,50 @@ async def test_the_ceiling_outranks_the_strike_budget(
     assert outcome is ShutdownOutcome.DESTROYED
     assert owed.attempts < shutdown_module._STRIKES_BEFORE_IT_GOES
     assert client.torn_down == [scene.app_name]
+
+
+async def test_a_shared_view_owed_a_delete_is_destroyed_with_no_write_back(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+    scene: _Scene,
+) -> None:
+    """★ A SHARED VIEW HOLDS NOTHING OF THE RECIPIENT'S TO SAVE. It is a restore of its owner's
+    saved copy, and that storage is read-never-write for the recipient, so a debt owed on a view is
+    settled by the delete alone — and the row names the owner's app, so a write-back here would
+    land on the owner's saved copy.
+
+    Mutation check: drop the shared-view arm and the recipient's view is written over the owner's
+    saved copy."""
+    recipient = await UserFactory.create(db_session)
+    name = shr_name_for(scene.app_id, recipient.id)
+    born = _born_at(10)
+    await _seed_registry(fake_redis, recipient.id, app_name=name, created_at=born)
+    client = _answers_by_name(_Sandbox(), name, born=born)
+    async with scene.factory() as db:
+        owed = await claim_the_teardown_we_owe(
+            db,
+            user_id=recipient.id,
+            app_id=scene.app_id,
+            app_name=name,
+            project_id=scene.project_id,
+            instance_ref=born,
+            conversation_id=None,
+        )
+    on_record = dict(fake_storage.objects)
+
+    outcome = await run_the_shutdown(
+        owed,
+        redis=fake_redis,
+        sandbox_client=client,
+        reason=ShutdownReason.PROJECT_SWITCHED,
+        session_factory=scene.factory,
+    )
+
+    assert outcome is ShutdownOutcome.DESTROYED
+    assert client.torn_down == [name]
+    assert fake_storage.objects == on_record, "nothing was written back anywhere"
+    assert snapshot_key(scene.app_id) not in fake_storage.objects
 
 
 async def test_a_name_nothing_answers_to_settles_the_debt(

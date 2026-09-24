@@ -101,6 +101,7 @@ from src.services.build_sessions.locks import (
     release_lock_as_holder,
     renew_lock,
     settle_stay_once_the_app_is_serving,
+    shared_view_stamp,
     stamp_is_proven,
     write_heartbeat,
     write_starting_marker,
@@ -131,8 +132,6 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_SERVING_SINCE,
-    REGISTRY_FIELD_SHARED_OWNER_ID,
-    REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_STATE,
     REGISTRY_STATE_READY,
 )
@@ -787,10 +786,9 @@ async def _occupying_shared_project(
 
     `_occupying_project` exists ONLY because `app_name_for` cannot be reverse-parsed, so a
     caller's own app rows must be re-derived and matched forward one at a time. `shr_name_for`
-    is exactly as lossy, but a `shr-` occupant's slot is stamped with
-    `REGISTRY_FIELD_SHARED_PROJECT_ID`/`REGISTRY_FIELD_SHARED_OWNER_ID` at Launch
-    (`launch_shared_preview`) precisely so this never needs to guess: the identity is read
-    straight off the hash, not re-derived from a name.
+    is exactly as lossy, but a `shr-` occupant's slot is stamped with its owner and project at
+    Launch (`launch_shared_preview`, read back by `shared_view_stamp`) precisely so this never
+    needs to guess: the identity is read straight off the hash, not re-derived from a name.
 
     Called BEFORE `_occupying_project`, not after — a `shr-` occupant belongs to the
     PROJECT'S OWNER, who is almost never the caller (`user_id` in `_occupying_project`'s own
@@ -799,19 +797,16 @@ async def _occupying_shared_project(
     return `None` — the second is the identical 'ghost' reading `_occupying_project` gives a
     dangling registry entry: nothing left to warn about, so the caller falls through and
     reclaims silently."""
-    project_id_raw = reg.get(REGISTRY_FIELD_SHARED_PROJECT_ID)
-    owner_id_raw = reg.get(REGISTRY_FIELD_SHARED_OWNER_ID)
-    if not project_id_raw or not owner_id_raw:
+    stamp = shared_view_stamp(reg)
+    if stamp is None:
         return None
-    project_id = uuid.UUID(project_id_raw)
-    owner_id = uuid.UUID(owner_id_raw)
-    project_name = await db.scalar(sa.select(Project.name).where(Project.id == project_id))
+    project_name = await db.scalar(sa.select(Project.name).where(Project.id == stamp.project_id))
     if project_name is None:
         return None
-    app_id = await existing_app_id(db, owner_id, project_id)
+    app_id = await existing_app_id(db, stamp.owner_id, stamp.project_id)
     if app_id is None:
         return None
-    return _OccupyingProject(app_id=app_id, project_id=project_id, project_name=project_name)
+    return _OccupyingProject(app_id=app_id, project_id=stamp.project_id, project_name=project_name)
 
 
 async def _project_name_owned_by(

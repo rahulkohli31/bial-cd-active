@@ -65,6 +65,7 @@ from src.services.build_sessions.locks import (
     read_starting_marker,
     reap_lock,
     release_liveness_lease,
+    shared_view_stamp,
     stamp_is_proven,
     stay_of_execution_is_current,
 )
@@ -690,6 +691,7 @@ async def _hand_the_debt_over(
             # against: it is re-stamped at every registration, so it can tell this container from
             # whatever is created under the same name next. No stamp, no discriminator, no row.
             instance_ref=an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT),
+            shared_view=shared_view_stamp(reg),
         )
     except Exception:
         _log.exception(
@@ -920,16 +922,22 @@ async def _renew_shared_view_from_traffic(
         )
 
 
-def _shared_view_past_its_ceiling(reg: dict[str, str], now: datetime) -> bool:
+async def _shared_view_past_its_ceiling(
+    sandbox_client: SandboxClient, reg: dict[str, str], now: datetime
+) -> bool:
     """#198's absolute session ceiling (requirement 20) — independent of the renewable traffic
     stay above, so a wedged or spoofed supervisor report can never buy a shared view
     immortality. `False` for every OTHER kind of record (an ordinary build sandbox has no
     ceiling of its own here; its own signals govern it) and for a shared view still inside the
     window — this only ever SUBTRACTS from what the stay would otherwise spare, never adds a
-    reason to spare one."""
-    if not is_a_shared_sandbox_name(reg.get(REGISTRY_FIELD_APP_NAME, "")):
+    reason to spare one.
+
+    Measured from the CONTAINER's birthday (`_container_age_source`), because the record's is
+    re-stamped by every Launch that attaches to the standing view."""
+    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+    if not is_a_shared_sandbox_name(app_name):
         return False
-    created = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
+    created = (await _container_age_source(sandbox_client, reg, app_name)).created_at
     if created is None:
         return False  # cannot prove an age; the arms in `reconcile_user` decide instead
     return now - created >= _SHARED_PREVIEW_ABSOLUTE_CEILING
@@ -1111,7 +1119,7 @@ async def reconcile_user(
         # nothing about a relaunched build preview's own reprieve. A shared view past its
         # absolute ceiling falls straight through to the reap below EVEN THOUGH its stay is
         # still current — the one condition nothing renews, by design (requirement 20).
-        and not _shared_view_past_its_ceiling(reg, datetime.now(UTC))
+        and not await _shared_view_past_its_ceiling(sandbox_client, reg, datetime.now(UTC))
         # The build sandbox's own absolute ceiling, and the reason presence renewal is safe: a
         # surface renewing on a timer pushes this stay forward indefinitely, and this clause is
         # the only thing that ever stops it. SUBTRACTS from what the stay would spare, exactly
