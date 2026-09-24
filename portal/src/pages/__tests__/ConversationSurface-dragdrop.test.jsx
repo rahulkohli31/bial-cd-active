@@ -17,8 +17,6 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(), relaunchPreview: vi.fn(),
-  acquireLock: vi.fn(), releaseLock: vi.fn(),
   notifyUsageChanged: vi.fn(),
 }))
 
@@ -45,9 +43,7 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
-import { makeClient, primeClient, primeTurn, renderBuilder, waitForGateOpen } from './_builderSession.jsx'
-
-const dragDeps = () => ({ deps: { client: makeClient(h), eventSourceFactory: () => ({ close: () => {} }) } })
+import { primeTurn, renderBuilder, waitForGateOpen } from './_builderSession.jsx'
 
 function dropFiles(target, files) {
   fireEvent.drop(target, { dataTransfer: { types: ['Files'], files } })
@@ -59,7 +55,6 @@ beforeEach(() => {
   vi.clearAllMocks()
   sessionStorage.clear()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   primeTurn(h)
   h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
   h.loadBuilds.mockResolvedValue([])
@@ -76,8 +71,7 @@ afterEach(() => cleanup())
  * falling through to the browser, which would navigate the tab away and discard everything.
  */
 async function renderReady() {
-  const { deps } = dragDeps()
-  renderBuilder({ deps })
+  renderBuilder()
   await waitForGateOpen()
   return screen.getByTestId('composer-dropzone')
 }
@@ -133,10 +127,10 @@ describe('BuilderPage — drop-target feedback', () => {
     expect(composer.getAttribute('data-dragging')).toBeNull()
   })
 
-  // The composer wrapper here carries SessionBanners, the mode switcher, and the composer-gate
-  // note ABOVE the actual input row — the drag handlers have to live on the wrapper that encloses
-  // ALL of that, not just the input row, or a drop landing on the pending-attachment chips falls
-  // through to the browser's default navigate-to-file handler.
+  // The composer wrapper here carries the mode switcher and the composer-gate note ABOVE the
+  // actual input row — the drag handlers have to live on the wrapper that encloses ALL of that,
+  // not just the input row, or a drop landing on the pending-attachment chips falls through to
+  // the browser's default navigate-to-file handler.
   it('claims a drop on the pending-attachment row too, not only the input row beneath it', async () => {
     const composer = await renderReady()
     dropFiles(composer, [new File(['x'.repeat(100)], 'photo.png', { type: 'image/png' })])

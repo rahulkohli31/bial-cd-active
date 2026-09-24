@@ -40,9 +40,9 @@ def test_redis_error_becomes_a_503_with_the_approved_copy() -> None:
 
 
 def test_the_approved_copy_is_user_facing_and_leaks_nothing() -> None:
-    """The frontend surfaces this string VERBATIM (`useBuildSession.ts` sets its error from
-    `ApiError.message`), so it is
-    product copy, not a log line: professional, actionable, and free of internal detail."""
+    """The frontend surfaces this string VERBATIM (`ConversationSurface.tsx` sets its turn error
+    from `TurnStartError.message`), so it is product copy, not a log line: professional,
+    actionable, and free of internal detail."""
     assert (
         BUILD_COORDINATION_UNAVAILABLE_MSG
         == "Build coordination is temporarily unavailable. Please try again."

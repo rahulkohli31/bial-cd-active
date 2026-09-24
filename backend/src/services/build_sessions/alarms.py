@@ -12,7 +12,7 @@ distinguish one firing from another belong in structured fields, not in the even
 NOT EVERY NAME BELOW IS AN ALARM. The eight sandbox-lifecycle constants are LIFECYCLE NOTICES —
 the handful of `info` lines one build now prints, in order, so an operator handed "a citizen saw
 an error page for eight seconds" can reconstruct that build from the logs alone, with no database
-query and no in-memory session object (which is evicted five minutes after the turn ends anyway).
+query and no in-memory session object (which leaves memory when the turn ends anyway).
 Nothing pages on them. They live in this module regardless, because THE ONE RULE above is exactly
 what keeps them greppable, and a second home for event names is how a second spelling gets
 written.

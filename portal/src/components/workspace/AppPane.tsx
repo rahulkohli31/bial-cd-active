@@ -9,7 +9,7 @@
  * WHY THIS EXISTS
  *
  * The address comes from `previewAddress.ts`, never `PreviewState.previewUrl`, so the live turn's
- * preview outranks the session URL describing the previous build. Its `.url` alone is not enough: a
+ * preview outranks the relaunched and project URLs. Its `.url` alone is not enough: a
  * provisioning build has a status and no URL yet, driving the loading state instead of an empty
  * pane, and an address outlives its publisher on purpose, so framing a stale one leaves a sleeping
  * app with no way to wake it. The workspace state is what decides whether that address is framed

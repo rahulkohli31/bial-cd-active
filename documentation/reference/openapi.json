@@ -1013,15 +1013,11 @@
         "type": "object"
       },
       "BuildInProgressItem": {
-        "description": "A build began here and no outcome closed it — mid-build (live) or lost to a crash.\nThe catch-up snapshot's `active_turn` disambiguates; this item only states the durable truth.\n\nHISTORICAL ROWS ONLY. Its source, the hidden `build_started` marker, had exactly one writer\n(`outcome.write_build_started`, called from `SessionManager.start`), and that writer is deleted\nwith the standalone build stack. No new `build_started` row can be created, so this item can\nonly ever be derived from rows already in the database — which is precisely why it, and the\nthree `{session_id}` routes the portal reattaches through, were kept. A build that runs as an\nordinary Write chat turn records its ending as a `turn_terminal` row instead.",
+        "description": "A build began here and no outcome closed it. DISPLAY-ONLY: the portal renders it as a\nsentence saying so, and nothing can reattach to the build it names.\n\nHISTORICAL ROWS ONLY. Its source, the hidden `build_started` marker, has no writer left; a\nbuild that runs as an ordinary Write chat turn records its ending as a `turn_terminal` row\ninstead. The rows already in the database are permanent, so this item stays as their account\nof a build that never finished.",
         "properties": {
           "seq": {
             "title": "Seq",
             "type": "integer"
-          },
-          "sessionId": {
-            "title": "Sessionid",
-            "type": "string"
           },
           "type": {
             "const": "build_in_progress",
@@ -1031,8 +1027,7 @@
           }
         },
         "required": [
-          "seq",
-          "sessionId"
+          "seq"
         ],
         "title": "BuildInProgressItem",
         "type": "object"
@@ -1048,73 +1043,6 @@
         ],
         "title": "BuildSessionStatus",
         "type": "string"
-      },
-      "BuildSessionStatusResponse": {
-        "description": "`GET /v1/build-sessions/{sessionId}` → 200. The poll surface and the\nsource of the framable `preview_url`.",
-        "properties": {
-          "appId": {
-            "format": "uuid",
-            "title": "Appid",
-            "type": "string"
-          },
-          "createdAt": {
-            "format": "date-time",
-            "title": "Createdat",
-            "type": "string"
-          },
-          "lastSeq": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Lastseq"
-          },
-          "previewUrl": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Previewurl"
-          },
-          "projectId": {
-            "format": "uuid",
-            "title": "Projectid",
-            "type": "string"
-          },
-          "sessionId": {
-            "format": "uuid",
-            "title": "Sessionid",
-            "type": "string"
-          },
-          "status": {
-            "$ref": "#/components/schemas/BuildSessionStatus"
-          },
-          "updatedAt": {
-            "format": "date-time",
-            "title": "Updatedat",
-            "type": "string"
-          }
-        },
-        "required": [
-          "sessionId",
-          "projectId",
-          "appId",
-          "status",
-          "previewUrl",
-          "lastSeq",
-          "createdAt",
-          "updatedAt"
-        ],
-        "title": "BuildSessionStatusResponse",
-        "type": "object"
       },
       "BulkLimitsRequest": {
         "description": "The admin \"Global Limits\" bulk apply (sets, never resets-to-default — unlike\nthe single-user `LimitFields` patch, there is no \"use default\" concept in a bulk\naction). `user_ids=None` means every user, system-wide; a non-empty list means\nexactly those users and no others.",
@@ -10467,171 +10395,6 @@
           }
         },
         "summary": "Release Shared View",
-        "tags": [
-          "build_sessions"
-        ]
-      }
-    },
-    "/v1/build-sessions/{session_id}": {
-      "get": {
-        "operationId": "build_status_v1_build_sessions__session_id__get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "title": "Session Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BuildSessionStatusResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Not authenticated"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Account suspended"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Build session not found"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Internal server error"
-          }
-        },
-        "summary": "Build Status",
-        "tags": [
-          "build_sessions"
-        ]
-      }
-    },
-    "/v1/build-sessions/{session_id}/events": {
-      "get": {
-        "description": "The build-session SSE progress feed (cookie-authed, `Last-Event-ID`-resumable, no CSRF). The\nonly synchronous pre-stream failure is the 404 ownership check; a brain failure is\ndelivered IN-BAND as a synthesized terminal FAILED `ended` + `[DONE]`.",
-        "operationId": "build_events_v1_build_sessions__session_id__events_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "title": "Session Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Not authenticated"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Account suspended"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Build session not found"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Internal server error"
-          }
-        },
-        "summary": "Build Events",
         "tags": [
           "build_sessions"
         ]

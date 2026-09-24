@@ -341,19 +341,16 @@ class BannerItem(CamelModel):
 
 
 class BuildInProgressItem(CamelModel):
-    """A build began here and no outcome closed it — mid-build (live) or lost to a crash.
-    The catch-up snapshot's `active_turn` disambiguates; this item only states the durable truth.
+    """A build began here and no outcome closed it. DISPLAY-ONLY: the portal renders it as a
+    sentence saying so, and nothing can reattach to the build it names.
 
-    HISTORICAL ROWS ONLY. Its source, the hidden `build_started` marker, had exactly one writer
-    (`outcome.write_build_started`, called from `SessionManager.start`), and that writer is deleted
-    with the standalone build stack. No new `build_started` row can be created, so this item can
-    only ever be derived from rows already in the database — which is precisely why it, and the
-    three `{session_id}` routes the portal reattaches through, were kept. A build that runs as an
-    ordinary Write chat turn records its ending as a `turn_terminal` row instead."""
+    HISTORICAL ROWS ONLY. Its source, the hidden `build_started` marker, has no writer left; a
+    build that runs as an ordinary Write chat turn records its ending as a `turn_terminal` row
+    instead. The rows already in the database are permanent, so this item stays as their account
+    of a build that never finished."""
 
     type: Literal["build_in_progress"] = "build_in_progress"
     seq: int
-    session_id: str
 
 
 class PlanOptionsItem(CamelModel):
@@ -1332,7 +1329,7 @@ def project_rows(rows: Sequence[Message], *, tail: int | None = None) -> list[Di
             session_id = meta.get("sessionId")
             if kind == "build_started":
                 if isinstance(session_id, str) and session_id not in closed:
-                    items.append(BuildInProgressItem(seq=row.seq, session_id=session_id))
+                    items.append(BuildInProgressItem(seq=row.seq))
                 continue
             if kind == "plan_options_pending" and meta.get("synthesized"):
                 # The retry-cap fallback card: hidden row, visible card — its state

@@ -1,13 +1,13 @@
 """Build-session schemas — the frozen control surface plus the brain interface.
 
-The portal↔session-API control API (`BuildSessionStatus`, `start`/`stop`/`status`, lock-op
-bodies) crosses the JSON wire, so it subclasses `CamelModel` (snake_case ⇄ camelCase). The
+The portal↔session-API control API (`BuildSessionStatus` and the request/response bodies)
+crosses the JSON wire, so it subclasses `CamelModel` (snake_case ⇄ camelCase). The
 status is an API `StrEnum`, not a native PG enum — no durable row is persisted.
 
 The brain seam is the tagged-union progress envelope, `BuildResult`, and the `run_build`
-protocol. It keeps snake_case fields AND `type` literals — a streaming frame that must stay
-byte-stable emit→relay→portal-consume — so these subclass plain `BaseModel` with no alias
-generator, discriminating on `type` like `FileOp` on `action`. Freezing them here as shared
+protocol. It keeps snake_case fields AND `type` literals — a frame whose keys must stay
+byte-stable — so these subclass plain `BaseModel` with no alias generator, discriminating on
+`type` like `FileOp` on `action`. Freezing them here as shared
 read-only code stops both sides inventing the shape separately.
 """
 
@@ -268,7 +268,7 @@ asserts every member is present). See `PreviewStateAction` for what each bucket 
 one rule this mapping exists to enforce: `UNKNOWN` never maps to `REMEDY`."""
 
 
-# --- Control operations: status ----------------------------------------------
+# --- Control operations ------------------------------------------------------
 #
 # THE START ROUTE IS GONE and these two shapes outlive it. The bare `POST` on the build-sessions
 # collection was deleted with the whole harness behind it — it had had no browser client for a
@@ -298,11 +298,9 @@ class StartBuildRequest(CamelModel):
 
 class StartBuildResponse(CamelModel):
     """The 201 the deleted start route returned. NO ROUTE PRODUCES IT — and with it went the last
-    live producer of a session id the browser could hold. What still reaches the portal is a
-    `build_started` transcript row written before the deletion; those rows are permanent, which
-    is why `status`/`events` survive as their reader."""
+    producer of a session id the browser could hold."""
 
-    session_id: uuid.UUID  # the build-session id — path key for status/SSE.
+    session_id: uuid.UUID
     project_id: uuid.UUID
     app_id: uuid.UUID  # the app_registry row being built (== BIAL_APP_ID). Fresh per project.
     status: BuildSessionStatus  # always `provisioning` on a fresh start.
@@ -383,23 +381,6 @@ class SharedPreviewResponse(CamelModel):
     # entire point is moving this forward. `None` only when the store could not be asked for
     # the timestamp; the restore itself already confirmed the snapshot exists.
     snapshot_taken_at: datetime | None
-
-
-class BuildSessionStatusResponse(CamelModel):
-    """`GET /v1/build-sessions/{sessionId}` → 200. The poll surface and the
-    source of the framable `preview_url`."""
-
-    session_id: uuid.UUID
-    project_id: uuid.UUID
-    app_id: uuid.UUID
-    status: BuildSessionStatus
-    # The PUBLIC address the portal frames — prefixed with the app's key. It is NOT the sandbox
-    # `next dev` root: the control plane reaches that directly and privately, and the two are
-    # deliberately different hosts. Null until `ready`.
-    preview_url: str | None
-    last_seq: int | None  # highest envelope `seq` so far; a client resumes SSE from it.
-    created_at: datetime
-    updated_at: datetime
 
 
 # --- the app's own client-error report ----------------
@@ -536,8 +517,8 @@ class RenewPresenceResponse(CamelModel):
 # =============================================================================
 #
 # Snake_case field names + snake_case `type` literals, NO camelCase alias generator
-# on purpose: the envelope is a streaming frame whose keys must be byte-stable
-# across BRAIN-emit → SESSION-API-relay → the pinned schema test → portal-consume.
+# on purpose: the envelope is a frame whose keys must be byte-stable between the
+# emitter and the pinned schema test.
 
 
 class ErrorSource(enum.StrEnum):
@@ -594,7 +575,7 @@ class _ProgressEventBase(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    seq: int  # per-session, starts at 1, strictly +1, gap-free. The SSE `id:` cursor.
+    seq: int  # per-session, starts at 1, strictly +1, gap-free.
 
 
 class StepEvent(_ProgressEventBase):
@@ -622,22 +603,19 @@ class ErrorEvent(_ProgressEventBase):
 
 class PreviewReadyEvent(_ProgressEventBase):
     """`preview_ready` — the dev server is live and framable; carries `preview_url`.
-    Flips the session status → `ready` and triggers the portal iframe (re)load."""
+    Flips the session status → `ready`."""
 
     type: Literal["preview_ready"] = "preview_ready"
-    # The PUBLIC address — `https://<apps-host>/a/<app-name>/`. Handed straight to the portal's
-    # iframe, so it must be the address a browser can actually resolve, never the container's.
+    # The PUBLIC address — `https://<apps-host>/a/<app-name>/`, never the container's.
     preview_url: str
 
 
 class PreviewReconnectingEvent(_ProgressEventBase):
     """`preview_reconnecting` — the dev-server PROCESS exited (the port closed) AFTER the preview
-    was already framed. A feed-only status SIGNAL, not a lifecycle transition: the
-    `BuildSessionStatus` enum is frozen at five members with no "reconnecting" state, so this never
-    changes the session status (a completed build stays `ended`, a live one stays `ready`). The
-    portal reads it to show a DISTINCT reconnecting visual — never the "building" spinner — over
-    the now-dead frame, and a following `preview_ready` re-frames once the dev server serves. The
-    FRONTEND cannot originate this: `/dev/status` is supervisor-internal + bearer-guarded, so crash
+    was already framed. A status SIGNAL, not a lifecycle transition: the `BuildSessionStatus`
+    enum is frozen at five members with no "reconnecting" state, so this never changes the session
+    status (a completed build stays `ended`, a live one stays `ready`). The FRONTEND cannot
+    originate this: `/dev/status` is supervisor-internal + bearer-guarded, so crash
     detection is backend-only (the early readiness watcher owns it)."""
 
     type: Literal["preview_reconnecting"] = "preview_reconnecting"
@@ -664,8 +642,7 @@ class QuotaExceededEvent(_ProgressEventBase):
 
 
 class EndedEvent(_ProgressEventBase):
-    """`ended` — the terminal envelope. After it, the SSE feed emits
-    `data: [DONE]\\n\\n` and closes. `status` equals `BuildResult.status`, and exactly one is
+    """`ended` — the terminal envelope. `status` equals `BuildResult.status`, and exactly one is
     emitted per session."""
 
     type: Literal["ended"] = "ended"
@@ -688,8 +665,7 @@ ProgressEnvelope = Annotated[
     Field(discriminator="type"),
 ]
 """The tagged-union progress envelope — seven members, discriminated on `type`.
-BRAIN emits one per `await on_progress(env)`;
-SESSION-API relays each over the SSE feed verbatim (snake_case, `seq` preserved).
+BRAIN emits one per `await on_progress(env)`.
 
 A later cleanup retired the `log` member: no production BRAIN path had ever called the
 emitter's `log` helper (a dead-code audit finding, not a behavior change), so removing it
@@ -711,7 +687,7 @@ class BuildResult(BaseModel):
     reason: str  # becomes the `ended` envelope's `reason`: "completed" | "quota_exceeded" | …
     app_id: uuid.UUID  # the built app (app_registry.id == BIAL_APP_ID).
     preview_url: str | None = None  # the live preview URL if the dev server came up, else None.
-    last_seq: int  # the final envelope `seq` emitted — reconciles the feed + `status.last_seq`.
+    last_seq: int  # the final envelope `seq` emitted.
     # ALWAYS False by construction — this value is taken before the snapshot runs. NEVER read it
     # as the answer to "was the work saved?": only the terminal `ended` frame carries that. Kept
     # solely so the frozen verdict shape keeps its field.
@@ -738,7 +714,7 @@ class RunBuild(Protocol):
 
     async def __call__(
         self,
-        session_id: uuid.UUID,  # the build session (the SSE feed key). Identifies the run.
+        session_id: uuid.UUID,  # the build session. Identifies the run.
         user_id: uuid.UUID,  # the session OWNER — all metering is charged here
         sandbox_client: SandboxClient,  # the client ABC instance. Imported READ-ONLY.
         on_progress: ProgressSink,  # the in-process sink for every emitted envelope.

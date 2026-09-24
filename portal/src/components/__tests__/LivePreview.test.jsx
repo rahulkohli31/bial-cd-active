@@ -192,11 +192,10 @@ describe('LivePreview — reload semantics (no HMR-socket leak)', () => {
   it('re-rendering with the SAME previewUrl but a changed prop keeps the SAME DOM node (no reload, no socket leak)', () => {
     const { container, rerender } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
     const first = container.querySelector('iframe')
-    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" iterating />)
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" onFrameMessage={() => {}} />)
     const second = container.querySelector('iframe')
-    // Same node. The key is now `previewUrl` + a reload nonce, and the nonce is bumped only when
-    // a turn ENDS over a live preview — `iterating` going false→true is a turn starting, so it
-    // must not reload and leak the framed app's HMR socket.
+    // Same node. The key is `previewUrl` plus the reload nonces, so a prop that moves nothing about
+    // the document must not reload it and leak the framed app's HMR socket.
     expect(second).toBe(first)
     expect(second.getAttribute('src')).toBe(SANDBOX_URL)
   })
@@ -209,9 +208,6 @@ describe('LivePreview — reload semantics (no HMR-socket leak)', () => {
     // router's 502 page — the app was not listening yet — and the citizen keeps looking at "This
     // app isn't running right now" over an app that is now running perfectly. Reported from
     // production as needing four reloads.
-    //
-    // `iterating` cannot cover this: it fires when a turn ends OVER a live preview, and a first
-    // build has no live preview to have been iterating over.
     //
     // Mutation check: delete the `status === 'ready'` nonce effect in LivePreview and this goes
     // red with `second` being the same node — the stale document survives the app coming up.
@@ -367,10 +363,9 @@ describe('LivePreview — status-driven visuals, all five statuses', () => {
   // its own navigation — a chip there writes across the citizen's app.
   //
   // ASSERT-ABSENCE, PAIRED WITH LIVENESS — an empty pane would satisfy the absence on its own, so
-  // the frame has to be found in the same breath. `iterating` is still a live prop (it drives the
-  // reload nonce); what it no longer does is draw anything over the app.
-  it('★ draws NOTHING over the framed app while a turn keeps refining it', () => {
-    const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" iterating />)
+  // the frame has to be found in the same breath.
+  it('★ draws NOTHING over the framed app', () => {
+    const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
     expect(container.textContent).not.toMatch(/still working/i)
     // LIVENESS: the app really is framed, so the absence is a deletion rather than a blank pane.
     expect(container.querySelector('iframe')).toBeTruthy()
@@ -625,24 +620,6 @@ describe('LivePreview — relaunch a torn-down preview', () => {
     } finally {
       vi.useRealTimers()
     }
-  })
-
-  it('re-requests the SAME url after a repair turn ends', () => {
-    // The attach arm makes "same container, same url" the common case, so a repair turn ends
-    // with previewUrl byte-identical. Keyed on the url alone React kept the same DOM node, the
-    // browser never re-requested, and the citizen kept staring at the broken render of an app
-    // the server had already fixed. This was measured as `iframe loads 1 -> 1`.
-    const view = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" iterating />)
-    const before = view.container.querySelector('iframe')
-
-    // The repair turn ends: `iterating` falls while the preview stays framed.
-    view.rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" iterating={false} />)
-
-    const after = view.container.querySelector('iframe')
-    expect(after?.getAttribute('src')).toBe(SANDBOX_URL)
-    // A DIFFERENT element is the remount, and the remount is what re-requests. Node identity
-    // rather than a test-only attribute: this is the same thing the browser reacts to.
-    expect(after).not.toBe(before)
   })
 
   it('remounts the frame when the shell asks it to reload', () => {
@@ -1657,26 +1634,25 @@ describe('LivePreview — the vouch wait: a silent document is asked again, and 
     }
   })
 
-  it('★ and NOT by a turn edge: `iterating` falling costs one fetch and two pings, never a fresh budget', () => {
-    // `iterating` falls after any four-second gap in the stream, so a budget reset there would
-    // hand a document that never answers a fresh three fetches several times per turn, and the
-    // bound on the counter would bound nothing. The edge is still worth ONE fetch — that is the
-    // repair case, where the served bundle really can be stale — and that is the whole of what it
-    // is worth. Stated in the component's own words: "a turn edge afterwards costs one fetch and
-    // two pings, never a fresh budget".
+  it('★ and NOT by an automatic reload: the app coming back up costs one fetch and two pings, never a fresh budget', () => {
+    // A budget reset on an automatic reload would hand a document that never answers a fresh three
+    // fetches every time one fired, and the bound on the counter would bound nothing. The edge is
+    // still worth ONE fetch — the document that loaded before the app answered really can be
+    // stale — and that is the whole of what it is worth. Stated in the component's own words: "an
+    // automatic reload afterwards costs one fetch and two pings, never a fresh budget".
     //
-    // Mutation check: add `iterating` (or the auto nonce) to the budget-reset effect's deps and
-    // the last stretch goes red — the key climbs past `#4.0` and the stall card never comes back.
+    // Mutation check: add the auto nonce to the budget-reset effect's deps and the last stretch
+    // goes red — the key climbs past `#4.0` and the stall card never comes back.
     vi.useFakeTimers()
     try {
       const { container, rerender } = render(
-        <LivePreview previewUrl={SANDBOX_URL} status="ready" iterating={false} />,
+        <LivePreview previewUrl={SANDBOX_URL} status="ready" />,
       )
       exhaustTheVouchBudget()
       expect(container.textContent).toMatch(/taking longer than usual/i)
 
-      rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" iterating />)
-      rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" iterating={false} />)
+      rerender(<LivePreview previewUrl={SANDBOX_URL} status="building" />)
+      rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
 
       // ONE re-request from the edge, and the honest wait back with it: a new key, so the stall
       // verdict does not outlive the frame it was a complaint about.

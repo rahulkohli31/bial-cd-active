@@ -11,7 +11,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, waitFor, cleanup, within, act, fireEvent } from '@testing-library/react'
 import {
-  FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
+  PREVIEW_URL, renderBuilder,
   waitForGateOpen, composer, T_STEP, T_WORKSPACE, T_PREVIEW,
 } from './_builderSession.jsx'
 
@@ -20,7 +20,6 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -42,11 +41,6 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   buildFromPlan: (...a) => h.buildFromPlan(...a),
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
-
-function deps() {
-  const fake = new FakeEventSource('x')
-  return { fake, deps: { client: makeClient(h), eventSourceFactory: () => fake } }
-}
 
 /**
  * An ordinary send's turn stream as an OPEN socket a test can push frames into by hand. The
@@ -88,7 +82,6 @@ async function startBuild(text = 'build me a tool') {
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'build', title: 'My build', updatedAt: new Date().toISOString() }])
@@ -101,7 +94,7 @@ describe('BuilderPage — build turn visible without a refresh', () => {
   it('shows the live status line immediately on sending, and the feed as frames arrive — no remount', async () => {
     const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await startBuild()
 
     expect(await screen.findByTestId('stop-turn')).toBeTruthy()
@@ -115,7 +108,7 @@ describe('BuilderPage — build turn visible without a refresh', () => {
   it('frames the preview as soon as its frame arrives', async () => {
     const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await startBuild()
 
     await turn.frame(T_PREVIEW())
@@ -128,7 +121,7 @@ describe('BuilderPage — build turn visible without a refresh', () => {
   it('does NOT blank the live preview while the agent keeps working after the preview frames', async () => {
     const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await startBuild()
 
     await turn.frame(T_PREVIEW())

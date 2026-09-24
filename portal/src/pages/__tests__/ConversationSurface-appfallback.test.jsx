@@ -6,12 +6,11 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, waitFor, cleanup } from '@testing-library/react'
-import { FakeEventSource, makeClient, primeClient, renderBuilder } from './_builderSession.jsx'
+import { renderBuilder } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
-  getStatus: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -25,15 +24,9 @@ vi.mock('../../utils/conversationApi', () => ({
 }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 
-function deps() {
-  const fake = new FakeEventSource('x')
-  return { client: makeClient(h), eventSourceFactory: () => fake }
-}
-
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'build', title: 'My build', updatedAt: new Date().toISOString() }])
 })
@@ -46,7 +39,7 @@ describe('BuilderPage — the passive stored-app preview is inert', () => {
       context: { theme: 'bial' },
       code: { current: { source: 'DURABLE-APP-CODE', entry: 'PreviewApp' } },
     })
-    renderBuilder({ deps: deps() })
+    renderBuilder()
 
     expect(await screen.findByText(/build the gate board/i)).toBeTruthy()
     // The durable app code is deliberately never read into the preview; no frame is mounted.

@@ -13,11 +13,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, within, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
-  FakeEventSource, makeClient, primeClient, BRIEF, PLAN_CARD_ID, primeTurn,
+  BRIEF, PLAN_CARD_ID, primeTurn,
   turnStreaming, textReply,
   waitForGateOpen,
 } from './_builderSession.jsx'
-import { ApiError } from '../../utils/apiError'
 
 // The id `handleBuildIt` mints for every Build-it press in this file (client-minted via
 // `uuidv7`, echoed back as `BuildFromPlanOutcome.chatId`). One fixed id is enough here because
@@ -30,8 +29,6 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(), uuidv7: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(),
-  relaunchPreview: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -59,19 +56,16 @@ import ConversationSurface from '../../components/chat/ConversationSurface'
 const QUESTIONS = 'Which terminals should this cover, and who approves a visitor?'
 
 function renderThread({ state, chatId = 'thread-1' } = {}) {
-  const fake = new FakeEventSource(chatId)
-  const deps = { client: makeClient(h), eventSourceFactory: () => fake }
-  const view = render(
+  return render(
     <MemoryRouter initialEntries={[{ pathname: `/chat/${chatId}`, state }]}>
       <Routes>
         <Route
           path="/chat/:chatId"
-          element={<ConversationSurface projectId="p1" projectName="VIP Movement" buildSessionDeps={deps} />}
+          element={<ConversationSurface projectId="p1" projectName="VIP Movement" />}
         />
       </Routes>
     </MemoryRouter>,
   )
-  return { ...view, fake }
 }
 
 const composer = () => screen.getByPlaceholderText(/ask for another change/i)
@@ -93,7 +87,6 @@ const storedCard = (seq, toolCallId, state) => ({
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
@@ -104,7 +97,11 @@ beforeEach(() => {
   // the shared harness's `primeTurn` still answers the pre-handoff shape, so tests need this.
   h.buildFromPlan.mockResolvedValue({ outcome: 'started', chatId: MINTED_BUILD_CHAT_ID, turnId: 'bt-1' })
 })
-afterEach(() => cleanup())
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+})
 
 describe('the routing rule — a send is a chat turn, never a build', () => {
   it('streams the plan as prose with the card beside it; nothing builds until the click', async () => {
@@ -247,7 +244,7 @@ describe('a used card cannot re-fire', () => {
 })
 
 describe('the reload half of the build narrative', () => {
-  it('renders stored friendly steps and the in-progress truth line from the projection', async () => {
+  it('renders stored steps and the build-was-running sentence, opens send, and asks no build session about the anchor', async () => {
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
       messages: [
@@ -258,29 +255,33 @@ describe('the reload half of the build narrative', () => {
           seq: 1,
           parts: [{ type: 'step', step: { type: 'step', seq: 1, tool: 'write_file', label: 'Updated app/page.tsx', state: 'ok', hidden: false } }],
         },
-        { id: 'srv_2_g', role: 'assistant', seq: 2, parts: [{ type: 'build_in_progress', sessionId: 'gone-1' }] },
+        { id: 'srv_2_g_2', role: 'assistant', seq: 2, parts: [{ type: 'build_in_progress' }] },
       ],
     })
-    // The page now reattaches to any session the transcript says was running, so "gone-1" has to
-    // actually be gone — a 404 is the ordinary way that happens.
-    h.getStatus.mockRejectedValue(new ApiError('Build session not found.', 404))
-    const { container } = renderThread()
+    const requested = vi.spyOn(globalThis, 'fetch')
+    const openedFeed = vi.fn()
+    vi.stubGlobal('EventSource', openedFeed)
+    renderThread()
 
     // The stored step renders through the SAME activity group the live path uses — one
     // converter, one renderer, so a build read back looks like the build watched.
     fireEvent.click(await screen.findByTestId('activity-group-trigger'))
     const step = await screen.findByText('Updated app/page.tsx')
     expect(step.closest('[data-state]')?.getAttribute('data-state')).toBe('ok')
-    expect(h.getStatus).toHaveBeenCalledWith('gone-1') // it DID try to rejoin
-    // Nothing live re-tells this build, so the durable truth line renders instead of a dead
-    // spinner. `build_in_progress` maps to no rendered part, so the surface turns the anchor into
-    // prose itself, rather than the transcript simply stopping with no account of the build.
-    await waitFor(() =>
-      expect(container.textContent).toMatch(
-        /a build was running here/i,
-      ),
-    )
-    expect(screen.queryByText(/could not check on the build/i)).toBeNull()
+    // `build_in_progress` maps to no rendered part, so the surface turns the anchor into prose
+    // itself rather than letting the transcript stop with no account of the build.
+    expect(await screen.findByText('A build was running here when this chat was last open.')).toBeTruthy()
+
+    await send('carry on')
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
+
+    // Project-scoped routes are the workspace's own reads; anything else under /build-sessions/
+    // is a per-session status read or event feed.
+    const sessionReads = requested.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.includes('/build-sessions/') && !url.includes('/build-sessions/projects/'))
+    expect(sessionReads).toEqual([])
+    expect(openedFeed).not.toHaveBeenCalled()
   })
 
   it('groups a RUN of consecutive stored steps into ONE collapsed dropdown, and starts a new group after an interruption', async () => {
@@ -335,6 +336,30 @@ describe('the header ignores a legacy mode field and mounts no mode control', ()
 })
 
 describe('a reload MID-TURN re-attaches to the running reply', () => {
+  it('over a RUNNING build: no build-was-running sentence, Stop is offered, and send stays shut', async () => {
+    // The anchor's past tense would be a sentence about a build that is still running here.
+    h.getBuild.mockResolvedValue({
+      id: 'thread-1',
+      activeTurn: { turnId: 't-live', lastSeq: 2 },
+      messages: [
+        { id: 'srv_1_u_0', role: 'user', seq: 1, parts: [{ type: 'text', text: 'add a page' }] },
+        { id: 'srv_2_g_2', role: 'assistant', seq: 2, parts: [{ type: 'build_in_progress' }] },
+      ],
+    })
+    h.readTurnStream.mockImplementation(() => new Promise(() => {}))
+    renderThread()
+
+    // LIVENESS: the running turn was re-attached, which is what puts Stop on the composer.
+    await waitFor(() => expect(screen.getByTestId('stop-turn')).toBeTruthy())
+    expect(h.readTurnStream.mock.calls[0][0].turnId).toBe('t-live')
+    expect(screen.getByText('add a page')).toBeTruthy()
+    expect(screen.queryByText(/a build was running here/i)).toBeNull()
+
+    await send('another change')
+    await act(async () => { await Promise.resolve() })
+    expect(h.startTurn).not.toHaveBeenCalled()
+  })
+
   it('re-subscribes to the running turn and lands its text in the transcript', async () => {
     // `getBuild` already returned `activeTurn` and nothing consumed it: the reload showed a
     // frozen transcript while the server kept generating, and the next send 409'd against it.

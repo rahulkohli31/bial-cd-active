@@ -1,8 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import {
   relaunchPreview,
-  getStatus,
-  buildSessionClient,
   BuildSessionAlreadyActiveError,
   asReclaimBlocked,
   releaseProject,
@@ -45,22 +43,6 @@ function optsOf(m: ReturnType<typeof jsonFetch>, call = 0): RequestInit {
 function headerOf(m: ReturnType<typeof jsonFetch>, name: string, call = 0): string | undefined {
   return (optsOf(m, call).headers as Record<string, string> | undefined)?.[name]
 }
-
-// The frozen `buildSessionClient` member set — the portal's mirror of the backend's
-// `test_abstractmethod_set_equals_the_pinned_contract`. A drifted mock bag is what this
-// guards: one call site (`ConversationSurface-memo.test.jsx`) went on mocking `acquireLock` /
-// `renewLock` / `releaseLock` / `heartbeat` after they were gone, unnoticed because nothing
-// forced its stale keys to be read against the real surface. This test fails LOUDLY the
-// moment `buildSessionClient` gains or loses a member, so the next removal cannot leave the
-// same kind of residue behind unnoticed — it did its job again for `forceEnd`'s removal and
-// again for the session-scoped `stop`'s, which is why the set is DOWN to two.
-const _CLIENT_MEMBERS = new Set(['relaunchPreview', 'getStatus'])
-
-describe('buildSessionApi — buildSessionClient member set (inertness guard)', () => {
-  it('exposes exactly the two surviving client operations', () => {
-    expect(new Set(Object.keys(buildSessionClient))).toEqual(_CLIENT_MEMBERS)
-  })
-})
 
 describe('buildSessionApi — control operations', () => {
   // The typed 409 mapping lives in the shared `postJson`, and `relaunchPreview` is the only
@@ -141,23 +123,6 @@ describe('buildSessionApi — control operations', () => {
     expect(statusErr).toBeInstanceOf(ApiError)
     expect((statusErr as ApiError).status).toBe(500)
   })
-
-  it('getStatus: previewUrl is null before ready and the stable URL once ready; lastSeq present after the first envelope', async () => {
-    const before = jsonFetch(200, { sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'building', previewUrl: null, lastSeq: 3, createdAt: 'c', updatedAt: 'u' })
-    const b = await getStatus('s1', { fetchImpl: before })
-    expect(b.previewUrl).toBeNull()
-    expect(b.status).toBe('building')
-    expect(b.lastSeq).toBe(3)
-
-    const READY_URL = 'https://app.example.azurecontainerapps.io/'
-    const after = jsonFetch(200, { sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'ready', previewUrl: READY_URL, lastSeq: 7, createdAt: 'c', updatedAt: 'u' })
-    const a = await getStatus('s1', { fetchImpl: after })
-    expect(a.previewUrl).toBe(READY_URL)
-    expect(a.status).toBe('ready')
-
-    expect(headerOf(after, 'X-CSRF-Token')).toBeUndefined()
-    expect(optsOf(after).method).toBeUndefined()
-  })
 })
 
 describe('buildSessionApi — CSRF discipline', () => {
@@ -199,26 +164,10 @@ describe('buildSessionApi — lock ops + fail-closed errors', () => {
   // `forceEnd`'s OWN test — the kill switch's `403 build_session_forbidden` surfacing fail-closed
   // — is gone rather than re-pointed, because it had no contract left to describe once the client
   // AND the route went in the same change: no other call can answer that code. The generic
-  // non-2xx → `ApiError` mapping it rode is pinned by the 409 and boundary cases either side.
+  // non-2xx → `ApiError` mapping it rode is pinned by the 409 and boundary cases above.
 
   // `renew`'s 409 and `heartbeat`'s 404 are not tested here — the keep-alive loop that called
   // them is gone. The backend routes keep their own tests.
-
-  it('a malformed success body fails at the boundary rather than corrupting state downstream', async () => {
-    const fetchImpl = jsonFetch(200, { status: 'ready' }) // no sessionId
-    const err = await getStatus('s', { fetchImpl }).catch((e: unknown) => e)
-    expect(err).toBeInstanceOf(ApiError)
-    expect((err as ApiError).status).toBe(500)
-  })
-
-  it('a session body with NO projectId fails at the boundary — it drives the 409 reattach/block routing', async () => {
-    // getStatus is the ONE reader of this guard now: the projectId comparison is the
-    // reattach-vs-block gate that `start`, gone with its wrapper, used to anchor.
-    const statusImpl = jsonFetch(200, { sessionId: 's1', appId: 'a1', status: 'ready', previewUrl: null, lastSeq: 1, createdAt: 'c', updatedAt: 'u' })
-    const statusErr = await getStatus('s1', { fetchImpl: statusImpl }).catch((e: unknown) => e)
-    expect(statusErr).toBeInstanceOf(ApiError)
-    expect((statusErr as ApiError).status).toBe(500)
-  })
 })
 
 describe('asReclaimBlocked', () => {

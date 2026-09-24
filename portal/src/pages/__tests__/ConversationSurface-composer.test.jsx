@@ -5,10 +5,10 @@
  * stay live so the citizen can compose while they wait.
  *
  * Four defects live here. The composer went dead mid-reply and stole focus. G1: the gate read
- * "open" while the adopt round-trip was unresolved over a possibly-live build, and its fix has
- * FOUR arms — miss the no-anchor one and every ordinary chat bricks. G2: `generating` was global,
- * so a mid-stream switch gated the new chat on the old chat's turn. G3: a typed draft died on a
- * reload, on a switch, and to a refinement chip; the chips are gone, so nothing canned may seed it.
+ * "open" before the chat's own load had answered whether anything was running in it. G2:
+ * `generating` was global, so a mid-stream switch gated the new chat on the old chat's turn. G3: a
+ * typed draft died on a reload, on a switch, and to a refinement chip; the chips are gone, so
+ * nothing canned may seed it.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
@@ -19,7 +19,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(), relaunchPreview: vi.fn(),
+  relaunchPreview: vi.fn(),
   notifyUsageChanged: vi.fn(), releaseUploadedAttachments: vi.fn(),
 }))
 
@@ -52,22 +52,16 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
 }))
 
 import ConversationSurface from '../../components/chat/ConversationSurface'
-import { ApiError } from '../../utils/apiError'
 import {
-  FakeEventSource, makeClient, primeClient, primeTurn, statusResp, turnStreaming, planReply,
+  primeTurn, turnStreaming, planReply,
   waitForGateOpen, scriptBuildTurn, BUILD_TURN_ID, T_PREVIEW, T_BUILD_END,
 } from './_builderSession.jsx'
 
-const deps = () => {
-  const fake = new FakeEventSource('x')
-  return { fake, deps: { client: makeClient(h), eventSourceFactory: () => fake } }
-}
-
 /** Render at an explicit chat id, so a rerender can move the SAME instance to a sibling chat. */
-function renderAt(chatId, sessionDeps, projectId = 'p1') {
+function renderAt(chatId, projectId = 'p1') {
   return render(
     <MemoryRouter initialEntries={['/x']}>
-      <ConversationSurface chatId={chatId} projectId={projectId} projectName="VIP Movement" buildSessionDeps={sessionDeps} />
+      <ConversationSurface chatId={chatId} projectId={projectId} projectName="VIP Movement" />
     </MemoryRouter>,
   )
 }
@@ -79,21 +73,10 @@ const composer = () => screen.getByTestId('composer-input')
 const sendButton = () => composer().parentElement.querySelector('button:last-of-type')
 const type = (text) => fireEvent.change(composer(), { target: { value: text } })
 
-/** A transcript whose newest assistant part anchors a build that may still be running. */
-const withAnchor = (sessionId = 'live-7') => ({
-  id: 'build-X',
-  kind: 'build',
-  messages: [
-    { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
-    { id: 'srv_1_g', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId }] },
-  ],
-})
-
 beforeEach(() => {
   vi.clearAllMocks()
   sessionStorage.clear()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   primeTurn(h)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
@@ -106,8 +89,7 @@ describe('the gate withholds SENDING, not typing', () => {
   it('mid-reply: the box takes input, attach is live, send is unavailable — the mode pill is gone entirely', async () => {
     h.readTurnStream.mockImplementation(() => new Promise(() => {}))
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
     await waitForGateOpen()
     type('first')
     fireEvent.keyDown(composer(), { key: 'Enter' })
@@ -137,8 +119,7 @@ describe('the gate withholds SENDING, not typing', () => {
       onFrame({ type: 'turn_ended', seq: 9, turnId: 't1', status: 'completed' })
       return 'completed'
     })
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
     await waitForGateOpen()
 
     composer().focus()
@@ -158,8 +139,7 @@ describe('the gate withholds SENDING, not typing', () => {
   it('Enter is refused by handleSend itself, not by an attribute', async () => {
     h.readTurnStream.mockImplementation(() => new Promise(() => {}))
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
     await waitForGateOpen()
     type('first')
     fireEvent.keyDown(composer(), { key: 'Enter' })
@@ -175,8 +155,7 @@ describe('the gate withholds SENDING, not typing', () => {
   it('send exposes aria-disabled rather than disabled, so a tabbed-to Send is never blurred to body', async () => {
     h.readTurnStream.mockImplementation(() => new Promise(() => {}))
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
     await waitForGateOpen()
     type('first')
     sendButton().focus()
@@ -191,23 +170,32 @@ describe('the gate withholds SENDING, not typing', () => {
 
 describe('the closed gate always states its reason', () => {
   it('names the reply, the build, and the check as three different waits', async () => {
-    h.readTurnStream.mockImplementation(() => new Promise(() => {}))
+    let landThePlan = () => {}
+    h.readTurnStream.mockImplementation(async ({ onFrame }) => {
+      await new Promise((resolve) => { landThePlan = resolve })
+      for (const frame of planReply()) onFrame(frame)
+      return 'completed'
+    })
+    h.buildFromPlan.mockImplementation(() => new Promise(() => {}))
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
+    const note = () => screen.getByTestId('composer-gate-note').textContent
 
-    expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/checking whether a build/i)
+    expect(note()).toMatch(/checking whether a build/i)
     await waitForGateOpen()
     expect(screen.queryByTestId('composer-gate-note')).toBeNull()
 
     type('hi')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    await waitFor(() => expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/^Replying/i))
+    await waitFor(() => expect(note()).toMatch(/^Replying/i))
+
+    await act(async () => { landThePlan() })
+    fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
+    await waitFor(() => expect(note()).toMatch(/building your app/i))
   })
 
   it('the build wait says the app is being built', async () => {
-    const d = deps()
-    renderAt('build-X', d.deps)
+    renderAt('build-X')
     await waitForGateOpen()
     type('a visitor app')
     fireEvent.keyDown(composer(), { key: 'Enter' })
@@ -216,71 +204,21 @@ describe('the closed gate always states its reason', () => {
   })
 })
 
-describe('the gate waits for the adopt round-trip', () => {
-  it('THE COMMON CASE: a chat with no build anchor resolves on mount and send is available', async () => {
-    // The arm that would brick the whole product if missed: `reattachToLiveBuild` early-returns
-    // when there's no `build_in_progress` anchor — every ordinary chat — so send must not key on
-    // `session.reattach` settling alone.
-    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+describe('the gate waits for the chat’s own load', () => {
+  it('send stays shut until the load answers, then opens', async () => {
+    let land = () => {}
+    h.getBuild.mockImplementation(() => new Promise((resolve) => {
+      land = () => resolve({ id: 'build-X', kind: 'build', messages: [] })
+    }))
+    renderAt('build-X')
 
-    await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
+    expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/checking whether a build/i)
     type('hello')
     fireEvent.keyDown(composer(), { key: 'Enter' })
-    await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
-  })
-
-  it('an unresolved anchor keeps send shut until the round-trip settles', async () => {
-    let settle = () => {}
-    h.getBuild.mockResolvedValue(withAnchor())
-    h.getStatus.mockImplementation(
-      () => new Promise((resolve) => { settle = () => resolve(statusResp({ sessionId: 'live-7', projectId: 'p1', status: 'ended' })) }),
-    )
-    const { deps: d } = deps()
-    renderAt('build-X', d)
-
-    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
-    expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/checking whether a build/i)
-    type('too early')
-    fireEvent.keyDown(composer(), { key: 'Enter' })
     await act(async () => { await Promise.resolve() })
     expect(h.startTurn).not.toHaveBeenCalled()
 
-    await act(async () => { settle(); await Promise.resolve() })
-    await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
-  })
-
-  it('a 404 on reattach — the ordinary retention lapse — resolves the gate quietly', async () => {
-    h.getBuild.mockResolvedValue(withAnchor())
-    h.getStatus.mockRejectedValue(new ApiError('gone', 404))
-    const { deps: d } = deps()
-    renderAt('build-X', d)
-
-    await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
-    expect(screen.queryByText(/couldn’t check/i)).toBeNull() // quiet: there is nothing to report
-    type('carry on')
-    fireEvent.keyDown(composer(), { key: 'Enter' })
-    await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
-  })
-
-  it('a NON-404 failure leaves send shut AND renders a Retry that re-runs the check', async () => {
-    // The one arm that stays closed, because the page genuinely could not ask. Leaving it closed
-    // with only a vanishing toast would recreate the dead-end class.
-    h.getBuild.mockResolvedValue(withAnchor())
-    h.getStatus.mockRejectedValue(new ApiError('upstream exploded', 500))
-    const { deps: d } = deps()
-    renderAt('build-X', d)
-
-    const note = await screen.findByTestId('composer-gate-note')
-    await waitFor(() => expect(note.textContent).toMatch(/couldn’t check whether a build is running/i))
-    type('let me in')
-    fireEvent.keyDown(composer(), { key: 'Enter' })
-    await act(async () => { await Promise.resolve() })
-    expect(h.startTurn).not.toHaveBeenCalled()
-
-    h.getStatus.mockResolvedValue(statusResp({ sessionId: 'live-7', projectId: 'p1', status: 'ended' }))
-    fireEvent.click(screen.getByRole('button', { name: /^Retry$/ }))
+    await act(async () => { land() })
     await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
     fireEvent.keyDown(composer(), { key: 'Enter' })
     await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
@@ -291,8 +229,7 @@ describe('an in-flight turn belongs to ONE chat', () => {
   it('a turn streaming in chat A does not gate chat B\'s send', async () => {
     h.readTurnStream.mockImplementation(() => new Promise(() => {})) // A's reply never lands
     h.getBuild.mockResolvedValue({ id: 'chat-A', kind: 'build', messages: [] })
-    const { deps: d } = deps()
-    const { rerender } = renderAt('chat-A', d)
+    const { rerender } = renderAt('chat-A')
     await waitForGateOpen()
     type('a question')
     fireEvent.keyDown(composer(), { key: 'Enter' })
@@ -309,7 +246,7 @@ describe('an in-flight turn belongs to ONE chat', () => {
     h.readTurnStream.mockImplementation(turnStreaming(planReply('B plan', 'opt-B')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -331,8 +268,7 @@ describe('an in-flight turn belongs to ONE chat', () => {
     let dropTheConnection
     h.readTurnStream.mockImplementation(() => new Promise((resolve) => { dropTheConnection = resolve }))
     h.getBuild.mockResolvedValue({ id: 'chat-A', kind: 'build', messages: [] })
-    const { deps: d } = deps()
-    const { rerender } = renderAt('chat-A', d)
+    const { rerender } = renderAt('chat-A')
     await waitForGateOpen()
     type('a question')
     fireEvent.keyDown(composer(), { key: 'Enter' })
@@ -346,7 +282,7 @@ describe('an in-flight turn belongs to ONE chat', () => {
     })
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -367,20 +303,18 @@ describe('an in-flight turn belongs to ONE chat', () => {
 describe('a typed draft survives', () => {
   it('a reload restores it', async () => {
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
     await waitForGateOpen()
     type('half a thought about gate assignments')
 
     cleanup()
-    renderAt('build-X', deps().deps)
+    renderAt('build-X')
     await waitFor(() => expect(composer().value).toBe('half a thought about gate assignments'))
   })
 
   it('each chat keeps its own — switching never leaks A\'s text into B', async () => {
     h.getBuild.mockResolvedValue({ id: 'chat-A', kind: 'build', messages: [] })
-    const { deps: d } = deps()
-    const { rerender } = renderAt('chat-A', d)
+    const { rerender } = renderAt('chat-A')
     await waitForGateOpen()
     type("A's draft")
 
@@ -388,7 +322,7 @@ describe('a typed draft survives', () => {
       h.getBuild.mockResolvedValue({ id: chatId, kind: 'build', messages: [] })
       rerender(
         <MemoryRouter initialEntries={['/x']}>
-          <ConversationSurface chatId={chatId} projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+          <ConversationSurface chatId={chatId} projectId="p1" projectName="VIP Movement" />
         </MemoryRouter>,
       )
       await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith(chatId))
@@ -406,8 +340,7 @@ describe('a typed draft survives', () => {
     // An uncleared draft re-populates the composer with the text that was already sent, which is
     // easy to send twice by accident — the failure mode that makes persistence worse than nothing.
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
     await waitForGateOpen()
     type('ship it')
     fireEvent.keyDown(composer(), { key: 'Enter' })
@@ -415,7 +348,7 @@ describe('a typed draft survives', () => {
     await waitFor(() => expect(composer().value).toBe(''))
 
     cleanup()
-    renderAt('build-X', deps().deps)
+    renderAt('build-X')
     await waitForGateOpen()
     expect(composer().value).toBe('')
   })
@@ -428,8 +361,7 @@ describe('a typed draft survives', () => {
     // `ConversationSurface-projectfirst.test.jsx`.)
     h.getBuild.mockResolvedValue(null) // seq 0 → the FIRST message, so the create runs too
     h.startTurn.mockRejectedValue(new Error('network down'))
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
     await waitForGateOpen()
     type('please do not eat this')
     fireEvent.keyDown(composer(), { key: 'Enter' })
@@ -455,8 +387,7 @@ describe('a finished build offers no canned follow-ups (2026-07-30)', () => {
     const turn = scriptBuildTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     h.buildFromPlan.mockResolvedValue({ outcome: 'started', chatId: NEW_BUILD_CHAT, turnId: BUILD_TURN_ID })
-    const d = deps()
-    const { rerender } = renderAt('build-X', d.deps)
+    const { rerender } = renderAt('build-X')
     await waitForGateOpen()
     type('a visitor app')
     fireEvent.keyDown(composer(), { key: 'Enter' })
@@ -470,7 +401,7 @@ describe('a finished build offers no canned follow-ups (2026-07-30)', () => {
     })
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId={NEW_BUILD_CHAT} projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
+        <ConversationSurface chatId={NEW_BUILD_CHAT} projectId="p1" projectName="VIP Movement" />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith(NEW_BUILD_CHAT))
@@ -508,8 +439,7 @@ describe('a finished build offers no canned follow-ups (2026-07-30)', () => {
 describe('the usage meter settles at every turn terminal', () => {
   it('a completed turn signals the meter', async () => {
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
     await waitForGateOpen()
     expect(h.notifyUsageChanged).not.toHaveBeenCalled()
 
@@ -523,8 +453,7 @@ describe('the usage meter settles at every turn terminal', () => {
     // skipping the signal here understates the budget exactly when the user is closest to it.
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
     h.startTurn.mockRejectedValue(new Error('the turn could not start'))
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
     await waitForGateOpen()
 
     type('this will not fly')
@@ -535,8 +464,7 @@ describe('the usage meter settles at every turn terminal', () => {
   it('a stopped/truncated stream settles it as well', async () => {
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
     h.readTurnStream.mockImplementation(turnStreaming([], 'truncated'))
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
     await waitForGateOpen()
 
     type('half a reply')
@@ -546,78 +474,23 @@ describe('the usage meter settles at every turn terminal', () => {
 })
 
 
-// CC1–CC4 — opening one chat must never damage another chat's live build, and reloading
-// mid-build must not erase the story. All four live in this file's neighbourhood because they
-// share the adopt/reattach predicates the composer gate is built on.
+// Opening one chat must never damage another chat's live build, and a reload must not erase the
+// story.
 describe('cross-chat build scoping and reload fidelity', () => {
-  const liveStatus = (sessionId) =>
-    statusResp({ sessionId, projectId: 'p1', status: 'building' })
-
-  it('adopting a SIBLING chat with a stale anchor does not tear down the live session', async () => {
-    // Stamp the ownership refs BEFORE classifying — reversed, every same-session guard is
-    // tautological, and worse here: `session.reattach()`'s first act is a synchronous `reset()`,
-    // so a sibling's adopt would kill the running build's heartbeat and lock renewal.
-    h.getBuild.mockResolvedValue(withAnchor('live-7'))
-    h.getStatus.mockResolvedValue(liveStatus('live-7'))
-    const d = deps()
-    const { rerender } = renderAt('chat-A', d.deps)
-    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
-    await waitFor(() => expect(screen.getByTestId('stop-turn')).toBeTruthy())
-
-    h.getBuild.mockResolvedValue({
-      id: 'chat-B',
-      kind: 'build',
-      messages: [
-        { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'older build' }] },
-        { id: 'srv_1_g_1', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId: 'stale-9' }] },
-      ],
-    })
-    h.getStatus.mockClear()
-    rerender(
-      <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
-      </MemoryRouter>,
-    )
-    await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
-    await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
-
-    // The stale session was never reattached, so A's keep-alive was never reset.
-    expect(h.getStatus).not.toHaveBeenCalledWith('stale-9')
-  })
-
-  it('the OWNING chat still reattaches on its own reload', async () => {
-    // The other arm — the guard must not be so broad that it breaks legitimate reattach.
-    h.getBuild.mockResolvedValue(withAnchor('live-7'))
-    h.getStatus.mockResolvedValue(liveStatus('live-7'))
-    const { deps: d } = deps()
-    renderAt('build-X', d)
-
-    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
-    await waitFor(() => expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/building your app/i))
-  })
-
-  it('a reload mid-build still renders the stored step history', async () => {
-    // `reattach()` resets `envelopes` and subscribes to the LIVE feed — it replays nothing — so
-    // suppressing every stored row "because the live bubble re-tells them" blanked the whole
-    // transcript. Assert a COUNT, not merely the absence of a crash.
+  it('a reload of an unfinished build renders its stored step history as one group', async () => {
     h.getBuild.mockResolvedValue({
       id: 'build-X',
       kind: 'build',
-      // The REAL ordering: the anchor is written when the build starts, the steps arrive after
-      // it. Putting the steps before it would leave them outside the suppression range entirely
-      // and the test would pass against the very bug it is meant to catch.
+      // The REAL ordering: the anchor is written when the build starts, the steps arrive after it.
       messages: [
         { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
-        { id: 'g1', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId: 'live-7' }] },
+        { id: 'g1', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress' }] },
         { id: 's2', role: 'assistant', seq: 2, parts: [{ type: 'step', step: { tool: 'write_file', label: 'Updated the home page', state: 'ok' } }] },
         { id: 's3', role: 'assistant', seq: 3, parts: [{ type: 'step', step: { tool: 'write_file', label: 'Added the form', state: 'ok' } }] },
       ],
     })
-    h.getStatus.mockResolvedValue(liveStatus('live-7'))
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
 
-    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
     // ONE GROUP, NOT TWO — live/reload parity, not a styling preference. The projection stores
     // one MESSAGE per step while the live path streams every step onto one message, so without
     // merging, a build watched live shows one group and the same build after reload shows many.
@@ -626,10 +499,7 @@ describe('cross-chat build scoping and reload fidelity', () => {
     const rows = within(await screen.findByTestId('activity-group-rows'))
     expect(rows.getByText(/Updated the home page/i)).toBeTruthy()
     expect(rows.getByText(/Added the form/i)).toBeTruthy()
-    // …and the past-tense anchor stays out of the transcript: `build_in_progress` maps to no
-    // rendered part at all now, so the sentence cannot appear whether a build is live or not.
-    expect(document.querySelector('[data-kind="build-in-progress"]')).toBeNull()
-    expect(screen.getByTestId('stop-turn')).toBeTruthy()
+    expect(screen.getByText(/a build was running here/i)).toBeTruthy()
   })
 
   it('a sibling chat renders no live build bubble, and therefore no Stop button', async () => {
@@ -648,8 +518,7 @@ describe('cross-chat build scoping and reload fidelity', () => {
     h.buildFromPlan.mockResolvedValue({ outcome: 'started', chatId: LIVE_BUILD_CHAT, turnId: BUILD_TURN_ID })
     const turn = scriptBuildTurn()
     h.readTurnStream.mockImplementation(turn.impl)
-    const d = deps()
-    const { rerender } = renderAt('chat-A', d.deps)
+    const { rerender } = renderAt('chat-A')
     await waitForGateOpen()
     type('build me a thing')
     fireEvent.keyDown(composer(), { key: 'Enter' })
@@ -658,7 +527,7 @@ describe('cross-chat build scoping and reload fidelity', () => {
 
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId={LIVE_BUILD_CHAT} projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
+        <ConversationSurface chatId={LIVE_BUILD_CHAT} projectId="p1" projectName="VIP Movement" />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith(LIVE_BUILD_CHAT))
@@ -675,7 +544,7 @@ describe('cross-chat build scoping and reload fidelity', () => {
     h.getBuild.mockResolvedValue({ id: 'chat-B', kind: 'build', messages: [] })
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
+        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -709,8 +578,7 @@ describe('cross-chat build scoping and reload fidelity', () => {
       onFrame({ type: 'turn_ended', seq: 9, turnId: 't1', status: 'completed' })
       return 'completed'
     })
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
 
     await waitFor(() => expect(reads).toBe(2))
     expect(screen.queryByText(/the connection dropped/i)).toBeNull()
@@ -724,8 +592,7 @@ describe('cross-chat build scoping and reload fidelity', () => {
       activeTurn: { turnId: 't1' },
     })
     h.readTurnStream.mockResolvedValue('truncated')
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
 
     expect(await screen.findByText(/the connection dropped/i)).toBeTruthy()
     expect(h.readTurnStream).toHaveBeenCalledTimes(2) // once + one resume, never a third
@@ -740,8 +607,7 @@ describe('the send-failure catch splits on whether the turn was accepted', () =>
   it('a startTurn refusal rolls back BOTH bubbles and says the message was not sent', async () => {
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
     h.startTurn.mockRejectedValue(new Error('refused at the door'))
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
     await waitForGateOpen()
 
     type('build me a thing')
@@ -767,8 +633,7 @@ describe('the send-failure catch splits on whether the turn was accepted', () =>
   it('a subscribe failure AFTER the 202 keeps the user bubble and says reload, not resend', async () => {
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
     h.readTurnStream.mockRejectedValue(new Error('the stream never opened'))
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
     await waitForGateOpen()
 
     type('build me a thing')
@@ -803,7 +668,7 @@ describe('a refused send leaves the citizen holding their message', () => {
     // call (`createBuild`); every message after it released the composer on nothing at all.
     h.getBuild.mockResolvedValue(continuing())
     h.startTurn.mockRejectedValue(new Error('429 over the daily cap'))
-    renderAt('build-X', deps().deps)
+    renderAt('build-X')
     await waitForGateOpen()
 
     type('and add a search box')
@@ -822,7 +687,7 @@ describe('a refused send leaves the citizen holding their message', () => {
     // message is persisted, so the box may clear right there, well before the reply streams.
     h.getBuild.mockResolvedValue(continuing())
     h.readTurnStream.mockImplementation(() => new Promise(() => {})) // accepted, and still streaming
-    renderAt('build-X', deps().deps)
+    renderAt('build-X')
     await waitForGateOpen()
 
     type('and add a search box')
@@ -839,7 +704,7 @@ describe('a refused send leaves the citizen holding their message', () => {
     h.getBuild.mockResolvedValue(continuing())
     let releaseStart
     h.startTurn.mockImplementation(() => new Promise((resolve) => { releaseStart = resolve }))
-    renderAt('build-X', deps().deps)
+    renderAt('build-X')
     await waitForGateOpen()
 
     type('do not lose this')
@@ -866,8 +731,7 @@ describe('a refused send leaves the citizen holding their message', () => {
     // stale double-Enter guard and returned as though it had sent, silently, for the session.
     h.getBuild.mockResolvedValue(continuing())
     h.startTurn.mockRejectedValueOnce(new Error('refused at the door'))
-    const { deps: d } = deps()
-    const { rerender } = renderAt('build-X', d)
+    const { rerender } = renderAt('build-X')
     await waitForGateOpen()
 
     type('first attempt')
@@ -875,12 +739,12 @@ describe('a refused send leaves the citizen holding their message', () => {
     // Away and back while the refusal is in flight.
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="build-Y" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+        <ConversationSurface chatId="build-Y" projectId="p1" projectName="VIP Movement" />
       </MemoryRouter>,
     )
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="build-X" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+        <ConversationSurface chatId="build-X" projectId="p1" projectName="VIP Movement" />
       </MemoryRouter>,
     )
     await waitForGateOpen()
@@ -903,8 +767,7 @@ describe('a refused send leaves the citizen holding their message', () => {
     h.buildUserParts.mockImplementationOnce(
       () => new Promise((_resolve, reject) => { failUpload = () => reject(new Error('the store refused it')) }),
     )
-    const { deps: d } = deps()
-    const { rerender } = renderAt('build-X', d)
+    const { rerender } = renderAt('build-X')
     await waitForGateOpen()
 
     type('what does this say?')
@@ -912,7 +775,7 @@ describe('a refused send leaves the citizen holding their message', () => {
 
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="build-Y" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+        <ConversationSurface chatId="build-Y" projectId="p1" projectName="VIP Movement" />
       </MemoryRouter>,
     )
     await waitForGateOpen()
@@ -944,8 +807,7 @@ describe('a refused send leaves the citizen holding their message', () => {
     h.buildUserParts.mockImplementationOnce(
       () => new Promise((resolve) => { landUpload = () => resolve(uploaded) }),
     )
-    const { deps: d } = deps()
-    const { rerender } = renderAt('build-X', d)
+    const { rerender } = renderAt('build-X')
     await waitForGateOpen()
 
     type('what does this say?')
@@ -953,7 +815,7 @@ describe('a refused send leaves the citizen holding their message', () => {
 
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="build-Y" projectId="p1" projectName="VIP Movement" buildSessionDeps={d} />
+        <ConversationSurface chatId="build-Y" projectId="p1" projectName="VIP Movement" />
       </MemoryRouter>,
     )
     await waitForGateOpen()
@@ -1012,8 +874,7 @@ describe('an upload the server refuses says WHY, not "try again"', () => {
   it('shows the server’s sentence and keeps the message in the box', async () => {
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
     h.buildUserParts.mockRejectedValue(new Error(REFUSAL))
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
     await waitForGateOpen()
 
     type('what does this say?')

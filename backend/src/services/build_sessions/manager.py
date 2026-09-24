@@ -5,13 +5,11 @@ standalone build path behind the deleted start route — are gone, and the end s
 (`stop` / `force_end` / `_finalize`) went with the session-scoped route that was its last door.
 What allocates a workspace now is `ensure_sandbox`, on behalf of a Write chat turn whose agent
 runs in `services/turns/engine.py`, and what ends one is `finish_turn_sandbox`, on behalf of that
-turn. Build sessions the transcript still points at are readable through the surviving
-`{session_id}` GET routes.
+turn. A session leaves memory when its turn lets go of the slot; nothing reads it afterwards.
 
 WHY THIS EXISTS. The non-serializable core of a session — the `SandboxHandle` holding the raw
-bearer, the progress `asyncio.Queue` subscribers, the in-process envelope buffer — lives in
-memory, NOT Postgres. On a single replica the whole session is in-process; the frozen Redis keys
-(lock/heartbeat/registry) are the durable cross-restart coordination.
+bearer — lives in memory, NOT Postgres. On a single replica the whole session is in-process; the
+frozen Redis keys (lock/heartbeat/registry) are the durable cross-restart coordination.
 
 Lock-release belongs to this module, SESSION-API-owned, not the turn itself. `finish_turn_sandbox`
 runs the end of a turn: the PARDON — the container stays up under the bounded stay-of-execution
@@ -239,14 +237,6 @@ async def _asleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
-# How long an ended session (with its envelope replay buffer) stays resident after its
-# terminal commit: long enough that a late SSE reconnect still replays + [DONE], short
-# enough that `_sessions` never grows unbounded. Evicted opportunistically at the top of
-# start() and on the internal reap sweep — nothing evicts them on a timer. Read as scoped to
-# THIS in-process map, which is per-process state no shared scheduler could reach, even though
-# the repo does have other scheduled work elsewhere.
-_ENDED_RETENTION_SECONDS: float = 300.0
-
 # How long a start will wait for an ended-but-still-finalizing session to let go of the slot
 # before keeping the 409 — a message sent right after natural completion must not bounce off
 # its own finished turn (letting go is usually sub-second; the bound only guards a wedged
@@ -296,11 +286,10 @@ _STOP_ACTIVE_WORK_TIMEOUT_SECONDS: float = (
 )
 
 # How long a settled stop record is kept so a status read can still tell "stopped" from "nothing
-# was running". The same window ended sessions keep, and for the same reason: a client that lost
-# its connection mid-stop comes back and asks again. Pruning past it can only ever turn one
-# proceed-able answer (stopped) into the other (nothing was running) — never a false "stopped",
-# and never a false permission.
-_STOP_RECORD_RETENTION_SECONDS: float = _ENDED_RETENTION_SECONDS
+# was running": a client that lost its connection mid-stop comes back and asks again. Pruning past
+# it can only ever turn one proceed-able answer (stopped) into the other (nothing was running) —
+# never a false "stopped", and never a false permission.
+_STOP_RECORD_RETENTION_SECONDS: float = 300.0
 
 _ATTACHED_READY_BUDGET_SECONDS: float = 15.0
 _COLD_READY_BUDGET_SECONDS: float = 120.0
@@ -1271,19 +1260,12 @@ class BuildSession:
     preview_url: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-    # The replay buffer (every emitted envelope) + one queue per live SSE connection.
-    envelopes: list[ProgressEnvelope] = field(default_factory=list)
-    subscribers: set[asyncio.Queue[ProgressEnvelope]] = field(default_factory=set)
-    terminal_emitted: bool = False
     # What has to finish before this session lets go of the one-per-user slot. A turn's end runs
     # `finish_turn_sandbox` inline in the turn that is unwinding, so there is no task for anyone
     # else to await: this is bound the moment that sequence starts and SET the moment it lets go
     # of the slot — which is what lets a message sent the instant a turn ends wait for the
     # release instead of bouncing off the sender's own finished turn.
     turn_finish: asyncio.Event | None = None
-    # Stamped when the end sequence completes — starts the retention window after which the
-    # session (and its envelope buffer) is evicted from the manager.
-    ended_at: datetime | None = None
 
 
 def _what_will_release_the_slot(session: BuildSession | None) -> asyncio.Event | None:
@@ -1351,37 +1333,14 @@ class SessionManager:
         """Evict the per-user start lock once no live session remains — bounding the
         otherwise-unbounded `_start_locks` growth. Skipped when a concurrent start currently
         HOLDS the lock: that start owns the exact `Lock` object, so dropping it would let the
-        next start build a fresh one and shatter mutual exclusion. This addresses only the
-        start-lock leak; the `_sessions`/envelope retention window is a separate decision."""
+        next start build a fresh one and shatter mutual exclusion."""
         if user_id in self._active_by_user:
             return
         lock = self._start_locks.get(user_id)
         if lock is not None and not lock.locked():
             self._start_locks.pop(user_id, None)
 
-    def evict_ended_sessions(self, *, now: datetime | None = None) -> int:
-        """Drop every session whose `ended_at` is past the retention window, with its
-        envelope buffer and any consistent `_active_by_user`/`_start_locks` entries.
-        Called opportunistically (start + the internal reap sweep) — a session inside the
-        window is KEPT so a late SSE reconnect can still replay + `[DONE]`."""
-        now = now or datetime.now(UTC)
-        evicted = 0
-        for session_id, session in list(self._sessions.items()):
-            if session.ended_at is None:
-                continue
-            if (now - session.ended_at).total_seconds() < _ENDED_RETENTION_SECONDS:
-                continue
-            self._sessions.pop(session_id, None)
-            if self._active_by_user.get(session.user_id) == session_id:
-                self._active_by_user.pop(session.user_id, None)
-            self._maybe_prune_start_lock(session.user_id)
-            evicted += 1
-        return evicted
-
-    # --- lookups (router owns the user-scoping 404) --------------------------
-
-    def get(self, session_id: uuid.UUID) -> BuildSession | None:
-        return self._sessions.get(session_id)
+    # --- lookups ---------------------------------------------------------------
 
     def active_session_for(self, user_id: uuid.UUID) -> BuildSession | None:
         session_id = self._active_by_user.get(user_id)
@@ -3857,10 +3816,6 @@ class SessionManager:
         `active_session_for` must see this exactly as they see a build's session. The two
         empty fields are the honest answer: there is no build prompt and no mode to restore.
         """
-        # The opportunistic retention sweep, and since `start` was deleted this is the ONLY
-        # recurring seam for the in-process map — nothing evicts it on a timer, so ended
-        # sessions must not be allowed to accumulate on a workspace that only ever chats.
-        self.evict_ended_sessions()
         async with self._start_lock_for(user.id):
             redis = get_redis()
             user_id = user.id
@@ -4265,41 +4220,36 @@ class SessionManager:
     # --- progress channel ----------------------------------------------------
 
     async def on_progress(self, session: BuildSession, env: ProgressEnvelope) -> None:
-        """The `ProgressSink`: buffer the envelope, derive status, refresh liveness,
-        and fan out to every live SSE subscriber (no Redis — this IS the transport).
+        """The `ProgressSink`: derive status and refresh liveness.
 
         ONE PRODUCER LEFT. The build harness that emitted the six BRAIN members is deleted, so in
         production nothing emits into it at all: a turn's narrative is the turn's own frames. The
         generic derivation below is kept deliberately: this is a SINK, and it has to derive
         correct state from any envelope handed to it — including the ones tests push directly —
         without reaching back into who emitted them."""
-        session.envelopes.append(env)
         session.last_seq = env.seq
         session.updated_at = datetime.now(UTC)
         if isinstance(env, PreviewReadyEvent):
             session.status = BuildSessionStatus.READY
             session.preview_url = env.preview_url
         elif isinstance(env, PreviewReconnectingEvent):
-            # The dev-server PROCESS crashed after the preview was framed. A feed-only
-            # signal: the status enum is frozen at five members with no "reconnecting" state, so
-            # the lifecycle status is deliberately LEFT UNCHANGED (a completed build stays `ended`,
-            # a live one stays `ready`). It is still buffered + fanned out below like any envelope;
-            # the portal reads it to show a distinct reconnecting visual, and the following
-            # `preview_ready` re-frames. Explicit branch so it never falls into the provisioning
-            # bump below (a reconnecting frame is never the first sign of the loop running).
+            # The dev-server PROCESS crashed after the preview was framed. The status enum is
+            # frozen at five members with no "reconnecting" state, so the lifecycle status is
+            # deliberately LEFT UNCHANGED (a completed build stays `ended`, a live one stays
+            # `ready`). Explicit branch so it never falls into the provisioning bump below (a
+            # reconnecting frame is never the first sign of the loop running).
             pass
         elif isinstance(env, EndedEvent):
             session.status = env.status
             if env.preview_url is not None:
                 session.preview_url = env.preview_url
-            session.terminal_emitted = True
         elif session.status == BuildSessionStatus.PROVISIONING:
             session.status = BuildSessionStatus.BUILDING  # first sign of the loop running
 
         # Build activity = liveness: renew the lock + heartbeat SERVER-side so an active
         # build whose tab is closed keeps its lock and is never reaped as idle. Skipped for
         # a terminal frame (the lock is about to be released) and best-effort (a redis blip
-        # must not break the feed).
+        # must not break the sink).
         if not isinstance(env, EndedEvent) and session.lock_token:
             try:
                 redis = get_redis()
@@ -4319,14 +4269,6 @@ class SessionManager:
                     "liveness renew/heartbeat failed during build",
                     session_id=str(session.session_id),
                 )
-
-        # Fan out with per-subscriber failure isolation — a slow/dead subscriber is dropped,
-        # never allowed to raise QueueFull back at whatever is emitting.
-        for queue in list(session.subscribers):
-            try:
-                queue.put_nowait(env)
-            except asyncio.QueueFull:
-                session.subscribers.discard(queue)
 
     # --- completion + the single-owner end sequence --------------------------
 
@@ -4422,12 +4364,12 @@ class SessionManager:
             # outgoing turn reaches here the slot can already belong to the incoming one —
             # and a pop by user id alone would hand that live session's workspace away.
             self._release_the_slot_if_still_ours(session)
+            self._sessions.pop(session.session_id, None)
             self._maybe_prune_start_lock(session.user_id)
             # AFTER the pop, so whoever this wakes finds the slot already free.
             finishing.set()
 
         session.status = BuildSessionStatus.ENDED
-        session.ended_at = datetime.now(UTC)
 
 
 # --- accessor singleton (mirrors get_redis / get_sandbox) --------------------

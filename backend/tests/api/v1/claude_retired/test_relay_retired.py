@@ -89,22 +89,14 @@ def test_the_relay_is_gone_from_the_openapi_schema() -> None:
 def test_there_is_exactly_one_send_path_and_one_stream_path() -> None:
     """STRUCTURAL: no second send path or conversation stream is mounted under `/v1`. This is
     the assertion that would have caught the second relay for as long as it existed, and the
-    one that stops a third engine arriving the way the second did.
-
-    `/v1/build-sessions/{session_id}/events` IS a second stream, and it is named here rather
-    than filtered away: it is the older build harness, still mounted and unreachable from the
-    portal, and retiring it is its own tracked piece of work. Pinning it means this test goes
-    red when it goes — which is the right way round. What must never grow is the list."""
+    one that stops a third engine arriving the way the second did."""
     paths = create_app().openapi()["paths"]
 
     senders = sorted(p for p, ops in paths.items() if "post" in ops and p.endswith("/turns"))
     assert senders == ["/v1/conversations/{conversation_id}/turns"]
 
     streamers = sorted(p for p, ops in paths.items() if "get" in ops and p.endswith("/events"))
-    assert streamers == [
-        "/v1/build-sessions/{session_id}/events",  # the known second harness; see above
-        "/v1/conversations/{conversation_id}/events",
-    ]
+    assert streamers == ["/v1/conversations/{conversation_id}/events"]
 
 
 def test_the_relay_module_is_gone_from_the_tree() -> None:

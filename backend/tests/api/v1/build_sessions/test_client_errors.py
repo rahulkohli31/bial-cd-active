@@ -23,8 +23,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.v1.build_sessions.schemas import (
     CLIENT_ERROR_STACK_MAX_CHARS,
     BuildError,
-    BuildSessionStatus,
-    EndedEvent,
     ErrorSource,
 )
 from src.api.v1.conversations.schemas import DiagnosticFrame
@@ -287,12 +285,7 @@ async def test_a_late_report_does_not_resurrect_a_finished_turn(
 ) -> None:
     """A preview outlives its build session — the frame keeps rendering (and keeps crashing) long
     after the turn ended. The report must be receivable then, and must change nothing about the
-    finished turn: this store is drained by the NEXT verify, and never pushes into anything.
-
-    Re-fixtured onto `a_live_session` (the `ensure_sandbox` door) now that the start route is
-    gone; the terminal is the `ended` frame the feed carries, pushed through the manager's own
-    progress sink, so what this asserts against is a genuinely terminal session rather than a
-    hand-built one."""
+    finished turn: this store is drained by the NEXT verify, and never pushes into anything."""
     from tests.api.v1.build_sessions.conftest import a_live_session
     from tests.factories import ProjectFactory
 
@@ -302,33 +295,18 @@ async def test_a_late_report_does_not_resurrect_a_finished_turn(
 
     session = await a_live_session(wire, db_session, user, project.id)
     assert session.app_id == app.id  # the session really is holding THIS app's container
-    await wire.manager.on_progress(
-        session,
-        EndedEvent(
-            seq=1,
-            status=BuildSessionStatus.ENDED,
-            preview_url=None,
-            snapshot_committed=True,
-            reason="completed",
-        ),
-    )
-    session_id = session.session_id
-
-    finished = await client.get(f"/v1/build-sessions/{session_id}", headers=auth_headers(user))
-    ended_status, ended_seq = finished.json()["status"], finished.json()["lastSeq"]
+    assert wire.manager.active_session_for(user.id) is session
+    await wire.manager.finish_turn_sandbox(session, wire.sbx, touched=True)
 
     late = await client.post(
         _ROUTE.format(project_id=app.project_id), json=_A_CRASH, headers=auth_headers(user)
     )
 
     assert late.status_code == 202
-    after = await client.get(f"/v1/build-sessions/{session_id}", headers=auth_headers(user))
-    # ABSENCE: the terminal session did not move, gain a frame, or come back to life.
-    assert after.json()["status"] == ended_status
-    assert after.json()["lastSeq"] == ended_seq
+    # ABSENCE: the finished turn did not come back to life.
+    assert wire.manager.active_session_for(user.id) is None
     # LIVENESS: the report really was received and is waiting — this test is not green because
-    # the POST 404'd or the session was never there to begin with.
-    assert ended_status == "ended"
+    # the POST 404'd.
     assert len(client_errors.drain_client_errors(app_name_for(app.id))) == 1
 
 

@@ -23,7 +23,6 @@ from src.api.v1.build_sessions.schemas import (
     BuildError,
     BuildResult,
     BuildSessionStatus,
-    BuildSessionStatusResponse,
     EndedEvent,
     ErrorEvent,
     ErrorSource,
@@ -75,38 +74,6 @@ def test_cadence_constants_are_the_frozen_values() -> None:
 
 
 # --- control-op response models -----------------------------------------------
-
-
-def test_status_response_serializes_with_preview_url_camel() -> None:
-    resp = BuildSessionStatusResponse(
-        session_id=uuid.uuid4(),
-        project_id=uuid.uuid4(),
-        app_id=uuid.uuid4(),
-        status=BuildSessionStatus.READY,
-        preview_url="https://app-xyz.westeurope.azurecontainerapps.io/",
-        last_seq=42,
-        created_at=_NOW,
-        updated_at=_NOW,
-    )
-    wire = resp.model_dump(by_alias=True)
-    assert wire["previewUrl"] == "https://app-xyz.westeurope.azurecontainerapps.io/"
-    assert wire["lastSeq"] == 42
-    assert "sessionId" in wire and "session_id" not in wire
-
-
-def test_status_response_preview_url_nullable_until_ready() -> None:
-    resp = BuildSessionStatusResponse(
-        session_id=uuid.uuid4(),
-        project_id=uuid.uuid4(),
-        app_id=uuid.uuid4(),
-        status=BuildSessionStatus.PROVISIONING,
-        preview_url=None,
-        last_seq=None,
-        created_at=_NOW,
-        updated_at=_NOW,
-    )
-    assert resp.preview_url is None
-    assert resp.last_seq is None
 
 
 def test_start_response_defaults_preview_url_null() -> None:
@@ -381,11 +348,8 @@ def test_app_boots_with_build_sessions_router_mounted() -> None:
     schema = app.openapi()
     assert schema["openapi"].startswith("3.")
     paths = schema.get("paths", {})
-    # INVERTED, deliberately: `POST /v1/build-sessions` (`start`) is deleted, so its absence is
-    # the fact worth pinning here — a route re-added would be a route with no client and no
-    # `SessionManager.start` behind it. `lock/force-end` is gone the same way and is asserted
-    # absent beside it.
-    assert "/v1/build-sessions" not in paths  # start — DELETED, must not come back
-    assert "/v1/build-sessions/{session_id}/lock/force-end" not in paths  # also deleted
-    assert "/v1/build-sessions/{session_id}" in paths  # status — the reader that survives
-    assert "/v1/build-sessions/{session_id}/events" in paths  # SSE feed
+    assert "/v1/build-sessions/relaunch" in paths
+    # Nothing can mint a session id for a client to name, so a route addressed by one would have
+    # no caller that could reach anything but a 404.
+    assert "/v1/build-sessions" not in paths
+    assert not [p for p in paths if p.startswith("/v1/build-sessions/{session_id}")]

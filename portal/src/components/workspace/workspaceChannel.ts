@@ -118,7 +118,6 @@ export interface PaneView {
      spread would silently drop it, since JSX spread attributes are exempt from excess-property
      checking. `UnacceptedPaneProps` below is what catches that. */
   /** Chat-scoped: this conversation's own turn. */
-  iterating: boolean
   reconnecting: boolean
   /* THE RELAUNCH FOUR ARE GONE — `onRelaunch`, `relaunching`, `relaunchError`, `lastBuildFailed`.
      `LivePreview` accepted the callback and never read it, so `ConversationSurface.handleRelaunch`

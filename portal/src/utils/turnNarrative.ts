@@ -1,13 +1,10 @@
 /**
- * Turn frames → the progress-envelope shape, plus what the surface asks ABOUT a turn. A build is
- * a Write turn now, so its narrative arrives as `step`/`diagnostic`/`quota` turn frames instead of
- * progress envelopes; ADAPTING rather than rewriting is deliberate — one mapping is how the two
- * transports agree by construction, not by discipline.
+ * Turn frames → the progress-envelope shape, plus what the surface asks ABOUT a turn.
  *
- * THE ENVELOPES HAVE ONE READER: the legacy build-session feed and the two questions the surface
- * asks of a turn — `turnPhase` (app pane) and `atLimitSendState` (composer) — both live here so
- * neither caller has to learn this module's vocabulary. The one place the two vocabularies
- * genuinely differ (`diagnostic` → `error`) is explained at its mapping below.
+ * The two questions the surface asks of a turn — `turnPhase` (app pane) and `atLimitSendState`
+ * (composer) — both live here so neither caller has to learn this module's vocabulary. The one
+ * place the two vocabularies genuinely differ (`diagnostic` → `error`) is explained at its
+ * mapping below.
  */
 import type { StepItem } from './turnStreamApi'
 import type {
@@ -67,11 +64,10 @@ export function narrativeEnvelopes(narrative: TurnNarrative): FeedEnvelope[] {
       // Fail to `server` rather than drop: an unrecognized source still carries a sentence
       // the user needs to see, and a swallowed diagnostic is a silent build failure.
       source: (ERROR_SOURCES.has(diagnostic.source) ? diagnostic.source : 'server') as ErrorSource,
-      // EMPTY, and deliberately. The target `ErrorEvent` is the LEGACY feed's shape, which
-      // still has these two fields because that transport still carries them; the turn stream
-      // does not send them any more, so there is nothing to map. They are written explicitly
-      // rather than omitted because the field list above is what makes a dropped field a
-      // compile error, and that property is worth more than two blank strings cost.
+      // EMPTY, and deliberately: the turn stream does not send these two, so there is nothing to
+      // map. They are written explicitly rather than omitted because the field list above is
+      // what makes a dropped field a compile error, and that property is worth more than two
+      // blank strings cost.
       title: '',
       cleaned_stack: '',
       // THE HALF THE USER ACTUALLY READS.

@@ -16,7 +16,6 @@ const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(),
   relaunchPreview: vi.fn(), fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
   fetchCompileState: vi.fn(), checkWorkspace: vi.fn(), renewPresence: vi.fn(),
 }))
@@ -50,14 +49,9 @@ vi.mock('../../../utils/buildSessionApi', async (orig) => ({
   renewPresence: (...a: unknown[]) => h.renewPresence(...a),
 }))
 
-const { renderBuilder, makeClient, primeClient, FakeEventSource } =
+const { renderBuilder } =
   await import('../../../pages/__tests__/_builderSession.jsx')
 const { HIDDEN_PROBE_MS, PREVIEW_PROBE_MS, STARTING_PROBE_MS } = await import('../../workspace/workspaceState')
-
-function deps() {
-  const fake = new FakeEventSource('x')
-  return { client: makeClient(h), eventSourceFactory: () => fake }
-}
 
 const LIVE: PreviewState = {
   state: 'alive' as PreviewLifeState,
@@ -89,7 +83,6 @@ beforeEach(() => {
   vi.clearAllMocks()
   vi.useFakeTimers({ shouldAdvanceTime: true })
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.newBuild.mockReturnValue('build-Y')
   h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue(null)
@@ -121,7 +114,7 @@ describe('the chat route holds its container open', () => {
   it('renews on the ordinary tick', async () => {
     // A citizen sitting on the chat route between turns has not left, and the ten minutes they
     // spend reading the last answer must not cost them their app.
-    renderBuilder({ deps: deps() })
+    renderBuilder()
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
 
     await waitFor(() => expect(h.renewPresence).toHaveBeenCalledWith(expect.any(String), 'visible'))
@@ -129,7 +122,7 @@ describe('the chat route holds its container open', () => {
 
   it('renews from a hidden tab, on the longer budget', async () => {
     hide(true)
-    renderBuilder({ deps: deps() })
+    renderBuilder()
 
     await waitFor(() => expect(h.renewPresence).toHaveBeenCalledWith(expect.any(String), 'hidden'))
   })
@@ -138,7 +131,7 @@ describe('the chat route holds its container open', () => {
     // `checkWorkspace` is a POST whose server side puts a stopped app away. Reaching it from a
     // background tab would end a workspace with nobody looking.
     hide(true)
-    renderBuilder({ deps: deps() })
+    renderBuilder()
     await waitFor(() => expect(h.renewPresence).toHaveBeenCalled())
     await settle()
 
@@ -147,7 +140,7 @@ describe('the chat route holds its container open', () => {
   })
 
   it('polls a hidden tab on the longer cadence', async () => {
-    renderBuilder({ deps: deps() })
+    renderBuilder()
     await waitFor(() => expect(h.renewPresence).toHaveBeenCalled())
     hide(true)
     await settle()
@@ -169,7 +162,7 @@ describe('the chat route holds its container open', () => {
     // container held open on one surface cannot be quietly abandoned on the other — and the window
     // it used to skip is the one where the marker and the lock lapse together.
     h.fetchPreviewState.mockResolvedValue({ ...LIVE, state: 'starting' as PreviewLifeState, alive: false, previewUrl: null })
-    renderBuilder({ deps: deps() })
+    renderBuilder()
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
     await settle()
     h.renewPresence.mockClear()
@@ -185,7 +178,7 @@ describe('the chat route holds its container open', () => {
   })
 
   it('sends nothing on unmount — leaving is silence', async () => {
-    const { unmount } = renderBuilder({ deps: deps() })
+    const { unmount } = renderBuilder()
     await waitFor(() => expect(h.renewPresence).toHaveBeenCalled())
     h.renewPresence.mockClear()
 

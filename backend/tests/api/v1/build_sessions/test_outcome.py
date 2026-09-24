@@ -1,9 +1,9 @@
 """The server-written build outcome, native-store edition.
 
 The SERVER records a finished build in its thread because the portal is not reliably
-there to do it: builds take minutes, users close tabs, and a session is evicted after
-`_ENDED_RETENTION_SECONDS` — a portal-only record would be missing for exactly the
-users a permanent one serves.
+there to do it: builds take minutes, users close tabs, and the in-memory session does not
+outlive its turn — a portal-only record would be missing for exactly the users a permanent
+one serves.
 
 `write_build_outcome` writes a `system_event` row whose payload is synthesized assistant
 text (replayed to the model as history) and whose structured record lives in `meta`. Seq
@@ -189,7 +189,7 @@ async def test_a_foreign_conversation_is_never_written_to(db_session) -> None:
 
 async def test_a_deleted_thread_is_a_no_op_not_a_crash(db_session) -> None:
     """The thread can vanish mid-build (the user deletes it while it runs). The end sequence must
-    survive that: a raise here would skip the terminal frame and hang every SSE feed."""
+    survive that: a raise here would skip the terminal frame."""
     user, _ = await _thread(db_session)
 
     assert (

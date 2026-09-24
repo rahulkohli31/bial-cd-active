@@ -55,9 +55,8 @@ export interface ProjectWorkspaceProps {
 
 export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   const { project } = props
-  // THE URL A START JUST PRODUCED, fed into the resolver's RELAUNCHED arm — the one arm that needs
-  // no session and no chat, and which resolves its own status to `ready` because a restore has no
-  // build lifecycle. Without it the pane waits for the next poll tick to frame an app the citizen
+  // THE URL A START JUST PRODUCED, fed into the resolver's RELAUNCHED arm — which needs no chat,
+  // and resolves its own status to `ready` because a restore has no build lifecycle. Without it the pane waits for the next poll tick to frame an app the citizen
   // just pressed a button to bring up, which reads as the press having done nothing.
   const [startedPreviewUrl, setStartedPreviewUrl] = useState<string | null>(null)
   // THE SETTINGS DIALOG'S STATE IS HERE BECAUSE ITS DATA IS. The control is in the shell's
@@ -93,9 +92,6 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     turnStatus: null,
     narratingChatIsOpenChat: false,
     relaunchedUrl: startedPreviewUrl,
-    sessionUrl: null,
-    sessionStatus: null,
-    sessionId: null,
     projectPreviewUrl: workspace.preview?.state === 'alive' ? workspace.preview.previewUrl : null,
     // …AND IT IS ALSO THIS SCREEN'S WHOLE ANSWER ON LIVENESS. A non-null value here is the read
     // saying `alive`, which is what the resolver builds `serving` from — so the pardon that used to
@@ -105,9 +101,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     // project this surface is showing. It is passed rather than assumed because the resolver's own
     // note says an arm must carry its predicate INTO the module — a gate that depends on where it
     // was declared is one reorder away from silently opening.
-    sessionBelongsToOpenProject: true,
-    // NO SESSION ON THIS SURFACE AT ALL, so there is no session end to have been a success.
-    sessionEndedCompleted: false,
+    belongsToOpenProject: true,
     transcriptHasBuildOutcome: false,
   })
 
@@ -258,7 +252,6 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       // of asserting it. Nothing is lost on the framing side: `previewAddress.ts` already resolves
       // this screen's status to `ready`, which is not terminal, so there is nothing for a pardon to
       // outrank here in the first place.
-      iterating: false,
       reconnecting: false,
       turnRunning: false,
       previewState: workspace.preview?.state ?? null,

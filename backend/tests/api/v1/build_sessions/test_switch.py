@@ -324,6 +324,9 @@ async def test_the_outgoing_turn_ending_late_does_not_take_the_incoming_workspac
     await manager.finish_turn_sandbox(outgoing, client, touched=True)
 
     assert manager.active_session_for(user.id) is incoming
+    # The outgoing session still leaves memory, though the slot it would have released is B's.
+    assert outgoing.session_id not in manager._sessions  # noqa: SLF001
+    assert incoming.session_id in manager._sessions  # noqa: SLF001
 
 
 async def test_a_switch_out_of_a_plan_turn_cuts_it_where_it_stands(

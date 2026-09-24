@@ -1,5 +1,5 @@
 """The reusable CSRF dependency: mutating POSTs require a valid signed double-submit
-token; the status GET is exempt."""
+token. The GET exemption is proven on the stop-state read in `test_control.py`."""
 
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ from src.api.deps_csrf import require_csrf
 from src.api.deps_rbac import superadmin_allowlist
 from src.config import settings
 from src.services.auth.session_jwt import mint_session_jwt
-from tests.api.v1.build_sessions.conftest import a_live_session, auth_headers
-from tests.factories import ProjectFactory, UserFactory
+from tests.api.v1.build_sessions.conftest import auth_headers
+from tests.factories import UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
 
@@ -127,12 +127,6 @@ def _slug(path_tmpl: str) -> str:
     )
 
 
-async def _user_project(db: AsyncSession, email: str):
-    user = await UserFactory.create(db, email=email)
-    project = await ProjectFactory.create(db, user.id)
-    return user, project
-
-
 @pytest.mark.parametrize("path_tmpl", _MUTATING_POSTS)
 async def test_missing_csrf_header_is_403_on_every_mutating_post(
     client: AsyncClient, db_session: AsyncSession, wire, path_tmpl: str
@@ -161,16 +155,3 @@ async def test_mismatched_csrf_token_is_403_on_every_mutating_post(
     resp = await client.post(path, headers=headers)
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "csrf_failed"
-
-
-async def test_status_get_needs_no_csrf(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
-) -> None:
-    user, project = await _user_project(db_session, "csrf4@rvaiglobal.com")
-    session = await a_live_session(wire, db_session, user, project.id)
-    # A cookie-only GET (no X-CSRF-Token) is accepted.
-    jwt = mint_session_jwt(user.id, user.token_version, _TTL)
-    s = await client.get(
-        f"/v1/build-sessions/{session.session_id}", headers={"Cookie": f"session={jwt}"}
-    )
-    assert s.status_code == 200

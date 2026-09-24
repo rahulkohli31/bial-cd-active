@@ -20,7 +20,7 @@ from src.db.models.message import MessageEntryKind
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.messages.store import append_batch
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import write_build_outcome
+from tests.fakes import write_build_outcome, write_legacy_build_started
 
 _TTL = settings.auth.access_ttl_seconds
 PREVIEW = "https://sbx-abc.westeurope.azurecontainerapps.io/"
@@ -93,6 +93,28 @@ async def test_get_returns_header_projection_and_null_active_turn(client, db_ses
     # which the header already carries — not individual items.
     assert all("seq" in item for item in projection)
     assert all("mode" not in item and "kind" not in item for item in projection)
+
+
+async def test_reloading_a_thread_with_an_unfinished_legacy_build(client, db_session) -> None:
+    """A thread holding a `build_started` row no outcome ever closed still reads back, as a
+    display-only marker: no session id, and no running turn."""
+    headers, user = await _auth(db_session)
+    conversation = await _seeded_conversation(db_session, user)
+    await write_legacy_build_started(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        session_id=uuid.uuid4(),
+        started_seq=-1,
+    )
+
+    resp = await client.get(f"/v1/conversations/{conversation.id}", headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["activeTurn"] is None
+    anchor = body["projection"][-1]
+    assert anchor == {"type": "build_in_progress", "seq": anchor["seq"]}
 
 
 async def test_empty_conversation_projects_an_empty_list(client, db_session) -> None:

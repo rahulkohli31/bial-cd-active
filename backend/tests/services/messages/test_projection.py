@@ -688,7 +688,11 @@ async def test_unclosed_build_started_projects_an_in_progress_anchor(db_session)
     assert [item.type for item in items] == ["build_in_progress"]
     anchor = items[0]
     assert isinstance(anchor, BuildInProgressItem)
-    assert anchor.session_id == str(session_id)
+    # Display-only: the session the row names is not on the wire, because nothing can follow it.
+    assert anchor.model_dump(mode="json", by_alias=True) == {
+        "type": "build_in_progress",
+        "seq": anchor.seq,
+    }
 
 
 async def test_failed_build_projects_a_failure_banner(db_session) -> None:

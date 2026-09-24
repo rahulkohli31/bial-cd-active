@@ -113,7 +113,7 @@ const deployment = (publishState: PublishState = 'draft', over: Partial<Deployme
 })
 
 const EMPTY_PANE: PaneView = {
-  iterating: false, reconnecting: false,
+  reconnecting: false,
   previewState: null, turnRunning: false,
   compileState: null, workspaceLost: false,
 }

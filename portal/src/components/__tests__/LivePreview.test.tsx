@@ -857,15 +857,15 @@ describe('LivePreview — one persistent status region announces every state', (
   it('★ and that claim is held up by `AppPane``s VETO, not by this pane`s own inputs', () => {
     // ★ WRITTEN DOWN BECAUSE IT IS LOAD-BEARING AND INVISIBLE, and because the tempting version of
     // this claim is false. It is NOT true that the serving stamp reaches every input of the live
-    // sentence: `serving` has three arms (`utils/previewAddress.ts`) and only `fromProject`
-    // consults the preview-state poll — `fromTurn` and `fromSession` are a live turn's own word for
-    // it and never see the stamp. So this component, handed a turn-sourced `serving` and a clean
+    // sentence: `serving` has two arms (`utils/previewAddress.ts`) and only `fromProject`
+    // consults the preview-state poll — `fromTurn` is a live turn's own word for it and never sees
+    // the stamp. So this component, handed a turn-sourced `serving` and a clean
     // compile, will announce the app live over a workspace reading that is nowhere near `running`.
     //
     // That is exactly what this test shows, and it is not a bug HERE: the sentence is honest in
     // the product because `AppPane` will not mount this component at all unless the reading is
     // `running`. Weaken that veto and the claim goes back to being unearned on the turn-sourced
-    // arms, with nothing in this file to catch it — which is why the veto has its own exhaustive
+    // arm, with nothing in this file to catch it — which is why the veto has its own exhaustive
     // test in `workspace/__tests__/AppPane.test.tsx` and why this one points at it.
     const view = render(
       <LivePreview previewUrl={SANDBOX_URL} status="ended" serving previewState="asleep" compileState="clean" />,

@@ -1,8 +1,6 @@
 /**
- * STOP, MOVED TO WHERE THE COMPOSER IS. The two arms are not a mode branch — they discriminate on
- * whether a TURN ID EXISTS (a transport fact): a turn build stops via the turn endpoint with its
- * conversation/turn ids, a legacy build session (no turn id) stops via the session. Force-end
- * deliberately did NOT move — a turn build has no force-end equivalent, and a kill switch that
+ * STOP, MOVED TO WHERE THE COMPOSER IS. It stops the live turn through the turn endpoint, by its
+ * conversation and turn ids. Force-end deliberately did NOT move — a turn build has no force-end equivalent, and a kill switch that
  * confirms "this kills in-progress work" and then does nothing is worse than none. The accessible
  * name is stable: the old button flipped "Stop" → "Stopping…" mid-interaction; the word stays
  * "Stop" in every state, with the in-flight state carried by the glyph and `title` instead. Mounted
@@ -19,7 +17,7 @@ export interface StopTarget {
 }
 
 export interface StopTurnControlProps {
-  /** A turn — or a legacy build session — is running. No run, no control: this renders `null`. */
+  /** A turn is running. No run, no control: this renders `null`. */
   running: boolean
   /**
    * Resolve the live turn AT PRESS TIME, returning `null` when there is no turn id — the window
@@ -75,8 +73,7 @@ export default function StopTurnControl({
     setStopping(true)
     try {
       const target = resolveTarget()
-      // A press with no turn to name does nothing: this control is turn-only now, and the
-      // session-scoped stop it used to fall back to is retired along with its route.
+      // A press with no turn to name does nothing.
       if (target) await onStopTurn(target.conversationId, target.turnId)
     } catch {
       onStopFailed(STOP_FAILED)

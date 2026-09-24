@@ -3,9 +3,8 @@ subscribable per-conversation event stream for chat AND build activity.
 
 WHY THIS EXISTS
 A message STARTS a turn server-side, detached from the HTTP connection: the subscriber
-transport (`api/v1/conversations/turns.py`) only OBSERVES. Generalized from the build feed's
-proven shape (`build_sessions/sse.py`, copy-not-share): an append-only per-turn frame RING is
-the replay authority, subscriber queues are pure wakeups, and the terminal frame explicitly
+transport (`api/v1/conversations/turns.py`) only OBSERVES. An append-only per-turn frame RING
+is the replay authority, subscriber queues are pure wakeups, and the terminal frame explicitly
 closes the transport. Deliberately NO Redis: a run dies with the process, Postgres is the
 durable log, and the ring is the one seam a Streams buffer would replace for multi-replica later.
 
@@ -2208,9 +2207,8 @@ class TurnEngine:
         # `ensure_sandbox` has already REGISTERED this session in `_active_by_user` and ADOPTED
         # the user's build lock. The `finally` that hands both back is guarded on
         # `state.write_session is not None` — so while this assignment sat BELOW the two raises,
-        # either of them left a registered session with `ended_at` never set, no renewer, and
-        # nothing that could ever release it. `_active_by_user` never evicts an unended session,
-        # so for the remaining life of the process that user was answered:
+        # either of them left a registered session with no renewer and nothing that could ever
+        # release it, so for the remaining life of the process that user was answered:
         #   • 409 `already_building_here` on every turn, in every conversation
         #   • 409 on relaunch
         #   • `still_running`, for ever, from `stop-active-build` — with no running turn to cancel

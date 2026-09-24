@@ -24,7 +24,6 @@ const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(),
   relaunchPreview: vi.fn(), fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
 }))
 
@@ -55,13 +54,8 @@ vi.mock('../../../utils/buildSessionApi', async (orig) => ({
   relaunchPreview: (...a: unknown[]) => h.relaunchPreview(...a),
 }))
 
-const { renderBuilder, makeClient, primeClient, composer, waitForGateOpen, FakeEventSource } =
+const { renderBuilder, composer, waitForGateOpen } =
   await import('../../../pages/__tests__/_builderSession.jsx')
-
-function deps() {
-  const fake = new FakeEventSource('x')
-  return { client: makeClient(h), eventSourceFactory: () => fake }
-}
 
 /** The wire still names the holder; what is pinned here is that no screen repeats it. */
 const HELD: PreviewState = {
@@ -89,7 +83,6 @@ const launch = () => screen.getByRole('button', { name: /^Launch Application$/ }
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.newBuild.mockReturnValue('build-Y')
   h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue(null)
@@ -106,7 +99,7 @@ afterEach(() => cleanup())
 
 /** Mount the chat with the workspace held elsewhere, and wait for the pane to offer the way back. */
 async function blockedChat() {
-  renderBuilder({ deps: deps() })
+  renderBuilder()
   await screen.findByRole('button', { name: /^Launch Application$/ })
 }
 

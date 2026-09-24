@@ -1,6 +1,5 @@
 /**
- * Wire shapes for the build-session control surface and the SSE progress envelope, plus two
- * pure helpers (`isActiveBuildStatus`, `formatDailyLimitMessage`) shared by every surface.
+ * Wire shapes for the build-session control surface and the progress envelope.
  *
  * TWO DELIBERATELY DIFFERENT CASINGS: REST bodies are camelCase (backend serializes by alias);
  * the progress envelope stays snake_case — field names AND `type` literals (`preview_ready`,
@@ -21,16 +20,7 @@
  */
 export type BuildSessionStatus = 'provisioning' | 'building' | 'ready' | 'ended' | 'failed'
 
-/** The three non-terminal (in-progress) lifecycle states — a build is "active" while in any of them. */
-export function isActiveBuildStatus(status: BuildSessionStatus | null): boolean {
-  return status === 'provisioning' || status === 'building' || status === 'ready'
-}
-
-// ─── Control operations — relaunch / stop / status ───────────────────────────
-//
-// `StartBuildRequest` / `StartBuildResponse` are GONE with the client `start` wrapper they
-// typed, and nothing else read them. The ROUTE is untouched — deleting a browser client says
-// nothing about it.
+// ─── Control operations — relaunch / shared launch ───────────────────────────
 
 /** `POST …/relaunch` body — restore a project's saved app into a fresh, ready sandbox. */
 export interface RelaunchPreviewRequest {
@@ -81,25 +71,6 @@ export interface SharedPreviewResponse {
   snapshotTakenAt: string | null
 }
 
-/**
- * `GET /v1/build-sessions/{id}` → 200. The poll surface and the source of the
- * framable `previewUrl`. `previewUrl` is null until `ready`, then STABLE. `lastSeq`
- * is the highest envelope `seq` emitted so far (the reconnect cursor), or null before the
- * first envelope. On connect/reattach the owning hook seeds preview continuity from
- * here, so a `preview_ready` that fired before the client connected still frames the
- * app.
- */
-export interface BuildSessionStatusResponse {
-  sessionId: string
-  projectId: string
-  appId: string
-  status: BuildSessionStatus
-  previewUrl: string | null
-  lastSeq: number | null
-  createdAt: string
-  updatedAt: string
-}
-
 // ─── The tagged-union progress envelope (snake_case surface) ─────────────────
 
 /**
@@ -139,16 +110,12 @@ export interface ErrorEvent {
   title: string
   cleaned_stack: string
   /** True when this came off the turn stream as a `diagnostic` — the turn is NOT failing, a
-   *  repair run follows — so it renders as a retry, never as the terminal red block. Absent
-   *  on the legacy build-session feed, which keeps its historical red rendering. */
+   *  repair run follows — so it renders as a retry, never as the terminal red block. */
   recovering?: boolean
   /**
    * The CITIZEN-facing half of the split: `title`/`cleaned_stack` above are the model's (built
    * to be the compiler's own first line, naming a file and construct by design); these two are
    * what the feed renders instead — a plain sentence and something the reader can do.
-   *
-   * OPTIONAL: the legacy build-session feed emits neither, so a committed fallback pair renders
-   * in its place (`DIAGNOSTIC_FALLBACK`) — an error status is never shown without an action.
    */
   user_message?: string
   user_action?: string
@@ -188,13 +155,6 @@ export interface QuotaExceededEvent {
   limit: number
   used: number
   resets_at: string
-}
-
-/** The daily-limit copy shared by the activity-feed row and the session-controls banner ("resets at midnight IST"). */
-export function formatDailyLimitMessage(limit: number, used: number): string {
-  const cap = limit > 0 ? `${limit.toLocaleString('en-US')} tokens` : 'daily token limit'
-  const spent = used > 0 ? ` (used ${used.toLocaleString('en-US')})` : ''
-  return `You've hit your daily limit of ${cap}${spent}. It resets at midnight IST.`
 }
 
 /**

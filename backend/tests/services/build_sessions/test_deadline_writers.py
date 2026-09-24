@@ -10,11 +10,7 @@ What this file pins:
 
 * the closed writer set, and that registration alone is not on it;
 * monotonic extension — a weaker writer arriving later cannot SHORTEN a stronger one's reprieve;
-* provenance recorded beside the deadline, so "what is holding this open?" has an answer;
-* the negative space that matters most: an open tab, a framed preview and a held-open
-  connection extend NOTHING. Those are proved on the browser side
-  (`portal/src/hooks/__tests__/useBuildSession.test.ts`), because the loop that made an open tab
-  a writer lived there and the only honest way to prove it is gone is that it makes no calls.
+* provenance recorded beside the deadline, so "what is holding this open?" has an answer.
 """
 
 from __future__ import annotations

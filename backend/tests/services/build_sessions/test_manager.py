@@ -8,8 +8,7 @@ task, the in-process build feed, and the `FakeBrain` that drove them; the end se
 — `stop` / `force_end` / `_finalize` — is deleted too. What is left is the pair production uses:
 `ensure_sandbox` allocates (the identical skeleton — slot claim, reconcile, lock, app row, env,
 resolve, heartbeat, adopt) and `finish_turn_sandbox` ends, and `on_progress` is the same sink the
-feed always went through. So a test that needed "a live session with a step buffered" pushes the
-step into `on_progress` itself, and a test that needed "a session that ended" finishes the turn.
+feed always went through.
 """
 
 from __future__ import annotations
@@ -32,7 +31,6 @@ from src.api.v1.build_sessions.schemas import (
     BuildSessionStatus,
     PreviewReadyEvent,
     PreviewReconnectingEvent,
-    ProgressEnvelope,
     StepEvent,
 )
 from src.config import settings
@@ -55,7 +53,6 @@ from src.services.build_sessions.locks import (
     write_heartbeat,
 )
 from src.services.build_sessions.manager import (
-    _ENDED_RETENTION_SECONDS,
     _HEAD_ATTEMPTS,
     _RESTORE_ATTEMPTS,
     BuildSession,
@@ -119,9 +116,6 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
             image_ref="acr/img:latest",
         ),
     )
-
-
-A_STEP = StepEvent(seq=1, name="scaffold", label="Scaffolding", state="started")
 
 
 async def _end_the_turn(
@@ -394,7 +388,7 @@ async def test_a_failed_starting_marker_write_leaks_no_lock(
     assert manager.active_session_for(user.id) is None
 
 
-async def test_on_progress_buffers_derives_status_and_fans_out(fake_redis: aioredis.Redis) -> None:
+async def test_on_progress_derives_status(fake_redis: aioredis.Redis) -> None:
     manager = SessionManager()
     session = BuildSession(
         session_id=uuid.uuid7(),
@@ -411,30 +405,20 @@ async def test_on_progress_buffers_derives_status_and_fans_out(fake_redis: aiore
             ready=False,
         ),
     )
-    q1: asyncio.Queue[ProgressEnvelope] = asyncio.Queue()
-    q2: asyncio.Queue[ProgressEnvelope] = asyncio.Queue()
-    session.subscribers.update({q1, q2})
-
     await manager.on_progress(session, StepEvent(seq=1, name="s", label="l", state="started"))
     assert session.status.value == "building"  # provisioning -> building
     await manager.on_progress(session, PreviewReadyEvent(seq=2, preview_url="https://p/"))
     assert session.status == BuildSessionStatus.READY
     assert session.preview_url == "https://p/"
     assert session.last_seq == 2
-    assert [e.seq for e in session.envelopes] == [1, 2]
-    # Fanned out to BOTH subscribers, in order.
-    assert q1.get_nowait().seq == 1
-    assert q1.get_nowait().seq == 2
-    assert q2.get_nowait().seq == 1
 
 
-async def test_on_progress_reconnecting_buffers_and_fans_out_without_changing_status(
+async def test_on_progress_reconnecting_leaves_the_status_unchanged(
     fake_redis: aioredis.Redis,
 ) -> None:
-    """A `preview_reconnecting` envelope is buffered, bumps `last_seq`, and fans out like
-    any other, but does NOT change the lifecycle status (the status enum is frozen at five, with no
-    reconnecting member): a framed session stays `ready`, and the portal reads the envelope for a
-    distinct reconnecting visual."""
+    """A `preview_reconnecting` envelope bumps `last_seq` but does NOT change the lifecycle status
+    (the status enum is frozen at five, with no reconnecting member): a framed session stays
+    `ready`."""
     manager = SessionManager()
     session = BuildSession(
         session_id=uuid.uuid7(),
@@ -451,18 +435,11 @@ async def test_on_progress_reconnecting_buffers_and_fans_out_without_changing_st
             ready=False,
         ),
     )
-    q: asyncio.Queue[ProgressEnvelope] = asyncio.Queue()
-    session.subscribers.add(q)
-
     await manager.on_progress(session, PreviewReadyEvent(seq=1, preview_url="https://p/"))
     assert session.status == BuildSessionStatus.READY
-    # The dev process crashes — reconnecting is buffered + fanned out, status LEFT unchanged.
     await manager.on_progress(session, PreviewReconnectingEvent(seq=2))
     assert session.status == BuildSessionStatus.READY  # NOT a 6th status; still ready
     assert session.last_seq == 2
-    assert [e.seq for e in session.envelopes] == [1, 2]
-    assert q.get_nowait().seq == 1
-    assert q.get_nowait().seq == 2
     # A following preview_ready re-frames — the gap-free stream continues.
     await manager.on_progress(session, PreviewReadyEvent(seq=3, preview_url="https://p/"))
     assert session.status == BuildSessionStatus.READY
@@ -875,56 +852,25 @@ async def test_start_with_object_storage_unconfigured_provisions_fresh_instead_o
     assert session.status == BuildSessionStatus.ENDED
 
 
-# --- the ended-session retention window --------------------------------------------
+# --- an ended session leaves the map ------------------------------------------------
 
 
-async def test_ended_session_kept_inside_retention_window_evicted_after(
+async def test_an_ended_session_leaves_the_map(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
+    """Nothing reads a session once its turn has let go of the slot, so it is not kept."""
     user, project_id = await _mk(db_session, "m17@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
     session = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
-    await manager.on_progress(session, A_STEP)  # something in the replay buffer to retain
+    assert session.session_id in manager._sessions  # noqa: SLF001
+
     await _end_the_turn(manager, session, client)
-    assert session.ended_at is not None  # the retention clock started when the turn ended
 
-    # INSIDE the window: kept, with the full envelope buffer intact — a late SSE reconnect
-    # can still replay the story (the replay itself is covered in test_sse.py).
-    assert manager.evict_ended_sessions() == 0
-    assert manager.get(session.session_id) is session
-    assert session.envelopes == [A_STEP]
-
-    # PAST the window: dropped from _sessions (and _active_by_user, defensively).
-    past = datetime.now(UTC) + timedelta(seconds=_ENDED_RETENTION_SECONDS + 1)
-    assert manager.evict_ended_sessions(now=past) == 1
-    assert manager.get(session.session_id) is None
+    assert session.session_id not in manager._sessions  # noqa: SLF001
     assert manager.active_session_for(user.id) is None
-
-
-async def test_next_start_sweeps_an_expired_ended_session(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    # The opportunistic sweep at the top of `ensure_sandbox` is the guaranteed-recurring seam
-    # — an expired ended session must be gone once the next allocation (any user) runs. It is
-    # also the ONLY recurring seam left now that `start` is deleted: nothing evicts on a timer,
-    # so a workspace that only ever chats would otherwise accumulate ended sessions forever.
-    user, project_id = await _mk(db_session, "m18@rvaiglobal.com")
-    manager = SessionManager()
-    client = FakeSandboxClient()
-    first = await manager.ensure_sandbox(
-        db_session, user, project_id, sandbox_client=client, may_write=True
-    )
-    await _end_the_turn(manager, first, client)
-    first.ended_at = datetime.now(UTC) - timedelta(seconds=_ENDED_RETENTION_SECONDS + 1)
-
-    second = await manager.ensure_sandbox(
-        db_session, user, project_id, sandbox_client=client, may_write=True
-    )
-    assert manager.get(first.session_id) is None  # swept on entry
-    assert manager.get(second.session_id) is second
 
 
 # --- the turn seam: a message sent the instant a turn ends ----------------------------

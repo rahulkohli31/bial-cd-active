@@ -2805,8 +2805,8 @@ async def test_a_workspace_that_came_back_wrong_still_frees_the_slot(
     `ensure_sandbox` registers the session in `_active_by_user` and adopts the user's lock before
     it returns. The engine assigned `state.write_session` BELOW the two integrity holds, and the
     `finally` that releases everything is guarded on that field being set — so this arm left a
-    registered session with `ended_at` never set and no renewer. `_active_by_user` never evicts an
-    unended session, so for the rest of the process's life that user got 409
+    registered session that nothing released, and no renewer, so for the rest of the process's
+    life that user got 409
     `already_building_here` on every turn in every conversation, 409 on relaunch, and
     `still_running` for ever from
     `stop-active-build`, which had no running turn to cancel. In a citizen's words: they could no

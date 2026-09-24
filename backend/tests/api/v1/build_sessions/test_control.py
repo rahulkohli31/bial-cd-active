@@ -1,10 +1,4 @@
-"""Build-session control ops: status (cookie auth + CSRF, owner-scoping) and the
-project-scoped stop-and-switch.
-
-`start` is gone from the title and from this file, and so is the session-scoped `stop`. The bare
-`POST /v1/build-sessions` was deleted along with `SessionManager.start`, and `POST
-/{session_id}/stop` followed with the end sequence behind it; every test whose subject was
-either route went with it. The ones below test surfaces that survive, re-fixtured onto
+"""Build-session control ops: the project-scoped stop-and-switch, over HTTP, fixtured onto
 `a_live_session` — the `ensure_sandbox` door production uses."""
 
 from __future__ import annotations
@@ -17,12 +11,6 @@ from fastapi import FastAPI
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.build_sessions.schemas import (
-    BuildSessionStatus,
-    EndedEvent,
-    PreviewReadyEvent,
-    StepEvent,
-)
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.manager import StopOutcome
 from tests.api.v1.build_sessions.conftest import a_live_session, auth_headers
@@ -33,56 +21,6 @@ async def _user_project(db: AsyncSession, email: str):
     user = await UserFactory.create(db, email=email)
     project = await ProjectFactory.create(db, user.id)
     return user, project
-
-
-async def test_status_after_completion_carries_preview_and_last_seq(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
-) -> None:
-    """The status read reports a FINISHED session's terminal state — the three fields the
-    portal branches on, and the reason the route survived the start route's deletion.
-
-    Re-fixtured onto `a_live_session`. All three frames are pushed straight through
-    `manager.on_progress`, which documents that it must derive state from any envelope handed to
-    it directly; the terminal `ended` is the frame a finished session's feed carries, so the
-    status this asserts is derived exactly as production derives it."""
-    user, project = await _user_project(db_session, "ctl5@rvaiglobal.com")
-    session = await a_live_session(wire, db_session, user, project.id)
-    await wire.manager.on_progress(
-        session, StepEvent(seq=1, name="scaffold", label="Scaffolding the app", state="started")
-    )
-    await wire.manager.on_progress(
-        session, PreviewReadyEvent(seq=2, preview_url="https://preview.example/")
-    )
-    await wire.manager.on_progress(
-        session,
-        EndedEvent(
-            seq=3,
-            status=BuildSessionStatus.ENDED,
-            preview_url="https://preview.example/",
-            snapshot_committed=True,
-            reason="completed",
-        ),
-    )
-
-    sid = session.session_id
-    s = await client.get(f"/v1/build-sessions/{sid}", headers=auth_headers(user))
-    assert s.status_code == 200
-    body = s.json()
-    assert body["status"] == "ended"
-    assert body["previewUrl"] == "https://preview.example/"
-    assert body["lastSeq"] == 3
-
-
-async def test_status_of_another_users_session_is_404(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
-) -> None:
-    owner, project = await _user_project(db_session, "ctl6a@rvaiglobal.com")
-    intruder = await UserFactory.create(db_session, email="ctl6b@rvaiglobal.com")
-    session = await a_live_session(wire, db_session, owner, project.id)
-    s = await client.get(
-        f"/v1/build-sessions/{session.session_id}", headers=auth_headers(intruder)
-    )
-    assert s.status_code == 404  # non-leaking
 
 
 # --- stop-and-switch, over HTTP -------------------------------------------------------

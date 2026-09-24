@@ -67,8 +67,8 @@ import { DEVICES, type DeviceName } from './workspace/devices'
 //                         to see; its "painting" answer to a heartbeat takes the reveal back.
 //   VOUCH_RETRY_LIMIT     re-requests per ADDRESS — never per turn. A container whose image
 //                         predates the beacon never answers, and this is what it costs: three
-//                         fetches of its app, then the labelled stall card; a turn edge afterwards
-//                         costs one fetch and two pings, never a fresh budget.
+//                         fetches of its app, then the labelled stall card; an automatic reload
+//                         afterwards costs one fetch and two pings, never a fresh budget.
 const FRAME_LOAD_CAP_MS = 20000
 const VOUCH_AFTER_LOAD_MS = 5000
 const PINGS_BEFORE_RELOAD = 2
@@ -304,12 +304,10 @@ function BouncingWait({ children, className = '' }: { children: ReactNode; class
  * already retired; the app now gets its data credentials server-side at provision — the portal
  * feeds the app nothing).
  *
- * Driven entirely by the build session:
- *   - `previewUrl` — the sandbox `next dev` root, from the status read / `preview_ready`.
- *                    Framed once set.
+ * Driven by the resolved workspace address (`utils/previewAddress.ts`):
+ *   - `previewUrl` — the sandbox `next dev` root, from the live turn's preview, a start or
+ *                    relaunch, or the project's preview read. Framed once set.
  *   - `status`     — the session lifecycle; drives loading / framed / terminal visuals.
- *   - `iterating`  — true while the loop keeps emitting step/log envelopes AFTER the preview
- *                    went live (a refine turn holding at `ready`); shows a subtle overlay.
  *   - `onFrameMessage` — the client-error receiver seam. The inbound `message` listener
  *                    validates BOTH `e.origin` against the preview origin AND `e.source` against
  *                    this pane's own iframe window, and forwards only messages that pass both;
@@ -338,11 +336,10 @@ function BouncingWait({ children, className = '' }: { children: ReactNode; class
  *                    left is liveness, and liveness alone: this prop is not evidence that anything
  *                    compiled, and it must never be read as such. What the pane may SAY about the
  *                    newest build comes from `compileState`, whose `unknown` asserts nothing.
- *   - `reconnecting` — the dev-server PROCESS crashed after the preview was framed (a backend
- *                    `preview_reconnecting` signal — the frontend can't poll /dev/status).
- *                    DISTINCT from the "Building…" loading bounce and from `feedDisconnected` (the
- *                    SSE feed dropping): the pane shows a "Reconnecting…" cover over the dead frame
- *                    until a fresh `preview_ready` re-frames.
+ *   - `reconnecting` — the dev-server PROCESS crashed after the preview was framed (the turn
+ *                    stream's `reconnecting` preview state — the frontend can't poll /dev/status).
+ *                    DISTINCT from the "Building…" loading bounce: the pane shows a "Reconnecting…"
+ *                    cover over the dead frame until a fresh `preview_ready` re-frames.
  *
  *                    IT IS NO LONGER BOUNDED HERE, AND THE BOUND MOVED TO THE SERVER RATHER THAN
  *                    BEING DROPPED. A 20-second cap used to collapse this cover into a "preview
@@ -366,7 +363,6 @@ function BouncingWait({ children, className = '' }: { children: ReactNode; class
 export interface LivePreviewProps {
   previewUrl?: string | null
   status?: BuildSessionStatus | null
-  iterating?: boolean
   onFrameMessage?: (data: unknown) => void
   serving?: boolean
   reconnecting?: boolean
@@ -454,7 +450,6 @@ export interface LivePreviewProps {
 export default function LivePreview({
   previewUrl = null,
   status = null,
-  iterating = false,
   onFrameMessage,
   // Absent means NOTHING IS KNOWN TO BE SERVING, which is restrictive on purpose: it is the only
   // default under which a caller that forgot the prop cannot keep framing a URL nobody is
@@ -652,38 +647,24 @@ export default function LivePreview({
   // Note what a reveal does and does NOT claim: the beacon says the document showed something in
   // this browser, never that the app is healthy. Whatever ends up rendering over a framed-but-broken app hangs off a
   // health signal from the server, not off this flag.
-  // …but `previewUrl` alone is NOT a sufficient identity for the frame. Attaching to a container
-  // that is already up makes "same container, same FQDN, same URL" the common case, so a repair
-  // turn ends with `previewUrl` byte-identical to what it was before: React sees the same key,
-  // keeps the same DOM node, the browser never re-requests — and the citizen keeps staring at the
-  // broken render of an app the server has already fixed. A browser run caught it exactly: the
-  // server served 341 chars of the repaired app while the frame reported `loads 1 -> 1`. HMR
-  // usually rescues it, which is why it is intermittent rather than constant — but not when
-  // self-heal restarts `next dev` mid-turn, which kills the framed document's HMR socket without
-  // anything on this side noticing.
-  //
-  // So the frame gets an identity that can change when the URL cannot. `iterating` falling is the
-  // honest moment: it means a turn that was running OVER a live preview just ended, which is the
-  // repair case and nothing else. A timer would reload an idle pane; a status tick would reload
-  // on every poll and leak the HMR socket the frame's `key` comment rightly protects.
+  // …but `previewUrl` alone is NOT a sufficient identity for the frame: the same URL can front a
+  // document that has gone stale, so the frame gets an identity that can change when the URL
+  // cannot. Only the edges below move it — a timer would reload an idle pane, and a status tick
+  // would reload on every poll and leak the HMR socket the frame's `key` comment rightly protects.
+  // A turn ending over a live preview does not move it; the citizen's Reload covers a repair that
+  // HMR did not carry.
   const [autoReloadNonce, setAutoReloadNonce] = useState(0)
   // Re-requests spent on a document that ignored its pings (the vouch wait below), counted per
   // ADDRESS and reset by exactly two things: a new URL and the citizen's own Reload. NOT by the
-  // platform's turn edges below — `iterating` falls after any four-second gap in the stream, so
-  // a reset there would hand a document that never answers a fresh budget several times per turn,
-  // and the bound on this counter would bound nothing. Pings are counted per KEY beside it and
-  // reset with the verdicts. Refs, because a count must not render.
+  // automatic reloads below — a reset there would hand a document that never answers a fresh
+  // budget on every one of them, and the bound on this counter would bound nothing. Pings are
+  // counted per KEY beside it and reset with the verdicts. Refs, because a count must not render.
   const vouchRetriesRef = useRef(0)
   const pingsRef = useRef(0)
   const alivePingsRef = useRef(0)
   useEffect(() => {
     vouchRetriesRef.current = 0
   }, [previewUrl, externalReloadNonce])
-  const wasIterating = useRef(false)
-  useEffect(() => {
-    if (wasIterating.current && !iterating && previewUrl) setAutoReloadNonce((n) => n + 1)
-    wasIterating.current = iterating
-  }, [iterating, previewUrl])
   // AND THE FIRST TIME THE APP ACTUALLY STARTS ANSWERING, which is the one this pane was missing
   // and the reason a citizen had to reload four times to see their first build.
   //
@@ -694,11 +675,9 @@ export default function LivePreview({
   // first build what loaded first is the router's 502 page, because the app was not listening yet.
   // Nothing on this side notices, because nothing about the address changed.
   //
-  // `iterating` above cannot cover it: it fires when a turn ends OVER a live preview, and a first
-  // build has no live preview to have been iterating over. This is the other edge — not-serving to
-  // serving — and it is the only moment at which the document that failed becomes worth asking for
-  // again. Guarded on a previous status existing so a pane that mounts straight into `ready` does
-  // not reload a document it just asked for.
+  // This is the not-serving to serving edge, and it is the only moment at which the document that
+  // failed becomes worth asking for again. Guarded on a previous status existing so a pane that
+  // mounts straight into `ready` does not reload a document it just asked for.
   //
   // THE EDGE IS "A BUILD FINISHED", NOT "THE STATUS BECAME READY", and the difference is a
   // regression this nearly shipped. Written as `!== 'ready'` it also fired on `ended`→`ready`,
@@ -728,7 +707,7 @@ export default function LivePreview({
     wasStatus.current = { status, url: previewUrl }
   }, [status, previewUrl])
   // TWO INDEPENDENT REASONS TO RE-REQUEST THE DOCUMENT, COMBINED RATHER THAN COLLAPSED. The one
-  // above is the platform's — a turn ended over a live preview, so the served bundle may be stale.
+  // above is the platform's — the app started answering, so what loaded before it may be a 502.
   // The other is the citizen's, from the toolbar row's Reload control, for the staleness the
   // platform cannot detect (a dev server restarted, an HMR socket that died quietly). Either one
   // moving changes the key; neither can reset the other, which a single shared counter would.
@@ -872,9 +851,8 @@ export default function LivePreview({
   // when the turn does; a white rectangle ends when the person gives up on the product.
   //
   // AND IT COMES OFF ON ITS OWN, WITHOUT A RELOAD. `turnRunning` falling clears this arm in the
-  // same render, and the auto-reload nonce above re-requests the document on exactly that edge (a
-  // turn ending over a live preview, or provisioning/building → ready), so the first paint after a
-  // build is a FRESH document rather than the stale one this cover was hiding.
+  // same render and uncovers the document already in the frame; the auto-reload nonce above
+  // re-requests it only on the provisioning/building → ready edge.
   //
   // DO NOT "SIMPLIFY" THIS BACK TO READING `compileState` ALONE. That single-signal version is the
   // one that failed in front of the owner, twice, and it fails SILENTLY: a supervisor can always
@@ -1108,8 +1086,8 @@ export default function LivePreview({
   //
   // WHAT THIS COSTS, stated rather than left to be discovered: a container running an image older
   // than the beacon never vouches. Its app is asked twice, fetched again up to three times
-  // (VOUCH_RETRY_LIMIT, per address — a turn edge afterwards costs one fetch and two pings, never
-  // a fresh budget), and then sits behind the labelled stall card until it is next launched — the
+  // (VOUCH_RETRY_LIMIT, per address — an automatic reload afterwards costs one fetch and two pings,
+  // never a fresh budget), and then sits behind the labelled stall card until it is next launched — the
   // beacon rides the image and reaches every app on its next provision or restore. That is the
   // trade the owner chose over a fourth guess: a labelled wait that ends on the next launch,
   // never a white rectangle presented as the citizen's app.
@@ -1221,15 +1199,15 @@ export default function LivePreview({
               // nothing is serving.
               //
               // AND THE GATE IS LEFT EXACTLY AS IT IS, INCLUDING WHAT IT DOES NOT PROVE ON ITS OWN.
-              // The serving stamp does not reach two of `serving`'s three arms: `fromProject`
-              // consults the preview-state poll, but `fromTurn`/`fromSession`
-              // (`utils/previewAddress.ts`) are a live turn's own word for it and never see the
-              // stamp. So it is NOT true that this sentence became honest because its own inputs
-              // carry proof. It is honest because `AppPane` will not mount this component at all
-              // unless the workspace reading is `running` — the frame VETO is what holds it, one
-              // level up, in a file this one cannot see. Written down because it is load-bearing
-              // and invisible: weaken that veto and this claim goes back to being unearned on the
-              // turn-sourced arms, with nothing here to catch it.
+              // The serving stamp reaches only one of `serving`'s two arms: `fromProject`
+              // consults the preview-state poll, but `fromTurn` (`utils/previewAddress.ts`) is a
+              // live turn's own word for it and never sees the stamp. So it is NOT true that this
+              // sentence became honest because its own inputs carry proof. It is honest because
+              // `AppPane` will not mount this component at all unless the workspace reading is
+              // `running` — the frame VETO is what holds it, one level up, in a file this one
+              // cannot see. Written down because it is load-bearing and invisible: weaken that veto
+              // and this claim goes back to being unearned on the turn-sourced arm, with nothing
+              // here to catch it.
               revealed && serving && compileState === 'clean'
                 ? 'Your app preview is live'
                 : ''

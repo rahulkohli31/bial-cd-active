@@ -4,13 +4,9 @@
  * called from above the chat. A resolver that "tidied" the two gating predicates into one must
  * not pass unnoticed, so this pins the asymmetry below that looks like a bug and is not.
  *
- * THE RULE: a live turn's preview outranks a relaunched URL, which outranks the session's URL —
- * the turn arm is gated by the CHAT predicate alone, the lower two by the PROJECT predicate alone.
- *
- * Why the lower arm below is usually the relaunched URL: a session still framing is by definition
- * an ACTIVE build, which closes this chat's own composer gate — so a scenario needing both a
- * lower arm and a send can't use it. A relaunch has no lifecycle at all, so it frames without
- * gating anything.
+ * THE RULE: a live turn's preview outranks a relaunched URL, which outranks the project's own
+ * live preview — the turn arm is gated by the CHAT predicate alone, the lower two by the PROJECT
+ * predicate alone.
  *
  * NOT RE-PINNED HERE (already pinned once, elsewhere):
  *  - composer draft + scroll across a hide/show cycle → `ProjectWorkspace.test.tsx`
@@ -26,14 +22,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createElement } from 'react'
 import { act, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
 import {
-  FakeEventSource, makeClient, primeClient, primeTurn, renderBuilderAt, withLiveBuildAnchor,
-  statusResp, send, scriptBuildTurn, T_PREVIEW, T_BUILD_END, turnStreaming,
-  T_DELTA, T_END, findStartAppControl, primeStandbyReattach,
+  primeTurn, renderBuilderAt, send, scriptBuildTurn, T_PREVIEW, T_BUILD_END, turnStreaming,
+  T_DELTA, T_END, findStartAppControl, waitForGateOpen,
 } from './_builderSession.jsx'
 import type { PreviewLifeState, PreviewState } from '../../utils/buildSessionApi'
 
-/** The four arms, given URLs that cannot be confused with one another. */
-const SESSION_URL = 'https://session-app.example.azurecontainerapps.io/'
+/** The three arms, given URLs that cannot be confused with one another. */
 const TURN_URL = 'https://turn-app.example.azurecontainerapps.io/'
 const RELAUNCH_URL = 'https://relaunched-app.example.azurecontainerapps.io/'
 /** The PROJECT arm's — the one a hard load arrives on, answered by the preview-state read. */
@@ -44,7 +38,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  relaunchPreview: vi.fn(), getStatus: vi.fn(),
+  relaunchPreview: vi.fn(),
   fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
   // THE TWO PROBES THAT RIDE THE PREVIEW TICK, mocked only so they cannot reach a real `fetch`.
   // Neither was needed while every scenario here answered the read `unknown`: both are gated on a
@@ -104,11 +98,6 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
   relaunchPreview: (...a: unknown[]) => h.relaunchPreview(...a),
 }))
 
-const deps = () => {
-  const fake = new FakeEventSource('x')
-  return { client: makeClient(h), eventSourceFactory: () => fake }
-}
-
 const frame = () => document.querySelector('iframe')
 const framedUrl = () => frame()?.getAttribute('src') ?? null
 /** The newest value the pane was handed for `name` — the app-scoped props read this. */
@@ -119,7 +108,6 @@ beforeEach(() => {
   paneProps.length = 0
   sessionStorage.clear()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   primeTurn(h)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
@@ -142,21 +130,15 @@ afterEach(() => cleanup())
  * Brings up a page whose RELAUNCH arm is live, stamped to `projectId`.
  *
  * The vehicle is `StartAppControl` (the old Relaunch-button affordance is gone):
- * `primeStandbyReattach` stamps the ref its own click path never touches, and
- * `findStartAppControl` presses whichever label it's currently showing. Full account,
- * including a real product bug this uncovered, is in `_builderSession.jsx`'s docblock.
+ * the cold-load claim stamps the project ref on render, so this only has to press whichever
+ * label it's currently showing. `findStartAppControl` does that.
  */
 async function relaunchFramedAt(chatId: string, projectId: string) {
-  const reattach = primeStandbyReattach(h, { chatId, projectId })
-  const view = renderBuilderAt({ chatId, projectId, hasSavedBuild: true, deps: deps() })
-  await waitFor(() => expect(h.getStatus).toHaveBeenCalled())
+  const view = renderBuilderAt({ chatId, projectId, hasSavedBuild: true })
+  await waitForGateOpen()
   fireEvent.click(await findStartAppControl())
   await waitFor(() => expect(h.relaunchPreview).toHaveBeenCalled())
   await waitFor(() => expect(framedUrl()).toBe(RELAUNCH_URL))
-  // Several callers send a turn right after this returns — a reattach left pending would keep
-  // the composer gate shut on them for good (see `primeStandbyReattach`'s docblock).
-  reattach.settle()
-  await waitFor(() => expect(screen.queryByText(/checking whether a build/i)).toBeNull())
   return view
 }
 
@@ -218,52 +200,6 @@ describe('BuilderPage — the preview address: three sources, two predicates', (
     view.unmount()
   })
 
-  it('a relaunched URL outranks the session\'s own URL', async () => {
-    // The middle of the precedence, which only shows when both lower arms are populated at once: a
-    // relaunch restores an app the ENDED session's dead preview would otherwise still be naming.
-    // `asleep`+`restorable` is what resolves the workspace map to `not-running` for that dead
-    // session. The poll only runs once something is framed, so the sequence here is mount, let the
-    // poll answer, THEN press.
-    h.getBuild.mockResolvedValue(withLiveBuildAnchor('live-7'))
-    h.getStatus.mockResolvedValue(
-      statusResp({ sessionId: 'live-7', status: 'ended', previewUrl: SESSION_URL }),
-    )
-    h.fetchPreviewState.mockResolvedValue({
-      state: 'asleep', alive: false, previewUrl: null, occupyingProjectName: null, restorable: true,
-    })
-    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA', hasSavedBuild: true, deps: deps() })
-    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
-
-    fireEvent.click(await findStartAppControl())
-    await waitFor(() => expect(h.relaunchPreview).toHaveBeenCalled())
-    // The press doesn't itself change what the workspace map says — `onStartOutcome` only asks it
-    // again. Answer `alive` now so the frame this test is actually about gets a chance to mount.
-    h.fetchPreviewState.mockResolvedValue({
-      state: 'alive', alive: true, previewUrl: RELAUNCH_URL, occupyingProjectName: null, restorable: null,
-    })
-    fireEvent.focus(window)
-
-    await waitFor(() => expect(framedUrl()).toBe(RELAUNCH_URL))
-    view.unmount()
-  })
-
-  it('the session\'s URL frames on its own, and only for the project it belongs to', async () => {
-    // The bottom arm, and the project predicate that gates it. Nothing is sent here — a session
-    // still framing is an ACTIVE build, which closes this chat's composer by design.
-    h.getBuild.mockResolvedValue(withLiveBuildAnchor('live-7'))
-    h.getStatus.mockResolvedValue(
-      statusResp({ sessionId: 'live-7', status: 'ready', previewUrl: SESSION_URL }),
-    )
-    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA', deps: deps() })
-    await waitFor(() => expect(framedUrl()).toBe(SESSION_URL))
-
-    // The SAME session, viewed from another project: out of scope, so it reaches nothing.
-    h.getBuild.mockResolvedValue(null)
-    view.moveTo({ chatId: 'chat-B', projectId: 'pB' })
-
-    await waitFor(() => expect(frame()).toBeNull())
-    view.unmount()
-  })
 })
 
 describe('BuilderPage — the app-scoped props are NOT narrowed to the open chat', () => {
@@ -373,7 +309,7 @@ describe('BuilderPage — the frame\'s identity is its ADDRESS, and nothing else
         },
       ],
     })
-    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA', deps: deps() })
+    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA' })
 
     h.readTurnStream.mockImplementation(turnFraming(TURN_URL))
     await send('build me a visitor app')
@@ -415,7 +351,7 @@ describe('BuilderPage — the frame\'s identity is its ADDRESS, and nothing else
 })
 
 /**
- * THE FOURTH ARM: the project's own live preview, on a CHAT route.
+ * THE THIRD ARM: the project's own live preview, on a CHAT route.
  *
  * WHAT WAS BROKEN. Reload a build chat whose app is up — a bookmark, an F5, a browser restart —
  * and the headline said the app was running while the pane framed nothing. Two independent
@@ -423,9 +359,10 @@ describe('BuilderPage — the frame\'s identity is its ADDRESS, and nothing else
  *
  *  1. this surface fed the resolver `projectPreviewUrl: null`, so the read it was already making
  *     could not reach the address at all;
- *  2. every project-scoped arm is gated by `sessionBelongsToOpenProject`, which this route supplies
- *     as `sessionProjectMatches` — a ref stamped only by a reattach or by the start control. A hard
- *     load has done neither, so it is `false` and the arm is closed whatever it is fed.
+ *  2. every project-scoped arm is gated by `belongsToOpenProject`, which this route supplies as
+ *     `stampedProjectMatches` — true only while `stampedProjectRef` holds the open project, a
+ *     stamp only a fresh start set and a cold load never did. Reason 1 alone was not enough:
+ *     without this stamp the arm stayed closed no matter what `projectPreviewUrl` carried.
  *
  * The scenarios below pin the pair, and the LOOP GUARD pins the third part: with the address now
  * downstream of the poll's own answer, keeping the framed URL in the poll effect's dependency list
@@ -455,7 +392,7 @@ describe('BuilderPage — the project arm, and the hard load it exists for', () 
     // read it already makes. Before the fix this rendered the running-app copy over an empty pane.
     h.fetchPreviewState.mockResolvedValue(polled('alive'))
 
-    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA', deps: deps() })
+    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA' })
 
     await waitFor(() => expect(framedUrl()).toBe(PROJECT_URL))
     expect(document.querySelectorAll('iframe')).toHaveLength(1)
@@ -478,7 +415,7 @@ describe('BuilderPage — the project arm, and the hard load it exists for', () 
     h.fetchPreviewState.mockImplementation(
       () => new Promise<PreviewState>((resolve) => { setTimeout(() => resolve(polled('alive')), 0) }),
     )
-    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA', deps: deps() })
+    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA' })
     await waitFor(() => expect(framedUrl()).toBe(PROJECT_URL))
 
     // ONE read got us here — the mount's. Asserted as a number rather than as "it stopped",
@@ -502,7 +439,7 @@ describe('BuilderPage — the project arm, and the hard load it exists for', () 
     // about the project, so a move between its conversations is not an invalidation: the address is
     // byte-identical, the iframe node is the same node, and the app inside it never reloads.
     h.fetchPreviewState.mockResolvedValue(polled('alive'))
-    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA', deps: deps() })
+    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA' })
     await waitFor(() => expect(framedUrl()).toBe(PROJECT_URL))
     const before = frame()
 
@@ -518,7 +455,7 @@ describe('BuilderPage — the project arm, and the hard load it exists for', () 
     // the citizen is watching. (This is also the scenario that exercises the fold — the turn's
     // `preview` frame is one of the two lifecycle signals now folded into the probe epoch.)
     h.fetchPreviewState.mockResolvedValue(polled('alive'))
-    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA', deps: deps() })
+    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA' })
     await waitFor(() => expect(framedUrl()).toBe(PROJECT_URL))
 
     h.readTurnStream.mockImplementation(turnFraming(TURN_URL))
@@ -535,7 +472,7 @@ describe('BuilderPage — the project arm, and the hard load it exists for', () 
     // project is asked for, so a held slot is a switch away rather than a negotiation.
     h.fetchPreviewState.mockResolvedValue(polled('slot_taken', true))
 
-    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA', deps: deps() })
+    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA' })
 
     await waitFor(() => expect(screen.queryByTestId('app-pane-empty')).not.toBeNull())
     expect(screen.getByTestId('app-pane-empty').getAttribute('data-workspace-state'))
@@ -554,7 +491,7 @@ describe('BuilderPage — the project arm, and the hard load it exists for', () 
     h.fetchPreviewState.mockImplementation(async (id: string) =>
       id === 'pA' ? polled('alive') : polled('asleep', true),
     )
-    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA', deps: deps() })
+    const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA' })
     await waitFor(() => expect(framedUrl()).toBe(PROJECT_URL))
     const seen = paneProps.length
 

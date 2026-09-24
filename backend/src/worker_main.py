@@ -8,8 +8,7 @@ rides along.
 WHAT IS ON A TIMER: deploy reconciliation and the sandbox sweep every five minutes, the fleet
 reclamation pass every fifteen (report-only — its destroy flag is off everywhere today).
 Everything else that sweeps is OPERATOR-INVOKED, run only when a superadmin calls it; `main.py`'s
-boot one-shot and the in-process ended-session eviction are neither — one settles a deploy before
-cron can run, the other is per-process state a shared scheduler couldn't reach.
+boot one-shot is neither — it settles a deploy before cron can run.
 
 WHY THIS EXISTS instead of `taskiq worker` / `taskiq scheduler`: both were tried and both are
 broken — a `WORKER_STARTUP` handler that starts the scheduler recurses without bound

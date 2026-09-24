@@ -8,9 +8,8 @@
  *
  * CSRF: `relaunchPreview` (and the project-scoped save / release / stop-active calls below)
  * are mutating POSTs and carry the signed double-submit token (`X-CSRF-Token`,
- * reusing `auth.ts` `getCsrfToken()`); `getStatus` GET and the SSE GET (a separate transport,
- * `buildSessionEvents.ts`) are safe methods and carry NO token. This is net-new: no prior
- * business route in the portal enforces CSRF.
+ * reusing `auth.ts` `getCsrfToken()`); the GETs are safe methods and carry NO token. This is
+ * net-new: no prior business route in the portal enforces CSRF.
  */
 import { ApiError, extractApiCode, extractApiMessage, isRecord, readApiError } from './apiError'
 import { authFetch } from './api'
@@ -19,7 +18,6 @@ import type { CompileState } from './compileState'
 import { getCsrfToken } from './auth'
 import type {
   BuildSessionStatus,
-  BuildSessionStatusResponse,
   RelaunchPreviewRequest,
   RelaunchPreviewResponse,
   SharedPreviewResponse,
@@ -59,14 +57,6 @@ function asString(value: unknown): string {
   return typeof value === 'string' ? value : ''
 }
 
-function asStringOrNull(value: unknown): string | null {
-  return typeof value === 'string' ? value : null
-}
-
-function asNumberOrNull(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null
-}
-
 /** A status we don't recognize is unusable — fail closed rather than let the UI render an undefined lifecycle. */
 function toBuildSessionStatus(value: unknown): BuildSessionStatus {
   if (
@@ -81,29 +71,8 @@ function toBuildSessionStatus(value: unknown): BuildSessionStatus {
   throw new ApiError('The server returned a build session we could not read.', 500)
 }
 
-/** A build session with no `sessionId` is not a session — fail at the boundary (parity with `projectApi.toProject`). */
-function requireSessionId(value: Record<string, unknown>): string {
-  if (typeof value.sessionId !== 'string' || value.sessionId === '') {
-    throw new ApiError('The server returned a build session we could not read.', 500)
-  }
-  return value.sessionId
-}
-
-/**
- * `projectId` drives the 409 reattach-vs-block routing (the projectId comparison IS the
- * gate, not the bare 409) — a session response without one would silently mis-route every
- * reattach decision, so it fails at the boundary like a missing `sessionId` (mirror guard).
- */
-function requireProjectId(value: Record<string, unknown>): string {
-  if (typeof value.projectId !== 'string' || value.projectId === '') {
-    throw new ApiError('The server returned a build session we could not read.', 500)
-  }
-  return value.projectId
-}
-
 function toRelaunchPreviewResponse(value: unknown): RelaunchPreviewResponse {
   if (!isRecord(value)) throw new ApiError('The server returned a preview we could not read.', 500)
-  // No sessionId/createdAt on this shape — do NOT reuse requireSessionId here.
   return {
     appId: asString(value.appId),
     previewUrl: asString(value.previewUrl),
@@ -114,20 +83,6 @@ function toRelaunchPreviewResponse(value: unknown): RelaunchPreviewResponse {
     // new, and every server that predates it only ever answered once the app was serving. Reading
     // a missing value as `false` would put a permanent "not ready yet" on those correct responses.
     ready: value.ready !== false,
-  }
-}
-
-function toBuildSessionStatusResponse(value: unknown): BuildSessionStatusResponse {
-  if (!isRecord(value)) throw new ApiError('The server returned a build session we could not read.', 500)
-  return {
-    sessionId: requireSessionId(value),
-    projectId: requireProjectId(value),
-    appId: asString(value.appId),
-    status: toBuildSessionStatus(value.status),
-    previewUrl: asStringOrNull(value.previewUrl),
-    lastSeq: asNumberOrNull(value.lastSeq),
-    createdAt: asString(value.createdAt),
-    updatedAt: asString(value.updatedAt),
   }
 }
 
@@ -212,13 +167,6 @@ export async function relaunchPreview(
   return toRelaunchPreviewResponse(body)
 }
 
-/** `getStatus` — the poll surface and the source of the framable `previewUrl` + `lastSeq`. A safe GET: no CSRF. */
-export async function getStatus(sessionId: string, deps: AuthFetchDeps = {}): Promise<BuildSessionStatusResponse> {
-  const res = await authFetch(`${BASE}/${encodeURIComponent(sessionId)}`, {}, deps)
-  if (!res.ok) throw await readApiError(res, 'Failed to load build session status')
-  return toBuildSessionStatusResponse(await res.json())
-}
-
 // ─── lock operations — THERE ARE NONE LEFT ─────────────────────────────────
 //
 // `acquireLock` and `releaseLock` are gone: nothing called them — the portal's blind
@@ -228,23 +176,6 @@ export async function getStatus(sessionId: string, deps: AuthFetchDeps = {}): Pr
 // `forceEnd` is gone too, and so is the ROUTE it spoke to; the session-scoped `stop` that
 // replaced it in this comment has since been retired the same way, route and all. What a live
 // build offers now is the turn's own stop and, project-scoped, `stopActiveBuild`.
-
-/**
- * The dependency bag the client + event feed accept, so a hook and a page
- * can swap in the scripted mock (dev/test) or the real transport (prod default).
- * The client half is the `buildSessionApi` module surface; the feed half is the
- * `EventSource` factory (`buildSessionEvents.ts`).
- */
-export interface BuildSessionClient {
-  relaunchPreview: typeof relaunchPreview
-  getStatus: typeof getStatus
-}
-
-/** The real, wired-by-default client — already the final implementation, so no later swap between mock and real is needed. */
-export const buildSessionClient: BuildSessionClient = {
-  relaunchPreview,
-  getStatus,
-}
 
 // --- the save model ---------------------------------------------------------
 

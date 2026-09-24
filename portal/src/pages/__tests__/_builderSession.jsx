@@ -4,18 +4,16 @@
  *
  * WHY THIS EXISTS
  *
- * Each test file declares its own vi.mock and injects the mock client plus FakeEventSource via
- * the `buildSessionDeps` prop; the real useBuildSession/LivePreview/ActivityFeed/SessionControls
- * hooks run, so tests assert real rendered DOM.
+ * Each test file declares its own vi.mock and mounts the real ConversationSurface inside the real
+ * WorkspaceShell, whose app pane frames the real LivePreview, so tests assert real rendered DOM.
  *
  * A composer send is a TURN (POST /turns + the frame stream); the plan streams as text and
  * `present_plan_options` renders the card; a build starts only through the atomic Build-it
  * transition — mock `turnStreamApi`, prime with `primeTurn(h)`, and drive `sendAndConfirm()`.
  *
- * Build-it is a WRITE TURN now, not a build SESSION: `buildFromPlan` returns a `turnId`, never
- * a `sessionId`, and the page subscribes with the same `readTurnStream` an ordinary send uses.
- * `scriptBuildTurn()` drives one via workspace/step/preview/diagnostic/quota/turn_ended frames.
- * `FakeEventSource` now serves only the LEGACY session path (the reload-mid-build reattach).
+ * Build-it is a WRITE TURN, not a build SESSION: `buildFromPlan` returns a `turnId`, and the page
+ * subscribes with the same `readTurnStream` an ordinary send uses. `scriptBuildTurn()` drives one
+ * via workspace/step/preview/diagnostic/quota/turn_ended frames.
  *
  * Not a `*.test.*` file — the runner never collects it.
  */
@@ -39,32 +37,7 @@ export const inWorkspace = (...routes) => (
   </Route>
 )
 
-export { FakeEventSource } from '../../utils/buildSessionMock'
-
 export const PREVIEW_URL = 'https://app-xyz.example.azurecontainerapps.io/'
-
-// Build-session response builders (camelCase). `over` lets a test tweak one field. `startResp`
-// is GONE with the `start` it answered — nothing on this harness can post one any more.
-export const statusResp = (over = {}) => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u', ...over })
-
-/** Assemble a BuildSessionClient from a per-file `h` bag of vi.fn()s.
- *
- *  TWO MEMBERS NOW: `acquireLock`/`releaseLock` went with the keep-alive loop that was their
- *  only caller; `start` went the same way, because the build lives inside the turn's own
- *  transaction and nothing provisions a session from the browser; `forceEnd` and then the
- *  session-scoped `stop` each went with the route they spoke to. Pinned against the real client
- *  in `utils/__tests__/buildSessionApi.test.ts`. */
-export function makeClient(h) {
-  return {
-    relaunchPreview: h.relaunchPreview,
-    getStatus: h.getStatus,
-  }
-}
-
-/** Give the per-file `h` bag its default happy resolutions (call inside beforeEach). */
-export function primeClient(h) {
-  h.getStatus.mockResolvedValue(statusResp())
-}
 
 // ─── The turn half (streamed plan + the options card) ───────────────────
 
@@ -185,8 +158,8 @@ export function primeTurn(h, frames = planReply()) {
 export const composer = () => screen.getByPlaceholderText(/ask for another change/i)
 
 /**
- * Wait out the composer gate's OPENING state (G1): send stays unavailable until the adopt
- * round-trip answers whether a build is still running in this chat. Waits for the CHECKING copy
+ * Wait out the composer gate's OPENING state (G1): send stays unavailable until the chat's own
+ * load answers whether a turn is still running in it. Waits for the CHECKING copy
  * only, not for it to vanish — several tests send while a build IS running, to assert the refusal.
  */
 export const waitForGateOpen = () =>
@@ -210,42 +183,6 @@ export const findStartAppControl = () =>
   screen.findByRole('button', { name: /^(Launch Application|Try again)$/ })
 
 /**
- * Stamps `sessionProjectRef` directly (no real reattach) — only a REATTACH stamps that ref, never
- * the control's own click path (confirmed empirically; filed as a real product bug, not papered
- * over here). Left PENDING on purpose: the ref stamps synchronously before `getStatus` resolves,
- * so a call that never settles still reaches `NoFrame`/`StartAppControl`; the composer gate stays
- * shut until the caller resolves the returned `settle()`.
- */
-export function primeStandbyReattach(h, { chatId = 'chat-A', projectId = 'p1', sessionId = 'standby-1' } = {}) {
-  let resolveStatus
-  // KEYED BY ID, not a blanket `mockResolvedValue` — moving the SAME page instance to a sibling
-  // chat triggers that chat's own adopt effect, and a blanket answer would overwrite
-  // `resolveStatus`, so `settle()` would stop reaching the original session.
-  h.getBuild.mockImplementation(async (id) =>
-    id === chatId
-      ? {
-          id,
-          kind: 'build',
-          messages: [
-            { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
-            { id: 'srv_1_g', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId }] },
-          ],
-        }
-      : null,
-  )
-  h.getStatus.mockImplementation(() => new Promise((resolve) => { resolveStatus = resolve }))
-  return {
-    /** Settle the reattach on an already-dead session (no URL, no status the resolver can use) —
-     *  opens the composer gate without disturbing whatever `StartAppControl` already framed. */
-    settle: () =>
-      resolveStatus?.({
-        sessionId, projectId, appId: 'a1', status: 'ended', previewUrl: null,
-        lastSeq: null, createdAt: 'c', updatedAt: 'u',
-      }),
-  }
-}
-
-/**
  * The full PRESS path: send a turn, wait for the plan-options card, click Build it.
  *
  * The click is a HANDOFF, not a stream into this chat: it creates a second chat, starts the turn
@@ -264,18 +201,17 @@ export async function sendAndConfirm(text = 'a visitor app') {
  * literal `null` and a legitimate `false` fails to typecheck.
  *
  * @param {{
- *   deps?: object,
  *   projectId?: string,
  *   hasSavedBuild?: boolean | null,
  *   initialEntries?: string[],
  * }} [opts]
  */
-export function renderBuilder({ deps, projectId = 'p1', hasSavedBuild = null, initialEntries = ['/chat/build-X?projectId=p1&kind=build'] } = {}) {
+export function renderBuilder({ projectId = 'p1', hasSavedBuild = null, initialEntries = ['/chat/build-X?projectId=p1&kind=build'] } = {}) {
   return render(
     <MemoryRouter initialEntries={initialEntries}>
       <Routes>
         <Route element={<WorkspaceShell />}>
-          <Route path="/chat/:chatId" element={<ConversationSurface projectId={projectId} projectName="VIP Movement" projectHasSavedBuild={hasSavedBuild} buildSessionDeps={deps} />} />
+          <Route path="/chat/:chatId" element={<ConversationSurface projectId={projectId} projectName="VIP Movement" projectHasSavedBuild={hasSavedBuild} />} />
         </Route>
         <Route path="/projects" element={<div>projects index</div>} />
         <Route path="/projects/:pid" element={<div>project page</div>} />
@@ -283,29 +219,6 @@ export function renderBuilder({ deps, projectId = 'p1', hasSavedBuild = null, in
     </MemoryRouter>,
   )
 }
-
-// ─── Fixtures for the PREVIEW ADDRESS and its two scoping predicates ─────────────
-//
-// A predicate is only OBSERVABLE when the chat/project on screen differs from the one a signal
-// was attributed to — these two fixtures supply an anchor attributed to whatever project is on
-// screen, and a render helper that can move the SAME instance to a sibling chat or project.
-
-/**
- * A transcript whose newest assistant part anchors a build with no recorded outcome.
- *
- * This is all a reattach needs (`reattachToLiveBuild`): the page reads the session id off the
- * anchor and stamps `sessionChatRef`/`sessionProjectRef` with the identities it is CURRENTLY
- * mounted at, then calls `getStatus`. Pair it with a `getStatus` answering a `previewUrl`.
- */
-export const withLiveBuildAnchor = (sessionId = 'live-7', over = {}) => ({
-  id: 'build-X',
-  kind: 'build',
-  messages: [
-    { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
-    { id: 'srv_1_g', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId }] },
-  ],
-  ...over,
-})
 
 /**
  * Render BuilderPage at an EXPLICIT chat/project identity, and hand back a `moveTo` that changes
@@ -318,7 +231,6 @@ export const withLiveBuildAnchor = (sessionId = 'live-7', over = {}) => ({
  *   projectId?: string,
  *   projectName?: string,
  *   hasSavedBuild?: boolean | null,
- *   deps?: object,
  * }} [opts]
  */
 export function renderBuilderAt({
@@ -326,7 +238,6 @@ export function renderBuilderAt({
   projectId = 'pA',
   projectName = 'VIP Movement',
   hasSavedBuild = null,
-  deps,
 } = {}) {
   const at = { chatId, projectId, projectName }
   const tree = () => (
@@ -341,7 +252,6 @@ export function renderBuilderAt({
                 projectId={at.projectId}
                 projectName={at.projectName}
                 projectHasSavedBuild={hasSavedBuild}
-                buildSessionDeps={deps}
               />
             }
           />

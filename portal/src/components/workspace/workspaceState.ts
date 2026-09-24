@@ -7,7 +7,8 @@
  *
  * IT DOES NOT ANSWER WHAT TO FRAME: there is no URL field to put one in, and that absence is the
  * enforcement. The address comes only from `utils/previewAddress.ts`, whose precedence — a live
- * turn's preview outranks the session URL — a `PreviewState` in hand here would silently drop.
+ * turn's preview outranks the relaunched and project URLs — a `PreviewState` in hand here would
+ * silently drop.
  *
  * FOUR STATES A CITIZEN READS, PLUS ONE INTERNAL.
  *

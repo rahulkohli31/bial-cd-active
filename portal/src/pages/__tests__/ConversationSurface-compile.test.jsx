@@ -14,7 +14,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
-  FakeEventSource, makeClient, primeClient,
   waitForGateOpen, T_STEP, T_WORKSPACE, T_PREVIEW, T_BUILD_END, T_DELTA, PREVIEW_URL,
   inWorkspace,
 } from './_builderSession.jsx'
@@ -24,7 +23,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  relaunchPreview: vi.fn(), getStatus: vi.fn(),
+  relaunchPreview: vi.fn(),
   fetchPreviewState: vi.fn(), fetchCompileState: vi.fn(), fetchSaveState: vi.fn(),
   checkWorkspace: vi.fn(),
 }))
@@ -80,12 +79,10 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
 import ConversationSurface from '../../components/chat/ConversationSurface'
 
 function renderThread(chatId = 'thread-1') {
-  const fake = new FakeEventSource(chatId)
-  const deps = { client: makeClient(h), eventSourceFactory: () => fake }
   return render(
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <Routes>
-        {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" buildSessionDeps={deps} />} />)}
+        {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" />} />)}
       </Routes>
     </MemoryRouter>,
   )
@@ -154,7 +151,6 @@ beforeEach(() => {
   reportStall = null
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])

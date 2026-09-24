@@ -24,7 +24,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
 import {
-  FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
+  PREVIEW_URL, renderBuilder,
   waitForGateOpen, composer, T_WORKSPACE, T_PREVIEW,
 } from './_builderSession.jsx'
 import type { PreviewLifeState, PreviewState } from '../../utils/buildSessionApi'
@@ -38,7 +38,6 @@ const h = vi.hoisted(() => ({
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(),
   relaunchPreview: vi.fn(),
   fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
 }))
@@ -73,18 +72,11 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
   ...(await orig<typeof import('../../utils/buildSessionApi')>()),
   fetchPreviewState: (...a: unknown[]) => h.fetchPreviewState(...a),
   fetchSaveState: (...a: unknown[]) => h.fetchSaveState(...a),
-  // THE START CONTROL CALLS THE MODULE, NOT THE INJECTED CLIENT. `relaunchPreview`
-  // reached the build-session hook through `deps.client` before, so mocking the client bag was
-  // enough; the one start control the product has now imports the function directly, because it
-  // is rendered by the app pane and the pane is a sibling of the surface that owns the client.
-  // Without this line the relaunch assertions below watch a mock nothing calls.
+  // `StartAppControl` imports `relaunchPreview` directly from this module — it is rendered by
+  // the app pane, a sibling of the surface. Without this line the relaunch assertions below
+  // watch a mock nothing calls.
   relaunchPreview: (...a: unknown[]) => h.relaunchPreview(...a),
 }))
-
-function deps() {
-  const fake = new FakeEventSource('x')
-  return { client: makeClient(h), eventSourceFactory: () => fake }
-}
 
 /**
  * Scripts an ordinary send's own turn stream as an OPEN socket a test can push frames into by
@@ -198,7 +190,7 @@ const tick = (cadences = 1) =>
 async function framedBuild(hasSavedBuild: boolean | null = null) {
   const turn = scriptTurn()
   h.readTurnStream.mockImplementation(turn.impl)
-  renderBuilder({ deps: deps(), hasSavedBuild })
+  renderBuilder({ hasSavedBuild })
   await send()
   await waitFor(() => expect(h.readTurnStream).toHaveBeenCalled())
   vi.useFakeTimers()
@@ -210,7 +202,6 @@ async function framedBuild(hasSavedBuild: boolean | null = null) {
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.relaunchPreview.mockResolvedValue({
     appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false, ready: true,
   })

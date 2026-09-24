@@ -11,14 +11,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
-import { FakeEventSource, makeClient, primeClient, PLAN_CARD_ID, primeTurn, waitForGateOpen } from './_builderSession.jsx'
+import { PLAN_CARD_ID, primeTurn, waitForGateOpen } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), getBuild: vi.fn(),
   listProjectConversations: vi.fn(), createConversation: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -51,18 +50,15 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
 import ConversationSurface from '../../components/chat/ConversationSurface'
 
 function renderBuilder(chatId = 'build-X') {
-  const fake = new FakeEventSource(chatId)
-  const deps = { client: makeClient(h), eventSourceFactory: () => fake }
-  const view = render(
+  return render(
     <MemoryRouter initialEntries={[`/chat/${chatId}?projectId=p1&kind=build`]}>
       <Routes>
-        <Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="VIP Movement" buildSessionDeps={deps} />} />
+        <Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="VIP Movement" />} />
         <Route path="/projects/:projectId" element={<div>project home</div>} />
         <Route path="/projects" element={<div>projects index</div>} />
       </Routes>
     </MemoryRouter>,
   )
-  return { ...view, fake }
 }
 
 /**
@@ -82,7 +78,6 @@ async function startBuild(text = 'make it blue') {
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])

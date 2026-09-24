@@ -21,9 +21,6 @@ from src.api.v1.build_sessions.schemas import BillingSessionFactory as BillingSe
 from src.api.v1.build_sessions.schemas import BuildError as BuildError
 from src.api.v1.build_sessions.schemas import BuildResult as BuildResult
 from src.api.v1.build_sessions.schemas import BuildSessionStatus as BuildSessionStatus
-from src.api.v1.build_sessions.schemas import (
-    BuildSessionStatusResponse as BuildSessionStatusResponse,
-)
 from src.api.v1.build_sessions.schemas import EndedEvent as EndedEvent
 from src.api.v1.build_sessions.schemas import ErrorEvent as ErrorEvent
 from src.api.v1.build_sessions.schemas import ErrorSource as ErrorSource

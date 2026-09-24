@@ -1,4 +1,4 @@
-"""Shared fixtures for the build-session router + SSE tests: cookie/CSRF auth, the
+"""Shared fixtures for the build-session router tests: cookie/CSRF auth, the
 dep-override wiring, and `a_live_session` — the one door left into a live in-process session."""
 
 from __future__ import annotations
@@ -69,16 +69,8 @@ async def a_live_session(
 ) -> BuildSession:
     """A live in-process session holding this project's container — THE door, packaged once.
 
-    `ensure_sandbox` is the allocator production actually uses, and since `manager.start` and
-    the bare `POST /v1/build-sessions` were deleted it is the ONLY one: nothing else claims the
-    one-per-user slot, registers in `_active_by_user`, or hands back a session id the surviving
-    `{session_id}` routes can resolve. Every test in this package that used to conjure a session
-    by starting a build now comes through here.
-
-    One thing the deleted start route produced that this deliberately does NOT: envelopes. A
-    test that needs progress frames — a terminal `ended` included — pushes them through
-    `manager.on_progress`, which documents that it must derive correct state from envelopes
-    handed to it directly.
+    `ensure_sandbox` is the allocator production actually uses, and the ONLY one: nothing else
+    claims the one-per-user slot or registers in `_active_by_user`.
 
     `may_write=True` by default because that is what the guards this package tests actually
     branch on — `_writing_session_holds` is what makes Save refuse — and a read-only default

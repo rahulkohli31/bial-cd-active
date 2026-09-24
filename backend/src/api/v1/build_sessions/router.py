@@ -2,19 +2,12 @@
 
 WHY THIS EXISTS
 
-`status` + the SSE feed + `relaunch` + the project-scoped save/preview/stop ops + the
-superadmin `internal/reap`, all owner-scoped by `user.id`: every not-found-or-other-user case
-is a non-leaking 404. The mutating POSTs carry the reusable `RequireCsrf` dependency; the
-`status` GET and the GET-SSE progress feed (`sse.py`, `Last-Event-ID`-resumable) are exempt.
+`relaunch` + the project-scoped save/preview/stop ops + the superadmin `internal/reap`, all
+owner-scoped by `user.id`: every not-found-or-other-user case is a non-leaking 404. The mutating
+POSTs carry the reusable `RequireCsrf` dependency; the GETs are exempt.
 
-THERE IS NO `start` ANY MORE, and the two `{session_id}` routes below serve HISTORICAL sessions
-only. The bare `POST` on this collection — the start route — lost its browser client and was
-deleted here with the whole harness behind it; the last lock op, `lock/force-end`, went with it,
-and the session-scoped `stop` followed once nothing could mint a session id for a client to name.
-The only remaining producer of a session id the portal can reach is a `build_started` transcript
-row written before that deletion — those rows are permanent, so `status`/`events` stay as their
-reader. A build now runs as an ordinary Write chat turn, which registers its workspace through
-`SessionManager.ensure_sandbox` and never serialises a session id at all.
+No route here is addressed by a session id. A build runs as an ordinary Write chat turn, which
+registers its workspace through `SessionManager.ensure_sandbox` and never serialises one.
 
 One inbound route here is not a control op at all — `projects/{project_id}/client-error`,
 where the app's own in-browser error reporter's findings arrive by way of the portal. It
@@ -30,8 +23,8 @@ from typing import Any
 
 import sqlalchemy as sa
 import structlog
-from fastapi import APIRouter, Request, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, status
+from fastapi.responses import JSONResponse
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_rbac import CurrentSuperadmin
@@ -43,7 +36,6 @@ from src.api.v1.build_sessions.deps import (
 )
 from src.api.v1.build_sessions.schemas import (
     BuildSessionStatus,
-    BuildSessionStatusResponse,
     ClientErrorReportRequest,
     ClientErrorReportResponse,
     CompileStateResponse,
@@ -57,7 +49,6 @@ from src.api.v1.build_sessions.schemas import (
     SharedPreviewResponse,
     WorkspaceCheckResponse,
 )
-from src.api.v1.build_sessions.sse import build_sse_response
 from src.api.v1.live_build import ReclaimBlockedError, reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.core.integrity_types import WorkspaceState
@@ -66,7 +57,6 @@ from src.db.models.conversation import Conversation
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
 from src.services.build_sessions import (
-    BuildSession,
     BuildSessionConflictError,
     NoLiveSandboxError,
     NoSnapshotToRelaunchError,
@@ -74,7 +64,6 @@ from src.services.build_sessions import (
     SandboxReclaimBlockedError,
     SandboxUnreachableError,
     SaveState,
-    SessionManager,
     SharedProjectHasNoAppError,
     SnapshotUnavailableError,
     StopOutcome,
@@ -137,16 +126,6 @@ class ConflictEnvelope(CamelModel):
     error: _ConflictError
 
 
-def _owned_or_404(
-    manager: SessionManager, session_id: uuid.UUID, user_id: uuid.UUID
-) -> BuildSession:
-    """Load a session scoped to its owner, or fail closed with a 404."""
-    session = manager.get(session_id)
-    if session is None or session.user_id != user_id:
-        raise AppApiError(status.HTTP_404_NOT_FOUND, "Build session not found.")
-    return session
-
-
 class BuildConflictEnvelope(CamelModel):
     """The 409 for a route that can conflict two ways: this very project's own work already
     running, or a COLLEAGUE'S SHARED VIEW holding the one workspace
@@ -206,7 +185,7 @@ def _coordination_is_gone() -> AppApiError:
     return coordination_is_gone()
 
 
-# --- internal/reap (registered FIRST so `internal` is never parsed as a session id) ---
+# --- internal/reap ---
 
 
 @router.post(
@@ -227,10 +206,6 @@ async def internal_reap(
     """Operator-triggered full reconciliation sweep — `CurrentSuperadmin`-guarded, CSRF'd,
     audited, idempotent, concurrency-safe. The by-hand door onto the same sweep the scheduled
     pass runs; this route itself is cookie-only, so nothing machine-authed can drive it."""
-    # Retention sweep of ended in-process sessions rides the same operator path (the other
-    # opportunistic seam is start()) — nothing evicts them on a timer, and nothing scheduled
-    # could: this map is per-process state another process cannot reach.
-    manager.evict_ended_sessions()
     # The sweep walks the registry namespace with bare primitives, so an outage here is a 503
     # to the operator rather than an opaque 500. The audit row is deliberately inside: a sweep
     # that never ran is not an action worth recording. Redis is resolved LAZILY inside the seam,
@@ -260,7 +235,7 @@ async def internal_reap(
     raise _coordination_is_gone()
 
 
-# --- control ops: relaunch / status -------------------------------------------
+# --- control ops: relaunch ----------------------------------------------------
 
 
 @router.post(
@@ -351,51 +326,6 @@ async def relaunch_preview(
             ready=relaunched.ready,
         )
     raise _coordination_is_gone()
-
-
-@router.get(
-    "/{session_id}",
-    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Build session not found")),
-)
-async def build_status(
-    session_id: uuid.UUID, user: CurrentUser, manager: SessionManagerDep
-) -> BuildSessionStatusResponse:
-    session = _owned_or_404(manager, session_id, user.id)
-    return BuildSessionStatusResponse(
-        session_id=session.session_id,
-        project_id=session.project_id,
-        app_id=session.app_id,
-        status=session.status,
-        preview_url=session.preview_url,
-        last_seq=session.last_seq if session.last_seq > 0 else None,
-        created_at=session.created_at,
-        updated_at=session.updated_at,
-    )
-
-
-def _parse_last_event_id(raw: str | None) -> int | None:
-    """The SSE resume cursor. Absent → None (live-from-now); a non-integer is ignored
-    (treated as absent) rather than 4xx'ing a reconnect."""
-    if raw is None:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
-
-
-@router.get(
-    "/{session_id}/events",
-    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Build session not found")),
-)
-async def build_events(
-    session_id: uuid.UUID, request: Request, user: CurrentUser, manager: SessionManagerDep
-) -> StreamingResponse:
-    """The build-session SSE progress feed (cookie-authed, `Last-Event-ID`-resumable, no CSRF). The
-    only synchronous pre-stream failure is the 404 ownership check; a brain failure is
-    delivered IN-BAND as a synthesized terminal FAILED `ended` + `[DONE]`."""
-    session = _owned_or_404(manager, session_id, user.id)
-    return build_sse_response(session, _parse_last_event_id(request.headers.get("last-event-id")))
 
 
 # A turn is held open by the wall-clock lease the SERVER renews, legible to a sweep in another

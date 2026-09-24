@@ -78,7 +78,7 @@ const shellRoot = () => grid().parentElement as HTMLElement
 
 /** Every pane prop at its quiet default. Individual tests set only what they are about. */
 const EMPTY_PANE: PaneView = {
-  iterating: false, reconnecting: false,
+  reconnecting: false,
   previewState: null, turnRunning: false,
   compileState: null, workspaceLost: false,
 }
