@@ -63,37 +63,12 @@ class SandboxConfig(BaseModel):
     # signing account's account_url — a defined, correct default (fail-first optional-knob rule).
     blob_base_url: str | None = None
 
-    # --- fleet reclamation --------------------------------------------------
-    # TWO FLAGS, NOT ONE, and the split is the whole safety posture. `reclaim_enabled` turns the
-    # PASS on — it enumerates, classifies, and reports what it would do. `reclaim_destroy` is what
-    # lets it act. Collapsing them into one switch would mean the only way to see what reclamation
-    # would do is to let it do it, and there would be no state in which an operator can read a
-    # candidate list before agreeing to it.
-    #
-    # Both default OFF, in every environment. `reclaim_destroy` additionally must not be flipped
-    # until the ARM tag backfill reports zero untagged sandboxes — an untagged
-    # container is escalate-only, so flipping early buys a feature that reclaims nothing while
-    # every check reads green.
-    reclaim_enabled: bool = False
-    reclaim_destroy: bool = False
-    # THE SWEEP THAT HAS ALWAYS RUN, and this default is the whole point of the flag existing
-    # separately. `sweep_all` → `reconcile_user` → `reap_user` predates these reclaim flags
-    # entirely: it was an UNFLAGGED `while True` in the API lifespan, running wherever a
-    # sandbox was configured, and it does almost all of the deleting. Porting it onto the
-    # scheduler changes WHERE it runs; hanging it off `reclaim_enabled` would have changed
-    # WHETHER it runs, and since that flag ships off in every environment, deploying this
-    # release would have stopped all reaping while every health check read green. The only
-    # symptom would have been the bill.
-    #
-    # So: on by default, because a port must not change behaviour. It remains a real kill switch
-    # for an operator who needs to stop the timer, and it gates the CLOCK only — reconcile-on-
-    # start and `POST /v1/build-sessions/internal/reap` are unaffected. (That path used to be
-    # written `/v1/internal/reap` here, which 404s: the route is on the build-sessions router.)
+    # THE KILL SWITCH FOR THE SCHEDULED SWEEP. `sweep_all` → `reconcile_user` → `reap_user` does
+    # almost all of the fleet's deleting, on a timer; an operator who needs to stop that timer
+    # flips this. It gates the CLOCK only — reconcile-on-start and
+    # `POST /v1/build-sessions/internal/reap` are unaffected. On by default: this is a live
+    # sweep, not a report-only preview.
     sweep_enabled: bool = True
-    # The fleet size at which a pass raises the cost alarm. Not a limit — nothing is refused
-    # at this number; it is the point at which a human should be told the fleet is larger than
-    # anyone intended.
-    reclaim_fleet_alarm_threshold: PositiveInt = 25
     # --- the absolute age ceiling -------------------------------------------
     # THE ONE RULE THAT DOES NOT ASK WHETHER ANYTHING IS CLAIMING THE CONTAINER. Every other
     # sparing signal — the lease, the starting marker, the lock, the stay — is a claim, so a

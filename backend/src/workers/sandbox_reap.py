@@ -38,9 +38,6 @@ def _off_duty_because() -> str | None:
         # The sweep enumerates from the registry, so with no coordination store it would report
         # a zero it has not earned rather than an answer.
         return "unconfigured"
-    # `sweep_enabled`, NOT `reclaim_enabled`: this flag gates this sweep and ships ON, while
-    # `reclaim_enabled` gates the reclamation pass and is off everywhere. Reading the other one
-    # here would stop all reaping on every deployment that has not opted into that pass.
     if settings.sandbox is None or not settings.sandbox.sweep_enabled:
         return "flag_off"
     # This gates the SCHEDULED sweep only: `POST /v1/build-sessions/internal/reap` still runs

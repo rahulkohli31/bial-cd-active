@@ -1,8 +1,8 @@
 """The import graph must let a NON-FastAPI process import `src/`.
 
-WHY THIS EXISTS. Reclamation moves out of the API process onto a Taskiq worker. That worker
-imports `src.services.build_sessions.reaper` and `src.services.deploy.reconcile` without ever
-building a FastAPI app. Those imports used to FAIL — not because the services needed the API,
+WHY THIS EXISTS. The scheduled sandbox sweep runs on a Taskiq worker. That worker imports
+`src.services.build_sessions.reaper` and `src.services.deploy.reconcile` without ever building a
+FastAPI app. Those imports used to FAIL — not because the services needed the API,
 but because `src/api/v1/build_sessions/__init__.py` re-exported `deps` and `router` at package
 level, so touching any of its schemas dragged the whole route tree in behind it. Those six lines
 were dead: every real consumer already imported the submodule.
@@ -46,8 +46,8 @@ def _import_in_fresh_interpreter(snippet: str) -> subprocess.CompletedProcess[st
 
 
 def test_the_reaper_imports_without_the_fastapi_app() -> None:
-    """The worker's reclamation task imports this. It used to raise on a cold interpreter, before
-    `build_sessions/__init__.py` stopped re-exporting `deps`/`router`."""
+    """The worker's scheduled sweep task imports this. It used to raise on a cold interpreter,
+    before `build_sessions/__init__.py` stopped re-exporting `deps`/`router`."""
     result = _import_in_fresh_interpreter(
         "import importlib;"
         " importlib.import_module('src.services.build_sessions.reaper');"

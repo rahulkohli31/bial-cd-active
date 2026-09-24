@@ -69,8 +69,6 @@ from src.api.v1.admin.schemas import (
     MarkDeployedResponse,
     PatchAppRequest,
     PrefixReconcileCounts,
-    ReclamationCandidate,
-    ReclamationReportResponse,
     RejectRequest,
     RoleReconcileCounts,
     SandboxReconcileResponse,
@@ -111,7 +109,6 @@ from src.db.models.project_database import ProjectDatabase
 from src.db.models.token_usage import TokenUsage, TokenUsageKind
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
-from src.db.models.worker_pass import PassOutcome, WorkerPass
 from src.schemas import ADMIN_AUTH, AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.appdb.engine import get_maintenance_engine
 from src.services.appdb.errors import AppDatabaseUnconfiguredError
@@ -139,8 +136,6 @@ from src.services.build_sessions.inventory import (
     backfill_sandbox_tags,
     take_sandbox_inventory,
 )
-from src.services.build_sessions.pass_history import reclamation_pass_freshness
-from src.services.build_sessions.reclamation_pass import run_reclamation_pass
 from src.services.deploy.aca_publish import DeployNotConfiguredError, get_published_apps
 from src.services.deploy.reconcile import reconcile_stalled_deployments
 from src.services.rbac.roles import is_super_duper_admin, role_for
@@ -165,7 +160,6 @@ from src.services.usage.limits import (
     MODEL_CONTEXT_WINDOW,
     effective_context,
 )
-from src.workers.reclamation import RECLAMATION_TASK_NAME
 
 _log = structlog.get_logger()
 
@@ -1476,141 +1470,16 @@ async def reconcile_sandboxes(
             },
         )
         await db.commit()
-        last_pass, stale = await reclamation_pass_freshness(db)
         return SandboxReconcileResponse(
             live=len(inventory.live),
             registered=len(inventory.registered),
             unregistered=list(inventory.unregistered),
             registered_missing=list(inventory.registered_missing),
-            last_reclamation_pass_at=last_pass,
-            reclamation_stale=stale,
         )
     # Reached only when `build_coordination_or_503` skipped the body on an unconfigured
     # Redis. The registry IS half of this reconcile — without it there is no "registered"
     # set to diff the live fleet against, so an answer here would be a fleet inventory
     # dressed up as a reconciliation, with every live container reported as unregistered.
-    raise coordination_is_gone()
-
-
-async def _what_the_worker_actually_did(db: DbSession) -> tuple[PassOutcome | None, str | None]:
-    """The newest reclamation pass's `(outcome, detail)`, or `(None, None)` if none was ever run.
-
-    THE FIELD `reclaimEnabled` CANNOT ANSWER THIS AND NEVER COULD. It is the API process's own
-    flag; the pass is gated on the worker's, in another container reading another env file. The
-    row the worker wrote is the only artefact in this deployment that both processes agree about,
-    so it is what the report quotes.
-    """
-    # A SECOND READ OF THE SAME ROW `reclamation_pass_freshness` just took, deliberately. That
-    # function owns exactly one question — is the worker alive — and answers it for two endpoints;
-    # widening its return to carry an outcome would push the reporting concern into the liveness
-    # check that `reconcile-sandboxes` also depends on. The cost is one extra indexed single-row
-    # select on a superadmin-only, human-invoked endpoint. Worst case under READ COMMITTED is a
-    # pass landing between the two reads, which pairs a fresh timestamp with the previous outcome
-    # — one tick of staleness in a report whose whole subject is a 15-minute cadence.
-    row = (
-        await db.execute(
-            sa.select(WorkerPass.outcome, WorkerPass.detail)
-            .where(WorkerPass.task_name == RECLAMATION_TASK_NAME)
-            .order_by(WorkerPass.finished_at.desc())
-            .limit(1)
-        )
-    ).one_or_none()
-    if row is None:
-        return None, None
-    # The member itself: the response model is typed `PassOutcome`, so pydantic owns the wire
-    # rendering and a future change to the enum's base class cannot silently re-spell it here.
-    return row.outcome, row.detail
-
-
-@router.post(
-    "/reclamation-report",
-    responses=error_responses(
-        (503, ErrorEnvelope, "The sandbox control plane is temporarily unavailable"),
-        *_ADMIN_AUTH,
-    ),
-)
-async def reclamation_report(
-    admin: CurrentSuperadmin, db: DbSession, sandbox: OptionalSandbox
-) -> ReclamationReportResponse:
-    """WHAT WOULD THE RECLAMATION PASS DELETE RIGHT NOW?
-
-    IT DESTROYS NOTHING, AND CANNOT. `run_reclamation_pass` is the pure half: it enumerates ARM,
-    reads the coordination store as a spare-list, reads the app table, and returns verdicts. The
-    staging stamp and the destroy arm live in the worker task, not here, and neither is
-    reachable from this function. That is a property of the seam, not a flag this endpoint
-    remembers to check."""
-    # THE QUESTION THERE WAS NO WAY TO ASK. Before flipping `SANDBOX__RECLAIM_DESTROY` an
-    # operator could learn what a pass would do in exactly two ways: read the worker's logs after
-    # a pass had already run, or turn destruction on and find out. Both answer after the decision
-    # is made. The whole two-flag design rests on there being a state in which somebody reads a
-    # candidate list and agrees with it.
-    #
-    # ANSWERS WITH THE FLAGS OFF, deliberately. Refusing to preview because reclamation is
-    # disabled would withhold the report exactly when it is most wanted — the deployment deciding
-    # whether to enable it. So the flags come back in the response instead, because they change
-    # what the same `destroy` list MEANS: a preview on a report-only deployment, a description of
-    # what is about to happen on an armed one.
-    #
-    # Audited with COUNTS ONLY, like every sibling report here. The names go in the response,
-    # where the operator needs them.
-    if sandbox is None or not isinstance(sandbox, FleetLister):
-        # Retryable-shaped, not a 500: nothing is wrong with the request — this deployment has no
-        # ARM access, or a substrate that cannot enumerate, so it cannot answer.
-        raise AppApiError(503, _SANDBOX_UNAVAILABLE)
-    with build_coordination_or_503():
-        try:
-            report = await run_reclamation_pass(control_plane=sandbox)
-        except SandboxError as exc:
-            # A half-enumerated fleet must never be reported as a whole one: "nothing to collect"
-            # read off a truncated list is the answer that gets a ghost forgotten, and it is
-            # indistinguishable from success.
-            raise AppApiError(503, _SANDBOX_UNAVAILABLE) from exc
-        await append_audit(
-            db,
-            actor_id=admin.id,
-            action="sandbox:reclamation_report",
-            resource_type="sandbox",
-            resource_id=None,
-            detail={
-                "scanned": report.scanned,
-                "spared": report.spared,
-                "staged": report.staged,
-                "destroy": report.destroy,
-                "escalate": report.escalate,
-                "notOurs": report.not_ours,
-                "storeFault": report.store_fault,
-                "untagged": report.untagged,
-            },
-        )
-        await db.commit()
-        last_pass, stale = await reclamation_pass_freshness(db)
-        outcome, detail = await _what_the_worker_actually_did(db)
-        flags = settings.sandbox
-        return ReclamationReportResponse(
-            scanned=report.scanned,
-            spared=report.spared,
-            staged=report.staged,
-            destroy=report.destroy,
-            escalate=report.escalate,
-            not_ours=report.not_ours,
-            untagged=report.untagged,
-            store_fault=report.store_fault,
-            candidates=[
-                ReclamationCandidate(
-                    name=c.name, tier=str(c.tier), verdict=str(c.verdict), reason=c.reason
-                )
-                for c in report.candidates
-            ],
-            reclaim_enabled=flags is not None and flags.reclaim_enabled,
-            reclaim_destroy=flags is not None and flags.reclaim_destroy,
-            last_reclamation_pass_at=last_pass,
-            reclamation_stale=stale,
-            last_pass_outcome=outcome,
-            last_pass_detail=detail,
-        )
-    # Reached only when `build_coordination_or_503` skipped the body on an unconfigured Redis.
-    # The spare-list IS the classifier's second source — without it every claimed container reads
-    # as unclaimed, which is a preview of a fleet-wide deletion rather than a report.
     raise coordination_is_gone()
 
 
@@ -1628,20 +1497,17 @@ async def backfill_sandbox_tags_endpoint(
 
     THIS DESTROYS NOTHING. It only writes tags, via ARM merge-`PATCH`, which creates no revision
     and cannot touch container env — a live sandbox being stamped keeps its replica, its restart
-    count and its supervisor bearer. Until this has run and the fleet reports zero untagged
-    sandboxes, `SANDBOX_RECLAIM_DESTROY` must stay off."""
-    # WHY THIS IS A RELEASE PREREQUISITE AND NOT A FOLLOW-UP. Everything provisioned from the
-    # identity-stamping release onward carries owner, app, control plane and a self-stamped
-    # creation time on the ARM resource, so it can be judged with Redis down. Every container
-    # created BEFORE that carries nothing — and those are exactly the ghosts this whole plan
-    # exists to collect.
+    count and its supervisor bearer."""
+    # WHY THIS RUNS AT ALL. Everything provisioned from the identity-stamping release onward
+    # carries owner, app, control plane and a self-stamped creation time on the ARM resource, so
+    # a container is judgeable with Redis down — that self-stamped `created_at` is what the
+    # fleet sweep's own age ceiling reads. Every container created BEFORE that carries nothing.
     #
     # OWNERSHIP IS RECOVERED, NEVER GUESSED. `app_name_for` keeps 28 of an app_id's 32 hex
     # characters, so a sandbox name is NOT invertible; names are matched FORWARD against the app
     # table. A container matching no row is stamped `kind` + `backfilled_at` and nothing else — no
-    # owner, no app — which leaves it escalate-forever: reported on every pass, destroyed by none
-    # of them. Inventing a plausible owner for it is the one move the escalate-never-destroy
-    # architecture exists to prevent.
+    # owner, no app — and stays for an operator to find in the `unowned` count. Inventing a
+    # plausible owner for it is the one move this would need to be careful never to make.
     #
     # A sibling of the three reconcilers above in every operational respect: superadmin-gated,
     # operator-invoked, idempotent (an already-tagged container is skipped, so the age clock is

@@ -3115,16 +3115,6 @@
         "title": "OkResponse",
         "type": "object"
       },
-      "PassOutcome": {
-        "description": "How a pass ended. A NATIVE PG enum, so a typo is a database error.",
-        "enum": [
-          "ok",
-          "declined",
-          "failed"
-        ],
-        "title": "PassOutcome",
-        "type": "string"
-      },
       "PatchAppRequest": {
         "properties": {
           "loginRequired": {
@@ -3871,140 +3861,6 @@
         "title": "ReclaimBlockedError",
         "type": "object"
       },
-      "ReclamationCandidate": {
-        "description": "One container the pass would act on, with the evidence behind the decision.\n\nTHE TIER AND THE REASON TRAVEL WITH THE VERDICT, deliberately. An operator reading this at 2am\nhas to be able to DISAGREE with it — \"high_confidence / staged on an earlier pass and idle\nsince\" is a claim they can check, and a bare `destroy` is one they can only accept.",
-        "properties": {
-          "name": {
-            "title": "Name",
-            "type": "string"
-          },
-          "reason": {
-            "title": "Reason",
-            "type": "string"
-          },
-          "tier": {
-            "title": "Tier",
-            "type": "string"
-          },
-          "verdict": {
-            "title": "Verdict",
-            "type": "string"
-          }
-        },
-        "required": [
-          "name",
-          "tier",
-          "verdict",
-          "reason"
-        ],
-        "title": "ReclamationCandidate",
-        "type": "object"
-      },
-      "ReclamationReportResponse": {
-        "description": "What the reclamation pass would do RIGHT NOW, without doing any of it.\n\nTHE QUESTION AN OPERATOR COULD NOT ASK before: the only ways to learn what a pass would\ndelete were the worker's logs after the fact, or arming it to find out. This answers before\nthe decision, running the same classifier over the same three sources.\nTHE FLAGS TRAVEL WITH THE VERDICTS because they change what the verdicts MEAN: the same\n`destroy` list is a preview off-armed, a description of what is about to happen once armed.\nCOUNTS TO THE AUDIT ROW, NAMES ONLY TO THE RESPONSE — the split every sibling report makes.",
-        "properties": {
-          "candidates": {
-            "items": {
-              "$ref": "#/components/schemas/ReclamationCandidate"
-            },
-            "title": "Candidates",
-            "type": "array"
-          },
-          "destroy": {
-            "title": "Destroy",
-            "type": "integer"
-          },
-          "escalate": {
-            "title": "Escalate",
-            "type": "integer"
-          },
-          "lastPassDetail": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Lastpassdetail"
-          },
-          "lastPassOutcome": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/PassOutcome"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "lastReclamationPassAt": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Lastreclamationpassat"
-          },
-          "notOurs": {
-            "title": "Notours",
-            "type": "integer"
-          },
-          "reclaimDestroy": {
-            "title": "Reclaimdestroy",
-            "type": "boolean"
-          },
-          "reclaimEnabled": {
-            "title": "Reclaimenabled",
-            "type": "boolean"
-          },
-          "reclamationStale": {
-            "default": true,
-            "title": "Reclamationstale",
-            "type": "boolean"
-          },
-          "scanned": {
-            "title": "Scanned",
-            "type": "integer"
-          },
-          "spared": {
-            "title": "Spared",
-            "type": "integer"
-          },
-          "staged": {
-            "title": "Staged",
-            "type": "integer"
-          },
-          "storeFault": {
-            "title": "Storefault",
-            "type": "boolean"
-          },
-          "untagged": {
-            "title": "Untagged",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "scanned",
-          "spared",
-          "staged",
-          "destroy",
-          "escalate",
-          "notOurs",
-          "untagged",
-          "storeFault",
-          "candidates",
-          "reclaimEnabled",
-          "reclaimDestroy"
-        ],
-        "title": "ReclamationReportResponse",
-        "type": "object"
-      },
       "RefreshResponse": {
         "description": "Body returned on a successful silent refresh.",
         "properties": {
@@ -4295,26 +4151,9 @@
       "SandboxReconcileResponse": {
         "description": "The operator-invoked sandbox-fleet sweep's report.\n\nA SIBLING of the storage and database reports, and report-only for the same reason: the\nambiguity between \"orphaned\" and \"provisioned seconds ago, registry not written yet\" is not\nsomething to hand an irreversible ARM delete.\n\nCounts for the fleet, NAMES only for the gaps — the operator needs those to act on. The\nnames travel in the RESPONSE and never in the audit row.",
         "properties": {
-          "lastReclamationPassAt": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Lastreclamationpassat"
-          },
           "live": {
             "title": "Live",
             "type": "integer"
-          },
-          "reclamationStale": {
-            "default": true,
-            "title": "Reclamationstale",
-            "type": "boolean"
           },
           "registered": {
             "title": "Registered",
@@ -4345,7 +4184,7 @@
         "type": "object"
       },
       "SandboxTagBackfillResponse": {
-        "description": "What one identity backfill pass did to the pre-existing fleet.\n\nTHE BUCKETS SUM: `scanned == alreadyTagged + stamped + skippedNoRow + failed`. `skippedNoRow`\ncontainers WERE stamped (`kind` + `backfilled_at`) but match no app row — a sandbox name keeps\nonly 28 of 32 hex chars, so it is not invertible — and are therefore escalate-forever.\n`unowned` is that same population, RECOUNTED EVERY PASS, deliberately outside the sum: a\ncontainer `alreadyTagged` on pass 2 makes `skippedNoRow` read zero and `scanned` look clean —\nthe trap `unowned` alone still catches. Counts only; failures travel to the logs by name.",
+        "description": "What one identity backfill pass did to the pre-existing fleet.\n\nTHE BUCKETS SUM: `scanned == alreadyTagged + stamped + skippedNoRow + failed`. `skippedNoRow`\ncontainers WERE stamped (`kind` + `backfilled_at`) but match no app row — a sandbox name keeps\nonly 28 of 32 hex chars, so it is not invertible — and stay unowned rather than guessed at.\n`unowned` is that same population, RECOUNTED EVERY PASS, deliberately outside the sum: a\ncontainer `alreadyTagged` on pass 2 makes `skippedNoRow` read zero and `scanned` look clean —\nthe trap `unowned` alone still catches. Counts only; failures travel to the logs by name.",
         "properties": {
           "alreadyTagged": {
             "title": "Alreadytagged",
@@ -5567,7 +5406,7 @@
     },
     "/v1/admin/apps/backfill-sandbox-tags": {
       "post": {
-        "description": "Stamp identity tags onto every sandbox container that predates identity stamping.\n\nTHIS DESTROYS NOTHING. It only writes tags, via ARM merge-`PATCH`, which creates no revision\nand cannot touch container env — a live sandbox being stamped keeps its replica, its restart\ncount and its supervisor bearer. Until this has run and the fleet reports zero untagged\nsandboxes, `SANDBOX_RECLAIM_DESTROY` must stay off.",
+        "description": "Stamp identity tags onto every sandbox container that predates identity stamping.\n\nTHIS DESTROYS NOTHING. It only writes tags, via ARM merge-`PATCH`, which creates no revision\nand cannot touch container env — a live sandbox being stamped keeps its replica, its restart\ncount and its supervisor bearer.",
         "operationId": "backfill_sandbox_tags_endpoint_v1_admin_apps_backfill_sandbox_tags_post",
         "responses": {
           "200": {
@@ -5674,68 +5513,6 @@
           }
         },
         "summary": "App Counts",
-        "tags": [
-          "admin"
-        ]
-      }
-    },
-    "/v1/admin/apps/reclamation-report": {
-      "post": {
-        "description": "WHAT WOULD THE RECLAMATION PASS DELETE RIGHT NOW?\n\nIT DESTROYS NOTHING, AND CANNOT. `run_reclamation_pass` is the pure half: it enumerates ARM,\nreads the coordination store as a spare-list, reads the app table, and returns verdicts. The\nstaging stamp and the destroy arm live in the worker task, not here, and neither is\nreachable from this function. That is a property of the seam, not a flag this endpoint\nremembers to check.",
-        "operationId": "reclamation_report_v1_admin_apps_reclamation_report_post",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReclamationReportResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Not authenticated"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Super-admin privileges required"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Internal server error"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "The sandbox control plane is temporarily unavailable"
-          }
-        },
-        "summary": "Reclamation Report",
         "tags": [
           "admin"
         ]

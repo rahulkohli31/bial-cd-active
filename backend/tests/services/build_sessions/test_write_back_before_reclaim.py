@@ -27,10 +27,9 @@ from src.services.build_sessions.integrity import PORCELAIN_FAILED_MARK
 from src.services.build_sessions.pass_history import (
     _ATTEMPT_MEANING,
     CopyAttempt,
-    reclamation_pass_freshness,
     record_durable_copy_attempt,
 )
-from src.services.build_sessions.reaper import reap_the_container_we_judged, reap_user
+from src.services.build_sessions.reaper import reap_user
 from src.services.build_sessions.snapshot import (
     _NO_REPOSITORY_EXIT,
     SavedCopyOutcome,
@@ -67,8 +66,8 @@ def attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
 
     AUTOUSE, not convenience: `record_durable_copy_attempt` opens its own session and commits, so
     inside this suite's otherwise-rolled-back transaction an unguarded reap would leave a
-    permanent row that `test_reclamation_report_only.py` counts. The one place the real writer
-    runs is `test_the_copy_record_reaches_the_database_and_is_committed` below."""
+    permanent row in the shared test database. The one place the real writer runs is
+    `test_the_copy_record_reaches_the_database_and_is_committed` below, which counts every row."""
     recorded: list[CopyAttempt] = []
 
     async def _spy(attempt: CopyAttempt) -> None:
@@ -369,8 +368,8 @@ async def test_a_container_that_will_not_attach_is_collected_against_a_saved_bun
     fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
 ) -> None:
     """★ THE ESCAPE HATCH FOR A CONTAINER THAT WILL NOT ANSWER. Nothing can be bundled from a
-    container that will not attach, and neither `reap_user` nor the janitor carries a strike
-    count — so without this a wedged container is spared on every pass, forever, billing forever.
+    container that will not attach, and `reap_user` carries no strike count of its own — so
+    without this a wedged container is spared on every pass, forever, billing forever.
     Mutation check: return False whenever `reached is None` and this goes red."""
     await _register(fake_redis)
     await _put_saved(fake_storage, HEAD)
@@ -526,64 +525,6 @@ async def test_a_commit_that_fails_for_any_other_reason_still_spares(
     assert attempts == [CopyAttempt.FAILED]
 
 
-# --- and the janitor's call site does the same ---------------------------------------
-
-
-async def test_the_janitor_writes_the_tree_back_before_it_collects(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
-) -> None:
-    """The second call site, keyed by container name rather than by user. It writes to the same
-    slot — a janitor writing somewhere nothing restores from would lose the fleet's work quietly.
-    Mutation check: skip the write-back here and the head assertion goes red."""
-    await _register(fake_redis)
-    await _put_saved(fake_storage, OLDER)
-    client = _bundles(FakeSandboxClient(), head=HEAD, bundles_to=BUNDLED)
-
-    assert await reap_the_container_we_judged(
-        fake_redis, client, app_name=a_sandbox_name("x"), user_uuid=USER, app_id=APP
-    )
-    meta = await fake_storage.head(snapshot_key(APP))
-    assert meta is not None and (meta.metadata or {})["head_sha"] == BUNDLED
-    assert client.torn_down == [a_sandbox_name("x")]
-    assert attempts == [CopyAttempt.COPIED]
-
-
-async def test_the_janitor_spares_the_container_it_cannot_write_back_from(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
-) -> None:
-    """The sparing half of the same call site: nothing on record, and no container answering, so
-    the only copy of the work may be the one it is about to delete.
-    Mutation check: authorise the destroy on an unreachable container with no bundle → red."""
-    await _register(fake_redis)
-    client = FakeSandboxClient()
-    client.attach_handle = None
-
-    assert (
-        await reap_the_container_we_judged(
-            fake_redis, client, app_name=a_sandbox_name("x"), user_uuid=USER, app_id=APP
-        )
-        is False
-    )
-    assert client.torn_down == []
-    assert await fake_storage.head(snapshot_key(APP)) is None
-    assert attempts == [CopyAttempt.UNREACHABLE]
-
-
-async def test_the_janitor_reclaims_a_container_that_lost_its_repository(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
-) -> None:
-    """The same arm, reached from the call site nobody is watching."""
-    await _register(fake_redis)
-    await _put_saved(fake_storage, OLDER)
-    client = _lost_its_repository(FakeSandboxClient())
-
-    assert await reap_the_container_we_judged(
-        fake_redis, client, app_name=a_sandbox_name("x"), user_uuid=USER, app_id=APP
-    )
-    assert client.torn_down == [a_sandbox_name("x")]
-    assert attempts == [CopyAttempt.NOTHING_TO_COPY]
-
-
 # --- the record an operator reads ----------------------------------------------------
 
 
@@ -661,20 +602,3 @@ async def test_the_copy_record_reaches_the_database_and_is_committed(
     assert rows[0].counts == {"copied": 0, "spared": 1}
     assert rows[0].detail
     assert all(getattr(session, "committed", False) for session in sessions)
-
-
-async def test_a_copy_record_never_makes_a_dead_reclamation_worker_look_alive(
-    copy_record_writes_here: tuple[AsyncSession, Sequence[object]],
-) -> None:
-    """`reclamation_pass_freshness` reads the single newest row for `RECLAMATION_TASK_NAME` and
-    pronounces the scheduler alive on the strength of it — the only detector of a dead worker in
-    the system, since a crashlooping scheduler emits no alarms of its own. Filing a per-container
-    write-back attempt under the pass's own name would keep that detector permanently satisfied by
-    a different subsystem.
-    Mutation check: set `DURABLE_COPY_TASK_NAME = RECLAMATION_TASK_NAME` and this goes red."""
-    db, _ = copy_record_writes_here
-    before = await reclamation_pass_freshness(db)
-
-    await record_durable_copy_attempt(CopyAttempt.COPIED)
-
-    assert await reclamation_pass_freshness(db) == before

@@ -4,10 +4,9 @@ it.
 Covers the half of the fleet that was never stamped at create; the destroy flag stays off until
 this reports zero untagged sandboxes, which makes running it a release prerequisite.
 
-THE LOAD-BEARING TEST IN THIS FILE is `test_a_container_matching_no_app_row_gets_no_owner`, with
-its mutation-check sibling `test_a_guessed_owner_would_wrongly_become_destroy_eligible`. An owner
-is recovered by matching names FORWARD against the app table; failing to match stamps no owner at
-all, and filling in a plausible one turns "report this to a human" into "delete unsaved work".
+THE LOAD-BEARING TEST IN THIS FILE is `test_a_container_matching_no_app_row_gets_no_owner`. An
+owner is recovered by matching names FORWARD against the app table; failing to match stamps no
+owner at all, never a guessed one.
 """
 
 from __future__ import annotations
@@ -32,6 +31,7 @@ from src.services.sandbox.base import (
     TAG_KIND,
     TAG_USER_ID,
     FleetMember,
+    control_plane_segment,
     identity_from_tags,
 )
 from tests.factories import AppRegistryFactory, UserFactory
@@ -142,7 +142,11 @@ async def test_an_owned_container_gets_the_whole_identity(client, app, db_sessio
     assert tags[TAG_USER_ID] == str(owner.id)
     assert tags[TAG_APP_ID] == str(row.id)
     assert tags[TAG_CONTROL_PLANE] == str(settings.ENVIRONMENT)
-    assert identity_from_tags(tags).escalate_only is False
+    identity = identity_from_tags(tags)
+    assert identity.user_id == owner.id
+    assert identity.app_id == row.id
+    assert identity.created_at is not None
+    assert identity.control_plane == control_plane_segment()
 
 
 async def test_a_backfilled_age_is_marked_synthetic_and_starts_now(
@@ -161,7 +165,7 @@ async def test_a_backfilled_age_is_marked_synthetic_and_starts_now(
     assert (await client.post(_BACKFILL, headers=admin)).status_code == 200
 
     identity = identity_from_tags(fleet.fleet[name])
-    assert identity.was_backfilled is True
+    assert identity.backfilled_at is not None
     assert identity.created_at is not None
     assert identity.backfilled_at == identity.created_at
 
@@ -188,32 +192,6 @@ async def test_a_container_matching_no_app_row_gets_no_owner(client, app, db_ses
     assert TAG_USER_ID not in tags
     assert TAG_APP_ID not in tags
     assert TAG_CREATED_AT not in tags
-    assert identity_from_tags(tags).escalate_only is True
-
-
-async def test_a_guessed_owner_would_wrongly_become_destroy_eligible(
-    client, app, db_session
-) -> None:
-    """MUTATION CHECK, written as an executable statement of the failure rather than a comment.
-
-    This is what the code above would produce if `_backfill_tags` guessed an owner for an
-    unmatched container — the "closest match" temptation. The identity comes out complete, so
-    `escalate_only` flips to False and the container becomes destroy-eligible on evidence that is
-    a coincidence of 28 truncated hex characters. The assertion below is the alarm: if the real
-    backfill ever produces this shape for an unmatched name, the test above goes red."""
-    guessed = {
-        TAG_KIND: KIND_BUILD_SANDBOX,
-        TAG_USER_ID: str(uuid.uuid7()),
-        TAG_APP_ID: str(uuid.uuid7()),
-        TAG_CONTROL_PLANE: str(settings.ENVIRONMENT),
-        TAG_CREATED_AT: "2026-08-11T00:00:00+00:00",
-        TAG_BACKFILLED_AT: "2026-08-11T00:00:00+00:00",
-    }
-
-    assert identity_from_tags(guessed).escalate_only is False, (
-        "a guessed owner makes an unprovable container destroy-eligible — this is exactly what "
-        "the backfill must never write for a name that matches no app row"
-    )
 
 
 # --- idempotence ------------------------------------------------------------------

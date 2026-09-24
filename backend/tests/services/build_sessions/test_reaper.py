@@ -5,7 +5,6 @@ and sweep idempotency/timer-safety."""
 from __future__ import annotations
 
 import ast
-import base64
 import contextlib
 import time
 import uuid
@@ -58,7 +57,6 @@ from src.services.sandbox.base import (
     TAG_CREATED_AT,
     TAG_KIND,
     DevStatus,
-    ExecResult,
 )
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
@@ -80,9 +78,10 @@ def attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
     """Every copy-before-reclaim outcome this test recorded, WITHOUT touching the database.
 
     AUTOUSE, AND NOT FOR CONVENIENCE: `record_durable_copy_attempt` opens its own session and
-    COMMITS, so an unspied reap here would leave a permanent row in the SHARED test database
-    that `test_reclamation_report_only.py` counts. The real writer is exercised, against a
-    connection that rolls back, in `test_write_back_before_reclaim.py`."""
+    COMMITS, so an unspied reap here would leave a permanent row in the SHARED test database.
+    The real writer is exercised, against a connection that rolls back, in
+    `test_write_back_before_reclaim.py::test_the_copy_record_reaches_the_database_and_is_committed`,
+    which counts every row."""
     recorded: list[CopyAttempt] = []
 
     async def _spy(attempt: CopyAttempt) -> None:
@@ -401,210 +400,14 @@ async def test_the_scheduled_sweep_resolves_the_owning_app_id_and_the_operator_o
     assert gated_with == [app_id, None]
 
 
-# --- the janitor's reap: keyed by CONTAINER, not by user ----------------------
-#
-# The reclamation pass judges a container. `reap_user` reaps a user, destroying whatever their
-# registry names at the moment it looks. Those are the same container right up until they are not,
-# and both ways they diverge are this feature's own failure modes rather than exotica.
-
-
-async def _preserve(store: FakeStorage, app_id: uuid.UUID, *, head: str = "a" * 40) -> None:
-    """A saved copy the durable-copy gate will accept, so these tests are about the reap."""
-    await store.put(snapshot_key(app_id), a_git_bundle(head), metadata={"head_sha": head})
-
-
-async def test_the_janitor_destroys_the_container_it_judged_not_the_one_the_record_names(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """THE INVERSION, the worst outcome this feature can produce: between enumeration and
-    delete the builder started a fresh sandbox, so the registry now names `sbx-new`. Reaping
-    by USER destroys the live `sbx-new` and leaves `sbx-old` — the actual orphan — standing
-    and billing, then reports one destruction that is wrong in both directions.
-
-    Mutation-check: key the teardown off `reg[app_name]` instead of the argument and this goes
-    red — `sbx-new` is torn down and the live user's record is wiped."""
-    await _seed(fake_redis, USER, app_name=a_sandbox_name("new"))
-    await _preserve(fake_storage, APP)
-    client = FakeSandboxClient()
-
-    destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name=a_sandbox_name("old"), user_uuid=USER, app_id=APP
-    )
-
-    assert destroyed is True
-    assert client.torn_down == [a_sandbox_name("old")]
-    # The live container's Redis state is NOT ours to touch: it belongs to the other container.
-    assert await locks.read_registry(fake_redis, USER) is not None
-    assert await locks.lock_is_held(fake_redis, USER) is True
-
-
-async def test_an_unregistered_orphan_is_actually_deleted_and_says_so(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """THE POPULATION THIS WHOLE SYSTEM EXISTS TO COLLECT — containers with no registry record at
-    all. `reap_user` takes its no-registry early-out here: it clears an orphaned lock, returns
-    False, and deletes NOTHING, while the pass that called it counted a destruction. The container
-    goes on billing and the report says it is gone, which is the single most misleading thing this
-    feature could tell an operator."""
-    await _preserve(fake_storage, APP)
-    by_name, by_user = FakeSandboxClient(), FakeSandboxClient()
-
-    assert (
-        await reaper.reap_the_container_we_judged(
-            fake_redis, by_name, app_name=a_sandbox_name("ghost"), user_uuid=USER, app_id=APP
-        )
-        is True
-    )
-    assert by_name.torn_down == [a_sandbox_name("ghost")]
-    assert await reaper.reap_user(fake_redis, USER, by_user, app_id=APP) is False
-    assert by_user.torn_down == []
-
-
-async def test_the_four_step_ordering_still_runs_when_the_record_does_name_it(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """Keying by name changes WHICH container dies, never HOW. When the registry does still name
-    the judged container, the full ordering applies — mark-ending before teardown (the guard a
-    concurrent attach depends on), then registry, lease and the lock LAST."""
-    await _seed(fake_redis, USER, app_name=SBX)
-    await _preserve(fake_storage, APP)
-    client = OrderTrackingClient(fake_redis, USER)
-
-    destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name=SBX, user_uuid=USER, app_id=APP
-    )
-
-    assert destroyed is True
-    assert client.state_at_teardown == REGISTRY_STATE_ENDING
-    assert client.torn_down == [SBX]
-    assert await locks.read_registry(fake_redis, USER) is None
-    assert await locks.lock_is_held(fake_redis, USER) is False
-
-
-async def test_the_janitor_is_still_refused_when_the_work_is_not_preserved(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """The name-keyed reap is not a way around the durable-copy gate. No saved copy means
-    nothing was established, and nothing established never authorises a delete."""
-    await _seed(fake_redis, USER, app_name=SBX)
-    client = FakeSandboxClient()
-
-    destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name=SBX, user_uuid=USER, app_id=APP
-    )
-
-    assert destroyed is False
-    assert client.torn_down == []
-    assert await locks.read_registry(fake_redis, USER) is not None
-
-
-async def test_a_failed_teardown_is_not_reported_as_a_destruction(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """ARM refused, so the container is still standing. Saying otherwise would have the pass
-    report a shrinking fleet while it grows, and would clear the state a later pass needs."""
-    await _seed(fake_redis, USER, app_name=SBX)
-    await _preserve(fake_storage, APP)
-    client = FakeSandboxClient()
-    client.teardown_error = SandboxError("ARM said no")
-
-    destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name=SBX, user_uuid=USER, app_id=APP
-    )
-
-    assert destroyed is False
-    assert await locks.read_registry(fake_redis, USER) is not None
-
-
-# --- The janitor writes the tree back too, and it is a SECOND call site -------------
-#
-# The two reaps share no code above `_take_the_copy_we_promised`. A suite that exercised only
-# `reap_user` — the obvious one — would leave the janitor's write-back unproven: the caller with
-# nobody watching it, deleting containers whose work reached nowhere.
-
-
-def _a_container_that_bundles(*, head: str, bundles_to: str, name: str = SBX) -> FakeSandboxClient:
-    """A container that attaches AND answers the snapshot ladder — commit, bundle, base64.
-
-    The bare `FakeSandboxClient` refuses to attach at all (no `attach_handle`), which is the right
-    default for every test above and is exactly the state that spares. This scenario needs the
-    opposite: a container the reaper can genuinely take a copy out of."""
-    client = FakeSandboxClient()
-    client.attach_handle = SandboxHandle(
-        fqdn=f"{name}.example",
-        token="tok",
-        app_name=name,
-        preview_url=f"https://{name}.example/",
-        ready=True,
-    )
-    bundle = base64.b64encode(a_git_bundle(bundles_to)).decode()
-
-    def handler(cmd: list[str]) -> ExecResult:
-        if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
-            return ExecResult(stdout=f"{head}@@@@4@@", stderr="", exit=0)
-        if cmd[0] == "base64":
-            return ExecResult(stdout=bundle, stderr="", exit=0)
-        return ExecResult(stdout="", stderr="", exit=0)
-
-    client.exec_handler = handler
-    return client
-
-
-async def test_the_janitor_writes_the_tree_back_before_it_destroys_what_it_judged(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
-) -> None:
-    """★ THE SECOND CALL SITE: the tree goes into the saved copy and then the container goes.
-
-    Deleting this test leaves the janitor's write-back unproven: `test_write_back_before_reclaim`
-    covers both, but only this file drives the janitor beside its own registry cases.
-
-    Mutation check: skip the write-back in `reap_the_container_we_judged` and this goes red."""
-    await _seed(fake_redis, USER, app_name=SBX)
-    await _preserve(fake_storage, APP, head="b" * 40)  # the copy is BEHIND the container
-    client = _a_container_that_bundles(head="a" * 40, bundles_to="c" * 40)
-
-    destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name=SBX, user_uuid=USER, app_id=APP
-    )
-
-    assert destroyed is True
-    assert client.torn_down == [SBX]
-    meta = await fake_storage.head(snapshot_key(APP))
-    assert meta is not None and (meta.metadata or {})["head_sha"] == "c" * 40
-    assert attempts == [CopyAttempt.COPIED]
-
-
-async def test_an_orphan_with_no_copy_is_spared_with_a_record_rather_than_in_silence(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
-) -> None:
-    """THE POPULATION THAT BILLS FOREVER, and the reason the record exists at all: an
-    unregistered orphan has no address (`attach_existing` builds its handle from the registry),
-    so it cannot be bundled from, and the honest answer stays "spare" — exactly as before. What
-    changes is that it stops being silent: the same spared container is now a row an operator
-    can find instead of a log line repeating every fifteen minutes.
-
-    Mutation check: drop the `record_durable_copy_attempt` call from the unreachable arm and
-    this goes red — nothing else in the codebase notices a permanently-spared container."""
-    await _seed(fake_redis, USER, app_name=a_sandbox_name("live"))  # names a DIFFERENT container
-    client = FakeSandboxClient()
-
-    destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name=a_sandbox_name("ghost"), user_uuid=USER, app_id=APP
-    )
-
-    assert destroyed is False
-    assert client.torn_down == []
-    assert attempts == [CopyAttempt.UNREACHABLE]
-
-
 def test_the_reaper_never_binds_the_pass_record_at_module_scope() -> None:
-    """★ THE IMPORT BOUNDARY THE COPY-BEFORE-RECLAIM WORK HAD TO WRITE AROUND, pinned so it cannot
-    quietly close. `pass_history` imports `src.workers.reclamation` for its cron staleness window,
-    so a module-level `pass_history` import in the reaper would import that worker module back and
-    drag the ORM engine (built at `src.db.base` import) behind every import of `reaper`. Asserted
-    on the SOURCE via AST: an in-process check is vacuous because `conftest.py` already imports
-    `src.main` before any test runs, populating `sys.modules`; parsing (not grepping) also catches
-    a re-spelled import path. Mutation check: hoist the `pass_history` import in
+    """★ THE IMPORT BOUNDARY THE COPY-BEFORE-DESTROY WORK HAD TO WRITE AROUND, pinned so it
+    cannot quietly close. `pass_history` imports the `WorkerPass` model, which reaches
+    `src.db.base`, so a module-level `pass_history` import in the reaper would drag the ORM
+    engine (built at that import) behind every import of `reaper`. Asserted on the SOURCE via
+    AST: an in-process check is vacuous because `conftest.py` already imports `src.main` before
+    any test runs, populating `sys.modules`; parsing (not grepping) also catches a re-spelled
+    import path. Mutation check: hoist the `pass_history` import in
     `_take_the_copy_we_promised` to module scope."""
     source = Path(reaper.__file__).read_text(encoding="utf-8")
     for node in ast.parse(source).body:  # TOP LEVEL ONLY — a function-scoped import is the fix
@@ -1201,6 +1004,11 @@ async def test_a_failed_teardown_keeps_the_lease_when_nothing_can_own_the_debt(
 # the container after the record is gone, so the state can go and the retry survives.
 
 
+async def _preserve(store: FakeStorage, app_id: uuid.UUID, *, head: str = "a" * 40) -> None:
+    """A saved copy the durable-copy gate will accept, so these tests are about the reap."""
+    await store.put(snapshot_key(app_id), a_git_bundle(head), metadata={"head_sha": head})
+
+
 async def test_a_failed_teardown_hands_the_debt_over_and_gives_the_slot_back(
     fake_redis: aioredis.Redis,
     fake_storage: FakeStorage,
@@ -1544,22 +1352,6 @@ async def test_a_marker_alone_does_not_conjure_a_container_to_spare(
 
     assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
     assert client.torn_down == []
-
-
-async def test_the_reclamation_passes_own_predicate_agrees(fake_redis: aioredis.Redis) -> None:
-    """THE SECOND READER. `reconcile_user` is the per-user sweep; the fleet pass builds a
-    `RegistryClaim` and asks `spares_the_container`. Both must count the marker, or a container
-    spared by one is destroyed by the other — and the fleet pass is the one that destroys."""
-    from src.services.build_sessions.reclamation_pass import claim_for_container
-
-    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
-    unspared = await claim_for_container(fake_redis, app_name=SBX)
-    assert unspared is not None and unspared.spares_the_container is False
-
-    await locks.write_starting_marker(fake_redis, USER, uuid.uuid4())
-    spared = await claim_for_container(fake_redis, app_name=SBX)
-    assert spared is not None and spared.starting is True
-    assert spared.spares_the_container is True
 
 
 # --- the serving proof, watched out of turn ---------------------------------------------------

@@ -28,7 +28,7 @@ from pydantic import SecretStr
 
 from src.services.sandbox import aca as aca_module
 from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError, is_transient
-from src.services.sandbox.base import FleetMember, SandboxTagError
+from src.services.sandbox.base import FleetMember, SandboxTagError, identity_from_tags
 from src.services.sandbox.config import SandboxConfig
 
 _ENV = {"BIAL_APP_ID": "x", "SUPERVISOR_TOKEN": "t"}
@@ -469,12 +469,11 @@ async def test_stamp_tags_uses_patch_and_never_put(monkeypatch: pytest.MonkeyPat
 
 
 async def test_a_stamp_carries_the_tags_it_did_not_write(monkeypatch: pytest.MonkeyPatch) -> None:
-    """THE PROVIDER REPLACES; THE MERGE HAS TO BE OURS. Observed against real Azure, twice: PATCH
-    on `Microsoft.App/containerApps` is documented as JSON Merge Patch, but the provider treats
+    """THE PROVIDER REPLACES; THE MERGE HAS TO BE OURS. Observed against real Azure: PATCH on
+    `Microsoft.App/containerApps` is documented as JSON Merge Patch, but the provider treats
     `tags` as ONE property and swaps the whole map for whatever the body carries — stamping
-    `bial-reclaim-staged-at` onto a staging candidate DELETED its owner, app id and created-at,
-    making the container escalate-only so the two-pass protocol could never reach
-    `Verdict.DESTROY` on a container the first pass had staged.
+    `bial-backfilled-at` onto a container with no read-before-write would have deleted its
+    owner, app id and created-at, making it escalate-only on a pass meant only to mark its age.
     MUTATION-CHECK: send `tags=stamp` instead of the union and this goes red on the identity keys
     while every other stamp test stays green — which is exactly what shipping looked like."""
     seen: dict[str, object] = {}
@@ -491,28 +490,28 @@ async def test_a_stamp_carries_the_tags_it_did_not_write(monkeypatch: pytest.Mon
     }
     cp = _stamper(monkeypatch, existing=identity, update=_update)
 
-    await cp.stamp_tags(name="sbx-x", tags={"bial-reclaim-staged-at": "2026-08-12T00:00:00+00:00"})
+    await cp.stamp_tags(name="sbx-x", tags={"bial-backfilled-at": "2026-08-12T00:00:00+00:00"})
 
     envelope = seen["envelope"]
     assert isinstance(envelope, aca_models.ContainerApp)
-    assert envelope.tags == identity | {"bial-reclaim-staged-at": "2026-08-12T00:00:00+00:00"}
+    assert envelope.tags == identity | {"bial-backfilled-at": "2026-08-12T00:00:00+00:00"}
 
 
 async def test_a_stamp_overwrites_only_the_keys_it_names(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Merge, not append: re-staging must move `staged-at` forward, or the minimum-staging-age
-    window would be measured from the first sighting forever."""
+    """Merge, not append: re-stamping must move the value forward, never leave the old one
+    sitting beside the new."""
     seen: dict[str, object] = {}
     cp = _stamper(
         monkeypatch,
-        existing={"bial-kind": "build-sandbox", "bial-reclaim-staged-at": "old"},
+        existing={"bial-kind": "build-sandbox", "bial-backfilled-at": "old"},
         update=lambda rg, name, envelope: (seen.update(envelope=envelope), _settled(None))[1],
     )
 
-    await cp.stamp_tags(name="sbx-x", tags={"bial-reclaim-staged-at": "new"})
+    await cp.stamp_tags(name="sbx-x", tags={"bial-backfilled-at": "new"})
 
     envelope = seen["envelope"]
     assert isinstance(envelope, aca_models.ContainerApp)
-    assert envelope.tags == {"bial-kind": "build-sandbox", "bial-reclaim-staged-at": "new"}
+    assert envelope.tags == {"bial-kind": "build-sandbox", "bial-backfilled-at": "new"}
 
 
 async def test_a_stamp_on_an_untagged_container_still_writes(
@@ -662,7 +661,7 @@ async def test_the_fleet_projection_keeps_the_identity(monkeypatch: pytest.Monke
     # Absent `tags` normalizes to {} — present, carrying no identity. Two different answers,
     # and the backfill acts on the difference.
     assert fleet["sbx-bare"].tags == {}
-    assert fleet["sbx-bare"].identity.escalate_only is True
+    assert identity_from_tags(fleet["sbx-bare"].tags).kind is None
 
 
 async def test_the_projection_carries_what_a_judgement_needs(
@@ -758,8 +757,7 @@ async def test_a_malformed_item_degrades_instead_of_echoing_the_payload(
 ) -> None:
     """A parse failure must not become the leak. Validation errors routinely quote the offending
     object, and the offending object here is the one carrying the supervisor bearer — so every
-    leaf degrades to None (which the tiers already read as "cannot judge ⇒ escalate") rather than
-    raising with the payload attached."""
+    leaf degrades to None rather than raising with the payload attached."""
     broken = SimpleNamespace(
         name="sbx-broken",
         tags=None,
@@ -778,7 +776,7 @@ async def test_a_malformed_item_degrades_instead_of_echoing_the_payload(
 
     assert member.name == "sbx-broken"
     assert member.fqdn is None and member.arm_created_at is None
-    assert member.identity.escalate_only is True
+    assert identity_from_tags(member.tags).kind is None
     assert "leak-me" not in str(member)
 
 

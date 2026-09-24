@@ -28,12 +28,14 @@ versioned schema evolution that is reviewable and reversible.
 
 - The async path stays non-blocking end to end. The same session machinery is reused
   unchanged by the platform's background worker (ADR-0011), which runs scheduled
-  reconcilers rather than request work moved off the hot path. Two properties of that
-  reuse are load-bearing: the worker's reclamation passes single-flight on a PostgreSQL
-  advisory lock taken through this same engine, rather than a Redis lock, chosen because
-  Redis is the store that reconciliation work exists to distrust; and every worker process
-  builds its own settings from the environment alone, since the multiprocessing start
-  method used in production inherits nothing from a parent process.
+  reconcilers rather than request work moved off the hot path. A scheduled destructive
+  pass single-flights on a PostgreSQL advisory lock, rather than a Redis lock, chosen
+  because Redis is the store that reconciliation work exists to distrust — taken through
+  its own dedicated `NullPool` engine (`build_sessions/destroy.py::_the_lock_engine`),
+  never this one, so a connection this pool recycles mid-pass cannot silently drop the
+  lock. Every worker process also builds its own settings from the environment alone,
+  since the multiprocessing start method used in production inherits nothing from a
+  parent process.
 - Typed models are checked by the project's type-check gates, so a mis-typed column or a
   missing scope surfaces as a type error, not a runtime surprise.
 - Alembic gives reviewable, reversible schema history for the control-plane database. A

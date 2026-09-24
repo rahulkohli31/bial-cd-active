@@ -7,9 +7,10 @@ container won't boot. That costs the API a broken feature; here it costs contain
 fail in EVERY environment and cannot be talked out of.
 
 DELIBERATELY ABSENT: auth (nothing to authenticate), portal knobs (no browser to serve), foundry
-(runs no model), and app_db — reclamation reads the product DB via `DATABASE_URL`, never a
-per-project one, so a maintenance credential here is the union-of-everything problem this split
-exists to remove; a future provisioning role declares it in its own manifest."""
+(runs no model), and app_db — every scheduled pass in this process reads the product DB via
+`DATABASE_URL`, never a per-project one, so a maintenance credential here is the
+union-of-everything problem this split exists to remove; a future provisioning role declares it
+in its own manifest."""
 
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ class WorkerSettings(CoreSettings):
     # No default, so a missing block fails construction in EVERY environment. This is the whole
     # point of the role split: read the three docstrings below before making any of them optional.
 
-    # Required in EVERY environment, unlike the API's production gate: the reclamation pass runs
+    # Required in EVERY environment, unlike the API's production gate: the scheduled sweep runs
     # in this process, and nothing it destroys can be checked against a recovery bundle without
     # this store. A worker booted without one deletes containers blind.
     object_store: StorageConfig
@@ -60,10 +61,9 @@ class WorkerSettings(CoreSettings):
     # included. Turning it on is a decision somebody makes once, having read that.
     conversation_retention_enabled: bool
 
-    # TWO FLAGS, NOT ONE, the same split the fleet-reclamation pass runs on. The flag above turns
-    # the pass ON: it selects, counts and reports what it would remove. This one is what lets it
-    # ACT. Collapsed into a single switch, the only way to see which conversations retention would
-    # take is to let it take them.
+    # TWO FLAGS, NOT ONE. The flag above turns the pass ON: it selects, counts and reports what
+    # it would remove. This one is what lets it ACT. Collapsed into a single switch, the only way
+    # to see which conversations retention would take is to let it take them.
     #
     # A plain default rather than a required field, and the asymmetry is deliberate: the flag
     # above is where a deployment states its policy, and until it says yes there is nothing to

@@ -82,13 +82,13 @@ state), `recovery_copy_available` (was there anything to put back), and `verdict
 four states was reached).
 
 THE CONTAINER'S AGE IS DELIBERATELY NOT HERE: reading it costs an ARM listing, which a poll a
-browser tab drives every 45 seconds will not pay. An operator who needs it has the age in the
-reclamation pass records, keyed by the same `app_name`.
+browser tab drives every 45 seconds will not pay. An operator who needs it can read the
+`bial-created-at` tag directly off the container named by `app_name`.
 
 WHAT TO DO: the citizen has already been told on the preview pane and the standing completion
 claim has been retracted, so this is not an emergency page. It is the number to watch. If it
 fires more than rarely, the containers are being reclaimed or reset out from under live sessions
-and the reclamation policy is what wants looking at, not this code."""
+and the fleet sweep's own ceiling is what wants looking at, not this code."""
 
 
 REAP_FOUND_NO_REPOSITORY_EVENT: Final = "reap_found_no_repository"

@@ -31,7 +31,7 @@ actually succeeded — the platform has to do on its own.
 |---|---|---|
 | **Control plane** | The HTTP API. Authentication, projects and conversations, quota, the approval workflow, and the orchestration of everything below. | App Service for Containers |
 | **Portal** | The single-page application people actually use, served by a small web edge that also forwards API calls to the control plane. | App Service for Containers |
-| **Background worker** | The scheduled passes nobody triggers: reconciling deployments, sweeping idle sandboxes, reclaiming the fleet, removing conversations nobody has come back to. Same image as the control plane, started with a different command and no inbound traffic. | Container Apps |
+| **Background worker** | The scheduled passes nobody triggers: reconciling deployments, sweeping and reclaiming idle sandboxes, removing conversations nobody has come back to. Same image as the control plane, started with a different command and no inbound traffic. | Container Apps |
 | **Build sandbox** | One disposable container per project, holding a live workspace and running the generated application so its author can see it. | Container Apps |
 | **Deployed application** | An approved application, built from a durable snapshot and published for its audience. | Container Apps |
 
@@ -261,29 +261,20 @@ Three stores, with distinct jobs, and the distinction matters:
 Sandboxes are created constantly and are meant to be thrown away. Something has to throw them
 away, because the people creating them cannot be asked to.
 
-**The cloud provider is the authority on what exists.** Not the coordination store, not the
-database. The principle is simple: the inventory that matters is the one being billed. A
-coordination store is a *spare list* — a useful hint about what the platform believes it started —
-and treating a hint as an inventory means the platform confidently deletes records for containers
-that are still running, and leaves running containers nothing is tracking. So reclamation asks the
-provider what exists and treats that answer as the truth.
-
-**Destruction waits for signals that agree.** Deleting a container that somebody is still using is
-the expensive mistake, and the cheap mistake — waiting longer — costs only money. So the pass
-reads several independent signals and destroys only what several of them concur on, waiting longer
-where the consequence of being wrong is higher. A container that clearly nothing has claimed goes
-sooner than one that might still belong to someone.
+**The coordination store's own signals decide.** A scheduled sweep walks every registered
+sandbox and destroys one whose lock, heartbeat, stay of execution and liveness lease have all
+lapsed — several independent claims, all gone, rather than one. A build still in flight holds at
+least one of them, so nothing is claimed by mistake.
 
 **Nothing is destroyed until a durable copy exists.** The snapshot precedes the delete, always.
 This is the same ordering the build flow follows, for the same reason. The one exception is a
 workspace whose repository is already gone: no snapshot can be taken of it, now or later, so it is
 reclaimed and counted rather than kept billing forever.
 
-**A pass records that it ran, whatever the outcome.** Including when it decided to do nothing. A
-job that only writes a record when it acts is indistinguishable, from the outside, from a job that
-has stopped running — and the failure that actually happens is the scheduled work quietly dying,
-not the work doing the wrong thing. The absence of a pass record is the only honest detector of
-that.
+**A container the coordination store has no record of is found separately, by hand.** The cloud
+provider knows about every container the store has forgotten; an operator asks it directly and
+deletes what it names. This is a reported inventory, not an automatic pass — it is not something
+the platform is asked to get right unattended.
 
 ## Where to go next
 

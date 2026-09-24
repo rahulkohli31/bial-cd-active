@@ -308,10 +308,10 @@ async def write_starting_marker(
 
 def _parse_starting_marker(raw: object, user_uuid: uuid.UUID) -> uuid.UUID | None:
     """The ONE reading of a marker's value, shared by both readers below — they feed ONE
-    predicate (is a start in flight) from different call sites (`reaper.reconcile_user` /
-    `reclamation_pass._claim_of` via the direct read, `project_preview_state` via the pipelined
-    one). A value one called garbage and the other called a claim would spare a container on
-    one path and destroy it on the other.
+    predicate (is a start in flight) from different call sites (`reaper.reconcile_user` and
+    `shutdown.py` via the direct read, `project_preview_state` via the pipelined one). A value
+    one called garbage and the other called a claim would spare a container on one path and
+    destroy it on the other.
 
     Fails toward `None` on anything unparseable rather than treat garbage as a claim — same
     fail-closed reading `liveness_lease_is_held` gives an unparseable deadline."""
@@ -328,8 +328,8 @@ def _parse_starting_marker(raw: object, user_uuid: uuid.UUID) -> uuid.UUID | Non
 async def read_starting_marker(redis: aioredis.Redis, user_uuid: uuid.UUID) -> uuid.UUID | None:
     """The project id a start names for this user, or `None` when nothing is starting.
 
-    `reclamation_pass._claim_of` reads this (or the pipelined form below) to add the marker as
-    a fourth disjunct to the reclamation spare predicate."""
+    `reaper.reconcile_user` reads this (or the pipelined form below) to add the marker as a
+    fourth disjunct to its sparing predicate."""
     return _parse_starting_marker(await redis.get(starting_key(user_uuid)), user_uuid)
 
 

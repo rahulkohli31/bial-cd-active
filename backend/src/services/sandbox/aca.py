@@ -202,14 +202,15 @@ def _user_assigned(resource_id: str | None) -> aca_models.ManagedServiceIdentity
 
 
 def _fleet_member_of(app: aca_models.ContainerApp) -> FleetMember:
-    """Project one SDK `ContainerApp` down to the five fields a reclamation pass may judge on.
+    """Project one SDK `ContainerApp` down to the five fields a fleet sweep may judge a container
+    on.
 
     THE NARROWING IS THE POINT (see `FleetMember`): the payload carries every app's container
     env in plaintext, so only what is named here may reach a log line or operator report.
 
     NEVER RAISE WITH THE PAYLOAD IN THE MESSAGE — it carries `SUPERVISOR_TOKEN`. Every leaf is
-    coerced defensively rather than parsed strictly, degrading to `None` (which the tier logic
-    treats as "cannot be judged ⇒ escalate") rather than failing loudly with its contents."""
+    coerced defensively rather than parsed strictly, degrading to `None` rather than failing
+    loudly with its contents."""
     props = app.properties
     running = getattr(props, "running_status", None) if props else None
     created = getattr(app.system_data, "created_at", None) if app.system_data else None
@@ -429,13 +430,13 @@ class AcaControlPlane:
 
         THE ONLY AZURE-SIDE VIEW OF THE FLEET (Redis only sees what it has a record of),
         filtered to `SANDBOX_NAME_PREFIX` so it never touches published apps or other workloads.
-        DELIBERATELY EXCLUDES `SHARED_SANDBOX_NAME_PREFIX` (#198) too, as of this writing — see
-        `reclaim.py::_the_registry_looks_wrong`'s own note on what widening this filter must be
-        paired with before a `shr-` container can safely join this listing.
+        DELIBERATELY EXCLUDES `SHARED_SANDBOX_NAME_PREFIX` (#198) too, as of this writing — a
+        `shr-` container needs its own read before it can safely join this listing.
 
         A TRUNCATED FLEET MUST NEVER READ AS CLEAN: transient ARM failures raise
         `AcaTransientError` rather than a short list — a half-enumerated "no orphans" is
-        indistinguishable from success, and the destroy flag rests on it."""
+        indistinguishable from success, and the inventory report and the tag backfill both rest
+        on it."""
 
         def _run() -> list[FleetMember]:
             apps = self._client.container_apps.list_by_resource_group(self._config.resource_group)

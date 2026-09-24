@@ -1015,9 +1015,8 @@ async def _reap_the_project_sandbox_or_shrug(
     500 on a delete that in fact succeeded. There is no scheduled sweep that will take this
     one: `sweep_all` runs on a timer, but `may_destroy_on_this_control_plane` gates the destroy
     half on `environment == "production"`, and no other reconciler on this path is on a timer
-    at all — the storage and database ones are operator-invoked (and the database one deletes
-    nothing), and the reclamation janitor's destroy flag is off everywhere. Hence the alarm,
-    and hence the record.
+    at all — the storage and database ones are operator-invoked, and the database one deletes
+    nothing. Hence the alarm, and hence the record.
     `reap_user` guards only `SandboxError` around the teardown — its Redis calls are bare by
     module policy — so the explicit `except Exception` below is the mechanism, not the
     intention (it mirrors `salt_the_earth`'s own posture).

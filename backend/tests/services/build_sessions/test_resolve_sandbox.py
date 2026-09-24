@@ -103,9 +103,10 @@ def attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
     """Every copy-before-reclaim outcome a test here recorded, WITHOUT touching the database.
 
     AUTOUSE, AND NOT FOR CONVENIENCE: `record_durable_copy_attempt` opens its own session and
-    COMMITS, so an unspied reap here leaves a permanent row in the SHARED test database that
-    `test_reclamation_report_only.py` counts. The real writer is exercised, against a connection
-    that rolls back, in `test_write_back_before_reclaim.py`."""
+    COMMITS, so an unspied reap here leaves a permanent row in the SHARED test database. The real
+    writer is exercised, against a connection that rolls back, in
+    `test_write_back_before_reclaim.py::test_the_copy_record_reaches_the_database_and_is_committed`,
+    which counts every row."""
     recorded: list[CopyAttempt] = []
 
     async def _spy(attempt: CopyAttempt) -> None:

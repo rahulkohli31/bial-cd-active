@@ -18,8 +18,9 @@ if the third lost it. Each test builds ONE engine through the source's own const
   points, so covering it covers both. Pointed at the TEST database rather than the maintenance DSN,
   since the flag is set in the constructor and borrowing the app substrate keeps this test
   independent of whether an `APP_DB__*` cluster is reachable.
-- `src/services/build_sessions/destroy.py`'s reclamation-pass advisory-lock engine, via
-  `_the_lock_engine()` with its module cache reset so the call really constructs one.
+- `src/services/build_sessions/destroy.py`'s advisory-lock engine, shared by every scheduled
+  destructive pass, via `_the_lock_engine()` with its module cache reset so the call really
+  constructs one.
 
 Each test asserts the ABSENCE of the marker value AND the PRESENCE of the "parameters hidden" line
 SQLAlchemy substitutes; absence alone would pass on an exception that never rendered at all.
@@ -124,7 +125,7 @@ def unbuilt_lock_engine() -> Iterator[None]:
         yield
 
 
-async def test_the_reclamation_lock_engine_hides_bound_parameters(
+async def test_the_scheduled_pass_lock_engine_hides_bound_parameters(
     unbuilt_lock_engine, disposing
 ) -> None:
     from src.services.build_sessions.destroy import _the_lock_engine

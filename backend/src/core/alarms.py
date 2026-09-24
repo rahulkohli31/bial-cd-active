@@ -26,9 +26,8 @@ already committed, so a raise there would 500 a delete that in fact succeeded â€
 unit each arm's comment said the leftover would be picked up by "the scheduled sweep". It will
 not be. The only reconciler on a timer is the sandbox reap, which runs solely when
 `environment == "production"` (`build_sessions/destroy.py::may_destroy_on_this_control_plane`);
-the storage reconciler and the per-project-database reconciler are operator-invoked, the latter
-deletes nothing at all (`storage/reconcile.py`, `appdb/reconcile.py`), and the reclamation
-janitor's destroy flag is off in every environment (`workers/reclamation.py`). So a surviving
+the storage reconciler and the per-project-database reconciler are operator-invoked, and the
+latter deletes nothing at all (`storage/reconcile.py`, `appdb/reconcile.py`). So a surviving
 blob, container, image, database or sandbox is collected by a human reading this event, or by
 nobody, ever.
 

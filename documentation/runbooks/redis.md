@@ -106,12 +106,11 @@ a double failover. What actually happens:
 3. Interrupted builds are the affected users' to restart. There is no queue to drain and no lock
    to clear by hand.
 4. **Containers that lost their registry entry are the one thing worth checking by hand.** The
-   background worker runs a scheduled pass that compares the live container fleet against the
-   platform's own records and can report containers it can no longer account for. As shipped, it
-   only *reports*; it does not delete anything on its own. Preview what it finds and triage any
-   orphaned container using `reconcile-and-reclamation.md` and `reclamation-escalation.md`. A
-   report that comes back empty against a fleet known to be non-trivial is a sign the check
-   itself is failing, not proof that nothing was lost.
+   orphan inventory endpoint compares the live container fleet against the platform's own records
+   and reports containers it can no longer account for. It only *reports*; it does not delete
+   anything on its own. Preview what it finds and delete any orphan by hand using
+   `reconcile-and-reclamation.md`. A report that comes back empty against a fleet known to be
+   non-trivial is a sign the check itself is failing, not proof that nothing was lost.
 
 Because every key here is short-lived and reconstructable, and the platform's durable data lives
 in PostgreSQL and blob storage, a total Redis loss costs a handful of interrupted builds and a

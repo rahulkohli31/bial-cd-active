@@ -173,7 +173,7 @@ symptoms are easy to confuse.
 
 ## Where to go next
 
-- `runbooks/` — recovering the cache, the background worker, the reclamation levers, and taking an
-  approved application live.
+- `runbooks/` — recovering the cache, the background worker, reconciling the sandbox fleet, and
+  taking an approved application live.
 - `architecture.md` — why the pieces are arranged this way.
 - `reference/` — the API surface and the permissions the platform requires.

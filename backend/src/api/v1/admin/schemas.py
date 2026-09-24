@@ -30,7 +30,6 @@ from pydantic import AfterValidator, AnyUrl, Field, UrlConstraints, field_valida
 from src.api.v1.connectors.schemas import ConsentLine
 from src.db.models.app_registry import MAX_DEPLOYED_URL, ApprovalRoute, AppStatus
 from src.db.models.connector_access import ConnectorRequestStatus
-from src.db.models.worker_pass import PassOutcome
 from src.schemas import CamelModel, clean_stated_reason
 
 
@@ -426,103 +425,6 @@ class SandboxReconcileResponse(CamelModel):
     registered: int
     unregistered: list[str]
     registered_missing: list[str]
-    # --- Is the scheduled worker alive? ------------------------------------------
-    # THE FLEET COUNT ABOVE CANNOT ANSWER THIS. Every alarm the reclamation pass raises is
-    # emitted BY the pass, so a crashlooping scheduler emits nothing and reads exactly like a
-    # healthy quiet fleet. The only detector of a dead worker is the ABSENCE of a pass record,
-    # which is why these two fields hang off the operator's existing fleet endpoint rather than
-    # waiting for a metrics system this deployment does not have.
-    #
-    # `lastReclamationPassAt` is null when no pass has EVER run — a fresh deployment, or a
-    # worker that has never started. `reclamationStale` is the derived answer an operator
-    # actually wants, and it is true in that null case too: never-ran and stopped-running are
-    # different causes with the same consequence.
-    last_reclamation_pass_at: datetime | None = None
-    reclamation_stale: bool = True
-
-
-class ReclamationCandidate(CamelModel):
-    """One container the pass would act on, with the evidence behind the decision.
-
-    THE TIER AND THE REASON TRAVEL WITH THE VERDICT, deliberately. An operator reading this at 2am
-    has to be able to DISAGREE with it — "high_confidence / staged on an earlier pass and idle
-    since" is a claim they can check, and a bare `destroy` is one they can only accept."""
-
-    name: str
-    tier: str
-    verdict: str
-    reason: str
-
-
-class ReclamationReportResponse(CamelModel):
-    """What the reclamation pass would do RIGHT NOW, without doing any of it.
-
-    THE QUESTION AN OPERATOR COULD NOT ASK before: the only ways to learn what a pass would
-    delete were the worker's logs after the fact, or arming it to find out. This answers before
-    the decision, running the same classifier over the same three sources.
-    THE FLAGS TRAVEL WITH THE VERDICTS because they change what the verdicts MEAN: the same
-    `destroy` list is a preview off-armed, a description of what is about to happen once armed.
-    COUNTS TO THE AUDIT ROW, NAMES ONLY TO THE RESPONSE — the split every sibling report makes."""
-
-    scanned: int
-    spared: int
-    staged: int
-    destroy: int
-    escalate: int
-    not_ours: int
-    #: Enumerated containers carrying no identity tag at all. `SANDBOX_RECLAIM_DESTROY`'s
-    #: precondition is this reading zero across the fleet — before this field, checking it meant
-    #: running the tag-backfill endpoint, a write, to find out. Not the same number as `escalate`:
-    #: an untagged container always escalates, but so does a tagged-and-ownerless one and a
-    #: foreign control plane's container, so that count cannot answer this question alone.
-    untagged: int
-    #: The pass REFUSED to judge: too little of the live fleet is claimed by the coordination
-    #: store, so the spare-list is not trustworthy enough to sentence anything by. Every verdict
-    #: below is meaningless when this is true, which is why it is reported and not hidden.
-    store_fault: bool
-    #: Destroy candidates AND escalations — everything a human has a decision to make about.
-    #: Spared containers are the boring majority and are a count only.
-    candidates: list[ReclamationCandidate]
-    #: What THIS PROCESS'S flags say right now — and that qualifier is the whole of the field's
-    #: meaning, because two processes read two different files. `reclaimEnabled` is read from the
-    #: API's own `settings.sandbox`, while the scheduled pass is gated on the WORKER's, loaded from
-    #: a different env file in a different container.
-    #: An operator who set `SANDBOX__RECLAIM_ENABLED` in `.env` and not `.env.worker` — the
-    #: ordinary mistake, since `.env` is the file everyone edits — got `reclaimEnabled: true`
-    #: beside a worker declining every pass with `flag_off`. This field therefore answers "did my
-    #: config change reach the API", never "is the pass running"; `lastPassOutcome` below is the
-    #: only field that can answer the second. Its meaning is deliberately UNCHANGED: deriving
-    #: it from the worker would silently redefine a shipped field.
-    #:
-    #: `reclaimDestroy` false means a running pass reports rather than acts. This endpoint answers
-    #: regardless of both — refusing to preview because the feature is off would make the preview
-    #: useless exactly when it is most wanted.
-    reclaim_enabled: bool
-    reclaim_destroy: bool
-    #: The same dead-worker signal `reconcile-sandboxes` carries, for the same reason: this
-    #: endpoint runs the pass IN THE REQUEST, so a green report here says nothing at all about
-    #: whether the scheduled worker is alive.
-    last_reclamation_pass_at: datetime | None = None
-    reclamation_stale: bool = True
-    #: WHAT THE WORKER ACTUALLY DID, straight off the `worker_passes` row it wrote.
-    #:
-    #: `lastReclamationPassAt` proves a pass HAPPENED; on its own it cannot say whether the pass
-    #: looked at anything. `_record_pass` writes `declined`/`flag_off` deliberately — "reclamation
-    #: is switched off" is a thing an operator should SEE rather than infer from silence — so the
-    #: row already knew, and the report was the only thing that did not. Surfacing both fields is
-    #: what makes `scanned: 0` falsifiable: it is "the fleet is clean" only when the outcome says
-    #: a pass ran, and `lastPassDetail` names the resource group and managed environment it ran
-    #: against, so a worker sweeping somebody else's subscription cannot read as ours.
-    #:
-    #: NO SUBSCRIPTION ID travels here, by construction — `workers/reclamation._enumerated_fleet`
-    #: keeps it in the server-side log only.
-    #:
-    #: Both null when no pass has ever been recorded, which pairs with `reclamationStale: true`.
-    #: THE WORKER'S OWN ENUM rather than a re-spelled `str`, the same call
-    #: `BuildCompilePart.state` makes: a `StrEnum` has an identical wire shape, and a second
-    #: copy of the member list is a copy that can drift from the value the producer holds.
-    last_pass_outcome: PassOutcome | None = None
-    last_pass_detail: str | None = None
 
 
 class SandboxTagBackfillResponse(CamelModel):
@@ -530,7 +432,7 @@ class SandboxTagBackfillResponse(CamelModel):
 
     THE BUCKETS SUM: `scanned == alreadyTagged + stamped + skippedNoRow + failed`. `skippedNoRow`
     containers WERE stamped (`kind` + `backfilled_at`) but match no app row — a sandbox name keeps
-    only 28 of 32 hex chars, so it is not invertible — and are therefore escalate-forever.
+    only 28 of 32 hex chars, so it is not invertible — and stay unowned rather than guessed at.
     `unowned` is that same population, RECOUNTED EVERY PASS, deliberately outside the sum: a
     container `alreadyTagged` on pass 2 makes `skippedNoRow` read zero and `scanned` look clean —
     the trap `unowned` alone still catches. Counts only; failures travel to the logs by name."""

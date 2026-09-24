@@ -85,18 +85,15 @@ def base_path_for(app_name: str) -> str:
 # ~$0.108/hr forever. So identity lives on the ARM resource, written into the creation envelope so
 # it exists from the first moment.
 #
-# These keys sit here for the same reason `SANDBOX_NAME_PREFIX` does — three writers and (soon) a
-# destructive reader have to agree on them and cannot import each other: `sandbox/aca.py` stamps
-# them at create, `deploy/aca_publish.py` re-asserts them on every publish PUT, the backfill fills
-# them in for containers that predate all this, and the reclamation classifier reads them back. A
-# drift in one key is not a typo: it is either a container that never becomes reclaimable, or one
-# reclaimed on a misunderstanding.
+# These keys sit here for the same reason `SANDBOX_NAME_PREFIX` does — three writers have to
+# agree on them and cannot import each other: `sandbox/aca.py` stamps them at create,
+# `deploy/aca_publish.py` re-asserts them on every publish PUT, and the backfill fills them in
+# for containers that predate all this. A drift in one key is not a typo: it is a container the
+# fleet sweep can no longer judge.
 
 TAG_KIND: Final = "bial-kind"
 """What the resource IS. Today only the name prefix (`sbx-`/`pub-`/`shr-`) says this, which is a
-convention, rather than a record. Reclamation only ever DESTROYS `KIND_BUILD_SANDBOX` — a
-`KIND_SHARED_SANDBOX` container is recognized and escalated (never silently ignored), but has
-no destroy policy of its own yet (`reclaim.py::_judge_one`)."""
+convention, rather than a record."""
 
 TAG_USER_ID: Final = "bial-user-id"
 """The owning user's UUID, in plaintext. A container must be judgeable without the coordination
@@ -126,14 +123,6 @@ TAG_BACKFILLED_AT: Final = "bial-backfilled-at"
 """Present ONLY on a container whose identity was reconstructed after the fact. It marks the
 `TAG_CREATED_AT` above as synthetic, so the tier clock can tell a real age from a manufactured one
 and err toward waiting."""
-
-TAG_RECLAIM_STAGED_AT: Final = "bial-reclaim-staged-at"
-"""The two-pass staging marker. RESERVED — pinned here so the code that eventually writes it
-inherits the spelling instead of re-opening it; nothing writes it yet.
-
-Deliberately NOT named or parseable as `ending`: the attach path refuses an `ending` sandbox BEFORE
-it probes, and a container merely staged for a second look is still fully attachable. A citizen
-coming back to it must get their sandbox, not a refusal."""
 
 KIND_BUILD_SANDBOX: Final = "build-sandbox"
 KIND_PUBLISHED_APP: Final = "published-app"
@@ -173,10 +162,8 @@ def checked_tags(tags: Mapping[str, str]) -> dict[str, str]:
 def _uuid_or_none(raw: str | None) -> uuid.UUID | None:
     """Parse a tag value that should be a UUID, treating a malformed one as ABSENT.
 
-    Fail-closed in the direction that matters: an unparseable owner tag means the platform cannot
-    prove who owns the container, and "cannot prove" must land in the escalate-only bucket rather
-    than raise and take the whole fleet pass down with it (an unreadable signal escalates; it never
-    expires into a decision)."""
+    An unparseable owner tag means the platform cannot prove who owns the container; it reads as
+    unknown rather than raising and taking the whole caller down with it."""
     if raw is None:
         return None
     try:
@@ -199,8 +186,7 @@ def _timestamp_or_none(raw: str | None) -> dt.datetime | None:
 
 @dataclass(frozen=True)
 class SandboxIdentity:
-    """What a container app's ARM tags say about itself — the whole of what a reclamation pass gets
-    to judge it on when Redis is gone."""
+    """What a container app's ARM tags say about itself, readable when Redis is gone."""
 
     kind: str | None
     user_id: uuid.UUID | None
@@ -208,37 +194,6 @@ class SandboxIdentity:
     control_plane: str | None
     created_at: dt.datetime | None
     backfilled_at: dt.datetime | None
-    reclaim_staged_at: dt.datetime | None
-
-    @property
-    def is_a_sandbox(self) -> bool:
-        """Positively identified as a build sandbox. A published app or an untagged resource is
-        not."""
-        return self.kind == KIND_BUILD_SANDBOX
-
-    @property
-    def escalate_only(self) -> bool:
-        """No owner, no app, no age, or NOT OURS TO JUDGE ⇒ REPORT IT, NEVER DESTROY IT.
-        The escalate-never-destroy invariant in one predicate — why the backfill refuses to guess
-        an owner from a lossy name. An unprovable container stays here forever (a visible bill),
-        never deleting someone's unsaved work on a near-miss.
-        THE CONTROL-PLANE CLAUSE LIVES HERE, NOT IN THE CLASSIFIER: a dev deployment sharing a
-        resource group with production-stamped sandboxes can read them but must never sentence
-        them. Failing this clause open (e.g. an `ENVIRONMENT` rename) makes the whole fleet
-        escalate-only — the correct direction to be wrong in."""
-        return (
-            self.user_id is None
-            or self.app_id is None
-            or self.created_at is None
-            or self.control_plane != control_plane_segment()
-        )
-
-    @property
-    def was_backfilled(self) -> bool:
-        """Its age is SYNTHETIC — stamped by the backfill, not by the code that created it. The
-        tier clock must run from that stamp, so a backfilled container reads as new and serves its
-        full clock before it is eligible for anything."""
-        return self.backfilled_at is not None
 
 
 def identity_from_tags(tags: Mapping[str, str] | None) -> SandboxIdentity:
@@ -246,8 +201,8 @@ def identity_from_tags(tags: Mapping[str, str] | None) -> SandboxIdentity:
 
     `None` is the input this function exists for. On an untagged app ARM omits the `tags` key
     entirely — not `{}`, not `null`, verified live against every app in `bial-dev-rg` — and that
-    shape IS the orphan population. A parser that raised on it would blind the reclamation system
-    to exactly the containers it was built to collect."""
+    shape IS the orphan population. A parser that raised on it would fail on exactly the
+    containers nobody else has a record of."""
     raw: Mapping[str, str] = tags or {}
     return SandboxIdentity(
         kind=raw.get(TAG_KIND),
@@ -256,31 +211,24 @@ def identity_from_tags(tags: Mapping[str, str] | None) -> SandboxIdentity:
         control_plane=raw.get(TAG_CONTROL_PLANE),
         created_at=_timestamp_or_none(raw.get(TAG_CREATED_AT)),
         backfilled_at=_timestamp_or_none(raw.get(TAG_BACKFILLED_AT)),
-        reclaim_staged_at=_timestamp_or_none(raw.get(TAG_RECLAIM_STAGED_AT)),
     )
 
 
 @dataclass(frozen=True)
 class FleetMember:
-    """One container app as a reclamation pass sees it — all Azure will tell us about a sandbox.
+    """One container app as a fleet sweep sees it — all Azure will tell us about a sandbox.
 
     THE PROJECTION IS THE SECURITY BOUNDARY: ARM's list endpoint returns `containers[].env` in
     PLAINTEXT (tokens, DB URL, blob SAS), unrequested and unredacted — only
     `configuration.secrets` is masked. These five fields keep secrets out of every caller, log
     line and operator report *by construction* — a frozen dataclass, not the SDK's `ContainerApp`.
-    `tags` is normalized, never `None`. `arm_created_at` is evidence for a HUMAN only — never the
-    tier clock's age, which runs off `identity.created_at`."""
+    `tags` is normalized, never `None`. `arm_created_at` is evidence for a HUMAN only."""
 
     name: str
     tags: Mapping[str, str]
     running_status: str | None
     fqdn: str | None
     arm_created_at: dt.datetime | None
-
-    @property
-    def identity(self) -> SandboxIdentity:
-        """What this container says about itself, judged without the coordination store."""
-        return identity_from_tags(self.tags)
 
 
 def control_plane_segment() -> str:
@@ -289,7 +237,7 @@ def control_plane_segment() -> str:
     Delegated to `src.core.runtime_env` (a leaf, no module-scope imports) to avoid the import
     cycle: `src.config` → `src.settings.api` → sandbox config would close at module level here.
 
-    Its own function, not an inline accessor call: this answers WHICH control plane may JUDGE a
+    Its own function, not an inline accessor call: this answers WHICH control plane stamped a
     container — a different question from which environment's coordination keys to read, and the
     two are free to diverge."""
     from src.core.runtime_env import environment_segment

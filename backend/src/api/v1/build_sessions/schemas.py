@@ -141,11 +141,10 @@ TURN_ENDED_STAY_SECONDS = 300  # 5 min
 # Independent of `DeadlineWriter.APP_SERVED_TRAFFIC`'s renewable stay above, so a wedged or
 # spoofed supervisor report can never buy a shared view immortality: every renewable signal in
 # this file bounds how long a container survives WITHOUT proof of use, and this bounds how long
-# it may survive no matter how much proof arrives. Four hours — the same scale reclaim.py's own
-# `REAL_APP_AGE` uses for "this has run long enough that it is worth a fresh look" — long enough
-# that a colleague reading through a shared app across a working session is never cut off
-# mid-read by a number nobody chose on purpose, short enough that a spoofed or wedged traffic
-# report cannot keep a container alive indefinitely.
+# it may survive no matter how much proof arrives. Four hours: long enough that a colleague
+# reading through a shared app across a working session is never cut off mid-read by a number
+# nobody chose on purpose, short enough that a spoofed or wedged traffic report cannot keep a
+# container alive indefinitely.
 SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS = 4 * 60 * 60  # 4 hours
 
 # --- A surface that is holding the project open ------------------------------

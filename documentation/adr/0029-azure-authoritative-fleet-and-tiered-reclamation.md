@@ -1,5 +1,9 @@
 # ADR-0029: Azure Is the Fleet of Record — Tiered Sandbox Reclamation
 
+The destroy pass, its staging marker and its confidence tiers are withdrawn by ADR-0030; the
+identity tags, the durable-copy gate, the four-step destroy ordering, the liveness lease and the
+absolute ceiling this record describes remain in force.
+
 ## Context
 
 Every build sandbox is a container app. The only record that a container belongs to somebody is a

@@ -1,9 +1,8 @@
 """`_app_names_to_owners` / `backfill_sandbox_tags` (#198) — the Azure-inventory half of the
-same fail-closed-name-guard requirement `test_reaper.py`/`test_reclaim.py` cover for their own
-guards. Before this, the map only ever derived `sbx-` names: an untagged `shr-` container found
-by the backfill matched nothing here and was stamped a plain, ownerless `KIND_BUILD_SANDBOX` —
-misclassifying a colleague's shared view as an orphaned build sandbox, which the reclaimer would
-then judge under the wrong kind entirely.
+same fail-closed-name-guard requirement `test_reaper.py` covers for its own guards. Before this,
+the map only ever derived `sbx-` names: an untagged `shr-` container found by the backfill
+matched nothing here and was stamped a plain, ownerless `KIND_BUILD_SANDBOX` — misclassifying a
+colleague's shared view as an orphaned build sandbox.
 """
 
 from __future__ import annotations

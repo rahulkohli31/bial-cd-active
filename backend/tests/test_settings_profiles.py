@@ -3,8 +3,8 @@
 WHY THIS EXISTS. `src/config.py` used to be one `Settings` carrying every field every subsystem
 might need, behind prod-only gates — so a worker could dodge the whole union by narrowing
 `ENVIRONMENT=development`. That is the single most dangerous misconfiguration available here:
-with object storage unconfigured, the reclamation destroy path reads "storage unconfirmed" as
-"safe to delete" and wipes the fleet. `WorkerSettings` now refuses to construct without object
+with object storage unconfigured, the scheduled sweep reads "storage unconfirmed" as "safe to
+delete" and wipes the fleet. `WorkerSettings` now refuses to construct without object
 storage, sandbox/ARM access, or Redis, **in every environment** — stronger than a prod gate, which
 lying about `ENVIRONMENT` can still dodge.
 

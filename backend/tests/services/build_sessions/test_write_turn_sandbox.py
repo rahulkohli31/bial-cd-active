@@ -93,8 +93,9 @@ _CTX = PromptContext(user_name="Ada", project_name="Visitors", project_descripti
 @pytest.fixture(autouse=True)
 def _no_copy_rows_escape(monkeypatch: pytest.MonkeyPatch) -> None:
     """AUTOUSE, AND NOT FOR CONVENIENCE: `record_durable_copy_attempt` opens its own session and
-    COMMITS, so a reap driven here would leave a permanent row in the SHARED test database that
-    `test_reclamation_report_only.py` counts."""
+    COMMITS, so a reap driven here would leave a permanent row in the SHARED test database. See
+    `test_write_back_before_reclaim.py::test_the_copy_record_reaches_the_database_and_is_committed`,
+    which counts every row."""
     from src.services.build_sessions import pass_history
 
     async def _swallow(_attempt: object) -> None:

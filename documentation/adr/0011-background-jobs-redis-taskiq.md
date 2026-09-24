@@ -3,9 +3,8 @@
 ## Context
 
 Some work has to run on a schedule, independent of any request: reconciling a deploy
-that never finished, sweeping idle sandboxes, periodically checking the running fleet
-against a tiered reclamation policy, and removing conversations nobody has come back to.
-That work also has to be able to delete cloud resources and stored records safely, which
+that never finished, sweeping idle sandboxes, and removing conversations nobody has come
+back to. That work also has to be able to delete cloud resources and stored records safely, which
 rules out the easiest place to put it — inside the request-serving process itself.
 
 Running scheduled work inline within the request process, rather than as a separate
@@ -24,8 +23,8 @@ worker, has several problems for exactly this kind of work:
 
 **Taskiq is adopted, with a Redis broker**, to run scheduled reconciliation work. The
 queue's passengers are scheduled reconcilers and retention passes — deploy
-reconciliation, the sandbox sweep, the fleet reclamation pass, and the conversation
-retention pass — not request work moved off the hot path. Long-running
+reconciliation, the sandbox sweep, and the conversation retention pass — not request
+work moved off the hot path. Long-running
 work that a request cannot finish in time follows a different pattern instead: claim a
 database row, run the work as a detached task that owns its own database session, and
 have the client poll for the result.
@@ -129,8 +128,8 @@ handler twice.
   properties in Context — most sharply, that it is unobservable, which is worse for work
   that deletes cloud resources than for any other kind.
 - **A scheduled job on the platform's own timer-triggered container primitive**, instead
-  of an always-on worker. Rejected for this workload: the reclamation pass holds a
-  database-level advisory lock and must complete inside a bounded window, a fresh cold
+  of an always-on worker. Rejected for this workload: more than one scheduled pass holds
+  a database-level advisory lock and must complete inside a bounded window, a fresh cold
   start on every scheduled invocation would be paid against an image sized for the whole
   backend, and a one-shot job gives no natural home for the next scheduled task.
 - **A result backend.** Rejected for the reason given above — an arbitrary-object
@@ -146,10 +145,10 @@ handler twice.
   leader election. Every scheduled pass is therefore written to be idempotent and safe
   to run more than once concurrently, rather than relying on the replica count for
   exclusivity.
-- Liveness is not a health-check endpoint for this process; at least one scheduled
-  pass — reclamation — records a durable row for every run, including a declined or
-  failed one, specifically so an operator can tell "a pass ran and found nothing to do"
-  apart from "nothing has run in a long time."
+- Liveness is not a health-check endpoint for this process; the conversation-retention
+  pass records a durable row for every run, including a declined or failed one,
+  specifically so an operator can tell "a pass ran and found nothing to do" apart from
+  "nothing has run in a long time."
 - Adding the next scheduled job is now a small, well-worn change: a task module, a cron
   schedule label, and a feature flag — not a new place to put a loop.
 - The orchestrator that builds and iterates on generated apps remains a separate,
@@ -161,4 +160,5 @@ handler twice.
 - ADR-0014 (the orchestrator stays a standalone service and does not move onto this
   queue)
 - ADR-0015 (the worker's deployment as the backend image's second run target)
-- ADR-0029 (the fleet reclamation pass that is this queue's most demanding passenger)
+- ADR-0029 and ADR-0030 (the scheduled sandbox sweep, this queue's most demanding
+  passenger, and what ADR-0029 withdrew around it)

@@ -7,9 +7,6 @@ Two entry points, plus `src/workers/sandbox_reap.py`, the scheduled caller of
   every `start` — closes the "crashed tab -> can never start again" lockout.
 * `sweep_all` reconciles EVERY registered user, idempotent + concurrency-safe; runs on
   a schedule, or by hand at `POST /v1/build-sessions/internal/reap`.
-* `reap_the_container_we_judged` is the janitor's, keyed by CONTAINER NAME rather than
-  user, because a user's record can name a different container by the time the delete
-  lands. See its own docstring.
 
 A COMPLETED build is not torn down: the registry stays with a bounded stay-of-execution
 lease and the lock releases. `sweep_all` honours an unexpired lease; `reconcile_user`
@@ -558,22 +555,20 @@ async def _take_the_copy_we_promised(
 ) -> bool:
     """True when this container may now be reclaimed.
 
-    WRITE THE TREE BACK, THEN DESTROY. Both call sites once spared instead, so a failed copy
-    billed forever behind a log line repeating every fifteen minutes and looked, to anyone
-    reading it, like the guard working correctly. This really happened. Every failing arm SPARES
-    and RECORDS, so the next pass retries — except a workspace with no repository, which no pass
+    WRITE THE TREE BACK, THEN DESTROY. A caller that spared instead on a failed copy billed
+    forever behind a log line repeating every fifteen minutes and looked, to anyone reading it,
+    like the guard working correctly. This really happened. Every failing arm SPARES and
+    RECORDS, so the next pass retries — except a workspace with no repository, which no pass
     could ever save.
 
     THE UNREACHABLE ARM STILL COLLECTS, and that is what stops a wedged container being spared
     forever: nothing can be bundled from a container that will not attach, so the question
     becomes whether a saved bundle already stands for this app. One head call, and an absent or
     unreadable store spares."""
-    # IMPORTED HERE, NOT AT MODULE SCOPE, and the reason is weight rather than a cycle. There is
-    # no import cycle — `src.workers.reclamation` imports the reaper function-scoped, so nothing
-    # closes a loop at module-import time. The weight is real: `pass_history` reaches
+    # IMPORTED HERE, NOT AT MODULE SCOPE, for weight rather than a cycle: `pass_history` reaches
     # `src.db.base`, which BUILDS THE ORM ENGINE at import, so a module-level bind puts that
-    # (and `src.broker`, by way of `src.workers.reclamation`) behind every import of the reaper
-    # — including the cold one `test_the_reaper_imports_without_the_fastapi_app` performs.
+    # behind every import of the reaper — including the cold one
+    # `test_the_reaper_imports_without_the_fastapi_app` performs.
     from src.services.build_sessions.pass_history import (
         CopyAttempt,
         record_durable_copy_attempt,
@@ -631,10 +626,9 @@ async def _a_saved_bundle_stands_in(app_id: uuid.UUID) -> bool:
     """May a container nobody can attach to be destroyed? Only against a saved bundle.
 
     WITHOUT THIS A WEDGED CONTAINER IS SPARED ON EVERY PASS, FOREVER, billing forever — the
-    exact leak the age ceiling exists to close, since neither `reap_user` nor
-    `reap_the_container_we_judged` carries a strike count. An unconfigured or unreadable store is
-    a fact about the deployment or about this moment, never about anybody's work, so both spare.
-    """
+    exact leak the age ceiling exists to close, since `reap_user` carries no strike count of its
+    own. An unconfigured or unreadable store is a fact about the deployment or about this
+    moment, never about anybody's work, so both spare."""
     from src.services.build_sessions.pass_history import (
         CopyAttempt,
         record_durable_copy_attempt,
@@ -806,62 +800,6 @@ async def reap_user(
     # standing and may still be building.
     await release_liveness_lease(redis, user_uuid)
     await reap_lock(redis, user_uuid)  # step 3: release the (possibly drifted) lock — LAST
-    return True
-
-
-async def reap_the_container_we_judged(
-    redis: aioredis.Redis,
-    sandbox_client: SandboxClient,
-    *,
-    app_name: str,
-    user_uuid: uuid.UUID,
-    app_id: uuid.UUID,
-) -> bool:
-    """The ordered reap for ONE container, keyed by NAME. True only when it actually deleted it.
-
-    NOT `reap_user`, which destroys whatever the registry currently names for a user. Keying by
-    name keeps the janitor honest across an enumerate-then-delete pass: a sandbox started between
-    the two would otherwise be deleted while the judged orphan was spared, and an unregistered
-    orphan — the population this exists to collect — reported destroyed with nothing deleted. The
-    ARM delete uses the judged name; the user's Redis state is touched ONLY when the registry
-    still names it: `mark_registry_ending` -> `teardown` -> `delete_registry` -> `reap_lock`."""
-    reg = await read_registry(redis, user_uuid)
-    ours = reg is not None and reg.get(REGISTRY_FIELD_APP_NAME) == app_name
-    # The container is only reachable THROUGH the registry — `attach_existing` builds its handle
-    # from that record — so a container the registry no longer claims is judged on its saved copy
-    # alone. It is also why no copy can be taken for an unregistered orphan: there is no address
-    # to bundle from, and the address we DO have belongs to somebody else's container.
-    reached = await _reach_the_container(sandbox_client, user_uuid) if ours else None
-    # THE JANITOR IS THE CALLER WITH NOBODY WATCHING IT.
-    if not await _take_the_copy_we_promised(
-        sandbox_client, app_id=app_id, reached=reached, expected_name=app_name
-    ):
-        # SPARE AND REPORT — never destroy. Nothing is cleared, so the next pass retries once the
-        # tree is written back or the store is readable again.
-        _log.warning(
-            "reclamation refused: this container's work could not be written back",
-            app_name=app_name,
-            user_id=str(user_uuid),
-            app_id=str(app_id),
-        )
-        return False
-    if ours:
-        await mark_registry_ending(redis, user_uuid)  # step 1: guard a concurrent attach
-    try:
-        await sandbox_client.teardown(
-            handle_named(app_name, fqdn=(reg or {}).get(REGISTRY_FIELD_FQDN, ""))
-        )
-    except SandboxError:
-        # KEEP whatever state there is so a later pass retries; clearing it now would orphan a
-        # container that is still standing. Not silent (logged), and NOT counted as destroyed.
-        _log.exception(
-            "reclamation teardown failed; leaving state for a later pass", app_name=app_name
-        )
-        return False
-    if ours:
-        await delete_registry(redis, user_uuid)
-        await release_liveness_lease(redis, user_uuid)
-        await reap_lock(redis, user_uuid)  # LAST
     return True
 
 
