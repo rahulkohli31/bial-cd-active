@@ -9,7 +9,7 @@ a string that exists in two spellings, and the second spelling is invisible unti
 the only one firing. Import the constant, never retype the literal — tests included. Reasons that
 distinguish one firing from another belong in structured fields, not in the event name.
 
-NOT EVERY NAME BELOW IS AN ALARM. The nine sandbox-lifecycle constants are LIFECYCLE NOTICES —
+NOT EVERY NAME BELOW IS AN ALARM. The eight sandbox-lifecycle constants are LIFECYCLE NOTICES —
 the handful of `info` lines one build now prints, in order, so an operator handed "a citizen saw
 an error page for eight seconds" can reconstruct that build from the logs alone, with no database
 query and no in-memory session object (which is evicted five minutes after the turn ends anyway).
@@ -107,10 +107,10 @@ under a citizen, and a rising count is the signal to find out why sandboxes rest
 
 
 # --- the sandbox build lifecycle, in order ------------------------------------------------
-# The nine notices. structlog ONLY — a bare `logging.getLogger` line is dropped on the floor in
+# The eight notices. structlog ONLY — a bare `logging.getLogger` line is dropped on the floor in
 # this process — at `info` unless the constant says otherwise, and each one carries its fields IN
 # ADDITION to the contextvars bound for the whole build (`build_id`, `user_id`, `project_id`,
-# `app_id`, `app_name`). That binding is what makes one build one grep; without it these are nine
+# `app_id`, `app_name`). That binding is what makes one build one grep; without it these are eight
 # unrelated lines. Never a token, a DSN, or a DSN's password sub-token.
 
 
@@ -244,16 +244,6 @@ ORDINARY PREVIEW-STATE ANSWERS ARE DELIBERATELY NOT LOGGED, recorded here as a d
 nobody adds it later. A per-tab poll on two surfaces would drown the stream and tell an operator
 nothing that the marked-pending / first-served / serving-lost lines and their timestamps do not
 already reconstruct."""
-
-
-SANDBOX_TORN_DOWN_EVENT: Final = "sandbox_torn_down"
-"""A container's life ended cleanly. The clean finish is silent today, so the log holds starts
-with no ends and no way to tell a tidy shutdown from a process that simply vanished.
-
-Fields: `reason` (`reap_idle` | `reclaim_for_other_project` | `operator` — one event, three
-reasons in a FIELD, per THE ONE RULE), `pardoned`, `lifetime_ms`, and `served: bool`
-read off the serving stamp — the most useful retrospective field in the set, because it answers
-whether this container was ever any use to anybody at all."""
 
 
 # --- the two pinned alarms ----------------------------------------------------------------

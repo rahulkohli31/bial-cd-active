@@ -382,18 +382,14 @@ async def test_a_switch_stops_the_turn_bundles_the_tree_and_destroys_the_contain
     assert await fake_redis.exists(registry_key(scene.user_id)) == 0
 
 
-@pytest.mark.parametrize(
-    "reason", [ShutdownReason.PRESENCE_LAPSED, ShutdownReason.PAST_THE_CEILING]
-)
-async def test_the_lapse_and_the_ceiling_differ_only_in_the_reason_they_record(
+async def test_a_carried_debt_publishes_no_stop_and_waits_for_nothing(
     fake_redis: aioredis.Redis,
     fake_storage: FakeStorage,
     scene: _Scene,
-    reason: ShutdownReason,
 ) -> None:
-    """Three triggers, one implementation. Neither of these two has a turn to stop, so neither
-    publishes a stop or sits through the wait — waiting on an ending that was never coming would
-    add the whole stop budget to the path every sweep takes."""
+    """A debt the sweep carries forward has no turn to stop, so it publishes no stop and sits
+    through no wait — waiting on an ending that was never coming would add the whole stop budget
+    to the path every sweep takes."""
     born = _born_at(200)
     await _seed_registry(fake_redis, scene.user_id, app_name=scene.app_name, created_at=born)
     await _saved_copy(fake_storage, scene.app_id)
@@ -404,7 +400,7 @@ async def test_the_lapse_and_the_ceiling_differ_only_in_the_reason_they_record(
         owed,
         redis=fake_redis,
         sandbox_client=client,
-        reason=reason,
+        reason=ShutdownReason.PRESENCE_LAPSED,
         session_factory=scene.factory,
     )
 
@@ -790,7 +786,7 @@ async def test_the_ceiling_outranks_the_strike_budget(
         owed,
         redis=fake_redis,
         sandbox_client=client,
-        reason=ShutdownReason.PAST_THE_CEILING,
+        reason=ShutdownReason.PRESENCE_LAPSED,
         session_factory=scene.factory,
     )
 

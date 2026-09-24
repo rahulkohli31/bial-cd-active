@@ -937,12 +937,13 @@ async def test_an_absent_stay_reads_as_lapsed(fake_redis: aioredis.Redis) -> Non
 async def test_grant_stay_never_conjures_a_registry(fake_redis: aioredis.Redis) -> None:
     # Guarded on existence exactly like mark_registry_ending: a user with no sandbox must
     # not end up with a one-field registry hash that the sweep would then try to tear down.
-    deadline = await locks.grant_stay_of_execution(fake_redis, USER, ttl_seconds=60)
+    writer = locks.DeadlineWriter.BUILDER_ACTED
+    deadline = await locks.grant_stay_of_execution(fake_redis, USER, writer=writer)
     assert deadline > datetime.now(UTC)
     assert await locks.read_registry(fake_redis, USER) is None
     # With a registry present the deadline lands on the hash and reads back as current.
     await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
-    await locks.grant_stay_of_execution(fake_redis, USER, ttl_seconds=60)
+    await locks.grant_stay_of_execution(fake_redis, USER, writer=writer)
     assert await locks.stay_of_execution_is_current(fake_redis, USER) is True
 
 

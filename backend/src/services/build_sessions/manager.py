@@ -4440,8 +4440,3 @@ def get_session_manager() -> SessionManager:
     if _manager_singleton is None:
         _manager_singleton = SessionManager()
     return _manager_singleton
-
-
-def set_session_manager_for_tests(manager: SessionManager | None) -> None:
-    global _manager_singleton
-    _manager_singleton = manager

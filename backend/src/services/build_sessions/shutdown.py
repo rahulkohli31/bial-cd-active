@@ -135,9 +135,6 @@ class ShutdownReason(enum.StrEnum):
     PROJECT_SWITCHED = "project_switched"
     #: A debt carried forward: the sweep is retrying a deletion an earlier run could not perform.
     PRESENCE_LAPSED = "presence_lapsed"
-    #: The container outlived the absolute age ceiling. Reachable only from a test today — the
-    #: ceiling is enforced in `reaper.reconcile_user`, which reaps through `reap_user` instead.
-    PAST_THE_CEILING = "past_the_ceiling"
 
 
 class ShutdownOutcome(enum.StrEnum):
@@ -286,7 +283,6 @@ async def owe_a_teardown_the_reap_could_not_perform(
     app_name: str,
     instance_ref: datetime | None,
     shared_view: SharedViewStamp | None = None,
-    session_factory: SessionFactory | None = None,
 ) -> bool:
     """Hand a failed reap's deletion to the owed-row ledger. True when the ledger took it.
 
@@ -302,7 +298,7 @@ async def owe_a_teardown_the_reap_could_not_perform(
     The routine deletes a shared view with no write-back."""
     if instance_ref is None:
         return False
-    factory = session_factory if session_factory is not None else _the_default_factory()
+    factory = _the_default_factory()
     if is_a_shared_sandbox_name(app_name):
         return await _owe_a_shared_view(
             factory,

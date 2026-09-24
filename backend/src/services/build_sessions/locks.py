@@ -456,8 +456,7 @@ async def grant_stay_of_execution(
     redis: aioredis.Redis,
     user_uuid: uuid.UUID,
     *,
-    writer: DeadlineWriter = DeadlineWriter.BUILDER_ACTED,
-    ttl_seconds: int | None = None,
+    writer: DeadlineWriter,
 ) -> datetime:
     """Stamp the registry hash with the UTC instant this preview's reprieve lapses, and return
     it. Guarded on registry existence like `mark_registry_ending` — never conjures a hash for a
@@ -467,8 +466,7 @@ async def grant_stay_of_execution(
     Every caller names its writer; the TTL comes from that identity, and the name is stamped
     beside the deadline for audit. THE DEADLINE NEVER MOVES BACKWARD: `max(existing, computed)`
     keeps a weaker writer from truncating a stronger one's reprieve, no lock needed."""
-    ttl = DEADLINE_WRITER_TTL_SECONDS[writer] if ttl_seconds is None else ttl_seconds
-    deadline = datetime.now(UTC) + timedelta(seconds=ttl)
+    deadline = datetime.now(UTC) + timedelta(seconds=DEADLINE_WRITER_TTL_SECONDS[writer])
     if not await redis.exists(registry_key(user_uuid)):
         _log.warning(
             "no registry hash to stamp a preview stay onto; the container has no lease",
