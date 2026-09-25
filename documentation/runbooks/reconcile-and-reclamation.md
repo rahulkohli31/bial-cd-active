@@ -40,11 +40,16 @@ applies.
 
 ## Blast radius
 
-Only two things ever delete a container: the reap lever above, and the scheduled sweep it runs on
-demand — the same code path either way. Everything else only reports. That is a deliberate
-design, not an unfinished feature: a container provisioned seconds ago, before the build that owns
-it has finished writing its own registry record, looks exactly like an orphan for a short window,
-and that ambiguity is not something to hand an irreversible delete.
+Only the reap lever above and the scheduled sweep ever delete a container; everything else here
+only reports. That is a deliberate design, not an unfinished feature: a container provisioned
+seconds ago, before the build that owns it has finished writing its own registry record, looks
+exactly like an orphan for a short window, and that ambiguity is not something to hand an
+irreversible delete.
+
+The scheduled sweep runs two passes: first the same registry sweep the reap lever runs, then a
+retry of any container deletion the platform still owes because an earlier delete failed. The
+registry no longer names those containers, so the first pass cannot reach them. The reap lever
+runs only the first pass; the owed-deletion retry runs only on the sweep's own schedule.
 
 The reap lever, on its scheduled cadence, additionally refuses to run anywhere except the
 production control plane, regardless of how its flags are set.

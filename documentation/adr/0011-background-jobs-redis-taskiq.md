@@ -128,7 +128,7 @@ handler twice.
   properties in Context — most sharply, that it is unobservable, which is worse for work
   that deletes cloud resources than for any other kind.
 - **A scheduled job on the platform's own timer-triggered container primitive**, instead
-  of an always-on worker. Rejected for this workload: more than one scheduled pass holds
+  of an always-on worker. Rejected for this workload: the conversation-retention pass holds
   a database-level advisory lock and must complete inside a bounded window, a fresh cold
   start on every scheduled invocation would be paid against an image sized for the whole
   backend, and a one-shot job gives no natural home for the next scheduled task.

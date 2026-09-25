@@ -262,9 +262,9 @@ Sandboxes are created constantly and are meant to be thrown away. Something has 
 away, because the people creating them cannot be asked to.
 
 **The coordination store's own signals decide.** A scheduled sweep walks every registered
-sandbox and destroys one whose lock, heartbeat, stay of execution and liveness lease have all
-lapsed — several independent claims, all gone, rather than one. A build still in flight holds at
-least one of them, so nothing is claimed by mistake.
+sandbox and destroys a container once no claim on it stands: no start in flight, no turn in
+progress, and no current stay of execution. A build still in flight holds one of those claims, so
+nothing is claimed by mistake.
 
 **Nothing is destroyed until a durable copy exists.** The snapshot precedes the delete, always.
 This is the same ordering the build flow follows, for the same reason. The one exception is a
