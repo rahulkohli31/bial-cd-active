@@ -282,6 +282,14 @@ REGISTRY_FIELD_STATE: Final = "state"
 # resurrects the pre-cutover reading and would report a crashed app as running.
 REGISTRY_FIELD_SERVING_SINCE: Final = "serving_since"
 
+# WHEN THE CURRENT WAIT FOR THIS CONTAINER'S PAGE BEGAN, as an ISO-8601 UTC instant. Seeded with
+# the birth instant by `_write_registry`; moved back to the start's own beginning by
+# `build_sessions/locks.py::date_the_wait_from_the_start` as that start clears its marker; and
+# rewritten by `clear_serving` in the same script that retracts the proof, so a restart in place
+# is dated from the restart rather than from a container that may be hours old. Absent on a hash
+# written before this field existed; readers fall back to `created_at` then.
+REGISTRY_FIELD_WAITING_SINCE: Final = "waiting_since"
+
 # A relaunched preview's STAY OF EXECUTION: the ISO-8601 UTC instant its bounded
 # lease lapses. A relaunched preview holds no lock and renews no heartbeat, so
 # absent this field the background sweep would reap a preview the user is still
@@ -348,6 +356,7 @@ REGISTRY_FIELDS: Final = frozenset(
         REGISTRY_FIELD_CREATED_AT,
         REGISTRY_FIELD_STATE,
         REGISTRY_FIELD_SERVING_SINCE,
+        REGISTRY_FIELD_WAITING_SINCE,
         REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
         REGISTRY_FIELD_STAY_WRITER,
         REGISTRY_FIELD_ADOPTED_FROM_LEGACY,

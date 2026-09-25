@@ -240,6 +240,7 @@ def test_registry_fields_are_the_frozen_set() -> None:
             # the contract: absent = pre-cutover (proven), "" = never served, ISO-8601 = the
             # instant of first serve.
             "serving_since",
+            "waiting_since",
             "preview_stay_until",
             "stay_writer",
             # Temporary: `keys.py` retires this one with the rest of the legacy arm.

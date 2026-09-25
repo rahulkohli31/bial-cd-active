@@ -87,6 +87,7 @@ from src.services.build_sessions.locks import (
     an_instant_on_the_hash,
     clear_serving,
     clear_starting_marker,
+    date_the_wait_from_the_start,
     delete_registry,
     grant_stay_of_execution,
     liveness_lease_is_held,
@@ -127,6 +128,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_STATE,
+    REGISTRY_FIELD_WAITING_SINCE,
     REGISTRY_STATE_READY,
 )
 from src.services.sandbox import (
@@ -1420,6 +1422,13 @@ class SessionManager:
                 project_id=str(project_id),
             )
             yield scope
+            # Before the marker goes: the pane has been counting from it, and counts from the
+            # registry next.
+            if scope.handle is not None:
+                with suppress(RedisError):
+                    await date_the_wait_from_the_start(
+                        redis, user_id, app_name=scope.handle.app_name
+                    )
             # Clean exit — the body either released control back to us (RELEASE below) or
             # adopted the lock (a session now owns the container). Either way the start this
             # marker named is OVER: it succeeded or it handed off, and the container's own
@@ -2314,12 +2323,14 @@ class SessionManager:
                 # No `preview_url` and no `restorable`: STARTING's existing defaults are already
                 # the honest answer (nothing to frame, no restore offered mid-start).
                 #
-                # `created_at` is the fallback anchor, and it is the one this arm needs: a
-                # container that outlives its 300s marker without ever serving reaches here with
-                # nothing else left to date the wait by.
+                # Past the marker, the hash dates the wait: from the start that brought the
+                # container up, or from the retraction that put a container which had already
+                # served back into one. `created_at` only for a hash written before the wait had
+                # a field of its own.
                 return PreviewState(
                     state=PreviewLifeState.STARTING,
                     starting_since=waiting_since
+                    or an_instant_on_the_hash(reg, REGISTRY_FIELD_WAITING_SINCE)
                     or an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT),
                 )
             fqdn = reg.get(REGISTRY_FIELD_FQDN)

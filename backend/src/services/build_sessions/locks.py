@@ -78,6 +78,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_STAY_WRITER,
+    REGISTRY_FIELD_WAITING_SINCE,
     starting_key,
 )
 
@@ -706,11 +707,23 @@ _CAS_MARK_SERVING_LUA: Final = (
 # DELIBERATELY NOT GUARDED ON `state`, unlike the stamp above: a crash edge can be observed after
 # the reaper has already flipped this hash to `ending`, and refusing there would leave a proof
 # standing on a container being torn down.
+#
+# The wait restarts in the same write, so no reader can see the proof gone with the old wait's
+# start still standing beside it.
 _CAS_CLEAR_SERVING_LUA: Final = (
     f"if redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}') ~= ARGV[1] then return 0 end "
     f"local stamped = redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_SERVING_SINCE}') "
     "if not stamped or stamped == '' then return 0 end "
-    f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_SERVING_SINCE}', '') return 1"
+    f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_SERVING_SINCE}', '', "
+    f"'{REGISTRY_FIELD_WAITING_SINCE}', ARGV[2]) return 1"
+)
+
+# Date an unproven container's wait from the start in flight, on the same identity guard. A hash
+# with no `serving_since` at all is pre-cutover and read as proven, so it is not waiting either.
+_CAS_DATE_THE_WAIT_LUA: Final = (
+    f"if redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}') ~= ARGV[1] then return 0 end "
+    f"if redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_SERVING_SINCE}') ~= '' then return 0 end "
+    f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_WAITING_SINCE}', ARGV[2]) return 1"
 )
 
 
@@ -749,10 +762,35 @@ async def clear_serving(redis: aioredis.Redis, user_uuid: uuid.UUID, *, app_name
 
     Idempotent, and False on a hash that names a different container: the identity guard the
     stamp carries, for the identical reason. Retracting costs the citizen a card, not an error
-    page — the pane falls back to "getting your app ready" — but callers still debounce, because
-    a single unanswered poll is a poll, not a dead app."""
-    cleared = await redis.eval(_CAS_CLEAR_SERVING_LUA, 1, registry_key(user_uuid), app_name)
+    page — the pane falls back to "getting your app ready", counted from this retraction — but
+    callers still debounce, because a single unanswered poll is a poll, not a dead app."""
+    cleared = await redis.eval(
+        _CAS_CLEAR_SERVING_LUA,
+        1,
+        registry_key(user_uuid),
+        app_name,
+        datetime.now(UTC).isoformat(),
+    )
     return bool(cleared)
+
+
+async def date_the_wait_from_the_start(
+    redis: aioredis.Redis, user_uuid: uuid.UUID, *, app_name: str
+) -> bool:
+    """Date this container's wait from the start in flight, read off that start's own marker.
+    True iff the hash was re-dated; False when no marker stands, or the container is proven or
+    no longer the one named.
+
+    For the start to call just before it clears its marker: the pane has been counting from the
+    marker, and counts from the hash next, whose birth instant is later by however long the
+    start took to create the container."""
+    began = _when_this_start_began(await redis.pttl(starting_key(user_uuid)), user_uuid)
+    if began is None:
+        return False
+    dated = await redis.eval(
+        _CAS_DATE_THE_WAIT_LUA, 1, registry_key(user_uuid), app_name, began.isoformat()
+    )
+    return bool(dated)
 
 
 async def record_the_first_serve(

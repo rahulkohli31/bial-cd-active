@@ -4,7 +4,7 @@ decided nothing."""
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -24,7 +24,7 @@ from src.services.build_sessions.alarms import (
     PREVIEW_STATE_REPORTED_UNKNOWN_EVENT,
 )
 from src.services.build_sessions.appdata import resolve_app_for_project
-from src.services.build_sessions.locks import write_starting_marker
+from src.services.build_sessions.locks import clear_serving, write_starting_marker
 from src.services.build_sessions.manager import SessionManager, app_name_for
 from src.services.redis import (
     BUILD_COORDINATION_UNAVAILABLE_MSG,
@@ -39,6 +39,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
+    REGISTRY_FIELD_WAITING_SINCE,
     starting_key,
 )
 from src.services.sandbox import DevStatus, SandboxError, SandboxHandle, SandboxNotReadyError
@@ -769,6 +770,66 @@ async def test_a_container_outliving_its_marker_is_dated_from_the_registry(
     assert body["startingSince"] is not None
 
 
+async def _a_container_born_forty_minutes_ago(redis, user_id: uuid.UUID, app_name: str) -> None:
+    """Up for forty minutes and serving: the hash `_write_registry` wrote at its birth, stamped
+    since by an observer."""
+    born = (datetime.now(UTC) - timedelta(minutes=40)).isoformat()
+    await redis.hset(
+        registry_key(user_id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: app_name,
+            REGISTRY_FIELD_FQDN: f"{app_name}.example.azurecontainerapps.io",
+            REGISTRY_FIELD_TOKEN_REF: f"ref-{app_name}",
+            REGISTRY_FIELD_CREATED_AT: born,
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+            REGISTRY_FIELD_WAITING_SINCE: born,
+            REGISTRY_FIELD_SERVING_SINCE: SERVED,
+        },
+    )
+
+
+async def test_a_restart_in_place_is_dated_from_the_restart_not_from_the_containers_birth(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """Every retraction of a container that has served opens a new wait with no marker to date
+    it. Dated from the birth, the pane opens a restart one second old on "taking longer than
+    usual" with a forty-minute counter.
+
+    Mutation check: drop `REGISTRY_FIELD_WAITING_SINCE` from the fallback in
+    `project_preview_state` and the span below reads forty minutes."""
+    user, project = await _user_project(db_session, "ps-restart-clock@rvaiglobal.com")
+    app_id = await _built(db_session, user, project)
+    await _a_container_born_forty_minutes_ago(fake_redis, user.id, app_name_for(app_id))
+    assert await clear_serving(fake_redis, user.id, app_name=app_name_for(app_id)) is True
+
+    body = await _probe(client, user, project)
+
+    assert body["state"] == "starting"
+    began = datetime.fromisoformat(body["startingSince"])
+    assert (datetime.now(UTC) - began).total_seconds() < 5
+
+
+async def test_a_hash_written_before_the_wait_had_a_field_is_dated_from_its_birth(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """A container registered by a process that never wrote the wait's field is still dated,
+    and from the only instant its hash holds.
+
+    Mutation check: drop the `REGISTRY_FIELD_CREATED_AT` fallback and `startingSince` is
+    null."""
+    user, project = await _user_project(db_session, "ps-older-hash-clock@rvaiglobal.com")
+    app_id = await _built(db_session, user, project)
+    await _a_container_born_forty_minutes_ago(fake_redis, user.id, app_name_for(app_id))
+    await fake_redis.hdel(registry_key(user.id), REGISTRY_FIELD_WAITING_SINCE)
+    await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE, NEVER_SERVED)
+
+    body = await _probe(client, user, project)
+
+    assert body["state"] == "starting"
+    began = datetime.fromisoformat(body["startingSince"])
+    assert 39 * 60 < (datetime.now(UTC) - began).total_seconds() < 41 * 60
+
+
 async def test_a_completed_start_clears_the_marker_and_the_next_read_answers_alive(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
@@ -1275,6 +1336,45 @@ async def test_a_cold_relaunch_whose_root_shows_no_page_keeps_the_container_it_j
     settled = await _probe(client, user, project)
     assert settled["state"] == "starting", "the pane was told to frame a page-less container"
     assert settled["previewUrl"] is None
+
+
+async def test_a_cold_start_is_still_dated_from_its_admission_once_its_marker_is_cleared(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    monkeypatch: pytest.MonkeyPatch,
+    instant_first_serve_watch,
+) -> None:
+    """The start clears its marker once the dev server is started, well before the first page,
+    and from then on the registry dates the wait. Its birth instant is later than the press by
+    however long the container took to create, so the counter would run backwards and the
+    pane's patience would restart.
+
+    Ninety seconds of creation are simulated by aging the marker inside the restore.
+
+    Mutation check: drop the `date_the_wait_from_the_start` call from `_holding_user_lock` and
+    the span below collapses to the container's birth, seconds ago."""
+    user, project, _ = await _a_saved_project(
+        db_session, fake_storage, "ps-cold-start-clock@rvaiglobal.com"
+    )
+    wire.sbx.root_status = 404
+    restore = wire.sbx.restore_from_snapshot
+
+    async def a_restore_that_takes_ninety_seconds(*args: Any, **kwargs: Any) -> SandboxHandle:
+        await fake_redis.expire(starting_key(user.id), STARTING_MARKER_TTL_SECONDS - 90)
+        return await restore(*args, **kwargs)
+
+    monkeypatch.setattr(wire.sbx, "restore_from_snapshot", a_restore_that_takes_ninety_seconds)
+
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
+
+    assert await fake_redis.exists(starting_key(user.id)) == 0, "guard the premise: marker gone"
+    body = await _probe(client, user, project)
+    assert body["state"] == "starting"
+    began = datetime.fromisoformat(body["startingSince"])
+    assert 85 < (datetime.now(UTC) - began).total_seconds() < 95
 
 
 async def test_an_attached_container_whose_root_shows_no_page_loses_its_proof_not_its_life(

@@ -56,6 +56,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_SHARED_SERVED_COUNT,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
+    REGISTRY_FIELD_WAITING_SINCE,
 )
 from src.services.sandbox.base import (
     CompileReport,
@@ -243,6 +244,7 @@ async def _hydrate_registry(
     `shared_project_id`/`shared_owner_id` (#198) mirror the real client's `_write_registry`:
     stamped only when given, `None` on the ordinary `provision_new` arm."""
     key = registry_key(uuid.UUID(user_id))
+    born = datetime.now(UTC).isoformat()
     await get_redis().hset(
         key,
         mapping={
@@ -250,8 +252,9 @@ async def _hydrate_registry(
             REGISTRY_FIELD_FQDN: handle.fqdn,
             # A reference, never the raw token — mirrors the real client's contract.
             REGISTRY_FIELD_TOKEN_REF: f"ref-{handle.app_name}",
-            REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
+            REGISTRY_FIELD_CREATED_AT: born,
             REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+            REGISTRY_FIELD_WAITING_SINCE: born,
             # Scheduled, not serving. Only an observer that watched this app answer a request
             # may replace it (`build_sessions/locks.py::mark_serving`).
             REGISTRY_FIELD_SERVING_SINCE: "",
