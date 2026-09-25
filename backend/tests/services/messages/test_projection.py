@@ -34,7 +34,7 @@ from pydantic_ai.messages import (
 )
 from sqlalchemy import event
 
-from src.api.v1.build_sessions.schemas import BuildSessionStatus, ErrorSource
+from src.api.v1.build_sessions.schemas import ErrorSource
 from src.api.v1.conversations.schemas import DiagnosticFrame
 from src.core.redaction import redact_secrets
 from src.db.models.attachment import Attachment
@@ -79,7 +79,7 @@ from src.services.messages.store import (
     load_rows,
 )
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import write_build_outcome, write_legacy_build_started
+from tests.fakes import BuildSessionStatus, write_build_outcome, write_legacy_build_started
 
 PREVIEW = "https://sbx-abc.westeurope.azurecontainerapps.io/"
 # Matches `test_store_roundtrip.py`'s fixture — a real PNG magic prefix, so the store's own

@@ -794,8 +794,8 @@ async def _renew_shared_view_from_traffic(
         )
 
 
-async def _shared_view_past_its_ceiling(
-    sandbox_client: SandboxClient, reg: dict[str, str], now: datetime
+def _shared_view_past_its_ceiling(
+    identity: SandboxIdentity | None, app_name: str, now: datetime
 ) -> bool:
     """#198's absolute session ceiling (requirement 20) — independent of the renewable traffic
     stay above, so a wedged or spoofed supervisor report can never buy a shared view
@@ -807,13 +807,11 @@ async def _shared_view_past_its_ceiling(
     Measured from the CONTAINER's birthday (`_container_age_source`), because a failed teardown
     followed by a fresh registration would otherwise reset the record's `created_at` and let a
     shared view earn a new ceiling each time."""
-    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
     if not is_a_shared_sandbox_name(app_name):
         return False
-    created = (await _container_age_source(sandbox_client, reg, app_name)).created_at
-    if created is None:
+    if identity is None or identity.created_at is None:
         return False  # cannot prove an age, so this subtracts nothing
-    return now - created >= _SHARED_PREVIEW_ABSOLUTE_CEILING
+    return now - identity.created_at >= _SHARED_PREVIEW_ABSOLUTE_CEILING
 
 
 async def _container_age_source(
@@ -855,8 +853,8 @@ def _the_jammed_turn_grace() -> float:
     return RUN_WALL_CLOCK_DEADLINE_S + RUN_COMMAND_SLOW_TIMEOUT_S
 
 
-async def _past_the_ceiling(
-    sandbox_client: SandboxClient, reg: dict[str, str], *, now: datetime, outranks_a_turn: bool
+def _past_the_ceiling(
+    identity: SandboxIdentity | None, *, now: datetime, outranks_a_turn: bool
 ) -> bool:
     """Has this container outlived the absolute ceiling?
 
@@ -864,12 +862,11 @@ async def _past_the_ceiling(
     turn in flight would outrank, or the outer one, which nothing does. The caller knows which
     claim it is bounding; this does not guess.
 
-    Costs one ARM tag read, and only when something is about to be spared."""
-    after_hours = the_ceiling_hours()
-    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
-    if not app_name:
+    `identity` is `None` for an empty app_name (no ceiling applies) or when the caller never
+    needed to read one — either way, that answers False rather than reading anything itself."""
+    if identity is None:
         return False
-    identity = await _container_age_source(sandbox_client, reg, app_name)
+    after_hours = the_ceiling_hours()
     if outranks_a_turn:
         return past_the_turn_bound(
             identity,
@@ -932,7 +929,11 @@ async def _a_claim_still_stands(
     heartbeat together) is bounded by the OUTER mark: one loop renews all three, so a jam holds
     all three and a real turn must not be cut short. A STAY OF EXECUTION is bounded by the
     ordinary mark and, for a shared view, its absolute ceiling — the only things that ever stop
-    a tab renewing on a timer. A bound only ever subtracts from a claim."""
+    a tab renewing on a timer. A bound only ever subtracts from a claim.
+
+    The container's identity (`_container_age_source`, one ARM tag read) is fetched AT MOST
+    ONCE, lazily, and only once something is actually about to be spared — never for a record
+    neither claim reaches at all."""
     if await read_starting_marker(redis, user_uuid) is not None:
         return True
     now = datetime.now(UTC)
@@ -942,14 +943,19 @@ async def _a_claim_still_stands(
     a_turn_claims_it = await liveness_lease_is_held(redis, user_uuid) or (
         await lock_is_held(redis, user_uuid) and await heartbeat_is_alive(redis, user_uuid)
     )
-    if a_turn_claims_it and not await _past_the_ceiling(
-        sandbox_client, reg, now=now, outranks_a_turn=True
-    ):
-        return True
-    return (
-        await stay_of_execution_is_current(redis, user_uuid)
-        and not await _shared_view_past_its_ceiling(sandbox_client, reg, now)
-        and not await _past_the_ceiling(sandbox_client, reg, now=now, outranks_a_turn=False)
+    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+    identity: SandboxIdentity | None = None
+    if a_turn_claims_it:
+        if app_name:
+            identity = await _container_age_source(sandbox_client, reg, app_name)
+        if not _past_the_ceiling(identity, now=now, outranks_a_turn=True):
+            return True
+    if not await stay_of_execution_is_current(redis, user_uuid):
+        return False
+    if identity is None and app_name:
+        identity = await _container_age_source(sandbox_client, reg, app_name)
+    return not _shared_view_past_its_ceiling(identity, app_name, now) and not _past_the_ceiling(
+        identity, now=now, outranks_a_turn=False
     )
 
 

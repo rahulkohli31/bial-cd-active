@@ -13,14 +13,13 @@ import uuid
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.usage import RequestUsage
 
-from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.config import settings
 from src.db.models.conversation import ChatKind
 from src.db.models.message import MessageEntryKind
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.messages.store import append_batch
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import write_build_outcome, write_legacy_build_started
+from tests.fakes import BuildSessionStatus, write_build_outcome, write_legacy_build_started
 
 _TTL = settings.auth.access_ttl_seconds
 PREVIEW = "https://sbx-abc.westeurope.azurecontainerapps.io/"

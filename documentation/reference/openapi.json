@@ -3190,7 +3190,7 @@
         "type": "object"
       },
       "PreviewLifeState": {
-        "description": "What is (or is not) serving a project's preview right now. An **API** StrEnum like\n`BuildSessionStatus`, not a native PG enum — wire value equals the member's lowercase name.\n\nA read that could not decide is not a member. The route answers 503 instead, so no member\nis ever the reassuring answer given about a store nobody could read.",
+        "description": "What is (or is not) serving a project's preview right now. An **API** StrEnum, not a\nnative PG enum — wire value equals the member's lowercase name.\n\nA read that could not decide is not a member. The route answers 503 instead, so no member\nis ever the reassuring answer given about a store nobody could read.",
         "enum": [
           "alive",
           "asleep",

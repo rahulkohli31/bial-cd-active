@@ -21,11 +21,10 @@ import uuid
 
 import sqlalchemy as sa
 
-from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.messages.store import load_history, load_rows
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import write_build_outcome, write_legacy_build_started
+from tests.fakes import BuildSessionStatus, write_build_outcome, write_legacy_build_started
 
 
 async def _thread(db_session):

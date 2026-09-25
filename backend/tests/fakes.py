@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import enum
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -26,7 +27,6 @@ from pydantic import AnyUrl, TypeAdapter, UrlConstraints, ValidationError
 from pydantic_ai.messages import ModelResponse, TextPart
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.core.connectors import CONNECTORS, ConnectedSystem, ResolvedWindow
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
@@ -660,6 +660,18 @@ def _safe_preview_url(preview_url: str | None) -> str | None:
     except ValidationError:
         return None
     return preview_url
+
+
+class BuildSessionStatus(enum.StrEnum):
+    """The status recorded on a legacy build-outcome row's `meta.status` field
+    (`build_outcome_meta`, `write_build_outcome`) — test-only now; nothing in `src/` still
+    names it. Five members, the wire value equal to the lowercase name."""
+
+    PROVISIONING = "provisioning"
+    BUILDING = "building"
+    READY = "ready"
+    ENDED = "ended"
+    FAILED = "failed"
 
 
 def _summary(status: BuildSessionStatus, reason: str | None) -> str:

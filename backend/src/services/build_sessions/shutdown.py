@@ -362,15 +362,10 @@ async def _owe_a_shared_view(
     and a name that describe different containers owe nothing."""
     if shared_view is None:
         return False
-    from src.services.build_sessions.manager import shr_name_for
+    from src.services.build_sessions.manager import existing_app_id, shr_name_for
 
     async with factory() as db:
-        app_id = await db.scalar(
-            sa.select(AppRegistry.id).where(
-                AppRegistry.user_id == shared_view.owner_id,
-                AppRegistry.project_id == shared_view.project_id,
-            )
-        )
+        app_id = await existing_app_id(db, shared_view.owner_id, shared_view.project_id)
         if app_id is None:
             return False
         if app_name != shr_name_for(app_id, user_id):

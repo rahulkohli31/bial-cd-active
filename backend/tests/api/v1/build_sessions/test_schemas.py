@@ -17,10 +17,10 @@ from src.api.v1.build_sessions.schemas import (
     LOCK_RENEW_CADENCE_SECONDS,
     LOCK_TTL_SECONDS,
     BuildError,
-    BuildSessionStatus,
     ErrorSource,
 )
 from src.main import create_app
+from tests.fakes import BuildSessionStatus
 
 # --- BuildSessionStatus StrEnum ------------------------------------------------
 

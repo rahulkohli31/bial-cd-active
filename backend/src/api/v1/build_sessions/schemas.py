@@ -1,8 +1,7 @@
 """Build-session schemas — the frozen control surface, plus the self-heal error shape.
 
-The portal↔session-API control API (`BuildSessionStatus` and the request/response bodies)
-crosses the JSON wire, so it subclasses `CamelModel` (snake_case ⇄ camelCase). The
-status is an API `StrEnum`, not a native PG enum — no durable row is persisted.
+The portal↔session-API control API (the request/response bodies) crosses the JSON wire, so it
+subclasses `CamelModel` (snake_case ⇄ camelCase).
 
 `BuildError` is the self-heal error shape, classed by `ErrorSource`: read in-process by the
 repair prompt and the deploy failure path, so it subclasses plain `BaseModel` with no alias
@@ -24,22 +23,6 @@ from src.services.sandbox.base import CompileState
 # =============================================================================
 # Build-session control API
 # =============================================================================
-
-
-class BuildSessionStatus(enum.StrEnum):
-    """The build-session lifecycle. Five members; the wire value equals the
-    member's lowercase name. An **API** StrEnum, not a native PG enum — no durable
-    row lands until SESSION-API's migration.
-
-    Forward path `PROVISIONING → BUILDING → READY`; any non-terminal state →
-    `ENDED` (graceful) or `FAILED` (unrecoverable). `ENDED`/`FAILED` are absorbing.
-    """
-
-    PROVISIONING = "provisioning"  # session created; sandbox provisioning/attaching. No preview.
-    BUILDING = "building"  # the agentic build loop is executing model steps + self-heal.
-    READY = "ready"  # dev server serving; set on `RelaunchPreviewResponse.status`.
-    ENDED = "ended"  # terminal, GRACEFUL: user stop / idle-teardown / quota. Not a failure.
-    FAILED = "failed"  # terminal, UNRECOVERABLE: self-heal exhausted / unrecoverable error.
 
 
 # --- Frozen lock TTL + cadence constants -------------------------------------
@@ -163,8 +146,8 @@ HIDDEN_SURFACE_PRESENT_STAY_SECONDS = 1200  # 20 min — a throttled tab's budge
 
 
 class PreviewLifeState(enum.StrEnum):
-    """What is (or is not) serving a project's preview right now. An **API** StrEnum like
-    `BuildSessionStatus`, not a native PG enum — wire value equals the member's lowercase name.
+    """What is (or is not) serving a project's preview right now. An **API** StrEnum, not a
+    native PG enum — wire value equals the member's lowercase name.
 
     A read that could not decide is not a member. The route answers 503 instead, so no member
     is ever the reassuring answer given about a store nobody could read."""

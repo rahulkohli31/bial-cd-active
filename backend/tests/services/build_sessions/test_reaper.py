@@ -1837,8 +1837,10 @@ class _ArmKnowsItsAge(FakeSandboxClient):
     def __init__(self, *, created_at: str | None) -> None:
         super().__init__()
         self._created_at = created_at
+        self.tag_reads = 0
 
     async def get_app_tags(self, *, name: str) -> dict[str, str] | None:
+        self.tag_reads += 1
         if self._created_at is None:
             return None
         return {TAG_KIND: KIND_BUILD_SANDBOX, TAG_CREATED_AT: self._created_at}
@@ -2002,3 +2004,36 @@ async def test_with_the_ceiling_off_a_renewed_stay_is_immortal_again(
     reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is False
+
+
+async def test_a_spared_shared_view_with_a_current_stay_reads_its_tags_once(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """`_a_claim_still_stands` asks two ceiling questions of a shared view with a current stay
+    — its own absolute ceiling and the ordinary mark — and both are answered off the SAME tag
+    read, not one apiece.
+
+    Mutation check: read the identity separately for each ceiling question again and this goes
+    red — `tag_reads` climbs to 2."""
+    name = a_shared_sandbox_name("colleague")
+    await _seed_shared_view(fake_redis, USER, app_name=name, stay=_in(600))
+    client = _ArmKnowsItsAge(created_at=_hours_ago(0.01))
+
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
+
+    assert reaped is False
+    assert client.tag_reads == 1
+
+
+async def test_a_record_with_neither_a_turn_nor_a_stay_reads_no_tags(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Nothing claims this container, so nothing needs its age — the reap decision is already
+    made before either ceiling question is even worth asking."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    client = _ArmKnowsItsAge(created_at=_hours_ago(0.01))
+
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
+
+    assert reaped is True
+    assert client.tag_reads == 0
