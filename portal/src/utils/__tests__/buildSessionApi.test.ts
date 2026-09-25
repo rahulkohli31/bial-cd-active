@@ -333,7 +333,7 @@ describe('asReclaimBlocked — a project that is still being built', () => {
 /**
  * `fetchPreviewState` narrows the wire by hand, so a field the server sends that this parser
  * doesn't read is discarded SILENTLY — no type error, no failing test, just a dead feature.
- * `starting` and `occupyingProjectId`, pinned below, are exactly that risk.
+ * `starting`, pinned below, is exactly that risk.
  */
 /** A clock that jumps rather than waits: the CEILING's behaviour is the thing under test, and a
  *  test that genuinely waited two minutes for it is a test nobody runs. */
@@ -662,82 +662,56 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
 })
 
 describe('fetchPreviewState — the wire mirror', () => {
-  const previewFetch = (body: unknown) =>
-    ({ fetchImpl: async () => res(200, body) })
+  const previewFetch = (body: unknown, status = 200) =>
+    ({ fetchImpl: async () => res(status, body) })
 
-  it('narrows `starting` to itself, not to `unknown`', async () => {
-    // Without `starting`, a closed tuple falls back to `unknown` — the pane would say "we
-    // could not check" and offer a retry for a start actively under way.
+  it('narrows `starting` to itself', async () => {
+    // Without `starting`, a closed tuple would throw on it — the pane would say "we could not
+    // check" and offer a retry for a start actively under way.
     const state = await fetchPreviewState('p1', previewFetch({ state: 'starting', alive: false }))
     expect(state.state).toBe('starting')
   })
 
-  it('parses BOTH halves of the slot_taken attribution', async () => {
+  it('keeps only the fields a surface reads', async () => {
     const state = await fetchPreviewState(
       'p1',
       previewFetch({
-        state: 'slot_taken',
+        state: 'asleep',
         alive: false,
+        previewUrl: null,
+        restorable: true,
+        startingSince: null,
         occupyingProjectName: 'Car pool apps',
-        occupyingProjectId: 'proj-9',
       }),
     )
-    expect(state.occupyingProjectName).toBe('Car pool apps')
-    expect(state.occupyingProjectId).toBe('proj-9')
+    expect(state).toEqual({
+      state: 'asleep',
+      alive: false,
+      previewUrl: null,
+      restorable: true,
+      startingSince: null,
+    })
   })
 
-  it('leaves a withheld attribution null on BOTH fields rather than inventing one', async () => {
-    // The server withholds the whole attribution when it can't map the container to an owned
-    // project — naming the wrong project is worse than naming none, id included now.
-    const state = await fetchPreviewState('p1', previewFetch({ state: 'slot_taken', alive: false }))
-    expect(state.occupyingProjectName).toBeNull()
-    expect(state.occupyingProjectId).toBeNull()
-  })
-
-  it('does not fill in the half that is missing when only one arrives', async () => {
-    const nameOnly = await fetchPreviewState(
-      'p1',
-      previewFetch({ state: 'slot_taken', alive: false, occupyingProjectName: 'Roster' }),
-    )
-    expect(nameOnly.occupyingProjectName).toBe('Roster')
-    expect(nameOnly.occupyingProjectId).toBeNull()
-
-    const idOnly = await fetchPreviewState(
-      'p1',
-      previewFetch({ state: 'slot_taken', alive: false, occupyingProjectId: 'proj-9' }),
-    )
-    expect(idOnly.occupyingProjectName).toBeNull()
-    expect(idOnly.occupyingProjectId).toBe('proj-9')
-  })
-
-  it('refuses a non-string id rather than coercing it into a route', async () => {
-    // A number or an object here becomes a URL segment the go-to action navigates into and
-    // 404s on. Same discipline the name beside it already follows.
-    const state = await fetchPreviewState(
-      'p1',
-      previewFetch({ state: 'slot_taken', alive: false, occupyingProjectId: 42 }),
-    )
-    expect(state.occupyingProjectId).toBeNull()
-  })
-
-  it('keeps the deploy-outliving fallback: an unrecognised state is unknown, never gone', async () => {
-    const dead = await fetchPreviewState('p1', previewFetch({ state: 'teleporting', alive: false }))
-    expect(dead.state).toBe('unknown')
+  it('keeps the deploy-outliving fallback: an unrecognised state is a failed read, never gone', async () => {
+    // Mutation-check: return `'asleep'` for an unrecognised state and the first expectation
+    // resolves instead of rejecting.
+    await expect(
+      fetchPreviewState('p1', previewFetch({ state: 'teleporting', alive: false })),
+    ).rejects.toBeInstanceOf(ApiError)
 
     const live = await fetchPreviewState('p1', previewFetch({ state: 'teleporting', alive: true }))
     expect(live.state).toBe('alive')
   })
 
-  it('returns the all-null unknown shape for an unreadable body, id included', async () => {
-    const state = await fetchPreviewState('p1', previewFetch(null))
-    expect(state).toEqual({
-      state: 'unknown',
-      alive: false,
-      previewUrl: null,
-      occupyingProjectName: null,
-      occupyingProjectId: null,
-      restorable: null,
-      startingSince: null,
+  it('throws for an unreadable body rather than inventing a reading', async () => {
+    await expect(fetchPreviewState('p1', previewFetch(null))).rejects.toBeInstanceOf(ApiError)
+  })
+
+  it("throws for the server's 503, which is a check that decided nothing", async () => {
+    const outage = { error: { message: 'Build coordination is temporarily unavailable. Please try again.' } }
+    await expect(fetchPreviewState('p1', previewFetch(outage, 503))).rejects.toMatchObject({
+      status: 503,
     })
   })
 })

@@ -129,8 +129,8 @@ beforeEach(() => {
   // before the composer ever got to ask, which is a different story than the one under test. The
   // two running at once is a story of its own, and it has its own block at the foot of this file.
   api.fetchPreviewState.mockResolvedValue({
-    state: 'asleep', alive: false, previewUrl: null, occupyingProjectName: null,
-    occupyingProjectId: null, restorable: false,
+    state: 'asleep', alive: false, previewUrl: null,
+    restorable: false,
   })
   api.fetchSaveState.mockResolvedValue(null)
 })
@@ -205,8 +205,8 @@ describe('a project with nothing built yet — the first message anybody sends',
 
   beforeEach(() => {
     api.fetchPreviewState.mockResolvedValue({
-      state: 'asleep', alive: false, previewUrl: null, occupyingProjectName: null,
-      occupyingProjectId: null, restorable: false,
+      state: 'asleep', alive: false, previewUrl: null,
+      restorable: false,
     })
   })
 
@@ -342,8 +342,8 @@ describe('what the navigation carries', () => {
  */
 describe('★ a held workspace comes back on its own, with nothing sent', () => {
   const held = {
-    state: 'slot_taken' as const, alive: false, previewUrl: null,
-    occupyingProjectName: 'Car pool', occupyingProjectId: 'pA', restorable: true,
+    state: 'asleep' as const, alive: false, previewUrl: null,
+    restorable: true,
   }
 
   it('★ opening the project takes the workspace, without opening a chat or sending the message', async () => {
@@ -390,7 +390,7 @@ describe('★ a held workspace comes back on its own, with nothing sent', () => 
 describe('★ a send that arrives while the app is already starting', () => {
   const SAVED_AND_ASLEEP = {
     state: 'asleep' as const, alive: false, previewUrl: null,
-    occupyingProjectName: null, occupyingProjectId: null, restorable: true,
+    restorable: true,
   }
 
   const paneState = () =>

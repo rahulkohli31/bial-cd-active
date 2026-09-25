@@ -19,7 +19,7 @@ import {
   type WorkspaceChannel,
   type WorkspaceReport,
 } from '../workspaceChannel'
-import { asDecidedReading, resolveWorkspaceState, type DecidedPreview, type StartOutcome } from '../workspaceState'
+import { resolveWorkspaceState, type StartOutcome } from '../workspaceState'
 import { createStarter } from '../startApp'
 import { ApiError } from '../../../utils/apiError'
 import type { PreviewState } from '../../../utils/buildSessionApi'
@@ -44,28 +44,15 @@ const reading = (over: Partial<PreviewState> = {}): PreviewState => ({
   state: 'asleep',
   alive: false,
   previewUrl: null,
-  occupyingProjectName: null,
-  occupyingProjectId: null,
   restorable: null,
   startingSince: null,
   ...over,
 })
 
-/** A reading the platform stood behind — the memory an unreadable read falls back to. */
-const settled = (over: Partial<PreviewState> = {}): DecidedPreview => {
-  const decided = asDecidedReading(reading(over))
-  if (decided === null) throw new Error('a settled reading may not be `unknown`')
-  return decided
-}
-
 function reportFor(
   preview: PreviewState | null,
   startOutcome: StartOutcome | null = null,
   startInFlight = false,
-  // WHAT THE PANE WAS SHOWING BEFORE, and it defaults to "nothing has ever been decided" so a
-  // caller that does not care about the memory gets the cold-load answer rather than a smuggled
-  // one. Every test that exercises decision D3 passes it explicitly.
-  lastDecidedPreview: DecidedPreview | null = null,
   // THE WAIT HAS OUTLIVED ITS BUDGET. A boolean here rather than a fake clock: the timer that
   // decides it belongs to `useTheWaitHasGoneOnTooLong`, which has its own tests, and this file
   // is about what the pane DRAWS once the answer is in.
@@ -85,7 +72,6 @@ function reportFor(
     settled: true,
     state: resolveWorkspaceState({
       preview,
-      lastDecidedPreview,
       projectHasSavedBuild: null,
       startOutcome,
       startInFlight,
@@ -163,7 +149,6 @@ describe('★ NOT ORPHANED — every no-frame state still offers a way to start 
   // check the file docstring's trap requires.
   const restorable = [
     ['asleep, with a saved copy', reading({ state: 'asleep', restorable: true })],
-    ['never built, but restorable', reading({ state: 'never_built', restorable: true })],
   ] as const
 
   for (const [name, preview] of restorable) {
@@ -173,13 +158,13 @@ describe('★ NOT ORPHANED — every no-frame state still offers a way to start 
     })
   }
 
-  it('offers a retry on the one arm that still has one: nothing has ever been decided', () => {
+  it('offers a retry on the one arm that still has one: nothing has answered yet', () => {
     // THE RETRY SHRANK FROM FOUR ARMS TO ONE, and the three that lost it are the three cards the
     // ten-to-five collapse deleted. `not-painted`, `timed-out` and `start-failed` all described a
     // FETCH rather than a workspace, and each of them landed the citizen on a card whose Try again
     // asked the same question that had just been answered. The reading decides the card now, and
     // the press's own ending rides along as a note.
-    renderPane((c) => c.workspace.set(reportFor(reading({ state: 'unknown' }))))
+    renderPane((c) => c.workspace.set(reportFor(null)))
     expect(screen.getByRole('button', { name: /try again/i })).toBeTruthy()
   })
 
@@ -228,7 +213,7 @@ describe('★ NOT ORPHANED — every no-frame state still offers a way to start 
     renderPane((c) =>
       c.workspace.set(
         reportFor(
-          reading({ state: 'slot_taken', occupyingProjectName: 'Roster', occupyingProjectId: 'p-9', restorable: true }),
+          reading({ state: 'asleep', restorable: true }),
         ),
       ),
     )
@@ -238,7 +223,7 @@ describe('★ NOT ORPHANED — every no-frame state still offers a way to start 
   })
 
   it('offers NOTHING for the two states where nothing can be pressed', () => {
-    for (const preview of [reading({ state: 'never_built', restorable: false }), reading({ state: 'starting' })]) {
+    for (const preview of [reading({ state: 'asleep', restorable: false }), reading({ state: 'starting' })]) {
       const { unmount } = renderPane((c) => c.workspace.set(reportFor(preview)))
       expect(screen.queryByRole('button', { name: /launch application|try again|open /i })).toBeNull()
       // Liveness: it still SAYS something. An absence assertion alone passes on a blank pane.
@@ -338,10 +323,10 @@ describe('one author for every pane sentence', () => {
     // the glyph exists to prevent. Every board that draws a real card carries the mark this
     // product already uses for what that board is.
     const everyBoard: [string, PreviewState | null][] = [
-      ['never-built', reading({ state: 'never_built', restorable: false })],
+      ['never-built', reading({ state: 'asleep', restorable: false })],
       ['not-running', reading({ state: 'asleep', restorable: true })],
       ['starting', reading({ state: 'starting' })],
-      ['could-not-read', reading({ state: 'unknown' })],
+      ['could-not-read', null],
     ]
 
     for (const [name, preview] of everyBoard) {
@@ -373,7 +358,7 @@ describe('one author for every pane sentence', () => {
     // The piece count is asserted because a stage that rendered its wrapper and none of its parts
     // would satisfy every other assertion here while drawing an empty box.
     renderPane((c) =>
-      c.workspace.set(reportFor(reading({ state: 'never_built', restorable: false }))),
+      c.workspace.set(reportFor(reading({ state: 'asleep', restorable: false }))),
     )
     const stage = screen.getByTestId('app-pane-stage')
     expect(stage.querySelectorAll('.starter-piece')).toHaveLength(8)
@@ -402,9 +387,9 @@ describe('one author for every pane sentence', () => {
   it('never says what the app is NOT', () => {
     for (const preview of [
       reading({ state: 'asleep', restorable: true }),
-      reading({ state: 'never_built', restorable: false }),
+      reading({ state: 'asleep', restorable: false }),
       reading({ state: 'starting' }),
-      reading({ state: 'unknown' }),
+      null,
     ]) {
       const { unmount } = renderPane((c) => c.workspace.set(reportFor(preview)))
       const text = region().textContent ?? ''
@@ -460,11 +445,11 @@ describe('the seam is the address AND the state, not the URL alone', () => {
     expect(screen.getByRole('button', { name: /launch application/i })).toBeTruthy()
   })
 
-  it('★ an UNKNOWN never pulls a framed app off the screen', () => {
+  it('★ a pane nothing has answered for never pulls a framed app off the screen', () => {
     // The rule the whole preview reshape exists for: a read that decided nothing must not retire a
     // frame somebody is looking at. `could-not-read` is deliberately absent from the veto set.
     const { container } = renderPane((c) => {
-      c.workspace.set(reportFor(reading({ state: 'unknown' })))
+      c.workspace.set(reportFor(null))
       c.address.set({ url: 'https://app.example/', status: 'ready', serving: true, projectId: 'p1' })
       c.project.set('p1')
       c.visible.set(true)
@@ -474,42 +459,6 @@ describe('the seam is the address AND the state, not the URL alone', () => {
     expect(screen.queryByTestId('app-pane-empty')).toBeNull()
   })
 
-  it('★ DECISION D3 — a blip over a RUNNING app leaves the frame exactly where it is', () => {
-    // The pane-level half of "an unreadable read never changes the pane". The map renders the last
-    // settled reading, so this arrives here as `running` and the frame is never even asked to come
-    // down — which is the point: the invariant is kept by the value the pane receives not moving,
-    // rather than by this component carving an exception into its own frame rule.
-    //
-    // MUTATION RECEIPT: drop the map's `?? lastDecidedPreview` fallback and this goes red — the
-    // report becomes `could-not-read` and the card replaces the app.
-    const { container } = renderPane((c) => {
-      c.workspace.set(
-        reportFor(reading({ state: 'unknown' }), null, false, settled({ state: 'alive', alive: true })),
-      )
-      c.address.set({ url: 'https://app.example/', status: 'ready', serving: true, projectId: 'p1' })
-      c.project.set('p1')
-      c.visible.set(true)
-    })
-
-    expect(container.querySelector('iframe')).toBeTruthy()
-    expect(screen.queryByTestId('app-pane-empty')).toBeNull()
-  })
-
-  it('★ and a blip over a STANDING CARD leaves that card exactly where it is', () => {
-    // The other direction of the same rule, and the one a name-only assertion would miss: the
-    // citizen keeps the sentence AND the button they were looking at, rather than watching
-    // "Your app is saved. [Launch Application]" turn into "We could not check on your app.
-    // [Try again]" because one poll did not come back.
-    renderPane((c) =>
-      c.workspace.set(
-        reportFor(reading({ state: 'unknown' }), null, false, settled({ state: 'asleep', restorable: true })),
-      ),
-    )
-
-    expect(screen.getByTestId('app-pane-empty').getAttribute('data-workspace-state')).toBe('not-running')
-    expect(screen.getByRole('button', { name: /^Launch Application$/ })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /try again/i })).toBeNull()
-  })
 })
 
 /**
@@ -536,10 +485,9 @@ describe('★ the frame mounts if and only if the state is RUNNING', () => {
 
   it('★ mounts it on `running`, and on nothing else a citizen is ever shown', () => {
     const withheld: [string, PreviewState][] = [
-      ['never-built', reading({ state: 'never_built', restorable: false })],
+      ['never-built', reading({ state: 'asleep', restorable: false })],
       ['not-running', reading({ state: 'asleep', restorable: true })],
       ['starting', reading({ state: 'starting' })],
-      ['not-running', reading({ state: 'slot_taken', occupyingProjectName: 'Roster', occupyingProjectId: 'p-9', restorable: true })],
     ]
 
     for (const [name, preview] of withheld) {
@@ -578,9 +526,9 @@ describe('★ the frame mounts if and only if the state is RUNNING', () => {
     // between two surfaces has, because the publisher clears on unmount. Withholding on either
     // would unmount the host on every navigation into a running app: a cross-origin `src`
     // re-issued, and the citizen's form entries, scroll position and open tab thrown away.
-    for (const preview of [reading({ state: 'unknown' }), null] as const) {
+    for (const report of [reportFor(null), null]) {
       const { container, unmount } = renderPane((c) => {
-        if (preview !== null) c.workspace.set(reportFor(preview))
+        if (report !== null) c.workspace.set(report)
         c.address.set({ url: 'https://app.example/', status: 'ready', serving: true, projectId: 'p1' })
         c.project.set('p1')
         c.visible.set(true)
@@ -646,7 +594,7 @@ describe('★ the wait`s two sentences, and the one control', () => {
 
   it('★ past the budget it says something else and offers exactly one thing — never a start', () => {
     renderPane((c) =>
-      c.workspace.set(reportFor(reading({ state: 'starting' }), null, false, null, true)),
+      c.workspace.set(reportFor(reading({ state: 'starting' }), null, false, true)),
     )
 
     // STILL A WAIT. The sentence changed; the state did not, and neither did the spinner-less
@@ -681,7 +629,7 @@ describe('★ the wait`s two sentences, and the one control', () => {
     )
 
     act(() => {
-      channel.workspace.set(reportFor(reading({ state: 'starting' }), null, false, null, true))
+      channel.workspace.set(reportFor(reading({ state: 'starting' }), null, false, true))
     })
     const later = screen.getByTestId('app-pane-empty').textContent ?? ''
 
@@ -893,7 +841,7 @@ describe('the movement between the two layouts', () => {
  */
 describe('★ a taken slot opens no question', () => {
   const HELD: Partial<PreviewState> = {
-    state: 'slot_taken', occupyingProjectName: 'Car pool', occupyingProjectId: 'pA', restorable: true,
+    state: 'asleep', restorable: true,
   }
 
   /** The refusal `POST /relaunch` raises when a colleague's shared view holds the one workspace. */
@@ -913,8 +861,8 @@ describe('★ a taken slot opens no question', () => {
     expect(dialog()).toBeNull()
   })
 
-  it('★ names no other application, with or without the attribution on the wire', () => {
-    for (const held of [reading(HELD), reading({ state: 'slot_taken', restorable: true })]) {
+  it('★ names no other application', () => {
+    for (const held of [reading(HELD)]) {
       const view = renderPane((c) => c.workspace.set(reportFor(held)))
       const board = screen.getByTestId('app-pane-empty').textContent ?? ''
 
@@ -991,7 +939,7 @@ describe('★ a taken slot opens no question', () => {
 
     act(() =>
       channel.workspace.set({
-        ...reportFor(reading({ state: 'slot_taken', occupyingProjectName: 'Roster', occupyingProjectId: 'pB', restorable: true })),
+        ...reportFor(reading({ state: 'asleep', restorable: true })),
         projectId: 'p2',
       }),
     )

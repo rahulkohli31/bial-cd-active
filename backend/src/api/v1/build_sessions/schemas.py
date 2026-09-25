@@ -13,9 +13,7 @@ from __future__ import annotations
 
 import enum
 import uuid
-from collections.abc import Mapping
 from datetime import datetime
-from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -169,10 +167,8 @@ class PreviewLifeState(enum.StrEnum):
     """What is (or is not) serving a project's preview right now. An **API** StrEnum like
     `BuildSessionStatus`, not a native PG enum — wire value equals the member's lowercase name.
 
-    Exists because `preview-state` once collapsed four different situations into one `alive:
-    false`, including a registry-read ERROR misread as "gone" — pulling a live app off screen.
-    UNKNOWN keeps its own member, never folded in, for the same reason `SaveState.dirty` is
-    tri-state: never give the reassuring answer for someone else."""
+    A read that could not decide is not a member. The route answers 503 instead, so no member
+    is ever the reassuring answer given about a store nobody could read."""
 
     # A container is SERVING this project — served, not merely scheduled — and `preview_url` is
     # framable. THE WORDING HERE DID NOT CHANGE WITH THE SERVING PROOF; THE CODE FINALLY MATCHES
@@ -200,8 +196,11 @@ class PreviewLifeState(enum.StrEnum):
     # ALIVE over a 404 forever. The invariant governs the FIRST edge only: nothing may make the
     # first `alive` for a container arrive sooner than it arrived before the stamp existed.
     ALIVE = "alive"
-    # Built before, nothing serving it now. The next prompt brings it back from the durable
-    # copy on Blob. NOT an error, NOT a loss — which is why no surface may style it as one.
+    # NOTHING IS SERVING THIS PROJECT AND NO START OF IT IS IN FLIGHT: never built, put away, or
+    # standing aside while another of this user's projects holds the one workspace. The client
+    # offers the same start in all three, so they are one member, and `restorable` is what tells
+    # "bring the work back" from "describe what to build". NOT an error, NOT a loss — which is
+    # why no surface may style it as one.
     ASLEEP = "asleep"
     # NOTHING IS PROVEN TO BE SERVING THIS PROJECT YET, and TWO situations reach that one word.
     # (1) A build start, a relaunch or a turn's `ensure_sandbox` is IN FLIGHT right now: the
@@ -219,44 +218,6 @@ class PreviewLifeState(enum.StrEnum):
     # `sandbox_registry_marked_pending` and `app_first_served`. A member nobody renders
     # differently is a member that only gives two code paths a way to disagree about one wait.
     STARTING = "starting"
-    # Another of this user's projects holds the one-per-user workspace. `occupying_project_name`
-    # names it, or is null when the live container matches no app this user owns (a ghost —
-    # say nothing rather than guess a name into a sentence about someone's work).
-    SLOT_TAKEN = "slot_taken"
-    NEVER_BUILT = "never_built"  # no app row: nothing was built here, so nothing can serve it.
-    # The coordination store could not be read. Claims NOTHING in either direction; a client
-    # that renders this as "gone" has reintroduced the bug this enum was written to kill.
-    UNKNOWN = "unknown"
-
-
-class PreviewStateAction(enum.StrEnum):
-    """What a citizen may be OFFERED for a `PreviewLifeState` — kept as data, not a docstring
-    claim, because this path has a recorded data-loss incident. THREE BUCKETS: `RETRY` (never
-    destructive, safe even on an ambiguous read); `NEITHER` (nothing to offer); `REMEDY`
-    (consequential — releases ANOTHER project's container via `release_project_sandbox`, only
-    on a CONFIRMED occupying-project fact, never a guess). THE RULE A TEST ENFORCES: `UNKNOWN`
-    maps to `RETRY`, never `REMEDY` — an ambiguous or timed-out read must never route to a
-    consequential remedy, the discipline missing when a readiness TIMEOUT was once read as
-    death and routed straight into teardown-then-restore."""
-
-    RETRY = "retry"  # try again; by construction this can never destroy anything.
-    REMEDY = "remedy"  # a specific, nameable fix exists — and it may be consequential.
-    NEITHER = "neither"  # nothing to offer: already settled, or nothing exists to act on.
-
-
-PREVIEW_STATE_ACTION: Final[Mapping[PreviewLifeState, PreviewStateAction]] = {
-    PreviewLifeState.ALIVE: PreviewStateAction.NEITHER,
-    PreviewLifeState.ASLEEP: PreviewStateAction.RETRY,
-    PreviewLifeState.STARTING: PreviewStateAction.NEITHER,
-    PreviewLifeState.SLOT_TAKEN: PreviewStateAction.REMEDY,
-    PreviewLifeState.NEVER_BUILT: PreviewStateAction.NEITHER,
-    PreviewLifeState.UNKNOWN: PreviewStateAction.RETRY,
-}
-"""A TOTAL FUNCTION over the enum, by construction rather than by convention: a `PreviewLifeState`
-added later with no entry here raises `KeyError` on lookup rather than silently rendering a button
-whose meaning nobody chose (`tests/api/v1/build_sessions/test_preview_state.py`
-asserts every member is present). See `PreviewStateAction` for what each bucket may do, and for the
-one rule this mapping exists to enforce: `UNKNOWN` never maps to `REMEDY`."""
 
 
 class RelaunchPreviewRequest(CamelModel):

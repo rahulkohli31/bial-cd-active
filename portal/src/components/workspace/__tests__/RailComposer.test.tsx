@@ -423,8 +423,6 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
     state: 'asleep',
     alive: false,
     previewUrl: null,
-    occupyingProjectName: null,
-    occupyingProjectId: null,
     restorable: true,
     startingSince: null,
   }
@@ -443,7 +441,6 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
     const stateFor = (startInFlight: boolean) =>
       resolveWorkspaceState({
         preview: ASLEEP,
-        lastDecidedPreview: null,
         projectHasSavedBuild: null,
         startOutcome: null,
         startInFlight,

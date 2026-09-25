@@ -49,7 +49,6 @@ import {
   HIDDEN_PROBE_MS,
   PREVIEW_PROBE_MS,
   STARTING_PROBE_MS,
-  asDecidedReading,
   isTerminalReading,
   mayHaveStopped,
   nextProbeCadence,
@@ -249,19 +248,12 @@ export function useWorkspaceState({
         // arrived in. Bail before touching state OR the timer — an overtaken read calling
         // `stopAsking()` would end the poll on a verdict that has already been replaced.
         if (!live || generation !== latest) return
-        // AN `unknown` NEVER OVERWRITES A DECIDED VERDICT. A blip must not pull a running app off
-        // screen, and it must not wipe a settled answer somebody is already reading either. It is
-        // recorded only when nothing has been decided yet — because "we could not check" is a real
-        // thing to say when it is the only thing we know.
         // HOLDING THE OLD REFERENCE WHEN NOTHING CHANGED is not an optimisation detail here: this
         // poll runs every 45 seconds on every project screen, and the reading is identical on
         // almost all of them. A fresh object each tick republishes the workspace report, which
         // wakes the shell, and re-renders the rail's whole conversation list — for an answer
         // nobody's screen can tell apart from the one already up.
-        setPreview((prev) => {
-          if (next.state === 'unknown' && prev) return prev
-          return samePreviewState(prev, next) ? prev : next
-        })
+        setPreview((prev) => (samePreviewState(prev, next) ? prev : next))
 
         // ONE TICK PER ANSWER, and deliberately not per CHANGE — a caller re-asking its own
         // question needs to hear that the world was looked at, and an answer identical to the last
@@ -311,7 +303,7 @@ export function useWorkspaceState({
         // one more read, made as an accelerated one so it cannot ask again, and this read leaves
         // its cadence decision to that one. Never on an accelerated tick: that timer is watching a
         // start land, and a check there is a container call about a dev server still booting.
-        if (next.state !== 'alive' && next.state !== 'unknown') frameStalledRef.current = false
+        if (next.state !== 'alive') frameStalledRef.current = false
         if (!accelerated && !hidden && mayHaveStopped(next.state, frameStalledRef.current, cadence)) {
           await checkWorkspace(projectId)
           if (!live || generation !== latest) return
@@ -331,9 +323,10 @@ export function useWorkspaceState({
         // again, and a tick this arm deliberately withholds would leave it behind a blank pane
         // with no way out.
         setSettled(true)
-        // A read that could not answer SAYS NOTHING. Painting "gone" on a network blip is the
-        // over-claiming this whole shape exists to remove, and the timer is left running so the
-        // next tick can correct it.
+        // A read that could not answer SAYS NOTHING: `preview` is left exactly where it was, so a
+        // blip — a network drop, or the server's 503 for a coordination store it could not read —
+        // never pulls a running app off screen or wipes an answer somebody is already reading. The
+        // timer is left running so the next tick can correct it.
         //
         // BUT IT STILL SPENDS FROM THE ACCELERATED WINDOW. Until it did, the 120-second bound was
         // a ceiling on SUCCESSFUL reads only, so a workspace that reached `starting` and then began
@@ -383,14 +376,8 @@ export function useWorkspaceState({
   }, [projectId, epoch])
 
   return {
-    // `lastDecidedPreview` IS DERIVED FROM `preview`, NOT KEPT BESIDE IT, because this hook's own
-    // reducer is already the memory: `setPreview` returns the previous object when the new reading
-    // is `unknown` (see the guard above it), so `preview` only ever HOLDS an `unknown` when nothing
-    // has been decided yet — the one case whose answer is the fallback sentence anyway. A second
-    // copy of that memory could only ever disagree with the first.
     state: resolveWorkspaceState({
       preview,
-      lastDecidedPreview: asDecidedReading(preview),
       projectHasSavedBuild,
       startOutcome,
       startInFlight,

@@ -5,9 +5,9 @@
  * the page. The 45-second tick used to self-correct within one cadence; this unit removed that
  * corrective, so the replacement invalidation triggers are asserted here explicitly.
  *
- * The poll stops once the server has said `asleep` / `slot_taken` / `never_built` — a settled
- * fact, so re-asking learns nothing. `unknown` does NOT stop it: it decided nothing, and
- * stopping on it would pin "we could not check" for the life of the tab.
+ * The poll stops once the server has said `asleep` — a settled fact, so re-asking learns
+ * nothing. A read that fails does NOT stop it: it decided nothing, and stopping on it would pin
+ * "we could not check" for the life of the tab.
  *
  * The naive replacement ("re-ask when the user sends a new prompt") is tested BECAUSE IT IS NOT
  * SUFFICIENT: it fires mid-provision, hears `alive=false` truthfully, and stops again,
@@ -124,8 +124,6 @@ const answer = (state: PreviewLifeState, restorable: boolean | null = null): Pre
   alive: state === 'alive',
   previewUrl: state === 'alive' ? PREVIEW_URL : null,
   startingSince: null,
-  occupyingProjectName: null,
-  occupyingProjectId: null,
   restorable,
 })
 
@@ -159,17 +157,9 @@ const goneCard = () => screen.queryByTestId('app-pane-empty')
  */
 const paneState = () => goneCard()?.getAttribute('data-workspace-state') ?? null
 
-/**
- * `PreviewLifeState` in, `WorkspaceStateName` out — the map's own arms, as this suite reads them.
- *
- * `slot_taken` HAS NO ENTRY BECAUSE IT HAS NO ARM OF ITS OWN: a slot held by another of this
- * citizen's projects resolves against whether anything can be brought back, exactly as `asleep`
- * does. It is a settled reading either way, which is all this suite asks of it.
- */
+/** `PreviewLifeState` in, `WorkspaceStateName` out — the map's own arms, as this suite reads them. */
 const WORKSPACE_STATE_FOR: Record<string, string> = {
   asleep: 'not-running',
-  never_built: 'never-built',
-  unknown: 'could-not-read',
 }
 const framedUrl = () => document.querySelector('iframe')?.getAttribute('src') ?? null
 
@@ -235,23 +225,20 @@ describe('BuilderPage — the preview poll stops on a terminal answer', () => {
     expect(readsSince(settled)).toBe(0)
   })
 
-  it.each<PreviewLifeState>(['slot_taken', 'never_built'])(
-    'stops asking on a settled "%s" too — all three are facts, not faults',
-    async (state) => {
-      h.fetchPreviewState.mockResolvedValue(answer(state, false))
-      await framedBuild()
+  it('stops asking on a settled `asleep` with nothing to restore too — a fact, not a fault', async () => {
+    h.fetchPreviewState.mockResolvedValue(answer('asleep', false))
+    await framedBuild()
 
-      const settled = probeCount()
-      await tick(4)
-      expect(readsSince(settled)).toBe(0)
-    },
-  )
+    const settled = probeCount()
+    await tick(4)
+    expect(readsSince(settled)).toBe(0)
+  })
 
-  it('KEEPS asking after an "unknown" — a question nobody answered must not end the asking', async () => {
-    // The mutation this pins: adding `unknown` to the settled set. It reads like a fourth
-    // "not alive" state and it is not one — it is the ERROR arm, and stopping on it would
-    // leave a tab that blinked once never checking again for the rest of its life.
-    h.fetchPreviewState.mockResolvedValue(answer('unknown'))
+  it('KEEPS asking after a failed read — a question nobody answered must not end the asking', async () => {
+    // The mutation this pins: stopping the timer in the read's `catch`. A failed read is not a
+    // settled answer, and stopping on it would leave a tab that blinked once never checking
+    // again for the rest of its life.
+    h.fetchPreviewState.mockRejectedValue(new Error('503'))
     await framedBuild()
 
     expect(goneCard()).toBeNull() // and it changes nothing on screen, either

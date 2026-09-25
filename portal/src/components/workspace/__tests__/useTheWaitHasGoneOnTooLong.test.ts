@@ -18,8 +18,6 @@ const reading = (over: Partial<PreviewState> = {}): PreviewState => ({
   state: 'asleep',
   alive: false,
   previewUrl: null,
-  occupyingProjectName: null,
-  occupyingProjectId: null,
   restorable: null,
   startingSince: null,
   ...over,
@@ -80,7 +78,7 @@ describe('useTheWaitHasGoneOnTooLong', () => {
   })
 
   it('claims nothing about a reading that is not a wait, however old the clock gets', () => {
-    for (const state of ['alive', 'asleep', 'never_built', 'slot_taken', 'unknown'] as const) {
+    for (const state of ['alive', 'asleep'] as const) {
       const { result } = renderHook(() => useTheWaitHasGoneOnTooLong(reading({ state })))
       act(() => {
         vi.advanceTimersByTime(START_PATIENCE_MS * 3)

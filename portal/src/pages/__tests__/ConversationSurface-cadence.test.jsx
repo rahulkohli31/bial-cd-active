@@ -145,8 +145,6 @@ const preview = (state) => ({
   state,
   alive: state === 'alive',
   previewUrl: state === 'alive' ? PREVIEW_URL : null,
-  occupyingProjectName: null,
-  occupyingProjectId: null,
   restorable: true,
 })
 

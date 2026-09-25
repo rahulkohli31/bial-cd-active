@@ -25,6 +25,7 @@ import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
+from redis.exceptions import RedisError
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_rbac import CurrentSuperadmin
@@ -348,19 +349,17 @@ class SaveResponse(CamelModel):
 
 
 class PreviewStateResponse(CamelModel):
-    """FIVE STATES AND AN UNKNOWN, not one boolean.
+    """THREE STATES, and a read that could not decide is not one of them: it is a 503.
 
-    A boolean has no unknown arm, so a FAILED registry read says "your preview is gone" for a
-    question nobody managed to ask. It also flattens three genuinely different ordinary states
-    — never built, asleep, another project took the slot — into the same shrug, leaving the
-    pane only one sentence to offer back. `previewUrl` is echoed so a tab that reconnects can
-    re-frame without a second call."""
+    A boolean would let a FAILED registry read say "your preview is gone" for a question nobody
+    managed to ask, and it cannot tell a wait from a rest. `previewUrl` is echoed so a tab that
+    reconnects can re-frame without a second call."""
 
     state: PreviewLifeState
     # RETAINED, strictly `state == alive`. A browser tab loaded before this change is still
     # polling `alive`, and a tab reading a missing field as false would paint "gone" over a
-    # live preview for the whole rollout window. It cannot express UNKNOWN — new clients
-    # branch on `state`, and this field exists only so old ones keep working.
+    # live preview for the whole rollout window. New clients branch on `state` and read this
+    # only as the fallback for a state they do not recognise.
     alive: bool
     preview_url: str | None = None
     # DIAGNOSTIC ONLY — NO CLIENT LOGIC MAY BRANCH ON THIS FIELD. Non-null strictly when
@@ -395,15 +394,11 @@ class PreviewStateResponse(CamelModel):
     #
     # Additive and defaulted, so emitters and readers written before it stay wire-valid.
     starting_since: datetime | None = None
-    # SLOT_TAKEN only. Null when the live container matches no app this user owns (a ghost) —
-    # naming the wrong project in a sentence about someone's work is worse than naming none.
-    occupying_project_id: uuid.UUID | None = None
-    occupying_project_name: str | None = None
     # TRI-STATE like `SaveStateResponse.dirty`, and for the identical reason: `null` is NO
     # CLAIM, never "no". Two ways to reach it, one instruction to the client — the object store
-    # was unreachable, or `state` is `alive` and the poll declined to spend a Blob round trip on
-    # a question no surface asks about a running app (this route's fixed budget allows none on
-    # the hot path).
+    # was unreachable, or `state` is `alive` or `starting` and the poll declined to spend a Blob
+    # round trip on a question no surface asks about a running app (this route's fixed budget
+    # allows none on the hot path).
     # Answered WITHOUT a container, which is the whole point — it is the one restore signal
     # that survives the container being reclaimed.
     restorable: bool | None = None
@@ -912,7 +907,11 @@ async def release_shared_view(
 @router.get(
     "/projects/{project_id}/preview-state",
     response_model=PreviewStateResponse,
-    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
+    responses=error_responses(
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found"),
+        (503, ErrorEnvelope, "Build coordination is temporarily unavailable"),
+    ),
 )
 async def preview_state(
     project_id: uuid.UUID,
@@ -923,8 +922,9 @@ async def preview_state(
     """Is the preview this tab is framing still real — and if not, WHY?
 
     Answers about THIS project only, and its budget is deliberately fixed: one round trip to
-    the coordination store (two commands, pipelined), at most two user-scoped rows, at most two
-    object-store HEADs, and NO container call of any kind."""
+    the coordination store (two commands, pipelined), two user-scoped rows, at most two
+    object-store HEADs, and NO container call of any kind. A store that will not answer is a 503,
+    which both polls already read as a check that decided nothing."""
     # A framed preview that has been reclaimed looks EXACTLY like a working app — the last render
     # stays on screen, the iframe reports nothing, and a cross-origin pane cannot read a status
     # code. Once a build ends the tab holds no SSE and no timer, and the teardown happens inside a
@@ -934,27 +934,26 @@ async def preview_state(
     # `git` execs inside the container per call, and its `dirty=null` conflates three unrelated
     # causes.
     #
-    # A container serving a different app is `slot_taken` here, named where we can name it: the
-    # one-per-user registry means somebody else's container is exactly when yours is asleep, and
-    # the builder deserves to be told which of their own projects is standing in the way rather
-    # than that their app disappeared. A start already in flight for this project — this tab's own
-    # press, another tab's, or a chat message that just started one — answers `starting` rather
-    # than the stale `asleep` a second press used to invite. So does a container that exists but
-    # has never answered a request: `alive` here means SERVED, not scheduled, and the whole
-    # window between "a container was created" and "the app answered" is now a wait rather than
-    # a preview URL a tab would frame over nginx's 404 page. The budget above is unchanged by
-    # that — the serving proof is one more field on the registry hash this route already reads
-    # whole, so it costs no extra round trip and still no container call.
+    # A container serving a different app is `asleep` here: pressing start takes the one workspace
+    # back, so the pane offers the same thing whoever is holding it. A start already in flight for
+    # this project — this tab's own press, another tab's, or a chat message that just started one
+    # — answers `starting` rather than the stale `asleep` a second press used to invite. So does a
+    # container that exists but has never answered a request: `alive` here means SERVED, not
+    # scheduled, and the whole window between "a container was created" and "the app answered" is
+    # now a wait rather than a preview URL a tab would frame over nginx's 404 page. The budget
+    # above is unchanged by that — the serving proof is one more field on the registry hash this
+    # route already reads whole, so it costs no extra round trip and still no container call.
     await owned_project_or_404(db, user.id, project_id)
-    state = await manager.project_preview_state(db, user, project_id)
+    try:
+        state = await manager.project_preview_state(db, user, project_id)
+    except RedisError as exc:
+        raise coordination_is_gone() from exc
     return PreviewStateResponse(
         state=state.state,
         alive=state.alive,
         preview_url=state.preview_url,
         serving_since=state.serving_since,
         starting_since=state.starting_since,
-        occupying_project_id=state.occupying_project_id,
-        occupying_project_name=state.occupying_project_name,
         restorable=state.restorable,
     )
 

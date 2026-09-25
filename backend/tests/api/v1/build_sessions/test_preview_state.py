@@ -1,4 +1,5 @@
-"""`GET /v1/build-sessions/projects/{id}/preview-state` — five states, not one boolean."""
+"""`GET /v1/build-sessions/projects/{id}/preview-state` — three states, and a 503 for a read that
+decided nothing."""
 
 from __future__ import annotations
 
@@ -15,19 +16,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import src.services.build_sessions.manager as manager_mod
 from src.api.v1.build_sessions.schemas import (
-    PREVIEW_STATE_ACTION,
     STARTING_MARKER_TTL_SECONDS,
     PreviewLifeState,
-    PreviewStateAction,
 )
 from src.services.build_sessions.alarms import (
     APP_FIRST_SERVE_NOT_OBSERVED_EVENT,
     APP_FIRST_SERVED_EVENT,
+    PREVIEW_STATE_REPORTED_UNKNOWN_EVENT,
 )
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import write_starting_marker
 from src.services.build_sessions.manager import SessionManager, app_name_for
 from src.services.redis import (
+    BUILD_COORDINATION_UNAVAILABLE_MSG,
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
     registry_key,
@@ -148,14 +149,16 @@ def instant_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
 # --------------------------------------------------------------------------------------
 
 
-async def test_a_project_nobody_ever_built_says_so(
+async def test_a_project_nobody_ever_built_is_asleep_with_nothing_to_restore(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
+    """`restorable` is what tells this apart from a project with work to bring back, and the
+    client reads its `false` as "describe what to build"."""
     user, project = await _user_project(db_session, "ps-new@rvaiglobal.com")
 
     body = await _probe(client, user, project)
 
-    assert body["state"] == "never_built"
+    assert body["state"] == "asleep"
     assert body["restorable"] is False
     assert body["previewUrl"] is None
 
@@ -215,52 +218,45 @@ async def test_a_live_container_for_this_project_is_alive_with_a_framable_url(
     assert body["alive"] is True
     assert body["previewUrl"] == (f"https://citizenapps.bialairport.com/a/{app_name_for(app_id)}")
     assert "azurecontainerapps.io" not in body["previewUrl"]
-    assert body["occupyingProjectName"] is None
+    assert set(body) == {
+        "state",
+        "alive",
+        "previewUrl",
+        "servingSince",
+        "startingSince",
+        "restorable",
+    }
     # ALIVE NOW MEANS SERVED. This container carries a real stamp, so the answer comes off the
     # proven arm rather than the pre-cutover grandfather — see the serving-proof section below.
     assert body["servingSince"] is not None
 
 
-async def test_another_project_holding_the_slot_is_named(
+async def test_whoever_holds_the_workspace_this_project_reads_asleep_and_restorable(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
+    """Pressing start takes the one workspace back from its holder, so the answer does not
+    depend on who that is: another of this user's projects, or a container nobody can
+    attribute. The restore question is still asked, because this is where it is rendered.
+
+    Mutation-check: answer `restorable=None` on this arm and the first assertion goes red."""
     user, mine = await _user_project(db_session, "ps-taken@rvaiglobal.com")
     theirs = await ProjectFactory.create(db_session, user.id, name="Baggage Reconciliation")
-    await _built(db_session, user, mine)
+    my_app = await _built(db_session, user, mine)
+    await fake_storage.put(snapshot_key(my_app), b"SAVED-BUNDLE")
     other_app = await _built(db_session, user, theirs)
-    await _register_container(
-        fake_redis,
-        user.id,
-        app_name_for(other_app),
-        state=REGISTRY_STATE_READY,
-        serving_since=SERVED,
-    )
 
-    body = await _probe(client, user, mine)
+    readings = []
+    for holder in (app_name_for(other_app), "sbx-somebodyelses"):
+        await _register_container(
+            fake_redis, user.id, holder, state=REGISTRY_STATE_READY, serving_since=SERVED
+        )
+        body = await _probe(client, user, mine)
+        readings.append((body["state"], body["restorable"], body["previewUrl"]))
 
-    assert body["state"] == "slot_taken"
-    assert body["occupyingProjectName"] == "Baggage Reconciliation"
-    assert body["occupyingProjectId"] == str(theirs.id)
-    assert body["previewUrl"] is None, "the other project's URL is not this project's preview"
+    assert readings == [("asleep", True, None), ("asleep", True, None)]
 
 
-async def test_an_unattributable_container_takes_the_slot_without_naming_anyone(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
-) -> None:
-    user, project = await _user_project(db_session, "ps-ghost@rvaiglobal.com")
-    await _built(db_session, user, project)
-    await _register_container(
-        fake_redis, user.id, "sbx-somebodyelses", state=REGISTRY_STATE_READY, serving_since=SERVED
-    )
-
-    body = await _probe(client, user, project)
-
-    assert body["state"] == "slot_taken"
-    assert body["occupyingProjectName"] is None
-    assert body["occupyingProjectId"] is None
-
-
-async def test_a_container_of_ours_mid_teardown_reads_as_asleep_not_taken(
+async def test_a_container_of_ours_mid_teardown_reads_as_asleep_with_no_url(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
     user, project = await _user_project(db_session, "ps-ending@rvaiglobal.com")
@@ -519,7 +515,7 @@ async def test_no_state_but_running_ever_names_a_serving_instant(
     user, mine = await _user_project(db_session, "ps-diagnostic@rvaiglobal.com")
     named: list[tuple[str, object]] = []
 
-    named.append(_state_and_instant(await _probe(client, user, mine)))  # never_built
+    named.append(_state_and_instant(await _probe(client, user, mine)))  # never built
 
     app_id = await _built(db_session, user, mine)
     named.append(_state_and_instant(await _probe(client, user, mine)))  # asleep
@@ -546,14 +542,14 @@ async def test_no_state_but_running_ever_names_a_serving_instant(
         state=REGISTRY_STATE_READY,
         serving_since=SERVED,
     )
-    named.append(_state_and_instant(await _probe(client, user, mine)))  # slot_taken
+    named.append(_state_and_instant(await _probe(client, user, mine)))  # held elsewhere
 
     assert named == [
-        ("never_built", None),
+        ("asleep", None),
         ("asleep", None),
         ("starting", None),
         ("starting", None),
-        ("slot_taken", None),
+        ("asleep", None),
     ]
     # …and the positive control, so the list above proves an omission rather than a field that
     # is simply never populated at all.
@@ -563,7 +559,7 @@ async def test_no_state_but_running_ever_names_a_serving_instant(
     assert _state_and_instant(await _probe(client, user, mine))[1] is not None
 
 
-async def test_a_registry_read_failure_is_unknown_not_gone(
+async def test_a_registry_read_failure_is_a_503_not_a_state(
     client: AsyncClient,
     db_session: AsyncSession,
     fake_redis,
@@ -571,13 +567,14 @@ async def test_a_registry_read_failure_is_unknown_not_gone(
     wire,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Mutation-check: fold the `except RedisError` arm back into the `asleep` return and this goes
-    # red on the `state` assertion.
+    """A read that decided nothing answers no state at all, so no state can be the reassuring
+    one. Both polls already read a failed request as "we could not check".
+
+    Mutation-check: fold the `except RedisError` arm into `_at_rest` and this goes red on the
+    status."""
     user, project = await _user_project(db_session, "ps-blip@rvaiglobal.com")
     app_id = await _built(db_session, user, project)
     await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
-
-    from src.services.build_sessions import manager as manager_module
 
     async def the_store_will_not_answer(*_args: object, **_kwargs: object) -> None:
         raise RedisConnectionError("connection refused (pipeline)")
@@ -585,15 +582,69 @@ async def test_a_registry_read_failure_is_unknown_not_gone(
     # The route reads through `read_registry_and_starting_marker`, not a bare `read_registry`:
     # patching the latter would leave the route perfectly able to answer.
     monkeypatch.setattr(
-        manager_module, "read_registry_and_starting_marker", the_store_will_not_answer
+        manager_mod, "read_registry_and_starting_marker", the_store_will_not_answer
     )
 
-    body = await _probe(client, user, project)
+    resp = await client.get(
+        f"/v1/build-sessions/projects/{project.id}/preview-state", headers=auth_headers(user)
+    )
 
-    assert body["state"] == "unknown"
-    assert body["state"] not in {"asleep", "never_built", "slot_taken"}
-    assert body["alive"] is False
-    assert body["restorable"] is True
+    assert resp.status_code == 503, resp.text
+    assert resp.json() == {"error": {"message": BUILD_COORDINATION_UNAVAILABLE_MSG}}
+
+
+async def test_a_failed_read_is_logged_once_per_user_however_often_the_tab_asks(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The warning is the only record of an outage the pane deliberately does not draw, and the
+    caller is a browser timer, so it is said once per silence window rather than once per poll.
+
+    Mutation-check: drop the `_say_the_preview_read_failed` call and `said` is empty; drop its
+    early return and `said` has three lines."""
+    user, project = await _user_project(db_session, "ps-blip-log@rvaiglobal.com")
+
+    async def the_store_will_not_answer(*_args: object, **_kwargs: object) -> None:
+        raise RedisConnectionError("connection refused (pipeline)")
+
+    monkeypatch.setattr(
+        manager_mod, "read_registry_and_starting_marker", the_store_will_not_answer
+    )
+
+    url = f"/v1/build-sessions/projects/{project.id}/preview-state"
+    with structlog.testing.capture_logs() as logs:
+        statuses = [
+            (await client.get(url, headers=auth_headers(user))).status_code for _ in range(3)
+        ]
+
+    said = [e for e in logs if e.get("event") == PREVIEW_STATE_REPORTED_UNKNOWN_EVENT]
+    assert statuses == [503, 503, 503]
+    assert len(said) == 1
+    assert said[0]["project_id"] == str(project.id)
+
+
+async def test_with_no_coordination_store_configured_a_project_is_asleep_not_a_503(
+    client: AsyncClient, db_session: AsyncSession, fake_storage, wire
+) -> None:
+    """No `fake_redis`: with the singleton unset, `get_redis()` raises `RedisNotConfiguredError`,
+    which is a CERTAIN answer — no sandbox subsystem, so nothing can be serving or starting.
+
+    Mutation-check: let `RedisNotConfiguredError` reach the `RedisError` arm and both probes
+    below leave 200."""
+    user, never = await _user_project(db_session, "ps-noredis-new@rvaiglobal.com")
+    saved = await ProjectFactory.create(db_session, user.id)
+    app_id = await _built(db_session, user, saved)
+    await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
+
+    first = await _probe(client, user, never)
+    second = await _probe(client, user, saved)
+
+    assert (first["state"], first["restorable"]) == ("asleep", False)
+    assert (second["state"], second["restorable"]) == ("asleep", True)
 
 
 async def test_restorable_is_null_when_the_object_store_is_unreachable(
@@ -782,18 +833,19 @@ async def test_an_abandoned_marker_expires_and_the_next_read_falls_back_to_the_r
     assert body["state"] == "asleep"
 
 
-async def test_a_marker_naming_another_project_is_slot_taken_and_names_it(
+async def test_a_marker_naming_another_project_leaves_this_one_asleep(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
+    """The marker is per user: a start in flight for another project is not this pane's wait.
+
+    Mutation-check: answer `starting` for any marker and this goes red on `state`."""
     user, mine = await _user_project(db_session, "ps-marker-taken@rvaiglobal.com")
     theirs = await ProjectFactory.create(db_session, user.id, name="Runway Allocation")
     await write_starting_marker(fake_redis, user.id, theirs.id)
 
     body = await _probe(client, user, mine)
 
-    assert body["state"] == "slot_taken"
-    assert body["occupyingProjectId"] == str(theirs.id)
-    assert body["occupyingProjectName"] == "Runway Allocation"
+    assert (body["state"], body["restorable"], body["startingSince"]) == ("asleep", False, None)
 
 
 async def test_a_marker_naming_this_project_while_the_registry_already_serves_it_is_alive(
@@ -899,7 +951,7 @@ async def test_the_alive_path_spends_nothing_on_the_object_store(
     assert heads == [snapshot_key(app_id)], "one HEAD, and only where the answer is rendered"
 
 
-async def test_every_state_is_reachable_and_they_are_all_different(
+async def test_every_state_is_reachable_and_there_are_three(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
     user, mine = await _user_project(db_session, "ps-ladder@rvaiglobal.com")
@@ -929,8 +981,8 @@ async def test_every_state_is_reachable_and_they_are_all_different(
     )
     seen.append((await _probe(client, user, mine))["state"])
 
-    assert seen == ["never_built", "asleep", "starting", "alive", "slot_taken"]
-    assert len(set(seen)) == 5, "five states, not one boolean"
+    assert seen == ["asleep", "asleep", "starting", "alive", "asleep"]
+    assert set(seen) == {member.value for member in PreviewLifeState}
 
 
 # --------------------------------------------------------------------------------------
@@ -983,23 +1035,6 @@ async def test_the_registry_and_marker_are_read_in_one_pipelined_round_trip(
     assert body["state"] == "alive"
     assert len(pipelines) == 1, "one round trip, not two sequential ones"
     assert bare_reads == [], "the registry and marker travel inside the pipeline, not beside it"
-
-
-# --------------------------------------------------------------------------------------
-# The signal→action mapping
-# --------------------------------------------------------------------------------------
-
-
-def test_every_preview_life_state_maps_to_exactly_one_action() -> None:
-    assert set(PREVIEW_STATE_ACTION) == set(PreviewLifeState)
-    for state in PreviewLifeState:
-        assert PREVIEW_STATE_ACTION[state] in set(PreviewStateAction)
-
-
-def test_no_ambiguous_state_maps_to_the_remedy_action() -> None:
-    assert PREVIEW_STATE_ACTION[PreviewLifeState.UNKNOWN] is not PreviewStateAction.REMEDY
-    assert PREVIEW_STATE_ACTION[PreviewLifeState.UNKNOWN] == PreviewStateAction.RETRY
-    assert PREVIEW_STATE_ACTION[PreviewLifeState.STARTING] == PreviewStateAction.NEITHER
 
 
 async def test_a_readiness_timeout_on_the_attach_arm_is_non_destructive_and_the_triple_holds(
@@ -1710,54 +1745,38 @@ async def test_a_continuation_that_watches_the_page_arrive_stamps_it_once_and_na
     assert (await _probe(client, user, project))["state"] == "alive"
 
 
-# --- a workspace somebody else is holding, BEFORE this project has ever built -------------------
-#
-# ★ THE VANISHING MESSAGE. `project_preview_state`'s "no app row -> NEVER_BUILT" arm used to sit
-# ABOVE the slot-taken check, which made SLOT_TAKEN structurally unreachable for a project that had
-# never built — the project most likely to meet it, since a citizen only ever has one workspace.
-#
-# WHAT IT COST, MEASURED ON 2026-09-10 IN TWO OF THREE REAL RUNS: the pane said "Describe what you
-# want to build." over a workspace another project was holding. The citizen typed, pressed send,
-# the server refused the start with a 409, and the composer — which rolls both bubbles back on a
-# refusal, correctly — left NOTHING on screen. No message, no error, no card, no button. The
-# platform's answer to "why did my message disappear" was a sentence inviting them to type it
-# again.
+# --- a first-time project ---------------------------------------------------------------------
 
 
-async def test_a_first_time_project_reports_a_workspace_another_project_is_holding(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+async def test_a_first_time_project_reads_the_same_whoever_holds_the_workspace(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """★ The arm that could not be reached. No app row here, and the registry names somebody
-    else's container: the honest answer is SLOT_TAKEN, not "you have never built anything".
+    """No app row means no bundle key can exist, so `restorable` is a confirmed `false` that
+    costs no object-store call — held workspace or free.
 
-    Mutation-check: move the `NEVER_BUILT` return back above the registry read in
-    `project_preview_state` and this goes red on `state`.
-    """
-    user, project = await _user_project(db_session, "ps-held-first@rvaiglobal.com")
+    Mutation-check: answer `None` for a missing app row in `_at_rest` and this goes red on
+    `restorable`."""
+    user, project = await _user_project(db_session, "ps-first@rvaiglobal.com")
+    heads: list[str] = []
+    read_head = fake_storage.head
+
+    async def record_a_head(key: str):
+        heads.append(key)
+        return await read_head(key)
+
+    monkeypatch.setattr(fake_storage, "head", record_a_head)
+
+    free = await _probe(client, user, project)
     await _register_container(
         fake_redis, user.id, "sbx-somebodyelses", state=REGISTRY_STATE_READY, serving_since=""
     )
+    held = await _probe(client, user, project)
 
-    body = await _probe(client, user, project)
-
-    assert body["state"] == "slot_taken", "a held workspace read as 'never built'"
-    # STILL A CONFIRMED ABSENT. No app row means no bundle key can exist, so this is an answer
-    # rather than an omission — and the card must not offer to restore something that cannot exist.
-    assert body["restorable"] is False
-    assert body["previewUrl"] is None
-
-
-async def test_a_first_time_project_with_a_free_workspace_still_says_never_built(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
-) -> None:
-    """THE OTHER HALF, and the reason the fix is a reorder rather than a replacement: with nothing
-    holding the workspace, "nothing has been built here" is still the true and useful answer.
-
-    Mutation-check: make the new arm answer SLOT_TAKEN unconditionally and this goes red — which
-    is what stops the fix from turning every empty project into a held one."""
-    user, project = await _user_project(db_session, "ps-free-first@rvaiglobal.com")
-
-    body = await _probe(client, user, project)
-
-    assert body["state"] == "never_built"
-    assert body["restorable"] is False
+    for body in (free, held):
+        assert (body["state"], body["restorable"], body["previewUrl"]) == ("asleep", False, None)
+    assert heads == []

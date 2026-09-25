@@ -17,8 +17,8 @@
  *   RUNNING   proven serving                                 running
  *   SAVED     a saved copy, nothing serving it               not-running
  *
- * plus `could-not-read`, which is INTERNAL: it is what is left when a read decided nothing AND
- * nothing has ever been decided before. See {@link WorkspaceInputs.lastDecidedPreview}.
+ * plus `could-not-read`, which is INTERNAL: it is what is left when no read has answered yet. See
+ * {@link WorkspaceInputs.preview}.
  *
  * THE ACTION UNION REACHES NOTHING DESTRUCTIVE UNASKED. Two members: start and retry. No restore,
  * rebuild, teardown or stop-somebody-else verb exists in the type, so a signal this client could
@@ -41,57 +41,25 @@ import { assertNever } from '../../utils/assertNever'
  * The reason this is not left duplicated: the same file already records what happened the last
  * time a one-liner was copied instead of shared — two sites kept private `crypto.randomUUID()`
  * mints and both went on producing v4s long after the shared mint moved on. A cadence and a
- * terminal set that drift apart are worse than that, because the symptom is a poll that stops on
+ * terminal rule that drift apart are worse than that, because the symptom is a poll that stops on
  * one surface and not on the other, with nothing red anywhere.
  */
 export const PREVIEW_PROBE_MS = 45_000
 
 /**
- * The answers that END the asking. All three are SETTLED FACTS about a workspace: nothing that
- * could change one of them happens without a reader hearing about it first. `unknown` is
- * deliberately absent — it is the one answer that decided nothing, so it must leave the timer
- * running rather than pin "we could not check" for the life of the tab.
+ * HAS THE PLATFORM SAID EVERYTHING IT IS GOING TO SAY, so re-asking can only hear it again?
  *
- * AND `restorable` BINDS THE SAME RULE. A settled `state` whose `restorable` is still `null` is
- * half an answer: the workspace is confirmed gone, but whether the work can be brought back was
- * not decided. Callers pair this set with a `restorable !== null` test; see `isTerminalReading`.
+ * `asleep` is a SETTLED FACT about a workspace: nothing that could change it happens without a
+ * reader hearing about it first. A read that threw decided nothing, so it never reaches here and
+ * leaves the timer running rather than pinning "we could not check" for the life of the tab.
+ *
+ * AND `restorable` BINDS THE SAME RULE. An `asleep` whose `restorable` is still `null` is half an
+ * answer: the workspace is confirmed at rest, but whether the work can be brought back was not
+ * decided.
  */
-export const SETTLED_GONE: ReadonlySet<PreviewLifeState> = new Set<PreviewLifeState>([
-  'asleep',
-  'slot_taken',
-  'never_built',
-])
-
-/** Has the platform said everything it is going to say, so re-asking can only hear it again? */
 export function isTerminalReading(preview: Pick<PreviewState, 'state' | 'restorable'>): boolean {
-  return SETTLED_GONE.has(preview.state) && preview.restorable !== null
+  return preview.state === 'asleep' && preview.restorable !== null
 }
-
-// ─── a read that decided something ────────────────────────────────────────────────────────────
-
-/**
- * A READING THAT DECIDED SOMETHING — anything but `unknown`.
- *
- * "DECIDED" IS WEAKER THAN "SETTLED", AND THE TWO MUST NOT BE CONFUSED. {@link SETTLED_GONE} is
- * about a workspace that has finished changing, so re-asking it can only hear the same sentence
- * again. This is about the READ: the server answered with a state it was willing to stand behind.
- * `starting` and `alive` are decided and are the opposite of settled — their successors arrive
- * with no gesture from anybody.
- *
- * IT IS A TYPE RATHER THAN A CONVENTION because it is the input the map REMEMBERS across reads,
- * and a caller that fed an `unknown` into that slot would be storing "we could not check" as the
- * thing to fall back to when we cannot check — the exact circularity the fallback exists to break.
- * {@link asDecidedReading} is the only way to build one.
- */
-export type DecidedPreview = PreviewState & { state: Exclude<PreviewLifeState, 'unknown'> }
-
-/** The one narrowing, so no caller hand-rolls `state !== 'unknown'` and gets the polarity wrong. */
-export function asDecidedReading(preview: PreviewState | null): DecidedPreview | null {
-  return preview !== null && decidedSomething(preview) ? preview : null
-}
-
-const decidedSomething = (preview: PreviewState): preview is DecidedPreview =>
-  preview.state !== 'unknown'
 
 // ─── the cadence while a start is in flight ───────────────────────────────────────────────────
 
@@ -242,20 +210,11 @@ export const BACKGROUND_CADENCE: ProbeCadence = { delayMs: PREVIEW_PROBE_MS, fas
  * the read, on the `keepAsking`/`stopAsking` seam both effects already own.
  *
  * STRICTLY `starting`, and it reverts on anything else. A window that stayed open on `alive` would
- * put the whole product on a 3-second poll, which is the change nobody asked for.
- *
- * `unknown` NEITHER OPENS NOR CLOSES ONE, and that is worth stating precisely rather than as "an
- * unreadable read keeps the fast cadence", which is not what this does. It CONTINUES a window that
- * is already open, at 3 seconds — which is what a blip during a start needs, and is why the
- * unreadable arm is not a reason to slow down. It does NOT open one: a poll that has never seen
- * `starting` must not be accelerated by a broken server, so an `unknown` on a cold load is asked
- * again at the background cadence. And it still SPENDS from an open window, because the bound is
- * on reads made, not on answers liked: a server answering `unknown` forever must not buy an
- * unbounded fast poll.
+ * put the whole product on a 3-second poll, which is the change nobody asked for. A read that
+ * never answered is {@link spendProbeCadence}'s, not this function's.
  */
 export function nextProbeCadence(answer: PreviewLifeState, held: ProbeCadence): ProbeCadence {
-  if (answer !== 'starting' && answer !== 'unknown') return BACKGROUND_CADENCE
-  if (answer === 'unknown' && held.fastReads === 0) return BACKGROUND_CADENCE
+  if (answer !== 'starting') return BACKGROUND_CADENCE
   return spendOpenWindow(held)
 }
 
@@ -450,9 +409,8 @@ const RETRY: WorkspaceAction = { kind: 'retry', label: RETRY_LABEL }
  * `not-running` is the one to watch: it is a state name here and on the wire, and it is the exact
  * phrase the copy rule forbids on screen.
  *
- * FOUR ARE DRAWN AND ONE IS NOT. `could-not-read` is reachable only when a read decided nothing
- * AND nothing had ever been decided before it — see {@link WorkspaceInputs.lastDecidedPreview}. It
- * is kept in the union deliberately: the surfaces that special-case it — `AppPane`'s frame veto,
+ * FOUR ARE DRAWN AND ONE IS NOT. `could-not-read` is reachable only when no read has answered
+ * yet — see {@link WorkspaceInputs.preview}. It is kept in the union deliberately: the surfaces that special-case it — `AppPane`'s frame veto,
  * which leaves a standing frame alone, and the Plan chat's spoken set — are the reason a
  * coordination-store blip cannot pull a running app off somebody's screen.
  */
@@ -593,29 +551,16 @@ const sameAction = (a: WorkspaceAction | null, b: WorkspaceAction | null): boole
 // ─── the inputs ───────────────────────────────────────────────────────────────────────────────
 
 export interface WorkspaceInputs {
-  /** The preview-state read as it arrived, `unknown` included. `null` before the first one lands. */
-  readonly preview: PreviewState | null
   /**
-   * THE LAST READ THAT DECIDED ANYTHING — what an unreadable read falls back to.
+   * THE LAST READ THAT ANSWERED. `null` until one has.
    *
-   * WHY IT IS NOT DERIVABLE HERE. This map is a pure function of one reading, so "an unreadable
-   * read never changes the pane" cannot be a rule it enforces on its own: it has no yesterday. The
-   * callers have one — both polls already keep the previous reading and already refuse to let an
-   * `unknown` overwrite it — so the memory is threaded in rather than invented, and there is still
-   * exactly one place that decides what the memory MEANS.
-   *
-   * WHAT IT PREVENTS, CONCRETELY, because the alternative was to delete the unreadable arm
-   * outright. Without it an `unknown` falls through to the at-rest arms, where `restorable` is
-   * `null` (the object store was not consulted) and `projectHasSavedBuild` is still `null` on a
-   * cold load — so a coordination-store blip printed "Describe what you want to build." over a
-   * project whose app may be serving right now, with no action on the card at all. Rendering the
-   * last decided reading instead means the pane simply does not move, which is the whole of the
-   * rule.
-   *
-   * `null` ONLY WHEN NOTHING HAS EVER BEEN DECIDED, and only then does the map fall back to saying
-   * so — see {@link resolveWorkspaceState}'s third step.
+   * A READ THAT THROWS NEVER REACHES THIS FIELD, and that is the whole of "an unreadable read never
+   * changes the pane": both polls leave their reading exactly where it was when `fetchPreviewState`
+   * throws, so a standing frame stays framed and a standing card stays put. The map never sees the
+   * failure at all, which is why it has no arm for one beyond `null` — see
+   * {@link resolveWorkspaceState}'s second step.
    */
-  readonly lastDecidedPreview: DecidedPreview | null
+  readonly preview: PreviewState | null
   /**
    * The project row's own "is there anything to restore" — a cold-load answer that predates the
    * first read. Read with `??` against the read's fresher `restorable`, never `||`: `restorable`
@@ -661,33 +606,26 @@ export interface WorkspaceInputs {
  *     previous attempt's ending are all facts from before the button went down — and if the app is
  *     already serving then the start succeeded whatever it reported on the way, so saying "getting
  *     your app ready" over it would be the pane contradicting the frame beside it.
- *  2. WHICH READING IS BEING RENDERED AT ALL. The read that just landed, unless it decided nothing
- *     (`unknown`, or none has landed yet), in which case the last one that did. This is the whole
- *     of "an unreadable read never changes the pane": a standing frame stays framed and a standing
- *     card stays put, because the value the surfaces receive does not move.
- *  3. NOTHING HAS EVER BEEN DECIDED → "we could not check", with a retry. Not an empty pane, and
- *     not an invitation to build over an app that may be running: before the platform has said
- *     anything at all, the honest sentence is that we have not heard, and the retry is the only
- *     thing a person can usefully do with it.
- *  4. `alive` → RUNNING. It now means the platform watched the app answer a request rather than
+ *  2. NOTHING HAS ANSWERED YET → "we could not check", with a retry. Not an empty pane, and not an
+ *     invitation to build over an app that may be running: before the platform has said anything
+ *     at all, the honest sentence is that we have not heard, and the retry is the only thing a
+ *     person can usefully do with it.
+ *  3. `alive` → RUNNING. It now means the platform watched the app answer a request rather than
  *     that a container was scheduled — which is why the arms that used to hedge against it are
  *     gone.
- *  5. `starting` → BUILDING. Something under way, nothing proven to be serving.
- *  6. `slot_taken` / `asleep` / `never_built` → SAVED or NEW, resolved against whether anything can
- *     be brought back. `slot_taken` shares that arm rather than having one of its own — see the
- *     case below for why the citizen's own other project holding the slot is not a negotiation.
+ *  4. `starting` → BUILDING. Something under way, nothing proven to be serving.
+ *  5. `asleep` → SAVED or NEW, resolved against whether anything can be brought back.
  *
  * A START OUTCOME SELECTS NO ARM OF ITS OWN. It contributes a `note` — the server's words about a
  * press the citizen made — to whichever arm the READING chose.
  *
- * A SERVER STATE THIS CLIENT DOES NOT RECOGNISE never reaches here: `asPreviewLifeState` narrows it
- * to `unknown` at the wire, which resolves to the last decided reading — never to a confident
- * "gone". The `assertNever` at the bottom is what keeps that true when the union grows.
+ * A SERVER STATE THIS CLIENT DOES NOT RECOGNISE never reaches here: `fetchPreviewState` throws on
+ * it, so the pane keeps the last reading that answered — never a confident "gone". The
+ * `assertNever` at the bottom is what keeps that true when the union grows.
  */
 export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
   const {
-    preview,
-    lastDecidedPreview,
+    preview: reading,
     projectHasSavedBuild,
     startOutcome,
     startInFlight,
@@ -697,10 +635,6 @@ export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
   // reading selects rather than selecting one of its own. Computed once, here, so the two arms
   // that can carry it cannot come to disagree about what it says.
   const note = pressNote(startOutcome)
-  // Step 2. `asDecidedReading` is the only narrowing in the file, so no arm below has to think
-  // about `unknown` at all — and none of them can accidentally treat it as a verdict.
-  const reading = asDecidedReading(preview) ?? lastDecidedPreview
-
   const startedAt = waitBeganAt(reading)
 
   if (startInFlight && reading?.state !== 'alive')
@@ -723,14 +657,11 @@ export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
       }
     case 'starting':
       return gettingReady(note, startedAt, waitHasGoneOnTooLong)
-    // ANOTHER OF THIS CITIZEN'S PROJECTS HOLDS THE SLOT, AND THAT IS NOT A QUESTION FOR THEM.
+    // ANOTHER OF THIS CITIZEN'S PROJECTS MAY HOLD THE SLOT, AND THAT IS NOT A QUESTION FOR THEM.
     // Pressing start takes the workspace: the server starts the project that was asked for and
-    // tears the outgoing one down behind it. So this reads exactly as a saved, stopped app does —
-    // the same sentence and the same one control — and it names no other project, because a tab
-    // whose container was taken by a switch made elsewhere has no cause to name.
-    case 'slot_taken':
+    // tears the outgoing one down behind it. So a held workspace reads exactly as a saved, stopped
+    // app does — the same sentence and the same one control — and names no other project.
     case 'asleep':
-    case 'never_built':
       return atRest(reading, projectHasSavedBuild, note)
     default:
       return assertNever(reading.state)
@@ -897,10 +828,10 @@ function gettingReady(
  * THE ONE HONEST ANSWER TO A QUESTION NOBODY MANAGED TO ASK — and the only arm that is not drawn
  * for a state of the workspace.
  *
- * REACHED FROM ONE PLACE ONLY: a read that decided nothing, at a moment when nothing had ever been
- * decided. Once ANY reading has landed, an unreadable one renders THAT reading instead and this is
- * unreachable — see {@link WorkspaceInputs.lastDecidedPreview}. That narrowing is the whole reason
- * it survived the collapse while four other arms did not. "We could not check on your app." is an
+ * REACHED FROM ONE PLACE ONLY: no read has answered yet. Once ANY reading has landed, an
+ * unreadable one leaves THAT reading in place and this is unreachable — see
+ * {@link WorkspaceInputs.preview}. That narrowing is the whole reason it survived the collapse
+ * while four other arms did not. "We could not check on your app." is an
  * engineer's sentence about the platform's own plumbing, and showing it to somebody whose app is
  * fine is the failure; showing it to somebody about whom we have genuinely never managed to learn
  * anything is simply the truth.

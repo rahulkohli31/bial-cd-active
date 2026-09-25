@@ -595,12 +595,10 @@ class DiscardOutcome:
 @dataclass(frozen=True)
 class PreviewState:
     """What is (or is not) serving this project right now. `alive` is DERIVED rather than
-    stored: as a field, `False` meant "never built" and "another project took the slot" and
-    "asleep" and "the registry read threw" indistinguishably; as a property it can only ever
-    mean `state is ALIVE`. `PreviewLifeState.STARTING` needs no field of its own: a start in
-    flight names no preview URL and offers no restore, so the existing defaults
-    (`preview_url=None`, `restorable=None`) are already right — `state` alone carries the
-    new fact."""
+    stored, so it can only ever mean `state is ALIVE`. `PreviewLifeState.STARTING` needs no
+    field of its own: a start in flight names no preview URL and offers no restore, so the
+    existing defaults (`preview_url=None`, `restorable=None`) are already right — `state` alone
+    carries the new fact."""
 
     state: PreviewLifeState
     preview_url: str | None = None
@@ -617,17 +615,12 @@ class PreviewState:
     # a one-second wait look identical to the citizen and to us. `None` is NO CLAIM: the client
     # falls back to counting from mount, which is what it did before.
     starting_since: datetime | None = None
-    # SLOT_TAKEN only — whose work is in the container standing where this project's was. Also
-    # populated directly from the starting marker's own payload (no registry round trip needed
-    # to name the occupier) when a start, rather than a live container, is what is holding the
-    # slot.
-    occupying_project_id: uuid.UUID | None = None
-    occupying_project_name: str | None = None
     # TRI-STATE (`snapshot_presence`), and `None` is NO CLAIM rather than "no": either the
     # object store was unreachable, or nothing on screen for this state could use the answer
-    # (the alive path, which declines to spend a Blob round trip per poll on a question about
-    # an app that is currently running). Both readings are the same instruction to the client —
-    # believe nothing from this field, fall back to what you already knew.
+    # (the alive and starting paths, which decline to spend a Blob round trip per poll on a
+    # question about an app that is running or on its way). Both readings are the same
+    # instruction to the client — believe nothing from this field, fall back to what you
+    # already knew.
     restorable: bool | None = None
 
     @property
@@ -793,21 +786,11 @@ async def _occupying_shared_project(
     return _OccupyingProject(app_id=app_id, project_id=stamp.project_id, project_name=project_name)
 
 
-async def _project_name_owned_by(
-    db: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
-) -> str | None:
-    """The name of a project this user owns, or `None` when it does not exist (or is not
-    theirs) — the starting marker's direct counterpart to `_occupying_project` above.
-
-    `_occupying_project` exists ONLY because a registry hash cannot say which project a
-    container belongs to and must invert an app NAME back to one. The starting marker
-    carries the project id outright, so the SLOT_TAKEN answer it feeds needs no inversion and
-    no ghost case — a marker that named a project the caller does not own could only mean the
-    marker itself is corrupt, which is exactly the `None` this returns."""
-    name: str | None = await db.scalar(
-        sa.select(Project.name).where(Project.id == project_id, Project.user_id == user_id)
-    )
-    return name
+async def _at_rest(app_id: uuid.UUID | None) -> PreviewState:
+    """ASLEEP, with the restore answer it is the only state to carry. No app row means no bundle
+    key can exist, so `False` there is a confirmed absent rather than a skipped question."""
+    restorable = False if app_id is None else await snapshot_presence(app_id)
+    return PreviewState(state=PreviewLifeState.ASLEEP, restorable=restorable)
 
 
 async def _saved_head(app_id: uuid.UUID) -> str | None:
@@ -1403,8 +1386,8 @@ class SessionManager:
 
         `project_id` NAMES the start for `project_preview_state` and the reclamation spare
         predicate — it is the marker's whole payload. Required, not optional: a marker that
-        could not say which project it is starting would be able to report `starting` but
-        never `slot_taken`, which is the ghost this unit replaces.
+        could not say which project it is starting would put every one of this user's panes
+        into the same wait.
 
         `arm` NAMES THE DOOR on the `build_workspace_claimed` line, and is required for the same
         reason: from inside here the two callers are indistinguishable, and "a citizen pressed
@@ -1502,13 +1485,13 @@ class SessionManager:
         scope = _LockScope(token=token)
         try:
             # From here until the scope exits, a poll of `project_preview_state` for
-            # `project_id` answers `starting` rather than whatever it would otherwise have said
-            # (a stale `asleep`, or a ghost `slot_taken`). Written AFTER the lock is held so a
-            # request that loses the race to acquire it never claims a start it did not win,
-            # and INSIDE the try because by this point a lock IS held: a Redis blip on this one
-            # `SET`, raised from above the try, would have unwound past the compensation arm and
-            # left that lock in place for its full 900s — every later start, relaunch and turn
-            # for this user answered "already building" with nothing building.
+            # `project_id` answers `starting` rather than the stale `asleep` it would otherwise
+            # have said. Written AFTER the lock is held so a request that loses the race to
+            # acquire it never claims a start it did not win, and INSIDE the try because by this
+            # point a lock IS held: a Redis blip on this one `SET`, raised from above the try,
+            # would have unwound past the compensation arm and left that lock in place for its
+            # full 900s — every later start, relaunch and turn for this user answered "already
+            # building" with nothing building.
             await write_starting_marker(redis, user_id, project_id)
             # THE FIRST LINE OF A BUILD, and until now the only way to answer "did this citizen
             # get a slot at all, and whose slot was it" was to infer it backwards from a later
@@ -2358,27 +2341,21 @@ class SessionManager:
     async def project_preview_state(
         self, db: AsyncSession, user: User, project_id: uuid.UUID
     ) -> PreviewState:
-        """What is serving THIS project — and if nothing is, WHY? Five states, never one
-        boolean: `alive=False` used to mean never built, another project took the slot,
-        asleep, AND the registry read throwing indistinguishably — the last is an ERROR, not
-        a fact, and a STARTING state closes the same gap for a start in flight (once
-        indistinguishable from asleep, inviting a second press to provision a second
-        container). THE COST BUDGET IS PART OF THE CONTRACT, since the caller is a browser
-        tab on a 45-second timer: one pipelined Redis round trip, at most two user-scoped DB
-        rows and two object-store HEADs, NONE on the alive path, and NO container call, ever."""
-        # PRECEDENCE, AND THE ORDER MATTERS. An unreadable store still answers `unknown`,
-        # checked first, so ambiguity never wears a confident face. A registry that serves
-        # this project, is READY and carries a SERVING PROOF still answers `alive` even with a
-        # stale marker present — a marker must never hide a running app; the same registry
-        # WITHOUT that proof answers `starting` from the same block, because a container that
-        # has been scheduled and has never answered a request is a wait, not a preview, however
-        # the markers happen to read. A marker naming THIS project answers
-        # `starting`, ABOVE the never-built check below it, because a first build mints its
-        # app row only once the start commits, so `app_id is None` does not yet mean nothing
-        # is happening. A marker naming ANOTHER project answers `slot_taken`, named directly
-        # from the marker rather than inverted from an app name (no ghost — the marker already
-        # carries the project id). Only then do the existing arms run: never-built, asleep,
-        # and the registry-sourced `slot_taken`.
+        """What is serving THIS project — and if nothing is, is there work to bring back?
+        Three states, never one boolean, and a store that will not answer raises `RedisError`
+        rather than returning one of them: a read that decided nothing must not wear the face of
+        a fact about a container. THE COST BUDGET IS PART OF THE CONTRACT, since the caller is a
+        browser tab on a 45-second timer: one pipelined Redis round trip, one user-scoped DB
+        row, at most two object-store HEADs and NONE on the alive or starting paths, and NO
+        container call, ever."""
+        # PRECEDENCE, AND THE ORDER MATTERS. A registry that serves this project, is READY and
+        # carries a SERVING PROOF answers `alive` even with a stale marker present — a marker
+        # must never hide a running app; the same registry WITHOUT that proof answers `starting`
+        # from the same block, because a container that has been scheduled and has never
+        # answered a request is a wait, not a preview, however the markers happen to read. A
+        # marker naming THIS project answers `starting` next, whether or not an app row exists
+        # yet, because a first build mints its app row only once the start commits. Everything
+        # else is `asleep`.
         #
         # THE RESTORE QUESTION IS ONLY ASKED WHEN ITS ANSWER CAN CHANGE THE SCREEN. Asking it
         # before the registry read costs a Blob round trip per tab per 45 seconds to answer
@@ -2386,10 +2363,6 @@ class SessionManager:
         # renders the answer only exists when nothing is serving the project, so the alive and
         # starting arms return `None` (no claim) and the client falls through to the answer the
         # project route already gave it at load.
-        #
-        # NOT BUILT ON `_refuse_if_reclaim_would_destroy_work`: it answers a different question
-        # — whose container holds the slot — and letting a `RedisError` from it turn a poll into
-        # a 503 would break a read that every framed preview makes every 45 seconds.
         app_id = await existing_app_id(db, user.id, project_id)
         try:
             reg, starting, start_began_at = await read_registry_and_starting_marker(
@@ -2399,36 +2372,14 @@ class SessionManager:
             # A CERTAIN answer, not an ambiguous one (`services/redis/errors.py`): Redis is
             # genuinely optional outside production, and with no coordination store there is no
             # sandbox subsystem at all — so nothing can be serving OR starting this project.
-            # `app_id` is a DB fact, independent of Redis, so it still settles NEVER_BUILT.
-            if app_id is None:
-                return PreviewState(state=PreviewLifeState.NEVER_BUILT, restorable=False)
-            return PreviewState(
-                state=PreviewLifeState.ASLEEP, restorable=await snapshot_presence(app_id)
-            )
+            return await _at_rest(app_id)
         except RedisError:
-            # AMBIGUITY. The store exists and would not answer, so this decided nothing —
-            # and a thing that decided nothing must not be reported as a fact about a
-            # container. Note it is NOT a 503 either: the caller is a poll, and 503ing a
-            # background timer would turn a blip into an error the user has to read.
-            #
-            # UNKNOWN outranks even NEVER_BUILT here, deliberately: a Redis outage means a start
-            # already in flight (which mints its app row only on success) is exactly as
-            # unreadable as one that never happened, and reporting the DB's "no app row" as a
-            # confident NEVER_BUILT would be papering over the one thing this arm exists to
-            # admit it cannot see.
-            #
-            # The store question is INDEPENDENT of the registry question and still answerable,
-            # so it is still asked when there is an app to ask it about.
-            #
-            # AND THE LOG IS THE WHOLE RECORD OF THIS ONE. Nothing is drawn for UNKNOWN by
+            # THE LOG IS THE WHOLE RECORD OF THIS ONE. Nothing is drawn for a failed read by
             # design — a standing frame stays framed, a standing card stays put — so without a
             # line here the failure is invisible from both ends at once: the citizen is told
             # nothing, and so is the operator.
             self._say_the_preview_read_failed(user.id, project_id)
-            return PreviewState(
-                state=PreviewLifeState.UNKNOWN,
-                restorable=await snapshot_presence(app_id) if app_id is not None else None,
-            )
+            raise
         mine = app_name_for(app_id) if app_id is not None else None
         # WHEN THIS PROJECT'S WAIT BEGAN, and only this project's: the marker is per USER, so a
         # start in flight for a DIFFERENT project of theirs names an instant that is not this
@@ -2443,15 +2394,15 @@ class SessionManager:
                 # right now" page while the live region announced the preview was live.
                 #
                 # WHY IT SITS HERE AND NOWHERE ELSE, three times over:
-                #  * ABOVE `snapshot_presence`, so the whole pre-serve window — every 3s
-                #    accelerated poll of it — costs no object-store HEAD. Placing it after that
-                #    call would quietly move the build window onto the expensive path.
+                #  * ABOVE `_at_rest`'s `snapshot_presence`, so the whole pre-serve window —
+                #    every 3s accelerated poll of it — costs no object-store HEAD. Placing it
+                #    after that call would quietly move the build window onto the expensive path.
                 #  * INSIDE this block, so the app-name/state comparison happens exactly once.
                 #    Two hand-written copies of "is this mine and ready" answer differently the
                 #    first time one is updated alone.
                 #  * ABOVE the `starting` marker check below, which takes the 300s marker TTL
                 #    off the screen entirely: a container that outlives its marker without ever
-                #    serving still reads as a wait, instead of falling through to SLOT_TAKEN or
+                #    serving still reads as a wait, instead of falling through to `asleep` and
                 #    offering a Launch button in the middle of the citizen's own build.
                 #
                 # No `preview_url` and no `restorable`: STARTING's existing defaults are already
@@ -2479,64 +2430,12 @@ class SessionManager:
                 preview_url=settings.app_url(mine) if fqdn else None,
                 serving_since=an_instant_on_the_hash(reg, REGISTRY_FIELD_SERVING_SINCE),
             )
-        if starting is not None:
-            # A start is in flight for THIS user, and it was not the one just ruled ALIVE
-            # above (a stale marker never wins against a serving registry). Naming it directly
-            # from the marker's own payload is the whole improvement over the registry-only
-            # SLOT_TAKEN arm below: no app-name inversion, no ghost, because the marker already
-            # says which project it is.
-            if starting == project_id:
-                return PreviewState(state=PreviewLifeState.STARTING, starting_since=waiting_since)
-            occupying_name = await _project_name_owned_by(db, user.id, starting)
-            return PreviewState(
-                state=PreviewLifeState.SLOT_TAKEN,
-                occupying_project_id=starting,
-                occupying_project_name=occupying_name,
-                restorable=(await snapshot_presence(app_id) if app_id is not None else False),
-            )
-        if app_id is None:
-            # NEVER BUILT — BUT ONLY IF THE WORKSPACE IS NOT SOMEBODY ELSE'S, and that ordering is
-            # the whole of this arm.
-            #
-            # This return used to sit ABOVE the slot-taken check below, which made SLOT_TAKEN
-            # structurally unreachable for a project that had never built — the project most
-            # likely to hit it. What a citizen actually got: "Describe what you want to build."
-            # over a workspace another project was holding, and because the composer rolls its
-            # bubbles back when the server refuses the start, their first message VANISHED. No
-            # message, no error, no card, nothing to press. Measured on 2026-09-10: two of three
-            # real runs, because holding one project open is the normal state of things.
-            #
-            # `restorable=False` stays a CONFIRMED absent on both paths: no app row means no
-            # bundle key can exist, so skipping the store call is an answer rather than an
-            # omission (the same reading `get_project` makes).
-            held = reg.get(REGISTRY_FIELD_APP_NAME) if reg is not None else None
-            if held is None:
-                return PreviewState(state=PreviewLifeState.NEVER_BUILT, restorable=False)
-            occupier = await _occupying_project(db, user.id, held)
-            return PreviewState(
-                state=PreviewLifeState.SLOT_TAKEN,
-                occupying_project_id=occupier.project_id if occupier else None,
-                occupying_project_name=occupier.project_name if occupier else None,
-                restorable=False,
-            )
-        # Everything below is a workspace that is NOT serving this project and has no start in
-        # flight — which is the only place the restore offer is rendered, so this is the one
-        # place the answer earns its round trip.
-        restorable = await snapshot_presence(app_id)
-        if reg is None:
-            return PreviewState(state=PreviewLifeState.ASLEEP, restorable=restorable)
-        live_app = reg.get(REGISTRY_FIELD_APP_NAME)
-        if live_app == mine:
-            # Ours, but mid-teardown (`ending`) — from the builder's side that is a workspace
-            # going to sleep, not a workspace somebody stole. The next prompt brings it back.
-            return PreviewState(state=PreviewLifeState.ASLEEP, restorable=restorable)
-        occupier = await _occupying_project(db, user.id, live_app or "")
-        return PreviewState(
-            state=PreviewLifeState.SLOT_TAKEN,
-            occupying_project_id=occupier.project_id if occupier else None,
-            occupying_project_name=occupier.project_name if occupier else None,
-            restorable=restorable,
-        )
+        if starting == project_id:
+            return PreviewState(state=PreviewLifeState.STARTING, starting_since=waiting_since)
+        # Nothing serving this project and no start of it in flight, which is the only place the
+        # restore offer is rendered. That includes a container of ours mid-teardown: from the
+        # builder's side that is a workspace going to sleep, and it is never handed back as a URL.
+        return await _at_rest(app_id)
 
     async def reclaim_preflight(
         self,

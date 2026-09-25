@@ -244,7 +244,7 @@ const WORKSPACE_REVERTED_TEXT =
  * through, so "Your workspace is asleep" was drawn over an app the map was at that moment calling
  * up, for as long as a 45-second poll cycle.
  *
- * The `slot_taken` copy was already unreachable through the composed product (the map sends every
+ * The `slot_taken` copy was already unreachable through the composed product (the map sent every
  * slot-taken reading to a held state, which `AppPane` never frames), and once BUILDING absorbs the
  * container-up-but-not-serving reading, nothing escapes that veto with a gone `previewState` at
  * all. So the rest went with it.
@@ -369,9 +369,8 @@ export interface LivePreviewProps {
   // The server's verdict on THIS project's container. ONE value of it is read here now, and it is
   // read for one purpose: `starting` withholds the frame.
   //
-  // EVERY OTHER VALUE IS SOMEBODY ELSE'S TO SPEAK FOR. `asleep`, `slot_taken`, `never_built` and
-  // `unknown` used to each pick a headline out of this file's own copy table; they are the map's
-  // now, and `AppPane` will not mount this component while the workspace reading is any of them.
+  // EVERY OTHER VALUE IS SOMEBODY ELSE'S TO SPEAK FOR. `asleep` is the map's, and `AppPane` will
+  // not mount this component while the workspace reading is at rest.
   // What is left is a refusal, not a sentence — see `starting` below for why the refusal stays
   // even though the veto above it makes it unreachable.
   //

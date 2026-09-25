@@ -21,7 +21,7 @@ import type { WorkspaceStateName } from './workspaceState'
 
 /**
  * The exact set of workspace states a Plan chat must describe in the board's own wording,
- * and no others. Scoped deliberately: extending the same wording to `never_built` and
+ * and no others. Scoped deliberately: extending the same wording to `never-built` and
  * `not-running` would lock in phrasing those states don't need, and whose copy may
  * reasonably want to say something different — a Plan chat has no business inviting somebody
  * to press a start control it does not render.

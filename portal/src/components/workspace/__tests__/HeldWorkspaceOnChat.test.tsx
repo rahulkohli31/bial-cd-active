@@ -17,7 +17,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, waitFor, cleanup, fireEvent, act } from '@testing-library/react'
-import type { PreviewLifeState, PreviewState } from '../../../utils/buildSessionApi'
+import type { PreviewState } from '../../../utils/buildSessionApi'
 import { ApiError } from '../../../utils/apiError'
 
 const h = vi.hoisted(() => ({
@@ -57,13 +57,11 @@ vi.mock('../../../utils/buildSessionApi', async (orig) => ({
 const { renderBuilder, composer, waitForGateOpen } =
   await import('../../../pages/__tests__/_builderSession.jsx')
 
-/** The wire still names the holder; what is pinned here is that no screen repeats it. */
+/** What the server answers for a project whose workspace another project holds. */
 const HELD: PreviewState = {
-  state: 'slot_taken' as PreviewLifeState,
+  state: 'asleep',
   alive: false,
   previewUrl: null,
-  occupyingProjectName: 'Car pool',
-  occupyingProjectId: 'pA',
   restorable: true,
   startingSince: null,
 }

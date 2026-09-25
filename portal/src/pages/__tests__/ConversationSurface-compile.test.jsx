@@ -159,9 +159,7 @@ beforeEach(() => {
   h.fetchCompileState.mockResolvedValue('unknown')
   h.checkWorkspace.mockResolvedValue(false)
   h.fetchSaveState.mockResolvedValue({ appId: null, dirty: null, containerHead: null, savedHead: null })
-  h.fetchPreviewState.mockResolvedValue({
-    state: 'unknown', alive: false, previewUrl: null, occupyingProjectName: null, restorable: null,
-  })
+  h.fetchPreviewState.mockRejectedValue(new Error('the read is not this file\'s subject'))
 })
 
 afterEach(cleanup)
@@ -175,7 +173,7 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
     h.fetchCompileState.mockResolvedValue('failed')
     h.fetchPreviewState.mockResolvedValue({
       state: 'alive', alive: true, previewUrl: PREVIEW_URL,
-      occupyingProjectName: null, restorable: true,
+      restorable: true,
     })
     const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
@@ -202,7 +200,7 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
   it('does not ask while a turn is running — the stream is the better authority', async () => {
     h.fetchPreviewState.mockResolvedValue({
       state: 'alive', alive: true, previewUrl: PREVIEW_URL,
-      occupyingProjectName: null, restorable: true,
+      restorable: true,
     })
     const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
@@ -311,7 +309,7 @@ describe('BuilderPage — a workspace lost while the tab sat idle', () => {
   async function idleOverAFinishedBuild() {
     h.fetchPreviewState.mockResolvedValue({
       state: 'alive', alive: true, previewUrl: PREVIEW_URL,
-      occupyingProjectName: null, restorable: true,
+      restorable: true,
     })
     const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
@@ -388,7 +386,7 @@ describe('BuilderPage — a stalled frame asks whether the app has stopped', () 
   async function framedWithNoClaim() {
     h.fetchPreviewState.mockResolvedValue({
       state: 'alive', alive: true, previewUrl: PREVIEW_URL,
-      occupyingProjectName: null, restorable: true,
+      restorable: true,
     })
     renderThread()
     await waitFor(() => expect(reportStall).not.toBeNull())
@@ -423,10 +421,10 @@ describe('BuilderPage — a stalled frame asks whether the app has stopped', () 
     h.checkWorkspace.mockImplementation(async () => { putAway = true; return false })
     h.fetchPreviewState.mockImplementation(async () => {
       if (launched || !putAway) {
-        return { state: 'alive', alive: true, previewUrl: PREVIEW_URL, occupyingProjectName: null, restorable: true }
+        return { state: 'alive', alive: true, previewUrl: PREVIEW_URL, restorable: true }
       }
       asleepAnswers += 1
-      return { state: 'asleep', alive: false, previewUrl: null, occupyingProjectName: null, restorable: true }
+      return { state: 'asleep', alive: false, previewUrl: null, restorable: true }
     })
     renderThread()
     await waitFor(() => expect(reportStall).not.toBeNull())

@@ -612,7 +612,7 @@ async def test_the_pipelined_read_surfaces_redis_errors_bare(
 ) -> None:
     """BARE, per the module's REDIS-ERROR POLICY: a `RedisError` from `pipe.execute()`
     propagates exactly as a bare `hgetall` would have, so `project_preview_state`'s existing
-    `except RedisError` (answering `unknown`) keeps working unchanged."""
+    `except RedisError` keeps working unchanged."""
     monkeypatch.setattr(fake_redis, "pipeline", lambda *a, **k: _BoomPipeline())
     with pytest.raises(RedisError):
         await locks.read_registry_and_starting_marker(fake_redis, USER)

@@ -71,12 +71,9 @@ beforeEach(() => {
   h.buildUserParts.mockImplementation(async (t) => [{ type: 'text', text: t }])
   h.fetchSaveState.mockResolvedValue({ dirty: false })
   h.saveProject.mockResolvedValue({ appId: 'a1', headSha: 'ccc' })
-  // Neither the workspace read nor the start is this file's subject by default: answered so
-  // nothing reaches a real `fetch`, and re-primed by the two scenarios that are about them.
-  h.fetchPreviewState.mockResolvedValue({
-    state: 'unknown', alive: false, previewUrl: null,
-    occupyingProjectName: null, occupyingProjectId: null, restorable: null,
-  })
+  // Neither the workspace read nor the start is this file's subject by default: a read that
+  // decides nothing, so nothing reaches a real `fetch`, re-primed by the two scenarios about it.
+  h.fetchPreviewState.mockRejectedValue(new Error('the read is not this file\'s subject'))
   h.relaunchPreview.mockResolvedValue({ appId: 'a1', previewUrl: 'https://app/', status: 'ready', ready: true, restoredFromFailedBuild: false })
 })
 afterEach(cleanup)
@@ -286,7 +283,7 @@ describe('a failed launch INSIDE a chat says why', () => {
     // here would silently swallow the pane's own failure and show only a stopped spinner.
     h.fetchPreviewState.mockResolvedValue({
       state: 'asleep', alive: false, previewUrl: null,
-      occupyingProjectName: null, occupyingProjectId: null, restorable: true,
+      restorable: true,
     })
     h.relaunchPreview.mockRejectedValue(
       new ApiError('Your app could not be brought back just now.', 503),
@@ -420,7 +417,7 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
     // Mutation check: remove the re-read on arrival and only the mount read ever happens.
     h.fetchPreviewState.mockResolvedValue({
       state: 'asleep', alive: false, previewUrl: null,
-      occupyingProjectName: null, occupyingProjectId: null, restorable: true,
+      restorable: true,
     })
     h.fetchSaveState.mockResolvedValue({ dirty: null })
     renderBuilder()
@@ -429,7 +426,7 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
 
     h.fetchPreviewState.mockResolvedValue({
       state: 'alive', alive: true, previewUrl: 'https://app/',
-      occupyingProjectName: null, occupyingProjectId: null, restorable: null,
+      restorable: null,
     })
     h.fetchSaveState.mockResolvedValue({ dirty: true })
     fireEvent.click(launch)
@@ -498,7 +495,7 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
     // Mutation check: let the first preview answer re-read too and every page load asks twice.
     h.fetchPreviewState.mockResolvedValue({
       state: 'alive', alive: true, previewUrl: 'https://app/',
-      occupyingProjectName: null, occupyingProjectId: null, restorable: null,
+      restorable: null,
     })
     h.fetchSaveState.mockResolvedValue({ dirty: true })
     renderBuilder()

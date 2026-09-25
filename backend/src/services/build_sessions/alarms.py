@@ -233,10 +233,11 @@ is the most common answer there is), `served_for_ms`."""
 
 
 PREVIEW_STATE_REPORTED_UNKNOWN_EVENT: Final = "preview_state_reported_unknown"
-"""The preview-state read itself failed, so the platform told the citizen nothing. WARNING.
+"""The preview-state read itself failed and the route answered 503, so the platform told the
+citizen nothing. WARNING.
 
-THE LOG IS THE WHOLE RECORD HERE. The pane deliberately does not draw this state — an unreadable
-read leaves a standing frame framed and a standing card put, rather than telling a citizen their
+THE LOG IS THE WHOLE RECORD HERE. The pane deliberately draws nothing for it — an unreadable read
+leaves a standing frame framed and a standing card put, rather than telling a citizen their
 working app does not exist — which means that without this line the failure is invisible from
 both ends. Rate-limited per user: the caller is a browser timer.
 

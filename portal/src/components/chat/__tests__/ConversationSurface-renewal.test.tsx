@@ -57,8 +57,6 @@ const LIVE: PreviewState = {
   state: 'alive' as PreviewLifeState,
   alive: true,
   previewUrl: 'https://app.example/',
-  occupyingProjectName: null,
-  occupyingProjectId: null,
   restorable: true,
   startingSince: null,
 }

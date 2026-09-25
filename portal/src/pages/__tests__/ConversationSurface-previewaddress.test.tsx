@@ -117,9 +117,7 @@ beforeEach(() => {
     appId: 'a1', previewUrl: RELAUNCH_URL, status: 'ready', restoredFromFailedBuild: false,
   })
   // Neither probe is this file's subject; both are answered so nothing reaches a real `fetch`.
-  h.fetchPreviewState.mockResolvedValue({
-    state: 'unknown', alive: false, previewUrl: null, occupyingProjectName: null, restorable: null,
-  })
+  h.fetchPreviewState.mockRejectedValue(new Error('the read is not this file\'s subject'))
   h.fetchSaveState.mockResolvedValue({ dirty: null })
   h.fetchCompileState.mockResolvedValue('unknown')
   h.checkWorkspace.mockResolvedValue(false)
@@ -378,8 +376,6 @@ describe('BuilderPage — the project arm, and the hard load it exists for', () 
     alive: state === 'alive',
     previewUrl: state === 'alive' ? PROJECT_URL : null,
     startingSince: null,
-    occupyingProjectName: null,
-    occupyingProjectId: null,
     restorable,
   })
   const probeCount = () => h.fetchPreviewState.mock.calls.length
@@ -465,12 +461,12 @@ describe('BuilderPage — the project arm, and the hard load it exists for', () 
     view.unmount()
   })
 
-  it('a `slot_taken` answer frames NOTHING, and reads as the saved app it is', async () => {
-    // The arm's contract is `alive` and nothing else. Another of this citizen's projects is
+  it('an `asleep` answer frames NOTHING, and reads as the saved app it is', async () => {
+    // The arm's contract is `alive` and nothing else. Another of this citizen's projects may be
     // holding the one slot, so there is no framable URL — and the pane says so rather than framing
     // a guess. What it says is the ordinary saved sentence: the workspace follows whichever
     // project is asked for, so a held slot is a switch away rather than a negotiation.
-    h.fetchPreviewState.mockResolvedValue(polled('slot_taken', true))
+    h.fetchPreviewState.mockResolvedValue(polled('asleep', true))
 
     const view = renderBuilderAt({ chatId: 'chat-A', projectId: 'pA' })
 

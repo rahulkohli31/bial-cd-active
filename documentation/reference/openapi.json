@@ -3202,47 +3202,21 @@
         "type": "object"
       },
       "PreviewLifeState": {
-        "description": "What is (or is not) serving a project's preview right now. An **API** StrEnum like\n`BuildSessionStatus`, not a native PG enum — wire value equals the member's lowercase name.\n\nExists because `preview-state` once collapsed four different situations into one `alive:\nfalse`, including a registry-read ERROR misread as \"gone\" — pulling a live app off screen.\nUNKNOWN keeps its own member, never folded in, for the same reason `SaveState.dirty` is\ntri-state: never give the reassuring answer for someone else.",
+        "description": "What is (or is not) serving a project's preview right now. An **API** StrEnum like\n`BuildSessionStatus`, not a native PG enum — wire value equals the member's lowercase name.\n\nA read that could not decide is not a member. The route answers 503 instead, so no member\nis ever the reassuring answer given about a store nobody could read.",
         "enum": [
           "alive",
           "asleep",
-          "starting",
-          "slot_taken",
-          "never_built",
-          "unknown"
+          "starting"
         ],
         "title": "PreviewLifeState",
         "type": "string"
       },
       "PreviewStateResponse": {
-        "description": "FIVE STATES AND AN UNKNOWN, not one boolean.\n\nA boolean has no unknown arm, so a FAILED registry read says \"your preview is gone\" for a\nquestion nobody managed to ask. It also flattens three genuinely different ordinary states\n— never built, asleep, another project took the slot — into the same shrug, leaving the\npane only one sentence to offer back. `previewUrl` is echoed so a tab that reconnects can\nre-frame without a second call.",
+        "description": "THREE STATES, and a read that could not decide is not one of them: it is a 503.\n\nA boolean would let a FAILED registry read say \"your preview is gone\" for a question nobody\nmanaged to ask, and it cannot tell a wait from a rest. `previewUrl` is echoed so a tab that\nreconnects can re-frame without a second call.",
         "properties": {
           "alive": {
             "title": "Alive",
             "type": "boolean"
-          },
-          "occupyingProjectId": {
-            "anyOf": [
-              {
-                "format": "uuid",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Occupyingprojectid"
-          },
-          "occupyingProjectName": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Occupyingprojectname"
           },
           "previewUrl": {
             "anyOf": [
@@ -9055,7 +9029,7 @@
     },
     "/v1/build-sessions/projects/{project_id}/preview-state": {
       "get": {
-        "description": "Is the preview this tab is framing still real — and if not, WHY?\n\nAnswers about THIS project only, and its budget is deliberately fixed: one round trip to\nthe coordination store (two commands, pipelined), at most two user-scoped rows, at most two\nobject-store HEADs, and NO container call of any kind.",
+        "description": "Is the preview this tab is framing still real — and if not, WHY?\n\nAnswers about THIS project only, and its budget is deliberately fixed: one round trip to\nthe coordination store (two commands, pipelined), two user-scoped rows, at most two\nobject-store HEADs, and NO container call of any kind. A store that will not answer is a 503,\nwhich both polls already read as a check that decided nothing.",
         "operationId": "preview_state_v1_build_sessions_projects__project_id__preview_state_get",
         "parameters": [
           {
@@ -9129,6 +9103,16 @@
               }
             },
             "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Build coordination is temporarily unavailable"
           }
         },
         "summary": "Preview State",

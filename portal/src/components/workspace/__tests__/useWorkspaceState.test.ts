@@ -13,6 +13,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, renderHook, waitFor } from '@testing-library/react'
 import type { PreviewState, SaveState } from '../../../utils/buildSessionApi'
+import { ApiError } from '../../../utils/apiError'
 
 const api = vi.hoisted(() => ({
   fetchPreviewState: vi.fn(),
@@ -43,8 +44,6 @@ function reading(over: Partial<PreviewState> = {}): PreviewState {
     state: 'asleep',
     alive: false,
     previewUrl: null,
-    occupyingProjectName: null,
-    occupyingProjectId: null,
     restorable: null,
     startingSince: null,
     ...over,
@@ -403,25 +402,14 @@ describe('the accelerated cadence while a start is in flight', () => {
  * an unreliable server to play against.
  */
 describe('nextProbeCadence — what opens a window, what closes it, what spends it', () => {
-  it('a blip mid-start does not drop the reader back to the background wait', () => {
-    const open = nextProbeCadence('starting', BACKGROUND_CADENCE)
-    expect(open).toEqual({ delayMs: STARTING_PROBE_MS, fastReads: 1 })
-
-    // `unknown` decided nothing, and the readers already refuse to let it overwrite the verdict on
-    // screen. Letting it close the window would put the pane back on a 45-second wait over a
-    // sentence that still says a start is happening — the bug, restored by a network hiccup.
-    const blip = nextProbeCadence('unknown', open)
-    expect(blip.delayMs).toBe(STARTING_PROBE_MS)
-    // …but it SPENDS from the window. The bound is on reads made, not on answers we liked: a
-    // server answering `unknown` forever must not buy an unbounded fast poll.
-    expect(blip.fastReads).toBe(2)
+  it('a `starting` opens the window', () => {
+    expect(nextProbeCadence('starting', BACKGROUND_CADENCE)).toEqual({
+      delayMs: STARTING_PROBE_MS,
+      fastReads: 1,
+    })
   })
 
-  it('an `unknown` on its own never opens a window', () => {
-    expect(nextProbeCadence('unknown', BACKGROUND_CADENCE)).toEqual(BACKGROUND_CADENCE)
-  })
-
-  it.each(['alive', 'asleep', 'slot_taken', 'never_built'] as const)(
+  it.each(['alive', 'asleep'] as const)(
     'a decided "%s" closes the window and gives the next start a whole one',
     (state) => {
       expect(nextProbeCadence(state, { delayMs: STARTING_PROBE_MS, fastReads: 7 })).toEqual(
@@ -492,19 +480,21 @@ describe('spendProbeCadence — what a read that never answered costs the window
 })
 
 describe('what an unreadable answer may and may not do', () => {
-  it('an `unknown` after a decided `asleep` leaves the decided value in place', async () => {
+  it('a 503 after a decided `asleep` leaves the decided value in place', async () => {
     // A blip must not pull a running app off screen, and it must not wipe a settled answer
-    // somebody is already reading either.
+    // somebody is already reading either. Mutation-check: clear `preview` in the read's `catch`
+    // and this answers `could-not-read`.
     api.fetchPreviewState.mockResolvedValueOnce(reading({ state: 'asleep', restorable: true }))
     const { result } = mount()
     await waitFor(() => expect(result.current.state.name).toBe('not-running'))
 
-    api.fetchPreviewState.mockResolvedValue(reading({ state: 'unknown' }))
+    api.fetchPreviewState.mockRejectedValue(new ApiError('Build coordination is temporarily unavailable.', 503))
     await act(async () => {
       result.current.refresh()
     })
     await settle()
 
+    expect(api.fetchPreviewState).toHaveBeenCalledTimes(2)
     expect(result.current.state.name).toBe('not-running')
   })
 
@@ -633,10 +623,11 @@ describe('what an unreadable answer may and may not do', () => {
   })
 
   it('records "could not read" when it is the ONLY thing we know', async () => {
-    api.fetchPreviewState.mockResolvedValue(reading({ state: 'unknown' }))
+    api.fetchPreviewState.mockRejectedValue(new ApiError('Build coordination is temporarily unavailable.', 503))
     const { result } = mount()
 
-    await waitFor(() => expect(result.current.state.name).toBe('could-not-read'))
+    await waitFor(() => expect(result.current.settled).toBe(true))
+    expect(result.current.state.name).toBe('could-not-read')
     expect(result.current.state.action?.kind).toBe('retry')
   })
 })
@@ -644,7 +635,7 @@ describe('what an unreadable answer may and may not do', () => {
 describe('cost — the calls this hook refuses to make', () => {
   it('never asks a stopped workspace whether it has unsaved work', async () => {
     // Two `git` execs against a dead container is an attach the screen caused.
-    for (const state of ['asleep', 'never_built', 'slot_taken', 'starting', 'unknown'] as const) {
+    for (const state of ['asleep', 'starting'] as const) {
       api.fetchSaveState.mockClear()
       api.fetchPreviewState.mockResolvedValue(reading({ state, restorable: true }))
       const { result, unmount } = mount()

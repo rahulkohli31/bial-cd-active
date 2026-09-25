@@ -38,9 +38,8 @@ import {
   BACKGROUND_CADENCE,
   HIDDEN_PROBE_MS,
   PREVIEW_PROBE_MS,
-  SETTLED_GONE,
   STARTING_PROBE_MS,
-  asDecidedReading,
+  isTerminalReading,
   mayHaveStopped,
   nextProbeCadence,
   presenceToRenew,
@@ -92,8 +91,8 @@ import type { ChatMessage, MessagePart, BuildPartLive } from '../../utils/messag
 //
 // The background poll's cadence and its terminal answers live in
 // `components/workspace/workspaceState.ts`, imported above. The cadence is deliberately slow
-// because focus and visibilitychange carry the real flow, and `unknown` is deliberately not
-// terminal because it is the one answer that decided nothing.
+// because focus and visibilitychange carry the real flow, and a failed read is deliberately not
+// terminal because it decided nothing.
 
 const WELCOME_TEXT = "Hello! I'm Citizen Developer AI. Tell me what you'd like to build for BIAL operations."
 const welcomeMessage = (): ChatMessage => ({ id: 'welcome', ephemeral: true, role: 'assistant', parts: [{ type: 'text', text: WELCOME_TEXT }], createdAt: new Date().toISOString() })
@@ -2067,10 +2066,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   // project whose workspace was taken. The slow interval only covers the second-monitor case,
   // and is deliberately lazy — this is honesty, not telemetry.
   //
-  // FOUR STATES, NOT ONE BOOLEAN. This held `previewReclaimed: boolean`, set from
-  // `!state.alive` — which meant a Redis blip, a sleeping workspace, a sibling project holding
-  // the slot and a project nobody ever built all arrived as the same "your preview is gone".
-  // The whole verdict is kept now, and `unknown` deliberately changes NOTHING on screen.
+  // THREE STATES, NOT ONE BOOLEAN — a Redis blip is not a sleeping workspace — and a read that
+  // fails is none of them: it deliberately changes NOTHING on screen.
   // The app stopped running while nobody was sending messages. A REVERSION FOUND AT THE
   // PREVIEW POLL, which is the only place it can be found: the turn that would otherwise catch it
   // may never come, and until then the standing completion claim goes on being displayed above a
@@ -2254,27 +2251,23 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // two responses arrived in. Bail before touching state OR the timer — an overtaken probe
         // calling `stopAsking()` would end the poll on a verdict that has already been replaced.
         if (!live || generation !== latestProbe) return
-        // An `unknown` never OVERWRITES a decided verdict — a blip must not pull a live
-        // preview off screen, and it must not wipe a "gone" the user is already reading
-        // either. It is recorded only when nothing has been decided yet, because "we could
-        // not check" is a real thing to say when it is the only thing we know.
-        // AND AN UNCHANGED ANSWER KEEPS ITS OLD OBJECT. `fetchPreviewState` parses a fresh object
+        // AN UNCHANGED ANSWER KEEPS ITS OLD OBJECT. `fetchPreviewState` parses a fresh object
         // every tick, so replacing unconditionally re-renders this whole surface — message list,
         // composer and toolbar — for a reading nobody's screen can tell apart from the one already
         // up. `useWorkspaceState` has guarded this since it was written; the guard was never ported
         // here, and the accelerated cadence turned that from one wasted render every 45 seconds
         // into one every 3, through exactly the window a citizen is watching their app come up.
-        setPolledPreview((prev) => {
-          if (state.state === 'unknown' && prev) return prev
-          if (prev && prev.projectId === projectId && samePreviewState(prev.state, state)) return prev
-          return { projectId, state }
-        })
-        // A TERMINAL ANSWER ENDS THE POLL. `asleep` / `slot_taken` / `never_built`
-        // are settled facts about a workspace: nothing that could change them happens without
-        // one of this effect's inputs changing first, so re-asking every 45 seconds forever
-        // was a timer that could only ever hear the same sentence again. `unknown` is
-        // POINTEDLY not terminal — it decided nothing, so it must not be allowed to end the
-        // asking (that would pin "we could not check" for the life of the tab).
+        setPolledPreview((prev) =>
+          prev && prev.projectId === projectId && samePreviewState(prev.state, state)
+            ? prev
+            : { projectId, state },
+        )
+        // A TERMINAL ANSWER ENDS THE POLL. `asleep` is a settled fact about a workspace:
+        // nothing that could change it happens without one of this effect's inputs changing
+        // first, so re-asking every 45 seconds forever was a timer that could only ever hear
+        // the same sentence again. A read that throws is POINTEDLY not terminal — it decided
+        // nothing, so it must not be allowed to end the asking (that would pin "we could not
+        // check" for the life of the tab).
         //
         // AND THE SAME RULE BINDS `restorable`. A settled `state` with `restorable === null`
         // is half an answer: the workspace is confirmed gone, but whether the work can be
@@ -2333,7 +2326,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // that. So a check asked for this reason is followed at once by one
         // more probe, made as an accelerated one so it cannot ask again, and this probe leaves its
         // cadence decision to that one.
-        if (state.state !== 'alive' && state.state !== 'unknown') frameStalledRef.current = false
+        if (state.state !== 'alive') frameStalledRef.current = false
         const claimToCheck =
           state.state === 'alive' && standingClaimRef.current !== null && !workspaceLostRef.current
         const mayBeStopped = mayHaveStopped(state.state, frameStalledRef.current, cadence)
@@ -2349,11 +2342,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // THE RESCHEDULE, MADE FROM THE ANSWER — beside the stopping rule, because both are
         // the same question asked of the same reading: what this answer means for when we ask next.
         cadence = nextProbeCadence(state.state, cadence)
-        if (SETTLED_GONE.has(state.state) && state.restorable !== null) stopAsking()
+        if (isTerminalReading(state)) stopAsking()
         else keepAsking()
       } catch {
-        // A probe that could not answer says NOTHING. Painting "gone" on a network blip would
-        // pull a working preview off screen — the same over-claiming this fix exists to remove.
+        // A probe that could not answer says NOTHING, and leaves the reading where it was.
+        // Painting "gone" on a network blip — or on the server's 503 for a coordination store it
+        // could not read — would pull a working preview off screen.
         //
         // IT DOES STILL SPEND FROM THE ACCELERATED WINDOW, though. `fetchPreviewState` throws on
         // any non-2xx and on a dropped connection, so while only the success path could advance
@@ -2514,10 +2508,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       ? {
           ...startSinks,
           projectId,
-          // DERIVED, NOT KEPT BESIDE IT — same reason as `useWorkspaceState`'s call: this
-          // surface's own `setPolledPreview` returns the previous object when the reading is
-          // `unknown`, so `previewState` only ever HOLDS an `unknown` before anything has been
-          // decided, which is the one case whose answer is the fallback sentence anyway.
           // ALWAYS SETTLED FROM THIS SURFACE, deliberately. The guard `settled` feeds exists to
           // stop the cold-open failure card on the PROJECT screen, which is where a citizen
           // arrives from the applications list. This surface reaches the pane by a different
@@ -2526,7 +2516,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
           settled: true,
           state: resolveWorkspaceState({
             preview: previewState,
-            lastDecidedPreview: asDecidedReading(previewState),
             projectHasSavedBuild: hasSavedBuild,
             startOutcome,
             startInFlight: startPending,

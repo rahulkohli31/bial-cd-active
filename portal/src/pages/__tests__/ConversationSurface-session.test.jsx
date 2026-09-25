@@ -24,8 +24,6 @@ const previewState = (state, restorable = null) => ({
   state,
   alive: state === 'alive',
   previewUrl: state === 'alive' ? PREVIEW_URL : null,
-  occupyingProjectName: null,
-  occupyingProjectId: null,
   restorable,
 })
 
@@ -301,7 +299,7 @@ describe('BuilderPage — the build-turn flow', () => {
     // project id as scenery; under it the pane now correctly frames the serving container
     // instead of saying the preview is gone. This test is about the banner, not about a
     // live container, so it says so.
-    h.fetchPreviewState.mockResolvedValue(previewState('unknown'))
+    h.fetchPreviewState.mockRejectedValue(new Error('unreadable'))
     const turn = scriptedBuild()
     renderBuilder()
     await sendPrompt()
@@ -357,7 +355,7 @@ describe('BuilderPage — the transition\'s refusals are typed HTTP statuses now
     // project id as scenery; under it the pane now correctly frames the serving container
     // instead of saying the preview is gone. This test is about the banner, not about a
     // live container, so it says so.
-    h.fetchPreviewState.mockResolvedValue(previewState('unknown'))
+    h.fetchPreviewState.mockRejectedValue(new Error('unreadable'))
     renderBuilder()
     await sendPrompt()
 
@@ -616,9 +614,10 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     // Project B must answer for ITSELF. The blanket `alive` fixture would have B's
     // pane frame project A's container — the cross-project frame the resolver's project
     // label exists to prevent — so each id now answers its own truth.
-    h.fetchPreviewState.mockImplementation(async (id) =>
-      previewState(id === 'pA' ? 'alive' : 'unknown'),
-    )
+    h.fetchPreviewState.mockImplementation(async (id) => {
+      if (id === 'pA') return previewState('alive')
+      throw new Error('unreadable')
+    })
     h.buildFromPlan.mockClear()
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Build B, please.', 'opt-B')))
     rerender(
@@ -703,9 +702,10 @@ describe('BuilderPage — the "come back later" relaunch entry point', () => {
   })
 
   // `AppPane` mounts `NoFrame` whenever the address resolver has no URL — this test overrides the
-  // default `alive` fixture to `never_built` so the pane's own empty-state sentence renders.
+  // default `alive` fixture to `asleep` with nothing saved so the pane's own empty-state sentence
+  // renders.
   it('a fresh mount with NO outcome keeps the idle empty state — nothing to relaunch', async () => {
-    h.fetchPreviewState.mockResolvedValue(previewState('never_built', false))
+    h.fetchPreviewState.mockResolvedValue(previewState('asleep', false))
     h.getBuild.mockResolvedValue(null)
     const { container } = renderBuilder()
     await screen.findByPlaceholderText(/ask for another change/i)

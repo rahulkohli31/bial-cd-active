@@ -103,9 +103,7 @@ beforeEach(() => {
   h.fetchSaveState.mockResolvedValue({
     appId: null, dirty: null, containerHead: null, savedHead: null,
   })
-  h.fetchPreviewState.mockResolvedValue({
-    state: 'unknown', alive: false, previewUrl: null, occupyingProjectName: null, restorable: null,
-  })
+  h.fetchPreviewState.mockRejectedValue(new Error('the read is not this file\'s subject'))
 })
 
 afterEach(() => {

@@ -80,11 +80,9 @@ const PROJECT: Project = {
 }
 
 const preview = (over: Record<string, unknown> = {}) => ({
-  state: 'never_built',
+  state: 'asleep',
   alive: false,
   previewUrl: null,
-  occupyingProjectName: null,
-  occupyingProjectId: null,
   restorable: null,
   ...over,
 })
@@ -275,7 +273,7 @@ describe('loading a project address frames the running app, with no chat in the 
   it('★ publishes a pane even for a project with NOTHING built, so the pane says so', async () => {
     // Two columns are the REST STATE of the project screen — nothing built shows the empty-state
     // sentence IN the pane, not a hidden pane the citizen has to interpret.
-    api.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
+    api.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: false }))
     render(<Workspace project={{ ...PROJECT, appId: null, hasRelaunchableSnapshot: false }} />)
 
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
@@ -619,9 +617,9 @@ describe('the app survives the round trip, in BOTH directions', () => {
   })
 
   it('starts NOTHING for a project that has never been built', async () => {
-    // Nothing to open. `never_built` is the one reading with no container behind it at all, and
-    // a start here would be a request that can only fail.
-    api.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
+    // Nothing to open. `asleep` with nothing to restore has no container and no saved copy behind
+    // it, and a start here would be a request that can only fail.
+    api.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: false }))
     render(<Workspace project={{ ...PROJECT, appId: null, hasRelaunchableSnapshot: false }} />)
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
 
@@ -714,7 +712,7 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     // The toggle can't live in the pane's toolbar slot: that toolbar is rendered by `LivePreview`,
     // which only mounts once there is something to frame, so a project with nothing built would
     // have NO toggle at all. Its home has to be a surface that always renders.
-    api.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
+    api.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: false }))
     render(<Workspace project={{ ...PROJECT, appId: null, hasRelaunchableSnapshot: false }} />)
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
     expect(frame()).toBeNull()
