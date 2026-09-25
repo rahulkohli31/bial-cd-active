@@ -18,8 +18,9 @@ harness's health verdict."""
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any
+from typing import Any, Final
 
 import sqlalchemy as sa
 import structlog
@@ -72,6 +73,7 @@ from src.services.build_sessions import (
 )
 from src.services.build_sessions.inventory import owning_app_ids
 from src.services.build_sessions.locks import (
+    StartFailure,
     renew_presence_stay,
 )
 from src.services.orchestrator.client_errors import (
@@ -83,6 +85,7 @@ from src.services.projects.resolve import (
     resolve_project_access,
 )
 from src.services.redis import (
+    BUILD_COORDINATION_UNAVAILABLE_MSG,
     build_coordination_or_503,
     coordination_is_gone,
     get_redis,
@@ -99,6 +102,15 @@ _log = structlog.get_logger()
 # unmodified. Do not reword, re-punctuate or "improve" it; a test pins it character-for-
 # character so a well-meaning edit fails CI instead of shipping.
 _SANDBOX_UNAVAILABLE_MSG = "Sandbox unavailable. Please try again later or contact the admin"
+
+_NO_SAVED_BUILD_MSG = "No saved build to relaunch. Build the app first."
+
+# A start that fails after its 202 is told in the words its refusal would have used at admission.
+_START_FAILURE_SENTENCES: Final[Mapping[StartFailure, str]] = {
+    StartFailure.NO_SAVED_BUILD: _NO_SAVED_BUILD_MSG,
+    StartFailure.SANDBOX_UNAVAILABLE: _SANDBOX_UNAVAILABLE_MSG,
+    StartFailure.COORDINATION_UNAVAILABLE: BUILD_COORDINATION_UNAVAILABLE_MSG,
+}
 
 
 class ReapResponse(CamelModel):
@@ -296,9 +308,7 @@ async def relaunch_preview(
             # carries `no_saved_build`, so the rail's arm can be exact — the same reason
             # `sandbox_reclaim_blocked` names itself rather than letting a client match prose.
             raise AppApiError(
-                status.HTTP_404_NOT_FOUND,
-                "No saved build to relaunch. Build the app first.",
-                code="no_saved_build",
+                status.HTTP_404_NOT_FOUND, _NO_SAVED_BUILD_MSG, code="no_saved_build"
             ) from exc
         except (SnapshotUnavailableError, SandboxUnreachableError, SandboxError) as exc:
             # An unreadable snapshot, or a container the registry names that the attach could
@@ -384,6 +394,9 @@ class PreviewStateResponse(CamelModel):
     # Answered WITHOUT a container, which is the whole point — it is the one restore signal
     # that survives the container being reclaimed.
     restorable: bool | None = None
+    # ASLEEP only: the sentence for this project's last start, when it failed after its 202 and
+    # recently. Null everywhere else. Additive and defaulted, like the fields above.
+    start_failure: str | None = None
 
 
 class StopActiveBuildResponse(CamelModel):
@@ -904,7 +917,7 @@ async def preview_state(
     """Is the preview this tab is framing still real — and if not, WHY?
 
     Answers about THIS project only, and its budget is deliberately fixed: one round trip to
-    the coordination store (two commands, pipelined), two user-scoped rows, at most two
+    the coordination store (one pipeline), two user-scoped rows, at most two
     object-store HEADs, and NO container call of any kind. A store that will not answer is a 503,
     which both polls already read as a check that decided nothing."""
     # A framed preview that has been reclaimed looks EXACTLY like a working app — the last render
@@ -937,6 +950,9 @@ async def preview_state(
         serving_since=state.serving_since,
         starting_since=state.starting_since,
         restorable=state.restorable,
+        start_failure=(
+            None if state.start_failure is None else _START_FAILURE_SENTENCES[state.start_failure]
+        ),
     )
 
 

@@ -4,23 +4,24 @@ These key strings are a **byte-stable cross-track contract**, built only through
 `ns()` choke point — a hand-written key drifts a prefix invisible to another track. Builders take
 `uuid.UUID` and enforce it at RUNTIME: a UUID cannot contain a `:`, so the type IS the boundary.
 
-Six sandbox families share the environment-scoped root `bial:{environment}:sandbox:` — five
-keyed by user, and one, the cooperative stop, keyed by conversation:
+The sandbox families share the environment-scoped root `bial:{environment}:sandbox:`, all
+keyed by user except the cooperative stop, which is keyed by conversation:
 
     lock:{user_id}       string — one-per-user lock (SET NX EX)
     heartbeat:{user_id}  string — idle timer (presence = active)
     registry:{user_id}   hash   — see REGISTRY_FIELD_* below
     lease:{user_id}      string — liveness lease (epoch seconds, TTL mandatory)
     starting:{user_id}   string — start-in-flight marker (project id, TTL mandatory)
+    start_failure:{user_id} string — the last failed start (JSON, TTL mandatory)
     stop:{conversation_id} string — cooperative stop ask (TTL mandatory)
 
-AN EIGHTH DOMAIN, `bial:{environment}:lake:`, holds the connector data-plane copy — parquet
+ANOTHER DOMAIN, `bial:{environment}:lake:`, holds the connector data-plane copy — parquet
 bytes and the index that orders them. It is DELIBERATELY NOT under `sandbox:`: that segment is
 reserved for sandbox LIFECYCLE state, a fleet sweep scans it and deletes Azure containers on the
 strength of what it finds, and a family of file blobs sitting in the middle of that would be
 read by a reader who assumed everything below `sandbox:` describes a container.
 
-A seventh family, taskiq's queue in `src/broker.py`, sits under `bial:` but outside `sandbox:` —
+One more family, taskiq's queue in `src/broker.py`, sits under `bial:` but outside `sandbox:` —
 `bial:{env}:taskiq:stream`, where those braces are a literal Redis hash tag, not a placeholder.
 Only the library-derived `autoclaim:<group>:<stream>` lock has a literal prefix outside `bial:`.
 There is deliberately NO `:channel` family — single-replica means build progress is in-process.
@@ -68,6 +69,7 @@ FAMILY_HEARTBEAT: Final = "heartbeat"
 FAMILY_REGISTRY: Final = "registry"
 FAMILY_LEASE: Final = "lease"
 FAMILY_STARTING: Final = "starting"
+FAMILY_START_FAILURE: Final = "start_failure"
 FAMILY_COOPERATIVE_STOP: Final = "stop"
 
 # The two lake families. `file` holds one copied parquet file's BYTES; `index` is the single
@@ -160,6 +162,15 @@ def starting_key(user_id: uuid.UUID) -> str:
     DELIBERATELY NOT A REGISTRY FIELD: written before a container exists, it would read as a
     live container that is not there, and get spared rather than collected."""
     return ns(FAMILY_STARTING, user_id)
+
+
+def start_failure_key(user_id: uuid.UUID) -> str:
+    """`bial:{env}:sandbox:start_failure:{user_id}` — a start that failed after it was admitted.
+
+    Value names the project and what went wrong, so the pane that waited on it can say so once
+    the wait is over; **must** carry a TTL. Written by the start's detached half, cleared when
+    the next start for this user is admitted."""
+    return ns(FAMILY_START_FAILURE, user_id)
 
 
 def cooperative_stop_key(conversation_id: uuid.UUID) -> str:

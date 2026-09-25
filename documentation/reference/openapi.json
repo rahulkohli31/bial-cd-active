@@ -3240,6 +3240,17 @@
             ],
             "title": "Servingsince"
           },
+          "startFailure": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startfailure"
+          },
           "startingSince": {
             "anyOf": [
               {
@@ -3894,6 +3905,12 @@
           "appId": {
             "format": "uuid",
             "title": "Appid",
+            "type": "string"
+          },
+          "status": {
+            "const": "provisioning",
+            "default": "provisioning",
+            "title": "Status",
             "type": "string"
           }
         },
@@ -8998,7 +9015,7 @@
     },
     "/v1/build-sessions/projects/{project_id}/preview-state": {
       "get": {
-        "description": "Is the preview this tab is framing still real — and if not, WHY?\n\nAnswers about THIS project only, and its budget is deliberately fixed: one round trip to\nthe coordination store (two commands, pipelined), two user-scoped rows, at most two\nobject-store HEADs, and NO container call of any kind. A store that will not answer is a 503,\nwhich both polls already read as a check that decided nothing.",
+        "description": "Is the preview this tab is framing still real — and if not, WHY?\n\nAnswers about THIS project only, and its budget is deliberately fixed: one round trip to\nthe coordination store (one pipeline), two user-scoped rows, at most two\nobject-store HEADs, and NO container call of any kind. A store that will not answer is a 503,\nwhich both polls already read as a check that decided nothing.",
         "operationId": "preview_state_v1_build_sessions_projects__project_id__preview_state_get",
         "parameters": [
           {

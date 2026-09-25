@@ -32,6 +32,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_WAITING_SINCE,
+    start_failure_key,
     starting_key,
 )
 from tests.fakes import a_sandbox_name
@@ -707,12 +708,12 @@ async def test_an_abandoned_marker_expires_on_its_own(fake_redis: aioredis.Redis
 async def test_the_pipelined_read_returns_the_registry_the_marker_and_the_clock_in_one_trip(
     fake_redis: aioredis.Redis,
 ) -> None:
-    """The exact reading `project_preview_state` spends its one Redis round trip on: three
-    commands, not three round trips."""
+    """The exact reading `project_preview_state` spends its one Redis round trip on: four
+    commands, not four round trips."""
     await fake_redis.hset(registry_key(USER), mapping={REGISTRY_FIELD_APP_NAME: "sbx-x"})
     await locks.write_starting_marker(fake_redis, USER, PROJECT)
 
-    reg, starting, began_at = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    reg, starting, began_at, _ = await locks.read_registry_and_starting_marker(fake_redis, USER)
 
     assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == "sbx-x"
     assert starting == PROJECT
@@ -734,7 +735,7 @@ async def test_the_marker_clock_reads_the_wait_a_reload_would_have_forgotten(
     await locks.write_starting_marker(fake_redis, USER, PROJECT)
     await fake_redis.expire(starting_key(USER), STARTING_MARKER_TTL_SECONDS - 90)
 
-    _, _, began_at = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    _, _, began_at, _ = await locks.read_registry_and_starting_marker(fake_redis, USER)
 
     assert began_at is not None
     assert 85 < (datetime.now(UTC) - began_at).total_seconds() < 95
@@ -747,7 +748,7 @@ async def test_the_marker_clock_says_nothing_when_there_is_no_marker(
     an instant, and inventing one would date a wait that is not happening."""
     await fake_redis.set(starting_key(USER), str(PROJECT))  # no expiry: PTTL answers -1
 
-    _, starting, began_at = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    _, starting, began_at, _ = await locks.read_registry_and_starting_marker(fake_redis, USER)
 
     assert starting == PROJECT  # the marker is still a claim...
     assert began_at is None  # ...it just cannot date itself
@@ -756,7 +757,7 @@ async def test_the_marker_clock_says_nothing_when_there_is_no_marker(
 async def test_the_pipelined_read_answers_both_absent_with_no_registry_or_marker(
     fake_redis: aioredis.Redis,
 ) -> None:
-    reg, starting, began_at = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    reg, starting, began_at, _ = await locks.read_registry_and_starting_marker(fake_redis, USER)
     assert reg is None
     assert starting is None
     assert began_at is None
@@ -771,10 +772,40 @@ async def test_the_pipelined_read_still_migrates_a_legacy_registry_record(
 
     await fake_redis.hset(legacy_registry_key(USER), mapping={REGISTRY_FIELD_APP_NAME: "sbx-x"})
 
-    reg, starting, _ = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    reg, starting, _, _ = await locks.read_registry_and_starting_marker(fake_redis, USER)
 
     assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == "sbx-x"
     assert starting is None
+
+
+async def test_a_start_failure_lives_as_long_as_a_marker_and_reads_back_in_the_pipeline(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Mutation-check: write it with no expiry and the TTL assertion goes red."""
+    failed = locks.FailedStart(PROJECT, locks.StartFailure.NO_SAVED_BUILD)
+
+    await locks.write_start_failure(fake_redis, USER, failed)
+
+    *_, read_back = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    assert read_back == failed
+    assert 0 < await fake_redis.ttl(start_failure_key(USER)) <= STARTING_MARKER_TTL_SECONDS
+
+
+@pytest.mark.parametrize(
+    "unreadable",
+    ["not json", "[]", '{"project_id": "nope", "failure": "sandbox_unavailable"}', '{"x": 1}'],
+)
+async def test_an_unreadable_start_failure_reads_as_absent(
+    fake_redis: aioredis.Redis, unreadable: str
+) -> None:
+    """A value nobody can read says nothing, and the poll still answers.
+
+    Mutation-check: drop the `except` from `_parse_start_failure` and every case goes red."""
+    await fake_redis.set(start_failure_key(USER), unreadable)
+
+    *_, read_back = await locks.read_registry_and_starting_marker(fake_redis, USER)
+
+    assert read_back is None
 
 
 class _BoomPipeline:

@@ -13,6 +13,7 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -226,6 +227,8 @@ class RelaunchPreviewResponse(CamelModel):
     once something has watched it show a page. One reader for one fact."""
 
     app_id: uuid.UUID
+    # For browser tabs loaded before this server: their parser refuses a body with no status.
+    status: Literal["provisioning"] = "provisioning"
 
 
 class SharedPreviewResponse(CamelModel):

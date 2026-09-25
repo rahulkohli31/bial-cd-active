@@ -88,16 +88,19 @@ async def _seed_worked_on(store, app_id: uuid.UUID) -> None:
 async def test_relaunch_is_accepted_and_the_poll_reports_the_app(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
-    """The start answers 202 with the app it admitted and nothing else: whether the app is up,
-    and where, is the preview-state poll's to say, and saying it twice is how two readers came
-    to disagree about one container."""
+    """The start answers 202 with the app it admitted: whether the app is up, and where, is the
+    preview-state poll's to say, and saying it twice is how two readers came to disagree about
+    one container. The one other field is a constant `status`, which a tab loaded before this
+    server needs to read the body at all.
+
+    Mutation-check: drop `status` from `RelaunchPreviewResponse` and this goes red."""
     user, project = await _user_project(db_session, "rl1@rvaiglobal.com")
     app_id = await _seed_snapshot(db_session, user, project, fake_storage)
 
     resp = await _relaunch(client, user, project, wire.manager)
 
     assert resp.status_code == 202
-    assert resp.json() == {"appId": str(app_id)}
+    assert resp.json() == {"appId": str(app_id), "status": "provisioning"}
     polled = await client.get(
         f"/v1/build-sessions/projects/{project.id}/preview-state", headers=auth_headers(user)
     )

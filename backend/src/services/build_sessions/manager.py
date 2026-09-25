@@ -83,9 +83,12 @@ from src.services.build_sessions.integrity import (
 from src.services.build_sessions.liveness import flag_liveness_overpromise
 from src.services.build_sessions.locks import (
     DeadlineWriter,
+    FailedStart,
+    StartFailure,
     acquire_lock,
     an_instant_on_the_hash,
     clear_serving,
+    clear_start_failure,
     clear_starting_marker,
     date_the_wait_from_the_start,
     delete_registry,
@@ -100,6 +103,7 @@ from src.services.build_sessions.locks import (
     shared_view_stamp,
     stamp_is_proven,
     write_heartbeat,
+    write_start_failure,
     write_starting_marker,
 )
 from src.services.build_sessions.reaper import is_a_shared_sandbox_name, reap_user, reconcile_user
@@ -616,6 +620,9 @@ class PreviewState:
     # instruction to the client — believe nothing from this field, fall back to what you
     # already knew.
     restorable: bool | None = None
+    # ASLEEP only: why this project's last start ended here instead of in a running app, when
+    # it failed after the press was answered and recently enough to still be the news.
+    start_failure: StartFailure | None = None
 
     @property
     def alive(self) -> bool:
@@ -780,11 +787,24 @@ async def _occupying_shared_project(
     return _OccupyingProject(app_id=app_id, project_id=stamp.project_id, project_name=project_name)
 
 
-async def _at_rest(app_id: uuid.UUID | None) -> PreviewState:
+async def _at_rest(
+    app_id: uuid.UUID | None, start_failure: StartFailure | None = None
+) -> PreviewState:
     """ASLEEP, with the restore answer it is the only state to carry. No app row means no bundle
     key can exist, so `False` there is a confirmed absent rather than a skipped question."""
     restorable = False if app_id is None else await snapshot_presence(app_id)
-    return PreviewState(state=PreviewLifeState.ASLEEP, restorable=restorable)
+    return PreviewState(
+        state=PreviewLifeState.ASLEEP, restorable=restorable, start_failure=start_failure
+    )
+
+
+def _start_failure_for(exc: Exception) -> StartFailure:
+    """The refusal the start route gives for the same failure when it happens before the 202."""
+    if isinstance(exc, StorageNotFoundError):
+        return StartFailure.NO_SAVED_BUILD
+    if isinstance(exc, RedisError):
+        return StartFailure.COORDINATION_UNAVAILABLE
+    return StartFailure.SANDBOX_UNAVAILABLE
 
 
 async def _saved_head(app_id: uuid.UUID) -> str | None:
@@ -1401,6 +1421,8 @@ class SessionManager:
             # full 900s — every later start, relaunch and turn for this user answered "already
             # building" with nothing building.
             await write_starting_marker(redis, user_id, project_id)
+            # A new start for this user, of any project, retires the last one's failure.
+            await clear_start_failure(redis, user_id)
             # THE FIRST LINE OF A BUILD, and until now the only way to answer "did this citizen
             # get a slot at all, and whose slot was it" was to infer it backwards from a later
             # failure. `reclaimed` is the field that matters most: one of this citizen's own
@@ -2284,7 +2306,7 @@ class SessionManager:
         # project route already gave it at load.
         app_id = await existing_app_id(db, user.id, project_id)
         try:
-            reg, starting, start_began_at = await read_registry_and_starting_marker(
+            reg, starting, start_began_at, failed = await read_registry_and_starting_marker(
                 get_redis(), user.id
             )
         except RedisNotConfiguredError:
@@ -2356,7 +2378,11 @@ class SessionManager:
         # Nothing serving this project and no start of it in flight, which is the only place the
         # restore offer is rendered. That includes a container of ours mid-teardown: from the
         # builder's side that is a workspace going to sleep, and it is never handed back as a URL.
-        return await _at_rest(app_id)
+        # The failure is per USER too, so only one naming this project is this pane's to show.
+        return await _at_rest(
+            app_id,
+            failed.failure if failed is not None and failed.project_id == project_id else None,
+        )
 
     async def reclaim_preflight(
         self,
@@ -2816,7 +2842,8 @@ class SessionManager:
     ) -> None:
         """The detached half of `relaunch_preview`: bring the container up under both locks,
         let them go, then watch for the first page. A failure is compensated by the lock's own
-        scope and logged here; the next `preview-state` poll finds the app at rest again."""
+        scope and logged here; the next `preview-state` poll finds the app at rest, with what
+        went wrong."""
         try:
             handle = await self._up_under_the_locks(
                 held,
@@ -2873,43 +2900,65 @@ class SessionManager:
         app_name = app_name_for(app_id)
         attached = env is None
         async with held:
-            if env is not None:
-                scope.handle = await self._restore_or_bust(
-                    sandbox_client, user_id, app_name, app_id, env, source_key=None
-                )
-                # A birth, so the connector copy fires, detached and unawaited: nothing on the
-                # platform reads what it writes, so no start may wait on it or be lost to it.
-                schedule_window_copy(user_id, project_id)
-                # The registry exists from this instant, and a slow restore can outlive the
-                # starting marker that was sparing it.
-                await grant_stay_of_execution(redis, user_id, writer=DeadlineWriter.BUILDER_ACTED)
-            assert scope.handle is not None
-            handle = scope.handle
             try:
-                await sandbox_client.dev_start(handle)
-            except SandboxError:
-                if not attached:
-                    raise  # a fresh container with no dev server has nothing to preview
-                # The supervisor refuses a server it does not own even while the page is up, and
-                # destroying a container for already serving is not a rollback.
-                _log.warning(
-                    "relaunch_dev_start_refused_on_attached_container",
-                    user_id=str(user_id),
-                    app_id=str(app_id),
-                    exc_info=True,
+                if env is not None:
+                    scope.handle = await self._restore_or_bust(
+                        sandbox_client, user_id, app_name, app_id, env, source_key=None
+                    )
+                    # A birth, so the connector copy fires, detached and unawaited: nothing on
+                    # the platform reads what it writes, so no start may wait on it or be lost
+                    # to it.
+                    schedule_window_copy(user_id, project_id)
+                    # The registry exists from this instant, and a slow restore can outlive the
+                    # starting marker that was sparing it.
+                    await grant_stay_of_execution(
+                        redis, user_id, writer=DeadlineWriter.BUILDER_ACTED
+                    )
+                assert scope.handle is not None
+                handle = scope.handle
+                try:
+                    await sandbox_client.dev_start(handle)
+                except SandboxError:
+                    if not attached:
+                        raise  # a fresh container with no dev server has nothing to preview
+                    # The supervisor refuses a server it does not own even while the page is up,
+                    # and destroying a container for already serving is not a rollback.
+                    _log.warning(
+                        "relaunch_dev_start_refused_on_attached_container",
+                        user_id=str(user_id),
+                        app_id=str(app_id),
+                        exc_info=True,
+                    )
+                await self._retract_a_proof_it_cannot_back(
+                    sandbox_client, handle, redis, user_id, app_name=app_name
                 )
-            await self._retract_a_proof_it_cannot_back(
-                sandbox_client, handle, redis, user_id, app_name=app_name
-            )
-            # Up, with its dev server started: destroying it over a later Redis blip is no
-            # longer a rollback.
-            scope.spare()
-            if attached:
-                await grant_stay_of_execution(redis, user_id, writer=DeadlineWriter.BUILDER_ACTED)
-            # Settled rather than re-granted: provisioning is over, and the screen framing the
-            # app renews its own stay from here.
-            await settle_stay_once_provisioning_ends(redis, user_id, app_name=app_name)
+                # Up, with its dev server started: destroying it over a later Redis blip is no
+                # longer a rollback.
+                scope.spare()
+                if attached:
+                    await grant_stay_of_execution(
+                        redis, user_id, writer=DeadlineWriter.BUILDER_ACTED
+                    )
+                # Settled rather than re-granted: provisioning is over, and the screen framing
+                # the app renews its own stay from here.
+                await settle_stay_once_provisioning_ends(redis, user_id, app_name=app_name)
+            except Exception as exc:
+                if not scope.spared:
+                    await self._say_the_start_failed(redis, user_id, project_id, exc)
+                raise
         return handle
+
+    async def _say_the_start_failed(
+        self, redis: aioredis.Redis, user_id: uuid.UUID, project_id: uuid.UUID, exc: Exception
+    ) -> None:
+        """Leave what went wrong for the pane that waited on this start. Written under the start
+        lock, so the next start's admission, which clears it, can only come after."""
+        try:
+            await write_start_failure(
+                redis, user_id, FailedStart(project_id, _start_failure_for(exc))
+            )
+        except RedisError:
+            _log.exception("the failed start could not be recorded", user_id=str(user_id))
 
     async def _retract_a_proof_it_cannot_back(
         self,

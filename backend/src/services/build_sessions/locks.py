@@ -32,6 +32,7 @@ is single-key by construction, and a dev Redis cannot reproduce the cross-slot r
 from __future__ import annotations
 
 import enum
+import json
 import math
 import secrets
 import time
@@ -79,6 +80,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_STAY_WRITER,
     REGISTRY_FIELD_WAITING_SINCE,
+    start_failure_key,
     starting_key,
 )
 
@@ -344,6 +346,46 @@ async def clear_starting_marker(redis: aioredis.Redis, user_uuid: uuid.UUID) -> 
     await redis.delete(starting_key(user_uuid))
 
 
+class StartFailure(enum.StrEnum):
+    """What stopped a start that failed after it was admitted: one member per refusal the start
+    route gives for the same failure at admission, whose sentence the pane is then shown."""
+
+    NO_SAVED_BUILD = "no_saved_build"
+    SANDBOX_UNAVAILABLE = "sandbox_unavailable"
+    COORDINATION_UNAVAILABLE = "coordination_unavailable"
+
+
+class FailedStart(NamedTuple):
+    project_id: uuid.UUID
+    failure: StartFailure
+
+
+async def write_start_failure(
+    redis: aioredis.Redis, user_uuid: uuid.UUID, failed: FailedStart
+) -> None:
+    """`SET start_failure <json> EX STARTING_MARKER_TTL_SECONDS`. It outlives the start by as
+    long as the start's own marker could have, which is long enough for every tab polling that
+    project to read it."""
+    value = json.dumps({"project_id": str(failed.project_id), "failure": failed.failure.value})
+    await redis.set(start_failure_key(user_uuid), value, ex=STARTING_MARKER_TTL_SECONDS)
+
+
+async def clear_start_failure(redis: aioredis.Redis, user_uuid: uuid.UUID) -> None:
+    await redis.delete(start_failure_key(user_uuid))
+
+
+def _parse_start_failure(raw: object, user_uuid: uuid.UUID) -> FailedStart | None:
+    """Fails toward `None`, like the starting marker: a value nobody can read says nothing."""
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
+        return FailedStart(uuid.UUID(str(payload["project_id"])), StartFailure(payload["failure"]))
+    except ValueError, KeyError, TypeError:
+        _log.warning("unreadable start failure; treating as absent", user_id=str(user_uuid))
+        return None
+
+
 def _when_this_start_began(raw_pttl: object, user_uuid: uuid.UUID) -> datetime | None:
     """The instant the starting marker was written, read off WHAT IS LEFT of its TTL.
 
@@ -370,11 +412,11 @@ def _when_this_start_began(raw_pttl: object, user_uuid: uuid.UUID) -> datetime |
 
 async def read_registry_and_starting_marker(
     redis: aioredis.Redis, user_uuid: uuid.UUID
-) -> tuple[dict[str, str] | None, uuid.UUID | None, datetime | None]:
+) -> tuple[dict[str, str] | None, uuid.UUID | None, datetime | None, FailedStart | None]:
     """The one round trip `project_preview_state` spends on Redis: registry hash + starting
-    marker + how much of that marker's life is left, as ONE PIPELINE, not three sequential
-    round trips — keeps the frozen cost budget ("one registry hash read") honest instead of
-    tripling it on every poll.
+    marker + how much of that marker's life is left + the last failed start, as ONE PIPELINE,
+    not four sequential round trips — keeps the frozen cost budget ("one registry hash read")
+    honest instead of multiplying it on every poll.
 
     Falls back to `read_registry`'s legacy-prefix adoption ONLY when the pipelined `HGETALL`
     comes back empty — that migration is itself a second round trip, so it stays off the hot
@@ -384,7 +426,8 @@ async def read_registry_and_starting_marker(
     pipe.hgetall(registry_key(user_uuid))
     pipe.get(starting_key(user_uuid))
     pipe.pttl(starting_key(user_uuid))
-    raw_registry, raw_starting, raw_pttl = await pipe.execute()
+    pipe.get(start_failure_key(user_uuid))
+    raw_registry, raw_starting, raw_pttl, raw_failure = await pipe.execute()
     registry = {str(k): str(v) for k, v in raw_registry.items()} if raw_registry else None
     if registry is None:
         registry = await _adopt_a_pre_cutover_record(redis, user_uuid)
@@ -392,6 +435,7 @@ async def read_registry_and_starting_marker(
         registry,
         _parse_starting_marker(raw_starting, user_uuid),
         _when_this_start_began(raw_pttl, user_uuid),
+        _parse_start_failure(raw_failure, user_uuid),
     )
 
 

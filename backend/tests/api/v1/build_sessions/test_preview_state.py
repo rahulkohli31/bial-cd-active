@@ -24,13 +24,20 @@ from src.services.build_sessions.alarms import (
     PREVIEW_STATE_REPORTED_UNKNOWN_EVENT,
 )
 from src.services.build_sessions.appdata import resolve_app_for_project
-from src.services.build_sessions.locks import clear_serving, write_starting_marker
+from src.services.build_sessions.locks import (
+    FailedStart,
+    StartFailure,
+    clear_serving,
+    write_start_failure,
+    write_starting_marker,
+)
 from src.services.build_sessions.manager import SessionManager, app_name_for
 from src.services.redis import (
     BUILD_COORDINATION_UNAVAILABLE_MSG,
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
     registry_key,
+    registry_scan_patterns,
 )
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
@@ -43,10 +50,10 @@ from src.services.redis.keys import (
     starting_key,
 )
 from src.services.sandbox import DevStatus, SandboxError, SandboxHandle, SandboxNotReadyError
-from src.services.storage import StorageError, snapshot_key
+from src.services.storage import StorageError, StorageNotFoundError, snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
-from tests.fakes import detached_work_done
+from tests.fakes import FakeSandboxClient, detached_work_done
 
 
 async def _user_project(db: AsyncSession, email: str):
@@ -68,6 +75,10 @@ SERVED = "2026-09-10T09:41:04+00:00"
 
 #: The create-time sentinel `_write_registry` seeds: the container exists and has NEVER served.
 NEVER_SERVED = ""
+
+#: What a start that failed after its 202 is told, word for word what its refusal said at the door.
+SANDBOX_UNAVAILABLE = "Sandbox unavailable. Please try again later or contact the admin"
+NO_SAVED_BUILD = "No saved build to relaunch. Build the app first."
 
 
 async def _register_container(
@@ -226,6 +237,7 @@ async def test_a_live_container_for_this_project_is_alive_with_a_framable_url(
         "servingSince",
         "startingSince",
         "restorable",
+        "startFailure",
     }
     # ALIVE NOW MEANS SERVED. This container carries a real stamp, so the answer comes off the
     # proven arm rather than the pre-cutover grandfather — see the serving-proof section below.
@@ -1047,10 +1059,11 @@ async def test_every_state_is_reachable_and_there_are_three(
 
 
 # --------------------------------------------------------------------------------------
-# One round trip, two pipelined commands
+# One round trip, one pipeline
 # --------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("after_a_failed_start", [False, True], ids=["alive", "asleep"])
 async def test_the_registry_and_marker_are_read_in_one_pipelined_round_trip(
     client: AsyncClient,
     db_session: AsyncSession,
@@ -1058,15 +1071,31 @@ async def test_the_registry_and_marker_are_read_in_one_pipelined_round_trip(
     fake_storage,
     wire,
     monkeypatch: pytest.MonkeyPatch,
+    after_a_failed_start: bool,
 ) -> None:
     # Mutation-check: replace `read_registry_and_starting_marker`'s pipeline with two sequential
     # `redis.hgetall` / `redis.get` calls and `pipelines` goes to `[]` while `bare_reads` goes to
-    # `2` — this test catches exactly that regression.
+    # `2` — this test catches exactly that regression. Read the start failure with a bare `get`
+    # beside the pipeline and the at-rest case's `bare_reads` goes to `["get"]`.
     user, project = await _user_project(db_session, "ps-pipeline@rvaiglobal.com")
     app_id = await _built(db_session, user, project)
-    await _register_container(
-        fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY, serving_since=SERVED
-    )
+    if after_a_failed_start:
+        # Another app holds the workspace, so the registry read is not empty: an empty one takes
+        # the legacy-prefix adoption, a second read this test is not about.
+        await _register_container(
+            fake_redis, user.id, "sbx-somebodyelses", state=REGISTRY_STATE_READY, serving_since=""
+        )
+        await write_start_failure(
+            fake_redis, user.id, FailedStart(project.id, StartFailure.SANDBOX_UNAVAILABLE)
+        )
+    else:
+        await _register_container(
+            fake_redis,
+            user.id,
+            app_name_for(app_id),
+            state=REGISTRY_STATE_READY,
+            serving_since=SERVED,
+        )
 
     pipelines: list[object] = []
     bare_reads: list[str] = []
@@ -1093,7 +1122,9 @@ async def test_the_registry_and_marker_are_read_in_one_pipelined_round_trip(
 
     body = await _probe(client, user, project)
 
-    assert body["state"] == "alive"
+    assert (body["state"], body["startFailure"]) == (
+        ("asleep", SANDBOX_UNAVAILABLE) if after_a_failed_start else ("alive", None)
+    )
     assert len(pipelines) == 1, "one round trip, not two sequential ones"
     assert bare_reads == [], "the registry and marker travel inside the pipeline, not beside it"
 
@@ -1561,6 +1592,150 @@ async def test_a_watch_that_sees_the_page_arrive_stamps_it_once_and_names_its_ar
     assert polls["taken"] > 1, "guard the premise: the watch really did look again"
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE)
     assert (await _probe(client, user, project))["state"] == "alive"
+
+
+# --- a start that fails after its 202 ---------------------------------------------------------
+#
+# The press is answered once the start is admitted, so a restore or a dev server that fails later
+# has no response left to fail. The poll is the only thing still listening, and its at-rest answer
+# carries the sentence the same failure got when the start was answered only once it was up.
+
+
+async def _the_restore_fails_every_attempt(*_args: object, **_kwargs: object) -> SandboxHandle:
+    raise SandboxError("npm install failed under set -e")
+
+
+async def _the_bundle_is_gone_by_the_pull(*_args: object, **_kwargs: object) -> SandboxHandle:
+    raise StorageNotFoundError("snapshot vanished", provider="fake", key="k")
+
+
+async def _the_dev_server_will_not_start(*_args: object, **_kwargs: object) -> int:
+    raise SandboxError("supervisor refused /dev/start")
+
+
+async def _the_store_stops_answering(*_args: object, **_kwargs: object) -> datetime:
+    raise RedisConnectionError("connection refused")
+
+
+def _break_the_start(what: str, sbx: FakeSandboxClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    if what == "restore":
+        monkeypatch.setattr(sbx, "restore_from_snapshot", _the_restore_fails_every_attempt)
+    elif what == "bundle":
+        monkeypatch.setattr(sbx, "restore_from_snapshot", _the_bundle_is_gone_by_the_pull)
+    elif what == "dev_start":
+        monkeypatch.setattr(sbx, "dev_start", _the_dev_server_will_not_start)
+    else:
+        monkeypatch.setattr(manager_mod, "grant_stay_of_execution", _the_store_stops_answering)
+
+
+@pytest.fixture
+def teardown_deletes_the_record(wire, fake_redis, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real client deletes the registry record of a container it tears down; the fake keeps
+    it, and a failed start's leftover record would read as a wait rather than at rest."""
+    tear_it_down = wire.sbx.teardown
+
+    async def teardown(handle: SandboxHandle) -> None:
+        await tear_it_down(handle)
+        async for key in fake_redis.scan_iter(match=registry_scan_patterns()[0]):
+            if await fake_redis.hget(key, REGISTRY_FIELD_APP_NAME) == handle.app_name:
+                await fake_redis.delete(key)
+
+    monkeypatch.setattr(wire.sbx, "teardown", teardown)
+
+
+@pytest.mark.parametrize(
+    ("what_fails", "sentence"),
+    [
+        ("restore", SANDBOX_UNAVAILABLE),
+        ("bundle", NO_SAVED_BUILD),
+        ("dev_start", SANDBOX_UNAVAILABLE),
+        ("store", BUILD_COORDINATION_UNAVAILABLE_MSG),
+    ],
+)
+async def test_a_start_that_fails_after_its_202_says_why_when_the_app_is_at_rest(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    instant_backoff: None,
+    teardown_deletes_the_record: None,
+    monkeypatch: pytest.MonkeyPatch,
+    what_fails: str,
+    sentence: str,
+) -> None:
+    """Said about this project only: the record is per user, and another project of the same
+    user reads at rest with nothing to explain.
+
+    Mutation-check: drop the write from `_up_under_the_locks`'s failure arm and every case goes
+    red; answer the failure without comparing its project and the second project goes red."""
+    user, project, _ = await _a_saved_project(db_session, fake_storage, "ps-fail@rvaiglobal.com")
+    other = await ProjectFactory.create(db_session, user.id)
+    other_app = await resolve_app_for_project(db_session, user.id, other.id)
+    await db_session.commit()
+    await fake_storage.put(snapshot_key(other_app), b"SAVED-BUNDLE")
+    _break_the_start(what_fails, wire.sbx, monkeypatch)
+
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
+
+    here = await _probe(client, user, project)
+    elsewhere = await _probe(client, user, other)
+    assert (here["state"], here["startFailure"]) == ("asleep", sentence)
+    assert (elsewhere["state"], elsewhere["startFailure"]) == ("asleep", None)
+
+
+async def test_the_next_start_admitted_for_this_user_retires_the_failure(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    instant_backoff: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Of ANY project: once another start is under way, an old failure is not what happened last,
+    and a pane returning to this project must not be told it is.
+
+    Mutation-check: drop the clear from `_holding_user_lock` and this goes red."""
+    user, project, _ = await _a_saved_project(db_session, fake_storage, "ps-retire@rvaiglobal.com")
+    other = await ProjectFactory.create(db_session, user.id)
+    other_app = await resolve_app_for_project(db_session, user.id, other.id)
+    await db_session.commit()
+    await fake_storage.put(snapshot_key(other_app), b"SAVED-BUNDLE")
+    restore = wire.sbx.restore_from_snapshot
+    monkeypatch.setattr(wire.sbx, "restore_from_snapshot", _the_restore_fails_every_attempt)
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
+    assert (await _probe(client, user, project))["startFailure"] == SANDBOX_UNAVAILABLE
+    monkeypatch.setattr(wire.sbx, "restore_from_snapshot", restore)
+
+    assert (await _relaunch(client, user, other, wire.manager)).status_code == 202
+
+    body = await _probe(client, user, project)
+    assert (body["state"], body["startFailure"]) == ("asleep", None)
+
+
+async def test_only_the_at_rest_answer_carries_a_start_failure(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """A start in flight, or an app that is up, is its own news.
+
+    Mutation-check: hand the failure to the answer the marker gives and this goes red."""
+    user, project = await _user_project(db_session, "ps-fail-at-rest@rvaiglobal.com")
+    app_id = await _built(db_session, user, project)
+    await write_start_failure(
+        fake_redis, user.id, FailedStart(project.id, StartFailure.SANDBOX_UNAVAILABLE)
+    )
+
+    await write_starting_marker(fake_redis, user.id, project.id)
+    starting = await _probe(client, user, project)
+    await fake_redis.delete(starting_key(user.id))
+    await _register_container(
+        fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY, serving_since=SERVED
+    )
+    alive = await _probe(client, user, project)
+
+    assert (starting["state"], starting["startFailure"]) == ("starting", None)
+    assert (alive["state"], alive["startFailure"]) == ("alive", None)
 
 
 # --- a first-time project ---------------------------------------------------------------------
