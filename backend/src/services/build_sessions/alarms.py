@@ -202,9 +202,10 @@ missing from this list. A value named here that nothing emits sends an operator 
 watcher that does not exist; one emitted but unnamed makes their filter silently drop rows.
 
 Emitted at most once per standing proof by construction: the stamp is first-serve-wins, so a
-second observer's refusal raises `SERVING_PROOF_STAMP_REFUSED` and never a second line here. A
-retraction clears the proof — a stopped dev server restarted in place is one — and the restarted
-app's first page is stamped again."""
+second sighting of the same container is silent, and a refused one raises
+`SERVING_PROOF_STAMP_REFUSED` — never a second line here. A retraction clears the proof — a
+stopped dev server restarted in place is one — and the restarted app's first page is stamped
+again."""
 
 
 APP_FIRST_SERVE_NOT_OBSERVED_EVENT: Final = "app_first_serve_not_observed"
@@ -272,7 +273,7 @@ does not boot, and that is what wants looking at, not this code."""
 
 SERVING_PROOF_STAMP_REFUSED: Final = "serving_proof_stamp_refused"
 """An observer watched an app serve and the compare-and-set REFUSED to record it: the registry
-hash was gone, marked `ending`, or named a different container. WARNING.
+hash was gone, marked `ending` with no proof on it, or named a different container. WARNING.
 
 THE NEAR-MISS OF STAMPING THE WRONG CONTAINER, which is the single most dangerous thing in this
 design — the one-per-user slot flipped between the observation and the write, so a slow observer

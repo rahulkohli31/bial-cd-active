@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 import pytest
 import redis.asyncio as aioredis
+import structlog.testing
 from redis.exceptions import RedisError
 
 from src.api.v1.build_sessions.schemas import (
@@ -18,6 +19,7 @@ from src.api.v1.build_sessions.schemas import (
     STARTING_MARKER_TTL_SECONDS,
 )
 from src.services.build_sessions import locks
+from src.services.build_sessions.alarms import APP_FIRST_SERVED_EVENT, SERVING_PROOF_STAMP_REFUSED
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -26,6 +28,7 @@ from src.services.redis import (
 )
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_STATE,
     starting_key,
@@ -159,6 +162,12 @@ async def test_the_one_guard_never_swallows_cancellation(
         # An alarm raised on an outage is an alarm nobody can act on.
         ("eval", lambda r: locks.mark_serving(r, USER, app_name=SBX, when=datetime.now(UTC))),
         ("eval", lambda r: locks.clear_serving(r, USER, app_name=SBX)),
+        (
+            "eval",
+            lambda r: locks.record_the_first_serve(
+                r, USER, app_name=SBX, observer="relaunch", cold=True
+            ),
+        ),
     ],
 )
 async def test_every_primitive_but_acquire_still_surfaces_redis_errors(
@@ -404,6 +413,76 @@ async def test_an_app_that_comes_back_can_be_proven_again(fake_redis: aioredis.R
     assert await locks.clear_serving(fake_redis, USER, app_name=SBX) is True
     assert await locks.mark_serving(fake_redis, USER, app_name=SBX, when=recovered) is True
     assert await _stamp_on(fake_redis, USER) == recovered.isoformat()
+
+
+# --- the one recorder every observer shares ------------------------------------------------
+
+
+async def test_the_first_sighting_is_recorded_once_and_every_later_one_is_silent(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """First serve wins, so the first observer's line is the record. A later sighting of the same
+    container, by another observer or after the reaper has marked it `ending`, finds the proof
+    already standing and has nothing to add, least of all an alarm.
+
+    Mutation-check: drop the second-sighting return and this goes red on the refusals."""
+    await _a_registered_container(fake_redis, USER)
+    await fake_redis.hset(
+        registry_key(USER), REGISTRY_FIELD_CREATED_AT, "2026-09-10T09:40:56+00:00"
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        await locks.record_the_first_serve(
+            fake_redis, USER, app_name=SBX, observer="relaunch", cold=True
+        )
+        await locks.record_the_first_serve(
+            fake_redis, USER, app_name=SBX, observer="turn_watcher", cold=False
+        )
+        await locks.mark_registry_ending(fake_redis, USER)
+        await locks.record_the_first_serve(
+            fake_redis, USER, app_name=SBX, observer="reconciler", cold=None
+        )
+
+    served = [e for e in logs if e.get("event") == APP_FIRST_SERVED_EVENT]
+    assert len(served) == 1, "`app_first_served` means FIRST"
+    assert served[0]["observer"] == "relaunch"
+    assert served[0]["cold"] is True
+    assert isinstance(served[0]["ms_since_container_created"], int)
+    assert [e for e in logs if e.get("event") == SERVING_PROOF_STAMP_REFUSED] == []
+
+
+@pytest.mark.parametrize(
+    ("occupant", "state", "found_app_present"),
+    [
+        pytest.param(None, REGISTRY_STATE_READY, False, id="the-hash-is-gone"),
+        pytest.param(SBX, REGISTRY_STATE_ENDING, True, id="torn-down-before-a-proof-landed"),
+        pytest.param(
+            a_sandbox_name("successor"), REGISTRY_STATE_READY, True, id="another-container"
+        ),
+    ],
+)
+async def test_a_stamp_the_hash_refuses_is_the_alarm_whichever_observer_saw_it(
+    fake_redis: aioredis.Redis, occupant: str | None, state: str, found_app_present: bool
+) -> None:
+    """★ ONE RULE FOR EVERY OBSERVER. The middle case is the one the copies disagreed on: a
+    container marked `ending` before any proof landed is about to be torn down unproven, and its
+    `serving_proof_absent_at_teardown` needs this line beside it to say the app did serve.
+
+    Mutation-check: count a hash that still names this app as a second sighting whatever its
+    proof says, and the middle case goes red."""
+    if occupant is not None:
+        await _a_registered_container(fake_redis, USER, app_name=occupant, state=state)
+
+    with structlog.testing.capture_logs() as logs:
+        await locks.record_the_first_serve(
+            fake_redis, USER, app_name=SBX, observer="turn_watcher", cold=False
+        )
+
+    refusals = [e for e in logs if e.get("event") == SERVING_PROOF_STAMP_REFUSED]
+    assert len(refusals) == 1, "the near-miss went unrecorded"
+    assert refusals[0]["found_app_present"] is found_app_present
+    assert refusals[0]["observer"] == "turn_watcher"
+    assert [e for e in logs if e.get("event") == APP_FIRST_SERVED_EVENT] == []
 
 
 def test_neither_serving_script_names_a_registry_field_by_hand() -> None:

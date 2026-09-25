@@ -11,10 +11,10 @@ REDIS-ERROR POLICY: only `acquire_lock` catches `RedisError` (to retype it as
 `LockUnavailableError`); every other primitive lets it propagate, deliberately. Answer-bearing
 primitives (`lock_is_held`, `read_registry`, `renew_lock`, `mark_serving`) must never swallow —
 that would fabricate a certain answer from an ambiguous store; a swallowed `mark_serving` error
-in particular would report "the stamp was refused" for a store that never answered, and its
-caller raises an alarm on exactly that. `mark_registry_ending` returns nothing to
-fabricate; it is an ordering guard, and its failure must abort the reaper sequence rather than
-let it delete a container a racing `attach_existing` still believes is ready.
+in particular would report "the stamp was refused" for a store that never answered, and
+`record_the_first_serve` raises an alarm on exactly that. `mark_registry_ending` returns nothing
+to fabricate; it is an ordering guard, and its failure must abort the reaper sequence rather
+than let it delete a container a racing `attach_existing` still believes is ready.
 `release_lock_as_holder` and `write_heartbeat` look like they want a guard; they don't —
 callers that need one already have it, and inside `_holding_user_lock`'s protected region
 the raise IS what triggers compensation.
@@ -58,6 +58,7 @@ from src.api.v1.build_sessions.schemas import (
     RenewalOutcome,
     SurfacePresence,
 )
+from src.services.build_sessions.alarms import APP_FIRST_SERVED_EVENT, SERVING_PROOF_STAMP_REFUSED
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -728,8 +729,8 @@ async def mark_serving(
     False therefore carries two situations, and the caller reacts identically to both: do not
     stamp. It is a no-op second sighting, or the write was REFUSED because the hash is gone,
     marked `ending`, or names another project's container — the near-miss that owes a
-    `SERVING_PROOF_STAMP_REFUSED`. Only the caller, which knows whether it had already watched
-    this container serve, can tell those apart, so only the caller logs.
+    `SERVING_PROOF_STAMP_REFUSED`. Only a re-read of the hash can tell those apart, so
+    `record_the_first_serve`, below, is the one that logs.
 
     BARE on Redis errors, per the module's REDIS-ERROR POLICY: this is answer-bearing, and a
     swallowed error would hand the caller a refusal that never happened."""
@@ -753,6 +754,58 @@ async def clear_serving(redis: aioredis.Redis, user_uuid: uuid.UUID, *, app_name
     a single unanswered poll is a poll, not a dead app."""
     cleared = await redis.eval(_CAS_CLEAR_SERVING_LUA, 1, registry_key(user_uuid), app_name)
     return bool(cleared)
+
+
+async def record_the_first_serve(
+    redis: aioredis.Redis,
+    user_uuid: uuid.UUID,
+    *,
+    app_name: str,
+    observer: str,
+    cold: bool | None,
+) -> None:
+    """An observer watched this container's app show a page: stamp the proof, and say so once.
+
+    THE ONE RECORDER EVERY OBSERVER SHARES — the turn's watcher and verify, the start and
+    continuation watches, and the reconciler's sweep — so there is one answer to what a refusal
+    means. `mark_serving` answering False carries two situations, and the re-read tells them
+    apart: this same container already carrying a proof is a SECOND SIGHTING, and silent, because
+    first serve wins and the first observer's line is the record. Anything else — the hash gone,
+    marked `ending` before a proof landed, or naming another container — is
+    `SERVING_PROOF_STAMP_REFUSED`. The `ending` one is why the rule is shared: that container's
+    teardown raises `SERVING_PROOF_ABSENT_AT_TEARDOWN`, and this line is the evidence it served.
+
+    `cold` is `None` from an observer that was not there when the container was created.
+
+    BARE on Redis errors, per the module's policy: every caller has its own answer to a store
+    that would not reply, and none of them is to report a refusal."""
+    when = datetime.now(UTC)
+    stamped = await mark_serving(redis, user_uuid, app_name=app_name, when=when)
+    reg = await read_registry(redis, user_uuid)
+    if stamped:
+        _log.info(
+            APP_FIRST_SERVED_EVENT,
+            user_id=str(user_uuid),
+            app_name=app_name,
+            serving_since=when.isoformat(),
+            ms_since_container_created=elapsed_ms(
+                an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT), when
+            ),
+            observer=observer,
+            cold=cold,
+        )
+        return
+    if reg is not None and reg.get(REGISTRY_FIELD_APP_NAME) == app_name and stamp_is_proven(reg):
+        return
+    _log.warning(
+        SERVING_PROOF_STAMP_REFUSED,
+        user_id=str(user_uuid),
+        expected_app=app_name,
+        # A BOOL, never the name that was found: it belongs to another of this citizen's
+        # projects, and the id vocabulary in this log stays user-scoped.
+        found_app_present=bool(reg and reg.get(REGISTRY_FIELD_APP_NAME)),
+        observer=observer,
+    )
 
 
 # --- registry state -----------------------------------------------------------

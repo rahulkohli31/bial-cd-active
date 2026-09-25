@@ -933,6 +933,34 @@ async def test_an_attach_that_shows_no_page_is_a_press_that_never_arrived(
     assert len(await _counter_values(HarnessCounter.APP_COLD_START_MS)) == 1
 
 
+async def test_a_page_the_store_would_not_record_is_still_a_press_that_arrived(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    empty_harness_counts,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The proof is bookkeeping behind an app that is already up. A store that will not take it
+    leaves the stamp to the reconciler's sweep; the page was still seen.
+
+    Mutation check: drop the `except RedisError` around the recorder in the watch and this goes
+    red."""
+    monkeypatch.setattr(manager_mod, "_COLD_READY_BUDGET_SECONDS", 0.0)
+    user, project = await _user_project(db_session, "rl-count-store-down@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+
+    async def the_store_will_not_answer(*args: object, **kwargs: object) -> None:
+        raise RedisError("redis is down")
+
+    monkeypatch.setattr(manager_mod, "record_the_first_serve", the_store_will_not_answer)
+
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
+
+    assert len(await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING)) == 1
+
+
 async def test_a_press_refused_by_the_one_slot_conflict_still_counts_as_a_press(
     client: AsyncClient,
     db_session: AsyncSession,

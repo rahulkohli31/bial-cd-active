@@ -62,12 +62,10 @@ from src.db.models.project import Project
 from src.db.models.user import User
 from src.services.build_sessions.alarms import (
     APP_FIRST_SERVE_NOT_OBSERVED_EVENT,
-    APP_FIRST_SERVED_EVENT,
     APP_STOPPED_WHILE_IDLE_EVENT,
     BUILD_WORKSPACE_CLAIMED_EVENT,
     PREVIEW_STATE_REPORTED_UNKNOWN_EVENT,
     SANDBOX_DEV_STARTED_EVENT,
-    SERVING_PROOF_STAMP_REFUSED,
     WORKSPACE_LOST_WHILE_IDLE_EVENT,
 )
 from src.services.build_sessions.appconnector_env import build_connector_env
@@ -90,13 +88,12 @@ from src.services.build_sessions.locks import (
     clear_serving,
     clear_starting_marker,
     delete_registry,
-    elapsed_ms,
     grant_stay_of_execution,
     liveness_lease_is_held,
-    mark_serving,
     read_registry,
     read_registry_and_starting_marker,
     reap_lock,
+    record_the_first_serve,
     release_lock_as_holder,
     settle_stay_once_the_app_is_serving,
     shared_view_stamp,
@@ -947,62 +944,6 @@ _OBSERVER_FOR_THE_BOOT: Final[dict[_BootArm, _ServingObserver]] = {
     "discard": "discard_continuation",
     "idle": "idle_continuation",
 }
-
-
-async def _record_the_first_serve(
-    redis: aioredis.Redis,
-    user_id: uuid.UUID,
-    *,
-    app_name: str,
-    observer: _ServingObserver,
-    cold: bool,
-) -> None:
-    """Something watched this container's app ANSWER a request — write the proof down and say
-    so. NEVER RAISES: this is bookkeeping behind a container that is already up and already
-    handed to the citizen, exactly like the counters beside it, and a coordination-store blip
-    must not fail a start that is already up.
-
-    THE REFUSAL IS THE INTERESTING CASE. `mark_serving` answering False carries two situations
-    that only a caller can tell apart, so the discrimination is made here, once: a hash that
-    still names this app and already holds an instant is a SECOND SIGHTING — first serve wins,
-    nothing to say — while a hash that is gone, marked `ending`, or naming another container is
-    the near-miss the design is most afraid of, and it gets `SERVING_PROOF_STAMP_REFUSED`."""
-    when = datetime.now(UTC)
-    try:
-        stamped = await mark_serving(redis, user_id, app_name=app_name, when=when)
-        # Re-read either way: on a stamp it is where `created_at` comes from (so the operator
-        # is handed the window rather than two timestamps to subtract), and on a refusal it is
-        # the only thing that can say WHICH refusal this was.
-        reg = await read_registry(redis, user_id)
-    except RedisError:
-        _log.exception(
-            "serving proof could not be recorded; the reconciler's sweep is the backstop",
-            user_id=str(user_id),
-            app_name=app_name,
-        )
-        return
-    if stamped:
-        _log.info(
-            APP_FIRST_SERVED_EVENT,
-            app_name=app_name,
-            serving_since=when.isoformat(),
-            ms_since_container_created=elapsed_ms(
-                an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT), when
-            ),
-            observer=observer,
-            cold=cold,
-        )
-        return
-    if reg is not None and _registry_serves_and_is_ready(reg, app_name) and stamp_is_proven(reg):
-        return  # a second sighting of a container that already carries its proof
-    _log.warning(
-        SERVING_PROOF_STAMP_REFUSED,
-        expected_app=app_name,
-        # A BOOL, and never the other project's container name: the id vocabulary in this log
-        # stays user-scoped, and naming the loser would put one of the citizen's projects into
-        # another's build trace.
-        found_app_present=bool(reg and reg.get(REGISTRY_FIELD_APP_NAME)),
-    )
 
 
 async def _last_supervisor_reading(
@@ -2667,9 +2608,19 @@ class SessionManager:
                     # an iteration and nothing more, and only the deadline ends this.
                     it_paints = False
                 if it_paints:
-                    await _record_the_first_serve(
-                        redis, user_id, app_name=app_name, observer=observer, cold=cold
-                    )
+                    # Past this point the page was seen, whatever the store says: a start that is
+                    # already up is never failed by its bookkeeping.
+                    try:
+                        await record_the_first_serve(
+                            redis, user_id, app_name=app_name, observer=observer, cold=cold
+                        )
+                    except RedisError:
+                        _log.exception(
+                            "serving proof could not be recorded; the reconciler's sweep is the "
+                            "backstop",
+                            user_id=str(user_id),
+                            app_name=app_name,
+                        )
                     return True
                 if loop.time() >= deadline:
                     break

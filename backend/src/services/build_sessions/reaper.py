@@ -35,11 +35,9 @@ import structlog
 
 from src.api.v1.build_sessions.schemas import SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS
 from src.services.build_sessions.alarms import (
-    APP_FIRST_SERVED_EVENT,
     APP_SERVING_LOST_EVENT,
     REAP_FOUND_NO_REPOSITORY_EVENT,
     SERVING_PROOF_ABSENT_AT_TEARDOWN,
-    SERVING_PROOF_STAMP_REFUSED,
 )
 from src.services.build_sessions.drain import (
     is_drained,
@@ -57,10 +55,10 @@ from src.services.build_sessions.locks import (
     liveness_lease_is_held,
     lock_is_held,
     mark_registry_ending,
-    mark_serving,
     read_registry,
     read_starting_marker,
     reap_lock,
+    record_the_first_serve,
     release_liveness_lease,
     shared_view_stamp,
     stamp_is_proven,
@@ -121,7 +119,7 @@ _PROBE_BUDGET_SECONDS: float = 10.0
 
 #: WHICH observer this module is, in `APP_FIRST_SERVED_EVENT`'s `observer` vocabulary — a named
 #: constant for the same reason the turn engine and the session manager each have one: a typo in
-#: one of the three call sites below would mint an observer that never existed, and the log rule
+#: one of the call sites below would mint an observer that never existed, and the log rule
 #: keyed on the name would go on matching nothing while looking perfectly healthy.
 _OBSERVER_RECONCILER: Final = "reconciler"
 
@@ -432,25 +430,9 @@ async def _make_the_stamp_agree(
             # alarm rather than a notice. That the proof is still absent is recorded ONCE, where
             # it becomes final — `SERVING_PROOF_ABSENT_AT_TEARDOWN`, at teardown.
             return
-        created = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
-        if await mark_serving(redis, user_uuid, app_name=answered.app_name, when=now):
-            _log.info(
-                APP_FIRST_SERVED_EVENT,
-                user_id=str(user_uuid),
-                app_name=answered.app_name,
-                serving_since=now.isoformat(),
-                # Non-None by construction — the stamp arm is reached only through an age gate
-                # that needs it — but expressed rather than asserted, since `python -O` strips
-                # an `assert` and this line is the operator's whole answer to "how long".
-                ms_since_container_created=elapsed_ms(created, now),
-                # WHICH watcher won, and this one winning is itself the finding: it means every
-                # in-turn observer for this container was lost. `cold` is deliberately absent
-                # rather than guessed — it says which arm CREATED the container, and a sweep that
-                # arrived minutes later was not there for it.
-                observer=_OBSERVER_RECONCILER,
-            )
-            return
-        await _record_a_refused_stamp(redis, user_uuid, expected_app=answered.app_name)
+        await record_the_first_serve(
+            redis, user_uuid, app_name=answered.app_name, observer=_OBSERVER_RECONCILER, cold=None
+        )
         return
     # BOTH READINGS HAVE TO SAY NO, and `ready` is the one that carries the weight. `running` is
     # child-process truth about the dev server the supervisor itself started; `ready` means a
@@ -478,37 +460,6 @@ async def _make_the_stamp_agree(
             served_for_ms=elapsed_ms(served_since, now),
             observer=_OBSERVER_RECONCILER,
         )
-
-
-async def _record_a_refused_stamp(
-    redis: aioredis.Redis, user_uuid: uuid.UUID, *, expected_app: str
-) -> None:
-    """Tell a benign race apart from the near-miss, and alarm on the near-miss only.
-
-    `mark_serving` answers False for two very different situations and cannot distinguish them
-    from the inside. One is another observer landing the same first serve microseconds earlier —
-    first-serve-wins working exactly as designed, and their `app_first_served` line is the
-    record, so a second line here would double-count a single event. The other is the dangerous
-    one: the hash is gone, marked `ending`, or names a different container, which means this
-    observer came back holding evidence about a container that no longer occupies the slot.
-
-    The re-read is what separates them. `found_app_present` is a BOOL and never the other
-    project's container name — the id vocabulary in this log stays user-scoped, and naming the
-    loser would put one of the citizen's projects into another's build trace."""
-    reg = await read_registry(redis, user_uuid)
-    if (
-        reg is not None
-        and reg.get(REGISTRY_FIELD_APP_NAME) == expected_app
-        and reg.get(REGISTRY_FIELD_SERVING_SINCE)
-    ):
-        return
-    _log.warning(
-        SERVING_PROOF_STAMP_REFUSED,
-        user_id=str(user_uuid),
-        expected_app=expected_app,
-        found_app_present=bool(reg is not None and reg.get(REGISTRY_FIELD_APP_NAME)),
-        observer=_OBSERVER_RECONCILER,
-    )
 
 
 def _sound_the_alarm_if_the_proof_is_absent(reg: dict[str, str], *, user_uuid: uuid.UUID) -> None:

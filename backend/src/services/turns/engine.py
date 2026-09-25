@@ -112,11 +112,9 @@ from src.services.attachments.materialize import (
     AttachmentPlacementError,
 )
 from src.services.build_sessions.alarms import (
-    APP_FIRST_SERVED_EVENT,
     APP_SERVING_LOST_EVENT,
     HMR_PROTOCOL_DRIFT_EVENT,
     SANDBOX_DEV_STARTED_EVENT,
-    SERVING_PROOF_STAMP_REFUSED,
 )
 from src.services.build_sessions.counters import count
 from src.services.build_sessions.integrity import (
@@ -127,8 +125,8 @@ from src.services.build_sessions.locks import (
     an_instant_on_the_hash,
     clear_serving,
     elapsed_ms,
-    mark_serving,
     read_registry,
+    record_the_first_serve,
     release_liveness_lease,
     renew_liveness_lease,
     renew_lock,
@@ -195,8 +193,6 @@ from src.services.orchestrator.selfheal import (
 )
 from src.services.redis import get_redis
 from src.services.redis.keys import (
-    REGISTRY_FIELD_APP_NAME,
-    REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_SERVING_SINCE,
     cooperative_stop_key,
 )
@@ -3185,10 +3181,10 @@ class TurnEngine:
 
         THIS IS THE WHOLE CHANGE. `state == ready` on the registry hash says a container was
         SCHEDULED, and the platform reporting that as running is the defect the `serving_since`
-        stamp exists to end. Both of this file's observers call this, and so does the relaunch
-        path in the manager; the compare-and-set in `build_sessions/locks.py` is what makes
-        "first serve wins" true across all of them, and what refuses a stamp aimed at a
-        container the one-per-user slot no longer holds.
+        stamp exists to end. Both of this file's observers call this, and it records through
+        `locks.record_the_first_serve`, the recorder every observer shares: its compare-and-set
+        is what makes "first serve wins" true across all of them, and what refuses a stamp aimed
+        at a container the one-per-user slot no longer holds.
 
         ASKED ONCE PER TURN, NOT ONCE PER POLL — but latched on the ANSWER, never on a token
         somebody else can take. `state.serving_proof_settled` is set only by a call that got a
@@ -3211,56 +3207,17 @@ class TurnEngine:
         if not shows_a_page:
             return
         app_name = sandbox.handle.app_name
-        when = datetime.now(UTC)
         try:
-            redis = get_redis()
-            stamped = await mark_serving(redis, state.user_id, app_name=app_name, when=when)
-            # ONE EXTRA READ, AND ONLY ONCE PER TURN. On the way in it buys the registry's own
-            # `created_at`, so `ms_since_container_created` is an answer rather than a
-            # subtraction the operator has to do across two log lines — this is the eight-second
-            # number the 2026-09-10 measurement had to be reconstructed from a screen recording
-            # to get. On the refusal path it is the only way to tell the ordinary case (another
-            # observer already proved this same container) from the dangerous one (the hash is
-            # gone, ending, or names a different app), which `locks.mark_serving` cannot tell
-            # apart on its own and says so.
-            registry = await read_registry(redis, state.user_id)
-            state.serving_proof_settled = True
-            if stamped:
-                _log.info(
-                    APP_FIRST_SERVED_EVENT,
-                    app_name=app_name,
-                    serving_since=when.isoformat(),
-                    ms_since_container_created=elapsed_ms(
-                        an_instant_on_the_hash(registry, REGISTRY_FIELD_CREATED_AT), when
-                    ),
-                    observer=observer,
-                    # WHETHER THIS TURN BROUGHT THE CONTAINER UP, read off the same field the
-                    # container-start ratio's denominator is gated on. A turn that joined a
-                    # container already serving is not a cold start, and calling it one would
-                    # put a sub-second window beside a sixty-second one under the same name.
-                    cold=state.started_a_container,
-                )
-                return
-            if registry is not None and registry.get(REGISTRY_FIELD_APP_NAME) == app_name:
-                if registry.get(REGISTRY_FIELD_SERVING_SINCE):
-                    # ALREADY PROVEN, BY AN OBSERVER THAT GOT HERE FIRST — the verify path, an
-                    # earlier turn, or the relaunch that started this container. Silent on
-                    # purpose: `app_first_served` means FIRST, so a second line under that name
-                    # would make `ms_since_container_created` meaningless.
-                    return
-                # The hash still names our container and the field is still the empty sentinel.
-                # Two ways to get here and neither is the near-miss: the compare-and-set refused
-                # on `state`, meaning the reaper has already marked this container `ending` and
-                # it is going away — or the crash edge retracted a proof in the window between
-                # the write and this read, and the next poll will re-stamp. Nothing to alarm on.
-                return
-            _log.warning(
-                SERVING_PROOF_STAMP_REFUSED,
-                expected_app=app_name,
-                # A BOOL, NEVER THE NAME THAT WAS FOUND. The other name belongs to another of
-                # this citizen's projects, and the id vocabulary in this log stays user-scoped.
-                found_app_present=bool(registry and registry.get(REGISTRY_FIELD_APP_NAME)),
+            await record_the_first_serve(
+                get_redis(),
+                state.user_id,
+                app_name=app_name,
                 observer=observer,
+                # WHETHER THIS TURN BROUGHT THE CONTAINER UP, read off the same field the
+                # container-start ratio's denominator is gated on. A turn that joined a container
+                # already serving is not a cold start, and calling it one would put a sub-second
+                # window beside a sixty-second one under the same name.
+                cold=state.started_a_container,
             )
         except Exception:
             # NOT LATCHED — the next poll asks again, because a store that would not answer has
@@ -3276,6 +3233,8 @@ class TurnEngine:
                 observer=observer,
                 exc_info=True,
             )
+            return
+        state.serving_proof_settled = True
 
     async def _retract_serving_proof(
         self,
