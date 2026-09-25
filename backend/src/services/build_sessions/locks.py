@@ -563,19 +563,18 @@ async def renew_presence_stay(
     return RenewalOutcome.RENEWED, an_instant_in_utc(raw.removeprefix("renewed:"))
 
 
-# Retire a provisioning stay now that provisioning is demonstrably over, guarded on the same
-# `app_name` identity every other write here carries.
+# Retire a provisioning stay now that provisioning is over, guarded on the same `app_name`
+# identity every other write here carries.
 #
 # THE ONE WRITE IN THIS MODULE THAT MAY SHORTEN A DEADLINE, and the exception is narrow enough to
-# state exactly: a start grants a long stay because a hung restore can block for the better part
-# of twenty minutes with nothing else protecting the container — not the heartbeat, which is not
-# seeded yet, and not the starting marker, whose TTL is shorter than that worst case. The moment
-# the app answers a request, that reason is gone. Leaving the long stay standing would keep a
-# container nobody came back to alive for half an hour after the tab closed, which is precisely
-# what presence renewal exists to stop paying for.
+# state exactly: a start grants a long stay once its restore has written the registry, because a
+# slow restore can outlive the starting marker and leave the stay as the only claim on the
+# container. Once the dev server has been started, that reason is gone. Leaving the long stay
+# standing would keep a container nobody came back to alive for half an hour after the tab
+# closed, which is precisely what presence renewal exists to stop paying for.
 #
-# It is issued by the same code path that granted the long stay, at the point that path can prove
-# provisioning ended. `grant_stay_of_execution`'s monotonic rule is untouched and still governs
+# It is issued by the same code path that granted the long stay, the moment that path has started
+# the dev server. `grant_stay_of_execution`'s monotonic rule is untouched and still governs
 # every OTHER writer: it exists so a weaker writer cannot truncate a stronger one's reprieve, and
 # nothing here is a different writer arriving with a weaker claim.
 _CAS_SETTLE_STAY_LUA: Final = (
@@ -585,7 +584,7 @@ _CAS_SETTLE_STAY_LUA: Final = (
 )
 
 
-async def settle_stay_once_the_app_is_serving(
+async def settle_stay_once_provisioning_ends(
     redis: aioredis.Redis, user_uuid: uuid.UUID, *, app_name: str
 ) -> datetime | None:
     """Hand this container's lifetime to the screen that asked for it, and return the deadline.

@@ -96,7 +96,7 @@ from src.services.build_sessions.locks import (
     reap_lock,
     record_the_first_serve,
     release_lock_as_holder,
-    settle_stay_once_the_app_is_serving,
+    settle_stay_once_provisioning_ends,
     shared_view_stamp,
     stamp_is_proven,
     write_heartbeat,
@@ -2908,7 +2908,7 @@ class SessionManager:
                 await grant_stay_of_execution(redis, user_id, writer=DeadlineWriter.BUILDER_ACTED)
             # Settled rather than re-granted: provisioning is over, and the screen framing the
             # app renews its own stay from here.
-            await settle_stay_once_the_app_is_serving(redis, user_id, app_name=app_name)
+            await settle_stay_once_provisioning_ends(redis, user_id, app_name=app_name)
         return handle
 
     async def _retract_a_proof_it_cannot_back(

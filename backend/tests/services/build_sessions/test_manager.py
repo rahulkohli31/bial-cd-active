@@ -1600,7 +1600,7 @@ async def test_a_sweep_during_the_relaunch_provision_window_does_not_reap_it(
 async def test_the_next_real_start_reaps_a_relaunched_preview_through_its_stay(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    # Driven end to end: relaunch a preview of project A (which grants a live 30-minute stay),
+    # Driven end to end: relaunch a preview of project A (which leaves a live 5-minute stay),
     # then allocate for project B for the SAME user. The stay would spare A's container from the
     # sweep and B needs the one-per-user slot, so the start itself has to take A out — the
     # switch hands it to the shutdown routine. Left running while B registers its own over that
