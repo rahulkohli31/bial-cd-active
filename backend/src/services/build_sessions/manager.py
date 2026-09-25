@@ -281,9 +281,10 @@ _STOP_RECORD_RETENTION_SECONDS: float = 300.0
 
 # How long a shared view's launch waits for `dev/status.ready`, PER ARM, because the two arms ask
 # different questions. The COLD arm covers a real boot — `npm` reconcile, a first Turbopack
-# compile — and the same 120s bounds every watch for a first page. The ATTACHED arm is asking
-# whether the citizen's own root route answers, which a heavy query blows whatever the budget, so
-# 15s — well above a warm attach, measured at ~380ms — lets a slow app degrade promptly.
+# compile — and the same 120s bounds every watch for a first page but a restored relaunch's, which
+# gets two of it. The ATTACHED arm is asking whether the citizen's own root route answers, which a
+# heavy query blows whatever the budget, so 15s — well above a warm attach, measured at ~380ms —
+# lets a slow app degrade promptly.
 _ATTACHED_READY_BUDGET_SECONDS: float = 15.0
 _COLD_READY_BUDGET_SECONDS: float = 120.0
 
@@ -2611,6 +2612,7 @@ class SessionManager:
                 app_name=app_name,
                 cold=cold,
                 observer=observer,
+                budget_s=_COLD_READY_BUDGET_SECONDS,
             )
         )
         self._tasks.add(watcher)
@@ -2626,8 +2628,9 @@ class SessionManager:
         app_name: str,
         cold: bool,
         observer: _ServingObserver,
+        budget_s: float,
     ) -> bool:
-        """Ask once a second, for one cold budget, whether the app is SHOWING A PAGE; record the
+        """Ask once a second, for `budget_s`, whether the app is SHOWING A PAGE; record the
         first sighting, or write `app_first_serve_not_observed` when the budget runs out. True
         when a page was seen. NEVER RAISES except to cancel: nothing may lose a start to it.
 
@@ -2637,7 +2640,7 @@ class SessionManager:
         reconciler's sweep covers whatever every watcher misses."""
         loop = asyncio.get_running_loop()
         started_at = loop.time()
-        deadline = started_at + _COLD_READY_BUDGET_SECONDS
+        deadline = started_at + budget_s
         try:
             while True:
                 try:
@@ -2670,7 +2673,7 @@ class SessionManager:
             _log.warning(
                 APP_FIRST_SERVE_NOT_OBSERVED_EVENT,
                 waited_ms=int((loop.time() - started_at) * 1000),
-                budget_ms=int(_COLD_READY_BUDGET_SECONDS * 1000),
+                budget_ms=int(budget_s * 1000),
                 arm=observer,
                 dev_running=dev_running,
                 dev_compile=dev_compile,
@@ -2882,6 +2885,9 @@ class SessionManager:
             app_name=app_name_for(app_id),
             cold=env is not None,
             observer="relaunch",
+            # A restored app's first page can come well after one budget, an `npm` reconcile
+            # then a first compile on one vCPU, and past this watch only the sweep stamps it.
+            budget_s=(2 if env is not None else 1) * _COLD_READY_BUDGET_SECONDS,
         ):
             return
         await count(HarnessCounter.APP_START_REACHED_RUNNING, app_id=app_id)

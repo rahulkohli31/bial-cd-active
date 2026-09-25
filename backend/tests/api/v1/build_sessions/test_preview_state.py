@@ -3,6 +3,7 @@ decided nothing."""
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -1591,6 +1592,46 @@ async def test_a_watch_that_sees_the_page_arrive_stamps_it_once_and_names_its_ar
     assert served[0]["cold"] is True, "a restored container's late first page read as a warm one"
     assert polls["taken"] > 1, "guard the premise: the watch really did look again"
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE)
+    assert (await _probe(client, user, project))["state"] == "alive"
+
+
+async def test_a_restored_app_whose_first_page_comes_after_one_budget_is_still_stamped(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An `npm` reconcile then a first compile on one vCPU can put a restored app's first page
+    past one watch budget. The relaunch watches a restored app for two, so the page is stamped
+    by the start that brought it up instead of waiting on the five-minute sweep.
+
+    Mutation-check: give the relaunch's cold watch one budget and this goes red."""
+    user, project, _ = await _a_saved_project(
+        db_session, fake_storage, "ps-slow-first-page@rvaiglobal.com"
+    )
+    # A budget of a fraction of a second, so the test waits that rather than minutes; the page
+    # arrives one and a half budgets after the first look.
+    budget = 0.4
+    monkeypatch.setattr(manager_mod, "_COLD_READY_BUDGET_SECONDS", budget)
+    monkeypatch.setattr(manager_mod, "READINESS_POLL_S", 0.01)
+    first_look: list[float] = []
+
+    async def the_page_arrives_after_one_budget(handle: SandboxHandle) -> DevStatus:
+        if not first_look:
+            first_look.append(time.monotonic())
+        late = time.monotonic() - first_look[0] >= 1.5 * budget
+        return DevStatus(running=True, ready=True, port=3000, root_status=200 if late else 404)
+
+    monkeypatch.setattr(wire.sbx, "dev_status", the_page_arrives_after_one_budget)
+
+    with structlog.testing.capture_logs() as logs:
+        assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
+
+    served = [e for e in logs if e.get("event") == APP_FIRST_SERVED_EVENT]
+    assert [(e["observer"], e["cold"]) for e in served] == [("relaunch", True)]
+    assert [e for e in logs if e.get("event") == APP_FIRST_SERVE_NOT_OBSERVED_EVENT] == []
     assert (await _probe(client, user, project))["state"] == "alive"
 
 
