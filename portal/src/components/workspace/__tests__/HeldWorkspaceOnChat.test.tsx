@@ -73,10 +73,6 @@ const sharedViewHolds = (over: Record<string, unknown> = {}) =>
     projectId: 'pA', projectName: 'Car pool', dirty: true, building: false, isSharedView: true, ...over,
   })
 
-const STARTED = {
-  appId: 'a1', previewUrl: 'https://app/', status: 'ready', restoredFromFailedBuild: false, ready: true,
-}
-
 const launch = () => screen.getByRole('button', { name: /^Launch Application$/ })
 
 beforeEach(() => {
@@ -111,7 +107,7 @@ describe('★ a taken slot asks the citizen nothing, on the chat surface too', (
   })
 
   it('★ pressing it brings this app up, and posts no turn', async () => {
-    h.relaunchPreview.mockResolvedValue(STARTED)
+    h.relaunchPreview.mockResolvedValue(undefined)
     await blockedChat()
     await waitForGateOpen()
     fireEvent.change(composer(), { target: { value: 'add a filter row' } })

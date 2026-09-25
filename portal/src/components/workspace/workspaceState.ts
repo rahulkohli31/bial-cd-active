@@ -76,11 +76,8 @@ export function isTerminalReading(preview: Pick<PreviewState, 'state' | 'restora
  *
  * WHY 3 SECONDS. Chosen from the platform's own timings, because no start could be measured in
  * the session that wrote this (the Azure subscription was read-only) — and that is worth saying
- * plainly rather than dressing a guess as a measurement. Three anchors:
+ * plainly rather than dressing a guess as a measurement. Two anchors:
  *
- *  - `_ATTACHED_READY_BUDGET_SECONDS` is 15s server-side: a warm attach is expected to be serving
- *    inside it. An interval of 3s resolves such a start within a fifth of its own budget, so the
- *    lag the poll adds is small next to the event it is waiting for.
  *  - The one start measured directly had the flip at 2.7s. At 3s that start is caught on the
  *    first or second accelerated read; at 45s it was caught 42.8s late.
  *  - The read is cheap by contract — one cache read, at most two rows and two object-store HEADs,
@@ -92,7 +89,7 @@ export function isTerminalReading(preview: Pick<PreviewState, 'state' | 'restora
  * window near the ninety-fifth. Anyone holding that data should change these two numbers and say
  * so here.
  *
- * WHY IT STOPS, AND WHY THE BOUND MOVED — see {@link STARTING_PROBE_LIMIT}.
+ * WHY IT STOPS, AND WHEN — see {@link STARTING_PROBE_LIMIT}.
  *
  * FALLING BACK IS NOT A VERDICT. The reading is left exactly as it was — still `starting`, still
  * "Getting your app ready." — and the background poll goes on correcting it if the app lands late.
@@ -113,17 +110,11 @@ export const STARTING_PROBE_MS = 3_000
 /**
  * 300 SECONDS OF ACCELERATED ASKING — the server's own outer bound on a start in flight.
  *
- * IT WAS 40 READS (120s), AND THAT NUMBER IS NOW WRONG BY CONSTRUCTION. 120s was
- * `_COLD_READY_BUDGET_SECONDS`, and that budget covers ONE LEG: the final `wait_ready` once the
- * container is already up. `manager.py` says so in as many words beside the number it records —
- * blob and app-DB provision, the bundle pull, the ACA create, the container's own startup and
- * `dev_start` all happen BEFORE the budget starts, so "the budget is not a ceiling on what gets
- * recorded". That mattered little while the wait on screen began at the final leg. It matters now:
- * BUILDING spans the WHOLE pre-serve interval, because `alive` is no longer allowed to mean
- * "scheduled". A build that first served past 120s would have fallen to the 45-second background
- * cadence at exactly the point it was most likely to land, leaving somebody sitting in front of a
- * finished app for up to 45 more seconds — the same defect this change exists to close, one door
- * down.
+ * BUILDING spans the WHOLE pre-serve interval, because `alive` is not allowed to mean "scheduled":
+ * blob and app-DB provision, the bundle pull, the ACA create, the container's own startup,
+ * `dev_start` and the wait for a first page all happen inside it. A bound shorter than that
+ * interval drops a start to the 45-second background cadence at exactly the point it is most
+ * likely to land, leaving somebody sitting in front of a finished app for up to 45 more seconds.
  *
  * 300s IS THE PLATFORM'S OWN NUMBER, NOT A LARGER GUESS. `STARTING_MARKER_TTL_SECONDS` is 300, and
  * its comment derives it the way this bound needs deriving: double the wait budget, plus margin
@@ -131,10 +122,10 @@ export const STARTING_PROBE_MS = 3_000
  * that setup twice. Past it the server itself stops claiming a start is in flight, so neither does
  * this timer.
  *
- * WHAT IT COSTS, STATED RATHER THAN BURIED: 100 cheap reads instead of 40, and only while somebody
- * is watching a start. It is also the ceiling a dark endpoint buys (see {@link spendProbeCadence})
- * — five minutes of 3-second polling against a broken server rather than two. That is the price of
- * the same ceiling covering the whole wait it is now a ceiling on.
+ * WHAT IT COSTS, STATED RATHER THAN BURIED: 100 cheap reads, and only while somebody is watching a
+ * start. It is also the ceiling a dark endpoint buys (see {@link spendProbeCadence}) — five
+ * minutes of 3-second polling against a broken server. That is the price of one ceiling covering
+ * the whole wait.
  */
 export const STARTING_PROBE_LIMIT = 100
 

@@ -74,7 +74,7 @@ beforeEach(() => {
   // Neither the workspace read nor the start is this file's subject by default: a read that
   // decides nothing, so nothing reaches a real `fetch`, re-primed by the two scenarios about it.
   h.fetchPreviewState.mockRejectedValue(new Error('the read is not this file\'s subject'))
-  h.relaunchPreview.mockResolvedValue({ appId: 'a1', previewUrl: 'https://app/', status: 'ready', ready: true, restoredFromFailedBuild: false })
+  h.relaunchPreview.mockResolvedValue(undefined)
 })
 afterEach(cleanup)
 

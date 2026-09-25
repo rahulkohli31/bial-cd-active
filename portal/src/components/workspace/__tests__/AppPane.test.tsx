@@ -31,13 +31,9 @@ vi.mock('../../../utils/buildSessionApi', async (importOriginal) => ({
   relaunchPreview: api.relaunchPreview,
 }))
 
-const STARTED = {
-  appId: 'a1', previewUrl: 'https://app/', status: 'ready', restoredFromFailedBuild: false, ready: true,
-}
-
 beforeEach(() => {
   vi.clearAllMocks()
-  api.relaunchPreview.mockResolvedValue(STARTED)
+  api.relaunchPreview.mockResolvedValue(undefined)
 })
 
 const reading = (over: Partial<PreviewState> = {}): PreviewState => ({

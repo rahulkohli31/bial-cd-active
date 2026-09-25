@@ -102,7 +102,7 @@ describe('buildSessionApi — CSRF discipline', () => {
 
   it('omits the CSRF header when no csrf cookie is readable (parity with auth.js)', async () => {
     document.cookie = 'csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT'
-    const impl = jsonFetch(200, { appId: 'a1', previewUrl: null, status: 'ready', ready: true, restoredFromFailedBuild: false })
+    const impl = jsonFetch(202, { appId: 'a1' })
     await relaunchPreview({ projectId: 'p1' }, { fetchImpl: impl })
     expect(headerOf(impl, 'X-CSRF-Token')).toBeUndefined()
   })

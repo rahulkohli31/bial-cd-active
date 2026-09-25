@@ -668,9 +668,7 @@ describe('BuilderPage — the "come back later" relaunch entry point', () => {
     // (`Launch Application`), drawn by `AppPane` itself rather than nested inside the terminal card.
     h.fetchPreviewState.mockResolvedValue(previewState('asleep', true))
     h.getBuild.mockResolvedValue(outcomeTranscript())
-    h.relaunchPreview.mockResolvedValue({
-      appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false, ready: true,
-    })
+    h.relaunchPreview.mockResolvedValue(undefined)
     // The affordance needs the PROJECT's confirmed saved build — an outcome in the transcript
     // alone proves a build ran, not that a Save happened.
     renderBuilder({ hasSavedBuild: true })
@@ -686,10 +684,8 @@ describe('BuilderPage — the "come back later" relaunch entry point', () => {
   })
 
   it('INERTNESS GUARD: a FAILED newest outcome no longer gets its own button label', async () => {
-    // There is one control now, saying the same thing however the last build ended — but
-    // `restoredFromFailedBuild` still travels to the pane and says "this is your last SAVED
-    // version" in a sentence instead. Paired with a liveness assertion: an absence alone would
-    // pass on a pane offering no way back at all.
+    // There is one control now, saying the same thing however the last build ended. Paired with a
+    // liveness assertion: an absence alone would pass on a pane offering no way back at all.
     h.fetchPreviewState.mockResolvedValue(previewState('asleep', true))
     h.getBuild.mockResolvedValue(outcomeTranscript('failed'))
     renderBuilder({ hasSavedBuild: true })

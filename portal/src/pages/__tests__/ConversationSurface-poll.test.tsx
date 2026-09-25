@@ -207,9 +207,7 @@ async function framedBuild(hasSavedBuild: boolean | null = null) {
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  h.relaunchPreview.mockResolvedValue({
-    appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false, ready: true,
-  })
+  h.relaunchPreview.mockResolvedValue(undefined)
   h.newBuild.mockReturnValue('build-Y')
   h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue(null)
@@ -480,7 +478,7 @@ describe('BuilderPage — stopping the poll must not pin "gone"', () => {
 
     h.fetchPreviewState.mockResolvedValue(answer('alive'))
     await act(async () => {
-      finish({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false, ready: true })
+      finish(undefined)
     })
     await settle()
     // …and the wait GIVES WAY once the restore lands. TWO flushes, not `waitFor`: this suite runs
@@ -501,7 +499,6 @@ describe('BuilderPage — stopping the poll must not pin "gone"', () => {
     const WHY = 'Your app could not be started. Try again in a minute.'
     h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
     await framedBuild()
-    h.relaunchPreview.mockResolvedValue(undefined)
     let answerRead: (value: PreviewState) => void = () => {}
     h.fetchPreviewState.mockImplementation(
       () => new Promise<PreviewState>((resolve) => { answerRead = resolve }),
@@ -526,7 +523,6 @@ describe('BuilderPage — stopping the poll must not pin "gone"', () => {
   it('★ a read that fails after the admission still ends the press, with Try again', async () => {
     h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
     await framedBuild()
-    h.relaunchPreview.mockResolvedValue(undefined)
     h.fetchPreviewState.mockRejectedValue(new Error('503'))
 
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: /launch application/i })) })
