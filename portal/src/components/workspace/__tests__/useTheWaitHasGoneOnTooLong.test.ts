@@ -20,6 +20,7 @@ const reading = (over: Partial<PreviewState> = {}): PreviewState => ({
   previewUrl: null,
   restorable: null,
   startingSince: null,
+  startFailure: null,
   ...over,
 })
 

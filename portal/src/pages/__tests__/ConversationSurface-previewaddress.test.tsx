@@ -36,6 +36,7 @@ const polled = (state: PreviewLifeState, restorable: boolean | null = null): Pre
   alive: state === 'alive',
   previewUrl: state === 'alive' ? PROJECT_URL : null,
   startingSince: null,
+  startFailure: null,
   restorable,
 })
 

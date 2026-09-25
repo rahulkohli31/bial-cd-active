@@ -425,6 +425,7 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
     previewUrl: null,
     restorable: true,
     startingSince: null,
+    startFailure: null,
   }
 
   /**

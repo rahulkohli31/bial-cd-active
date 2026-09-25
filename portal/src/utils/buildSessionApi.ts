@@ -635,6 +635,9 @@ export interface PreviewState {
    *  the fallback. The server answers it to the second, so the same wait reads as the same
    *  instant on every poll and this can be compared like any other field. */
   startingSince: string | null
+  /** `asleep` only: the citizen's sentence for why their last start of THIS project failed after
+   *  the server admitted it. `null` when there is none, and on a backend that does not send it. */
+  startFailure: string | null
 }
 
 /** Two readings that say the same thing — see `sameSaveState`. `alive` is omitted deliberately:
@@ -647,7 +650,8 @@ export const samePreviewState = (a: PreviewState | null, b: PreviewState | null)
     a.state === b.state &&
     a.previewUrl === b.previewUrl &&
     a.restorable === b.restorable &&
-    a.startingSince === b.startingSince)
+    a.startingSince === b.startingSince &&
+    a.startFailure === b.startFailure)
 
 const UNREADABLE_PREVIEW = 'The server returned a preview state we could not read.'
 
@@ -701,6 +705,7 @@ export async function fetchPreviewState(
       typeof body.startingSince === 'string' && !Number.isNaN(Date.parse(body.startingSince))
         ? body.startingSince
         : null,
+    startFailure: typeof body.startFailure === 'string' ? body.startFailure : null,
   }
 }
 

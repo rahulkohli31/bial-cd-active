@@ -7,12 +7,13 @@ import {
   fetchPreviewState,
   fetchSaveState,
   sameSaveState,
+  samePreviewState,
   handOverWorkspace,
   discardUnsavedChanges,
   STOP_CEILING_MS,
   STOP_POLL_MS,
 } from '../buildSessionApi'
-import type { ReclaimBlocked, SaveState } from '../buildSessionApi'
+import type { PreviewState, ReclaimBlocked, SaveState } from '../buildSessionApi'
 import { ApiError } from '../apiError'
 
 /** A fake `Response`: `json()` is re-callable and `clone()` returns itself, so the
@@ -644,6 +645,7 @@ describe('fetchPreviewState — the wire mirror', () => {
         previewUrl: null,
         restorable: true,
         startingSince: null,
+        startFailure: null,
         occupyingProjectName: 'Car pool apps',
       }),
     )
@@ -653,7 +655,35 @@ describe('fetchPreviewState — the wire mirror', () => {
       previewUrl: null,
       restorable: true,
       startingSince: null,
+      startFailure: null,
     })
+  })
+
+  it('★ carries a failed start in the server’s words, and anything else as none', async () => {
+    const WHY = 'Your app could not be started. Try again in a minute.'
+    const read = (startFailure: unknown) =>
+      fetchPreviewState('p1', previewFetch({ state: 'asleep', alive: false, restorable: true, startFailure }))
+
+    expect((await read(WHY)).startFailure).toBe(WHY)
+    // An older backend omits the field; a malformed one sends something that is not a sentence.
+    expect((await fetchPreviewState('p1', previewFetch({ state: 'asleep', alive: false }))).startFailure).toBeNull()
+    expect((await read(42)).startFailure).toBeNull()
+    expect((await read({ message: WHY })).startFailure).toBeNull()
+  })
+
+  it('★ a reading whose failed start changed is a new reading', () => {
+    // The polls keep the OLD object whenever this answers "same", so a field it cannot see never
+    // reaches the pane.
+    const asleep: PreviewState = {
+      state: 'asleep',
+      alive: false,
+      previewUrl: null,
+      restorable: true,
+      startingSince: null,
+      startFailure: null,
+    }
+    expect(samePreviewState(asleep, { ...asleep })).toBe(true)
+    expect(samePreviewState(asleep, { ...asleep, startFailure: 'It could not start.' })).toBe(false)
   })
 
   it('keeps the deploy-outliving fallback: an unrecognised state is a failed read, never gone', async () => {

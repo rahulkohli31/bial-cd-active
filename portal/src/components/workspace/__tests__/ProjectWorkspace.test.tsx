@@ -616,6 +616,28 @@ describe('the app survives the round trip, in BOTH directions', () => {
     expect(api.relaunchPreview).toHaveBeenCalledTimes(1)
   })
 
+  it('★ starts nothing over a start that failed, across a crossing, and says why with Launch', async () => {
+    // The auto-start's guard is a ref that every remount resets, so without the rule each visit
+    // back to this screen would run another start that fails the same way, silently.
+    const WHY = 'Your app could not be started. Try again in a minute.'
+    api.fetchPreviewState.mockResolvedValue(
+      preview({ state: 'asleep', restorable: true, startFailure: WHY }),
+    )
+    render(<Workspace />)
+    await screen.findByText(WHY)
+    expect(screen.getByRole('button', { name: 'Launch Application' })).toBeTruthy()
+
+    fireEvent.click(screen.getByText('to chat'))
+    fireEvent.click(screen.getByText('to project'))
+    await waitFor(() => expect(railComposer()).toBeTruthy())
+    await screen.findByText(WHY)
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(api.relaunchPreview).not.toHaveBeenCalled()
+  })
+
   it('starts NOTHING for a project that has never been built', async () => {
     // Nothing to open. `asleep` with nothing to restore has no container and no saved copy behind
     // it, and a start here would be a request that can only fail.

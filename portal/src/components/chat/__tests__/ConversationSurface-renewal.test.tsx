@@ -59,6 +59,7 @@ const LIVE: PreviewState = {
   previewUrl: 'https://app.example/',
   restorable: true,
   startingSince: null,
+  startFailure: null,
 }
 
 /**

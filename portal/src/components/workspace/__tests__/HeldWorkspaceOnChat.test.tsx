@@ -64,6 +64,7 @@ const HELD: PreviewState = {
   previewUrl: null,
   restorable: true,
   startingSince: null,
+  startFailure: null,
 }
 
 /** The one refusal `POST /relaunch` can still raise: a colleague's shared view in the slot. */

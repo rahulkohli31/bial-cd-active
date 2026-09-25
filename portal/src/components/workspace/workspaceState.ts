@@ -648,8 +648,11 @@ export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
     // Pressing start takes the workspace: the server starts the project that was asked for and
     // tears the outgoing one down behind it. So a held workspace reads exactly as a saved, stopped
     // app does — the same sentence and the same one control — and names no other project.
+    //
+    // A start that failed after the server admitted it has no press left to carry its sentence, so
+    // the reading carries it. The press's own refusal is newer, and wins.
     case 'asleep':
-      return atRest(reading, projectHasSavedBuild, note)
+      return atRest(reading, projectHasSavedBuild, note ?? reading.startFailure)
     default:
       return assertNever(reading.state)
   }

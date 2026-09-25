@@ -44,6 +44,7 @@ function reading(over: Partial<PreviewState> = {}): PreviewState {
     previewUrl: null,
     restorable: null,
     startingSince: null,
+    startFailure: null,
     ...over,
   }
 }
@@ -402,6 +403,43 @@ describe('a start outcome selects no arm of its own — the READING decides the 
     expect(resolve({ preview: null, startInFlight: true }).name).toBe('starting')
     expect(resolve({ preview: reading({ state: 'alive', alive: true }), startInFlight: true }).name)
       .toBe('running')
+  })
+})
+
+describe('★ a start that failed after the server admitted it', () => {
+  const WHY = 'Your app could not be started. Try again in a minute.'
+
+  it('says why at rest, beside Launch', () => {
+    const state = resolve({ preview: reading({ state: 'asleep', restorable: true, startFailure: WHY }) })
+
+    expect(state.name).toBe('not-running')
+    expect(state.note).toBe(WHY)
+    expect(state.action).toEqual({ kind: 'start', label: LAUNCH_LABEL })
+    expect(state.busy ?? false).toBe(false)
+  })
+
+  it('gives way to the press’s own refusal, which is newer', () => {
+    const state = resolve({
+      preview: reading({ state: 'asleep', restorable: true, startFailure: WHY }),
+      startOutcome: { kind: 'failed', reason: 'A build is already running in this application.' },
+    })
+
+    expect(state.note).toBe('A build is already running in this application.')
+  })
+
+  it('is never said over a wait or a running app', () => {
+    // The contract puts it on `asleep` alone; these pin that the map would not carry it further
+    // if a reading ever did.
+    for (const preview of [
+      reading({ state: 'starting', startFailure: WHY }),
+      reading({ state: 'alive', alive: true, startFailure: WHY }),
+    ]) {
+      expect(resolve({ preview }).note ?? null, preview.state).toBeNull()
+    }
+    expect(
+      resolve({ preview: reading({ state: 'asleep', restorable: true, startFailure: WHY }), startInFlight: true }).note ??
+        null,
+    ).toBeNull()
   })
 })
 

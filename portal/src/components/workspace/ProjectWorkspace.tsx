@@ -221,13 +221,18 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   //
   // ONCE PER PROJECT, guarded by a ref: the reading stays `not-running` until the server's own
   // `starting` lands, so without this the poll would fire a second start on its next tick.
+  //
+  // NEVER OVER A START THAT FAILED. The ref resets on every remount, so each crossing back to this
+  // screen would re-run a start that fails the same way. The reading says why, and Launch retries.
   const autoStarted = useRef<string | null>(null)
+  const startFailed = workspace.preview?.startFailure != null
   useEffect(() => {
     if (workspace.state.name !== 'not-running') return
     if (autoStarted.current === project.id) return
     autoStarted.current = project.id
+    if (startFailed) return
     void start()
-  }, [workspace.state.name, project.id, start])
+  }, [workspace.state.name, startFailed, project.id, start])
 
   const paneView = useMemo(
     () => ({
