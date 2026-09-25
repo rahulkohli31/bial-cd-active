@@ -49,6 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models.app_registry import AppRegistry
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.pending_teardown import PendingTeardown
+from src.services.build_sessions.alarms import REAP_FOUND_NO_REPOSITORY_EVENT
 from src.services.build_sessions.drain import is_drained, the_ceiling_hours
 from src.services.build_sessions.locks import (
     SharedViewStamp,
@@ -64,7 +65,7 @@ from src.services.build_sessions.reaper import (
     is_a_sandbox_name,
     is_a_shared_sandbox_name,
 )
-from src.services.build_sessions.snapshot import write_the_tree_back
+from src.services.build_sessions.snapshot import WorkspaceHasNoRepositoryError, write_the_tree_back
 from src.services.messages.projection import TURN_TERMINAL_KIND
 from src.services.redis import REGISTRY_STATE_ENDING, registry_key
 from src.services.redis.keys import (
@@ -491,6 +492,11 @@ async def run_the_shutdown(
 
     try:
         await write_the_tree_back(sandbox_client, handle, owed.app_id)
+    except WorkspaceHasNoRepositoryError:
+        # Ahead of `SandboxError`, which it is. No later attempt could save this tree, so sparing
+        # it would only bill: see `REAP_FOUND_NO_REPOSITORY_EVENT`.
+        _log.warning(REAP_FOUND_NO_REPOSITORY_EVENT, **_about(owed, reason))
+        return await _destroy(owed, redis, sandbox_client, factory, handle, reason)
     except SandboxError as exc:
         return await _spare_or_go_in_unread(
             owed, redis, sandbox_client, factory, reason, why=f"the tree could not be read: {exc}"
