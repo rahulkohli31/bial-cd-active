@@ -7,11 +7,10 @@
  *
  * THE PRECEDENCE, AND TWO PREDICATES THAT ARE NOT THE SAME PREDICATE:
  *   1. the live turn's preview      — CHAT-scoped   (`narratingChatIsOpenChat`)
- *   2. a relaunched URL             — PROJECT-scoped
- *   3. the project's live preview   — PROJECT-scoped, ranked last
+ *   2. the project's live preview   — PROJECT-scoped, ranked last
  *
  * WHY THIS EXISTS — THE ASYMMETRY IS LOAD-BEARING, not a tidy-up target. The turn arm is gated by
- * the chat predicate ALONE, the two below it by the project predicate alone. Merging them into
+ * the chat predicate ALONE, the project arm by the project predicate alone. Merging them into
  * one "is this ours" test breaks both directions at once: it stops a live turn framing in the case
  * that matters most (a chat whose project the page was never stamped with), and it lets one
  * project's build frame into another project's pane. `previewAddress.test.ts` and
@@ -52,15 +51,10 @@ export interface PreviewAddressInputs {
 
   // ── project-scoped ────────────────────────────────────────────────────────────────────────
   /**
-   * A restored app. It has no build lifecycle at all — no feed, no keep-alive, no lock —
-   * which is why it resolves the status to `ready` on its own rather than reading one.
-   */
-  relaunchedUrl: string | null
-  /**
    * The project's own live preview, from the preview-state read (`alive`: "a container is
    * serving this project; `previewUrl` is framable" — `buildSessionApi.ts`). RANKED LAST, and
-   * the only arm that needs no chat: the two above it need a live turn or a relaunch, so at a
-   * bare project address on a fresh load neither exists.
+   * the only arm that needs no chat: the turn arm above it needs a live turn. It is also where a
+   * started app arrives — the start answers with no address, and this read is the one that has it.
    *
    * IT HAS TWO CALLERS. `components/workspace/ProjectWorkspace.tsx` is the project-scoped
    * publisher this arm was written for, and `components/chat/ConversationSurface.tsx` joined it:
@@ -127,24 +121,22 @@ export interface PreviewAddress {
 export function resolvePreviewAddress(inputs: PreviewAddressInputs): PreviewAddress {
   const {
     turnPreviewUrl, turnStatus, narratingChatIsOpenChat,
-    relaunchedUrl, projectPreviewUrl, belongsToOpenProject,
+    projectPreviewUrl, belongsToOpenProject,
     transcriptHasBuildOutcome,
   } = inputs
 
   // The chat predicate, and ONLY the chat predicate. See the asymmetry note above.
   const fromTurn = narratingChatIsOpenChat ? turnPreviewUrl : null
-  // The project predicate, and only it. A relaunch is a restore, not a build.
-  const fromRelaunch = belongsToOpenProject ? relaunchedUrl : null
+  // The project predicate, and only it.
   const fromProject = belongsToOpenProject ? projectPreviewUrl : null
 
-  const url = fromTurn ?? fromRelaunch ?? fromProject ?? null
+  const url = fromTurn ?? fromProject ?? null
 
   // A live turn's own status outranks everything — it is the only source describing what is
-  // happening RIGHT NOW. Below it, the two arms with no lifecycle of their own resolve to `ready`
-  // because that is what they are: an app that is up.
+  // happening RIGHT NOW. Below it, the project arm has no lifecycle of its own and resolves to
+  // `ready` because that is what it is: an app that is up.
   const status =
     (narratingChatIsOpenChat ? turnStatus : null) ??
-    (fromRelaunch ? 'ready' : null) ??
     (fromProject ? 'ready' : null) ??
     (transcriptHasBuildOutcome ? 'ended' : null)
 

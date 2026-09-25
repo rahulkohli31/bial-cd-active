@@ -39,7 +39,6 @@ const reading = (over: Partial<PreviewState> = {}): PreviewState => ({
 const reportFor = (preview: PreviewState | null): WorkspaceReport => {
   const sinks = {
     projectId: 'p1',
-    onStarted: vi.fn(),
     onStartPending: vi.fn(),
     onStartOutcome: vi.fn(),
   }

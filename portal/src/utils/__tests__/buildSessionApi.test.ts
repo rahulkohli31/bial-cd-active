@@ -59,69 +59,32 @@ describe('buildSessionApi — control operations', () => {
     expect(active.message).toBe('You already have a build running.')
   })
 
-  it('relaunchPreview: 200 maps {appId, previewUrl, status} — no sessionId/createdAt on this shape', async () => {
-    const READY_URL = 'https://app.example.azurecontainerapps.io/'
-    const fetchImpl = jsonFetch(200, { appId: 'a1', previewUrl: READY_URL, status: 'ready' })
-    const out = await relaunchPreview({ projectId: 'p1' }, { fetchImpl })
+  it('relaunchPreview: a 202 resolves with nothing to read — the poll reports the start', async () => {
+    // The answer means ADMITTED, not up: whether the app is serving, and where, is the
+    // preview-state poll's to say. A client that read an address off this answer would be a
+    // second reader of one fact, and the two disagreed about the same container before.
+    const fetchImpl = jsonFetch(202, { appId: 'a1' })
 
-    // Two absent fields, two DIFFERENT defaults: `restoredFromFailedBuild` absent reads FALSE
-    // (the label is an aid, not a gate — silence claims nothing), `ready` absent reads TRUE
-    // (every server predating that field only replied once serving, so defaulting false would
-    // paint a permanent "not ready yet" over correct responses).
-    expect(out).toEqual({
-      appId: 'a1',
-      previewUrl: READY_URL,
-      status: 'ready',
-      restoredFromFailedBuild: false,
-      ready: true,
-    })
+    await expect(relaunchPreview({ projectId: 'p1' }, { fetchImpl })).resolves.toBeUndefined()
+
     expect(headerOf(fetchImpl, 'X-CSRF-Token')).toBe(CSRF)
     expect(JSON.parse(optsOf(fetchImpl).body as string)).toEqual({ projectId: 'p1' })
     expect(optsOf(fetchImpl).method).toBe('POST')
     expect(fetchImpl.mock.calls[0][0]).toBe('/api/build-sessions/relaunch')
   })
 
-  it('relaunchPreview: carries `ready: false` through — a framable URL that is not serving yet', async () => {
-    // The attach arm hands back the live container's URL even when it hasn't answered within
-    // its readiness budget — the alternative, condemning the container, rolled a citizen back
-    // to their last save. So `false` here must survive decoding, not fall to the absent-reads-true
-    // default meant for older servers.
-    const URL_NOT_SERVING = 'https://app.example.azurecontainerapps.io/'
-    const fetchImpl = jsonFetch(200, {
-      appId: 'a1',
-      previewUrl: URL_NOT_SERVING,
-      status: 'provisioning',
-      restoredFromFailedBuild: false,
-      ready: false,
+  it('relaunchPreview: a refusal still rejects, carrying the server`s code', async () => {
+    // Every refusal is decided before the server admits a start, so the codes the rail and the
+    // start control branch on still arrive on this call and nowhere else.
+    const fetchImpl = jsonFetch(404, {
+      error: { message: 'No saved build to relaunch. Build the app first.', code: 'no_saved_build' },
     })
 
-    const out = await relaunchPreview({ projectId: 'p1' }, { fetchImpl })
+    const err = await relaunchPreview({ projectId: 'p1' }, { fetchImpl }).catch((e: unknown) => e)
 
-    expect(out.ready).toBe(false)
-    expect(out.previewUrl).toBe(URL_NOT_SERVING) // still framable — that is the whole point
-    expect(out.status).toBe('provisioning') // …and `status` does not claim READY over it
-  })
-
-  it('relaunchPreview: the wire restoredFromFailedBuild=true survives the mapping', async () => {
-    const fetchImpl = jsonFetch(200, {
-      appId: 'a1', previewUrl: 'https://x.example/', status: 'ready', restoredFromFailedBuild: true,
-    })
-    const out = await relaunchPreview({ projectId: 'p1' }, { fetchImpl })
-    expect(out.restoredFromFailedBuild).toBe(true)
-  })
-
-  it('relaunchPreview: a malformed success body fails at the boundary (parity with start)', async () => {
-    // A non-object body trips the mapper's isRecord guard.
-    const nonObject = jsonFetch(200, 'not a preview')
-    const err = await relaunchPreview({ projectId: 'p1' }, { fetchImpl: nonObject }).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(ApiError)
-    expect((err as ApiError).status).toBe(500)
-
-    // A status outside the known lifecycle fails closed rather than rendering an undefined state.
-    const unknownStatus = jsonFetch(200, { appId: 'a1', previewUrl: 'u', status: 'warp-speed' })
-    const statusErr = await relaunchPreview({ projectId: 'p1' }, { fetchImpl: unknownStatus }).catch((e: unknown) => e)
-    expect(statusErr).toBeInstanceOf(ApiError)
-    expect((statusErr as ApiError).status).toBe(500)
+    expect((err as ApiError).status).toBe(404)
+    expect((err as ApiError).code).toBe('no_saved_build')
   })
 })
 
@@ -130,7 +93,7 @@ describe('buildSessionApi — CSRF discipline', () => {
   // `relaunchPreview` is the one session-namespace mutating POST the portal still makes, and
   // the contract — every mutating POST carries the token — is unchanged.
   it('attaches X-CSRF-Token on the mutating POST (relaunchPreview)', async () => {
-    const relaunchImpl = jsonFetch(200, { appId: 'a1', previewUrl: null, status: 'ready', ready: true, restoredFromFailedBuild: false })
+    const relaunchImpl = jsonFetch(202, { appId: 'a1' })
     await relaunchPreview({ projectId: 'p1' }, { fetchImpl: relaunchImpl })
     expect(headerOf(relaunchImpl, 'X-CSRF-Token')).toBe(CSRF)
     expect(optsOf(relaunchImpl).method).toBe('POST')

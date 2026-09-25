@@ -3442,9 +3442,9 @@ class TurnEngine:
                         # place the turn learns the answer.
                         #
                         # IT RIDES THE PAGE GATE ABOVE rather than the bare `ready`, because
-                        # `relaunch_preview` refuses its own `ready` for a root that answered
-                        # without a page — so both writers count a start that reached a SERVING
-                        # PAGE, and neither can quietly start counting something else.
+                        # `relaunch_preview` counts only once its watch has seen a page — so
+                        # both writers count a start that reached a SERVING PAGE, and neither can
+                        # quietly start counting something else.
                         #
                         # AFTER THE FRAME, NEVER BEFORE. This is an await on the one code path
                         # between the app becoming servable and the citizen seeing it, so counting

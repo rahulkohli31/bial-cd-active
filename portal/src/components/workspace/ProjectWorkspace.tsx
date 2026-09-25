@@ -55,10 +55,6 @@ export interface ProjectWorkspaceProps {
 
 export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   const { project } = props
-  // THE URL A START JUST PRODUCED, fed into the resolver's RELAUNCHED arm — which needs no chat,
-  // and resolves its own status to `ready` because a restore has no build lifecycle. Without it the pane waits for the next poll tick to frame an app the citizen
-  // just pressed a button to bring up, which reads as the press having done nothing.
-  const [startedPreviewUrl, setStartedPreviewUrl] = useState<string | null>(null)
   // THE SETTINGS DIALOG'S STATE IS HERE BECAUSE ITS DATA IS. The control is in the shell's
   // toolbar row, which sits above the Outlet and has no project object; this surface has both
   // the project and the update callback, so the row publishes a press upward and the editing
@@ -91,7 +87,6 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     turnPreviewUrl: null,
     turnStatus: null,
     narratingChatIsOpenChat: false,
-    relaunchedUrl: startedPreviewUrl,
     projectPreviewUrl: workspace.preview?.state === 'alive' ? workspace.preview.previewUrl : null,
     // …AND IT IS ALSO THIS SCREEN'S WHOLE ANSWER ON LIVENESS. A non-null value here is the read
     // saying `alive`, which is what the resolver builds `serving` from — so the pardon that used to
@@ -188,12 +183,12 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   const sinks: StartSinks = useMemo(
     () => ({
       projectId: project.id,
-      onStarted: setStartedPreviewUrl,
       onStartPending: workspace.reportStartPending,
       onStartOutcome: (outcome: StartOutcome | null) => {
         workspace.reportStartOutcome(outcome)
-        // A start that reached the app clears the outcome AND asks again immediately, so the pane
-        // arrives at the running app on the press rather than on the next tick of a 45-second timer.
+        // An admitted start clears the outcome AND asks again immediately: the server's `starting`
+        // is waiting on the next read, and that read is what turns the poll up to the fast cadence
+        // that catches the app arriving, instead of the next tick of a 45-second timer.
         if (outcome === null) workspace.refresh()
       },
     }),

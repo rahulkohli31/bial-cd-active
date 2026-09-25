@@ -130,10 +130,9 @@ function RailComposerBody({ projectId }: RailComposerProps) {
 
   /**
    * ASKS FOR THE WORKSPACE BEFORE IT NAVIGATES, which is why this is not a two-line navigate.
-   * Nothing starts and no address changes until the citizen has answered: the start doubles as
-   * the preflight, a held workspace opens the dialog and rejects here, a transfer re-runs this
-   * whole function including the navigate, and the chat is minted only once the container is
-   * ready. The typed message stays in the composer throughout, which makes cancelling free.
+   * The start doubles as the preflight: a refusal rejects here with the message still in the
+   * composer, and the chat is minted only once the server has admitted the start. The app comes
+   * up behind the navigate, and the chat's first turn waits for it on the server.
    */
   const startChat = useCallback(
     async ({ text, attachments }: ComposerSubmission) => {
@@ -177,14 +176,12 @@ function RailComposerBody({ projectId }: RailComposerProps) {
 
       // THE APP IS ASKED FOR BEFORE THE ADDRESS MOVES — `open()`, the navigate, sits BELOW this
       // await, which is what stops a citizen landing in a chat whose workspace turns out not to be
-      // theirs. This surface stays mounted for the whole of it: the POST blocks server-side until
-      // the container answers, and a cold restore is bounded at two minutes, so the pane's
-      // narration of that wait comes from the start's own pending flag rather than from here.
+      // theirs. The POST answers once the start is admitted, every refusal decided by then; the
+      // app comes up afterwards and the pane narrates that from the poll, not from here.
       //
       // JOINS A START ALREADY RUNNING rather than making a second one. Opening the project starts
-      // the app, and a citizen who types over that two-minute restore is precisely the person who
-      // would otherwise fire a second container's worth of work and be shown its answer instead of
-      // their own.
+      // the app, and a citizen who sends before that start is admitted would otherwise fire a
+      // second request and be shown its answer instead of their own.
       const result = await report.start()
       // A REFUSAL IS RE-SAID WHERE THEY ARE STANDING, and stops the address: the message stays in
       // the composer and no chat opens onto a workspace this citizen has not got. Everything else

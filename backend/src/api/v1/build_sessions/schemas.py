@@ -237,52 +237,20 @@ class DiscardRequest(CamelModel):
 
 
 class RelaunchPreviewResponse(CamelModel):
-    """`POST /v1/build-sessions/relaunch` → 200. No `session_id`/`created_at`: relaunch
-    registers NO in-process build session (it must not occupy the build slot), so
-    there is nothing to poll or stop.
+    """`POST /v1/build-sessions/relaunch` → 202: the start is admitted and runs detached.
 
-    `preview_url` is always framable; `ready` says whether it is SERVING yet. The two came apart
-    when relaunch stopped 503ing on a slow app: an attached container whose root route
-    outruns the readiness budget still hands back its URL, because the alternative — condemning
-    the container — cost a citizen their unsaved work."""
+    Nothing here says whether the app is up, and nothing here carries its address: both are
+    `preview-state`'s to report — `starting` while it comes up, `alive` with the framable URL
+    once something has watched it show a page. One reader for one fact."""
 
     app_id: uuid.UUID
-    # The framable PUBLIC address — `https://<apps-host>/a/<app-name>/`, NOT the container's own
-    # ACA fqdn, which an internal environment publishes no public DNS for and a BIAL desk cannot
-    # resolve. Live whenever `ready`; on a degraded attach it is the right URL for a server that
-    # has not answered yet.
-    preview_url: str
-    status: BuildSessionStatus  # `ready`, or `provisioning` when the app is not serving yet.
-    # The "last saved version" signal: True when the project's NEWEST recorded build
-    # outcome was FAILED. Nothing about a failed verdict withheld the snapshot of the day, so
-    # the restored workspace is the last SAVED state, not that build's intent. The portal labels
-    # the relaunched preview accordingly instead of presenting an unqualified "ready".
-    restored_from_failed_build: bool
-    # Is the app SERVING the URL above yet? False only on the attach arm's fail-open path — the
-    # container is alive and holds the user's work, the app is just slow to answer. The portal
-    # frames the URL either way and keeps its labelled wait up until the frame loads. Defaulted
-    # so an older client that ignores the field reads the historic "relaunch returns ready".
-    #
-    # UNCHANGED BY THE SERVING PROOF, AND DEFINITIONALLY THE SAME FACT AS A PROVEN
-    # `serving_since` STAMP — say it here so the two cannot drift. `wait_ready` returning
-    # without `SandboxNotReadyError` is what sets this True, and that IDENTICAL success arm is
-    # where `relaunch_preview` stamps the registry. Anyone who makes one of the two conditional
-    # has to make the other conditional in the same commit, or this wire field says "ready"
-    # while the preview-state poll goes on answering `starting` about the same container.
-    #
-    # What changes is only who MINTS A STATE from it. `ready: false` is no longer a card of its
-    # own on the pane: it leaves the citizen waiting and lets the poll — which now reads the
-    # stamp — be the single authority on what is serving. The field itself stays because old
-    # clients read it and the backend's own start-success numerator is gated on it.
-    ready: bool = True
 
 
 class SharedPreviewResponse(CamelModel):
     """`POST /v1/build-sessions/projects/{projectId}/shared-launch` and `.../shared-refresh`
-    → 200 (#198). `RelaunchPreviewResponse`'s sibling for a colleague's read-only view of a
-    project shared with them — no `session_id`/`status`/`restored_from_failed_build`: a shared
-    view registers no build session, has no build-outcome history of its own to qualify, and
-    `ready` alone says whether the frame is serving yet."""
+    → 200 (#198), for a colleague's view of a project shared with them. Answered once the view
+    is up, not detached like a relaunch: a recipient has no `preview-state` to poll, so this
+    response is the only place the URL and `ready` can reach them."""
 
     app_id: uuid.UUID
     preview_url: str

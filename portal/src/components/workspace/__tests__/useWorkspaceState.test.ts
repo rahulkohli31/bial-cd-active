@@ -699,21 +699,11 @@ describe('the start outcome slot', () => {
     // contributes at most a `note`.
     //
     // WHAT THE SLOT STILL HAS TO DO, and the reason this scenario survives rather than being
-    // deleted: the hook must hold the ending and must let go of it. Both halves are asserted
-    // through an ending that DOES have something to say, because two of the four say nothing by
-    // design and would make the "cleared" assertion vacuous — it would pass against a hook that
-    // never recorded anything at all.
+    // deleted: the hook must hold the ending and must let go of it.
     const { result } = mount()
     await waitFor(() => expect(result.current.state.name).toBe('never-built'))
 
-    // The endings with no server prose change nothing a person reads — that IS their contract.
-    await act(async () => {
-      result.current.reportStartOutcome({ kind: 'timed-out' })
-    })
-    expect(result.current.state.name).toBe('never-built')
-    expect(result.current.state.note ?? null).toBeNull()
-
-    // …and one that names a reason rides in `note`, on the card the reading already chose.
+    // A refusal names a reason, and it rides in `note`, on the card the reading already chose.
     await act(async () => {
       result.current.reportStartOutcome({ kind: 'failed', reason: 'no image' })
     })
@@ -732,7 +722,7 @@ describe('the start outcome slot', () => {
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalledTimes(1))
 
     await act(async () => {
-      result.current.reportStartOutcome({ kind: 'not-painted' })
+      result.current.reportStartOutcome({ kind: 'failed', reason: 'no image' })
     })
     await settle()
 

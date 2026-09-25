@@ -63,7 +63,6 @@ function reportFor(
   // nothing, and every start scenario below would be asserting against a spy.
   const sinks = {
     projectId: 'p1',
-    onStarted: vi.fn(),
     onStartPending: vi.fn(),
     onStartOutcome: vi.fn(),
   }
@@ -160,17 +159,16 @@ describe('★ NOT ORPHANED — every no-frame state still offers a way to start 
 
   it('offers a retry on the one arm that still has one: nothing has answered yet', () => {
     // THE RETRY SHRANK FROM FOUR ARMS TO ONE, and the three that lost it are the three cards the
-    // ten-to-five collapse deleted. `not-painted`, `timed-out` and `start-failed` all described a
-    // FETCH rather than a workspace, and each of them landed the citizen on a card whose Try again
+    // ten-to-five collapse deleted. Each of them described a FETCH rather than a workspace, and
+    // each of them landed the citizen on a card whose Try again
     // asked the same question that had just been answered. The reading decides the card now, and
     // the press's own ending rides along as a note.
     renderPane((c) => c.workspace.set(reportFor(null)))
     expect(screen.getByRole('button', { name: /try again/i })).toBeTruthy()
   })
 
-  const nowASavedCard: [string, StartOutcome][] = [
-    ['the start did not paint', { kind: 'not-painted' }],
-    ['the start timed out', { kind: 'timed-out' }],
+  const nowASavedCard: [string, StartOutcome | null][] = [
+    ['nothing refused the start', null],
     ['the start failed with a reason', { kind: 'failed', reason: 'no image' }],
   ]
 

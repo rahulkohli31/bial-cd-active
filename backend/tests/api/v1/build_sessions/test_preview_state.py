@@ -3,7 +3,6 @@ decided nothing."""
 
 from __future__ import annotations
 
-import contextlib
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -46,6 +45,7 @@ from src.services.sandbox import DevStatus, SandboxError, SandboxHandle, Sandbox
 from src.services.storage import StorageError, snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
+from tests.fakes import detached_work_done
 
 
 async def _user_project(db: AsyncSession, email: str):
@@ -1037,37 +1037,70 @@ async def test_the_registry_and_marker_are_read_in_one_pipelined_round_trip(
     assert bare_reads == [], "the registry and marker travel inside the pipeline, not beside it"
 
 
-async def test_a_readiness_timeout_on_the_attach_arm_is_non_destructive_and_the_triple_holds(
+@pytest.fixture
+def instant_first_serve_watch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collapse the first-serve watch's clock so a test can drive it to its own end.
+
+    THE REAL BUDGET IS 120 SECONDS AND A TEST MUST NOT WAIT IT OUT — but neither may a test
+    quietly stop the watch from running, because the watch IS half the behaviour here:
+    everything the citizen sees after the press comes from the detached start. So the budget
+    goes to zero (one poll, then the give-up line) and the poll interval with it. A test that
+    needs MORE than one poll re-patches the budget itself and says why."""
+    monkeypatch.setattr(manager_mod, "_COLD_READY_BUDGET_SECONDS", 0.0)
+    monkeypatch.setattr(manager_mod, "READINESS_POLL_S", 0)
+
+
+async def _relaunch(client: AsyncClient, user, project, manager: SessionManager):
+    """One press, with the detached start and its watch run to completion: the stamp the
+    citizen's pane reads is written by that half, not by the request."""
+    resp = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+    await detached_work_done(manager)
+    return resp
+
+
+async def _a_saved_project(db: AsyncSession, store, email: str):
+    user, project = await _user_project(db, email)
+    app_id = await resolve_app_for_project(db, user.id, project.id)
+    await db.commit()
+    await store.put(snapshot_key(app_id), b"SAVED-BUNDLE")
+    return user, project, app_id
+
+
+def _the_live_container(app_id: uuid.UUID) -> SandboxHandle:
+    """What `attach_existing` hands back for a container that is already up — the handle that
+    makes the next relaunch take the ATTACH arm instead of restoring."""
+    return SandboxHandle(
+        fqdn="live.example",
+        token="tok",  # noqa: S106 - a fake, never a real bearer
+        app_name=app_name_for(app_id),
+        preview_url="https://live.example",
+        ready=True,
+    )
+
+
+async def test_a_page_less_attach_is_non_destructive_and_the_triple_holds(
     client: AsyncClient,
     db_session: AsyncSession,
     fake_redis,
     fake_storage,
     wire,
-    monkeypatch: pytest.MonkeyPatch,
+    instant_first_serve_watch,
 ) -> None:
     """The fake's `etag` is always `None`, so the snapshot's write time stands in for it: a
     `put` bumps the mtime on every write, so an unchanged mtime IS the unchanged-etag claim."""
-    user, project = await _user_project(db_session, "ps-timeout-confirm@rvaiglobal.com")
-    app_id = await resolve_app_for_project(db_session, user.id, project.id)
-    await db_session.commit()
-    await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
+    user, project, app_id = await _a_saved_project(
+        db_session, fake_storage, "ps-timeout-confirm@rvaiglobal.com"
+    )
 
     # A cold relaunch first, so a real container is up and registered for this app. The attach
     # handle is set BEFORE either baseline is read: set it after, and "before" and "after"
-    # would differ in what the fake can answer rather than in the timeout under test.
-    cold = await client.post(
-        "/v1/build-sessions/relaunch",
-        json={"projectId": str(project.id)},
-        headers=auth_headers(user),
-    )
-    assert cold.status_code == 200
-    wire.sbx.attach_handle = SandboxHandle(
-        fqdn="live.example",
-        token="tok",
-        app_name=app_name_for(app_id),
-        preview_url="https://live.example",
-        ready=True,
-    )
+    # would differ in what the fake can answer rather than in the reading under test.
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
+    wire.sbx.attach_handle = _the_live_container(app_id)
 
     save_state_url = f"/v1/build-sessions/projects/{project.id}/save-state"
     before_save_state = (await client.get(save_state_url, headers=auth_headers(user))).json()
@@ -1077,22 +1110,12 @@ async def test_a_readiness_timeout_on_the_attach_arm_is_non_destructive_and_the_
     snapshot_before = fake_storage.objects[snapshot_key(app_id)]
     mtime_before = fake_storage.mtimes[snapshot_key(app_id)]
 
-    async def the_dev_server_never_answers(handle: SandboxHandle, *, timeout_s: float = 120.0):
-        raise SandboxNotReadyError("the app root never served")
+    wire.sbx.root_status = 404
 
-    monkeypatch.setattr(wire.sbx, "wait_ready", the_dev_server_never_answers)
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
-    timed_out = await client.post(
-        "/v1/build-sessions/relaunch",
-        json={"projectId": str(project.id)},
-        headers=auth_headers(user),
-    )
-
-    assert timed_out.status_code == 200
-    assert timed_out.json()["ready"] is False
     reg = await fake_redis.hgetall(registry_key(user.id))
     assert reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_ENDING
-
     assert wire.sbx.provisioned == provisioned_before
     assert wire.sbx.restored == restored_before
     assert wire.sbx.torn_down == torn_down_before
@@ -1109,106 +1132,22 @@ async def test_a_launch_that_proves_the_app_serves_stamps_it_and_the_pane_says_r
     fake_storage,
     wire,
 ) -> None:
-    """THE RELAUNCH OBSERVER, end to end and through the real route. `wait_ready` returning
-    without `SandboxNotReadyError` IS the proof — it means a request to the app root actually
-    succeeded — so the very poll that follows the press already answers `alive`, with no second
-    round trip and no watcher needing to catch up.
+    """THE RELAUNCH OBSERVER, end to end and through the real route: the start's own watch sees
+    the page and stamps it, so the poll that follows answers `alive`.
 
     Driven from the container's create-time sentinel rather than a hand-written stamp: the
     registry hash here is written by the provisioning path, so this asserts the whole chain
     (`_write_registry` seeds `""` → the relaunch stamps it → the poll reads it), which is the
     one thing three separate unit tests cannot say between them."""
-    user, project = await _user_project(db_session, "ps-launch-proves@rvaiglobal.com")
-    app_id = await resolve_app_for_project(db_session, user.id, project.id)
-    await db_session.commit()
-    await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
-
-    launched = await client.post(
-        "/v1/build-sessions/relaunch",
-        json={"projectId": str(project.id)},
-        headers=auth_headers(user),
+    user, project, _ = await _a_saved_project(
+        db_session, fake_storage, "ps-launch-proves@rvaiglobal.com"
     )
 
-    assert launched.status_code == 200
-    assert launched.json()["ready"] is True
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
+
     stamped = await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE)
     assert stamped, "the relaunch watched the app answer and recorded nothing"
     assert (await _probe(client, user, project))["state"] == "alive"
-
-
-async def test_a_readiness_timeout_on_the_attach_arm_takes_the_serving_proof_back(
-    client: AsyncClient,
-    db_session: AsyncSession,
-    fake_redis,
-    fake_storage,
-    wire,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """★ THE ONE PLACE OUTSIDE A LIVE TURN THAT CAN RETRACT. This arm has just watched a root
-    GET fail against a container it attached to — real evidence the app is not answering — and
-    that container HAS served, so it carries an instant nothing else would ever clear: the only
-    other clearer, the turn watcher's crash edge, exists only while a turn is streaming.
-
-    Without this the pane goes on reporting RUNNING and frames nginx's "This app isn't running
-    right now" page: the measured 2026-09-10 defect, one door down.
-
-    IT MARKS NOTHING `ending` AND TEARS NOTHING DOWN, and that is not timidity — condemning a
-    container for a slow root GET once cost a citizen their unsaved work. Retracting a claim
-    costs them a card. The sibling test above pins the non-destruction in full; what is added
-    here is that the claim itself comes off, and that the pane follows."""
-    user, project = await _user_project(db_session, "ps-timeout-retracts@rvaiglobal.com")
-    app_id = await resolve_app_for_project(db_session, user.id, project.id)
-    await db_session.commit()
-    await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
-
-    cold = await client.post(
-        "/v1/build-sessions/relaunch",
-        json={"projectId": str(project.id)},
-        headers=auth_headers(user),
-    )
-    assert cold.status_code == 200
-    assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE), (
-        "guard the premise: there has to be a standing proof for the retraction to take back"
-    )
-    assert (await _probe(client, user, project))["state"] == "alive"
-
-    wire.sbx.attach_handle = SandboxHandle(
-        fqdn="live.example",
-        token="tok",  # noqa: S106 - a fake, never a real bearer
-        app_name=app_name_for(app_id),
-        preview_url="https://live.example",
-        ready=True,
-    )
-    torn_down_before = list(wire.sbx.torn_down)
-
-    async def the_dev_server_stopped_answering(handle: SandboxHandle, *, timeout_s: float = 120.0):
-        raise SandboxNotReadyError("the app root never served")
-
-    monkeypatch.setattr(wire.sbx, "wait_ready", the_dev_server_stopped_answering)
-    # AND THE ROOT HAS TO AGREE WITH THE WAIT, or this test contradicts itself. The continuation
-    # this arm spawns reads `dev_status` for itself and never borrows the wait's verdict, so a
-    # fake whose `wait_ready` refuses while its `/dev/status` still reports a page is scripting
-    # a container that IS serving — and the continuation correctly re-takes the proof one tick
-    # later, exactly as it should. 404 is what the app whose root never served actually says.
-    wire.sbx.root_status = 404
-
-    degraded = await client.post(
-        "/v1/build-sessions/relaunch",
-        json={"projectId": str(project.id)},
-        headers=auth_headers(user),
-    )
-
-    assert degraded.status_code == 200
-    assert degraded.json()["ready"] is False
-    # BACK TO THE SENTINEL, NEVER DELETED: an absent field is the pre-cutover reading and is
-    # grandfathered as PROVEN, so a delete here would report the dead app as running again.
-    assert await fake_redis.hexists(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE) == 1
-    assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE) == ""
-    assert wire.sbx.torn_down == torn_down_before, "a claim was retracted by destroying something"
-
-    settled = await _probe(client, user, project)
-    assert settled["state"] == "starting", "the pane went on framing an app that stopped serving"
-    assert settled["previewUrl"] is None
 
 
 async def test_an_attach_that_cannot_confirm_anything_refuses_rather_than_restoring(
@@ -1219,29 +1158,17 @@ async def test_an_attach_that_cannot_confirm_anything_refuses_rather_than_restor
     wire,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The status code alone cannot carry this: the restore arm answers a perfectly good 200
-    with a working preview URL, having thrown away whatever was in the container it replaced.
-    What is asserted instead is that nothing was torn down, provisioned or restored."""
-    user, project = await _user_project(db_session, "ps-unknown-attach@rvaiglobal.com")
-    app_id = await resolve_app_for_project(db_session, user.id, project.id)
-    await db_session.commit()
-    await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
+    """The status code alone cannot carry this: the restore arm answers a perfectly good 202,
+    having thrown away whatever was in the container it replaced. What is asserted instead is
+    that nothing was torn down, provisioned or restored."""
+    user, project, app_id = await _a_saved_project(
+        db_session, fake_storage, "ps-unknown-attach@rvaiglobal.com"
+    )
 
     # A cold relaunch first, so a real container is up and registered for this app: without it
     # the attach below would be the certain-absent case rather than the unknown one.
-    cold = await client.post(
-        "/v1/build-sessions/relaunch",
-        json={"projectId": str(project.id)},
-        headers=auth_headers(user),
-    )
-    assert cold.status_code == 200
-    wire.sbx.attach_handle = SandboxHandle(
-        fqdn="live.example",
-        token="tok",
-        app_name=app_name_for(app_id),
-        preview_url="https://live.example",
-        ready=True,
-    )
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
+    wire.sbx.attach_handle = _the_live_container(app_id)
 
     save_state_url = f"/v1/build-sessions/projects/{project.id}/save-state"
     before_save_state = (await client.get(save_state_url, headers=auth_headers(user))).json()
@@ -1258,11 +1185,7 @@ async def test_an_attach_that_cannot_confirm_anything_refuses_rather_than_restor
 
     monkeypatch.setattr(wire.sbx, "attach_existing", the_attach_cannot_confirm_anything)
 
-    refused = await client.post(
-        "/v1/build-sessions/relaunch",
-        json={"projectId": str(project.id)},
-        headers=auth_headers(user),
-    )
+    refused = await _relaunch(client, user, project, wire.manager)
 
     assert refused.status_code == 503
 
@@ -1289,98 +1212,36 @@ async def test_a_confirmed_absent_container_still_restores(
     fake_storage,
     wire,
 ) -> None:
-    user, project = await _user_project(db_session, "ps-cold-start-still-works@rvaiglobal.com")
-    app_id = await resolve_app_for_project(db_session, user.id, project.id)
-    await db_session.commit()
-    await fake_storage.put(snapshot_key(app_id), b"SAVED-BUNDLE")
+    user, project, _ = await _a_saved_project(
+        db_session, fake_storage, "ps-cold-start-still-works@rvaiglobal.com"
+    )
 
     # `attach_handle` is deliberately left `None`: that is what makes the fake raise
     # `SandboxGoneError`, its certain-absence refusal.
     assert wire.sbx.attach_handle is None
 
-    restored = await client.post(
-        "/v1/build-sessions/relaunch",
-        json={"projectId": str(project.id)},
-        headers=auth_headers(user),
-    )
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
-    assert restored.status_code == 200
-    assert restored.json()["previewUrl"]
     assert wire.sbx.restored, "the cold path must still restore, or the app never comes back"
+    assert (await _probe(client, user, project))["state"] == "alive"
 
 
 # --- a root that answers WITHOUT A PAGE, which is not the same as a root that never answers ----
 #
-# ★ THE READING NO TEST DOUBLE IN THIS REPO COULD PRODUCE UNTIL NOW, and the reason a fix could
-# tear a restored container down with a green suite. Every fake's `dev_status` returned
-# `root_status=None`, which `shows_a_page` reads as the GRANDFATHER arm and answers True — so
-# `if not something_watched_it_paint` had never once been True in a test, on any path. The whole
-# page proof was inert across the suite. `FakeSandboxClient.root_status` is what ends that; every
-# test below sets it and says which reading it is scripting.
+# ★ `FakeSandboxClient.root_status` is the only double that can produce this reading: every
+# other fake's `dev_status` returns `root_status=None`, which `shows_a_page` reads as the
+# GRANDFATHER arm and answers True. Every test below sets it and says which reading it scripts.
 #
-# THE DISTINCTION THESE PIN, in the words the manager uses: `/dev/status.ready` is fail-open by
-# the supervisor's own design (ANY answer counts, 404 and 500 included, so a compile error cannot
-# wedge it False and mislead the model), while the FRAME has to ask the narrower question — would
-# a citizen opening this preview right now see a page. A build spends its first seconds answering
-# 404s, genuinely ready with nothing to show. Measured on 2026-09-10: the platform framed exactly
-# that, and the citizen got a blank white pane with no words on it.
+# THE DISTINCTION THESE PIN: `/dev/status.ready` is fail-open by the supervisor's own design (ANY
+# answer counts, 404 and 500 included, so a compile error cannot wedge it False and mislead the
+# model), while the FRAME has to ask the narrower question — would a citizen opening this preview
+# right now see a page. A build spends its first seconds answering 404s, genuinely ready with
+# nothing to show. Measured on 2026-09-10: the platform framed exactly that, and the citizen got a
+# blank white pane with no words on it.
 #
-# AND THE REMEDY IS NEVER DESTRUCTION. A root with nothing to show is a container that is up
-# and holds the citizen's tree; answering it with a raise escapes the lock scope before
-# `scope.spare()` and lets compensation tear that container down. These tests keep that out.
-
-
-@pytest.fixture
-def instant_first_serve_watch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Collapse the detached continuation's clock so a test can drive it to its own end.
-
-    THE REAL BUDGET IS 120 SECONDS AND A TEST MUST NOT WAIT IT OUT — but neither may a test
-    quietly stop the continuation from running, because the continuation IS half the behaviour
-    here: the request hands the wait over and returns, and everything the citizen sees next comes
-    from the task. So the budget goes to zero (one poll, then the give-up line) and the poll
-    interval with it. A test that needs MORE than one poll re-patches the budget itself and says
-    why."""
-    monkeypatch.setattr(manager_mod, "_COLD_READY_BUDGET_SECONDS", 0.0)
-    monkeypatch.setattr(manager_mod, "READINESS_POLL_S", 0)
-
-
-async def _drain_the_watchers(manager: SessionManager) -> None:
-    """Run every detached first-serve continuation this relaunch spawned to completion.
-
-    Not tidiness: `_retract_the_proof_and_keep_watching` hands its wait to a task that OUTLIVES
-    the request, so a test asserting only on the response has asserted on the half that finished
-    first — and the stamp the citizen's pane reads is written by the other half."""
-    for task in list(manager._tasks):
-        with contextlib.suppress(Exception):
-            await task
-
-
-async def _relaunch(client: AsyncClient, user, project):
-    return await client.post(
-        "/v1/build-sessions/relaunch",
-        json={"projectId": str(project.id)},
-        headers=auth_headers(user),
-    )
-
-
-async def _a_saved_project(db: AsyncSession, store, email: str):
-    user, project = await _user_project(db, email)
-    app_id = await resolve_app_for_project(db, user.id, project.id)
-    await db.commit()
-    await store.put(snapshot_key(app_id), b"SAVED-BUNDLE")
-    return user, project, app_id
-
-
-def _the_live_container(app_id: uuid.UUID) -> SandboxHandle:
-    """What `attach_existing` hands back for a container that is already up — the handle that
-    makes the next relaunch take the ATTACH arm instead of restoring."""
-    return SandboxHandle(
-        fqdn="live.example",
-        token="tok",  # noqa: S106 - a fake, never a real bearer
-        app_name=app_name_for(app_id),
-        preview_url="https://live.example",
-        ready=True,
-    )
+# AND THE REMEDY IS NEVER DESTRUCTION. A root with nothing to show is a container that is up and
+# holds the citizen's tree; answering it with a raise escapes the lock scope before
+# `scope.spare()` and lets compensation tear that container down.
 
 
 async def test_a_cold_relaunch_whose_root_shows_no_page_keeps_the_container_it_just_restored(
@@ -1391,15 +1252,13 @@ async def test_a_cold_relaunch_whose_root_shows_no_page_keeps_the_container_it_j
     wire,
     instant_first_serve_watch,
 ) -> None:
-    """★ THE REGRESSION THAT SHIPPED. A cold relaunch restores the citizen's tree into a fresh
-    container, the dev server comes up, and the app root answers 404 because the agent has not
-    written `app/page.tsx` yet. That container is up, holds the work, and becomes framable the
-    moment a page exists — so the page check answers it by retracting the serving proof and
-    watching, never by raising: a raise here escapes `_holding_user_lock` before `scope.spare()`,
-    and compensation tears down the container `_restore_or_bust` has just built.
+    """★ A cold relaunch restores the citizen's tree into a fresh container, the dev server comes
+    up, and the app root answers 404 because the agent has not written `app/page.tsx` yet. That
+    container is up, holds the work, and becomes framable the moment a page exists — so nothing
+    may claim it serves, and nothing may destroy it.
 
-    Mutation-check: revert the gate to `something_watched_it_paint = dev.ready` and this goes red
-    on `ready` — the fail-open readiness flag counts the 404 as a serve."""
+    Mutation-check: read `.ready` instead of `.shows_a_page` in `_watch_for_a_first_serve` and
+    this goes red on the stamp — the fail-open readiness flag counts the 404 as a serve."""
     user, project, app_id = await _a_saved_project(
         db_session, fake_storage, "ps-cold-no-page@rvaiglobal.com"
     )
@@ -1407,22 +1266,12 @@ async def test_a_cold_relaunch_whose_root_shows_no_page_keeps_the_container_it_j
     # whose app has never had a page at all, which is what a first build looks like.
     wire.sbx.root_status = 404
 
-    restored = await _relaunch(client, user, project)
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
-    assert restored.status_code == 200, "the citizen got an error over a container that is up"
-    assert restored.json()["ready"] is False, "a 404 root was reported as a running app"
-    # AND THE WORD ON THE WIRE, NOT ONLY THE FLAG. `ready` and `status` are two fields the router
-    # derives from one value (`READY if relaunched.ready else PROVISIONING`), and every other test
-    # here reads the flag alone — so hardcoding that mapping back to READY left the whole suite
-    # green. Issue #49's acceptance criterion is written in terms of this field, not of `ready`.
-    assert restored.json()["status"] == "provisioning", "a page-less container was called READY"
-    assert restored.json()["previewUrl"], "the URL is framable the moment a page exists"
     assert wire.sbx.torn_down == [], "the restored container was destroyed for answering 404"
     assert wire.sbx.restored == [app_name_for(app_id)], "guard the premise: this was the cold arm"
     # NOTHING WATCHED IT PAINT, so nothing may claim it did.
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE) == ""
-
-    await _drain_the_watchers(wire.manager)
     settled = await _probe(client, user, project)
     assert settled["state"] == "starting", "the pane was told to frame a page-less container"
     assert settled["previewUrl"] is None
@@ -1436,100 +1285,39 @@ async def test_an_attached_container_whose_root_shows_no_page_loses_its_proof_no
     wire,
     instant_first_serve_watch,
 ) -> None:
-    """★ THE SAME READING ON THE OTHER ARM, and it must reach the same outcome. A container that
-    served yesterday carries an ISO stamp nothing else would ever clear — the only other clearer,
-    the turn watcher's crash edge, exists only while a turn is streaming — so an attach that finds
-    the root answering 404 has to take the claim back, or the poll goes on reporting RUNNING and
-    the pane frames nginx's "This app isn't running right now" page.
+    """★ A container that served yesterday carries an ISO stamp nothing else would clear while
+    no turn is streaming, so a start that finds the root answering 404 has to take the claim
+    back, or the poll goes on reporting RUNNING and the pane frames nginx's "This app isn't
+    running right now" page.
 
     RETRACTED TO THE SENTINEL, NEVER DELETED: an absent `serving_since` is the pre-cutover reading
     and is grandfathered as PROVEN, so a delete here would report the dead app as running again.
 
-    Mutation-check: revert the gate to `something_watched_it_paint = dev.ready` and this goes red
-    on the stamp, which never comes off."""
+    Mutation-check: drop the clear in `_retract_a_proof_it_cannot_back` and this goes red on the
+    stamp, which never comes off."""
     user, project, app_id = await _a_saved_project(
         db_session, fake_storage, "ps-attach-no-page@rvaiglobal.com"
     )
 
-    cold = await _relaunch(client, user, project)
-    assert cold.status_code == 200
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE), (
         "guard the premise: there has to be a standing proof for the retraction to take back"
     )
+    assert (await _probe(client, user, project))["state"] == "alive"
     wire.sbx.attach_handle = _the_live_container(app_id)
     torn_down_before = list(wire.sbx.torn_down)
     # The agent deleted the page, or the route it is mid-edit stopped compiling. The container is
     # the same one that was serving a moment ago — nothing about it is gone.
     wire.sbx.root_status = 404
 
-    degraded = await _relaunch(client, user, project)
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
-    assert degraded.status_code == 200
-    assert degraded.json()["ready"] is False
-    assert degraded.json()["previewUrl"], "the citizen keeps the URL; only the claim comes off"
     assert await fake_redis.hexists(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE) == 1
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE) == ""
     assert wire.sbx.torn_down == torn_down_before, "a claim was retracted by destroying something"
-
-    await _drain_the_watchers(wire.manager)
     settled = await _probe(client, user, project)
     assert settled["state"] == "starting", "the pane went on framing an app with nothing to show"
-
-
-async def test_both_ways_into_the_page_wait_go_through_one_retraction(
-    client: AsyncClient,
-    db_session: AsyncSession,
-    fake_redis,
-    fake_storage,
-    wire,
-    monkeypatch: pytest.MonkeyPatch,
-    instant_first_serve_watch,
-) -> None:
-    """★ THE DRIFT GUARD, and it is the whole defence against this defect coming back. TWO
-    readings end in the same place — the readiness wait lapsing, and the root answering without a
-    page — and they want the identical outcome: keep the container, hand back the URL with
-    `ready=False`, retract any standing proof, keep watching. While those were two hand-written
-    copies, the second one reached its outcome by RAISING into the first one's handler, and that
-    handler re-raises on a cold relaunch. One shared method is what makes that impossible to
-    write again.
-
-    Asserted on the CALL, not on the outcome, deliberately: two copies that agree today would
-    pass every outcome assertion in this file and still be two copies. `cold` rides along because
-    it is the parameter that separates the two entry points' log lines, and nothing else asserts
-    it.
-
-    Mutation-check: inline either arm's remedy back into its own three lines and this goes red on
-    the call count while every sibling above stays green."""
-    user, project, app_id = await _a_saved_project(
-        db_session, fake_storage, "ps-one-retraction@rvaiglobal.com"
-    )
-    went_through: list[bool] = []
-    the_shared_remedy = wire.manager._retract_the_proof_and_keep_watching
-
-    async def _record(*args: object, **kwargs: object) -> None:
-        went_through.append(bool(kwargs["cold"]))
-        await the_shared_remedy(*args, **kwargs)
-
-    monkeypatch.setattr(wire.manager, "_retract_the_proof_and_keep_watching", _record)
-
-    # ARM ONE: the cold arm, root answering without a page.
-    wire.sbx.root_status = 404
-    assert (await _relaunch(client, user, project)).status_code == 200
-    assert went_through == [True], "the page-less arm found its own way out"
-
-    # ARM TWO: an attach whose readiness wait lapses. A different reading, a different handler,
-    # and the same remedy — that is the invariant.
-    wire.sbx.attach_handle = _the_live_container(app_id)
-
-    async def the_dev_server_never_answers(handle: SandboxHandle, *, timeout_s: float = 120.0):
-        raise SandboxNotReadyError("the app root never served")
-
-    monkeypatch.setattr(wire.sbx, "wait_ready", the_dev_server_never_answers)
-
-    assert (await _relaunch(client, user, project)).status_code == 200
-
-    assert went_through == [True, False], "the readiness-timeout arm found its own way out"
-    await _drain_the_watchers(wire.manager)
+    assert settled["previewUrl"] is None
 
 
 async def test_a_supervisor_that_cannot_be_asked_mints_no_proof_on_a_cold_relaunch(
@@ -1541,15 +1329,12 @@ async def test_a_supervisor_that_cannot_be_asked_mints_no_proof_on_a_cold_relaun
     monkeypatch: pytest.MonkeyPatch,
     instant_first_serve_watch,
 ) -> None:
-    """★ THE THIRD ANSWER: WE COULD NOT ASK. It is not a quiet vote for either neighbour, and it
-    used to be collapsed into the wrong one. Declining to DEMOTE is right — a transport error is
-    no evidence about the app, so `ready` stays exactly as the wait left it and a preview that is
-    painting keeps its frame. But the same fail-open flag also gated the serving stamp, so one
-    blip minted a proof for a container NOTHING HAS EVER WATCHED SERVE, which is the claim this
-    whole branch exists to make honest.
+    """★ THE THIRD ANSWER: WE COULD NOT ASK. A transport error is no evidence about the app, and
+    it is not a sighting either: a proof minted on one is a claim that something watched a
+    container serve when nothing did.
 
-    Mutation-check: gate the stamp on `ready` again — or answer the blip with
-    `something_watched_it_paint = True` — and this goes red on the stamp."""
+    Mutation-check: read a transport failure as a page in `_watch_for_a_first_serve` and this
+    goes red on the stamp."""
     user, project, _ = await _a_saved_project(
         db_session, fake_storage, "ps-blip-cold@rvaiglobal.com"
     )
@@ -1559,14 +1344,11 @@ async def test_a_supervisor_that_cannot_be_asked_mints_no_proof_on_a_cold_relaun
 
     monkeypatch.setattr(wire.sbx, "dev_status", the_supervisor_did_not_answer)
 
-    launched = await _relaunch(client, user, project)
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
-    assert launched.status_code == 200
-    assert launched.json()["ready"] is True, "a blip demoted a preview that may be painting fine"
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE) == "", (
         "a transport error was read as a sighting"
     )
-    await _drain_the_watchers(wire.manager)
 
 
 async def test_a_supervisor_blip_never_retracts_a_proof_the_container_already_earned(
@@ -1578,19 +1360,19 @@ async def test_a_supervisor_blip_never_retracts_a_proof_the_container_already_ea
     monkeypatch: pytest.MonkeyPatch,
     instant_first_serve_watch,
 ) -> None:
-    """★ THE OTHER HALF OF THE BLIP, and it is the arm that must NOT share the remedy above. A
-    container that has been serving its citizen for an hour answers one unreachable `/dev/status`
-    on the next press of the control. Retracting there would take a good app's preview away over
-    a wedged ingress — the same asymmetry the reconciler's probe is built on, and the reason a
-    fleet-wide ARM outage cannot unframe the fleet. The blip keeps watching; it never clears.
+    """★ THE OTHER HALF OF THE BLIP. A container that has been serving its citizen for an hour
+    answers one unreachable `/dev/status` on the next press of the control. Retracting there
+    would take a good app's preview away over a wedged ingress — the same asymmetry the
+    reconciler's probe is built on, and the reason a fleet-wide ARM outage cannot unframe the
+    fleet.
 
-    Mutation-check: point the blip arm at `_retract_the_proof_and_keep_watching` instead of
-    `_keep_watching_for_a_first_serve` and this goes red on the surviving stamp."""
+    Mutation-check: retract when the reading in `_retract_a_proof_it_cannot_back` could not be
+    taken, and this goes red on the surviving stamp."""
     user, project, app_id = await _a_saved_project(
         db_session, fake_storage, "ps-blip-attached@rvaiglobal.com"
     )
 
-    assert (await _relaunch(client, user, project)).status_code == 200
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
     standing = await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE)
     assert standing, "guard the premise: the container earned a proof on the way up"
     wire.sbx.attach_handle = _the_live_container(app_id)
@@ -1600,66 +1382,13 @@ async def test_a_supervisor_blip_never_retracts_a_proof_the_container_already_ea
 
     monkeypatch.setattr(wire.sbx, "dev_status", the_supervisor_did_not_answer)
 
-    pressed_again = await _relaunch(client, user, project)
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
-    assert pressed_again.status_code == 200
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE) == standing
-    await _drain_the_watchers(wire.manager)
     assert (await _probe(client, user, project))["state"] == "alive"
 
 
-async def test_the_continuation_reads_the_root_itself_and_never_borrows_the_readiness_verdict(
-    client: AsyncClient,
-    db_session: AsyncSession,
-    fake_redis,
-    fake_storage,
-    wire,
-    monkeypatch: pytest.MonkeyPatch,
-    instant_first_serve_watch,
-) -> None:
-    """★ THE CONTINUATION'S OWN DEFECT, and it undid the fix one second later. The task borrowed
-    `wait_ready` to decide whether the app had come up — and `wait_ready` returns on
-    `/dev/status.ready`, the fail-open flag that counts a 404. So the page check refused to call
-    the app ready, cleared the standing proof on the way out, and the first iteration of the
-    watcher it spawned wrote that proof straight back over the same 404: the poll flipped to
-    RUNNING and the pane framed the blank container the refusal had just saved the citizen from.
-
-    The script is the discriminator: `wait_ready` REFUSES ONCE (which is what puts the request on
-    this arm) and would succeed on any later call, while the root goes on answering 404 for the
-    whole budget. A continuation reading `wait_ready` stamps; one reading `shows_a_page` does not.
-
-    Mutation-check: swap the continuation's `dev_status` reading back to
-    `await sandbox_client.wait_ready(handle, timeout_s=1.0)` and this goes red."""
-    user, project, app_id = await _a_saved_project(
-        db_session, fake_storage, "ps-continuation-reads@rvaiglobal.com"
-    )
-
-    assert (await _relaunch(client, user, project)).status_code == 200
-    wire.sbx.attach_handle = _the_live_container(app_id)
-    wire.sbx.root_status = 404
-    refusals = {"left": 1}
-
-    async def it_refuses_once_then_answers(handle: SandboxHandle, *, timeout_s: float = 120.0):
-        if refusals["left"]:
-            refusals["left"] -= 1
-            raise SandboxNotReadyError("the app root did not answer inside the budget")
-        return handle
-
-    monkeypatch.setattr(wire.sbx, "wait_ready", it_refuses_once_then_answers)
-
-    degraded = await _relaunch(client, user, project)
-    assert degraded.status_code == 200
-    assert degraded.json()["ready"] is False
-    await _drain_the_watchers(wire.manager)
-
-    assert refusals["left"] == 0, "guard the premise: the refusal really did put us on this arm"
-    assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE) == "", (
-        "the continuation re-minted the proof the page check had just taken back"
-    )
-    assert (await _probe(client, user, project))["state"] == "starting"
-
-
-async def test_a_continuation_that_never_sees_a_page_gives_up_out_loud_and_stamps_nothing(
+async def test_a_watch_that_never_sees_a_page_gives_up_out_loud_and_stamps_nothing(
     client: AsyncClient,
     db_session: AsyncSession,
     fake_redis,
@@ -1669,30 +1398,27 @@ async def test_a_continuation_that_never_sees_a_page_gives_up_out_loud_and_stamp
 ) -> None:
     """The give-up line, which is NOT a claim that the app is dead — the five-minute reconciler
     may still stamp this container. What it says is that for this long, nothing the platform runs
-    watched the app show a page, and for two of the three callers that means a citizen sat in
-    front of a wait card for the whole of it. Without it, a build that never painted leaves an
-    operator nothing but silence to read.
+    watched the app show a page. Without it, a start that never painted leaves an operator
+    nothing but silence to read.
 
-    Mutation-check: move the `app_first_serve_not_observed` warning up into
-    `_retract_the_proof_and_keep_watching` (where the wait is delegated, not over) and this goes
-    red on the count — it would fire once for the hand-over and once for the give-up."""
+    Mutation-check: drop the `app_first_serve_not_observed` warning and this goes red on the
+    count."""
     user, project, _ = await _a_saved_project(
         db_session, fake_storage, "ps-continuation-gives-up@rvaiglobal.com"
     )
     wire.sbx.root_status = 404
 
     with structlog.testing.capture_logs() as logs:
-        assert (await _relaunch(client, user, project)).status_code == 200
-        await _drain_the_watchers(wire.manager)
+        assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
     gave_up = [e for e in logs if e.get("event") == APP_FIRST_SERVE_NOT_OBSERVED_EVENT]
     assert len(gave_up) == 1, "the citizen's whole wait went unrecorded"
-    assert gave_up[0]["arm"] == "relaunch_continuation"
+    assert gave_up[0]["arm"] == "relaunch"
     assert [e for e in logs if e.get("event") == APP_FIRST_SERVED_EVENT] == []
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE) == ""
 
 
-async def test_a_continuation_that_watches_the_page_arrive_stamps_it_once_and_names_its_arm(
+async def test_a_watch_that_sees_the_page_arrive_stamps_it_once_and_names_its_arm(
     client: AsyncClient,
     db_session: AsyncSession,
     fake_redis,
@@ -1700,17 +1426,14 @@ async def test_a_continuation_that_watches_the_page_arrive_stamps_it_once_and_na
     wire,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """★ THE POSITIVE ARM, and the only thing that pins the `cold` parameter at all. The
-    continuation is not a formality: a heavy dashboard route compiling under 1.0 vCPU shows no
-    page for far longer than the press's own budget, and this task is what turns that into a
-    preview seconds later instead of a wait until the five-minute reconciler notices.
+    """★ THE POSITIVE ARM, and the only thing that pins the `cold` parameter at all. A heavy
+    dashboard route compiling under 1.0 vCPU shows no page for a while, and the watch is what
+    turns that into a preview seconds later instead of a wait until the five-minute reconciler
+    notices. `cold=True` IS THE CLAIM UNDER TEST: a cold start whose first page arrived late is
+    exactly what an operator reading that field is looking for.
 
-    `cold=True` IS THE CLAIM UNDER TEST. It rides from the caller rather than being assumed
-    False, because the page check can now hand over a RESTORED container too — and a cold start
-    whose first page arrived late is exactly what an operator reading that field is looking for.
-
-    Mutation-check: hard-code `cold=False` at the continuation's `_record_the_first_serve` call
-    and this goes red; nothing else in the tree asserts it."""
+    Mutation-check: hard-code `cold=False` at the relaunch's watch and this goes red; nothing
+    else in the tree asserts it."""
     user, project, _ = await _a_saved_project(
         db_session, fake_storage, "ps-continuation-stamps@rvaiglobal.com"
     )
@@ -1729,18 +1452,13 @@ async def test_a_continuation_that_watches_the_page_arrive_stamps_it_once_and_na
     monkeypatch.setattr(wire.sbx, "dev_status", the_page_arrives_on_the_fourth_look)
 
     with structlog.testing.capture_logs() as logs:
-        launched = await _relaunch(client, user, project)
-        assert launched.status_code == 200
-        assert launched.json()["ready"] is False, (
-            "the press itself saw no page — that is the setup"
-        )
-        await _drain_the_watchers(wire.manager)
+        assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
     served = [e for e in logs if e.get("event") == APP_FIRST_SERVED_EVENT]
     assert len(served) == 1, "`app_first_served` means FIRST — a second line makes it meaningless"
-    assert served[0]["observer"] == "relaunch_continuation"
+    assert served[0]["observer"] == "relaunch"
     assert served[0]["cold"] is True, "a restored container's late first page read as a warm one"
-    assert polls["taken"] > 1, "guard the premise: the continuation really did look again"
+    assert polls["taken"] > 1, "guard the premise: the watch really did look again"
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE)
     assert (await _probe(client, user, project))["state"] == "alive"
 

@@ -60,7 +60,7 @@ from src.services.storage import StorageError, snapshot_key
 from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
 from src.services.turns.guard import _mid_reply
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import FakeSandboxClient, FakeStorage
+from tests.fakes import FakeSandboxClient, FakeStorage, detached_work_done
 
 
 @pytest.fixture(autouse=True)
@@ -1415,8 +1415,8 @@ async def test_a_user_who_never_saved_can_still_get_their_work_back(
     await reap_user(fake_redis, user.id, client, app_id=session.app_id)
     client.attach_handle = None
 
-    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
-    assert relaunched.app_id == session.app_id
+    assert await manager.relaunch_preview(db_session, user, project_id, client) == session.app_id
+    await detached_work_done(manager)
     assert client.restored_from[-1] is None
 
 

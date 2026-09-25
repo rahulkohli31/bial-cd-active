@@ -7,7 +7,7 @@
  *
  * IT DOES NOT ANSWER WHAT TO FRAME: there is no URL field to put one in, and that absence is the
  * enforcement. The address comes only from `utils/previewAddress.ts`, whose precedence — a live
- * turn's preview outranks the relaunched and project URLs — a `PreviewState` in hand here would
+ * turn's preview outranks the project's own — a `PreviewState` in hand here would
  * silently drop.
  *
  * FOUR STATES A CITIZEN READS, PLUS ONE INTERNAL.
@@ -295,29 +295,16 @@ function spendOpenWindow(held: ProbeCadence): ProbeCadence {
 // ─── what came back from a start attempt ──────────────────────────────────────────────────────
 
 /**
- * How the most recent press of the start control ended — and only the endings that are this map's
- * business. A start that SUCCEEDED produces none of these: the read takes over and reports
- * `alive` on its own.
+ * How the most recent press of the start control ended, when the server REFUSED it in words — the
+ * only ending that is this map's business. A start that was admitted produces none: the read takes
+ * over, and `starting` then `alive` say how it went.
  *
- * NONE OF THE THREE IS A STATE. The READING decides which card is on screen, and an ending
- * contributes at most a `note` — the server's own words about a press the citizen made and is owed
- * an answer to. Two of the three have no such words and so change nothing a person sees; they are
- * kept because the producers still have to say how a press ended, and "it ended with nothing to
- * report" is a different fact from "no press has been made".
+ * NOT A STATE. The READING decides which card is on screen, and a refusal contributes a `note` —
+ * the server's own words about a press the citizen made and is owed an answer to, carried
+ * verbatim, because this map does not rewrite server prose. A refusal nobody put into words is no
+ * outcome at all: a fact about a fetch is not a fact about a workspace.
  */
-export type StartOutcome =
-  /** The server answered, and answered `ready: false` — the container is up and has not served a
-   *  page yet. NOT a death: the wire's own contract records that an ABSENT `ready` reads `true`,
-   *  which is exactly why liveness can never hang off this boolean. SAYS NOTHING ON SCREEN,
-   *  because the state it describes is the one the citizen is already in: the registry's serving
-   *  stamp is still empty, so the next read answers `starting` and the wait says so properly. */
-  | { readonly kind: 'not-painted' }
-  /** Nothing came back inside the budget. Says nothing about the container, and therefore nothing
-   *  on screen either — a fact about a fetch is not a fact about a workspace, and the sentence it
-   *  used to carry ("It may still be coming up.") was a guess the copy rule forbids. */
-  | { readonly kind: 'timed-out' }
-  /** The server named a reason. Carried verbatim — this map does not rewrite server prose. */
-  | { readonly kind: 'failed'; readonly reason: string }
+export type StartOutcome = { readonly kind: 'failed'; readonly reason: string }
 
 /**
  * HOW A START ATTEMPT ENDED, for the caller that has to decide what to do NEXT — distinct from
@@ -669,30 +656,12 @@ export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
 }
 
 /**
- * WHAT THE LAST PRESS ENDED AS, AS ONE LINE — or `null` when it left nothing worth saying.
- *
- * TWO OF THE THREE ENDINGS SAY NOTHING, AND THAT IS THE POINT rather than an omission.
- * `not-painted` is "the container is up and has not served a page yet", which is the DEFINITION of
- * the wait the citizen is already sitting in — the serving stamp is empty, so the next read
- * answers `starting` and the wait says it properly, with one author. `timed-out` is a fact about a
- * fetch that did not come back; it is not evidence about the container, and inventing a sentence
- * out of it is how a guess about a duration reached a screen in the first place.
- *
- * THE THIRD CARRIES SERVER PROSE VERBATIM. Rewriting it would put a second author on a sentence
- * that already has one and lose the only specific thing we know. See {@link WorkspaceState.note}
- * for why it rides in that field rather than in `detail`.
+ * WHAT THE LAST PRESS WAS REFUSED WITH, AS ONE LINE — or `null` when nothing refused it. Server
+ * prose, verbatim: rewriting it would put a second author on a sentence that already has one. See
+ * {@link WorkspaceState.note} for why it rides in that field rather than in `detail`.
  */
 function pressNote(outcome: StartOutcome | null): string | null {
-  if (outcome === null) return null
-  switch (outcome.kind) {
-    case 'not-painted':
-    case 'timed-out':
-      return null
-    case 'failed':
-      return outcome.reason
-    default:
-      return assertNever(outcome)
-  }
+  return outcome === null ? null : outcome.reason
 }
 
 /**
@@ -752,12 +721,10 @@ function atRest(
  * because nobody has measured one. The canvas's "about thirty seconds" and the register's "about
  * half a minute" are both dropped; a duration arrives from a measured constant or not at all.
  *
- * ONE SENTENCE FOR THE WHOLE PRE-SERVE INTERVAL, and it covers more of one than it used to. The
- * server's `starting`, this surface's own in-flight press, a relaunch that came back
- * `ready: false`, and a container that exists and has never answered a request are all the same
+ * ONE SENTENCE FOR THE WHOLE PRE-SERVE INTERVAL. The server's `starting`, this surface's own
+ * in-flight press, and a container that exists and has never answered a request are all the same
  * state — a start is happening, nothing is serving yet — and giving them one sentence is what
- * keeps them from drifting into four slightly different waits. Three of the four had cards of
- * their own until the platform could prove a serve.
+ * keeps them from drifting into three slightly different waits.
  *
  * TWO SENTENCES, AND THE SECOND ONE HAS A BUTTON. Past {@link START_PATIENCE_MS} the wait is no
  * longer the ordinary one the first sentence describes, and a sentence with no end and nothing to
@@ -806,8 +773,8 @@ function gettingReady(
       : 'Setting up somewhere for it to run.',
     // THE SECOND SENTENCE COMES WITH SOMETHING TO PRESS, and it is the verb that already exists
     // rather than a third one. A press lands on the same door the start went through, which
-    // attaches to the container that start left standing instead of building over it — see the
-    // readiness arm in `relaunch_preview`, which is what makes asking again safe.
+    // attaches to the container that start left standing instead of building over it, or joins
+    // the start still bringing it up — which is what makes asking again safe.
     action: tooLong ? RETRY : null,
     // WHY A WAIT MAY CARRY A REFUSAL. A press refused while a start really was in flight — the
     // server answering `BUILD_ALREADY_RUNNING` to somebody pressing Launch during a build — is a

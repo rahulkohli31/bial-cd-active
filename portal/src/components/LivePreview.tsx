@@ -305,8 +305,8 @@ function BouncingWait({ children, className = '' }: { children: ReactNode; class
  * feeds the app nothing).
  *
  * Driven by the resolved workspace address (`utils/previewAddress.ts`):
- *   - `previewUrl` — the sandbox `next dev` root, from the live turn's preview, a start or
- *                    relaunch, or the project's preview read. Framed once set.
+ *   - `previewUrl` — the sandbox `next dev` root, from the live turn's preview or the project's
+ *                    preview read. Framed once set.
  *   - `status`     — the session lifecycle; drives loading / framed / terminal visuals.
  *   - `onFrameMessage` — the client-error receiver seam. The inbound `message` listener
  *                    validates BOTH `e.origin` against the preview origin AND `e.source` against

@@ -719,15 +719,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   const projectIdRef = useRef(projectId)
   projectIdRef.current = projectId
 
-  // The project this surface has claimed the workspace for — the render gate of every
-  // project-scoped arm of the preview address.
-  const stampedProjectRef = useRef<string | null>(null)
-  // THE URL THE WORKSPACE'S OWN START CONTROL JUST PRODUCED, and whether a press is in flight.
-  // Hoisted to sit beside the stamp below rather than beside the address resolution that reads it:
-  // the stamp's guard has to know whether this surface is still holding a URL some OTHER project's
-  // start produced, and a guard that could not see it would re-label that URL with the project now
-  // on screen. See `onStarted` at the publish block far below for what fills it.
-  const [startedPreviewUrl, setStartedPreviewUrl] = useState<string | null>(null)
+  // WHETHER A PRESS OF THE WORKSPACE'S OWN START CONTROL IS IN FLIGHT.
   const [startPending, setStartPending] = useState(false)
   // DROPPED WITH THE PROJECT IT DESCRIBED. This surface is not remounted when the screen moves,
   // and `startApp`'s own clear is gated on the start still being ours — correctly, or a late
@@ -736,25 +728,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   useEffect(() => {
     setStartPending(false)
   }, [projectId])
-  // A CHAT LOADED COLD CLAIMS THE OPEN PROJECT'S WORKSPACE.
-  //
-  // The stamp gates EVERY project-scoped arm of the address. A hard load — a bookmark, an F5, a
-  // browser restart — has no start control reporting behind it, so without this claim the surface
-  // read the project's preview state, told the reader their app was running, and then refused to
-  // point the pane at the very URL that read had handed it.
-  //
-  // WHY THE CLAIM IS HONEST, AND WHY THE GUARD IS THE WHOLE OF IT. One instance of this component
-  // survives a project switch, so an unconditional stamp would hand the URL project A's start
-  // produced to project B. So the claim is made only while this surface holds no URL from a start;
-  // in that state the stamp moves exactly one thing — the project arm, whose input is a read keyed
-  // on the open project by construction.
-  //
-  // Assigned during render, like the refs above: a gate that depends on declaration order is one
-  // reorder away from silently opening.
-  if (projectId && startedPreviewUrl === null) {
-    stampedProjectRef.current = projectId
-  }
-  const stampedProjectMatches = stampedProjectRef.current === projectId
   const generating = generatingChatId === buildId
   // THE ONE GATE, AND ITS ONLY TERM IS TURN STATE. What a chat IS appears nowhere in it: a
   // kind is a tool-access level, not a thing that can shut the composer, and using it as a gate is
@@ -1997,10 +1970,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     turnPreviewUrl: turnPreview.url,
     turnStatus: turnBuildStatus,
     narratingChatIsOpenChat: turnNarrativeIsThisChat,
-    // THE RELAUNCHED ARM, NOT THE PROJECT ONE. They are gated identically, so the choice is about
-    // RANKING: a restore the citizen just asked for outranks the poll's reading, which may not have
-    // caught up with it yet.
-    relaunchedUrl: startedPreviewUrl,
     // THE ARM A HARD LOAD ARRIVES ON. Fed from the preview-state read this surface already
     // makes, exactly as the project surface feeds it: `alive` is the one state whose `previewUrl`
     // the wire's own contract calls framable, and every other state resolves to no address rather
@@ -2016,7 +1985,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     // terminal status is allowed to unframe a container that is demonstrably up. That widening
     // is needed because the backend pardons a container whether the turn completed, stopped or
     // failed, so what is serving is the only honest source.
-    belongsToOpenProject: stampedProjectMatches,
+    // The project arm's only input is a read keyed on the open project, so it belongs to the open
+    // project whenever there is one — including a chat loaded cold, which has no start behind it.
+    belongsToOpenProject: Boolean(projectId),
     transcriptHasBuildOutcome: newestOutcome !== null,
   })
   const framedPreviewUrl = address.url
@@ -2472,31 +2443,14 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   const startSinks: StartSinks = useMemo(
     () => ({
       projectId,
-      // WHERE A START'S URL LANDS ON THIS SURFACE, and without it the start control
-      // did nothing visible here. This surface feeds the resolver's project-scoped arm with
-      // `null` (its own poll only runs over an ALREADY framed URL, by design), and its
-      // `relaunchedUrl` arm used to be fed by a Relaunch button inside the pane that was
-      // retired — so a fresh start had no arm left to populate and the app came up in a
-      // container nothing framed. The relaunched arm is exactly right for it: a restore has no
-      // build lifecycle, which is why that arm resolves its own status to `ready`.
-      onStarted: (previewUrl: string) => {
-        // STAMP THE PROJECT, then record the URL — and the order does not matter, but the
-        // stamp does. Every project-scoped arm of the address resolver is gated by it; without
-        // this a start fired here resolved to no address at all and the app came up in a
-        // container the pane refused to point at. Setting it is not a widening of the predicate,
-        // which must stay independent of the chat one — it is this surface honestly claiming the
-        // project's workspace.
-        stampedProjectRef.current = projectId
-        setStartedPreviewUrl(previewUrl)
-      },
       // This surface has no map state of its own to move — it hands the pure map a `preview`
       // and nothing else — so an in-flight press is local state here, exactly as it is in the
       // hook the project surface uses.
       onStartPending: setStartPending,
       onStartOutcome: (outcome: StartOutcome | null) => {
         setStartOutcome(outcome)
-        // A start that REACHED the app clears the outcome and asks again immediately, so the
-        // pane arrives at the running app on the press rather than on the next poll tick.
+        // An admitted start clears the outcome and asks again immediately: the next read is the
+        // one that sees `starting` and turns the poll up to catch the app arriving.
         if (outcome === null) setPreviewProbeEpoch((n) => n + 1)
       },
     }),
@@ -2531,14 +2485,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
        drew inside the pane. The chip is not re-homed on another surface — it is drawn by the
        shell's own toolbar row beside the chat title, from the same computed state, so there is one
        mount for both screens rather than two that happen never to be live at once. */
-    /* `restoredFromFailedBuild` IS NOT PUBLISHED ANY MORE, because there is nothing left to render
-       it — the chip it fed, which sat on the framed app's own navigation, is deleted. The
-       server still ANSWERS it on every relaunch — `RelaunchPreviewResponse`, parsed and tested in
-       `buildSessionApi` — so that fact is not lost at the wire; what it lacks is a home on screen.
-       Whoever gives it one (the toolbar row, or a transcript line) re-publishes it there.
-
-       AND `completedLive` LEFT WITH IT, onto the address as `serving` — see the block above the
-       address resolution. Nothing on this view can unmount the frame any more. */
+    /* Liveness is not published here: it rides on the address as `serving` — see the block above
+       the address resolution — so nothing on this view can unmount the frame. */
     previewState: previewState?.state ?? null,
     reconnecting: turnNarrativeIsThisChat && turnPreview.state === 'reconnecting',
     /* NOT gated on `turnNarrativeIsThisChat`, unlike the narrative values above it. This is a fact

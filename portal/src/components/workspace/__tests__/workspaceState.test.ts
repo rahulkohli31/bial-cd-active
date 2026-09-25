@@ -74,8 +74,6 @@ const rendered = (over: Partial<WorkspaceInputs> = {}) => {
 /** Every ending a press can have, so a sweep can be exhaustive over the union rather than sample it. */
 const EVERY_ENDING: readonly (StartOutcome | null)[] = [
   null,
-  { kind: 'not-painted' },
-  { kind: 'timed-out' },
   { kind: 'failed', reason: 'the image could not be pulled' },
 ]
 
@@ -154,15 +152,13 @@ describe('★ the four a citizen reads, each from its own real inputs', () => {
 
 describe('★ BUILDING absorbed three cards, and it still has no verb', () => {
   /**
-   * FOUR SOURCES, ONE SENTENCE. The wire's `starting`, this surface's own outstanding press, a
-   * relaunch that came back `ready:false`, and a container that exists and has never answered are
-   * all the same situation — a start is happening, nothing is serving yet.
+   * THREE SOURCES, ONE SENTENCE. The wire's `starting`, this surface's own outstanding press, and a
+   * container that exists and has never answered are all the same situation — a start is
+   * happening, nothing is serving yet.
    */
   const everyWayIn: [string, Partial<WorkspaceInputs>][] = [
     ['the server says a start is in flight', { preview: reading({ state: 'starting' }) }],
     ['this surface`s own press is outstanding', { preview: reading({ state: 'asleep', restorable: true }), startInFlight: true }],
-    ['a relaunch answered ready:false', { preview: reading({ state: 'starting' }), startOutcome: { kind: 'not-painted' } }],
-    ['the press got no answer inside budget', { preview: reading({ state: 'starting' }), startOutcome: { kind: 'timed-out' } }],
   ]
 
   for (const [how, inputs] of everyWayIn) {
@@ -252,17 +248,6 @@ describe('★ BUILDING absorbed three cards, and it still has no verb', () => {
     )
   })
 
-  it('a press that ended with nothing to report changes nothing a person reads', () => {
-    // `not-painted` and `timed-out` are the two endings with no server prose behind them, and the
-    // reason they say nothing is not politeness: one describes the state the citizen is already
-    // in, and the other is a fact about a FETCH, which is not evidence about a workspace.
-    const bare = resolve({ preview: reading({ state: 'starting' }) })
-    for (const kind of ['not-painted', 'timed-out'] as const) {
-      const withEnding = resolve({ preview: reading({ state: 'starting' }), startOutcome: { kind } })
-      expect(sameWorkspaceState(bare, withEnding), kind).toBe(true)
-    }
-  })
-
   it('but a press REFUSED while a start really was in flight still gets its answer', () => {
     // A citizen who pressed Launch during a build asked a question and is owed an answer to it.
     // The honest answer does not change the state they are in, so it is a note rather than a card.
@@ -297,8 +282,6 @@ describe('the register — what the pane may and may not say', () => {
       { preview: reading({ state: 'starting' }) },
       { preview: reading({ state: 'alive', alive: true }) },
       { preview: null },
-      { preview: reading({ state: 'asleep' }), startOutcome: { kind: 'not-painted' } },
-      { preview: reading({ state: 'asleep' }), startOutcome: { kind: 'timed-out' } },
       { preview: reading({ state: 'asleep' }), startOutcome: { kind: 'failed', reason: 'no image' } },
     ]
 
@@ -402,7 +385,7 @@ describe('a start outcome selects no arm of its own — the READING decides the 
   it('a live read outranks a stale start outcome — reaching alive IS the start succeeding', () => {
     const state = resolve({
       preview: reading({ state: 'alive', alive: true }),
-      startOutcome: { kind: 'timed-out' },
+      startOutcome: { kind: 'failed', reason: 'the image could not be pulled' },
     })
     expect(state.name).toBe('running')
     // AND THE REFUSAL GOES WITH IT. A note left over from a press that has since succeeded is
@@ -419,6 +402,38 @@ describe('a start outcome selects no arm of its own — the READING decides the 
     expect(resolve({ preview: null, startInFlight: true }).name).toBe('starting')
     expect(resolve({ preview: reading({ state: 'alive', alive: true }), startInFlight: true }).name)
       .toBe('running')
+  })
+})
+
+describe('sameWorkspaceState — what the channel compares before it publishes', () => {
+  it('★ the comparator sees BOTH optional fields, and each one on its own', () => {
+    // The channel skips a publish when `sameWorkspaceState` says two readings render identically,
+    // and both optional fields are things a citizen reads. ISOLATED DELIBERATELY: a pair that
+    // differs in the headline too would pass against a comparator that had never heard of either
+    // field. Each assertion below moves exactly one.
+
+    // THE NOTE, alone: the same saved card, told apart only by the server's sentence on it.
+    const saved = (reason: string | null) =>
+      resolve({
+        preview: reading({ state: 'asleep', restorable: true }),
+        startOutcome: reason === null ? null : { kind: 'failed', reason },
+      })
+    expect(saved(null).headline).toBe(saved('Could not save your work').headline)
+    expect(saved(null).detail).toBe(saved('Could not save your work').detail)
+    expect(sameWorkspaceState(saved(null), saved('Could not save your work'))).toBe(false)
+
+    // AN OMITTED OPTIONAL AND AN EXPLICIT `null` ARE THE SAME CLAIM, and must compare equal.
+    const atRest = saved(null)
+    expect(sameWorkspaceState(atRest, atRest)).toBe(true)
+    const { note: _n, busy: _b, ...bare } = atRest
+    expect(sameWorkspaceState({ ...bare, note: null, busy: false }, bare)).toBe(true)
+    // THE ACTION, alone: a different verb behind the same sentences is a different card.
+    expect(sameWorkspaceState(atRest, { ...atRest, action: null })).toBe(false)
+
+    // ★ AND `busy`, which is the field a wait turns on and nothing else moves. Isolated the same
+    // way: hand-built, because the only arm that sets it also changes every other field.
+    const wait = resolve({ preview: reading({ state: 'starting' }) })
+    expect(sameWorkspaceState(wait, { ...wait, busy: false })).toBe(false)
   })
 })
 

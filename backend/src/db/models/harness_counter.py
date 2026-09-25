@@ -100,16 +100,16 @@ class HarnessCounter(enum.StrEnum):
     #: resolved.
     APP_START_ATTEMPTED = "app_start_attempted"
     #: One per start that reached a SERVING page — the numerator of the start-success ratio.
-    #: Never written for the attach arm's fail-open `ready=False` outcome — that is a
-    #: framable URL, not a running app, and counting it would make the ratio measure nothing.
+    #: Never written for a container that is up with nothing showing — that is a framable URL,
+    #: not a running app, and counting it would make the ratio measure nothing.
     #:
     #: Same two writers, each gated so its numerator can only come from its own denominator:
-    #: `relaunch_preview` gates on `wait_ready` returning, and the turn engine gates on the
+    #: `relaunch_preview` gates on its watch seeing a page, and the turn engine gates on the
     #: preview watcher's first served poll AND on this turn having started something.
     APP_START_REACHED_RUNNING = "app_start_reached_running"
-    #: Milliseconds from the platform DECIDING to restore to the app answering — the restore arm
-    #: only. The attach arm writes no duration at all: a 15-second attach budget and a
-    #: 120-second cold budget averaged together produce a number that describes neither.
+    #: Milliseconds from the platform DECIDING to restore to the app showing a page — the restore
+    #: arm only. The attach arm writes no duration at all: it restored nothing, and folding its
+    #: near-instant readings in would make the number describe neither.
     #: SCOPE, because a later reader will want to quote it: this is the explicit start CONTROL's
     #: number, and it is the ONE counter here with a single writer. A first build provisions
     #: through a different path and is not in it, and neither is the turn engine's attach —

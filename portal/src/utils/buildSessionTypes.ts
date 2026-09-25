@@ -18,42 +18,17 @@ export type BuildSessionStatus = 'provisioning' | 'building' | 'ready' | 'ended'
 
 // ─── Control operations — relaunch / shared launch ───────────────────────────
 
-/** `POST …/relaunch` body — restore a project's saved app into a fresh, ready sandbox. */
+/** `POST …/relaunch` body — start a project's saved app. The 202 it earns carries nothing a client
+ *  reads: the preview-state poll reports the start. */
 export interface RelaunchPreviewRequest {
   projectId: string
 }
 
 /**
- * `POST …/relaunch` → 200. NO `sessionId`/`createdAt`: relaunch registers no build session
- * (it must not occupy the build slot), so there is nothing to poll or stop. It
- * returns a live `previewUrl` synchronously (the server blocked on `wait_ready` before replying).
- */
-export interface RelaunchPreviewResponse {
-  appId: string
-  previewUrl: string
-  status: BuildSessionStatus
-  /**
-   * The "last saved version" signal: the project's NEWEST recorded build outcome was FAILED, so
-   * the restored snapshot is the last SAVED state — not that build's intent. The preview pane
-   * surfaces this so the user isn't silently shown older code as an unqualified "ready".
-   */
-  restoredFromFailedBuild: boolean
-  /**
-   * Is the app actually SERVING `previewUrl` yet? False when the server attached to a live
-   * container whose root route had not answered within its readiness budget. The URL is framable
-   * either way — the pane keeps its labelled wait up until the framed document loads, exactly as
-   * it does for a first build. Absent reads as `true` (the historic contract: relaunch only ever
-   * replied once the dev server was up).
-   */
-  ready: boolean
-}
-
-/**
- * `POST …/projects/{id}/shared-launch` and `.../shared-refresh` → 200 (#198).
- * `RelaunchPreviewResponse`'s sibling for a project a colleague shares with the viewer — "Can
- * use", never "view only": the viewer can create, update and delete the
- * owner's records through the app's own UI. No `status`/`restoredFromFailedBuild`: this view
- * registers no build session and has no build-outcome history of its own to qualify.
+ * `POST …/projects/{id}/shared-launch` and `.../shared-refresh` → 200 (#198), for a project a
+ * colleague shares with the viewer — "Can use", never "view only": the viewer can create, update
+ * and delete the owner's records through the app's own UI. Answered once the view is up: the
+ * viewer has no preview-state to poll, so this is where the address and `ready` arrive.
  */
 export interface SharedPreviewResponse {
   appId: string

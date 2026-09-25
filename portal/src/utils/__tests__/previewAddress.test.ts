@@ -14,7 +14,6 @@ import { describe, it, expect } from 'vitest'
 import { resolvePreviewAddress, type PreviewAddressInputs } from '../previewAddress'
 
 const TURN = 'https://turn.example.azurecontainerapps.io/'
-const RELAUNCH = 'https://relaunch.example.azurecontainerapps.io/'
 const PROJECT = 'https://project.example.azurecontainerapps.io/'
 
 /** Nothing qualifies. Every scenario states only the inputs it is actually about. */
@@ -22,7 +21,6 @@ const nothing: PreviewAddressInputs = {
   turnPreviewUrl: null,
   turnStatus: null,
   narratingChatIsOpenChat: false,
-  relaunchedUrl: null,
   projectPreviewUrl: null,
   belongsToOpenProject: false,
   transcriptHasBuildOutcome: false,
@@ -31,27 +29,22 @@ const nothing: PreviewAddressInputs = {
 const resolve = (over: Partial<PreviewAddressInputs>) =>
   resolvePreviewAddress({ ...nothing, ...over })
 
-/** All three sources populated at once, both predicates true — precedence tests narrow from here. */
+/** Both sources populated at once, both predicates true — precedence tests narrow from here. */
 const everything: Partial<PreviewAddressInputs> = {
   turnPreviewUrl: TURN,
   narratingChatIsOpenChat: true,
-  relaunchedUrl: RELAUNCH,
   projectPreviewUrl: PROJECT,
   belongsToOpenProject: true,
 }
 
 describe('resolvePreviewAddress — the precedence', () => {
-  it('a live turn preview outranks both arms below it', () => {
+  it('a live turn preview outranks the project arm below it', () => {
     expect(resolve(everything).url).toBe(TURN)
-  })
-
-  it('a relaunched URL outranks the project preview', () => {
-    expect(resolve({ ...everything, turnPreviewUrl: null }).url).toBe(RELAUNCH)
   })
 
   it('the project preview resolves last, when nothing above it qualifies', () => {
     // The first screen: arrive at a project, see the app. There is no chat here at all, so
-    // the two arms above are structurally unavailable — this arm is the only one that can
+    // the turn arm above is structurally unavailable — this arm is the only one that can
     // answer, and without it the project screen frames nothing.
     expect(
       resolve({
@@ -68,27 +61,26 @@ describe('resolvePreviewAddress — the precedence', () => {
 
 describe('resolvePreviewAddress — the chat predicate gates the turn arm, and nothing else', () => {
   it('a false chat predicate drops the turn arm even though its URL is non-null', () => {
-    expect(resolve({ ...everything, narratingChatIsOpenChat: false }).url).toBe(RELAUNCH)
+    expect(resolve({ ...everything, narratingChatIsOpenChat: false }).url).toBe(PROJECT)
   })
 
-  it('a false chat predicate does NOT disturb the two project-scoped arms', () => {
+  it('a false chat predicate does NOT disturb the project-scoped arm', () => {
     // The sibling-chat case: another conversation in this project is mid-build. Its preview is not
-    // this chat's, but the project's own relaunched app is.
+    // this chat's, but the project's own running app is.
     const { url } = resolve({
       turnPreviewUrl: TURN,
       narratingChatIsOpenChat: false,
-      relaunchedUrl: RELAUNCH,
+      projectPreviewUrl: PROJECT,
       belongsToOpenProject: true,
     })
-    expect(url).toBe(RELAUNCH)
+    expect(url).toBe(PROJECT)
   })
 })
 
 describe('resolvePreviewAddress — the project predicate gates the two lower arms, and nothing else', () => {
-  it('a false project predicate drops the relaunched URL and the project preview', () => {
+  it('a false project predicate drops the project preview', () => {
     expect(
       resolve({
-        relaunchedUrl: RELAUNCH,
         projectPreviewUrl: PROJECT,
         belongsToOpenProject: false,
       }).url,
@@ -96,7 +88,7 @@ describe('resolvePreviewAddress — the project predicate gates the two lower ar
   })
 
   it('the same project preview URL for a DIFFERENT project does not resolve', () => {
-    // The project arm is gated exactly as the relaunch arm above it is. Without this it would be
+    // The project arm is gated by the project predicate. Without this it would be
     // the one arm that could frame another project's app, and it is the arm with no chat behind it
     // to make the mistake visible.
     expect(resolve({ projectPreviewUrl: PROJECT, belongsToOpenProject: false }).url).toBeNull()
@@ -245,22 +237,10 @@ describe('resolvePreviewAddress — the status is resolved independently of the 
       resolve({
         turnStatus: 'building',
         narratingChatIsOpenChat: false,
-        relaunchedUrl: RELAUNCH,
+        projectPreviewUrl: PROJECT,
         belongsToOpenProject: true,
       }),
-    ).toEqual({ url: RELAUNCH, status: 'ready', serving: false })
-  })
-
-  it('a relaunched URL resolves the status to ready — it is a restore, not a build', () => {
-    // A relaunch has no lifecycle: no feed, no keep-alive, no lock. The transcript's own `ended`
-    // sits below it, so a restored app is never painted "no longer running".
-    expect(
-      resolve({
-        relaunchedUrl: RELAUNCH,
-        belongsToOpenProject: true,
-        transcriptHasBuildOutcome: true,
-      }),
-    ).toEqual({ url: RELAUNCH, status: 'ready', serving: false })
+    ).toEqual({ url: PROJECT, status: 'ready', serving: true })
   })
 
   it('a container the project read finds up outranks the transcript\'s ended build', () => {

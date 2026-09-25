@@ -1032,18 +1032,6 @@
         "title": "BuildInProgressItem",
         "type": "object"
       },
-      "BuildSessionStatus": {
-        "description": "The build-session lifecycle. Five members; the wire value equals the\nmember's lowercase name. An **API** StrEnum, not a native PG enum — no durable\nrow lands until SESSION-API's migration.\n\nForward path `PROVISIONING → BUILDING → READY`; any non-terminal state →\n`ENDED` (graceful) or `FAILED` (unrecoverable). `ENDED`/`FAILED` are absorbing.",
-        "enum": [
-          "provisioning",
-          "building",
-          "ready",
-          "ended",
-          "failed"
-        ],
-        "title": "BuildSessionStatus",
-        "type": "string"
-      },
       "BulkLimitsRequest": {
         "description": "The admin \"Global Limits\" bulk apply (sets, never resets-to-default — unlike\nthe single-user `LimitFields` patch, there is no \"use default\" concept in a bulk\naction). `user_ids=None` means every user, system-wide; a non-empty list means\nexactly those users and no others.",
         "properties": {
@@ -3901,35 +3889,16 @@
         "type": "object"
       },
       "RelaunchPreviewResponse": {
-        "description": "`POST /v1/build-sessions/relaunch` → 200. No `session_id`/`created_at`: relaunch\nregisters NO in-process build session (it must not occupy the build slot), so\nthere is nothing to poll or stop.\n\n`preview_url` is always framable; `ready` says whether it is SERVING yet. The two came apart\nwhen relaunch stopped 503ing on a slow app: an attached container whose root route\noutruns the readiness budget still hands back its URL, because the alternative — condemning\nthe container — cost a citizen their unsaved work.",
+        "description": "`POST /v1/build-sessions/relaunch` → 202: the start is admitted and runs detached.\n\nNothing here says whether the app is up, and nothing here carries its address: both are\n`preview-state`'s to report — `starting` while it comes up, `alive` with the framable URL\nonce something has watched it show a page. One reader for one fact.",
         "properties": {
           "appId": {
             "format": "uuid",
             "title": "Appid",
             "type": "string"
-          },
-          "previewUrl": {
-            "title": "Previewurl",
-            "type": "string"
-          },
-          "ready": {
-            "default": true,
-            "title": "Ready",
-            "type": "boolean"
-          },
-          "restoredFromFailedBuild": {
-            "title": "Restoredfromfailedbuild",
-            "type": "boolean"
-          },
-          "status": {
-            "$ref": "#/components/schemas/BuildSessionStatus"
           }
         },
         "required": [
-          "appId",
-          "previewUrl",
-          "status",
-          "restoredFromFailedBuild"
+          "appId"
         ],
         "title": "RelaunchPreviewResponse",
         "type": "object"
@@ -4343,7 +4312,7 @@
         "type": "object"
       },
       "SharedPreviewResponse": {
-        "description": "`POST /v1/build-sessions/projects/{projectId}/shared-launch` and `.../shared-refresh`\n→ 200 (#198). `RelaunchPreviewResponse`'s sibling for a colleague's read-only view of a\nproject shared with them — no `session_id`/`status`/`restored_from_failed_build`: a shared\nview registers no build session, has no build-outcome history of its own to qualify, and\n`ready` alone says whether the frame is serving yet.",
+        "description": "`POST /v1/build-sessions/projects/{projectId}/shared-launch` and `.../shared-refresh`\n→ 200 (#198), for a colleague's view of a project shared with them. Answered once the view\nis up, not detached like a relaunch: a recipient has no `preview-state` to poll, so this\nresponse is the only place the URL and `ready` can reach them.",
         "properties": {
           "appId": {
             "format": "uuid",
@@ -9989,7 +9958,7 @@
     },
     "/v1/build-sessions/relaunch": {
       "post": {
-        "description": "Restore a torn-down app from its snapshot into a fresh, READY sandbox.\n\nNot a build: it runs no agent at all, and the manager path never occupies the\none-per-user build slot — it registers a ready handle in Redis, releases the lock, and\nreturns the live preview synchronously (`wait_ready` blocks until the dev server is up).",
+        "description": "Start the project's saved app, or attach to the container already running it.\n\nAnswers 202 once the start is admitted — every refusal below is decided first — and brings\nthe app up detached. `preview-state` is the one reader of how it went: `starting`, then\n`alive` with the framable URL. Not a build: it runs no agent and never occupies the\none-per-user build slot.",
         "operationId": "relaunch_preview_v1_build_sessions_relaunch_post",
         "requestBody": {
           "content": {
@@ -10002,7 +9971,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "202": {
             "content": {
               "application/json": {
                 "schema": {

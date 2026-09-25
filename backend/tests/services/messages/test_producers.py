@@ -3,9 +3,9 @@ legacy `build_started` marker's rows. It is a test fake: the live readers it fee
 these tests are really about.
 
 `write_build_started` ITSELF IS DELETED — the build-start path it belonged to is gone. Rows of
-its shape are permanent in production transcripts, though, so both of the readers covered here
-(`write_build_outcome`'s idempotency probe and `newest_build_outcome_status`) still have to step
-around one. They are exercised against a faithful legacy row produced by
+its shape are permanent in production transcripts, though, so the reader covered here
+(`write_build_outcome`'s idempotency probe) still has to step around one. It is exercised
+against a faithful legacy row produced by
 `tests.fakes.write_legacy_build_started`, which is byte-identical to the deleted writer.
 
 The per-step BRAIN producer is tested with its own fixtures in
@@ -23,7 +23,6 @@ import sqlalchemy as sa
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
-from src.services.build_sessions.outcome import newest_build_outcome_status
 from src.services.messages.store import load_history, load_rows
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import write_build_outcome, write_legacy_build_started
@@ -40,8 +39,8 @@ async def test_build_started_row_is_hidden_and_replay_inert(db_session) -> None:
     """Pins the SHAPE of a legacy `build_started` row, not the behaviour of a writer.
 
     The production writer is deleted; what survives is a database full of rows it already wrote
-    and the live readers over them — the projection's `BuildInProgressItem` arm, the outcome
-    idempotency probe, `newest_build_outcome_status`. Those readers are only as trustworthy as
+    and the live readers over them — the projection's `BuildInProgressItem` arm and the outcome
+    idempotency probe. Those readers are only as trustworthy as
     the row they are tested against, so this pins that row: hidden `system_event`, empty native
     payload, `meta = {kind, sessionId, startedSeq}`, invisible to both transcript reads."""
     user, _, conversation = await _thread(db_session)
@@ -118,31 +117,3 @@ async def test_outcome_idempotency_ignores_the_started_marker(db_session) -> Non
         started_seq=-1,
     )
     assert second is False  # the real outcome still deduplicates itself
-
-
-async def test_newest_outcome_status_skips_started_markers(db_session) -> None:
-    """A NEWER build's start marker must not blank the newest OUTCOME's status (the relaunch
-    label would regress to 'nothing known' the moment any new build starts)."""
-    user, project, conversation = await _thread(db_session)
-    finished = uuid.uuid4()
-    await write_build_outcome(
-        db_session,
-        user_id=user.id,
-        conversation_id=conversation.id,
-        session_id=finished,
-        status=BuildSessionStatus.FAILED,
-        preview_url=None,
-        snapshot_committed=True,
-        reason="build_failed",
-        started_seq=-1,
-    )
-    await write_legacy_build_started(
-        db_session,
-        user_id=user.id,
-        conversation_id=conversation.id,
-        session_id=uuid.uuid4(),
-        started_seq=0,
-    )
-
-    status = await newest_build_outcome_status(db_session, user_id=user.id, project_id=project.id)
-    assert status is BuildSessionStatus.FAILED

@@ -357,7 +357,7 @@ export interface WorkspaceReport {
   settled: boolean
   /** The project the state describes. `null` while a route is still resolving one. */
   projectId: string | null
-  /** Record how a start attempt ended; `null` clears it (a start that reached the app). */
+  /** Record how a start attempt ended; `null` clears it (a start the server admitted). */
   onStartOutcome: (outcome: StartOutcome | null) => void
   /**
    * A PRESS HAS BEGUN, OR FINISHED — and the pane needs to know before the server does.
@@ -368,14 +368,6 @@ export interface WorkspaceReport {
    * feedback was a spinner inside the control itself.
    */
   onStartPending: (pending: boolean) => void
-  /**
-   * THE URL A SUCCESSFUL START JUST PRODUCED — and the publisher decides what to do with it.
-   *
-   * Without it a start inside a Build chat has no arm of the address resolver it can populate, and
-   * the app comes up in a container nothing frames. `previewAddress.ts`'s relaunched arm is its
-   * home: a restore has no build lifecycle, which is why that arm resolves straight to `ready`.
-   */
-  onStarted: (previewUrl: string) => void
   /** Ask the platform again, now. A retry press, or a start that just finished. */
   onRefresh: () => void
   /**

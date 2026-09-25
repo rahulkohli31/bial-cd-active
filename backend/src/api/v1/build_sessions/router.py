@@ -36,7 +36,6 @@ from src.api.v1.build_sessions.deps import (
     SessionManagerDep,
 )
 from src.api.v1.build_sessions.schemas import (
-    BuildSessionStatus,
     ClientErrorReportRequest,
     ClientErrorReportResponse,
     CompileStateResponse,
@@ -241,6 +240,7 @@ async def internal_reap(
 
 @router.post(
     "/relaunch",
+    status_code=status.HTTP_202_ACCEPTED,
     response_model=RelaunchPreviewResponse,
     dependencies=[RequireCsrf],
     responses=error_responses(
@@ -263,20 +263,20 @@ async def relaunch_preview(
     sandbox: OptionalSandbox,
     manager: SessionManagerDep,
 ) -> RelaunchPreviewResponse | JSONResponse:
-    """Restore a torn-down app from its snapshot into a fresh, READY sandbox.
+    """Start the project's saved app, or attach to the container already running it.
 
-    Not a build: it runs no agent at all, and the manager path never occupies the
-    one-per-user build slot — it registers a ready handle in Redis, releases the lock, and
-    returns the live preview synchronously (`wait_ready` blocks until the dev server is up).
+    Answers 202 once the start is admitted — every refusal below is decided first — and brings
+    the app up detached. `preview-state` is the one reader of how it went: `starting`, then
+    `alive` with the framable URL. Not a build: it runs no agent and never occupies the
+    one-per-user build slot.
     """
     if sandbox is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
-    # The coordination seam the deleted `start_build` also ran inside, and relaunch needs it
-    # at least as badly: it takes the same per-user lock through the same `_holding_user_lock`,
-    # so before the split a Redis blip here told the user a build was already running.
+    # It takes the same per-user lock through the same `_holding_user_lock` a turn does, so an
+    # outage of the coordination store is a 503 here, never a claim that a build is running.
     with build_coordination_or_503():
         try:
-            relaunched = await manager.relaunch_preview(db, user, body.project_id, sandbox)
+            app_id = await manager.relaunch_preview(db, user, body.project_id, sandbox)
         except BuildSessionConflictError:
             # This project's own work is running — relaunch never pre-empts it (409). A
             # DIFFERENT project of theirs never reaches here: that is a switch, and it starts.
@@ -285,8 +285,8 @@ async def relaunch_preview(
             # A colleague's shared view holds the one slot, and it has no hand-over.
             return reclaim_blocked_response(exc)
         except NoSnapshotToRelaunchError as exc:
-            # Confirmed-absent (or vanished) snapshot: nothing to relaunch, and there is no
-            # blank-template fallback (an empty app is not a preview of the user's work). 404.
+            # Confirmed-absent snapshot: nothing to relaunch, and there is no blank-template
+            # fallback (an empty app is not a preview of the user's work). 404.
             #
             # CODED, because this route answers 404 for TWO unrelated reasons and a client has to
             # tell them apart. `owned_project_or_404` fails a deleted or someone else's project
@@ -301,31 +301,14 @@ async def relaunch_preview(
                 code="no_saved_build",
             ) from exc
         except (SnapshotUnavailableError, SandboxUnreachableError, SandboxError) as exc:
-            # Transient/unknown snapshot state, a restore that failed every attempt, or the dev
-            # server not coming ready — the saved version is intact; a retry is the way forward.
-            #
-            # `SandboxUnreachableError` IS THIS ANSWER, and it is named here rather than left to
-            # fall through as a 500. The attach fork now refuses on it instead of restoring: the
-            # registry says a container is live, the attach could not confirm anything, and the
-            # honest reply is "we could not tell" — which is precisely what this arm already
-            # says. It is NOT a `SandboxError` (it is a `NoLiveSandboxError` subclass), so
-            # listing it is the only way it reaches this message rather than an unhandled 500.
+            # An unreadable snapshot, or a container the registry names that the attach could
+            # not confirm either way — the saved version is intact; a retry is the way forward.
+            # `SandboxUnreachableError` is a `NoLiveSandboxError`, not a `SandboxError`, so it
+            # is named here or it falls through as a 500.
             raise AppApiError(
                 status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG
             ) from exc
-        return RelaunchPreviewResponse(
-            app_id=relaunched.app_id,
-            preview_url=relaunched.preview_url,
-            # PROVISIONING, not READY, when the app is not serving yet: `status` is the field an
-            # older client reads, and telling it READY over a page that has not answered is the
-            # dishonesty this whole branch has been unwinding. The URL still ships — see the
-            # fail-open note on `relaunch_preview`.
-            status=(
-                BuildSessionStatus.READY if relaunched.ready else BuildSessionStatus.PROVISIONING
-            ),
-            restored_from_failed_build=relaunched.restored_from_failed_build,
-            ready=relaunched.ready,
-        )
+        return RelaunchPreviewResponse(app_id=app_id)
     raise _coordination_is_gone()
 
 

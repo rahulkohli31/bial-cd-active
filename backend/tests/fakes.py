@@ -13,6 +13,7 @@ tests of code that is still live. See the section comment there.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import uuid
 from collections.abc import Callable, Mapping
@@ -30,6 +31,7 @@ from src.core.connectors import CONNECTORS, ConnectedSystem, ResolvedWindow
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.project_connector import ConnectorWindowKind
+from src.services.build_sessions.manager import SessionManager
 from src.services.build_sessions.outcome import (
     FORCE_ENDED,
     IDLE_TEARDOWN,
@@ -564,6 +566,13 @@ class DevServerDownUntilStarted(FakeSandboxClient):
         return DevStatus(running=up, ready=up, port=3000, root_status=200 if up else None)
 
 
+async def detached_work_done(manager: SessionManager) -> None:
+    """Wait out everything the manager has detached — a start's slow half, its watch for a first
+    page, a compensation — including whatever those spawn while being waited on."""
+    while manager._tasks:
+        await asyncio.gather(*list(manager._tasks), return_exceptions=True)
+
+
 # ── Writers re-hosted from `src/`, where nothing calls them any more ──────────
 #
 # `BuildDeps`, `write_build_started` and `write_build_outcome` were all in `src/` until their
@@ -599,7 +608,7 @@ async def write_legacy_build_started(
 
     THE PRODUCTION WRITER IS DELETED and this is deliberately not a re-implementation for its own
     sake: rows of this shape are PERMANENT in the production transcript, the projection still
-    reads them (`BuildInProgressItem`), and `newest_build_outcome_status` still has to skip them.
+    reads them (`BuildInProgressItem`), and the outcome idempotency probe still has to skip them.
     Those readers are live and must stay tested against a faithful row rather than a hand-built
     dict that can drift from what is actually in the database.
 

@@ -16,12 +16,7 @@ import { authFetch } from './api'
 import { asCompileState } from './compileState'
 import type { CompileState } from './compileState'
 import { getCsrfToken } from './auth'
-import type {
-  BuildSessionStatus,
-  RelaunchPreviewRequest,
-  RelaunchPreviewResponse,
-  SharedPreviewResponse,
-} from './buildSessionTypes'
+import type { RelaunchPreviewRequest, SharedPreviewResponse } from './buildSessionTypes'
 
 /**
  * The dep bundle `authFetch` accepts, injectable so tests need no real network.
@@ -48,41 +43,6 @@ export class BuildSessionAlreadyActiveError extends ApiError {
   constructor(message: string) {
     super(message, 409, 'build_session_already_active')
     this.name = 'BuildSessionAlreadyActiveError'
-  }
-}
-
-// ─── narrowing helpers (parse untrusted responses at the boundary) ───────────
-
-function asString(value: unknown): string {
-  return typeof value === 'string' ? value : ''
-}
-
-/** A status we don't recognize is unusable — fail closed rather than let the UI render an undefined lifecycle. */
-function toBuildSessionStatus(value: unknown): BuildSessionStatus {
-  if (
-    value === 'provisioning' ||
-    value === 'building' ||
-    value === 'ready' ||
-    value === 'ended' ||
-    value === 'failed'
-  ) {
-    return value
-  }
-  throw new ApiError('The server returned a build session we could not read.', 500)
-}
-
-function toRelaunchPreviewResponse(value: unknown): RelaunchPreviewResponse {
-  if (!isRecord(value)) throw new ApiError('The server returned a preview we could not read.', 500)
-  return {
-    appId: asString(value.appId),
-    previewUrl: asString(value.previewUrl),
-    status: toBuildSessionStatus(value.status),
-    // Absent/malformed reads as false — the label is an honesty aid, never a gate.
-    restoredFromFailedBuild: value.restoredFromFailedBuild === true,
-    // Absent reads as TRUE, unlike the flag above, and the asymmetry is deliberate: this field is
-    // new, and every server that predates it only ever answered once the app was serving. Reading
-    // a missing value as `false` would put a permanent "not ready yet" on those correct responses.
-    ready: value.ready !== false,
   }
 }
 
@@ -154,17 +114,18 @@ async function postJson(url: string, body: unknown, fallback: string, deps: Auth
 // transaction. The ROUTE is untouched; deleting a browser client says nothing about it.
 
 /**
- * `relaunch` — restore a project's saved app into a fresh, ready sandbox and get its live URL.
- * A mutating POST (carries CSRF). Project-scoped, not session-scoped: the torn-down session is gone.
- * `postJson` already turns a `409 build_session_already_active` into `BuildSessionAlreadyActiveError`
- * (a build is running); 404 = nothing to relaunch, 503 = transient/retryable.
+ * `relaunch` — start a project's saved app. Resolves once the server has ADMITTED the start (202);
+ * the app comes up afterwards, and the preview-state poll is what reports it — `starting`, then
+ * `alive` with the address to frame. Nothing in the answer is read, so nothing is parsed.
+ * A mutating POST (carries CSRF). `postJson` already turns a `409 build_session_already_active` into
+ * `BuildSessionAlreadyActiveError` (a build is running); 404 = nothing to relaunch, 503 =
+ * transient/retryable.
  */
 export async function relaunchPreview(
   args: RelaunchPreviewRequest,
   deps: AuthFetchDeps = {},
-): Promise<RelaunchPreviewResponse> {
-  const body = await postJson(`${BASE}/relaunch`, { projectId: args.projectId }, 'Failed to relaunch the preview', deps)
-  return toRelaunchPreviewResponse(body)
+): Promise<void> {
+  await postJson(`${BASE}/relaunch`, { projectId: args.projectId }, 'Failed to relaunch the preview', deps)
 }
 
 // ─── lock operations — THERE ARE NONE LEFT ─────────────────────────────────

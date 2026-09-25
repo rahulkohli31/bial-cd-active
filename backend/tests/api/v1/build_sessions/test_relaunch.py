@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import json
 import uuid
 from collections.abc import AsyncIterator
@@ -27,11 +26,9 @@ from src.api.v1.build_sessions.deps import (
 )
 from src.api.v1.build_sessions.schemas import (
     SURFACE_PRESENT_STAY_SECONDS,
-    BuildSessionStatus,
 )
 from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
-from src.db.models.conversation import ChatKind
 from src.db.models.harness_counter import HarnessCount, HarnessCounter
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
@@ -51,7 +48,6 @@ from src.services.sandbox.base import (
     SandboxError,
     SandboxGoneError,
     SandboxHandle,
-    SandboxNotReadyError,
 )
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
@@ -62,8 +58,8 @@ from tests.api.v1.build_sessions.conftest import (
     seed_live_sandbox_state,
 )
 from tests.conftest import forget_every_harness_count
-from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import a_git_bundle, write_build_outcome
+from tests.factories import ProjectFactory, UserFactory
+from tests.fakes import a_git_bundle, detached_work_done
 
 
 async def _user_project(db: AsyncSession, email: str):
@@ -89,24 +85,24 @@ async def _seed_worked_on(store, app_id: uuid.UUID) -> None:
     store.mtimes[key] = datetime.now(UTC)
 
 
-async def test_relaunch_happy_returns_200_ready_preview(
+async def test_relaunch_is_accepted_and_the_poll_reports_the_app(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
+    """The start answers 202 with the app it admitted and nothing else: whether the app is up,
+    and where, is the preview-state poll's to say, and saying it twice is how two readers came
+    to disagree about one container."""
     user, project = await _user_project(db_session, "rl1@rvaiglobal.com")
     app_id = await _seed_snapshot(db_session, user, project, fake_storage)
 
-    resp = await client.post(
-        "/v1/build-sessions/relaunch",
-        json={"projectId": str(project.id)},
-        headers=auth_headers(user),
-    )
+    resp = await _relaunch(client, user, project, wire.manager)
 
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["appId"] == str(app_id)
-    assert body["status"] == "ready"
-    assert body["previewUrl"].startswith("https://")
-    assert body["restoredFromFailedBuild"] is False
+    assert resp.status_code == 202
+    assert resp.json() == {"appId": str(app_id)}
+    polled = await client.get(
+        f"/v1/build-sessions/projects/{project.id}/preview-state", headers=auth_headers(user)
+    )
+    assert polled.json()["state"] == "alive"
+    assert polled.json()["previewUrl"].startswith("https://")
     # Relaunch does NOT occupy the build slot: the lock is free and no session is live.
     assert wire.manager._active_by_user == {}
     assert await lock_is_held(fake_redis, user.id) is False
@@ -128,12 +124,8 @@ async def test_a_served_preview_is_handed_to_the_screen_that_asked_for_it(
     await _seed_snapshot(db_session, user, project, fake_storage)
     before = datetime.now(UTC)
 
-    resp = await client.post(
-        "/v1/build-sessions/relaunch",
-        json={"projectId": str(project.id)},
-        headers=auth_headers(user),
-    )
-    assert resp.status_code == 200
+    resp = await _relaunch(client, user, project, wire.manager)
+    assert resp.status_code == 202
 
     raw = await fake_redis.hmget(
         registry_key(user.id),
@@ -143,34 +135,6 @@ async def test_a_served_preview_is_handed_to_the_screen_that_asked_for_it(
     assert (writer.decode() if isinstance(writer, bytes) else str(writer)) == "surface_present"
     stay = datetime.fromisoformat(stamp.decode() if isinstance(stamp, bytes) else str(stamp))
     assert stay - before <= timedelta(seconds=SURFACE_PRESENT_STAY_SECONDS + 5)
-
-
-async def test_relaunch_after_failed_build_signals_last_saved_version(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
-) -> None:
-    user, project = await _user_project(db_session, "rl6@rvaiglobal.com")
-    await _seed_snapshot(db_session, user, project, fake_storage)
-    conv = await ConversationFactory.create(
-        db_session, user.id, project_id=project.id, kind=ChatKind.BUILD
-    )
-    await write_build_outcome(
-        db_session,
-        user_id=user.id,
-        conversation_id=conv.id,
-        session_id=uuid.uuid4(),
-        status=BuildSessionStatus.FAILED,
-        preview_url=None,
-        snapshot_committed=True,
-        reason="build_failed",
-    )
-
-    resp = await client.post(
-        "/v1/build-sessions/relaunch",
-        json={"projectId": str(project.id)},
-        headers=auth_headers(user),
-    )
-    assert resp.status_code == 200
-    assert resp.json()["restoredFromFailedBuild"] is True
 
 
 async def test_relaunch_without_snapshot_is_404(
@@ -204,9 +168,9 @@ async def test_relaunch_while_a_build_is_running_is_409(
 
     Re-fixtured onto `a_live_session`. The slot has to be genuinely OCCUPIED for this to prove
     anything, and relaunch provably cannot occupy it itself — asserted directly by
-    `test_relaunch_happy_returns_200_ready_preview`: `_active_by_user == {}` — so the occupant
-    comes from `ensure_sandbox`, the only allocator left that claims the slot. Same project as
-    the relaunch, which is what earns the BARE conflict rather than the hand-over 409
+    `test_relaunch_is_accepted_and_the_poll_reports_the_app`: `_active_by_user == {}` — so the
+    occupant comes from `ensure_sandbox`, the only allocator left that claims the slot. Same
+    project as the relaunch, which is what earns the BARE conflict rather than the hand-over 409
     (`_slot_conflict_for`)."""
     user, project = await _user_project(db_session, "rl3@rvaiglobal.com")
     await _seed_snapshot(db_session, user, project, fake_storage)
@@ -323,13 +287,8 @@ async def test_relaunch_reaps_through_anothers_dead_residue_at_the_acquire_seam(
     await _seed_snapshot(db_session, user, project, fake_storage)
     await seed_live_sandbox_state(fake_redis, user.id)
 
-    resp = await client.post(
-        "/v1/build-sessions/relaunch",
-        json={"projectId": str(project.id)},
-        headers=auth_headers(user),
-    )
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "ready"
+    resp = await _relaunch(client, user, project, wire.manager)
+    assert resp.status_code == 202
     assert wire.sbx.restored != []
 
 
@@ -518,12 +477,15 @@ def handed_over(monkeypatch: pytest.MonkeyPatch) -> list[object]:
     return spawned
 
 
-async def _relaunch(client: AsyncClient, user, project) -> httpx.Response:
-    return await client.post(
+async def _relaunch(client: AsyncClient, user, project, manager: SessionManager) -> httpx.Response:
+    """One press, with everything the start detached waited out before the caller asserts."""
+    resp = await client.post(
         "/v1/build-sessions/relaunch",
         json={"projectId": str(project.id)},
         headers=auth_headers(user),
     )
+    await detached_work_done(manager)
+    return resp
 
 
 async def test_a_relaunch_onto_a_live_healthy_container_touches_no_aca_lifecycle(
@@ -536,14 +498,14 @@ async def test_a_relaunch_onto_a_live_healthy_container_touches_no_aca_lifecycle
     user, project = await _user_project(db_session, "rl-attach@rvaiglobal.com")
     app_id = await _seed_snapshot(db_session, user, project, fake_storage)
 
-    cold = await _relaunch(client, user, project)
-    assert cold.status_code == 200
+    cold = await _relaunch(client, user, project, aca_wire.manager)
+    assert cold.status_code == 202
     assert aca_wire.aca.create_calls == [app_name_for(app_id)]
     assert aca_wire.aca.delete_calls == []
 
-    warm = await _relaunch(client, user, project)
+    warm = await _relaunch(client, user, project, aca_wire.manager)
 
-    assert warm.status_code == 200
+    assert warm.status_code == 202
     assert aca_wire.aca.delete_calls == []
     assert aca_wire.aca.create_calls == [app_name_for(app_id)]
 
@@ -551,22 +513,19 @@ async def test_a_relaunch_onto_a_live_healthy_container_touches_no_aca_lifecycle
 async def test_the_warm_relaunch_attaches_to_the_pre_existing_container(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
 ) -> None:
-    """Every app is served from one public hostname under a key derived from the app id, so
-    `previewUrl` is IDENTICAL for a reuse and for a rebuild: the create-call count is the only
+    """Every app is served from one public hostname under a key derived from the app id, so the
+    preview URL is IDENTICAL for a reuse and for a rebuild: the create-call count is the only
     falsifiable proof here, and asserting the URL alone would be a tautology."""
     user, project = await _user_project(db_session, "rl-attach-fqdn@rvaiglobal.com")
-    app_id = await _seed_snapshot(db_session, user, project, fake_storage)
+    await _seed_snapshot(db_session, user, project, fake_storage)
 
-    cold = await _relaunch(client, user, project)
+    assert (await _relaunch(client, user, project, aca_wire.manager)).status_code == 202
     creates_after_cold = list(aca_wire.aca.create_calls)
-    warm = await _relaunch(client, user, project)
+    assert (await _relaunch(client, user, project, aca_wire.manager)).status_code == 202
 
     assert aca_wire.aca.create_calls == creates_after_cold, (
         "the warm relaunch attached; a rebuild would have appended another create"
     )
-    expected = f"https://citizenapps.bialairport.com/a/{app_name_for(app_id)}"
-    assert cold.json()["previewUrl"] == expected
-    assert warm.json()["previewUrl"] == expected
 
 
 async def test_a_registry_naming_a_different_app_is_a_switch_not_a_refusal(
@@ -578,7 +537,7 @@ async def test_a_registry_naming_a_different_app_is_a_switch_not_a_refusal(
     handed_over: list[object],
 ) -> None:
     """Pressing start on a second project used to answer 409 `sandbox_reclaim_blocked` naming
-    the first. It answers 200 and starts, and the outgoing container leaves by the hand-over.
+    the first. It is admitted and starts, and the outgoing container leaves by the hand-over.
 
     THE DELETE COUNT IS THE ASSERTION WITH TEETH. Two parties aimed at one container is the
     failure this whole design is built around, so the start must issue no ARM delete at all —
@@ -589,10 +548,10 @@ async def test_a_registry_naming_a_different_app_is_a_switch_not_a_refusal(
     app_b = await _seed_snapshot(db_session, user, project_b, fake_storage)
     await _seed_worked_on(fake_storage, app_a)
 
-    assert (await _relaunch(client, user, project_a)).status_code == 200
-    resp = await _relaunch(client, user, project_b)
+    assert (await _relaunch(client, user, project_a, aca_wire.manager)).status_code == 202
+    resp = await _relaunch(client, user, project_b, aca_wire.manager)
 
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     assert resp.json()["appId"] == str(app_b)
     assert aca_wire.aca.delete_calls == []
     assert aca_wire.aca.create_calls == [app_name_for(app_a), app_name_for(app_b)]
@@ -605,12 +564,12 @@ async def test_a_registry_marked_ending_is_never_attached_to(
     user, project = await _user_project(db_session, "rl-ending@rvaiglobal.com")
     app_id = await _seed_snapshot(db_session, user, project, fake_storage)
 
-    assert (await _relaunch(client, user, project)).status_code == 200
+    assert (await _relaunch(client, user, project, aca_wire.manager)).status_code == 202
     await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_STATE, REGISTRY_STATE_ENDING)
 
-    resp = await _relaunch(client, user, project)
+    resp = await _relaunch(client, user, project, aca_wire.manager)
 
-    assert resp.status_code == 200
+    assert resp.status_code == 202
     name = app_name_for(app_id)
     assert aca_wire.aca.delete_calls == [name]
     assert aca_wire.aca.create_calls == [name, name]
@@ -622,12 +581,12 @@ async def test_no_registry_at_all_still_takes_the_restore_arm(
     user, project = await _user_project(db_session, "rl-noreg@rvaiglobal.com")
     app_id = await _seed_snapshot(db_session, user, project, fake_storage)
 
-    assert (await _relaunch(client, user, project)).status_code == 200
+    assert (await _relaunch(client, user, project, aca_wire.manager)).status_code == 202
     await fake_redis.delete(registry_key(user.id))
 
-    resp = await _relaunch(client, user, project)
+    resp = await _relaunch(client, user, project, aca_wire.manager)
 
-    assert resp.status_code == 200
+    assert resp.status_code == 202
     assert aca_wire.aca.create_calls == [app_name_for(app_id), app_name_for(app_id)]
 
 
@@ -637,17 +596,15 @@ async def test_a_control_plane_restart_reattaches_instead_of_rebuilding_the_cont
     user, project = await _user_project(db_session, "rl-restart@rvaiglobal.com")
     app_id = await _seed_snapshot(db_session, user, project, fake_storage)
 
-    first = await _relaunch(client, user, project)
-    assert first.status_code == 200
+    assert (await _relaunch(client, user, project, aca_wire.manager)).status_code == 202
     aca_wire.sandbox._token_refs.clear()  # what a control-plane restart leaves behind
 
-    resp = await _relaunch(client, user, project)
+    resp = await _relaunch(client, user, project, aca_wire.manager)
 
-    assert resp.status_code == 200
+    assert resp.status_code == 202
     name = app_name_for(app_id)
     assert aca_wire.aca.delete_calls == [], "a restart must not destroy a live container"
     assert aca_wire.aca.create_calls == [name], "…nor build a replacement over the citizen's tree"
-    assert resp.json()["previewUrl"] == first.json()["previewUrl"]
 
 
 async def test_a_relaunch_with_no_snapshot_creates_no_container_at_all(
@@ -655,40 +612,28 @@ async def test_a_relaunch_with_no_snapshot_creates_no_container_at_all(
 ) -> None:
     user, project = await _user_project(db_session, "rl-nosnap-aca@rvaiglobal.com")
 
-    resp = await _relaunch(client, user, project)
+    resp = await _relaunch(client, user, project, aca_wire.manager)
 
     assert resp.status_code == 404
     assert aca_wire.aca.create_calls == []
     assert aca_wire.aca.delete_calls == []
 
 
-async def test_an_unowned_server_409_after_attach_still_returns_200_and_deletes_nothing(
+async def test_an_unowned_server_409_after_attach_is_still_admitted_and_deletes_nothing(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
 ) -> None:
     user, project = await _user_project(db_session, "rl-409@rvaiglobal.com")
     app_id = await _seed_snapshot(db_session, user, project, fake_storage)
 
-    assert (await _relaunch(client, user, project)).status_code == 200
+    assert (await _relaunch(client, user, project, aca_wire.manager)).status_code == 202
     aca_wire.sup.dev_start_status = 409  # something is already serving on the dev port...
     aca_wire.sup.dev_running = False  # ...and it is not the supervisor's child
 
-    resp = await _relaunch(client, user, project)
+    resp = await _relaunch(client, user, project, aca_wire.manager)
 
-    assert resp.status_code == 200
+    assert resp.status_code == 202
     assert aca_wire.aca.delete_calls == []
     assert aca_wire.aca.create_calls == [app_name_for(app_id)]
-
-
-async def _drain_the_watchers(manager: SessionManager) -> None:
-    """Run the detached first-serve continuation to completion.
-
-    Duplicated from `test_preview_state.py` rather than shared through the package conftest, and
-    deliberately: this lane's assertions are ACA call counts, so what the continuation must not
-    do here — issue a delete of its own — is a claim about this file's fixtures and belongs
-    beside them."""
-    for task in list(manager._tasks):
-        with contextlib.suppress(Exception):
-            await task
 
 
 async def test_a_cold_relaunch_whose_root_shows_no_page_deletes_nothing_from_aca(
@@ -699,7 +644,7 @@ async def test_a_cold_relaunch_whose_root_shows_no_page_deletes_nothing_from_aca
     aca_wire,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """★ THE REGRESSION, PINNED WHERE DESTRUCTION IS ACTUALLY OBSERVABLE. A 200 from this route
+    """★ THE REGRESSION, PINNED WHERE DESTRUCTION IS ACTUALLY OBSERVABLE. A 202 from this route
     says nothing about whether a container was destroyed — `restore_from_snapshot` issues its own
     teardown from INSIDE the client, so only the recording control plane can see it. This is the
     composition in which "the container survived" is a falsifiable claim.
@@ -707,11 +652,10 @@ async def test_a_cold_relaunch_whose_root_shows_no_page_deletes_nothing_from_aca
     The shape: a cold relaunch restores the citizen's tree, the dev server comes up, and the app
     root answers 404 because the agent has not written `app/page.tsx` yet. The container is up and
     holds the work. Answering that with a raise escapes the lock scope before `scope.spare()`, so
-    compensation tears down the container that has just been built and the citizen gets a 503 over
-    their own workspace.
+    compensation tears down the container that has just been built.
 
-    Mutation-check: raise `SandboxNotReadyError` from the page-less arm instead of retracting, and
-    this goes red on the status code with a delete recorded against the app it just created."""
+    Mutation-check: raise from `_retract_a_proof_it_cannot_back` when the root shows no page, and
+    this goes red with a delete recorded against the app it just created."""
     monkeypatch.setattr(manager_mod, "_COLD_READY_BUDGET_SECONDS", 0.0)
     monkeypatch.setattr(manager_mod, "READINESS_POLL_S", 0)
     user, project = await _user_project(db_session, "rl-no-page@rvaiglobal.com")
@@ -721,16 +665,15 @@ async def test_a_cold_relaunch_whose_root_shows_no_page_deletes_nothing_from_aca
     # to show. Script them apart and the two questions collapse into one.
     aca_wire.sup.root_status = 404
 
-    resp = await _relaunch(client, user, project)
+    resp = await _relaunch(client, user, project, aca_wire.manager)
 
-    assert resp.status_code == 200, "the citizen got an error over a container that is up"
-    assert resp.json()["ready"] is False, "a 404 root was reported as a running app"
-    assert resp.json()["previewUrl"], "the URL is framable the moment a page exists"
+    assert resp.status_code == 202
     assert aca_wire.aca.delete_calls == [], "the restored container was destroyed over a 404"
     assert aca_wire.aca.create_calls == [app_name_for(app_id)], "guard the premise: it was cold"
-
-    await _drain_the_watchers(aca_wire.manager)
-    assert aca_wire.aca.delete_calls == [], "the continuation is an observer, never an executioner"
+    polled = await client.get(
+        f"/v1/build-sessions/projects/{project.id}/preview-state", headers=auth_headers(user)
+    )
+    assert polled.json()["state"] == "starting", "a 404 root was reported as a running app"
 
 
 # --- the release route, and the refusal it exists to resolve -------------------------
@@ -754,14 +697,14 @@ async def test_release_gives_up_the_container_on_the_spot(
     app_b = await _seed_snapshot(db_session, user, project_b, fake_storage)
     await _seed_worked_on(fake_storage, app_a)
 
-    assert (await _relaunch(client, user, project_a)).status_code == 200
+    assert (await _relaunch(client, user, project_a, aca_wire.manager)).status_code == 202
 
     released = await _release(client, user, project_a)
 
     assert released.status_code == 200
     assert released.json()["released"] is True
     assert aca_wire.aca.delete_calls == [app_name_for(app_a)]
-    assert (await _relaunch(client, user, project_b)).status_code == 200
+    assert (await _relaunch(client, user, project_b, aca_wire.manager)).status_code == 202
     assert app_name_for(app_b) in aca_wire.aca.create_calls
 
 
@@ -794,7 +737,7 @@ async def test_a_teardown_that_fails_is_a_503_not_a_reported_success(
     user, project_a = await _user_project(db_session, "rl-release-fail@rvaiglobal.com")
     app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
     await _seed_worked_on(fake_storage, app_a)
-    assert (await _relaunch(client, user, project_a)).status_code == 200
+    assert (await _relaunch(client, user, project_a, aca_wire.manager)).status_code == 202
 
     async def throttled(*, name: str) -> None:
         aca_wire.aca.delete_calls.append(name)
@@ -835,7 +778,7 @@ async def test_preview_state_says_gone_when_another_project_took_the_workspace(
     await _seed_snapshot(db_session, user, project_a, fake_storage)
     await _seed_snapshot(db_session, user, project_b, fake_storage)
 
-    assert (await _relaunch(client, user, project_a)).status_code == 200
+    assert (await _relaunch(client, user, project_a, aca_wire.manager)).status_code == 202
     alive = await client.get(
         f"/v1/build-sessions/projects/{project_a.id}/preview-state", headers=auth_headers(user)
     )
@@ -920,7 +863,7 @@ async def test_a_cold_relaunch_records_the_press_the_arrival_and_the_wait(
     user, project = await _user_project(db_session, "rl-count-cold@rvaiglobal.com")
     app_id = await _seed_snapshot(db_session, user, project, fake_storage)
 
-    assert (await _relaunch(client, user, project)).status_code == 200
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
     assert await _counter_values(HarnessCounter.APP_START_ATTEMPTED) == [1]
     assert await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING) == [1]
@@ -943,34 +886,36 @@ async def test_the_attach_arm_records_the_press_and_the_arrival_but_no_duration(
     aca_wire,
     empty_harness_counts,
 ) -> None:
-    """A 15-second attach budget and a 120-second cold budget averaged together produce a
-    number that describes neither, so only the restore arm writes a duration."""
+    """The attach arm restored nothing, so only the restore arm writes a duration: folding the
+    attach arm's near-instant readings in would make the number describe neither."""
     user, project = await _user_project(db_session, "rl-count-attach@rvaiglobal.com")
     await _seed_snapshot(db_session, user, project, fake_storage)
 
-    assert (await _relaunch(client, user, project)).status_code == 200
-    assert (await _relaunch(client, user, project)).status_code == 200
+    assert (await _relaunch(client, user, project, aca_wire.manager)).status_code == 202
+    assert (await _relaunch(client, user, project, aca_wire.manager)).status_code == 202
 
     assert len(await _counter_values(HarnessCounter.APP_START_ATTEMPTED)) == 2
     assert len(await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING)) == 2
     assert len(await _counter_values(HarnessCounter.APP_COLD_START_MS)) == 1
 
 
-async def test_an_attach_that_fails_open_unready_is_a_press_that_never_arrived(
+async def test_an_attach_that_shows_no_page_is_a_press_that_never_arrived(
     client: AsyncClient,
     db_session: AsyncSession,
     fake_redis,
     fake_storage,
     wire,
     empty_harness_counts,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Mutation check: move the reached-running emit out from under `if ready:` and this goes red.
+    # Mutation check: count the arrival whatever the watch answered and this goes red.
+    monkeypatch.setattr(manager_mod, "_COLD_READY_BUDGET_SECONDS", 0.0)
     user, project = await _user_project(db_session, "rl-count-unready@rvaiglobal.com")
     app_id = await _seed_snapshot(db_session, user, project, fake_storage)
 
     # A cold relaunch first, so the registry names THIS app and the second press below actually
     # takes the attach arm rather than building again.
-    assert (await _relaunch(client, user, project)).status_code == 200
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
     wire.sbx.attach_handle = SandboxHandle(
         fqdn="live.example",
         token="tok",
@@ -979,12 +924,9 @@ async def test_an_attach_that_fails_open_unready_is_a_press_that_never_arrived(
         ready=True,
     )
 
-    async def the_dev_server_never_answers(handle, *, timeout_s: float = 120.0):
-        raise SandboxNotReadyError("the app root never served")
+    wire.sbx.root_status = 404
 
-    wire.sbx.wait_ready = the_dev_server_never_answers
-
-    assert (await _relaunch(client, user, project)).status_code == 200
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
     assert len(await _counter_values(HarnessCounter.APP_START_ATTEMPTED)) == 2
     assert len(await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING)) == 1
@@ -1014,7 +956,7 @@ async def test_a_press_refused_by_the_one_slot_conflict_still_counts_as_a_press(
 
     await a_live_session(wire, db_session, user, project.id)
 
-    assert (await _relaunch(client, user, project)).status_code == 409
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 409
 
     assert await _counter_values(HarnessCounter.APP_START_ATTEMPTED) == [1]
     assert await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING) == []
@@ -1040,8 +982,8 @@ async def test_a_press_that_switches_projects_counts_as_a_press_that_arrived(
     await _seed_snapshot(db_session, user, project_b, fake_storage)
     await _seed_worked_on(fake_storage, app_a)
 
-    assert (await _relaunch(client, user, project_a)).status_code == 200
-    assert (await _relaunch(client, user, project_b)).status_code == 200
+    assert (await _relaunch(client, user, project_a, aca_wire.manager)).status_code == 202
+    assert (await _relaunch(client, user, project_b, aca_wire.manager)).status_code == 202
 
     assert len(await _counter_values(HarnessCounter.APP_START_ATTEMPTED)) == 2
     assert len(await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING)) == 2
@@ -1058,7 +1000,7 @@ async def test_a_press_with_nothing_to_restore_still_counts_as_a_press(
 ) -> None:
     user, project = await _user_project(db_session, "rl-count-404@rvaiglobal.com")
 
-    assert (await _relaunch(client, user, project)).status_code == 404
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 404
 
     assert await _counter_values(HarnessCounter.APP_START_ATTEMPTED) == [1]
     assert await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING) == []
@@ -1081,7 +1023,7 @@ async def test_a_relaunch_that_dies_after_the_arm_is_chosen_records_no_arrival(
 
     wire.sbx.dev_start = the_dev_server_will_not_start
 
-    assert (await _relaunch(client, user, project)).status_code != 200
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
     assert await _counter_values(HarnessCounter.APP_START_ATTEMPTED) == [1]
     assert await _counter_values(HarnessCounter.APP_START_REACHED_RUNNING) == []
@@ -1102,7 +1044,7 @@ async def test_the_cold_clock_times_the_restore_not_the_whole_request(
 
     # A cold relaunch first, so the registry names this app and the slow attach below is
     # actually MADE rather than skipped by the registry check.
-    assert (await _relaunch(client, user, project)).status_code == 200
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
     await forget_every_harness_count()
 
     slow_attach_seconds = 1.0
@@ -1113,7 +1055,7 @@ async def test_the_cold_clock_times_the_restore_not_the_whole_request(
 
     wire.sbx.attach_existing = a_slow_goodbye
 
-    assert (await _relaunch(client, user, project)).status_code == 200
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
     cold = await _counter_values(HarnessCounter.APP_COLD_START_MS)
     assert len(cold) == 1
