@@ -2925,8 +2925,8 @@ class SessionManager:
                     # the platform reads what it writes, so no start may wait on it or be lost
                     # to it.
                     schedule_window_copy(user_id, project_id)
-                    # The registry exists from this instant, and a slow restore can outlive the
-                    # starting marker that was sparing it.
+                    # A slow restore can outlive the starting marker that was sparing it, and
+                    # from here the stay is what spares the container until the start settles.
                     await grant_stay_of_execution(
                         redis, user_id, writer=DeadlineWriter.BUILDER_ACTED
                     )
