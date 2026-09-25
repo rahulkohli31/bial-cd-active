@@ -55,8 +55,8 @@ RELAUNCH_PREVIEW_STAY_SECONDS = 1800  # 30 min
 # --- The wall-clock liveness lease (sandbox key family 4) --------------------
 # A build in flight renews `bial:{env}:sandbox:lease:{user_id}` on the cadence below, and
 # the reconciliation sweep reads it. It is the one signal that means a turn is live:
-# `sweep_all`'s `live_users` is in-process and empty everywhere else, and the lock and the
-# heartbeat above are also written by starts that run no turn.
+# `sweep_all`'s `live_users` is in-process and empty everywhere else, and the lock above is
+# also taken by starts that run no turn.
 #
 # The TTL is MANDATORY, not a default. The registry hash's own missing TTL is exactly the
 # mistake a lease must not repeat: one that never expires is a container that can never be

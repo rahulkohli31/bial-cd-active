@@ -1449,9 +1449,6 @@ class SessionManager:
                     "starting marker clear failed on clean exit; its TTL will expire it",
                     user_id=str(user_id),
                 )
-            # Two tests in `test_manager.py` pin the release-inside-the-protected-region rule
-            # the docstring states — `test_relaunch_spares_the_container_when_
-            # the_lock_release_hits_a_redis_error` and its `..._heartbeat_seed_...` twin.
             if not scope.adopted:
                 await release_lock_as_holder(redis, user_id, token)
         except BaseException:
@@ -2871,8 +2868,8 @@ class SessionManager:
         app_id: uuid.UUID,
         env: dict[str, str] | None,
     ) -> SandboxHandle:
-        """Restore when `env` is given, then start the dev server, hand the container its stay
-        and heartbeat, and let both locks go. Returns the handle the watch reads."""
+        """Restore when `env` is given, then start the dev server, hand the container its stay,
+        and let both locks go. Returns the handle the watch reads."""
         app_name = app_name_for(app_id)
         attached = env is None
         async with held:
@@ -2883,8 +2880,8 @@ class SessionManager:
                 # A birth, so the connector copy fires, detached and unawaited: nothing on the
                 # platform reads what it writes, so no start may wait on it or be lost to it.
                 schedule_window_copy(user_id, project_id)
-                # Now, before anything slow: the registry exists from this instant, and a lock
-                # held with no heartbeat yet is reapable by a concurrent sweep.
+                # The registry exists from this instant, and a slow restore can outlive the
+                # starting marker that was sparing it.
                 await grant_stay_of_execution(redis, user_id, writer=DeadlineWriter.BUILDER_ACTED)
             assert scope.handle is not None
             handle = scope.handle
@@ -2909,9 +2906,6 @@ class SessionManager:
             scope.spare()
             if attached:
                 await grant_stay_of_execution(redis, user_id, writer=DeadlineWriter.BUILDER_ACTED)
-            # Inside the protected region: a relaunch never enters `_active_by_user`, so no
-            # turn-end sequence ever runs for it.
-            await write_heartbeat(redis, user_id)
             # Settled rather than re-granted: provisioning is over, and the screen framing the
             # app renews its own stay from here.
             await settle_stay_once_the_app_is_serving(redis, user_id, app_name=app_name)
@@ -3083,10 +3077,8 @@ class SessionManager:
                         raise NoSnapshotToRelaunchError(owner_app_id) from exc
                     # THE RESTORE ARM'S LEASE STARTS HERE, before the wait, for the identical
                     # reason `_up_under_the_locks` grants one at this exact point:
-                    # `_restore_or_bust` has already written the registry hash, so from this
-                    # instant the sweep can see lock-held-without-a-heartbeat, which
-                    # `reconcile_user`'s AND is happy to reap. Nothing else protects a
-                    # freshly-restored container until the heartbeat below.
+                    # `_restore_or_bust` has already written the registry hash, and a slow
+                    # restore can outlive the starting marker that was sparing it.
                     await grant_stay_of_execution(
                         redis, recipient.id, writer=DeadlineWriter.BUILDER_ACTED
                     )
@@ -3144,13 +3136,6 @@ class SessionManager:
                     # not: this view is framed the moment the response lands.
                     await sandbox_client.someone_has_to_go_first(handle)
                 preview_url = handle.preview_url
-                # Seeded INSIDE the protected region for the same reason a relaunch seeds one:
-                # a failure past this point tears the container down rather than 500ing with
-                # a live container behind a held lock. Nothing RENEWS this
-                # heartbeat afterward — the stay of execution above (and
-                # `reaper.py`'s traffic-based renewal of it) is what actually owns this
-                # container's lifetime from here on.
-                await write_heartbeat(redis, recipient.id)
                 # …and the FINAL re-grant, re-basing the reprieve on the instant the preview
                 # actually became viewable rather than the instant either arm merely attempted
                 # it — the warm request above can take seconds, long enough for a sweep to

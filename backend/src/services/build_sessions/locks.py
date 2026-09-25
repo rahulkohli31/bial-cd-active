@@ -182,9 +182,8 @@ async def write_heartbeat(redis: aioredis.Redis, user_uuid: uuid.UUID) -> dateti
     `release_lock_as_holder` (module's REDIS-ERROR POLICY). THE IN-BUILD RENEWER is the turn
     engine's liveness-lease loop, renewing on a wall clock well inside the TTL so a tool call
     longer than `HEARTBEAT_TTL_SECONDS` never lets the heartbeat expire under a live build. It
-    guards its own call; at the relaunch and start seeds the raise tears the container down,
-    each sitting inside `_holding_user_lock`'s compensated region before the scope adopts the
-    lock."""
+    guards its own call; the turn's seed sits inside `_holding_user_lock`'s compensated region,
+    before the scope adopts the lock, so a raise there compensates."""
     now = datetime.now(UTC)
     await redis.set(heartbeat_key(user_uuid), now.isoformat(), ex=HEARTBEAT_TTL_SECONDS)
     return now + timedelta(seconds=HEARTBEAT_TTL_SECONDS)

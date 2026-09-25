@@ -1379,40 +1379,6 @@ async def test_relaunch_spares_the_container_when_the_stay_settle_hits_a_redis_e
     assert manager._active_by_user == {}
 
 
-async def test_relaunch_spares_the_container_when_the_heartbeat_seed_hits_a_redis_error(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """The heartbeat is seeded INSIDE the protected region, so a failure there compensates
-    instead of leaving a live container behind a held lock. A swallow in the primitive would
-    return normally and strand the container."""
-    user, project_id = await _mk(db_session, "r-hb@rvaiglobal.com")
-    manager = SessionManager()
-    client = FakeSandboxClient()
-    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
-
-    # Patched at the manager's own import site rather than on the client: `acquire_lock`
-    # writes through the same `redis.set`, so cursing that instead would fail closed into a
-    # 409 and never reach the seed.
-    async def the_heartbeat_is_cursed(*args: object, **kwargs: object) -> datetime:
-        raise RedisError("redis is down")
-
-    monkeypatch_hb = pytest.MonkeyPatch()
-    monkeypatch_hb.setattr(
-        "src.services.build_sessions.manager.write_heartbeat", the_heartbeat_is_cursed
-    )
-    try:
-        await _relaunched(manager, db_session, user, project_id, client)
-    finally:
-        monkeypatch_hb.undo()
-
-    assert client.restored == [app_name_for(app_id)]
-    # NOT TORN DOWN: the container is up with its dev server started, the same state a
-    # successful relaunch leaves, and the citizen's retry ATTACHES to it in seconds.
-    assert client.torn_down == []
-    assert await lock_is_held(fake_redis, user.id) is False  # the lock IS still given back
-    assert manager._active_by_user == {}
-
-
 async def test_relaunch_while_a_build_is_live_is_409(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
