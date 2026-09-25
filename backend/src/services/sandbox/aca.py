@@ -495,8 +495,8 @@ class AcaControlPlane:
         """This container's CURRENT tags, or `None` when ARM says it does not exist.
 
         A FRESH READ, deliberately per-container: the destroy path re-validates immediately
-        before each delete, since between an enumeration snapshot and the delete a builder's
-        start can provision a NEW container into the very name about to be destroyed.
+        before each delete, since between deciding to destroy this name and the delete itself a
+        builder's start can provision a NEW container into the very name about to be destroyed.
 
         `None` (absent) differs from `{}` (present, untagged): absent means the delete already
         landed, untagged means somebody rewrote the resource."""

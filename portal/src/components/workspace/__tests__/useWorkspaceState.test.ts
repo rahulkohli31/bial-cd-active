@@ -870,7 +870,7 @@ describe('presence renewal — what holds the container open', () => {
 
   it('asks a hidden tab for nothing but the read and the renewal', async () => {
     // THE HALF THAT MATTERS. `fetchSaveState` costs two `git` executions inside the container and
-    // `checkWorkspace` can PUT THE CONTAINER AWAY — doing either with nobody looking is the
+    // `checkWorkspace` can restart the app's dev server — doing either with nobody looking is the
     // opposite of what renewing from a hidden tab is for.
     api.fetchPreviewState.mockResolvedValue(reading({ state: 'alive', alive: true }))
     hide(true)

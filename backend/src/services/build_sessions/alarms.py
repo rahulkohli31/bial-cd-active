@@ -129,10 +129,11 @@ one) and `restarted` — True when the supervisor accepted the start; False when
 `put_back_tree_dev_start_failed` warning beside this line says why. Either way the container, its
 unsaved work and its commit are left exactly as they were.
 
-READING `exit_code`: the supervisor reports `Popen.poll()`, so a signal death is the NEGATIVE
-signal number. `-9` is a SIGKILL that landed on the supervisor's own child; `137` is the same
-SIGKILL reported by a shell in between. Both are the out-of-memory killer's usual signature — and
-an agent's `pkill -9` looks identical, which is why this names no cause.
+READING `exit_code`: the supervisor reports `Popen.poll()` on `npm run dev`, its direct child —
+a wrapper, not the process that serves traffic. An out-of-memory kill lands on a grandchild
+(`next-server`), and the wrapper chain above it exits 0, so `exit_code` does not identify an
+out-of-memory kill for a sandbox dev server: a clean 0 is the common case even when memory
+pressure caused the restart.
 
 WHAT TO DO: nothing for a one-off — the app comes back in the same container. Repeats for the
 same app mean its dev server keeps dying under it, restarted at most once a minute and only while a

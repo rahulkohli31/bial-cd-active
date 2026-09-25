@@ -252,7 +252,7 @@ def _now_iso() -> str:
 def sandbox_tags(*, user_id: uuid.UUID, app_id: uuid.UUID) -> dict[str, str]:
     """The full ARM-tag identity for a build sandbox, stamped at create.
 
-    Every field the escalate-never-destroy rule needs is here, which is the whole point: a
+    Every field the sweep's own judgment needs is here, which is the whole point: a
     container created through this function is judgeable from ARM alone, with Redis down, by an
     operator reading the portal."""
     return checked_tags(
@@ -269,9 +269,9 @@ def sandbox_tags(*, user_id: uuid.UUID, app_id: uuid.UUID) -> dict[str, str]:
 def shared_sandbox_tags(*, recipient_id: uuid.UUID, app_id: uuid.UUID) -> dict[str, str]:
     """The full ARM-tag identity for a SHARED-RUNTIME sandbox, stamped at create (#198).
 
-    Same shape as `sandbox_tags` — every field the escalate-never-destroy rule needs, `
-    TAG_CREATED_AT` included, since this container's own absolute session ceiling (a Slice-3
-    concern) runs off the same age clock every other tier does. `user_id` is the RECIPIENT
+    Same shape as `sandbox_tags` — every field the sweep's own judgment needs, `TAG_CREATED_AT`
+    included, since this container's own absolute session ceiling (a Slice-3 concern) runs off
+    the same age clock every other sandbox does. `user_id` is the RECIPIENT
     (see `KIND_SHARED_SANDBOX`'s docstring for why), never the project's owner."""
     return checked_tags(
         {

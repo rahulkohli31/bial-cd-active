@@ -2208,9 +2208,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       // renewal decision is shared with the project surface (`presenceToRenew`) so the two
       // surfaces cannot drift, and so neither can forget it.
       //
-      // WHAT STAYS VISIBLE-ONLY: `fetchCompileState` and `checkWorkspace` below. The second can
-      // PUT THE CONTAINER AWAY, and doing that with nobody looking is the opposite of what this
-      // change is for.
+      // WHAT STAYS VISIBLE-ONLY: `fetchCompileState` and `checkWorkspace` below. Each spends a
+      // container call, and the second can restart the app's dev server; a hidden tab has nobody
+      // to show either answer to.
       const hidden = document.visibilityState !== 'visible'
       // NOT AWAITED. The renewal holds the container open; this surface reports it and never
       // waits on it, so a slow renewal cannot delay the read the screen is rendering.

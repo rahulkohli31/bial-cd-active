@@ -141,12 +141,9 @@ describe('refreshAccessToken (cookie-based, single-flight)', () => {
 /**
  * ★ A DEAD SESSION STOPS THE PAGE INSTEAD OF STRANDING IT.
  *
- * Clearing two module variables used to be the whole response to a refresh that 401s, and it
- * stopped nothing: the tab went on polling `preview-state` and `renew` behind a screen that still
- * looked alive, writing no heartbeat, until the lease lapsed and the container was collected under
- * somebody who was looking right at it. Fifty unbroken minutes of exactly that are in the capture
- * this branch came from. `RequireAuth` re-evaluates on navigation, so a tab parked on one route
- * never re-runs the guard and a reload is the only thing that rescues it.
+ * A 401 from refresh means the session cannot be revived, so the page is discarded: a tab parked
+ * on one route never re-runs `RequireAuth`'s guard, and its pollers (`preview-state`, `renew`)
+ * would otherwise keep running with no heartbeat until the lease lapses.
  *
  * The remedy is the bounce that was already built for a SUSPENDED session, reached by a second
  * caller. Nothing downstream learns to interpret a status code: the pollers stop because the page

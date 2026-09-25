@@ -122,8 +122,8 @@ def test_the_outer_mark_needs_a_configured_ceiling_too() -> None:
 
 
 def test_an_untagged_container_is_never_torn_out_from_under_an_agent() -> None:
-    """No age means no bound — the escalate-never-destroy rule reaching the one clause that can
-    interrupt live work. A container whose birthday cannot be proved is reported, never cut."""
+    """No age means no bound — the one clause that can interrupt live work never reaches it.
+    A container whose birthday cannot be proved is reported, never cut."""
     ageless = identity_from_tags({TAG_KIND: KIND_BUILD_SANDBOX})
 
     assert past_the_turn_bound(ageless, now=NOW, after_hours=2, turn_grace_seconds=2400) is False

@@ -303,12 +303,9 @@ async function doRefresh(): Promise<true | null> {
       // A 401 on any single business request is a fact about that request; a 401
       // HERE says the session itself cannot be revived, so the page is over.
       //
-      // Clearing two module variables used to be the whole response, and it
-      // stopped nothing: the tab went on polling `preview-state` and `renew`
-      // every two minutes behind a screen that still looked alive, writing no
-      // heartbeat, until the lease lapsed and the container was collected under
-      // somebody who was looking right at it. `RequireAuth` re-evaluates on
-      // navigation, so a tab parked on one route never re-runs the guard.
+      // A tab parked on one route never re-runs `RequireAuth`'s guard, so its pollers
+      // (`preview-state`, `renew`) would otherwise keep running with no heartbeat
+      // until the lease lapses. Bouncing to login discards the page outright.
       //
       // ONLY IF WE HAD A SESSION. A csrf cookie was present means there was one
       // to lose — a first-time visitor hitting a guarded route is not "expired",

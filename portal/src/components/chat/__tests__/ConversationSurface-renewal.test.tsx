@@ -125,9 +125,9 @@ describe('the chat route holds its container open', () => {
     await waitFor(() => expect(h.renewPresence).toHaveBeenCalledWith(expect.any(String), 'hidden'))
   })
 
-  it('asks a hidden tab for nothing that could put the container away', async () => {
-    // `checkWorkspace` is a POST whose server side puts a stopped app away. Reaching it from a
-    // background tab would end a workspace with nobody looking.
+  it('asks a hidden tab for nothing that could restart the dev server', async () => {
+    // `checkWorkspace` is a POST whose server side can restart a stopped app's dev server.
+    // Reaching it from a background tab would do that with nobody looking.
     hide(true)
     renderBuilder()
     await waitFor(() => expect(h.renewPresence).toHaveBeenCalled())

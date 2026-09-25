@@ -225,8 +225,8 @@ export function nextProbeCadence(answer: PreviewLifeState, held: ProbeCadence): 
  * answers from the registry alone — so a stopped app reads as a wait that never ends. Either
  * `alive` with a frame that never vouches (the pane's slow card), or, once the reaper's probe has
  * retracted the serving proof, `starting` with nothing ever arriving. Neither has a control. The
- * workspace check can see the process, and when it finds the app stopped with its work provably
- * saved it puts the container away, so the next reading is the saved app with its start control.
+ * workspace check can see the process, and when it finds the app stopped on an intact workspace it
+ * restarts the dev server in place; the readings then follow it through `starting` back to `alive`.
  *
  * `alive` ONLY WITH A STALLED FRAME: a frame still loading, or one that has vouched, is an app the
  * citizen can see, and asking would spend a container call to hear "yes".

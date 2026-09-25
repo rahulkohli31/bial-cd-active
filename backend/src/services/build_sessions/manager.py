@@ -1292,7 +1292,7 @@ class SessionManager:
         flight is reported identically to every tab, every session and a page reloaded
         mid-start, never something a browser has to remember across a request.
 
-        `project_id` NAMES the start for `project_preview_state` and the reclamation spare
+        `project_id` NAMES the start for `project_preview_state` and the sweep's sparing
         predicate — it is the marker's whole payload. Required, not optional: a marker that
         could not say which project it is starting would put every one of this user's panes
         into the same wait.

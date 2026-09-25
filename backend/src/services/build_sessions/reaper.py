@@ -804,8 +804,9 @@ async def _shared_view_past_its_ceiling(
     window — this only ever SUBTRACTS from what the stay would otherwise spare, never adds a
     reason to spare one.
 
-    Measured from the CONTAINER's birthday (`_container_age_source`), because the record's is
-    re-stamped by every Launch that attaches to the standing view."""
+    Measured from the CONTAINER's birthday (`_container_age_source`), because a failed teardown
+    followed by a fresh registration would otherwise reset the record's `created_at` and let a
+    shared view earn a new ceiling each time."""
     app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
     if not is_a_shared_sandbox_name(app_name):
         return False

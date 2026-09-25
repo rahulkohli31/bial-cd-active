@@ -1,4 +1,4 @@
-"""The absolute age ceiling — the hole the confidence tiers cannot see.
+"""The absolute age ceiling — the hole every other sparing signal cannot see.
 
 WHAT EVERY OTHER SPARING SIGNAL STRUCTURALLY MISSES. `reconcile_user` asks "is anything claiming
 this container?" — the lock, the heartbeat, the stay, the liveness lease — so one held open by a

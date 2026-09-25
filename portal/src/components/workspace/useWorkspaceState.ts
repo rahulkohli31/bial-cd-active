@@ -17,8 +17,9 @@
  * start a container. The consequence is stated rather than hidden: at rest, a stopped project shows no
  * save state and no commit. `checkWorkspace` costs a container exec and can raise an operational alarm,
  * so it is asked here for ONE reason only: a wait that looks stuck (`mayHaveStopped`), where the server
- * may find the app stopped and put it away — never about a completion claim, which the project screen
- * does not make, and never on an accelerated tick. `fetchCompileState` IS asked from this surface: its
+ * may find the app stopped and restart its dev server — never about a completion claim, which
+ * the project screen does not make, and never on an accelerated tick. `fetchCompileState` IS
+ * asked from this surface: its
  * route short-circuits before any attach when nothing is live, so it cannot start a stopped container.
  * `ProjectWorkspace` asks it beside this read rather than from inside it, because it is gated on THIS
  * hook's `alive` answer and on the resolved address, neither of which this hook holds.
@@ -233,9 +234,9 @@ export function useWorkspaceState({
       // back is worse than one cheap read.
       //
       // WHAT STAYS VISIBLE-ONLY, and this is the half that matters: `fetchSaveState` costs two
-      // `git` executions in the container, and `checkWorkspace` can PUT THE CONTAINER AWAY. A
-      // background tab that could reach either would be spending a container call, or ending a
-      // workspace, with nobody looking.
+      // `git` executions in the container, and `checkWorkspace` can restart the app's dev
+      // server. A background tab that could reach either would be spending a container call, or
+      // restarting a dev server, with nobody looking.
       const hidden = document.visibilityState !== 'visible'
       // NOT AWAITED. The renewal is a fact this surface reports, not one the read waits on: a
       // slow renewal must never delay the answer the screen is rendering. Its own result is
