@@ -219,10 +219,10 @@ def _positions(commands: list[list[str]], head: list[str]) -> list[int]:
 
 
 def _read_paths(commands: list[list[str]]) -> list[str]:
-    """The bundle path each call handed to `base64`. Derived from the READ rather than the write
-    so the assertion holds against any bundle-creation spelling — what matters is which file each
-    call believed was its own."""
-    return [cmd[1] for cmd in commands if cmd[:1] == ["base64"]]
+    """The bundle path each call read from. Derived from the READ rather than the write so the
+    assertion holds against any bundle-creation spelling — what matters is which file each call
+    believed was its own."""
+    return [cmd[1].removeprefix("if=") for cmd in commands if cmd[:1] == ["dd"]]
 
 
 async def test_concurrent_snapshots_of_one_app_never_share_a_bundle_path(
@@ -348,3 +348,61 @@ async def test_write_snapshot_times_every_step_of_a_save(fake_storage: FakeStora
     ):
         assert isinstance(timing[field], int)
         assert timing[field] >= 0
+
+
+def _a_container_holding(bundle: bytes) -> tuple[FakeSandboxClient, list[list[str]]]:
+    """A fake whose `dd` really cuts the byte range it names and whose `base64` reads back the
+    last cut, so a multi-chunk read is reassembled from the pieces rather than handed whole."""
+    client = FakeSandboxClient()
+    commands: list[list[str]] = []
+    cut: dict[str, bytes] = {}
+
+    def handler(cmd: list[str]) -> ExecResult:
+        commands.append(cmd)
+        if cmd[:1] == ["dd"]:
+            args = dict(arg.split("=", 1) for arg in cmd[1:])
+            start = int(args["skip"]) * 1024 * 1024
+            cut["piece"] = bundle[start : start + int(args["count"]) * 1024 * 1024]
+            return ExecResult(stdout="", stderr="", exit=0)
+        if cmd[:1] == ["base64"]:
+            return ExecResult(stdout=base64.b64encode(cut["piece"]).decode(), stderr="", exit=0)
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    client.exec_handler = handler
+    return client, commands
+
+
+@pytest.mark.parametrize("extra", [0, 1, 5 * 1024 * 1024])
+async def test_a_large_bundle_leaves_the_container_in_chunks_and_arrives_whole(
+    fake_storage: FakeStorage, extra: int
+) -> None:
+    # Two full chunks plus a remainder of 0, 1 and 5 MiB: the exact multiple is the case where
+    # the last full chunk is followed by an empty one.
+    bundle = a_git_bundle()
+    bundle += b"x" * (2 * 8 * 1024 * 1024 + extra - len(bundle))
+    client, commands = _a_container_holding(bundle)
+
+    await write_snapshot(client, _handle(), APP_ID)
+
+    stored = await fake_storage.get(snapshot_key(APP_ID))
+    assert stored == bundle
+    reads = [cmd for cmd in commands if cmd[:1] == ["base64"]]
+    assert len(reads) == 3, "two full chunks, then the short one that ends the read"
+
+
+async def test_a_failed_cut_aborts_the_save_instead_of_storing_a_short_bundle(
+    fake_storage: FakeStorage,
+) -> None:
+    client = FakeSandboxClient()
+
+    def handler(cmd: list[str]) -> ExecResult:
+        if cmd[:1] == ["dd"]:
+            return ExecResult(stdout="", stderr="no space", exit=1)
+        if cmd[:1] == ["base64"]:
+            return ExecResult(stdout=base64.b64encode(a_git_bundle()).decode(), stderr="", exit=0)
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    client.exec_handler = handler
+    with pytest.raises(SandboxError, match="cut failed"):
+        await write_snapshot(client, _handle(), APP_ID)
+    assert snapshot_key(APP_ID) not in fake_storage.objects

@@ -107,9 +107,15 @@ _BUNDLE_PREFIX = "/tmp/bial-snapshot"
 SNAPSHOT_EXEC_TIMEOUT_SECONDS: Final = 120
 
 SNAPSHOT_EXECS: Final = 4
-"""How many bounded execs one `write_snapshot` runs: commit, bundle, base64, and the cleanup in
-the `finally`. Named beside the per-exec bound so the product of the two is a number a caller can
-derive rather than count by reading this file."""
+"""The fewest bounded execs one `write_snapshot` runs: commit, bundle, one read, and the cleanup
+in the `finally`. A bundle larger than `_READ_CHUNK_BYTES` takes two more execs per extra chunk."""
+
+# The bundle leaves the container in pieces of this size. The supervisor holds an exec's whole
+# output in memory several times over while answering, so reading a large bundle in one exec
+# pushed a 2 GiB container, already running `next dev`, past its limit: the container restarted,
+# and a restart loses the repository with everything else.
+_READ_CHUNK_MIB: Final = 8
+_READ_CHUNK_BYTES: Final = _READ_CHUNK_MIB * 1024 * 1024
 
 #: Fields: `app_id`, `lock_wait_ms`, `commit_ms`, `bundle_ms`, `base64_ms`, `cleanup_ms`,
 #: `store_ms`. Save is synchronous in-request with no client-side timeout, so this is the only
@@ -388,13 +394,8 @@ async def _bundle_the_tree(
         if bundle.exit != 0:
             raise SandboxError(f"snapshot bundle failed (exit {bundle.exit})")
         base64_started = time.monotonic()
-        result = await run_command(
-            handle, ["base64", bundle_name], timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS
-        )
+        data = await _read_in_chunks(sandbox_client, handle, bundle_name)
         timings.base64_ms = _elapsed_ms(base64_started)
-        if result.exit != 0:
-            raise SandboxError(f"snapshot bundle read failed (exit {result.exit})")
-        data = base64.b64decode(result.stdout)
         # Parse before the upload, not after: this both validates what we are about to store
         # and gives the caller the HEAD sha, which is what lets a reader compare two bundles
         # for "which of these is the newer tree" without downloading both.
@@ -404,9 +405,54 @@ async def _bundle_the_tree(
         cleanup_started = time.monotonic()
         with suppress(SandboxError):
             await run_command(
-                handle, ["rm", "-f", bundle_name], timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS
+                handle,
+                ["rm", "-f", bundle_name, _chunk_path(bundle_name)],
+                timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS,
             )
         timings.cleanup_ms = _elapsed_ms(cleanup_started)
+
+
+def _chunk_path(bundle_name: str) -> str:
+    return f"{bundle_name}.chunk"
+
+
+async def _read_in_chunks(
+    sandbox_client: SandboxClient, handle: SandboxHandle, bundle_name: str
+) -> bytes:
+    """Read the bundle out `_READ_CHUNK_BYTES` at a time. A chunk shorter than that is the last.
+
+    Each chunk is cut to a file and then read with its own exec, so both exit codes are checked:
+    `sh` has no `pipefail`, and a `dd | base64` pipe would report a failed cut as a short read."""
+    run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
+    chunk = _chunk_path(bundle_name)
+    pieces: list[bytes] = []
+    index = 0
+    while True:
+        cut = await run_command(
+            handle,
+            [
+                "dd",
+                f"if={bundle_name}",
+                f"of={chunk}",
+                "bs=1M",
+                f"skip={index * _READ_CHUNK_MIB}",
+                f"count={_READ_CHUNK_MIB}",
+                "status=none",
+            ],
+            timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS,
+        )
+        if cut.exit != 0:
+            raise SandboxError(f"snapshot bundle cut failed (exit {cut.exit})")
+        result = await run_command(
+            handle, ["base64", chunk], timeout_s=SNAPSHOT_EXEC_TIMEOUT_SECONDS
+        )
+        if result.exit != 0:
+            raise SandboxError(f"snapshot bundle read failed (exit {result.exit})")
+        piece = base64.b64decode(result.stdout)
+        pieces.append(piece)
+        if len(piece) < _READ_CHUNK_BYTES:
+            return b"".join(pieces)
+        index += 1
 
 
 class NothingSavedToGoBackToError(Exception):
