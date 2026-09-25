@@ -1634,16 +1634,15 @@ async def test_a_sweep_during_the_relaunch_provision_window_does_not_reap_it(
 async def test_the_next_real_start_reaps_a_relaunched_preview_through_its_stay(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    # THE CRUX, pinned AT THE CALL SITE THAT DECIDES IT. `reaper.reconcile_user` takes
-    # `honor_stay` as a keyword with a default, and every other test calls the helper
-    # directly — which pins the DEFAULT, not the argument `manager` actually passes. Patching
-    # `reaper.reconcile_user` does not even reach it: `manager` imports the function BY VALUE.
+    # Driven end to end: relaunch a preview of project A (which grants a live 30-minute stay),
+    # then allocate for project B for the SAME user. The stay would spare A's container from the
+    # sweep and B needs the one-per-user slot, so the start itself has to take A out — the
+    # switch hands it to the shutdown routine. Left running while B registers its own over that
+    # hash, A would be orphaned, invisible to the registry-only sweep forever after.
     #
-    # So drive the real thing end to end: relaunch a preview of project A (which grants a
-    # live lease), then allocate for project B for the SAME user. The new session needs the
-    # one-per-user sandbox slot, so reconcile-on-start must reap THROUGH the unexpired stay.
-    # Sparing it would leave A's container running while B registers its own over that hash —
-    # the container orphaned, invisible to the registry-only sweep forever after.
+    # The reconcile's reap-through is not what decides this case; dropping `certified_dead=True`
+    # at the manager's call site leaves it green and turns
+    # `test_start_reaps_through_a_dead_sessions_lingering_lock` red instead.
     user, project_a = await _mk(db_session, "r12@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()

@@ -321,12 +321,10 @@ async def test_the_sweep_spares_a_container_inside_the_short_stay_and_reaps_thro
 
     await manager._pardon_the_container(fake_redis, session)
 
-    # Inside the short stay the background sweep (`honor_stay=True`) spares it. No lock,
+    # Inside the short stay the background sweep spares it. No lock,
     # heartbeat, or lease is held after a pardon, so the stay is the ONLY thing standing between
     # this container and the sweep.
-    reaped = await reconcile_user(
-        fake_redis, user_id, sandbox, has_live_session=False, honor_stay=True
-    )
+    reaped = await reconcile_user(fake_redis, user_id, sandbox)
     assert reaped is False
     assert sandbox.torn_down == []
     assert await fake_redis.exists(registry_key(user_id)) == 1
@@ -337,9 +335,7 @@ async def test_the_sweep_spares_a_container_inside_the_short_stay_and_reaps_thro
     lapsed = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
     await fake_redis.hset(registry_key(user_id), REGISTRY_FIELD_PREVIEW_STAY_UNTIL, lapsed)
 
-    reaped_after = await reconcile_user(
-        fake_redis, user_id, sandbox, has_live_session=False, honor_stay=True
-    )
+    reaped_after = await reconcile_user(fake_redis, user_id, sandbox)
     assert reaped_after is True
     assert sandbox.torn_down == [app_name]
     assert await fake_redis.exists(registry_key(user_id)) == 0

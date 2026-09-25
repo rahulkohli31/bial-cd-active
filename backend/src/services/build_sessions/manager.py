@@ -1383,9 +1383,7 @@ class SessionManager:
                 await delete_registry(redis, user_id)
             await reap_lock(redis, user_id)
         else:
-            reclaimed = await reconcile_user(
-                redis, user_id, sandbox_client, has_live_session=False, certified_dead=True
-            )
+            reclaimed = await reconcile_user(redis, user_id, sandbox_client, certified_dead=True)
         token = await acquire_lock(redis, user_id)
         if token is None:
             raise BuildSessionConflictError()
