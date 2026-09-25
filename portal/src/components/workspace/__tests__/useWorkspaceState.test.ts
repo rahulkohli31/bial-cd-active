@@ -346,10 +346,10 @@ describe('the accelerated cadence while a start is in flight', () => {
   })
 
   it('the own-press short-circuit still asks exactly once more, and leaves ONE timer behind', async () => {
-    // `ProjectWorkspace`'s `onStartOutcome(null)` calls `refresh()` so a start that reached the app
-    // lands on the press rather than on a tick. It bumps the epoch, so the effect tears down and
-    // re-runs — and a cadence change that failed to clear the interval it replaced would double
-    // every read from here on, invisibly, for the life of the tab.
+    // An admitted press asks again at once, so a start that reached the app lands on the press
+    // rather than on a tick. It bumps the epoch, so the effect tears down and re-runs — and a
+    // cadence change that failed to clear the interval it replaced would double every read from
+    // here on, invisibly, for the life of the tab.
     api.fetchPreviewState.mockResolvedValue(reading({ state: 'starting' }))
 
     const { result } = mount()
@@ -360,7 +360,7 @@ describe('the accelerated cadence while a start is in flight', () => {
     expect(api.fetchPreviewState).toHaveBeenCalledTimes(2)
 
     await act(async () => {
-      result.current.refresh()
+      result.current.reportStartAdmitted()
     })
     await settle()
     expect(api.fetchPreviewState).toHaveBeenCalledTimes(3)

@@ -61,6 +61,7 @@ import {
   type WorkspaceState,
 } from './workspaceState'
 import { useTheWaitHasGoneOnTooLong } from './useTheWaitHasGoneOnTooLong'
+import { createPressEnd } from './startApp'
 
 export interface WorkspaceReading {
   /** WHAT TO SAY. The single value the pane and the Plan-chat line both render. */
@@ -92,10 +93,12 @@ export interface WorkspaceReading {
   /** Has any read FINISHED, by answering or by failing? False only before the first attempt
    *  settles, which is the one window in which no verdict may be drawn. */
   settled: boolean
-  /** Record how the most recent start attempt ended. `null` clears it (a start that worked). */
+  /** Record how the most recent start attempt ended. `null` clears it. */
   reportStartOutcome: (outcome: StartOutcome | null) => void
-  /** A press has begun, or finished. Drives the map's in-flight arm. */
+  /** A press has begun, or was refused. Drives the map's in-flight arm. */
   reportStartPending: (pending: boolean) => void
+  /** The server admitted the press — see `WorkspaceReport.onStartAdmitted`. */
+  reportStartAdmitted: () => void
   /** Ask again NOW. A deliberate gesture: a start that just finished, or a retry press. */
   refresh: () => void
   /**
@@ -122,6 +125,7 @@ export function useWorkspaceState({
   // A press is in flight. See `WorkspaceInputs.startInFlight` for why the map needs to know: the
   // server's own `starting` arrives on the next read, and this covers the gap until it does.
   const [startInFlight, setStartInFlight] = useState(false)
+  const [pressEnd] = useState(() => createPressEnd(() => setStartInFlight(false)))
   // ONE TIMER, NOT A TICK — see the hook. It reads the wait's own instant off `preview`, so a tab
   // reloaded well into a start crosses the boundary at once instead of starting its patience over.
   const waitHasGoneOnTooLong = useTheWaitHasGoneOnTooLong(preview)
@@ -146,7 +150,8 @@ export function useWorkspaceState({
   // never on `epoch`: a retry press is not news about the container.
   useEffect(() => {
     setStartInFlight(false)
-  }, [projectId])
+    pressEnd.drop()
+  }, [projectId, pressEnd])
 
   const refresh = useCallback(() => setEpoch((n) => n + 1), [])
   // WHAT THE PANE LAST SAID ABOUT ITS FRAME. A ref, not state: it changes what the next read ASKS
@@ -166,6 +171,11 @@ export function useWorkspaceState({
     // time" standing under a fresh start is the pane arguing with the button somebody is holding.
     if (pending) setStartOutcome(null)
   }, [])
+  const reportStartAdmitted = useCallback(() => {
+    setStartOutcome(null)
+    pressEnd.admitted()
+    setEpoch((n) => n + 1)
+  }, [pressEnd])
 
   // Read inside the async body without re-arming the effect. A start outcome must not restart the
   // poll — it is a fact about a press, not about the workspace — but the save read below has to
@@ -243,6 +253,7 @@ export function useWorkspaceState({
       // recorded when it lands, and a failure records nothing at all.
       void renewPresence(projectId, presenceToRenew(hidden))
       const generation = ++latest
+      const readSettled = pressEnd.readBegins()
       try {
         const next = await fetchPreviewState(projectId)
         // Superseded: a later read started, so its answer is newer whatever order the responses
@@ -255,6 +266,7 @@ export function useWorkspaceState({
         // wakes the shell, and re-renders the rail's whole conversation list — for an answer
         // nobody's screen can tell apart from the one already up.
         setPreview((prev) => (samePreviewState(prev, next) ? prev : next))
+        readSettled()
 
         // ONE TICK PER ANSWER, and deliberately not per CHANGE — a caller re-asking its own
         // question needs to hear that the world was looked at, and an answer identical to the last
@@ -324,6 +336,8 @@ export function useWorkspaceState({
         // again, and a tick this arm deliberately withholds would leave it behind a blank pane
         // with no way out.
         setSettled(true)
+        // It ends an admitted press all the same, or a dead endpoint would hold the press forever.
+        if (live && generation === latest) readSettled()
         // A read that could not answer SAYS NOTHING: `preview` is left exactly where it was, so a
         // blip — a network drop, or the server's 503 for a coordination store it could not read —
         // never pulls a running app off screen or wipes an answer somebody is already reading. The
@@ -374,7 +388,7 @@ export function useWorkspaceState({
       window.removeEventListener('focus', onVisible)
       stopAsking()
     }
-  }, [projectId, epoch])
+  }, [projectId, epoch, pressEnd])
 
   return {
     state: resolveWorkspaceState({
@@ -390,6 +404,7 @@ export function useWorkspaceState({
     settled,
     reportStartOutcome,
     reportStartPending,
+    reportStartAdmitted,
     refresh,
     reportFrameStall,
   }

@@ -42,6 +42,7 @@ const reportFor = (preview: PreviewState | null): WorkspaceReport => {
     projectId: 'p1',
     onStartPending: vi.fn(),
     onStartOutcome: vi.fn(),
+    onStartAdmitted: vi.fn(),
   }
   return {
     ...sinks,

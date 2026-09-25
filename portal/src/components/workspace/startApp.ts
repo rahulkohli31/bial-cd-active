@@ -29,7 +29,10 @@ export const BUILD_ALREADY_RUNNING = 'A build is already running in this applica
  * below wrap the sinks without also wrapping the state and the refresh, which it has no business
  * touching.
  */
-export type StartSinks = Pick<WorkspaceReport, 'projectId' | 'onStartPending' | 'onStartOutcome'>
+export type StartSinks = Pick<
+  WorkspaceReport,
+  'projectId' | 'onStartPending' | 'onStartOutcome' | 'onStartAdmitted'
+>
 
 /** What the server itself said, or `null` when it said nothing a person could read. */
 export function serverMessage(err: unknown): string | null {
@@ -84,12 +87,15 @@ export async function startApp(sinks: StartSinks): Promise<StartResult> {
   // `starting` is the authority and it arrives later; this is what stops the sentence above the
   // pane saying nothing happened for up to forty-five seconds.
   sinks.onStartPending(true)
+  let admitted = false
   try {
     await relaunchPreview({ projectId })
     // ADMITTED, NOT UP. The app comes up after this answer, and the poll is its one reader:
     // `starting` now, `alive` with the address to frame once something has watched it show a
-    // page. `null` clears the last refusal, and it is what makes the surface ask again at once.
-    sinks.onStartOutcome(null)
+    // page. The press stays pending: the surface asks again at once and ends it when that read
+    // settles, because cleared here it would land beside the reading from before the press.
+    admitted = true
+    sinks.onStartAdmitted()
     return { kind: 'ok' }
   } catch (err) {
     // NOTHING TO RESTORE IS REPORTED AS NOTHING AT ALL — the snapshot gate's own 404, and
@@ -105,7 +111,44 @@ export async function startApp(sinks: StartSinks): Promise<StartResult> {
     sinks.onStartOutcome(outcomeFor(err))
     return { kind: 'failed', error: err }
   } finally {
-    sinks.onStartPending(false)
+    if (!admitted) sinks.onStartPending(false)
+  }
+}
+
+/**
+ * WHEN AN ADMITTED PRESS ENDS: on the first read BEGUN after the admission, once it settles.
+ *
+ * Only a read begun after the admission can end it — one already in flight carries the reading
+ * from before the press. Answered or failed, that read ends it, so a press lasts no longer than
+ * one read: a read that hangs is overtaken by the poll's next tick, which begins another.
+ */
+export interface PressEnd {
+  /** The server admitted the press. */
+  readonly admitted: () => void
+  /** The press no longer belongs to this surface: its project has left the screen. */
+  readonly drop: () => void
+  /** A read is beginning. Call what this returns when that read's answer, or failure, lands. */
+  readonly readBegins: () => () => void
+}
+
+export function createPressEnd(endPress: () => void): PressEnd {
+  let begun = 0
+  let endsAfterRead: number | null = null
+  return {
+    admitted: () => {
+      endsAfterRead = begun
+    },
+    drop: () => {
+      endsAfterRead = null
+    },
+    readBegins: () => {
+      const read = ++begun
+      return () => {
+        if (endsAfterRead === null || read <= endsAfterRead) return
+        endsAfterRead = null
+        endPress()
+      }
+    },
   }
 }
 
@@ -142,6 +185,9 @@ export function createStarter(current: () => StartSinks): () => Promise<StartRes
       },
       onStartOutcome: (outcome) => {
         if (stillOurs()) current().onStartOutcome(outcome)
+      },
+      onStartAdmitted: () => {
+        if (stillOurs()) current().onStartAdmitted()
       },
     }
     running = startApp(guarded).finally(() => {

@@ -453,6 +453,7 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
         act(() => channel.workspace.set({ ...report, state: stateFor(pending) }))
       }),
       onStartOutcome: vi.fn(),
+      onStartAdmitted: vi.fn(),
     }
     const report: WorkspaceReport = {
       ...sinks,

@@ -28,6 +28,7 @@ import {
   waitForGateOpen, composer, T_WORKSPACE, T_PREVIEW,
 } from './_builderSession.jsx'
 import type { PreviewLifeState, PreviewState } from '../../utils/buildSessionApi'
+import type { WorkspaceState } from '../../components/workspace/workspaceState'
 
 /** BuilderPage's own cadence (`PREVIEW_PROBE_MS`), which it does not export. Mirrored, not
  *  imported, so a change to it is a deliberate edit here rather than a silently-passing test. */
@@ -77,6 +78,19 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
   // watch a mock nothing calls.
   relaunchPreview: (...a: unknown[]) => h.relaunchPreview(...a),
 }))
+/** Every workspace state a reader of the report was handed, in order. */
+const reported = vi.hoisted(() => ({ states: [] as WorkspaceState[] }))
+vi.mock('../../components/workspace/workspaceChannel', async (orig) => {
+  const actual = await orig<typeof import('../../components/workspace/workspaceChannel')>()
+  return {
+    ...actual,
+    useWorkspaceReport: () => {
+      const report = actual.useWorkspaceReport()
+      if (report) reported.states.push(report.state)
+      return report
+    },
+  }
+})
 
 /**
  * Scripts an ordinary send's own turn stream as an OPEN socket a test can push frames into by
@@ -425,15 +439,17 @@ describe('BuilderPage — stopping the poll must not pin "gone"', () => {
     // window it closes is invisible unless a test holds the answer open on purpose. That window
     // is a full network round trip with the reclaimed card painted over an app that is coming
     // back up, which is the same stale-verdict symptom, narrowed rather than removed.
+    //
+    // The vehicle is a turn frame rather than a Launch press: an admitted press holds the pane on
+    // its own wait until the next read answers, which would cover this window whether or not the
+    // verdict was dropped.
     h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
-    await framedBuild()
+    const turn = await framedBuild()
     expect(goneCard()).not.toBeNull()
 
     // The next probe never answers. Any drop of the card from here is the invalidation itself.
     h.fetchPreviewState.mockReturnValue(new Promise<PreviewState>(() => {}))
-    // "Launch Application" — the vehicle, renamed (see the earlier test in this describe block).
-    const bringItBack = screen.getByRole('button', { name: /launch application/i })
-    await act(async () => { fireEvent.click(bringItBack) })
+    await turn.frame(T_WORKSPACE('preparing'))
 
     expect(goneCard()).toBeNull()
   })
@@ -476,6 +492,49 @@ describe('BuilderPage — stopping the poll must not pin "gone"', () => {
     await settle()
     expect(goneCard()).toBeNull()
     expect(framedUrl()).toBe(PREVIEW_URL)
+  })
+
+  it('★ an admitted press holds the pane on its wait until the next read, which then decides', async () => {
+    // The admission re-runs the poll, and the re-run blanks the reading. Were the press cleared at
+    // the 202, that blank would draw "We could not check on your app." with Try again — or the old
+    // reading "Your app is saved." with Launch — for the round trip before `starting` arrives.
+    const WHY = 'Your app could not be started. Try again in a minute.'
+    h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
+    await framedBuild()
+    h.relaunchPreview.mockResolvedValue(undefined)
+    let answerRead: (value: PreviewState) => void = () => {}
+    h.fetchPreviewState.mockImplementation(
+      () => new Promise<PreviewState>((resolve) => { answerRead = resolve }),
+    )
+    const reads = probeCount()
+
+    reported.states.length = 0
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /launch application/i })) })
+    await settle()
+
+    expect(h.relaunchPreview).toHaveBeenCalledTimes(1)
+    expect(readsSince(reads)).toBe(1)
+    expect(reported.states.length).toBeGreaterThan(0)
+    expect(reported.states.map((state) => state.name).filter((name) => name !== 'starting')).toEqual([])
+
+    await act(async () => { answerRead({ ...answer('asleep', true), startFailure: WHY }) })
+    await settle()
+    expect(paneState()).toBe('not-running')
+    expect(goneCard()?.textContent).toContain(WHY)
+  })
+
+  it('★ a read that fails after the admission still ends the press, with Try again', async () => {
+    h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
+    await framedBuild()
+    h.relaunchPreview.mockResolvedValue(undefined)
+    h.fetchPreviewState.mockRejectedValue(new Error('503'))
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /launch application/i })) })
+    await settle()
+
+    expect(h.relaunchPreview).toHaveBeenCalledTimes(1)
+    expect(reported.states.at(-1)?.name).toBe('could-not-read')
+    expect(reported.states.at(-1)?.action?.kind).toBe('retry')
   })
 })
 

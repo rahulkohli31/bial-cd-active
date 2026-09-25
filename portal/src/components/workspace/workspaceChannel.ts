@@ -357,8 +357,14 @@ export interface WorkspaceReport {
   settled: boolean
   /** The project the state describes. `null` while a route is still resolving one. */
   projectId: string | null
-  /** Record how a start attempt ended; `null` clears it (a start the server admitted). */
+  /** Record how a start attempt ended; `null` clears it and asks again. */
   onStartOutcome: (outcome: StartOutcome | null) => void
+  /**
+   * The server admitted the press. Clears the last outcome and asks again now; the press stays
+   * pending until that read settles, so nothing between the answer and the server's `starting`
+   * is drawn from the reading that predates the press.
+   */
+  onStartAdmitted: () => void
   /**
    * A PRESS HAS BEGUN, OR FINISHED — and the pane needs to know before the server does.
    *

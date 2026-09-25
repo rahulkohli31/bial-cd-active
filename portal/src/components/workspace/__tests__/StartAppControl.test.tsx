@@ -13,7 +13,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import StartAppControl from '../StartAppControl'
-import { createStarter } from '../startApp'
+import { createPressEnd, createStarter } from '../startApp'
 import type { StartSinks } from '../startApp'
 import { LAUNCH_LABEL, type WorkspaceAction } from '../workspaceState'
 import type { WorkspaceReport } from '../workspaceChannel'
@@ -38,6 +38,7 @@ function reportSpy(over: Partial<WorkspaceReport> = {}): WorkspaceReport {
     projectId: 'p1',
     onStartPending: vi.fn(),
     onStartOutcome: vi.fn(),
+    onStartAdmitted: vi.fn(),
     ...over,
   }
   return {
@@ -120,12 +121,13 @@ describe('one deliberate press, one request', () => {
     await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(1))
   })
 
-  it('clears the outcome when the server admits the start', async () => {
+  it('tells the surface when the server admits the start, and leaves the press for its read to end', async () => {
     const report = reportSpy()
     renderControl(START, report)
     fireEvent.click(button())
 
-    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalledWith(null))
+    await waitFor(() => expect(report.onStartAdmitted).toHaveBeenCalledTimes(1))
+    expect(report.onStartPending).not.toHaveBeenCalledWith(false)
   })
 })
 
@@ -370,9 +372,9 @@ describe('★ the report reaches the surface even after this control is gone', (
       finish(undefined)
     })
 
-    expect(report.onStartOutcome).toHaveBeenCalledWith(null)
-    // …and the wait is cleared, or the pane holds `starting` for the life of the tab.
-    expect(report.onStartPending).toHaveBeenLastCalledWith(false)
+    // …and the surface hears the admission, which is what ends the wait on its next read — without
+    // it the pane holds `starting` for the life of the tab.
+    expect(report.onStartAdmitted).toHaveBeenCalledTimes(1)
   })
 
   it('records a REFUSAL the same way', async () => {
@@ -403,6 +405,7 @@ describe('★ a start that is overtaken by a change of project', () => {
     projectId,
     onStartPending: vi.fn(),
     onStartOutcome: vi.fn(),
+    onStartAdmitted: vi.fn(),
   })
 
   it('★ reports into nothing once the screen has moved on', async () => {
@@ -438,5 +441,35 @@ describe('★ a start that is overtaken by a change of project', () => {
     expect(second).not.toBe(first)
     expect(api.relaunchPreview).toHaveBeenCalledWith({ projectId: 'p2' })
     expect(api.relaunchPreview).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('★ an admitted press ends on the first read begun after the admission', () => {
+  it('a read already in flight at the admission cannot end it; the next one does, once', () => {
+    // The read in flight carries the reading from before the press, which is what the press is
+    // standing in front of.
+    const end = vi.fn()
+    const press = createPressEnd(end)
+    const inFlight = press.readBegins()
+    press.admitted()
+    inFlight()
+    expect(end).not.toHaveBeenCalled()
+
+    press.readBegins()()
+    expect(end).toHaveBeenCalledTimes(1)
+    press.readBegins()()
+    expect(end).toHaveBeenCalledTimes(1)
+  })
+
+  it('no read ends a press that was never admitted, or one whose project left', () => {
+    const end = vi.fn()
+    const press = createPressEnd(end)
+    press.readBegins()()
+    expect(end).not.toHaveBeenCalled()
+
+    press.admitted()
+    press.drop()
+    press.readBegins()()
+    expect(end).not.toHaveBeenCalled()
   })
 })

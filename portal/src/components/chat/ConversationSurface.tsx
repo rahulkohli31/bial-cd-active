@@ -48,7 +48,7 @@ import {
 } from '../workspace/workspaceState'
 import type { ProbeCadence, StartOutcome } from '../workspace/workspaceState'
 import { useTheWaitHasGoneOnTooLong } from '../workspace/useTheWaitHasGoneOnTooLong'
-import { useStartApp } from '../workspace/startApp'
+import { createPressEnd, useStartApp } from '../workspace/startApp'
 import type { StartSinks } from '../workspace/startApp'
 import {
   useAppPaneVisible,
@@ -721,13 +721,15 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
 
   // WHETHER A PRESS OF THE WORKSPACE'S OWN START CONTROL IS IN FLIGHT.
   const [startPending, setStartPending] = useState(false)
+  const [pressEnd] = useState(() => createPressEnd(() => setStartPending(false)))
   // DROPPED WITH THE PROJECT IT DESCRIBED. This surface is not remounted when the screen moves,
   // and `startApp`'s own clear is gated on the start still being ours — correctly, or a late
   // clear from the outgoing start would wipe the incoming one's flag. So the hop itself has to
   // do it, or the incoming app is drawn mid-start with no press behind it.
   useEffect(() => {
     setStartPending(false)
-  }, [projectId])
+    pressEnd.drop()
+  }, [projectId, pressEnd])
   const generating = generatingChatId === buildId
   // THE ONE GATE, AND ITS ONLY TERM IS TURN STATE. What a chat IS appears nowhere in it: a
   // kind is a tool-access level, not a thing that can shut the composer, and using it as a gate is
@@ -2216,6 +2218,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       // waits on it, so a slow renewal cannot delay the read the screen is rendering.
       void renewPresence(projectId, presenceToRenew(hidden))
       const generation = ++latestProbe
+      const probeSettled = pressEnd.readBegins()
       try {
         const state = await fetchPreviewState(projectId)
         // Superseded: a probe started after this one, so its answer is newer whatever order the
@@ -2233,6 +2236,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
             ? prev
             : { projectId, state },
         )
+        probeSettled()
         // A TERMINAL ANSWER ENDS THE POLL. `asleep` is a settled fact about a workspace:
         // nothing that could change it happens without one of this effect's inputs changing
         // first, so re-asking every 45 seconds forever was a timer that could only ever hear
@@ -2328,6 +2332,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // without deciding anything about the workspace; see its own note for why that asymmetry
         // is the point.
         //
+        // It ends an admitted press all the same, or a dead endpoint would hold the press forever.
+        if (live && generation === latestProbe) probeSettled()
         // The guards mirror the success path's, plus `timer === null` — a poll a settled answer
         // has already stopped must not be resurrected by a failure. `keepAsking` only: nothing
         // that failed to ask is ever terminal.
@@ -2367,7 +2373,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       window.removeEventListener('focus', onVisible)
       stopAsking()
     }
-  }, [projectId, previewProbeEpoch])
+  }, [projectId, previewProbeEpoch, pressEnd])
 
   // The pane's stalled-frame edge, into the probe above. A `true` asks at once rather than on the
   // next tick: somebody is looking at a stuck app now.
@@ -2449,12 +2455,19 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       onStartPending: setStartPending,
       onStartOutcome: (outcome: StartOutcome | null) => {
         setStartOutcome(outcome)
-        // An admitted start clears the outcome and asks again immediately: the next read is the
-        // one that sees `starting` and turns the poll up to catch the app arriving.
+        // A cleared outcome asks again at once: a retry, or a refusal with no words, is answered
+        // by the reading rather than by the press.
         if (outcome === null) setPreviewProbeEpoch((n) => n + 1)
       },
+      // An admitted start clears the outcome and asks again immediately: the next read is the one
+      // that sees `starting`, turns the poll up to catch the app arriving, and ends the press.
+      onStartAdmitted: () => {
+        setStartOutcome(null)
+        pressEnd.admitted()
+        setPreviewProbeEpoch((n) => n + 1)
+      },
     }),
-    [projectId],
+    [projectId, pressEnd],
   )
   const startTheApp = useStartApp(startSinks)
   usePublishWorkspaceReport(

@@ -186,11 +186,13 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       onStartPending: workspace.reportStartPending,
       onStartOutcome: (outcome: StartOutcome | null) => {
         workspace.reportStartOutcome(outcome)
-        // An admitted start clears the outcome AND asks again immediately: the server's `starting`
-        // is waiting on the next read, and that read is what turns the poll up to the fast cadence
-        // that catches the app arriving, instead of the next tick of a 45-second timer.
+        // A cleared outcome asks again at once: a retry, or a refusal with no words, is answered by
+        // the reading rather than by the press.
         if (outcome === null) workspace.refresh()
       },
+      // Asks again at once as well: the server's `starting` is waiting on the next read, and that
+      // read is what turns the poll up to the fast cadence that catches the app arriving.
+      onStartAdmitted: workspace.reportStartAdmitted,
     }),
     [workspace, project.id],
   )

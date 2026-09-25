@@ -66,6 +66,7 @@ function reportFor(
     projectId: 'p1',
     onStartPending: vi.fn(),
     onStartOutcome: vi.fn(),
+    onStartAdmitted: vi.fn(),
   }
   return {
     ...sinks,
