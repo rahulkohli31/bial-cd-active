@@ -2841,9 +2841,9 @@ class SessionManager:
         start: _StartInFlight,
     ) -> None:
         """The detached half of `relaunch_preview`: bring the container up under both locks,
-        let them go, then watch for the first page. A failure is compensated by the lock's own
-        scope and logged here; the next `preview-state` poll finds the app at rest, with what
-        went wrong."""
+        let them go, then watch for the first page. A failure before the container is up is
+        compensated by the lock's own scope, and the next `preview-state` poll finds the app at
+        rest with what went wrong. One after it is up still leaves an app to watch."""
         try:
             handle = await self._up_under_the_locks(
                 held,
@@ -2854,15 +2854,24 @@ class SessionManager:
                 project_id=project_id,
                 app_id=app_id,
                 env=env,
+                start=start,
             )
         except Exception:
-            _log.exception(
-                "the detached start failed; its lock scope has compensated",
+            if not scope.spared or scope.handle is None:
+                _log.exception(
+                    "the detached start failed; its lock scope has compensated",
+                    user_id=str(user_id),
+                    app_id=str(app_id),
+                    attached=env is None,
+                )
+                return
+            _log.warning(
+                "the app is up, but a store write after its start failed",
                 user_id=str(user_id),
                 app_id=str(app_id),
-                attached=env is None,
+                exc_info=True,
             )
-            return
+            handle = scope.handle
         finally:
             self._forget_the_start(user_id, start)
         if not await self._watch_for_a_first_serve(
@@ -2894,6 +2903,7 @@ class SessionManager:
         project_id: uuid.UUID,
         app_id: uuid.UUID,
         env: dict[str, str] | None,
+        start: _StartInFlight,
     ) -> SandboxHandle:
         """Restore when `env` is given, then start the dev server, hand the container its stay,
         and let both locks go. Returns the handle the watch reads."""
@@ -2942,8 +2952,11 @@ class SessionManager:
                 # Settled rather than re-granted: provisioning is over, and the screen framing
                 # the app renews its own stay from here.
                 await settle_stay_once_provisioning_ends(redis, user_id, app_name=app_name)
-            except Exception as exc:
-                if not scope.spared:
+            except BaseException as exc:
+                # Before compensation, which can spend tens of seconds tearing the container
+                # down: a press arriving meanwhile starts afresh instead of joining a lost start.
+                self._forget_the_start(user_id, start)
+                if not scope.spared and isinstance(exc, Exception):
                     await self._say_the_start_failed(redis, user_id, project_id, exc)
                 raise
         return handle

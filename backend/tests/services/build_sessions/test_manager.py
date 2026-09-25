@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import redis.asyncio as aioredis
 import sqlalchemy as sa
+import structlog.testing
 from pydantic import SecretStr
 from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -72,6 +73,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
+    start_failure_key,
 )
 from src.services.sandbox import (
     ExecResult,
@@ -1377,6 +1379,87 @@ async def test_relaunch_spares_the_container_when_the_stay_settle_hits_a_redis_e
     assert client.restored == [app_name_for(app_id)]  # a container WAS created...
     assert client.torn_down == []  # ...and SURVIVES
     assert manager._active_by_user == {}
+
+
+async def test_a_store_blip_once_the_app_is_up_still_watches_for_its_first_page(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past `scope.spare()` the container is up, so a Redis error in the settle or the lock
+    release is bookkeeping, not a failed start: the app still gets its first-serve watch, and
+    nothing tells the pane the start failed.
+
+    Mutation check: return on every failure in `_bring_it_up` and the proof is never stamped;
+    record the failure whether or not the scope was spared and the failure key is written."""
+    user, project_id = await _mk(db_session, "r-up-blip@rvaiglobal.com")
+    manager = SessionManager()
+    client = _RelaunchRecorder()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    async def the_settle_hits_a_blip(*_args: object, **_kwargs: object) -> datetime:
+        raise RedisError("redis is down")
+
+    monkeypatch.setattr(
+        manager_module, "settle_stay_once_provisioning_ends", the_settle_hits_a_blip
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        await _relaunched(manager, db_session, user, project_id, client)
+
+    assert client.restored == [app_name_for(app_id)]
+    assert client.torn_down == []
+    assert await _proven(fake_redis, user.id), "the app was up and nothing watched it"
+    assert await fake_redis.get(start_failure_key(user.id)) is None
+    assert not [e for e in logs if str(e["event"]).startswith("the detached start failed")]
+    assert await lock_is_held(fake_redis, user.id) is False
+
+
+async def test_a_press_during_a_failed_starts_teardown_starts_afresh_instead_of_joining_it(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """A failed start's compensation tears its container down, which can take tens of seconds.
+    A press in that window must start again, not join the start already lost: joining answers
+    202 and lands back at rest with nothing started.
+
+    Mutation check: forget the start only once `_bring_it_up` returns and the second restore
+    never happens."""
+    user, project_id = await _mk(db_session, "r-press-in-teardown@rvaiglobal.com")
+    manager = SessionManager()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    class TheFirstStartDiesSlowly(_RelaunchRecorder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.tearing_down = asyncio.Event()
+            self.gate = asyncio.Event()
+
+        async def dev_start(self, handle, *, cmd=None, cwd=None):
+            if not self.dev_started:
+                self.dev_started.append(handle.app_name)
+                raise SandboxError("supervisor refused /dev/start")
+            return await super().dev_start(handle, cmd=cmd, cwd=cwd)
+
+        async def teardown(self, handle):
+            self.tearing_down.set()
+            await self.gate.wait()
+            await super().teardown(handle)
+
+    client = TheFirstStartDiesSlowly()
+    await manager.relaunch_preview(db_session, user, project_id, client)
+    await asyncio.wait_for(client.tearing_down.wait(), timeout=5)
+
+    again = asyncio.create_task(manager.relaunch_preview(db_session, user, project_id, client))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    client.gate.set()
+
+    assert await asyncio.wait_for(again, timeout=5) == app_id
+    await detached_work_done(manager)
+    name = app_name_for(app_id)
+    assert client.restored == [name, name], "the second press joined the lost start"
+    assert await _proven(fake_redis, user.id)
 
 
 async def test_relaunch_while_a_build_is_live_is_409(
