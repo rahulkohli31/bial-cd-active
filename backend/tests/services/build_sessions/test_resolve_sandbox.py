@@ -954,6 +954,31 @@ async def test_a_registry_that_moves_on_before_the_restart_restarts_nothing(
     assert client.dev_started == []
 
 
+async def test_a_stopped_reading_that_goes_stale_before_the_lock_is_held_restarts_nothing(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first reading is taken before the start lock, and a start or a Discard can bring the
+    server back up under that lock before this check takes it. Acting on the old reading retracts
+    a proof the app still earns and logs a stop that is no longer true.
+
+    Mutation check: drop the reading taken under the lock and `dev_started` fills."""
+    manager, client, user, project_id = await _a_stopped_app(
+        db_session, fake_redis, fake_storage, "u4-stopped-stale@rvaiglobal.com"
+    )
+    _script_dev(monkeypatch, client, _STOPPED, _SERVING)
+
+    with capture_logs() as logs:
+        await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
+
+    assert client.dev_started == []
+    reg = await read_registry(fake_redis, user.id)
+    assert reg is not None and stamp_is_proven(reg), "a serving app lost its proof"
+    assert [e for e in logs if e["event"] == APP_STOPPED_WHILE_IDLE_EVENT] == []
+
+
 async def test_a_restart_the_supervisor_refuses_is_logged_and_destroys_nothing(
     db_session: AsyncSession,
     fake_redis: aioredis.Redis,

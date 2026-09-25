@@ -1637,7 +1637,9 @@ class SessionManager:
             saved = await discard_back_to_saved(
                 sandbox_client, handle, app_id, taken_at=datetime.now(UTC)
             )
-        await self._boot_the_tree_we_put_back(sandbox_client, handle, user.id, arm="discard")
+            # Under the lock, which is what keeps the idle check from starting a second server
+            # beside this one.
+            await self._boot_the_tree_we_put_back(sandbox_client, handle, user.id, arm="discard")
         notes = await _note_the_discard(
             db, user.id, project_id, origin=conversation_id, saved=saved
         )
@@ -1763,6 +1765,11 @@ class SessionManager:
                     redis, user_id, app_name_for(app_id)
                 )
             ):
+                return
+            # Asked again now the lock is held: the reading above may predate a start or a
+            # Discard that has since brought the server back up under it.
+            stopped = await _stopped_reading(sandbox_client, handle)
+            if stopped is None:
                 return
             # Retracted first, so the pane waits for the restarted server's first page instead
             # of framing the dead one.
