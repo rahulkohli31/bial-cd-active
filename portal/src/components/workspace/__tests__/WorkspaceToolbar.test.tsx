@@ -63,7 +63,7 @@ const APP_URL = 'https://app-a.example.azurecontainerapps.io/'
 const SAVED_AT = '2026-09-13T14:32:00Z'
 
 const EMPTY_PANE: PaneView = {
-  iterating: false, reconnecting: false,
+  reconnecting: false,
   previewState: null, turnRunning: false,
   compileState: null, workspaceLost: false,
 }

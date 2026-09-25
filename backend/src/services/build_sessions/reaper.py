@@ -7,18 +7,15 @@ Two entry points, plus `src/workers/sandbox_reap.py`, the scheduled caller of
   every `start` — closes the "crashed tab -> can never start again" lockout.
 * `sweep_all` reconciles EVERY registered user, idempotent + concurrency-safe; runs on
   a schedule, or by hand at `POST /v1/build-sessions/internal/reap`.
-* `reap_the_container_we_judged` is the janitor's, keyed by CONTAINER NAME rather than
-  user, because a user's record can name a different container by the time the delete
-  lands. See its own docstring.
 
 A COMPLETED build is not torn down: the registry stays with a bounded stay-of-execution
-lease and the lock releases. `sweep_all` honours an unexpired lease; `reconcile_user`
+lease and the lock releases. `sweep_all` honours an unexpired lease; reconcile-on-start
 reaps through one — the incoming build needs the slot. The sweep only reaches containers
 with a Redis registry record; one whose record is gone is invisible here forever
 (`inventory.take_sandbox_inventory`, `POST /v1/admin/apps/reconcile-sandboxes`, reports
 rather than deletes).
 
-WHY THIS EXISTS. The live-session shield (`has_live_session`) reads an IN-PROCESS set,
+WHY THIS EXISTS. The live-session shield (`sweep_all`'s `live_users`) reads an IN-PROCESS set,
 blind on a second replica — it bit in the quiet stretches between heartbeat renews. A
 wall-clock LIVENESS LEASE, renewed every turn, closed that for the sweep;
 `certified_dead` still asserts single-replica, and no worker may ever pass it
@@ -38,10 +35,9 @@ import structlog
 
 from src.api.v1.build_sessions.schemas import SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS
 from src.services.build_sessions.alarms import (
-    APP_FIRST_SERVED_EVENT,
     APP_SERVING_LOST_EVENT,
+    REAP_FOUND_NO_REPOSITORY_EVENT,
     SERVING_PROOF_ABSENT_AT_TEARDOWN,
-    SERVING_PROOF_STAMP_REFUSED,
 )
 from src.services.build_sessions.drain import (
     is_drained,
@@ -59,15 +55,20 @@ from src.services.build_sessions.locks import (
     liveness_lease_is_held,
     lock_is_held,
     mark_registry_ending,
-    mark_serving,
     read_registry,
     read_starting_marker,
     reap_lock,
+    record_the_first_serve,
     release_liveness_lease,
+    shared_view_stamp,
     stamp_is_proven,
     stay_of_execution_is_current,
 )
-from src.services.build_sessions.snapshot import SavedCopyOutcome, write_the_tree_back
+from src.services.build_sessions.snapshot import (
+    SavedCopyOutcome,
+    WorkspaceHasNoRepositoryError,
+    write_the_tree_back,
+)
 from src.services.redis import REGISTRY_STATE_READY, registry_key, registry_scan_patterns
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
@@ -118,7 +119,7 @@ _PROBE_BUDGET_SECONDS: float = 10.0
 
 #: WHICH observer this module is, in `APP_FIRST_SERVED_EVENT`'s `observer` vocabulary — a named
 #: constant for the same reason the turn engine and the session manager each have one: a typo in
-#: one of the three call sites below would mint an observer that never existed, and the log rule
+#: one of the call sites below would mint an observer that never existed, and the log rule
 #: keyed on the name would go on matching nothing while looking perfectly healthy.
 _OBSERVER_RECONCILER: Final = "reconciler"
 
@@ -235,10 +236,10 @@ async def _reach_the_container(
 # WHAT IT MAY NEVER DO IS DECIDE ANYTHING. A container that has not yet served is not therefore
 # reapable, and this section is structured so that it CANNOT become evidence in that judgement:
 # both entry points (`_observe_the_serving_proof` and `_sound_the_alarm_if_the_proof_is_absent`)
-# return `None`, so there is no value for the reap decision to read; each of their call sites is
-# a statement on its own line beside a `return False` / a teardown that is character for
-# character the one that was already there; and nothing here marks a registry `ending`, tears
-# anything down, or touches a lock, a lease or a heartbeat.
+# return `None`, so there is no value for the reap decision to read; each is called only once
+# that decision is already taken — the sparing verdict, or a teardown that has succeeded; and
+# nothing here marks a registry `ending`, tears anything down, or touches a lock, a lease or a
+# heartbeat.
 
 
 @dataclass(frozen=True)
@@ -324,7 +325,7 @@ def _this_users_turn_to_be_re_asked(user_uuid: uuid.UUID, now: datetime) -> bool
 
 
 def _what_this_record_is_missing(
-    reg: dict[str, str], now: datetime, user_uuid: uuid.UUID, *, thin_the_re_ask: bool
+    reg: dict[str, str], now: datetime, user_uuid: uuid.UUID
 ) -> Literal["stamp", "retract"] | None:
     """Which correction this hash could want, or `None` to ask the container nothing.
 
@@ -345,24 +346,16 @@ def _what_this_record_is_missing(
         return None
     if stamp:
         # PROVEN, so the only open question is whether it is STILL true. An AGE gate is wrong
-        # here — a container that first served yesterday can die a minute from now — so on the
-        # FLEET SWEEP the cadence is what gets thinned instead, and only on this arm.
+        # here — a container that first served yesterday can die a minute from now — so the
+        # cadence is what gets thinned instead, and only on this arm.
         #
-        # WHY IT HAD TO BE THINNED THERE. This arm matches the STEADY STATE of every healthy
-        # preview: ready, stamped, spared. Asked on every pass it meant one `attach_existing`
-        # plus one `dev_status` per live preview per five minutes, forever — and `sweep_all`
-        # walks its users ONE AT A TIME, so a fleet of N live previews added N serial probes,
-        # each of them up to `_PROBE_BUDGET_SECONDS`, to a pass that used to be Redis-only. A
-        # sweep that overruns its own cadence starves the REAP, which is the job that matters.
-        #
-        # AND WHY ONLY THERE. Reconcile-on-start asks about ONE user, because that user just
-        # pressed something — there is no fleet to multiply, and the answer is about to decide
-        # what they see. It pays the probe every time.
-        return (
-            "retract"
-            if not thin_the_re_ask or _this_users_turn_to_be_re_asked(user_uuid, now)
-            else None
-        )
+        # WHY IT IS THINNED. This arm matches the STEADY STATE of every healthy preview: ready,
+        # stamped, spared. Asked on every pass it would mean one `attach_existing` plus one
+        # `dev_status` per live preview per five minutes, forever — and `sweep_all` walks its
+        # users ONE AT A TIME, so a fleet of N live previews adds N serial probes, each of them
+        # up to `_PROBE_BUDGET_SECONDS`. A sweep that overruns its own cadence starves the REAP,
+        # which is the job that matters.
+        return "retract" if _this_users_turn_to_be_re_asked(user_uuid, now) else None
     created = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
     if created is None or (now - created).total_seconds() < _NOBODY_IS_COMING_AFTER_SECONDS:
         return None
@@ -374,25 +367,19 @@ async def _observe_the_serving_proof(
     user_uuid: uuid.UUID,
     sandbox_client: SandboxClient,
     reg: dict[str, str],
-    *,
-    thin_the_re_ask: bool,
 ) -> None:
     """Make this user's serving stamp agree with what their container is doing now.
 
     RETURNS NOTHING, AND THE EMPTINESS IS THE GUARANTEE: there is no value here for a caller's
     reap decision to read, so an observation cannot quietly become a verdict.
 
-    BROAD ON THE WAY OUT, for the same reason. Every caller is a sparing arm that has already
-    made up its mind, and the one thing this must never do is change that outcome — an escaping
-    `RedisError` would fail the reconcile a citizen's own build start is waiting on, and an
-    escaping anything would be counted by `sweep_all` as a user it could not reconcile. So the
-    failure is RECORDED and the arm proceeds exactly as it would have. `CancelledError` is a
-    `BaseException` and still propagates, so a shutdown stops the sweep rather than being logged
-    and swallowed."""
+    BROAD ON THE WAY OUT, for the same reason. The caller has already decided to spare, and the
+    one thing this must never do is change that outcome — an escaping anything would be counted
+    by `sweep_all` as a user it could not reconcile. So the failure is RECORDED and the sparing
+    proceeds exactly as it would have. `CancelledError` is a `BaseException` and still
+    propagates, so a shutdown stops the sweep rather than being logged and swallowed."""
     try:
-        await _make_the_stamp_agree(
-            redis, user_uuid, sandbox_client, reg, thin_the_re_ask=thin_the_re_ask
-        )
+        await _make_the_stamp_agree(redis, user_uuid, sandbox_client, reg)
     except Exception:
         _log.exception(
             "the serving-proof observation failed; the reap decision is unaffected",
@@ -406,12 +393,10 @@ async def _make_the_stamp_agree(
     user_uuid: uuid.UUID,
     sandbox_client: SandboxClient,
     reg: dict[str, str],
-    *,
-    thin_the_re_ask: bool,
 ) -> None:
     """The observation itself: at most one probe, and at most one compare-and-set."""
     now = datetime.now(UTC)
-    arm = _what_this_record_is_missing(reg, now, user_uuid, thin_the_re_ask=thin_the_re_ask)
+    arm = _what_this_record_is_missing(reg, now, user_uuid)
     if arm is None:
         return
     answered = await _ask_whether_the_app_answers(sandbox_client, user_uuid)  # THE ONE PROBE
@@ -429,25 +414,9 @@ async def _make_the_stamp_agree(
             # alarm rather than a notice. That the proof is still absent is recorded ONCE, where
             # it becomes final — `SERVING_PROOF_ABSENT_AT_TEARDOWN`, at teardown.
             return
-        created = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
-        if await mark_serving(redis, user_uuid, app_name=answered.app_name, when=now):
-            _log.info(
-                APP_FIRST_SERVED_EVENT,
-                user_id=str(user_uuid),
-                app_name=answered.app_name,
-                serving_since=now.isoformat(),
-                # Non-None by construction — the stamp arm is reached only through an age gate
-                # that needs it — but expressed rather than asserted, since `python -O` strips
-                # an `assert` and this line is the operator's whole answer to "how long".
-                ms_since_container_created=elapsed_ms(created, now),
-                # WHICH watcher won, and this one winning is itself the finding: it means every
-                # in-turn observer for this container was lost. `cold` is deliberately absent
-                # rather than guessed — it says which arm CREATED the container, and a sweep that
-                # arrived minutes later was not there for it.
-                observer=_OBSERVER_RECONCILER,
-            )
-            return
-        await _record_a_refused_stamp(redis, user_uuid, expected_app=answered.app_name)
+        await record_the_first_serve(
+            redis, user_uuid, app_name=answered.app_name, observer=_OBSERVER_RECONCILER, cold=None
+        )
         return
     # BOTH READINGS HAVE TO SAY NO, and `ready` is the one that carries the weight. `running` is
     # child-process truth about the dev server the supervisor itself started; `ready` means a
@@ -475,37 +444,6 @@ async def _make_the_stamp_agree(
             served_for_ms=elapsed_ms(served_since, now),
             observer=_OBSERVER_RECONCILER,
         )
-
-
-async def _record_a_refused_stamp(
-    redis: aioredis.Redis, user_uuid: uuid.UUID, *, expected_app: str
-) -> None:
-    """Tell a benign race apart from the near-miss, and alarm on the near-miss only.
-
-    `mark_serving` answers False for two very different situations and cannot distinguish them
-    from the inside. One is another observer landing the same first serve microseconds earlier —
-    first-serve-wins working exactly as designed, and their `app_first_served` line is the
-    record, so a second line here would double-count a single event. The other is the dangerous
-    one: the hash is gone, marked `ending`, or names a different container, which means this
-    observer came back holding evidence about a container that no longer occupies the slot.
-
-    The re-read is what separates them. `found_app_present` is a BOOL and never the other
-    project's container name — the id vocabulary in this log stays user-scoped, and naming the
-    loser would put one of the citizen's projects into another's build trace."""
-    reg = await read_registry(redis, user_uuid)
-    if (
-        reg is not None
-        and reg.get(REGISTRY_FIELD_APP_NAME) == expected_app
-        and reg.get(REGISTRY_FIELD_SERVING_SINCE)
-    ):
-        return
-    _log.warning(
-        SERVING_PROOF_STAMP_REFUSED,
-        user_id=str(user_uuid),
-        expected_app=expected_app,
-        found_app_present=bool(reg is not None and reg.get(REGISTRY_FIELD_APP_NAME)),
-        observer=_OBSERVER_RECONCILER,
-    )
 
 
 def _sound_the_alarm_if_the_proof_is_absent(reg: dict[str, str], *, user_uuid: uuid.UUID) -> None:
@@ -552,21 +490,20 @@ async def _take_the_copy_we_promised(
 ) -> bool:
     """True when this container may now be reclaimed.
 
-    WRITE THE TREE BACK, THEN DESTROY. Both call sites once spared instead, so a failed copy
-    billed forever behind a log line repeating every fifteen minutes and looked, to anyone
-    reading it, like the guard working correctly. This really happened. Every failing arm SPARES
-    and RECORDS, so the next pass retries.
+    WRITE THE TREE BACK, THEN DESTROY. A caller that spared instead on a failed copy billed
+    forever behind a log line repeating every fifteen minutes and looked, to anyone reading it,
+    like the guard working correctly. This really happened. Every failing arm SPARES and
+    RECORDS, so the next pass retries — except a workspace with no repository, which no pass
+    could ever save.
 
     THE UNREACHABLE ARM STILL COLLECTS, and that is what stops a wedged container being spared
     forever: nothing can be bundled from a container that will not attach, so the question
     becomes whether a saved bundle already stands for this app. One head call, and an absent or
     unreadable store spares."""
-    # IMPORTED HERE, NOT AT MODULE SCOPE, and the reason is weight rather than a cycle. There is
-    # no import cycle — `src.workers.reclamation` imports the reaper function-scoped, so nothing
-    # closes a loop at module-import time. The weight is real: `pass_history` reaches
+    # IMPORTED HERE, NOT AT MODULE SCOPE, for weight rather than a cycle: `pass_history` reaches
     # `src.db.base`, which BUILDS THE ORM ENGINE at import, so a module-level bind puts that
-    # (and `src.broker`, by way of `src.workers.reclamation`) behind every import of the reaper
-    # — including the cold one `test_the_reaper_imports_without_the_fastapi_app` performs.
+    # behind every import of the reaper — including the cold one
+    # `test_the_reaper_imports_without_the_fastapi_app` performs.
     from src.services.build_sessions.pass_history import (
         CopyAttempt,
         record_durable_copy_attempt,
@@ -590,6 +527,12 @@ async def _take_the_copy_we_promised(
         return False
     try:
         written = await write_the_tree_back(sandbox_client, reached, app_id)
+    except WorkspaceHasNoRepositoryError:
+        # NO LATER PASS COULD SAVE THIS TREE, so sparing it would only bill forever: see
+        # `REAP_FOUND_NO_REPOSITORY_EVENT`. The saved copy is untouched.
+        _log.warning(REAP_FOUND_NO_REPOSITORY_EVENT, app_id=str(app_id), app_name=expected_name)
+        await record_durable_copy_attempt(CopyAttempt.NOTHING_TO_COPY)
+        return True
     except Exception:
         # BROAD ON PURPOSE, and it is the fail-CLOSED direction. Every way this can fail — the
         # exec, the bundle, the base64 read-back, the store, bytes that will not parse as a
@@ -618,10 +561,9 @@ async def _a_saved_bundle_stands_in(app_id: uuid.UUID) -> bool:
     """May a container nobody can attach to be destroyed? Only against a saved bundle.
 
     WITHOUT THIS A WEDGED CONTAINER IS SPARED ON EVERY PASS, FOREVER, billing forever — the
-    exact leak the age ceiling exists to close, since neither `reap_user` nor
-    `reap_the_container_we_judged` carries a strike count. An unconfigured or unreadable store is
-    a fact about the deployment or about this moment, never about anybody's work, so both spare.
-    """
+    exact leak the age ceiling exists to close, since `reap_user` carries no strike count of its
+    own. An unconfigured or unreadable store is a fact about the deployment or about this
+    moment, never about anybody's work, so both spare."""
     from src.services.build_sessions.pass_history import (
         CopyAttempt,
         record_durable_copy_attempt,
@@ -678,6 +620,7 @@ async def _hand_the_debt_over(
             # against: it is re-stamped at every registration, so it can tell this container from
             # whatever is created under the same name next. No stamp, no discriminator, no row.
             instance_ref=an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT),
+            shared_view=shared_view_stamp(reg),
         )
     except Exception:
         _log.exception(
@@ -795,62 +738,6 @@ async def reap_user(
     return True
 
 
-async def reap_the_container_we_judged(
-    redis: aioredis.Redis,
-    sandbox_client: SandboxClient,
-    *,
-    app_name: str,
-    user_uuid: uuid.UUID,
-    app_id: uuid.UUID,
-) -> bool:
-    """The ordered reap for ONE container, keyed by NAME. True only when it actually deleted it.
-
-    NOT `reap_user`, which destroys whatever the registry currently names for a user. Keying by
-    name keeps the janitor honest across an enumerate-then-delete pass: a sandbox started between
-    the two would otherwise be deleted while the judged orphan was spared, and an unregistered
-    orphan — the population this exists to collect — reported destroyed with nothing deleted. The
-    ARM delete uses the judged name; the user's Redis state is touched ONLY when the registry
-    still names it: `mark_registry_ending` -> `teardown` -> `delete_registry` -> `reap_lock`."""
-    reg = await read_registry(redis, user_uuid)
-    ours = reg is not None and reg.get(REGISTRY_FIELD_APP_NAME) == app_name
-    # The container is only reachable THROUGH the registry — `attach_existing` builds its handle
-    # from that record — so a container the registry no longer claims is judged on its saved copy
-    # alone. It is also why no copy can be taken for an unregistered orphan: there is no address
-    # to bundle from, and the address we DO have belongs to somebody else's container.
-    reached = await _reach_the_container(sandbox_client, user_uuid) if ours else None
-    # THE JANITOR IS THE CALLER WITH NOBODY WATCHING IT.
-    if not await _take_the_copy_we_promised(
-        sandbox_client, app_id=app_id, reached=reached, expected_name=app_name
-    ):
-        # SPARE AND REPORT — never destroy. Nothing is cleared, so the next pass retries once the
-        # tree is written back or the store is readable again.
-        _log.warning(
-            "reclamation refused: this container's work could not be written back",
-            app_name=app_name,
-            user_id=str(user_uuid),
-            app_id=str(app_id),
-        )
-        return False
-    if ours:
-        await mark_registry_ending(redis, user_uuid)  # step 1: guard a concurrent attach
-    try:
-        await sandbox_client.teardown(
-            handle_named(app_name, fqdn=(reg or {}).get(REGISTRY_FIELD_FQDN, ""))
-        )
-    except SandboxError:
-        # KEEP whatever state there is so a later pass retries; clearing it now would orphan a
-        # container that is still standing. Not silent (logged), and NOT counted as destroyed.
-        _log.exception(
-            "reclamation teardown failed; leaving state for a later pass", app_name=app_name
-        )
-        return False
-    if ours:
-        await delete_registry(redis, user_uuid)
-        await release_liveness_lease(redis, user_uuid)
-        await reap_lock(redis, user_uuid)  # LAST
-    return True
-
-
 _SHARED_PREVIEW_ABSOLUTE_CEILING = timedelta(seconds=SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS)
 
 
@@ -867,9 +754,8 @@ async def _renew_shared_view_from_traffic(
     never compete with those or run an extra supervisor round trip on their behalf.
 
     OBSERVATION, NOT AN INPUT, same posture as `_observe_the_serving_proof` and for the same
-    reason: it runs ahead of every sparing arm in `reconcile_user`, so a failure here must never
-    affect the reap decision reading them. Recorded and swallowed; `CancelledError` still
-    propagates."""
+    reason: it runs ahead of the claims the sweep reads, so a failure here must never affect the
+    reap decision reading them. Recorded and swallowed; `CancelledError` still propagates."""
     app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
     if not is_a_shared_sandbox_name(app_name):
         return
@@ -908,19 +794,24 @@ async def _renew_shared_view_from_traffic(
         )
 
 
-def _shared_view_past_its_ceiling(reg: dict[str, str], now: datetime) -> bool:
+def _shared_view_past_its_ceiling(
+    identity: SandboxIdentity | None, app_name: str, now: datetime
+) -> bool:
     """#198's absolute session ceiling (requirement 20) — independent of the renewable traffic
     stay above, so a wedged or spoofed supervisor report can never buy a shared view
     immortality. `False` for every OTHER kind of record (an ordinary build sandbox has no
     ceiling of its own here; its own signals govern it) and for a shared view still inside the
     window — this only ever SUBTRACTS from what the stay would otherwise spare, never adds a
-    reason to spare one."""
-    if not is_a_shared_sandbox_name(reg.get(REGISTRY_FIELD_APP_NAME, "")):
+    reason to spare one.
+
+    Measured from the CONTAINER's birthday (`_container_age_source`), because a failed teardown
+    followed by a fresh registration would otherwise reset the record's `created_at` and let a
+    shared view earn a new ceiling each time."""
+    if not is_a_shared_sandbox_name(app_name):
         return False
-    created = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
-    if created is None:
-        return False  # cannot prove an age; the arms in `reconcile_user` decide instead
-    return now - created >= _SHARED_PREVIEW_ABSOLUTE_CEILING
+    if identity is None or identity.created_at is None:
+        return False  # cannot prove an age, so this subtracts nothing
+    return now - identity.created_at >= _SHARED_PREVIEW_ABSOLUTE_CEILING
 
 
 async def _container_age_source(
@@ -962,21 +853,20 @@ def _the_jammed_turn_grace() -> float:
     return RUN_WALL_CLOCK_DEADLINE_S + RUN_COMMAND_SLOW_TIMEOUT_S
 
 
-async def _past_the_ceiling(
-    sandbox_client: SandboxClient, reg: dict[str, str], *, now: datetime, outranks_a_turn: bool
+def _past_the_ceiling(
+    identity: SandboxIdentity | None, *, now: datetime, outranks_a_turn: bool
 ) -> bool:
     """Has this container outlived the absolute ceiling?
 
     `outranks_a_turn` picks WHICH of the two marks is asked about — the ordinary one, which a
     turn in flight would outrank, or the outer one, which nothing does. The caller knows which
-    arm it is standing in; this does not guess.
+    claim it is bounding; this does not guess.
 
-    Costs one ARM tag read, and only when something is about to be spared."""
-    after_hours = the_ceiling_hours()
-    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
-    if not app_name:
+    `identity` is `None` for an empty app_name (no ceiling applies) or when the caller never
+    needed to read one — either way, that answers False rather than reading anything itself."""
+    if identity is None:
         return False
-    identity = await _container_age_source(sandbox_client, reg, app_name)
+    after_hours = the_ceiling_hours()
     if outranks_a_turn:
         return past_the_turn_bound(
             identity,
@@ -992,132 +882,80 @@ async def reconcile_user(
     user_uuid: uuid.UUID,
     sandbox_client: SandboxClient,
     *,
-    has_live_session: bool,
-    honor_stay: bool = False,
     certified_dead: bool = False,
     app_ids_by_name: Mapping[str, uuid.UUID] | None = None,
-    thin_the_re_ask: bool = False,
 ) -> bool:
-    """Reconcile the user's OWN stale state; True if it reaped. Reaps only when a registry entry
-    exists, no live in-process session is held, and the state does not merely LOOK live.
+    """Reconcile the user's OWN stale state; True if it reaped.
 
-    `honor_stay`, the liveness lease and `certified_dead` are three caller asymmetries, not one
-    behaviour with three names; each arm below says what collapsing it would cost.
-    `certified_dead` is the sweep's forbidden argument, pinned by
-    `test_no_worker_module_may_certify_death`: only a caller under the per-user start lock, on a
-    single-replica deploy, holds the facts it asserts.
-
-    FOUR OF THE FIVE SPARING ARMS ALSO TAKE A READING of the serving proof on their way out —
-    the liveness lease, the start-in-flight marker, the lock/heartbeat pair and the stay of
-    execution, which are the four that hold a registry record when they spare. It is an
-    OBSERVATION AND NEVER AN INPUT: `_observe_the_serving_proof` returns nothing, and every
-    `return False` below is the one that was already there. The fifth arm, `has_live_session`,
-    is deliberately not one of them: it returns above the registry read, so observing there
-    would cost every build start an extra Redis round trip, its caller is about to take the
-    slot itself anyway, and it is never True on the scheduled sweep — `workers/sandbox_reap.py`
-    passes `has_live_session=False` and an empty `live_users`, which is the pass this backstop
-    exists to run on."""
-    if has_live_session:
-        # `run_build` outlives the SSE disconnect, so a multi-minute build whose tab closed
-        # over 90 seconds ago still owns a session here and is not reaped mid-flight.
-        return False
+    `certified_dead` NAMES THE CALLER. Reconcile-on-start passes True: it holds the per-user
+    start lock, has refused a live in-process session, and runs on a single-replica deploy, so
+    whatever still claims the container is a dead session's residue and it reaps THROUGH it,
+    writing nothing back — its builder is about to get a fresh container. The sweep holds none
+    of those facts and spares while any claim stands. True is the sweep's forbidden argument,
+    pinned by `test_no_worker_module_may_certify_death`."""
     if certified_dead:
-        # DELETE THE LEASE, do not merely decline to read it — and do it here, above every
-        # other arm, so a stray lease is cleared even when there is no registry left to
-        # reap. Leaving it would let the background sweep go on sparing a container this
-        # call has already certified dead and is about to tear down, and the next build
-        # registers a DIFFERENT container under the same user. It would also 409 this same
-        # builder's next start until the TTL lapsed — the crashed-tab lockout, reproduced.
+        # DELETE THE LEASE, do not merely decline to read it — and even when no registry is left
+        # to reap. Left standing, it would let the background sweep go on sparing a container
+        # this call is about to tear down, and then whatever this user registers next.
         await release_liveness_lease(redis, user_uuid)
+        return await reap_user(redis, user_uuid, sandbox_client)
     reg = await read_registry(redis, user_uuid)
     if reg is None:
         await reap_lock(redis, user_uuid)  # clear any orphaned lock (no lockout)
         return False
-    # #198: a no-op for every record but a shared-runtime view (checked inside), so this changes
-    # nothing about the four arms below for an ordinary build sandbox. Ahead of them because a
-    # renewal it grants THIS pass must be visible to the stay check further down THIS SAME pass —
-    # picking it up only on the next sweep would needlessly reap a session that just proved active.
+    # A no-op for every record but a shared-runtime view. Ahead of the claims because a stay it
+    # grants THIS pass must count THIS pass — picking it up only on the next sweep would reap a
+    # session that just proved active.
     await _renew_shared_view_from_traffic(redis, user_uuid, sandbox_client, reg)
-    if (
-        not certified_dead
-        and await liveness_lease_is_held(redis, user_uuid)
-        # EVERY ARM A JAM CAN HOLD NEEDS ITS OWN CLAUSE. Each arm returns above the next, so a
-        # bound placed in one of them is unreachable from the others — and a jammed turn holds
-        # the lease, the lock and the heartbeat together, because one loop renews all three. The
-        # mark asked for here is the OUTER one — a whole run plus a slow tool call past the
-        # ceiling — because a lease is what a real turn holds and a real turn must not be cut
-        # short. The stay arm asks the ordinary mark: a tab renewing on a timer is not a turn.
-        and not await _past_the_ceiling(
-            sandbox_client, reg, now=datetime.now(UTC), outranks_a_turn=True
-        )
-    ):
-        # The one liveness input readable from a process that is not running the build.
-        # Checked BEFORE the lock/heartbeat pair below because it outranks it in both
-        # directions — a live build has lost that pair 90 seconds in, and a dead one leaves
-        # it standing for a TTL. A held lease means an agent is making tool calls inside
-        # that container right now.
-        await _observe_the_serving_proof(
-            redis, user_uuid, sandbox_client, reg, thin_the_re_ask=thin_the_re_ask
-        )
-        return False
-    if not certified_dead and await read_starting_marker(redis, user_uuid) is not None:
-        # THE PRE-ADOPT WINDOW, and the only signal that can cover it. Between the registry hash
-        # landing and the container's heartbeat being seeded, the lock/heartbeat pair below is an
-        # AND that cannot be satisfied — so a sweep landing mid-cold-start would reap a container
-        # this user is seconds away from building in. The marker spans exactly that interval and
-        # carries a mandatory TTL, so it stops sparing on its own rather than needing anyone to
-        # remember to clear it.
-        #
-        # BELOW the lease, above the pair, for the same reason the lease sits where it does: a
-        # start that has already reached a live turn is answered by the stronger signal first.
-        await _observe_the_serving_proof(
-            redis, user_uuid, sandbox_client, reg, thin_the_re_ask=thin_the_re_ask
-        )
-        return False
-    if (
-        not certified_dead
-        and await lock_is_held(redis, user_uuid)
-        and await heartbeat_is_alive(redis, user_uuid)
-        # THE SAME OUTER MARK AS THE LEASE ARM, and for the same reason one arm further down.
-        # `_hold_liveness_lease` renews the lease, the lock AND the heartbeat on one 30-second
-        # loop — their only clock — so the jammed turn the outer bound exists for holds all
-        # three. Bounding only the lease arm lets that jam fall through to this pair and be
-        # spared here forever, which is the one population the ceiling was written to end.
-        and not await _past_the_ceiling(
-            sandbox_client, reg, now=datetime.now(UTC), outranks_a_turn=True
-        )
-    ):
-        # looks live + recent (bounded by the heartbeat TTL) — leave it
-        await _observe_the_serving_proof(
-            redis, user_uuid, sandbox_client, reg, thin_the_re_ask=thin_the_re_ask
-        )
-        return False
-    if (
-        honor_stay
-        and await stay_of_execution_is_current(redis, user_uuid)
-        # #198: `False` for every record but a shared view (checked inside), so this changes
-        # nothing about a relaunched build preview's own reprieve. A shared view past its
-        # absolute ceiling falls straight through to the reap below EVEN THOUGH its stay is
-        # still current — the one condition nothing renews, by design (requirement 20).
-        and not _shared_view_past_its_ceiling(reg, datetime.now(UTC))
-        # The build sandbox's own absolute ceiling, and the reason presence renewal is safe: a
-        # surface renewing on a timer pushes this stay forward indefinitely, and this clause is
-        # the only thing that ever stops it. SUBTRACTS from what the stay would spare, exactly
-        # like the shared view's ceiling above; it never adds a reason to spare one.
-        and not await _past_the_ceiling(
-            sandbox_client, reg, now=datetime.now(UTC), outranks_a_turn=False
-        )
-    ):
-        # A relaunched preview holds no lock and renews no heartbeat, so the stay is all that
-        # stands between it and the sweep, which passes True. Reconcile-on-start keeps the
-        # default and reaps THROUGH an unexpired stay: the incoming build needs the single
-        # per-user slot, and sparing the preview there would orphan its own container.
-        await _observe_the_serving_proof(
-            redis, user_uuid, sandbox_client, reg, thin_the_re_ask=thin_the_re_ask
-        )
+    if await _a_claim_still_stands(redis, user_uuid, sandbox_client, reg):
+        # The verdict is already taken; this reading cannot change it.
+        await _observe_the_serving_proof(redis, user_uuid, sandbox_client, reg)
         return False
     return await reap_user(
         redis, user_uuid, sandbox_client, app_id=_owning_app_id(reg, app_ids_by_name, user_uuid)
+    )
+
+
+async def _a_claim_still_stands(
+    redis: aioredis.Redis,
+    user_uuid: uuid.UUID,
+    sandbox_client: SandboxClient,
+    reg: dict[str, str],
+) -> bool:
+    """Does anything still claim this container? The sweep's whole sparing rule, as three claims.
+
+    A START IN FLIGHT (the starting marker) covers the registry hash landing before the
+    heartbeat's seed, and its mandatory TTL is its bound. A TURN (the lease, or the lock and
+    heartbeat together) is bounded by the OUTER mark: one loop renews all three, so a jam holds
+    all three and a real turn must not be cut short. A STAY OF EXECUTION is bounded by the
+    ordinary mark and, for a shared view, its absolute ceiling — the only things that ever stop
+    a tab renewing on a timer. A bound only ever subtracts from a claim.
+
+    The container's identity (`_container_age_source`, one ARM tag read) is fetched AT MOST
+    ONCE, lazily, and only once something is actually about to be spared — never for a record
+    neither claim reaches at all."""
+    if await read_starting_marker(redis, user_uuid) is not None:
+        return True
+    now = datetime.now(UTC)
+    # KEPT BESIDE THE LEASE, though one loop renews both: the pair is all another process can see
+    # of a freshly started container between its turn adopting it and the lease's first write,
+    # and it expires on the store's clock where the lease compares two hosts' wall clocks.
+    a_turn_claims_it = await liveness_lease_is_held(redis, user_uuid) or (
+        await lock_is_held(redis, user_uuid) and await heartbeat_is_alive(redis, user_uuid)
+    )
+    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+    identity: SandboxIdentity | None = None
+    if a_turn_claims_it:
+        if app_name:
+            identity = await _container_age_source(sandbox_client, reg, app_name)
+        if not _past_the_ceiling(identity, now=now, outranks_a_turn=True):
+            return True
+    if not await stay_of_execution_is_current(redis, user_uuid):
+        return False
+    if identity is None and app_name:
+        identity = await _container_age_source(sandbox_client, reg, app_name)
+    return not _shared_view_past_its_ceiling(identity, app_name, now) and not _past_the_ceiling(
+        identity, now=now, outranks_a_turn=False
     )
 
 
@@ -1171,10 +1009,9 @@ async def sweep_all(
     it reaped AND what it could not. Idempotent + concurrency-safe, safe to call on a timer.
     `live_users` are the SessionManager's live in-process sessions — never reaped.
 
-    The scheduled reader of the liveness lease — a lease nothing consults spares nothing. Keeps
-    `certified_dead=False`, holding none of the facts certification rests on, and passes
-    `honor_stay=True`, since a timer has no reason to kill what the user is still looking at.
-    `app_ids_by_name` is FORWARDED: the name->id match happens where the record is read."""
+    The scheduled reader of the liveness lease — a lease nothing consults spares nothing. Never
+    certifies death, holding none of the facts certification rests on. `app_ids_by_name` is
+    FORWARDED: the name->id match happens where the record is read."""
     live = live_users if live_users is not None else set()
     reaped = 0
     failed = 0
@@ -1197,15 +1034,7 @@ async def sweep_all(
         # the sweep, not be logged and swallowed per user.
         try:
             if await reconcile_user(
-                redis,
-                user_uuid,
-                sandbox_client,
-                has_live_session=False,
-                honor_stay=True,
-                app_ids_by_name=app_ids_by_name,
-                # THE FLEET IS WHAT MAKES THE PROBE EXPENSIVE, so the fleet is where it is
-                # thinned. Reconcile-on-start leaves this False and pays it every time.
-                thin_the_re_ask=True,
+                redis, user_uuid, sandbox_client, app_ids_by_name=app_ids_by_name
             ):
                 reaped += 1
         except Exception as exc:

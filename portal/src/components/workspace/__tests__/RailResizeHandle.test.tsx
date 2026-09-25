@@ -29,7 +29,7 @@ vi.mock('../../LivePreview', () => ({ default: () => <div data-testid="live-prev
 const APP_URL = 'https://app-a.example.azurecontainerapps.io/'
 
 const EMPTY_PANE: PaneView = {
-  iterating: false, reconnecting: false,
+  reconnecting: false,
   previewState: null, turnRunning: false,
   compileState: null, workspaceLost: false,
 }

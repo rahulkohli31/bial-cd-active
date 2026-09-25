@@ -31,32 +31,28 @@ const reading = (over: Partial<PreviewState> = {}): PreviewState => ({
   state: 'asleep',
   alive: false,
   previewUrl: null,
-  occupyingProjectName: null,
-  occupyingProjectId: null,
   restorable: null,
+  startingSince: null,
+  startFailure: null,
   ...over,
 })
 
-const reportFor = (preview: PreviewState): WorkspaceReport => {
+const reportFor = (preview: PreviewState | null): WorkspaceReport => {
   const sinks = {
     projectId: 'p1',
-    onStarted: vi.fn(),
     onStartPending: vi.fn(),
     onStartOutcome: vi.fn(),
+    onStartAdmitted: vi.fn(),
   }
   return {
     ...sinks,
     settled: true,
-    // `lastDecidedPreview: null` is "nothing has ever been decided", which is the cold-load answer
-    // and the only one this surface's scenarios need: every reading below is a decided one, so the
-    // memory is never consulted. Decision D3's own behaviour — an unreadable read rendering the
-    // last settled reading — is pinned where the rule lives, in `workspaceState.test.ts`.
     state: resolveWorkspaceState({
       preview,
-      lastDecidedPreview: null,
       projectHasSavedBuild: null,
       startOutcome: null,
       startInFlight: false,
+      waitHasGoneOnTooLong: false,
     }),
     onRefresh: vi.fn(),
     start: createStarter(() => sinks),
@@ -73,7 +69,7 @@ function renderIn(node: React.ReactElement, prime: (c: WorkspaceChannel) => void
   )
 }
 
-const line = (preview: PreviewState) =>
+const line = (preview: PreviewState | null) =>
   renderIn(<PlanChatWorkspaceLine />, (c) => c.workspace.set(reportFor(preview)))
 
 afterEach(() => cleanup())
@@ -105,12 +101,12 @@ describe('the standing line says what this chat DOES', () => {
 
 describe('★ the same value, the same sentence, on both surfaces', () => {
   // Scoped to the two states this scenario covers, deliberately. Asserting sameness across
-  // `never_built` and `asleep` too would pin wording this scenario does not require, when the
+  // `asleep` too would pin wording this scenario does not require, when the
   // pane's own wording there may need to differ — a Plan chat has no business inviting somebody
   // to press a start control it does not render.
-  const spoken: [string, PreviewState][] = [
+  const spoken: [string, PreviewState | null][] = [
     ['being got ready', reading({ state: 'starting' })],
-    ['it could not be read', reading({ state: 'unknown' })],
+    ['it could not be read', null],
   ]
 
   for (const [name, preview] of spoken) {
@@ -142,7 +138,6 @@ describe('★ the sentence, and never a verb', () => {
     // action there, and the pane renders it.
     for (const preview of [
       reading({ state: 'asleep', restorable: true }),
-      reading({ state: 'never_built', restorable: true }),
       reading({ state: 'starting' }),
       reading({ state: 'alive', alive: true }),
     ]) {
@@ -154,18 +149,17 @@ describe('★ the sentence, and never a verb', () => {
 
   it('★ renders NO retry either — the pane already owns that state', () => {
     // A second author for one state, on a surface with no pane for the retry to land in.
-    const { unmount } = line(reading({ state: 'unknown' }))
+    const { unmount } = line(null)
     expect(screen.queryByRole('button', { name: /try again/i })).toBeNull()
     // …and it still SAYS what happened, which is the half an absence assertion cannot see.
     expect(screen.getByTestId('plan-chat-workspace-state').textContent).toMatch(/could not check/i)
     unmount()
   })
 
-  it('★ a taken slot is not spoken here at all, and offers nothing', () => {
-    // A slot held by the citizen's own other project reads as the saved app it is, and `asleep`
-    // is the pane's to speak for — so this surface says its standing line and no more. What it
-    // must never do is grow a control that leaves the chat the person is in.
-    const report = reportFor(reading({ state: 'slot_taken', occupyingProjectName: 'Roster', occupyingProjectId: 'p-9', restorable: true }))
+  it('★ a saved app is not spoken here at all, and offers nothing', () => {
+    // `asleep` is the pane's to speak for — so this surface says its standing line and no more.
+    // What it must never do is grow a control that leaves the chat the person is in.
+    const report = reportFor(reading({ state: 'asleep', restorable: true }))
     expect(report.state.name).toBe('not-running')
 
     renderIn(<PlanChatWorkspaceLine />, (c) => c.workspace.set(report))
@@ -179,7 +173,7 @@ describe('★ the sentence, and never a verb', () => {
   it('★ and no spoken state renders any control at all', () => {
     // The two verbs that exist both act on this project's app, and this surface deliberately keeps
     // that app off screen — so neither may appear beside a sentence here.
-    for (const preview of [reading({ state: 'starting' }), reading({ state: 'unknown' })]) {
+    for (const preview of [reading({ state: 'starting' }), null]) {
       const { unmount } = line(preview)
       expect(screen.getByTestId('plan-chat-workspace-state').textContent?.length).toBeGreaterThan(0)
       expect(screen.queryByRole('button')).toBeNull()
@@ -188,10 +182,9 @@ describe('★ the sentence, and never a verb', () => {
   })
 
   it('says nothing extra for the states the pane owns alone', () => {
-    // `asleep` and `never_built` are the pane's to speak for: this scenario does not ask a Plan
-    // chat to repeat them, and repeating them would put a start-shaped sentence on a surface with
-    // no start.
-    for (const preview of [reading({ state: 'asleep', restorable: true }), reading({ state: 'never_built' })]) {
+    // `asleep` is the pane's to speak for, saved or not: this scenario does not ask a Plan chat to
+    // repeat it, and repeating it would put a start-shaped sentence on a surface with no start.
+    for (const preview of [reading({ state: 'asleep', restorable: true }), reading({ state: 'asleep', restorable: false })]) {
       const { unmount } = line(preview)
       expect(screen.queryByTestId('plan-chat-workspace-state')).toBeNull()
       unmount()

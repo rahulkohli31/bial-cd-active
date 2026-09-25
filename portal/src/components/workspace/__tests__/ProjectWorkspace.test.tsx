@@ -19,8 +19,11 @@ import {
   usePublishPaneView,
   useWorkspacePane,
   useWorkspaceProject,
+  useWorkspaceReport,
   type PaneView,
 } from '../workspaceChannel'
+import type { WorkspaceState } from '../workspaceState'
+import { ApiError } from '../../../utils/apiError'
 import type { ReactNode } from 'react'
 import type { Project } from '../../../utils/projectApi'
 import type { DeploymentView, PublishState } from '../../../utils/deployApi'
@@ -80,11 +83,9 @@ const PROJECT: Project = {
 }
 
 const preview = (over: Record<string, unknown> = {}) => ({
-  state: 'never_built',
+  state: 'asleep',
   alive: false,
   previewUrl: null,
-  occupyingProjectName: null,
-  occupyingProjectId: null,
   restorable: null,
   ...over,
 })
@@ -113,7 +114,7 @@ const deployment = (publishState: PublishState = 'draft', over: Partial<Deployme
 })
 
 const EMPTY_PANE: PaneView = {
-  iterating: false, reconnecting: false,
+  reconnecting: false,
   previewState: null, turnRunning: false,
   compileState: null, workspaceLost: false,
 }
@@ -275,7 +276,7 @@ describe('loading a project address frames the running app, with no chat in the 
   it('★ publishes a pane even for a project with NOTHING built, so the pane says so', async () => {
     // Two columns are the REST STATE of the project screen — nothing built shows the empty-state
     // sentence IN the pane, not a hidden pane the citizen has to interpret.
-    api.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
+    api.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: false }))
     render(<Workspace project={{ ...PROJECT, appId: null, hasRelaunchableSnapshot: false }} />)
 
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
@@ -618,10 +619,32 @@ describe('the app survives the round trip, in BOTH directions', () => {
     expect(api.relaunchPreview).toHaveBeenCalledTimes(1)
   })
 
+  it('★ starts nothing over a start that failed, across a crossing, and says why with Launch', async () => {
+    // The auto-start's guard is a ref that every remount resets, so without the rule each visit
+    // back to this screen would run another start that fails the same way, silently.
+    const WHY = 'Your app could not be started. Try again in a minute.'
+    api.fetchPreviewState.mockResolvedValue(
+      preview({ state: 'asleep', restorable: true, startFailure: WHY }),
+    )
+    render(<Workspace />)
+    await screen.findByText(WHY)
+    expect(screen.getByRole('button', { name: 'Launch Application' })).toBeTruthy()
+
+    fireEvent.click(screen.getByText('to chat'))
+    fireEvent.click(screen.getByText('to project'))
+    await waitFor(() => expect(railComposer()).toBeTruthy())
+    await screen.findByText(WHY)
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(api.relaunchPreview).not.toHaveBeenCalled()
+  })
+
   it('starts NOTHING for a project that has never been built', async () => {
-    // Nothing to open. `never_built` is the one reading with no container behind it at all, and
-    // a start here would be a request that can only fail.
-    api.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
+    // Nothing to open. `asleep` with nothing to restore has no container and no saved copy behind
+    // it, and a start here would be a request that can only fail.
+    api.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: false }))
     render(<Workspace project={{ ...PROJECT, appId: null, hasRelaunchableSnapshot: false }} />)
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
 
@@ -714,7 +737,7 @@ describe('the collapse control — hidden, not unmounted, and never a one-way do
     // The toggle can't live in the pane's toolbar slot: that toolbar is rendered by `LivePreview`,
     // which only mounts once there is something to frame, so a project with nothing built would
     // have NO toggle at all. Its home has to be a surface that always renders.
-    api.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
+    api.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: false }))
     render(<Workspace project={{ ...PROJECT, appId: null, hasRelaunchableSnapshot: false }} />)
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalled())
     expect(frame()).toBeNull()
@@ -1000,5 +1023,100 @@ describe('the project screen asks whether a stuck app has stopped', () => {
     })
 
     await waitFor(() => expect(api.checkWorkspace).toHaveBeenCalledWith('pA'))
+  })
+})
+
+/**
+ * ★ A PRESS THE SERVER ADMITTED STAYS PENDING UNTIL THE NEXT READ.
+ *
+ * Cleared at the 202, the press would land in the same render as the reading from before it, and
+ * the pane would say "Your app is saved." with Launch for a round trip while the app is starting.
+ */
+describe('★ an admitted press holds the pane until the next read', () => {
+  const WHY = 'Your app could not be started. Try again in a minute.'
+
+  /** Every workspace state the pane was handed, in order. */
+  function renderRecording() {
+    const seen: WorkspaceState[] = []
+    function Recorder() {
+      const report = useWorkspaceReport()
+      if (report) seen.push(report.state)
+      return null
+    }
+    render(
+      <MemoryRouter initialEntries={['/projects/pA']}>
+        <Routes>
+          <Route element={<WorkspaceShell />}>
+            <Route
+              path="/projects/:projectId"
+              element={
+                <>
+                  <Surface />
+                  <Recorder />
+                </>
+              }
+            />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    )
+    return seen
+  }
+
+  const paneState = () => screen.getByTestId('app-pane-empty').getAttribute('data-workspace-state')
+
+  it('★ shows no Launch and no could-not-read between the 202 and the read, then the read decides', async () => {
+    let admit: () => void = () => {}
+    api.relaunchPreview.mockImplementation(() => new Promise<void>((resolve) => { admit = resolve }))
+    let answer: (value: unknown) => void = () => {}
+    api.fetchPreviewState
+      .mockResolvedValueOnce(preview({ state: 'asleep', restorable: true }))
+      .mockImplementation(() => new Promise((resolve) => { answer = resolve }))
+    const seen = renderRecording()
+    // The auto-start is the press: opening the project asks for its app.
+    await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(1))
+
+    seen.length = 0
+    await act(async () => {
+      admit()
+    })
+    await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalledTimes(2))
+
+    expect(seen.map((state) => state.name).filter((name) => name !== 'starting')).toEqual([])
+    expect(paneState()).toBe('starting')
+
+    // The start failed after it was admitted: the read ends the press and says why.
+    await act(async () => {
+      answer(preview({ state: 'asleep', restorable: true, startFailure: WHY }))
+    })
+    expect(paneState()).toBe('not-running')
+    expect(screen.getByText(WHY)).toBeTruthy()
+    expect(api.relaunchPreview).toHaveBeenCalledTimes(1)
+  })
+
+  it('★ a read that fails after the admission still ends the press', async () => {
+    // The bound on a pending press: it lasts one read, answered or not, so a dead endpoint leaves
+    // the last reading and its Launch rather than a wait with no end.
+    api.relaunchPreview.mockResolvedValue(undefined)
+    api.fetchPreviewState
+      .mockResolvedValueOnce(preview({ state: 'asleep', restorable: true }))
+      .mockRejectedValue(new ApiError('Could not check the preview', 503))
+    renderRecording()
+    await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalledTimes(2))
+
+    await waitFor(() => expect(paneState()).toBe('not-running'))
+    expect(screen.getByRole('button', { name: 'Launch Application' })).toBeTruthy()
+  })
+
+  it('a refused press says why at once, with no read in between', async () => {
+    const REFUSED = 'The saved copy of your app could not be reached.'
+    api.relaunchPreview.mockRejectedValue(new ApiError(REFUSED, 503))
+    api.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
+    renderRecording()
+
+    await screen.findByText(REFUSED)
+    expect(paneState()).toBe('not-running')
+    expect(api.fetchPreviewState).toHaveBeenCalledTimes(1)
   })
 })

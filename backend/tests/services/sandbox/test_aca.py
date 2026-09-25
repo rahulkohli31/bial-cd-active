@@ -177,20 +177,20 @@ async def test_a_provisioned_sandbox_is_judgeable_without_redis(
     here, so a REAL control plane that dropped `tags=` would sail through. That property lives
     in `test_aca_control_plane.py::test_the_create_envelope_carries_the_identity_tags`, which
     drives the actual `_envelope` — do not delete it on the strength of this one."""
+    from src.services.sandbox.base import KIND_BUILD_SANDBOX, control_plane_segment
+
     aca = FakeAca()
     client = _client(aca)
     await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
 
     identity = identity_from_tags(aca.tags[APP_NAME])
-    assert identity.is_a_sandbox is True
+    assert identity.kind == KIND_BUILD_SANDBOX
     assert identity.user_id == USER
     assert identity.app_id == APP_ID
     assert identity.created_at is not None
-    # The whole point: complete identity ⇒ the reclamation tiers can judge it rather than
-    # escalating it to a human forever.
-    assert identity.escalate_only is False
+    assert identity.control_plane == control_plane_segment()
     # Stamped at create, so it is never a backfilled synthetic age.
-    assert identity.was_backfilled is False
+    assert identity.backfilled_at is None
 
 
 async def test_a_shared_restore_is_stamped_with_the_recipient_not_the_owner(

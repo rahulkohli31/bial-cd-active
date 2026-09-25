@@ -341,19 +341,16 @@ class BannerItem(CamelModel):
 
 
 class BuildInProgressItem(CamelModel):
-    """A build began here and no outcome closed it — mid-build (live) or lost to a crash.
-    The catch-up snapshot's `active_turn` disambiguates; this item only states the durable truth.
+    """A build began here and no outcome closed it. DISPLAY-ONLY: the portal renders it as a
+    sentence saying so, and nothing can reattach to the build it names.
 
-    HISTORICAL ROWS ONLY. Its source, the hidden `build_started` marker, had exactly one writer
-    (`outcome.write_build_started`, called from `SessionManager.start`), and that writer is deleted
-    with the standalone build stack. No new `build_started` row can be created, so this item can
-    only ever be derived from rows already in the database — which is precisely why it, and the
-    three `{session_id}` routes the portal reattaches through, were kept. A build that runs as an
-    ordinary Write chat turn records its ending as a `turn_terminal` row instead."""
+    HISTORICAL ROWS ONLY. Its source, the hidden `build_started` marker, has no writer left; a
+    build that runs as an ordinary Write chat turn records its ending as a `turn_terminal` row
+    instead. The rows already in the database are permanent, so this item stays as their account
+    of a build that never finished."""
 
     type: Literal["build_in_progress"] = "build_in_progress"
     seq: int
-    session_id: str
 
 
 class PlanOptionsItem(CamelModel):
@@ -665,7 +662,7 @@ def label_when_settled(tool_name: str, label: str, *, failed: bool) -> str:
     """One step's label once its result has landed: the failure wording when the call came back
     a failure, "Checked on your app" for the state tool, and the label unchanged otherwise.
 
-    PUBLIC AND SHARED, like the three classifiers beside it: the live emitter resolves a step
+    PUBLIC AND SHARED, like `classify_tool_call` beside it: the turn engine resolves a step
     when the return arrives and the reload projection derives the same step from the stored
     return, so wording that only one of them applied would be a live/reload disagreement about
     what the citizen is reading. `failed` is keyword-only and has NO DEFAULT — both callers
@@ -677,16 +674,6 @@ def label_when_settled(tool_name: str, label: str, *, failed: bool) -> str:
     if failed:
         return failed_step_line(label)
     return _LBL_CHECKED_APP if tool_name == APP_STATE_TOOL else label
-
-
-def classify_command(argv: list[str]) -> tuple[str, bool]:
-    """Public entry to the run_command classifier — the LIVE emitter (`orchestrator/tools.py`)
-    shares this exact logic with the reload projection: same friendly BASE label + `hidden`
-    flag + step state, neither feed ever shows raw shell/argv, and a command classifies
-    identically on both. Parity on a FAILURE is the same friendly base with both sides naming
-    the failure — through `failed_step_line`, or through the more specific suffix the live
-    emitter has for a command it refused to run — never byte-identical labels, and never argv."""
-    return _classify_command(argv)
 
 
 def command_needs_the_long_timeout(argv: list[str]) -> bool:
@@ -732,12 +719,6 @@ def long_operation_line(label: str) -> str:
         return base
     opener = base if base.startswith(_STILL) else f"{_STILL}{base[0].lower()}{base[1:]}"
     return f"{opener}{_LONG_OPERATION_TAIL}"
-
-
-def classify_file_step(tool_name: str, path: str | None) -> tuple[str, bool]:
-    """Public entry to the file-tool friendly-area mapping — shared by the live emitter and the
-    reload projection (one translator, one source of truth)."""
-    return _file_step_label(tool_name, path)
 
 
 def classify_tool_call(tool_name: str, args_json: str) -> tuple[str, bool]:
@@ -1332,7 +1313,7 @@ def project_rows(rows: Sequence[Message], *, tail: int | None = None) -> list[Di
             session_id = meta.get("sessionId")
             if kind == "build_started":
                 if isinstance(session_id, str) and session_id not in closed:
-                    items.append(BuildInProgressItem(seq=row.seq, session_id=session_id))
+                    items.append(BuildInProgressItem(seq=row.seq))
                 continue
             if kind == "plan_options_pending" and meta.get("synthesized"):
                 # The retry-cap fallback card: hidden row, visible card — its state

@@ -157,7 +157,7 @@ describe('messagesFromProjection', () => {
       messagesFromProjection([
         visible,
         { type: 'step', seq: 2, tool: 'read_file', label: 'Read y', state: 'ok', hidden: true },
-        { type: 'build_in_progress', seq: 3, sessionId: 's' },
+        { type: 'build_in_progress', seq: 3 },
       ]),
     ).toEqual([
       // The step part is now toStepItem(visible), not the raw stored item — the same
@@ -173,7 +173,7 @@ describe('messagesFromProjection', () => {
       },
       // …index 2, not 1: the ordinal counts SOURCE position, so skipping the hidden step at
       // index 1 does not renumber everything after it.
-      { id: 'srv_3_g_2', role: 'assistant', parts: [{ type: 'build_in_progress', sessionId: 's' }], seq: 3 },
+      { id: 'srv_3_g_2', role: 'assistant', parts: [{ type: 'build_in_progress' }], seq: 3 },
     ])
   })
 
@@ -266,7 +266,7 @@ describe('messagesFromProjection — the loud fallback arm', () => {
         { type: 'user_text', seq: 1, text: 'hi' },
         { type: 'assistant_text', seq: 2, text: 'hello' },
         { type: 'step', seq: 3, tool: 'bash', label: 'Read the file', state: 'ok', hidden: false },
-        { type: 'build_in_progress', seq: 4, sessionId: 's1' },
+        { type: 'build_in_progress', seq: 4 },
       ],
       onUnknown,
     )
@@ -498,8 +498,8 @@ describe('messagesFromProjection — keys are unique per ITEM, not per row', () 
       { type: 'user_text', seq: 1, mode: 'ask', text: 'b', attachmentIds: [] },
       { type: 'step', seq: 2, tool: 'write_file', label: 'x', state: 'ok', hidden: false },
       { type: 'step', seq: 2, tool: 'write_file', label: 'y', state: 'ok', hidden: false },
-      { type: 'build_in_progress', seq: 3, sessionId: 's' },
-      { type: 'build_in_progress', seq: 3, sessionId: 's' },
+      { type: 'build_in_progress', seq: 3 },
+      { type: 'build_in_progress', seq: 3 },
     ])
     expect(keys).toHaveLength(5)
     expect(unique(keys)).toBe(true)

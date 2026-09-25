@@ -17,14 +17,13 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, waitFor, cleanup, fireEvent, act } from '@testing-library/react'
-import type { PreviewLifeState, PreviewState } from '../../../utils/buildSessionApi'
+import type { PreviewState } from '../../../utils/buildSessionApi'
 import { ApiError } from '../../../utils/apiError'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(),
   relaunchPreview: vi.fn(), fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
 }))
 
@@ -55,22 +54,17 @@ vi.mock('../../../utils/buildSessionApi', async (orig) => ({
   relaunchPreview: (...a: unknown[]) => h.relaunchPreview(...a),
 }))
 
-const { renderBuilder, makeClient, primeClient, composer, waitForGateOpen, FakeEventSource } =
+const { renderBuilder, composer, waitForGateOpen } =
   await import('../../../pages/__tests__/_builderSession.jsx')
 
-function deps() {
-  const fake = new FakeEventSource('x')
-  return { client: makeClient(h), eventSourceFactory: () => fake }
-}
-
-/** The wire still names the holder; what is pinned here is that no screen repeats it. */
+/** What the server answers for a project whose workspace another project holds. */
 const HELD: PreviewState = {
-  state: 'slot_taken' as PreviewLifeState,
+  state: 'asleep',
   alive: false,
   previewUrl: null,
-  occupyingProjectName: 'Car pool',
-  occupyingProjectId: 'pA',
   restorable: true,
+  startingSince: null,
+  startFailure: null,
 }
 
 /** The one refusal `POST /relaunch` can still raise: a colleague's shared view in the slot. */
@@ -79,16 +73,11 @@ const sharedViewHolds = (over: Record<string, unknown> = {}) =>
     projectId: 'pA', projectName: 'Car pool', dirty: true, building: false, isSharedView: true, ...over,
   })
 
-const STARTED = {
-  appId: 'a1', previewUrl: 'https://app/', status: 'ready', restoredFromFailedBuild: false, ready: true,
-}
-
 const launch = () => screen.getByRole('button', { name: /^Launch Application$/ })
 
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.newBuild.mockReturnValue('build-Y')
   h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue(null)
@@ -105,7 +94,7 @@ afterEach(() => cleanup())
 
 /** Mount the chat with the workspace held elsewhere, and wait for the pane to offer the way back. */
 async function blockedChat() {
-  renderBuilder({ deps: deps() })
+  renderBuilder()
   await screen.findByRole('button', { name: /^Launch Application$/ })
 }
 
@@ -118,7 +107,7 @@ describe('★ a taken slot asks the citizen nothing, on the chat surface too', (
   })
 
   it('★ pressing it brings this app up, and posts no turn', async () => {
-    h.relaunchPreview.mockResolvedValue(STARTED)
+    h.relaunchPreview.mockResolvedValue(undefined)
     await blockedChat()
     await waitForGateOpen()
     fireEvent.change(composer(), { target: { value: 'add a filter row' } })

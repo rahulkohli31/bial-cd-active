@@ -11,10 +11,10 @@ REDIS-ERROR POLICY: only `acquire_lock` catches `RedisError` (to retype it as
 `LockUnavailableError`); every other primitive lets it propagate, deliberately. Answer-bearing
 primitives (`lock_is_held`, `read_registry`, `renew_lock`, `mark_serving`) must never swallow —
 that would fabricate a certain answer from an ambiguous store; a swallowed `mark_serving` error
-in particular would report "the stamp was refused" for a store that never answered, and its
-caller raises an alarm on exactly that. `mark_registry_ending` returns nothing to
-fabricate; it is an ordering guard, and its failure must abort the reaper sequence rather than
-let it delete a container a racing `attach_existing` still believes is ready.
+in particular would report "the stamp was refused" for a store that never answered, and
+`record_the_first_serve` raises an alarm on exactly that. `mark_registry_ending` returns nothing
+to fabricate; it is an ordering guard, and its failure must abort the reaper sequence rather
+than let it delete a container a racing `attach_existing` still believes is ready.
 `release_lock_as_holder` and `write_heartbeat` look like they want a guard; they don't —
 callers that need one already have it, and inside `_holding_user_lock`'s protected region
 the raise IS what triggers compensation.
@@ -32,13 +32,14 @@ is single-key by construction, and a dev Redis cannot reproduce the cross-slot r
 from __future__ import annotations
 
 import enum
+import json
 import math
 import secrets
 import time
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Final
+from typing import Final, NamedTuple
 
 import redis.asyncio as aioredis
 import structlog
@@ -58,6 +59,7 @@ from src.api.v1.build_sessions.schemas import (
     RenewalOutcome,
     SurfacePresence,
 )
+from src.services.build_sessions.alarms import APP_FIRST_SERVED_EVENT, SERVING_PROOF_STAMP_REFUSED
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -73,8 +75,12 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_SERVING_SINCE,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_STAY_WRITER,
+    REGISTRY_FIELD_WAITING_SINCE,
+    start_failure_key,
     starting_key,
 )
 
@@ -175,12 +181,11 @@ async def lock_is_held(redis: aioredis.Redis, user_uuid: uuid.UUID) -> bool:
 async def write_heartbeat(redis: aioredis.Redis, user_uuid: uuid.UUID) -> datetime:
     """`SET heartbeat <iso8601> EX HEARTBEAT_TTL` — presence = active, expiry = idle and
     reaper-eligible; returns the UTC instant the reaper treats the session idle. BARE, like
-    `release_lock_as_holder` (module's REDIS-ERROR POLICY). TWO IN-BUILD RENEWERS run on different
-    clocks — `SessionManager.on_progress` per frame, and the turn engine's liveness-lease loop on a
-    wall clock inside the TTL, because a tool call longer than `HEARTBEAT_TTL_SECONDS` emits no
-    frame and the frame-driven one alone let the heartbeat expire under a live build. Both guard
-    their own call; at the relaunch and start seeds the raise tears the container down, each
-    sitting inside `_holding_user_lock`'s compensated region before the scope adopts the lock."""
+    `release_lock_as_holder` (module's REDIS-ERROR POLICY). THE IN-BUILD RENEWER is the turn
+    engine's liveness-lease loop, renewing on a wall clock well inside the TTL so a tool call
+    longer than `HEARTBEAT_TTL_SECONDS` never lets the heartbeat expire under a live build. It
+    guards its own call; the turn's seed sits inside `_holding_user_lock`'s compensated region,
+    before the scope adopts the lock, so a raise there compensates."""
     now = datetime.now(UTC)
     await redis.set(heartbeat_key(user_uuid), now.isoformat(), ex=HEARTBEAT_TTL_SECONDS)
     return now + timedelta(seconds=HEARTBEAT_TTL_SECONDS)
@@ -191,15 +196,14 @@ async def heartbeat_is_alive(redis: aioredis.Redis, user_uuid: uuid.UUID) -> boo
 
 
 # --- the wall-clock liveness lease (sandbox key family 4) --------------------
-# THE ONE SIGNAL HERE THAT IS LEGIBLE FROM ANOTHER PROCESS. Everything above is either
-# in-process (`live_users`) or a facade a crashed builder leaves standing for a TTL; the
-# heartbeat is seeded once per turn, so ~90 s into any build the only thing keeping the
-# sweep off a live container is an in-memory set that is empty everywhere else. That is
-# why nothing capable of destroying a container may run out of the API process until this
-# exists, and why the reader below fails closed at both ends.
+# THE ONE SIGNAL HERE THAT MEANS A TURN IS LIVE, readable from any process: `live_users` is
+# in-process and empty everywhere else, and the lock and the heartbeat are also written by
+# starts that run no turn. The reader below fails closed at both ends.
 #
 # The renewal loop lives on the TURN (`services/turns/engine.py`), beside the preview
-# watcher: a background task the turn owns, stopped in its `finally`, idempotent.
+# watcher: a background task the turn owns, stopped in its `finally`, idempotent. It renews
+# the lock and the heartbeat as well, and `reaper._a_claim_still_stands` says why that pair is
+# kept beside the lease rather than folded into it.
 
 
 def _wall_clock_now() -> float:
@@ -306,10 +310,10 @@ async def write_starting_marker(
 
 def _parse_starting_marker(raw: object, user_uuid: uuid.UUID) -> uuid.UUID | None:
     """The ONE reading of a marker's value, shared by both readers below — they feed ONE
-    predicate (is a start in flight) from different call sites (`reaper.reconcile_user` /
-    `reclamation_pass._claim_of` via the direct read, `project_preview_state` via the pipelined
-    one). A value one called garbage and the other called a claim would spare a container on
-    one path and destroy it on the other.
+    predicate (is a start in flight) from different call sites (`reaper.reconcile_user` and
+    `shutdown.py` via the direct read, `project_preview_state` via the pipelined one). A value
+    one called garbage and the other called a claim would spare a container on one path and
+    destroy it on the other.
 
     Fails toward `None` on anything unparseable rather than treat garbage as a claim — same
     fail-closed reading `liveness_lease_is_held` gives an unparseable deadline."""
@@ -326,8 +330,8 @@ def _parse_starting_marker(raw: object, user_uuid: uuid.UUID) -> uuid.UUID | Non
 async def read_starting_marker(redis: aioredis.Redis, user_uuid: uuid.UUID) -> uuid.UUID | None:
     """The project id a start names for this user, or `None` when nothing is starting.
 
-    `reclamation_pass._claim_of` reads this (or the pipelined form below) to add the marker as
-    a fourth disjunct to the reclamation spare predicate."""
+    `reaper.reconcile_user` reads this (or the pipelined form below) to add the marker as a
+    fourth disjunct to its sparing predicate."""
     return _parse_starting_marker(await redis.get(starting_key(user_uuid)), user_uuid)
 
 
@@ -342,12 +346,77 @@ async def clear_starting_marker(redis: aioredis.Redis, user_uuid: uuid.UUID) -> 
     await redis.delete(starting_key(user_uuid))
 
 
+class StartFailure(enum.StrEnum):
+    """What stopped a start that failed after it was admitted: one member per refusal the start
+    route gives for the same failure at admission, whose sentence the pane is then shown."""
+
+    NO_SAVED_BUILD = "no_saved_build"
+    SANDBOX_UNAVAILABLE = "sandbox_unavailable"
+    COORDINATION_UNAVAILABLE = "coordination_unavailable"
+
+
+class FailedStart(NamedTuple):
+    project_id: uuid.UUID
+    failure: StartFailure
+
+
+async def write_start_failure(
+    redis: aioredis.Redis, user_uuid: uuid.UUID, failed: FailedStart
+) -> None:
+    """`SET start_failure <json> EX STARTING_MARKER_TTL_SECONDS`. It outlives the start by as
+    long as the start's own marker could have, which is long enough for every tab polling that
+    project to read it."""
+    value = json.dumps({"project_id": str(failed.project_id), "failure": failed.failure.value})
+    await redis.set(start_failure_key(user_uuid), value, ex=STARTING_MARKER_TTL_SECONDS)
+
+
+async def clear_start_failure(redis: aioredis.Redis, user_uuid: uuid.UUID) -> None:
+    await redis.delete(start_failure_key(user_uuid))
+
+
+def _parse_start_failure(raw: object, user_uuid: uuid.UUID) -> FailedStart | None:
+    """Fails toward `None`, like the starting marker: a value nobody can read says nothing."""
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
+        return FailedStart(uuid.UUID(str(payload["project_id"])), StartFailure(payload["failure"]))
+    except ValueError, KeyError, TypeError:
+        _log.warning("unreadable start failure; treating as absent", user_id=str(user_uuid))
+        return None
+
+
+def _when_this_start_began(raw_pttl: object, user_uuid: uuid.UUID) -> datetime | None:
+    """The instant the starting marker was written, read off WHAT IS LEFT of its TTL.
+
+    The marker is written once per start and never renewed, so its decay IS the wait's clock —
+    and it is the only anchor that survives a page reload. A counter started when a pane mounts
+    tells a citizen who has been waiting five minutes that they have been waiting one second.
+
+    `PTTL` answers -1 (key with no expiry) and -2 (no key); both are "cannot say", as is a
+    remaining span longer than the TTL itself, which could only come from a clock nobody can
+    trust. `None` in every one of those cases, never a guessed instant."""
+    remaining_ms = raw_pttl if isinstance(raw_pttl, int) else None
+    if remaining_ms is None or remaining_ms <= 0:
+        return None
+    elapsed = timedelta(seconds=STARTING_MARKER_TTL_SECONDS) - timedelta(milliseconds=remaining_ms)
+    if elapsed < timedelta(0):
+        _log.warning("starting marker outlives its own TTL", user_id=str(user_uuid))
+        return None
+    # TO THE SECOND, so the same wait reads as the same instant on every poll. The arithmetic
+    # recovers the write time exactly, but `now` and Redis's own clock differ by a few
+    # milliseconds — and a field that jitters is a field every reading comparator sees change,
+    # which wakes both surfaces every three seconds for a number that has not moved.
+    return (datetime.now(UTC) - elapsed).replace(microsecond=0)
+
+
 async def read_registry_and_starting_marker(
     redis: aioredis.Redis, user_uuid: uuid.UUID
-) -> tuple[dict[str, str] | None, uuid.UUID | None]:
+) -> tuple[dict[str, str] | None, uuid.UUID | None, datetime | None, FailedStart | None]:
     """The one round trip `project_preview_state` spends on Redis: registry hash + starting
-    marker as ONE PIPELINE (two commands), not two sequential round trips — keeps the frozen
-    cost budget ("one registry hash read") honest instead of doubling it on every poll.
+    marker + how much of that marker's life is left + the last failed start, as ONE PIPELINE,
+    not four sequential round trips — keeps the frozen cost budget ("one registry hash read")
+    honest instead of multiplying it on every poll.
 
     Falls back to `read_registry`'s legacy-prefix adoption ONLY when the pipelined `HGETALL`
     comes back empty — that migration is itself a second round trip, so it stays off the hot
@@ -356,11 +425,18 @@ async def read_registry_and_starting_marker(
     pipe = redis.pipeline(transaction=False)
     pipe.hgetall(registry_key(user_uuid))
     pipe.get(starting_key(user_uuid))
-    raw_registry, raw_starting = await pipe.execute()
+    pipe.pttl(starting_key(user_uuid))
+    pipe.get(start_failure_key(user_uuid))
+    raw_registry, raw_starting, raw_pttl, raw_failure = await pipe.execute()
     registry = {str(k): str(v) for k, v in raw_registry.items()} if raw_registry else None
     if registry is None:
         registry = await _adopt_a_pre_cutover_record(redis, user_uuid)
-    return registry, _parse_starting_marker(raw_starting, user_uuid)
+    return (
+        registry,
+        _parse_starting_marker(raw_starting, user_uuid),
+        _when_this_start_began(raw_pttl, user_uuid),
+        _parse_start_failure(raw_failure, user_uuid),
+    )
 
 
 # --- the lingering preview's stay of execution -------------------------------
@@ -424,8 +500,7 @@ async def grant_stay_of_execution(
     redis: aioredis.Redis,
     user_uuid: uuid.UUID,
     *,
-    writer: DeadlineWriter = DeadlineWriter.BUILDER_ACTED,
-    ttl_seconds: int | None = None,
+    writer: DeadlineWriter,
 ) -> datetime:
     """Stamp the registry hash with the UTC instant this preview's reprieve lapses, and return
     it. Guarded on registry existence like `mark_registry_ending` — never conjures a hash for a
@@ -435,8 +510,7 @@ async def grant_stay_of_execution(
     Every caller names its writer; the TTL comes from that identity, and the name is stamped
     beside the deadline for audit. THE DEADLINE NEVER MOVES BACKWARD: `max(existing, computed)`
     keeps a weaker writer from truncating a stronger one's reprieve, no lock needed."""
-    ttl = DEADLINE_WRITER_TTL_SECONDS[writer] if ttl_seconds is None else ttl_seconds
-    deadline = datetime.now(UTC) + timedelta(seconds=ttl)
+    deadline = datetime.now(UTC) + timedelta(seconds=DEADLINE_WRITER_TTL_SECONDS[writer])
     if not await redis.exists(registry_key(user_uuid)):
         _log.warning(
             "no registry hash to stamp a preview stay onto; the container has no lease",
@@ -533,19 +607,18 @@ async def renew_presence_stay(
     return RenewalOutcome.RENEWED, an_instant_in_utc(raw.removeprefix("renewed:"))
 
 
-# Retire a provisioning stay now that provisioning is demonstrably over, guarded on the same
-# `app_name` identity every other write here carries.
+# Retire a provisioning stay now that provisioning is over, guarded on the same `app_name`
+# identity every other write here carries.
 #
 # THE ONE WRITE IN THIS MODULE THAT MAY SHORTEN A DEADLINE, and the exception is narrow enough to
-# state exactly: a start grants a long stay because a hung restore can block for the better part
-# of twenty minutes with nothing else protecting the container — not the heartbeat, which is not
-# seeded yet, and not the starting marker, whose TTL is shorter than that worst case. The moment
-# the app answers a request, that reason is gone. Leaving the long stay standing would keep a
-# container nobody came back to alive for half an hour after the tab closed, which is precisely
-# what presence renewal exists to stop paying for.
+# state exactly: a start grants a long stay once its restore has written the registry, because a
+# slow restore can outlive the starting marker and leave the stay as the only claim on the
+# container. Once the dev server has been started, that reason is gone. Leaving the long stay
+# standing would keep a container nobody came back to alive for half an hour after the tab
+# closed, which is precisely what presence renewal exists to stop paying for.
 #
-# It is issued by the same code path that granted the long stay, at the point that path can prove
-# provisioning ended. `grant_stay_of_execution`'s monotonic rule is untouched and still governs
+# It is issued by the same code path that granted the long stay, the moment that path has started
+# the dev server. `grant_stay_of_execution`'s monotonic rule is untouched and still governs
 # every OTHER writer: it exists so a weaker writer cannot truncate a stronger one's reprieve, and
 # nothing here is a different writer arriving with a weaker claim.
 _CAS_SETTLE_STAY_LUA: Final = (
@@ -555,7 +628,7 @@ _CAS_SETTLE_STAY_LUA: Final = (
 )
 
 
-async def settle_stay_once_the_app_is_serving(
+async def settle_stay_once_provisioning_ends(
     redis: aioredis.Redis, user_uuid: uuid.UUID, *, app_name: str
 ) -> datetime | None:
     """Hand this container's lifetime to the screen that asked for it, and return the deadline.
@@ -676,11 +749,23 @@ _CAS_MARK_SERVING_LUA: Final = (
 # DELIBERATELY NOT GUARDED ON `state`, unlike the stamp above: a crash edge can be observed after
 # the reaper has already flipped this hash to `ending`, and refusing there would leave a proof
 # standing on a container being torn down.
+#
+# The wait restarts in the same write, so no reader can see the proof gone with the old wait's
+# start still standing beside it.
 _CAS_CLEAR_SERVING_LUA: Final = (
     f"if redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}') ~= ARGV[1] then return 0 end "
     f"local stamped = redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_SERVING_SINCE}') "
     "if not stamped or stamped == '' then return 0 end "
-    f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_SERVING_SINCE}', '') return 1"
+    f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_SERVING_SINCE}', '', "
+    f"'{REGISTRY_FIELD_WAITING_SINCE}', ARGV[2]) return 1"
+)
+
+# Date an unproven container's wait from the start in flight, on the same identity guard. A hash
+# with no `serving_since` at all is pre-cutover and read as proven, so it is not waiting either.
+_CAS_DATE_THE_WAIT_LUA: Final = (
+    f"if redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}') ~= ARGV[1] then return 0 end "
+    f"if redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_SERVING_SINCE}') ~= '' then return 0 end "
+    f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_WAITING_SINCE}', ARGV[2]) return 1"
 )
 
 
@@ -698,8 +783,8 @@ async def mark_serving(
     False therefore carries two situations, and the caller reacts identically to both: do not
     stamp. It is a no-op second sighting, or the write was REFUSED because the hash is gone,
     marked `ending`, or names another project's container — the near-miss that owes a
-    `SERVING_PROOF_STAMP_REFUSED`. Only the caller, which knows whether it had already watched
-    this container serve, can tell those apart, so only the caller logs.
+    `SERVING_PROOF_STAMP_REFUSED`. Only a re-read of the hash can tell those apart, so
+    `record_the_first_serve`, below, is the one that logs.
 
     BARE on Redis errors, per the module's REDIS-ERROR POLICY: this is answer-bearing, and a
     swallowed error would hand the caller a refusal that never happened."""
@@ -719,10 +804,87 @@ async def clear_serving(redis: aioredis.Redis, user_uuid: uuid.UUID, *, app_name
 
     Idempotent, and False on a hash that names a different container: the identity guard the
     stamp carries, for the identical reason. Retracting costs the citizen a card, not an error
-    page — the pane falls back to "getting your app ready" — but callers still debounce, because
-    a single unanswered poll is a poll, not a dead app."""
-    cleared = await redis.eval(_CAS_CLEAR_SERVING_LUA, 1, registry_key(user_uuid), app_name)
+    page — the pane falls back to "getting your app ready", counted from this retraction — but
+    callers still debounce, because a single unanswered poll is a poll, not a dead app."""
+    cleared = await redis.eval(
+        _CAS_CLEAR_SERVING_LUA,
+        1,
+        registry_key(user_uuid),
+        app_name,
+        datetime.now(UTC).isoformat(),
+    )
     return bool(cleared)
+
+
+async def date_the_wait_from_the_start(
+    redis: aioredis.Redis, user_uuid: uuid.UUID, *, app_name: str
+) -> bool:
+    """Date this container's wait from the start in flight, read off that start's own marker.
+    True iff the hash was re-dated; False when no marker stands, or the container is proven or
+    no longer the one named.
+
+    For the start to call just before it clears its marker: the pane has been counting from the
+    marker, and counts from the hash next, whose birth instant is later by however long the
+    start took to create the container."""
+    began = _when_this_start_began(await redis.pttl(starting_key(user_uuid)), user_uuid)
+    if began is None:
+        return False
+    dated = await redis.eval(
+        _CAS_DATE_THE_WAIT_LUA, 1, registry_key(user_uuid), app_name, began.isoformat()
+    )
+    return bool(dated)
+
+
+async def record_the_first_serve(
+    redis: aioredis.Redis,
+    user_uuid: uuid.UUID,
+    *,
+    app_name: str,
+    observer: str,
+    cold: bool | None,
+) -> None:
+    """An observer watched this container's app show a page: stamp the proof, and say so once.
+
+    THE ONE RECORDER EVERY OBSERVER SHARES — the turn's watcher and verify, the start and
+    continuation watches, and the reconciler's sweep — so there is one answer to what a refusal
+    means. `mark_serving` answering False carries two situations, and the re-read tells them
+    apart: this same container already carrying a proof is a SECOND SIGHTING, and silent, because
+    first serve wins and the first observer's line is the record. Anything else — the hash gone,
+    marked `ending` before a proof landed, or naming another container — is
+    `SERVING_PROOF_STAMP_REFUSED`. The `ending` one is why the rule is shared: that container's
+    teardown raises `SERVING_PROOF_ABSENT_AT_TEARDOWN`, and this line is the evidence it served.
+
+    `cold` is `None` from an observer that was not there when the container was created.
+
+    BARE on Redis errors, per the module's policy: every caller has its own answer to a store
+    that would not reply, and none of them is to report a refusal."""
+    when = datetime.now(UTC)
+    stamped = await mark_serving(redis, user_uuid, app_name=app_name, when=when)
+    reg = await read_registry(redis, user_uuid)
+    if stamped:
+        _log.info(
+            APP_FIRST_SERVED_EVENT,
+            user_id=str(user_uuid),
+            app_name=app_name,
+            serving_since=when.isoformat(),
+            ms_since_container_created=elapsed_ms(
+                an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT), when
+            ),
+            observer=observer,
+            cold=cold,
+        )
+        return
+    if reg is not None and reg.get(REGISTRY_FIELD_APP_NAME) == app_name and stamp_is_proven(reg):
+        return
+    _log.warning(
+        SERVING_PROOF_STAMP_REFUSED,
+        user_id=str(user_uuid),
+        expected_app=app_name,
+        # A BOOL, never the name that was found: it belongs to another of this citizen's
+        # projects, and the id vocabulary in this log stays user-scoped.
+        found_app_present=bool(reg and reg.get(REGISTRY_FIELD_APP_NAME)),
+        observer=observer,
+    )
 
 
 # --- registry state -----------------------------------------------------------
@@ -773,6 +935,24 @@ def an_instant_on_the_hash(reg: Mapping[str, str] | None, field: str) -> datetim
     if not raw:
         return None
     return an_instant_in_utc(raw)
+
+
+class SharedViewStamp(NamedTuple):
+    """Whose project a shared view in this slot shows: stamped on the record at Launch, because
+    neither can be read back out of a `shr-` name."""
+
+    owner_id: uuid.UUID
+    project_id: uuid.UUID
+
+
+def shared_view_stamp(reg: Mapping[str, str]) -> SharedViewStamp | None:
+    """The owner and project a shared view's launch stamped on this record, or `None` on any other
+    record. A stamp that will not parse raises: it is not a record this platform wrote."""
+    project_id = reg.get(REGISTRY_FIELD_SHARED_PROJECT_ID)
+    owner_id = reg.get(REGISTRY_FIELD_SHARED_OWNER_ID)
+    if not project_id or not owner_id:
+        return None
+    return SharedViewStamp(owner_id=uuid.UUID(owner_id), project_id=uuid.UUID(project_id))
 
 
 def elapsed_ms(since: datetime | None, until: datetime) -> int | None:

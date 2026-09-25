@@ -24,6 +24,7 @@ import structlog.testing
 from pydantic import SecretStr
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from redis.exceptions import RedisError
 
 import src.services.turns.engine as engine_mod
 from src.config import settings
@@ -31,6 +32,7 @@ from src.db.base import async_session_factory
 from src.db.models.conversation import ChatKind
 from src.db.models.harness_counter import HarnessCount, HarnessCounter
 from src.services.agent.mode_prompts import PromptContext
+from src.services.build_sessions import locks
 from src.services.build_sessions.alarms import (
     APP_SERVING_LOST_EVENT,
     SERVING_PROOF_STAMP_REFUSED,
@@ -444,6 +446,47 @@ async def test_a_stamp_is_never_written_onto_another_projects_container(
     # build trace.
     assert refusals[0]["found_app_present"] is True
     assert "sbx-somebody-elses" not in str(refusals[0])
+
+
+async def test_a_store_that_will_not_answer_is_asked_again_and_named_once(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The turn stops asking only once the store has ANSWERED. An outage has said nothing about
+    whether the app served, so the next poll asks again, and the outage is one line per turn
+    rather than one a second.
+
+    Mutation-check: latch the proof before the write is attempted and the stamp assertion goes
+    red; drop the once-per-turn guard and the line count does."""
+    monkeypatch.setattr(engine_mod, "READINESS_POLL_S", 0)
+    state = _framed_state(_ScriptedStatusSandbox(running=True, ready=True))
+    await _the_registry_says(fake_redis, state, serving_since="")
+    asked = {"times": 0}
+
+    async def down_for_three_asks(
+        redis: aioredis.Redis,
+        user_uuid: uuid.UUID,
+        *,
+        app_name: str,
+        observer: str,
+        cold: bool | None,
+    ) -> None:
+        asked["times"] += 1
+        if asked["times"] <= 3:
+            raise RedisError("redis is down")
+        await locks.record_the_first_serve(
+            redis, user_uuid, app_name=app_name, observer=observer, cold=cold
+        )
+
+    monkeypatch.setattr(engine_mod, "record_the_first_serve", down_for_three_asks)
+
+    with structlog.testing.capture_logs() as logs:
+        await _poll_a_while(state)
+
+    stamped = await _stamp(fake_redis, state)
+    assert stamped is not None and stamped != "", "an outage ended the turn's asking"
+    assert asked["times"] == 4, "the turn kept asking after the store had answered"
+    failed = [e for e in logs if e.get("event") == engine_mod.SERVING_PROOF_WRITE_FAILED_EVENT]
+    assert len(failed) == 1
 
 
 # ─── the watcher's lifetime: read-mode turns must not leak it ─────────────────────────────

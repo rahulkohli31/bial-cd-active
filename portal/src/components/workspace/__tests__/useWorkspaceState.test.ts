@@ -13,6 +13,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, renderHook, waitFor } from '@testing-library/react'
 import type { PreviewState, SaveState } from '../../../utils/buildSessionApi'
+import { ApiError } from '../../../utils/apiError'
 
 const api = vi.hoisted(() => ({
   fetchPreviewState: vi.fn(),
@@ -43,9 +44,9 @@ function reading(over: Partial<PreviewState> = {}): PreviewState {
     state: 'asleep',
     alive: false,
     previewUrl: null,
-    occupyingProjectName: null,
-    occupyingProjectId: null,
     restorable: null,
+    startingSince: null,
+    startFailure: null,
     ...over,
   }
 }
@@ -273,10 +274,14 @@ describe('the accelerated cadence while a start is in flight', () => {
     })
     expect(api.fetchPreviewState.mock.calls.length).toBe(spent)
 
-    // …and the sentence is UNCHANGED. A budget elapsing is a fact about our waiting, not about the
-    // container: no "gone", no "try again", no verb that assumes the workspace is dead.
+    // …and the wait is NOT RECLASSIFIED. The poll's budget elapsing is a fact about our asking,
+    // not about the container: still `starting`, still busy, and no verb that assumes the
+    // workspace is dead. What the citizen may be offered by now is one that assumes nothing —
+    // asking again, which attaches to whatever the start left standing — and the clock that
+    // decides when to offer it is the wait's own, not this poll's.
     expect(result.current.state.name).toBe('starting')
-    expect(result.current.state.action).toBeNull()
+    expect(result.current.state.busy).toBe(true)
+    expect(result.current.state.action?.kind ?? null).not.toBe('start')
 
     // And the background poll is still there to correct the pane if the app lands two minutes late.
     await act(async () => {
@@ -341,10 +346,10 @@ describe('the accelerated cadence while a start is in flight', () => {
   })
 
   it('the own-press short-circuit still asks exactly once more, and leaves ONE timer behind', async () => {
-    // `ProjectWorkspace`'s `onStartOutcome(null)` calls `refresh()` so a start that reached the app
-    // lands on the press rather than on a tick. It bumps the epoch, so the effect tears down and
-    // re-runs — and a cadence change that failed to clear the interval it replaced would double
-    // every read from here on, invisibly, for the life of the tab.
+    // An admitted press asks again at once, so a start that reached the app lands on the press
+    // rather than on a tick. It bumps the epoch, so the effect tears down and re-runs — and a
+    // cadence change that failed to clear the interval it replaced would double every read from
+    // here on, invisibly, for the life of the tab.
     api.fetchPreviewState.mockResolvedValue(reading({ state: 'starting' }))
 
     const { result } = mount()
@@ -355,7 +360,7 @@ describe('the accelerated cadence while a start is in flight', () => {
     expect(api.fetchPreviewState).toHaveBeenCalledTimes(2)
 
     await act(async () => {
-      result.current.refresh()
+      result.current.reportStartAdmitted()
     })
     await settle()
     expect(api.fetchPreviewState).toHaveBeenCalledTimes(3)
@@ -398,25 +403,14 @@ describe('the accelerated cadence while a start is in flight', () => {
  * an unreliable server to play against.
  */
 describe('nextProbeCadence — what opens a window, what closes it, what spends it', () => {
-  it('a blip mid-start does not drop the reader back to the background wait', () => {
-    const open = nextProbeCadence('starting', BACKGROUND_CADENCE)
-    expect(open).toEqual({ delayMs: STARTING_PROBE_MS, fastReads: 1 })
-
-    // `unknown` decided nothing, and the readers already refuse to let it overwrite the verdict on
-    // screen. Letting it close the window would put the pane back on a 45-second wait over a
-    // sentence that still says a start is happening — the bug, restored by a network hiccup.
-    const blip = nextProbeCadence('unknown', open)
-    expect(blip.delayMs).toBe(STARTING_PROBE_MS)
-    // …but it SPENDS from the window. The bound is on reads made, not on answers we liked: a
-    // server answering `unknown` forever must not buy an unbounded fast poll.
-    expect(blip.fastReads).toBe(2)
+  it('a `starting` opens the window', () => {
+    expect(nextProbeCadence('starting', BACKGROUND_CADENCE)).toEqual({
+      delayMs: STARTING_PROBE_MS,
+      fastReads: 1,
+    })
   })
 
-  it('an `unknown` on its own never opens a window', () => {
-    expect(nextProbeCadence('unknown', BACKGROUND_CADENCE)).toEqual(BACKGROUND_CADENCE)
-  })
-
-  it.each(['alive', 'asleep', 'slot_taken', 'never_built'] as const)(
+  it.each(['alive', 'asleep'] as const)(
     'a decided "%s" closes the window and gives the next start a whole one',
     (state) => {
       expect(nextProbeCadence(state, { delayMs: STARTING_PROBE_MS, fastReads: 7 })).toEqual(
@@ -487,19 +481,21 @@ describe('spendProbeCadence — what a read that never answered costs the window
 })
 
 describe('what an unreadable answer may and may not do', () => {
-  it('an `unknown` after a decided `asleep` leaves the decided value in place', async () => {
+  it('a 503 after a decided `asleep` leaves the decided value in place', async () => {
     // A blip must not pull a running app off screen, and it must not wipe a settled answer
-    // somebody is already reading either.
+    // somebody is already reading either. Mutation-check: clear `preview` in the read's `catch`
+    // and this answers `could-not-read`.
     api.fetchPreviewState.mockResolvedValueOnce(reading({ state: 'asleep', restorable: true }))
     const { result } = mount()
     await waitFor(() => expect(result.current.state.name).toBe('not-running'))
 
-    api.fetchPreviewState.mockResolvedValue(reading({ state: 'unknown' }))
+    api.fetchPreviewState.mockRejectedValue(new ApiError('Build coordination is temporarily unavailable.', 503))
     await act(async () => {
       result.current.refresh()
     })
     await settle()
 
+    expect(api.fetchPreviewState).toHaveBeenCalledTimes(2)
     expect(result.current.state.name).toBe('not-running')
   })
 
@@ -550,11 +546,14 @@ describe('what an unreadable answer may and may not do', () => {
     })
     expect(reads).toBe(spent)
 
-    // …AND NOTHING WAS RECLASSIFIED ON THE WAY. Not `could-not-read`, not gone, not a retry verb: a
-    // string of failures is not evidence about a container, and the last thing anybody actually
-    // told us is that a start is happening. The reading underneath is untouched too.
+    // …AND NOTHING WAS RECLASSIFIED ON THE WAY. Not `could-not-read`, not gone, not a verb that
+    // assumes the workspace is dead: a string of failures is not evidence about a container, and
+    // the last thing anybody actually told us is that a start is happening. The reading underneath
+    // is untouched too. (A wait this long may by now offer to ask again — that is the wait's own
+    // clock, not these failures, and it assumes nothing about the container either.)
     expect(result.current.state.name).toBe('starting')
-    expect(result.current.state.action).toBeNull()
+    expect(result.current.state.busy).toBe(true)
+    expect(result.current.state.action?.kind ?? null).not.toBe('start')
     expect(result.current.preview?.state).toBe('starting')
 
     // ABSENCE PAIRED WITH LIVENESS: quiet because it is slow, not because it died. The background
@@ -625,10 +624,11 @@ describe('what an unreadable answer may and may not do', () => {
   })
 
   it('records "could not read" when it is the ONLY thing we know', async () => {
-    api.fetchPreviewState.mockResolvedValue(reading({ state: 'unknown' }))
+    api.fetchPreviewState.mockRejectedValue(new ApiError('Build coordination is temporarily unavailable.', 503))
     const { result } = mount()
 
-    await waitFor(() => expect(result.current.state.name).toBe('could-not-read'))
+    await waitFor(() => expect(result.current.settled).toBe(true))
+    expect(result.current.state.name).toBe('could-not-read')
     expect(result.current.state.action?.kind).toBe('retry')
   })
 })
@@ -636,7 +636,7 @@ describe('what an unreadable answer may and may not do', () => {
 describe('cost — the calls this hook refuses to make', () => {
   it('never asks a stopped workspace whether it has unsaved work', async () => {
     // Two `git` execs against a dead container is an attach the screen caused.
-    for (const state of ['asleep', 'never_built', 'slot_taken', 'starting', 'unknown'] as const) {
+    for (const state of ['asleep', 'starting'] as const) {
       api.fetchSaveState.mockClear()
       api.fetchPreviewState.mockResolvedValue(reading({ state, restorable: true }))
       const { result, unmount } = mount()
@@ -700,21 +700,11 @@ describe('the start outcome slot', () => {
     // contributes at most a `note`.
     //
     // WHAT THE SLOT STILL HAS TO DO, and the reason this scenario survives rather than being
-    // deleted: the hook must hold the ending and must let go of it. Both halves are asserted
-    // through an ending that DOES have something to say, because two of the four say nothing by
-    // design and would make the "cleared" assertion vacuous — it would pass against a hook that
-    // never recorded anything at all.
+    // deleted: the hook must hold the ending and must let go of it.
     const { result } = mount()
     await waitFor(() => expect(result.current.state.name).toBe('never-built'))
 
-    // The endings with no server prose change nothing a person reads — that IS their contract.
-    await act(async () => {
-      result.current.reportStartOutcome({ kind: 'timed-out' })
-    })
-    expect(result.current.state.name).toBe('never-built')
-    expect(result.current.state.note ?? null).toBeNull()
-
-    // …and one that names a reason rides in `note`, on the card the reading already chose.
+    // A refusal names a reason, and it rides in `note`, on the card the reading already chose.
     await act(async () => {
       result.current.reportStartOutcome({ kind: 'failed', reason: 'no image' })
     })
@@ -733,7 +723,7 @@ describe('the start outcome slot', () => {
     await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalledTimes(1))
 
     await act(async () => {
-      result.current.reportStartOutcome({ kind: 'not-painted' })
+      result.current.reportStartOutcome({ kind: 'failed', reason: 'no image' })
     })
     await settle()
 
@@ -756,8 +746,8 @@ describe('a wait that looks stuck asks whether the app has stopped', () => {
   }
 
   it('★ a stalled frame on a running app asks at once, then reads again for the answer', async () => {
-    // The reading that prompted the question predates the put-away, so the check is followed by one
-    // more read — which is what lands the pane on the saved app instead of on the slow card.
+    // The reading that prompted the question predates whatever the server did about it, so the
+    // check is followed by one more read — which is what moves the pane off the slow card.
     aServerThatPutsTheAppAway(reading({ state: 'alive', alive: true }))
     const { result } = mount()
     await waitFor(() => expect(result.current.state.name).toBe('running'))
@@ -796,8 +786,8 @@ describe('a wait that looks stuck asks whether the app has stopped', () => {
   })
 
   it('★ a stall does not outlive the app it was about — launched again, a running app is not asked', async () => {
-    // Put away, the pane unmounts with no chance to take its stall back, so the reading that takes
-    // the frame away has to. Mutation check: drop that reset and the relaunched app is asked about
+    // A reading that takes the frame away unmounts the pane with no chance to take its stall back,
+    // so that reading has to. Mutation check: drop that reset and the relaunched app is asked about
     // on every background read, for as long as the tab stays open.
     let putAway = false
     let launched = false
@@ -881,7 +871,7 @@ describe('presence renewal — what holds the container open', () => {
 
   it('asks a hidden tab for nothing but the read and the renewal', async () => {
     // THE HALF THAT MATTERS. `fetchSaveState` costs two `git` executions inside the container and
-    // `checkWorkspace` can PUT THE CONTAINER AWAY — doing either with nobody looking is the
+    // `checkWorkspace` can restart the app's dev server — doing either with nobody looking is the
     // opposite of what renewing from a hidden tab is for.
     api.fetchPreviewState.mockResolvedValue(reading({ state: 'alive', alive: true }))
     hide(true)
@@ -925,20 +915,31 @@ describe('presence renewal — what holds the container open', () => {
     expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'hidden')
   })
 
-  it('never renews on the accelerated starting tick', async () => {
-    // A container in `starting` is held by the start-in-flight marker and the lock, not by a stay,
-    // so a renewal there writes a deadline onto a record nothing is judging it by.
+  it('★ renews throughout a watched start — the window where nothing else holds the container', async () => {
+    // THE GAP THIS CLOSES. Accelerated ticks used to renew nothing, on the grounds that a starting
+    // container is held by the marker and the lock rather than by a stay. But the marker is written
+    // ONCE with a five-minute TTL and the accelerated window is five minutes, so a citizen watching
+    // a start sent zero renewals across exactly the window in which both of those lapse — and the
+    // sweep runs every five minutes.
+    //
+    // Renewing here is a no-op when there is no record to renew: the server's write is a
+    // compare-and-set on the registry's own `app_name`, and its deadline is a monotonic max, so it
+    // can neither conjure a lease nor truncate the longer one a start already granted itself.
     api.fetchPreviewState.mockResolvedValue(reading({ state: 'starting' }))
     mount()
     await settle()
     api.renewPresence.mockClear()
 
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
-    })
+    // Three accelerated ticks, three renewals — not one at the start and silence after it.
+    for (let tick = 0; tick < 3; tick += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
+      })
+    }
 
     expect(api.fetchPreviewState).toHaveBeenCalled()
-    expect(api.renewPresence).not.toHaveBeenCalled()
+    expect(api.renewPresence).toHaveBeenCalledTimes(3)
+    expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'visible')
   })
 
   it('renders nothing and assumes nothing when a renewal cannot be made', async () => {

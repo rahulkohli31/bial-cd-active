@@ -3,9 +3,8 @@
 `FakeStorage` is a dict-backed `ObjectStorage` so attachment upload/download/delete,
 conversation delete-sweeps, and the snapshot round-trip run without Azurite.
 
-`FakeSandboxClient` is a canned `SandboxClient` (the mock helper) and `FakeBrain`
-is a scripted mock `run_build` — together they let SESSION-API's reaper + SessionManager
-+ router tests run without a live container, real ACA, or BRAIN.
+`FakeSandboxClient` is a canned `SandboxClient` (the mock helper) that lets SESSION-API's
+reaper + SessionManager + router tests run without a live container or real ACA.
 
 `ToolDeps` and `write_legacy_build_started` at the foot of the file are re-hosted from `src/`:
 both were harness-only in production and were deleted with it, and both were the driver for
@@ -14,9 +13,11 @@ tests of code that is still live. See the section comment there.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import enum
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Final, Literal
@@ -26,17 +27,11 @@ from pydantic import AnyUrl, TypeAdapter, UrlConstraints, ValidationError
 from pydantic_ai.messages import ModelResponse, TextPart
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.build_sessions.schemas import (
-    BuildResult,
-    BuildSessionStatus,
-    PreviewReadyEvent,
-    ProgressEnvelope,
-    StepEvent,
-)
 from src.core.connectors import CONNECTORS, ConnectedSystem, ResolvedWindow
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.project_connector import ConnectorWindowKind
+from src.services.build_sessions.manager import SessionManager
 from src.services.build_sessions.outcome import (
     FORCE_ENDED,
     IDLE_TEARDOWN,
@@ -45,7 +40,6 @@ from src.services.build_sessions.outcome import (
 )
 from src.services.messages.store import SeqContentionError, append_batch
 from src.services.orchestrator.deps import SandboxSession
-from src.services.orchestrator.progress import ProgressEmitter
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -62,6 +56,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_SHARED_SERVED_COUNT,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
+    REGISTRY_FIELD_WAITING_SINCE,
 )
 from src.services.sandbox.base import (
     CompileReport,
@@ -249,6 +244,7 @@ async def _hydrate_registry(
     `shared_project_id`/`shared_owner_id` (#198) mirror the real client's `_write_registry`:
     stamped only when given, `None` on the ordinary `provision_new` arm."""
     key = registry_key(uuid.UUID(user_id))
+    born = datetime.now(UTC).isoformat()
     await get_redis().hset(
         key,
         mapping={
@@ -256,8 +252,9 @@ async def _hydrate_registry(
             REGISTRY_FIELD_FQDN: handle.fqdn,
             # A reference, never the raw token — mirrors the real client's contract.
             REGISTRY_FIELD_TOKEN_REF: f"ref-{handle.app_name}",
-            REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
+            REGISTRY_FIELD_CREATED_AT: born,
             REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+            REGISTRY_FIELD_WAITING_SINCE: born,
             # Scheduled, not serving. Only an observer that watched this app answer a request
             # may replace it (`build_sessions/locks.py::mark_serving`).
             REGISTRY_FIELD_SERVING_SINCE: "",
@@ -526,9 +523,6 @@ class FakeSandboxClient(SandboxClient):
         self.unreachable_by_name.discard(handle.app_name)
 
 
-ProgressSinkFn = Callable[[ProgressEnvelope], Awaitable[None]]
-
-
 class DevServerDownUntilStarted(FakeSandboxClient):
     """A container whose dev server is down until something starts it.
 
@@ -575,55 +569,11 @@ class DevServerDownUntilStarted(FakeSandboxClient):
         return DevStatus(running=up, ready=up, port=3000, root_status=200 if up else None)
 
 
-class FakeBrain:
-    """A scripted mock `run_build`: emits step → preview_ready via `on_progress`,
-    then RETURNS its verdict as a `BuildResult`.
-
-    It emits no terminal `ended` because real BRAIN cannot: the frame is SESSION-API's,
-    rendered from the returned verdict after the snapshot. A fake that emitted one would
-    mask that seam — the manager would look correct while never exercising its own emission.
-    `raise_before_ended` scripts the abnormal path where BRAIN dies with no verdict at all."""
-
-    def __init__(
-        self,
-        *,
-        raise_before_ended: bool = False,
-        reason: str = "completed",
-        status: Literal[
-            BuildSessionStatus.ENDED, BuildSessionStatus.FAILED
-        ] = BuildSessionStatus.ENDED,
-        preview_url: str = "https://preview.example/",
-        app_id: uuid.UUID | None = None,
-    ) -> None:
-        self.raise_before_ended = raise_before_ended
-        self.reason = reason
-        # Annotated so the terminal narrowing survives the attribute assignment (pyright
-        # widens to the bare enum otherwise, and `BuildResult.status` only takes the two).
-        self.status: Literal[BuildSessionStatus.ENDED, BuildSessionStatus.FAILED] = status
-        self.preview_url = preview_url
-        self.app_id = app_id or uuid.uuid4()
-
-    async def __call__(
-        self,
-        session_id: uuid.UUID,
-        user_id: uuid.UUID,
-        sandbox_client: SandboxClient,
-        on_progress: ProgressSinkFn,
-    ) -> BuildResult:
-        await on_progress(
-            StepEvent(seq=1, name="scaffold", label="Scaffolding the app", state="started")
-        )
-        await on_progress(PreviewReadyEvent(seq=2, preview_url=self.preview_url))
-        if self.raise_before_ended:
-            raise RuntimeError("brain blew up mid-build")
-        return BuildResult(
-            status=self.status,
-            reason=self.reason,
-            app_id=self.app_id,
-            preview_url=self.preview_url,
-            last_seq=2,
-            snapshot_committed=False,
-        )
+async def detached_work_done(manager: SessionManager) -> None:
+    """Wait out everything the manager has detached — a start's slow half, its watch for a first
+    page, a compensation — including whatever those spawn while being waited on."""
+    while manager._tasks:
+        await asyncio.gather(*list(manager._tasks), return_exceptions=True)
 
 
 # ── Writers re-hosted from `src/`, where nothing calls them any more ──────────
@@ -646,7 +596,6 @@ class ToolDeps:
     take this instead."""
 
     sandbox: SandboxSession
-    emitter: ProgressEmitter | None = None
     user_id: uuid.UUID = field(default_factory=uuid.uuid4)
 
 
@@ -662,7 +611,7 @@ async def write_legacy_build_started(
 
     THE PRODUCTION WRITER IS DELETED and this is deliberately not a re-implementation for its own
     sake: rows of this shape are PERMANENT in the production transcript, the projection still
-    reads them (`BuildInProgressItem`), and `newest_build_outcome_status` still has to skip them.
+    reads them (`BuildInProgressItem`), and the outcome idempotency probe still has to skip them.
     Those readers are live and must stay tested against a faithful row rather than a hand-built
     dict that can drift from what is actually in the database.
 
@@ -714,6 +663,18 @@ def _safe_preview_url(preview_url: str | None) -> str | None:
     except ValidationError:
         return None
     return preview_url
+
+
+class BuildSessionStatus(enum.StrEnum):
+    """The status recorded on a legacy build-outcome row's `meta.status` field
+    (`build_outcome_meta`, `write_build_outcome`) — test-only now; nothing in `src/` still
+    names it. Five members, the wire value equal to the lowercase name."""
+
+    PROVISIONING = "provisioning"
+    BUILDING = "building"
+    READY = "ready"
+    ENDED = "ended"
+    FAILED = "failed"
 
 
 def _summary(status: BuildSessionStatus, reason: str | None) -> str:

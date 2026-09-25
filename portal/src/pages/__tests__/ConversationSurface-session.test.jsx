@@ -6,15 +6,14 @@
  * The transition's refusals are typed HTTP statuses now (429 daily cap, 409 busy, 503
  * unconfigured) — `buildFromPlan` THROWS and the card re-arms with the server's message.
  *
- * The REAL useBuildSession hook + LivePreview run; only the build-session transport and the
- * turn transport are mocked.
+ * The REAL surface + LivePreview run over mocked transports.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import ConversationSurface from '../../components/chat/ConversationSurface'
 import {
-  FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder, statusResp,
+  PREVIEW_URL, renderBuilder,
   PLAN_CARD_ID, planReply, primeTurn, turnStreaming, send, T_DELTA,
   scriptBuildTurn, BUILD_TURN_ID, T_STEP, T_PREVIEW, T_QUOTA, T_BUILD_END, T_WORKSPACE, T_END,
   T_DIAGNOSTIC,
@@ -25,8 +24,6 @@ const previewState = (state, restorable = null) => ({
   state,
   alive: state === 'alive',
   previewUrl: state === 'alive' ? PREVIEW_URL : null,
-  occupyingProjectName: null,
-  occupyingProjectId: null,
   restorable,
 })
 
@@ -41,7 +38,6 @@ const h = vi.hoisted(() => ({
   stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
   relaunchPreview: vi.fn(),
-  getStatus: vi.fn(),
   fetchPreviewState: vi.fn(),
 }))
 
@@ -59,8 +55,7 @@ vi.mock('../../utils/conversationApi', async (importOriginal) => ({
   listProjectConversations: h.listProjectConversations,
 }))
 // THE WORKSPACE READ: left unmocked, the poll's real fetch fails and the pane reports it could
-// not check on the app — wrong for a workspace that has gone to sleep. `relaunchPreview` reaches
-// this module directly, so it is mocked here too, not only on the injected client.
+// not check on the app — wrong for a workspace that has gone to sleep.
 vi.mock('../../utils/buildSessionApi', async (orig) => ({
   ...(await orig()),
   fetchPreviewState: (...a) => h.fetchPreviewState(...a),
@@ -77,11 +72,6 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   stopTurn: (...a) => h.stopTurn(...a),
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
-
-function deps() {
-  const fake = new FakeEventSource('x')
-  return { fake, deps: { client: makeClient(h), eventSourceFactory: () => fake } }
-}
 
 // BUILD-IT IS A HANDOFF, not a flip: the atomic transition creates a SECOND, new build chat
 // seeded with the plan and starts the turn there; the plan chat (`'build-X'`) is left as-is. So
@@ -140,7 +130,6 @@ beforeEach(() => {
   h.fetchPreviewState.mockResolvedValue(previewState('alive'))
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'build', title: 'My build', updatedAt: new Date().toISOString() }])
@@ -153,14 +142,13 @@ afterEach(() => cleanup())
 describe('BuilderPage — the build-turn flow', () => {
   it('Build it starts a WRITE TURN; its step frames render; the preview frame frames the sandbox URL', async () => {
     const turn = scriptedBuild()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await sendPrompt()
 
     // Started via the ATOMIC TRANSITION: a second, new build chat is created and started
-    // server-side — the build-session door stays shut, `getStatus` is never called. Third arg is
-    // the new chat's client-minted id (a real `uuidv7()` — only its shape is pinned).
+    // server-side. Third arg is the new chat's client-minted id (a real `uuidv7()` — only its
+    // shape is pinned).
     expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID, expect.any(String))
-    expect(h.getStatus).not.toHaveBeenCalled()
     // Cursor 0 deliberately: the build may have run for seconds before this subscribe landed, and
     // the snapshot recovers missed frames. The conversation is the LIVE build chat, not the plan chat.
     await waitFor(() =>
@@ -184,12 +172,11 @@ describe('BuilderPage — the build-turn flow', () => {
   })
 
   it('a doubly-truncated turn resubscribes once, then surfaces the connection-dropped notice', async () => {
-    const { deps: sessionDeps } = deps()
     h.readTurnStream.mockImplementation(async ({ onFrame }) => {
       onFrame(T_DELTA('partial…'))
       return 'truncated'
     })
-    renderBuilder({ deps: sessionDeps })
+    renderBuilder()
     await send('just answer me')
 
     expect(await screen.findByText(/connection dropped\. reload to catch up/i)).toBeTruthy()
@@ -201,7 +188,7 @@ describe('BuilderPage — the build-turn flow', () => {
     // address — and cursor 0 gets one on every real subscribe (the wire contract `readTurnStream`
     // documents); `scriptBuildTurn`'s default opening predates that, so it's supplied here.
     const turn = scriptedBuild({ opening: [T_SNAPSHOT(BUILD_TURN_ID), T_WORKSPACE()] })
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await sendPrompt()
     await awaitBuildTurn()
     await turn.frame(T_PREVIEW())
@@ -233,7 +220,7 @@ describe('BuilderPage — the build-turn flow', () => {
 
   it('a COMPLETED build keeps the preview framed — never "no longer running"', async () => {
     const turn = scriptedBuild()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await sendPrompt()
     await awaitBuildTurn()
     await turn.frame(T_PREVIEW())
@@ -253,17 +240,9 @@ describe('BuilderPage — the build-turn flow', () => {
     expect(screen.queryByText(/your app is live below/i)).toBeNull()
   })
 
-  // ('Force-end → the kill switch confirms, then ends the session' is RETIRED.) It drove
-  // `session.forceEnd`, the kill switch that tore a build SESSION's sandbox down out of band —
-  // and the composer-initiated build path has no session to tear down, nor a turn-level
-  // equivalent of one. `stopTurn` is the whole interrupt vocabulary a build turn has, and the Stop
-  // test above is what pins it. The kill switch is gone everywhere now, not just from this
-  // surface: the client, the hook wrapper and the backend route were deleted together, once no UI
-  // call site was left anywhere — the block banner took its Force-end button with it.
-
   it('a self-heal diagnostic renders as a RETRY mid-build, and leaves no residue after completion', async () => {
     const turn = scriptedBuild()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await sendPrompt()
     await awaitBuildTurn()
 
@@ -296,7 +275,7 @@ describe('BuilderPage — the build-turn flow', () => {
 
   it('repair exhausted → turn_ended(failed) — the retry framing does NOT persist beside the terminal', async () => {
     const turn = scriptedBuild()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await sendPrompt()
     await awaitBuildTurn()
 
@@ -320,9 +299,9 @@ describe('BuilderPage — the build-turn flow', () => {
     // project id as scenery; under it the pane now correctly frames the serving container
     // instead of saying the preview is gone. This test is about the banner, not about a
     // live container, so it says so.
-    h.fetchPreviewState.mockResolvedValue(previewState('unknown'))
+    h.fetchPreviewState.mockRejectedValue(new Error('unreadable'))
     const turn = scriptedBuild()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await sendPrompt()
     await awaitBuildTurn()
 
@@ -376,15 +355,14 @@ describe('BuilderPage — the transition\'s refusals are typed HTTP statuses now
     // project id as scenery; under it the pane now correctly frames the serving container
     // instead of saying the preview is gone. This test is about the banner, not about a
     // live container, so it says so.
-    h.fetchPreviewState.mockResolvedValue(previewState('unknown'))
-    renderBuilder({ deps: deps().deps })
+    h.fetchPreviewState.mockRejectedValue(new Error('unreadable'))
+    renderBuilder()
     await sendPrompt()
 
     expect(await screen.findByText(/another build is already running/i)).toBeTruthy()
     expect(screen.getByRole('button', { name: /^Build this plan$/ })).toBeTruthy()
     expect(document.querySelector('iframe')).toBeNull()
     expect(h.readTurnStream).not.toHaveBeenCalledWith(expect.objectContaining({ turnId: BUILD_TURN_ID }))
-    expect(h.getStatus).not.toHaveBeenCalled() // and no client-side 409 dance any more
   })
 
   it('an already_started outcome (double click / second tab) JOINS the running turn', async () => {
@@ -397,7 +375,7 @@ describe('BuilderPage — the transition\'s refusals are typed HTTP statuses now
         : null,
     )
     const turn = scriptedBuild()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await sendPrompt()
     await awaitBuildTurn('other-turn')
 
@@ -412,7 +390,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     // The decision this pins: a build is not a parallel track you talk over — the tool calls the
     // agent makes ARE its answer, so while it works the composer says there is nothing to send.
     const turn = scriptedBuild()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await sendPrompt('first build')
     await awaitBuildTurn()
     await turn.frame(T_PREVIEW())
@@ -430,8 +408,8 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
 
     // ENFORCED, not merely rendered: `aria-disabled` is affordance only, so Enter must be refused
     // by `handleSend`. The refusal's wording is the GENERIC one, not "your app is being built" —
-    // that branch only fires for a LEGACY session reattach now. "Building your app…" still
-    // appears, but only for the click-time round-trip, pinned in `ConversationSurface-composer.test.jsx`.
+    // that sentence belongs only to the click-time round-trip, pinned below and in
+    // `ConversationSurface-composer.test.jsx`.
     fireEvent.change(textarea, { target: { value: 'make it dark mode' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
     expect(await screen.findByText(/send unlocks when it is done/i)).toBeTruthy()
@@ -440,7 +418,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     expect(document.querySelector('iframe')).toBeTruthy() // the live build is untouched
 
     // No second Build-it to click while the build runs either: the card that started it is
-    // resolved, so the "build over a still-live session" hazard is unreachable from this chat.
+    // resolved, so the "second build over a live one" hazard is unreachable from this chat.
     expect(screen.queryByRole('button', { name: /^Build this plan$/ })).toBeNull()
   })
 
@@ -448,7 +426,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     // The other half of the one gate: the wait ends by itself. When the build finishes, a send is
     // a question to the assistant — it never touches the build (every mode accepts a send now).
     const turn = scriptedBuild()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await sendPrompt('first build')
     await awaitBuildTurn()
     await turn.frame(T_PREVIEW())
@@ -474,7 +452,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     // Restated as an absence: no build terminal ever renders a mode control, and a `getBuild` row
     // still carrying a legacy `mode` field is simply ignored rather than read.
     const turn = scriptedBuild()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await sendPrompt('first build')
     await awaitBuildTurn()
     // LIVENESS FIRST: the page is genuinely on the live build, not merely missing a mode control
@@ -493,10 +471,10 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
   })
 
   it('confirming the next brief starts a fresh build — nothing live to stop, so never a self-inflicted 409', async () => {
-    // The old flow had to STOP the running session before starting the replacement; under one
-    // gate the previous build is already terminal by the time a brief can be asked for.
+    // Under one gate the previous build is already terminal by the time a brief can be asked
+    // for, so there is nothing to stop before starting the replacement.
     const first = scriptedBuild()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await sendPrompt('first build')
     await awaitBuildTurn()
     await first.frame(T_PREVIEW(), T_BUILD_END())
@@ -514,45 +492,6 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     )
   })
 
-  it('a RELOAD mid-build re-takes the gate from the transcript', async () => {
-    // The window the gate mattered most in, and was simply ABSENT from: `buildActive` derives
-    // from refs only `Build it` stamps, so a fresh mount over a RUNNING build rendered an open
-    // textarea and no note. The projection carries the session id on the `build_in_progress` part.
-    h.getBuild.mockResolvedValue({
-      id: 'build-X',
-      kind: 'build',
-      messages: [
-        { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
-        { id: 'srv_1_g', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId: 'live-7' }] },
-      ],
-    })
-    h.getStatus.mockResolvedValue(
-      statusResp({ sessionId: 'live-7', projectId: 'p1', status: 'building' }),
-    )
-    const { deps: sessionDeps } = deps()
-    renderBuilder({ deps: sessionDeps })
-
-    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
-    const textarea = await screen.findByPlaceholderText(/ask for another change/i)
-    await waitFor(() => expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks/i))
-    expect(textarea.disabled).toBe(false)
-    expect(screen.getByTestId('composer-attach').disabled).toBe(false)
-    // AN INERTNESS GUARD, not a frozen-pill assertion: there is no mode pill to freeze or thaw,
-    // mid-build reload or otherwise.
-    expect(screen.queryByRole('button', { name: /^Mode:/ })).toBeNull()
-    // The transcript stops lying in the past tense too: `build_in_progress` maps to no rendered
-    // part at all (see `convertMessage`), so the anchor sentence cannot appear either way.
-    expect(document.querySelector('[data-kind="build-in-progress"]')).toBeNull()
-    expect(screen.getByTestId('stop-turn')).toBeTruthy()
-
-    fireEvent.change(textarea, { target: { value: 'while you are at it, add a chart' } })
-    fireEvent.keyDown(textarea, { key: 'Enter' })
-    expect((await screen.findByTestId('composer-gate-note')).textContent).toMatch(/building your app/i)
-    expect(h.startTurn).not.toHaveBeenCalled()
-    // …and the typed text SURVIVES the refusal, which is the point of keeping the box live.
-    expect(textarea.value).toBe('while you are at it, add a chart')
-  })
-
   it('the composer shuts on the CLICK, not on the server\'s answer', async () => {
     // `buildFromPlan` is a full round-trip, seconds long. The composer used to stay open for all
     // of it; a send in that window hit the silent double-Enter ref guard, and the message was gone.
@@ -561,7 +500,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
       () => new Promise((resolve) => { answer = () => resolve({ outcome: 'started', chatId: LIVE_CHAT_ID, turnId: BUILD_TURN_ID }) }),
     )
     const turn = scriptedBuild()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await send('a visitor app')
     fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
 
@@ -587,8 +526,6 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     // BUILD-IT IS A HANDOFF: pressing it navigates to a second, new build chat — simulated here,
     // as in every sibling-chat guard in this file, by a `chatId` prop swap on the same instance.
     const CHAT_A_LIVE = 'chat-A-live'
-    const fake = new FakeEventSource('x')
-    const sessionDeps = { client: makeClient(h), eventSourceFactory: () => fake }
     h.buildFromPlan.mockResolvedValue({ outcome: 'started', chatId: CHAT_A_LIVE, turnId: BUILD_TURN_ID })
     h.getBuild.mockImplementation(async (id) =>
       id === CHAT_A_LIVE
@@ -598,7 +535,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     scriptedBuild()
     const { rerender } = render(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-A" projectId="pA" projectName="Project A" /> />)}</Routes>
       </MemoryRouter>,
     )
     await screen.findByPlaceholderText(/ask for another change/i)
@@ -610,7 +547,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
 
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId={CHAT_A_LIVE} projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
+        <ConversationSurface chatId={CHAT_A_LIVE} projectId="pA" projectName="Project A" />
       </MemoryRouter>,
     )
     await awaitBuildTurn(BUILD_TURN_ID, CHAT_A_LIVE)
@@ -621,7 +558,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     h.readTurnStream.mockImplementation(turnStreaming(planReply('A sibling plan.', 'opt-S')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-B" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-B" projectId="pA" projectName="Project A" /> />)}</Routes>
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -642,8 +579,6 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     // server; `buildFromPlan` throws it, but A's build must NOT be stopped to make room for B's.
     // Simulated, as above, by a `chatId` prop swap on the same instance.
     const CHAT_A_LIVE = 'chat-A-live'
-    const fake = new FakeEventSource('x')
-    const sessionDeps = { client: makeClient(h), eventSourceFactory: () => fake }
     h.buildFromPlan.mockResolvedValue({ outcome: 'started', chatId: CHAT_A_LIVE, turnId: BUILD_TURN_ID })
     h.getBuild.mockImplementation(async (id) =>
       id === CHAT_A_LIVE
@@ -653,7 +588,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     const turn = scriptedBuild()
     const { rerender } = render(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-A" projectId="pA" projectName="Project A" /> />)}</Routes>
       </MemoryRouter>,
     )
     // Build + frame a preview in project A.
@@ -668,7 +603,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     // bare `<ConversationSurface>` has no host to frame the preview into.
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId={CHAT_A_LIVE} projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId={CHAT_A_LIVE} projectId="pA" projectName="Project A" /> />)}</Routes>
       </MemoryRouter>,
     )
     await awaitBuildTurn(BUILD_TURN_ID, CHAT_A_LIVE)
@@ -679,14 +614,15 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     // Project B must answer for ITSELF. The blanket `alive` fixture would have B's
     // pane frame project A's container — the cross-project frame the resolver's project
     // label exists to prevent — so each id now answers its own truth.
-    h.fetchPreviewState.mockImplementation(async (id) =>
-      previewState(id === 'pA' ? 'alive' : 'unknown'),
-    )
+    h.fetchPreviewState.mockImplementation(async (id) => {
+      if (id === 'pA') return previewState('alive')
+      throw new Error('unreadable')
+    })
     h.buildFromPlan.mockClear()
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Build B, please.', 'opt-B')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-B" projectId="pB" projectName="Project B" buildSessionDeps={sessionDeps} /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-B" projectId="pB" projectName="Project B" /> />)}</Routes>
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -702,13 +638,14 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     expect(await screen.findByText(/running in another project/i)).toBeTruthy()
     const retry = screen.getByRole('button', { name: /^Build this plan$/ })
     expect(retry.disabled).toBe(false)
+    expect(h.stopTurn).not.toHaveBeenCalled()
   })
 })
 
 describe('BuilderPage — the "come back later" relaunch entry point', () => {
-  // A reload drops the in-memory session, but the transcript's persisted BuildOutcome part proves
-  // a build once ran — so a fresh mount must render the terminal placeholder, not the idle empty
-  // state. The live/reattach flow always wins: this fallback only fires with no session at all.
+  // A reload drops the in-memory turn, but the transcript's persisted BuildOutcome part proves a
+  // build once ran — so a fresh mount must render the terminal placeholder, not the idle empty
+  // state. A live turn always wins: this fallback only fires with no live build at all.
   const outcomeTranscript = (status = 'ended') => ({
     id: 'build-X',
     messages: [
@@ -725,19 +662,16 @@ describe('BuilderPage — the "come back later" relaunch entry point', () => {
     ],
   })
 
-  it('a fresh mount with a persisted outcome and no live session offers the way back; pressing it starts the app', async () => {
+  it('a fresh mount with a persisted outcome and no live build offers the way back; pressing it starts the app', async () => {
     // The journey is unchanged: reload, find a way back to the app, press it, watch the restored
     // preview frame. What moved is the CONTROL — exactly one control starts the app now
     // (`Launch Application`), drawn by `AppPane` itself rather than nested inside the terminal card.
     h.fetchPreviewState.mockResolvedValue(previewState('asleep', true))
     h.getBuild.mockResolvedValue(outcomeTranscript())
-    h.relaunchPreview.mockResolvedValue({
-      appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false, ready: true,
-    })
-    const { deps: sessionDeps } = deps()
+    h.relaunchPreview.mockResolvedValue(undefined)
     // The affordance needs the PROJECT's confirmed saved build — an outcome in the transcript
     // alone proves a build ran, not that a Save happened.
-    renderBuilder({ deps: sessionDeps, hasSavedBuild: true })
+    renderBuilder({ hasSavedBuild: true })
 
     const button = await screen.findByRole('button', { name: /launch application/i })
     // Without this the fixture keeps answering `asleep` after a successful start, and the pane is
@@ -750,14 +684,11 @@ describe('BuilderPage — the "come back later" relaunch entry point', () => {
   })
 
   it('INERTNESS GUARD: a FAILED newest outcome no longer gets its own button label', async () => {
-    // There is one control now, saying the same thing however the last build ended — but
-    // `restoredFromFailedBuild` still travels to the pane and says "this is your last SAVED
-    // version" in a sentence instead. Paired with a liveness assertion: an absence alone would
-    // pass on a pane offering no way back at all.
+    // There is one control now, saying the same thing however the last build ended. Paired with a
+    // liveness assertion: an absence alone would pass on a pane offering no way back at all.
     h.fetchPreviewState.mockResolvedValue(previewState('asleep', true))
     h.getBuild.mockResolvedValue(outcomeTranscript('failed'))
-    const { deps: sessionDeps } = deps()
-    renderBuilder({ deps: sessionDeps, hasSavedBuild: true })
+    renderBuilder({ hasSavedBuild: true })
 
     // LIVENESS: there is still exactly one way back.
     expect(await screen.findByRole('button', { name: /launch application/i })).toBeTruthy()
@@ -767,12 +698,12 @@ describe('BuilderPage — the "come back later" relaunch entry point', () => {
   })
 
   // `AppPane` mounts `NoFrame` whenever the address resolver has no URL — this test overrides the
-  // default `alive` fixture to `never_built` so the pane's own empty-state sentence renders.
+  // default `alive` fixture to `asleep` with nothing saved so the pane's own empty-state sentence
+  // renders.
   it('a fresh mount with NO outcome keeps the idle empty state — nothing to relaunch', async () => {
-    h.fetchPreviewState.mockResolvedValue(previewState('never_built', false))
+    h.fetchPreviewState.mockResolvedValue(previewState('asleep', false))
     h.getBuild.mockResolvedValue(null)
-    const { deps: sessionDeps } = deps()
-    const { container } = renderBuilder({ deps: sessionDeps })
+    const { container } = renderBuilder()
     await screen.findByPlaceholderText(/ask for another change/i)
     await waitFor(() => expect(container.textContent).toMatch(/describe what you want to build/i))
     // The half that has not changed: no phantom way back for a project that has never been built.
@@ -786,8 +717,7 @@ describe('BuilderPage — the "come back later" relaunch entry point', () => {
 describe('a failed mode switch says what actually failed — RETIRED, now an inertness guard', () => {
   it('no mode pill exists idle, and ⌥P opens no menu — the whole surface this suite exercised is gone', async () => {
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
-    const { deps: sessionDeps } = deps()
-    renderBuilder({ deps: sessionDeps })
+    renderBuilder()
 
     // LIVENESS FIRST: an absent pill also describes a component that threw and rendered nothing.
     await screen.findByPlaceholderText(/ask for another change/i)
@@ -798,7 +728,7 @@ describe('a failed mode switch says what actually failed — RETIRED, now an ine
 
   it('no mode pill exists mid-build either — the frozen-pill mechanic this suite also drove is gone', async () => {
     const turn = scriptedBuild()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await sendPrompt('first build')
     await awaitBuildTurn()
 
@@ -837,7 +767,7 @@ describe('a read turn reads the live container without becoming a build', () => 
     // watched. It must still not go silent: the composer says a reply is coming for the whole wait.
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
     const turn = scriptReadTurn()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await send('What is the heading text on the page right now? One line.')
 
     await waitFor(() =>
@@ -861,7 +791,7 @@ describe('a read turn reads the live container without becoming a build', () => 
     it(`leaves no empty bubble behind once a ${status} answer has landed`, async () => {
       h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
       const turn = scriptReadTurn()
-      renderBuilder({ deps: deps().deps })
+      renderBuilder()
       await send('What is the heading text on the page right now? One line.')
       await screen.findByTestId('stop-turn')
 
@@ -887,7 +817,7 @@ describe('a read turn reads the live container without becoming a build', () => 
 describe('a build that dies before its first step shows no empty bubble', () => {
   it('renders the failure, not an empty assistant bubble', async () => {
     const turn = scriptedBuild({ opening: [T_WORKSPACE('unavailable', 1, 'The workspace service is not available right now.')] })
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await sendPrompt()
     await awaitBuildTurn()
     await turn.frame(T_BUILD_END({ status: 'failed' }))
@@ -919,7 +849,7 @@ describe('what the platform says about the workspace itself', () => {
   it('shows a recovery sentence above the composer, not in the transcript', async () => {
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
     const turn = scriptReadTurn()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await send('Add a column for the gate number.')
     // `resetTurnNarrative` clears the banner at the start of every turn, so a notice framed before
     // that lands would be wiped by setup, not by this test — wait on the composer's stop instead.
@@ -936,7 +866,7 @@ describe('what the platform says about the workspace itself', () => {
   it('is not posted or cleared by the ordinary lifecycle frames', async () => {
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
     const turn = scriptReadTurn()
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await send('Add a column for the gate number.')
     await screen.findByTestId('stop-turn')
 

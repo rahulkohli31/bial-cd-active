@@ -66,10 +66,6 @@ const sharedViewHolds = (over: Record<string, unknown> = {}) =>
     projectId: 'pA', projectName: 'Car pool', dirty: false, building: false, isSharedView: true, ...over,
   })
 
-const STARTED = {
-  appId: 'app-1', previewUrl: 'https://app/', status: 'ready', ready: true, restoredFromFailedBuild: false,
-}
-
 function Where() {
   const loc = useLocation()
   return <span data-testid="where">{loc.pathname + loc.search}</span>
@@ -129,8 +125,8 @@ beforeEach(() => {
   // before the composer ever got to ask, which is a different story than the one under test. The
   // two running at once is a story of its own, and it has its own block at the foot of this file.
   api.fetchPreviewState.mockResolvedValue({
-    state: 'asleep', alive: false, previewUrl: null, occupyingProjectName: null,
-    occupyingProjectId: null, restorable: false,
+    state: 'asleep', alive: false, previewUrl: null,
+    restorable: false,
   })
   api.fetchSaveState.mockResolvedValue(null)
 })
@@ -141,7 +137,7 @@ describe('★ the app is asked for BEFORE the address moves', () => {
     // The server takes the workspace for the project that asked. So the ordering that used to
     // exist to get a question in before the navigation now exists purely to get the APP in before
     // it: the citizen lands in a chat whose workspace is already theirs.
-    api.relaunchPreview.mockResolvedValue(STARTED)
+    api.relaunchPreview.mockResolvedValue(undefined)
     render(<Workspace />)
     type('add an out-time column')
 
@@ -157,7 +153,7 @@ describe('★ the app is asked for BEFORE the address moves', () => {
     // goes red on the mid-wait assertion while everything else here stays green.
     let startTheApp: (() => void) | undefined
     api.relaunchPreview.mockImplementation(
-      () => new Promise((resolve) => { startTheApp = () => resolve(STARTED) }),
+      () => new Promise((resolve) => { startTheApp = () => resolve(undefined) }),
     )
     render(<Workspace />)
     type('add an out-time column')
@@ -205,8 +201,8 @@ describe('a project with nothing built yet — the first message anybody sends',
 
   beforeEach(() => {
     api.fetchPreviewState.mockResolvedValue({
-      state: 'asleep', alive: false, previewUrl: null, occupyingProjectName: null,
-      occupyingProjectId: null, restorable: false,
+      state: 'asleep', alive: false, previewUrl: null,
+      restorable: false,
     })
   })
 
@@ -282,7 +278,7 @@ describe('what the navigation carries', () => {
     // The files are the half most easily lost: they live only as decoded bytes in a composer the
     // navigation is about to leave. Removing `pendingAttachments` from the navigation's state
     // passes every other scenario in this file.
-    api.relaunchPreview.mockResolvedValue(STARTED)
+    api.relaunchPreview.mockResolvedValue(undefined)
     render(<Workspace />)
     type('add an out-time column')
     // STAGED BY DROP rather than through the add control, which opens an OS picker jsdom cannot
@@ -342,15 +338,15 @@ describe('what the navigation carries', () => {
  */
 describe('★ a held workspace comes back on its own, with nothing sent', () => {
   const held = {
-    state: 'slot_taken' as const, alive: false, previewUrl: null,
-    occupyingProjectName: 'Car pool', occupyingProjectId: 'pA', restorable: true,
+    state: 'asleep' as const, alive: false, previewUrl: null,
+    restorable: true,
   }
 
   it('★ opening the project takes the workspace, without opening a chat or sending the message', async () => {
     // A taken slot reads as the saved app it is, so the screen starts it the way it starts any
     // saved app — no press, no question, and nothing at all about the project that had it.
     api.fetchPreviewState.mockResolvedValue(held)
-    api.relaunchPreview.mockResolvedValue(STARTED)
+    api.relaunchPreview.mockResolvedValue(undefined)
     render(<Workspace />)
     // The message is in the composer and stays there — this citizen never pressed send.
     type('add an out-time column')
@@ -366,7 +362,7 @@ describe('★ a held workspace comes back on its own, with nothing sent', () => 
 
   it('★ and names the project that had it nowhere on the screen', async () => {
     api.fetchPreviewState.mockResolvedValue(held)
-    api.relaunchPreview.mockResolvedValue(STARTED)
+    api.relaunchPreview.mockResolvedValue(undefined)
     render(<Workspace />)
 
     await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalled())
@@ -390,7 +386,7 @@ describe('★ a held workspace comes back on its own, with nothing sent', () => 
 describe('★ a send that arrives while the app is already starting', () => {
   const SAVED_AND_ASLEEP = {
     state: 'asleep' as const, alive: false, previewUrl: null,
-    occupyingProjectName: null, occupyingProjectId: null, restorable: true,
+    restorable: true,
   }
 
   const paneState = () =>
@@ -406,7 +402,7 @@ describe('★ a send that arrives while the app is already starting', () => {
     let finish: (() => void) | undefined
     api.fetchPreviewState.mockResolvedValue(SAVED_AND_ASLEEP)
     api.relaunchPreview.mockImplementation(
-      () => new Promise((resolve) => { finish = () => resolve(STARTED) }),
+      () => new Promise((resolve) => { finish = () => resolve(undefined) }),
     )
     render(<Workspace />)
 
@@ -438,7 +434,7 @@ describe('★ a send that arrives while the app is already starting', () => {
     let finish: (() => void) | undefined
     api.fetchPreviewState.mockResolvedValue(SAVED_AND_ASLEEP)
     api.relaunchPreview
-      .mockImplementationOnce(() => new Promise((resolve) => { finish = () => resolve(STARTED) }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finish = () => resolve(undefined) }))
       .mockRejectedValue(sharedViewHolds())
     render(<Workspace />)
     await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(1))

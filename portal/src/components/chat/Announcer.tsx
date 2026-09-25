@@ -3,9 +3,9 @@
  *
  * THREE CHANNELS, each with a distinct job, no new dependency: `Announcer` is polite and
  * INVISIBLE (agent started working, a group sealed); `TurnBanner` is polite and VISIBLE (one
- * value, newest wins — the app's current state); `SessionBanners` is ASSERTIVE (what genuinely
- * interrupts: refusals, blocks, failures). `assertive` is reserved to `SessionBanners` alone,
- * despite older plan text calling `TurnBanner` "the assertive slot".
+ * value, newest wins — the app's current state); `ConversationSurface`'s urgent banner is
+ * ASSERTIVE (what genuinely interrupts: refusals and failures). `assertive` is reserved to that
+ * banner alone.
  *
  * WHY THIS EXISTS: `sonner` (recommended by the component research) renders exactly ONE live
  * region for everything, with no way to make any toast assertive — it could never carry this

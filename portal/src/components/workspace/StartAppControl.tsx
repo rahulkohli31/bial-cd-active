@@ -6,7 +6,7 @@
  * WHY THIS EXISTS
  *
  * `relaunchPreview` reaches a two-armed endpoint. ATTACH is safe: it reuses the live container and
- * fails open on a readiness timeout. RESTORE tears the container down before pulling the last saved
+ * keeps it when the app shows no page. RESTORE tears the container down before pulling the last saved
  * bundle, so a guard keeps an unreadable attach — the recorded data-loss path — out of it. A stale
  * `asleep` read stays reachable, the registry hash having no TTL, and this control answers it with
  * one start and whatever comes back, refusals included, never a retry or an invented recovery verb.

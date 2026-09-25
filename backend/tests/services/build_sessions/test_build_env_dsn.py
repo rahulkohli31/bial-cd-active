@@ -38,7 +38,7 @@ from src.services.build_sessions.manager import SessionManager, app_name_for
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from tests.factories import ProjectFactory, UserFactory
-from tests.fakes import FakeSandboxClient, FakeStorage
+from tests.fakes import FakeSandboxClient, FakeStorage, detached_work_done
 
 _BASE_ENV = ("BIAL_APP_ID", "BIAL_PORTAL_ORIGIN")
 
@@ -240,6 +240,7 @@ async def test_relaunch_preview_reinjects_the_dsn(
 
     client = FakeSandboxClient()
     await manager.relaunch_preview(db_session, user, project_id, client)
+    await detached_work_done(manager)
 
     assert client.restored == [app_name_for(built.app_id)]
     assert client.restore_env is not None

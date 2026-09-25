@@ -32,8 +32,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.user import User
-from src.services.build_sessions import app_name_for
+from src.services.build_sessions import app_name_for, shr_name_for
 from src.services.build_sessions import shutdown as shutdown_module
+from src.services.build_sessions.alarms import REAP_FOUND_NO_REPOSITORY_EVENT
+from src.services.build_sessions.integrity import PORCELAIN_FAILED_MARK
 from src.services.build_sessions.manager import SessionManager
 from src.services.build_sessions.shutdown import (
     SANDBOX_DESTROYED_UNREAD_EVENT,
@@ -45,6 +47,7 @@ from src.services.build_sessions.shutdown import (
     shut_it_down_in_the_background,
     sweep_owed_teardowns,
 )
+from src.services.build_sessions.snapshot import _NO_REPOSITORY_EXIT
 from src.services.messages.projection import TURN_TERMINAL_KIND
 from src.services.redis import REGISTRY_STATE_READY, lease_key, lock_key, registry_key
 from src.services.redis.keys import (
@@ -160,6 +163,7 @@ def _answers_by_name[Client: _Sandbox](
     porcelain: str = " M page.tsx",
     commits: int = 4,
     born: datetime | None = None,
+    commit_exit: int = 0,
 ) -> Client:
     """A container reachable ONLY by name, answering the whole snapshot ladder.
 
@@ -180,6 +184,8 @@ def _answers_by_name[Client: _Sandbox](
     bundle = base64.b64encode(a_git_bundle(bundles_to)).decode()
 
     def handler(cmd: list[str]) -> ExecResult:
+        if cmd[0] == "sh" and "git add -A" in cmd[-1]:
+            return ExecResult(stdout="", stderr="", exit=commit_exit)
         if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
             return ExecResult(stdout=f"{head}@@{porcelain}@@{commits}@@", stderr="", exit=0)
         if cmd[0] == "base64":
@@ -382,18 +388,14 @@ async def test_a_switch_stops_the_turn_bundles_the_tree_and_destroys_the_contain
     assert await fake_redis.exists(registry_key(scene.user_id)) == 0
 
 
-@pytest.mark.parametrize(
-    "reason", [ShutdownReason.PRESENCE_LAPSED, ShutdownReason.PAST_THE_CEILING]
-)
-async def test_the_lapse_and_the_ceiling_differ_only_in_the_reason_they_record(
+async def test_a_carried_debt_publishes_no_stop_and_waits_for_nothing(
     fake_redis: aioredis.Redis,
     fake_storage: FakeStorage,
     scene: _Scene,
-    reason: ShutdownReason,
 ) -> None:
-    """Three triggers, one implementation. Neither of these two has a turn to stop, so neither
-    publishes a stop or sits through the wait — waiting on an ending that was never coming would
-    add the whole stop budget to the path every sweep takes."""
+    """A debt the sweep carries forward has no turn to stop, so it publishes no stop and sits
+    through no wait — waiting on an ending that was never coming would add the whole stop budget
+    to the path every sweep takes."""
     born = _born_at(200)
     await _seed_registry(fake_redis, scene.user_id, app_name=scene.app_name, created_at=born)
     await _saved_copy(fake_storage, scene.app_id)
@@ -404,7 +406,7 @@ async def test_the_lapse_and_the_ceiling_differ_only_in_the_reason_they_record(
         owed,
         redis=fake_redis,
         sandbox_client=client,
-        reason=reason,
+        reason=ShutdownReason.PRESENCE_LAPSED,
         session_factory=scene.factory,
     )
 
@@ -673,6 +675,72 @@ async def test_a_container_still_holding_the_starter_template_loses_it_without_a
     assert meta is not None and (meta.metadata or {})["head_sha"] == SAVED
 
 
+async def test_a_container_that_lost_its_repository_is_destroyed_rather_than_spared(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage, scene: _Scene
+) -> None:
+    """★ No later attempt could save a tree with no repository, so sparing it only bills, and the
+    destroyed-unread alarm would misname a container that answered. The saved copy stands.
+    Mutation check: drop the `WorkspaceHasNoRepositoryError` arm and this goes red."""
+    born = _born_at(10)
+    await _seed_registry(fake_redis, scene.user_id, app_name=scene.app_name, created_at=born)
+    await _saved_copy(fake_storage, scene.app_id)
+    client = _answers_by_name(
+        _Sandbox(),
+        scene.app_name,
+        head="",
+        porcelain=PORCELAIN_FAILED_MARK,
+        commits=0,
+        commit_exit=_NO_REPOSITORY_EXIT,
+    )
+    owed = await _owe(scene, instance_ref=born)
+
+    with structlog.testing.capture_logs() as logs:
+        outcome = await run_the_shutdown(
+            owed,
+            redis=fake_redis,
+            sandbox_client=client,
+            reason=ShutdownReason.PRESENCE_LAPSED,
+            session_factory=scene.factory,
+        )
+
+    assert outcome is ShutdownOutcome.DESTROYED
+    assert client.torn_down == [scene.app_name]
+    assert await _rows_for(scene) == []
+    meta = await fake_storage.head(snapshot_key(scene.app_id))
+    assert meta is not None and (meta.metadata or {})["head_sha"] == SAVED
+    events = [(line["event"], line["log_level"]) for line in logs]
+    assert (REAP_FOUND_NO_REPOSITORY_EVENT, "warning") in events
+    assert SANDBOX_DESTROYED_UNREAD_EVENT not in [event for event, _ in events]
+
+
+async def test_a_missing_repository_the_state_probe_contradicts_is_spared(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage, scene: _Scene
+) -> None:
+    """★ The state probe read a HEAD, so the commit's no-repository answer is a failing git and the
+    unsaved tree is still there. It takes the unreadable budget, never the destroy.
+    Mutation check: re-raise `WorkspaceHasNoRepositoryError` whatever the state probe read and
+    this goes red."""
+    born = _born_at(10)
+    await _seed_registry(fake_redis, scene.user_id, app_name=scene.app_name, created_at=born)
+    client = _answers_by_name(_Sandbox(), scene.app_name, commit_exit=_NO_REPOSITORY_EXIT)
+    owed = await _owe(scene, instance_ref=born)
+
+    with structlog.testing.capture_logs() as logs:
+        outcome = await run_the_shutdown(
+            owed,
+            redis=fake_redis,
+            sandbox_client=client,
+            reason=ShutdownReason.PRESENCE_LAPSED,
+            session_factory=scene.factory,
+        )
+
+    assert outcome is ShutdownOutcome.SPARED
+    assert client.torn_down == []
+    rows = await _rows_for(scene)
+    assert len(rows) == 1 and rows[0].last_error is not None
+    assert REAP_FOUND_NO_REPOSITORY_EVENT not in [line["event"] for line in logs]
+
+
 async def test_a_container_that_will_not_answer_is_spared_inside_its_budget(
     fake_redis: aioredis.Redis, scene: _Scene
 ) -> None:
@@ -790,13 +858,57 @@ async def test_the_ceiling_outranks_the_strike_budget(
         owed,
         redis=fake_redis,
         sandbox_client=client,
-        reason=ShutdownReason.PAST_THE_CEILING,
+        reason=ShutdownReason.PRESENCE_LAPSED,
         session_factory=scene.factory,
     )
 
     assert outcome is ShutdownOutcome.DESTROYED
     assert owed.attempts < shutdown_module._STRIKES_BEFORE_IT_GOES
     assert client.torn_down == [scene.app_name]
+
+
+async def test_a_shared_view_owed_a_delete_is_destroyed_with_no_write_back(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+    scene: _Scene,
+) -> None:
+    """★ A SHARED VIEW HOLDS NOTHING OF THE RECIPIENT'S TO SAVE. It is a restore of its owner's
+    saved copy, and that storage is read-never-write for the recipient, so a debt owed on a view is
+    settled by the delete alone — and the row names the owner's app, so a write-back here would
+    land on the owner's saved copy.
+
+    Mutation check: drop the shared-view arm and the recipient's view is written over the owner's
+    saved copy."""
+    recipient = await UserFactory.create(db_session)
+    name = shr_name_for(scene.app_id, recipient.id)
+    born = _born_at(10)
+    await _seed_registry(fake_redis, recipient.id, app_name=name, created_at=born)
+    client = _answers_by_name(_Sandbox(), name, born=born)
+    async with scene.factory() as db:
+        owed = await claim_the_teardown_we_owe(
+            db,
+            user_id=recipient.id,
+            app_id=scene.app_id,
+            app_name=name,
+            project_id=scene.project_id,
+            instance_ref=born,
+            conversation_id=None,
+        )
+    on_record = dict(fake_storage.objects)
+
+    outcome = await run_the_shutdown(
+        owed,
+        redis=fake_redis,
+        sandbox_client=client,
+        reason=ShutdownReason.PROJECT_SWITCHED,
+        session_factory=scene.factory,
+    )
+
+    assert outcome is ShutdownOutcome.DESTROYED
+    assert client.torn_down == [name]
+    assert fake_storage.objects == on_record, "nothing was written back anywhere"
+    assert snapshot_key(scene.app_id) not in fake_storage.objects
 
 
 async def test_a_name_nothing_answers_to_settles_the_debt(

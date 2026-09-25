@@ -13,14 +13,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
-import { FakeEventSource, makeClient, primeClient, waitForGateOpen, PREVIEW_URL, T_STEP, T_WORKSPACE, T_PREVIEW, T_BUILD_END } from './_builderSession.jsx'
+import { waitForGateOpen, PREVIEW_URL, T_STEP, T_WORKSPACE, T_PREVIEW, T_BUILD_END } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), getBuild: vi.fn(),
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  relaunchPreview: vi.fn(), getStatus: vi.fn(),
+  relaunchPreview: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -52,16 +52,13 @@ import ConversationSurface from '../../components/chat/ConversationSurface'
 import { OUTCOME_COPY, outcomeSummary } from '../../utils/messageTypes'
 
 function renderThread(chatId = 'thread-1') {
-  const fake = new FakeEventSource(chatId)
-  const deps = { client: makeClient(h), eventSourceFactory: () => fake }
-  const view = render(
+  return render(
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <Routes>
-        <Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" buildSessionDeps={deps} />} />
+        <Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" />} />
       </Routes>
     </MemoryRouter>,
   )
-  return { ...view, fake }
 }
 
 const composer = () => screen.getByPlaceholderText(/ask for another change/i)
@@ -175,7 +172,6 @@ const wireSends = () => h.startTurn.mock.calls.map((call) => JSON.stringify(call
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])

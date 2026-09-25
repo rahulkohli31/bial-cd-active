@@ -17,8 +17,9 @@
  * start a container. The consequence is stated rather than hidden: at rest, a stopped project shows no
  * save state and no commit. `checkWorkspace` costs a container exec and can raise an operational alarm,
  * so it is asked here for ONE reason only: a wait that looks stuck (`mayHaveStopped`), where the server
- * may find the app stopped and put it away — never about a completion claim, which the project screen
- * does not make, and never on an accelerated tick. `fetchCompileState` IS asked from this surface: its
+ * may find the app stopped and restart its dev server — never about a completion claim, which
+ * the project screen does not make, and never on an accelerated tick. `fetchCompileState` IS
+ * asked from this surface: its
  * route short-circuits before any attach when nothing is live, so it cannot start a stopped container.
  * `ProjectWorkspace` asks it beside this read rather than from inside it, because it is gated on THIS
  * hook's `alive` answer and on the resolved address, neither of which this hook holds.
@@ -49,7 +50,6 @@ import {
   HIDDEN_PROBE_MS,
   PREVIEW_PROBE_MS,
   STARTING_PROBE_MS,
-  asDecidedReading,
   isTerminalReading,
   mayHaveStopped,
   nextProbeCadence,
@@ -60,6 +60,8 @@ import {
   type StartOutcome,
   type WorkspaceState,
 } from './workspaceState'
+import { useTheWaitHasGoneOnTooLong } from './useTheWaitHasGoneOnTooLong'
+import { createPressEnd } from './startApp'
 
 export interface WorkspaceReading {
   /** WHAT TO SAY. The single value the pane and the Plan-chat line both render. */
@@ -91,10 +93,12 @@ export interface WorkspaceReading {
   /** Has any read FINISHED, by answering or by failing? False only before the first attempt
    *  settles, which is the one window in which no verdict may be drawn. */
   settled: boolean
-  /** Record how the most recent start attempt ended. `null` clears it (a start that worked). */
+  /** Record how the most recent start attempt ended. `null` clears it. */
   reportStartOutcome: (outcome: StartOutcome | null) => void
-  /** A press has begun, or finished. Drives the map's in-flight arm. */
+  /** A press has begun, or was refused. Drives the map's in-flight arm. */
   reportStartPending: (pending: boolean) => void
+  /** The server admitted the press — see `WorkspaceReport.onStartAdmitted`. */
+  reportStartAdmitted: () => void
   /** Ask again NOW. A deliberate gesture: a start that just finished, or a retry press. */
   refresh: () => void
   /**
@@ -121,6 +125,10 @@ export function useWorkspaceState({
   // A press is in flight. See `WorkspaceInputs.startInFlight` for why the map needs to know: the
   // server's own `starting` arrives on the next read, and this covers the gap until it does.
   const [startInFlight, setStartInFlight] = useState(false)
+  const [pressEnd] = useState(() => createPressEnd(() => setStartInFlight(false)))
+  // ONE TIMER, NOT A TICK — see the hook. It reads the wait's own instant off `preview`, so a tab
+  // reloaded well into a start crosses the boundary at once instead of starting its patience over.
+  const waitHasGoneOnTooLong = useTheWaitHasGoneOnTooLong(preview)
   // NOT DERIVED FROM ANYTHING, and it cannot be. A retry press is a synchronous fact whose only
   // observable state change can be collapsed into one commit by React's batching, so an
   // invalidation spelled as "something changed" is one a fast enough server erases. A counter
@@ -142,7 +150,8 @@ export function useWorkspaceState({
   // never on `epoch`: a retry press is not news about the container.
   useEffect(() => {
     setStartInFlight(false)
-  }, [projectId])
+    pressEnd.drop()
+  }, [projectId, pressEnd])
 
   const refresh = useCallback(() => setEpoch((n) => n + 1), [])
   // WHAT THE PANE LAST SAID ABOUT ITS FRAME. A ref, not state: it changes what the next read ASKS
@@ -162,6 +171,11 @@ export function useWorkspaceState({
     // time" standing under a fresh start is the pane arguing with the button somebody is holding.
     if (pending) setStartOutcome(null)
   }, [])
+  const reportStartAdmitted = useCallback(() => {
+    setStartOutcome(null)
+    pressEnd.admitted()
+    setEpoch((n) => n + 1)
+  }, [pressEnd])
 
   // Read inside the async body without re-arming the effect. A start outcome must not restart the
   // poll — it is a fact about a press, not about the workspace — but the save read below has to
@@ -230,37 +244,29 @@ export function useWorkspaceState({
       // back is worse than one cheap read.
       //
       // WHAT STAYS VISIBLE-ONLY, and this is the half that matters: `fetchSaveState` costs two
-      // `git` executions in the container, and `checkWorkspace` can PUT THE CONTAINER AWAY. A
-      // background tab that could reach either would be spending a container call, or ending a
-      // workspace, with nobody looking.
+      // `git` executions in the container, and `checkWorkspace` can restart the app's dev
+      // server. A background tab that could reach either would be spending a container call, or
+      // restarting a dev server, with nobody looking.
       const hidden = document.visibilityState !== 'visible'
-      const presence = presenceToRenew(accelerated, hidden)
-      if (presence) {
-        // NOT AWAITED. The renewal is a fact this surface reports, not one the read waits on: a
-        // slow renewal must never delay the answer the screen is rendering. Its own result is
-        // recorded when it lands, and a failure records nothing at all.
-        void renewPresence(projectId, presence)
-      }
+      // NOT AWAITED. The renewal is a fact this surface reports, not one the read waits on: a
+      // slow renewal must never delay the answer the screen is rendering. Its own result is
+      // recorded when it lands, and a failure records nothing at all.
+      void renewPresence(projectId, presenceToRenew(hidden))
       const generation = ++latest
+      const readSettled = pressEnd.readBegins()
       try {
         const next = await fetchPreviewState(projectId)
         // Superseded: a later read started, so its answer is newer whatever order the responses
         // arrived in. Bail before touching state OR the timer — an overtaken read calling
         // `stopAsking()` would end the poll on a verdict that has already been replaced.
         if (!live || generation !== latest) return
-        // AN `unknown` NEVER OVERWRITES A DECIDED VERDICT. A blip must not pull a running app off
-        // screen, and it must not wipe a settled answer somebody is already reading either. It is
-        // recorded only when nothing has been decided yet — because "we could not check" is a real
-        // thing to say when it is the only thing we know.
         // HOLDING THE OLD REFERENCE WHEN NOTHING CHANGED is not an optimisation detail here: this
         // poll runs every 45 seconds on every project screen, and the reading is identical on
         // almost all of them. A fresh object each tick republishes the workspace report, which
         // wakes the shell, and re-renders the rail's whole conversation list — for an answer
         // nobody's screen can tell apart from the one already up.
-        setPreview((prev) => {
-          if (next.state === 'unknown' && prev) return prev
-          return samePreviewState(prev, next) ? prev : next
-        })
+        setPreview((prev) => (samePreviewState(prev, next) ? prev : next))
+        readSettled()
 
         // ONE TICK PER ANSWER, and deliberately not per CHANGE — a caller re-asking its own
         // question needs to hear that the world was looked at, and an answer identical to the last
@@ -305,12 +311,12 @@ export function useWorkspaceState({
         // HAS THE APP STOPPED? `mayHaveStopped` says which readings ask. A reading that takes the
         // frame away clears the pane's last stall first, since no pane is left to clear it.
         //
-        // THE SERVER ACTS ON THE ANSWER — a process found dead with the work provably saved has its
-        // container put away — and this reading predates that. So a check is followed at once by
+        // THE SERVER ACTS ON THE ANSWER — a process found dead is started again in its container —
+        // and this reading predates that. So a check is followed at once by
         // one more read, made as an accelerated one so it cannot ask again, and this read leaves
         // its cadence decision to that one. Never on an accelerated tick: that timer is watching a
         // start land, and a check there is a container call about a dev server still booting.
-        if (next.state !== 'alive' && next.state !== 'unknown') frameStalledRef.current = false
+        if (next.state !== 'alive') frameStalledRef.current = false
         if (!accelerated && !hidden && mayHaveStopped(next.state, frameStalledRef.current, cadence)) {
           await checkWorkspace(projectId)
           if (!live || generation !== latest) return
@@ -330,9 +336,12 @@ export function useWorkspaceState({
         // again, and a tick this arm deliberately withholds would leave it behind a blank pane
         // with no way out.
         setSettled(true)
-        // A read that could not answer SAYS NOTHING. Painting "gone" on a network blip is the
-        // over-claiming this whole shape exists to remove, and the timer is left running so the
-        // next tick can correct it.
+        // It ends an admitted press all the same, or a dead endpoint would hold the press forever.
+        if (live && generation === latest) readSettled()
+        // A read that could not answer SAYS NOTHING: `preview` is left exactly where it was, so a
+        // blip — a network drop, or the server's 503 for a coordination store it could not read —
+        // never pulls a running app off screen or wipes an answer somebody is already reading. The
+        // timer is left running so the next tick can correct it.
         //
         // BUT IT STILL SPENDS FROM THE ACCELERATED WINDOW. Until it did, the 120-second bound was
         // a ceiling on SUCCESSFUL reads only, so a workspace that reached `starting` and then began
@@ -379,20 +388,15 @@ export function useWorkspaceState({
       window.removeEventListener('focus', onVisible)
       stopAsking()
     }
-  }, [projectId, epoch])
+  }, [projectId, epoch, pressEnd])
 
   return {
-    // `lastDecidedPreview` IS DERIVED FROM `preview`, NOT KEPT BESIDE IT, because this hook's own
-    // reducer is already the memory: `setPreview` returns the previous object when the new reading
-    // is `unknown` (see the guard above it), so `preview` only ever HOLDS an `unknown` when nothing
-    // has been decided yet — the one case whose answer is the fallback sentence anyway. A second
-    // copy of that memory could only ever disagree with the first.
     state: resolveWorkspaceState({
       preview,
-      lastDecidedPreview: asDecidedReading(preview),
       projectHasSavedBuild,
       startOutcome,
       startInFlight,
+      waitHasGoneOnTooLong,
     }),
     preview,
     save,
@@ -400,6 +404,7 @@ export function useWorkspaceState({
     settled,
     reportStartOutcome,
     reportStartPending,
+    reportStartAdmitted,
     refresh,
     reportFrameStall,
   }

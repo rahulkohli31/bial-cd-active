@@ -36,7 +36,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_SHARED_SERVED_COUNT,
 )
-from src.services.sandbox import SandboxHandle
+from src.services.sandbox import SandboxHandle, SandboxNotReadyError
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from tests.factories import ProjectFactory, UserFactory
@@ -95,6 +95,36 @@ async def test_launch_cold_restores_and_returns_the_owners_app_id(
     assert client.provisioned == []  # never a blank template
     assert preview.ready is True
     assert await lock_is_held(fake_redis, recipient.id) is False  # lock released, slot free
+
+
+async def test_launch_keeps_a_restored_container_whose_dev_server_never_readies(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The readiness arm is the one piece of the state machine this door does NOT share with
+    `relaunch_preview` — it is a second copy of the same handler — so it gets its own pin here
+    rather than in `test_manager.py`. A readiness timeout is a statement about the owner's app,
+    and the heaviest apps in the estate are exactly the ones a colleague is sent a link to.
+
+    Mutation check: restore `if not attached: raise` on the shared arm and this goes red."""
+    owner, project, app_id = await _owner_with_saved_app(
+        db_session, fake_storage, email="owner-slow@example.com"
+    )
+    recipient = await UserFactory.create(db_session, email="recipient-slow@example.com")
+    manager = SessionManager()
+
+    class DevNeverReadies(FakeSandboxClient):
+        async def wait_ready(self, handle, *, timeout_s=120.0):
+            raise SandboxNotReadyError("dev server not ready within 120s")
+
+    client = DevNeverReadies()
+
+    preview = await manager.launch_shared_preview(db_session, recipient, project, client)
+
+    assert preview.ready is False, "an app that never served must not be reported as ready"
+    assert preview.preview_url, "…but the URL still ships — the pane owns the labelled wait"
+    assert client.restored == [shr_name_for(app_id, recipient.id)]  # it WAS created...
+    assert client.torn_down == []  # ...and it survives the owner's app being slow
+    assert await lock_is_held(fake_redis, recipient.id) is False
 
 
 async def test_launch_restores_the_owners_saved_bundle_and_nothing_beside_it(

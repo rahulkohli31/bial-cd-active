@@ -45,6 +45,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_SHARED_SERVED_COUNT,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
+    REGISTRY_FIELD_WAITING_SINCE,
 )
 from src.services.sandbox.aca import (
     AcaControlPlane,
@@ -754,14 +755,18 @@ class AcaSandboxClient(SandboxClient):
         an ordinary build sandbox" and both fields are `hdel`-ed; passing one without the
         other is a caller error (`launch_shared_preview` always supplies both together)."""
         key = registry_key(user_uuid)
+        born = datetime.now(UTC).isoformat()
         await get_redis().hset(
             key,
             mapping={
                 REGISTRY_FIELD_APP_NAME: app_name,
                 REGISTRY_FIELD_FQDN: fqdn,
                 REGISTRY_FIELD_TOKEN_REF: token_ref,
-                REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
+                REGISTRY_FIELD_CREATED_AT: born,
                 REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+                # In the mapping for the reason the sentinel below is: a previous occupant's
+                # wait must be overwritten, not inherited.
+                REGISTRY_FIELD_WAITING_SINCE: born,
                 # THE SENTINEL BELONGS IN THE MAPPING AND NOWHERE ELSE. Do not "tidy" it into
                 # the `hdel` beside `preview_stay_until` — that line runs SECOND, so it would
                 # delete what this write just put there, and an ABSENT `serving_since` is read

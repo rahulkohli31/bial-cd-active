@@ -151,10 +151,8 @@ async def test_a_save_racing_the_write_back_corrupts_neither_bundle(
 async def test_no_bundle_artifact_is_ever_left_in_or_committed_to_the_users_tree(
     db_session: AsyncSession, live_redis: aioredis.Redis, live_storage, sandbox
 ) -> None:
-    """The bundle is written under /tmp precisely so no `.gitignore` rule has to be right —
-    a RESTORED container carries the `.gitignore` committed in its own bundle, which for
-    pre-existing apps lists the literal `/app.bundle` and would not match the randomized
-    names. Several saves, then look at what git actually tracks."""
+    """The bundle is written under /tmp so no ignore rule has to be right. Several saves, then
+    look at what git actually tracks."""
     user, project_id = await _project(db_session, "e2e10@rvaiglobal.com")
     manager = SessionManager()
     session = await manager.ensure_sandbox(

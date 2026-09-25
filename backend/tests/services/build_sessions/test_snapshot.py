@@ -21,8 +21,7 @@ from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
 APP_ID = uuid.uuid4()
 
 #: Spelled out rather than imported from the module under test, so a changed constant moves the
-#: script and the assertion apart instead of moving them together. It is a shell exit code and
-#: `sandbox/scripts/snapshot.sh` carries the same literal.
+#: script and the assertion apart instead of moving them together.
 NO_REPO_EXIT = 64
 
 
@@ -54,7 +53,7 @@ async def test_write_snapshot_bundles_and_puts_to_blob(fake_storage: FakeStorage
     # PROBES for a repository and never creates one: a root commit written at the end of a turn
     # holds the finished app, which makes the starter-page check compare the app against itself.
     assert "git init" not in scripts[0]
-    assert scripts[0].startswith(f"git rev-parse --git-dir >/dev/null 2>&1 || exit {NO_REPO_EXIT}")
+    assert scripts[0].startswith(f"[ -e .git ] || exit {NO_REPO_EXIT}; ")
     assert "git diff --cached --quiet || git commit" in scripts[0]
 
 

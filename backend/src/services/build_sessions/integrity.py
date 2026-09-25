@@ -386,16 +386,13 @@ REGENERATED_ONLY: Final = frozenset({"next-env.d.ts"})
 # Seven characters is git's own minimum abbreviation, forty its full length. A sha that fails
 # this is a fact about the metadata, not about the container: it will not become well-formed on
 # a retry, so it is `UNVERIFIABLE` rather than `UNREADABLE`, and it never reaches the shell.
-_SHA_RE: Final = re.compile(r"^[0-9a-f]{7,40}$")
+_SHA_RE: Final = re.compile(r"[0-9a-f]{7,40}")
 
 
-def is_a_commit_sha(value: str | None) -> bool:
-    """May this value be interpolated into the probe's shell string? (See `_SHA_RE`.)
-
-    Exposed rather than kept private because callers ask the same question of the same metadata
-    before composing the same script — and a second, subtly different spelling of "is this a sha"
-    is how one of the two would eventually let something else through."""
-    return value is not None and _SHA_RE.match(value) is not None
+def _is_a_commit_sha(value: str) -> bool:
+    """`fullmatch`, never `match`: a `$`-anchored match admits a trailing newline, and this string
+    goes to `sh -c`."""
+    return _SHA_RE.fullmatch(value) is not None
 
 
 #: Printed instead of the porcelain when `git status` could not run. An empty porcelain because
@@ -423,10 +420,12 @@ def state_script(reference_sha: str | None) -> str:
     Ancestry empty means `NOT_ASKED`, distinct from "asked, couldn't tell" — conflating them lets
     a probe that silently stopped running read as healthy. It's two exit codes, in ORDER: `git
     cat-file -e` (is the reference even here?) then `--is-ancestor` — reversed, a missing object
-    misreads as "diverged" for reasons unrelated to lineage. `reference_sha` is trusted
-    `_SHA_RE`-shaped; callers validate first, or pass `None`."""
+    misreads as "diverged" for reasons unrelated to lineage. A `reference_sha` that is not a
+    commit sha is refused here, where the shell string is built."""
     if reference_sha is None:
         return _STATE_FIELDS
+    if not _is_a_commit_sha(reference_sha):
+        raise ValueError("the reference is not a commit sha")
     return (
         f"{_STATE_FIELDS}; "
         f"git cat-file -e {reference_sha} 2>/dev/null; a=$?; "
@@ -854,7 +853,7 @@ async def workspace_integrity(
         return _remember_unreadable(app_id, "the object store could not be read")
 
     stamped = head_sha_from_metadata(saved.metadata if saved else None)
-    malformed = stamped is not None and _SHA_RE.match(stamped) is None
+    malformed = stamped is not None and not _is_a_commit_sha(stamped)
     facts = _DurableFacts(
         saved_present=saved is not None,
         reference_sha=None if malformed else stamped,

@@ -4,11 +4,6 @@ ONE dataclass now. `SandboxSession` holds EVERYTHING the eight sandbox tools tou
 else; a Write chat turn carries it on its own `ChatDeps.sandbox`, so one tool body serves the
 whole surface (`tools.sandbox_toolset`).
 
-`BuildDeps` — the harness-only surround (owner `user_id`, the single `ProgressEmitter`, the
-claim-once preview-frame guard) — was deleted with the standalone build harness. The turn engine
-keeps its own equivalents on the turn state (`turns/engine.py::claim_preview_frame`); they were
-never shared with this file, only mirrored.
-
 There are deliberately NO caches: an uncached `view` is always correct; a cache without
 invalidation risks stale content mid-self-heal.
 """
@@ -23,7 +18,6 @@ from src.services.orchestrator.constants import (
     OUTPUT_SLICE_HANDLES_PER_TURN,
     REPEATED_COMMAND_MEMORY,
 )
-from src.services.orchestrator.progress import ProgressEmitter
 from src.services.sandbox import SandboxClient, SandboxHandle
 
 
@@ -60,7 +54,6 @@ class SandboxSession:
 
     sandbox_client: SandboxClient
     handle: SandboxHandle
-    # From the run-context, so `BuildResult.app_id` is populated and the BRAIN trace binds.
     app_id: uuid.UUID
     # ── Mutable per-run signals the tools set and the loop reads ──────────────────────────────
     done_requested: bool = False
@@ -95,11 +88,6 @@ class SandboxSession:
     # Redacted, not raw, for the same reason `HeldOutput.lines` is: an argv token can carry
     # a credential, and this lives on the session for the whole turn.
     commands_seen: set[str] = field(default_factory=set)
-    # The legacy build feed, and NOTHING IN PRODUCTION SETS IT ANY MORE: the only constructor
-    # of a `ProgressEmitter` was the deleted harness, so on every live turn this is `None` and
-    # `tools._step` takes its early return. It stays because `tools._step` still has to handle
-    # both shapes and the tool tests drive the emitting arm; treat a non-None value as test-only.
-    emitter: ProgressEmitter | None = None
 
     def hold_output(self, handle: str, held: HeldOutput) -> None:
         """Retain one truncated output under `handle`, evicting the oldest beyond the ring's cap.

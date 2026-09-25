@@ -48,7 +48,6 @@ _EXCLUDED_FILES: Final = frozenset(
         ".dockerignore",
         "app.bundle",
         "app.bundle.b64",
-        ".bial-restore.b64",
     }
 )
 

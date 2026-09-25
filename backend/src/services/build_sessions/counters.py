@@ -8,7 +8,7 @@ the wrong lesson to draw from it.
 
 IT OWNS ITS OWN SESSION. Callers hold a session scoped to work that may still roll back; a count
 is a historical fact about something that HAPPENED and must not disappear because the surrounding
-transaction did. Same reasoning `workers/reclamation.py::_record_pass` uses for pass history.
+transaction did. Same reasoning `pass_history.record_durable_copy_attempt` uses.
 """
 
 from __future__ import annotations

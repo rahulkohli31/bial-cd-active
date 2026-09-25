@@ -118,7 +118,6 @@ export interface PaneView {
      spread would silently drop it, since JSX spread attributes are exempt from excess-property
      checking. `UnacceptedPaneProps` below is what catches that. */
   /** Chat-scoped: this conversation's own turn. */
-  iterating: boolean
   reconnecting: boolean
   /* THE RELAUNCH FOUR ARE GONE — `onRelaunch`, `relaunching`, `relaunchError`, `lastBuildFailed`.
      `LivePreview` accepted the callback and never read it, so `ConversationSurface.handleRelaunch`
@@ -358,8 +357,14 @@ export interface WorkspaceReport {
   settled: boolean
   /** The project the state describes. `null` while a route is still resolving one. */
   projectId: string | null
-  /** Record how a start attempt ended; `null` clears it (a start that reached the app). */
+  /** Record how a start attempt ended; `null` clears it and asks again. */
   onStartOutcome: (outcome: StartOutcome | null) => void
+  /**
+   * The server admitted the press. Clears the last outcome and asks again now; the press stays
+   * pending until that read settles, so nothing between the answer and the server's `starting`
+   * is drawn from the reading that predates the press.
+   */
+  onStartAdmitted: () => void
   /**
    * A PRESS HAS BEGUN, OR FINISHED — and the pane needs to know before the server does.
    *
@@ -369,14 +374,6 @@ export interface WorkspaceReport {
    * feedback was a spinner inside the control itself.
    */
   onStartPending: (pending: boolean) => void
-  /**
-   * THE URL A SUCCESSFUL START JUST PRODUCED — and the publisher decides what to do with it.
-   *
-   * Without it a start inside a Build chat has no arm of the address resolver it can populate, and
-   * the app comes up in a container nothing frames. `previewAddress.ts`'s relaunched arm is its
-   * home: a restore has no build lifecycle, which is why that arm resolves straight to `ready`.
-   */
-  onStarted: (previewUrl: string) => void
   /** Ask the platform again, now. A retry press, or a start that just finished. */
   onRefresh: () => void
   /**

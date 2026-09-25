@@ -327,12 +327,11 @@ export function messagesFromProjection(
       }
     } else if (item.type === 'build_in_progress') {
       seal()
-      // A build began and no outcome closed it — the page reattaches to the live session
-      // when there is one, and states the durable truth when there is not.
+      // A build began and no outcome closed it — the page states that durable truth.
       messages.push({
         id: `srv_${item.seq}_g_${index}`,
         role: 'assistant',
-        parts: [{ type: 'build_in_progress', sessionId: item.sessionId as string }],
+        parts: [{ type: 'build_in_progress' }],
         seq: item.seq,
       })
     } else if (item.type === 'turn_terminal') {

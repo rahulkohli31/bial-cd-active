@@ -9,7 +9,7 @@
  * WHY THIS EXISTS
  *
  * The address comes from `previewAddress.ts`, never `PreviewState.previewUrl`, so the live turn's
- * preview outranks the session URL describing the previous build. Its `.url` alone is not enough: a
+ * preview outranks the project's own URL. Its `.url` alone is not enough: a
  * provisioning build has a status and no URL yet, driving the loading state instead of an empty
  * pane, and an address outlives its publisher on purpose, so framing a stale one leaves a sleeping
  * app with no way to wake it. The workspace state is what decides whether that address is framed
@@ -35,6 +35,7 @@ import {
   useWorkspacePaneVisible,
   useWorkspaceReport,
 } from './workspaceChannel'
+import { msSpentSince } from './workspaceState'
 import type { WorkspaceStateName } from './workspaceState'
 
 /**
@@ -310,7 +311,7 @@ function NoFrame({ report }: { report: ReturnType<typeof useWorkspaceReport> }) 
             A still card that never changes reads as a hung screen after about twenty seconds; a
             number that moves is the cheapest possible evidence that the platform is still working,
             and unlike a bar every position on it is a measured fact. */}
-        {state.busy === true && <ElapsedSinceTheWaitBegan />}
+        {state.busy === true && <ElapsedSinceTheWaitBegan since={state.startedAt ?? null} />}
         {/* THE ROW IS NOT THE POLITE REGION, and must not become one again: a region mounted
             inside `state.action &&` does not exist on the one state that has a wait and no action.
             It lives on `AppPane`, wrapping this whole board, so the headline, the detail, the note
@@ -337,13 +338,18 @@ function NoFrame({ report }: { report: ReturnType<typeof useWorkspaceReport> }) 
  * time-determinate, and a bar that sits at 80% for two minutes is worse than the honest still
  * card. Elapsed time is what is left that is true.
  *
- * IT COUNTS FROM ITS OWN MOUNT, WHICH IS EXACTLY THE WAIT
+ * IT COUNTS FROM THE INSTANT THE SERVER DATES THE WAIT FROM
  *
- * No timestamp travels on the report and none needs to: this renders only while `state.busy`, so
- * mounting IS the wait beginning and unmounting IS it ending. A stamp on the state would have to be
- * compared in `sameWorkspaceState` — where a value that changes every render defeats the whole
- * comparator — and would re-render the entire shell once a second for a number only this pane
- * shows.
+ * Mounting is NOT the wait beginning, and treating it as such is what made this number lie: a
+ * reload discards the pane, so a citizen five minutes into a start was told one second, and six
+ * reloads looked exactly like one. `state.startedAt` is the server's own instant for this wait —
+ * constant for its whole length, which is what lets `sameWorkspaceState` compare it rather than
+ * be defeated by it. `null` when nothing can date the wait, and then this does count from mount,
+ * which is the old behaviour kept as the fallback rather than as the rule.
+ *
+ * THE TICK IS STILL LOCAL TO THIS COMPONENT. Nothing above it re-renders once a second for a
+ * number only this pane shows; the one fact the shell needs from the clock — that the wait has
+ * outlived its budget — arrives as a boolean from a single timer (`useTheWaitHasGoneOnTooLong`).
  *
  * AND IT IS NOT ANNOUNCED
  *
@@ -352,8 +358,8 @@ function NoFrame({ report }: { report: ReturnType<typeof useWorkspaceReport> }) 
  * on the nearest ancestor means the value is still in the accessibility tree — a reader can go and
  * read it whenever they want to know — without being pushed at anybody.
  */
-function ElapsedSinceTheWaitBegan() {
-  const [seconds, setSeconds] = useState(0)
+function ElapsedSinceTheWaitBegan({ since }: { since: number | null }) {
+  const [seconds, setSeconds] = useState(() => secondsSpentSince(since))
   useEffect(() => {
     // MEASURED AGAINST THE CLOCK, NEVER COUNTED IN TICKS. `setSeconds(was => was + 1)` counts
     // how many times the interval FIRED, and a browser throttles a hidden tab's timers — to
@@ -366,13 +372,19 @@ function ElapsedSinceTheWaitBegan() {
     // changing the system clock mid-wait cannot make this count backwards or jump. It keeps
     // the property the change is for — it advances while the tab is hidden, which is exactly
     // what the throttled interval does not.
-    const began = performance.now()
+    //
+    // THE SERVER'S INSTANT SETS THE ORIGIN, THE MONOTONIC CLOCK DOES THE COUNTING. The two have
+    // no common origin, so the wall-clock span already spent is read ONCE and the monotonic
+    // origin is moved back by it. After that, nothing this counter shows depends on a clock
+    // anybody can change.
+    const began = performance.now() - secondsSpentSince(since) * 1_000
+    setSeconds(Math.floor((performance.now() - began) / 1_000))
     const tick = setInterval(
       () => setSeconds(Math.floor((performance.now() - began) / 1_000)),
       1_000,
     )
     return () => clearInterval(tick)
-  }, [])
+  }, [since])
   return (
     <p
       data-testid="app-pane-elapsed"
@@ -382,6 +394,13 @@ function ElapsedSinceTheWaitBegan() {
       {formatElapsed(seconds)} so far
     </p>
   )
+}
+
+/** Whole seconds spent since a wall-clock instant — the pane's reading of the one span
+ *  `msSpentSince` defines, so the number drawn here and the boundary the shell compares against
+ *  cannot come from two different clamps. */
+function secondsSpentSince(since: number | null): number {
+  return Math.floor(msSpentSince(since, Date.now()) / 1_000)
 }
 
 /** `0s`, `45s`, `1m 05s`. Seconds stay two-digit past the minute so the line does not jitter. */

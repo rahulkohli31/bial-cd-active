@@ -31,6 +31,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_STATE,
+    REGISTRY_FIELD_WAITING_SINCE,
 )
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
@@ -147,3 +148,25 @@ async def test_the_record_is_born_ready_and_unproven_at_the_same_instant(
         "",
     )
     assert reg[REGISTRY_FIELD_CREATED_AT], "no birthday, so `ms_since_container_created` is blind"
+
+
+async def test_a_new_container_waits_from_its_own_birth_not_the_last_occupants_wait(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The pane dates a wait from this field, so a predecessor's value surviving the MERGE would
+    tell the citizen their brand-new container has been starting since the last one's restart.
+
+    Mutation-check: drop `REGISTRY_FIELD_WAITING_SINCE` from the `hset` mapping and the
+    predecessor's instant survives."""
+    user = uuid.uuid4()
+    await _the_previous_occupant(fake_redis, user)
+    await fake_redis.hset(
+        registry_key(user), REGISTRY_FIELD_WAITING_SINCE, "2026-09-10T09:50:00+00:00"
+    )
+
+    await _a_client()._write_registry(
+        user, app_name=_SUCCESSOR, fqdn=f"{_SUCCESSOR}.example", token_ref="ref-fresh"
+    )
+
+    reg = await fake_redis.hgetall(registry_key(user))
+    assert reg[REGISTRY_FIELD_WAITING_SINCE] == reg[REGISTRY_FIELD_CREATED_AT]

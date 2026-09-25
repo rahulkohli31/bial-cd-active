@@ -57,7 +57,7 @@ from src.services.turns.guard import _mid_reply
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.api.v1.build_sessions.test_relaunch import RecordingAca, SupervisorScript
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import FakeSandboxClient, FakeStorage
+from tests.fakes import FakeSandboxClient, FakeStorage, detached_work_done
 
 
 @pytest.fixture(autouse=True)
@@ -212,8 +212,8 @@ async def test_the_start_control_switches_without_a_dialog(
     wire: SimpleNamespace,
     spawns: _Spawns,
 ) -> None:
-    """The other door, at the wire: pressing start on a second project answers 200, not a 409 of
-    either code. The old answer here was `sandbox_reclaim_blocked` naming project A."""
+    """The other door, at the wire: pressing start on a second project is admitted, not refused
+    with a 409 of either code."""
     user, project_a, project_b = await _citizen_with_two_projects(db_session, "sw2@example.com")
     for project_id in (project_a, project_b):
         app_id = await resolve_app_for_project(db_session, user.id, project_id)
@@ -225,14 +225,16 @@ async def test_the_start_control_switches_without_a_dialog(
         json={"projectId": str(project_a)},
         headers=auth_headers(user),
     )
+    await detached_work_done(wire.manager)
     second = await client.post(
         "/v1/build-sessions/relaunch",
         json={"projectId": str(project_b)},
         headers=auth_headers(user),
     )
+    await detached_work_done(wire.manager)
 
-    assert first.status_code == 200
-    assert second.status_code == 200, second.text
+    assert first.status_code == 202
+    assert second.status_code == 202, second.text
     assert len(spawns.owed) == 1
     assert spawns.owed[0].project_id == project_a
 
@@ -324,6 +326,9 @@ async def test_the_outgoing_turn_ending_late_does_not_take_the_incoming_workspac
     await manager.finish_turn_sandbox(outgoing, client, touched=True)
 
     assert manager.active_session_for(user.id) is incoming
+    # The outgoing session still leaves memory, though the slot it would have released is B's.
+    assert outgoing.session_id not in manager._sessions  # noqa: SLF001
+    assert incoming.session_id in manager._sessions  # noqa: SLF001
 
 
 async def test_a_switch_out_of_a_plan_turn_cuts_it_where_it_stands(
@@ -628,8 +633,9 @@ async def test_a_refused_create_is_retried_under_the_same_name(
         json={"projectId": str(project)},
         headers=auth_headers(user),
     )
+    await detached_work_done(real_aca.manager)
 
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     assert real_aca.aca.create_calls == [name, name], "asked twice, under one name"
 
 

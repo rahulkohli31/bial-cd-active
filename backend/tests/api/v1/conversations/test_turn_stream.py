@@ -1899,7 +1899,6 @@ def _holding_the_workspace(app, user_id: uuid.UUID, *, still_letting_go: bool):
         user_id=user_id,
         project_id=uuid.uuid4(),
         app_id=uuid.uuid4(),
-        prompt="",
         lock_token="tok",
         handle=SandboxHandle(
             fqdn="x.example",

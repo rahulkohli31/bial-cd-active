@@ -301,7 +301,7 @@ export default function WorkspaceToolbar({
 
             {/* RELOAD IS A FOURTH OCCUPANT the boards do not draw, kept for the same reason the
                 navigation keeps Marketplace: it is a shipped recourse, not decoration. The automatic
-                remount covers what the platform can detect — a turn ending over a live preview —
+                remount covers what the platform can detect — the app starting to answer —
                 and "what I see is out of date" (a dev server restarted, an HMR socket that died
                 quietly) is a judgement only the person looking at it can make. Without it their
                 only recourse is reloading the whole portal. */}

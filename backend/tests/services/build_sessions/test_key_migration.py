@@ -430,9 +430,7 @@ async def test_reconcile_on_start_reaps_a_legacy_record(fake_redis: aioredis.Red
     await _seed_legacy(fake_redis, user, _LEGACY_APP)
     client = FakeSandboxClient()
 
-    reaped = await reaper.reconcile_user(
-        fake_redis, user, client, has_live_session=False, certified_dead=True
-    )
+    reaped = await reaper.reconcile_user(fake_redis, user, client, certified_dead=True)
 
     assert reaped is True
     assert client.torn_down == [_LEGACY_APP]

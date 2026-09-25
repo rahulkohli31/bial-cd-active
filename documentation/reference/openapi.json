@@ -1013,15 +1013,11 @@
         "type": "object"
       },
       "BuildInProgressItem": {
-        "description": "A build began here and no outcome closed it — mid-build (live) or lost to a crash.\nThe catch-up snapshot's `active_turn` disambiguates; this item only states the durable truth.\n\nHISTORICAL ROWS ONLY. Its source, the hidden `build_started` marker, had exactly one writer\n(`outcome.write_build_started`, called from `SessionManager.start`), and that writer is deleted\nwith the standalone build stack. No new `build_started` row can be created, so this item can\nonly ever be derived from rows already in the database — which is precisely why it, and the\nthree `{session_id}` routes the portal reattaches through, were kept. A build that runs as an\nordinary Write chat turn records its ending as a `turn_terminal` row instead.",
+        "description": "A build began here and no outcome closed it. DISPLAY-ONLY: the portal renders it as a\nsentence saying so, and nothing can reattach to the build it names.\n\nHISTORICAL ROWS ONLY. Its source, the hidden `build_started` marker, has no writer left; a\nbuild that runs as an ordinary Write chat turn records its ending as a `turn_terminal` row\ninstead. The rows already in the database are permanent, so this item stays as their account\nof a build that never finished.",
         "properties": {
           "seq": {
             "title": "Seq",
             "type": "integer"
-          },
-          "sessionId": {
-            "title": "Sessionid",
-            "type": "string"
           },
           "type": {
             "const": "build_in_progress",
@@ -1031,89 +1027,9 @@
           }
         },
         "required": [
-          "seq",
-          "sessionId"
+          "seq"
         ],
         "title": "BuildInProgressItem",
-        "type": "object"
-      },
-      "BuildSessionStatus": {
-        "description": "The build-session lifecycle. Five members; the wire value equals the\nmember's lowercase name. An **API** StrEnum, not a native PG enum — no durable\nrow lands until SESSION-API's migration.\n\nForward path `PROVISIONING → BUILDING → READY`; any non-terminal state →\n`ENDED` (graceful) or `FAILED` (unrecoverable). `ENDED`/`FAILED` are absorbing.",
-        "enum": [
-          "provisioning",
-          "building",
-          "ready",
-          "ended",
-          "failed"
-        ],
-        "title": "BuildSessionStatus",
-        "type": "string"
-      },
-      "BuildSessionStatusResponse": {
-        "description": "`GET /v1/build-sessions/{sessionId}` → 200. The poll surface and the\nsource of the framable `preview_url`.",
-        "properties": {
-          "appId": {
-            "format": "uuid",
-            "title": "Appid",
-            "type": "string"
-          },
-          "createdAt": {
-            "format": "date-time",
-            "title": "Createdat",
-            "type": "string"
-          },
-          "lastSeq": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Lastseq"
-          },
-          "previewUrl": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Previewurl"
-          },
-          "projectId": {
-            "format": "uuid",
-            "title": "Projectid",
-            "type": "string"
-          },
-          "sessionId": {
-            "format": "uuid",
-            "title": "Sessionid",
-            "type": "string"
-          },
-          "status": {
-            "$ref": "#/components/schemas/BuildSessionStatus"
-          },
-          "updatedAt": {
-            "format": "date-time",
-            "title": "Updatedat",
-            "type": "string"
-          }
-        },
-        "required": [
-          "sessionId",
-          "projectId",
-          "appId",
-          "status",
-          "previewUrl",
-          "lastSeq",
-          "createdAt",
-          "updatedAt"
-        ],
-        "title": "BuildSessionStatusResponse",
         "type": "object"
       },
       "BulkLimitsRequest": {
@@ -3187,16 +3103,6 @@
         "title": "OkResponse",
         "type": "object"
       },
-      "PassOutcome": {
-        "description": "How a pass ended. A NATIVE PG enum, so a typo is a database error.",
-        "enum": [
-          "ok",
-          "declined",
-          "failed"
-        ],
-        "title": "PassOutcome",
-        "type": "string"
-      },
       "PatchAppRequest": {
         "properties": {
           "loginRequired": {
@@ -3284,47 +3190,21 @@
         "type": "object"
       },
       "PreviewLifeState": {
-        "description": "What is (or is not) serving a project's preview right now. An **API** StrEnum like\n`BuildSessionStatus`, not a native PG enum — wire value equals the member's lowercase name.\n\nExists because `preview-state` once collapsed four different situations into one `alive:\nfalse`, including a registry-read ERROR misread as \"gone\" — pulling a live app off screen.\nUNKNOWN keeps its own member, never folded in, for the same reason `SaveState.dirty` is\ntri-state: never give the reassuring answer for someone else.",
+        "description": "What is (or is not) serving a project's preview right now. An **API** StrEnum, not a\nnative PG enum — wire value equals the member's lowercase name.\n\nA read that could not decide is not a member. The route answers 503 instead, so no member\nis ever the reassuring answer given about a store nobody could read.",
         "enum": [
           "alive",
           "asleep",
-          "starting",
-          "slot_taken",
-          "never_built",
-          "unknown"
+          "starting"
         ],
         "title": "PreviewLifeState",
         "type": "string"
       },
       "PreviewStateResponse": {
-        "description": "FIVE STATES AND AN UNKNOWN, not one boolean.\n\nA boolean has no unknown arm, so a FAILED registry read says \"your preview is gone\" for a\nquestion nobody managed to ask. It also flattens three genuinely different ordinary states\n— never built, asleep, another project took the slot — into the same shrug, leaving the\npane only one sentence to offer back. `previewUrl` is echoed so a tab that reconnects can\nre-frame without a second call.",
+        "description": "THREE STATES, and a read that could not decide is not one of them: it is a 503.\n\nA boolean would let a FAILED registry read say \"your preview is gone\" for a question nobody\nmanaged to ask, and it cannot tell a wait from a rest. `previewUrl` is echoed so a tab that\nreconnects can re-frame without a second call.",
         "properties": {
           "alive": {
             "title": "Alive",
             "type": "boolean"
-          },
-          "occupyingProjectId": {
-            "anyOf": [
-              {
-                "format": "uuid",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Occupyingprojectid"
-          },
-          "occupyingProjectName": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Occupyingprojectname"
           },
           "previewUrl": {
             "anyOf": [
@@ -3359,6 +3239,29 @@
               }
             ],
             "title": "Servingsince"
+          },
+          "startFailure": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startfailure"
+          },
+          "startingSince": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startingsince"
           },
           "state": {
             "$ref": "#/components/schemas/PreviewLifeState"
@@ -3931,140 +3834,6 @@
         "title": "ReclaimBlockedError",
         "type": "object"
       },
-      "ReclamationCandidate": {
-        "description": "One container the pass would act on, with the evidence behind the decision.\n\nTHE TIER AND THE REASON TRAVEL WITH THE VERDICT, deliberately. An operator reading this at 2am\nhas to be able to DISAGREE with it — \"high_confidence / staged on an earlier pass and idle\nsince\" is a claim they can check, and a bare `destroy` is one they can only accept.",
-        "properties": {
-          "name": {
-            "title": "Name",
-            "type": "string"
-          },
-          "reason": {
-            "title": "Reason",
-            "type": "string"
-          },
-          "tier": {
-            "title": "Tier",
-            "type": "string"
-          },
-          "verdict": {
-            "title": "Verdict",
-            "type": "string"
-          }
-        },
-        "required": [
-          "name",
-          "tier",
-          "verdict",
-          "reason"
-        ],
-        "title": "ReclamationCandidate",
-        "type": "object"
-      },
-      "ReclamationReportResponse": {
-        "description": "What the reclamation pass would do RIGHT NOW, without doing any of it.\n\nTHE QUESTION AN OPERATOR COULD NOT ASK before: the only ways to learn what a pass would\ndelete were the worker's logs after the fact, or arming it to find out. This answers before\nthe decision, running the same classifier over the same three sources.\nTHE FLAGS TRAVEL WITH THE VERDICTS because they change what the verdicts MEAN: the same\n`destroy` list is a preview off-armed, a description of what is about to happen once armed.\nCOUNTS TO THE AUDIT ROW, NAMES ONLY TO THE RESPONSE — the split every sibling report makes.",
-        "properties": {
-          "candidates": {
-            "items": {
-              "$ref": "#/components/schemas/ReclamationCandidate"
-            },
-            "title": "Candidates",
-            "type": "array"
-          },
-          "destroy": {
-            "title": "Destroy",
-            "type": "integer"
-          },
-          "escalate": {
-            "title": "Escalate",
-            "type": "integer"
-          },
-          "lastPassDetail": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Lastpassdetail"
-          },
-          "lastPassOutcome": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/PassOutcome"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "lastReclamationPassAt": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Lastreclamationpassat"
-          },
-          "notOurs": {
-            "title": "Notours",
-            "type": "integer"
-          },
-          "reclaimDestroy": {
-            "title": "Reclaimdestroy",
-            "type": "boolean"
-          },
-          "reclaimEnabled": {
-            "title": "Reclaimenabled",
-            "type": "boolean"
-          },
-          "reclamationStale": {
-            "default": true,
-            "title": "Reclamationstale",
-            "type": "boolean"
-          },
-          "scanned": {
-            "title": "Scanned",
-            "type": "integer"
-          },
-          "spared": {
-            "title": "Spared",
-            "type": "integer"
-          },
-          "staged": {
-            "title": "Staged",
-            "type": "integer"
-          },
-          "storeFault": {
-            "title": "Storefault",
-            "type": "boolean"
-          },
-          "untagged": {
-            "title": "Untagged",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "scanned",
-          "spared",
-          "staged",
-          "destroy",
-          "escalate",
-          "notOurs",
-          "untagged",
-          "storeFault",
-          "candidates",
-          "reclaimEnabled",
-          "reclaimDestroy"
-        ],
-        "title": "ReclamationReportResponse",
-        "type": "object"
-      },
       "RefreshResponse": {
         "description": "Body returned on a successful silent refresh.",
         "properties": {
@@ -4131,35 +3900,22 @@
         "type": "object"
       },
       "RelaunchPreviewResponse": {
-        "description": "`POST /v1/build-sessions/relaunch` → 200. No `session_id`/`created_at`: relaunch\nregisters NO in-process build session (it must not occupy the build slot), so\nthere is nothing to poll or stop.\n\n`preview_url` is always framable; `ready` says whether it is SERVING yet. The two came apart\nwhen relaunch stopped 503ing on a slow app: an attached container whose root route\noutruns the readiness budget still hands back its URL, because the alternative — condemning\nthe container — cost a citizen their unsaved work.",
+        "description": "`POST /v1/build-sessions/relaunch` → 202: the start is admitted and runs detached.\n\nNothing here says whether the app is up, and nothing here carries its address: both are\n`preview-state`'s to report — `starting` while it comes up, `alive` with the framable URL\nonce something has watched it show a page. One reader for one fact.",
         "properties": {
           "appId": {
             "format": "uuid",
             "title": "Appid",
             "type": "string"
           },
-          "previewUrl": {
-            "title": "Previewurl",
-            "type": "string"
-          },
-          "ready": {
-            "default": true,
-            "title": "Ready",
-            "type": "boolean"
-          },
-          "restoredFromFailedBuild": {
-            "title": "Restoredfromfailedbuild",
-            "type": "boolean"
-          },
           "status": {
-            "$ref": "#/components/schemas/BuildSessionStatus"
+            "const": "provisioning",
+            "default": "provisioning",
+            "title": "Status",
+            "type": "string"
           }
         },
         "required": [
-          "appId",
-          "previewUrl",
-          "status",
-          "restoredFromFailedBuild"
+          "appId"
         ],
         "title": "RelaunchPreviewResponse",
         "type": "object"
@@ -4355,26 +4111,9 @@
       "SandboxReconcileResponse": {
         "description": "The operator-invoked sandbox-fleet sweep's report.\n\nA SIBLING of the storage and database reports, and report-only for the same reason: the\nambiguity between \"orphaned\" and \"provisioned seconds ago, registry not written yet\" is not\nsomething to hand an irreversible ARM delete.\n\nCounts for the fleet, NAMES only for the gaps — the operator needs those to act on. The\nnames travel in the RESPONSE and never in the audit row.",
         "properties": {
-          "lastReclamationPassAt": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Lastreclamationpassat"
-          },
           "live": {
             "title": "Live",
             "type": "integer"
-          },
-          "reclamationStale": {
-            "default": true,
-            "title": "Reclamationstale",
-            "type": "boolean"
           },
           "registered": {
             "title": "Registered",
@@ -4405,7 +4144,7 @@
         "type": "object"
       },
       "SandboxTagBackfillResponse": {
-        "description": "What one identity backfill pass did to the pre-existing fleet.\n\nTHE BUCKETS SUM: `scanned == alreadyTagged + stamped + skippedNoRow + failed`. `skippedNoRow`\ncontainers WERE stamped (`kind` + `backfilled_at`) but match no app row — a sandbox name keeps\nonly 28 of 32 hex chars, so it is not invertible — and are therefore escalate-forever.\n`unowned` is that same population, RECOUNTED EVERY PASS, deliberately outside the sum: a\ncontainer `alreadyTagged` on pass 2 makes `skippedNoRow` read zero and `scanned` look clean —\nthe trap `unowned` alone still catches. Counts only; failures travel to the logs by name.",
+        "description": "What one identity backfill pass did to the pre-existing fleet.\n\nTHE BUCKETS SUM: `scanned == alreadyTagged + stamped + skippedNoRow + failed`. `skippedNoRow`\ncontainers WERE stamped (`kind` + `backfilled_at`) but match no app row — a sandbox name keeps\nonly 28 of 32 hex chars, so it is not invertible — and stay unowned rather than guessed at.\n`unowned` is that same population, RECOUNTED EVERY PASS, deliberately outside the sum: a\ncontainer `alreadyTagged` on pass 2 makes `skippedNoRow` read zero and `scanned` look clean —\nthe trap `unowned` alone still catches. Counts only; failures travel to the logs by name.",
         "properties": {
           "alreadyTagged": {
             "title": "Alreadytagged",
@@ -4590,7 +4329,7 @@
         "type": "object"
       },
       "SharedPreviewResponse": {
-        "description": "`POST /v1/build-sessions/projects/{projectId}/shared-launch` and `.../shared-refresh`\n→ 200 (#198). `RelaunchPreviewResponse`'s sibling for a colleague's read-only view of a\nproject shared with them — no `session_id`/`status`/`restored_from_failed_build`: a shared\nview registers no build session, has no build-outcome history of its own to qualify, and\n`ready` alone says whether the frame is serving yet.",
+        "description": "`POST /v1/build-sessions/projects/{projectId}/shared-launch` and `.../shared-refresh`\n→ 200 (#198), for a colleague's view of a project shared with them. Answered once the view\nis up, not detached like a relaunch: a recipient has no `preview-state` to poll, so this\nresponse is the only place the URL and `ready` can reach them.",
         "properties": {
           "appId": {
             "format": "uuid",
@@ -5627,7 +5366,7 @@
     },
     "/v1/admin/apps/backfill-sandbox-tags": {
       "post": {
-        "description": "Stamp identity tags onto every sandbox container that predates identity stamping.\n\nTHIS DESTROYS NOTHING. It only writes tags, via ARM merge-`PATCH`, which creates no revision\nand cannot touch container env — a live sandbox being stamped keeps its replica, its restart\ncount and its supervisor bearer. Until this has run and the fleet reports zero untagged\nsandboxes, `SANDBOX_RECLAIM_DESTROY` must stay off.",
+        "description": "Stamp identity tags onto every sandbox container that predates identity stamping.\n\nTHIS DESTROYS NOTHING. It only writes tags, via ARM merge-`PATCH`, which creates no revision\nand cannot touch container env — a live sandbox being stamped keeps its replica, its restart\ncount and its supervisor bearer.",
         "operationId": "backfill_sandbox_tags_endpoint_v1_admin_apps_backfill_sandbox_tags_post",
         "responses": {
           "200": {
@@ -5734,68 +5473,6 @@
           }
         },
         "summary": "App Counts",
-        "tags": [
-          "admin"
-        ]
-      }
-    },
-    "/v1/admin/apps/reclamation-report": {
-      "post": {
-        "description": "WHAT WOULD THE RECLAMATION PASS DELETE RIGHT NOW?\n\nIT DESTROYS NOTHING, AND CANNOT. `run_reclamation_pass` is the pure half: it enumerates ARM,\nreads the coordination store as a spare-list, reads the app table, and returns verdicts. The\nstaging stamp and the destroy arm live in the worker task, not here, and neither is\nreachable from this function. That is a property of the seam, not a flag this endpoint\nremembers to check.",
-        "operationId": "reclamation_report_v1_admin_apps_reclamation_report_post",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReclamationReportResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Not authenticated"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Super-admin privileges required"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Internal server error"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "The sandbox control plane is temporarily unavailable"
-          }
-        },
-        "summary": "Reclamation Report",
         "tags": [
           "admin"
         ]
@@ -9338,7 +9015,7 @@
     },
     "/v1/build-sessions/projects/{project_id}/preview-state": {
       "get": {
-        "description": "Is the preview this tab is framing still real — and if not, WHY?\n\nAnswers about THIS project only, and its budget is deliberately fixed: one round trip to\nthe coordination store (two commands, pipelined), at most two user-scoped rows, at most two\nobject-store HEADs, and NO container call of any kind.",
+        "description": "Is the preview this tab is framing still real — and if not, WHY?\n\nAnswers about THIS project only, and its budget is deliberately fixed: one round trip to\nthe coordination store (one pipeline), two user-scoped rows, at most two\nobject-store HEADs, and NO container call of any kind. A store that will not answer is a 503,\nwhich both polls already read as a check that decided nothing.",
         "operationId": "preview_state_v1_build_sessions_projects__project_id__preview_state_get",
         "parameters": [
           {
@@ -9412,6 +9089,16 @@
               }
             },
             "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Build coordination is temporarily unavailable"
           }
         },
         "summary": "Preview State",
@@ -10204,7 +9891,7 @@
     },
     "/v1/build-sessions/projects/{project_id}/workspace-check": {
       "post": {
-        "description": "Is the app this tab is framing still the citizen's app?\n\nA POST, WITH CSRF, because it is not a free read: it costs a container exec and it can\nraise an operational alarm. IT RESTORES NOTHING — the restore belongs to the next turn, where\nthe citizen is present, has been told, and can confirm. The one thing it may put away is an\nINTACT app whose dev server has stopped, because nothing else ever ends that wait; see\n`SessionManager.project_workspace_check` for the guards.",
+        "description": "Is the app this tab is framing still the citizen's app?\n\nA POST, WITH CSRF, because it is not a free read: it costs a container exec and it can\nraise an operational alarm. IT RESTORES NOTHING — the restore belongs to the next turn, where\nthe citizen is present, has been told, and can confirm. The one thing it may restart is the\ndev server of an INTACT app that has stopped, in the same container, because nothing else ever\nends that wait; see `SessionManager.project_workspace_check` for the guards.",
         "operationId": "workspace_check_v1_build_sessions_projects__project_id__workspace_check_post",
         "parameters": [
           {
@@ -10288,7 +9975,7 @@
     },
     "/v1/build-sessions/relaunch": {
       "post": {
-        "description": "Restore a torn-down app from its snapshot into a fresh, READY sandbox.\n\nNot a build: it runs no agent at all, and the manager path never occupies the\none-per-user build slot — it registers a ready handle in Redis, releases the lock, and\nreturns the live preview synchronously (`wait_ready` blocks until the dev server is up).",
+        "description": "Start the project's saved app, or attach to the container already running it.\n\nAnswers 202 once the start is admitted — every refusal below is decided first — and brings\nthe app up detached. `preview-state` is the one reader of how it went: `starting`, then\n`alive` with the framable URL. Not a build: it runs no agent and never occupies the\none-per-user build slot.",
         "operationId": "relaunch_preview_v1_build_sessions_relaunch_post",
         "requestBody": {
           "content": {
@@ -10301,7 +9988,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "202": {
             "content": {
               "application/json": {
                 "schema": {
@@ -10455,171 +10142,6 @@
           }
         },
         "summary": "Release Shared View",
-        "tags": [
-          "build_sessions"
-        ]
-      }
-    },
-    "/v1/build-sessions/{session_id}": {
-      "get": {
-        "operationId": "build_status_v1_build_sessions__session_id__get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "title": "Session Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BuildSessionStatusResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Not authenticated"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Account suspended"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Build session not found"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Internal server error"
-          }
-        },
-        "summary": "Build Status",
-        "tags": [
-          "build_sessions"
-        ]
-      }
-    },
-    "/v1/build-sessions/{session_id}/events": {
-      "get": {
-        "description": "The build-session SSE progress feed (cookie-authed, `Last-Event-ID`-resumable, no CSRF). The\nonly synchronous pre-stream failure is the 404 ownership check; a brain failure is\ndelivered IN-BAND as a synthesized terminal FAILED `ended` + `[DONE]`.",
-        "operationId": "build_events_v1_build_sessions__session_id__events_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "title": "Session Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Not authenticated"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Account suspended"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Build session not found"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Internal server error"
-          }
-        },
-        "summary": "Build Events",
         "tags": [
           "build_sessions"
         ]

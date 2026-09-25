@@ -5,7 +5,6 @@ and sweep idempotency/timer-safety."""
 from __future__ import annotations
 
 import ast
-import base64
 import contextlib
 import time
 import uuid
@@ -26,8 +25,9 @@ from src.api.v1.build_sessions.schemas import (
     RELAUNCH_PREVIEW_STAY_SECONDS,
 )
 from src.config import settings
+from src.db.models.app_registry import AppRegistry
 from src.db.models.pending_teardown import PendingTeardown
-from src.services.build_sessions import app_name_for, locks, pass_history, reaper
+from src.services.build_sessions import app_name_for, locks, pass_history, reaper, shr_name_for
 from src.services.build_sessions.alarms import SERVING_PROOF_ABSENT_AT_TEARDOWN
 from src.services.build_sessions.pass_history import CopyAttempt
 from src.services.redis import (
@@ -44,6 +44,8 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_SERVING_SINCE,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_SHARED_SERVED_COUNT,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
@@ -55,7 +57,7 @@ from src.services.sandbox.base import (
     TAG_CREATED_AT,
     TAG_KIND,
     DevStatus,
-    ExecResult,
+    ServedCount,
 )
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
@@ -77,9 +79,10 @@ def attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
     """Every copy-before-reclaim outcome this test recorded, WITHOUT touching the database.
 
     AUTOUSE, AND NOT FOR CONVENIENCE: `record_durable_copy_attempt` opens its own session and
-    COMMITS, so an unspied reap here would leave a permanent row in the SHARED test database
-    that `test_reclamation_report_only.py` counts. The real writer is exercised, against a
-    connection that rolls back, in `test_write_back_before_reclaim.py`."""
+    COMMITS, so an unspied reap here would leave a permanent row in the SHARED test database.
+    The real writer is exercised, against a connection that rolls back, in
+    `test_write_back_before_reclaim.py::test_the_copy_record_reaches_the_database_and_is_committed`,
+    which counts every row."""
     recorded: list[CopyAttempt] = []
 
     async def _spy(attempt: CopyAttempt) -> None:
@@ -244,7 +247,7 @@ async def test_reap_user_skips_the_write_back_for_a_shared_view_even_with_an_app
 async def test_reconcile_reaps_on_expired_lock(fake_redis: aioredis.Redis) -> None:
     await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
     client = FakeSandboxClient()
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is True
+    assert await reaper.reconcile_user(fake_redis, USER, client) is True
     assert SBX in client.torn_down
     assert await locks.read_registry(fake_redis, USER) is None
 
@@ -252,18 +255,17 @@ async def test_reconcile_reaps_on_expired_lock(fake_redis: aioredis.Redis) -> No
 async def test_reconcile_reaps_on_lapsed_heartbeat(fake_redis: aioredis.Redis) -> None:
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
     client = FakeSandboxClient()
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is True
+    assert await reaper.reconcile_user(fake_redis, USER, client) is True
     assert await locks.read_registry(fake_redis, USER) is None
 
 
 async def test_reconcile_leaves_a_live_session_untouched(fake_redis: aioredis.Redis) -> None:
+    # Both alive is left alone, bounded by the heartbeat TTL.
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
     client = FakeSandboxClient()
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=True) is False
+    assert await reaper.reconcile_user(fake_redis, USER, client) is False
     assert client.torn_down == []
     assert await locks.read_registry(fake_redis, USER) is not None
-    # Even with no in-proc session, both-alive is left alone (bounded by the heartbeat TTL).
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
 
 
 # --- the certified-dead reap-through ----------------------------------
@@ -283,12 +285,7 @@ async def test_certified_dead_reaps_through_a_lingering_lock_and_heartbeat(
     # ghost so the user is never told a build is running when nothing is.
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
     client = FakeSandboxClient()
-    assert (
-        await reaper.reconcile_user(
-            fake_redis, USER, client, has_live_session=False, certified_dead=True
-        )
-        is True
-    )
+    assert await reaper.reconcile_user(fake_redis, USER, client, certified_dead=True) is True
     assert SBX in client.torn_down  # the ghost's container is executed, not orphaned
     assert await locks.read_registry(fake_redis, USER) is None
     assert await locks.acquire_lock(fake_redis, USER) is not None  # no 409 on a phantom
@@ -307,31 +304,13 @@ async def test_the_sweep_never_certifies_and_still_trusts_the_facade(
     assert await locks.read_registry(fake_redis, USER) is not None
 
 
-async def test_certification_never_overrides_an_in_process_session(
-    fake_redis: aioredis.Redis,
-) -> None:
-    # has_live_session=True wins over everything, certification included: the in-process
-    # session IS liveness, not a facade — a caller that passes both has contradicted
-    # itself, and the safe reading wins.
-    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
-    client = FakeSandboxClient()
-    assert (
-        await reaper.reconcile_user(
-            fake_redis, USER, client, has_live_session=True, certified_dead=True
-        )
-        is False
-    )
-    assert client.torn_down == []
-    assert await locks.read_registry(fake_redis, USER) is not None
-
-
 async def test_reconcile_reclaims_drifted_lock_and_next_start_acquires(
     fake_redis: aioredis.Redis,
 ) -> None:
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
     client = FakeSandboxClient()
     assert await locks.lock_is_held(fake_redis, USER) is True
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is True
+    assert await reaper.reconcile_user(fake_redis, USER, client) is True
     # The value-guarded reaper release DELETED the still-live lock (never the holder helper).
     assert await locks.lock_is_held(fake_redis, USER) is False
     # The immediately-following start acquire succeeds — no 409 on a phantom session.
@@ -398,210 +377,14 @@ async def test_the_scheduled_sweep_resolves_the_owning_app_id_and_the_operator_o
     assert gated_with == [app_id, None]
 
 
-# --- the janitor's reap: keyed by CONTAINER, not by user ----------------------
-#
-# The reclamation pass judges a container. `reap_user` reaps a user, destroying whatever their
-# registry names at the moment it looks. Those are the same container right up until they are not,
-# and both ways they diverge are this feature's own failure modes rather than exotica.
-
-
-async def _preserve(store: FakeStorage, app_id: uuid.UUID, *, head: str = "a" * 40) -> None:
-    """A saved copy the durable-copy gate will accept, so these tests are about the reap."""
-    await store.put(snapshot_key(app_id), a_git_bundle(head), metadata={"head_sha": head})
-
-
-async def test_the_janitor_destroys_the_container_it_judged_not_the_one_the_record_names(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """THE INVERSION, the worst outcome this feature can produce: between enumeration and
-    delete the builder started a fresh sandbox, so the registry now names `sbx-new`. Reaping
-    by USER destroys the live `sbx-new` and leaves `sbx-old` — the actual orphan — standing
-    and billing, then reports one destruction that is wrong in both directions.
-
-    Mutation-check: key the teardown off `reg[app_name]` instead of the argument and this goes
-    red — `sbx-new` is torn down and the live user's record is wiped."""
-    await _seed(fake_redis, USER, app_name=a_sandbox_name("new"))
-    await _preserve(fake_storage, APP)
-    client = FakeSandboxClient()
-
-    destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name=a_sandbox_name("old"), user_uuid=USER, app_id=APP
-    )
-
-    assert destroyed is True
-    assert client.torn_down == [a_sandbox_name("old")]
-    # The live container's Redis state is NOT ours to touch: it belongs to the other container.
-    assert await locks.read_registry(fake_redis, USER) is not None
-    assert await locks.lock_is_held(fake_redis, USER) is True
-
-
-async def test_an_unregistered_orphan_is_actually_deleted_and_says_so(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """THE POPULATION THIS WHOLE SYSTEM EXISTS TO COLLECT — containers with no registry record at
-    all. `reap_user` takes its no-registry early-out here: it clears an orphaned lock, returns
-    False, and deletes NOTHING, while the pass that called it counted a destruction. The container
-    goes on billing and the report says it is gone, which is the single most misleading thing this
-    feature could tell an operator."""
-    await _preserve(fake_storage, APP)
-    by_name, by_user = FakeSandboxClient(), FakeSandboxClient()
-
-    assert (
-        await reaper.reap_the_container_we_judged(
-            fake_redis, by_name, app_name=a_sandbox_name("ghost"), user_uuid=USER, app_id=APP
-        )
-        is True
-    )
-    assert by_name.torn_down == [a_sandbox_name("ghost")]
-    assert await reaper.reap_user(fake_redis, USER, by_user, app_id=APP) is False
-    assert by_user.torn_down == []
-
-
-async def test_the_four_step_ordering_still_runs_when_the_record_does_name_it(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """Keying by name changes WHICH container dies, never HOW. When the registry does still name
-    the judged container, the full ordering applies — mark-ending before teardown (the guard a
-    concurrent attach depends on), then registry, lease and the lock LAST."""
-    await _seed(fake_redis, USER, app_name=SBX)
-    await _preserve(fake_storage, APP)
-    client = OrderTrackingClient(fake_redis, USER)
-
-    destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name=SBX, user_uuid=USER, app_id=APP
-    )
-
-    assert destroyed is True
-    assert client.state_at_teardown == REGISTRY_STATE_ENDING
-    assert client.torn_down == [SBX]
-    assert await locks.read_registry(fake_redis, USER) is None
-    assert await locks.lock_is_held(fake_redis, USER) is False
-
-
-async def test_the_janitor_is_still_refused_when_the_work_is_not_preserved(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """The name-keyed reap is not a way around the durable-copy gate. No saved copy means
-    nothing was established, and nothing established never authorises a delete."""
-    await _seed(fake_redis, USER, app_name=SBX)
-    client = FakeSandboxClient()
-
-    destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name=SBX, user_uuid=USER, app_id=APP
-    )
-
-    assert destroyed is False
-    assert client.torn_down == []
-    assert await locks.read_registry(fake_redis, USER) is not None
-
-
-async def test_a_failed_teardown_is_not_reported_as_a_destruction(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """ARM refused, so the container is still standing. Saying otherwise would have the pass
-    report a shrinking fleet while it grows, and would clear the state a later pass needs."""
-    await _seed(fake_redis, USER, app_name=SBX)
-    await _preserve(fake_storage, APP)
-    client = FakeSandboxClient()
-    client.teardown_error = SandboxError("ARM said no")
-
-    destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name=SBX, user_uuid=USER, app_id=APP
-    )
-
-    assert destroyed is False
-    assert await locks.read_registry(fake_redis, USER) is not None
-
-
-# --- The janitor writes the tree back too, and it is a SECOND call site -------------
-#
-# The two reaps share no code above `_take_the_copy_we_promised`. A suite that exercised only
-# `reap_user` — the obvious one — would leave the janitor's write-back unproven: the caller with
-# nobody watching it, deleting containers whose work reached nowhere.
-
-
-def _a_container_that_bundles(*, head: str, bundles_to: str, name: str = SBX) -> FakeSandboxClient:
-    """A container that attaches AND answers the snapshot ladder — commit, bundle, base64.
-
-    The bare `FakeSandboxClient` refuses to attach at all (no `attach_handle`), which is the right
-    default for every test above and is exactly the state that spares. This scenario needs the
-    opposite: a container the reaper can genuinely take a copy out of."""
-    client = FakeSandboxClient()
-    client.attach_handle = SandboxHandle(
-        fqdn=f"{name}.example",
-        token="tok",
-        app_name=name,
-        preview_url=f"https://{name}.example/",
-        ready=True,
-    )
-    bundle = base64.b64encode(a_git_bundle(bundles_to)).decode()
-
-    def handler(cmd: list[str]) -> ExecResult:
-        if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
-            return ExecResult(stdout=f"{head}@@@@4@@", stderr="", exit=0)
-        if cmd[0] == "base64":
-            return ExecResult(stdout=bundle, stderr="", exit=0)
-        return ExecResult(stdout="", stderr="", exit=0)
-
-    client.exec_handler = handler
-    return client
-
-
-async def test_the_janitor_writes_the_tree_back_before_it_destroys_what_it_judged(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
-) -> None:
-    """★ THE SECOND CALL SITE: the tree goes into the saved copy and then the container goes.
-
-    Deleting this test leaves the janitor's write-back unproven: `test_write_back_before_reclaim`
-    covers both, but only this file drives the janitor beside its own registry cases.
-
-    Mutation check: skip the write-back in `reap_the_container_we_judged` and this goes red."""
-    await _seed(fake_redis, USER, app_name=SBX)
-    await _preserve(fake_storage, APP, head="b" * 40)  # the copy is BEHIND the container
-    client = _a_container_that_bundles(head="a" * 40, bundles_to="c" * 40)
-
-    destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name=SBX, user_uuid=USER, app_id=APP
-    )
-
-    assert destroyed is True
-    assert client.torn_down == [SBX]
-    meta = await fake_storage.head(snapshot_key(APP))
-    assert meta is not None and (meta.metadata or {})["head_sha"] == "c" * 40
-    assert attempts == [CopyAttempt.COPIED]
-
-
-async def test_an_orphan_with_no_copy_is_spared_with_a_record_rather_than_in_silence(
-    fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
-) -> None:
-    """THE POPULATION THAT BILLS FOREVER, and the reason the record exists at all: an
-    unregistered orphan has no address (`attach_existing` builds its handle from the registry),
-    so it cannot be bundled from, and the honest answer stays "spare" — exactly as before. What
-    changes is that it stops being silent: the same spared container is now a row an operator
-    can find instead of a log line repeating every fifteen minutes.
-
-    Mutation check: drop the `record_durable_copy_attempt` call from the unreachable arm and
-    this goes red — nothing else in the codebase notices a permanently-spared container."""
-    await _seed(fake_redis, USER, app_name=a_sandbox_name("live"))  # names a DIFFERENT container
-    client = FakeSandboxClient()
-
-    destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name=a_sandbox_name("ghost"), user_uuid=USER, app_id=APP
-    )
-
-    assert destroyed is False
-    assert client.torn_down == []
-    assert attempts == [CopyAttempt.UNREACHABLE]
-
-
 def test_the_reaper_never_binds_the_pass_record_at_module_scope() -> None:
-    """★ THE IMPORT BOUNDARY THE COPY-BEFORE-RECLAIM WORK HAD TO WRITE AROUND, pinned so it cannot
-    quietly close. `pass_history` imports `src.workers.reclamation` for its cron staleness window,
-    so a module-level `pass_history` import in the reaper would import that worker module back and
-    drag the ORM engine (built at `src.db.base` import) behind every import of `reaper`. Asserted
-    on the SOURCE via AST: an in-process check is vacuous because `conftest.py` already imports
-    `src.main` before any test runs, populating `sys.modules`; parsing (not grepping) also catches
-    a re-spelled import path. Mutation check: hoist the `pass_history` import in
+    """★ THE IMPORT BOUNDARY THE COPY-BEFORE-DESTROY WORK HAD TO WRITE AROUND, pinned so it
+    cannot quietly close. `pass_history` imports the `WorkerPass` model, which reaches
+    `src.db.base`, so a module-level `pass_history` import in the reaper would drag the ORM
+    engine (built at that import) behind every import of `reaper`. Asserted on the SOURCE via
+    AST: an in-process check is vacuous because `conftest.py` already imports `src.main` before
+    any test runs, populating `sys.modules`; parsing (not grepping) also catches a re-spelled
+    import path. Mutation check: hoist the `pass_history` import in
     `_take_the_copy_we_promised` to module scope."""
     source = Path(reaper.__file__).read_text(encoding="utf-8")
     for node in ast.parse(source).body:  # TOP LEVEL ONLY — a function-scoped import is the fix
@@ -617,7 +400,7 @@ def test_the_reaper_never_binds_the_pass_record_at_module_scope() -> None:
 
 
 # The relaunched preview's stay of execution. `sweep_all` honours an unexpired stay and
-# `reconcile_user` reaps through it; the asymmetry belongs to `reaper.py`. The pair below is
+# reconcile-on-start reaps through it; the asymmetry belongs to `reaper.py`. The pair below is
 # the regression guard against collapsing the two into one behaviour.
 
 
@@ -652,10 +435,10 @@ async def test_sweep_reaps_a_preview_once_its_stay_lapses(fake_redis: aioredis.R
 
 
 async def test_start_reconcile_reaps_through_a_current_stay(fake_redis: aioredis.Redis) -> None:
-    # reconcile-on-start defaults to honor_stay=False and reaps the preview even mid-stay.
+    # Certified, as reconcile-on-start always is, it reaps the preview even mid-stay.
     await _seed_preview(fake_redis, USER, stay=_in(600))
     client = FakeSandboxClient()
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is True
+    assert await reaper.reconcile_user(fake_redis, USER, client, certified_dead=True) is True
     assert a_sandbox_name("preview") in client.torn_down  # torn down, NOT orphaned
     assert await locks.read_registry(fake_redis, USER) is None
     assert await locks.acquire_lock(fake_redis, USER) is not None  # the slot is free
@@ -669,7 +452,7 @@ async def test_a_normal_build_session_is_unaffected_by_the_stay_check(
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)  # live build
     client = FakeSandboxClient()
     assert (await reaper.sweep_all(fake_redis, client)).reaped == 0
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
+    assert await reaper.reconcile_user(fake_redis, USER, client) is False
 
     await _seed(
         fake_redis, OTHER, app_name=a_sandbox_name("y"), with_lock=True, with_heartbeat=False
@@ -874,6 +657,44 @@ async def test_the_ceiling_never_touches_an_ordinary_build_preview(
     assert client.torn_down == []
 
 
+@pytest.mark.parametrize("registry_birthday", ["restamped", "dropped"])
+async def test_a_shared_views_ceiling_is_measured_from_its_container(
+    fake_redis: aioredis.Redis, registry_birthday: str
+) -> None:
+    """★ THE RECORD'S BIRTHDAY IS NOT THE CONTAINER'S. It is re-stamped at every registration —
+    every Launch that attaches to the standing view — and dropped when a teardown fails, so a view
+    relaunched every day, or one whose delete once failed, would never reach its ceiling. The ARM
+    tag is stamped once, at create.
+
+    Mutation check: measure from the registry's `created_at` and this view is spared."""
+    from src.api.v1.build_sessions.schemas import SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS
+
+    name = a_shared_sandbox_name("colleague")
+    await _seed_shared_view(fake_redis, USER, app_name=name, stay=_in(600))
+    if registry_birthday == "dropped":
+        await fake_redis.hdel(registry_key(USER), REGISTRY_FIELD_CREATED_AT)
+    client = _ArmKnowsItsAge(
+        created_at=(
+            datetime.now(UTC) - timedelta(seconds=SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS + 60)
+        ).isoformat()
+    )
+
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 1
+    assert name in client.torn_down
+
+
+async def test_a_shared_view_its_container_says_is_young_is_spared(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The other direction, so the case above cannot pass on a sweep that reaps every view."""
+    name = a_shared_sandbox_name("colleague")
+    await _seed_shared_view(fake_redis, USER, app_name=name, stay=_in(600))
+    client = _ArmKnowsItsAge(created_at=(datetime.now(UTC) - timedelta(minutes=5)).isoformat())
+
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 0
+    assert client.torn_down == []
+
+
 async def test_a_malformed_stay_is_lapsed_not_a_reprieve(fake_redis: aioredis.Redis) -> None:
     # FAIL CLOSED: garbage or an empty stay buys NOTHING. An un-reaped container is a real
     # resource leak, so an unreadable lease must never grant an unbounded reprieve.
@@ -896,12 +717,13 @@ async def test_an_absent_stay_reads_as_lapsed(fake_redis: aioredis.Redis) -> Non
 async def test_grant_stay_never_conjures_a_registry(fake_redis: aioredis.Redis) -> None:
     # Guarded on existence exactly like mark_registry_ending: a user with no sandbox must
     # not end up with a one-field registry hash that the sweep would then try to tear down.
-    deadline = await locks.grant_stay_of_execution(fake_redis, USER, ttl_seconds=60)
+    writer = locks.DeadlineWriter.BUILDER_ACTED
+    deadline = await locks.grant_stay_of_execution(fake_redis, USER, writer=writer)
     assert deadline > datetime.now(UTC)
     assert await locks.read_registry(fake_redis, USER) is None
     # With a registry present the deadline lands on the hash and reads back as current.
     await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
-    await locks.grant_stay_of_execution(fake_redis, USER, ttl_seconds=60)
+    await locks.grant_stay_of_execution(fake_redis, USER, writer=writer)
     assert await locks.stay_of_execution_is_current(fake_redis, USER) is True
 
 
@@ -989,9 +811,9 @@ async def test_a_sweep_that_trips_on_one_user_still_reaps_the_rest(
 
 # --- The wall-clock liveness lease --------------------------------
 #
-# The lock+heartbeat pair is a FACADE in both directions: a crashed builder leaves it
-# standing, and a live one loses its heartbeat 90 seconds in. The lease is the one input
-# here that is readable from a process NOT running the build. The two behaviours below are
+# The lock+heartbeat pair is a FACADE: a crashed builder leaves it standing for a TTL, and a
+# start that runs no turn writes it too. The lease is the one input here that means a turn is
+# live, to a process NOT running the build. The two behaviours below are
 # opposite ON PURPOSE — a timer must be conservative, a request path decisive — and the pair
 # is the regression guard against collapsing them into one.
 
@@ -1045,12 +867,7 @@ async def test_certified_dead_deletes_the_lease_and_reaps_through_it(
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
     await _hold_a_lease(fake_redis, USER)
     client = FakeSandboxClient()
-    assert (
-        await reaper.reconcile_user(
-            fake_redis, USER, client, has_live_session=False, certified_dead=True
-        )
-        is True
-    )
+    assert await reaper.reconcile_user(fake_redis, USER, client, certified_dead=True) is True
     assert SBX in client.torn_down
     assert await locks.liveness_lease_is_held(fake_redis, USER) is False
     assert await fake_redis.exists(lease_key(USER)) == 0
@@ -1062,26 +879,22 @@ async def test_certification_reaps_through_a_lease_that_survives_the_delete(
 ) -> None:
     # THE BELT, WITH THE BRACES REMOVED. The certified path both deletes the lease and
     # declines to read it; the delete alone hides the held-lease case from every other test
-    # here. So the delete is neutered for this one test, leaving the `not certified_dead`
-    # guard as the only thing standing between the builder and a 409 that lasts until the TTL.
+    # here. So the delete is neutered for this one test, leaving the certified path's refusal to
+    # ask whether a claim stands as the only thing between the builder and a 409 that lasts until
+    # the TTL.
     #
     # Not a hypothetical pair of belts: the lease has a RENEWAL LOOP behind it, so a zombie
     # task re-writing the key between the delete and the read would restore exactly this
     # state — and the reaper would then refuse to reclaim a slot it has already certified
     # nobody is using.
     #
-    # Mutation-check: drop `not certified_dead` from the lease check and this goes red;
-    # every other test in this file stays green, which is the whole reason it exists.
+    # Mutation-check: spare on `_a_claim_still_stands` in the certified branch too and this goes
+    # red; every other test in this file stays green, which is the whole reason it exists.
     monkeypatch.setattr(reaper, "release_liveness_lease", _a_delete_that_does_not_take)
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
     await _hold_a_lease(fake_redis, USER)
     client = FakeSandboxClient()
-    assert (
-        await reaper.reconcile_user(
-            fake_redis, USER, client, has_live_session=False, certified_dead=True
-        )
-        is True
-    )
+    assert await reaper.reconcile_user(fake_redis, USER, client, certified_dead=True) is True
     assert SBX in client.torn_down
 
 
@@ -1101,30 +914,47 @@ async def test_certification_clears_a_stray_lease_even_with_no_sandbox_registere
     await locks.delete_registry(fake_redis, USER)
     client = FakeSandboxClient()
     assert (
-        await reaper.reconcile_user(
-            fake_redis, USER, client, has_live_session=False, certified_dead=True
-        )
+        await reaper.reconcile_user(fake_redis, USER, client, certified_dead=True)
         is False  # nothing registered to reap
     )
     assert await fake_redis.exists(lease_key(USER)) == 0
 
 
-async def test_an_in_process_session_still_wins_over_a_certification(
+async def test_reconcile_on_start_asks_the_container_nothing_before_reaping_it(
     fake_redis: aioredis.Redis,
 ) -> None:
-    # `has_live_session=True` short-circuits BEFORE the lease is touched: a caller passing
-    # both has contradicted itself, and the safe reading wins. Were the delete placed above
-    # that guard, a live build would lose its protection to a contradictory call.
-    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
-    await _hold_a_lease(fake_redis, USER)
-    client = FakeSandboxClient()
-    assert (
-        await reaper.reconcile_user(
-            fake_redis, USER, client, has_live_session=True, certified_dead=True
+    """A certified reconcile has already decided, so a reading of the container could change
+    nothing — and on a shared view an unreachable supervisor costs an attach ladder measured in
+    seconds, spent on the citizen's start.
+
+    Mutation check: renew the shared view from traffic on the certified path and `served` grows."""
+    name = a_shared_sandbox_name("colleague")
+    await _seed_shared_view(fake_redis, USER, app_name=name, stay=_in(600))
+    client = _CountsServedReads(name)
+
+    assert await reaper.reconcile_user(fake_redis, USER, client, certified_dead=True) is True
+    assert name in client.torn_down
+    assert client.served == 0
+
+
+class _CountsServedReads(FakeSandboxClient):
+    """A shared view that answers for its traffic, and counts every time it was asked."""
+
+    def __init__(self, app_name: str) -> None:
+        super().__init__()
+        self.attach_handle = SandboxHandle(
+            fqdn=f"{app_name}.example",
+            token="tok",  # noqa: S106 - a fake, never a real bearer
+            app_name=app_name,
+            preview_url=f"https://{app_name}.example/",
+            ready=True,
         )
-        is False
-    )
-    assert await locks.liveness_lease_is_held(fake_redis, USER) is True
+        self.served_count_value = 3
+        self.served = 0
+
+    async def served_count(self, handle: SandboxHandle) -> ServedCount | None:
+        self.served += 1
+        return await super().served_count(handle)
 
 
 async def test_the_reap_clears_the_lease_with_the_registry(fake_redis: aioredis.Redis) -> None:
@@ -1157,6 +987,11 @@ async def test_a_failed_teardown_keeps_the_lease_when_nothing_can_own_the_debt(
 # sweep can retry spends their one workspace on a failure of OURS: until an ARM that was refusing
 # us starts answering again, they cannot start their next project at all. An owed row still names
 # the container after the record is gone, so the state can go and the retry survives.
+
+
+async def _preserve(store: FakeStorage, app_id: uuid.UUID, *, head: str = "a" * 40) -> None:
+    """A saved copy the durable-copy gate will accept, so these tests are about the reap."""
+    await store.put(snapshot_key(app_id), a_git_bundle(head), metadata={"head_sha": head})
 
 
 async def test_a_failed_teardown_hands_the_debt_over_and_gives_the_slot_back(
@@ -1258,6 +1093,117 @@ async def test_a_name_and_an_app_id_describing_different_containers_are_refused(
     assert (await db_session.scalar(sa.select(sa.func.count()).select_from(PendingTeardown))) == 0
 
 
+async def _a_colleagues_view_in_the_slot(
+    db_session: AsyncSession, redis: aioredis.Redis, *, stamped: bool = True
+) -> tuple[uuid.UUID, AppRegistry, str, str]:
+    """A recipient's slot holding a colleague's shared view, as its launch registers it: the
+    record is keyed by the RECIPIENT and stamped with the OWNER and their project."""
+    owner = await UserFactory.create(db_session)
+    recipient = await UserFactory.create(db_session)
+    app = await AppRegistryFactory.create(db_session, user_id=owner.id)
+    name = shr_name_for(app.id, recipient.id)
+    born = "2026-07-14T00:00:00+00:00"
+    await _seed(redis, recipient.id, app_name=name, with_heartbeat=False, created_at=born)
+    if stamped:
+        await redis.hset(
+            registry_key(recipient.id),
+            mapping={
+                REGISTRY_FIELD_SHARED_PROJECT_ID: str(app.project_id),
+                REGISTRY_FIELD_SHARED_OWNER_ID: str(owner.id),
+            },
+        )
+    return recipient.id, app, name, born
+
+
+@pytest.mark.parametrize("the_owners_app_is_named", [False, True], ids=["released", "swept"])
+async def test_a_shared_view_whose_delete_fails_is_owed_against_its_owners_app(
+    fake_redis: aioredis.Redis,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    the_owners_app_is_named: bool,
+) -> None:
+    """★ A FAILED DELETE NEVER FORGETS A SHARED VIEW. Giving the view up, a revoke and the
+    reconcile before a start reap it with no app id; the sweep names its owner's. Either way the
+    app is the OWNER's, never the slot holder's, so the ledger reads the owner and project the
+    launch stamped on the record and owes the delete against them. Without the row, the next
+    container registered in this slot overwrites the only record naming the view, and it runs and
+    bills forever.
+
+    Mutation check: refuse a shared name in the ledger and no row is written, and the slot stays
+    taken."""
+    recipient, app, name, born = await _a_colleagues_view_in_the_slot(db_session, fake_redis)
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert (
+            await reaper.reap_user(
+                fake_redis, recipient, client, app_id=app.id if the_owners_app_is_named else None
+            )
+            is False
+        )
+
+    assert await locks.read_registry(fake_redis, recipient) is None, "the slot is given back"
+    owed = (
+        (
+            await db_session.execute(
+                sa.select(PendingTeardown).where(PendingTeardown.user_id == recipient)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [(row.app_name, row.app_id, row.project_id) for row in owed] == [
+        (name, app.id, app.project_id)
+    ]
+    assert owed[0].instance_ref == datetime.fromisoformat(born)
+
+
+async def test_a_shared_view_with_no_stamp_keeps_its_state_for_a_later_pass(
+    fake_redis: aioredis.Redis,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the stamp nothing says whose app the view is, so the ledger cannot describe it and
+    the old retry stands: the record stays for a later pass. Sparing, never forgetting."""
+    recipient, _app, _name, _born = await _a_colleagues_view_in_the_slot(
+        db_session, fake_redis, stamped=False
+    )
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert await reaper.reap_user(fake_redis, recipient, client) is False
+
+    assert await locks.read_registry(fake_redis, recipient) is not None
+    assert (await db_session.scalar(sa.select(sa.func.count()).select_from(PendingTeardown))) == 0
+
+
+async def test_a_shared_view_whose_stamp_names_another_app_is_refused(
+    fake_redis: aioredis.Redis,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stamp and the name are read together but written apart, so the ledger holds them to
+    each other: a stamp whose project's app cannot produce this name describes a different
+    container, and the delete is not owed against it.
+
+    Mutation check: skip the name check on the shared arm and a row is written for a name the
+    stamped app cannot produce."""
+    recipient, app, _name, _born = await _a_colleagues_view_in_the_slot(db_session, fake_redis)
+    other = await AppRegistryFactory.create(db_session, user_id=app.user_id)
+    await fake_redis.hset(
+        registry_key(recipient), REGISTRY_FIELD_SHARED_PROJECT_ID, str(other.project_id)
+    )
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert await reaper.reap_user(fake_redis, recipient, client) is False
+
+    assert (await db_session.scalar(sa.select(sa.func.count()).select_from(PendingTeardown))) == 0
+
+
 @contextlib.asynccontextmanager
 async def _the_test_session(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
@@ -1337,7 +1283,7 @@ async def test_the_starting_marker_spares_a_container_mid_cold_start(
     await locks.write_starting_marker(fake_redis, USER, uuid.uuid4())
     client = FakeSandboxClient()
 
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
+    assert await reaper.reconcile_user(fake_redis, USER, client) is False
     assert client.torn_down == []
     assert await locks.read_registry(fake_redis, USER) is not None
 
@@ -1352,7 +1298,7 @@ async def test_the_same_container_without_the_marker_is_reaped(
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
     client = FakeSandboxClient()
 
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is True
+    assert await reaper.reconcile_user(fake_redis, USER, client) is True
     assert SBX in client.torn_down
 
 
@@ -1367,16 +1313,13 @@ async def test_a_marker_that_outlives_its_start_stops_sparing(
     remove, and a claim with no expiry is that failure mode with an extra step."""
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
     await locks.write_starting_marker(fake_redis, USER, uuid.uuid4())
-    assert (
-        await reaper.reconcile_user(fake_redis, USER, FakeSandboxClient(), has_live_session=False)
-        is False
-    )
+    assert await reaper.reconcile_user(fake_redis, USER, FakeSandboxClient()) is False
 
     # The TTL lapses — expressed as the key expiring, which is what a wall clock does to it.
     await fake_redis.delete(starting_key(USER))
 
     client = FakeSandboxClient()
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is True
+    assert await reaper.reconcile_user(fake_redis, USER, client) is True
     assert SBX in client.torn_down
 
 
@@ -1389,24 +1332,8 @@ async def test_a_marker_alone_does_not_conjure_a_container_to_spare(
     await locks.write_starting_marker(fake_redis, USER, uuid.uuid4())
     client = FakeSandboxClient()
 
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
+    assert await reaper.reconcile_user(fake_redis, USER, client) is False
     assert client.torn_down == []
-
-
-async def test_the_reclamation_passes_own_predicate_agrees(fake_redis: aioredis.Redis) -> None:
-    """THE SECOND READER. `reconcile_user` is the per-user sweep; the fleet pass builds a
-    `RegistryClaim` and asks `spares_the_container`. Both must count the marker, or a container
-    spared by one is destroyed by the other — and the fleet pass is the one that destroys."""
-    from src.services.build_sessions.reclamation_pass import claim_for_container
-
-    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
-    unspared = await claim_for_container(fake_redis, app_name=SBX)
-    assert unspared is not None and unspared.spares_the_container is False
-
-    await locks.write_starting_marker(fake_redis, USER, uuid.uuid4())
-    spared = await claim_for_container(fake_redis, app_name=SBX)
-    assert spared is not None and spared.starting is True
-    assert spared.spares_the_container is True
 
 
 # --- the serving proof, watched out of turn ---------------------------------------------------
@@ -1490,6 +1417,13 @@ async def _stamp(redis: aioredis.Redis, user: uuid.UUID) -> str | None:
     return None if reg is None else reg.get(REGISTRY_FIELD_SERVING_SINCE)
 
 
+@pytest.fixture
+def on_its_re_ask_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This pass is the one on which this user's proven stamp is re-asked. Without it the re-ask
+    is taken on one pass in six, and a test of it depends on the clock."""
+    monkeypatch.setattr(reaper, "_this_users_turn_to_be_re_asked", lambda _user, _now: True)
+
+
 async def test_the_sweep_stamps_a_container_whose_in_turn_watchers_were_all_lost(
     fake_redis: aioredis.Redis,
 ) -> None:
@@ -1503,7 +1437,7 @@ async def test_the_sweep_stamps_a_container_whose_in_turn_watchers_were_all_lost
     await _seed(fake_redis, USER, serving_since="")
     client = _ProbeableClient()
 
-    reaped = await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False)
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is False, "an observation must never become a verdict"
     assert client.torn_down == []
@@ -1522,7 +1456,7 @@ async def test_a_container_that_still_answers_nothing_is_not_therefore_reapable(
     await _seed(fake_redis, USER, serving_since="")
     client = _ProbeableClient(running=True, ready=False)
 
-    reaped = await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False)
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is False
     assert client.torn_down == []
@@ -1552,7 +1486,7 @@ async def test_the_sweep_will_not_stamp_a_root_that_answers_without_a_page(
     await _seed(fake_redis, USER, serving_since="")
     client = _ProbeableClient(root_status=404)
 
-    reaped = await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False)
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is False, "an observation must never become a verdict"
     assert client.torn_down == [], (
@@ -1564,7 +1498,7 @@ async def test_the_sweep_will_not_stamp_a_root_that_answers_without_a_page(
     # is still open because the sentinel is still empty, and only the reading has changed.
     client.scripted = replace(client.scripted, root_status=200)
 
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
+    assert await reaper.reconcile_user(fake_redis, USER, client) is False
     stamped = await _stamp(fake_redis, USER)
     assert stamped is not None and stamped != "", (
         "the sweep's stamp arm was never live, so the refusal above proved nothing"
@@ -1584,13 +1518,13 @@ async def test_a_container_the_sweep_has_already_condemned_is_never_asked_anythi
     await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False, serving_since="")
     client = _ProbeableClient()
 
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is True
+    assert await reaper.reconcile_user(fake_redis, USER, client) is True
     assert SBX in client.torn_down
     assert client.attached_as == [], "the reaping arm stopped to take a reading"
 
 
 async def test_the_sweep_retracts_the_proof_of_an_app_that_has_stopped_answering(
-    fake_redis: aioredis.Redis,
+    fake_redis: aioredis.Redis, on_its_re_ask_pass: None
 ) -> None:
     """★ THE OTHER DIRECTION, and the one no in-turn observer can reach: the turn ended hours
     ago and the dev server has since died. The proof comes off, the pane falls back to a wait,
@@ -1602,7 +1536,7 @@ async def test_the_sweep_retracts_the_proof_of_an_app_that_has_stopped_answering
     await _seed(fake_redis, USER, serving_since="2026-09-10T09:41:04+00:00")
     client = _ProbeableClient(running=False, ready=False)
 
-    reaped = await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False)
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is False
     assert client.torn_down == []
@@ -1611,7 +1545,7 @@ async def test_the_sweep_retracts_the_proof_of_an_app_that_has_stopped_answering
 
 
 async def test_a_dead_child_that_is_still_serving_keeps_its_proof(
-    fake_redis: aioredis.Redis,
+    fake_redis: aioredis.Redis, on_its_re_ask_pass: None
 ) -> None:
     """`running=False, ready=True` is a DOCUMENTED NORMAL state, not a crash: the open sandbox
     lets the agent `pkill` our child and `nohup` its own replacement, which then answers the
@@ -1622,12 +1556,12 @@ async def test_a_dead_child_that_is_still_serving_keeps_its_proof(
     await _seed(fake_redis, USER, serving_since="2026-09-10T09:41:04+00:00")
     client = _ProbeableClient(running=False, ready=True)
 
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
+    assert await reaper.reconcile_user(fake_redis, USER, client) is False
     assert await _stamp(fake_redis, USER) == "2026-09-10T09:41:04+00:00"
 
 
 async def test_a_container_that_cannot_be_reached_keeps_its_standing_proof(
-    fake_redis: aioredis.Redis,
+    fake_redis: aioredis.Redis, on_its_re_ask_pass: None
 ) -> None:
     """★ UNREACHABLE IS NOT DEAD, and that asymmetry is the whole safety of the retraction. An
     expired ARM credential or a throttled subscription makes every container in the fleet
@@ -1637,7 +1571,7 @@ async def test_a_container_that_cannot_be_reached_keeps_its_standing_proof(
     await _seed(fake_redis, USER, serving_since="2026-09-10T09:41:04+00:00")
     client = _ProbeableClient(reachable=False)
 
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
+    assert await reaper.reconcile_user(fake_redis, USER, client) is False
     assert await _stamp(fake_redis, USER) == "2026-09-10T09:41:04+00:00"
 
 
@@ -1653,7 +1587,7 @@ async def test_a_pre_cutover_record_is_left_exactly_as_it_is_and_costs_no_probe(
     await _seed(fake_redis, USER)  # the pre-cutover shape: no stamp at all
     client = _ProbeableClient()
 
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
+    assert await reaper.reconcile_user(fake_redis, USER, client) is False
     assert client.attached_as == [], "a pre-cutover record was probed for no reason"
     assert await fake_redis.hexists(registry_key(USER), REGISTRY_FIELD_SERVING_SINCE) == 0
 
@@ -1669,7 +1603,7 @@ async def test_a_container_younger_than_the_cold_budget_is_left_to_its_own_obser
     await _seed(fake_redis, USER, serving_since="", created_at=datetime.now(UTC).isoformat())
     client = _ProbeableClient()
 
-    assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
+    assert await reaper.reconcile_user(fake_redis, USER, client) is False
     assert client.attached_as == []
     assert await _stamp(fake_redis, USER) == ""
 
@@ -1682,7 +1616,7 @@ async def test_a_container_the_reaper_has_marked_ending_is_never_stamped(
     await _seed(fake_redis, USER, serving_since="", state=REGISTRY_STATE_ENDING)
     client = _ProbeableClient()
 
-    await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False)
+    await reaper.reconcile_user(fake_redis, USER, client)
 
     assert client.attached_as == []
     assert await _stamp(fake_redis, USER) == ""
@@ -1697,10 +1631,8 @@ async def test_every_sparing_arm_that_holds_a_record_takes_the_reading(
     otherwise the backstop covers only the citizens whose state happens to take the right
     branch, which is nobody's idea of a backstop.
 
-    The fifth arm, `has_live_session`, is deliberately NOT one of them and is asserted here as
-    the exception rather than left to be inferred from silence: it returns above the registry
-    read, so observing there would cost every build start an extra round trip, and it is never
-    True on the scheduled sweep this backstop exists to run on."""
+    An in-process session is deliberately NOT one of them and is asserted here as the exception
+    rather than left to be inferred from silence: the sweep skips it before reading anything."""
     lease_user, marker_user, pair_user, stay_user, session_user = (uuid.uuid4() for _ in range(5))
 
     await _seed(fake_redis, lease_user, with_lock=False, with_heartbeat=False, serving_since="")
@@ -1721,27 +1653,24 @@ async def test_every_sparing_arm_that_holds_a_record_takes_the_reading(
     await _seed(fake_redis, session_user, serving_since="")
 
     proven: dict[str, bool] = {}
-    for name, user, honor_stay in (
-        ("lease", lease_user, False),
-        ("marker", marker_user, False),
-        ("lock+heartbeat", pair_user, False),
-        ("stay", stay_user, True),
+    for name, user in (
+        ("lease", lease_user),
+        ("marker", marker_user),
+        ("lock+heartbeat", pair_user),
+        ("stay", stay_user),
     ):
         client = _ProbeableClient()
-        spared = await reaper.reconcile_user(
-            fake_redis, user, client, has_live_session=False, honor_stay=honor_stay
-        )
+        spared = await reaper.reconcile_user(fake_redis, user, client)
         assert spared is False, f"the {name} arm stopped sparing"
         assert client.torn_down == []
         proven[name] = bool(await _stamp(fake_redis, user))
 
     live = _ProbeableClient()
-    assert (
-        await reaper.reconcile_user(fake_redis, session_user, live, has_live_session=True) is False
-    )
+    everyone = {lease_user, marker_user, pair_user, stay_user, session_user}
+    assert (await reaper.sweep_all(fake_redis, live, live_users=everyone)).reaped == 0
 
     assert proven == {"lease": True, "marker": True, "lock+heartbeat": True, "stay": True}
-    assert live.attached_as == [], "the in-process-session arm returns above the record"
+    assert live.attached_as == [], "the sweep read a user with a live in-process session"
     assert await _stamp(fake_redis, session_user) == ""
 
 
@@ -1815,21 +1744,6 @@ def _a_proven_record() -> dict[str, str]:
     }
 
 
-def test_reconcile_on_start_re_asks_every_time_it_is_asked() -> None:
-    """★ THE UNTHINNED PATH, and it is the one a citizen is waiting on.
-
-    Reconcile-on-start is about ONE user who just pressed something, so there is no fleet to
-    multiply and the answer is about to decide what they see. It pays the probe on every pass,
-    whichever shard the user falls in — so this asserts the arm over a full cycle of passes.
-    """
-    reg = _a_proven_record()
-    for pass_offset in range(reaper._RE_ASK_A_PROVEN_STAMP_EVERY_N_SWEEPS):
-        now = datetime.fromtimestamp(pass_offset * reaper._SWEEP_CADENCE_SECONDS, tz=UTC)
-        assert (
-            reaper._what_this_record_is_missing(reg, now, USER, thin_the_re_ask=False) == "retract"
-        ), f"the on-start path declined to re-ask on pass {pass_offset}"
-
-
 def test_the_fleet_sweep_re_asks_each_proven_container_exactly_once_per_cycle() -> None:
     """★ THE THINNED PATH: over one full cycle of passes a given user comes up exactly ONCE.
 
@@ -1846,7 +1760,6 @@ def test_the_fleet_sweep_re_asks_each_proven_container_exactly_once_per_cycle() 
                 reg,
                 datetime.fromtimestamp(pass_offset * reaper._SWEEP_CADENCE_SECONDS, tz=UTC),
                 user,
-                thin_the_re_ask=True,
             )
             == "retract"
         ]
@@ -1865,11 +1778,7 @@ def test_the_thinning_spreads_the_fleet_across_passes_instead_of_spiking() -> No
     reg = _a_proven_record()
     fleet = [uuid.uuid4() for _ in range(600)]
     now = datetime.fromtimestamp(0, tz=UTC)
-    asked = [
-        u
-        for u in fleet
-        if reaper._what_this_record_is_missing(reg, now, u, thin_the_re_ask=True) == "retract"
-    ]
+    asked = [u for u in fleet if reaper._what_this_record_is_missing(reg, now, u) == "retract"]
     # A sixth of six hundred is a hundred; the bound is loose enough not to be a coin-flip test
     # and tight enough that "the whole fleet on one pass" and "nobody, ever" both fail it.
     assert 40 < len(asked) < 200, f"{len(asked)} of {len(fleet)} on a single pass"
@@ -1884,17 +1793,16 @@ def test_thinning_never_reaches_the_arm_that_stamps_an_unproven_container() -> N
     old_enough = datetime.fromisoformat("2026-09-10T09:00:00+00:00") + timedelta(seconds=300)
     for pass_offset in range(reaper._RE_ASK_A_PROVEN_STAMP_EVERY_N_SWEEPS):
         now = old_enough + timedelta(seconds=pass_offset * reaper._SWEEP_CADENCE_SECONDS)
-        assert (
-            reaper._what_this_record_is_missing(unproven, now, USER, thin_the_re_ask=True)
-            == "stamp"
-        ), f"an unproven container was thinned out of its own stamp on pass {pass_offset}"
+        assert reaper._what_this_record_is_missing(unproven, now, USER) == "stamp", (
+            f"an unproven container was thinned out of its own stamp on pass {pass_offset}"
+        )
 
 
 # --- the absolute age ceiling ------------------------------------------------
 #
-# Two arms, not one, and the second is the whole reason this section exists: `reconcile_user`'s
-# liveness-lease arm RETURNS above the stay arm, so a bound written only into the stay would
-# never see a container with a turn in flight and would be dead code from the day it landed.
+# Two bounds, not one, and the second is the whole reason this section exists: a turn's claim
+# answers before the stay's, so a bound written only into the stay would never see a container
+# with a turn in flight and would be dead code from the day it landed.
 
 
 @pytest.fixture
@@ -1929,8 +1837,10 @@ class _ArmKnowsItsAge(FakeSandboxClient):
     def __init__(self, *, created_at: str | None) -> None:
         super().__init__()
         self._created_at = created_at
+        self.tag_reads = 0
 
     async def get_app_tags(self, *, name: str) -> dict[str, str] | None:
+        self.tag_reads += 1
         if self._created_at is None:
             return None
         return {TAG_KIND: KIND_BUILD_SANDBOX, TAG_CREATED_AT: self._created_at}
@@ -1948,9 +1858,7 @@ async def test_a_screen_left_open_for_three_hours_is_collected_at_two(
     )
     client = _ArmKnowsItsAge(created_at=_hours_ago(3))
 
-    reaped = await reaper.reconcile_user(
-        fake_redis, USER, client, has_live_session=False, honor_stay=True
-    )
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is True
     assert SBX in client.torn_down
@@ -1967,9 +1875,7 @@ async def test_a_screen_open_for_one_hour_keeps_its_container(
     )
     client = _ArmKnowsItsAge(created_at=_hours_ago(1))
 
-    reaped = await reaper.reconcile_user(
-        fake_redis, USER, client, has_live_session=False, honor_stay=True
-    )
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is False
     assert client.torn_down == []
@@ -1985,9 +1891,7 @@ async def test_a_turn_in_flight_at_the_ceiling_is_deferred_not_cut(
     await locks.renew_liveness_lease(fake_redis, USER)
     client = _ArmKnowsItsAge(created_at=_hours_ago(2.2))
 
-    reaped = await reaper.reconcile_user(
-        fake_redis, USER, client, has_live_session=False, honor_stay=True
-    )
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is False
     assert client.torn_down == []
@@ -1996,20 +1900,17 @@ async def test_a_turn_in_flight_at_the_ceiling_is_deferred_not_cut(
 async def test_a_lease_that_will_not_stop_renewing_is_no_longer_spared(
     fake_redis: aioredis.Redis, ceiling_on: None
 ) -> None:
-    """THE ARM THE WHOLE SECOND CLAUSE EXISTS FOR. A jammed lease is indistinguishable from a
-    working agent, so the arm that protects real work protects a wedged container forever. Past
+    """THE CLAIM THE WHOLE SECOND BOUND EXISTS FOR. A jammed lease is indistinguishable from a
+    working agent, so the claim that protects real work protects a wedged container forever. Past
     the ceiling plus a whole run plus a slow tool call, nothing honest is still in there.
 
-    Mutation check: delete the ceiling clause from `reconcile_user`'s liveness-lease arm and this
-    test alone goes red — the stay arm's clause can never reach this case, because the lease arm
-    returns above it."""
+    Mutation check: delete the outer mark from the turn's claim and this goes red — the stay's
+    bound can never reach this case, because the turn's claim answers first."""
     await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
     await locks.renew_liveness_lease(fake_redis, USER)
     client = _ArmKnowsItsAge(created_at=_hours_ago(24))
 
-    reaped = await reaper.reconcile_user(
-        fake_redis, USER, client, has_live_session=False, honor_stay=True
-    )
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is True
     assert SBX in client.torn_down
@@ -2021,20 +1922,17 @@ async def test_a_jam_holding_lease_lock_and_heartbeat_together_is_still_collecte
     """THE SHAPE A REAL JAM ACTUALLY MAKES, which the lease-only test above cannot produce.
 
     `_hold_liveness_lease` renews the lease, the lock and the heartbeat on one 30-second loop —
-    their only clock — so a wedged turn holds all three at once. The arm above seeds
+    their only clock — so a wedged turn holds all three at once. The test above seeds
     `with_lock=False, with_heartbeat=False`, a shape the engine never leaves behind, and passes
-    on a ceiling clause that reaches only the lease. With all three held, the lease arm declines
-    to spare and control falls through to the lock/heartbeat pair.
+    on a bound that reaches only the lease.
 
-    Mutation check: delete the ceiling clause from the lock/heartbeat arm and this test alone
-    goes red — every other ceiling test seeds the pair off and never reaches it."""
+    Mutation check: bound the lease but not the lock/heartbeat pair and this test alone goes red
+    — every other ceiling test seeds the pair off and never reaches it."""
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
     await locks.renew_liveness_lease(fake_redis, USER)
     client = _ArmKnowsItsAge(created_at=_hours_ago(24))
 
-    reaped = await reaper.reconcile_user(
-        fake_redis, USER, client, has_live_session=False, honor_stay=True
-    )
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is True
     assert SBX in client.torn_down
@@ -2050,9 +1948,7 @@ async def test_a_live_turn_inside_the_outer_mark_keeps_all_three_signals(
     await locks.renew_liveness_lease(fake_redis, USER)
     client = _ArmKnowsItsAge(created_at=_hours_ago(0.1))
 
-    reaped = await reaper.reconcile_user(
-        fake_redis, USER, client, has_live_session=False, honor_stay=True
-    )
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is False
     assert client.torn_down == []
@@ -2072,9 +1968,7 @@ async def test_the_ceiling_measures_the_container_not_its_registry_record(
     )
     client = _ArmKnowsItsAge(created_at=_hours_ago(9))
 
-    reaped = await reaper.reconcile_user(
-        fake_redis, USER, client, has_live_session=False, honor_stay=True
-    )
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is True, "the record's fresh birthday was believed over the container's own"
 
@@ -2091,9 +1985,7 @@ async def test_an_arm_that_cannot_answer_falls_back_to_the_record(
     )
     client = _ArmKnowsItsAge(created_at=None)
 
-    reaped = await reaper.reconcile_user(
-        fake_redis, USER, client, has_live_session=False, honor_stay=True
-    )
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is True
 
@@ -2109,8 +2001,39 @@ async def test_with_the_ceiling_off_a_renewed_stay_is_immortal_again(
     )
     client = _ArmKnowsItsAge(created_at=_hours_ago(500))
 
-    reaped = await reaper.reconcile_user(
-        fake_redis, USER, client, has_live_session=False, honor_stay=True
-    )
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
 
     assert reaped is False
+
+
+async def test_a_spared_shared_view_with_a_current_stay_reads_its_tags_once(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """`_a_claim_still_stands` asks two ceiling questions of a shared view with a current stay
+    — its own absolute ceiling and the ordinary mark — and both are answered off the SAME tag
+    read, not one apiece.
+
+    Mutation check: read the identity separately for each ceiling question again and this goes
+    red — `tag_reads` climbs to 2."""
+    name = a_shared_sandbox_name("colleague")
+    await _seed_shared_view(fake_redis, USER, app_name=name, stay=_in(600))
+    client = _ArmKnowsItsAge(created_at=_hours_ago(0.01))
+
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
+
+    assert reaped is False
+    assert client.tag_reads == 1
+
+
+async def test_a_record_with_neither_a_turn_nor_a_stay_reads_no_tags(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Nothing claims this container, so nothing needs its age — the reap decision is already
+    made before either ceiling question is even worth asking."""
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    client = _ArmKnowsItsAge(created_at=_hours_ago(0.01))
+
+    reaped = await reaper.reconcile_user(fake_redis, USER, client)
+
+    assert reaped is True
+    assert client.tag_reads == 0

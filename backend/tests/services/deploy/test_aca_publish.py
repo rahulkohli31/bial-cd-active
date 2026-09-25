@@ -224,14 +224,13 @@ def test_the_published_envelope_declares_what_it_is() -> None:
     is not merely un-written — it is STRIPPED from a resource that already carried it.
 
     `bial-kind=published-app` turns "this is a citizen's live application, not a build sandbox"
-    from a `pub-` naming convention into a record. Getting that distinction wrong is how a fleet
-    reclamation pass takes production down."""
+    from a `pub-` naming convention into a record."""
     tags = _envelope().tags
 
     assert tags is not None
     assert tags[TAG_KIND] == KIND_PUBLISHED_APP
     assert tags[TAG_APP_ID] == str(_APP_ID)
-    assert identity_from_tags(tags).is_a_sandbox is False
+    assert identity_from_tags(tags).kind == KIND_PUBLISHED_APP
 
 
 def test_the_published_envelope_carries_no_creation_stamp() -> None:

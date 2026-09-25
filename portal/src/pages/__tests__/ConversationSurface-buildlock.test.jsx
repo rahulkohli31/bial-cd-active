@@ -28,7 +28,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useNavigate } from 'react-router-dom'
 import {
-  FakeEventSource, makeClient, primeClient,
   PLAN_CARD_ID, planReply, primeTurn,
   waitForGateOpen, scriptBuildTurn, T_BUILD_END, BUILD_TURN_ID,
 } from './_builderSession.jsx'
@@ -38,7 +37,6 @@ const h = vi.hoisted(() => ({
   resolvePlanOptions: vi.fn(), uuidv7: vi.fn(),
   loadBuilds: vi.fn(), getBuild: vi.fn(),
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
-  getStatus: vi.fn(),
 }))
 
 // Both kinds of chat run on the turn stream now, so the mock below is the only transport this
@@ -73,17 +71,14 @@ function BackButton() {
 }
 
 function renderBuilder(chatId, projectId = 'p1') {
-  const fake = new FakeEventSource(chatId)
-  const deps = { client: makeClient(h), eventSourceFactory: () => fake }
-  const view = render(
+  return render(
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <BackButton />
       <Routes>
-        <Route path="/chat/:chatId" element={<ConversationSurface projectId={projectId} projectName="VIP Movement" buildSessionDeps={deps} />} />
+        <Route path="/chat/:chatId" element={<ConversationSurface projectId={projectId} projectName="VIP Movement" />} />
       </Routes>
     </MemoryRouter>,
   )
-  return { ...view, fake }
 }
 
 /** A chat turn — the model answers with a brief, so a card appears. Starts nothing on its own. */
@@ -146,7 +141,6 @@ function mintBuild(id, title, { turnId = BUILD_TURN_ID } = {}) {
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.loadBuilds.mockResolvedValue([])
   liveTurnByChat = new Map()
   h.getBuild.mockImplementation(async (id) => ({

@@ -35,7 +35,7 @@ import { Profiler } from 'react'
 import { render, screen, fireEvent, waitFor, cleanup, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
-  FakeEventSource, makeClient, primeClient, waitForGateOpen,
+  waitForGateOpen,
   T_STEP, T_WORKSPACE, T_PREVIEW, T_BUILD_END, T_DELTA, PREVIEW_URL, inWorkspace,
 } from './_builderSession.jsx'
 import { PREVIEW_PROBE_MS, STARTING_PROBE_LIMIT, STARTING_PROBE_MS } from '../../components/workspace/workspaceState'
@@ -45,7 +45,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  relaunchPreview: vi.fn(), getStatus: vi.fn(),
+  relaunchPreview: vi.fn(),
   fetchPreviewState: vi.fn(), fetchCompileState: vi.fn(), fetchSaveState: vi.fn(),
   checkWorkspace: vi.fn(),
 }))
@@ -102,14 +102,12 @@ let surfaceCommits = 0
 const countSurfaceCommit = () => { surfaceCommits += 1 }
 
 function renderThread(chatId = 'thread-1') {
-  const fake = new FakeEventSource(chatId)
-  const deps = { client: makeClient(h), eventSourceFactory: () => fake }
   return render(
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <Routes>
         {inWorkspace(<Route path="/chat/:chatId" element={
           <Profiler id="surface" onRender={countSurfaceCommit}>
-            <ConversationSurface projectId="p1" buildSessionDeps={deps} />
+            <ConversationSurface projectId="p1" />
           </Profiler>
         } />)}
       </Routes>
@@ -147,8 +145,6 @@ const preview = (state) => ({
   state,
   alive: state === 'alive',
   previewUrl: state === 'alive' ? PREVIEW_URL : null,
-  occupyingProjectName: null,
-  occupyingProjectId: null,
   restorable: true,
 })
 
@@ -194,7 +190,6 @@ beforeEach(() => {
   surfaceCommits = 0
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
@@ -279,8 +274,15 @@ describe('the chat surface asks faster while a workspace is starting', () => {
     expect(h.fetchPreviewState.mock.calls.length).toBe(spent)
 
     // NOTHING WAS RECLASSIFIED ON THE WAY. Forty failures say nothing about a container, so the
-    // pane still says a start is happening — no "we could not check", no "gone", no retry verb.
-    expect(screen.getByText('Getting your app ready.')).toBeTruthy()
+    // pane still says a start is happening — no "we could not check", no "gone".
+    //
+    // READ OFF THE STATE HANDLE, NOT THE SENTENCE. This window is longer than the pane's own
+    // patience, so by now the wait is on its second sentence; which words it is wearing is not
+    // what this test is about, and pinning them here would fail on a copy change that means
+    // nothing to the cadence.
+    expect(screen.getByTestId('app-pane-empty').getAttribute('data-workspace-state')).toBe(
+      'starting',
+    )
     expect(screen.queryByText(/we could not check/i)).toBeNull()
 
     // ABSENCE PAIRED WITH LIVENESS: quiet because it is slow, not because it died.
@@ -338,10 +340,9 @@ describe('an unchanged reading re-renders nothing', () => {
     // Fresh, field-identical objects from here on. See the docblock.
     h.fetchPreviewState.mockImplementation(async () => preview('starting'))
 
-    // DRAIN THE ONE-SHOTS FIRST. The turn that just ended leaves `useBuildSession`'s "still
-    // working" overlay on a 4s timer of its own (`ITERATION_QUIET_MS`), and its commit belongs to
-    // that turn, not to the poll. Counting through it would measure the wrong thing — and would
-    // pass a mutant by exactly the margin it hid.
+    // DRAIN THE ONE-SHOTS FIRST. A commit or two still lands right after the turn ends, and that
+    // settling belongs to the turn, not to the poll. Counting through it would measure the wrong
+    // thing — and would pass a mutant by exactly the margin it hid.
     await act(async () => { await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS * 2 + 1) })
     const reads = h.fetchPreviewState.mock.calls.length
     surfaceCommits = 0

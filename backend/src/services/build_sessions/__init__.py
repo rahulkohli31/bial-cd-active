@@ -3,7 +3,7 @@
 The one-per-user Redis lock + heartbeat + registry-state helpers (`locks`), the reaper
 ordering + reconciliation sweep (`reaper`), the app-data credential mint + injection
 (`appdata`) and the per-project database half of that env (`appdb_env`), the snapshot
-write (`snapshot`), and the in-process session lifecycle + progress channel (`manager`).
+write (`snapshot`), and the in-process session lifecycle (`manager`).
 
 `attachments` is GONE. It materialized a conversation's file parts into the standalone build
 agent's prompt, and its one caller was `SessionManager.start` — deleted with the start route. A
@@ -58,9 +58,6 @@ from src.services.build_sessions.manager import (
 from src.services.build_sessions.manager import StopOutcome as StopOutcome
 from src.services.build_sessions.manager import app_name_for as app_name_for
 from src.services.build_sessions.manager import get_session_manager as get_session_manager
-from src.services.build_sessions.manager import (
-    set_session_manager_for_tests as set_session_manager_for_tests,
-)
 from src.services.build_sessions.manager import shr_name_for as shr_name_for
 from src.services.build_sessions.reaper import reap_user as reap_user
 from src.services.build_sessions.reaper import reconcile_user as reconcile_user

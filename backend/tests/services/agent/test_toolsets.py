@@ -46,13 +46,11 @@ from src.services.agent.toolsets import (
 from src.services.build_sessions.integrity import BASELINE_COMMIT_SUBJECT
 from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
 from src.services.orchestrator.deps import SandboxSession
-from src.services.orchestrator.progress import ProgressEmitter
 from src.services.orchestrator.selfheal import AppState, read_the_app_state
 from src.services.orchestrator.tools import sandbox_toolset
 from src.services.sandbox import DevStatus, SandboxError, SandboxHandle
 from src.services.sandbox.base import ExecResult
 from tests.fakes import ToolDeps, a_connected_system
-from tests.services.orchestrator.conftest import CollectingSink
 from tests.services.orchestrator.fake_sandbox import FakeSandbox
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
@@ -215,15 +213,12 @@ async def test_an_offer_with_no_plan_is_not_a_deferral_at_all(
 
 def _build_deps() -> ToolDeps:
     fake = FakeSandbox()
-    emitter = ProgressEmitter(CollectingSink())
     return ToolDeps(
         sandbox=SandboxSession(
             sandbox_client=fake,
             handle=fake.handle(),
             app_id=uuid.uuid4(),
-            emitter=emitter,
         ),
-        emitter=emitter,
         user_id=uuid.uuid4(),
     )
 

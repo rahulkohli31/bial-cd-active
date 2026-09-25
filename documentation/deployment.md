@@ -69,6 +69,10 @@ scripts, Dockerfiles, the shipped configuration and every generated artefact; an
 strips carriage returns from its entrypoint before making it executable, so a checkout that
 ignored the first guard still produces a working image.
 
+The registry's build service also drops every file named `.gitignore` from the build context, at
+any depth, so none reaches an image. The sandbox's ignore rules therefore live in the
+platform-owned exclude file the image installs for every workspace, never in a `.gitignore`.
+
 **Anything that will run on, or ship to, the build host must be written to work there.** Shell
 scripts and Dockerfiles in LF, no Unix-only assumptions, OS-agnostic paths, and tooling that works
 on Windows. Verifying a change on a Linux or macOS build does not cover the build that actually
@@ -169,7 +173,7 @@ symptoms are easy to confuse.
 
 ## Where to go next
 
-- `runbooks/` — recovering the cache, the background worker, the reclamation levers, and taking an
-  approved application live.
+- `runbooks/` — recovering the cache, the background worker, reconciling the sandbox fleet, and
+  taking an approved application live.
 - `architecture.md` — why the pieces are arranged this way.
 - `reference/` — the API surface and the permissions the platform requires.

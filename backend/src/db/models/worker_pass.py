@@ -1,6 +1,6 @@
 """What a scheduled worker pass did, and — far more important — THAT it happened.
 
-A TABLE, NOT A REDIS KEY: the fleet-count alarm is emitted *by the pass itself*, so a
+A TABLE, NOT A REDIS KEY: every alarm a pass could raise is emitted *by the pass itself*, so a
 crashlooping scheduler reads like a healthy quiet fleet — the only detector of a dead worker
 is the ABSENCE of a pass record, which must outlive everything the worker depends on. A Redis
 marker is evictable under any `allkeys-*` policy and would make that absence indistinguishable
@@ -58,14 +58,14 @@ class WorkerPass(UUIDv7PrimaryKeyMixin, TimestampMixin, Base):
 
     __tablename__ = "worker_passes"
 
-    #: The task's own name (`sandbox_reclamation`, `deploy_reconcile`). Not an enum: a new
+    #: The task's own name (`sandbox_durable_copy`, `conversation_retention`). Not an enum: a new
     #: scheduled task should not need a migration to become observable.
     task_name: Mapped[str] = mapped_column(sa.String(128), index=True)
     outcome: Mapped[PassOutcome] = mapped_column(worker_pass_outcome_enum)
     finished_at: Mapped[dt.datetime] = mapped_column(sa.DateTime(timezone=True), index=True)
-    #: Whatever counts the task wants an operator to be able to read back — scanned/spared/
-    #: staged/destroyed/escalated for reclamation. JSONB rather than columns so a second task
-    #: with different counts needs no migration.
+    #: Whatever counts the task wants an operator to be able to read back — `copied`/`spared` for
+    #: a durable-copy attempt, `condemned`/`removed` for retention. JSONB rather than columns so
+    #: a second task with different counts needs no migration.
     #:
     #: `JSONB`, NOT `sa.JSON`, which is what this said and is not the same type. `sa.JSON` renders
     #: as `json` on Postgres: text, re-parsed on every read, un-indexable and with no containment

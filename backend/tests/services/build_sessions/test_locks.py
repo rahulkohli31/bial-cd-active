@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 import pytest
 import redis.asyncio as aioredis
+import structlog.testing
 from redis.exceptions import RedisError
 
 from src.api.v1.build_sessions.schemas import (
@@ -18,6 +19,7 @@ from src.api.v1.build_sessions.schemas import (
     STARTING_MARKER_TTL_SECONDS,
 )
 from src.services.build_sessions import locks
+from src.services.build_sessions.alarms import APP_FIRST_SERVED_EVENT, SERVING_PROOF_STAMP_REFUSED
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -26,8 +28,11 @@ from src.services.redis import (
 )
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_STATE,
+    REGISTRY_FIELD_WAITING_SINCE,
+    start_failure_key,
     starting_key,
 )
 from tests.fakes import a_sandbox_name
@@ -159,6 +164,13 @@ async def test_the_one_guard_never_swallows_cancellation(
         # An alarm raised on an outage is an alarm nobody can act on.
         ("eval", lambda r: locks.mark_serving(r, USER, app_name=SBX, when=datetime.now(UTC))),
         ("eval", lambda r: locks.clear_serving(r, USER, app_name=SBX)),
+        ("pttl", lambda r: locks.date_the_wait_from_the_start(r, USER, app_name=SBX)),
+        (
+            "eval",
+            lambda r: locks.record_the_first_serve(
+                r, USER, app_name=SBX, observer="relaunch", cold=True
+            ),
+        ),
     ],
 )
 async def test_every_primitive_but_acquire_still_surfaces_redis_errors(
@@ -375,6 +387,42 @@ async def test_retracting_carries_the_same_identity_guard_as_the_stamp(
     assert await _stamp_on(fake_redis, USER) == "2026-09-10T10:00:00Z"
 
 
+async def test_retracting_a_proof_dates_the_new_wait_from_the_retraction(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The wait a retraction opens began at the retraction, not when the container was born:
+    the pane counts from this field, and a container hours old would otherwise open its restart
+    on "taking longer than usual".
+
+    Mutation-check: drop the `waiting_since` pair from the `HSET` in `_CAS_CLEAR_SERVING_LUA`
+    and the birth instant survives."""
+    born = "2026-09-10T09:00:00+00:00"
+    await _a_registered_container(fake_redis, USER, serving_since="2026-09-10T09:01:00+00:00")
+    await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_WAITING_SINCE, born)
+
+    assert await locks.clear_serving(fake_redis, USER, app_name=SBX) is True
+
+    reg = await locks.read_registry(fake_redis, USER)
+    restarted = locks.an_instant_on_the_hash(reg, REGISTRY_FIELD_WAITING_SINCE)
+    assert restarted is not None
+    assert (datetime.now(UTC) - restarted).total_seconds() < 5
+
+
+async def test_a_refused_retraction_leaves_the_wait_where_it_began(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Nothing was retracted, so no new wait began: a container still waiting for its first page
+    keeps counting from its birth, and a successor's wait is not this observer's to restart."""
+    born = "2026-09-10T09:00:00+00:00"
+    await _a_registered_container(fake_redis, USER)
+    await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_WAITING_SINCE, born)
+
+    assert await locks.clear_serving(fake_redis, USER, app_name=SBX) is False
+    assert await locks.clear_serving(fake_redis, USER, app_name=a_sandbox_name("other")) is False
+
+    assert await fake_redis.hget(registry_key(USER), REGISTRY_FIELD_WAITING_SINCE) == born
+
+
 async def test_retracting_still_works_on_a_container_already_marked_ending(
     fake_redis: aioredis.Redis,
 ) -> None:
@@ -406,6 +454,147 @@ async def test_an_app_that_comes_back_can_be_proven_again(fake_redis: aioredis.R
     assert await _stamp_on(fake_redis, USER) == recovered.isoformat()
 
 
+async def _a_start_ninety_seconds_old(redis: aioredis.Redis, user: uuid.UUID) -> None:
+    await locks.write_starting_marker(redis, user, PROJECT)
+    await redis.expire(starting_key(user), STARTING_MARKER_TTL_SECONDS - 90)
+
+
+async def _wait_on(redis: aioredis.Redis, user: uuid.UUID) -> datetime | None:
+    return locks.an_instant_on_the_hash(
+        await locks.read_registry(redis, user), REGISTRY_FIELD_WAITING_SINCE
+    )
+
+
+async def test_a_start_dates_the_wait_of_the_container_it_brought_up_from_its_own_beginning(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Mutation-check: date the hash from `datetime.now(UTC)` instead of the marker, and the
+    span below collapses to zero."""
+    await _a_registered_container(fake_redis, USER)
+    await fake_redis.hset(
+        registry_key(USER), REGISTRY_FIELD_WAITING_SINCE, datetime.now(UTC).isoformat()
+    )
+    await _a_start_ninety_seconds_old(fake_redis, USER)
+
+    assert await locks.date_the_wait_from_the_start(fake_redis, USER, app_name=SBX) is True
+
+    began = await _wait_on(fake_redis, USER)
+    assert began is not None
+    assert 85 < (datetime.now(UTC) - began).total_seconds() < 95
+
+
+@pytest.mark.parametrize(
+    ("app_name", "serving_since"),
+    [
+        (SBX, "2026-09-10T09:41:04+00:00"),  # proven: nothing is waiting
+        (a_sandbox_name("successor"), ""),  # the slot moved on to another container
+    ],
+)
+async def test_a_start_leaves_alone_a_container_that_is_not_waiting_or_not_its_own(
+    fake_redis: aioredis.Redis, app_name: str, serving_since: str
+) -> None:
+    born = "2026-09-10T09:00:00+00:00"
+    await _a_registered_container(fake_redis, USER, app_name=app_name, serving_since=serving_since)
+    await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_WAITING_SINCE, born)
+    await _a_start_ninety_seconds_old(fake_redis, USER)
+
+    assert await locks.date_the_wait_from_the_start(fake_redis, USER, app_name=SBX) is False
+    assert await fake_redis.hget(registry_key(USER), REGISTRY_FIELD_WAITING_SINCE) == born
+
+
+async def test_a_pre_cutover_hash_or_no_hash_at_all_is_never_dated(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """An absent `serving_since` is read as proven, and a write here must never conjure a record
+    for a user with no sandbox."""
+    await _a_start_ninety_seconds_old(fake_redis, USER)
+    assert await locks.date_the_wait_from_the_start(fake_redis, USER, app_name=SBX) is False
+    assert await locks.read_registry(fake_redis, USER) is None
+
+    await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_APP_NAME, SBX)
+    assert await locks.date_the_wait_from_the_start(fake_redis, USER, app_name=SBX) is False
+    assert await fake_redis.hexists(registry_key(USER), REGISTRY_FIELD_WAITING_SINCE) == 0
+
+
+async def test_with_no_start_in_flight_nothing_is_dated(fake_redis: aioredis.Redis) -> None:
+    born = "2026-09-10T09:00:00+00:00"
+    await _a_registered_container(fake_redis, USER)
+    await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_WAITING_SINCE, born)
+
+    assert await locks.date_the_wait_from_the_start(fake_redis, USER, app_name=SBX) is False
+    assert await fake_redis.hget(registry_key(USER), REGISTRY_FIELD_WAITING_SINCE) == born
+
+
+# --- the one recorder every observer shares ------------------------------------------------
+
+
+async def test_the_first_sighting_is_recorded_once_and_every_later_one_is_silent(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """First serve wins, so the first observer's line is the record. A later sighting of the same
+    container, by another observer or after the reaper has marked it `ending`, finds the proof
+    already standing and has nothing to add, least of all an alarm.
+
+    Mutation-check: drop the second-sighting return and this goes red on the refusals."""
+    await _a_registered_container(fake_redis, USER)
+    await fake_redis.hset(
+        registry_key(USER), REGISTRY_FIELD_CREATED_AT, "2026-09-10T09:40:56+00:00"
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        await locks.record_the_first_serve(
+            fake_redis, USER, app_name=SBX, observer="relaunch", cold=True
+        )
+        await locks.record_the_first_serve(
+            fake_redis, USER, app_name=SBX, observer="turn_watcher", cold=False
+        )
+        await locks.mark_registry_ending(fake_redis, USER)
+        await locks.record_the_first_serve(
+            fake_redis, USER, app_name=SBX, observer="reconciler", cold=None
+        )
+
+    served = [e for e in logs if e.get("event") == APP_FIRST_SERVED_EVENT]
+    assert len(served) == 1, "`app_first_served` means FIRST"
+    assert served[0]["observer"] == "relaunch"
+    assert served[0]["cold"] is True
+    assert isinstance(served[0]["ms_since_container_created"], int)
+    assert [e for e in logs if e.get("event") == SERVING_PROOF_STAMP_REFUSED] == []
+
+
+@pytest.mark.parametrize(
+    ("occupant", "state", "found_app_present"),
+    [
+        pytest.param(None, REGISTRY_STATE_READY, False, id="the-hash-is-gone"),
+        pytest.param(SBX, REGISTRY_STATE_ENDING, True, id="torn-down-before-a-proof-landed"),
+        pytest.param(
+            a_sandbox_name("successor"), REGISTRY_STATE_READY, True, id="another-container"
+        ),
+    ],
+)
+async def test_a_stamp_the_hash_refuses_is_the_alarm_whichever_observer_saw_it(
+    fake_redis: aioredis.Redis, occupant: str | None, state: str, found_app_present: bool
+) -> None:
+    """★ ONE RULE FOR EVERY OBSERVER. The middle case is the one the copies disagreed on: a
+    container marked `ending` before any proof landed is about to be torn down unproven, and its
+    `serving_proof_absent_at_teardown` needs this line beside it to say the app did serve.
+
+    Mutation-check: count a hash that still names this app as a second sighting whatever its
+    proof says, and the middle case goes red."""
+    if occupant is not None:
+        await _a_registered_container(fake_redis, USER, app_name=occupant, state=state)
+
+    with structlog.testing.capture_logs() as logs:
+        await locks.record_the_first_serve(
+            fake_redis, USER, app_name=SBX, observer="turn_watcher", cold=False
+        )
+
+    refusals = [e for e in logs if e.get("event") == SERVING_PROOF_STAMP_REFUSED]
+    assert len(refusals) == 1, "the near-miss went unrecorded"
+    assert refusals[0]["found_app_present"] is found_app_present
+    assert refusals[0]["observer"] == "turn_watcher"
+    assert [e for e in logs if e.get("event") == APP_FIRST_SERVED_EVENT] == []
+
+
 def test_neither_serving_script_names_a_registry_field_by_hand() -> None:
     """Both scripts are BUILT from the `REGISTRY_FIELD_*` constants at module scope, so renaming
     a field cannot leave a Lua string pointing at the old spelling — a drift that fails SILENTLY,
@@ -423,7 +612,7 @@ def test_neither_serving_script_names_a_registry_field_by_hand() -> None:
     import inspect
 
     tree = ast.parse(inspect.getsource(locks))
-    scripts = {"_CAS_MARK_SERVING_LUA", "_CAS_CLEAR_SERVING_LUA"}
+    scripts = {"_CAS_MARK_SERVING_LUA", "_CAS_CLEAR_SERVING_LUA", "_CAS_DATE_THE_WAIT_LUA"}
     literals: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.AnnAssign | ast.Assign):
@@ -446,6 +635,7 @@ def test_neither_serving_script_names_a_registry_field_by_hand() -> None:
             REGISTRY_FIELD_APP_NAME,
             REGISTRY_FIELD_STATE,
             REGISTRY_FIELD_SERVING_SINCE,
+            REGISTRY_FIELD_WAITING_SINCE,
         )
         if field in text
     ]
@@ -515,26 +705,62 @@ async def test_an_abandoned_marker_expires_on_its_own(fake_redis: aioredis.Redis
     assert await locks.read_starting_marker(fake_redis, USER) is None
 
 
-async def test_the_pipelined_read_returns_both_the_registry_and_the_marker_in_one_round_trip(
+async def test_the_pipelined_read_returns_the_registry_the_marker_and_the_clock_in_one_trip(
     fake_redis: aioredis.Redis,
 ) -> None:
-    """The exact pairing `project_preview_state` spends its one Redis round trip on: two
-    commands, not two round trips."""
+    """The exact reading `project_preview_state` spends its one Redis round trip on: four
+    commands, not four round trips."""
     await fake_redis.hset(registry_key(USER), mapping={REGISTRY_FIELD_APP_NAME: "sbx-x"})
     await locks.write_starting_marker(fake_redis, USER, PROJECT)
 
-    reg, starting = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    reg, starting, began_at, _ = await locks.read_registry_and_starting_marker(fake_redis, USER)
 
     assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == "sbx-x"
     assert starting == PROJECT
+    assert began_at is not None
+    # Written a moment ago, so its full TTL is still ahead of it and the derived instant is now.
+    assert abs((datetime.now(UTC) - began_at).total_seconds()) < 5
+
+
+async def test_the_marker_clock_reads_the_wait_a_reload_would_have_forgotten(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """THE DEFECT THIS FIELD EXISTS FOR. The pane used to count from its own mount, so a reload
+    two minutes into a start reported one second. The marker is written once per start and
+    never renewed, so what is left of its TTL is the wait — and it is the same answer however
+    many times the page has been reloaded on top of it.
+
+    Ninety seconds spent is simulated by shortening the key's expiry, which is what a TTL
+    decaying looks like from a reader's side."""
+    await locks.write_starting_marker(fake_redis, USER, PROJECT)
+    await fake_redis.expire(starting_key(USER), STARTING_MARKER_TTL_SECONDS - 90)
+
+    _, _, began_at, _ = await locks.read_registry_and_starting_marker(fake_redis, USER)
+
+    assert began_at is not None
+    assert 85 < (datetime.now(UTC) - began_at).total_seconds() < 95
+
+
+async def test_the_marker_clock_says_nothing_when_there_is_no_marker(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """`PTTL` answers -2 for a key that is not there and -1 for one with no expiry. Neither is
+    an instant, and inventing one would date a wait that is not happening."""
+    await fake_redis.set(starting_key(USER), str(PROJECT))  # no expiry: PTTL answers -1
+
+    _, starting, began_at, _ = await locks.read_registry_and_starting_marker(fake_redis, USER)
+
+    assert starting == PROJECT  # the marker is still a claim...
+    assert began_at is None  # ...it just cannot date itself
 
 
 async def test_the_pipelined_read_answers_both_absent_with_no_registry_or_marker(
     fake_redis: aioredis.Redis,
 ) -> None:
-    reg, starting = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    reg, starting, began_at, _ = await locks.read_registry_and_starting_marker(fake_redis, USER)
     assert reg is None
     assert starting is None
+    assert began_at is None
 
 
 async def test_the_pipelined_read_still_migrates_a_legacy_registry_record(
@@ -546,10 +772,40 @@ async def test_the_pipelined_read_still_migrates_a_legacy_registry_record(
 
     await fake_redis.hset(legacy_registry_key(USER), mapping={REGISTRY_FIELD_APP_NAME: "sbx-x"})
 
-    reg, starting = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    reg, starting, _, _ = await locks.read_registry_and_starting_marker(fake_redis, USER)
 
     assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == "sbx-x"
     assert starting is None
+
+
+async def test_a_start_failure_lives_as_long_as_a_marker_and_reads_back_in_the_pipeline(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Mutation-check: write it with no expiry and the TTL assertion goes red."""
+    failed = locks.FailedStart(PROJECT, locks.StartFailure.NO_SAVED_BUILD)
+
+    await locks.write_start_failure(fake_redis, USER, failed)
+
+    *_, read_back = await locks.read_registry_and_starting_marker(fake_redis, USER)
+    assert read_back == failed
+    assert 0 < await fake_redis.ttl(start_failure_key(USER)) <= STARTING_MARKER_TTL_SECONDS
+
+
+@pytest.mark.parametrize(
+    "unreadable",
+    ["not json", "[]", '{"project_id": "nope", "failure": "sandbox_unavailable"}', '{"x": 1}'],
+)
+async def test_an_unreadable_start_failure_reads_as_absent(
+    fake_redis: aioredis.Redis, unreadable: str
+) -> None:
+    """A value nobody can read says nothing, and the poll still answers.
+
+    Mutation-check: drop the `except` from `_parse_start_failure` and every case goes red."""
+    await fake_redis.set(start_failure_key(USER), unreadable)
+
+    *_, read_back = await locks.read_registry_and_starting_marker(fake_redis, USER)
+
+    assert read_back is None
 
 
 class _BoomPipeline:
@@ -564,6 +820,9 @@ class _BoomPipeline:
     def get(self, *_args: object, **_kwargs: object) -> _BoomPipeline:
         return self
 
+    def pttl(self, *_args: object, **_kwargs: object) -> _BoomPipeline:
+        return self
+
     async def execute(self) -> object:
         raise RedisError("redis is down")
 
@@ -573,7 +832,7 @@ async def test_the_pipelined_read_surfaces_redis_errors_bare(
 ) -> None:
     """BARE, per the module's REDIS-ERROR POLICY: a `RedisError` from `pipe.execute()`
     propagates exactly as a bare `hgetall` would have, so `project_preview_state`'s existing
-    `except RedisError` (answering `unknown`) keeps working unchanged."""
+    `except RedisError` keeps working unchanged."""
     monkeypatch.setattr(fake_redis, "pipeline", lambda *a, **k: _BoomPipeline())
     with pytest.raises(RedisError):
         await locks.read_registry_and_starting_marker(fake_redis, USER)

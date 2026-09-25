@@ -13,8 +13,8 @@
  * chat are NOT part of it, and this host adds no `key`. THE FAILURE this guards against: buying
  * continuity by weakening that identity, most obviously by never unmounting at all, which leaves
  * a frame pointing at a gone container, undetectably. Continuity comes from WHERE THE ELEMENT
- * LIVES, not from what identifies it — so the two legitimate re-frames stay exactly as they are:
- * a turn ending over a live preview, and the manual Reload control. A different project is a
+ * LIVES, not from what identifies it — so the legitimate re-frames stay exactly as they are: the
+ * app starting to answer at its URL, and the citizen's Reload. A different project is a
  * different app, so a different address, so a legitimate remount; an UNRESOLVED project is not a
  * different project.
  *
@@ -26,7 +26,6 @@
  * ADDRESS: the host frames what already exists and never starts a sandbox, so a mounted-but-
  * hidden pane on the project screen costs nothing.
  */
-import { useRef } from 'react'
 import LivePreview from '../LivePreview'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 import type { DeviceName } from './devices'
@@ -49,45 +48,10 @@ export default function AppPaneHost({ device, reloadNonce, leaving }: AppPaneHos
   const pane = useWorkspacePane()
   const visible = useWorkspacePaneVisible()
 
-  // ONE PANE FIELD IS FRAME IDENTITY RATHER THAN CHROME, AND THAT IS WHY IT IS HELD HERE.
-  //
-  // The pane view is cleared when its publisher unmounts, which is right for everything else on it:
-  // a departed conversation's toolbar and handlers are not this pane's business. This one is not
-  // chrome — left to fall back to `LivePreview`'s prop default, it disturbs the very frame this
-  // host exists to keep alive:
-  //
-  //   iterating      `LivePreview` turns a true→false edge into a reload nonce — its "a turn just
-  //                  ended over a live preview, re-request the document" signal. Defaulting it
-  //                  FABRICATES that edge, so leaving a build chat WHILE A BUILD IS RUNNING reloads
-  //                  the app: silently, and semantically wrongly, because the turn had not ended.
-  //
-  // IT USED TO BE TWO, AND THE SECOND ONE IS NOW SOMEBODY ELSE'S PROBLEM. `completedLive` — the
-  // pardon, "this container is alive under an idle lease" — was the field that made
-  // `keepFramed` outrank a terminal status, so defaulting it to `false` on a leave collapsed
-  // `frameContext` and UNMOUNTED the iframe: leaving a build chat right after the build succeeded,
-  // which is the most common moment to leave one, destroyed an app the server was still serving.
-  //
-  // The comment that stood here proposed the fix, and the fix landed: liveness is a fact about
-  // WHAT IS FRAMED, not about the conversation's chrome, so it moved onto the ADDRESS as
-  // `serving`. The address cell is KEPT across an unmount by the channel's own rules, so the
-  // hazard is structural rather than guarded — there is no held ref to forget to update, and no
-  // second copy of the value to go stale. The hold below is what remains, and it is genuinely
-  // chat-scoped.
-  //
-  // Every other pane field that reaches the frame chain — `reconnecting`, `previewState`,
-  // `compileState` — defaults to the permissive value, so losing it cannot unmount anything.
-  // (`relaunching` was another such field and the one genuine counter-example: it defaulted
-  // permissively too, but only because it was never read. It is gone with the rest of the
-  // relaunch chain.) Adding a restrictive-by-default field to `PaneView` means adding it here
-  // too — or, better, asking first whether it describes the ADDRESS rather than the conversation.
-  //
-  // Holding the last published value keeps the leave side inert. The RETURN side still re-frames
-  // where it should, and that is correct and unchanged: a remounted surface publishes its own pane
-  // view on its first commit, which replaces the held value before it can be read again.
-  const lastIterating = useRef(false)
-  if (pane) {
-    lastIterating.current = pane.iterating
-  }
+  // EVERY PANE FIELD THAT REACHES THE FRAME CHAIN DEFAULTS PERMISSIVELY. The pane view is cleared
+  // when its publisher unmounts, and the spread below then falls back to `LivePreview`'s own
+  // defaults. A field whose default would unmount or reload the frame has to be held across that
+  // unmount here — or, better, belongs on the ADDRESS, which the channel keeps.
 
   // NOTHING TO HOST AT ALL. Not the same as "hidden": there is no address and no surface asking
   // for a pane, so there is no element to keep alive and none to hide. This is the project screen
@@ -155,9 +119,6 @@ export default function AppPaneHost({ device, reloadNonce, leaving }: AppPaneHos
         // surface that published them, together, which is what "the pane is rendered by the address"
         // has to mean if it is to survive a leave.
         serving={address.serving}
-        // AFTER the spread, deliberately: this one must not be allowed to fall back to the
-        // component default when the publisher is gone. See the hold above for what it breaks.
-        iterating={pane ? pane.iterating : lastIterating.current}
         device={device}
         reloadNonce={reloadNonce}
       />

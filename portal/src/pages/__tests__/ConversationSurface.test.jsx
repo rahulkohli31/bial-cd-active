@@ -14,7 +14,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(), relaunchPreview: vi.fn(),
+  relaunchPreview: vi.fn(),
   fetchSaveState: vi.fn(), fetchPreviewState: vi.fn(), saveProject: vi.fn(),
   discardUnsavedChanges: vi.fn(),
 }))
@@ -42,9 +42,9 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
 vi.mock('../../utils/buildSessionApi', async (orig) => ({
   ...(await orig()),
   fetchSaveState: (...a) => h.fetchSaveState(...a),
-  // The workspace read, and the start `StartAppControl` imports DIRECTLY from this module rather
-  // than through the injected client — both are what the failed-launch scenario at the bottom
-  // drives, and leaving either real would put this suite on the network.
+  // The workspace read, and the start `StartAppControl` imports from this module — both are what
+  // the failed-launch scenario at the bottom drives, and leaving either real would put this suite
+  // on the network.
   fetchPreviewState: (...a) => h.fetchPreviewState(...a),
   relaunchPreview: (...a) => h.relaunchPreview(...a),
   // The WRITER of the bundle. It is the subject of the deployment-nudge scenario at the
@@ -54,22 +54,16 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
 }))
 
 import {
-  FakeEventSource, makeClient, primeClient, primeTurn, renderBuilder, send, waitForGateOpen,
+  primeTurn, renderBuilder, send, waitForGateOpen,
   planReply, turnStreaming, PLAN_CARD_ID, findStartAppControl,
 } from './_builderSession.jsx'
 import { ApiError } from '../../utils/apiError'
 import { discardNoticeText } from '../../utils/conversationApi'
 import { DEFAULT_CONTEXT_SOFT } from '../../utils/contextLimits'
 
-const deps = () => {
-  const fake = new FakeEventSource('x')
-  return { fake, deps: { client: makeClient(h), eventSourceFactory: () => fake } }
-}
-
 beforeEach(() => {
   vi.clearAllMocks()
   sessionStorage.clear()
-  primeClient(h)
   primeTurn(h)
   h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'build', messages: [] })
   h.loadBuilds.mockResolvedValue([])
@@ -77,13 +71,10 @@ beforeEach(() => {
   h.buildUserParts.mockImplementation(async (t) => [{ type: 'text', text: t }])
   h.fetchSaveState.mockResolvedValue({ dirty: false })
   h.saveProject.mockResolvedValue({ appId: 'a1', headSha: 'ccc' })
-  // Neither the workspace read nor the start is this file's subject by default: answered so
-  // nothing reaches a real `fetch`, and re-primed by the two scenarios that are about them.
-  h.fetchPreviewState.mockResolvedValue({
-    state: 'unknown', alive: false, previewUrl: null,
-    occupyingProjectName: null, occupyingProjectId: null, restorable: null,
-  })
-  h.relaunchPreview.mockResolvedValue({ appId: 'a1', previewUrl: 'https://app/', status: 'ready', ready: true, restoredFromFailedBuild: false })
+  // Neither the workspace read nor the start is this file's subject by default: a read that
+  // decides nothing, so nothing reaches a real `fetch`, re-primed by the two scenarios about it.
+  h.fetchPreviewState.mockRejectedValue(new Error('the read is not this file\'s subject'))
+  h.relaunchPreview.mockResolvedValue(undefined)
 })
 afterEach(cleanup)
 
@@ -93,12 +84,12 @@ describe('a running turn is STILL stoppable now the card is gone', () => {
     // stop shipped before anything was removed.
     // THE SNAPSHOT IS WHAT CARRIES THE TURN ID, and every subscribe gets one first on cursor 0
     // (the server emits it before any model byte). Without it the control resolves no target and
-    // correctly falls through to the legacy session stop — a real arm, but not the one under test.
+    // the press stops nothing.
     h.readTurnStream.mockImplementation(async ({ onFrame }) => {
       onFrame({ type: 'snapshot', seq: 1, turnId: 'turn-7', turnStatus: 'running', items: [], parts: [], working: false })
       return new Promise(() => {}) // …and then the turn never lands
     })
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await send('build me a thing')
 
     const stop = await screen.findByTestId('stop-turn')
@@ -114,7 +105,7 @@ describe('a running turn is STILL stoppable now the card is gone', () => {
 
   it('and nothing on the surface is a build-progress card any more', async () => {
     h.readTurnStream.mockImplementation(() => new Promise(() => {}))
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await send('build me a thing')
     await screen.findByTestId('stop-turn')
 
@@ -132,7 +123,7 @@ describe('exactly one control initiates a build', () => {
     // to be there does not.
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Here is the plan.', PLAN_CARD_ID)))
     return (async () => {
-      renderBuilder({ deps: deps().deps })
+      renderBuilder()
       await send('plan me a thing')
 
       const initiators = await screen.findAllByRole('button', { name: /^Build this plan$/ })
@@ -145,7 +136,7 @@ describe('exactly one control initiates a build', () => {
 
 describe('one scroll container, and no viewport-height assertions', () => {
   it('exactly one `overflow-y-auto` inside the chat slot', async () => {
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await waitForGateOpen()
 
     const panel = screen.getByTestId('chat-panel')
@@ -180,7 +171,7 @@ describe('no chat list came back while the pages were being rewritten', () => {
       { id: 'other-1', kind: 'build', title: 'Another build', updatedAt: '2026-08-01T00:00:00Z' },
       { id: 'other-2', kind: 'plan', title: 'Some planning', updatedAt: '2026-08-02T00:00:00Z' },
     ])
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await waitForGateOpen()
 
     const panel = within(screen.getByTestId('chat-panel'))
@@ -226,7 +217,7 @@ describe('the per-conversation guardrail reaches the composer', () => {
     // The default soft threshold, as the profile-less session resolves it.
     h.getBuild.mockResolvedValue(conversationOf(DEFAULT_CONTEXT_SOFT))
     h.readTurnStream.mockImplementation(() => new Promise(() => {}))
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
 
     const warning = await screen.findByTestId('composer-context-warning')
     expect(warning.textContent).toMatch(/new chat/i)
@@ -235,7 +226,7 @@ describe('the per-conversation guardrail reaches the composer', () => {
   it('and an ordinary conversation says nothing', async () => {
     h.getBuild.mockResolvedValue(conversationOf(1_000))
     h.readTurnStream.mockImplementation(() => new Promise(() => {}))
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
 
     // PAIRED WITH A LIVENESS ASSERTION. `queryByTestId(...) === null` is also what a surface
     // that threw would produce, and this repo has been bitten by exactly that: the absence only
@@ -251,7 +242,7 @@ describe('the per-conversation guardrail reaches the composer', () => {
     // that "silent" is a decision on this branch and not an accident of the fixture above.
     h.getBuild.mockResolvedValue(conversationOf(null))
     h.readTurnStream.mockImplementation(() => new Promise(() => {}))
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
 
     await waitForGateOpen()
     expect(screen.getByTestId('composer-input')).toBeTruthy()
@@ -272,7 +263,7 @@ describe('the offer\'s Build opens no question either', () => {
         details: { projectId: 'pA', projectName: 'Car pool', dirty: false, building: false, isSharedView: true },
       }),
     )
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await send('plan me a thing')
 
     fireEvent.click(await screen.findByRole('button', { name: /^Build this plan$/ }))
@@ -292,12 +283,12 @@ describe('a failed launch INSIDE a chat says why', () => {
     // here would silently swallow the pane's own failure and show only a stopped spinner.
     h.fetchPreviewState.mockResolvedValue({
       state: 'asleep', alive: false, previewUrl: null,
-      occupyingProjectName: null, occupyingProjectId: null, restorable: true,
+      restorable: true,
     })
     h.relaunchPreview.mockRejectedValue(
       new ApiError('Your app could not be brought back just now.', 503),
     )
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
 
     fireEvent.click(await findStartAppControl())
 
@@ -350,7 +341,7 @@ describe('★ a Save from the chat raises the deployment nudge', () => {
   it('names the project it saved, and the save itself goes through', async () => {
     // Dirty, or the toolbar's Save is a chip rather than a button and the press does nothing.
     h.fetchSaveState.mockResolvedValue({ dirty: true })
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
 
     fireEvent.click(await screen.findByTestId('save-project'))
 
@@ -373,7 +364,7 @@ describe('★ a Save from the chat raises the deployment nudge', () => {
     // Mutation check: point the catch arm back at the inline slot and the banner never appears.
     h.fetchSaveState.mockResolvedValue({ dirty: true })
     h.saveProject.mockRejectedValue(new Error('Your workspace is no longer running.'))
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
 
     fireEvent.click(await screen.findByTestId('save-project'))
 
@@ -384,7 +375,7 @@ describe('★ a Save from the chat raises the deployment nudge', () => {
   it('falls back to a plain sentence when the failure carries none', async () => {
     h.fetchSaveState.mockResolvedValue({ dirty: true })
     h.saveProject.mockRejectedValue('nope')
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
 
     fireEvent.click(await screen.findByTestId('save-project'))
 
@@ -404,7 +395,7 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
   it('a read already on the wire when Save is pressed does not light Save again', async () => {
     // Mutation check: drop the sequence bump from `handleSave` and the late read relights Save.
     h.fetchSaveState.mockResolvedValue({ dirty: true })
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await screen.findByTestId('save-project')
 
     let answerLate = null
@@ -426,16 +417,16 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
     // Mutation check: remove the re-read on arrival and only the mount read ever happens.
     h.fetchPreviewState.mockResolvedValue({
       state: 'asleep', alive: false, previewUrl: null,
-      occupyingProjectName: null, occupyingProjectId: null, restorable: true,
+      restorable: true,
     })
     h.fetchSaveState.mockResolvedValue({ dirty: null })
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     const launch = await findStartAppControl()
     await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalledTimes(1))
 
     h.fetchPreviewState.mockResolvedValue({
       state: 'alive', alive: true, previewUrl: 'https://app/',
-      occupyingProjectName: null, occupyingProjectId: null, restorable: null,
+      restorable: null,
     })
     h.fetchSaveState.mockResolvedValue({ dirty: true })
     fireEvent.click(launch)
@@ -452,7 +443,7 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
       saveState: { appId: 'a1', dirty: false, containerHead: SAVED, savedHead: SAVED },
       notice: { seq: 9, savedAt: '2026-09-13T14:32:00Z' },
     })
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await send('add a date filter')
 
     const control = await screen.findByTestId('discard-changes')
@@ -475,7 +466,7 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
       saveState: { appId: 'a1', dirty: false, containerHead: SAVED, savedHead: SAVED },
       notice: null,
     })
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await screen.findByText(/Tell me what you'd like to build/i)
 
     const control = await screen.findByTestId('discard-changes')
@@ -492,7 +483,7 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
     // Mutation check: publish `replying: false` from this page and the control stays pressable.
     h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
     h.readTurnStream.mockImplementation(() => new Promise(() => {}))
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
     await send('add a date filter')
 
     const control = await screen.findByTestId('discard-changes')
@@ -504,10 +495,10 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
     // Mutation check: let the first preview answer re-read too and every page load asks twice.
     h.fetchPreviewState.mockResolvedValue({
       state: 'alive', alive: true, previewUrl: 'https://app/',
-      occupyingProjectName: null, occupyingProjectId: null, restorable: null,
+      restorable: null,
     })
     h.fetchSaveState.mockResolvedValue({ dirty: true })
-    renderBuilder({ deps: deps().deps })
+    renderBuilder()
 
     // Liveness: the running answer has landed and framed the app, so the count below is final.
     await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull())

@@ -55,11 +55,6 @@ export interface ProjectWorkspaceProps {
 
 export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   const { project } = props
-  // THE URL A START JUST PRODUCED, fed into the resolver's RELAUNCHED arm — the one arm that needs
-  // no session and no chat, and which resolves its own status to `ready` because a restore has no
-  // build lifecycle. Without it the pane waits for the next poll tick to frame an app the citizen
-  // just pressed a button to bring up, which reads as the press having done nothing.
-  const [startedPreviewUrl, setStartedPreviewUrl] = useState<string | null>(null)
   // THE SETTINGS DIALOG'S STATE IS HERE BECAUSE ITS DATA IS. The control is in the shell's
   // toolbar row, which sits above the Outlet and has no project object; this surface has both
   // the project and the update callback, so the row publishes a press upward and the editing
@@ -92,10 +87,6 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     turnPreviewUrl: null,
     turnStatus: null,
     narratingChatIsOpenChat: false,
-    relaunchedUrl: startedPreviewUrl,
-    sessionUrl: null,
-    sessionStatus: null,
-    sessionId: null,
     projectPreviewUrl: workspace.preview?.state === 'alive' ? workspace.preview.previewUrl : null,
     // …AND IT IS ALSO THIS SCREEN'S WHOLE ANSWER ON LIVENESS. A non-null value here is the read
     // saying `alive`, which is what the resolver builds `serving` from — so the pardon that used to
@@ -105,9 +96,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     // project this surface is showing. It is passed rather than assumed because the resolver's own
     // note says an arm must carry its predicate INTO the module — a gate that depends on where it
     // was declared is one reorder away from silently opening.
-    sessionBelongsToOpenProject: true,
-    // NO SESSION ON THIS SURFACE AT ALL, so there is no session end to have been a success.
-    sessionEndedCompleted: false,
+    belongsToOpenProject: true,
     transcriptHasBuildOutcome: false,
   })
 
@@ -194,14 +183,16 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   const sinks: StartSinks = useMemo(
     () => ({
       projectId: project.id,
-      onStarted: setStartedPreviewUrl,
       onStartPending: workspace.reportStartPending,
       onStartOutcome: (outcome: StartOutcome | null) => {
         workspace.reportStartOutcome(outcome)
-        // A start that reached the app clears the outcome AND asks again immediately, so the pane
-        // arrives at the running app on the press rather than on the next tick of a 45-second timer.
+        // A cleared outcome asks again at once: a retry, or a refusal with no words, is answered by
+        // the reading rather than by the press.
         if (outcome === null) workspace.refresh()
       },
+      // Asks again at once as well: the server's `starting` is waiting on the next read, and that
+      // read is what turns the poll up to the fast cadence that catches the app arriving.
+      onStartAdmitted: workspace.reportStartAdmitted,
     }),
     [workspace, project.id],
   )
@@ -232,13 +223,18 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   //
   // ONCE PER PROJECT, guarded by a ref: the reading stays `not-running` until the server's own
   // `starting` lands, so without this the poll would fire a second start on its next tick.
+  //
+  // NEVER OVER A START THAT FAILED. The ref resets on every remount, so each crossing back to this
+  // screen would re-run a start that fails the same way. The reading says why, and Launch retries.
   const autoStarted = useRef<string | null>(null)
+  const startFailed = workspace.preview?.startFailure != null
   useEffect(() => {
     if (workspace.state.name !== 'not-running') return
     if (autoStarted.current === project.id) return
     autoStarted.current = project.id
+    if (startFailed) return
     void start()
-  }, [workspace.state.name, project.id, start])
+  }, [workspace.state.name, startFailed, project.id, start])
 
   const paneView = useMemo(
     () => ({
@@ -258,7 +254,6 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       // of asserting it. Nothing is lost on the framing side: `previewAddress.ts` already resolves
       // this screen's status to `ready`, which is not terminal, so there is nothing for a pardon to
       // outrank here in the first place.
-      iterating: false,
       reconnecting: false,
       turnRunning: false,
       previewState: workspace.preview?.state ?? null,

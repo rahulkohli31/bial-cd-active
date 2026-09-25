@@ -28,7 +28,7 @@ def building(
 
     Hand-built rather than started for real: what these tests exercise is the ROUTE's refusal,
     and a real start would drag in Redis, a sandbox, and a brain to prove a lookup. The session
-    is PROVISIONING with no `turn_finish`, which is what "genuinely working" looks like to
+    has no `turn_finish`, which is what "genuinely working" looks like to
     `is_letting_go_of_the_workspace` — an ended session is waited for, not refused."""
     manager = SessionManager()
     app.dependency_overrides[session_manager_dependency] = lambda: manager
@@ -40,7 +40,6 @@ def building(
             user_id=user_id,
             project_id=uuid.uuid4(),
             app_id=uuid.uuid4(),
-            prompt="build it",
             lock_token="tok",
             handle=SandboxHandle(
                 fqdn="x.example",

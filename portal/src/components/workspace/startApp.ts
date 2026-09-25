@@ -10,10 +10,10 @@
  * must never differ between them.
  *
  * NONE OF THE THREE CAN SEE THE OTHERS, and all three report into one busy flag and one outcome
- * slot. A restore blocks for up to two minutes, which is exactly long enough for a citizen to type
- * a message over one already running — so `useStartApp` makes the second trigger JOIN the first
- * rather than fire a second request whose `finally` clears the first's busy state and whose answer
- * lands on top of it.
+ * slot. The server answers once the start is ADMITTED and brings the app up afterwards, but
+ * admission itself can wait — on a turn still letting go of the workspace, or on another start
+ * holding it — so `useStartApp` makes the second trigger JOIN the first rather than fire a second
+ * request whose `finally` clears the first's busy state and whose answer lands on top of it.
  */
 import { useRef, useState } from 'react'
 import { ApiError } from '../../utils/apiError'
@@ -31,7 +31,7 @@ export const BUILD_ALREADY_RUNNING = 'A build is already running in this applica
  */
 export type StartSinks = Pick<
   WorkspaceReport,
-  'projectId' | 'onStarted' | 'onStartPending' | 'onStartOutcome'
+  'projectId' | 'onStartPending' | 'onStartOutcome' | 'onStartAdmitted'
 >
 
 /** What the server itself said, or `null` when it said nothing a person could read. */
@@ -40,14 +40,12 @@ export function serverMessage(err: unknown): string | null {
 }
 
 /**
- * Anything the server named, carried verbatim; anything it did not, called a timeout.
- *
- * A start that does not end in a running app says WHICH WAY it ended: "we waited and nothing came
- * back" is a different sentence from "the server said why".
+ * Anything the server named, carried verbatim; anything it did not, nothing at all — a fetch that
+ * came back with no words is not a fact about the workspace, and the poll says what that is.
  */
-export function outcomeFor(err: unknown): StartOutcome {
+export function outcomeFor(err: unknown): StartOutcome | null {
   const reason = serverMessage(err)
-  return reason === null ? { kind: 'timed-out' } : { kind: 'failed', reason }
+  return reason === null ? null : { kind: 'failed', reason }
 }
 
 /**
@@ -89,18 +87,15 @@ export async function startApp(sinks: StartSinks): Promise<StartResult> {
   // `starting` is the authority and it arrives later; this is what stops the sentence above the
   // pane saying nothing happened for up to forty-five seconds.
   sinks.onStartPending(true)
+  let admitted = false
   try {
-    const res = await relaunchPreview({ projectId })
-    // THE URL FIRST, and before the outcome. It is what the surface frames, and reporting it
-    // second would leave one commit in which the state says "running" and the pane has no address
-    // to show for it. Handed over even when `ready` is false: the container is up and the document
-    // is what has not arrived, so the frame's own load-gated reveal is the right thing to be
-    // waiting on rather than a sentence in front of it.
-    if (res.previewUrl) sinks.onStarted(res.previewUrl)
-    // `ready === false` is "started but not painted yet", NOT "dead" — and an ABSENT `ready` reads
-    // `true` by the wire's recorded contract, which is exactly why liveness can never hang off
-    // this boolean. Safe here only because both sides of the read are non-destructive.
-    sinks.onStartOutcome(res.ready ? null : { kind: 'not-painted' })
+    await relaunchPreview({ projectId })
+    // ADMITTED, NOT UP. The app comes up after this answer, and the poll is its one reader:
+    // `starting` now, `alive` with the address to frame once something has watched it show a
+    // page. The press stays pending: the surface asks again at once and ends it when that read
+    // settles, because cleared here it would land beside the reading from before the press.
+    admitted = true
+    sinks.onStartAdmitted()
     return { kind: 'ok' }
   } catch (err) {
     // NOTHING TO RESTORE IS REPORTED AS NOTHING AT ALL — the snapshot gate's own 404, and
@@ -116,7 +111,44 @@ export async function startApp(sinks: StartSinks): Promise<StartResult> {
     sinks.onStartOutcome(outcomeFor(err))
     return { kind: 'failed', error: err }
   } finally {
-    sinks.onStartPending(false)
+    if (!admitted) sinks.onStartPending(false)
+  }
+}
+
+/**
+ * WHEN AN ADMITTED PRESS ENDS: on the first read BEGUN after the admission, once it settles.
+ *
+ * Only a read begun after the admission can end it — one already in flight carries the reading
+ * from before the press. Answered or failed, that read ends it, so a press lasts no longer than
+ * one read: a read that hangs is overtaken by the poll's next tick, which begins another.
+ */
+export interface PressEnd {
+  /** The server admitted the press. */
+  readonly admitted: () => void
+  /** The press no longer belongs to this surface: its project has left the screen. */
+  readonly drop: () => void
+  /** A read is beginning. Call what this returns when that read's answer, or failure, lands. */
+  readonly readBegins: () => () => void
+}
+
+export function createPressEnd(endPress: () => void): PressEnd {
+  let begun = 0
+  let endsAfterRead: number | null = null
+  return {
+    admitted: () => {
+      endsAfterRead = begun
+    },
+    drop: () => {
+      endsAfterRead = null
+    },
+    readBegins: () => {
+      const read = ++begun
+      return () => {
+        if (endsAfterRead === null || read <= endsAfterRead) return
+        endsAfterRead = null
+        endPress()
+      }
+    },
   }
 }
 
@@ -144,18 +176,18 @@ export function createStarter(current: () => StartSinks): () => Promise<StartRes
     claimedFor = claimingFor
     // OVERTAKEN MEANS SILENT, NOT CANCELLED. The request is made and the server will do what it
     // does; what must not happen is its answer landing on a screen showing something else — a
-    // preview URL, a busy flag or a failure sentence belonging to the project that left.
+    // busy flag or a failure sentence belonging to the project that left.
     const stillOurs = () => mine === generation && claimingFor === current().projectId
     const guarded: StartSinks = {
       projectId: claimingFor,
-      onStarted: (previewUrl) => {
-        if (stillOurs()) current().onStarted(previewUrl)
-      },
       onStartPending: (pending) => {
         if (stillOurs()) current().onStartPending(pending)
       },
       onStartOutcome: (outcome) => {
         if (stillOurs()) current().onStartOutcome(outcome)
+      },
+      onStartAdmitted: () => {
+        if (stillOurs()) current().onStartAdmitted()
       },
     }
     running = startApp(guarded).finally(() => {

@@ -5,9 +5,9 @@
  * the page. The 45-second tick used to self-correct within one cadence; this unit removed that
  * corrective, so the replacement invalidation triggers are asserted here explicitly.
  *
- * The poll stops once the server has said `asleep` / `slot_taken` / `never_built` — a settled
- * fact, so re-asking learns nothing. `unknown` does NOT stop it: it decided nothing, and
- * stopping on it would pin "we could not check" for the life of the tab.
+ * The poll stops once the server has said `asleep` — a settled fact, so re-asking learns
+ * nothing. A read that fails does NOT stop it: it decided nothing, and stopping on it would pin
+ * "we could not check" for the life of the tab.
  *
  * The naive replacement ("re-ask when the user sends a new prompt") is tested BECAUSE IT IS NOT
  * SUFFICIENT: it fires mid-provision, hears `alive=false` truthfully, and stops again,
@@ -24,10 +24,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
 import {
-  FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
+  PREVIEW_URL, renderBuilder,
   waitForGateOpen, composer, T_WORKSPACE, T_PREVIEW,
 } from './_builderSession.jsx'
 import type { PreviewLifeState, PreviewState } from '../../utils/buildSessionApi'
+import type { WorkspaceState } from '../../components/workspace/workspaceState'
 
 /** BuilderPage's own cadence (`PREVIEW_PROBE_MS`), which it does not export. Mirrored, not
  *  imported, so a change to it is a deliberate edit here rather than a silently-passing test. */
@@ -38,7 +39,6 @@ const h = vi.hoisted(() => ({
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(),
   relaunchPreview: vi.fn(),
   fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
 }))
@@ -73,18 +73,24 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
   ...(await orig<typeof import('../../utils/buildSessionApi')>()),
   fetchPreviewState: (...a: unknown[]) => h.fetchPreviewState(...a),
   fetchSaveState: (...a: unknown[]) => h.fetchSaveState(...a),
-  // THE START CONTROL CALLS THE MODULE, NOT THE INJECTED CLIENT. `relaunchPreview`
-  // reached the build-session hook through `deps.client` before, so mocking the client bag was
-  // enough; the one start control the product has now imports the function directly, because it
-  // is rendered by the app pane and the pane is a sibling of the surface that owns the client.
-  // Without this line the relaunch assertions below watch a mock nothing calls.
+  // `StartAppControl` imports `relaunchPreview` directly from this module — it is rendered by
+  // the app pane, a sibling of the surface. Without this line the relaunch assertions below
+  // watch a mock nothing calls.
   relaunchPreview: (...a: unknown[]) => h.relaunchPreview(...a),
 }))
-
-function deps() {
-  const fake = new FakeEventSource('x')
-  return { client: makeClient(h), eventSourceFactory: () => fake }
-}
+/** Every workspace state a reader of the report was handed, in order. */
+const reported = vi.hoisted(() => ({ states: [] as WorkspaceState[] }))
+vi.mock('../../components/workspace/workspaceChannel', async (orig) => {
+  const actual = await orig<typeof import('../../components/workspace/workspaceChannel')>()
+  return {
+    ...actual,
+    useWorkspaceReport: () => {
+      const report = actual.useWorkspaceReport()
+      if (report) reported.states.push(report.state)
+      return report
+    },
+  }
+})
 
 /**
  * Scripts an ordinary send's own turn stream as an OPEN socket a test can push frames into by
@@ -131,8 +137,8 @@ const answer = (state: PreviewLifeState, restorable: boolean | null = null): Pre
   state,
   alive: state === 'alive',
   previewUrl: state === 'alive' ? PREVIEW_URL : null,
-  occupyingProjectName: null,
-  occupyingProjectId: null,
+  startingSince: null,
+  startFailure: null,
   restorable,
 })
 
@@ -166,17 +172,9 @@ const goneCard = () => screen.queryByTestId('app-pane-empty')
  */
 const paneState = () => goneCard()?.getAttribute('data-workspace-state') ?? null
 
-/**
- * `PreviewLifeState` in, `WorkspaceStateName` out — the map's own arms, as this suite reads them.
- *
- * `slot_taken` HAS NO ENTRY BECAUSE IT HAS NO ARM OF ITS OWN: a slot held by another of this
- * citizen's projects resolves against whether anything can be brought back, exactly as `asleep`
- * does. It is a settled reading either way, which is all this suite asks of it.
- */
+/** `PreviewLifeState` in, `WorkspaceStateName` out — the map's own arms, as this suite reads them. */
 const WORKSPACE_STATE_FOR: Record<string, string> = {
   asleep: 'not-running',
-  never_built: 'never-built',
-  unknown: 'could-not-read',
 }
 const framedUrl = () => document.querySelector('iframe')?.getAttribute('src') ?? null
 
@@ -197,7 +195,7 @@ const tick = (cadences = 1) =>
 async function framedBuild(hasSavedBuild: boolean | null = null) {
   const turn = scriptTurn()
   h.readTurnStream.mockImplementation(turn.impl)
-  renderBuilder({ deps: deps(), hasSavedBuild })
+  renderBuilder({ hasSavedBuild })
   await send()
   await waitFor(() => expect(h.readTurnStream).toHaveBeenCalled())
   vi.useFakeTimers()
@@ -209,10 +207,7 @@ async function framedBuild(hasSavedBuild: boolean | null = null) {
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
-  h.relaunchPreview.mockResolvedValue({
-    appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false, ready: true,
-  })
+  h.relaunchPreview.mockResolvedValue(undefined)
   h.newBuild.mockReturnValue('build-Y')
   h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue(null)
@@ -243,23 +238,20 @@ describe('BuilderPage — the preview poll stops on a terminal answer', () => {
     expect(readsSince(settled)).toBe(0)
   })
 
-  it.each<PreviewLifeState>(['slot_taken', 'never_built'])(
-    'stops asking on a settled "%s" too — all three are facts, not faults',
-    async (state) => {
-      h.fetchPreviewState.mockResolvedValue(answer(state, false))
-      await framedBuild()
+  it('stops asking on a settled `asleep` with nothing to restore too — a fact, not a fault', async () => {
+    h.fetchPreviewState.mockResolvedValue(answer('asleep', false))
+    await framedBuild()
 
-      const settled = probeCount()
-      await tick(4)
-      expect(readsSince(settled)).toBe(0)
-    },
-  )
+    const settled = probeCount()
+    await tick(4)
+    expect(readsSince(settled)).toBe(0)
+  })
 
-  it('KEEPS asking after an "unknown" — a question nobody answered must not end the asking', async () => {
-    // The mutation this pins: adding `unknown` to the settled set. It reads like a fourth
-    // "not alive" state and it is not one — it is the ERROR arm, and stopping on it would
-    // leave a tab that blinked once never checking again for the rest of its life.
-    h.fetchPreviewState.mockResolvedValue(answer('unknown'))
+  it('KEEPS asking after a failed read — a question nobody answered must not end the asking', async () => {
+    // The mutation this pins: stopping the timer in the read's `catch`. A failed read is not a
+    // settled answer, and stopping on it would leave a tab that blinked once never checking
+    // again for the rest of its life.
+    h.fetchPreviewState.mockRejectedValue(new Error('503'))
     await framedBuild()
 
     expect(goneCard()).toBeNull() // and it changes nothing on screen, either
@@ -445,15 +437,17 @@ describe('BuilderPage — stopping the poll must not pin "gone"', () => {
     // window it closes is invisible unless a test holds the answer open on purpose. That window
     // is a full network round trip with the reclaimed card painted over an app that is coming
     // back up, which is the same stale-verdict symptom, narrowed rather than removed.
+    //
+    // The vehicle is a turn frame rather than a Launch press: an admitted press holds the pane on
+    // its own wait until the next read answers, which would cover this window whether or not the
+    // verdict was dropped.
     h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
-    await framedBuild()
+    const turn = await framedBuild()
     expect(goneCard()).not.toBeNull()
 
     // The next probe never answers. Any drop of the card from here is the invalidation itself.
     h.fetchPreviewState.mockReturnValue(new Promise<PreviewState>(() => {}))
-    // "Launch Application" — the vehicle, renamed (see the earlier test in this describe block).
-    const bringItBack = screen.getByRole('button', { name: /launch application/i })
-    await act(async () => { fireEvent.click(bringItBack) })
+    await turn.frame(T_WORKSPACE('preparing'))
 
     expect(goneCard()).toBeNull()
   })
@@ -484,7 +478,7 @@ describe('BuilderPage — stopping the poll must not pin "gone"', () => {
 
     h.fetchPreviewState.mockResolvedValue(answer('alive'))
     await act(async () => {
-      finish({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false, ready: true })
+      finish(undefined)
     })
     await settle()
     // …and the wait GIVES WAY once the restore lands. TWO flushes, not `waitFor`: this suite runs
@@ -496,6 +490,47 @@ describe('BuilderPage — stopping the poll must not pin "gone"', () => {
     await settle()
     expect(goneCard()).toBeNull()
     expect(framedUrl()).toBe(PREVIEW_URL)
+  })
+
+  it('★ an admitted press holds the pane on its wait until the next read, which then decides', async () => {
+    // The admission re-runs the poll, and the re-run blanks the reading. Were the press cleared at
+    // the 202, that blank would draw "We could not check on your app." with Try again — or the old
+    // reading "Your app is saved." with Launch — for the round trip before `starting` arrives.
+    const WHY = 'Your app could not be started. Try again in a minute.'
+    h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
+    await framedBuild()
+    let answerRead: (value: PreviewState) => void = () => {}
+    h.fetchPreviewState.mockImplementation(
+      () => new Promise<PreviewState>((resolve) => { answerRead = resolve }),
+    )
+    const reads = probeCount()
+
+    reported.states.length = 0
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /launch application/i })) })
+    await settle()
+
+    expect(h.relaunchPreview).toHaveBeenCalledTimes(1)
+    expect(readsSince(reads)).toBe(1)
+    expect(reported.states.length).toBeGreaterThan(0)
+    expect(reported.states.map((state) => state.name).filter((name) => name !== 'starting')).toEqual([])
+
+    await act(async () => { answerRead({ ...answer('asleep', true), startFailure: WHY }) })
+    await settle()
+    expect(paneState()).toBe('not-running')
+    expect(goneCard()?.textContent).toContain(WHY)
+  })
+
+  it('★ a read that fails after the admission still ends the press, with Try again', async () => {
+    h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
+    await framedBuild()
+    h.fetchPreviewState.mockRejectedValue(new Error('503'))
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /launch application/i })) })
+    await settle()
+
+    expect(h.relaunchPreview).toHaveBeenCalledTimes(1)
+    expect(reported.states.at(-1)?.name).toBe('could-not-read')
+    expect(reported.states.at(-1)?.action?.kind).toBe('retry')
   })
 })
 

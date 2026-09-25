@@ -8,22 +8,15 @@
  *
  * CSRF: `relaunchPreview` (and the project-scoped save / release / stop-active calls below)
  * are mutating POSTs and carry the signed double-submit token (`X-CSRF-Token`,
- * reusing `auth.ts` `getCsrfToken()`); `getStatus` GET and the SSE GET (a separate transport,
- * `buildSessionEvents.ts`) are safe methods and carry NO token. This is net-new: no prior
- * business route in the portal enforces CSRF.
+ * reusing `auth.ts` `getCsrfToken()`); the GETs are safe methods and carry NO token. This is
+ * net-new: no prior business route in the portal enforces CSRF.
  */
 import { ApiError, extractApiCode, extractApiMessage, isRecord, readApiError } from './apiError'
 import { authFetch } from './api'
 import { asCompileState } from './compileState'
 import type { CompileState } from './compileState'
 import { getCsrfToken } from './auth'
-import type {
-  BuildSessionStatus,
-  BuildSessionStatusResponse,
-  RelaunchPreviewRequest,
-  RelaunchPreviewResponse,
-  SharedPreviewResponse,
-} from './buildSessionTypes'
+import type { RelaunchPreviewRequest, SharedPreviewResponse } from './buildSessionTypes'
 
 /**
  * The dep bundle `authFetch` accepts, injectable so tests need no real network.
@@ -50,84 +43,6 @@ export class BuildSessionAlreadyActiveError extends ApiError {
   constructor(message: string) {
     super(message, 409, 'build_session_already_active')
     this.name = 'BuildSessionAlreadyActiveError'
-  }
-}
-
-// ─── narrowing helpers (parse untrusted responses at the boundary) ───────────
-
-function asString(value: unknown): string {
-  return typeof value === 'string' ? value : ''
-}
-
-function asStringOrNull(value: unknown): string | null {
-  return typeof value === 'string' ? value : null
-}
-
-function asNumberOrNull(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null
-}
-
-/** A status we don't recognize is unusable — fail closed rather than let the UI render an undefined lifecycle. */
-function toBuildSessionStatus(value: unknown): BuildSessionStatus {
-  if (
-    value === 'provisioning' ||
-    value === 'building' ||
-    value === 'ready' ||
-    value === 'ended' ||
-    value === 'failed'
-  ) {
-    return value
-  }
-  throw new ApiError('The server returned a build session we could not read.', 500)
-}
-
-/** A build session with no `sessionId` is not a session — fail at the boundary (parity with `projectApi.toProject`). */
-function requireSessionId(value: Record<string, unknown>): string {
-  if (typeof value.sessionId !== 'string' || value.sessionId === '') {
-    throw new ApiError('The server returned a build session we could not read.', 500)
-  }
-  return value.sessionId
-}
-
-/**
- * `projectId` drives the 409 reattach-vs-block routing (the projectId comparison IS the
- * gate, not the bare 409) — a session response without one would silently mis-route every
- * reattach decision, so it fails at the boundary like a missing `sessionId` (mirror guard).
- */
-function requireProjectId(value: Record<string, unknown>): string {
-  if (typeof value.projectId !== 'string' || value.projectId === '') {
-    throw new ApiError('The server returned a build session we could not read.', 500)
-  }
-  return value.projectId
-}
-
-function toRelaunchPreviewResponse(value: unknown): RelaunchPreviewResponse {
-  if (!isRecord(value)) throw new ApiError('The server returned a preview we could not read.', 500)
-  // No sessionId/createdAt on this shape — do NOT reuse requireSessionId here.
-  return {
-    appId: asString(value.appId),
-    previewUrl: asString(value.previewUrl),
-    status: toBuildSessionStatus(value.status),
-    // Absent/malformed reads as false — the label is an honesty aid, never a gate.
-    restoredFromFailedBuild: value.restoredFromFailedBuild === true,
-    // Absent reads as TRUE, unlike the flag above, and the asymmetry is deliberate: this field is
-    // new, and every server that predates it only ever answered once the app was serving. Reading
-    // a missing value as `false` would put a permanent "not ready yet" on those correct responses.
-    ready: value.ready !== false,
-  }
-}
-
-function toBuildSessionStatusResponse(value: unknown): BuildSessionStatusResponse {
-  if (!isRecord(value)) throw new ApiError('The server returned a build session we could not read.', 500)
-  return {
-    sessionId: requireSessionId(value),
-    projectId: requireProjectId(value),
-    appId: asString(value.appId),
-    status: toBuildSessionStatus(value.status),
-    previewUrl: asStringOrNull(value.previewUrl),
-    lastSeq: asNumberOrNull(value.lastSeq),
-    createdAt: asString(value.createdAt),
-    updatedAt: asString(value.updatedAt),
   }
 }
 
@@ -199,24 +114,18 @@ async function postJson(url: string, body: unknown, fallback: string, deps: Auth
 // transaction. The ROUTE is untouched; deleting a browser client says nothing about it.
 
 /**
- * `relaunch` — restore a project's saved app into a fresh, ready sandbox and get its live URL.
- * A mutating POST (carries CSRF). Project-scoped, not session-scoped: the torn-down session is gone.
- * `postJson` already turns a `409 build_session_already_active` into `BuildSessionAlreadyActiveError`
- * (a build is running); 404 = nothing to relaunch, 503 = transient/retryable.
+ * `relaunch` — start a project's saved app. Resolves once the server has ADMITTED the start (202);
+ * the app comes up afterwards, and the preview-state poll is what reports it — `starting`, then
+ * `alive` with the address to frame. Nothing in the answer is read, so nothing is parsed.
+ * A mutating POST (carries CSRF). `postJson` already turns a `409 build_session_already_active` into
+ * `BuildSessionAlreadyActiveError` (a build is running); 404 = nothing to relaunch, 503 =
+ * transient/retryable.
  */
 export async function relaunchPreview(
   args: RelaunchPreviewRequest,
   deps: AuthFetchDeps = {},
-): Promise<RelaunchPreviewResponse> {
-  const body = await postJson(`${BASE}/relaunch`, { projectId: args.projectId }, 'Failed to relaunch the preview', deps)
-  return toRelaunchPreviewResponse(body)
-}
-
-/** `getStatus` — the poll surface and the source of the framable `previewUrl` + `lastSeq`. A safe GET: no CSRF. */
-export async function getStatus(sessionId: string, deps: AuthFetchDeps = {}): Promise<BuildSessionStatusResponse> {
-  const res = await authFetch(`${BASE}/${encodeURIComponent(sessionId)}`, {}, deps)
-  if (!res.ok) throw await readApiError(res, 'Failed to load build session status')
-  return toBuildSessionStatusResponse(await res.json())
+): Promise<void> {
+  await postJson(`${BASE}/relaunch`, { projectId: args.projectId }, 'Failed to relaunch the preview', deps)
 }
 
 // ─── lock operations — THERE ARE NONE LEFT ─────────────────────────────────
@@ -228,23 +137,6 @@ export async function getStatus(sessionId: string, deps: AuthFetchDeps = {}): Pr
 // `forceEnd` is gone too, and so is the ROUTE it spoke to; the session-scoped `stop` that
 // replaced it in this comment has since been retired the same way, route and all. What a live
 // build offers now is the turn's own stop and, project-scoped, `stopActiveBuild`.
-
-/**
- * The dependency bag the client + event feed accept, so a hook and a page
- * can swap in the scripted mock (dev/test) or the real transport (prod default).
- * The client half is the `buildSessionApi` module surface; the feed half is the
- * `EventSource` factory (`buildSessionEvents.ts`).
- */
-export interface BuildSessionClient {
-  relaunchPreview: typeof relaunchPreview
-  getStatus: typeof getStatus
-}
-
-/** The real, wired-by-default client — already the final implementation, so no later swap between mock and real is needed. */
-export const buildSessionClient: BuildSessionClient = {
-  relaunchPreview,
-  getStatus,
-}
 
 // --- the save model ---------------------------------------------------------
 
@@ -712,19 +604,16 @@ export async function giveUpSharedView(deps: AuthFetchDeps = {}): Promise<boolea
 
 /** What is (or is not) serving a project's preview right now.
  *
- *  SIX STATES, because `alive: false` used to mean all of them at once and one was an error:
+ *  THREE STATES, and a read that could not decide is none of them — it throws:
  *
- *   - `alive`       — a container is serving this project; `previewUrl` is framable.
- *   - `asleep`      — built before, nothing serving it now; the next prompt restores it from
- *                     the durable copy. NOT a failure — never styled as one.
- *   - `starting`    — a build, relaunch, or turn sandbox-start is IN FLIGHT. Not `alive` (no
- *                     container yet), not `asleep` (a start is under way) — grouped with
- *                     `alive` as "just a wait", never as a "gone" state inviting a remedy.
- *   - `slot_taken`  — another of this user's projects holds the one-per-user workspace.
- *   - `never_built` — nothing has ever been built here.
- *   - `unknown`     — the server could not read its coordination store, so it claims NOTHING.
- *                     Rendering this as "gone" puts the bug back. */
-export const PREVIEW_LIFE_STATES = ['alive', 'asleep', 'starting', 'slot_taken', 'never_built', 'unknown'] as const
+ *   - `alive`    — a container is serving this project; `previewUrl` is framable.
+ *   - `starting` — a build, relaunch, or turn sandbox-start is IN FLIGHT, or a container is up
+ *                  and has not served yet. Grouped with `alive` as "just a wait", never as a
+ *                  "gone" state inviting a remedy.
+ *   - `asleep`   — nothing serving it and nothing starting: never built, put away, or another
+ *                  of this user's projects holds the workspace. `restorable` says whether there
+ *                  is work to bring back. NOT a failure — never styled as one. */
+export const PREVIEW_LIFE_STATES = ['alive', 'asleep', 'starting'] as const
 export type PreviewLifeState = (typeof PREVIEW_LIFE_STATES)[number]
 
 export interface PreviewState {
@@ -732,22 +621,23 @@ export interface PreviewState {
   /** Strictly `state === 'alive'`. Kept because the server keeps it; branch on `state`. */
   alive: boolean
   previewUrl: string | null
-  /** `slot_taken` only, and null when the server could not attribute the live container to
-   *  any project of this user's — naming the wrong project is worse than naming none. */
-  occupyingProjectName: string | null
-  /** The id behind that name, and the REMEDY's only input: "another project holds your
-   *  workspace" is a dead end without something to navigate to. Goes missing WITH the name and
-   *  for the same reason — the server withholds the whole attribution rather than guessing, so
-   *  a surface that has one and not the other is reading a body this parser did not produce. */
-  occupyingProjectId: string | null
   /** TRI-STATE, exactly like `SaveState.dirty`: `true` = the server could restore this app
    *  from the recovery copy or the saved bundle, `false` = confirmed it could not, `null` =
    *  NO CLAIM, so the UI promises nothing and keeps whatever it already knew. Two ways to
    *  reach that null and they mean the same thing to us: the object store was unreachable, or
-   *  `state === 'alive'` and the poll did not ask (a running app renders no restore
-   *  affordance, so the answer could not change the screen and is not worth a Blob round trip
-   *  every 45 seconds). This is why `hasSavedBuild` reads it with `??` and not `||`. */
+   *  `state` is `alive` or `starting` and the poll did not ask (the answer could not change the
+   *  screen and is not worth a Blob round trip every 45 seconds). This is why `hasSavedBuild`
+   *  reads it with `??` and not `||`. */
   restorable: boolean | null
+  /** `starting` only: the ISO-8601 instant THIS project's wait began, so an elapsed figure is
+   *  the real wait rather than the life of the current page. `null` is NO CLAIM — a surface
+   *  counting from its own mount is what the pane did before this field existed, and it stays
+   *  the fallback. The server answers it to the second, so the same wait reads as the same
+   *  instant on every poll and this can be compared like any other field. */
+  startingSince: string | null
+  /** `asleep` only: the citizen's sentence for why their last start of THIS project failed after
+   *  the server admitted it. `null` when there is none, and on a backend that does not send it. */
+  startFailure: string | null
 }
 
 /** Two readings that say the same thing — see `sameSaveState`. `alive` is omitted deliberately:
@@ -759,15 +649,20 @@ export const samePreviewState = (a: PreviewState | null, b: PreviewState | null)
     b !== null &&
     a.state === b.state &&
     a.previewUrl === b.previewUrl &&
-    a.occupyingProjectName === b.occupyingProjectName &&
-    a.occupyingProjectId === b.occupyingProjectId &&
-    a.restorable === b.restorable)
+    a.restorable === b.restorable &&
+    a.startingSince === b.startingSince &&
+    a.startFailure === b.startFailure)
+
+const UNREADABLE_PREVIEW = 'The server returned a preview state we could not read.'
 
 function asPreviewLifeState(value: unknown, alive: boolean): PreviewLifeState {
-  // An unrecognised (or absent) state falls back to what `alive` can prove and NO further:
-  // a live container is `alive`, and anything else is `unknown` — never a confident "gone".
-  // The fallback exists for a tab that outlives a deploy, not as a normal path.
-  return PREVIEW_LIFE_STATES.find((s) => s === value) ?? (alive ? 'alive' : 'unknown')
+  // An unrecognised (or absent) state falls back to what `alive` can prove and NO further: a
+  // live container is `alive`, and anything else is a read that decided nothing — never a
+  // confident "gone". The fallback exists for a tab that outlives a deploy, not as a normal path.
+  const known = PREVIEW_LIFE_STATES.find((s) => s === value)
+  if (known !== undefined) return known
+  if (alive) return 'alive'
+  throw new ApiError(UNREADABLE_PREVIEW, 500)
 }
 
 /** Is the preview this tab is framing still real — and if not, why?
@@ -777,8 +672,13 @@ function asPreviewLifeState(value: unknown, alive: boolean): PreviewLifeState {
  *  SSE and no timer left, and the teardown happens inside another project's request, so
  *  nothing can be pushed here — the tab has to ask.
  *
- *  Cheap by contract: one Redis hash read, at most two rows, at most two object-store HEADs,
- *  no container call — unlike `fetchSaveState`, which runs two `git` execs per call. */
+ *  THROWS ON ANYTHING THAT IS NOT AN ANSWER: a non-2xx (the server's 503 for a coordination
+ *  store it could not read among them), a body that is not an object, or a state this client
+ *  does not know. Both polls read a throw as a check that decided nothing, which is the only
+ *  honest reading of any of the three.
+ *
+ *  Cheap by contract: one Redis hash read, two rows, at most two object-store HEADs, no
+ *  container call — unlike `fetchSaveState`, which runs two `git` execs per call. */
 export async function fetchPreviewState(
   projectId: string,
   deps: AuthFetchDeps = {},
@@ -790,33 +690,22 @@ export async function fetchPreviewState(
   )
   if (!res.ok) throw await readApiError(res, 'Could not check the preview')
   const body: unknown = await res.json().catch(() => null)
-  // An unreadable body proves nothing about a container. `unknown`, not "gone" — the old
-  // `{alive: false}` here was the same over-claim this whole reshape exists to remove.
-  if (!isRecord(body)) {
-    return {
-      state: 'unknown',
-      alive: false,
-      previewUrl: null,
-      occupyingProjectName: null,
-      occupyingProjectId: null,
-      restorable: null,
-    }
-  }
+  if (!isRecord(body)) throw new ApiError(UNREADABLE_PREVIEW, 500)
   const alive = body.alive === true
   return {
     state: asPreviewLifeState(body.state, alive),
     alive,
     previewUrl: typeof body.previewUrl === 'string' ? body.previewUrl : null,
-    occupyingProjectName:
-      typeof body.occupyingProjectName === 'string' ? body.occupyingProjectName : null,
-    // Same discipline as the name beside it: anything that is not literally a string is
-    // `null`, never coerced. A number, an object or an empty-ish value would otherwise become
-    // a route the go-to action navigates into and 404s on.
-    occupyingProjectId:
-      typeof body.occupyingProjectId === 'string' ? body.occupyingProjectId : null,
     // Anything that is not literally a boolean stays UNKNOWN — the same rule `dirty` follows,
     // and for the same reason: coercing here is how a missing field becomes a false promise.
     restorable: typeof body.restorable === 'boolean' ? body.restorable : null,
+    // Same discipline again: a non-string is NO CLAIM, and so is a string no clock can read.
+    // Dating a wait from garbage would put the lying counter back wearing a server's face.
+    startingSince:
+      typeof body.startingSince === 'string' && !Number.isNaN(Date.parse(body.startingSince))
+        ? body.startingSince
+        : null,
+    startFailure: typeof body.startFailure === 'string' ? body.startFailure : null,
   }
 }
 

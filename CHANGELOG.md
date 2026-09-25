@@ -4,6 +4,121 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.3] - 2026-09-25
+
+An app you have built now stays up, and saving it stops counting as a change. This release fixes
+what the 22–24 Sep production incidents showed: an approved app that asked for approval again and
+could never be published, every save minting a new version, a crashed dev server taking the whole
+container with it, shared views that were never cleaned up, and a wiped container retried forever.
+
+It also cuts an app's lifecycle down to fewer moving parts. The screen shows one of three states
+instead of seven, there is one way to start an app, and the sweep that puts idle apps away decides
+on one rule.
+
+### Deploying this release
+
+- **Remove `SANDBOX__RECLAIM_ENABLED`, `SANDBOX__RECLAIM_DESTROY` and
+  `SANDBOX__RECLAIM_FLEET_ALARM_THRESHOLD` everywhere before the new images go live**: the API app
+  settings, the deployed `backend/.env`, and the worker's environment file. The configuration now
+  refuses unknown settings, so a process that still carries one will not start, and a worker that
+  cannot start runs no sweep, so containers go on billing. Removing them first is safe: the
+  previous image treats all three as off.
+- **Roll out in this order: the sandbox image, then the backend, then the portal.**
+  - The sandbox image changed: its ignore rules now live in a platform-owned exclude file, because
+    the registry's build service drops every file named `.gitignore`. Build and push it from the
+    Windows VM, then, in a new sandbox, check that `git check-ignore` reports `node_modules`,
+    `.next` and `.env` as ignored before anything else rolls.
+  - The backend must land no later than the portal. The new portal reads the previous backend's
+    other preview states as failed reads, so a never-built or held project would show "We could
+    not check on your app" until the backend arrives.
+  - Browser tabs opened before the deploy keep working against the new backend: the start answer
+    carries a `status` field for their sake, for this release only. The next release removes it.
+- **Replace sandboxes created before the new image** once the rollout is done: they are torn down
+  with a write-back as usual, then relaunched. Until then each of their saves still tracks build
+  output.
+- **Every existing app gets one clean-up version** on whichever comes first: its next Save, "Save
+  and publish", or the teardown write-back. For an approved app that is not yet published and needs
+  review, that is one more administrator round, and a citizen may read it as the same bug. Tell
+  BIAL before the release.
+- **No database migration.** The coordination store gains one registry field (when the current wait
+  began) and one short-lived key per user (the last start that failed after it was accepted, kept
+  for five minutes). Records the previous backend wrote are read correctly without them.
+- **Worker liveness reads differently.** The tiered reclamation pass and its daily row are retired;
+  the scheduled sweep that always did the reaping stays. A dead worker is now noticed from the
+  conversation-retention pass (daily) and the sweep's own log lines, so detection moves from about
+  half an hour to about a day until the sweep gets a liveness row of its own.
+- **Once, by hand, after the rollout: delete the shared-view containers that leaked before this
+  release.** The new rules only cover shared views the platform still tracks; one orphaned earlier
+  has no registry record and no owed row, and nothing will ever collect it. List every shared-view
+  container in the production resource group and delete any older than the four-hour ceiling.
+  Shared views hold no work of their own.
+- **Tell users the upload limits.** 40 MB per upload inside a generated app (the web edge refuses
+  anything larger), 10 MB per chat attachment, and about 1 MB where an app uploads through a Next.js
+  Server Action. Very large Excel sheets, hundreds of thousands of rows, are the memory risk.
+
+### Added
+
+- **The wait for your app has an honest clock and an end.** It counts from when the wait began,
+  keeps counting across a reload, and after two minutes says it is taking longer than usual and
+  offers Try again, instead of spinning with no end.
+- **A start that fails after it was accepted says why.** The app screen shows the reason beside
+  Launch, and the app is no longer started again, silently and in vain, every time you come back to
+  the project. Launch retries.
+
+### Changed
+
+- **Your app is running, getting ready, or at rest.** Three states on screen instead of seven. A
+  moment when the platform cannot tell is shown as "We could not check on your app" with Try again,
+  never as a guess.
+- **Starting an app answers at once.** The app comes up in the background and the screen follows it
+  from getting ready to running. Pressing start again while it comes up joins the start already
+  under way instead of queueing a second one.
+- **A dev server that stops is restarted in the same container**, with its unsaved work, instead of
+  the whole container being taken down.
+- **An app you are watching is kept alive while you watch it**, including a start you are waiting
+  on.
+- **The sweep that puts idle apps away decides on one rule**: it spares an app while a start is under
+  way, a build turn is running, or its stay of execution holds, and it reads each spared app's age
+  from the cloud once per pass instead of up to three times.
+- **A restored app is watched for its first page for about four minutes**, so a slow first compile
+  is recognised as soon as it serves rather than at the next sweep.
+
+### Fixed
+
+- **An approved app publishes without a second review.** A save no longer tracks build output
+  (`node_modules`, `.next`, `.env`), so a save with no code change keeps the approved version and
+  Publish goes straight through.
+- **A slow first request no longer destroys the app's container.**
+- **A container whose repository is gone is reclaimed once**, instead of retried every five minutes
+  forever, whether the sweep or a deferred teardown finds it. A git command that fails under memory
+  pressure is no longer mistaken for a lost repository, so a container that still holds unsaved
+  work is kept.
+- **Shared views no longer run for days.** A shared view whose delete fails is owed and retried, and
+  its age counts from when its container was created.
+- **The waiting clock tells the truth after a restart.** A dev server restarted in place is dated from
+  the restart, not from when its container was created, and a cold start's clock no longer jumps
+  backwards partway through.
+- **No flash of Launch or "We could not check on your app"** in the moment after you press start.
+- **Pressing start again while a failed start is being cleaned up starts afresh** instead of joining
+  the failed one.
+- **An app that came up is still recognised as serving** when a store write right after its start
+  fails.
+- **An idle check during Discard can no longer start a second dev server** beside the one Discard
+  starts.
+- **An expired session stops the tab** instead of leaving it polling behind a screen that still
+  looks signed in.
+- **The index the conversation-retention pass reads is declared on its model**, so the schema check
+  agrees with the migration that creates it.
+
+### Removed
+
+- **Tiered fleet reclamation**, its three settings, its report and its scheduled pass. The scheduled
+  sweep that did the reaping all along stays.
+- **The build-session id endpoints** and their event stream, the in-process build progress channel,
+  and a preview reload nothing triggered.
+- **Unused lifecycle code**, including heartbeat writes a start made just before letting go of its
+  lock, which protected nothing.
+
 ## [1.8.2] - 2026-09-22
 
 BIAL Chat is a conversation now. The screen that arrived last release could only greet you; this

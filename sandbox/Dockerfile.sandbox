@@ -97,16 +97,14 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 RUN useradd -m -u 10001 -s /usr/sbin/nologin appuser
 
 # Baked git identity for the snapshot commits. `git config --system`
-# writes world-readable /etc/gitconfig, so `snapshot.sh` — which runs as the demoted `appuser`
-# via /exec — commits WITHOUT per-invocation `-c user.name=…` flags, keeping the scripts clean.
+# writes world-readable /etc/gitconfig, so the snapshot commit, which runs as the demoted
+# `appuser` via /exec, needs no per-invocation `-c user.name=…` flags.
 # `safe.directory=*` is defensive: git keeps working if /workspace/app is ever re-owned (nothing
 # does today — entrypoint.sh no longer chowns at boot — but a bind-mounted workspace would);
 # `init.defaultBranch=main` silences the init hint on the idempotent `git init`.
-# `core.excludesFile` keeps the platform-owned files this image bakes into the workspace OUT of
-# every snapshot (`platform-owned.gitignore`, copied here): a workspace `.gitignore` is itself
-# tracked in the bundle, so it cannot protect a baked file from being tracked after a restore of
-# an older bundle. Excluded system-wide, the baked copy always wins and a fix in a newer image
-# reaches every app on its next launch.
+# `core.excludesFile` is the workspace's only ignore list (`platform-owned.gitignore`, copied
+# here). A file named `.gitignore` never reaches an image built by `az acr build`, which drops
+# every one from the build context.
 COPY platform-owned.gitignore /etc/bial/gitignore
 RUN git config --system user.name "BIAL Snapshot Bot" \
     && git config --system user.email "snapshot-bot@bial.local" \
@@ -119,9 +117,6 @@ WORKDIR /supervisor
 COPY supervisor/app.py /supervisor/app.py
 COPY Caddyfile /etc/caddy/Caddyfile
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-# Snapshot/restore mechanics. Baked onto PATH so the reference client drives them
-# over the frozen /exec (`/usr/local/bin/{snapshot,restore}.sh <workspace> [b64]`).
-COPY scripts/snapshot.sh scripts/restore.sh /usr/local/bin/
 
 # THE CANONICAL ATTACHMENT READER. Baked at a fixed path OUTSIDE the editable tree, so a
 # Build agent that edits its working copy into a state that no longer works has somewhere
@@ -129,13 +124,10 @@ COPY scripts/snapshot.sh scripts/restore.sh /usr/local/bin/
 COPY scripts/read_attachment.py /usr/local/lib/bial/read_attachment.py
 
 # Cross-platform guard: strip any CR a Windows checkout introduced, THEN chmod. (A
-# `#!/bin/sh\r` shebang would make the container fail at start — CRLF has burned BIAL twice.) The
-# guard is extended to cover the incoming scripts/ before they are marked executable.
+# `#!/bin/sh\r` shebang would make the container fail at start — CRLF has burned BIAL twice.)
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh /etc/caddy/Caddyfile \
-        /usr/local/bin/snapshot.sh /usr/local/bin/restore.sh \
         /usr/local/lib/bial/read_attachment.py \
-    && chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/snapshot.sh /usr/local/bin/restore.sh \
-        /usr/local/lib/bial/read_attachment.py
+    && chmod +x /usr/local/bin/entrypoint.sh /usr/local/lib/bial/read_attachment.py
 
 # --- golden template + baked node_modules -------------------------------------------------
 # Copy manifests first for layer caching, install with the pinned lockfile (byte-identical

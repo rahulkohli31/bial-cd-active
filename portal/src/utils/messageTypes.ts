@@ -340,9 +340,8 @@ export interface BuildPartPersisted {
   previewUrl: string | null
 }
 
-/** The live `build` part — rendered the moment a build turn ends, before any reload. Two call
- * sites feed this: the legacy session-based path (carries `sessionId`) and the current
- * turn-stream "Build it" path (carries `turnId`); both otherwise produce the same fields. */
+/** The live `build` part — rendered the moment a build turn ends, before any reload, keyed by
+ * the turn that produced it. */
 export interface BuildPartLive {
   type: 'build'
   status: BuildOutcomeStatus
@@ -350,7 +349,6 @@ export interface BuildPartLive {
   endedAt: string
   snapshotCommitted: boolean | null
   reason: string | null
-  sessionId?: string
   turnId?: string
 }
 
@@ -383,11 +381,10 @@ export interface ReasoningPart {
   type: 'reasoning'
 }
 
-/** A build began and no outcome closed it yet — the durable anchor
+/** A build began and no outcome closed it — display-only, rendered as a sentence saying so
  * (`conversationApi.ts` only — reload path). */
 export interface BuildInProgressPart {
   type: 'build_in_progress'
-  sessionId: string
 }
 
 export type MessagePart =

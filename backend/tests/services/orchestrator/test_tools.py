@@ -32,7 +32,6 @@ from src.services.messages.projection import long_operation_line
 from src.services.orchestrator import constants
 from src.services.orchestrator import tools as tools_module
 from src.services.orchestrator.deps import HeldOutput, SandboxSession
-from src.services.orchestrator.progress import ProgressEmitter
 from src.services.orchestrator.tools import (
     OUTPUT_NO_LONGER_HELD,
     _is_predictable_noise,
@@ -51,7 +50,7 @@ from src.services.sandbox import (
 from src.services.turns import engine as engine_module
 from src.services.turns.engine import _TurnState
 from tests.fakes import ToolDeps
-from tests.services.orchestrator.conftest import CollectingSink, build_tool_agent
+from tests.services.orchestrator.conftest import build_tool_agent
 from tests.services.orchestrator.fake_sandbox import FAKE_SUPERVISOR_TOKEN, FakeSandbox
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
@@ -113,52 +112,47 @@ def _capturing_model(turns: list[ModelResponse], captured: dict[str, Any]) -> Fu
     return FunctionModel(respond)
 
 
-def _deps(fake: FakeSandbox, sink: CollectingSink) -> ToolDeps:
-    emitter = ProgressEmitter(sink)
+def _deps(fake: FakeSandbox) -> ToolDeps:
     return ToolDeps(
         sandbox=SandboxSession(
             sandbox_client=fake,
             handle=fake.handle(),
             app_id=uuid.uuid4(),
-            emitter=emitter,
         ),
-        emitter=emitter,
         user_id=uuid.uuid4(),
     )
 
 
-async def _run(
-    fake: FakeSandbox, sink: CollectingSink, turns: list[ModelResponse]
-) -> dict[str, Any]:
+async def _run(fake: FakeSandbox, turns: list[ModelResponse]) -> dict[str, Any]:
     captured: dict[str, Any] = {}
     model = _capturing_model(turns, captured)
-    result = await _tool_agent.run("build the app", deps=_deps(fake, sink), model=model)
+    result = await _tool_agent.run("build the app", deps=_deps(fake), model=model)
     captured["output"] = result.output
     captured["all_incoming"] = "\n".join(captured.get("incoming", []))
     return captured
 
 
-async def test_registered_tool_surface_is_the_open_sandbox_set(sink: CollectingSink) -> None:
+async def test_registered_tool_surface_is_the_open_sandbox_set() -> None:
     fake = FakeSandbox()
-    captured = await _run(fake, sink, [text_turn("nothing to do")])
+    captured = await _run(fake, [text_turn("nothing to do")])
     # The open-sandbox surface: the five file tools + run_command (the vibe-coding pivot).
     assert captured["tool_names"] == _TOOL_NAMES
     assert "run_command" in captured["tool_names"]
 
 
-async def test_read_file_returns_numbered_lines(sink: CollectingSink) -> None:
+async def test_read_file_returns_numbered_lines() -> None:
     fake = FakeSandbox(seed_files={"app/records/page.tsx": "alpha\nbeta\ngamma"})
     captured = await _run(
-        fake, sink, [tool_turn("read_file", {"path": "app/records/page.tsx"}), text_turn()]
+        fake, [tool_turn("read_file", {"path": "app/records/page.tsx"}), text_turn()]
     )
     assert "1\talpha" in captured["all_incoming"]
     assert "3\tgamma" in captured["all_incoming"]
 
 
-async def test_read_file_refuses_the_ignore_set(sink: CollectingSink) -> None:
+async def test_read_file_refuses_the_ignore_set() -> None:
     fake = FakeSandbox()
     captured = await _run(
-        fake, sink, [tool_turn("read_file", {"path": "node_modules/react/index.js"}), text_turn()]
+        fake, [tool_turn("read_file", {"path": "node_modules/react/index.js"}), text_turn()]
     )
     assert "not readable" in captured["all_incoming"]
 
@@ -173,46 +167,42 @@ class _MalformedViewSandbox(FakeSandbox):
         return await super().files(handle, op)
 
 
-async def test_read_file_surfaces_a_malformed_response(sink: CollectingSink) -> None:
+async def test_read_file_surfaces_a_malformed_response() -> None:
     fake = _MalformedViewSandbox(seed_files={"app/x.tsx": "hi"})
-    captured = await _run(fake, sink, [tool_turn("read_file", {"path": "app/x.tsx"}), text_turn()])
+    captured = await _run(fake, [tool_turn("read_file", {"path": "app/x.tsx"}), text_turn()])
     # A missing `content` key surfaces as a retry — it must NOT masquerade as a legitimately-empty
     # file (fail-first: a malformed backend response should be loud).
     assert "returned no content" in captured["all_incoming"]
 
 
-async def test_read_file_clamps_an_unbounded_view(sink: CollectingSink) -> None:
+async def test_read_file_clamps_an_unbounded_view() -> None:
     big = "\n".join(f"row-{i}" for i in range(1, 1001))  # 1000 lines
     fake = FakeSandbox(seed_files={"app/big.tsx": big})
-    captured = await _run(
-        fake, sink, [tool_turn("read_file", {"path": "app/big.tsx"}), text_turn()]
-    )
+    captured = await _run(fake, [tool_turn("read_file", {"path": "app/big.tsx"}), text_turn()])
     # Bounded to VIEW_MAX_LINES (400) — line 500 is never surfaced.
     assert "400\trow-400" in captured["all_incoming"]
     assert "row-500" not in captured["all_incoming"]
 
 
-async def test_read_file_minus_one_end_reads_to_end_of_file(sink: CollectingSink) -> None:
+async def test_read_file_minus_one_end_reads_to_end_of_file() -> None:
     # The docstring promise "-1 = end of file" must round-trip NON-EMPTY (the pre-fix
     # supervisor computed an empty range for -1; the fake mirrors the fixed semantics).
     fake = FakeSandbox(seed_files={"app/x.tsx": "alpha\nbeta\ngamma"})
     captured = await _run(
         fake,
-        sink,
         [tool_turn("read_file", {"path": "app/x.tsx", "view_range": [1, -1]}), text_turn()],
     )
     assert "1\talpha" in captured["all_incoming"]
     assert "3\tgamma" in captured["all_incoming"]
 
 
-async def test_read_file_minus_one_end_is_still_budget_clamped(sink: CollectingSink) -> None:
+async def test_read_file_minus_one_end_is_still_budget_clamped() -> None:
     # -1 must not become an unbounded read: the VIEW_MAX_LINES clamp applies to it too
     # (previously only the end != -1 branch clamped).
     big = "\n".join(f"row-{i}" for i in range(1, 1001))  # 1000 lines
     fake = FakeSandbox(seed_files={"app/big.tsx": big})
     captured = await _run(
         fake,
-        sink,
         [tool_turn("read_file", {"path": "app/big.tsx", "view_range": [1, -1]}), text_turn()],
     )
     assert "400\trow-400" in captured["all_incoming"]
@@ -232,22 +222,18 @@ async def test_read_file_minus_one_end_is_still_budget_clamped(sink: CollectingS
         "components/ui/button.tsx",
     ],
 )
-async def test_write_allowed_across_the_open_surface(sink: CollectingSink, path: str) -> None:
+async def test_write_allowed_across_the_open_surface(path: str) -> None:
     fake = FakeSandbox()
     await _run(
-        fake, sink, [tool_turn("write_file", {"path": path, "file_text": "export const x = 1;\n"})]
+        fake, [tool_turn("write_file", {"path": path, "file_text": "export const x = 1;\n"})]
     )
     assert fake.workspace[path] == "export const x = 1;\n"
 
 
 @pytest.mark.parametrize("path", [".git/config", ".git/hooks/pre-push"])
-async def test_write_denied_paths_raise_model_retry_and_never_touch_files(
-    sink: CollectingSink, path: str
-) -> None:
+async def test_write_denied_paths_raise_model_retry_and_never_touch_files(path: str) -> None:
     fake = FakeSandbox()
-    captured = await _run(
-        fake, sink, [tool_turn("write_file", {"path": path, "file_text": "PWNED"})]
-    )
+    captured = await _run(fake, [tool_turn("write_file", {"path": path, "file_text": "PWNED"})])
     # The guard fired before files(): nothing was written…
     assert path not in fake.workspace
     assert "PWNED" not in "".join(fake.workspace.values())
@@ -255,11 +241,10 @@ async def test_write_denied_paths_raise_model_retry_and_never_touch_files(
     assert "cannot be written" in captured["all_incoming"]
 
 
-async def test_edit_file_bad_match_enriches_into_a_model_retry(sink: CollectingSink) -> None:
+async def test_edit_file_bad_match_enriches_into_a_model_retry() -> None:
     fake = FakeSandbox(seed_files={"app/records/page.tsx": "one\ntwo\nthree"})
     captured = await _run(
         fake,
-        sink,
         [
             tool_turn(
                 "edit_file",
@@ -273,11 +258,10 @@ async def test_edit_file_bad_match_enriches_into_a_model_retry(sink: CollectingS
     assert "1\tone" in captured["all_incoming"]
 
 
-async def test_str_replace_bad_then_fixed_recovers_in_run(sink: CollectingSink) -> None:
+async def test_str_replace_bad_then_fixed_recovers_in_run() -> None:
     fake = FakeSandbox(seed_files={"app/x.tsx": "aaa\nbbb\nccc\n"})
     captured = await _run(
         fake,
-        sink,
         [
             tool_turn("edit_file", {"path": "app/x.tsx", "old_str": "zzz", "new_str": "q"}),  # bad
             tool_turn(
@@ -291,12 +275,11 @@ async def test_str_replace_bad_then_fixed_recovers_in_run(sink: CollectingSink) 
     assert captured["output"] == "done"
 
 
-async def test_no_tool_leaks_the_supervisor_token(sink: CollectingSink) -> None:
+async def test_no_tool_leaks_the_supervisor_token() -> None:
     fake = FakeSandbox()
     # A failing read (missing file) plus a denied write — neither must render handle.token.
     captured = await _run(
         fake,
-        sink,
         [
             tool_turn("read_file", {"path": "app/missing.tsx"}),
             tool_turn("write_file", {"path": ".git/config", "file_text": "x"}),
@@ -306,9 +289,9 @@ async def test_no_tool_leaks_the_supervisor_token(sink: CollectingSink) -> None:
     assert FAKE_SUPERVISOR_TOKEN not in captured["all_incoming"]
 
 
-async def test_declare_done_sets_the_signal_and_emits_a_step(sink: CollectingSink) -> None:
+async def test_declare_done_sets_the_signal_and_summary() -> None:
     fake = FakeSandbox()
-    deps = _deps(fake, sink)
+    deps = _deps(fake)
     captured: dict[str, Any] = {}
     model = _capturing_model(
         [tool_turn("declare_done", {"summary": "built it"}), text_turn()], captured
@@ -316,12 +299,9 @@ async def test_declare_done_sets_the_signal_and_emits_a_step(sink: CollectingSin
     await _tool_agent.run("build", deps=deps, model=model)
     assert deps.sandbox.done_requested is True
     assert deps.sandbox.done_summary == "built it"
-    assert any(getattr(e, "name", None) == "declare_done" for e in sink.events)
 
 
-async def test_the_declare_done_description_the_model_reads_says_the_turn_ends(
-    sink: CollectingSink,
-) -> None:
+async def test_the_declare_done_description_the_model_reads_says_the_turn_ends() -> None:
     """★ THE TOOL'S OWN DESCRIPTION IS HALF THE BEHAVIOUR.
 
     `declare_done` used to promise the opposite of what it now does ("This does NOT end the
@@ -337,7 +317,7 @@ async def test_the_declare_done_description_the_model_reads_says_the_turn_ends(
     Mutation check: restore either retired sentence and the two absence asserts go red; drop
     the diagnostic clause and the liveness assert does."""
     fake = FakeSandbox()
-    captured = await _run(fake, sink, [text_turn("nothing to do")])
+    captured = await _run(fake, [text_turn("nothing to do")])
     description = captured["tool_descriptions"]["declare_done"]
     # Wrapped at 96 columns in the source, so every assertion below is made against the text
     # with its line breaks collapsed — otherwise a phrase straddling a wrap silently misses.
@@ -365,9 +345,7 @@ async def test_the_declare_done_description_the_model_reads_says_the_turn_ends(
     assert "summary" in first_sentence
 
 
-async def test_declare_done_tells_the_model_its_summary_is_the_last_word(
-    sink: CollectingSink,
-) -> None:
+async def test_declare_done_tells_the_model_its_summary_is_the_last_word() -> None:
     """★ THE RETURN STRING MOVED WITH THE BEHAVIOUR TOO.
 
     `declare_done` is terminal on the passing arm, so its return must say which of the two arms
@@ -377,7 +355,7 @@ async def test_declare_done_tells_the_model_its_summary_is_the_last_word(
     Asserted on what the MODEL received back (the tool return in its next input), not on the
     function's return value, for the same reason as the description test above."""
     fake = FakeSandbox()
-    deps = _deps(fake, sink)
+    deps = _deps(fake)
     captured: dict[str, Any] = {}
     model = _capturing_model(
         [tool_turn("declare_done", {"summary": "You can add visitors and check them in."})],
@@ -393,180 +371,14 @@ async def test_declare_done_tells_the_model_its_summary_is_the_last_word(
     assert "will now type-check the app" not in returned
 
 
-async def test_write_emits_a_step(sink: CollectingSink) -> None:
-    fake = FakeSandbox()
-    await _run(fake, sink, [tool_turn("write_file", {"path": "app/page.tsx", "file_text": "x\n"})])
-    assert any(getattr(e, "name", None) == "edit" for e in sink.events)
-
-
-# --- the LIVE feed emits friendly labels, never raw shell/argv/paths ---
-
-
-def _steps(sink: CollectingSink) -> list[Any]:
-    return [e for e in sink.events if getattr(e, "type", None) == "step"]
-
-
-async def test_write_file_emits_the_friendly_area_not_the_raw_path(sink: CollectingSink) -> None:
-    # The live file-tool emit routes through the shared classifier — the citizen sees an AREA.
-    fake = FakeSandbox()
-    await _run(fake, sink, [tool_turn("write_file", {"path": "app/page.tsx", "file_text": "x\n"})])
-    step = next(e for e in _steps(sink) if e.name == "edit")
-    assert step.label == "Building your app's main page"
-    assert "app/page.tsx" not in step.label
-    # A config write is hidden noise.
-    sink.events.clear()
-    await _run(
-        fake, sink, [tool_turn("write_file", {"path": "package.json", "file_text": "{}\n"})]
-    )
-    assert next(e for e in _steps(sink) if e.name == "edit").hidden is True
-
-
-async def test_run_command_emits_one_friendly_row_no_raw_shell(sink: CollectingSink) -> None:
-    # started+done collapse to ONE terminal row; the visible label is friendly, never `$ argv`.
-    fake = FakeSandbox()
-    fake.queue_commands(ExecResult(stdout="added 1 package", stderr="", exit=0))
-    await _run(
-        fake, sink, [tool_turn("run_command", {"command": ["npm", "install", "zod"]}), text_turn()]
-    )
-    rc = [e for e in _steps(sink) if e.name == "run_command"]
-    assert len(rc) == 1
-    assert rc[0].state == "ok"
-    assert rc[0].label == "Setting up the tools your app needs"
-    for leaked in ("$ ", "npm", "install", "zod"):
-        assert leaked not in rc[0].label
-
-
-async def test_run_command_unrecognized_fails_closed_in_the_live_label(
-    sink: CollectingSink,
-) -> None:
-    # The fail-closed property AT THE EMITTER: an arbitrary command never leaks its argv.
-    fake = FakeSandbox()
-    fake.queue_commands(ExecResult(stdout="", stderr="", exit=0))
-    await _run(
-        fake,
-        sink,
-        [tool_turn("run_command", {"command": ["bash", "-c", "rm -rf /tmp/x"]}), text_turn()],
-    )
-    rc = next(e for e in _steps(sink) if e.name == "run_command")
-    assert rc.label == "Working on your app"
-    for leaked in ("bash", "-c", "$ ", "rm -rf"):
-        assert leaked not in rc.label
-
-
-async def test_run_command_failed_transport_emits_a_friendly_failed_label(
-    sink: CollectingSink,
-) -> None:
-    # A transport failure → failed: still friendly, still no `$ argv`, and the failure wording is
-    # the one shared clause rather than a second spelling of it.
-    fake = FakeSandbox()
-    fake.queue_exec_errors(SandboxError("exec timed out after 600s"))
-    await _run(
-        fake,
-        sink,
-        [
-            tool_turn("run_command", {"command": ["npm", "install", "big-pkg"]}),
-            text_turn("healed"),
-        ],
-    )
-    rc = next(e for e in _steps(sink) if e.name == "run_command")
-    assert rc.state == "failed"
-    assert rc.label == "Setting up the tools your app needs — this step did not finish"
-    assert "$ " not in rc.label
-
-
-async def test_run_command_blocked_sql_emits_a_friendly_failed_label(sink: CollectingSink) -> None:
-    # Emit site 240 (blocked destructive SQL): friendly base + human suffix, never the raw SQL.
-    fake = FakeSandbox()
-    await _run(
-        fake,
-        sink,
-        [
-            tool_turn("run_command", {"command": ["psql", "-c", "DELETE FROM visitors"]}),
-            text_turn("understood"),
-        ],
-    )
-    rc = next(e for e in _steps(sink) if e.name == "run_command")
-    assert rc.state == "failed"
-    assert rc.label == "Working on your app — blocked to protect your data"
-    for leaked in ("psql", "DELETE", "visitors", "$ "):
-        assert leaked not in rc.label
-
-
-async def test_a_read_only_command_is_a_visible_step_and_housekeeping_is_not(
-    sink: CollectingSink,
-) -> None:
-    """★ WHAT `hidden` MEANS NOW: reads used to be hidden as a class, so a build's activity
-    opened on a write with no account of what the agent had looked at first — looking at the
-    app is work the citizen recognises, so it's drawn; housekeeping (`mkdir`, `mv`, `touch`)
-    isn't. BOTH HALVES IN ONE TEST: asserting only that a read is visible would pass just as
-    well against a change that deleted the flag outright.
-    Mutation check: flip either arm's `hidden` in `_classify_command` and exactly one of these
-    two assertions goes red."""
-    fake = FakeSandbox()
-    fake.queue_commands(
-        ExecResult(stdout="app/page.tsx", stderr="", exit=0),
-        ExecResult(stdout="", stderr="", exit=0),
-    )
-    await _run(
-        fake,
-        sink,
-        [
-            tool_turn("run_command", {"command": ["ls", "app"]}),
-            tool_turn("run_command", {"command": ["mkdir", "-p", "app/visitors"]}),
-            text_turn(),
-        ],
-    )
-    read, housekeeping = (e for e in _steps(sink) if e.name == "run_command")
-    assert read.hidden is False
-    assert housekeeping.hidden is True
-    # And neither one puts the raw command on screen, whichever side of the line it falls.
-    for step in (read, housekeeping):
-        for leaked in ("ls", "mkdir", "-p", "$ "):
-            assert leaked not in step.label
-
-
-async def test_housekeeping_that_fails_is_drawn_rather_than_hidden(
-    sink: CollectingSink,
-) -> None:
-    """★ NOTHING IS HIDDEN WHEN SOMETHING WENT WRONG, on this emitter too — `_resolve_step` and
-    the reload projection both clear `hidden` on a failure, and this feed used to pass the
-    classifier's flag straight through instead, so a failed `mkdir` was a problem counted in
-    the group's total with no row anyone could open. THE PAIR IS THE TEST: the same command
-    succeeding stays hidden — narrowed by state, not deleted — which is what makes the visible
-    arm mean something.
-    Mutation check: pass `hidden=hidden` through `_step` again and the failed arm goes red while
-    the succeeding one stays green."""
-    fake = FakeSandbox()
-    fake.queue_commands(
-        ExecResult(stdout="", stderr="", exit=0),
-        ExecResult(stdout="", stderr="mkdir: permission denied", exit=1),
-    )
-    await _run(
-        fake,
-        sink,
-        [
-            tool_turn("run_command", {"command": ["mkdir", "-p", "app/visitors"]}),
-            tool_turn("run_command", {"command": ["mkdir", "-p", "app/reports"]}),
-            text_turn(),
-        ],
-    )
-    worked, failed = (e for e in _steps(sink) if e.name == "run_command")
-    assert worked.state == "ok" and worked.hidden is True
-    assert failed.state == "failed" and failed.hidden is False
-    # Still no raw command on screen on the way out of hiding.
-    for leaked in ("mkdir", "-p", "permission denied", "$ "):
-        assert leaked not in failed.label
-
-
 # --- run_command -----------------------------------
 
 
-async def test_run_command_returns_exit_and_redacted_output(sink: CollectingSink) -> None:
+async def test_run_command_returns_exit_and_redacted_output() -> None:
     fake = FakeSandbox()
     fake.queue_commands(ExecResult(stdout="added 1 package in 2s", stderr="", exit=0))
     captured = await _run(
         fake,
-        sink,
         [tool_turn("run_command", {"command": ["npm", "install", "zod"]}), text_turn()],
     )
     assert "exit code: 0" in captured["all_incoming"]
@@ -574,16 +386,13 @@ async def test_run_command_returns_exit_and_redacted_output(sink: CollectingSink
     assert fake.command_calls == [["npm", "install", "zod"]]
 
 
-async def test_run_command_nonzero_exit_is_a_normal_result_not_an_exception(
-    sink: CollectingSink,
-) -> None:
+async def test_run_command_nonzero_exit_is_a_normal_result_not_an_exception() -> None:
     # An npm 404 / peer-dep conflict is exit != 0 — it must come back as a NORMAL tool result the
     # model can read and re-feed, never a raised exception.
     fake = FakeSandbox()
     fake.queue_commands(ExecResult(stdout="", stderr="npm ERR! 404 Not Found: nosuchpkg", exit=1))
     captured = await _run(
         fake,
-        sink,
         [tool_turn("run_command", {"command": ["npm", "install", "nosuchpkg"]}), text_turn("ok")],
     )
     assert "exit code: 1" in captured["all_incoming"]
@@ -592,16 +401,13 @@ async def test_run_command_nonzero_exit_is_a_normal_result_not_an_exception(
     assert captured["output"] == "ok"
 
 
-async def test_run_command_sandbox_error_becomes_a_model_retry_in_loop(
-    sink: CollectingSink,
-) -> None:
+async def test_run_command_sandbox_error_becomes_a_model_retry_in_loop() -> None:
     # A supervisor 504 (incl. an install-timeout) surfaces as SandboxError → converted to a
     # ModelRetry and re-fed in-loop, never a hard build failure.
     fake = FakeSandbox()
     fake.queue_exec_errors(SandboxError("exec timed out after 600s"))
     captured = await _run(
         fake,
-        sink,
         [
             tool_turn("run_command", {"command": ["npm", "install", "big-pkg"]}),
             text_turn("healed"),
@@ -611,12 +417,12 @@ async def test_run_command_sandbox_error_becomes_a_model_retry_in_loop(
     assert captured["output"] == "healed"  # the loop recovered rather than crashing
 
 
-async def test_run_command_sandbox_gone_escalates(sink: CollectingSink) -> None:
+async def test_run_command_sandbox_gone_escalates() -> None:
     # Only SandboxGoneError propagates out of the run (→ run_build's sandbox_gone escalation).
     fake = FakeSandbox()
     fake.queue_exec_errors(SandboxGoneError("the sandbox is gone"))
     with pytest.raises(SandboxGoneError):
-        await _run(fake, sink, [tool_turn("run_command", {"command": ["npm", "install"]})])
+        await _run(fake, [tool_turn("run_command", {"command": ["npm", "install"]})])
 
 
 # The bound depends on WHAT the command is, and one global value could not satisfy both halves.
@@ -640,11 +446,11 @@ async def test_run_command_sandbox_gone_escalates(sink: CollectingSink) -> None:
     ],
 )
 async def test_run_command_picks_its_timeout_by_command_class(
-    sink: CollectingSink, command: list[str], slow: bool
+    command: list[str], slow: bool
 ) -> None:
     fake = FakeSandbox()
     fake.queue_commands(ExecResult(stdout="ok", stderr="", exit=0))
-    await _run(fake, sink, [tool_turn("run_command", {"command": command})])
+    await _run(fake, [tool_turn("run_command", {"command": command})])
     expected = (
         constants.RUN_COMMAND_SLOW_TIMEOUT_S if slow else constants.RUN_COMMAND_DEFAULT_TIMEOUT_S
     )
@@ -671,16 +477,12 @@ def test_the_short_bound_catches_the_observed_wedge_and_the_long_one_does_not() 
         "DATABASE_URL=postgres://user:hunter2@db:5432/app",
     ],
 )
-async def test_run_command_output_is_secret_redacted(
-    sink: CollectingSink, secret_line: str
-) -> None:
+async def test_run_command_output_is_secret_redacted(secret_line: str) -> None:
     # run_command is the first tool to egress captured stdout — a credential-shaped value must be
     # masked before it re-enters the model context.
     fake = FakeSandbox()
     fake.queue_commands(ExecResult(stdout=secret_line, stderr="", exit=0))
-    captured = await _run(
-        fake, sink, [tool_turn("run_command", {"command": ["env"]}), text_turn()]
-    )
+    captured = await _run(fake, [tool_turn("run_command", {"command": ["env"]}), text_turn()])
     for leaked in (
         "bial_AbCdEf0123456789ghIjKlMnOpQr",
         "super-secret-value-do-not-leak",
@@ -703,12 +505,11 @@ def test_redact_command_output_caps_raw_input_before_redacting() -> None:
     assert len(out) <= constants.RUN_COMMAND_OUTPUT_MAX_CHARS + 400
 
 
-async def test_run_command_never_leaks_the_supervisor_token(sink: CollectingSink) -> None:
+async def test_run_command_never_leaks_the_supervisor_token() -> None:
     fake = FakeSandbox()
     fake.queue_exec_errors(SandboxError("boom"))
     captured = await _run(
         fake,
-        sink,
         [tool_turn("run_command", {"command": ["npm", "install"]}), text_turn()],
     )
     assert FAKE_SUPERVISOR_TOKEN not in captured["all_incoming"]
@@ -723,7 +524,7 @@ async def test_run_command_never_leaks_the_supervisor_token(sink: CollectingSink
 # model to commit a slice nothing ever asked it to commit rides every third write.
 
 
-async def test_no_reminder_rides_a_write_result_any_more(sink: CollectingSink) -> None:
+async def test_no_reminder_rides_a_write_result_any_more() -> None:
     """★ Asserted at THREE writes — `COMMIT_REMINDER_AFTER_WRITES`, the count at which the
     reminder used to fire — so this is a real observation rather than a test that never reached
     the trigger. A fourth and fifth write follow, because the retired counter reset itself on
@@ -733,7 +534,6 @@ async def test_no_reminder_rides_a_write_result_any_more(sink: CollectingSink) -
     fake = FakeSandbox()
     captured = await _run(
         fake,
-        sink,
         [
             tool_turn("write_file", {"path": f"app/{n}.tsx", "file_text": "x"})
             for n in ("one", "two", "three", "four", "five")
@@ -748,9 +548,7 @@ async def test_no_reminder_rides_a_write_result_any_more(sink: CollectingSink) -
     assert "Wrote `app/three.tsx`." in captured["all_incoming"]
 
 
-async def test_a_git_commit_through_run_command_is_still_an_ordinary_command(
-    sink: CollectingSink,
-) -> None:
+async def test_a_git_commit_through_run_command_is_still_an_ordinary_command() -> None:
     """The agent is no longer TOLD to commit; `run_command` is still a real shell, so a commit it
     chooses to run must behave like any other command. The retired `_is_git_commit` sniffer is
     gone with the counter it reset, and nothing replaces it — no special-casing of `git` on the
@@ -758,7 +556,6 @@ async def test_a_git_commit_through_run_command_is_still_an_ordinary_command(
     fake = FakeSandbox()
     captured = await _run(
         fake,
-        sink,
         [
             tool_turn("write_file", {"path": "app/one.tsx", "file_text": "a"}),
             tool_turn("run_command", {"command": ["git", "commit", "-m", "whatever"]}),
@@ -832,12 +629,10 @@ def _following_model(command: list[str], captured: dict[str, Any]) -> FunctionMo
     return FunctionModel(respond)
 
 
-async def _run_following(
-    fake: FakeSandbox, sink: CollectingSink, command: list[str]
-) -> dict[str, Any]:
+async def _run_following(fake: FakeSandbox, command: list[str]) -> dict[str, Any]:
     captured: dict[str, Any] = {}
     result = await _tool_agent.run(
-        "build the app", deps=_deps(fake, sink), model=_following_model(command, captured)
+        "build the app", deps=_deps(fake), model=_following_model(command, captured)
     )
     captured["output"] = result.output
     captured["all_incoming"] = "\n".join(captured.get("incoming", []))
@@ -887,21 +682,17 @@ def test_the_truncation_notice_states_the_loss_and_names_the_tool_and_handle_inl
     assert f"  at frame {last - 2:03d} " not in out  # the LAST line elided
 
 
-async def test_the_handle_fetches_the_named_middle_region_in_one_call(
-    sink: CollectingSink,
-) -> None:
+async def test_the_handle_fetches_the_named_middle_region_in_one_call() -> None:
     """★ ONE round-trip, driven by a model that knows nothing but the notice it was handed."""
     marker = "  at frame 070 of a long and tedious stack (the one the model came back for)"
     fake = FakeSandbox()
     fake.queue_commands(ExecResult(stdout=_long_output(middle=marker), stderr="", exit=0))
-    captured = await _run_following(fake, sink, ["npm", "run", "build"])
+    captured = await _run_following(fake, ["npm", "run", "build"])
     assert marker not in captured["incoming"][1]  # elided from the run_command result …
     assert marker in captured["slice_result"]  # … and recovered by the handle it named
 
 
-async def test_a_secret_inside_the_elided_middle_is_never_retrievable(
-    sink: CollectingSink,
-) -> None:
+async def test_a_secret_inside_the_elided_middle_is_never_retrievable() -> None:
     """★ THE MUTATION TARGET (delete the `scrub_untrusted` call in `_redacted_lines` → red).
 
     The returned artifact only ever exposed an already-redacted head. A handle retains a SECOND
@@ -913,7 +704,7 @@ async def test_a_secret_inside_the_elided_middle_is_never_retrievable(
     fake.queue_commands(
         ExecResult(stdout=_long_output(middle=_SECRET_IN_THE_MIDDLE), stderr="", exit=0)
     )
-    captured = await _run_following(fake, sink, ["npm", "run", "env-dump"])
+    captured = await _run_following(fake, ["npm", "run", "env-dump"])
     # It really was in the elided middle: the slice fetched the region that held it …
     assert "DATABASE_PASSWORD" in captured["slice_result"]
     # … and what came back through the handle is masked, in the slice AND in every other thing
@@ -938,15 +729,12 @@ def test_a_secret_spanning_the_truncation_boundary_is_not_re_exposed() -> None:
     assert "DATABASE_PASSWORD=***" in out
 
 
-async def test_an_unknown_handle_returns_the_plain_instruction_not_an_exception(
-    sink: CollectingSink,
-) -> None:
+async def test_an_unknown_handle_returns_the_plain_instruction_not_an_exception() -> None:
     """A `ModelRetry` here would spend the round-trip the tool exists to save, and there is
     nothing to self-correct: the buffer is gone because the turn moved on."""
     fake = FakeSandbox()
     captured = await _run(
         fake,
-        sink,
         [
             tool_turn(
                 "fetch_output_slice",
@@ -959,21 +747,20 @@ async def test_an_unknown_handle_returns_the_plain_instruction_not_an_exception(
     assert "retry" not in captured["all_incoming"].lower()
 
 
-async def test_a_handle_from_a_previous_run_is_no_longer_held(sink: CollectingSink) -> None:
+async def test_a_handle_from_a_previous_run_is_no_longer_held() -> None:
     """★ THE STATED LIFETIME, exercised rather than asserted about. The turn engine builds a
     fresh `SandboxSession` per turn (`turns/engine.py`, at `state.sandbox = SandboxSession(`), so
     the buffer dies with the turn —
     nothing here is persisted to the database or to blob."""
     fake = FakeSandbox()
     fake.queue_commands(ExecResult(stdout=_long_output(), stderr="", exit=0))
-    first = await _run_following(fake, sink, ["npm", "run", "build"])
+    first = await _run_following(fake, ["npm", "run", "build"])
     handle = _slice_call_in(first["incoming"][1])
     assert handle is not None
 
     # A SECOND run, with its own session — exactly what the engine does at the start of a turn.
     second = await _run(
         fake,
-        sink,
         [
             tool_turn(
                 "fetch_output_slice",
@@ -999,15 +786,13 @@ def test_the_held_output_ring_is_bounded() -> None:
     assert handles[-1] in session.held_outputs  # newest kept
 
 
-async def test_a_very_large_capture_does_not_retain_unbounded_memory(
-    sink: CollectingSink,
-) -> None:
+async def test_a_very_large_capture_does_not_retain_unbounded_memory() -> None:
     """The other half of the bound: ONE entry is capped too, by the same ReDoS input cap the
     redactor runs under. 8 handles x 32k is the whole ceiling a live turn can reach."""
     fake = FakeSandbox()
     huge = "\n".join(f"line {n} {'y' * 200}" for n in range(5_000))  # ~1MB
     fake.queue_commands(ExecResult(stdout=huge, stderr="", exit=1))
-    deps = _deps(fake, sink)
+    deps = _deps(fake)
     await _tool_agent.run(
         "build",
         deps=deps,
@@ -1071,30 +856,27 @@ def counted(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 async def test_truncation_is_counted_and_only_when_output_is_actually_cut(
-    sink: CollectingSink, counted: list[str]
+    counted: list[str],
 ) -> None:
     fake = FakeSandbox()
     fake.queue_commands(ExecResult(stdout="all good", stderr="", exit=0))
-    await _run(fake, sink, [tool_turn("run_command", {"command": ["npm", "test"]}), text_turn()])
+    await _run(fake, [tool_turn("run_command", {"command": ["npm", "test"]}), text_turn()])
     assert counted == []  # nothing was cut, so nothing is counted
 
     fake.queue_commands(ExecResult(stdout=_long_output(lines=900), stderr="", exit=1))
-    await _run(fake, sink, [tool_turn("run_command", {"command": ["npm", "test"]}), text_turn()])
+    await _run(fake, [tool_turn("run_command", {"command": ["npm", "test"]}), text_turn()])
     assert counted == [HarnessCounter.OUTPUT_TRUNCATED]
 
 
-async def test_a_slice_fetch_is_counted_and_a_dead_handle_is_not(
-    sink: CollectingSink, counted: list[str]
-) -> None:
+async def test_a_slice_fetch_is_counted_and_a_dead_handle_is_not(counted: list[str]) -> None:
     fake = FakeSandbox()
     fake.queue_commands(ExecResult(stdout=_long_output(), stderr="", exit=0))
-    await _run_following(fake, sink, ["npm", "run", "build"])
+    await _run_following(fake, ["npm", "run", "build"])
     assert counted == [HarnessCounter.OUTPUT_TRUNCATED, HarnessCounter.OUTPUT_SLICE_FETCHED]
 
     counted.clear()
     await _run(
         fake,
-        sink,
         [
             tool_turn(
                 "fetch_output_slice", {"handle": "out_gone", "start_line": 1, "end_line": 2}
@@ -1105,9 +887,7 @@ async def test_a_slice_fetch_is_counted_and_a_dead_handle_is_not(
     assert counted == []  # a handle that resolved to nothing fetched nothing
 
 
-async def test_a_repeat_run_is_counted_on_the_repeat_only(
-    sink: CollectingSink, counted: list[str]
-) -> None:
+async def test_a_repeat_run_is_counted_on_the_repeat_only(counted: list[str]) -> None:
     """★ The other half of the adoption pair, and the one that has to be exact: counted on the
     SECOND identical command, never on the first, and never on a merely similar one."""
     fake = FakeSandbox()
@@ -1115,7 +895,6 @@ async def test_a_repeat_run_is_counted_on_the_repeat_only(
         fake.queue_commands(ExecResult(stdout="ok", stderr="", exit=0))
     await _run(
         fake,
-        sink,
         [
             tool_turn("run_command", {"command": ["npm", "run", "lint"]}),
             tool_turn("run_command", {"command": ["npm", "run", "build"]}),
@@ -1165,12 +944,9 @@ def _report_in(captured: dict[str, Any]) -> str:
     return match.group(0)
 
 
-async def _apply(
-    fake: FakeSandbox, sink: CollectingSink, *, what_changed: str = "add visitors table"
-) -> dict[str, Any]:
+async def _apply(fake: FakeSandbox, *, what_changed: str = "add visitors table") -> dict[str, Any]:
     return await _run(
         fake,
-        sink,
         [tool_turn("apply_schema_change", {"what_changed": what_changed}), text_turn("ok")],
     )
 
@@ -1196,9 +972,7 @@ def test_the_zero_exit_lie_detector_reads_a_marker_anywhere_in_a_huge_capture() 
     assert time.perf_counter() - started < 1.5
 
 
-async def test_a_step_that_exits_zero_after_failing_is_reported_as_a_failure(
-    sink: CollectingSink,
-) -> None:
+async def test_a_step_that_exits_zero_after_failing_is_reported_as_a_failure() -> None:
     """★ THE HEADLINE. drizzle-kit reached the rename resolver: it printed the refusal to
     stderr, wrote no migration, and exited 0. The operation must report FAILURE anyway, name the
     step, say what state the workspace was left in, and say out loud that it is overriding the
@@ -1209,7 +983,7 @@ async def test_a_step_that_exits_zero_after_failing_is_reported_as_a_failure(
     every exit-code assertion in this file stays green, which is the whole point of the unit."""
     fake = FakeSandbox()
     fake.queue_commands(ExecResult(stdout="", stderr=_THE_TTY_REFUSAL, exit=0))
-    report = _report_in(await _apply(fake, sink))
+    report = _report_in(await _apply(fake))
 
     assert report.startswith("apply_schema_change FAILED at step 1 of 2 — generate the migration.")
     # WHAT STATE IT LEFT THINGS IN — the half a bare "it failed" leaves the model guessing at.
@@ -1222,9 +996,7 @@ async def test_a_step_that_exits_zero_after_failing_is_reported_as_a_failure(
     assert _THE_TTY_REFUSAL in report
 
 
-async def test_every_step_succeeding_reports_success_with_a_per_step_outcome(
-    sink: CollectingSink,
-) -> None:
+async def test_every_step_succeeding_reports_success_with_a_per_step_outcome() -> None:
     """The other terminal state, and the liveness guard on every failure marker above: a real
     generate and a real migrate print lines that must NOT be read as failures."""
     fake = FakeSandbox()
@@ -1232,7 +1004,7 @@ async def test_every_step_succeeding_reports_success_with_a_per_step_outcome(
         ExecResult(stdout=_A_MIGRATION_WAS_WRITTEN, stderr="", exit=0),
         ExecResult(stdout=_MIGRATIONS_APPLIED, stderr="", exit=0),
     )
-    report = _report_in(await _apply(fake, sink))
+    report = _report_in(await _apply(fake))
 
     assert report.startswith("apply_schema_change SUCCEEDED — all 2 steps ran.")
     assert "the migration is applied — the database now matches `db/schema.ts`" in report
@@ -1244,16 +1016,14 @@ async def test_every_step_succeeding_reports_success_with_a_per_step_outcome(
     assert fake.command_calls == [_THE_GENERATE, _THE_MIGRATE]
 
 
-async def test_a_failed_first_step_stops_the_second_and_the_report_says_so(
-    sink: CollectingSink,
-) -> None:
+async def test_a_failed_first_step_stops_the_second_and_the_report_says_so() -> None:
     """★ Applying half a schema change is worse than applying none: the migrate step would have
     re-applied whatever was already pending under a name the model thinks describes its new edit.
     So step two does not run — and "did not run" is REPORTED, because the state it implies
     (nothing reached the database) is different from "ran and failed"."""
     fake = FakeSandbox()
     fake.queue_commands(ExecResult(stdout="", stderr=_THE_TTY_REFUSAL, exit=0))
-    report = _report_in(await _apply(fake, sink))
+    report = _report_in(await _apply(fake))
 
     assert fake.command_calls == [_THE_GENERATE], "the migrate step ran after a failed generate"
     assert "STEP 2 of 2 — apply the migration to the database: NOT RUN" in report
@@ -1266,7 +1036,7 @@ async def test_a_failed_first_step_stops_the_second_and_the_report_says_so(
     ids=["swallowed", "abandoned", "skipped"],
 )
 async def test_the_migrator_always_exits_zero_so_its_output_is_what_gets_read(
-    sink: CollectingSink, printed: str
+    printed: str,
 ) -> None:
     """★ THE SAME HEADLINE AGAIN, on the second step and all three of its shapes. `db-migrate.mjs`
     is non-fatal BY DESIGN — its own header explains why — so a caught error, a migration
@@ -1277,7 +1047,7 @@ async def test_the_migrator_always_exits_zero_so_its_output_is_what_gets_read(
         ExecResult(stdout=_A_MIGRATION_WAS_WRITTEN, stderr="", exit=0),
         ExecResult(stdout=printed, stderr="", exit=0),
     )
-    report = _report_in(await _apply(fake, sink))
+    report = _report_in(await _apply(fake))
 
     assert report.startswith(
         "apply_schema_change FAILED at step 2 of 2 — apply the migration to the database."
@@ -1308,9 +1078,7 @@ def test_the_migrate_failure_markers_match_the_script_that_prints_them() -> None
     )
 
 
-async def test_the_interactive_resolver_fails_fast_with_a_plain_explanation(
-    sink: CollectingSink,
-) -> None:
+async def test_the_interactive_resolver_fails_fast_with_a_plain_explanation() -> None:
     """The wedge, asserted the only honest way: on the BOUND and the measured signature, never by
     waiting one out.
 
@@ -1321,7 +1089,7 @@ async def test_the_interactive_resolver_fails_fast_with_a_plain_explanation(
     hands back an explanation in words rather than a wedged command and a timeout."""
     fake = FakeSandbox()
     fake.queue_commands(ExecResult(stdout="", stderr=_THE_TTY_REFUSAL, exit=0))
-    captured = await _apply(fake, sink)
+    captured = await _apply(fake)
 
     # A migration generate should take seconds. Ten minutes of waiting for a terminal that does
     # not exist is ten minutes of the citizen's build.
@@ -1341,9 +1109,9 @@ async def test_the_interactive_resolver_fails_fast_with_a_plain_explanation(
     assert captured["output"] == "ok"
 
 
-async def test_the_composites_output_is_capped_by_its_verdict_not_by_the_commands_exit_code(
-    sink: CollectingSink,
-) -> None:
+async def test_the_composites_output_is_capped_by_its_verdict_not_by_the_commands_exit_code() -> (
+    None
+):
     """★ The output cap, reached through the composite's own override. A step that failed while
     exiting 0 would be SUMMARISED if the budget were read off `result.exit` — the misleading
     zero deciding how much of the failure the model gets to see. The budget is asked about
@@ -1353,14 +1121,14 @@ async def test_the_composites_output_is_capped_by_its_verdict_not_by_the_command
     failing.queue_commands(
         ExecResult(stdout=_long_output(lines=900), stderr=_THE_TTY_REFUSAL, exit=0)
     )
-    failed = _report_in(await _apply(failing, sink))
+    failed = _report_in(await _apply(failing))
 
     passing = FakeSandbox()
     passing.queue_commands(
         ExecResult(stdout=_long_output(lines=900), stderr="", exit=0),
         ExecResult(stdout=_MIGRATIONS_APPLIED, stderr="", exit=0),
     )
-    passed = _report_in(await _apply(passing, sink))
+    passed = _report_in(await _apply(passing))
 
     assert "FAILED" in failed and "SUCCEEDED" in passed
     # THE TWO BUDGETS, NAMED — not merely "one is bigger". A `len(failed) > len(passed)` pair
@@ -1376,32 +1144,30 @@ async def test_the_composites_output_is_capped_by_its_verdict_not_by_the_command
     assert _slice_call_in(passed) is not None
 
 
-async def test_a_transport_failure_names_the_step_and_the_state_and_re_enters_the_loop(
-    sink: CollectingSink,
-) -> None:
+async def test_a_transport_failure_names_the_step_and_the_state_and_re_enters_the_loop() -> None:
     """A supervisor blip is not a step verdict — the step never returned one — so it comes back as
     a `ModelRetry` like `run_command`'s rather than a fabricated failure report. It still has to
     say which step and what state, because "something went wrong somewhere in there" is exactly
     the answer this tool exists to stop giving."""
     fake = FakeSandbox()
     fake.queue_exec_errors(SandboxError("exec timed out after 180s"))
-    captured = await _apply(fake, sink)
+    captured = await _apply(fake)
 
     assert "The `generate the migration` step could not run" in captured["all_incoming"]
     assert "NO migration file was written" in captured["all_incoming"]
     assert captured["output"] == "ok"  # the loop healed rather than crashing
 
 
-async def test_a_gone_sandbox_still_escalates_from_the_composite(sink: CollectingSink) -> None:
+async def test_a_gone_sandbox_still_escalates_from_the_composite() -> None:
     """Only `SandboxGoneError` leaves the tool — the restore-needed escalation is terminal for the
     handle and must not be dressed up as a step outcome."""
     fake = FakeSandbox()
     fake.queue_exec_errors(SandboxGoneError("the sandbox is gone"))
     with pytest.raises(SandboxGoneError):
-        await _apply(fake, sink)
+        await _apply(fake)
 
 
-async def test_the_model_writes_the_migration_name_in_words(sink: CollectingSink) -> None:
+async def test_the_model_writes_the_migration_name_in_words() -> None:
     """`what_changed` is prose in the prompt and a slug on the command line, and the tool does the
     conversion rather than bouncing the model for a formatting quibble — a `ModelRetry` here would
     spend the exact round trip the whole unit exists to save. Only an input with nothing usable in
@@ -1411,7 +1177,7 @@ async def test_the_model_writes_the_migration_name_in_words(sink: CollectingSink
         ExecResult(stdout=_A_MIGRATION_WAS_WRITTEN, stderr="", exit=0),
         ExecResult(stdout=_MIGRATIONS_APPLIED, stderr="", exit=0),
     )
-    await _apply(fake, sink, what_changed="Add a Visitors table!")
+    await _apply(fake, what_changed="Add a Visitors table!")
     assert fake.command_calls[0] == [
         "npx",
         "drizzle-kit",
@@ -1421,26 +1187,9 @@ async def test_the_model_writes_the_migration_name_in_words(sink: CollectingSink
     ]
 
     nameless = FakeSandbox()
-    captured = await _apply(nameless, sink, what_changed="   !!!   ")
+    captured = await _apply(nameless, what_changed="   !!!   ")
     assert "has to describe the schema edit in words" in captured["all_incoming"]
     assert nameless.command_calls == [], "a nameless call still ran the generate"
-
-
-async def test_the_live_step_says_what_the_citizen_sees_never_the_shell(
-    sink: CollectingSink,
-) -> None:
-    """The composite runs two commands and emits ONE step, under the same friendly label the two
-    raw commands already classified to — a citizen must not be able to tell which spelling the
-    agent reached for. The fallback would have rendered the raw tool name into their feed."""
-    fake = FakeSandbox()
-    fake.queue_commands(ExecResult(stdout="", stderr=_THE_TTY_REFUSAL, exit=0))
-    await _apply(fake, sink)
-    step = next(e for e in _steps(sink) if e.name == "apply_schema_change")
-    assert step.state == "failed"
-    assert step.hidden is False
-    assert step.label == "Setting up where your app stores information"
-    for leaked in ("drizzle", "npm", "npx", "apply_schema_change", "$ "):
-        assert leaked not in step.label
 
 
 async def test_the_composite_gets_the_long_operation_status_line(
@@ -1493,7 +1242,7 @@ async def test_the_composite_gets_the_long_operation_status_line(
 
 
 async def test_the_adoption_pair_tells_the_composite_from_the_hand_rolled_sequence(
-    sink: CollectingSink, counted: list[str]
+    counted: list[str],
 ) -> None:
     """★ The behavioural bet, counted. The open question is whether the agent actually REACHES
     for the composite, and neither number answers it alone: "40 composite calls" is a fact about
@@ -1507,7 +1256,7 @@ async def test_the_adoption_pair_tells_the_composite_from_the_hand_rolled_sequen
         ExecResult(stdout=_A_MIGRATION_WAS_WRITTEN, stderr="", exit=0),
         ExecResult(stdout=_MIGRATIONS_APPLIED, stderr="", exit=0),
     )
-    await _apply(fake, sink)
+    await _apply(fake)
     assert counted == [HarnessCounter.SCHEMA_CHANGE_COMPOSED]
 
     counted.clear()
@@ -1517,7 +1266,6 @@ async def test_the_adoption_pair_tells_the_composite_from_the_hand_rolled_sequen
     )
     await _run(
         fake,
-        sink,
         [
             tool_turn("run_command", {"command": _THE_GENERATE}),
             tool_turn("run_command", {"command": _THE_MIGRATE}),
@@ -1529,5 +1277,5 @@ async def test_the_adoption_pair_tells_the_composite_from_the_hand_rolled_sequen
 
     counted.clear()
     fake.queue_commands(ExecResult(stdout="ok", stderr="", exit=0))
-    await _run(fake, sink, [tool_turn("run_command", {"command": ["npm", "run", "lint"]})])
+    await _run(fake, [tool_turn("run_command", {"command": ["npm", "run", "lint"]})])
     assert counted == [], "an ordinary command was counted as a schema change"

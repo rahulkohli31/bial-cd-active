@@ -200,21 +200,17 @@ def test_production_boots_with_redis_and_sandbox() -> None:
     assert s.sandbox.image_ref == "bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest"
 
 
-def test_the_sweep_ships_on_and_the_new_reclamation_ships_off() -> None:
-    """A PORT MUST NOT CHANGE BEHAVIOUR, and the defaults are where that is decided.
+def test_the_sweep_ships_on() -> None:
+    """A PORT MUST NOT CHANGE BEHAVIOUR, and the default is where that is decided.
 
-    `sweep_all` predates the fleet-reclamation redesign: it ran as an unflagged `while True` in
-    the API lifespan wherever a sandbox was configured. The redesign moved it to the scheduler
-    and gated it on `reclaim_enabled` — off by default — so an upgrade with reaping silently
-    stopped would leave every check green, with the Azure bill as the only symptom.
+    `sweep_all` predates the move onto the scheduler: it ran as an unflagged `while True` in
+    the API lifespan wherever a sandbox was configured. Porting it changed WHERE it runs, and
+    the default must not also change WHETHER it runs.
 
-    Mutation-check: flip `sweep_enabled` to `False`, or point `sandbox_reap` at
-    `reclaim_enabled`."""
+    Mutation-check: flip `sweep_enabled` to `False`."""
     s = _prod_settings()
     assert s.sandbox is not None
     assert s.sandbox.sweep_enabled is True, "the pre-existing sweep must survive the upgrade"
-    assert s.sandbox.reclaim_enabled is False, "the NEW pass still ships off"
-    assert s.sandbox.reclaim_destroy is False
 
 
 def test_the_ceiling_is_two_hours_and_has_no_off_switch() -> None:

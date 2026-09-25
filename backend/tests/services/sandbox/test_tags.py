@@ -7,8 +7,8 @@ so the parser has to work from a plain dict and nothing else.
 
 The one scenario worth naming up front is `test_absent_tags_parse_to_no_identity`. On an untagged
 container ARM omits the `tags` key entirely — not `{}`, not `null` — and that shape IS the orphan
-population. A parser that raised on it would blind the reclamation system to exactly the
-containers it exists to collect.
+population. A parser that raised on it would blind the fleet sweep to exactly the containers it
+exists to collect.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ from src.services.sandbox.base import (
     TAG_CONTROL_PLANE,
     TAG_CREATED_AT,
     TAG_KIND,
-    TAG_RECLAIM_STAGED_AT,
     TAG_USER_ID,
     SandboxTagError,
     checked_tags,
@@ -67,28 +66,12 @@ def test_the_values_round_trip_through_the_parser() -> None:
     assert identity.control_plane == str(settings.ENVIRONMENT)
     assert identity.created_at is not None
     assert before <= identity.created_at <= dt.datetime.now(dt.UTC)
-    assert identity.is_a_sandbox is True
-
-
-def test_a_fresh_sandbox_is_not_escalate_only() -> None:
-    # The positive control for the mutation check below: a fully-identified container is
-    # judgeable, so `escalate_only` must be False or the predicate proves nothing.
-    assert identity_from_tags(sandbox_tags(user_id=USER, app_id=APP)).escalate_only is False
+    assert identity.kind == KIND_BUILD_SANDBOX
 
 
 def test_a_fresh_sandbox_is_not_marked_backfilled() -> None:
     identity = identity_from_tags(sandbox_tags(user_id=USER, app_id=APP))
-    assert identity.was_backfilled is False
     assert identity.backfilled_at is None
-
-
-def test_a_new_sandbox_is_not_staged_for_reclamation() -> None:
-    """ONE thing writes `bial-reclaim-staged-at` — the reclamation pass's staging step
-    (`_stage_the_candidates`) — and creation is not it. Pinned so a future writer cannot quietly
-    start stamping it here: a container staged from birth would satisfy the two-pass rule on its
-    first pass, which is the rule's whole purpose."""
-    assert identity_from_tags(sandbox_tags(user_id=USER, app_id=APP)).reclaim_staged_at is None
-    assert TAG_RECLAIM_STAGED_AT not in sandbox_tags(user_id=USER, app_id=APP)
 
 
 # --- a published app is a different animal, and says so --------------------------
@@ -102,7 +85,7 @@ def test_a_published_app_is_tagged_as_one() -> None:
 
     assert tags[TAG_KIND] == KIND_PUBLISHED_APP
     assert tags[TAG_APP_ID] == str(APP)
-    assert identity_from_tags(tags).is_a_sandbox is False
+    assert identity_from_tags(tags).kind == KIND_PUBLISHED_APP
 
 
 def test_a_published_app_carries_no_creation_stamp() -> None:
@@ -116,16 +99,13 @@ def test_a_published_app_carries_no_creation_stamp() -> None:
 
 def test_absent_tags_parse_to_no_identity() -> None:
     """THE ORPHAN SHAPE. ARM omits `tags` entirely on an untagged app, and every container that
-    predates the tag schema looks exactly like this. It must parse, and it must land in the
-    bucket that is reported and never destroyed."""
+    predates the tag schema looks exactly like this. It must parse without raising."""
     identity = identity_from_tags(None)
 
     assert identity.kind is None
     assert identity.user_id is None
     assert identity.app_id is None
     assert identity.created_at is None
-    assert identity.escalate_only is True
-    assert identity.is_a_sandbox is False
 
 
 def test_an_empty_tag_dict_parses_the_same_way() -> None:
@@ -134,13 +114,12 @@ def test_an_empty_tag_dict_parses_the_same_way() -> None:
 
 @pytest.mark.parametrize("junk", ["", "not-a-uuid", "1234", "sbx-abc"])
 def test_an_unparseable_owner_reads_as_no_owner_rather_than_raising(junk: str) -> None:
-    """An unreadable signal ESCALATES; it never expires into a decision, and it certainly never
-    takes a fleet pass down with it. A malformed owner tag means the platform cannot prove who
-    owns the container — which is the escalate-only bucket, by definition."""
+    """An unreadable signal reads as ABSENT rather than raising and taking the whole caller
+    down with it. A malformed owner tag means the platform cannot prove who owns the
+    container."""
     identity = identity_from_tags({TAG_KIND: KIND_BUILD_SANDBOX, TAG_USER_ID: junk})
 
     assert identity.user_id is None
-    assert identity.escalate_only is True
 
 
 @pytest.mark.parametrize("junk", ["", "yesterday", "2026-13-45T99:99:99"])
@@ -151,7 +130,6 @@ def test_an_unparseable_timestamp_reads_as_no_age(junk: str) -> None:
     )
 
     assert identity.created_at is None
-    assert identity.escalate_only is True
 
 
 def test_a_naive_timestamp_is_read_as_utc() -> None:
@@ -163,56 +141,20 @@ def test_a_naive_timestamp_is_read_as_utc() -> None:
     assert identity.created_at == dt.datetime(2026, 8, 1, 10, 0, tzinfo=dt.UTC)
 
 
-# --- the escalate-never-destroy predicate ----------------------------------------
+# --- the backfill's own tag shape -------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "missing",
-    [TAG_USER_ID, TAG_APP_ID, TAG_CREATED_AT],
-    ids=["no-owner", "no-app", "no-age"],
-)
-def test_any_missing_identity_field_makes_it_escalate_only(missing: str) -> None:
-    """Each of the three is individually load-bearing. Destroying on two-thirds of an identity
-    is destroying on a guess, and the guess is somebody's unsaved work."""
-    tags = sandbox_tags(user_id=USER, app_id=APP)
-    del tags[missing]
-
-    assert identity_from_tags(tags).escalate_only is True
-
-
-def test_a_container_stamped_by_another_control_plane_is_escalate_only() -> None:
-    """A foreign control plane's container is escalate-only, enforced by the predicate.
-
-    Two control planes can see one resource group — a dev deployment pointed at a subscription
-    that also holds production-stamped sandboxes, or an `ENVIRONMENT` rename. Reading somebody
-    else's container is fine; SENTENCING it is not, and the predicate settles that for everyone.
-
-    Mutation-check: drop the `control_plane` clause from `escalate_only` and this goes red while
-    a fully-formed identity from THIS control plane stays judgeable."""
-    theirs = sandbox_tags(user_id=USER, app_id=APP)
-    theirs[TAG_CONTROL_PLANE] = "some-other-control-plane"
-
-    identity = identity_from_tags(theirs)
-
-    # Fully formed in every other respect — owner, app, age all present and parseable.
-    assert identity.user_id == USER
-    assert identity.app_id == APP
-    assert identity.created_at is not None
-    # ...and still untouchable.
-    assert identity.escalate_only is True
-
-
-def test_a_backfilled_container_with_no_owner_is_escalate_only() -> None:
+def test_a_backfilled_container_with_no_owner_parses_kind_and_backfill_only() -> None:
     """The exact shape the backfill writes for a container matching no app row: kind and a
-    backfill marker, and nothing else. It is reported forever and destroyed by nothing,
-    by design."""
+    backfill marker, and nothing else."""
     identity = identity_from_tags(
         {TAG_KIND: KIND_BUILD_SANDBOX, TAG_BACKFILLED_AT: "2026-08-11T00:00:00+00:00"}
     )
 
-    assert identity.is_a_sandbox is True
-    assert identity.escalate_only is True
-    assert identity.was_backfilled is True
+    assert identity.kind == KIND_BUILD_SANDBOX
+    assert identity.user_id is None
+    assert identity.app_id is None
+    assert identity.backfilled_at is not None
 
 
 # --- the ARM value ceiling, enforced here rather than by a 400 -------------------

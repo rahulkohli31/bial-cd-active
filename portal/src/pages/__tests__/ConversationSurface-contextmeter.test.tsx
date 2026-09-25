@@ -28,7 +28,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(), relaunchPreview: vi.fn(),
+  relaunchPreview: vi.fn(),
   fetchSaveState: vi.fn(), fetchPreviewState: vi.fn(), saveProject: vi.fn(),
   getStoredUser: vi.fn(),
 }))
@@ -69,7 +69,7 @@ vi.mock('../../utils/auth', async (orig) => ({
 }))
 
 import {
-  FakeEventSource, makeClient, primeClient, primeTurn, renderBuilder, send, waitForGateOpen,
+  primeTurn, renderBuilder, send, waitForGateOpen,
   composer,
 } from './_builderSession.jsx'
 
@@ -79,11 +79,6 @@ const HARD = 500_000
 
 const WARNING =
   'This chat is getting long. Start a new chat soon to keep things quick — your app and everything you have built stays exactly as it is.'
-
-const deps = () => {
-  const fake = new FakeEventSource('x')
-  return { fake, deps: { client: makeClient(h), eventSourceFactory: () => fake } }
-}
 
 /** A conversation as the cold read hands it back, at a stated occupancy. */
 const savedChat = (contextTokens: number | null) => ({
@@ -97,7 +92,6 @@ const savedChat = (contextTokens: number | null) => ({
 beforeEach(() => {
   vi.clearAllMocks()
   sessionStorage.clear()
-  primeClient(h)
   primeTurn(h)
   h.getStoredUser.mockReturnValue({
     limits: { contextSoftLimit: SOFT, contextHardLimit: HARD },
@@ -109,9 +103,7 @@ beforeEach(() => {
   h.fetchSaveState.mockResolvedValue({
     appId: null, dirty: null, containerHead: null, savedHead: null,
   })
-  h.fetchPreviewState.mockResolvedValue({
-    state: 'unknown', alive: false, previewUrl: null, occupyingProjectName: null, restorable: null,
-  })
+  h.fetchPreviewState.mockRejectedValue(new Error('the read is not this file\'s subject'))
 })
 
 afterEach(() => {
@@ -127,8 +119,7 @@ describe('the meter reads the server’s figure', () => {
     // `effective_context` says this chat is getting long, handed over by the read rather than
     // recomputed here. One number, two readers.
     h.getBuild.mockResolvedValue(savedChat(SOFT))
-    const { deps: d } = deps()
-    renderBuilder({ deps: d })
+    renderBuilder()
 
     await waitFor(() => expect(warning()).toBeTruthy())
     expect(warning()?.textContent).toBe(WARNING)
@@ -136,8 +127,7 @@ describe('the meter reads the server’s figure', () => {
 
   it('is silent one token below that threshold — the boundary is the server’s, not a mood', async () => {
     h.getBuild.mockResolvedValue(savedChat(SOFT - 1))
-    const { deps: d } = deps()
-    renderBuilder({ deps: d })
+    renderBuilder()
 
     await waitForGateOpen()
     expect(warning()).toBeNull()
@@ -151,8 +141,7 @@ describe('the meter reads the server’s figure', () => {
     // measurement. The honest answer is to say nothing: a browser that guessed here is exactly
     // the kind of estimate this surface no longer makes.
     h.getBuild.mockResolvedValue(savedChat(null))
-    const { deps: d } = deps()
-    renderBuilder({ deps: d })
+    renderBuilder()
 
     await waitForGateOpen()
     expect(warning()).toBeNull()
@@ -165,8 +154,7 @@ describe('the meter reads the server’s figure', () => {
     // judged on — so the line appears now rather than after a reload.
     h.getBuild.mockResolvedValue(savedChat(1_000))
     h.startTurn.mockResolvedValue({ turnId: 't1', contextTokens: SOFT + 25_000 })
-    const { deps: d } = deps()
-    renderBuilder({ deps: d })
+    renderBuilder()
 
     await waitForGateOpen()
     expect(warning()).toBeNull() // liveness: it really was silent before the send
@@ -182,8 +170,7 @@ describe('the meter reads the server’s figure', () => {
     // read had already delivered.
     h.getBuild.mockResolvedValue(savedChat(SOFT + 10_000))
     h.startTurn.mockResolvedValue({ turnId: 't1' })
-    const { deps: d } = deps()
-    renderBuilder({ deps: d })
+    renderBuilder()
 
     await waitFor(() => expect(warning()).toBeTruthy())
     await send('one more change')
@@ -202,8 +189,7 @@ describe('nothing is sized before a send', () => {
     // reported for a turn it already served. A "how big is this?" round trip on the keystroke
     // path is the thing that must never be added back, and this is what would notice.
     h.getBuild.mockResolvedValue(savedChat(1_000))
-    const { deps: d } = deps()
-    renderBuilder({ deps: d })
+    renderBuilder()
     await waitForGateOpen()
 
     const callsAfterLoad = [h.getBuild, h.startTurn, h.buildFromPlan, h.readTurnStream].map(

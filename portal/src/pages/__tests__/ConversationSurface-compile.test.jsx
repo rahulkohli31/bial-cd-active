@@ -14,7 +14,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
-  FakeEventSource, makeClient, primeClient,
   waitForGateOpen, T_STEP, T_WORKSPACE, T_PREVIEW, T_BUILD_END, T_DELTA, PREVIEW_URL,
   inWorkspace,
 } from './_builderSession.jsx'
@@ -24,7 +23,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(), stopTurn: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  relaunchPreview: vi.fn(), getStatus: vi.fn(),
+  relaunchPreview: vi.fn(),
   fetchPreviewState: vi.fn(), fetchCompileState: vi.fn(), fetchSaveState: vi.fn(),
   checkWorkspace: vi.fn(),
 }))
@@ -80,12 +79,10 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
 import ConversationSurface from '../../components/chat/ConversationSurface'
 
 function renderThread(chatId = 'thread-1') {
-  const fake = new FakeEventSource(chatId)
-  const deps = { client: makeClient(h), eventSourceFactory: () => fake }
   return render(
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <Routes>
-        {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" buildSessionDeps={deps} />} />)}
+        {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface projectId="p1" />} />)}
       </Routes>
     </MemoryRouter>,
   )
@@ -154,7 +151,6 @@ beforeEach(() => {
   reportStall = null
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
@@ -163,9 +159,7 @@ beforeEach(() => {
   h.fetchCompileState.mockResolvedValue('unknown')
   h.checkWorkspace.mockResolvedValue(false)
   h.fetchSaveState.mockResolvedValue({ appId: null, dirty: null, containerHead: null, savedHead: null })
-  h.fetchPreviewState.mockResolvedValue({
-    state: 'unknown', alive: false, previewUrl: null, occupyingProjectName: null, restorable: null,
-  })
+  h.fetchPreviewState.mockRejectedValue(new Error('the read is not this file\'s subject'))
 })
 
 afterEach(cleanup)
@@ -179,7 +173,7 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
     h.fetchCompileState.mockResolvedValue('failed')
     h.fetchPreviewState.mockResolvedValue({
       state: 'alive', alive: true, previewUrl: PREVIEW_URL,
-      occupyingProjectName: null, restorable: true,
+      restorable: true,
     })
     const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
@@ -206,7 +200,7 @@ describe('BuilderPage — the compile signal reaches the preview pane', () => {
   it('does not ask while a turn is running — the stream is the better authority', async () => {
     h.fetchPreviewState.mockResolvedValue({
       state: 'alive', alive: true, previewUrl: PREVIEW_URL,
-      occupyingProjectName: null, restorable: true,
+      restorable: true,
     })
     const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
@@ -315,7 +309,7 @@ describe('BuilderPage — a workspace lost while the tab sat idle', () => {
   async function idleOverAFinishedBuild() {
     h.fetchPreviewState.mockResolvedValue({
       state: 'alive', alive: true, previewUrl: PREVIEW_URL,
-      occupyingProjectName: null, restorable: true,
+      restorable: true,
     })
     const turn = scriptTurn()
     h.readTurnStream.mockImplementation(turn.impl)
@@ -392,7 +386,7 @@ describe('BuilderPage — a stalled frame asks whether the app has stopped', () 
   async function framedWithNoClaim() {
     h.fetchPreviewState.mockResolvedValue({
       state: 'alive', alive: true, previewUrl: PREVIEW_URL,
-      occupyingProjectName: null, restorable: true,
+      restorable: true,
     })
     renderThread()
     await waitFor(() => expect(reportStall).not.toBeNull())
@@ -418,8 +412,8 @@ describe('BuilderPage — a stalled frame asks whether the app has stopped', () 
     expect(h.checkWorkspace).toHaveBeenCalledTimes(1)
   })
 
-  // Put away, the pane unmounts without taking its stall back, so the reading that takes the frame
-  // away has to. Mutation check: drop that reset and the relaunched app is asked about on the next look.
+  // A reading that takes the frame away unmounts the pane without taking its stall back, so that
+  // reading has to. Mutation check: drop that reset and the relaunched app is asked about on the next look.
   it('★ a stall does not outlive the app it was about — launched again, a running app is not asked', async () => {
     let putAway = false
     let launched = false
@@ -427,10 +421,10 @@ describe('BuilderPage — a stalled frame asks whether the app has stopped', () 
     h.checkWorkspace.mockImplementation(async () => { putAway = true; return false })
     h.fetchPreviewState.mockImplementation(async () => {
       if (launched || !putAway) {
-        return { state: 'alive', alive: true, previewUrl: PREVIEW_URL, occupyingProjectName: null, restorable: true }
+        return { state: 'alive', alive: true, previewUrl: PREVIEW_URL, restorable: true }
       }
       asleepAnswers += 1
-      return { state: 'asleep', alive: false, previewUrl: null, occupyingProjectName: null, restorable: true }
+      return { state: 'asleep', alive: false, previewUrl: null, restorable: true }
     })
     renderThread()
     await waitFor(() => expect(reportStall).not.toBeNull())

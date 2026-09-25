@@ -52,12 +52,13 @@ RUN test -d tests && test -d alembic || (echo "gate context is missing tests/ or
 
 # WHAT THIS LANE CANNOT COVER, stated so nobody rediscovers it as a mystery failure.
 #
-# The build context is `backend/`, so nothing outside it exists in the image. One test reaches
-# across into `sandbox/template/` to check the golden-template manifest, and it therefore CANNOT
-# pass here — not because anything is broken, but because the tree it inspects was never copied
-# in. It is deselected BY NAME with this reason rather than left to fail: a lane that is expected
-# to be red teaches people to ignore red. It still runs in the host lane, which has the whole
-# repo, and that is where it belongs.
+# The build context is `backend/`, so nothing outside it exists in the image. Two test sites
+# reach across into `sandbox/`: one checks the golden-template manifest, and
+# `test_workspace_scripts.py` runs the workspace git scripts under the image's exclude file. They
+# therefore CANNOT pass here — not because anything is broken, but because the tree they inspect
+# was never copied in. They are deselected BY NAME with this reason rather than left to fail: a
+# lane that is expected to be red teaches people to ignore red. They still run in the host lane,
+# which has the whole repo, and that is where they belong.
 #
 # Widening the context to the repo root to "fix" this would pull the sandbox tree, the portal
 # tree and every node_modules into an image whose entire purpose is to be the shipped base plus
@@ -69,4 +70,5 @@ uv run ty check src tests; \
 uv run mypy src tests; \
 uv run pyright src tests; \
 uv run pytest -q --deselect \
-tests/services/orchestrator/test_prompt.py::test_every_golden_template_manifest_file_exists"]
+tests/services/orchestrator/test_prompt.py::test_every_golden_template_manifest_file_exists \
+--deselect tests/services/build_sessions/test_workspace_scripts.py"]

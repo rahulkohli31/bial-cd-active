@@ -399,11 +399,11 @@ describe('the kind picker — the control that makes the other half of the produ
  * ★ THE FIRST ONE WAS PROPOSED FOR DELETION, ON A READING OF THIS FILE THAT IS FALSE. The argument
  * was that `onStartPending(true)` "fires on a ProjectWorkspace that navigation is about to unmount
  * … for a page nobody sees". The ORDER is the proof that it does not: the flag goes up, then
- * `relaunchPreview` is AWAITED, and only then does the navigate happen. That await is the attach
- * or the cold restore — bounded server-side at `_COLD_READY_BUDGET_SECONDS` — and the citizen
- * spends every second of it on THIS page watching THIS pane. Delete the flag and the whole wait is
- * silent: the pane goes on saying "Your app is saved." over a start that is already running, and a
- * screen reader is told nothing at all.
+ * `relaunchPreview` is AWAITED, and only then does the navigate happen. That await is the server
+ * admitting the start, which can wait on a turn letting go of the workspace or on another start
+ * holding it, and the citizen spends it on THIS page watching THIS pane. Delete the flag and the
+ * wait is silent: the pane goes on saying "Your app is saved." over a start that is already
+ * running, and a screen reader is told nothing at all.
  *
  * SO BOTH HALVES ARE PINNED: the sentence exists for the whole wait, and there is exactly ONE of
  * it. The middle announcement's suppression is pinned in `ChatRoute.test.tsx` ("paints the wait
@@ -423,9 +423,9 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
     state: 'asleep',
     alive: false,
     previewUrl: null,
-    occupyingProjectName: null,
-    occupyingProjectId: null,
     restorable: true,
+    startingSince: null,
+    startFailure: null,
   }
 
   /**
@@ -442,18 +442,18 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
     const stateFor = (startInFlight: boolean) =>
       resolveWorkspaceState({
         preview: ASLEEP,
-        lastDecidedPreview: null,
         projectHasSavedBuild: null,
         startOutcome: null,
         startInFlight,
+        waitHasGoneOnTooLong: false,
       })
     const sinks = {
       projectId: 'p1',
-      onStarted: vi.fn(),
       onStartPending: vi.fn((pending: boolean) => {
         act(() => channel.workspace.set({ ...report, state: stateFor(pending) }))
       }),
       onStartOutcome: vi.fn(),
+      onStartAdmitted: vi.fn(),
     }
     const report: WorkspaceReport = {
       ...sinks,
@@ -494,7 +494,7 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
   it('★ says "Getting your app ready." for the WHOLE wait, before the navigate and not after', async () => {
     // Mutation receipt: delete `report.onStartPending(true)` from `startChat` and this goes red on
     // the mid-wait assertion — the pane sits on "Your app is saved." for the length of the restore.
-    const hold = deferred<{ previewUrl: string; ready: boolean }>()
+    const hold = deferred<void>()
     api.relaunchPreview.mockReturnValue(hold.promise)
     railAndPane()
 
@@ -516,7 +516,7 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
 
     // …and the navigate lands only once the server has answered.
     await act(async () => {
-      hold.settle({ previewUrl: 'https://app.example/', ready: true })
+      hold.settle()
       await Promise.resolve()
     })
     await waitFor(() => expect(screen.getByTestId('path').textContent).toMatch(/^\/chat\//))
@@ -525,7 +525,7 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
   it('★ and the wait names no duration, however long it runs', async () => {
     // The rule the pane's copy is written under, asserted from the surface that OPENS the wait:
     // nobody has measured a cold start, so no sentence may name one.
-    const hold = deferred<{ previewUrl: string; ready: boolean }>()
+    const hold = deferred<void>()
     api.relaunchPreview.mockReturnValue(hold.promise)
     railAndPane()
     send('a visitor log')
@@ -546,7 +546,7 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
     expect(sentences).toContain('Getting your app ready.')
 
     await act(async () => {
-      hold.settle({ previewUrl: 'https://app.example/', ready: true })
+      hold.settle()
       await Promise.resolve()
     })
   })

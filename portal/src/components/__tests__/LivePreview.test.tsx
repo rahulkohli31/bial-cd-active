@@ -253,7 +253,7 @@ const RETIRED_WORKSPACE_COPY = [
 ]
 
 describe('★ this pane speaks for the FRAME, and for nothing else', () => {
-  it.each(['asleep', 'slot_taken', 'never_built', 'unknown'] as const)(
+  it.each(['asleep'] as const)(
     '★ writes no headline, no body and no button for a `%s` workspace',
     async (state) => {
       // Each of these used to pick a title and a body out of this file's own copy table. The map
@@ -297,7 +297,7 @@ describe('★ this pane speaks for the FRAME, and for nothing else', () => {
   })
 
   it('★ no `role="alert"` survives here at all — a workspace verdict is not this pane`s emergency', async () => {
-    for (const state of ['asleep', 'slot_taken', 'never_built', 'unknown'] as const) {
+    for (const state of ['asleep'] as const) {
       const verdict = await asTheBrowserSeesIt({ state, alive: false, restorable: true })
       const view = paneFor(verdict)
       expect(screen.queryByRole('alert'), state).toBeNull()
@@ -857,15 +857,15 @@ describe('LivePreview — one persistent status region announces every state', (
   it('★ and that claim is held up by `AppPane``s VETO, not by this pane`s own inputs', () => {
     // ★ WRITTEN DOWN BECAUSE IT IS LOAD-BEARING AND INVISIBLE, and because the tempting version of
     // this claim is false. It is NOT true that the serving stamp reaches every input of the live
-    // sentence: `serving` has three arms (`utils/previewAddress.ts`) and only `fromProject`
-    // consults the preview-state poll — `fromTurn` and `fromSession` are a live turn's own word for
-    // it and never see the stamp. So this component, handed a turn-sourced `serving` and a clean
+    // sentence: `serving` has two arms (`utils/previewAddress.ts`) and only `fromProject`
+    // consults the preview-state poll — `fromTurn` is a live turn's own word for it and never sees
+    // the stamp. So this component, handed a turn-sourced `serving` and a clean
     // compile, will announce the app live over a workspace reading that is nowhere near `running`.
     //
     // That is exactly what this test shows, and it is not a bug HERE: the sentence is honest in
     // the product because `AppPane` will not mount this component at all unless the reading is
     // `running`. Weaken that veto and the claim goes back to being unearned on the turn-sourced
-    // arms, with nothing in this file to catch it — which is why the veto has its own exhaustive
+    // arm, with nothing in this file to catch it — which is why the veto has its own exhaustive
     // test in `workspace/__tests__/AppPane.test.tsx` and why this one points at it.
     const view = render(
       <LivePreview previewUrl={SANDBOX_URL} status="ended" serving previewState="asleep" compileState="clean" />,
@@ -940,24 +940,21 @@ describe('the wire parser — where a coercion would do its damage silently', ()
     expect(verdict.restorable).toBeNull()
   })
 
-  it('an unreadable body is `unknown`, never a confident "gone"', async () => {
-    const verdict = await asTheBrowserSeesIt('not json at all')
-    expect(verdict.state).toBe('unknown')
-    expect(verdict.alive).toBe(false)
-    expect(verdict.restorable).toBeNull()
+  it('an unreadable body is a failed read, never a confident "gone"', async () => {
+    await expect(asTheBrowserSeesIt('not json at all')).rejects.toThrow()
   })
 
   it('an unrecognised state falls back only as far as `alive` can prove', async () => {
-    // A tab that outlives a deploy. `alive: true` is still a fact; anything else is unknown —
-    // never a confident "gone", which is what the old parser would have produced.
+    // A tab that outlives a deploy. `alive: true` is still a fact; anything else is a read that
+    // decided nothing — never a confident "gone".
     expect((await asTheBrowserSeesIt({ alive: true, previewUrl: SANDBOX_URL })).state).toBe('alive')
-    expect((await asTheBrowserSeesIt({ alive: false, state: 'gone-ish' })).state).toBe('unknown')
+    await expect(asTheBrowserSeesIt({ alive: false, state: 'gone-ish' })).rejects.toThrow()
   })
 
-  it('STARTING parses as its own state, not a coerced "unknown"', async () => {
+  it('STARTING parses as its own state, not a failed read', async () => {
     // The closed-list defect this state exists to catch: an unwidened `PREVIEW_LIFE_STATES` would
-    // fall through `asPreviewLifeState`'s fallback straight to 'unknown' (`alive` is false), which
-    // is a confident-sounding "nothing to report" for a fact the server DID report.
+    // fall through `asPreviewLifeState`'s fallback to a thrown read (`alive` is false), which is a
+    // "we could not check" for a fact the server DID report.
     expect((await asTheBrowserSeesIt({ state: 'starting', alive: false })).state).toBe('starting')
   })
 })

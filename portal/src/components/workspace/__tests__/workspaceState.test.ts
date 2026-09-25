@@ -25,13 +25,11 @@ import {
   BACKGROUND_CADENCE,
   LAUNCH_LABEL,
   STARTING_PROBE_LIMIT,
-  asDecidedReading,
   isTerminalReading,
   mayHaveStopped,
   resolveWorkspaceState,
   sameWorkspaceState,
   WORKSPACE_STATE_FIELDS,
-  type DecidedPreview,
   type StartOutcome,
   type WorkspaceInputs,
   type WorkspaceState,
@@ -44,34 +42,20 @@ function reading(over: Partial<PreviewState> = {}): PreviewState {
     state: 'asleep',
     alive: false,
     previewUrl: null,
-    occupyingProjectName: null,
-    occupyingProjectId: null,
     restorable: null,
+    startingSince: null,
+    startFailure: null,
     ...over,
   }
-}
-
-/**
- * A reading the platform actually stood behind — the shape the map REMEMBERS across reads.
- *
- * Narrowed through the module's own `asDecidedReading` rather than cast, so a test cannot hand the
- * memory slot an `unknown` that the product could never put there. The non-null assertion is safe
- * by construction and would throw loudly here if it stopped being: every caller below passes a
- * decided state.
- */
-function settled(over: Partial<PreviewState> = {}): DecidedPreview {
-  const decided = asDecidedReading(reading(over))
-  if (decided === null) throw new Error('a settled reading may not be `unknown`')
-  return decided
 }
 
 function resolve(over: Partial<WorkspaceInputs> = {}) {
   return resolveWorkspaceState({
     preview: reading(),
-    lastDecidedPreview: null,
     projectHasSavedBuild: null,
     startOutcome: null,
     startInFlight: false,
+    waitHasGoneOnTooLong: false,
     ...over,
   })
 }
@@ -88,17 +72,9 @@ const rendered = (over: Partial<WorkspaceInputs> = {}) => {
   return [state.headline, state.detail ?? '', state.note ?? '', state.action?.label ?? ''].join(' ')
 }
 
-/** A workspace this citizen's OTHER project is holding — the server's `slot_taken`, attribution
- *  and all. The attribution is deliberately still on the wire; what is pinned below is that this
- *  map never puts it on a screen. */
-const heldBy = (name = 'Car pool apps', id = 'proj-9') =>
-  reading({ state: 'slot_taken', occupyingProjectName: name, occupyingProjectId: id })
-
 /** Every ending a press can have, so a sweep can be exhaustive over the union rather than sample it. */
 const EVERY_ENDING: readonly (StartOutcome | null)[] = [
   null,
-  { kind: 'not-painted' },
-  { kind: 'timed-out' },
   { kind: 'failed', reason: 'the image could not be pulled' },
 ]
 
@@ -110,7 +86,7 @@ describe('★ the four a citizen reads, each from its own real inputs', () => {
   it('NEW — a project with nothing to launch invites a description, and offers no button', () => {
     // Offering "Launch Application" here would 404: `POST /relaunch` answers `no_saved_build` for
     // a project with no saved copy. An invitation is the only honest affordance.
-    const state = resolve({ preview: reading({ state: 'never_built', restorable: false }) })
+    const state = resolve({ preview: reading({ state: 'asleep', restorable: false }) })
 
     expect(state.name).toBe('never-built')
     expect(state.headline).toBe('Describe what you want to build.')
@@ -154,56 +130,36 @@ describe('★ the four a citizen reads, each from its own real inputs', () => {
     expect(state.busy ?? false).toBe(false)
   })
 
-  it('★ HELD BY YOUR OWN OTHER PROJECT — read as the saved app it is, and nobody is named', () => {
-    // Pressing start takes the workspace: the server starts what was asked for and tears the
-    // outgoing container down behind it. So a held slot is the same situation as a stopped app —
-    // the same sentence, the same one control — and the holder is never named, because a tab
-    // preempted from elsewhere has no cause data to name one with.
-    const state = resolve({ preview: heldBy('Car pool', 'proj-9'), projectHasSavedBuild: true })
-
-    expect(state.name).toBe('not-running')
-    expect(state.headline).toBe('Your app is saved.')
-    expect(state.detail).toBe('It stays running while you work, so you only do this once.')
-    expect(state.action).toEqual({ kind: 'start', label: 'Launch Application' })
-    expect(state.busy ?? false).toBe(false)
-    // NOTHING NAMES THE HOLDER, even though the wire still carries its name and id.
-    expect(rendered({ preview: heldBy('Car pool', 'proj-9'), projectHasSavedBuild: true }))
-      .not.toContain('Car pool')
-  })
-
   it('★ and there are FOUR of them, plus the one that is never drawn', () => {
     // THE COUNT IS THE CONTRACT. Pinning the number is what makes a fifth card growing back a red
     // test rather than a review someone has to notice: every new arm has to be added HERE by
     // whoever adds it.
     const everyArm = [
-      resolve({ preview: reading({ state: 'never_built', restorable: false }) }),
+      resolve({ preview: reading({ state: 'asleep', restorable: false }) }),
       resolve({ preview: reading({ state: 'starting' }) }),
       resolve({ preview: reading({ state: 'alive', alive: true }) }),
       resolve({ preview: reading({ state: 'asleep', restorable: true }) }),
-      resolve({ preview: heldBy(), projectHasSavedBuild: true }),
-      resolve({ preview: reading({ state: 'unknown' }) }),
+      resolve({ preview: null }),
     ]
 
     expect(new Set(everyArm.map((s) => s.name))).toEqual(
       new Set(['never-built', 'starting', 'running', 'not-running', 'could-not-read']),
     )
     // Four of the five are DRAWN; the fifth is the internal one, reachable only where nothing has
-    // ever been decided. Asserted as a count so a sixth cannot arrive unnoticed.
+    // answered yet. Asserted as a count so a sixth cannot arrive unnoticed.
     expect(new Set(everyArm.map((s) => s.name)).size).toBe(5)
   })
 })
 
 describe('★ BUILDING absorbed three cards, and it still has no verb', () => {
   /**
-   * FOUR SOURCES, ONE SENTENCE. The wire's `starting`, this surface's own outstanding press, a
-   * relaunch that came back `ready:false`, and a container that exists and has never answered are
-   * all the same situation — a start is happening, nothing is serving yet.
+   * THREE SOURCES, ONE SENTENCE. The wire's `starting`, this surface's own outstanding press, and a
+   * container that exists and has never answered are all the same situation — a start is
+   * happening, nothing is serving yet.
    */
   const everyWayIn: [string, Partial<WorkspaceInputs>][] = [
     ['the server says a start is in flight', { preview: reading({ state: 'starting' }) }],
     ['this surface`s own press is outstanding', { preview: reading({ state: 'asleep', restorable: true }), startInFlight: true }],
-    ['a relaunch answered ready:false', { preview: reading({ state: 'starting' }), startOutcome: { kind: 'not-painted' } }],
-    ['the press got no answer inside budget', { preview: reading({ state: 'starting' }), startOutcome: { kind: 'timed-out' } }],
   ]
 
   for (const [how, inputs] of everyWayIn) {
@@ -215,39 +171,55 @@ describe('★ BUILDING absorbed three cards, and it still has no verb', () => {
     })
   }
 
-  it('★ carries NO action under ANY combination of inputs that reaches it — decision D2', () => {
-    // THERE IS NO PATIENCE BUTTON, and this is where that decision is kept honest.
+  it('★ carries NO action under ANY combination of inputs, until the budget is spent', () => {
+    // INSIDE THE BUDGET THERE IS NOTHING TO PRESS, and this is where that is kept honest.
     //
-    // The obvious kindness is a "Launch Application" appearing after a long enough wait so the
-    // wait is never a dead end. It is not offered because of WHERE that press would land:
-    // `relaunch_preview`'s cold arm tears the live container down before restoring the last saved
-    // bundle, and the situation such a button exists for — a start whose observer was lost — is
-    // exactly the situation that takes the cold arm. The button would be most dangerous at the
-    // precise moment it appeared. The escape is server-side instead.
-    //
-    // ASSERTED EXHAUSTIVELY OVER THE PRODUCT rather than on one input, because a patience escape
-    // would arrive as a condition — "…unless a reason came back", "…unless there is a saved copy"
-    // — and a single-input assertion is exactly what such a condition slips past.
+    // The escape a wait eventually offers is a function of ONE input — `waitHasGoneOnTooLong` —
+    // and of nothing else. A patience button that grew out of any other condition ("…unless a
+    // reason came back", "…unless there is a saved copy") would be a second author for the same
+    // affordance, and a single-input assertion is exactly what such a condition slips past. So
+    // the sweep is over the product, and the boundary is swept as a dimension of it rather than
+    // left at its default — which is what made this vacuous for the arm it now covers.
     for (const startOutcome of EVERY_ENDING) {
       for (const projectHasSavedBuild of [true, false, null]) {
         for (const [how, inputs] of everyWayIn) {
-          const state = resolve({ ...inputs, startOutcome, projectHasSavedBuild })
-          expect(state.name, how).toBe('starting')
-          expect(state.action, `${how} / ${startOutcome?.kind ?? 'no ending'}`).toBeNull()
+          const where = `${how} / ${startOutcome?.kind ?? 'no ending'}`
+          const inside = resolve({
+            ...inputs,
+            startOutcome,
+            projectHasSavedBuild,
+            waitHasGoneOnTooLong: false,
+          })
+          expect(inside.name, how).toBe('starting')
+          expect(inside.action, where).toBeNull()
           // LIVENESS. Every absence above would pass just as happily against an arm that returned
           // an empty husk, so the sentence has to be there too — a withheld verb, not a blank card.
-          expect(state.headline).toBe('Getting your app ready.')
-          expect(state.busy).toBe(true)
+          expect(inside.headline).toBe('Getting your app ready.')
+          expect(inside.busy).toBe(true)
+
+          // PAST IT, ONE VERB AND ONLY THAT ONE. `start` is the press that reaches the restoring
+          // arm; the wait must never offer it, however the wait was arrived at.
+          const spent = resolve({
+            ...inputs,
+            startOutcome,
+            projectHasSavedBuild,
+            waitHasGoneOnTooLong: true,
+          })
+          expect(spent.name, where).toBe('starting')
+          expect(spent.busy, where).toBe(true)
+          expect(spent.action?.kind, where).toBe('retry')
+          expect(spent.headline, where).not.toBe('Getting your app ready.')
         }
       }
     }
   })
 
-  it('★ and the map is handed no clock, so a TIMED action cannot exist here at all', () => {
-    // The behavioural sweep above proves no action for any INPUT. This closes the other half: a
-    // patience button is a function of elapsed TIME, and time is not an input to this module. A
-    // map that read a clock could satisfy every assertion above on the first call and grow a
-    // button on the hundredth, and no pure-function test would ever see it.
+  it('★ and the map is handed no clock, so time cannot reach it except as an input', () => {
+    // The sweep above proves the escape is a function of ONE input. This closes the other half:
+    // the map must not be able to consult a clock ITSELF. A map that read one could satisfy every
+    // assertion above on the first call and grow a different button on the hundredth, and no
+    // pure-function test would ever see it — the boundary has to arrive as
+    // `waitHasGoneOnTooLong`, decided by a caller with a timer and testable as a value.
     //
     // Asserted against the SOURCE because that is where a clock would have to appear, and because
     // the module is deliberately pure: there is no seam to observe one through. The two duration
@@ -275,17 +247,6 @@ describe('★ BUILDING absorbed three cards, and it still has no verb', () => {
     expect(text).not.toMatch(
       /\b(second|seconds|minute|minutes|moment|moments|hour|hours|soon|shortly|about|roughly|approximately|quick|quickly)\b/i,
     )
-  })
-
-  it('a press that ended with nothing to report changes nothing a person reads', () => {
-    // `not-painted` and `timed-out` are the two endings with no server prose behind them, and the
-    // reason they say nothing is not politeness: one describes the state the citizen is already
-    // in, and the other is a fact about a FETCH, which is not evidence about a workspace.
-    const bare = resolve({ preview: reading({ state: 'starting' }) })
-    for (const kind of ['not-painted', 'timed-out'] as const) {
-      const withEnding = resolve({ preview: reading({ state: 'starting' }), startOutcome: { kind } })
-      expect(sameWorkspaceState(bare, withEnding), kind).toBe(true)
-    }
   })
 
   it('but a press REFUSED while a start really was in flight still gets its answer', () => {
@@ -318,16 +279,10 @@ describe('the register — what the pane may and may not say', () => {
     const everyState: Partial<WorkspaceInputs>[] = [
       { preview: reading({ state: 'asleep', restorable: true }) },
       { preview: reading({ state: 'asleep', restorable: false }) },
-      { preview: reading({ state: 'never_built', restorable: false }) },
+      { preview: reading({ state: 'asleep', restorable: null }) },
       { preview: reading({ state: 'starting' }) },
       { preview: reading({ state: 'alive', alive: true }) },
-      { preview: reading({ state: 'unknown' }) },
       { preview: null },
-      { preview: reading({ state: 'unknown' }), lastDecidedPreview: settled({ state: 'asleep', restorable: true }) },
-      { preview: heldBy() },
-      { preview: reading({ state: 'slot_taken' }) },
-      { preview: reading({ state: 'asleep' }), startOutcome: { kind: 'not-painted' } },
-      { preview: reading({ state: 'asleep' }), startOutcome: { kind: 'timed-out' } },
       { preview: reading({ state: 'asleep' }), startOutcome: { kind: 'failed', reason: 'no image' } },
     ]
 
@@ -387,7 +342,7 @@ describe('the register — what the pane may and may not say', () => {
     // produces exactly this reading. An arm that dropped the note would answer a press the citizen
     // had just made with "Describe what you want to build." and no sign anything had happened.
     const state = resolve({
-      preview: reading({ state: 'never_built', restorable: false }),
+      preview: reading({ state: 'asleep', restorable: false }),
       startOutcome: { kind: 'failed', reason: 'This project has no saved copy yet.' },
     })
 
@@ -397,156 +352,98 @@ describe('the register — what the pane may and may not say', () => {
   })
 })
 
-/**
- * ★ DECISION D3 — AN UNREADABLE READ NEVER CHANGES THE PANE.
- *
- * `could-not-read` was proposed for deletion outright. It survives as an INTERNAL arm, and the
- * reason is what these tests are: without it a coordination-store blip falls through to the
- * at-rest arms, where `restorable` is null (the object store was not consulted) and
- * `projectHasSavedBuild` is still null on a cold load — so a Redis hiccup printed "Describe what
- * you want to build." over a project whose app may be serving right now, with no action at all.
- */
-describe('★ an unreadable read renders the LAST SETTLED reading — decision D3', () => {
-  it('★ a standing frame stays framed: unknown over a remembered `alive` still says RUNNING', () => {
-    const state = resolve({
-      preview: reading({ state: 'unknown' }),
-      lastDecidedPreview: settled({ state: 'alive', alive: true }),
-    })
-
-    expect(state.name).toBe('running')
-    expect(state.headline).toBe('Your app is running.')
-    // MUTATION RECEIPT: drop the `?? lastDecidedPreview` fallback and this answers `could-not-read`
-    // — "We could not check on your app." over an app the citizen is looking at.
-  })
-
-  it('★ a standing card stays put: unknown over a remembered `asleep` still says SAVED', () => {
-    const state = resolve({
-      preview: reading({ state: 'unknown' }),
-      lastDecidedPreview: settled({ state: 'asleep', restorable: true }),
-    })
-
-    expect(state.name).toBe('not-running')
-    expect(state.headline).toBe('Your app is saved.')
-    expect(state.action?.kind).toBe('start')
-  })
-
-  it('★ and only with NO settled reading at all does the fallback sentence appear', () => {
-    // The other half, and it is what keeps the arm honest rather than merely surviving: showing
-    // "we could not check" to somebody whose app is fine is the failure; showing it to somebody
-    // about whom the platform has genuinely never learned anything is simply the truth.
-    const state = resolve({ preview: reading({ state: 'unknown' }), lastDecidedPreview: null })
-
-    expect(state.name).toBe('could-not-read')
-    expect(state.headline).toBe('We could not check on your app.')
-    expect(state.detail).toBe('Nothing has changed while we were asking.')
-    expect(state.action?.kind).toBe('retry')
-    // NOT BUSY. A read that failed is not work in progress, and saying it is would put a wait on
-    // screen with nothing behind it.
-    expect(state.busy ?? false).toBe(false)
-  })
-
+describe('before any read has answered', () => {
   it('answers even before the platform has said anything at all', () => {
-    // Not an empty pane: the honest sentence before the first read is that we have not heard, and
-    // the retry is the only thing a person can usefully do with that.
-    const state = resolve({ preview: null, lastDecidedPreview: null })
-    expect(state.name).toBe('could-not-read')
-    expect(state.action?.kind).toBe('retry')
-  })
+    // A read that throws never reaches the map — both polls leave their reading where it was — so
+    // `null` is the only way in, and it means nothing has answered yet.
+    const state = resolve({ preview: null })
 
-  it('★ the memory covers every settled reading, not only the two above', () => {
-    // Written as a sweep because the rule is about the READ deciding nothing, not about which
-    // answer happens to be remembered — an implementation that special-cased `alive` would pass
-    // the first test in this block and still move the pane on a blip over a taken slot.
-    const remembered: [string, DecidedPreview][] = [
-      ['running', settled({ state: 'alive', alive: true })],
-      ['starting', settled({ state: 'starting' })],
-      ['not-running', settled({ state: 'asleep', restorable: true })],
-      ['never-built', settled({ state: 'never_built', restorable: false })],
-      ['not-running', settled({ state: 'slot_taken', restorable: true, occupyingProjectName: 'Roster', occupyingProjectId: 'p-9' })],
+    expect(state.name).toBe('could-not-read')
+    expect(state.action).toEqual({ kind: 'retry', label: 'Try again' })
+  })
+})
+
+describe('a start outcome selects no arm of its own — the READING decides the card', () => {
+  it('★ the same ending lands on whichever card the reading chose', () => {
+    // THE CHANGE, stated as one assertion. This union used to select three whole cards; it now
+    // contributes at most a `note` to an arm somebody else picked. Written as a sweep so that a
+    // new arm keyed off the ending — the exact regrowth this collapse exists to prevent — cannot
+    // land quietly.
+    const failure: StartOutcome = { kind: 'failed', reason: 'the image could not be pulled' }
+    const landings: [string, PreviewState][] = [
+      ['not-running', reading({ state: 'asleep', restorable: true })],
+      ['never-built', reading({ state: 'asleep', restorable: false })],
+      ['starting', reading({ state: 'starting' })],
+      ['running', reading({ state: 'alive', alive: true })],
     ]
 
-    for (const [expected, lastDecidedPreview] of remembered) {
-      const blipped = resolve({ preview: reading({ state: 'unknown' }), lastDecidedPreview })
-      const standing = resolve({ preview: lastDecidedPreview, lastDecidedPreview })
-      expect(blipped.name, expected).toBe(expected)
-      // THE WHOLE VALUE, not just the name: "the pane does not move" is a claim about every
-      // sentence and every button on it, and a name-only assertion would pass a card that kept
-      // its arm and lost its remedy.
-      expect(sameWorkspaceState(blipped, standing), expected).toBe(true)
+    for (const [expected, preview] of landings) {
+      const state = resolve({ preview, startOutcome: failure })
+      expect(state.name, expected).toBe(expected)
     }
   })
 
-  it('a read that DID decide something outranks the memory, in both directions', () => {
-    // The memory is a fallback, never a ceiling. Without this, a pane that had once seen `alive`
-    // would keep saying so after the container was reaped.
-    const wasAlive = settled({ state: 'alive', alive: true })
-    expect(resolve({ preview: reading({ state: 'asleep', restorable: true }), lastDecidedPreview: wasAlive }).name)
-      .toBe('not-running')
-    expect(resolve({ preview: reading({ state: 'alive', alive: true }), lastDecidedPreview: settled({ state: 'asleep' }) }).name)
+  it('a live read outranks a stale start outcome — reaching alive IS the start succeeding', () => {
+    const state = resolve({
+      preview: reading({ state: 'alive', alive: true }),
+      startOutcome: { kind: 'failed', reason: 'the image could not be pulled' },
+    })
+    expect(state.name).toBe('running')
+    // AND THE REFUSAL GOES WITH IT. A note left over from a press that has since succeeded is
+    // worse than noise — it is the pane contradicting the frame beside it.
+    expect(state.note ?? null).toBeNull()
+  })
+
+  it('an in-flight press outranks every reading EXCEPT one that already says alive', () => {
+    // A press is newer than a stale `asleep`, an unreadable answer or a previous ending. But if
+    // the app is already serving then the start succeeded whatever it reported on the way, and
+    // saying "getting your app ready" over it would contradict the frame beside it.
+    expect(resolve({ preview: reading({ state: 'asleep', restorable: true }), startInFlight: true }).name)
+      .toBe('starting')
+    expect(resolve({ preview: null, startInFlight: true }).name).toBe('starting')
+    expect(resolve({ preview: reading({ state: 'alive', alive: true }), startInFlight: true }).name)
       .toBe('running')
   })
 })
 
-/**
- * ★ A SLOT HELD BY YOUR OWN OTHER PROJECT IS NOT A NEGOTIATION.
- *
- * The server takes the one workspace for whichever project was asked for and tears the outgoing
- * one down behind it, so pressing start simply switches back. That makes `slot_taken` the same
- * reading a saved, stopped app gets — one sentence, one control — and it is why nothing here may
- * name another project, offer to navigate to one, or offer to stop one.
- */
-describe('★ a taken slot is read as the saved app it is', () => {
-  const EVERY_ATTRIBUTION: [string, PreviewState][] = [
-    ['named and routable', heldBy('Roster', 'p-9')],
-    ['name only', reading({ state: 'slot_taken', occupyingProjectName: 'Roster' })],
-    ['id only', reading({ state: 'slot_taken', occupyingProjectId: 'p-9' })],
-    ['neither', reading({ state: 'slot_taken' })],
-  ]
+describe('★ a start that failed after the server admitted it', () => {
+  const WHY = 'Your app could not be started. Try again in a minute.'
 
-  it('★ THE INVARIANT: no reading of a taken slot ever names another project or reaches one', () => {
-    // Swept over every attribution shape AND every press ending, because an ending is what would
-    // reintroduce one: an arm that decided to explain who took the workspace would look reasonable
-    // in review and would be drawing on cause data no surface has.
-    for (const [shape, preview] of EVERY_ATTRIBUTION) {
-      for (const startOutcome of EVERY_ENDING) {
-        for (const projectHasSavedBuild of [true, false, null]) {
-          const state = resolve({ preview, startOutcome, projectHasSavedBuild })
-          expect(['not-running', 'never-built'], shape).toContain(state.name)
-          const text = rendered({ preview, startOutcome, projectHasSavedBuild })
-          expect(text, shape).not.toContain('Roster')
-          expect(text, shape).not.toContain('p-9')
-          expect(text, shape).not.toMatch(/workspace/i)
-          // NO EMPTY QUOTES EITHER — the failure a template hits when it trusts a name to be there.
-          expect(text, shape).not.toMatch(/[“"]\s*[”"]/)
-          // THE VERBS, over the whole union: only the two that act on this citizen's own app.
-          if (state.action) expect(['start', 'retry'], shape).toContain(state.action.kind)
-        }
-      }
-    }
-  })
-
-  it('★ and it still offers the start, so a switch back is one press', () => {
-    // Saying less is right; doing less is not. Whatever the attribution, a project with something
-    // to bring back gets the same Launch every saved workspace offers.
-    for (const [shape, preview] of EVERY_ATTRIBUTION) {
-      const state = resolve({ preview, projectHasSavedBuild: true })
-      expect(state.name, shape).toBe('not-running')
-      expect(state.action, shape).toEqual({ kind: 'start', label: LAUNCH_LABEL })
-    }
-  })
-
-  it('a taken slot outranks nothing — a start outcome rides on it like any other at-rest read', () => {
-    const state = resolve({
-      preview: heldBy('Roster', 'p-9'),
-      projectHasSavedBuild: true,
-      startOutcome: { kind: 'failed', reason: 'the image could not be pulled' },
-    })
+  it('says why at rest, beside Launch', () => {
+    const state = resolve({ preview: reading({ state: 'asleep', restorable: true, startFailure: WHY }) })
 
     expect(state.name).toBe('not-running')
-    expect(state.note).toBe('the image could not be pulled')
+    expect(state.note).toBe(WHY)
     expect(state.action).toEqual({ kind: 'start', label: LAUNCH_LABEL })
+    expect(state.busy ?? false).toBe(false)
   })
 
+  it('gives way to the press’s own refusal, which is newer', () => {
+    const state = resolve({
+      preview: reading({ state: 'asleep', restorable: true, startFailure: WHY }),
+      startOutcome: { kind: 'failed', reason: 'A build is already running in this application.' },
+    })
+
+    expect(state.note).toBe('A build is already running in this application.')
+  })
+
+  it('is never said over a wait or a running app', () => {
+    // The contract puts it on `asleep` alone; these pin that the map would not carry it further
+    // if a reading ever did.
+    for (const preview of [
+      reading({ state: 'starting', startFailure: WHY }),
+      reading({ state: 'alive', alive: true, startFailure: WHY }),
+    ]) {
+      expect(resolve({ preview }).note ?? null, preview.state).toBeNull()
+    }
+    expect(
+      resolve({ preview: reading({ state: 'asleep', restorable: true, startFailure: WHY }), startInFlight: true }).note ??
+        null,
+    ).toBeNull()
+  })
+})
+
+describe('sameWorkspaceState — what the channel compares before it publishes', () => {
   it('★ the comparator sees BOTH optional fields, and each one on its own', () => {
     // The channel skips a publish when `sameWorkspaceState` says two readings render identically,
     // and both optional fields are things a citizen reads. ISOLATED DELIBERATELY: a pair that
@@ -564,70 +461,17 @@ describe('★ a taken slot is read as the saved app it is', () => {
     expect(sameWorkspaceState(saved(null), saved('Could not save your work'))).toBe(false)
 
     // AN OMITTED OPTIONAL AND AN EXPLICIT `null` ARE THE SAME CLAIM, and must compare equal.
-    const held = resolve({ preview: heldBy('Roster', 'p-9'), projectHasSavedBuild: true })
-    expect(sameWorkspaceState(held, held)).toBe(true)
-    const { note: _n, busy: _b, ...bare } = held
+    const atRest = saved(null)
+    expect(sameWorkspaceState(atRest, atRest)).toBe(true)
+    const { note: _n, busy: _b, ...bare } = atRest
     expect(sameWorkspaceState({ ...bare, note: null, busy: false }, bare)).toBe(true)
     // THE ACTION, alone: a different verb behind the same sentences is a different card.
-    expect(sameWorkspaceState(held, { ...held, action: null })).toBe(false)
+    expect(sameWorkspaceState(atRest, { ...atRest, action: null })).toBe(false)
 
     // ★ AND `busy`, which is the field a wait turns on and nothing else moves. Isolated the same
     // way: hand-built, because the only arm that sets it also changes every other field.
     const wait = resolve({ preview: reading({ state: 'starting' }) })
     expect(sameWorkspaceState(wait, { ...wait, busy: false })).toBe(false)
-  })
-})
-
-describe('a start outcome selects no arm of its own — the READING decides the card', () => {
-  it('★ the same ending lands on whichever card the reading chose', () => {
-    // THE CHANGE, stated as one assertion. This union used to select three whole cards; it now
-    // contributes at most a `note` to an arm somebody else picked. Written as a sweep so that a
-    // new arm keyed off the ending — the exact regrowth this collapse exists to prevent — cannot
-    // land quietly.
-    const failure: StartOutcome = { kind: 'failed', reason: 'the image could not be pulled' }
-    const landings: [string, PreviewState][] = [
-      ['not-running', reading({ state: 'asleep', restorable: true })],
-      ['never-built', reading({ state: 'never_built', restorable: false })],
-      ['starting', reading({ state: 'starting' })],
-      ['running', reading({ state: 'alive', alive: true })],
-    ]
-
-    for (const [expected, preview] of landings) {
-      const state = resolve({ preview, startOutcome: failure })
-      expect(state.name, expected).toBe(expected)
-    }
-  })
-
-  it('a live read outranks a stale start outcome — reaching alive IS the start succeeding', () => {
-    const state = resolve({
-      preview: reading({ state: 'alive', alive: true }),
-      startOutcome: { kind: 'timed-out' },
-    })
-    expect(state.name).toBe('running')
-    // AND THE REFUSAL GOES WITH IT. A note left over from a press that has since succeeded is
-    // worse than noise — it is the pane contradicting the frame beside it.
-    expect(state.note ?? null).toBeNull()
-  })
-
-  it('an in-flight press outranks every reading EXCEPT one that already says alive', () => {
-    // A press is newer than a stale `asleep`, an unreadable answer or a previous ending. But if
-    // the app is already serving then the start succeeded whatever it reported on the way, and
-    // saying "getting your app ready" over it would contradict the frame beside it.
-    expect(resolve({ preview: reading({ state: 'asleep', restorable: true }), startInFlight: true }).name)
-      .toBe('starting')
-    expect(resolve({ preview: reading({ state: 'slot_taken' }), startInFlight: true }).name)
-      .toBe('starting')
-    expect(resolve({ preview: reading({ state: 'alive', alive: true }), startInFlight: true }).name)
-      .toBe('running')
-    // AND THE MEMORY COUNTS AS THE READING for that one exception, so a blip mid-press does not
-    // pull a framed app back into the wait.
-    expect(
-      resolve({
-        preview: reading({ state: 'unknown' }),
-        lastDecidedPreview: settled({ state: 'alive', alive: true }),
-        startInFlight: true,
-      }).name,
-    ).toBe('running')
   })
 })
 
@@ -662,7 +506,7 @@ describe('the restore question, and the one answer that suppresses the start con
     ).toBeNull()
     expect(
       resolve({
-        preview: reading({ state: 'never_built', restorable: true }),
+        preview: reading({ state: 'asleep', restorable: true }),
         projectHasSavedBuild: false,
       }).action?.kind,
     ).toBe('start')
@@ -678,31 +522,22 @@ describe('the properties that hold across every input', () => {
       null,
       reading({ state: 'alive', alive: true }),
       reading({ state: 'starting' }),
-      reading({ state: 'unknown' }),
       reading({ state: 'asleep', restorable: true }),
       reading({ state: 'asleep', restorable: false }),
-      reading({ state: 'never_built', restorable: null }),
-      reading({ state: 'slot_taken', occupyingProjectName: 'A', occupyingProjectId: 'p' }),
-      reading({ state: 'slot_taken' }),
-    ]
-    const memories: (DecidedPreview | null)[] = [
-      null,
-      settled({ state: 'alive', alive: true }),
-      settled({ state: 'asleep', restorable: true }),
-      settled({ state: 'slot_taken', occupyingProjectName: 'A', occupyingProjectId: 'p' }),
+      reading({ state: 'asleep', restorable: null }),
     ]
 
     for (const preview of states) {
-      for (const lastDecidedPreview of memories) {
-        for (const startOutcome of EVERY_ENDING) {
-          for (const projectHasSavedBuild of [true, false, null]) {
-            for (const startInFlight of [true, false]) {
+      for (const startOutcome of EVERY_ENDING) {
+        for (const projectHasSavedBuild of [true, false, null]) {
+          for (const startInFlight of [true, false]) {
+            for (const waitHasGoneOnTooLong of [true, false]) {
               const state = resolveWorkspaceState({
                 preview,
-                lastDecidedPreview,
                 projectHasSavedBuild,
                 startOutcome,
                 startInFlight,
+                waitHasGoneOnTooLong,
               })
               const text = `${state.headline} ${state.detail ?? ''} ${state.note ?? ''} ${state.action?.label ?? ''}`
               expect(`${state.name}: ${text}`).not.toMatch(destructive)
@@ -744,9 +579,9 @@ describe('the properties that hold across every input', () => {
     const arms: Array<[string, WorkspaceState]> = [
       ['running', resolve({ preview: reading({ state: 'alive', alive: true }) })],
       ['starting', resolve({ preview: reading({ state: 'starting' }) })],
-      ['never-built', resolve({ preview: reading({ state: 'never_built', restorable: false }) })],
+      ['never-built', resolve({ preview: reading({ state: 'asleep', restorable: false }) })],
       ['not-running', resolve({ preview: reading({ state: 'asleep', restorable: true }) })],
-      ['could-not-read', resolve({ preview: null, lastDecidedPreview: null })],
+      ['could-not-read', resolve({ preview: null })],
     ]
 
     // Liveness first: the inputs really do reach five DISTINCT arms. Without this the loop below
@@ -756,11 +591,6 @@ describe('the properties that hold across every input', () => {
       expect(armState.name).toBe(expectedName)
       expect(Object.keys(armState).sort()).toEqual(KEYS)
     }
-    // AND A TAKEN SLOT CARRIES THE SAME KEY SET, from the same arm — asserted beside the totality
-    // pin rather than as a sixth entry, so the count above stays the count of arms.
-    const taken = resolve({ preview: heldBy('Roster', 'p-9'), projectHasSavedBuild: true })
-    expect(taken.name).toBe('not-running')
-    expect(Object.keys(taken).sort()).toEqual(KEYS)
   })
 
   it('exports the start label from one place so no surface can spell it differently', () => {
@@ -770,42 +600,19 @@ describe('the properties that hold across every input', () => {
 
 describe('isTerminalReading — when re-asking can only hear the same sentence again', () => {
   it('ends the asking on a settled state with a decided restore answer', () => {
-    for (const state of ['asleep', 'slot_taken', 'never_built'] as const) {
-      expect(isTerminalReading(reading({ state, restorable: true }))).toBe(true)
-      expect(isTerminalReading(reading({ state, restorable: false }))).toBe(true)
-    }
+    expect(isTerminalReading(reading({ state: 'asleep', restorable: true }))).toBe(true)
+    expect(isTerminalReading(reading({ state: 'asleep', restorable: false }))).toBe(true)
   })
 
   it('keeps asking while `restorable` is still null — a half answer is not an answer', () => {
     // Ending there pins the one sentence this must never say wrongly over a workspace sitting
     // safely on Blob, with no timer left to correct it.
-    for (const state of ['asleep', 'slot_taken', 'never_built'] as const) {
-      expect(isTerminalReading(reading({ state, restorable: null }))).toBe(false)
-    }
+    expect(isTerminalReading(reading({ state: 'asleep', restorable: null }))).toBe(false)
   })
 
-  it('never ends on an answer that decided nothing', () => {
-    expect(isTerminalReading(reading({ state: 'unknown', restorable: true }))).toBe(false)
+  it('never ends on a state whose successor arrives with no gesture from anybody', () => {
     expect(isTerminalReading(reading({ state: 'alive', restorable: true }))).toBe(false)
     expect(isTerminalReading(reading({ state: 'starting', restorable: true }))).toBe(false)
-  })
-})
-
-describe('asDecidedReading — the one narrowing, so no caller gets the polarity wrong', () => {
-  it('refuses an unreadable answer as the thing to fall back to when we cannot read', () => {
-    // The circularity the memory slot exists to break: storing "we could not check" as the value
-    // to render when we cannot check.
-    expect(asDecidedReading(reading({ state: 'unknown' }))).toBeNull()
-    expect(asDecidedReading(null)).toBeNull()
-  })
-
-  it('passes every answer the platform was willing to stand behind, settled or not', () => {
-    // `starting` and `alive` are DECIDED and are the opposite of SETTLED — their successors
-    // arrive with no gesture from anybody — and conflating the two words is how a poll that
-    // should keep asking stops.
-    for (const state of ['alive', 'starting', 'asleep', 'slot_taken', 'never_built'] as const) {
-      expect(asDecidedReading(reading({ state }))?.state, state).toBe(state)
-    }
   })
 })
 
@@ -826,9 +633,7 @@ describe('mayHaveStopped — when a stuck wait is worth a container call', () =>
     expect(mayHaveStopped('starting', false, windowSpent)).toBe(true)
   })
 
-  it('never asks about a settled or an unreadable answer, stalled or not', () => {
-    for (const reading of ['asleep', 'slot_taken', 'never_built', 'unknown'] as const) {
-      expect(mayHaveStopped(reading, true, windowSpent)).toBe(false)
-    }
+  it('never asks about a settled answer, stalled or not', () => {
+    expect(mayHaveStopped('asleep', true, windowSpent)).toBe(false)
   })
 })

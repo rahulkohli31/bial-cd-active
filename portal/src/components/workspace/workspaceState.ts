@@ -7,7 +7,8 @@
  *
  * IT DOES NOT ANSWER WHAT TO FRAME: there is no URL field to put one in, and that absence is the
  * enforcement. The address comes only from `utils/previewAddress.ts`, whose precedence — a live
- * turn's preview outranks the session URL — a `PreviewState` in hand here would silently drop.
+ * turn's preview outranks the project's own — a `PreviewState` in hand here would
+ * silently drop.
  *
  * FOUR STATES A CITIZEN READS, PLUS ONE INTERNAL.
  *
@@ -16,8 +17,8 @@
  *   RUNNING   proven serving                                 running
  *   SAVED     a saved copy, nothing serving it               not-running
  *
- * plus `could-not-read`, which is INTERNAL: it is what is left when a read decided nothing AND
- * nothing has ever been decided before. See {@link WorkspaceInputs.lastDecidedPreview}.
+ * plus `could-not-read`, which is INTERNAL: it is what is left when no read has answered yet. See
+ * {@link WorkspaceInputs.preview}.
  *
  * THE ACTION UNION REACHES NOTHING DESTRUCTIVE UNASKED. Two members: start and retry. No restore,
  * rebuild, teardown or stop-somebody-else verb exists in the type, so a signal this client could
@@ -40,57 +41,25 @@ import { assertNever } from '../../utils/assertNever'
  * The reason this is not left duplicated: the same file already records what happened the last
  * time a one-liner was copied instead of shared — two sites kept private `crypto.randomUUID()`
  * mints and both went on producing v4s long after the shared mint moved on. A cadence and a
- * terminal set that drift apart are worse than that, because the symptom is a poll that stops on
+ * terminal rule that drift apart are worse than that, because the symptom is a poll that stops on
  * one surface and not on the other, with nothing red anywhere.
  */
 export const PREVIEW_PROBE_MS = 45_000
 
 /**
- * The answers that END the asking. All three are SETTLED FACTS about a workspace: nothing that
- * could change one of them happens without a reader hearing about it first. `unknown` is
- * deliberately absent — it is the one answer that decided nothing, so it must leave the timer
- * running rather than pin "we could not check" for the life of the tab.
+ * HAS THE PLATFORM SAID EVERYTHING IT IS GOING TO SAY, so re-asking can only hear it again?
  *
- * AND `restorable` BINDS THE SAME RULE. A settled `state` whose `restorable` is still `null` is
- * half an answer: the workspace is confirmed gone, but whether the work can be brought back was
- * not decided. Callers pair this set with a `restorable !== null` test; see `isTerminalReading`.
+ * `asleep` is a SETTLED FACT about a workspace: nothing that could change it happens without a
+ * reader hearing about it first. A read that threw decided nothing, so it never reaches here and
+ * leaves the timer running rather than pinning "we could not check" for the life of the tab.
+ *
+ * AND `restorable` BINDS THE SAME RULE. An `asleep` whose `restorable` is still `null` is half an
+ * answer: the workspace is confirmed at rest, but whether the work can be brought back was not
+ * decided.
  */
-export const SETTLED_GONE: ReadonlySet<PreviewLifeState> = new Set<PreviewLifeState>([
-  'asleep',
-  'slot_taken',
-  'never_built',
-])
-
-/** Has the platform said everything it is going to say, so re-asking can only hear it again? */
 export function isTerminalReading(preview: Pick<PreviewState, 'state' | 'restorable'>): boolean {
-  return SETTLED_GONE.has(preview.state) && preview.restorable !== null
+  return preview.state === 'asleep' && preview.restorable !== null
 }
-
-// ─── a read that decided something ────────────────────────────────────────────────────────────
-
-/**
- * A READING THAT DECIDED SOMETHING — anything but `unknown`.
- *
- * "DECIDED" IS WEAKER THAN "SETTLED", AND THE TWO MUST NOT BE CONFUSED. {@link SETTLED_GONE} is
- * about a workspace that has finished changing, so re-asking it can only hear the same sentence
- * again. This is about the READ: the server answered with a state it was willing to stand behind.
- * `starting` and `alive` are decided and are the opposite of settled — their successors arrive
- * with no gesture from anybody.
- *
- * IT IS A TYPE RATHER THAN A CONVENTION because it is the input the map REMEMBERS across reads,
- * and a caller that fed an `unknown` into that slot would be storing "we could not check" as the
- * thing to fall back to when we cannot check — the exact circularity the fallback exists to break.
- * {@link asDecidedReading} is the only way to build one.
- */
-export type DecidedPreview = PreviewState & { state: Exclude<PreviewLifeState, 'unknown'> }
-
-/** The one narrowing, so no caller hand-rolls `state !== 'unknown'` and gets the polarity wrong. */
-export function asDecidedReading(preview: PreviewState | null): DecidedPreview | null {
-  return preview !== null && decidedSomething(preview) ? preview : null
-}
-
-const decidedSomething = (preview: PreviewState): preview is DecidedPreview =>
-  preview.state !== 'unknown'
 
 // ─── the cadence while a start is in flight ───────────────────────────────────────────────────
 
@@ -107,11 +76,8 @@ const decidedSomething = (preview: PreviewState): preview is DecidedPreview =>
  *
  * WHY 3 SECONDS. Chosen from the platform's own timings, because no start could be measured in
  * the session that wrote this (the Azure subscription was read-only) — and that is worth saying
- * plainly rather than dressing a guess as a measurement. Three anchors:
+ * plainly rather than dressing a guess as a measurement. Two anchors:
  *
- *  - `_ATTACHED_READY_BUDGET_SECONDS` is 15s server-side: a warm attach is expected to be serving
- *    inside it. An interval of 3s resolves such a start within a fifth of its own budget, so the
- *    lag the poll adds is small next to the event it is waiting for.
  *  - The one start measured directly had the flip at 2.7s. At 3s that start is caught on the
  *    first or second accelerated read; at 45s it was caught 42.8s late.
  *  - The read is cheap by contract — one cache read, at most two rows and two object-store HEADs,
@@ -123,7 +89,7 @@ const decidedSomething = (preview: PreviewState): preview is DecidedPreview =>
  * window near the ninety-fifth. Anyone holding that data should change these two numbers and say
  * so here.
  *
- * WHY IT STOPS, AND WHY THE BOUND MOVED — see {@link STARTING_PROBE_LIMIT}.
+ * WHY IT STOPS, AND WHEN — see {@link STARTING_PROBE_LIMIT}.
  *
  * FALLING BACK IS NOT A VERDICT. The reading is left exactly as it was — still `starting`, still
  * "Getting your app ready." — and the background poll goes on correcting it if the app lands late.
@@ -144,17 +110,11 @@ export const STARTING_PROBE_MS = 3_000
 /**
  * 300 SECONDS OF ACCELERATED ASKING — the server's own outer bound on a start in flight.
  *
- * IT WAS 40 READS (120s), AND THAT NUMBER IS NOW WRONG BY CONSTRUCTION. 120s was
- * `_COLD_READY_BUDGET_SECONDS`, and that budget covers ONE LEG: the final `wait_ready` once the
- * container is already up. `manager.py` says so in as many words beside the number it records —
- * blob and app-DB provision, the bundle pull, the ACA create, the container's own startup and
- * `dev_start` all happen BEFORE the budget starts, so "the budget is not a ceiling on what gets
- * recorded". That mattered little while the wait on screen began at the final leg. It matters now:
- * BUILDING spans the WHOLE pre-serve interval, because `alive` is no longer allowed to mean
- * "scheduled". A build that first served past 120s would have fallen to the 45-second background
- * cadence at exactly the point it was most likely to land, leaving somebody sitting in front of a
- * finished app for up to 45 more seconds — the same defect this change exists to close, one door
- * down.
+ * BUILDING spans the WHOLE pre-serve interval, because `alive` is not allowed to mean "scheduled":
+ * blob and app-DB provision, the bundle pull, the ACA create, the container's own startup,
+ * `dev_start` and the wait for a first page all happen inside it. A bound shorter than that
+ * interval drops a start to the 45-second background cadence at exactly the point it is most
+ * likely to land, leaving somebody sitting in front of a finished app for up to 45 more seconds.
  *
  * 300s IS THE PLATFORM'S OWN NUMBER, NOT A LARGER GUESS. `STARTING_MARKER_TTL_SECONDS` is 300, and
  * its comment derives it the way this bound needs deriving: double the wait budget, plus margin
@@ -162,10 +122,10 @@ export const STARTING_PROBE_MS = 3_000
  * that setup twice. Past it the server itself stops claiming a start is in flight, so neither does
  * this timer.
  *
- * WHAT IT COSTS, STATED RATHER THAN BURIED: 100 cheap reads instead of 40, and only while somebody
- * is watching a start. It is also the ceiling a dark endpoint buys (see {@link spendProbeCadence})
- * — five minutes of 3-second polling against a broken server rather than two. That is the price of
- * the same ceiling covering the whole wait it is now a ceiling on.
+ * WHAT IT COSTS, STATED RATHER THAN BURIED: 100 cheap reads, and only while somebody is watching a
+ * start. It is also the ceiling a dark endpoint buys (see {@link spendProbeCadence}) — five
+ * minutes of 3-second polling against a broken server. That is the price of one ceiling covering
+ * the whole wait.
  */
 export const STARTING_PROBE_LIMIT = 100
 
@@ -190,17 +150,26 @@ export const HIDDEN_PROBE_MS = 120_000
  * hook is precisely how the chat route would be missed, so it lives here where neither can drift
  * from the other and neither can forget it.
  *
- * `null` means this tick does not renew.
+ * EVERY TICK RENEWS, INCLUDING THROUGHOUT A START, and that is the half this used to get wrong.
+ * Accelerated ticks were exempt on the grounds that a starting container is held by the marker and
+ * the lock rather than by a stay — but the marker is written ONCE, with a five-minute TTL, and the
+ * accelerated window is five minutes too. A citizen watching a start therefore sent zero renewals
+ * across exactly the window where the two things holding their container both lapse, and the sweep
+ * runs every five minutes.
  *
- * NEVER ON AN ACCELERATED TICK. A container in `starting` is held by the start-in-flight marker
- * and the lock, not by a stay, so a renewal there writes a deadline onto a record that is not
- * being judged by it — the same reason the save read sits behind the same gate.
+ * RENEWING THERE IS STRUCTURALLY SAFE, which is what the old reasoning missed. `renew_presence_stay`
+ * is a compare-and-set on the registry's own `app_name`: with no record, or a record naming another
+ * container, it writes nothing and answers `nothing_running` / `not_this_container`. And the deadline
+ * it writes is a monotonic `max`, so a five-minute visible renewal cannot truncate the long stay a
+ * start already granted itself. The absolute age ceiling bounds all of it regardless.
+ *
+ * EVERY TICK RENEWS, so this answers WHICH BUDGET and never whether. It is still one exported
+ * function rather than a ternary at each call site: the two surfaces framing a project must not be
+ * able to disagree about this, and a surface that quietly stopped renewing is a silent
+ * container-killer — the citizen is looking right at their app while the platform counts it
+ * abandoned.
  */
-export function presenceToRenew(
-  accelerated: boolean,
-  documentHidden: boolean,
-): SurfacePresence | null {
-  if (accelerated) return null
+export function presenceToRenew(documentHidden: boolean): SurfacePresence {
   return documentHidden ? 'hidden' : 'visible'
 }
 
@@ -232,20 +201,11 @@ export const BACKGROUND_CADENCE: ProbeCadence = { delayMs: PREVIEW_PROBE_MS, fas
  * the read, on the `keepAsking`/`stopAsking` seam both effects already own.
  *
  * STRICTLY `starting`, and it reverts on anything else. A window that stayed open on `alive` would
- * put the whole product on a 3-second poll, which is the change nobody asked for.
- *
- * `unknown` NEITHER OPENS NOR CLOSES ONE, and that is worth stating precisely rather than as "an
- * unreadable read keeps the fast cadence", which is not what this does. It CONTINUES a window that
- * is already open, at 3 seconds — which is what a blip during a start needs, and is why the
- * unreadable arm is not a reason to slow down. It does NOT open one: a poll that has never seen
- * `starting` must not be accelerated by a broken server, so an `unknown` on a cold load is asked
- * again at the background cadence. And it still SPENDS from an open window, because the bound is
- * on reads made, not on answers liked: a server answering `unknown` forever must not buy an
- * unbounded fast poll.
+ * put the whole product on a 3-second poll, which is the change nobody asked for. A read that
+ * never answered is {@link spendProbeCadence}'s, not this function's.
  */
 export function nextProbeCadence(answer: PreviewLifeState, held: ProbeCadence): ProbeCadence {
-  if (answer !== 'starting' && answer !== 'unknown') return BACKGROUND_CADENCE
-  if (answer === 'unknown' && held.fastReads === 0) return BACKGROUND_CADENCE
+  if (answer !== 'starting') return BACKGROUND_CADENCE
   return spendOpenWindow(held)
 }
 
@@ -256,8 +216,8 @@ export function nextProbeCadence(answer: PreviewLifeState, held: ProbeCadence): 
  * answers from the registry alone — so a stopped app reads as a wait that never ends. Either
  * `alive` with a frame that never vouches (the pane's slow card), or, once the reaper's probe has
  * retracted the serving proof, `starting` with nothing ever arriving. Neither has a control. The
- * workspace check can see the process, and when it finds the app stopped with its work provably
- * saved it puts the container away, so the next reading is the saved app with its start control.
+ * workspace check can see the process, and when it finds the app stopped on an intact workspace it
+ * restarts the dev server in place; the readings then follow it through `starting` back to `alive`.
  *
  * `alive` ONLY WITH A STALLED FRAME: a frame still loading, or one that has vouched, is an app the
  * citizen can see, and asking would spend a container call to hear "yes".
@@ -326,29 +286,16 @@ function spendOpenWindow(held: ProbeCadence): ProbeCadence {
 // ─── what came back from a start attempt ──────────────────────────────────────────────────────
 
 /**
- * How the most recent press of the start control ended — and only the endings that are this map's
- * business. A start that SUCCEEDED produces none of these: the read takes over and reports
- * `alive` on its own.
+ * How the most recent press of the start control ended, when the server REFUSED it in words — the
+ * only ending that is this map's business. A start that was admitted produces none: the read takes
+ * over, and `starting` then `alive` say how it went.
  *
- * NONE OF THE THREE IS A STATE. The READING decides which card is on screen, and an ending
- * contributes at most a `note` — the server's own words about a press the citizen made and is owed
- * an answer to. Two of the three have no such words and so change nothing a person sees; they are
- * kept because the producers still have to say how a press ended, and "it ended with nothing to
- * report" is a different fact from "no press has been made".
+ * NOT A STATE. The READING decides which card is on screen, and a refusal contributes a `note` —
+ * the server's own words about a press the citizen made and is owed an answer to, carried
+ * verbatim, because this map does not rewrite server prose. A refusal nobody put into words is no
+ * outcome at all: a fact about a fetch is not a fact about a workspace.
  */
-export type StartOutcome =
-  /** The server answered, and answered `ready: false` — the container is up and has not served a
-   *  page yet. NOT a death: the wire's own contract records that an ABSENT `ready` reads `true`,
-   *  which is exactly why liveness can never hang off this boolean. SAYS NOTHING ON SCREEN,
-   *  because the state it describes is the one the citizen is already in: the registry's serving
-   *  stamp is still empty, so the next read answers `starting` and the wait says so properly. */
-  | { readonly kind: 'not-painted' }
-  /** Nothing came back inside the budget. Says nothing about the container, and therefore nothing
-   *  on screen either — a fact about a fetch is not a fact about a workspace, and the sentence it
-   *  used to carry ("It may still be coming up.") was a guess the copy rule forbids. */
-  | { readonly kind: 'timed-out' }
-  /** The server named a reason. Carried verbatim — this map does not rewrite server prose. */
-  | { readonly kind: 'failed'; readonly reason: string }
+export type StartOutcome = { readonly kind: 'failed'; readonly reason: string }
 
 /**
  * HOW A START ATTEMPT ENDED, for the caller that has to decide what to do NEXT — distinct from
@@ -379,6 +326,52 @@ export type WorkspaceAction =
   | { readonly kind: 'start'; readonly label: string }
   | { readonly kind: 'retry'; readonly label: string }
 
+/**
+ * HOW LONG THE PANE SAYS ONLY "getting your app ready" BEFORE IT SAYS SOMETHING ELSE.
+ *
+ * Two minutes because that is the platform's own readiness budget: past it the start has either
+ * degraded or been handed to a detached watcher, so the wait is no longer the ordinary one the
+ * opening sentence describes. Before this, that sentence had no end at all — it stayed on screen
+ * for as long as the tab did, with no error, no second sentence and nothing to press.
+ *
+ * IT IS A CLAIM ABOUT WHAT TO SAY, NEVER ABOUT THE CONTAINER. Nothing here stops a start,
+ * condemns one, or reports one as failed; the wait goes on and the pane goes on being busy.
+ */
+export const START_PATIENCE_MS = 120_000
+
+/**
+ * WHEN THIS WAIT BEGAN, as epoch milliseconds, or `null` when nothing can date it.
+ *
+ * ONE READING OF THE FIELD, shared by the map below and by the hook that arms the patience
+ * timer — two spellings of "is this wait old" would be two answers to it. `null` on any reading
+ * that is not a wait, and on a wait the server declined to date: the surface then counts from its
+ * own mount, which is what it did before the field existed.
+ */
+export function waitBeganAt(preview: Pick<PreviewState, 'state' | 'startingSince'> | null): number | null {
+  if (preview?.state !== 'starting' || preview.startingSince === null) return null
+  const began = Date.parse(preview.startingSince)
+  return Number.isNaN(began) ? null : began
+}
+
+/**
+ * HOW LONG A WAIT HAS BEEN RUNNING, in milliseconds — `0` when nothing dates it.
+ *
+ * ONE SPELLING, because two things read it and they must agree: the number the pane draws, and the
+ * boundary {@link START_PATIENCE_MS} is compared against. A counter saying "1m 58s" beside a
+ * sentence that had already given up would be two clocks disagreeing in front of the citizen.
+ *
+ * NEVER NEGATIVE. The instant comes off another machine's clock, and a server a little ahead of
+ * this browser would otherwise read as a wait that has not started — a counter running up from a
+ * number in the future, and a boundary that never arrives.
+ *
+ * `now` IS A PARAMETER, NOT A DEFAULT, and that is this module's rule rather than this function's
+ * taste: nothing here may read a clock, so a timed affordance cannot be derived inside the map.
+ * The test below asserts it against the source text.
+ */
+export function msSpentSince(began: number | null, now: number): number {
+  return began === null ? 0 : Math.max(0, now - began)
+}
+
 /** The person's word for the thing is their app. "Preview" is the developer's word. */
 export const LAUNCH_LABEL = 'Launch Application'
 const RETRY_LABEL = 'Try again'
@@ -394,9 +387,8 @@ const RETRY: WorkspaceAction = { kind: 'retry', label: RETRY_LABEL }
  * `not-running` is the one to watch: it is a state name here and on the wire, and it is the exact
  * phrase the copy rule forbids on screen.
  *
- * FOUR ARE DRAWN AND ONE IS NOT. `could-not-read` is reachable only when a read decided nothing
- * AND nothing had ever been decided before it — see {@link WorkspaceInputs.lastDecidedPreview}. It
- * is kept in the union deliberately: the surfaces that special-case it — `AppPane`'s frame veto,
+ * FOUR ARE DRAWN AND ONE IS NOT. `could-not-read` is reachable only when no read has answered
+ * yet — see {@link WorkspaceInputs.preview}. It is kept in the union deliberately: the surfaces that special-case it — `AppPane`'s frame veto,
  * which leaves a standing frame alone, and the Plan chat's spoken set — are the reason a
  * coordination-store blip cannot pull a running app off somebody's screen.
  */
@@ -463,6 +455,17 @@ export interface WorkspaceState {
    * comparator cannot see is a pane that never re-renders, with nothing red anywhere.
    */
   readonly busy?: boolean
+  /**
+   * WHEN THE WAIT BEGAN, as epoch milliseconds — the anchor the pane's elapsed figure counts
+   * from. `null` on every arm that is not a wait, and on a wait the server could not date.
+   *
+   * IT IS THE SERVER'S INSTANT, WHICH IS THE WHOLE POINT. A counter started when a pane mounts
+   * restarts on every reload, so a citizen five minutes into a start was told one second and so
+   * were we. This is constant for the length of one wait, which is what lets it be compared by
+   * {@link sameWorkspaceState} at all — a value that moved every render would defeat that
+   * comparator rather than feed it.
+   */
+  readonly startedAt?: number | null
 }
 
 /**
@@ -495,6 +498,7 @@ const STATE_FIELD_EQ: {
   detail: (a, b) => a === b,
   note: (a, b) => (a ?? null) === (b ?? null),
   busy: (a, b) => (a ?? false) === (b ?? false),
+  startedAt: (a, b) => (a ?? null) === (b ?? null),
   action: (a, b) => sameAction(a, b),
 }
 
@@ -525,29 +529,16 @@ const sameAction = (a: WorkspaceAction | null, b: WorkspaceAction | null): boole
 // ─── the inputs ───────────────────────────────────────────────────────────────────────────────
 
 export interface WorkspaceInputs {
-  /** The preview-state read as it arrived, `unknown` included. `null` before the first one lands. */
-  readonly preview: PreviewState | null
   /**
-   * THE LAST READ THAT DECIDED ANYTHING — what an unreadable read falls back to.
+   * THE LAST READ THAT ANSWERED. `null` until one has.
    *
-   * WHY IT IS NOT DERIVABLE HERE. This map is a pure function of one reading, so "an unreadable
-   * read never changes the pane" cannot be a rule it enforces on its own: it has no yesterday. The
-   * callers have one — both polls already keep the previous reading and already refuse to let an
-   * `unknown` overwrite it — so the memory is threaded in rather than invented, and there is still
-   * exactly one place that decides what the memory MEANS.
-   *
-   * WHAT IT PREVENTS, CONCRETELY, because the alternative was to delete the unreadable arm
-   * outright. Without it an `unknown` falls through to the at-rest arms, where `restorable` is
-   * `null` (the object store was not consulted) and `projectHasSavedBuild` is still `null` on a
-   * cold load — so a coordination-store blip printed "Describe what you want to build." over a
-   * project whose app may be serving right now, with no action on the card at all. Rendering the
-   * last decided reading instead means the pane simply does not move, which is the whole of the
-   * rule.
-   *
-   * `null` ONLY WHEN NOTHING HAS EVER BEEN DECIDED, and only then does the map fall back to saying
-   * so — see {@link resolveWorkspaceState}'s third step.
+   * A READ THAT THROWS NEVER REACHES THIS FIELD, and that is the whole of "an unreadable read never
+   * changes the pane": both polls leave their reading exactly where it was when `fetchPreviewState`
+   * throws, so a standing frame stays framed and a standing card stays put. The map never sees the
+   * failure at all, which is why it has no arm for one beyond `null` — see
+   * {@link resolveWorkspaceState}'s second step.
    */
-  readonly lastDecidedPreview: DecidedPreview | null
+  readonly preview: PreviewState | null
   /**
    * The project row's own "is there anything to restore" — a cold-load answer that predates the
    * first read. Read with `??` against the read's fresher `restorable`, never `||`: `restorable`
@@ -567,6 +558,17 @@ export interface WorkspaceInputs {
    * the sentence still has one author.
    */
   readonly startInFlight: boolean
+  /**
+   * THIS WAIT HAS OUTLIVED {@link START_PATIENCE_MS} — threaded in rather than computed here,
+   * because the map is a pure function of its inputs and this one is a fact about the clock.
+   *
+   * The surfaces arm ONE timer for it (`useTheWaitHasGoneOnTooLong`) rather than ticking: the
+   * pane already counts seconds for its own number, and re-deriving the whole shell's state once
+   * a second to discover a boundary that is crossed once would be the expensive way to learn it.
+   *
+   * `false` is the ordinary answer, including on every arm that is not a wait at all.
+   */
+  readonly waitHasGoneOnTooLong: boolean
 }
 
 // ─── the map ──────────────────────────────────────────────────────────────────────────────────
@@ -582,40 +584,39 @@ export interface WorkspaceInputs {
  *     previous attempt's ending are all facts from before the button went down — and if the app is
  *     already serving then the start succeeded whatever it reported on the way, so saying "getting
  *     your app ready" over it would be the pane contradicting the frame beside it.
- *  2. WHICH READING IS BEING RENDERED AT ALL. The read that just landed, unless it decided nothing
- *     (`unknown`, or none has landed yet), in which case the last one that did. This is the whole
- *     of "an unreadable read never changes the pane": a standing frame stays framed and a standing
- *     card stays put, because the value the surfaces receive does not move.
- *  3. NOTHING HAS EVER BEEN DECIDED → "we could not check", with a retry. Not an empty pane, and
- *     not an invitation to build over an app that may be running: before the platform has said
- *     anything at all, the honest sentence is that we have not heard, and the retry is the only
- *     thing a person can usefully do with it.
- *  4. `alive` → RUNNING. It now means the platform watched the app answer a request rather than
+ *  2. NOTHING HAS ANSWERED YET → "we could not check", with a retry. Not an empty pane, and not an
+ *     invitation to build over an app that may be running: before the platform has said anything
+ *     at all, the honest sentence is that we have not heard, and the retry is the only thing a
+ *     person can usefully do with it.
+ *  3. `alive` → RUNNING. It now means the platform watched the app answer a request rather than
  *     that a container was scheduled — which is why the arms that used to hedge against it are
  *     gone.
- *  5. `starting` → BUILDING. Something under way, nothing proven to be serving.
- *  6. `slot_taken` / `asleep` / `never_built` → SAVED or NEW, resolved against whether anything can
- *     be brought back. `slot_taken` shares that arm rather than having one of its own — see the
- *     case below for why the citizen's own other project holding the slot is not a negotiation.
+ *  4. `starting` → BUILDING. Something under way, nothing proven to be serving.
+ *  5. `asleep` → SAVED or NEW, resolved against whether anything can be brought back.
  *
  * A START OUTCOME SELECTS NO ARM OF ITS OWN. It contributes a `note` — the server's words about a
  * press the citizen made — to whichever arm the READING chose.
  *
- * A SERVER STATE THIS CLIENT DOES NOT RECOGNISE never reaches here: `asPreviewLifeState` narrows it
- * to `unknown` at the wire, which resolves to the last decided reading — never to a confident
- * "gone". The `assertNever` at the bottom is what keeps that true when the union grows.
+ * A SERVER STATE THIS CLIENT DOES NOT RECOGNISE never reaches here: `fetchPreviewState` throws on
+ * it, so the pane keeps the last reading that answered — never a confident "gone". The
+ * `assertNever` at the bottom is what keeps that true when the union grows.
  */
 export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
-  const { preview, lastDecidedPreview, projectHasSavedBuild, startOutcome, startInFlight } = inputs
+  const {
+    preview: reading,
+    projectHasSavedBuild,
+    startOutcome,
+    startInFlight,
+    waitHasGoneOnTooLong,
+  } = inputs
   // WHAT THE LAST PRESS ENDED AS, in the server's own words — carried onto whichever arm the
   // reading selects rather than selecting one of its own. Computed once, here, so the two arms
   // that can carry it cannot come to disagree about what it says.
   const note = pressNote(startOutcome)
-  // Step 2. `asDecidedReading` is the only narrowing in the file, so no arm below has to think
-  // about `unknown` at all — and none of them can accidentally treat it as a verdict.
-  const reading = asDecidedReading(preview) ?? lastDecidedPreview
+  const startedAt = waitBeganAt(reading)
 
-  if (startInFlight && reading?.state !== 'alive') return gettingReady(note)
+  if (startInFlight && reading?.state !== 'alive')
+    return gettingReady(note, startedAt, waitHasGoneOnTooLong)
 
   if (reading === null) return couldNotRead()
 
@@ -630,48 +631,31 @@ export function resolveWorkspaceState(inputs: WorkspaceInputs): WorkspaceState {
         action: null,
         note: null,
         busy: false,
+        startedAt: null,
       }
     case 'starting':
-      return gettingReady(note)
-    // ANOTHER OF THIS CITIZEN'S PROJECTS HOLDS THE SLOT, AND THAT IS NOT A QUESTION FOR THEM.
+      return gettingReady(note, startedAt, waitHasGoneOnTooLong)
+    // ANOTHER OF THIS CITIZEN'S PROJECTS MAY HOLD THE SLOT, AND THAT IS NOT A QUESTION FOR THEM.
     // Pressing start takes the workspace: the server starts the project that was asked for and
-    // tears the outgoing one down behind it. So this reads exactly as a saved, stopped app does —
-    // the same sentence and the same one control — and it names no other project, because a tab
-    // whose container was taken by a switch made elsewhere has no cause to name.
-    case 'slot_taken':
+    // tears the outgoing one down behind it. So a held workspace reads exactly as a saved, stopped
+    // app does — the same sentence and the same one control — and names no other project.
+    //
+    // A start that failed after the server admitted it has no press left to carry its sentence, so
+    // the reading carries it. The press's own refusal is newer, and wins.
     case 'asleep':
-    case 'never_built':
-      return atRest(reading, projectHasSavedBuild, note)
+      return atRest(reading, projectHasSavedBuild, note ?? reading.startFailure)
     default:
       return assertNever(reading.state)
   }
 }
 
 /**
- * WHAT THE LAST PRESS ENDED AS, AS ONE LINE — or `null` when it left nothing worth saying.
- *
- * TWO OF THE THREE ENDINGS SAY NOTHING, AND THAT IS THE POINT rather than an omission.
- * `not-painted` is "the container is up and has not served a page yet", which is the DEFINITION of
- * the wait the citizen is already sitting in — the serving stamp is empty, so the next read
- * answers `starting` and the wait says it properly, with one author. `timed-out` is a fact about a
- * fetch that did not come back; it is not evidence about the container, and inventing a sentence
- * out of it is how a guess about a duration reached a screen in the first place.
- *
- * THE THIRD CARRIES SERVER PROSE VERBATIM. Rewriting it would put a second author on a sentence
- * that already has one and lose the only specific thing we know. See {@link WorkspaceState.note}
- * for why it rides in that field rather than in `detail`.
+ * WHAT THE LAST PRESS WAS REFUSED WITH, AS ONE LINE — or `null` when nothing refused it. Server
+ * prose, verbatim: rewriting it would put a second author on a sentence that already has one. See
+ * {@link WorkspaceState.note} for why it rides in that field rather than in `detail`.
  */
 function pressNote(outcome: StartOutcome | null): string | null {
-  if (outcome === null) return null
-  switch (outcome.kind) {
-    case 'not-painted':
-    case 'timed-out':
-      return null
-    case 'failed':
-      return outcome.reason
-    default:
-      return assertNever(outcome)
-  }
+  return outcome === null ? null : outcome.reason
 }
 
 /**
@@ -710,6 +694,7 @@ function atRest(
       action: START,
       note,
       busy: false,
+      startedAt: null,
     }
   }
   return {
@@ -721,6 +706,7 @@ function atRest(
     action: null,
     note,
     busy: false,
+    startedAt: null,
   }
 }
 
@@ -729,21 +715,27 @@ function atRest(
  * because nobody has measured one. The canvas's "about thirty seconds" and the register's "about
  * half a minute" are both dropped; a duration arrives from a measured constant or not at all.
  *
- * ONE SENTENCE FOR THE WHOLE PRE-SERVE INTERVAL, and it covers more of one than it used to. The
- * server's `starting`, this surface's own in-flight press, a relaunch that came back
- * `ready: false`, and a container that exists and has never answered a request are all the same
+ * ONE SENTENCE FOR THE WHOLE PRE-SERVE INTERVAL. The server's `starting`, this surface's own
+ * in-flight press, and a container that exists and has never answered a request are all the same
  * state — a start is happening, nothing is serving yet — and giving them one sentence is what
- * keeps them from drifting into four slightly different waits. Three of the four had cards of
- * their own until the platform could prove a serve.
+ * keeps them from drifting into three slightly different waits.
  *
- * NO ESCAPE BUTTON, DELIBERATELY, AND IT IS NOT AN OVERSIGHT. The obvious kindness is a "Launch
- * Application" that appears after a long enough wait so the wait is never a dead end. It is not
- * offered, because of where that press would land: `relaunch_preview`'s cold arm tears the live
- * container down before restoring the last saved bundle, and the situation such a button exists
- * for — a start whose observer was lost — is exactly the situation that takes the cold arm. So the
- * button would be most dangerous at the precise moment it appeared. The escape is server-side
- * instead: a reconciler that un-sticks a stranded container with no gesture from the citizen,
- * which also reaches tabs that were loaded before it shipped and can destroy nothing.
+ * TWO SENTENCES, AND THE SECOND ONE HAS A BUTTON. Past {@link START_PATIENCE_MS} the wait is no
+ * longer the ordinary one the first sentence describes, and a sentence with no end and nothing to
+ * press is how "Getting your app ready." stayed on a screen for fourteen minutes.
+ *
+ * THE ARGUMENT AGAINST THE BUTTON WAS ABOUT WHERE THE PRESS LANDS, and it no longer holds. It used
+ * to land on a readiness arm that re-raised on a cold start, which escaped the lock scope and let
+ * compensation destroy the container — so a press was most dangerous at the moment a stuck wait
+ * would have produced it. That arm now fails open on both sides: the container and its registry
+ * record survive, so the next press ATTACHES to what the start left standing rather than restoring
+ * over it. The per-user start lock is the other half — a second press cannot run beside the first,
+ * only after it, by which time the registry says which arm is correct.
+ *
+ * IT DOES NOT REPLACE THE SERVER-SIDE ESCAPE. The reconciler still un-sticks a stranded container
+ * with no gesture from the citizen, and still reaches tabs loaded before any of this shipped. What
+ * the button adds is an answer for the person watching, who otherwise has only the reload that
+ * restarts the clock.
  *
  * THE SECOND SENTENCE, AND THE CLAUSE IT SHIPS WITHOUT. The board draws this state as a still
  * glyph, a headline and a second sentence, and this arm used to carry only the first two — a
@@ -753,20 +745,31 @@ function atRest(
  *
  * ITS DURATION CLAUSE IS STILL DROPPED, on the rule the docblock above states: the canvas pairs
  * this sentence with "about thirty seconds" and nothing in this tree has ever measured a cold
- * start. What replaces it is not a smaller guess but ELAPSED TIME, which `AppPane` counts from the
- * moment this state arrives — a fact rather than an estimate.
+ * start. What replaces it is not a smaller guess but ELAPSED TIME, counted from
+ * {@link WorkspaceState.startedAt} — the instant the SERVER dates this wait from, so a reload does
+ * not restart it. A fact rather than an estimate, and the same fact after six reloads.
  *
  * AND NO PROGRESS BAR. A step-determinate one would advance on the workspace claim, the container
  * start and the first document served, but the wire carries a single opaque `starting`/`alive`
  * field, so a bar here could only be time-determinate, and a bar that sits at 80% for two minutes
  * is worse than the honest still card.
  */
-function gettingReady(note: string | null): WorkspaceState {
+function gettingReady(
+  note: string | null,
+  startedAt: number | null,
+  tooLong: boolean,
+): WorkspaceState {
   return {
     name: 'starting',
-    headline: 'Getting your app ready.',
-    detail: 'Setting up somewhere for it to run.',
-    action: null,
+    headline: tooLong ? 'Your app is taking longer than usual.' : 'Getting your app ready.',
+    detail: tooLong
+      ? 'It is still starting. You can wait, or ask for it again.'
+      : 'Setting up somewhere for it to run.',
+    // THE SECOND SENTENCE COMES WITH SOMETHING TO PRESS, and it is the verb that already exists
+    // rather than a third one. A press lands on the same door the start went through, which
+    // attaches to the container that start left standing instead of building over it, or joins
+    // the start still bringing it up — which is what makes asking again safe.
+    action: tooLong ? RETRY : null,
     // WHY A WAIT MAY CARRY A REFUSAL. A press refused while a start really was in flight — the
     // server answering `BUILD_ALREADY_RUNNING` to somebody pressing Launch during a build — is a
     // question the citizen asked and is owed an answer to, and the honest answer does not change
@@ -774,9 +777,11 @@ function gettingReady(note: string | null): WorkspaceState {
     // other piece of server prose is one: this map does not put words it did not write where the
     // negative-copy sweep asserts.
     note,
-    // THE ONE ARM THAT IS BUSY. See `WorkspaceState.busy` — this is the state with a wait in it and
-    // no action row, so before this field the pane had no way to say a wait was under way at all.
+    // THE ONE ARM THAT IS BUSY, in both of its sentences. A wait that has gone on too long is
+    // still a wait: nothing here stops it, and saying otherwise would be this pane claiming
+    // something about the container that nobody has checked.
     busy: true,
+    startedAt,
   }
 }
 
@@ -784,10 +789,10 @@ function gettingReady(note: string | null): WorkspaceState {
  * THE ONE HONEST ANSWER TO A QUESTION NOBODY MANAGED TO ASK — and the only arm that is not drawn
  * for a state of the workspace.
  *
- * REACHED FROM ONE PLACE ONLY: a read that decided nothing, at a moment when nothing had ever been
- * decided. Once ANY reading has landed, an unreadable one renders THAT reading instead and this is
- * unreachable — see {@link WorkspaceInputs.lastDecidedPreview}. That narrowing is the whole reason
- * it survived the collapse while four other arms did not. "We could not check on your app." is an
+ * REACHED FROM ONE PLACE ONLY: no read has answered yet. Once ANY reading has landed, an
+ * unreadable one leaves THAT reading in place and this is unreachable — see
+ * {@link WorkspaceInputs.preview}. That narrowing is the whole reason it survived the collapse
+ * while four other arms did not. "We could not check on your app." is an
  * engineer's sentence about the platform's own plumbing, and showing it to somebody whose app is
  * fine is the failure; showing it to somebody about whom we have genuinely never managed to learn
  * anything is simply the truth.
@@ -803,5 +808,6 @@ function couldNotRead(): WorkspaceState {
     action: RETRY,
     note: null,
     busy: false,
+    startedAt: null,
   }
 }

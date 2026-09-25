@@ -68,9 +68,7 @@ def _file(
 
 def _session(sandbox: FakeSandbox) -> SandboxSession:
     # `handle` is a METHOD on the fake, not a property — the same call every other suite makes.
-    return SandboxSession(
-        sandbox_client=sandbox, handle=sandbox.handle(), app_id=uuid.uuid4(), emitter=None
-    )
+    return SandboxSession(sandbox_client=sandbox, handle=sandbox.handle(), app_id=uuid.uuid4())
 
 
 # --- the name on disk --------------------------------------------------------------

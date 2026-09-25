@@ -1,5 +1,9 @@
 # ADR-0029: Azure Is the Fleet of Record — Tiered Sandbox Reclamation
 
+The destroy pass, its staging marker and its confidence tiers are withdrawn by ADR-0030; the
+identity tags, the durable-copy gate, the four-step destroy ordering, the liveness lease and the
+absolute ceiling this record describes remain in force.
+
 ## Context
 
 Every build sandbox is a container app. The only record that a container belongs to somebody is a
@@ -126,7 +130,11 @@ signed as an accepted risk below. Separately, an unconfigured storage deployment
 "cannot confirm" rather than "confirmed nothing to preserve" — an existing helper's "absent"
 answer is correct for its other caller but would be catastrophic here, so the worker's own
 settings profile requires object storage to construct at all, making the misconfiguration
-unreachable rather than merely discouraged.
+unreachable rather than merely discouraged. One container is reclaimed with no copy taken: one
+whose workspace has lost its version-control repository, usually to a restart that discarded its
+disk. No copy of that tree can be taken on this pass or any later one, so sparing it would only
+retry and bill forever; it is reclaimed, the app's last saved copy is left untouched, and the
+reclaim is logged so these containers stay countable.
 
 **A wall-clock liveness lease, published by the process actually building.** Until a
 cross-process liveness signal existed, no process but the one running a build could safely destroy
@@ -221,7 +229,10 @@ container no claim signal ever disqualifies — a builder who leaves a tab open 
 that long loses the container and gets it back transparently on the next prompt; accepted as a
 bounded, designed-for cost against an unbounded one, and measured from the container's own age
 specifically so a stale coordination-store record cannot hand it a fresh ceiling it does not
-deserve. The pass-staleness alarm and the fleet-size alarm are, today, only distinguishable log
+deserve. A container that lost its repository is reclaimed without a copy, and whatever it held
+since the last save is gone with it; accepted because that work was already lost when the
+repository went, and the cause worth fixing is whatever discarded the disk. The pass-staleness
+alarm and the fleet-size alarm are, today, only distinguishable log
 events — pull-mode signals that still require a human to already be watching, close to the
 original incident's own failure mode. This is accepted only as a stated partial: it is not met
 until an actual alerting rule and a named recipient exist for each, and must not be read as met on

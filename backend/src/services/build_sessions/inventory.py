@@ -81,23 +81,9 @@ class FleetTagger(FleetLister, Protocol):
     `FleetLister` keeps the direction that is actually true — a client that can stamp can always
     list. `stamp_tags` is a MERGE, a promise the IMPLEMENTATION keeps rather than ARM:
     `Microsoft.App` replaces the whole tag map on PATCH, so the real client reads before it writes,
-    and a substrate that cannot merge would destroy the identity the classifier judges by."""
+    and a substrate that cannot merge would destroy the identity every fleet sweep judges by."""
 
     async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None: ...
-
-
-@runtime_checkable
-class FleetDestroyer(FleetTagger, Protocol):
-    """`FleetTagger` plus the one capability only a DESTROY path needs: re-reading a single
-    container's tags immediately before acting on it.
-
-    THREE PROTOCOLS, NOT TWO, for the same reason there are two rather than one: the backfill never
-    re-reads, and widening `FleetTagger` to demand it would 503 nine of its tests. `get_app_tags`
-    returns `None` when ARM says the container does not exist — different from `{}` (exists, no
-    identity), and the destroy path depends on the difference: absent means the delete already
-    landed; untagged means somebody rewrote the resource and it is no longer ours to judge."""
-
-    async def get_app_tags(self, *, name: str) -> dict[str, str] | None: ...
 
 
 @dataclass(frozen=True)
@@ -224,15 +210,15 @@ async def _app_names_to_owners(db: AsyncSession) -> dict[str, _KnownContainer]:
 
     FORWARD-MATCHED, never reverse-parsed, on both arms: `app_name_for`/`shr_name_for` each keep
     only 28 of 32 hex characters, so deriving every known name and comparing is exact, while
-    parsing an owner out of either is a guess that could promote an unproven container into the
-    destroy-eligible tiers. FLEET-WIDE ON PURPOSE — neither query here is scoped by `user_id`,
+    parsing an owner out of either is a guess that could write a future reap's tree back into the
+    wrong app's slot. FLEET-WIDE ON PURPOSE — neither query here is scoped by `user_id`,
     because the question is "does ANY user (or ANY share) own this"; between them they read two
     identifier columns plus one junction row, no user data, superadmin-only. `app_name_for`/
     `shr_name_for` are imported in-function to keep `manager`'s heavy imports out of the worker.
 
     A project shared with several colleagues produces one `shr-` entry per recipient, all keyed
-    off the SAME app id — a fan-out `_owning_app_ids` (this function's one non-reclaim consumer)
-    already tolerates, since it only ever reads the app id back out, never the name."""
+    off the SAME app id — a fan-out `_owning_app_ids` (this function's only consumer) already
+    tolerates, since it only ever reads the app id back out, never the name."""
     from src.services.build_sessions.manager import app_name_for, shr_name_for
 
     rows = (await db.execute(sa.select(AppRegistry.id, AppRegistry.user_id))).all()
@@ -259,18 +245,16 @@ async def _app_names_to_owners(db: AsyncSession) -> dict[str, _KnownContainer]:
 def _backfill_tags(owner: _KnownContainer | None) -> dict[str, str]:
     """The tags to merge onto one pre-existing container.
 
-    Two shapes, the difference being the escalate-never-destroy invariant made concrete. Owner
-    recovered: full identity, `created_at` set to NOW with a `backfilled_at` marker saying that age
-    is synthetic. No matching app row: `kind` and `backfilled_at` and NOTHING ELSE —
-    escalate-forever by construction, reported every pass and destroyed by none. Filling in a
-    plausible owner is the one change that would silently make it destroy-eligible.
+    Two shapes. Owner recovered: full identity, `created_at` set to NOW with a `backfilled_at`
+    marker saying that age is synthetic — the fleet sweep's ceiling reads `created_at` straight
+    off ARM (`_container_age_source`), so a real timestamp here is what lets a sweep judge a
+    container that carried none before. No matching app row: `kind` and `backfilled_at` and
+    NOTHING ELSE — no owner is guessed, because a wrong guess could send a future write-back into
+    someone else's app; the container is left for an operator to find in the `unowned` count.
 
     UNMATCHED STAMPS `KIND_BUILD_SANDBOX`, NEVER `KIND_SHARED_SANDBOX` — a container this pass
     cannot name is, definitionally, not one `_app_names_to_owners` could resolve to either fleet,
-    so the unmatched arm has no real "which kind" answer to give. `KIND_BUILD_SANDBOX` is the
-    reclaimer's only DESTROY-eligible kind, which is what makes it the correct default here: an
-    unowned container this platform cannot explain is exactly the population idle-reclaim exists
-    to collect, and `KIND_SHARED_SANDBOX` would instead escalate it forever on a guess."""
+    so the unmatched arm has no real "which kind" answer to give."""
     stamped_at = dt.datetime.now(dt.UTC).isoformat()
     if owner is None:
         return {TAG_KIND: KIND_BUILD_SANDBOX, TAG_BACKFILLED_AT: stamped_at}

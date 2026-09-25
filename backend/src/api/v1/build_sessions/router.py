@@ -2,19 +2,12 @@
 
 WHY THIS EXISTS
 
-`status` + the SSE feed + `relaunch` + the project-scoped save/preview/stop ops + the
-superadmin `internal/reap`, all owner-scoped by `user.id`: every not-found-or-other-user case
-is a non-leaking 404. The mutating POSTs carry the reusable `RequireCsrf` dependency; the
-`status` GET and the GET-SSE progress feed (`sse.py`, `Last-Event-ID`-resumable) are exempt.
+`relaunch` + the project-scoped save/preview/stop ops + the superadmin `internal/reap`, all
+owner-scoped by `user.id`: every not-found-or-other-user case is a non-leaking 404. The mutating
+POSTs carry the reusable `RequireCsrf` dependency; the GETs are exempt.
 
-THERE IS NO `start` ANY MORE, and the two `{session_id}` routes below serve HISTORICAL sessions
-only. The bare `POST` on this collection — the start route — lost its browser client and was
-deleted here with the whole harness behind it; the last lock op, `lock/force-end`, went with it,
-and the session-scoped `stop` followed once nothing could mint a session id for a client to name.
-The only remaining producer of a session id the portal can reach is a `build_started` transcript
-row written before that deletion — those rows are permanent, so `status`/`events` stay as their
-reader. A build now runs as an ordinary Write chat turn, which registers its workspace through
-`SessionManager.ensure_sandbox` and never serialises a session id at all.
+No route here is addressed by a session id. A build runs as an ordinary Write chat turn, which
+registers its workspace through `SessionManager.ensure_sandbox` and never serialises one.
 
 One inbound route here is not a control op at all — `projects/{project_id}/client-error`,
 where the app's own in-browser error reporter's findings arrive by way of the portal. It
@@ -25,13 +18,15 @@ harness's health verdict."""
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any
+from typing import Any, Final
 
 import sqlalchemy as sa
 import structlog
-from fastapi import APIRouter, Request, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, status
+from fastapi.responses import JSONResponse
+from redis.exceptions import RedisError
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_rbac import CurrentSuperadmin
@@ -42,8 +37,6 @@ from src.api.v1.build_sessions.deps import (
     SessionManagerDep,
 )
 from src.api.v1.build_sessions.schemas import (
-    BuildSessionStatus,
-    BuildSessionStatusResponse,
     ClientErrorReportRequest,
     ClientErrorReportResponse,
     CompileStateResponse,
@@ -57,7 +50,6 @@ from src.api.v1.build_sessions.schemas import (
     SharedPreviewResponse,
     WorkspaceCheckResponse,
 )
-from src.api.v1.build_sessions.sse import build_sse_response
 from src.api.v1.live_build import ReclaimBlockedError, reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.core.integrity_types import WorkspaceState
@@ -66,7 +58,6 @@ from src.db.models.conversation import Conversation
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
 from src.services.build_sessions import (
-    BuildSession,
     BuildSessionConflictError,
     NoLiveSandboxError,
     NoSnapshotToRelaunchError,
@@ -74,7 +65,6 @@ from src.services.build_sessions import (
     SandboxReclaimBlockedError,
     SandboxUnreachableError,
     SaveState,
-    SessionManager,
     SharedProjectHasNoAppError,
     SnapshotUnavailableError,
     StopOutcome,
@@ -83,6 +73,7 @@ from src.services.build_sessions import (
 )
 from src.services.build_sessions.inventory import owning_app_ids
 from src.services.build_sessions.locks import (
+    StartFailure,
     renew_presence_stay,
 )
 from src.services.orchestrator.client_errors import (
@@ -94,6 +85,7 @@ from src.services.projects.resolve import (
     resolve_project_access,
 )
 from src.services.redis import (
+    BUILD_COORDINATION_UNAVAILABLE_MSG,
     build_coordination_or_503,
     coordination_is_gone,
     get_redis,
@@ -110,6 +102,15 @@ _log = structlog.get_logger()
 # unmodified. Do not reword, re-punctuate or "improve" it; a test pins it character-for-
 # character so a well-meaning edit fails CI instead of shipping.
 _SANDBOX_UNAVAILABLE_MSG = "Sandbox unavailable. Please try again later or contact the admin"
+
+_NO_SAVED_BUILD_MSG = "No saved build to relaunch. Build the app first."
+
+# A start that fails after its 202 is told in the words its refusal would have used at admission.
+_START_FAILURE_SENTENCES: Final[Mapping[StartFailure, str]] = {
+    StartFailure.NO_SAVED_BUILD: _NO_SAVED_BUILD_MSG,
+    StartFailure.SANDBOX_UNAVAILABLE: _SANDBOX_UNAVAILABLE_MSG,
+    StartFailure.COORDINATION_UNAVAILABLE: BUILD_COORDINATION_UNAVAILABLE_MSG,
+}
 
 
 class ReapResponse(CamelModel):
@@ -135,16 +136,6 @@ class ConflictEnvelope(CamelModel):
     `lock_lost` 409 too."""
 
     error: _ConflictError
-
-
-def _owned_or_404(
-    manager: SessionManager, session_id: uuid.UUID, user_id: uuid.UUID
-) -> BuildSession:
-    """Load a session scoped to its owner, or fail closed with a 404."""
-    session = manager.get(session_id)
-    if session is None or session.user_id != user_id:
-        raise AppApiError(status.HTTP_404_NOT_FOUND, "Build session not found.")
-    return session
 
 
 class BuildConflictEnvelope(CamelModel):
@@ -206,7 +197,7 @@ def _coordination_is_gone() -> AppApiError:
     return coordination_is_gone()
 
 
-# --- internal/reap (registered FIRST so `internal` is never parsed as a session id) ---
+# --- internal/reap ---
 
 
 @router.post(
@@ -227,10 +218,6 @@ async def internal_reap(
     """Operator-triggered full reconciliation sweep — `CurrentSuperadmin`-guarded, CSRF'd,
     audited, idempotent, concurrency-safe. The by-hand door onto the same sweep the scheduled
     pass runs; this route itself is cookie-only, so nothing machine-authed can drive it."""
-    # Retention sweep of ended in-process sessions rides the same operator path (the other
-    # opportunistic seam is start()) — nothing evicts them on a timer, and nothing scheduled
-    # could: this map is per-process state another process cannot reach.
-    manager.evict_ended_sessions()
     # The sweep walks the registry namespace with bare primitives, so an outage here is a 503
     # to the operator rather than an opaque 500. The audit row is deliberately inside: a sweep
     # that never ran is not an action worth recording. Redis is resolved LAZILY inside the seam,
@@ -260,11 +247,12 @@ async def internal_reap(
     raise _coordination_is_gone()
 
 
-# --- control ops: relaunch / status -------------------------------------------
+# --- control ops: relaunch ----------------------------------------------------
 
 
 @router.post(
     "/relaunch",
+    status_code=status.HTTP_202_ACCEPTED,
     response_model=RelaunchPreviewResponse,
     dependencies=[RequireCsrf],
     responses=error_responses(
@@ -287,20 +275,20 @@ async def relaunch_preview(
     sandbox: OptionalSandbox,
     manager: SessionManagerDep,
 ) -> RelaunchPreviewResponse | JSONResponse:
-    """Restore a torn-down app from its snapshot into a fresh, READY sandbox.
+    """Start the project's saved app, or attach to the container already running it.
 
-    Not a build: it runs no agent at all, and the manager path never occupies the
-    one-per-user build slot — it registers a ready handle in Redis, releases the lock, and
-    returns the live preview synchronously (`wait_ready` blocks until the dev server is up).
+    Answers 202 once the start is admitted — every refusal below is decided first — and brings
+    the app up detached. `preview-state` is the one reader of how it went: `starting`, then
+    `alive` with the framable URL. Not a build: it runs no agent and never occupies the
+    one-per-user build slot.
     """
     if sandbox is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
-    # The coordination seam the deleted `start_build` also ran inside, and relaunch needs it
-    # at least as badly: it takes the same per-user lock through the same `_holding_user_lock`,
-    # so before the split a Redis blip here told the user a build was already running.
+    # It takes the same per-user lock through the same `_holding_user_lock` a turn does, so an
+    # outage of the coordination store is a 503 here, never a claim that a build is running.
     with build_coordination_or_503():
         try:
-            relaunched = await manager.relaunch_preview(db, user, body.project_id, sandbox)
+            app_id = await manager.relaunch_preview(db, user, body.project_id, sandbox)
         except BuildSessionConflictError:
             # This project's own work is running — relaunch never pre-empts it (409). A
             # DIFFERENT project of theirs never reaches here: that is a switch, and it starts.
@@ -309,8 +297,8 @@ async def relaunch_preview(
             # A colleague's shared view holds the one slot, and it has no hand-over.
             return reclaim_blocked_response(exc)
         except NoSnapshotToRelaunchError as exc:
-            # Confirmed-absent (or vanished) snapshot: nothing to relaunch, and there is no
-            # blank-template fallback (an empty app is not a preview of the user's work). 404.
+            # Confirmed-absent snapshot: nothing to relaunch, and there is no blank-template
+            # fallback (an empty app is not a preview of the user's work). 404.
             #
             # CODED, because this route answers 404 for TWO unrelated reasons and a client has to
             # tell them apart. `owned_project_or_404` fails a deleted or someone else's project
@@ -320,82 +308,18 @@ async def relaunch_preview(
             # carries `no_saved_build`, so the rail's arm can be exact — the same reason
             # `sandbox_reclaim_blocked` names itself rather than letting a client match prose.
             raise AppApiError(
-                status.HTTP_404_NOT_FOUND,
-                "No saved build to relaunch. Build the app first.",
-                code="no_saved_build",
+                status.HTTP_404_NOT_FOUND, _NO_SAVED_BUILD_MSG, code="no_saved_build"
             ) from exc
         except (SnapshotUnavailableError, SandboxUnreachableError, SandboxError) as exc:
-            # Transient/unknown snapshot state, a restore that failed every attempt, or the dev
-            # server not coming ready — the saved version is intact; a retry is the way forward.
-            #
-            # `SandboxUnreachableError` IS THIS ANSWER, and it is named here rather than left to
-            # fall through as a 500. The attach fork now refuses on it instead of restoring: the
-            # registry says a container is live, the attach could not confirm anything, and the
-            # honest reply is "we could not tell" — which is precisely what this arm already
-            # says. It is NOT a `SandboxError` (it is a `NoLiveSandboxError` subclass), so
-            # listing it is the only way it reaches this message rather than an unhandled 500.
+            # An unreadable snapshot, or a container the registry names that the attach could
+            # not confirm either way — the saved version is intact; a retry is the way forward.
+            # `SandboxUnreachableError` is a `NoLiveSandboxError`, not a `SandboxError`, so it
+            # is named here or it falls through as a 500.
             raise AppApiError(
                 status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG
             ) from exc
-        return RelaunchPreviewResponse(
-            app_id=relaunched.app_id,
-            preview_url=relaunched.preview_url,
-            # PROVISIONING, not READY, when the app is not serving yet: `status` is the field an
-            # older client reads, and telling it READY over a page that has not answered is the
-            # dishonesty this whole branch has been unwinding. The URL still ships — see the
-            # fail-open note on `relaunch_preview`.
-            status=(
-                BuildSessionStatus.READY if relaunched.ready else BuildSessionStatus.PROVISIONING
-            ),
-            restored_from_failed_build=relaunched.restored_from_failed_build,
-            ready=relaunched.ready,
-        )
+        return RelaunchPreviewResponse(app_id=app_id)
     raise _coordination_is_gone()
-
-
-@router.get(
-    "/{session_id}",
-    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Build session not found")),
-)
-async def build_status(
-    session_id: uuid.UUID, user: CurrentUser, manager: SessionManagerDep
-) -> BuildSessionStatusResponse:
-    session = _owned_or_404(manager, session_id, user.id)
-    return BuildSessionStatusResponse(
-        session_id=session.session_id,
-        project_id=session.project_id,
-        app_id=session.app_id,
-        status=session.status,
-        preview_url=session.preview_url,
-        last_seq=session.last_seq if session.last_seq > 0 else None,
-        created_at=session.created_at,
-        updated_at=session.updated_at,
-    )
-
-
-def _parse_last_event_id(raw: str | None) -> int | None:
-    """The SSE resume cursor. Absent → None (live-from-now); a non-integer is ignored
-    (treated as absent) rather than 4xx'ing a reconnect."""
-    if raw is None:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
-
-
-@router.get(
-    "/{session_id}/events",
-    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Build session not found")),
-)
-async def build_events(
-    session_id: uuid.UUID, request: Request, user: CurrentUser, manager: SessionManagerDep
-) -> StreamingResponse:
-    """The build-session SSE progress feed (cookie-authed, `Last-Event-ID`-resumable, no CSRF). The
-    only synchronous pre-stream failure is the 404 ownership check; a brain failure is
-    delivered IN-BAND as a synthesized terminal FAILED `ended` + `[DONE]`."""
-    session = _owned_or_404(manager, session_id, user.id)
-    return build_sse_response(session, _parse_last_event_id(request.headers.get("last-event-id")))
 
 
 # A turn is held open by the wall-clock lease the SERVER renews, legible to a sweep in another
@@ -418,19 +342,17 @@ class SaveResponse(CamelModel):
 
 
 class PreviewStateResponse(CamelModel):
-    """FIVE STATES AND AN UNKNOWN, not one boolean.
+    """THREE STATES, and a read that could not decide is not one of them: it is a 503.
 
-    A boolean has no unknown arm, so a FAILED registry read says "your preview is gone" for a
-    question nobody managed to ask. It also flattens three genuinely different ordinary states
-    — never built, asleep, another project took the slot — into the same shrug, leaving the
-    pane only one sentence to offer back. `previewUrl` is echoed so a tab that reconnects can
-    re-frame without a second call."""
+    A boolean would let a FAILED registry read say "your preview is gone" for a question nobody
+    managed to ask, and it cannot tell a wait from a rest. `previewUrl` is echoed so a tab that
+    reconnects can re-frame without a second call."""
 
     state: PreviewLifeState
     # RETAINED, strictly `state == alive`. A browser tab loaded before this change is still
     # polling `alive`, and a tab reading a missing field as false would paint "gone" over a
-    # live preview for the whole rollout window. It cannot express UNKNOWN — new clients
-    # branch on `state`, and this field exists only so old ones keep working.
+    # live preview for the whole rollout window. New clients branch on `state` and read this
+    # only as the fallback for a state they do not recognise.
     alive: bool
     preview_url: str | None = None
     # DIAGNOSTIC ONLY — NO CLIENT LOGIC MAY BRANCH ON THIS FIELD. Non-null strictly when
@@ -452,21 +374,29 @@ class PreviewStateResponse(CamelModel):
     # exactly this reason: one expression, one source. Keep the field; forbid the branch, in
     # this docstring and in review.
     #
-    # Additive and defaulted, so emitters and readers written before it stay wire-valid — the
-    # same rule `StepEvent.hidden` carries in `schemas.py`.
+    # Additive and defaulted, so emitters and readers written before it stay wire-valid.
     serving_since: datetime | None = None
-    # SLOT_TAKEN only. Null when the live container matches no app this user owns (a ghost) —
-    # naming the wrong project in a sentence about someone's work is worse than naming none.
-    occupying_project_id: uuid.UUID | None = None
-    occupying_project_name: str | None = None
+    # STARTING only: the ISO-8601 instant this project's wait began, so the pane's elapsed
+    # figure is the real wait rather than the life of the current page. Null is NO CLAIM — the
+    # client falls back to counting from its own mount.
+    #
+    # THE CLIENT MAY BRANCH ON THIS ONE, unlike `serving_since` above, and the difference is
+    # that it is not `state` spelled twice: `state == starting` says a wait is under way and
+    # this says how long it has been under way, which is a fact no other field carries.
+    #
+    # Additive and defaulted, so emitters and readers written before it stay wire-valid.
+    starting_since: datetime | None = None
     # TRI-STATE like `SaveStateResponse.dirty`, and for the identical reason: `null` is NO
     # CLAIM, never "no". Two ways to reach it, one instruction to the client — the object store
-    # was unreachable, or `state` is `alive` and the poll declined to spend a Blob round trip on
-    # a question no surface asks about a running app (this route's fixed budget allows none on
-    # the hot path).
+    # was unreachable, or `state` is `alive` or `starting` and the poll declined to spend a Blob
+    # round trip on a question no surface asks about a running app (this route's fixed budget
+    # allows none on the hot path).
     # Answered WITHOUT a container, which is the whole point — it is the one restore signal
     # that survives the container being reclaimed.
     restorable: bool | None = None
+    # ASLEEP only: the sentence for this project's last start, when it failed after its 202 and
+    # recently. Null everywhere else. Additive and defaulted, like the fields above.
+    start_failure: str | None = None
 
 
 class StopActiveBuildResponse(CamelModel):
@@ -972,7 +902,11 @@ async def release_shared_view(
 @router.get(
     "/projects/{project_id}/preview-state",
     response_model=PreviewStateResponse,
-    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
+    responses=error_responses(
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found"),
+        (503, ErrorEnvelope, "Build coordination is temporarily unavailable"),
+    ),
 )
 async def preview_state(
     project_id: uuid.UUID,
@@ -983,8 +917,9 @@ async def preview_state(
     """Is the preview this tab is framing still real — and if not, WHY?
 
     Answers about THIS project only, and its budget is deliberately fixed: one round trip to
-    the coordination store (two commands, pipelined), at most two user-scoped rows, at most two
-    object-store HEADs, and NO container call of any kind."""
+    the coordination store (one pipeline), two user-scoped rows, at most two
+    object-store HEADs, and NO container call of any kind. A store that will not answer is a 503,
+    which both polls already read as a check that decided nothing."""
     # A framed preview that has been reclaimed looks EXACTLY like a working app — the last render
     # stays on screen, the iframe reports nothing, and a cross-origin pane cannot read a status
     # code. Once a build ends the tab holds no SSE and no timer, and the teardown happens inside a
@@ -994,27 +929,30 @@ async def preview_state(
     # `git` execs inside the container per call, and its `dirty=null` conflates three unrelated
     # causes.
     #
-    # A container serving a different app is `slot_taken` here, named where we can name it: the
-    # one-per-user registry means somebody else's container is exactly when yours is asleep, and
-    # the builder deserves to be told which of their own projects is standing in the way rather
-    # than that their app disappeared. A start already in flight for this project — this tab's own
-    # press, another tab's, or a chat message that just started one — answers `starting` rather
-    # than the stale `asleep` a second press used to invite. So does a container that exists but
-    # has never answered a request: `alive` here means SERVED, not scheduled, and the whole
-    # window between "a container was created" and "the app answered" is now a wait rather than
-    # a preview URL a tab would frame over nginx's 404 page. The budget above is unchanged by
-    # that — the serving proof is one more field on the registry hash this route already reads
-    # whole, so it costs no extra round trip and still no container call.
+    # A container serving a different app is `asleep` here: pressing start takes the one workspace
+    # back, so the pane offers the same thing whoever is holding it. A start already in flight for
+    # this project — this tab's own press, another tab's, or a chat message that just started one
+    # — answers `starting` rather than the stale `asleep` a second press used to invite. So does a
+    # container that exists but has never answered a request: `alive` here means SERVED, not
+    # scheduled, and the whole window between "a container was created" and "the app answered" is
+    # now a wait rather than a preview URL a tab would frame over nginx's 404 page. The budget
+    # above is unchanged by that — the serving proof is one more field on the registry hash this
+    # route already reads whole, so it costs no extra round trip and still no container call.
     await owned_project_or_404(db, user.id, project_id)
-    state = await manager.project_preview_state(db, user, project_id)
+    try:
+        state = await manager.project_preview_state(db, user, project_id)
+    except RedisError as exc:
+        raise coordination_is_gone() from exc
     return PreviewStateResponse(
         state=state.state,
         alive=state.alive,
         preview_url=state.preview_url,
         serving_since=state.serving_since,
-        occupying_project_id=state.occupying_project_id,
-        occupying_project_name=state.occupying_project_name,
+        starting_since=state.starting_since,
         restorable=state.restorable,
+        start_failure=(
+            None if state.start_failure is None else _START_FAILURE_SENTENCES[state.start_failure]
+        ),
     )
 
 
@@ -1035,9 +973,9 @@ async def workspace_check(
 
     A POST, WITH CSRF, because it is not a free read: it costs a container exec and it can
     raise an operational alarm. IT RESTORES NOTHING — the restore belongs to the next turn, where
-    the citizen is present, has been told, and can confirm. The one thing it may put away is an
-    INTACT app whose dev server has stopped, because nothing else ever ends that wait; see
-    `SessionManager.project_workspace_check` for the guards."""
+    the citizen is present, has been told, and can confirm. The one thing it may restart is the
+    dev server of an INTACT app that has stopped, in the same container, because nothing else ever
+    ends that wait; see `SessionManager.project_workspace_check` for the guards."""
     # THE TURN MAY NEVER COME. Every other integrity check in this system runs at the start of a
     # turn, which catches every reversion between one message and the next — and catches nothing
     # at all for someone who is reading, or in another tab, or at lunch. A standing completion

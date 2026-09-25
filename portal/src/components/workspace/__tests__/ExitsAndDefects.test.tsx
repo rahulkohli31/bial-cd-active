@@ -115,8 +115,8 @@ function Workspace() {
 /** The workspace is alive and has work the saved bundle does not — the state every exit matters in. */
 const dirtyAndAlive = () => {
   api.fetchPreviewState.mockResolvedValue({
-    state: 'alive', alive: true, previewUrl: 'https://app/', occupyingProjectName: null,
-    occupyingProjectId: null, restorable: true,
+    state: 'alive', alive: true, previewUrl: 'https://app/',
+    restorable: true,
   })
   api.fetchSaveState.mockResolvedValue({ appId: 'app-1', dirty: true, containerHead: 'aaa', savedHead: 'bbb' })
 }
@@ -126,8 +126,8 @@ beforeEach(() => {
   api.logout.mockResolvedValue(true)
   api.saveProject.mockResolvedValue({ appId: 'app-1', headSha: 'ccc' })
   api.fetchPreviewState.mockResolvedValue({
-    state: 'asleep', alive: false, previewUrl: null, occupyingProjectName: null,
-    occupyingProjectId: null, restorable: true,
+    state: 'asleep', alive: false, previewUrl: null,
+    restorable: true,
   })
   api.fetchSaveState.mockResolvedValue(null)
 })

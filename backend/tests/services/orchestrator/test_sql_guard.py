@@ -21,11 +21,10 @@ from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from src.services.orchestrator.deps import SandboxSession
-from src.services.orchestrator.progress import ProgressEmitter
 from src.services.orchestrator.sql_guard import GUARD_INPUT_MAX_CHARS, you_shall_not_pass
 from src.services.sandbox import ExecResult
 from tests.fakes import ToolDeps
-from tests.services.orchestrator.conftest import CollectingSink, build_tool_agent
+from tests.services.orchestrator.conftest import build_tool_agent
 from tests.services.orchestrator.fake_sandbox import FakeSandbox
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
@@ -212,23 +211,18 @@ def _capturing_model(turns: list[ModelResponse], captured: dict[str, Any]) -> Fu
     return FunctionModel(respond)
 
 
-def _deps(fake: FakeSandbox, sink: CollectingSink) -> ToolDeps:
-    emitter = ProgressEmitter(sink)
+def _deps(fake: FakeSandbox) -> ToolDeps:
     return ToolDeps(
         sandbox=SandboxSession(
             sandbox_client=fake,
             handle=fake.handle(),
             app_id=uuid.uuid4(),
-            emitter=emitter,
         ),
-        emitter=emitter,
         user_id=uuid.uuid4(),
     )
 
 
-async def test_destructive_sql_is_blocked_in_run_and_the_build_self_heals(
-    sink: CollectingSink,
-) -> None:
+async def test_destructive_sql_is_blocked_in_run_and_the_build_self_heals() -> None:
     # The FunctionModel first improvises destructive SQL (blocked → ModelRetry re-enters the
     # loop), then self-corrects to a non-destructive verification. The destructive command
     # must NEVER reach the exec transport.
@@ -245,13 +239,10 @@ async def test_destructive_sql_is_blocked_in_run_and_the_build_self_heals(
         ],
         captured,
     )
-    result = await _tool_agent.run("tweak the app", deps=_deps(fake, sink), model=model)
+    result = await _tool_agent.run("tweak the app", deps=_deps(fake), model=model)
     # Only the benign verification ever executed.
     assert fake.command_calls == [["npx", "tsc", "--noEmit"]]
     # The corrective refusal was fed back to the model in-run.
     all_incoming = "\n".join(captured.get("incoming", []))
     assert "blocked" in all_incoming.lower()
     assert result.output == "verified without touching data"
-    # The blocked attempt is visible in the progress trace (the iteration-2 tripwire relies
-    # on route-around behaviour being observable).
-    assert any("blocked" in str(envelope).lower() for envelope in sink.events)

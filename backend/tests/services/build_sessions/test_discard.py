@@ -12,6 +12,7 @@ import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta
+from typing import Any
 
 import pytest
 import redis.asyncio as aioredis
@@ -176,6 +177,44 @@ async def test_a_discard_puts_the_saved_version_back_in_the_running_container(
     assert outcome.state.container_head == SAVED
     assert client.provisioned == [app_name_for(app_id)]
     assert client.restored == []
+    assert client.dev_started == [app_name_for(app_id)]
+
+
+async def test_an_idle_check_during_the_discards_start_leaves_the_app_to_the_discard(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    manager: SessionManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tab's idle check restarts a stopped app once the start lock is free. Asked while the
+    Discard is starting the app it put back, it has to find that lock still held, or it starts a
+    second dev server beside the Discard's in a container already short of memory.
+
+    Mutation check: start the app after the `async with` in `discard_unsaved_changes` and
+    `dev_started` names the app twice."""
+    user, project_id, app_id, client = await _a_saved_app_with_later_work(
+        db_session, manager, "discard-idle-race@rvaiglobal.com"
+    )
+    start = client.dev_start
+    asked = False
+
+    async def _the_idle_check_asks_mid_start(handle: SandboxHandle, **kw: Any) -> int:
+        nonlocal asked
+        if not asked:
+            asked = True
+            await manager.project_workspace_check(
+                db_session, user, project_id, sandbox_client=client
+            )
+        return await start(handle, **kw)
+
+    monkeypatch.setattr(client, "dev_start", _the_idle_check_asks_mid_start)
+
+    await manager.discard_unsaved_changes(
+        db_session, user, project_id, sandbox_client=client, conversation_id=None
+    )
+
+    assert asked, "guard the premise: the idle check ran inside the Discard's start"
     assert client.dev_started == [app_name_for(app_id)]
 
 

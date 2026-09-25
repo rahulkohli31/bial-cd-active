@@ -1,10 +1,9 @@
 """The WRITE turn's sandbox lifecycle: `ensure_sandbox` / `finish_turn_sandbox`.
 
-A Write turn allocates everything a build allocates (container, lock, registry, heartbeat) and
-none of what a build runs (`run_build`, `build_started`, attachments). These tests pin both
-halves, plus the save model: `write_snapshot` is the only path that pushes the tree to Blob
-storage, and a Write turn with no reachable save point would report success while silently
-losing every edit to the next reaper sweep.
+A Write turn allocates everything a build allocates (container, lock, registry, heartbeat).
+These tests pin that, plus the save model: `write_snapshot` is the only path that pushes the
+tree to Blob storage, and a Write turn with no reachable save point would report success while
+silently losing every edit to the next reaper sweep.
 
 `may_write` mirrors the turn's toolset (`toolsets_for_kind` gives the mutating `sandbox_toolset`
 only to `ChatKind.BUILD`), so `may_write=False` implies `touched=False` in production — a test
@@ -28,7 +27,6 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.config import settings
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import ChatKind
@@ -49,8 +47,8 @@ from src.services.build_sessions.manager import (
     StopOutcome,
     app_name_for,
 )
-from src.services.build_sessions.reaper import reap_user
-from src.services.redis import registry_key
+from src.services.build_sessions.reaper import reap_user, sweep_all
+from src.services.redis import heartbeat_key, registry_key
 from src.services.sandbox import (
     ExecResult,
     SandboxError,
@@ -62,7 +60,7 @@ from src.services.storage import StorageError, snapshot_key
 from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
 from src.services.turns.guard import _mid_reply
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import FakeSandboxClient, FakeStorage
+from tests.fakes import FakeSandboxClient, FakeStorage, detached_work_done
 
 
 @pytest.fixture(autouse=True)
@@ -95,8 +93,9 @@ _CTX = PromptContext(user_name="Ada", project_name="Visitors", project_descripti
 @pytest.fixture(autouse=True)
 def _no_copy_rows_escape(monkeypatch: pytest.MonkeyPatch) -> None:
     """AUTOUSE, AND NOT FOR CONVENIENCE: `record_durable_copy_attempt` opens its own session and
-    COMMITS, so a reap driven here would leave a permanent row in the SHARED test database that
-    `test_reclamation_report_only.py` counts."""
+    COMMITS, so a reap driven here would leave a permanent row in the SHARED test database. See
+    `test_write_back_before_reclaim.py::test_the_copy_record_reaches_the_database_and_is_committed`,
+    which counts every row."""
     from src.services.build_sessions import pass_history
 
     async def _swallow(_attempt: object) -> None:
@@ -167,8 +166,29 @@ async def test_ensure_sandbox_allocates_a_build_worth_of_state_without_the_build
     assert await heartbeat_is_alive(fake_redis, user.id) is True
     assert await read_registry(fake_redis, user.id) is not None
 
-    # And nothing a build would run.
-    assert session.prompt == ""
+
+async def test_a_container_its_turn_has_not_leased_yet_is_spared_on_its_heartbeat(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """THE HEARTBEAT IS NOT REDUNDANT WITH THE LEASE, though one loop renews both. Between the
+    turn adopting a freshly started container and the lease's first write, the starting marker
+    is already cleared, a fresh container holds no stay, and the in-process session is invisible
+    to the worker's sweep — the lock and the heartbeat are all it has.
+
+    Mutation check: stop `ensure_sandbox` seeding the heartbeat and this goes red."""
+    user, project_id = await _mk(db_session, "w-unleased@rvaiglobal.com")
+    await SessionManager().ensure_sandbox(
+        db_session, user, project_id, sandbox_client=FakeSandboxClient(), may_write=True
+    )
+    sweeper = FakeSandboxClient()
+
+    assert (await sweep_all(fake_redis, sweeper, live_users=set())).reaped == 0
+    assert sweeper.torn_down == []
+
+    await fake_redis.delete(heartbeat_key(user.id))
+    assert (await sweep_all(fake_redis, sweeper, live_users=set())).reaped == 1, (
+        "something other than the heartbeat was sparing it, so the first half proved nothing"
+    )
 
 
 async def test_ensure_sandbox_mints_the_app_row_a_fresh_project_lacks(
@@ -418,7 +438,6 @@ async def test_the_terminal_pardons_the_container_so_the_preview_outlives_the_tu
     assert await stay_of_execution_is_current(fake_redis, user.id) is True  # lease owns it now
     assert await lock_is_held(fake_redis, user.id) is False  # the slot is free
     assert manager.active_session_for(user.id) is None
-    assert session.status == BuildSessionStatus.ENDED
 
 
 async def test_a_second_message_attaches_instead_of_rebuilding_the_container(
@@ -812,12 +831,10 @@ async def test_a_confirmed_gone_container_still_reclaims_silently(
 class _Blocking:
     """Holds a live WRITE TURN open so the switch lands mid-write.
 
-    THE ONLY KIND OF WORK LEFT TO CATCH MID-FLIGHT. This used to hold a build session open by
-    parking a `FakeBrain` the manager had spawned and could cancel itself; that whole path went
-    with `SessionManager.start`. A turn on the real `TurnEngine` is what holds the workspace
-    now, so the hold lives where production's does — inside the streaming model. `stepped` says
-    the turn is genuinely under way, `gate` is the test's hand on the tap, and a stop cancels
-    the `gate.wait()`, which is the shape a real agent mid-write takes."""
+    THE ONLY KIND OF WORK LEFT TO CATCH MID-FLIGHT. A turn on the real `TurnEngine` is what
+    holds the workspace, so the hold lives where production's does — inside the streaming
+    model. `stepped` says the turn is genuinely under way, `gate` is the test's hand on the tap,
+    and a stop cancels the `gate.wait()`, which is the shape a real agent mid-write takes."""
 
     def __init__(self) -> None:
         self.gate = asyncio.Event()
@@ -1422,8 +1439,8 @@ async def test_a_user_who_never_saved_can_still_get_their_work_back(
     await reap_user(fake_redis, user.id, client, app_id=session.app_id)
     client.attach_handle = None
 
-    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
-    assert relaunched.app_id == session.app_id
+    assert await manager.relaunch_preview(db_session, user, project_id, client) == session.app_id
+    await detached_work_done(manager)
     assert client.restored_from[-1] is None
 
 

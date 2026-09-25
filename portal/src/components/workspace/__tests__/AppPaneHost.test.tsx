@@ -29,7 +29,7 @@ const APP_URL = 'https://app-a.example.azurecontainerapps.io/'
 const OTHER_APP_URL = 'https://app-b.example.azurecontainerapps.io/'
 
 const EMPTY_PANE: PaneView = {
-  iterating: false, reconnecting: false,
+  reconnecting: false,
   previewState: null, turnRunning: false,
   compileState: null, workspaceLost: false,
 }
@@ -177,20 +177,6 @@ describe('AppPaneHost — the frame outlives a move between the two addresses', 
     expect(wrapper?.getAttribute('aria-hidden')).toBe('true')
     await waitFor(() => expect(paneWrapper()?.className).toMatch(/invisible/))
     expect(paneWrapper()?.className).toMatch(/w-0/)
-  })
-
-  it('leaves the frame alone when the conversation unmounts MID-BUILD', () => {
-    // THE REGRESSION THIS SUITE WAS BLIND TO, and it was blind for a reason worth writing down:
-    // every other scenario here pins `iterating: false`, so none of them could see it. Why the
-    // host holds `iterating` rather than treating it as chrome is recorded in `AppPaneHost`.
-    render(<Workspace chatSurface={<ChatSurface pane={{ iterating: true }} />} />)
-    const original = frame()
-    expect(original).toBeTruthy()
-
-    fireEvent.click(screen.getByText('to project'))
-
-    expect(frame()).toBe(original)
-    expect(frame()?.getAttribute('src')).toBe(APP_URL)
   })
 
   it('survives the RETURN leg, when the remounted surface has not resolved an address yet', () => {

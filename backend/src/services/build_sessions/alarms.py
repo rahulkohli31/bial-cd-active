@@ -9,10 +9,10 @@ a string that exists in two spellings, and the second spelling is invisible unti
 the only one firing. Import the constant, never retype the literal — tests included. Reasons that
 distinguish one firing from another belong in structured fields, not in the event name.
 
-NOT EVERY NAME BELOW IS AN ALARM. The nine sandbox-lifecycle constants are LIFECYCLE NOTICES —
+NOT EVERY NAME BELOW IS AN ALARM. The eight sandbox-lifecycle constants are LIFECYCLE NOTICES —
 the handful of `info` lines one build now prints, in order, so an operator handed "a citizen saw
 an error page for eight seconds" can reconstruct that build from the logs alone, with no database
-query and no in-memory session object (which is evicted five minutes after the turn ends anyway).
+query and no in-memory session object (which leaves memory when the turn ends anyway).
 Nothing pages on them. They live in this module regardless, because THE ONE RULE above is exactly
 what keeps them greppable, and a second home for event names is how a second spelling gets
 written.
@@ -82,25 +82,41 @@ state), `recovery_copy_available` (was there anything to put back), and `verdict
 four states was reached).
 
 THE CONTAINER'S AGE IS DELIBERATELY NOT HERE: reading it costs an ARM listing, which a poll a
-browser tab drives every 45 seconds will not pay. An operator who needs it has the age in the
-reclamation pass records, keyed by the same `app_name`.
+browser tab drives every 45 seconds will not pay. An operator who needs it can read the
+`bial-created-at` tag directly off the container named by `app_name`.
 
 WHAT TO DO: the citizen has already been told on the preview pane and the standing completion
 claim has been retracted, so this is not an emergency page. It is the number to watch. If it
 fires more than rarely, the containers are being reclaimed or reset out from under live sessions
-and the reclamation policy is what wants looking at, not this code."""
+and the fleet sweep's own ceiling is what wants looking at, not this code."""
+
+
+REAP_FOUND_NO_REPOSITORY_EVENT: Final = "reap_found_no_repository"
+"""A container due to be reclaimed had no git repository, so nothing was written back, and it was
+reclaimed anyway.
+
+A workspace loses `.git` when the container's disk is discarded under it, most often by a
+restart. Nothing on the platform can save a tree without one: Save, the teardown write-back and
+the quarantine all refuse it the same way, so sparing it would retry on every pass and bill
+forever. The app's saved copy is untouched, and the next relaunch restores it.
+
+Fields: `app_id`, `app_name`.
+
+WHAT TO DO: count it beside `restore_performed`. Each firing is a container that lost its disk
+under a citizen, and a rising count is the signal to find out why sandboxes restart."""
 
 
 # --- the sandbox build lifecycle, in order ------------------------------------------------
-# The nine notices. structlog ONLY — a bare `logging.getLogger` line is dropped on the floor in
+# The eight notices. structlog ONLY — a bare `logging.getLogger` line is dropped on the floor in
 # this process — at `info` unless the constant says otherwise, and each one carries its fields IN
 # ADDITION to the contextvars bound for the whole build (`build_id`, `user_id`, `project_id`,
-# `app_id`, `app_name`). That binding is what makes one build one grep; without it these are nine
+# `app_id`, `app_name`). That binding is what makes one build one grep; without it these are eight
 # unrelated lines. Never a token, a DSN, or a DSN's password sub-token.
 
 
 APP_STOPPED_WHILE_IDLE_EVENT: Final = "app_stopped_while_idle"
-"""An idle tab's check found an intact app whose dev server is not running, and acted on it.
+"""An idle tab's check found an intact app whose dev server is not running, and started it again
+in the same container.
 
 A DIFFERENT FAULT FROM `WORKSPACE_LOST_WHILE_IDLE_EVENT`: the files are fine and the process is
 gone — exited, killed, or never brought back after a restart. Nothing else reports it:
@@ -109,19 +125,19 @@ verdict reads the git tree, which a dead process does not change. The citizen wa
 that could not end.
 
 Fields: `app_id`, `app_name`, `exit_code` (the supervisor's post-mortem of its child, when it had
-one) and `put_away` — True when the container was put away, so the next reading offers the saved
-app and its start control; False when the reap declined, and the reaper's own warning beside this
-line says which: "reap refused: this container's work could not be written back" is the common
-one, and the "no copy taken: ..." line under it names what stopped the write-back.
+one) and `restarted` — True when the supervisor accepted the start; False when it refused, and the
+`put_back_tree_dev_start_failed` warning beside this line says why. Either way the container, its
+unsaved work and its commit are left exactly as they were.
 
-READING `exit_code`: the supervisor reports `Popen.poll()`, so a signal death is the NEGATIVE
-signal number. `-9` is a SIGKILL that landed on the supervisor's own child; `137` is the same
-SIGKILL reported by a shell in between. Both are the out-of-memory killer's usual signature — and
-an agent's `pkill -9` looks identical, which is why this names no cause.
+READING `exit_code`: the supervisor reports `Popen.poll()` on `npm run dev`, its direct child —
+a wrapper, not the process that serves traffic. An out-of-memory kill lands on a grandchild
+(`next-server`), and the wrapper chain above it exits 0, so `exit_code` does not identify an
+out-of-memory kill for a sandbox dev server: a clean 0 is the common case even when memory
+pressure caused the restart.
 
-WHAT TO DO: nothing for a one-off — the citizen presses Launch and the app comes back running.
-Repeats for the same app mean its dev server keeps dying under it: suspect memory first, and the
-app's own build is where to look."""
+WHAT TO DO: nothing for a one-off — the app comes back in the same container. Repeats for the
+same app mean its dev server keeps dying under it, restarted at most once a minute and only while a
+tab asks: suspect memory first, and the app's own build is where to look."""
 
 
 BUILD_WORKSPACE_CLAIMED_EVENT: Final = "build_workspace_claimed"
@@ -175,9 +191,9 @@ compare-and-set that records it returned 1.
 Fields: `app_name`, `serving_since`, `ms_since_container_created` (computed from the registry
 hash's own `created_at`, so nobody has to subtract two timestamps by hand — this is the number
 the 2026-09-10 measurement had to be reconstructed from a screen recording to get), `observer`
-(`turn_watcher` | `turn_verify` | `relaunch_wait` | `relaunch_continuation` |
-`restore_continuation` | `discard_continuation` | `reconciler` — WHICH watcher won, the only way
-to tell a normal build from one the five-minute backstop rescued), `cold`.
+(`turn_watcher` | `turn_verify` | `relaunch` | `restore_continuation` | `discard_continuation` |
+`idle_continuation` | `reconciler` — WHICH watcher won, the only way to tell a normal build from
+one the five-minute backstop rescued), `cold`.
 
 THE VOCABULARY IS WHAT THE CODE EMITS, and it has already drifted once. An `attach_snapshot`
 stood here for an observer that was designed and then deliberately NOT built: the attach seam's
@@ -186,8 +202,11 @@ affirmative is too weak to be a permanent first-serve stamp. `turn_verify` was b
 missing from this list. A value named here that nothing emits sends an operator hunting for a
 watcher that does not exist; one emitted but unnamed makes their filter silently drop rows.
 
-Emitted at most once per container by construction: the stamp is first-serve-wins, so a second
-observer's refusal raises `SERVING_PROOF_STAMP_REFUSED` and never a second line here."""
+Emitted at most once per standing proof by construction: the stamp is first-serve-wins, so a
+second sighting of the same container is silent, and a refused one raises
+`SERVING_PROOF_STAMP_REFUSED` — never a second line here. A retraction clears the proof — a
+stopped dev server restarted in place is one — and the restarted app's first page is stamped
+again."""
 
 
 APP_FIRST_SERVE_NOT_OBSERVED_EVENT: Final = "app_first_serve_not_observed"
@@ -215,10 +234,11 @@ is the most common answer there is), `served_for_ms`."""
 
 
 PREVIEW_STATE_REPORTED_UNKNOWN_EVENT: Final = "preview_state_reported_unknown"
-"""The preview-state read itself failed, so the platform told the citizen nothing. WARNING.
+"""The preview-state read itself failed and the route answered 503, so the platform told the
+citizen nothing. WARNING.
 
-THE LOG IS THE WHOLE RECORD HERE. The pane deliberately does not draw this state — an unreadable
-read leaves a standing frame framed and a standing card put, rather than telling a citizen their
+THE LOG IS THE WHOLE RECORD HERE. The pane deliberately draws nothing for it — an unreadable read
+leaves a standing frame framed and a standing card put, rather than telling a citizen their
 working app does not exist — which means that without this line the failure is invisible from
 both ends. Rate-limited per user: the caller is a browser timer.
 
@@ -226,16 +246,6 @@ ORDINARY PREVIEW-STATE ANSWERS ARE DELIBERATELY NOT LOGGED, recorded here as a d
 nobody adds it later. A per-tab poll on two surfaces would drown the stream and tell an operator
 nothing that the marked-pending / first-served / serving-lost lines and their timestamps do not
 already reconstruct."""
-
-
-SANDBOX_TORN_DOWN_EVENT: Final = "sandbox_torn_down"
-"""A container's life ended cleanly. The clean finish is silent today, so the log holds starts
-with no ends and no way to tell a tidy shutdown from a process that simply vanished.
-
-Fields: `reason` (`reap_idle` | `reclaim_for_other_project` | `operator` — one event, three
-reasons in a FIELD, per THE ONE RULE), `pardoned`, `lifetime_ms`, and `served: bool`
-read off the serving stamp — the most useful retrospective field in the set, because it answers
-whether this container was ever any use to anybody at all."""
 
 
 # --- the two pinned alarms ----------------------------------------------------------------
@@ -264,7 +274,7 @@ does not boot, and that is what wants looking at, not this code."""
 
 SERVING_PROOF_STAMP_REFUSED: Final = "serving_proof_stamp_refused"
 """An observer watched an app serve and the compare-and-set REFUSED to record it: the registry
-hash was gone, marked `ending`, or named a different container. WARNING.
+hash was gone, marked `ending` with no proof on it, or named a different container. WARNING.
 
 THE NEAR-MISS OF STAMPING THE WRONG CONTAINER, which is the single most dangerous thing in this
 design — the one-per-user slot flipped between the observation and the write, so a slow observer

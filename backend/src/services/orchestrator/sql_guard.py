@@ -13,8 +13,7 @@ DROP` — guarding EVERY build, since improvised DML is never legitimately part 
 Generated Drizzle migrations remain the sanctioned channel for schema changes INCLUDING drops
 (requirements legitimately evolve to remove features). The exemption is structural: the
 sanctioned path carries no SQL text in argv, so it passes without special-casing. The sentinel
-never reads file contents by design; write-a-script-then-run-it is a named, accepted bypass,
-with BRAIN-trace monitoring as the tripwire.
+never reads file contents by design; write-a-script-then-run-it is a named, accepted bypass.
 
 Spelling coverage handles legal variants (raw and comment-stripped text, `UPDATE`'s `ONLY`/
 alias forms) rather than a keyword-shape trivia quiz. Every regex is linear and length-capped

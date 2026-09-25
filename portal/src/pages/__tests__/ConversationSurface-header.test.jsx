@@ -17,7 +17,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, within, act, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useParams } from 'react-router-dom'
 import {
-  FakeEventSource, makeClient, primeClient, primeTurn, waitForGateOpen, scriptBuildTurn,
+  primeTurn, waitForGateOpen, scriptBuildTurn,
   BUILD_TURN_ID,
 } from './_builderSession.jsx'
 
@@ -26,7 +26,6 @@ const h = vi.hoisted(() => ({
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(), relaunchPreview: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -64,20 +63,17 @@ function ProjectPageStub() {
 }
 
 function renderBuilder({ chatId = 'thread-1', projectId = 'p1', projectName = 'VIP Movement' } = {}) {
-  const fake = new FakeEventSource(chatId)
-  const deps = { client: makeClient(h), eventSourceFactory: () => fake }
-  const view = render(
+  return render(
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <Routes>
         <Route
           path="/chat/:chatId"
-          element={<ConversationSurface projectId={projectId} projectName={projectName} buildSessionDeps={deps} />}
+          element={<ConversationSurface projectId={projectId} projectName={projectName} />}
         />
         <Route path="/projects/:pid" element={<ProjectPageStub />} />
       </Routes>
     </MemoryRouter>,
   )
-  return { ...view, fake }
 }
 
 const composerIn = (c) => within(c).getByPlaceholderText(/ask for another change/i)
@@ -98,7 +94,6 @@ const flushChannel = () => act(async () => { for (let i = 0; i < 6; i += 1) awai
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockImplementation(async (id) => ({ id, kind: 'build', messages: [] }))
   h.loadBuilds.mockResolvedValue([])

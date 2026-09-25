@@ -70,7 +70,7 @@ describe('convertMessage — parts', () => {
   })
 
   it('renders no element for the parts that are not transcript prose', () => {
-    expect(convertPart({ type: 'build_in_progress', sessionId: 's1' })).toBeNull()
+    expect(convertPart({ type: 'build_in_progress' })).toBeNull()
     expect(
       convertPart({
         type: 'plan_options',
@@ -151,7 +151,7 @@ describe('convertMessage — identity is the server’s', () => {
     const converted = convertMessage({
       id: 'srv_3_g_0',
       role: 'assistant',
-      parts: [{ type: 'build_in_progress', sessionId: 's1' }],
+      parts: [{ type: 'build_in_progress' }],
       seq: 3,
     })
 

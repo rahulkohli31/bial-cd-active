@@ -13,7 +13,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import StartAppControl from '../StartAppControl'
-import { createStarter } from '../startApp'
+import { createPressEnd, createStarter } from '../startApp'
 import type { StartSinks } from '../startApp'
 import { LAUNCH_LABEL, type WorkspaceAction } from '../workspaceState'
 import type { WorkspaceReport } from '../workspaceChannel'
@@ -36,9 +36,9 @@ function reportSpy(over: Partial<WorkspaceReport> = {}): WorkspaceReport {
   // rail's send — so a stub here would prove nothing about a press and everything about the stub.
   const sinks = {
     projectId: 'p1',
-    onStarted: vi.fn(),
     onStartPending: vi.fn(),
     onStartOutcome: vi.fn(),
+    onStartAdmitted: vi.fn(),
     ...over,
   }
   return {
@@ -80,7 +80,7 @@ const button = () => screen.getAllByRole('button')[0]
 
 beforeEach(() => {
   vi.clearAllMocks()
-  api.relaunchPreview.mockResolvedValue({ appId: 'a1', previewUrl: 'https://app/', status: 'ready', restoredFromFailedBuild: false, ready: true })
+  api.relaunchPreview.mockResolvedValue(undefined)
 })
 
 afterEach(() => cleanup())
@@ -116,30 +116,22 @@ describe('one deliberate press, one request', () => {
       control.dispatchEvent(new MouseEvent('click', { bubbles: true }))
       control.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     })
-    release({ ready: true })
+    release(undefined)
 
     await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(1))
   })
 
-  it('clears the outcome when the start reached a serving app', async () => {
+  it('tells the surface when the server admits the start, and leaves the press for its read to end', async () => {
     const report = reportSpy()
     renderControl(START, report)
     fireEvent.click(button())
 
-    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalledWith(null))
+    await waitFor(() => expect(report.onStartAdmitted).toHaveBeenCalledTimes(1))
+    expect(report.onStartPending).not.toHaveBeenCalledWith(false)
   })
 })
 
-describe('a start that did not end in a running app says which way it ended', () => {
-  it('reads `ready: false` as "started but not painted", never as dead', async () => {
-    api.relaunchPreview.mockResolvedValue({ appId: 'a1', previewUrl: 'https://app/', status: 'provisioning', restoredFromFailedBuild: false, ready: false })
-    const report = reportSpy()
-    renderControl(START, report)
-    fireEvent.click(button())
-
-    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalledWith({ kind: 'not-painted' }))
-  })
-
+describe('a start the server refused says why, in its words', () => {
   it("carries the server's named reason verbatim", async () => {
     api.relaunchPreview.mockRejectedValue(new ApiError('The sandbox is temporarily unavailable.', 503))
     const report = reportSpy()
@@ -154,15 +146,17 @@ describe('a start that did not end in a running app says which way it ended', ()
     )
   })
 
-  it('calls a failure with no server answer a timeout, not a named failure', async () => {
-    // "We waited and nothing came back" is a different thing to have happened from "the server
-    // said why" — and that difference must reach the citizen.
+  it('puts no sentence on the pane for a failure the server did not name', async () => {
+    // A fetch that came back with no words is not a fact about the workspace, and the poll is
+    // what says what the workspace is doing — so the press leaves no note behind it.
     api.relaunchPreview.mockRejectedValue(new TypeError('Failed to fetch'))
     const report = reportSpy()
     renderControl(START, report)
     fireEvent.click(button())
 
-    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalledWith({ kind: 'timed-out' }))
+    await waitFor(() => expect(report.onStartPending).toHaveBeenLastCalledWith(false))
+    expect(report.onStartOutcome).toHaveBeenCalledWith(null)
+    expect(report.onStartOutcome).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'failed' }))
   })
 
   it('a start whose readiness cannot be read issues no second call of its own', async () => {
@@ -355,65 +349,14 @@ describe('the second verb, and the ones that do not exist', () => {
   })
 })
 
-describe('★ the URL a successful start produced reaches the surface that frames it', () => {
-  it('hands the preview URL back before it reports the outcome', async () => {
-    // WITHOUT THIS THE CONTROL DID NOTHING VISIBLE INSIDE A BUILD CHAT. That surface feeds the
-    // address resolver's project-scoped arm with `null` — its own poll only runs over an ALREADY
-    // framed URL, by design — and its `relaunchedUrl` arm was fed by a Relaunch button that has
-    // since been retired. So a fresh start had no arm left to populate: the app came up in a
-    // container nothing framed, and the citizen saw a sentence where their app should have been.
-    const report = reportSpy()
-    api.relaunchPreview.mockResolvedValue({
-      appId: 'a1', previewUrl: 'https://app.example/', status: 'ready',
-      restoredFromFailedBuild: false, ready: true,
-    })
-    renderControl(START, report)
-    fireEvent.click(button())
-
-    await waitFor(() => expect(report.onStarted).toHaveBeenCalledWith('https://app.example/'))
-    // ORDER MATTERS: the URL first, then the outcome. Reporting the outcome first leaves one
-    // commit in which the state says "running" and the pane has no address to show for it.
-    const startedAt = (report.onStarted as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]
-    const outcomeAt = (report.onStartOutcome as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]
-    expect(startedAt).toBeLessThan(outcomeAt)
-  })
-
-  it('hands it back even when the page has not painted yet', async () => {
-    // The container is up and the DOCUMENT is what has not arrived, so the frame's own load-gated
-    // reveal is the right thing to be waiting on — not a sentence drawn in front of it.
-    const report = reportSpy()
-    api.relaunchPreview.mockResolvedValue({
-      appId: 'a1', previewUrl: 'https://app.example/', status: 'provisioning',
-      restoredFromFailedBuild: false, ready: false,
-    })
-    renderControl(START, report)
-    fireEvent.click(button())
-
-    await waitFor(() => expect(report.onStarted).toHaveBeenCalledWith('https://app.example/'))
-    expect(report.onStartOutcome).toHaveBeenCalledWith({ kind: 'not-painted' })
-  })
-
-  it('reports no URL when the server sent none', async () => {
-    const report = reportSpy()
-    api.relaunchPreview.mockResolvedValue({
-      appId: 'a1', previewUrl: '', status: 'ready', restoredFromFailedBuild: false, ready: true,
-    })
-    renderControl(START, report)
-    fireEvent.click(button())
-
-    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalledWith(null))
-    expect(report.onStarted).not.toHaveBeenCalled()
-  })
-})
-
 describe('★ the report reaches the surface even after this control is gone', () => {
   it('records a successful start whose button unmounted mid-flight', async () => {
     // THE BUG THIS IS WRITTEN AGAINST, and it was introduced by the fix one layer up. The moment a
     // press reaches the map the state becomes `starting`, which offers no action — so the button
     // that fired the request is unmounted before the request comes back. A `mounted` guard in
-    // front of the report then swallowed the control's own success: no URL for the pane to frame,
-    // no outcome to clear the wait, and the screen sat on "Getting your app ready." forever while
-    // a perfectly good container served underneath it.
+    // front of the report then swallowed the control's own success: no outcome to clear, no end
+    // to the press's busy flag, and the screen sat on "Getting your app ready." forever while a
+    // perfectly good container served underneath it.
     //
     // `mounted` protects THIS component's state. The report writes into the SURFACE, which outlives
     // it and needs the answer either way.
@@ -426,13 +369,12 @@ describe('★ the report reaches the surface even after this control is gone', (
     // The control goes away while the request is still in the air.
     unmount()
     await act(async () => {
-      finish({ appId: 'a1', previewUrl: 'https://app.example/', status: 'ready', restoredFromFailedBuild: false, ready: true })
+      finish(undefined)
     })
 
-    expect(report.onStarted).toHaveBeenCalledWith('https://app.example/')
-    expect(report.onStartOutcome).toHaveBeenCalledWith(null)
-    // …and the wait is cleared, or the pane holds `starting` for the life of the tab.
-    expect(report.onStartPending).toHaveBeenLastCalledWith(false)
+    // …and the surface hears the admission, which is what ends the wait on its next read — without
+    // it the pane holds `starting` for the life of the tab.
+    expect(report.onStartAdmitted).toHaveBeenCalledTimes(1)
   })
 
   it('records a REFUSAL the same way', async () => {
@@ -454,23 +396,23 @@ describe('★ the report reaches the surface even after this control is gone', (
  * MOVES TO ANOTHER.
  *
  * So a start still in the air when the screen changes has two ways to be wrong: it can report a
- * preview URL, a busy flag or a failure sentence into the project that arrived, and it can be
+ * busy flag or a failure sentence into the project that arrived, and it can be
  * JOINED by that project's own trigger — which would leave the new app never started and its
  * citizen waiting on an answer about somebody else's.
  */
 describe('★ a start that is overtaken by a change of project', () => {
   const spySinks = (projectId: string): StartSinks => ({
     projectId,
-    onStarted: vi.fn(),
     onStartPending: vi.fn(),
     onStartOutcome: vi.fn(),
+    onStartAdmitted: vi.fn(),
   })
 
   it('★ reports into nothing once the screen has moved on', async () => {
     let finish: (() => void) | undefined
     api.relaunchPreview.mockImplementation(
       () => new Promise((resolve) => {
-        finish = () => resolve({ appId: 'a1', previewUrl: 'https://app/', status: 'ready', ready: true })
+        finish = () => resolve(undefined)
       }),
     )
     let sinks = spySinks('p1')
@@ -482,7 +424,6 @@ describe('★ a start that is overtaken by a change of project', () => {
     finish?.()
     await flight
 
-    expect(arrived.onStarted).not.toHaveBeenCalled()
     expect(arrived.onStartOutcome).not.toHaveBeenCalled()
     // LIVENESS: the start really did answer — it answered into nobody, which is the point.
     expect(api.relaunchPreview).toHaveBeenCalledWith({ projectId: 'p1' })
@@ -500,5 +441,35 @@ describe('★ a start that is overtaken by a change of project', () => {
     expect(second).not.toBe(first)
     expect(api.relaunchPreview).toHaveBeenCalledWith({ projectId: 'p2' })
     expect(api.relaunchPreview).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('★ an admitted press ends on the first read begun after the admission', () => {
+  it('a read already in flight at the admission cannot end it; the next one does, once', () => {
+    // The read in flight carries the reading from before the press, which is what the press is
+    // standing in front of.
+    const end = vi.fn()
+    const press = createPressEnd(end)
+    const inFlight = press.readBegins()
+    press.admitted()
+    inFlight()
+    expect(end).not.toHaveBeenCalled()
+
+    press.readBegins()()
+    expect(end).toHaveBeenCalledTimes(1)
+    press.readBegins()()
+    expect(end).toHaveBeenCalledTimes(1)
+  })
+
+  it('no read ends a press that was never admitted, or one whose project left', () => {
+    const end = vi.fn()
+    const press = createPressEnd(end)
+    press.readBegins()()
+    expect(end).not.toHaveBeenCalled()
+
+    press.admitted()
+    press.drop()
+    press.readBegins()()
+    expect(end).not.toHaveBeenCalled()
   })
 })

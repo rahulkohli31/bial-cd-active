@@ -369,14 +369,26 @@ async def test_a_malformed_head_sha_is_unverifiable_and_never_reaches_the_shell(
     assert all("merge-base" not in part for cmd in seen for part in cmd)
 
 
-@pytest.mark.parametrize("bad", ["ABCDEF1", "abc", "z" * 40, "a" * 41, "a" * 20 + "-"])
+_NOT_A_SHA = ["ABCDEF1", "abc", "z" * 40, "a" * 41, "a" * 20 + "-", "abcdef1\n"]
+
+
+@pytest.mark.parametrize("bad", _NOT_A_SHA)
 async def test_every_non_sha_shape_is_refused(store: FakeStorage, bad: str) -> None:
+    """`abcdef1\\n` is the shape a `$`-anchored `re.match` lets through."""
     await _seed_saved(store, sha=bad)
     client = _client(_stdout(head="abc", commits=4, ancestry=""))
 
     verdict = await workspace_integrity(client, _HANDLE, APP)
 
     assert verdict.state is WorkspaceState.UNVERIFIABLE
+
+
+@pytest.mark.parametrize("bad", _NOT_A_SHA)
+def test_the_script_refuses_a_reference_that_is_not_a_sha(bad: str) -> None:
+    """The shell string is built here, so the check lives here too: no future caller can hand
+    it something unchecked."""
+    with pytest.raises(ValueError, match="not a commit sha"):
+        state_script(bad)
 
 
 # =============================================================================

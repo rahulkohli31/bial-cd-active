@@ -16,7 +16,6 @@ import { StrictMode } from 'react'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useParams, useNavigate, useLocation } from 'react-router-dom'
 import {
-  FakeEventSource, makeClient, primeClient,
   PLAN_CARD_ID, primeTurn, send, sendAndConfirm,
   inWorkspace,
 } from './_builderSession.jsx'
@@ -28,7 +27,6 @@ const h = vi.hoisted(() => ({
   resolvePlanOptions: vi.fn(),
   previewProps: [],
   authFetch: vi.fn(),
-  getStatus: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -62,16 +60,11 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
 import ConversationSurface from '../../components/chat/ConversationSurface'
 import { TurnStartError } from '../../utils/turnStreamApi'
 
-function makeDeps() {
-  const fake = new FakeEventSource('x')
-  return { client: makeClient(h), eventSourceFactory: () => fake }
-}
-
 function renderHandoff({ chatId = 'build-X', prompt = 'build me a gate tracker' } = {}) {
   return render(
     <MemoryRouter initialEntries={[{ pathname: `/chat/${chatId}`, search: '?projectId=p1&kind=build', state: { prompt, theme: 'bial' } }]}>
       <Routes>
-        {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />} />)}
+        {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="VIP Movement" />} />)}
         <Route path="/projects/:projectId" element={<div>project home</div>} />
         <Route path="/projects" element={<div data-testid="projects-index">projects index</div>} />
       </Routes>
@@ -89,7 +82,6 @@ beforeEach(() => {
   h.previewProps.length = 0
   h.authFetch.mockResolvedValue({ ok: true })
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
@@ -229,7 +221,7 @@ describe('BuilderPage — a refine turn', () => {
     render(
       <MemoryRouter initialEntries={['/chat/build-X']}>
         <Routes>
-          {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />} />)}
+          {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="VIP Movement" />} />)}
         </Routes>
       </MemoryRouter>,
     )
@@ -302,7 +294,7 @@ describe('BuilderPage — the preview is handed the first-view stop-clock', () =
 describe('BuilderPage — the composer is not shared across a chat navigation', () => {
   function BuilderHost() {
     const { chatId } = useParams()
-    return <ConversationSurface kind="build" chatId={chatId} projectId="p1" projectName="P" buildSessionDeps={makeDeps()} />
+    return <ConversationSurface kind="build" chatId={chatId} projectId="p1" projectName="P" />
   }
   function GoToB() {
     const navigate = useNavigate()
@@ -365,7 +357,7 @@ describe('BuilderPage — the StrictMode load strand', () => {
       <StrictMode>
         <MemoryRouter initialEntries={['/chat/build-X']}>
           <Routes>
-            {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="P" buildSessionDeps={makeDeps()} />} />)}
+            {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="P" />} />)}
           </Routes>
         </MemoryRouter>
       </StrictMode>,
@@ -379,7 +371,7 @@ describe('BuilderPage — the StrictMode load strand', () => {
       <StrictMode>
         <MemoryRouter initialEntries={[{ pathname: '/chat/build-X', search: '?projectId=p1&kind=build', state: { prompt: 'build me a gate tracker', theme: 'bial' } }]}>
           <Routes>
-            {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="VIP" buildSessionDeps={makeDeps()} />} />)}
+            {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="VIP" />} />)}
           </Routes>
         </MemoryRouter>
       </StrictMode>,
@@ -404,7 +396,7 @@ describe('BuilderPage — a send blocked by an in-flight reply explains itself',
     render(
       <MemoryRouter initialEntries={['/chat/build-X']}>
         <Routes>
-          {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="P" buildSessionDeps={makeDeps()} />} />)}
+          {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="P" />} />)}
         </Routes>
       </MemoryRouter>,
     )
@@ -441,7 +433,7 @@ describe('BuilderPage — the hand-off does not replay on reload', () => {
           {inWorkspace(
             <Route
               path="/chat/:chatId"
-              element={<ConversationSurface kind="build" projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />}
+              element={<ConversationSurface kind="build" projectId="p1" projectName="VIP Movement" />}
             />,
           )}
           <Route path="/projects" element={<div data-testid="projects-index">projects index</div>} />

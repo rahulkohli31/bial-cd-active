@@ -2,8 +2,7 @@
 
 This is the **golden scaffold** every generated BIAL app is built from: a minimal, modern Next.js
 starter plus the in-container **supervisor + Caddy + entrypoint** that run it, baked into one
-Docker image. Snapshot/restore and the real Azure acceptance test have shipped (see *Ownership
-boundary*), and PTY-backed `/exec` is still deferred.
+Docker image. PTY-backed `/exec` is still deferred (see *Ownership boundary*).
 
 ## Ship order — read this before building the image
 
@@ -40,6 +39,7 @@ sandbox/
 ├── Dockerfile.sandbox     # node:24-trixie-slim base; bakes node_modules + the template
 ├── Caddyfile              # ingress :8080 → /_sup/* supervisor, /* → next dev (+ frame-ancestors framing)
 ├── entrypoint.sh          # PID 1: caddy + supervisor (root; children demoted to appuser)
+├── platform-owned.gitignore  # the workspace's only ignore list, installed as core.excludesFile
 ├── supervisor/
 │   └── app.py             # the supervisor HTTP API (forked from the spike, long since grown)
 └── template/              # the golden Next.js app (App Router + TS + Tailwind v4 + shadcn/ui)
@@ -150,7 +150,7 @@ only the portal origin may frame the live app (XFO cannot express a cross-origin
 > instead. `Dockerfile.sandbox`'s own header is the authority on this and says the same.
 >
 > Either way, a plain same-arch `docker build` below is a dev-loop convenience and not a
-> verification of what ships; the real Azure acceptance test is the real gate.
+> verification of what ships.
 
 Local smoke (from `sandbox/`):
 
@@ -186,19 +186,17 @@ curl -s -XPOST localhost:8080/_sup/exec -H "Authorization: Bearer $TOK" \
 
 - `*.sh`, `Dockerfile*`, `Caddyfile`, and the template are pinned to **LF** via the root `.gitattributes`
   (`sandbox/** text eol=lf`), so a Windows checkout does not ship a `#!/bin/sh\r` shebang.
-- `Dockerfile.sandbox` runs `sed -i 's/\r$//'` on `entrypoint.sh`, `Caddyfile`, `snapshot.sh` and
-  `restore.sh` **before** `chmod`, as a belt-and-braces guard for the Windows build host.
+- `Dockerfile.sandbox` runs `sed -i 's/\r$//'` on `entrypoint.sh`, `Caddyfile` and
+  `read_attachment.py` **before** `chmod`, as a belt-and-braces guard for the Windows build host.
+- **No file named `.gitignore` reaches the image.** `az acr build` drops every one from the build
+  context, at any depth. The workspace's ignore rules live in `platform-owned.gitignore` instead.
 
 ## Ownership boundary
 
-This tree has been proven **"known-good"** by running both acceptance gates against the real
-pre-baked image (local Docker + Azurite — for which build host is authoritative today, see the
-note under *Build / run locally*):
-
-- **Acceptance (b):** a local-disk → Azure-Blob snapshot/restore round-trip resumes the workspace,
-  driven through a client conforming to the frozen `SandboxClient` ABC
-  (`tests/test_acceptance_snapshot_roundtrip.py`).
 - The three supervisor guards + the full supervisor surface + the framing are pinned by regression tests.
+- The workspace's git scripts (the repository seed, the save's commit, the restore) are sent by the
+  control plane, and are tested there against `platform-owned.gitignore`
+  (`backend/tests/services/build_sessions/test_workspace_scripts.py`).
 - **PTY-backed `/exec` is DEFERRED** (no consumer yet) — the supervisor keeps it reserved; build it
   when a real TTY consumer + a matching PTY method exist.
 
@@ -225,17 +223,13 @@ on `/exec` and on `/dev/start`, and these two denylists.
 
 ## Verifying this tree
 
-The Python harness runs under the **backend `uv` env** (it subclasses the frozen `SandboxClient`
-ABC and the `ObjectStorage` port read-only via a `sys.path` bridge — no `backend/` file is
-edited). Run from `sandbox/`:
+The Python harness runs under the **backend `uv` env**, for its dependencies. Run from `sandbox/`:
 
 ```sh
-# Offline lane (no Docker): the fail-closed scrub, /files, auth, the 400-vs-422 split, and the
-# git-bundle round-trip mechanics.
+# Offline lane (no Docker): the fail-closed scrub, /files, auth, the 400-vs-422 split.
 cd sandbox && uv run --project ../backend pytest
 
-# Integration lane (Docker + Azurite): in-container guards + framing + the snapshot/restore round-trip.
-docker compose -f ../backend/docker-compose.test.yml up -d          # Azurite on 127.0.0.1:10000
+# Integration lane (Docker): in-container guards + framing.
 cd sandbox && uv run --project ../backend pytest -m integration     # builds the image once, or set
                                                                     # BIAL_SANDBOX_IMAGE to reuse a tag
 ```

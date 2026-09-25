@@ -136,11 +136,9 @@ function renderProjectPage(projectId = 'p1') {
 
 /** A preview-state read, in the shape the wire parser produces one. */
 const preview = (over: Record<string, unknown> = {}) => ({
-  state: 'never_built',
+  state: 'asleep',
   alive: false,
   previewUrl: null,
-  occupyingProjectName: null,
-  occupyingProjectId: null,
   restorable: null,
   ...over,
 })
@@ -209,7 +207,7 @@ describe('ProjectPage — the app arrives behind one deliberate press', () => {
 
   it('a project with nothing built offers no start control at all', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: null, hasRelaunchableSnapshot: false }))
-    h.fetchPreviewState.mockResolvedValue(preview({ state: 'never_built', restorable: false }))
+    h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: false }))
     renderProjectPage()
 
     await screen.findByPlaceholderText(/Describe what you have in mind/i)

@@ -12,7 +12,6 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   resolvePlanOptions: vi.fn(),
-  getStatus: vi.fn(), relaunchPreview: vi.fn(),
   notifyUsageChanged: vi.fn(),
   messageContentRender: vi.fn(),
 }))
@@ -45,19 +44,14 @@ vi.mock('../../components/chat/MessageContent', () => ({
 }))
 
 import ConversationSurface from '../../components/chat/ConversationSurface'
-import { FakeEventSource, makeClient, primeClient, primeTurn } from './_builderSession.jsx'
+import { primeTurn } from './_builderSession.jsx'
 
-function renderAt(chatId, sessionDeps, projectId = 'p1') {
+function renderAt(chatId, projectId = 'p1') {
   return render(
     <MemoryRouter initialEntries={['/x']}>
-      <ConversationSurface chatId={chatId} projectId={projectId} projectName="VIP Movement" buildSessionDeps={sessionDeps} />
+      <ConversationSurface chatId={chatId} projectId={projectId} projectName="VIP Movement" />
     </MemoryRouter>,
   )
-}
-
-const deps = () => {
-  const fake = new FakeEventSource('x')
-  return { fake, deps: { client: makeClient(h), eventSourceFactory: () => fake } }
 }
 
 const composer = () => screen.getByPlaceholderText(/ask for another change/i)
@@ -80,7 +74,6 @@ const rendersFor = (text) =>
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
-  primeClient(h)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
@@ -103,8 +96,7 @@ describe('typing never re-renders history', () => {
         { id: 'm1', role: 'assistant', seq: 1, parts: [{ type: 'text', text: 'first reply, unrelated to anything typed next' }] },
       ],
     })
-    const { deps: d } = deps()
-    renderAt('build-X', d)
+    renderAt('build-X')
 
     // MessageContent is mocked to render nothing observable, so wait on the spy itself rather
     // than on DOM text.

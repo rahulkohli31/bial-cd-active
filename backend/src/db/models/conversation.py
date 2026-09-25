@@ -72,7 +72,11 @@ class Conversation(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base
     # TWO writers, not one: the ORM `onupdate` here covers a title/context PATCH, and migration
     # 0045's statement-level trigger on `messages` covers a new message — the trigger writes
     # behind SQLAlchemy, so a session already holding this row is stale until refreshed.
-    __table_args__ = (sa.CheckConstraint(PARENTAGE_SHAPE, name="ck_conversations_parentage"),)
+    __table_args__ = (
+        sa.CheckConstraint(PARENTAGE_SHAPE, name="ck_conversations_parentage"),
+        # Created by migration 0046 for the retention pass's scan by age.
+        sa.Index("ix_conversations_updated_at", "updated_at"),
+    )
 
     # The parent project — present for a plan or build chat, absent for a generic one, and
     # `ck_conversations_parentage` above admits no third combination. The DB cascade is a row

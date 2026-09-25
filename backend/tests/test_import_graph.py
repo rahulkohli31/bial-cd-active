@@ -1,8 +1,8 @@
 """The import graph must let a NON-FastAPI process import `src/`.
 
-WHY THIS EXISTS. Reclamation moves out of the API process onto a Taskiq worker. That worker
-imports `src.services.build_sessions.reaper` and `src.services.deploy.reconcile` without ever
-building a FastAPI app. Those imports used to FAIL — not because the services needed the API,
+WHY THIS EXISTS. The scheduled sandbox sweep runs on a Taskiq worker. That worker imports
+`src.services.build_sessions.reaper` and `src.services.deploy.reconcile` without ever building a
+FastAPI app. Those imports used to FAIL — not because the services needed the API,
 but because `src/api/v1/build_sessions/__init__.py` re-exported `deps` and `router` at package
 level, so touching any of its schemas dragged the whole route tree in behind it. Those six lines
 were dead: every real consumer already imported the submodule.
@@ -46,8 +46,8 @@ def _import_in_fresh_interpreter(snippet: str) -> subprocess.CompletedProcess[st
 
 
 def test_the_reaper_imports_without_the_fastapi_app() -> None:
-    """The worker's reclamation task imports this. It used to raise on a cold interpreter, before
-    `build_sessions/__init__.py` stopped re-exporting `deps`/`router`."""
+    """The worker's scheduled sweep task imports this. It used to raise on a cold interpreter,
+    before `build_sessions/__init__.py` stopped re-exporting `deps`/`router`."""
     result = _import_in_fresh_interpreter(
         "import importlib;"
         " importlib.import_module('src.services.build_sessions.reaper');"
@@ -146,21 +146,8 @@ def test_the_package_does_not_drag_in_the_route_tree() -> None:
     assert "LOADED:" in result.stdout, result.stdout
     dragged_in = result.stdout.split("LOADED:")[1].strip()
     assert dragged_in == "", (
-        "the build-sessions package re-exports the route tree again — a worker importing a C7 "
-        f"schema now pulls in {dragged_in}. Keep the schemas re-exports; drop deps/router."
-    )
-
-
-def test_the_build_session_schema_re_exports_survive() -> None:
-    """The other half of the `deps`/`router` cleanup: these schemas (`ProgressEnvelope`,
-    `RunBuild`, `StartBuildRequest`) are frozen AT THIS LOCATION, so that cleanup must not
-    have taken them with it."""
-    result = _import_in_fresh_interpreter(
-        "from src.api.v1.build_sessions import ProgressEnvelope, RunBuild, StartBuildRequest;"
-        " print('ok')"
-    )
-    assert result.returncode == 0, (
-        f"a C7 schema re-export was lost.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        "the build-sessions package re-exports the route tree again — a worker importing this "
+        f"package now pulls in {dragged_in}. The package must not re-export deps/router."
     )
 
 
@@ -179,45 +166,10 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
     paths = list(app.openapi().get("paths", {}))
     build_session_paths = [p for p in paths if "build-session" in p]
 
-    # 19 build-session paths. Beyond the CRUD/turn set, this counts `projects/{project_id}/
-    # discard` (the saved version put back in the running container), `projects/{project_id}/
-    # client-error` (the app's own in-browser error report), `projects/{project_id}/
-    # compile-state` (the compile signal for a tab with no live turn — the turn stream's
-    # producer stops at the terminal), `projects/{project_id}/workspace-check` (the idle-tab
-    # integrity probe, for the reversion that happens while nobody is sending messages),
-    # `projects/{project_id}/stop-state` (the drain's ask, `stop-active-build`, now returns
-    # immediately while a detached task does the waiting, so the outcome — three states, not
-    # a boolean — needs a reader; holding the request open for the length of a stop was a
-    # dependency nobody could satisfy, since the budget had to sit under the request timeout
-    # of a gateway owned by the client's network), and three routes for #198:
-    # `projects/{project_id}/shared-launch`/`shared-refresh`, a colleague's own door into a
-    # project shared with them,
-    # restored into their own per-user slot rather than the owner's, and `shared-view/release`,
-    # the self-service exit from a shared view that needs no project id to ask for.
-    #
-    # It includes `projects/{project_id}/renew`, the one browser-driven renewal on this surface:
-    # a present screen holds its own container open on the poll it is already making, and what
-    # keeps that from being the retired keep-alive loop under a new name is the absolute age
-    # ceiling, which no renewal can push past.
-    #
-    # It excludes `activity`, retired with the applications page's starting/open/closing
-    # markers: the pill reported the platform's own housekeeping rather than anything about the
-    # app, and it read a registry record nothing clears when a stay lapses — so it could assert
-    # an app was open for as long as it took a sweep to come round. Opening the project answers
-    # the same question truthfully, so the marker, its poll and this route went together.
-    #
-    # It excludes the lock ops (`lock/acquire`/`renew`/`release`/`heartbeat`/`force-end`):
-    # nothing calls them any more. The portal's keep-alive loop, the only caller of the first
-    # four, is gone, and the block banner's Force-end button, the only caller of the fifth, is
-    # gone too. It excludes the SESSION-SCOPED `{session_id}/stop`, retired with the end
-    # sequence behind it once nothing could hand a client a session id to name — the stop a
-    # citizen reaches is `projects/{project_id}/stop-active-build`, counted above. And it
-    # excludes the standalone build stack's bare collection `POST` on `/v1/build-sessions`, the
-    # old start route, removed together with the harness, the module-level build agent, and the
-    # run-build dependency it was the sole door into, once the workspace moved onto the chat
-    # turn and took away its only browser client.
-    assert len(build_session_paths) == 18, (
-        f"the C3 build-session route surface changed: expected 18 paths, found "
+    # Counted so that a route added or removed is a decision rather than a side effect. None is
+    # addressed by a session id: nothing can mint one for a client to name.
+    assert len(build_session_paths) == 16, (
+        f"the C3 build-session route surface changed: expected 16 paths, found "
         f"{len(build_session_paths)}. If a route was deliberately added or removed, amend C3 "
         f"and update this number in the same change.\n{sorted(build_session_paths)}"
     )

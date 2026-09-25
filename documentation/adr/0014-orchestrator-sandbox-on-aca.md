@@ -107,6 +107,6 @@ it.
   idle-sandbox sweep)
 - ADR-0015 (how images are built and reach runtime, and the cross-platform constraint that shapes them)
 - ADR-0018 (the Next.js/TypeScript stack this sandbox builds)
-- ADR-0029 (fleet reclamation — a second process holds authority to remove sandboxes directly
-  against the cloud platform's own record of what exists, rather than trusting only the
-  coordination store this ADR describes)
+- ADR-0029 and ADR-0030 (the worker holds authority to remove sandboxes directly, driven off the
+  coordination store this ADR describes; ADR-0030 withdraws the Azure-as-fleet-of-record design
+  ADR-0029 also proposed)

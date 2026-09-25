@@ -19,9 +19,8 @@ Redis-off deployment and an eagerly-solved dependency would raise before that se
 route's own 404 — ever ran, turning the documented 503 into an undocumented 500. Nothing binds
 Redis through DI; `fake_redis` binds the accessor singleton directly instead.
 
-The frozen contract mandates signed double-submit CSRF on the mutating POSTs (`stop` /
-`internal/reap` and the project-scoped ops), a deliberate divergence from the chat-relay
-precedent; the `status` GET and the SSE GET are exempt. That gate now lives in
+The frozen contract mandates signed double-submit CSRF on the mutating POSTs, a deliberate
+divergence from the chat-relay precedent; the GETs are exempt. That gate now lives in
 `src/api/deps_csrf.py` — the conversations domain is its second consumer — and is re-exported
 here so this module stays the single dependency import for this domain's router.
 """

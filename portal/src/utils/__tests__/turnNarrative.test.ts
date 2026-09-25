@@ -11,23 +11,15 @@
 import { describe, it, expect } from 'vitest'
 
 import { atLimitSendState, formatResetTime, turnPhase, type TurnNarrative } from '../turnNarrative'
-import type { QuotaExceededEvent } from '../buildSessionTypes'
 
 const RESETS_AT = '2026-07-15T18:30:00.000Z'
 
-const quota = (seq = 3): QuotaExceededEvent => ({
-  type: 'quota_exceeded',
-  seq,
-  limit: 1_000_000,
-  used: 1_000_001,
-  resets_at: RESETS_AT,
-})
+const quota = () => ({ resetsAt: RESETS_AT })
 
 /** An empty narrative — every field at the value it holds before any frame arrives. */
 const narrative = (over: Partial<TurnNarrative> = {}): TurnNarrative => ({
   steps: {},
   diagnostics: [],
-  quota: null,
   workspace: null,
   preview: { url: null, state: null },
   ...over,
@@ -159,7 +151,9 @@ describe('turnPhase — a turn that worked on the app', () => {
     // its own. Mutation check: narrow `touchedTheApp` to steps alone and both halves go red.
     const viaDiagnostic = narrative({
       workspace: { state: 'ready', message: null },
-      diagnostics: [{ source: 'tsc', userMessage: 'A page did not compile.', userAction: 'Retry.' }],
+      diagnostics: [
+        { type: 'diagnostic', seq: 1, source: 'tsc', userMessage: 'A page did not compile.', userAction: 'Retry.' },
+      ],
     })
     expect(turnPhase(viaDiagnostic, { running: true, terminal: null })).toBe('building')
 
@@ -177,7 +171,7 @@ describe('atLimitSendState', () => {
     // until midnight.
     //
     // Mutation check: return `null` unconditionally from `atLimitSendState` and this goes red.
-    const state = atLimitSendState([quota()])
+    const state = atLimitSendState(quota())
     expect(state?.disabled).toBe(true)
     expect(state?.title).toMatch(/^You can send again after /)
     expect(state?.title).toContain(formatResetTime(RESETS_AT) as string)
@@ -186,35 +180,13 @@ describe('atLimitSendState', () => {
   it('says nothing about sending while the citizen still has budget', () => {
     // The state must be ABSENT rather than a disabled-false object: a composer that spreads it
     // unconditionally would otherwise refuse every ordinary turn.
-    expect(atLimitSendState([])).toBeNull()
-    expect(
-      atLimitSendState([{ type: 'step', seq: 1, name: 's', label: 'x', state: 'ok' }]),
-    ).toBeNull()
-  })
-
-  it('takes the NEWEST reset time by seq, not the last envelope that happened to arrive', () => {
-    // A reconnect replays the stream, so envelopes arrive out of order. Reading the last ARRIVED
-    // envelope hands the citizen a stale reset time from a replayed frame.
-    //
-    // The two instants differ in TIME OF DAY, not merely in date: `formatResetTime` renders a
-    // clock time, so two different DATES at the same hour would render identically and pass
-    // against either implementation.
-    //
-    // Mutation check: pick the last array element instead of sorting by seq and this goes red.
-    const stale: QuotaExceededEvent = { ...quota(9), resets_at: '2026-07-15T06:15:00.000Z' }
-    const newest: QuotaExceededEvent = { ...quota(12), resets_at: '2026-07-15T18:30:00.000Z' }
-
-    // Deliberately out of array order: newest first, stale last.
-    const state = atLimitSendState([newest, stale])
-
-    expect(state?.title).toContain(formatResetTime(newest.resets_at) as string)
-    expect(state?.title).not.toContain(formatResetTime(stale.resets_at) as string)
+    expect(atLimitSendState(null)).toBeNull()
   })
 })
 
 describe('formatResetTime', () => {
   it('degrades rather than printing "Invalid Date" into a citizen\'s banner', () => {
-    // `resets_at` is a wire value, and a naive `new Date(iso).toLocaleTimeString()` renders the
+    // `resetsAt` is a wire value, and a naive `new Date(iso).toLocaleTimeString()` renders the
     // literal words "Invalid Date", which is worse than the caller's vaguer fallback.
     //
     // Mutation check: drop the `Number.isNaN` guard and this goes red.
@@ -226,7 +198,7 @@ describe('formatResetTime', () => {
   it('and the caller says something true either way', () => {
     // The liveness half: `null` above must reach a sentence, not an empty title. The fallback is
     // true regardless of the wire value, because the reset IS the next IST midnight.
-    const unusable = atLimitSendState([{ ...quota(), resets_at: 'x' }])
+    const unusable = atLimitSendState({ ...quota(), resetsAt: 'x' })
     expect(unusable?.title).toBe('You can send again after midnight')
   })
 })
