@@ -319,6 +319,22 @@ def test_a_workspace_that_lost_its_repository_is_refused_not_re_rooted(sandbox: 
     assert not (sandbox.ws / ".git").exists(), "the save re-rooted a workspace holding the app"
 
 
+def test_a_git_killed_under_the_save_is_not_read_as_a_lost_repository(sandbox: _Sandbox) -> None:
+    """A caller destroys the container on the no-repository exit, so a git the kernel kills for
+    memory must fail the save instead, leaving the unsaved tree to a later attempt.
+    Mutation check: probe with `git rev-parse --git-dir || exit 64` again and this goes red."""
+    sandbox.write(_STARTER)
+    sandbox.ok(_INIT_REPO_SCRIPT)
+    sandbox.write({"app/page.tsx": "unsaved work\n"})
+    dies = sandbox.root / "shims" / "git"
+    dies.write_text("#!/bin/sh\nkill -9 $$\n", encoding="utf-8")
+    dies.chmod(0o755)
+
+    result = sandbox.run(_COMMIT_SCRIPT)
+
+    assert result.returncode not in (0, _NO_REPOSITORY_EXIT)
+
+
 def test_a_new_workspace_tracks_only_app_code(sandbox: _Sandbox) -> None:
     sandbox.write(
         {

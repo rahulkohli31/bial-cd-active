@@ -75,10 +75,13 @@ _UNTRACK_WHAT_THE_IMAGE_IGNORES: Final = (
 # starter page?" compare the app against itself forever. Refuse instead; the next turn's integrity
 # verdict routes a repo-less container into quarantine-and-restore.
 #
+# The probe is a shell builtin, not a git command: a git that fails for any other reason, killed
+# short of memory say, must not read as a lost repository, because a caller destroys on that.
+#
 # Commit only when something is staged (`git commit` exits non-zero on a clean tree); a no-change
 # re-snapshot still bundles the existing HEAD below.
 _COMMIT_SCRIPT = (
-    f"git rev-parse --git-dir >/dev/null 2>&1 || exit {_NO_REPOSITORY_EXIT}; "
+    f"[ -e .git ] || exit {_NO_REPOSITORY_EXIT}; "
     + _UNTRACK_WHAT_THE_IMAGE_IGNORES
     + "git add -A && { git diff --cached --quiet || git commit -q -m bial-snapshot; }"
 )
@@ -265,8 +268,9 @@ async def write_the_tree_back(
 
     Raises `SandboxError` when the container will not answer: an unestablished fact on a path
     that ends in an ARM delete is not an outcome to return, and both callers spare the container
-    on it. Raises `WorkspaceHasNoRepositoryError` out of the bundle when the workspace has lost its
-    repository, and the reaper reclaims the container on that: no later attempt could save it."""
+    on it. Raises `WorkspaceHasNoRepositoryError` when the commit finds no repository AND the state
+    probe read no HEAD, and both callers reclaim the container on that: no later attempt could
+    save it. Two reads that disagree are a plain `SandboxError`, which spares."""
     timings = _SaveStepTimings()
     lock_wait_started = time.monotonic()
     try:
@@ -278,7 +282,14 @@ async def write_the_tree_back(
                 raise SandboxError("the container would not answer its state probe")
             if is_the_untouched_starter(state):
                 return SavedCopyWrite(SavedCopyOutcome.SKIPPED)
-            tree = await _bundle_the_tree(sandbox_client, handle, timings)
+            try:
+                tree = await _bundle_the_tree(sandbox_client, handle, timings)
+            except WorkspaceHasNoRepositoryError as exc:
+                if state.head is None:
+                    raise
+                raise SandboxError(
+                    "the commit found no repository where the state probe had read a HEAD"
+                ) from exc
             await _timed_store(store, snapshot_key(app_id), tree, timings)
             # The one line that says a citizen's unsaved afternoon was kept. Nobody presses
             # anything on this path, so without it a preserved app and a lost one leave the

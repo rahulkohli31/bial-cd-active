@@ -53,7 +53,7 @@ async def test_write_snapshot_bundles_and_puts_to_blob(fake_storage: FakeStorage
     # PROBES for a repository and never creates one: a root commit written at the end of a turn
     # holds the finished app, which makes the starter-page check compare the app against itself.
     assert "git init" not in scripts[0]
-    assert scripts[0].startswith(f"git rev-parse --git-dir >/dev/null 2>&1 || exit {NO_REPO_EXIT}")
+    assert scripts[0].startswith(f"[ -e .git ] || exit {NO_REPO_EXIT}; ")
     assert "git diff --cached --quiet || git commit" in scripts[0]
 
 

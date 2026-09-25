@@ -525,6 +525,29 @@ async def test_a_commit_that_fails_for_any_other_reason_still_spares(
     assert attempts == [CopyAttempt.FAILED]
 
 
+async def test_a_missing_repository_the_state_probe_contradicts_still_spares(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
+) -> None:
+    """★ The state probe has just read a HEAD over a dirty tree, so a no-repository answer from
+    the commit is a failing git, not a lost disk, and destroying on it loses the unsaved tree.
+    Mutation check: re-raise `WorkspaceHasNoRepositoryError` whatever the state probe read and
+    this goes red."""
+    await _register(fake_redis)
+    await _put_saved(fake_storage, OLDER)
+    client = _the_commit_exits(
+        _bundles(FakeSandboxClient(), head=HEAD, bundles_to=BUNDLED, porcelain=" M page.tsx"),
+        _NO_REPOSITORY_EXIT,
+    )
+
+    with capture_logs() as logs:
+        assert await reap_user(fake_redis, USER, client, app_id=APP) is False
+
+    assert client.torn_down == []
+    assert await fake_redis.exists(registry_key(USER)) == 1, "state stays for a later pass"
+    assert attempts == [CopyAttempt.FAILED]
+    assert not [log for log in logs if log["event"] == REAP_FOUND_NO_REPOSITORY_EVENT]
+
+
 # --- the record an operator reads ----------------------------------------------------
 
 
