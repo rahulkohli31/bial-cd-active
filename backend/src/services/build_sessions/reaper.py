@@ -935,6 +935,9 @@ async def _a_claim_still_stands(
     if await read_starting_marker(redis, user_uuid) is not None:
         return True
     now = datetime.now(UTC)
+    # KEPT BESIDE THE LEASE, though one loop renews both: the pair is all another process can see
+    # of a freshly started container between its turn adopting it and the lease's first write,
+    # and it expires on the store's clock where the lease compares two hosts' wall clocks.
     a_turn_claims_it = await liveness_lease_is_held(redis, user_uuid) or (
         await lock_is_held(redis, user_uuid) and await heartbeat_is_alive(redis, user_uuid)
     )

@@ -47,8 +47,8 @@ from src.services.build_sessions.manager import (
     StopOutcome,
     app_name_for,
 )
-from src.services.build_sessions.reaper import reap_user
-from src.services.redis import registry_key
+from src.services.build_sessions.reaper import reap_user, sweep_all
+from src.services.redis import heartbeat_key, registry_key
 from src.services.sandbox import (
     ExecResult,
     SandboxError,
@@ -165,6 +165,30 @@ async def test_ensure_sandbox_allocates_a_build_worth_of_state_without_the_build
     assert await lock_is_held(fake_redis, user.id) is True
     assert await heartbeat_is_alive(fake_redis, user.id) is True
     assert await read_registry(fake_redis, user.id) is not None
+
+
+async def test_a_container_its_turn_has_not_leased_yet_is_spared_on_its_heartbeat(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """THE HEARTBEAT IS NOT REDUNDANT WITH THE LEASE, though one loop renews both. Between the
+    turn adopting a freshly started container and the lease's first write, the starting marker
+    is already cleared, a fresh container holds no stay, and the in-process session is invisible
+    to the worker's sweep — the lock and the heartbeat are all it has.
+
+    Mutation check: stop `ensure_sandbox` seeding the heartbeat and this goes red."""
+    user, project_id = await _mk(db_session, "w-unleased@rvaiglobal.com")
+    await SessionManager().ensure_sandbox(
+        db_session, user, project_id, sandbox_client=FakeSandboxClient(), may_write=True
+    )
+    sweeper = FakeSandboxClient()
+
+    assert (await sweep_all(fake_redis, sweeper, live_users=set())).reaped == 0
+    assert sweeper.torn_down == []
+
+    await fake_redis.delete(heartbeat_key(user.id))
+    assert (await sweep_all(fake_redis, sweeper, live_users=set())).reaped == 1, (
+        "something other than the heartbeat was sparing it, so the first half proved nothing"
+    )
 
 
 async def test_ensure_sandbox_mints_the_app_row_a_fresh_project_lacks(

@@ -658,8 +658,8 @@ async def test_a_sweep_sharing_only_the_store_spares_a_held_lease(
 ) -> None:
     turn_side, sweep_side = two_clients_one_store
     await _register(turn_side, USER)
-    # Deliberately NO lock and NO heartbeat: 90 seconds into any build that pair has lapsed,
-    # and the lease is then the only thing between a live build and a teardown.
+    # Deliberately NO lock and NO heartbeat, so the lease is the only thing between a live build
+    # and a teardown.
     state = _turn_state(USER, FakeSandboxClient())
     engine = TurnEngine()
     state.lease_task = asyncio.create_task(engine._hold_liveness_lease(state))

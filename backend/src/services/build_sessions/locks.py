@@ -194,15 +194,14 @@ async def heartbeat_is_alive(redis: aioredis.Redis, user_uuid: uuid.UUID) -> boo
 
 
 # --- the wall-clock liveness lease (sandbox key family 4) --------------------
-# THE ONE SIGNAL HERE THAT IS LEGIBLE FROM ANOTHER PROCESS. Everything above is either
-# in-process (`live_users`) or a facade a crashed builder leaves standing for a TTL; the
-# heartbeat is seeded once per turn, so ~90 s into any build the only thing keeping the
-# sweep off a live container is an in-memory set that is empty everywhere else. That is
-# why nothing capable of destroying a container may run out of the API process until this
-# exists, and why the reader below fails closed at both ends.
+# THE ONE SIGNAL HERE THAT MEANS A TURN IS LIVE, readable from any process: `live_users` is
+# in-process and empty everywhere else, and the lock and the heartbeat are also written by
+# starts that run no turn. The reader below fails closed at both ends.
 #
 # The renewal loop lives on the TURN (`services/turns/engine.py`), beside the preview
-# watcher: a background task the turn owns, stopped in its `finally`, idempotent.
+# watcher: a background task the turn owns, stopped in its `finally`, idempotent. It renews
+# the lock and the heartbeat as well, and `reaper._a_claim_still_stands` says why that pair is
+# kept beside the lease rather than folded into it.
 
 
 def _wall_clock_now() -> float:

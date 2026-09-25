@@ -3511,11 +3511,10 @@ class TurnEngine:
             )
 
     async def _hold_liveness_lease(self, state: _TurnState) -> None:
-        """Publishes that a build is live in this user's container. The heartbeat seeds once a turn
-        on a 90s TTL; past that only `sweep_all`'s in-process `live_users` set keeps the sweep off
-        it — empty in every other process — so nothing that can destroy a container may run outside
-        the API process until this exists. Wall clock, never `time.monotonic()`: cross-process
-        readable, and its TTL expires an abandoned lease rather than pinning the container. ALSO
+        """Publishes that a build is live in this user's container, to every process: `sweep_all`'s
+        `live_users` is in-process and empty in every other one. Wall clock, never
+        `time.monotonic()`: cross-process readable, and its TTL expires an abandoned lease rather
+        than pinning the container. ALSO
         RENEWS THE LOCK AND HEARTBEAT — this loop is their only clock, so a tool call past the TTL
         would otherwise silently drop the lock. Best-effort, never silent: both failures logged,
         lock arm caught apart from lease so one store error costs only its own renewal."""

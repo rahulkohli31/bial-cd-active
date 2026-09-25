@@ -811,9 +811,9 @@ async def test_a_sweep_that_trips_on_one_user_still_reaps_the_rest(
 
 # --- The wall-clock liveness lease --------------------------------
 #
-# The lock+heartbeat pair is a FACADE in both directions: a crashed builder leaves it
-# standing, and a live one loses its heartbeat 90 seconds in. The lease is the one input
-# here that is readable from a process NOT running the build. The two behaviours below are
+# The lock+heartbeat pair is a FACADE: a crashed builder leaves it standing for a TTL, and a
+# start that runs no turn writes it too. The lease is the one input here that means a turn is
+# live, to a process NOT running the build. The two behaviours below are
 # opposite ON PURPOSE — a timer must be conservative, a request path decisive — and the pair
 # is the regression guard against collapsing them into one.
 
