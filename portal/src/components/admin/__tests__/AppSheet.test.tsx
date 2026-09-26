@@ -200,6 +200,7 @@ function open(app: RegistryApp, onClose = vi.fn()) {
       title={app.name}
       status={<span>status</span>}
       withdrawn={null}
+      problem={null}
       onClose={onClose}
       onApprove={noop}
       onReject={noop}

@@ -55,10 +55,12 @@ const PENDING = {
   declaration: null,
 }
 
+const DRAFT = { ...PENDING, appId: 'app-4', name: 'Draft Tool', status: 'draft', registryStatus: 'draft', submissionId: null }
+
 beforeEach(() => {
   vi.clearAllMocks()
   h.getStoredUser.mockReturnValue(ADMIN)
-  h.listApps.mockResolvedValue({ apps: [PENDING], truncated: false })
+  h.listApps.mockResolvedValue({ apps: [PENDING, DRAFT], truncated: false })
   h.fetchHistory.mockResolvedValue({ entries: [], live: null, liveUrl: null, truncated: false })
 })
 afterEach(() => cleanup())
@@ -70,11 +72,17 @@ const renderAdmin = () =>
     </MemoryRouter>,
   )
 
-/** Open the one pending row's panel and press Approve — the exact path
- *  `AppRegistryPanel.act()` reports back through `onToast`. */
+/** Open the one pending row's panel and press Approve: a success reports through `onToast`. */
 const openReviewAndApprove = () => {
   fireEvent.click(screen.getByRole('button', { name: 'Gate Tool' }))
   fireEvent.click(screen.getByTestId('approve-btn'))
+}
+
+/** Disable the draft row from its ⋯ menu: a row action, which reports both outcomes through
+ *  `onToast`. A failed Approve is said inside the panel instead. */
+const disableDraft = () => {
+  fireEvent.pointerDown(screen.getByTestId('actions-app-4'))
+  fireEvent.click(screen.getByRole('menuitem', { name: 'Disable' }))
 }
 
 describe('the admin toast channel — confirmation vs failure through the SAME callback', () => {
@@ -91,11 +99,11 @@ describe('the admin toast channel — confirmation vs failure through the SAME c
   })
 
   it('an action that throws renders the failure appearance, through the exact same channel', async () => {
-    h.approveApp.mockRejectedValue(new Error('Could not reach the registry.'))
+    h.disableApp.mockRejectedValue(new Error('Could not reach the registry.'))
     renderAdmin()
-    await screen.findByText('Gate Tool')
+    await screen.findByText('Draft Tool')
 
-    openReviewAndApprove()
+    disableDraft()
 
     const toast = await screen.findByTestId('admin-toast')
     expect(toast.dataset.severity).toBe('problem')
@@ -124,14 +132,14 @@ describe('a failure waits to be dismissed; a confirmation may fade', () => {
   })
 
   it('a failure never auto-dismisses, well past the window a confirmation fades on', async () => {
-    h.approveApp.mockRejectedValue(new Error('Could not reach the registry.'))
+    h.disableApp.mockRejectedValue(new Error('Could not reach the registry.'))
     vi.useFakeTimers()
     try {
       renderAdmin()
       await vi.advanceTimersByTimeAsync(0)
-      expect(screen.getByText('Gate Tool')).toBeTruthy()
+      expect(screen.getByText('Draft Tool')).toBeTruthy()
 
-      openReviewAndApprove()
+      disableDraft()
       await vi.advanceTimersByTimeAsync(0)
       expect(screen.getByTestId('admin-toast').dataset.severity).toBe('problem')
 
@@ -147,19 +155,16 @@ describe('a failure waits to be dismissed; a confirmation may fade', () => {
 
 describe('a confirmation and a failure are visually distinguishable without reading the text', () => {
   it('carry different severity markers, not merely different words', async () => {
-    // Fail first: `act()` leaves the review modal OPEN on a non-withdrawal failure (the
-    // admin still needs the submission metadata), so `approve-btn` is still on screen —
-    // no second row click needed to retry the SAME action.
-    h.approveApp.mockRejectedValueOnce(new Error('Could not reach the registry.'))
+    h.disableApp.mockRejectedValueOnce(new Error('Could not reach the registry.'))
     renderAdmin()
-    await screen.findByText('Gate Tool')
-    openReviewAndApprove()
+    await screen.findByText('Draft Tool')
+    disableDraft()
     const problemToast = await screen.findByTestId('admin-toast')
     expect(problemToast.dataset.severity).toBe('problem')
     const problemClass = problemToast.className
 
-    h.approveApp.mockResolvedValueOnce({})
-    fireEvent.click(screen.getByTestId('approve-btn'))
+    h.disableApp.mockResolvedValueOnce({})
+    disableDraft()
 
     const okToast = await waitFor(() => {
       const toast = screen.getByTestId('admin-toast')
@@ -172,25 +177,24 @@ describe('a confirmation and a failure are visually distinguishable without read
 
 describe('two messages in quick succession', () => {
   it('the second message never leaves the first one’s text under the second’s styling', async () => {
-    // Fail, then immediately retry and succeed — `act()`'s catch and success branches
-    // each call `showToast` exactly once, and `showToast` replaces the whole
-    // `{ text, severity }` pair in a single `setState`, never the two halves separately —
-    // so there is no render where the SECOND message's text sits under the FIRST
-    // message's styling (or vice versa).
-    h.approveApp.mockRejectedValueOnce(new Error('Could not reach the registry.'))
+    // Fail, then immediately retry and succeed — a failed and a successful `act()` each call
+    // `showToast` exactly once, and `showToast` replaces the whole `{ text, severity }` pair in a
+    // single `setState`, never the two halves separately — so there is no render where the
+    // SECOND message's text sits under the FIRST message's styling (or vice versa).
+    h.disableApp.mockRejectedValueOnce(new Error('Could not reach the registry.'))
     renderAdmin()
-    await screen.findByText('Gate Tool')
-    openReviewAndApprove()
+    await screen.findByText('Draft Tool')
+    disableDraft()
     const failedToast = await screen.findByTestId('admin-toast')
     expect(failedToast.dataset.severity).toBe('problem')
 
-    h.approveApp.mockResolvedValueOnce({})
-    fireEvent.click(screen.getByTestId('approve-btn'))
+    h.disableApp.mockResolvedValueOnce({})
+    disableDraft()
 
     await waitFor(() => {
       const toast = screen.getByTestId('admin-toast')
       expect(toast.dataset.severity).toBe('ok')
-      expect(toast.textContent).toContain('approved')
+      expect(toast.textContent).toContain('disabled')
       expect(toast.textContent).not.toContain('Could not reach the registry.')
     })
   })

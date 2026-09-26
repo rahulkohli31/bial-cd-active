@@ -223,6 +223,8 @@ interface AppReviewTabProps {
   /** The owner pulled this submission back while the panel was open. Non-null replaces the
    *  actions: there is nothing left to decide, and a button that can only fail is worse. */
   withdrawn: string | null
+  /** Why the last Approve or Reject failed, said beside the actions it came from. */
+  problem: string | null
   onClose: () => void
   onApprove: () => Promise<void>
   onReject: (note: string) => Promise<void>
@@ -234,7 +236,7 @@ interface AppReviewTabProps {
  * sent. Approve sends the submission id on display, so a re-submit since this review is refused
  * instead of promoting an unseen build. No evidence location reaches this screen.
  */
-export default function AppReviewTab({ app, number, withdrawn, onClose, onApprove, onReject }: AppReviewTabProps) {
+export default function AppReviewTab({ app, number, withdrawn, problem, onClose, onApprove, onReject }: AppReviewTabProps) {
   const [rejecting, setRejecting] = useState(false)
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
@@ -243,8 +245,8 @@ export default function AppReviewTab({ app, number, withdrawn, onClose, onApprov
   const noteTooShort = trimmedNote.length < MIN_REJECTION_NOTE
   const version = `${number === null ? '' : `v${number} · `}${shortSha(app.commitSha)}`
 
-  // `onApprove`/`onReject` never reject — the panel owns every failure and its toast — so this
-  // only drives the button's spinner.
+  // `onApprove`/`onReject` never reject — the panel owns every failure and says it here — so
+  // this only drives the button's spinner.
   const run = async (fn: () => Promise<void>) => {
     setBusy(true)
     try {
@@ -401,6 +403,16 @@ export default function AppReviewTab({ app, number, withdrawn, onClose, onApprov
           </div>
         ) : (
           <>
+            {problem !== null && (
+              <p
+                data-testid="review-problem"
+                role="alert"
+                className="mb-3 flex items-start gap-1.5 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs leading-relaxed text-red-700"
+              >
+                <AlertTriangle size={13} className="mt-0.5 flex-shrink-0" aria-hidden />
+                {problem}
+              </p>
+            )}
             {rejecting && (
               <div className="mb-3">
                 <label htmlFor="reject-note" className="block text-xs font-semibold text-tertiary">

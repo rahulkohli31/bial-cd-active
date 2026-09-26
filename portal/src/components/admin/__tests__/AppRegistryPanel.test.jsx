@@ -208,16 +208,52 @@ describe('AppRegistryPanel — one list, every app', () => {
     expect(within(row).queryByText('Waiting for review')).toBeNull()
   })
 
-  it('an approve 409 surfaces the re-submitted-since-review copy, not a generic failure', async () => {
+  it('an approve 409 says the re-submitted-since-review copy inside the panel, and reloads the list', async () => {
     const copy = 'This app was re-submitted since you reviewed it — please re-review.'
-    h.approveApp.mockRejectedValue(new Error(copy))
+    h.approveApp.mockRejectedValue(new ApiError(copy, 409, 'conflict'))
     const onToast = vi.fn()
     render(<AppRegistryPanel onToast={onToast} />)
     await openReview()
     fireEvent.click(screen.getByTestId('approve-btn'))
-    await waitFor(() => expect(onToast).toHaveBeenCalledWith(copy, 'problem'))
-    // The panel stays OPEN on the 409: act() reports failure, so onApprove never closes it.
+
+    const problem = await screen.findByTestId('review-problem')
+    expect(problem.getAttribute('role')).toBe('alert')
+    expect(problem.textContent).toContain(copy)
+    // Inside the panel, where the admin is looking: the page's toast renders beneath it.
+    expect(screen.getByRole('dialog').contains(problem)).toBe(true)
+    expect(onToast).not.toHaveBeenCalled()
+    // The panel stays OPEN on the 409, and the list behind it re-reads what changed elsewhere.
     expect(screen.getByTestId('approve-btn')).toBeTruthy()
+    await waitFor(() => expect(h.listApps).toHaveBeenCalledTimes(2))
+  })
+
+  it('a reject refused because the app was decided elsewhere says so inside the panel', async () => {
+    const copy = 'This app is no longer waiting for review.'
+    h.rejectApp.mockRejectedValue(new ApiError(copy, 409, 'not_pending'))
+    const onToast = vi.fn()
+    render(<AppRegistryPanel onToast={onToast} />)
+    await openReview()
+    fireEvent.click(screen.getByTestId('reject-btn'))
+    fireEvent.change(screen.getByTestId('reject-note'), { target: { value: 'Please remove the passport field first.' } })
+    fireEvent.click(screen.getByTestId('reject-confirm'))
+
+    expect((await screen.findByTestId('review-problem')).textContent).toContain(copy)
+    expect(onToast).not.toHaveBeenCalled()
+    await waitFor(() => expect(h.listApps).toHaveBeenCalledTimes(2))
+  })
+
+  it('a failure that is no conflict leaves the list as it was, and the next open starts clean', async () => {
+    h.approveApp.mockRejectedValue(new Error('Network error'))
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await openReview()
+    fireEvent.click(screen.getByTestId('approve-btn'))
+    await screen.findByTestId('review-problem')
+    expect(h.listApps).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Close' }))
+    await openReview()
+    expect(screen.getByTestId('approve-btn')).toBeTruthy()
+    expect(screen.queryByTestId('review-problem')).toBeNull()
   })
 
   it('renders the advisory database size column, human-formatted, and "—" when null', async () => {
@@ -833,7 +869,7 @@ describe('a submission withdrawn while the panel was open', () => {
     await openReview()
     fireEvent.click(screen.getByTestId('approve-btn'))
 
-    await waitFor(() => expect(onToast).toHaveBeenCalledWith(copy, 'problem'))
+    expect((await screen.findByTestId('review-problem')).textContent).toContain(copy)
     expect(screen.queryByTestId('review-withdrawn')).toBeNull()
     expect(screen.getByTestId('approve-btn')).toBeTruthy()
   })

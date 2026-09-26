@@ -21,6 +21,8 @@ interface AppSheetProps {
   /** The app's registry status, as its row draws it. */
   status: ReactNode
   withdrawn: string | null
+  /** Why the last Approve or Reject failed, or null. */
+  problem: string | null
   onClose: () => void
   onApprove: () => Promise<void>
   onReject: (note: string) => Promise<void>
@@ -33,7 +35,7 @@ interface AppSheetProps {
  * Focus lands on the panel itself rather than its first control, and Radix's own restore is off:
  * the panel is unmounted rather than closed, and the list puts focus back on the row that opened it.
  */
-export default function AppSheet({ app, title, status, withdrawn, onClose, onApprove, onReject }: AppSheetProps) {
+export default function AppSheet({ app, title, status, withdrawn, problem, onClose, onApprove, onReject }: AppSheetProps) {
   const [history, setHistory] = useState<AppHistory | null>(null)
   const [error, setError] = useState<string | null>(null)
   const panel = useRef<HTMLDivElement>(null)
@@ -104,6 +106,7 @@ export default function AppSheet({ app, title, status, withdrawn, onClose, onApp
                 app={app}
                 number={reviewed?.number ?? null}
                 withdrawn={withdrawn}
+                problem={problem}
                 onClose={onClose}
                 onApprove={onApprove}
                 onReject={onReject}

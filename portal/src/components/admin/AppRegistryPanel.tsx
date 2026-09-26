@@ -397,7 +397,7 @@ const COLUMNS: ColumnDef<RegistryApp>[] = [
  */
 export interface AppRegistryPanelProps {
   // severity is optional (default 'ok' on the AdminPage side) so a plain confirmation
-  // call reads exactly as it always has — only `act()`'s catch branch below passes 'problem'.
+  // call reads exactly as it always has — only a failed `act()` below passes 'problem'.
   onToast: (msg: string, severity?: 'ok' | 'problem') => void
 }
 
@@ -412,6 +412,9 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   // Non-null once the developer withdraws the submission under review. Cleared
   // whenever a different item is opened, so one race can never haunt the next review.
   const [withdrawn, setWithdrawn] = useState<string | null>(null)
+  // Why the panel's last Approve or Reject failed. Said inside the panel: the page's toast
+  // renders beneath it.
+  const [problem, setProblem] = useState<string | null>(null)
   // A SET of in-flight app ids, not one shared lock: acting on row A must never
   // re-enable row B's still-pending buttons (which a single busyId did, opening the
   // door to duplicate concurrent mutations + duplicate audit rows).
@@ -462,43 +465,49 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
     [list],
   )
 
-  // Run a mutating action with a per-row busy lock + toast, then reload. Returns the FAILURE,
-  // or null on success — never a bare boolean, because the withdrawal race needs the error's
-  // `code` and re-throwing after already toasting would force every caller into a second try.
-  // The toast is one channel for both a confirmation and a raw failure (okMsg vs. e.message), so
-  // the two must NOT render alike — an administrator left to tell them apart by reading the words
-  // cannot know whether the action they just took worked, which is why the catch branch, and only
-  // it, passes a 'problem' severity.
-  const act = async (appId: string, fn: () => Promise<unknown>, okMsg?: string): Promise<unknown> => {
+  // Run a mutating action with a per-row busy lock, then reload. Returns the FAILURE, or null on
+  // success — never a bare boolean, because the withdrawal race needs the error's `code`. A 409
+  // means the app changed elsewhere, so the list reloads on that failure too.
+  const run = async (appId: string, fn: () => Promise<unknown>, okMsg?: string): Promise<unknown> => {
     setBusyIds((s) => new Set(s).add(appId))
     try { await fn(); if (okMsg) onToast(okMsg) ; await load(); return null }
-    catch (e) { onToast(e instanceof Error ? e.message : String(e), 'problem'); return e }
+    catch (e) { if (e instanceof ApiError && e.status === 409) await load(); return e }
     finally { setBusyIds((s) => { const n = new Set(s); n.delete(appId); return n }) }
   }
 
-  /** Close the panel on success; on the withdrawal race, keep it open and let it say what
-   *  happened instead. Every other failure is already a toast and leaves the panel alone —
-   *  on the 409 the admin still needs the submission metadata. */
-  const settleReview = (failure: unknown): void => {
-    if (failure === null) { setOpenApp(null); setWithdrawn(null); return }
-    if (failure instanceof ApiError && failure.code === 'submission_withdrawn') {
-      setWithdrawn(failure.message)
-    }
+  // A row action's failure is a toast. The toast is one channel for both a confirmation and a raw
+  // failure, so the two must NOT render alike — an administrator left to tell them apart by
+  // reading the words cannot know whether the action they just took worked, which is why only the
+  // failure passes a 'problem' severity.
+  const act = async (appId: string, fn: () => Promise<unknown>, okMsg?: string): Promise<unknown> => {
+    const failure = await run(appId, fn, okMsg)
+    if (failure !== null) onToast(failure instanceof Error ? failure.message : String(failure), 'problem')
+    return failure
   }
 
-  // Approve sends the on-display submission id (the reviewed-id guard's input); a stale
-  // review 409s with copy `act` surfaces verbatim via toast, and the panel closes only on
-  // success so a 409 leaves the metadata visible to re-review. `submissionId` is nullable in
-  // the schema but always present once an app is 'pending' — the `as string` below is an
-  // unchecked pass-through matching pre-migration behavior, not a missed null check.
-  const onApprove = (app: RegistryApp) => act(app.appId, () => approveApp(app.appId, app.submissionId as string), `“${appLabel(app)}” approved`).then(settleReview)
-  const onReject = (app: RegistryApp, note: string) => act(app.appId, () => rejectApp(app.appId, note), `“${appLabel(app)}” rejected`).then(settleReview)
+  /** Close the panel on success; on a failure keep it open and say why inside it — on the 409
+   *  the admin still needs the submission metadata. The withdrawal race replaces the actions. */
+  const settleReview = (failure: unknown): void => {
+    if (failure === null) { setOpenApp(null); setWithdrawn(null); return }
+    const message = failure instanceof Error ? failure.message : String(failure)
+    if (failure instanceof ApiError && failure.code === 'submission_withdrawn') setWithdrawn(message)
+    else setProblem(message)
+  }
+
+  // Approve sends the on-display submission id (the reviewed-id guard's input); a stale review
+  // 409s with copy the panel shows verbatim, and the panel closes only on success so a 409 leaves
+  // the metadata visible to re-review. `submissionId` is nullable in the schema but always present
+  // once an app is 'pending' — the `as string` below is an unchecked pass-through matching
+  // pre-migration behavior, not a missed null check.
+  const onApprove = (app: RegistryApp) => { setProblem(null); return run(app.appId, () => approveApp(app.appId, app.submissionId as string), `“${appLabel(app)}” approved`).then(settleReview) }
+  const onReject = (app: RegistryApp, note: string) => { setProblem(null); return run(app.appId, () => rejectApp(app.appId, note), `“${appLabel(app)}” rejected`).then(settleReview) }
   const onToggleLogin = (app: RegistryApp) => act(app.appId, () => patchApp(app.appId, { loginRequired: !app.loginRequired }), `Login ${app.loginRequired ? 'disabled' : 'required'} for “${appLabel(app)}”`)
   const onDisable = (app: RegistryApp) => act(app.appId, () => disableApp(app.appId), `“${appLabel(app)}” disabled`)
   const onEnable = (app: RegistryApp) => act(app.appId, () => enableApp(app.appId), `“${appLabel(app)}” re-enabled`)
   const onOpen = (app: RegistryApp, opener: HTMLElement | null) => {
     openerRef.current = opener
     setWithdrawn(null)
+    setProblem(null)
     setOpenApp(app)
   }
   // THE DELETE ASKS WHY, AND A `window.confirm` COULD NOT.
@@ -561,6 +570,7 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
           title={appLabel(openApp)}
           status={<RegistryBadge status={openApp.registryStatus} />}
           withdrawn={withdrawn}
+          problem={problem}
           onClose={() => { setOpenApp(null); setWithdrawn(null) }}
           onApprove={() => onApprove(openApp)}
           onReject={(note) => onReject(openApp, note)}
