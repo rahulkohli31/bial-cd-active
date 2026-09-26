@@ -1,11 +1,13 @@
-"""The live classification configuration: the active classes and the policy, read together.
+"""The live classification configuration: the active classes and the policy, read together, and
+the fingerprint of the class definitions a review reads.
 
-Classes come back in key order, never kind or weight order, so anything rendered from them stays
-byte-identical until a class is added, reworded or switched on or off.
+Classes come back in the order they were created, which is how every screen breaks weight ties.
+The reviewer's prompt sorts them by key itself, so the fingerprint does not depend on this order.
 """
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 import sqlalchemy as sa
@@ -16,6 +18,7 @@ from src.db.models.classification_config import (
     ClassificationKind,
     ClassificationPolicy,
 )
+from src.services.classification.prompts import review_instructions
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +35,13 @@ class LiveConfig:
     threshold: int
     owners_can_change_answers: bool
     classes: tuple[LiveClass, ...]
+
+    @property
+    def fingerprint(self) -> str:
+        """The sha256 of the reviewer's static instruction block for these classes. A review is
+        current only while its fingerprint matches this; a weight, kind or policy edit leaves it
+        unchanged."""
+        return hashlib.sha256(review_instructions(self.classes).encode()).hexdigest()
 
 
 async def load_live_config(db: AsyncSession) -> LiveConfig:
@@ -52,8 +62,8 @@ async def load_live_config(db: AsyncSession) -> LiveConfig:
             ClassificationClass.weight,
         )
         .where(ClassificationClass.active.is_(True))
-        # Byte order, so the order does not depend on the server's collation.
-        .order_by(ClassificationClass.key.collate("C"))
+        # UUIDv7: creation order.
+        .order_by(ClassificationClass.id)
     )
     return LiveConfig(
         threshold=policy.threshold,

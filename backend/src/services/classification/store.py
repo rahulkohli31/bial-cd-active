@@ -2,21 +2,23 @@
 
 WHY THIS EXISTS
 This claim differs from the deploy store's: that one serializes ATTEMPTS as append-only
-rows behind a partial index; this one settles which single row an app carries. Three
-outcomes, resolved in Postgres so a restart or a concurrent dialog cannot double-run:
+rows behind a partial index; this one settles which single row an app carries. A review's
+version is the pair (commit, class-definition fingerprint). Three outcomes, resolved in
+Postgres so a restart or a concurrent dialog cannot double-run:
 
-* no row, or a different version → replaced wholesale, attempt reset to 1;
-* a FAILED row, same version → re-claimed, attempt incremented (the form can ask again
-  without re-saving; the three-runs-per-version ceiling is service policy, enforced in
+* no row, or a different pair → replaced wholesale, attempt reset to 1;
+* a FAILED row, same pair → re-claimed, attempt incremented (the dialog can ask again
+  without re-saving; the three-runs-per-pair ceiling is service policy, enforced in
   exactly one place);
-* a RUNNING or COMPLETE row, same version → returned untouched, `claimed=False` (an
-  unchanged version returns the stored answers without re-running; a live run is never
+* a RUNNING or COMPLETE row, same pair → returned untouched, `claimed=False` (an
+  unchanged pair returns the stored answers without re-running; a live run is never
   doubled).
 
-Terminal writes are guarded on the version AND the attempt, not just `running`: unlike
+Terminal writes are guarded on the pair AND the attempt, not just `running`: unlike
 `deploy/store._finish`, this row SURVIVES a takeover (a newer claim rewrites it in
-place), so a stale `head_sha` or `attempt` is what makes a zombie runner's late write
-touch zero rows instead of overwriting a newer claim's verdicts.
+place, possibly at the same commit and attempt 1), so a stale commit, fingerprint or
+attempt is what makes a zombie runner's late write touch zero rows instead of overwriting
+a newer claim's verdicts.
 
 Every write commits on its own — the runner is a detached task with its own session.
 Every function returns plain scalars or a frozen dataclass, never a live ORM instance
@@ -47,6 +49,7 @@ _RECORD_COLUMNS: Final = (
     ClassificationReview.app_id,
     ClassificationReview.user_id,
     ClassificationReview.head_sha,
+    ClassificationReview.definitions_fingerprint,
     ClassificationReview.status,
     ClassificationReview.attempt,
     ClassificationReview.verdicts,
@@ -72,6 +75,7 @@ class ReviewRecord:
     app_id: uuid.UUID
     user_id: uuid.UUID
     head_sha: str
+    definitions_fingerprint: str | None
     status: ClassificationReviewStatus
     attempt: int
     verdicts: dict[str, Any] | None
@@ -103,7 +107,7 @@ def _record(row: Row[Any]) -> ReviewRecord:
     return ReviewRecord(*row)
 
 
-def _fresh_run_values(*, head_sha: str, user_id: uuid.UUID) -> dict[str, Any]:
+def _fresh_run_values(*, head_sha: str, fingerprint: str, user_id: uuid.UUID) -> dict[str, Any]:
     """Everything a (re)claimed row is reset to — the wholesale overwrite, minus
     `attempt`, which is the one column whose next value depends on WHY the claim won
     (1 on a version change, +1 on a same-version retry).
@@ -115,6 +119,7 @@ def _fresh_run_values(*, head_sha: str, user_id: uuid.UUID) -> dict[str, Any]:
     return {
         "user_id": user_id,
         "head_sha": head_sha,
+        "definitions_fingerprint": fingerprint,
         "status": ClassificationReviewStatus.RUNNING,
         "verdicts": None,
         "evidence": None,
@@ -136,26 +141,31 @@ async def claim(
     app_id: uuid.UUID,
     user_id: uuid.UUID,
     head_sha: str,
+    fingerprint: str,
 ) -> ClaimOutcome:
-    """Claim a review run for `app_id` at `head_sha`, or get the stored row back. Commits.
+    """Claim a review run for `app_id` at (`head_sha`, `fingerprint`), or get the stored row
+    back. Commits.
 
     Two passes at most, mirroring the deploy claim's bounded retry: the only way the
     first pass resolves to nothing is a concurrent claim replacing the row for another
     version in the gap between our writes and our read — a window one retry closes and
     an unbounded loop against a hot row would spin in."""
     for _ in range(2):
-        claimed = await _try_claim(db, app_id=app_id, user_id=user_id, head_sha=head_sha)
+        claimed = await _try_claim(
+            db, app_id=app_id, user_id=user_id, head_sha=head_sha, fingerprint=fingerprint
+        )
         if claimed is not None:
             return ClaimOutcome(claimed=True, review=claimed)
 
         stored = await get_for_app(db, app_id=app_id)
-        if stored is not None and stored.head_sha == head_sha:
+        if stored is not None and is_for(stored, head_sha=head_sha, fingerprint=fingerprint):
             return ClaimOutcome(claimed=False, review=stored)
 
         _log.warning(
             "classification_review_claim_contended",
             app_id=str(app_id),
             head_sha=head_sha,
+            fingerprint=fingerprint,
         )
 
     # Two full passes lost: either the app is being deleted under us (the CASCADE
@@ -168,12 +178,18 @@ async def claim(
     )
 
 
+def is_for(record: ReviewRecord, *, head_sha: str, fingerprint: str) -> bool:
+    """Whether `record` is the review of this commit under these class definitions."""
+    return record.head_sha == head_sha and record.definitions_fingerprint == fingerprint
+
+
 async def _try_claim(
     db: AsyncSession,
     *,
     app_id: uuid.UUID,
     user_id: uuid.UUID,
     head_sha: str,
+    fingerprint: str,
 ) -> ReviewRecord | None:
     """One pass over the three ways a claim can win. At most one statement mutates;
     all three land in a single committed transaction.
@@ -188,7 +204,12 @@ async def _try_claim(
     inserted = (
         await db.execute(
             pg_insert(ClassificationReview)
-            .values(app_id=app_id, user_id=user_id, head_sha=head_sha)
+            .values(
+                app_id=app_id,
+                user_id=user_id,
+                head_sha=head_sha,
+                definitions_fingerprint=fingerprint,
+            )
             .on_conflict_do_nothing(index_elements=[ClassificationReview.app_id])
             .returning(*_RECORD_COLUMNS)
         )
@@ -197,18 +218,25 @@ async def _try_claim(
         await db.commit()
         return _record(inserted)
 
-    # 2. The version moved → replace the row WHOLESALE, whatever its status. This is
-    #    the write that retires a stale COMPLETE answer, a stale failure, AND an older
-    #    version's still-running run (its late completion is disarmed by the terminal
-    #    guards below). Attempt resets: the counter belongs to the stamped version.
+    # 2. The commit or the class definitions moved → replace the row WHOLESALE, whatever its
+    #    status. This is the write that retires a stale COMPLETE answer, a stale failure, AND
+    #    an older pair's still-running run (its late completion is disarmed by the terminal
+    #    guards below). Attempt resets: the counter belongs to the pair. A legacy row's NULL
+    #    fingerprint counts as moved.
     replaced = (
         await db.execute(
             sa.update(ClassificationReview)
             .where(
                 ClassificationReview.app_id == app_id,
-                ClassificationReview.head_sha != head_sha,
+                sa.or_(
+                    ClassificationReview.head_sha != head_sha,
+                    ClassificationReview.definitions_fingerprint.is_distinct_from(fingerprint),
+                ),
             )
-            .values(attempt=1, **_fresh_run_values(head_sha=head_sha, user_id=user_id))
+            .values(
+                attempt=1,
+                **_fresh_run_values(head_sha=head_sha, fingerprint=fingerprint, user_id=user_id),
+            )
             .returning(*_RECORD_COLUMNS)
         )
     ).one_or_none()
@@ -216,7 +244,7 @@ async def _try_claim(
         await db.commit()
         return _record(replaced)
 
-    # 3. Same version, FAILED → re-claim it (ask again without re-saving). The
+    # 3. Same pair, FAILED → re-claim it (ask again without re-saving). The
     #    status predicate is the race guard — of two concurrent retries, the second
     #    finds the row RUNNING and falls through to the stored-row read.
     reclaimed = (
@@ -225,11 +253,12 @@ async def _try_claim(
             .where(
                 ClassificationReview.app_id == app_id,
                 ClassificationReview.head_sha == head_sha,
+                ClassificationReview.definitions_fingerprint == fingerprint,
                 ClassificationReview.status == ClassificationReviewStatus.FAILED,
             )
             .values(
                 attempt=ClassificationReview.attempt + 1,
-                **_fresh_run_values(head_sha=head_sha, user_id=user_id),
+                **_fresh_run_values(head_sha=head_sha, fingerprint=fingerprint, user_id=user_id),
             )
             .returning(*_RECORD_COLUMNS)
         )
@@ -238,7 +267,7 @@ async def _try_claim(
     if reclaimed is not None:
         return _record(reclaimed)
 
-    # Same version, RUNNING or COMPLETE: nothing to claim — the caller reads the row.
+    # Same pair, RUNNING or COMPLETE: nothing to claim — the caller reads the row.
     return None
 
 
@@ -247,6 +276,7 @@ async def succeed(
     *,
     review_id: uuid.UUID,
     head_sha: str,
+    fingerprint: str,
     attempt: int,
     verdicts: dict[str, Any],
     evidence: dict[str, Any],
@@ -263,6 +293,7 @@ async def succeed(
         db,
         review_id=review_id,
         head_sha=head_sha,
+        fingerprint=fingerprint,
         attempt=attempt,
         status=ClassificationReviewStatus.COMPLETE,
         verdicts=verdicts,
@@ -280,11 +311,10 @@ async def fail(
     *,
     review_id: uuid.UUID,
     head_sha: str,
+    fingerprint: str,
     attempt: int,
     code: str,
     detail: str | None = None,
-    verdicts: dict[str, Any] | None = None,
-    evidence: dict[str, Any] | None = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
     cache_read_tokens: int = 0,
@@ -294,20 +324,16 @@ async def fail(
     learning nothing. True iff this call settled the row.
 
     Stored ON the row as a BUCKET, never an answer set: `verdicts` stays NULL, because
-    "the check couldn't run" must never be readable as six No's. THE ONE EXCEPTION is
-    the Tier A floor: when the model never returned but the credential scan holds a
-    high-confidence hit, the runner passes credentials=yes-from-the-scan with the other
-    five `unanswered` — still never six No's."""
+    "the check couldn't run" must never be readable as a set of No's."""
     return await _finish(
         db,
         review_id=review_id,
         head_sha=head_sha,
+        fingerprint=fingerprint,
         attempt=attempt,
         status=ClassificationReviewStatus.FAILED,
         failure_code=code,
         failure_detail=detail,
-        verdicts=verdicts,
-        evidence=evidence,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
@@ -320,22 +346,25 @@ async def _finish(
     *,
     review_id: uuid.UUID,
     head_sha: str,
+    fingerprint: str,
     attempt: int,
     status: ClassificationReviewStatus,
     **fields: Any,
 ) -> bool:
     """The single terminal write, guarded so a run settles exactly its OWN claim.
 
-    All four predicates earn their place: `id` names the row, `status == running` stops
-    a second terminal write, `head_sha` stops a runner whose version was replaced under
-    it (the row survives a takeover here, unlike a deployment row), and `attempt` stops
-    a zombie from an earlier same-version run settling the retry that superseded it."""
+    Every predicate earns its place: `id` names the row, `status == running` stops a second
+    terminal write, the commit and the fingerprint stop a runner whose pair was replaced under
+    it (the row survives a takeover here, unlike a deployment row, and a fingerprint takeover
+    keeps the commit and resets the attempt to 1), and `attempt` stops a zombie from an earlier
+    run of the same pair settling the retry that superseded it."""
     result = await db.execute(
         sa.update(ClassificationReview)
         .where(
             ClassificationReview.id == review_id,
             ClassificationReview.status == ClassificationReviewStatus.RUNNING,
             ClassificationReview.head_sha == head_sha,
+            ClassificationReview.definitions_fingerprint == fingerprint,
             ClassificationReview.attempt == attempt,
         )
         .values(status=status, finished_at=sa.func.now(), **fields)
@@ -366,9 +395,9 @@ def _rows_touched(result: object) -> int:
 async def get_for_app(db: AsyncSession, *, app_id: uuid.UUID) -> ReviewRecord | None:
     """The app's one review row, frozen, or None if no review was ever claimed.
 
-    The record carries its `head_sha` and the CALLER compares it to the version in hand —
-    a stored row for an older version must never be read as the answer for a newer one,
-    and the store cannot know which version the caller is asking about."""
+    The record carries its commit and fingerprint and the CALLER compares them to the pair in
+    hand (`is_for`) — a stored row for an older pair must never be read as the answer for a
+    newer one, and the store cannot know which pair the caller is asking about."""
     row = (
         await db.execute(sa.select(*_RECORD_COLUMNS).where(ClassificationReview.app_id == app_id))
     ).one_or_none()

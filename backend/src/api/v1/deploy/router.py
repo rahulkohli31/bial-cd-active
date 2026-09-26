@@ -10,14 +10,14 @@ only the 202 would read as a promise the route does not make on every path. The 
 style choice: a deploy runs for minutes and the edge gateway times out at twenty seconds.
 
 THE PUBLISH GATE IS A PRECEDENCE LADDER. The request names the commit the owner acted on.
-`deploy_project` checks it is the saved version, reads the platform's own stored review of
-it, merges that with the citizen's declaration (stricter-of per question), and lands on
-exactly one of three outcomes in precedence order: refuse, PUBLISH, or ROUTE into the admin
-approve queue. The ladder is PROSE plus `# --- rule N ---` markers in `deploy_project`'s
-body; there is no `_LADDER` constant. THE INVARIANT ON THAT LAST OUTCOME: a routed deploy
-leaves the app in the queue at exactly the version examined, and publishes nothing.
-Approving a queued version publishes it (`admin/router.py`'s `approve`); the approved commit
-named here republishes that same copy, which is the owner's Try again.
+`deploy_project` refuses a disabled or waiting app, republishes the approved copy when the
+request names the approved commit, and refuses any commit that is not the saved version. For the
+saved version, `deploy/gate.py` decides from the platform's stored review, the live
+configuration and the owner's answers: a hard block, an unfinished review, a standing rejection
+or a score over the threshold ROUTES into the admin queue, and anything else PUBLISHES. A route
+needs the owner's note. THE INVARIANT ON A ROUTE: the app is queued at exactly the version
+examined, and nothing publishes. Approving it publishes that copy (`admin/router.py`'s
+`approve`); the approved commit named here republishes it, which is the owner's Try again.
 
 NO AUTHENTICATION ON THE PUBLISHED APP, deliberately out of scope: until that lands, anyone
 with the URL can open any deployed app. `ingress` is `external` (`deploy/config.py`); whether
@@ -44,7 +44,6 @@ from src.api.v1.classification.deps import ReviewService
 from src.api.v1.deploy.deps import OptionalDeployService, OptionalPublishedAppRemover
 from src.api.v1.deploy.schemas import (
     ApprovalState,
-    DataClassificationAnswers,
     DeploymentResponse,
     DeployRequest,
     DeployRoutedResponse,
@@ -69,14 +68,12 @@ from src.db.models.user import User
 from src.schemas import ADMIN_AUTH, AUTH_401, ErrorEnvelope, error_responses
 from src.services.approvals.submit import submit_app_for_review
 from src.services.audit.log import append_audit
-from src.services.classification.merge import merge_questions
+from src.services.classification.config import load_live_config
 from src.services.deploy import store
-from src.services.deploy.classification import total_weight
 from src.services.deploy.gate import (
-    ReviewAtHead,
     append_gate_audit,
+    decide,
     declaration_document,
-    merge_inputs,
     review_at_head,
 )
 from src.services.deploy.names import published_app_name
@@ -134,11 +131,11 @@ _WAITING_MSG = (
     "This version is already waiting for an administrator's review — "
     "withdraw it if you need to submit a different one."
 )
-_EXPLANATION_REQUIRED = (
-    "This app handles higher-sensitivity data — please explain what it does "
-    "with it before sending it for review."
+_NOTE_REQUIRED = "This app needs an administrator. Add a note for them before sending it."
+_UNKNOWN_CLASS = (
+    "Your answers name a class that is not part of the check any more. Reopen the dialog and "
+    "try again."
 )
-_ANSWERS_REQUIRED = "Answer the questions about your app's data before sending it."
 _ROUTED_MSG = (
     "Your app was sent to an administrator for review. You'll be able to publish "
     "this exact version once it's approved."
@@ -226,10 +223,11 @@ async def _owned_app_row(
             (
                 422,
                 ErrorEnvelope,
-                "The saved version sent without answers (`answers_required`), or a weighted "
-                "Yes on the merged answers with no explanation (`explanation_required`); an "
-                "incomplete body is FastAPI's own validation 422 with the "
-                '`{"detail": [...]}` shape instead',
+                "A send that goes to an administrator with no note (`note_required`, with "
+                "`error.detail.reason` one of `hard_block`, `over_threshold`, "
+                "`review_unfinished`, `rejection_standing`), or an answer for a class that is "
+                "not active (`unknown_class`); an incomplete body is FastAPI's own validation "
+                '422 with the `{"detail": [...]}` shape instead',
             ),
             (
                 503,
@@ -263,24 +261,15 @@ async def deploy_project(
     #   2.  pending                                      -> refuse: waiting
     #   3.  approved AND the commit is the approved one  -> PUBLISH the approved submission copy
     #   4.  the commit is not H                          -> refuse: snapshot_moved
-    #   5.  the stored review for H anything other than
-    #         genuinely COMPLETE (absent, stale, still
-    #         running, aged out, failed, or complete-
-    #         but-flagged-partial)                       -> ROUTE
-    #   6.  rejected                                     -> ROUTE    (sticky, whatever a fresh
-    #                                                       review says)
-    #   7.  any weighted category merges to Yes          -> ROUTE
-    #   8.  otherwise                                    -> PUBLISH the saved snapshot, pinned to H
+    #   5+. `gate.decide`: an unfinished review for (H, the live class definitions), a hard
+    #       block answered Yes, a standing rejection, or a score over the threshold -> ROUTE,
+    #       with the owner's note; otherwise -> PUBLISH the saved snapshot, pinned to H
     #
-    # Rule 3 sits ABOVE rule 7 deliberately: the review keeps returning the same Yes for the same
-    # code, so without it an approved app would route forever. Rule 5 says COMPLETE (status, the
-    # runner's own completeness signal, AND the age ceiling) because a review still running is
-    # neither absent nor failed — falling through to rule 7 there would publish on the citizen's
-    # word alone, reachable by answering six questions faster than the review lands.
+    # Rule 3 sits ABOVE the decision deliberately: the review keeps returning the same answers
+    # for the same code, so without it an approved app would route forever.
     #
     # THE GATE READS THE STORED REVIEW, NEVER THE BROWSER'S COPY: the request schema has no
-    # review field, unknown body keys are dropped at the boundary, and both answer sets plus the
-    # merge outcome are computed right here, server-side.
+    # review field and unknown body keys are dropped at the boundary.
     await owned_project_or_404(db, user.id, project_id)
 
     app_row = await _owned_app_row(db, project_id=project_id, user_id=user.id)
@@ -289,12 +278,8 @@ async def deploy_project(
         # exist, so a client asserts on `error.code` once for both.
         raise AppApiError(status.HTTP_409_CONFLICT, _NOTHING_TO_DEPLOY, code=FAIL_NO_SNAPSHOT)
 
-    answers = body.answers
-    flags = answers.classification_flags() if answers is not None else None
-    # The citizen's explanation passes through the shared redactor before it is
-    # stored anywhere — it lands in the same records the review's own text is kept clean of.
-    notes = (answers.notes or "").strip() if answers is not None else ""
-    explanation = redact_secrets(notes) if notes else None
+    # The owner's note passes through the shared redactor before it is stored anywhere.
+    note = redact_secrets(body.note.strip()) if body.note and body.note.strip() else None
 
     # --- rules 1 and 2: plain refusals ----------------------------------------------
     if app_row.status is AppStatus.DISABLED:
@@ -305,14 +290,14 @@ async def deploy_project(
             project_id=project_id,
             decision="refused",
             rule="disabled",
-            extra={"citizenAnswers": flags, "explanation": explanation},
+            extra={"ownerAnswers": body.answers, "note": note},
         )
         await db.commit()
         raise AppApiError(status.HTTP_409_CONFLICT, _DISABLED_MSG, code="app_disabled")
 
     if app_row.status is AppStatus.PENDING:
         # The structured 409: the state, the submitted version, and the rejection
-        # note when one exists — everything both citizen surfaces need to render the
+        # note when one exists — everything both owner surfaces need to render the
         # waiting state without a second call.
         pending = {
             "status": AppStatus.PENDING.value,
@@ -329,17 +314,12 @@ async def deploy_project(
             project_id=project_id,
             decision="refused",
             rule="pending",
-            extra={"citizenAnswers": flags, "explanation": explanation},
+            extra={"ownerAnswers": body.answers, "note": note},
         )
         await db.commit()
         raise AppApiError(
             status.HTTP_409_CONFLICT, _WAITING_MSG, code="waiting_for_review", detail=pending
         )
-
-    # Read off `rejection_standing`, NOT off `status`: a rejected app that routes (REJECTED ->
-    # PENDING) and is then withdrawn (PENDING -> DRAFT) has a status that forgot the refusal.
-    # `approve` alone clears the flag, which is what "an administrator lifts it" means.
-    rejected = app_row.rejection_standing
 
     # A build session writing files while the snapshot is taken would ship a tree that
     # never coherently existed: valid bytes, wrong app, undetectable afterwards.
@@ -370,6 +350,7 @@ async def deploy_project(
             app_row=app_row,
             project_id=project_id,
             declaration=app_row.declaration,
+            records_decision=False,
             expected_commit_sha=copy.commit_sha,
             bundle_key=submission_key(app_row.id, copy.submission_id),
             rule="approved_override",
@@ -388,48 +369,56 @@ async def deploy_project(
         )
         raise AppApiError(status.HTTP_409_CONFLICT, _SNAPSHOT_MOVED_MSG, code="snapshot_moved")
 
-    if answers is None or flags is None:
-        raise AppApiError(
-            status.HTTP_422_UNPROCESSABLE_CONTENT, _ANSWERS_REQUIRED, code="answers_required"
-        )
-
-    # THE STORED REVIEW, read through the same service the review routes resolve — by
-    # app, situated against H by `gate.review_at_head`. Never a browser-supplied copy.
-    readout = await reviews.read(db, app_id=app_row.id)
-    review: ReviewAtHead = review_at_head(readout, head_sha)
-
-    # Both answer sets and the merge outcome, computed server-side on every branch below,
-    # because the record of EVERY decision must carry the effective answers and the
-    # differences.
-    merged = merge_questions(merge_inputs(flags, review))
-    declaration = declaration_document(
-        head_sha=head_sha, citizen=flags, explanation=explanation, review=review, merged=merged
+    # --- rules 5 onward: the decision -------------------------------------------------
+    # THE STORED REVIEW, read through the same service the review routes resolve, situated
+    # against H and the live class definitions. Never a browser-supplied copy.
+    config = await load_live_config(db)
+    review = review_at_head(
+        await reviews.read(db, app_id=app_row.id), head_sha=head_sha, config=config
     )
-    score = total_weight(flags)
+    if review.current:
+        # Against a current review the dialog showed exactly the live classes, so a key outside
+        # them is a stale or forged answer. Against any other review the answers do not count.
+        unknown = sorted(set(body.answers) - {entry.key for entry in config.classes})
+        if unknown:
+            raise AppApiError(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                _UNKNOWN_CLASS,
+                code="unknown_class",
+                detail={"keys": unknown},
+            )
+    if body.answers and not config.owners_can_change_answers:
+        _log.warning(
+            "publish_gate_owner_answers_ignored",
+            app_id=str(app_row.id),
+            keys=sorted(body.answers),
+        )
+    decision = decide(
+        config=config,
+        review=review,
+        owner_answers=body.answers,
+        rejection_standing=app_row.rejection_standing,
+    )
 
-    # The explanation is obliged exactly when the MERGED answers would route. A 422, not a
-    # gate outcome: an unexplained weighted Yes is an INCOMPLETE submission, not a rejected
-    # one, so it writes no `publish_gate` row. `explanation_owed`, NOT `any_weighted_yes`: a
-    # Tier A hit the review overruled, or a Yes the review discarded, both route — but the form
-    # showed the review answering No, so no answer the citizen could type would satisfy it.
-    if merged.explanation_owed and explanation is None:
-        # Name the categories that oblige the explanation: the form marks the fields it is
-        # asking about, and these are questionnaire keys the citizen already sees.
+    if decision.reason is not None and note is None:
+        # A 422, not a gate outcome: a route with no note is an incomplete send, not a
+        # refused one, so it writes no `publish_gate` row.
         raise AppApiError(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
-            _EXPLANATION_REQUIRED,
-            code="explanation_required",
-            detail={
-                "weightedYesKeys": [
-                    question.key
-                    for question in merged.questions
-                    if question.weighted_yes and not question.disputed_only
-                ]
-            },
+            _NOTE_REQUIRED,
+            code="note_required",
+            detail={"reason": decision.reason.value},
         )
 
-    # --- rule 5: no genuinely-COMPLETE review for H -> ROUTE, whatever was answered
-    if not review.complete:
+    declaration = declaration_document(
+        head_sha=head_sha,
+        decided_at=datetime.now(UTC),
+        config=config,
+        review=review,
+        decision=decision,
+        note=note,
+    )
+    if decision.reason is not None:
         return await _route_to_review(
             db,
             storage,
@@ -438,39 +427,9 @@ async def deploy_project(
             project_id=project_id,
             head_sha=head_sha,
             declaration=declaration,
-            rule="review_not_current",
+            rule=decision.reason.value,
             response=response,
         )
-
-    # --- rule 6: a rejection is sticky — an administrator lifts it, a re-roll never
-    if rejected:
-        return await _route_to_review(
-            db,
-            storage,
-            user=user,
-            app_row=app_row,
-            project_id=project_id,
-            head_sha=head_sha,
-            declaration=declaration,
-            rule="rejection_standing",
-            response=response,
-        )
-
-    # --- rule 7: any weighted category merged to Yes -> ROUTE -----------------------
-    if merged.any_weighted_yes:
-        return await _route_to_review(
-            db,
-            storage,
-            user=user,
-            app_row=app_row,
-            project_id=project_id,
-            head_sha=head_sha,
-            declaration=declaration,
-            rule="weighted_yes",
-            response=response,
-        )
-
-    # --- rule 8: nothing weighted from either side -> PUBLISH, unattended ----------
     return await _start_pipeline(
         db,
         service=service,
@@ -478,10 +437,9 @@ async def deploy_project(
         app_row=app_row,
         project_id=project_id,
         declaration=declaration,
+        records_decision=True,
         expected_commit_sha=head_sha,
         rule="all_clear",
-        answers=answers,
-        score=score,
     )
 
 
@@ -585,22 +543,21 @@ async def _start_pipeline(
     app_row: AppRegistry,
     project_id: uuid.UUID,
     declaration: dict[str, Any] | None,
+    records_decision: bool,
     expected_commit_sha: str,
     rule: str,
     bundle_key: str | None = None,
-    answers: DataClassificationAnswers | None = None,
-    score: int | None = None,
 ) -> DeployStartedResponse:
     """PUBLISH: start the pipeline and hand back the id to poll.
 
     `expected_commit_sha` pins the tree the pipeline extracts to the version the gate decided
     about, and fails the deploy closed when it is another. `bundle_key` names the approved
-    submission copy when that is what ships."""
+    submission copy when that is what ships. `records_decision` stores `declaration` on the app
+    row, as a route does; the approved copy keeps the declaration it was approved under."""
     # THE UNCONFIGURED-DEPLOY 503 LIVES HERE, not at the top of the route: routing needs object
     # storage and the queue, never the deploy service, so every ROUTE branch completes without it.
     if service is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE)
-    classification = answers.model_dump() if answers is not None else None
     try:
         started = await service.start(
             db,
@@ -608,20 +565,16 @@ async def _start_pipeline(
             app_id=app_row.id,
             project_id=project_id,
             conversation_id=app_row.conversation_id,
-            classification=classification,
-            classification_score=score,
             expected_commit_sha=expected_commit_sha,
             bundle_key=bundle_key,
         )
     except DeployNotPossibleError as exc:
         raise AppApiError(status.HTTP_409_CONFLICT, str(exc), code=exc.code) from None
 
-    detail: dict[str, Any] = {"deploymentId": str(started.deployment_id)}
-    if answers is not None:
-        # What was declared, on the gated action itself: audit outlives the deployment row,
-        # which deleting the app cascades away.
-        detail["classificationScore"] = score
-        detail["classification"] = classification
+    # After the claim, which commits on its own: a refused claim must not leave the app row
+    # carrying a decision that never took effect.
+    if records_decision:
+        app_row.declaration = declaration
     await _audit_gate(
         db,
         user=user,
@@ -630,7 +583,7 @@ async def _start_pipeline(
         decision="published",
         rule=rule,
         declaration=declaration,
-        extra=detail,
+        extra={"deploymentId": str(started.deployment_id)},
     )
     await db.commit()
 

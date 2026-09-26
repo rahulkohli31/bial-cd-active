@@ -99,8 +99,6 @@ _EXPECTED_COLUMNS = frozenset(
         "finished_at",
         "created_at",
         "updated_at",
-        "classification",  # 0026 — the data-classification gate
-        "classification_score",  # 0029 — the review's score
         "unpublished_at",  # 0028 — the marketplace unpublish stamp
     }
 )

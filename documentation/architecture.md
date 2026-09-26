@@ -124,12 +124,22 @@ destroying look atomic to the person waiting.
 
 Asking to publish does not publish. The request names the version the author reviewed, and the gate
 decides about exactly that version: the saved one. A request about any other version is refused, so
-a save that lands after the author looked cannot slip into production under their answers. The gate
-merges two independent judgements about the version — the platform's own review of it, and the
-author's answers to what they are asked to declare — taking the stricter of the two wherever they
-disagree. It produces one of three outcomes: refuse, publish, or route the application into an
-administrator's queue. A request that is routed publishes nothing and leaves the application queued
-at exactly the version that was examined.
+a save that lands after the author looked cannot slip into production under their answers. It
+produces one of three outcomes: refuse, publish, or route the application into an administrator's
+queue. A request that is routed publishes nothing and leaves the application queued at exactly the
+version that was examined.
+
+**What the gate decides with is configured by administrators, not written into the code.** A
+reviewer agent reads the saved version and answers Yes or No for each active data class. A class is
+either a hard block, where a Yes always routes, or scored, where a Yes adds the class's weight to a
+score that is compared with a threshold. Whether the author may correct the reviewer's answers for
+scored classes is itself a setting; hard blocks are always the reviewer's. A review counts only for
+the saved version and for the class definitions it read: adding, rewording
+or switching off a class means the next attempt is reviewed again, while a change to a weight, a
+kind or the threshold applies from the next request without one. An application routes when a hard
+block is answered Yes, when there is no finished review, when an administrator's rejection stands,
+or when the score is over the threshold, and a route requires a note from the author. Every
+decision, publish or route, is recorded with the configuration it was made under.
 
 Saving happens before the review, never at send time. Opening the publish dialog saves any unsaved
 work first, the review runs on that saved version, and the dialog asks about that version and no

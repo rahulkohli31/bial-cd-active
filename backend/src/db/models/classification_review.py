@@ -1,14 +1,15 @@
-"""The `classification_reviews` table — ONE row per app, upserted and stamped with the commit
-it read (`head_sha`), so a stale answer for an older commit is detectable rather than kept.
+"""The `classification_reviews` table — ONE row per app, upserted and stamped with the commit it
+read (`head_sha`) and the class definitions it answered (`definitions_fingerprint`), so a stale
+answer is detectable rather than kept.
 
-Opposite of `deployments` on purpose: reviews are overwritten wholesale when the version moves
+Opposite of `deployments` on purpose: reviews are overwritten wholesale when either stamp moves
 because a stale claim is worse than none, while `deployments` stays append-only so a failed
 attempt can never overwrite the version still serving.
 
-`attempt` resets per version because review bypasses the daily token gate — service layer caps
-it at three per version, not the store. `evidence` (the machine-checkable half of `verdicts`)
-is NEVER projected to the citizen or administrator. `answers_complete` is independent of
-`status`: COMPLETE can still answer fewer than six, which the publish gate treats as failed.
+`attempt` resets per stamp pair because review bypasses the daily token gate — the service caps
+it at three per pair, not the store. `evidence` (the machine-checkable half of `verdicts`) is
+NEVER projected to the owner or administrator. The publish gate reads a COMPLETE row as a review
+only when `answers_complete` is also true.
 """
 
 from __future__ import annotations
@@ -88,25 +89,25 @@ class ClassificationReview(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMix
         server_default=ClassificationReviewStatus.RUNNING.value,
     )
 
-    # How many runs have been claimed for THIS `head_sha`. Increments per same-version
-    # claim, resets to 1 when the version changes. The cap (three) is service-layer
-    # policy; the store only counts.
+    # How many runs have been claimed for THIS commit and fingerprint. Increments per claim of
+    # the same pair, resets to 1 when either changes. The cap (three) is service-layer policy;
+    # the store only counts.
     attempt: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default=sa.text("1"))
 
-    # The six verdicts with their plain-language reasons, keyed by `CLASSIFICATION_KEYS`.
-    # NULL while running and after a failure — a failed run stores its bucket, never a
-    # partial answer set dressed up as one.
+    # Each class's verdict and plain-language reason, keyed by class key. NULL while running and
+    # after a failure — a failed run stores its bucket, never a partial answer set dressed up as
+    # one. Rows from before the fingerprint hold an older shape and are never read as current.
     verdicts: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
-    # The machine-checkable evidence behind each verdict. INTERNAL: stored for the
-    # gate and the disagreement record, never shown to the citizen or the administrator.
+    # The locations cited behind each verdict and the scan's hits. INTERNAL: never shown to the
+    # owner or the administrator.
     evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
-    # Whether the run answered all six questions. NULL until a terminal write; a
-    # COMPLETE row carrying False is treated as failed by the publish gate's ladder.
+    # Whether the run answered every class. NULL until a terminal write; a COMPLETE row carrying
+    # False is treated as failed by the publish gate.
     answers_complete: Mapped[bool | None] = mapped_column(sa.Boolean, nullable=True)
 
-    # The failure bucket (one of five defined states) and its redacted, length-capped
+    # The failure bucket (a stable code the service defines) and its redacted, length-capped
     # detail. The detail is model- and workspace-influenced text; the writer redacts it
     # before it lands here, same as `deployments.failure_detail`.
     failure_code: Mapped[str | None] = mapped_column(sa.String(MAX_FAILURE_CODE), nullable=True)

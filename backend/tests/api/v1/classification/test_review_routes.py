@@ -34,11 +34,13 @@ from src.api.deps import storage_or_none_dependency
 from src.api.v1.classification.deps import review_service_dependency
 from src.api.v1.classification.router import REVIEW_RATE_LIMIT
 from src.db.models.app_registry import AppRegistry
+from src.db.models.classification_config import ClassificationClass
 from src.db.models.classification_review import ClassificationReview, ClassificationReviewStatus
 from src.db.models.project import Project
 from src.db.models.user import User
 from src.db.session import get_db
 from src.services.classification import store
+from src.services.classification.config import load_live_config
 from src.services.classification.constants import REVIEW_WALL_CLOCK_CEILING_S
 from src.services.classification.service import (
     FAIL_ABANDONED,
@@ -48,7 +50,6 @@ from src.services.classification.service import (
     MAX_MODEL_RUNS_PER_VERSION,
     ClassificationReviewService,
 )
-from src.services.deploy.classification import CLASSIFICATION_KEYS
 from src.services.storage import snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
@@ -81,7 +82,7 @@ class NoRunService(ClassificationReviewService):
         super().__init__(session_factory=_no_sessions, model_factory=_no_model)
         self.runs: list[store.ReviewRecord] = []
 
-    async def _run(self, *, review, extracted) -> None:
+    async def _run(self, *, review, classes) -> None:
         self.runs.append(review)
 
 
@@ -130,64 +131,54 @@ async def _save_bundle(storage: FakeStorage, app_id, *, head_sha: str = _V1) -> 
     await storage.put(snapshot_key(app_id), b"not-a-real-bundle", metadata={"head_sha": head_sha})
 
 
-def _stored_verdicts() -> dict[str, Any]:
-    """The runner's stored shape — including the fields the response must NOT carry
-    (scan agreement, downgrade marker, the scan block)."""
-    questions: dict[str, Any] = {
-        key: {
-            "verdict": "no",
-            "reason": "Nothing of this kind was found in the app.",
-            "agreed_with_scan": True,
-            "downgraded_from_yes": False,
-        }
-        for key in CLASSIFICATION_KEYS
+async def _live_keys(db) -> list[str]:
+    return [entry.key for entry in (await load_live_config(db)).classes]
+
+
+async def _fingerprint(db) -> str:
+    return (await load_live_config(db)).fingerprint
+
+
+async def _stored_verdicts(db) -> dict[str, Any]:
+    """The runner's stored shape, for every live class."""
+    answers: dict[str, Any] = {
+        key: {"verdict": "no", "reason": "Nothing of this kind was found in the app."}
+        for key in await _live_keys(db)
     }
-    questions["credentials_secrets"] = {
+    answers["credentials_keys"] = {
         "verdict": "yes",
         "reason": "The app's saved code contains what looks like a real sign-in secret.",
-        "agreed_with_scan": True,
-        "downgraded_from_yes": False,
     }
-    questions["health_data"]["verdict"] = "unanswered"
-    questions["health_data"]["reason"] = "Not enough evidence either way."
-    return {
-        "source": "review",
-        "questions": questions,
-        "scan": {
-            "tier_a_hit": True,
-            "tier_b_hit": False,
-            "incomplete": False,
-            "tier_a_dispute": False,
-        },
-    }
+    return {"classes": answers}
 
 
-def _stored_evidence() -> dict[str, Any]:
+async def _stored_evidence(db) -> dict[str, Any]:
     """The INTERNAL half: cited locations and scan hits, marker-laden."""
     return {
-        "questions": {
-            key: (
-                [{"path": _SECRET_PATH, "kind": "code", "valid": True}]
-                if key == "credentials_secrets"
-                else []
-            )
-            for key in CLASSIFICATION_KEYS
+        "classes": {
+            key: ([{"path": _SECRET_PATH, "kind": "code"}] if key == "credentials_keys" else [])
+            for key in await _live_keys(db)
         },
         "scan_hits": [{"path": _SECRET_PATH, "family": _SECRET_FAMILY, "tier": "a", "line": 12}],
-        "downgraded": [],
     }
 
 
-async def _complete_row(db, *, app_id, user_id, head_sha: str = _V1) -> store.ReviewRecord:
-    outcome = await store.claim(db, app_id=app_id, user_id=user_id, head_sha=head_sha)
+async def _complete_row(
+    db, *, app_id, user_id, head_sha: str = _V1, fingerprint: str | None = None
+) -> store.ReviewRecord:
+    fingerprint = fingerprint or await _fingerprint(db)
+    outcome = await store.claim(
+        db, app_id=app_id, user_id=user_id, head_sha=head_sha, fingerprint=fingerprint
+    )
     assert outcome.claimed is True
     settled = await store.succeed(
         db,
         review_id=outcome.review.review_id,
         head_sha=head_sha,
+        fingerprint=fingerprint,
         attempt=outcome.review.attempt,
-        verdicts=_stored_verdicts(),
-        evidence=_stored_evidence(),
+        verdicts=await _stored_verdicts(db),
+        evidence=await _stored_evidence(db),
         answers_complete=True,
     )
     assert settled is True
@@ -205,13 +196,17 @@ async def _failed_row(
 ) -> None:
     """`times` failed attempts, claimed and settled the way the real runner would —
     three of them is the attempt cap, reached legitimately rather than poked in."""
+    fingerprint = await _fingerprint(db)
     for _ in range(times):
-        outcome = await store.claim(db, app_id=app_id, user_id=user_id, head_sha=head_sha)
+        outcome = await store.claim(
+            db, app_id=app_id, user_id=user_id, head_sha=head_sha, fingerprint=fingerprint
+        )
         assert outcome.claimed is True
         settled = await store.fail(
             db,
             review_id=outcome.review.review_id,
             head_sha=head_sha,
+            fingerprint=fingerprint,
             attempt=outcome.review.attempt,
             code=code,
             detail="scripted failure",
@@ -247,12 +242,13 @@ async def test_a_stored_complete_review_for_the_current_version_returns_without_
     assert body["headSha"] == _V1
     assert body["reviewedSha"] == _V1
     assert body["savedAt"] is not None
+    assert body["checkedAt"] is not None
+    assert body["current"] is True
     verdicts = body["verdicts"]
-    assert verdicts["credentialsSecrets"]["verdict"] == "yes"
-    assert verdicts["credentialsSecrets"]["reason"]
-    # `unanswered` survives as its own verdict, distinct from `no`.
-    assert verdicts["healthData"]["verdict"] == "unanswered"
-    assert verdicts["financialData"]["verdict"] == "no"
+    assert set(verdicts) == set(await _live_keys(db_session))  # class keys, as stored
+    assert verdicts["credentials_keys"]["verdict"] == "yes"
+    assert verdicts["credentials_keys"]["reason"]
+    assert verdicts["financial_data"]["verdict"] == "no"
     assert wire.service.runs == []
 
 
@@ -371,8 +367,8 @@ async def test_a_burst_of_review_starts_is_rate_limited_per_user(wire, client, d
     so without this a save/ensure loop mints premium-model runs without limit.
 
     Refusing here cannot open the gate: it only declines to START a review, and an app
-    with no complete review for its version is routed to an administrator by ladder rule
-    4. The failure direction is toward a human."""
+    with no complete review for its version is routed to an administrator. The failure
+    direction is toward a human."""
     user, app_row = await _owner_with_app(db_session)
     await _save_bundle(wire.storage, app_row.id)
     url = _PATH.format(pid=app_row.project_id)
@@ -417,11 +413,10 @@ async def test_csrf_is_required_on_the_ensure_route(wire, client, db_session) ->
 # --- the read route -----------------------------------------------------------------
 
 
-async def test_a_failed_review_reads_as_its_bucket_with_six_unanswered_questions(
+async def test_a_failed_review_reads_as_its_bucket_with_no_answers(
     wire, client, db_session
 ) -> None:
-    """The failure is a bucket plus six questions handed back to the citizen —
-    never readable as six No's, and `unanswered` is what every one of them says."""
+    """The failure is a bucket, never readable as a set of No's."""
     user, app_row = await _owner_with_app(db_session)
     await _save_bundle(wire.storage, app_row.id, head_sha=_V1)
     await _failed_row(db_session, app_id=app_row.id, user_id=user.id, head_sha=_V1)
@@ -434,11 +429,9 @@ async def test_a_failed_review_reads_as_its_bucket_with_six_unanswered_questions
     assert body["failureCode"] == FAIL_REVIEW
     assert body["failureMessage"] == "The automatic check couldn't run."
     assert body["retryable"] is True
-    verdicts = body["verdicts"]
-    assert len(verdicts) == len(CLASSIFICATION_KEYS)
-    for entry in verdicts.values():
-        assert entry["verdict"] == "unanswered"
-        assert entry["reason"]
+    assert body["current"] is True
+    assert body["checkedAt"] is not None
+    assert body["verdicts"] is None
     assert wire.service.runs == []
 
 
@@ -450,7 +443,13 @@ async def test_polling_a_running_review_downloads_nothing_and_starts_nothing(
     GET can never claim a run."""
     user, app_row = await _owner_with_app(db_session)
     await _save_bundle(wire.storage, app_row.id, head_sha=_V1)
-    outcome = await store.claim(db_session, app_id=app_row.id, user_id=user.id, head_sha=_V1)
+    outcome = await store.claim(
+        db_session,
+        app_id=app_row.id,
+        user_id=user.id,
+        head_sha=_V1,
+        fingerprint=await _fingerprint(db_session),
+    )
     assert outcome.claimed is True
 
     for _ in range(3):
@@ -475,7 +474,13 @@ async def test_an_aged_out_running_review_reads_as_abandoned_and_the_next_ask_un
     anything; the next ensure settles the wedge and claims attempt 2."""
     user, app_row = await _owner_with_app(db_session)
     await _save_bundle(wire.storage, app_row.id, head_sha=_V1)
-    outcome = await store.claim(db_session, app_id=app_row.id, user_id=user.id, head_sha=_V1)
+    outcome = await store.claim(
+        db_session,
+        app_id=app_row.id,
+        user_id=user.id,
+        head_sha=_V1,
+        fingerprint=await _fingerprint(db_session),
+    )
     assert outcome.claimed is True
     await db_session.execute(
         sa.update(ClassificationReview)
@@ -537,6 +542,8 @@ async def test_the_read_surfaces_both_stamps_when_the_stored_review_is_stale(
     assert body["status"] == "complete"
     assert body["reviewedSha"] == _V1
     assert body["headSha"] == _V2
+    assert body["current"] is False
+    assert body["verdicts"] is None
     assert wire.service.runs == []
 
 
@@ -560,6 +567,101 @@ async def test_a_bundle_without_a_version_stamp_reads_as_unreadable(
     assert wire.storage.gets == 0
 
 
+# --- the live configuration and the class definitions --------------------------------
+
+
+async def test_both_verbs_carry_the_live_policy_and_classes_but_never_a_description(
+    wire, client, db_session
+) -> None:
+    """The dialog renders and scores from this readout alone. A description is the reviewer's
+    instruction and never reaches an owner."""
+    user, app_row = await _owner_with_app(db_session)
+    await _save_bundle(wire.storage, app_row.id, head_sha=_V1)
+    await _complete_row(db_session, app_id=app_row.id, user_id=user.id, head_sha=_V1)
+    descriptions = (await db_session.scalars(sa.select(ClassificationClass.description))).all()
+    assert descriptions
+
+    for call in (client.post, client.get):
+        resp = await call(_PATH.format(pid=app_row.project_id), headers=auth_headers(user))
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["policy"] == {"threshold": 100, "ownersCanChangeAnswers": True}
+        assert [(c["key"], c["kind"], c["weight"]) for c in body["classes"]] == [
+            ("pii", "hard_block", None),
+            ("financial_data", "hard_block", None),
+            ("credentials_keys", "scored", 20),
+            ("confidential_business_data", "scored", 20),
+            ("ai_usage", "scored", 20),
+            ("integrations", "scored", 20),
+            ("public_data", "scored", 20),
+        ]
+        assert body["classes"][0]["title"] == "PII"
+        assert all(set(entry) == {"key", "title", "kind", "weight"} for entry in body["classes"])
+        for description in descriptions:
+            assert description not in resp.text
+
+
+async def test_a_review_under_older_class_definitions_reads_not_current_without_answers(
+    wire, client, db_session
+) -> None:
+    user, app_row = await _owner_with_app(db_session)
+    await _save_bundle(wire.storage, app_row.id, head_sha=_V1)
+    await _complete_row(
+        db_session, app_id=app_row.id, user_id=user.id, head_sha=_V1, fingerprint="0" * 64
+    )
+
+    resp = await client.get(_PATH.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "complete"
+    assert body["reviewedSha"] == _V1
+    assert body["headSha"] == _V1
+    assert body["current"] is False
+    assert body["verdicts"] is None
+    assert wire.service.runs == []
+
+
+async def test_turning_a_class_off_makes_the_stored_review_stale(wire, client, db_session) -> None:
+    user, app_row = await _owner_with_app(db_session)
+    await _save_bundle(wire.storage, app_row.id, head_sha=_V1)
+    await _complete_row(db_session, app_id=app_row.id, user_id=user.id, head_sha=_V1)
+    await db_session.execute(
+        sa.update(ClassificationClass)
+        .where(ClassificationClass.key == "public_data")
+        .values(active=False)
+    )
+
+    resp = await client.get(_PATH.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    body = resp.json()
+    assert body["current"] is False
+    assert "public_data" not in [entry["key"] for entry in body["classes"]]
+    assert "pii" in [entry["key"] for entry in body["classes"]]
+
+
+async def test_asking_after_the_class_definitions_changed_claims_a_fresh_review(
+    wire, client, db_session
+) -> None:
+    user, app_row = await _owner_with_app(db_session)
+    await _save_bundle(wire.storage, app_row.id, head_sha=_V1)
+    await _complete_row(
+        db_session, app_id=app_row.id, user_id=user.id, head_sha=_V1, fingerprint="0" * 64
+    )
+
+    resp = await client.post(_PATH.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["status"] == "running"
+    assert body["current"] is True
+    (run,) = wire.service.runs
+    assert run.attempt == 1
+    row = await _row(db_session, app_id=app_row.id)
+    assert row.definitions_fingerprint == await _fingerprint(db_session)
+    assert row.head_sha == _V1
+
+
 # --- nothing from evidence ----------------------------------------------------------
 
 
@@ -579,8 +681,6 @@ async def test_the_response_never_carries_evidence_for_any_verdict(
         text = resp.text
         assert _SECRET_PATH not in text
         assert _SECRET_FAMILY not in text
-        for admin_only in ("agreed_with_scan", "agreedWithScan", "downgraded", "tier_a", "tierA"):
-            assert admin_only not in text
         for entry in resp.json()["verdicts"].values():
             assert set(entry) == {"verdict", "reason"}
 

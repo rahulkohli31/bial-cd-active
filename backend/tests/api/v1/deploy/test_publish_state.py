@@ -195,8 +195,8 @@ def test_an_unreadable_saved_head_still_reads_newer_work_off_the_submitted_commi
     assert compute_publish_state(app, deployment, None) is PublishState.LIVE_NEWER_WORK
 
 
-def test_ladder_rule_7_unattended_publish_reads_live_off_the_saved_head_never_the_pin() -> None:
-    """An app published unattended (ladder rule 7) has `approved_commit_sha` NULL — it
+def test_an_unattended_publish_reads_live_off_the_saved_head_never_the_pin() -> None:
+    """An app published unattended has `approved_commit_sha` NULL — it
     never went through an administrator — and that column must play no part in
     deciding whether it reads as live. Deciding on the saved head against the
     deployment head, with the pin absent throughout, is the whole point."""

@@ -1,27 +1,24 @@
-"""Evaluate the classification review's budgets and its misses.
+"""Evaluate the classification review's budgets, its misses, and the golden scenarios.
 
 WHY THIS EXISTS: the review ships with PROVISIONAL ceilings (wall-clock, request budget, the
-8,000-token final-step cap) sized from ad-hoc runs that measured cost, not accuracy. This runs
-the real review loop over saved bundles and reports wall-clock, requests, tool calls, token
-classes — the final step's output count SEPARATELY, since the cap is later re-set from it — the
-six verdicts, catch/miss per seeded finding, and the deployment used (ceilings don't transfer).
-It also scores the model-free credential scan: Tier A/B precision-recall SEPARATELY, gated on
-Tier A reaching 100% precision — a Tier A false positive becomes a verdict nobody reviewed.
+per-class output cap) sized from ad-hoc runs that measured cost, not accuracy. This runs the real
+review loop against the live class configuration and reports wall-clock, requests, tool calls,
+token classes — the final step's output count SEPARATELY, since the cap is later re-set from it —
+each class's answer, catch/miss per seeded finding, and the deployment used (ceilings don't
+transfer). It also scores the model-free credential scan: Tier A/B precision-recall SEPARATELY,
+gated on Tier A reaching 100% precision.
 
-Two named figures: the FALSE-POSITIVE ROUTING RATE (known-clean bundles that would route — any
-weighted-Yes or run failure, counting a failure as a route, deliberately cautious) and the MISS
-RATE (seeded findings a completed review did not answer Yes on).
+Two named figures: the FALSE-POSITIVE ROUTING RATE (known-clean bundles the gate would route,
+counting a run failure as a route, deliberately cautious) and the MISS RATE (seeded findings a
+completed review did not answer Yes on). `--golden` runs the built-in scenarios instead of
+bundles, each with the answers the seeded class descriptions must produce.
 
 Drives `scan_snapshot` + `agent.run_review` directly, NOT `ClassificationReviewService` — the
-service's own ceilings would censor the very distributions this eval measures, and it needs no
-database or running control plane. The one service rule reused is the evidence-downgrade rule (a
-Yes with no real cited location becomes unanswered), imported from the service so catch/miss is
-judged on what production would actually store, not raw model output production would discard.
-
-Run from `backend/` with the backend env loaded (only `--help` and argument errors are env-free);
-model runs additionally need `FOUNDRY__*`, which `--scan-only` does not. Each manifest flag's
-`--help` carries its JSON shape. OUTPUT is an operator artifact: rows carry citizen file paths
-(never values), so — like the exception register's workbooks — it lives OUTSIDE the repo tree.
+service's own ceilings would censor the very distributions this eval measures. Run from
+`backend/` with the backend env loaded (only `--help` and argument errors are env-free): model
+runs read the class configuration from the database and need `FOUNDRY__*`, which `--scan-only`
+does not. OUTPUT is an operator artifact: rows carry citizen file paths (never values), so it
+lives OUTSIDE the repo tree.
 """
 
 # `--help` prints the hand-written `description=` in `_build_parser`, not this docstring.
@@ -53,6 +50,7 @@ from datetime import UTC, datetime  # noqa: E402
 from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict  # noqa: E402
 
 if TYPE_CHECKING:  # env-poisoned import chain — type-only here, runtime import is lazy
+    from src.services.classification.config import LiveConfig
     from src.services.classification.scan import CredentialSweep
 
 from pydantic_ai.exceptions import (  # noqa: E402
@@ -66,18 +64,13 @@ from pydantic_ai.models.wrapper import WrapperModel  # noqa: E402
 from pydantic_ai.settings import ModelSettings  # noqa: E402
 from pydantic_ai.usage import UsageLimits  # noqa: E402
 
-# The classification agent/scan/service modules are DELIBERATELY NOT imported here:
+# The classification agent/scan/config and the gate are DELIBERATELY NOT imported here:
 # their import chain reaches `src.services.agent` (package init) and the DB engine,
 # which resolve the full Settings at import — so importing them at module level would
 # make even `--help` demand a configured environment. They are imported inside the
-# functions that run the sweep (`_evaluate_one`, `_apply_evidence_rule`); everything
-# imported below is verified env-free.
+# functions that run the sweep; everything imported below is verified env-free.
 from src.core.redaction import Tier, redact_and_cap  # noqa: E402
-from src.services.classification.schema import Completeness, ReviewOutput  # noqa: E402
-from src.services.deploy.classification import (  # noqa: E402
-    CLASSIFICATION_KEYS,
-    DATA_CLASSIFICATION_QUESTIONS,
-)
+from src.services.classification.schema import ReviewOutput  # noqa: E402
 from src.services.storage.bundle import (  # noqa: E402
     BundleValidationError,
     parse_bundle_head_sha,
@@ -90,12 +83,6 @@ from src.services.storage.snapshot_read import (  # noqa: E402
 )
 
 ModelFactory = Callable[[], Model]
-
-#: The categories whose Yes routes an app — Public Data carries weight 0 and never
-#: routes anything, so the routing-rate arithmetic must not count it.
-WEIGHTED_KEYS: Final[tuple[str, ...]] = tuple(
-    key for key, _label, weight in DATA_CLASSIFICATION_QUESTIONS if weight
-)
 
 #: Bound on one local `git clone` from a bundle (mirrors the snapshot reader's bound —
 #: a HEAD-only bundle extracts in well under this; a hang is a wedged git).
@@ -111,7 +98,6 @@ _OUTPUT_TRUNCATED: Final = "output_truncated"
 _REQUEST_LIMIT: Final = "request_limit_exhausted"
 _RUN_TIMEOUT: Final = "run_timeout"
 _MODEL_ERROR: Final = "model_error"
-_PARTIAL_REVIEW: Final = "partial_review"
 
 #: How much of a failure detail is worth keeping in the report, matching the runner's own
 #: ceiling. Its own constant rather than an import of the service's private one: this
@@ -179,7 +165,7 @@ class _FlightRecorder(WrapperModel):
         self.cache_read_tokens += usage.cache_read_tokens
         self.cache_write_tokens += usage.cache_write_tokens
         # Overwritten every step: after the run, this holds the FINAL step's count —
-        # the one the 8,000 cap binds on (only the structured output step is large).
+        # the one the output cap binds on (only the structured output step is large).
         self.final_step_output_tokens = usage.output_tokens
         self.tool_calls += sum(
             1
@@ -193,22 +179,439 @@ class _FlightRecorder(WrapperModel):
 
 
 # ---------------------------------------------------------------------------------------
+# The golden scenarios
+# ---------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GoldenScenario:
+    """One built-in app and the answers the seeded class descriptions must produce for it:
+    `expect` names classes and their answers, and `every_class_no` expects No on every active
+    class besides."""
+
+    name: str
+    files: dict[str, str]
+    expect: dict[str, str]
+    every_class_no: bool = False
+
+
+# The platform's own database client, as the generated-app template ships it (abridged).
+_PLATFORM_DB: Final[dict[str, str]] = {
+    "db/index.ts": (
+        'import { drizzle } from "drizzle-orm/node-postgres";\n'
+        'import { Pool } from "pg";\n'
+        'import * as schema from "./schema";\n\n'
+        "// The app's own database, provided by the platform.\n"
+        "let pool: Pool | undefined;\n"
+        "export function getDb() {\n"
+        '  if (typeof window !== "undefined") throw new Error("server only");\n'
+        "  pool ??= new Pool({ connectionString: process.env.BIAL_DATABASE_URL, max: 3 });\n"
+        "  return drizzle(pool, { schema });\n"
+        "}\n"
+    ),
+}
+
+# The platform's own file storage, reached the way the template's environment manifest says.
+_PLATFORM_STORAGE: Final[dict[str, str]] = {
+    "lib/storage.ts": (
+        "// The app's own file storage, provided by the platform.\n"
+        "export async function saveFile(name: string, body: Blob): Promise<string> {\n"
+        "  const base = process.env.BIAL_BLOB_CONTAINER_URL;\n"
+        "  const sas = process.env.BIAL_BLOB_SAS;\n"
+        '  if (!base || !sas) throw new Error("File storage is not configured.");\n'
+        "  const res = await fetch(`${base}/${encodeURIComponent(name)}${sas}`, {\n"
+        '    method: "PUT",\n'
+        '    headers: { "x-ms-blob-type": "BlockBlob" },\n'
+        "    body,\n"
+        "  });\n"
+        "  if (!res.ok) throw new Error(`Upload failed: ${res.status}`);\n"
+        "  return name;\n"
+        "}\n"
+    ),
+}
+
+
+def _form_page(title: str, endpoint: str, fields: Sequence[tuple[str, str, bool]]) -> str:
+    """A client form page posting JSON to `endpoint`; fields are (name, label, required)."""
+    inputs = "\n".join(
+        f'        <label>{label}<input name="{name}"{" required" if required else ""} /></label>'
+        for name, label, required in fields
+    )
+    return (
+        '"use client";\n\n'
+        "export default function Page() {\n"
+        "  async function submit(form: FormData) {\n"
+        f'    await fetch("{endpoint}", {{\n'
+        '      method: "POST",\n'
+        '      headers: { "content-type": "application/json" },\n'
+        "      body: JSON.stringify(Object.fromEntries(form)),\n"
+        "    });\n"
+        "  }\n"
+        "  return (\n"
+        '    <main className="p-6">\n'
+        f"      <h1>{title}</h1>\n"
+        "      <form action={submit}>\n"
+        f"{inputs}\n"
+        '        <button type="submit">Send</button>\n'
+        "      </form>\n"
+        "    </main>\n"
+        "  );\n"
+        "}\n"
+    )
+
+
+def _insert_route(table: str, columns: Sequence[str]) -> str:
+    values = ", ".join(f"{column}: body.{column}" for column in columns)
+    return (
+        'import { getDb } from "@/db";\n'
+        f'import {{ {table} }} from "@/db/schema";\n\n'
+        "export async function POST(req: Request) {\n"
+        "  const body = await req.json();\n"
+        f"  await getDb().insert({table}).values({{ {values} }});\n"
+        "  return Response.json({ ok: true });\n"
+        "}\n"
+    )
+
+
+def _table(table: str, columns: Sequence[tuple[str, bool]]) -> str:
+    lines = "\n".join(
+        f'  {name}: text("{name}"){".notNull()" if required else ""},'
+        for name, required in columns
+    )
+    return (
+        'import { pgTable, serial, text, timestamp } from "drizzle-orm/pg-core";\n\n'
+        f'export const {table} = pgTable("{table}", {{\n'
+        '  id: serial("id").primaryKey(),\n'
+        f"{lines}\n"
+        '  createdAt: timestamp("created_at").defaultNow(),\n'
+        "});\n"
+    )
+
+
+GOLDEN_SCENARIOS: Final[tuple[GoldenScenario, ...]] = (
+    GoldenScenario(
+        name="calculator",
+        files={
+            "app/page.tsx": (
+                '"use client";\nimport { useState } from "react";\n\n'
+                "export default function Calculator() {\n"
+                '  const [a, setA] = useState("");\n'
+                '  const [b, setB] = useState("");\n'
+                '  const [op, setOp] = useState("+");\n'
+                "  const x = Number(a);\n"
+                "  const y = Number(b);\n"
+                '  const result = op === "+" ? x + y : op === "-" ? x - y : '
+                'op === "*" ? x * y : x / y;\n'
+                "  return (\n"
+                '    <main className="p-6">\n'
+                "      <h1>Calculator</h1>\n"
+                "      <input value={a} onChange={(e) => setA(e.target.value)} />\n"
+                "      <select value={op} onChange={(e) => setOp(e.target.value)}>\n"
+                "        <option>+</option><option>-</option>\n"
+                "        <option>*</option><option>/</option>\n"
+                "      </select>\n"
+                "      <input value={b} onChange={(e) => setB(e.target.value)} />\n"
+                '      <p>Result: {Number.isFinite(result) ? result : "-"}</p>\n'
+                "    </main>\n"
+                "  );\n"
+                "}\n"
+            ),
+        },
+        expect={},
+        every_class_no=True,
+    ),
+    GoldenScenario(
+        name="feedback form asking for name, email and phone",
+        files={
+            **_PLATFORM_DB,
+            "app/page.tsx": _form_page(
+                "Passenger feedback",
+                "/api/feedback",
+                [
+                    ("name", "Name", True),
+                    ("email", "Email", True),
+                    ("phone", "Phone", False),
+                    ("comments", "Comments", True),
+                ],
+            ),
+            "app/api/feedback/route.ts": _insert_route(
+                "feedback", ["name", "email", "phone", "comments"]
+            ),
+            "db/schema.ts": _table(
+                "feedback",
+                [("name", True), ("email", True), ("phone", False), ("comments", True)],
+            ),
+        },
+        expect={"pii": "no"},
+    ),
+    GoldenScenario(
+        name="event sign-up form collecting name, email and phone",
+        files={
+            **_PLATFORM_DB,
+            "app/page.tsx": _form_page(
+                "Staff sports day sign-up",
+                "/api/signups",
+                [
+                    ("name", "Name", True),
+                    ("email", "Email", True),
+                    ("phone", "Phone", True),
+                    ("event", "Event (100m, relay, tug of war)", True),
+                ],
+            ),
+            "app/api/signups/route.ts": _insert_route(
+                "signups", ["name", "email", "phone", "event"]
+            ),
+            "db/schema.ts": _table(
+                "signups", [("name", True), ("email", True), ("phone", True), ("event", True)]
+            ),
+        },
+        expect={"pii": "no"},
+    ),
+    GoldenScenario(
+        name="feedback form that also asks for an Aadhaar number",
+        files={
+            **_PLATFORM_DB,
+            "app/page.tsx": _form_page(
+                "Passenger feedback",
+                "/api/feedback",
+                [
+                    ("name", "Name", True),
+                    ("email", "Email", True),
+                    ("phone", "Phone", False),
+                    ("aadhaar", "Aadhaar number (optional)", False),
+                    ("comments", "Comments", True),
+                ],
+            ),
+            "app/api/feedback/route.ts": _insert_route(
+                "feedback", ["name", "email", "phone", "aadhaar", "comments"]
+            ),
+            "db/schema.ts": _table(
+                "feedback",
+                [
+                    ("name", True),
+                    ("email", True),
+                    ("phone", False),
+                    ("aadhaar", False),
+                    ("comments", True),
+                ],
+            ),
+        },
+        expect={"pii": "yes"},
+    ),
+    GoldenScenario(
+        name="visitor pass app that uploads a copy of each Aadhaar card",
+        files={
+            **_PLATFORM_DB,
+            **_PLATFORM_STORAGE,
+            "app/page.tsx": (
+                "export default function Page() {\n"
+                "  return (\n"
+                '    <form action="/api/visitors" method="post" encType="multipart/form-data">\n'
+                '      <label>Visitor name<input name="name" required /></label>\n'
+                '      <label>Company<input name="company" /></label>\n'
+                '      <label>Upload Aadhaar card<input name="aadhaarCard" '
+                'type="file" required /></label>\n'
+                '      <button type="submit">Issue pass</button>\n'
+                "    </form>\n"
+                "  );\n"
+                "}\n"
+            ),
+            "app/api/visitors/route.ts": (
+                'import { getDb } from "@/db";\n'
+                'import { visitors } from "@/db/schema";\n'
+                'import { saveFile } from "@/lib/storage";\n\n'
+                "export async function POST(req: Request) {\n"
+                "  const form = await req.formData();\n"
+                '  const card = form.get("aadhaarCard") as File;\n'
+                "  const path = await "
+                "saveFile(`aadhaar/${crypto.randomUUID()}-${card.name}`, card);\n"
+                "  await getDb().insert(visitors).values({\n"
+                '    name: String(form.get("name")),\n'
+                '    company: String(form.get("company") ?? ""),\n'
+                "    aadhaarCardPath: path,\n"
+                "  });\n"
+                '  return Response.redirect(new URL("/", req.url));\n'
+                "}\n"
+            ),
+            "db/schema.ts": _table(
+                "visitors", [("name", True), ("company", False), ("aadhaarCardPath", True)]
+            ),
+        },
+        expect={"pii": "yes"},
+    ),
+    GoldenScenario(
+        name="Zoho CRM account reader",
+        files={
+            "lib/zoho.ts": (
+                'const ZOHO_API = "https://www.zohoapis.in/crm/v2";\n\n'
+                "export async function listAccounts() {\n"
+                "  const res = await "
+                "fetch(`${ZOHO_API}/Accounts?fields=Account_Name,Industry`, {\n"
+                "    headers: { Authorization: `Zoho-oauthtoken "
+                "${process.env.ZOHO_ACCESS_TOKEN}` },\n"
+                '    cache: "no-store",\n'
+                "  });\n"
+                "  if (!res.ok) throw new Error(`Zoho returned ${res.status}`);\n"
+                "  const body = await res.json();\n"
+                "  return body.data as { id: string; Account_Name: string; "
+                "Industry: string | null }[];\n"
+                "}\n"
+            ),
+            "app/page.tsx": (
+                'import { listAccounts } from "@/lib/zoho";\n\n'
+                "export default async function Page() {\n"
+                "  const accounts = await listAccounts();\n"
+                "  return (\n"
+                "    <ul>\n"
+                "      {accounts.map((a) => <li key={a.id}>{a.Account_Name} "
+                "· {a.Industry}</li>)}\n"
+                "    </ul>\n"
+                "  );\n"
+                "}\n"
+            ),
+        },
+        expect={"integrations": "yes"},
+    ),
+    GoldenScenario(
+        name="comment summariser that calls an outside language model",
+        files={
+            "package.json": (
+                '{\n  "name": "comment-summary",\n  "dependencies": {\n'
+                '    "next": "16.0.0",\n    "openai": "^5.0.0",\n    "react": "19.0.0"\n  }\n}\n'
+            ),
+            "app/api/summarise/route.ts": (
+                'import OpenAI from "openai";\n\n'
+                "const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });\n\n"
+                "export async function POST(req: Request) {\n"
+                "  const { comments } = (await req.json()) as { comments: string[] };\n"
+                "  const completion = await client.chat.completions.create({\n"
+                '    model: "gpt-4o-mini",\n'
+                "    messages: [\n"
+                '      { role: "system", content: "Summarise these passenger '
+                'comments in three bullets." },\n'
+                '      { role: "user", content: comments.join("\\n") },\n'
+                "    ],\n"
+                "  });\n"
+                "  return Response.json({ summary: completion.choices[0].message.content });\n"
+                "}\n"
+            ),
+            "app/page.tsx": (
+                '"use client";\nimport { useState } from "react";\n\n'
+                "export default function Page() {\n"
+                '  const [text, setText] = useState("");\n'
+                '  const [summary, setSummary] = useState("");\n'
+                "  async function run() {\n"
+                '    const res = await fetch("/api/summarise", {\n'
+                '      method: "POST",\n'
+                '      body: JSON.stringify({ comments: text.split("\\n") }),\n'
+                "    });\n"
+                "    setSummary((await res.json()).summary);\n"
+                "  }\n"
+                "  return (\n"
+                "    <main>\n"
+                "      <textarea value={text} onChange={(e) => setText(e.target.value)} />\n"
+                "      <button onClick={run}>Summarise</button>\n"
+                "      <pre>{summary}</pre>\n"
+                "    </main>\n"
+                "  );\n"
+                "}\n"
+            ),
+        },
+        expect={"ai_usage": "yes", "integrations": "yes"},
+    ),
+    GoldenScenario(
+        name="flight board fed by the platform's flight data connection",
+        files={
+            "lib/flight-data.ts": (
+                "// The platform's flight data connection, injected when it is switched on.\n"
+                'import { BlobServiceClient } from "@azure/storage-blob";\n'
+                'import { ManagedIdentityCredential } from "@azure/identity";\n\n'
+                "export async function departureFiles(): Promise<string[]> {\n"
+                "  const url = process.env.BIAL_FLIGHT_DATA_URL;\n"
+                "  const clientId = process.env.BIAL_FLIGHT_DATA_CLIENT_ID;\n"
+                "  if (!url || !clientId) {\n"
+                '    throw new Error("The flight data connection is switched '
+                'off for this project.");\n'
+                "  }\n"
+                "  const parsed = new URL(url);\n"
+                '  const [container, ...rest] = parsed.pathname.slice(1).split("/");\n'
+                "  const service = new BlobServiceClient(\n"
+                "    parsed.origin,\n"
+                "    new ManagedIdentityCredential({ clientId }),\n"
+                "  );\n"
+                "  const names: string[] = [];\n"
+                "  const blobs = service.getContainerClient(container).listBlobsFlat({\n"
+                '    prefix: rest.join("/"),\n'
+                "  });\n"
+                "  for await (const blob of blobs) names.push(blob.name);\n"
+                "  return names;\n"
+                "}\n"
+            ),
+            "app/page.tsx": (
+                'import { departureFiles } from "@/lib/flight-data";\n\n'
+                "export default async function Page() {\n"
+                "  const files = await departureFiles();\n"
+                "  return (\n"
+                "    <main>\n"
+                "      <h1>Today's departures</h1>\n"
+                "      <ul>{files.map((f) => <li key={f}>{f}</li>)}</ul>\n"
+                "    </main>\n"
+                "  );\n"
+                "}\n"
+            ),
+        },
+        expect={"integrations": "no"},
+    ),
+    GoldenScenario(
+        name="document library kept in the platform's file storage",
+        files={
+            **_PLATFORM_STORAGE,
+            "app/api/documents/route.ts": (
+                'import { saveFile } from "@/lib/storage";\n\n'
+                "export async function POST(req: Request) {\n"
+                "  const form = await req.formData();\n"
+                '  const file = form.get("file") as File;\n'
+                "  const name = await saveFile(`manuals/${file.name}`, file);\n"
+                "  return Response.json({ name });\n"
+                "}\n"
+            ),
+            "app/page.tsx": (
+                "export default function Page() {\n"
+                "  return (\n"
+                '    <form action="/api/documents" method="post" encType="multipart/form-data">\n'
+                "      <h1>Equipment manuals</h1>\n"
+                '      <input name="file" type="file" accept="application/pdf" required />\n'
+                '      <button type="submit">Upload</button>\n'
+                "    </form>\n"
+                "  );\n"
+                "}\n"
+            ),
+        },
+        expect={"integrations": "no"},
+    ),
+)
+
+
+# ---------------------------------------------------------------------------------------
 # The sample spec
 # ---------------------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class _Source:
-    """One bundle to evaluate: a local `.bundle` file, or an app id to pull from
-    object storage."""
+    """One app to evaluate: a local `.bundle` file, an app id to pull from object storage, or a
+    golden scenario."""
 
     bundle_id: str
-    kind: Literal["local", "storage"]
+    kind: Literal["local", "storage", "golden"]
     path: Path | None = None
     app_id: uuid.UUID | None = None
+    golden: GoldenScenario | None = None
 
     @property
     def origin(self) -> str:
+        if self.kind == "golden":
+            return "golden"
         return str(self.path) if self.kind == "local" else str(self.app_id)
 
 
@@ -247,15 +650,20 @@ def _load_seeded(path: Path) -> dict[str, tuple[str, ...]]:
         if not isinstance(categories, list) or not all(
             isinstance(category, str) for category in categories
         ):
-            raise SpecError(f"--seeded {path}: {bundle_id!r} must map to a list of categories")
-        unknown = sorted(set(categories) - set(CLASSIFICATION_KEYS))
-        if unknown:
-            raise SpecError(
-                f"--seeded {path}: unknown category(s) {', '.join(unknown)} on "
-                f"{bundle_id!r}; the six keys are {', '.join(CLASSIFICATION_KEYS)}"
-            )
+            raise SpecError(f"--seeded {path}: {bundle_id!r} must map to a list of class keys")
         seeded[str(bundle_id)] = tuple(categories)
     return seeded
+
+
+def _check_seeded(seeded: dict[str, tuple[str, ...]], keys: Sequence[str]) -> None:
+    """Every seeded class key must be an active class, or its catch/miss would measure nothing."""
+    for bundle_id, categories in seeded.items():
+        unknown = sorted(set(categories) - set(keys))
+        if unknown:
+            raise SpecError(
+                f"--seeded: unknown class key(s) {', '.join(unknown)} on {bundle_id!r}; "
+                f"the active classes are {', '.join(keys)}"
+            )
 
 
 def _load_known_clean(path: Path) -> frozenset[str]:
@@ -331,7 +739,22 @@ def _collect_sources(
     return tuple(sources)
 
 
+def _golden_sources() -> tuple[_Source, ...]:
+    return tuple(
+        _Source(bundle_id=scenario.name, kind="golden", golden=scenario)
+        for scenario in GOLDEN_SCENARIOS
+    )
+
+
 def _build_spec(args: argparse.Namespace) -> _EvalSpec:
+    if args.golden:
+        if args.bundle or args.bundle_dir or args.app_id:
+            raise SpecError("--golden runs the built-in scenarios; it takes no bundles")
+        if args.seeded or args.known_clean or args.scan_labels:
+            raise SpecError("--golden carries its own expectations; it takes no manifests")
+        return _EvalSpec(
+            sources=_golden_sources(), seeded={}, known_clean=frozenset(), scan_labels={}
+        )
     sources = _collect_sources(args.bundle, args.bundle_dir, args.app_id)
     seeded = _load_seeded(args.seeded) if args.seeded else {}
     known_clean = _load_known_clean(args.known_clean) if args.known_clean else frozenset()
@@ -409,8 +832,22 @@ def _clone_local_bundle(bundle_path: Path, scratch: Path) -> tuple[str, Path]:
     return head_sha, clone_dir
 
 
-async def _extract(source: _Source, scratch: Path) -> tuple[str, Path]:
-    """One bundle to an extracted tree, every disappointment mapped to a failure kind."""
+def _write_golden_tree(scenario: GoldenScenario, scratch: Path) -> Path:
+    root = scratch / "tree"
+    for rel_path, text in scenario.files.items():
+        target = root / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    return root
+
+
+async def _extract(source: _Source, scratch: Path) -> tuple[str | None, Path]:
+    """One app to a tree on disk, every disappointment mapped to a failure kind. A golden
+    scenario is written out and names no commit."""
+    if source.kind == "golden":
+        if source.golden is None:  # structurally impossible; fail loudly, not silently
+            raise _EvalRunFailedError(_EXTRACT_FAILED, "golden source carries no scenario")
+        return None, await asyncio.to_thread(_write_golden_tree, source.golden, scratch)
     if source.kind == "local":
         if source.path is None:  # structurally impossible; fail loudly, not silently
             raise _EvalRunFailedError(_EXTRACT_FAILED, "local source carries no path")
@@ -450,34 +887,6 @@ def _scan_doc(sweep: CredentialSweep) -> dict[str, Any]:
     }
 
 
-def _apply_evidence_rule(
-    output: ReviewOutput, root: Path
-) -> tuple[dict[str, str], dict[str, str], list[str], dict[str, Any]]:
-    """The evidence-downgrade rule, exactly as production applies it (`_cites_a_real_location`
-    is imported from the service, not copied, so the rule cannot drift): a Yes whose every
-    cited location does not exist becomes unanswered. Returns (raw, effective, downgraded,
-    evidence)."""
-    from src.services.classification.service import _cites_a_real_location
-
-    raw: dict[str, str] = {}
-    effective: dict[str, str] = {}
-    downgraded: list[str] = []
-    evidence: dict[str, Any] = {}
-    for question in output.questions:
-        refs = [
-            {"path": ref.path, "kind": ref.kind, "valid": _cites_a_real_location(root, ref.path)}
-            for ref in question.evidence
-        ]
-        raw[question.key] = question.verdict.value
-        verdict = question.verdict.value
-        if verdict == "yes" and not any(ref["valid"] for ref in refs):
-            verdict = "unanswered"
-            downgraded.append(question.key)
-        effective[question.key] = verdict
-        evidence[question.key] = refs
-    return raw, effective, downgraded, evidence
-
-
 class EvalRow(TypedDict):
     """One `row_type: "run"` report row — the wire shape, named once.
 
@@ -505,16 +914,15 @@ class EvalRow(TypedDict):
     cache_read_tokens: int | None
     cache_write_tokens: int | None
     final_step_output_tokens: int | None
-    completeness: str | None
     verdicts: dict[str, str] | None
-    effective_verdicts: dict[str, str] | None
-    downgraded: list[str] | None
     evidence: dict[str, Any] | None
     scan: dict[str, Any] | None
     seeded: list[str] | None
     caught: dict[str, bool] | None
     known_clean: bool
     would_route: bool | None
+    expected: dict[str, str] | None
+    expected_met: dict[str, bool] | None
 
 
 def _row(
@@ -528,15 +936,14 @@ def _row(
     failure_kind: str | None = None,
     failure_detail: str | None = None,
     recorder: _FlightRecorder | None = None,
-    completeness: str | None = None,
     verdicts: dict[str, str] | None = None,
-    effective_verdicts: dict[str, str] | None = None,
-    downgraded: list[str] | None = None,
     evidence: dict[str, Any] | None = None,
     scan: dict[str, Any] | None = None,
     seeded: tuple[str, ...] | None = None,
     caught: dict[str, bool] | None = None,
     would_route: bool | None = None,
+    expected: dict[str, str] | None = None,
+    expected_met: dict[str, bool] | None = None,
 ) -> EvalRow:
     """One report row. EVERY key is always present — a consumer greps a field name and
     gets every run, with null where a field could not apply."""
@@ -565,23 +972,47 @@ def _row(
         "final_step_output_tokens": (
             recorder.final_step_output_tokens if recorder and recorder.requests else None
         ),
-        "completeness": completeness,
         "verdicts": verdicts,
-        "effective_verdicts": effective_verdicts,
-        "downgraded": downgraded,
         "evidence": evidence,
         "scan": scan,
         "seeded": list(seeded) if seeded is not None else None,
         "caught": caught,
         "known_clean": known_clean,
         "would_route": would_route,
+        "expected": expected,
+        "expected_met": expected_met,
     }
+
+
+def _would_route(verdicts: dict[str, str], config: LiveConfig) -> bool:
+    """Whether the gate would route a current review with these answers and no owner changes:
+    the gate's own decision, so the routing rate follows the live policy."""
+    from src.services.deploy.gate import ReviewAtHead, decide
+
+    review = ReviewAtHead(
+        current=True,
+        status="complete",
+        failure_code=None,
+        answers={key: verdict == "yes" for key, verdict in verdicts.items()},
+        reasons={},
+    )
+    decision = decide(config=config, review=review, owner_answers={}, rejection_standing=False)
+    return decision.reason is not None
+
+
+def _expected(source: _Source, config: LiveConfig) -> dict[str, str] | None:
+    scenario = source.golden
+    if scenario is None:
+        return None
+    expected = {entry.key: "no" for entry in config.classes} if scenario.every_class_no else {}
+    return {**expected, **scenario.expect}
 
 
 async def _evaluate_one(
     source: _Source,
     spec: _EvalSpec,
     *,
+    config: LiveConfig | None,
     model_factory: ModelFactory | None,
     deployment: str | None,
     scan_only: bool,
@@ -589,9 +1020,8 @@ async def _evaluate_one(
     run_timeout: float,
     sweep_root: Path,
 ) -> EvalRow:
-    """Run one bundle end to end. NEVER raises for a per-bundle problem — a bundle that
-    fails to extract (or a run that fails in the model) is a failure ROW, and the sweep
-    moves on to the next bundle."""
+    """Run one app end to end. NEVER raises for a per-app problem — an app that fails to
+    extract (or a run that fails in the model) is a failure ROW, and the sweep moves on."""
     # Lazy on purpose — these modules' import chain resolves the full Settings (see
     # the import-block note at the top of the file).
     from src.services.classification.agent import OUTPUT_TOOL_NAME, run_review
@@ -647,8 +1077,9 @@ async def _evaluate_one(
                 seeded=seeded,
             )
 
-        if model_factory is None:  # argument validation already prevents this
-            raise SpecError("model runs requested but no model factory resolved")
+        if model_factory is None or config is None:  # argument validation already prevents this
+            raise SpecError("model runs requested but no model or configuration resolved")
+        expected = _expected(source, config)
         recorder = _FlightRecorder(model_factory(), output_tool_name=OUTPUT_TOOL_NAME)
         failure_kind: str | None = None
         failure_detail: str | None = None
@@ -659,6 +1090,7 @@ async def _evaluate_one(
                     model=recorder,
                     user_id=uuid.uuid4(),  # attribution-only; nothing persists it here
                     snapshot_root=root,
+                    classes=config.classes,
                     scan_hits=sweep.hits,
                     usage_limits=UsageLimits(request_limit=request_limit),
                 )
@@ -697,35 +1129,38 @@ async def _evaluate_one(
                 recorder=recorder,
                 scan=scan,
                 seeded=seeded,
-                would_route=True,  # the ladder routes every run failure
+                would_route=True,  # the gate routes every unfinished review
+                expected=expected,
+                expected_met=(None if expected is None else dict.fromkeys(expected, False)),
             )
 
-        raw, effective, downgraded, evidence = _apply_evidence_rule(output, root)
-        partial = output.completeness is Completeness.PARTIAL
-        status = "failed" if partial else "complete"
+        verdicts = {answer.key: answer.verdict.value for answer in output.answers}
+        evidence = {
+            answer.key: [{"path": ref.path, "kind": ref.kind} for ref in answer.evidence]
+            for answer in output.answers
+        }
         caught: dict[str, bool] | None = None
-        if seeded is not None and not partial:
-            caught = {category: effective[category] == "yes" for category in seeded}
+        if seeded is not None:
+            caught = {category: verdicts.get(category) == "yes" for category in seeded}
         return _row(
             source,
             deployment=deployment,
-            status=status,
+            status="complete",
             wall_clock_s=time.monotonic() - started,
             known_clean=known_clean,
             head_sha=head_sha,
-            failure_kind=_PARTIAL_REVIEW if partial else None,
-            failure_detail="the model reported a partial review" if partial else None,
             recorder=recorder,
-            completeness=output.completeness.value,
-            verdicts=raw,
-            effective_verdicts=effective,
-            downgraded=downgraded,
+            verdicts=verdicts,
             evidence=evidence,
             scan=scan,
             seeded=seeded,
             caught=caught,
-            would_route=(
-                True if partial else any(effective[key] == "yes" for key in WEIGHTED_KEYS)
+            would_route=_would_route(verdicts, config),
+            expected=expected,
+            expected_met=(
+                None
+                if expected is None
+                else {key: verdicts.get(key) == answer for key, answer in expected.items()}
             ),
         )
     finally:
@@ -750,8 +1185,8 @@ def _dist(values: list[float]) -> dict[str, float] | None:
 def _summarize(rows: list[EvalRow], spec: _EvalSpec, deployment: str | None) -> dict[str, Any]:
     """The machine-readable summary row. The distributions here (wall-clock,
     requests, final-step output tokens) are the inputs that later re-set
-    `REVIEW_WALL_CLOCK_CEILING_S`, `REVIEW_REQUEST_BUDGET` and the 8,000-token
-    `MAX_TOKENS` cap in `src/services/classification/constants.py`. This script NEVER
+    `REVIEW_WALL_CLOCK_CEILING_S`, `REVIEW_REQUEST_BUDGET` and the per-class output cap
+    (`max_output_tokens`) in `src/services/classification/constants.py`. This script NEVER
     modifies those ceilings itself: bumping them in `service.py` happens after a real
     measured run against live Foundry, as its own reviewed change, and the ceilings
     belong to the deployment recorded here."""
@@ -759,7 +1194,7 @@ def _summarize(rows: list[EvalRow], spec: _EvalSpec, deployment: str | None) -> 
     failed = [row for row in rows if row["status"] == "failed"]
 
     # The false-positive routing rate — the figure the ceilings are tuned
-    # against: known-clean bundles that would route (weighted-Yes OR run failure).
+    # against: known-clean bundles the gate would route, run failures included.
     clean_rows = [row for row in rows if row["known_clean"]]
     clean_routed = [row for row in clean_rows if row["would_route"]]
 
@@ -811,6 +1246,19 @@ def _summarize(rows: list[EvalRow], spec: _EvalSpec, deployment: str | None) -> 
             "recall": round(stats["secrets_hit"] / secrets_total, 4) if secrets_total else None,
         }
 
+    golden = [row for row in rows if row["expected_met"] is not None]
+    golden_failures = [
+        {
+            "scenario": row["bundle_id"],
+            "class": key,
+            "expected": (row["expected"] or {})[key],
+            "answered": (row["verdicts"] or {}).get(key),
+        }
+        for row in golden
+        for key, met in (row["expected_met"] or {}).items()
+        if not met
+    ]
+
     tier_a = _precision_recall("A")
     if not spec.scan_labels:
         gate = "no-labeled-corpus"
@@ -841,6 +1289,9 @@ def _summarize(rows: list[EvalRow], spec: _EvalSpec, deployment: str | None) -> 
         "tier_a_precision_gate": gate,
         "tier_a_false_positive_paths": tier_a_false_paths,
         "labeled_bundles_unscanned": labeled_unscanned,
+        "golden_total": len(golden),
+        "golden_passed": sum(1 for row in golden if all((row["expected_met"] or {}).values())),
+        "golden_failures": golden_failures,
         "wall_clock_s": _dist([row["wall_clock_s"] for row in complete]),
         "requests": _dist([float(row["requests"]) for row in complete if row["requests"]]),
         "tool_calls": _dist(
@@ -882,7 +1333,7 @@ def _human_summary(summary: dict[str, Any]) -> str:
         "-- the two named figures --",
         f"false-positive routing rate: {_rate(summary['false_positive_routing_rate'])} "
         f"({summary['known_clean_routed']}/{summary['known_clean_total']} known-clean "
-        "bundles would route: weighted-Yes or run failure)",
+        "bundles the gate would route, run failures included)",
         f"miss rate: {_rate(summary['miss_rate'])} "
         f"({summary['seeded_findings_missed']}/{summary['seeded_findings_evaluated']} seeded "
         f"findings missed; {summary['seeded_findings_on_failed_runs']} on failed runs, "
@@ -902,6 +1353,16 @@ def _human_summary(summary: dict[str, Any]) -> str:
         lines.append(
             "  labeled but never scanned (extraction failed): "
             + ", ".join(summary["labeled_bundles_unscanned"])
+        )
+    if summary["golden_total"]:
+        lines += [
+            "",
+            f"-- golden scenarios: {summary['golden_passed']}/{summary['golden_total']} pass --",
+        ]
+        lines.extend(
+            f"  MISS {failure['scenario']}: {failure['class']} expected "
+            f"{failure['expected']}, answered {failure['answered']}"
+            for failure in summary["golden_failures"]
         )
     lines += [
         "",
@@ -936,10 +1397,20 @@ def _default_model_factory() -> ModelFactory:
     return lambda: build_foundry_model(foundry)
 
 
+async def _default_config() -> LiveConfig:
+    """The live class configuration, read from the database the backend env points at."""
+    from src.db.base import async_session_factory
+    from src.services.classification.config import load_live_config
+
+    async with async_session_factory() as db:
+        return await load_live_config(db)
+
+
 async def _run_sweep(
     spec: _EvalSpec,
     *,
     model_factory: ModelFactory | None,
+    config: LiveConfig | None,
     out_path: Path,
     scan_only: bool,
     request_limit: int,
@@ -947,6 +1418,9 @@ async def _run_sweep(
 ) -> list[EvalRow]:
     deployment: str | None = None
     if not scan_only:
+        if config is None:
+            config = await _default_config()
+        _check_seeded(spec.seeded, [entry.key for entry in config.classes])
         if model_factory is None:
             model_factory = _default_model_factory()
         # Resolve the deployment label once, up front — every row records the
@@ -963,6 +1437,7 @@ async def _run_sweep(
                 row = await _evaluate_one(
                     source,
                     spec,
+                    config=config,
                     model_factory=None if scan_only else model_factory,
                     deployment=deployment,
                     scan_only=scan_only,
@@ -995,10 +1470,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="eval_classification_review",
         description=(
-            "Measure the classification review over a corpus of saved app bundles: "
-            "budgets (wall-clock, requests, tokens, the final step's output tokens), "
-            "verdict accuracy against seeded/known-clean manifests, and the credential "
-            "scan's Tier A/B precision-recall against a labeled corpus."
+            "Measure the classification review against the live class configuration, over "
+            "a corpus of saved app bundles or the built-in golden scenarios: budgets "
+            "(wall-clock, requests, tokens, the final step's output tokens), answer accuracy "
+            "against seeded/known-clean manifests or the golden expectations, and the "
+            "credential scan's Tier A/B precision-recall against a labeled corpus."
         ),
     )
     parser.add_argument(
@@ -1024,18 +1500,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "needs the backend env loaded)",
     )
     parser.add_argument(
+        "--golden",
+        action="store_true",
+        help="run the built-in golden scenarios instead of bundles, each checked against "
+        "the answers the seeded class descriptions must produce",
+    )
+    parser.add_argument(
         "--seeded",
         type=Path,
         default=None,
-        help="JSON manifest: {bundle-id: [seeded category, ...]} — catch/miss is "
-        "reported per seeded finding",
+        help="JSON manifest: {bundle-id: [class key, ...]} — catch/miss is reported per "
+        "seeded finding",
     )
     parser.add_argument(
         "--known-clean",
         type=Path,
         default=None,
-        help="JSON list of bundle ids known to hold nothing weighted — the "
-        "false-positive routing rate is measured over these",
+        help="JSON list of bundle ids the gate should publish — the false-positive routing "
+        "rate is measured over these",
     )
     parser.add_argument(
         "--scan-labels",
@@ -1070,10 +1552,15 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None, *, model_factory: ModelFactory | None = None) -> int:
-    """Entry point. `model_factory` is the test seam: tests inject a scripted
-    (FunctionModel) factory so no real Foundry is ever called; the default resolves
-    the platform's configured Foundry deployment."""
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    model_factory: ModelFactory | None = None,
+    config: LiveConfig | None = None,
+) -> int:
+    """Entry point. `model_factory` and `config` are the test seams: tests inject a scripted
+    (FunctionModel) factory and a configuration, so no real Foundry or database is used; the
+    defaults resolve the platform's Foundry deployment and the live configuration."""
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.request_limit < 1:
@@ -1086,6 +1573,7 @@ def main(argv: Sequence[str] | None = None, *, model_factory: ModelFactory | Non
             _run_sweep(
                 spec,
                 model_factory=model_factory,
+                config=config,
                 out_path=args.out,
                 scan_only=args.scan_only,
                 request_limit=args.request_limit,

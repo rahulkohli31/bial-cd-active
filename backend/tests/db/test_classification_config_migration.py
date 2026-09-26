@@ -1,5 +1,6 @@
 """The classification configuration as the migration leaves it: the seeded launch set, the one
-policy row, the rules the database itself holds, and the review's fingerprint column.
+policy row, the rules the database itself holds, the review's fingerprint column, and the two
+unread deployment columns gone.
 
 Pinned against the migrated schema in raw SQL rather than through the models, because the
 migration and the model each state these rules once and autogenerate only notices when the two
@@ -136,6 +137,20 @@ async def test_reviews_gain_a_nullable_definitions_fingerprint(db_session) -> No
     assert row.column_default is None
 
 
+async def test_deployments_no_longer_carry_a_classification(db_session) -> None:
+    columns = (
+        await db_session.scalars(
+            sa.text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'deployments'"
+            )
+        )
+    ).all()
+    assert "classification" not in columns
+    assert "classification_score" not in columns
+    assert {"id", "app_id", "status", "head_sha", "unpublished_at"} <= set(columns)
+
+
 def _snapshot() -> dict[str, Any]:
     """What this revision owns, read on a fresh NullPool engine because alembic's env.py owns the
     event loop while the commands run."""
@@ -165,6 +180,16 @@ def _snapshot() -> dict[str, Any]:
                         "AND column_name = 'definitions_fingerprint'"
                     )
                 )
+                deployment_columns = set(
+                    (
+                        await conn.scalars(
+                            sa.text(
+                                "SELECT column_name FROM information_schema.columns "
+                                "WHERE table_name = 'deployments'"
+                            )
+                        )
+                    ).all()
+                )
                 seeded = policies = None
                 if classes is not None and policy is not None:
                     seeded = await conn.scalar(
@@ -182,6 +207,7 @@ def _snapshot() -> dict[str, Any]:
             "fingerprint": fingerprint,
             "seeded": seeded,
             "policies": policies,
+            "deployment_columns": deployment_columns,
         }
 
     return asyncio.run(_read())
@@ -193,6 +219,7 @@ def test_the_configuration_round_trips() -> None:
     command.upgrade(config, "head")
     previous = ScriptDirectory.from_config(config).get_revision(_REVISION).down_revision
     assert isinstance(previous, str)
+    at_head = _snapshot()
 
     try:
         command.downgrade(config, previous)
@@ -201,10 +228,16 @@ def test_the_configuration_round_trips() -> None:
         assert removed["policy"] is None
         assert removed["labels"] == []
         assert removed["fingerprint"] is None
+        assert removed["deployment_columns"] == at_head["deployment_columns"] | {
+            "classification",
+            "classification_score",
+        }
     finally:
         command.upgrade(config, "head")
 
     restored = _snapshot()
+    assert restored["deployment_columns"] == at_head["deployment_columns"]
+    assert "classification" not in restored["deployment_columns"]
     assert restored["classes"] is not None
     assert restored["policy"] is not None
     assert restored["labels"] == ["hard_block", "scored"]

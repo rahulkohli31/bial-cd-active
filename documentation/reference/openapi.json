@@ -1067,6 +1067,29 @@
         "title": "ChatKindInfo",
         "type": "object"
       },
+      "ClassReview": {
+        "description": "One class's owner-safe projection of the reviewer's answer.",
+        "properties": {
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "verdict": {
+            "enum": [
+              "yes",
+              "no"
+            ],
+            "title": "Verdict",
+            "type": "string"
+          }
+        },
+        "required": [
+          "verdict",
+          "reason"
+        ],
+        "title": "ClassReview",
+        "type": "object"
+      },
       "ClassificationClassCreate": {
         "description": "A new class. A hard block ignores `weight`; a scored class needs one.",
         "properties": {
@@ -1315,8 +1338,32 @@
         "type": "object"
       },
       "ClassificationReviewResponse": {
-        "description": "What the dialog knows: the version on record, what the review said about it (or\nwhy it could not say), and nothing an administrator sees that a citizen must not.\n\nTWO STAMPS, deliberately. `head_sha` is the CURRENT saved version (read from the\nsnapshot blob's metadata at answer time) and `reviewed_sha` is the version the\nstored review examined. They differ exactly when a Save landed after the review —\nthe dialog filters by the stamp it asked for, so a second tab's newer review can never\npaint answers for a version this dialog never named.",
+        "description": "What the dialog knows: the live policy and classes it scores with, the version on\nrecord, what the review said about it (or why it could not say), and nothing an\nadministrator sees that an owner must not.\n\nTWO STAMPS, deliberately. `head_sha` is the CURRENT saved version and `reviewed_sha` is the\nversion the stored review examined. `current` is true only when the review examined the saved\nversion under the live class definitions; a review that is not current is presented without\nits answers, and the dialog asks for a fresh one.",
         "properties": {
+          "checkedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checkedat"
+          },
+          "classes": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewClass"
+            },
+            "title": "Classes",
+            "type": "array"
+          },
+          "current": {
+            "default": false,
+            "title": "Current",
+            "type": "boolean"
+          },
           "failureCode": {
             "anyOf": [
               {
@@ -1349,6 +1396,9 @@
               }
             ],
             "title": "Headsha"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ReviewPolicy"
           },
           "retryable": {
             "anyOf": [
@@ -1398,16 +1448,22 @@
           "verdicts": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/ReviewAnswers"
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ClassReview"
+                },
+                "type": "object"
               },
               {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Verdicts"
           }
         },
         "required": [
-          "status"
+          "status",
+          "policy",
+          "classes"
         ],
         "title": "ClassificationReviewResponse",
         "type": "object"
@@ -1785,57 +1841,6 @@
         "title": "DailyTokenLimitDetail",
         "type": "object"
       },
-      "DataClassificationAnswers": {
-        "description": "What the citizen declares their app handles, answered fresh at every deploy.\nAll six are required booleans — the portal only builds this once every question is\nanswered, so a default would let a caller under-declare by omission.\nNO REVIEW FIELD, BY CONSTRUCTION: the platform's own review is read from the store\ninside the publish request, and `CamelModel`'s `extra=\"ignore\"` drops any unknown key\n— no request body can put words in the review's mouth. The notes gate lives in the\ndeploy route (`deploy/router.py`), which reads the MERGED answers this schema cannot see.",
-        "properties": {
-          "confidentialBusinessData": {
-            "title": "Confidentialbusinessdata",
-            "type": "boolean"
-          },
-          "credentialsSecrets": {
-            "title": "Credentialssecrets",
-            "type": "boolean"
-          },
-          "financialData": {
-            "title": "Financialdata",
-            "type": "boolean"
-          },
-          "healthData": {
-            "title": "Healthdata",
-            "type": "boolean"
-          },
-          "notes": {
-            "anyOf": [
-              {
-                "maxLength": 1000,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Notes"
-          },
-          "personalInformation": {
-            "title": "Personalinformation",
-            "type": "boolean"
-          },
-          "publicData": {
-            "title": "Publicdata",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "credentialsSecrets",
-          "healthData",
-          "personalInformation",
-          "financialData",
-          "confidentialBusinessData",
-          "publicData"
-        ],
-        "title": "DataClassificationAnswers",
-        "type": "object"
-      },
       "DatabaseCredentialResponse": {
         "description": "The project database's connection string, a deployed app's `BIAL_DATABASE_URL`.\n`dsn` embeds the app role's password, so it is the same\nkind of object as `DeployCredentialResponse.sas`: returned in this body and nowhere else\n— never logged, never in the audit `detail` (which records `roleName` + `host` instead),\nnever in a list projection.\n\n`dbName` / `roleName` / `host` are the non-secret half, repeated so an operator can\nidentify and later reconcile the database without re-reading the credential.",
         "properties": {
@@ -1968,23 +1973,36 @@
         "type": "object"
       },
       "DeployRequest": {
-        "description": "`commitSha` names the version the owner acted on: the saved version they reviewed, or\nthe approved commit, which republishes the approved copy. Any other commit is refused.\n`answers` is required for the saved version and ignored for the approved commit, whose\napproval already decided it.",
+        "description": "`commitSha` names the version the owner acted on: the saved version they reviewed, or\nthe approved commit, which republishes the approved copy. Any other commit is refused.\n\n`answers` are the owner's Yes/No answers keyed by class key. They count only for scored\nclasses, only while owners may change the reviewer's answers, and a class left out keeps\nthe reviewer's answer; a key that is no active class is refused. There is no review field:\nthe gate reads the stored review, and unknown body keys are dropped. `note` is required\nwhenever the send goes to an administrator.",
         "properties": {
           "answers": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/DataClassificationAnswers"
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "propertyNames": {
+              "maxLength": 64,
+              "minLength": 1
+            },
+            "title": "Answers",
+            "type": "object"
           },
           "commitSha": {
             "maxLength": 64,
             "minLength": 1,
             "title": "Commitsha",
             "type": "string"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
           }
         },
         "required": [
@@ -1994,7 +2012,7 @@
         "type": "object"
       },
       "DeployRoutedResponse": {
-        "description": "The 200 body when the publish gate ROUTES the app to an administrator instead\nof deploying (no current review, a standing rejection, or a weighted Yes on the\nmerged answers).\nAn OUTCOME, not a failure — this renders as an informational state (the app is\nwaiting in the queue, pinned to `commit_sha`) and must never paint the red failure\nbadge over it: the platform did exactly what it said it would. Wire shape\n(camelCase): `{\"outcome\": \"routed_for_review\", \"appId\", \"submissionId\",\n\"commitSha\", \"submittedAt\", \"message\"}`.",
+        "description": "The 200 body when the publish gate ROUTES the app to an administrator instead\nof deploying (a hard block answered Yes, an unfinished review, a standing rejection, or\na score over the threshold).\nAn OUTCOME, not a failure — this renders as an informational state (the app is\nwaiting in the queue, pinned to `commit_sha`) and must never paint the red failure\nbadge over it: the platform did exactly what it said it would. Wire shape\n(camelCase): `{\"outcome\": \"routed_for_review\", \"appId\", \"submissionId\",\n\"commitSha\", \"submittedAt\", \"message\"}`.",
         "properties": {
           "appId": {
             "title": "Appid",
@@ -2754,7 +2772,7 @@
         "type": "object"
       },
       "MarketplaceEntry": {
-        "description": "One published app as the catalog shows it — see the module docstring for why this list\nis short and closed. WORTH STATING PLAINLY: this widens a pre-existing accepted risk, not\na new one. `login_required` has no enforcement reader anywhere, and a published app has\nno auth of its own — so this converts \"you need the URL\" into \"everyone signed in has\nevery URL, searchable by what the app does.\" No `SECURITY.md` carries that line, so it is\nrecorded here, next to `url`; mitigation: `AUTO_DEPLOY_MAX_SCORE = 0` already routes any\nsensitive-category app through mandatory admin review first.",
+        "description": "One published app as the catalog shows it — see the module docstring for why this list\nis short and closed. WORTH STATING PLAINLY: this widens a pre-existing accepted risk, not\na new one. `login_required` has no enforcement reader anywhere, and a published app has\nno auth of its own — so this converts \"you need the URL\" into \"everyone signed in has\nevery URL, searchable by what the app does.\" No `SECURITY.md` carries that line, so it is\nrecorded here, next to `url`; mitigation: an app answered Yes on a hard-block class always\ngoes through administrator review first.",
         "properties": {
           "builderDisplayName": {
             "anyOf": [
@@ -3448,30 +3466,6 @@
         "title": "PublishState",
         "type": "string"
       },
-      "QuestionReview": {
-        "description": "One question's citizen-safe projection. `unanswered` is a real verdict, distinct\nfrom `no`: the review answers only where it has evidence, and an unanswered\nquestion is decided by the citizen alone.",
-        "properties": {
-          "reason": {
-            "title": "Reason",
-            "type": "string"
-          },
-          "verdict": {
-            "enum": [
-              "yes",
-              "no",
-              "unanswered"
-            ],
-            "title": "Verdict",
-            "type": "string"
-          }
-        },
-        "required": [
-          "verdict",
-          "reason"
-        ],
-        "title": "QuestionReview",
-        "type": "object"
-      },
       "ReapResponse": {
         "description": "`POST /internal/reap` → 200 — what the sweep reaped, and what it could not.\n\n`failed` is not decoration: without it a sweep in which every user threw is reported as\n`{\"reaped\": 0}`, which is indistinguishable from a sweep that found nothing to do.",
         "properties": {
@@ -3783,37 +3777,58 @@
         "title": "RestartStartedResponse",
         "type": "object"
       },
-      "ReviewAnswers": {
-        "description": "The six questions, declared in questionnaire order — the same fields (and the\nsame camelCase wire keys) as `DataClassificationAnswers`, so the portal's answer\nstate and this projection line up key-for-key.",
+      "ReviewClass": {
+        "description": "One active class, as the dialog renders and scores it.",
         "properties": {
-          "confidentialBusinessData": {
-            "$ref": "#/components/schemas/QuestionReview"
+          "key": {
+            "title": "Key",
+            "type": "string"
           },
-          "credentialsSecrets": {
-            "$ref": "#/components/schemas/QuestionReview"
+          "kind": {
+            "$ref": "#/components/schemas/ClassificationKind"
           },
-          "financialData": {
-            "$ref": "#/components/schemas/QuestionReview"
+          "title": {
+            "title": "Title",
+            "type": "string"
           },
-          "healthData": {
-            "$ref": "#/components/schemas/QuestionReview"
-          },
-          "personalInformation": {
-            "$ref": "#/components/schemas/QuestionReview"
-          },
-          "publicData": {
-            "$ref": "#/components/schemas/QuestionReview"
+          "weight": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight"
           }
         },
         "required": [
-          "credentialsSecrets",
-          "healthData",
-          "personalInformation",
-          "financialData",
-          "confidentialBusinessData",
-          "publicData"
+          "key",
+          "title",
+          "kind",
+          "weight"
         ],
-        "title": "ReviewAnswers",
+        "title": "ReviewClass",
+        "type": "object"
+      },
+      "ReviewPolicy": {
+        "description": "The two settings the owner's answers are scored with.",
+        "properties": {
+          "ownersCanChangeAnswers": {
+            "title": "Ownerscanchangeanswers",
+            "type": "boolean"
+          },
+          "threshold": {
+            "title": "Threshold",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "threshold",
+          "ownersCanChangeAnswers"
+        ],
+        "title": "ReviewPolicy",
         "type": "object"
       },
       "RoleReconcileCounts": {
@@ -12005,7 +12020,7 @@
         ]
       },
       "post": {
-        "description": "Ensure a review exists for the app's current saved version, and answer with it.\n\nOpening the publish dialog calls this. An unchanged version gets the stored answers back\nwith no run; a version the stored row does not match claims a fresh run, detached; a failed\nattempt is re-claimed by calling this same route again, until the service's per-version\nattempt cap returns the stored failure instead. 202 says a run is in flight (poll the GET);\n200 says the enclosed state is settled.",
+        "description": "Ensure a review exists for the app's current saved version, and answer with it.\n\nOpening the publish dialog calls this. An unchanged version under unchanged class\ndefinitions gets the stored answers back with no run; anything else claims a fresh run,\ndetached; a failed attempt is re-claimed by calling this same route again, until the\nservice's attempt cap returns the stored failure instead. 202 says a run is in flight (poll\nthe GET); 200 says the enclosed state is settled.",
         "operationId": "ensure_review_v1_projects__project_id__classification_review_post",
         "parameters": [
           {
@@ -12417,7 +12432,7 @@
                 }
               }
             },
-            "description": "The saved version sent without answers (`answers_required`), or a weighted Yes on the merged answers with no explanation (`explanation_required`); an incomplete body is FastAPI's own validation 422 with the `{\"detail\": [...]}` shape instead"
+            "description": "A send that goes to an administrator with no note (`note_required`, with `error.detail.reason` one of `hard_block`, `over_threshold`, `review_unfinished`, `rejection_standing`), or an answer for a class that is not active (`unknown_class`); an incomplete body is FastAPI's own validation 422 with the `{\"detail\": [...]}` shape instead"
           },
           "500": {
             "content": {

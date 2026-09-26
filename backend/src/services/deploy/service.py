@@ -29,7 +29,7 @@ import uuid
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Final
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -174,26 +174,15 @@ class DeployService:
         app_id: uuid.UUID,
         project_id: uuid.UUID,
         conversation_id: uuid.UUID | None,
-        classification: dict[str, Any] | None = None,
-        classification_score: int | None = None,
         expected_commit_sha: str | None = None,
         bundle_key: str | None = None,
     ) -> StartedDeploy:
         """Claim the slot and detach the pipeline. Fast — the caller holds an HTTP request
-        open and the edge gives it twenty seconds.
-        `classification`/`classification_score` are recorded, never re-checked — that's
-        the route's job, done before any side effect, so scoring twice would let two
-        policy copies disagree about a deploy already in flight. `expected_commit_sha` is
-        the one exception: an assertion, not a gate, that the tree extracted minutes later
-        is the tree the gate decided about. `bundle_key` names the bundle to ship when it
-        is not the saved snapshot — an approved submission copy."""
-        deployment_id = await store.claim(
-            db,
-            app_id=app_id,
-            user_id=user_id,
-            classification=classification,
-            classification_score=classification_score,
-        )
+        open and the edge gives it twenty seconds. The gate decided before any side effect;
+        `expected_commit_sha` is an assertion, not a gate, that the tree extracted minutes
+        later is the tree the gate decided about. `bundle_key` names the bundle to ship when
+        it is not the saved snapshot — an approved submission copy."""
+        deployment_id = await store.claim(db, app_id=app_id, user_id=user_id)
         if deployment_id is None:
             raise DeployNotPossibleError(
                 "This app is already being deployed. Wait for it to finish, then try again.",
@@ -233,8 +222,6 @@ class DeployService:
         examined into production. Claiming through the SAME one-in-flight slot a deploy
         claims is the whole of the concurrency story: a second press is refused, never a
         second operation against the same container."""
-        # No classification: a restart declares nothing new, because it ships nothing new —
-        # the answers that authorised this version are on the deploy that published it.
         deployment_id = await store.claim(db, app_id=app_id, user_id=user_id)
         if deployment_id is None:
             raise DeployNotPossibleError(

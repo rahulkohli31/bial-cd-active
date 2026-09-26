@@ -1,4 +1,4 @@
-"""The live classification configuration: the active classes in key order, and the policy."""
+"""The live classification configuration: the active classes in creation order, and the policy."""
 
 from __future__ import annotations
 
@@ -12,20 +12,20 @@ from src.db.models.classification_config import (
 from src.services.classification.config import LiveClass, load_live_config
 
 
-async def test_the_launch_set_loads_in_key_order_with_the_seeded_policy(db_session) -> None:
-    """Key order, never kind or weight order: the reviewer's prompt block is rendered in this
-    order, and a weight edit must not reorder it."""
+async def test_the_launch_set_loads_in_creation_order_with_the_seeded_policy(db_session) -> None:
+    """Creation order, never kind or weight order: the screens break weight ties by it, and a
+    weight edit must not reorder it."""
     live = await load_live_config(db_session)
 
     assert live.threshold == 100
     assert live.owners_can_change_answers is True
     assert [(entry.key, entry.kind, entry.weight) for entry in live.classes] == [
-        ("ai_usage", ClassificationKind.SCORED, 20),
-        ("confidential_business_data", ClassificationKind.SCORED, 20),
-        ("credentials_keys", ClassificationKind.SCORED, 20),
-        ("financial_data", ClassificationKind.HARD_BLOCK, None),
-        ("integrations", ClassificationKind.SCORED, 20),
         ("pii", ClassificationKind.HARD_BLOCK, None),
+        ("financial_data", ClassificationKind.HARD_BLOCK, None),
+        ("credentials_keys", ClassificationKind.SCORED, 20),
+        ("confidential_business_data", ClassificationKind.SCORED, 20),
+        ("ai_usage", ClassificationKind.SCORED, 20),
+        ("integrations", ClassificationKind.SCORED, 20),
         ("public_data", ClassificationKind.SCORED, 20),
     ]
     public_data = live.classes[-1]
@@ -47,23 +47,21 @@ async def test_the_launch_set_loads_in_key_order_with_the_seeded_policy(db_sessi
     )
 
 
-async def test_keys_sort_in_byte_order_whatever_the_collation(db_session) -> None:
-    """A linguistic collation ignores the underscore and puts `zza` first; byte order puts
-    `zz_z` first. The order must not change with the server it runs on."""
-    for key in ("zza", "zz_z"):
-        db_session.add(
-            ClassificationClass(
-                key=key,
-                title=key,
-                description="Yes if it does. No: a calculator.",
-                kind=ClassificationKind.HARD_BLOCK,
-            )
+async def test_a_class_added_later_comes_last_whatever_its_key(db_session) -> None:
+    db_session.add(
+        ClassificationClass(
+            key="aaa_first_by_key",
+            title="File uploads",
+            description="Yes if the app accepts file uploads. No: a calculator.",
+            kind=ClassificationKind.SCORED,
+            weight=20,
         )
+    )
     await db_session.flush()
 
     live = await load_live_config(db_session)
 
-    assert [entry.key for entry in live.classes][-2:] == ["zz_z", "zza"]
+    assert live.classes[-1].key == "aaa_first_by_key"
 
 
 async def test_an_inactive_class_is_not_live(db_session) -> None:
@@ -76,12 +74,12 @@ async def test_an_inactive_class_is_not_live(db_session) -> None:
     live = await load_live_config(db_session)
 
     assert [entry.key for entry in live.classes] == [
-        "ai_usage",
-        "confidential_business_data",
-        "credentials_keys",
-        "financial_data",
-        "integrations",
         "pii",
+        "financial_data",
+        "credentials_keys",
+        "confidential_business_data",
+        "ai_usage",
+        "integrations",
     ]
 
 

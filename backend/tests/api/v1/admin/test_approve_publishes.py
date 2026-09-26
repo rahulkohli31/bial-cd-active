@@ -140,27 +140,16 @@ def _save(wire, app_id: uuid.UUID, version: tuple[bytes, str]) -> str:
     return sha
 
 
-def _all_no() -> dict[str, object]:
-    return {
-        "credentialsSecrets": False,
-        "healthData": False,
-        "personalInformation": False,
-        "financialData": False,
-        "confidentialBusinessData": False,
-        "publicData": False,
-    }
-
-
 async def _submitted_for_review(wire, client, db_session, **app_overrides):
     """An owner whose publish ROUTED: no review exists for the version, so the gate sends it
-    to an administrator and forks the submission copy."""
+    to an administrator, with the owner's note, and forks the submission copy."""
     owner = await UserFactory.create(db_session)
     app_row = await AppRegistryFactory.create(db_session, user_id=owner.id, **app_overrides)
     head = _save(wire, app_row.id, wire.submitted)
     routed = await client.post(
         _DEPLOY.format(pid=app_row.project_id),
         headers=auth_headers(owner),
-        json={"commitSha": head, "answers": _all_no()},
+        json={"commitSha": head, "note": "Please check the visitor list."},
     )
     assert routed.status_code == 200, routed.text
     assert routed.json()["outcome"] == "routed_for_review"

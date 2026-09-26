@@ -11,35 +11,40 @@ from __future__ import annotations
 
 from typing import Final, Literal
 
-MAX_TOKENS: Final = 8_000
-"""Per-model-STEP output clamp, set EXPLICITLY. The framework's Anthropic default is 4096,
-which sits right on top of the sized pathological case (six verdicts with long reasons and
-many cited locations come to ~4,000 tokens) — inheriting it would make the worst legitimate
-answer truncate. The model's own ceiling is 128k output tokens on both the current and the
-intended deployment, so 8k is a self-imposed guard, not a platform limit; a larger cap
-costs nothing unless used (billing is on tokens produced), and only the final structured
-output is large — tool-call steps are tiny, so the cap binds on exactly one step.
-Truncation at this cap is a FAILURE — the review catches `finish_reason == "length"` and
-runs the one guided retry — never something to salvage partial verdicts from."""
+OUTPUT_TOKENS_BASE: Final = 2_000
+OUTPUT_TOKENS_PER_CLASS: Final = 1_000
+
+
+def max_output_tokens(class_count: int) -> int:
+    """The per-model-step output clamp, set explicitly and scaled with the active class count.
+
+    Only the final structured output is large, and a long reason with several cited locations
+    comes to roughly 700 tokens per class, so each class is budgeted 1,000 above a fixed base. The
+    framework's own default of 4,096 would truncate the worst legitimate answer. The model's
+    ceiling is far above any realistic class count, so this is a self-imposed guard; truncation
+    at it is a failure that runs the one guided retry, never something to salvage from."""
+    return OUTPUT_TOKENS_BASE + OUTPUT_TOKENS_PER_CLASS * class_count
+
 
 CACHE_TTL: Final[Literal["1h"]] = "1h"
 """TTL for every Anthropic prompt-cache breakpoint the review sets
 (`anthropic_cache_instructions`, `anthropic_cache_tool_definitions`, `anthropic_cache`) —
 the 1-HOUR tier, mirroring the build harness's block exactly. The economics here are
-BETTER than the harness's: the six-question rubric, the output schema and the four tool
+BETTER than the harness's: the class definitions, the output schema and the four tool
 definitions are byte-identical not merely across the steps of one run but across EVERY
-review of EVERY app, so that prefix is a shared cache hit platform-wide. Foundry prices
-cache reads at a tenth of base input; this is the largest cost lever available without
-changing model, and it is why the prompt is ordered static-first — anything app-specific
-placed above a breakpoint destroys the hit (`prompts.py` owns that ordering)."""
+review of EVERY app under one class-definition fingerprint, so that prefix is a shared cache
+hit platform-wide. Foundry prices cache reads at a tenth of base input; this is the largest
+cost lever available without changing model, and it is why the prompt is ordered static-first
+— anything app-specific placed above a breakpoint destroys the hit (`prompts.py` owns that
+ordering)."""
 
 REVIEW_EFFORT: Final[Literal["low"]] = "low"
 """Effort, set explicitly — and NOT a free knob. The parameter takes
 `low | medium | high | xhigh | max`, and thinking-disabled is only honoured up to `high`:
 `xhigh` and `max` force extended thinking back on, which reroutes output handling onto
 the fragile provider-native path this module already refuses (see `agent.py`). So effort
-is part of how the thinking-off requirement is ENFORCED, not a performance dial. Six
-bounded classification questions over a small tree do not need more than `low`."""
+is part of how the thinking-off requirement is ENFORCED, not a performance dial. Bounded
+Yes/No classification over a small tree does not need more than `low`."""
 
 THINKING_FORCING_EFFORT: Final[frozenset[str]] = frozenset({"xhigh", "max"})
 """The effort levels that silently re-enable extended thinking. `ensure_thinking_off`

@@ -2,9 +2,9 @@
 
 What is under test is the ORDER and the OUTCOMES: the scan runs first and its hits reach
 the prompt (never a value), a truncation short-circuits at the model seam instead of
-burning the agent's own retries, every failure lands in its taxonomy bucket, the Tier A
-floor stands exactly when it should, the throwaway extraction is gone on every exit path,
-the citizen's build budget is untouched, and every terminal run leaves an audit row.
+burning the agent's own retries, every failure lands in its taxonomy bucket, a review is
+pinned to the class definitions it ran under, the throwaway extraction is gone on every exit
+path, the citizen's build budget is untouched, and every terminal run leaves an audit row.
 
 The extract seam is faked (it materializes a real tree and records the `cache_root` it is
 handed, for the directory-lifecycle assertions); everything downstream — scan, agent loop,
@@ -36,11 +36,13 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
 from src.db.models.audit import AuditLog
+from src.db.models.classification_config import ClassificationKind
 from src.db.models.classification_review import ClassificationReview, ClassificationReviewStatus
 from src.db.models.token_usage import TokenUsage, TokenUsageKind
 from src.services.classification import service as service_module
 from src.services.classification import store
 from src.services.classification.agent import OUTPUT_TOOL_NAME
+from src.services.classification.config import LiveClass, LiveConfig
 from src.services.classification.service import (
     AUDIT_ACTION,
     FAIL_ABANDONED,
@@ -51,7 +53,6 @@ from src.services.classification.service import (
     FAIL_VERSION_DRIFT,
     ClassificationReviewService,
 )
-from src.services.deploy.classification import CLASSIFICATION_KEYS
 from src.services.storage.bundle import BundleValidationError
 from src.services.storage.errors import StorageError
 from src.services.storage.snapshot_read import ExtractedSnapshot, NoAppYet
@@ -73,6 +74,50 @@ _TIER_B_LINE = 'const password = "hunter2-fixture"\n'
 
 _CLEAN_FILES = {"app/page.tsx": "export default () => <div>VISITOR-LOG</div>\n"}
 
+_CONFIG = LiveConfig(
+    threshold=100,
+    owners_can_change_answers=True,
+    classes=(
+        LiveClass(
+            key="credentials_keys",
+            title="Credentials & keys",
+            description="Yes if the code holds a real secret. No: a login form.",
+            kind=ClassificationKind.SCORED,
+            weight=20,
+        ),
+        LiveClass(
+            key="pii",
+            title="PII",
+            description="Yes if the app stores identity documents. No: a name field.",
+            kind=ClassificationKind.HARD_BLOCK,
+            weight=None,
+        ),
+        LiveClass(
+            key="public_data",
+            title="Public data",
+            description="Yes if the app shows published information. No: a calculator.",
+            kind=ClassificationKind.SCORED,
+            weight=20,
+        ),
+    ),
+)
+_KEYS = tuple(entry.key for entry in _CONFIG.classes)
+# The same classes with one more added: different definitions, so a different fingerprint.
+_ADDED = LiveConfig(
+    threshold=100,
+    owners_can_change_answers=True,
+    classes=(
+        *_CONFIG.classes,
+        LiveClass(
+            key="ai_usage",
+            title="AI usage",
+            description="Yes if the app calls an AI model. No: fixed rules.",
+            kind=ClassificationKind.SCORED,
+            weight=20,
+        ),
+    ),
+)
+
 
 @pytest.fixture(autouse=True)
 def _no_live_model():
@@ -87,7 +132,7 @@ def _no_live_model():
 # ---------------------------------------------------------------------------------------
 
 
-def _question(key: str, verdict: str = "no", **overrides: Any) -> dict[str, Any]:
+def _answer(key: str, verdict: str = "no", **overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "key": key,
         "evidence": [],
@@ -98,23 +143,19 @@ def _question(key: str, verdict: str = "no", **overrides: Any) -> dict[str, Any]
     return payload
 
 
-def _six_questions(**per_key: dict[str, Any]) -> list[dict[str, Any]]:
-    return [per_key.get(key, _question(key)) for key in CLASSIFICATION_KEYS]
-
-
 def _output_response(args: dict[str, Any], **response_overrides: Any) -> ModelResponse:
     return ModelResponse(parts=[ToolCallPart(OUTPUT_TOOL_NAME, args)], **response_overrides)
 
 
-def _complete(**per_key: dict[str, Any]) -> ModelResponse:
-    return _output_response({"completeness": "complete", "questions": _six_questions(**per_key)})
+def _complete(keys: tuple[str, ...] = _KEYS, **per_key: dict[str, Any]) -> ModelResponse:
+    return _output_response({"answers": [per_key.get(key, _answer(key)) for key in keys]})
 
 
 def _truncated() -> ModelResponse:
     # What a real max_tokens stop looks like through pydantic-ai: normalized `length`,
     # the provider's raw reason kept alongside.
     return _output_response(
-        {"completeness": "complete"},
+        {"answers": []},
         finish_reason="length",
         provider_details={"finish_reason": "max_tokens"},
     )
@@ -220,9 +261,9 @@ async def _citizen_app(db):
     return user, app
 
 
-async def _run_to_settled(wire, db, *, app_id, user_id, head_sha=_V1, extracted=None):
+async def _run_to_settled(wire, db, *, app_id, user_id, head_sha=_V1, config=_CONFIG):
     record = await wire.service.start(
-        db, app_id=app_id, user_id=user_id, head_sha=head_sha, extracted=extracted
+        db, app_id=app_id, user_id=user_id, head_sha=head_sha, config=config
     )
     await wire.service.drain()
     stored = await store.get_for_app(db, app_id=app_id)
@@ -263,7 +304,9 @@ def _own_root(wire) -> Path:
 # ---------------------------------------------------------------------------------------
 
 
-async def test_a_clean_app_lands_a_complete_row_of_six_nos(wire, db_session) -> None:
+async def test_a_clean_app_lands_a_complete_row_of_nos_stamped_with_its_definitions(
+    wire, db_session
+) -> None:
     user, app = await _citizen_app(db_session)
     wire.models.queue(_scripted(_complete()))
 
@@ -272,18 +315,14 @@ async def test_a_clean_app_lands_a_complete_row_of_six_nos(wire, db_session) -> 
     assert record.status is ClassificationReviewStatus.RUNNING  # what `start` handed back
     assert stored.status is ClassificationReviewStatus.COMPLETE
     assert stored.head_sha == _V1
+    assert stored.definitions_fingerprint == _CONFIG.fingerprint
     assert stored.answers_complete is True
     assert stored.failure_code is None
     assert stored.verdicts is not None
-    questions = stored.verdicts["questions"]
-    assert set(questions) == set(CLASSIFICATION_KEYS)
-    assert all(entry["verdict"] == "no" for entry in questions.values())
-    assert stored.verdicts["scan"] == {
-        "tier_a_hit": False,
-        "tier_b_hit": False,
-        "incomplete": False,
-        "tier_a_dispute": False,
-    }
+    answers = stored.verdicts["classes"]
+    assert set(answers) == set(_KEYS)
+    assert all(set(entry) == {"verdict", "reason"} for entry in answers.values())
+    assert all(entry["verdict"] == "no" for entry in answers.values())
 
 
 async def test_rereading_the_same_version_returns_the_stored_row_without_a_run(
@@ -293,7 +332,9 @@ async def test_rereading_the_same_version_returns_the_stored_row_without_a_run(
     wire.models.queue(_scripted(_complete()))
     await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
 
-    again = await wire.service.start(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    again = await wire.service.start(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, config=_CONFIG
+    )
 
     assert again.status is ClassificationReviewStatus.COMPLETE
     assert wire.models.calls == 1  # no second model run
@@ -310,28 +351,6 @@ async def test_the_extraction_directory_is_gone_after_a_successful_run(wire, db_
     await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
 
     assert not _own_root(wire).exists()
-
-
-async def test_a_caller_owned_extraction_is_used_and_never_deleted(
-    wire, db_session, tmp_path
-) -> None:
-    # The drift path hands over a tree it already extracted and still needs for
-    # packing — ownership stays with whoever created it.
-    user, app = await _citizen_app(db_session)
-    root = tmp_path / "deploy-extract" / app.id.hex / _V1
-    root.mkdir(parents=True)
-    (root / "app").mkdir()
-    (root / "app" / "page.tsx").write_text("export default () => null\n")
-    handed_over = ExtractedSnapshot(app_id=app.id, head_sha=_V1, root=root)
-    wire.models.queue(_scripted(_complete()))
-
-    _record, stored = await _run_to_settled(
-        wire, db_session, app_id=app.id, user_id=user.id, extracted=handed_over
-    )
-
-    assert stored.status is ClassificationReviewStatus.COMPLETE
-    assert wire.extractor.cache_roots == []  # never re-extracted
-    assert root.exists() and (root / "app" / "page.tsx").exists()  # never deleted
 
 
 async def test_concurrent_same_commit_consumers_keep_disjoint_roots(
@@ -381,165 +400,9 @@ async def test_the_prompt_carries_hit_location_and_family_and_never_the_value(
     assert _TIER_A_VALUE not in text  # NEVER the value
 
 
-async def test_a_tier_a_overrule_is_recorded_as_a_dispute_on_the_complete_row(
-    wire, db_session
-) -> None:
-    user, app = await _citizen_app(db_session)
-    wire.extractor.files = {**_CLEAN_FILES, "app/db.ts": _TIER_A_LINE}
-    wire.models.queue(
-        _scripted(
-            _complete(
-                credentials_secrets=_question(
-                    "credentials_secrets",
-                    verdict="no",
-                    reason="The flagged value is sample data, not a live credential.",
-                    agreed_with_scan=False,
-                )
-            )
-        )
-    )
-
-    _record, stored = await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
-
-    assert stored.status is ClassificationReviewStatus.COMPLETE
-    assert stored.verdicts is not None
-    assert (
-        stored.verdicts["questions"]["credentials_secrets"]["verdict"] == "no"
-    )  # the model's No stands
-    assert stored.verdicts["scan"]["tier_a_hit"] is True
-    assert stored.verdicts["scan"]["tier_a_dispute"] is True  # but the admin will see it
-
-
-async def test_a_tier_b_overrule_records_nothing(wire, db_session) -> None:
-    user, app = await _citizen_app(db_session)
-    wire.extractor.files = {**_CLEAN_FILES, "app/login.tsx": _TIER_B_LINE}
-    wire.models.queue(
-        _scripted(
-            _complete(
-                credentials_secrets=_question(
-                    "credentials_secrets", verdict="no", agreed_with_scan=False
-                )
-            )
-        )
-    )
-
-    _record, stored = await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
-
-    assert stored.verdicts is not None
-    assert stored.verdicts["scan"] == {
-        "tier_a_hit": False,
-        "tier_b_hit": True,
-        "incomplete": False,
-        "tier_a_dispute": False,  # a Tier B overrule is routine
-    }
-
-
-async def test_a_tier_a_hit_stands_in_when_the_model_never_returned(wire, db_session) -> None:
-    # The guaranteed floor: the row is FAILED (it still routes), but the stored verdicts
-    # carry credentials=Yes from the scan with canned copy while the other five stay
-    # unanswered — shaped so anything reading the record afterward can tell the Tier A
-    # floor stands.
-    user, app = await _citizen_app(db_session)
-    wire.extractor.files = {**_CLEAN_FILES, "app/db.ts": _TIER_A_LINE}
-    wire.models.queue(_raising(ModelHTTPError(status_code=500, model_name="opus", body="boom")))
-
-    _record, stored = await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
-
-    assert stored.status is ClassificationReviewStatus.FAILED
-    assert stored.failure_code == FAIL_REVIEW
-    assert stored.verdicts is not None
-    assert stored.verdicts["source"] == "scan_floor"
-    questions = stored.verdicts["questions"]
-    assert questions["credentials_secrets"]["verdict"] == "yes"
-    for key in CLASSIFICATION_KEYS:
-        if key != "credentials_secrets":
-            assert questions[key]["verdict"] == "unanswered"
-    assert stored.evidence is not None
-    assert stored.evidence["scan_hits"][0]["family"] == "stripe-live-key"
-
-
-async def test_an_incomplete_scan_never_becomes_a_floor(wire, db_session) -> None:
-    # The Tier A hit was found, but another file was truncated at the per-file ceiling:
-    # the sweep saw a prefix of the app and must not be promoted to an answer.
-    from src.core.redaction import SCAN_INPUT_MAX_CHARS
-
-    user, app = await _citizen_app(db_session)
-    wire.extractor.files = {
-        **_CLEAN_FILES,
-        "app/db.ts": _TIER_A_LINE,
-        "app/huge.ts": "x" * (SCAN_INPUT_MAX_CHARS + 10),
-    }
-    wire.models.queue(_raising(ModelHTTPError(status_code=500, model_name="opus", body="boom")))
-
-    _record, stored = await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
-
-    assert stored.status is ClassificationReviewStatus.FAILED
-    assert stored.verdicts is None  # no floor from an incomplete sweep
-
-
-async def test_an_incomplete_scan_is_recorded_on_a_complete_review(wire, db_session) -> None:
-    # The model still ran and answered; the record must say the SCAN was incomplete so
-    # nothing downstream reads a truncated sweep as a clean no-hit.
-    from src.core.redaction import SCAN_INPUT_MAX_CHARS
-
-    user, app = await _citizen_app(db_session)
-    wire.extractor.files = {
-        **_CLEAN_FILES,
-        "app/huge.ts": ("y" * (SCAN_INPUT_MAX_CHARS // 2)) * 3 + _TIER_A_LINE,
-    }
-    wire.models.queue(_scripted(_complete()))
-
-    _record, stored = await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
-
-    assert stored.status is ClassificationReviewStatus.COMPLETE
-    assert stored.verdicts is not None
-    assert stored.verdicts["scan"]["incomplete"] is True
-
-
 # ---------------------------------------------------------------------------------------
 # Evidence validation and redaction
 # ---------------------------------------------------------------------------------------
-
-
-async def test_a_yes_citing_a_missing_path_is_downgraded_and_the_downgrade_recorded(
-    wire, db_session
-) -> None:
-    user, app = await _citizen_app(db_session)
-    wire.models.queue(
-        _scripted(
-            _complete(
-                health_data=_question(
-                    "health_data",
-                    verdict="yes",
-                    evidence=[{"path": "app/never-existed.ts", "kind": "schema-column"}],
-                    reason="The app appears to store medical records.",
-                ),
-                financial_data=_question(
-                    "financial_data",
-                    verdict="yes",
-                    evidence=[
-                        {"path": "app/never-existed.ts", "kind": "schema-column"},
-                        {"path": "app/page.tsx", "kind": "form-field"},
-                    ],
-                    reason="The app records invoice amounts.",
-                ),
-            )
-        )
-    )
-
-    _record, stored = await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
-
-    assert stored.verdicts is not None
-    health = stored.verdicts["questions"]["health_data"]
-    assert health["verdict"] == "unanswered"  # every cited path invalid → downgraded
-    assert health["downgraded_from_yes"] is True
-    financial = stored.verdicts["questions"]["financial_data"]
-    assert financial["verdict"] == "yes"  # one VALID citation keeps the Yes standing
-    assert financial["downgraded_from_yes"] is False
-    assert stored.evidence is not None
-    assert stored.evidence["downgraded"] == ["health_data"]
-    cited = {ref["path"]: ref["valid"] for ref in stored.evidence["questions"]["financial_data"]}
-    assert cited == {"app/never-existed.ts": False, "app/page.tsx": True}
 
 
 async def test_a_reason_containing_a_secret_is_redacted_before_storage(wire, db_session) -> None:
@@ -547,8 +410,8 @@ async def test_a_reason_containing_a_secret_is_redacted_before_storage(wire, db_
     wire.models.queue(
         _scripted(
             _complete(
-                credentials_secrets=_question(
-                    "credentials_secrets",
+                credentials_keys=_answer(
+                    "credentials_keys",
                     verdict="yes",
                     evidence=[{"path": "app/page.tsx", "kind": "hardcoded-value"}],
                     reason="The app hardcodes Password=hunter2-the-actual-value in its code.",
@@ -560,27 +423,14 @@ async def test_a_reason_containing_a_secret_is_redacted_before_storage(wire, db_
     _record, stored = await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
 
     assert stored.verdicts is not None
-    reason = stored.verdicts["questions"]["credentials_secrets"]["reason"]
+    reason = stored.verdicts["classes"]["credentials_keys"]["reason"]
     assert "hunter2-the-actual-value" not in reason
     assert "***" in reason
 
 
-async def test_a_partial_completeness_signal_is_a_failure_not_six_abstentions(
-    wire, db_session
-) -> None:
+async def test_an_answer_set_missing_a_class_fails_after_the_retries(wire, db_session) -> None:
     user, app = await _citizen_app(db_session)
-    wire.models.queue(
-        _scripted(
-            _output_response(
-                {
-                    "completeness": "partial",
-                    "questions": [
-                        _question(key, verdict="unanswered") for key in CLASSIFICATION_KEYS
-                    ],
-                }
-            )
-        )
-    )
+    wire.models.queue(_scripted(_complete(keys=_KEYS[:-1])))
 
     _record, stored = await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
 
@@ -757,7 +607,7 @@ async def test_a_malformed_output_lands_review_failed_not_an_empty_review(
     wire, db_session
 ) -> None:
     user, app = await _citizen_app(db_session)
-    wire.models.queue(_scripted(_output_response({"completeness": "complete", "questions": "?"})))
+    wire.models.queue(_scripted(_output_response({"answers": "?"})))
 
     _record, stored = await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
 
@@ -833,12 +683,14 @@ async def test_the_ceiling_is_measured_from_the_rows_started_at_not_the_run(
     # The row was claimed long "ago" (a rewound stamp); a runner picking it up must see
     # the ceiling already spent — measuring from its own start would happily proceed.
     user, app = await _citizen_app(db_session)
-    outcome = await store.claim(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    outcome = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_CONFIG.fingerprint
+    )
     assert outcome.claimed
     record = await _rewind_started_at(db_session, app_id=app.id, seconds=10_000)
     wire.models.queue(_raising(AssertionError("the model must not be invoked past the ceiling")))
 
-    await wire.service._run(review=record, extracted=None)
+    await wire.service._run(review=record, classes=_CONFIG.classes)
 
     stored = await store.get_for_app(db_session, app_id=app.id)
     assert stored is not None
@@ -847,7 +699,9 @@ async def test_the_ceiling_is_measured_from_the_rows_started_at_not_the_run(
 
 async def test_a_running_row_past_the_ceiling_reads_as_aged_out(wire, db_session) -> None:
     user, app = await _citizen_app(db_session)
-    outcome = await store.claim(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    outcome = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_CONFIG.fingerprint
+    )
     assert outcome.claimed
     await _rewind_started_at(db_session, app_id=app.id, seconds=10_000)
 
@@ -863,7 +717,9 @@ async def test_start_unwedges_an_orphaned_running_row_instead_of_hanging(wire, d
     # age it out (with its own audit row) and claim a fresh attempt — never return the
     # zombie as "still running" forever.
     user, app = await _citizen_app(db_session)
-    outcome = await store.claim(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    outcome = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_CONFIG.fingerprint
+    )
     assert outcome.claimed
     await _rewind_started_at(db_session, app_id=app.id, seconds=10_000)
     wire.models.queue(_scripted(_complete()))
@@ -912,7 +768,9 @@ async def test_the_fourth_claim_returns_the_stored_failure_without_the_model(
     for _ in range(3):
         await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
 
-    fourth = await wire.service.start(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    fourth = await wire.service.start(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, config=_CONFIG
+    )
 
     assert fourth.status is ClassificationReviewStatus.FAILED
     assert fourth.attempt == 3
@@ -938,7 +796,7 @@ async def test_every_terminal_run_writes_an_app_scoped_audit_row(wire, db_sessio
     assert detail["headSha"] == _V1
     assert detail["attempt"] == 1
     assert detail["outcome"] == "complete"
-    assert detail["verdicts"] == dict.fromkeys(CLASSIFICATION_KEYS, "no")
+    assert detail["verdicts"] == dict.fromkeys(_KEYS, "no")
 
 
 async def test_a_failed_run_audits_its_bucket(wire, db_session) -> None:
@@ -951,6 +809,97 @@ async def test_a_failed_run_audits_its_bucket(wire, db_session) -> None:
     assert len(audits) == 1
     assert _detail(audits[0])["outcome"] == FAIL_STORAGE
     assert _detail(audits[0])["verdicts"] is None
+
+
+# ---------------------------------------------------------------------------------------
+# The class definitions a review ran under
+# ---------------------------------------------------------------------------------------
+
+
+async def test_three_failures_under_old_definitions_do_not_block_a_review_of_new_ones(
+    wire, db_session
+) -> None:
+    """The attempt cap belongs to the pair. Without the fingerprint in the cap check, adding a
+    class would keep returning the old failure and the app could never be reviewed again."""
+    user, app = await _citizen_app(db_session)
+    boom = ModelHTTPError(status_code=500, model_name="opus", body="boom")
+    wire.models.queue(_raising(boom), _raising(boom), _raising(boom))
+    for _ in range(3):
+        await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
+    wire.models.queue(_scripted(_complete(keys=tuple(sorted(c.key for c in _ADDED.classes)))))
+
+    record, stored = await _run_to_settled(
+        wire, db_session, app_id=app.id, user_id=user.id, config=_ADDED
+    )
+
+    assert record.attempt == 1
+    assert record.status is ClassificationReviewStatus.RUNNING
+    assert wire.models.calls == 4
+    assert stored.status is ClassificationReviewStatus.COMPLETE
+    assert stored.definitions_fingerprint == _ADDED.fingerprint
+    assert stored.verdicts is not None
+    assert "ai_usage" in stored.verdicts["classes"]
+
+
+async def test_a_complete_review_under_old_definitions_is_reviewed_again(wire, db_session) -> None:
+    user, app = await _citizen_app(db_session)
+    wire.models.queue(_scripted(_complete()))
+    await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
+    captured: dict[str, Any] = {}
+
+    async def capture(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        captured["instructions"] = info.instructions
+        return _complete(keys=tuple(sorted(c.key for c in _ADDED.classes)))
+
+    wire.models.queue(FunctionModel(capture))
+
+    record, stored = await _run_to_settled(
+        wire, db_session, app_id=app.id, user_id=user.id, config=_ADDED
+    )
+
+    assert record.status is ClassificationReviewStatus.RUNNING
+    assert record.attempt == 1
+    assert wire.models.calls == 2
+    assert stored.definitions_fingerprint == _ADDED.fingerprint
+    assert '<class key="ai_usage">' in captured["instructions"]
+
+
+async def test_a_weight_kind_or_policy_edit_keeps_the_stored_review_current(
+    wire, db_session
+) -> None:
+    user, app = await _citizen_app(db_session)
+    wire.models.queue(_scripted(_complete()))
+    await _run_to_settled(wire, db_session, app_id=app.id, user_id=user.id)
+    pii, credentials, public = _CONFIG.classes
+    edited = LiveConfig(
+        threshold=40,
+        owners_can_change_answers=False,
+        classes=(
+            LiveClass(
+                key=credentials.key,
+                title=credentials.title,
+                description=credentials.description,
+                kind=ClassificationKind.HARD_BLOCK,
+                weight=None,
+            ),
+            pii,
+            LiveClass(
+                key=public.key,
+                title=public.title,
+                description=public.description,
+                kind=public.kind,
+                weight=80,
+            ),
+        ),
+    )
+
+    again = await wire.service.start(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, config=edited
+    )
+
+    assert edited.fingerprint == _CONFIG.fingerprint
+    assert again.status is ClassificationReviewStatus.COMPLETE
+    assert wire.models.calls == 1
 
 
 # ---------------------------------------------------------------------------------------
@@ -967,8 +916,8 @@ async def test_a_newer_start_supersedes_and_the_old_runs_completion_writes_nothi
     async def blocked_v1(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         await gate.wait()
         return _complete(
-            credentials_secrets=_question(
-                "credentials_secrets",
+            credentials_keys=_answer(
+                "credentials_keys",
                 verdict="yes",
                 evidence=[{"path": "app/page.tsx", "kind": "hardcoded-value"}],
                 reason="A stale verdict that must never dress the new claim.",
@@ -976,13 +925,17 @@ async def test_a_newer_start_supersedes_and_the_old_runs_completion_writes_nothi
         )
 
     wire.models.queue(FunctionModel(blocked_v1))
-    await wire.service.start(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    await wire.service.start(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, config=_CONFIG
+    )
     task_v1 = next(iter(wire.service._tasks))
     await asyncio.sleep(0.05)  # let run 1 reach the model and block
 
     wire.extractor.head_sha = _V2
     wire.models.queue(_scripted(_complete()))
-    await wire.service.start(db_session, app_id=app.id, user_id=user.id, head_sha=_V2)
+    await wire.service.start(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V2, config=_CONFIG
+    )
     task_v2 = next(task for task in wire.service._tasks if task is not task_v1)
     await task_v2  # run 2 settles first (sequential sessions — the test's one session)
 
@@ -1000,7 +953,7 @@ async def test_a_newer_start_supersedes_and_the_old_runs_completion_writes_nothi
     assert stored.head_sha == _V2
     assert stored.status is ClassificationReviewStatus.COMPLETE
     assert stored.verdicts is not None
-    assert stored.verdicts["questions"]["credentials_secrets"]["verdict"] == "no"  # run 2's
+    assert stored.verdicts["classes"]["credentials_keys"]["verdict"] == "no"  # run 2's
     audits = await _audit_rows(db_session, app_id=app.id)
     assert len(audits) == 2  # both RUNS are on the trail
     superseded = [row for row in audits if _detail(row).get("superseded")]

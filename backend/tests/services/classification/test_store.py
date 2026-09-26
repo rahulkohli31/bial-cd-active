@@ -3,10 +3,11 @@ terminal write. Three properties carry the design, each pinned by a test:
 
 * a stored COMPLETE answer for the SAME version is returned, never re-run — this store's
   whole reason to exist;
-* a stored answer for an OLDER version is never returned as the newer one's answer — the row
-  is replaced wholesale and the attempt counter resets;
+* a stored answer for an OLDER commit or older class definitions is never returned as the newer
+  one's answer — the row is replaced wholesale and the attempt counter resets;
 * a run settles only its OWN claim — the row survives being taken over, so a zombie runner's
-  `review_id` still points at a live row, and only `head_sha` + `attempt` stop its late write.
+  `review_id` still points at a live row, and only the commit, fingerprint and attempt stop its
+  late write.
 """
 
 from __future__ import annotations
@@ -24,20 +25,23 @@ from tests.factories import AppRegistryFactory, UserFactory
 # Two commits, forty hex chars each — the shape the bundle-header parse guarantees.
 _V1 = "a" * 40
 _V2 = "b" * 40
+# Two class-definition fingerprints, sha256 hex.
+_F1 = "1" * 64
+_F2 = "2" * 64
 
-# A complete six-verdict answer set, reasons included — the shape the review runner will store.
+# A complete answer set, reasons included — the shape the review runner stores.
 _VERDICTS: dict[str, Any] = {
-    "credentials_secrets": {"answer": "yes", "reason": "The app stores a sign-in secret."},
-    "health_data": {"answer": "no", "reason": "No health information is handled."},
-    "personal_information": {"answer": "no", "reason": "No personal details are stored."},
-    "financial_data": {"answer": "no", "reason": "No financial figures are handled."},
-    "confidential_business_data": {"answer": "no", "reason": "Nothing internal is stored."},
-    "public_data": {"answer": "yes", "reason": "The app shows public timetables."},
+    "classes": {
+        "credentials_keys": {"verdict": "yes", "reason": "The app stores a sign-in secret."},
+        "pii": {"verdict": "no", "reason": "No identity documents are handled."},
+        "public_data": {"verdict": "yes", "reason": "The app shows public timetables."},
+    }
 }
 
-# The internal half — locations the citizen and the administrator never see.
+# The internal half — locations the owner and the administrator never see.
 _EVIDENCE: dict[str, Any] = {
-    "credentials_secrets": [{"path": "src/lib/auth.ts", "line": 12, "family": "tier_a"}]
+    "classes": {"credentials_keys": [{"path": "src/lib/auth.ts", "kind": "hardcoded-value"}]},
+    "scan_hits": [],
 }
 
 
@@ -48,11 +52,13 @@ async def _app(db):
 
 
 async def _claimed(
-    db, *, app_id: uuid.UUID, user_id: uuid.UUID, head_sha: str
+    db, *, app_id: uuid.UUID, user_id: uuid.UUID, head_sha: str, fingerprint: str = _F1
 ) -> store.ReviewRecord:
     """Claim, asserting this caller won the run. Tests that need a live run to complete
     narrow the outcome once here instead of restating the assertion at every call site."""
-    outcome = await store.claim(db, app_id=app_id, user_id=user_id, head_sha=head_sha)
+    outcome = await store.claim(
+        db, app_id=app_id, user_id=user_id, head_sha=head_sha, fingerprint=fingerprint
+    )
     assert outcome.claimed is True
     return outcome.review
 
@@ -72,7 +78,9 @@ async def _row_count(db, *, app_id: uuid.UUID) -> int:
 async def test_a_first_claim_creates_the_row_running_and_stamped(db_session) -> None:
     user, app = await _app(db_session)
 
-    outcome = await store.claim(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    outcome = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_F1
+    )
 
     assert outcome.claimed is True
     record = outcome.review
@@ -101,13 +109,16 @@ async def test_a_stored_complete_row_for_the_same_version_is_returned_not_rerun(
         db_session,
         review_id=first.review_id,
         head_sha=_V1,
+        fingerprint=_F1,
         attempt=first.attempt,
         verdicts=_VERDICTS,
         evidence=_EVIDENCE,
         answers_complete=True,
     )
 
-    again = await store.claim(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    again = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_F1
+    )
 
     assert again.claimed is False
     assert again.review.status is ClassificationReviewStatus.COMPLETE
@@ -124,7 +135,9 @@ async def test_a_claim_while_the_same_version_is_running_does_not_double_the_run
     user, app = await _app(db_session)
     running = await _claimed(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
 
-    second = await store.claim(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    second = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_F1
+    )
 
     assert second.claimed is False
     assert second.review.status is ClassificationReviewStatus.RUNNING
@@ -142,6 +155,7 @@ async def test_a_claim_for_a_newer_version_replaces_the_row_wholesale(db_session
         db_session,
         review_id=first.review_id,
         head_sha=_V1,
+        fingerprint=_F1,
         attempt=first.attempt,
         verdicts=_VERDICTS,
         evidence=_EVIDENCE,
@@ -150,7 +164,9 @@ async def test_a_claim_for_a_newer_version_replaces_the_row_wholesale(db_session
         output_tokens=200,
     )
 
-    newer = await store.claim(db_session, app_id=app.id, user_id=user.id, head_sha=_V2)
+    newer = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V2, fingerprint=_F1
+    )
 
     assert newer.claimed is True
     record = newer.review
@@ -176,13 +192,16 @@ async def test_a_failed_row_can_be_reclaimed_for_the_same_version(db_session) ->
         db_session,
         review_id=first.review_id,
         head_sha=_V1,
+        fingerprint=_F1,
         attempt=first.attempt,
         code="review_failed",
         detail="The automatic check couldn't run.",
         input_tokens=5000,
     )
 
-    retry = await store.claim(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    retry = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_F1
+    )
 
     assert retry.claimed is True
     record = retry.review
@@ -209,6 +228,7 @@ async def test_the_attempt_counter_is_faithful_past_three(db_session) -> None:
             db_session,
             review_id=record.review_id,
             head_sha=_V1,
+            fingerprint=_F1,
             attempt=record.attempt,
             code="review_failed",
         )
@@ -220,7 +240,12 @@ async def test_a_reclaim_renews_the_wall_clock_start(db_session) -> None:
     user, app = await _app(db_session)
     first = await _claimed(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
     assert await store.fail(
-        db_session, review_id=first.review_id, head_sha=_V1, attempt=1, code="review_failed"
+        db_session,
+        review_id=first.review_id,
+        head_sha=_V1,
+        fingerprint=_F1,
+        attempt=1,
+        code="review_failed",
     )
     long_ago = datetime.now(UTC) - timedelta(seconds=10_000)
     await db_session.execute(
@@ -229,7 +254,9 @@ async def test_a_reclaim_renews_the_wall_clock_start(db_session) -> None:
         .values(started_at=long_ago)
     )
 
-    retry = await store.claim(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    retry = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_F1
+    )
 
     assert retry.claimed is True
     assert retry.review.started_at > long_ago
@@ -248,6 +275,7 @@ async def test_a_row_settles_exactly_once(db_session) -> None:
         db_session,
         review_id=record.review_id,
         head_sha=_V1,
+        fingerprint=_F1,
         attempt=record.attempt,
         verdicts=_VERDICTS,
         evidence=_EVIDENCE,
@@ -257,6 +285,7 @@ async def test_a_row_settles_exactly_once(db_session) -> None:
         db_session,
         review_id=record.review_id,
         head_sha=_V1,
+        fingerprint=_F1,
         attempt=record.attempt,
         code="too_late",
     )
@@ -276,7 +305,9 @@ async def test_completing_a_row_a_newer_version_took_over_writes_nothing(db_sess
     from dressing the new claim in old verdicts."""
     user, app = await _app(db_session)
     old_run = await _claimed(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
-    newer = await store.claim(db_session, app_id=app.id, user_id=user.id, head_sha=_V2)
+    newer = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V2, fingerprint=_F1
+    )
     assert newer.claimed is True
     assert newer.review.review_id == old_run.review_id  # the trap: the id still matches
 
@@ -284,6 +315,7 @@ async def test_completing_a_row_a_newer_version_took_over_writes_nothing(db_sess
         db_session,
         review_id=old_run.review_id,
         head_sha=_V1,
+        fingerprint=_F1,
         attempt=old_run.attempt,
         verdicts=_VERDICTS,
         evidence=_EVIDENCE,
@@ -305,13 +337,25 @@ async def test_a_zombie_from_a_superseded_attempt_writes_nothing(db_session) -> 
     user, app = await _app(db_session)
     first = await _claimed(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
     assert await store.fail(
-        db_session, review_id=first.review_id, head_sha=_V1, attempt=1, code="review_failed"
+        db_session,
+        review_id=first.review_id,
+        head_sha=_V1,
+        fingerprint=_F1,
+        attempt=1,
+        code="review_failed",
     )
-    retry = await store.claim(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    retry = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_F1
+    )
     assert retry.claimed is True and retry.review.attempt == 2
 
     zombie = await store.fail(
-        db_session, review_id=first.review_id, head_sha=_V1, attempt=1, code="zombie"
+        db_session,
+        review_id=first.review_id,
+        head_sha=_V1,
+        fingerprint=_F1,
+        attempt=1,
+        code="zombie",
     )
 
     assert zombie is False
@@ -333,6 +377,7 @@ async def test_a_failure_stores_the_bucket_and_the_spend_never_an_answer_set(db_
         db_session,
         review_id=record.review_id,
         head_sha=_V1,
+        fingerprint=_F1,
         attempt=record.attempt,
         code="review_abandoned",
         detail="The check ran past its ceiling.",
@@ -369,6 +414,7 @@ async def test_a_partial_answer_set_is_storable_as_complete_but_says_so(db_sessi
         db_session,
         review_id=record.review_id,
         head_sha=_V1,
+        fingerprint=_F1,
         attempt=record.attempt,
         verdicts={"credentials_secrets": {"answer": "yes", "reason": "A stored secret."}},
         evidence=_EVIDENCE,
@@ -395,8 +441,12 @@ async def test_two_apps_review_independently(db_session) -> None:
     app_a = await AppRegistryFactory.create(db_session, user_id=user.id)
     app_b = await AppRegistryFactory.create(db_session, user_id=user.id)
 
-    a = await store.claim(db_session, app_id=app_a.id, user_id=user.id, head_sha=_V1)
-    b = await store.claim(db_session, app_id=app_b.id, user_id=user.id, head_sha=_V2)
+    a = await store.claim(
+        db_session, app_id=app_a.id, user_id=user.id, head_sha=_V1, fingerprint=_F1
+    )
+    b = await store.claim(
+        db_session, app_id=app_b.id, user_id=user.id, head_sha=_V2, fingerprint=_F1
+    )
 
     assert a.claimed is True and b.claimed is True
     assert a.review.review_id != b.review.review_id
@@ -415,13 +465,16 @@ async def test_claim_complete_claim_newer_read_leaves_one_truthful_row(db_sessio
         db_session,
         review_id=v1.review_id,
         head_sha=_V1,
+        fingerprint=_F1,
         attempt=v1.attempt,
         verdicts=_VERDICTS,
         evidence=_EVIDENCE,
         answers_complete=True,
     )
 
-    unchanged = await store.claim(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    unchanged = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_F1
+    )
     assert unchanged.claimed is False
     assert unchanged.review.verdicts == _VERDICTS
 
@@ -431,6 +484,7 @@ async def test_claim_complete_claim_newer_read_leaves_one_truthful_row(db_sessio
         db_session,
         review_id=v2.review_id,
         head_sha=_V2,
+        fingerprint=_F1,
         attempt=v2.attempt,
         verdicts=fresh_verdicts,
         evidence={},
@@ -443,3 +497,109 @@ async def test_claim_complete_claim_newer_read_leaves_one_truthful_row(db_sessio
     assert row.verdicts == fresh_verdicts
     assert row.status is ClassificationReviewStatus.COMPLETE
     assert await _row_count(db_session, app_id=app.id) == 1
+
+
+# --- the class-definition fingerprint ------------------------------------------------------
+
+
+async def test_a_claim_under_new_class_definitions_replaces_the_row_at_attempt_one(
+    db_session,
+) -> None:
+    """Same commit, different definitions: the stored answers were given to other questions,
+    so they are retired and the attempt counter starts again for the new pair."""
+    user, app = await _app(db_session)
+    first = await _claimed(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    for attempt in (1, 2, 3):
+        assert await store.fail(
+            db_session,
+            review_id=first.review_id,
+            head_sha=_V1,
+            fingerprint=_F1,
+            attempt=attempt,
+            code="review_failed",
+        )
+        if attempt < 3:
+            await _claimed(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+
+    fresh = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_F2
+    )
+
+    assert fresh.claimed is True
+    assert fresh.review.attempt == 1
+    assert fresh.review.head_sha == _V1
+    assert fresh.review.definitions_fingerprint == _F2
+    assert fresh.review.status is ClassificationReviewStatus.RUNNING
+    assert fresh.review.failure_code is None
+    assert await _row_count(db_session, app_id=app.id) == 1
+
+
+async def test_a_complete_row_under_older_definitions_is_not_returned(db_session) -> None:
+    user, app = await _app(db_session)
+    first = await _claimed(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    assert await store.succeed(
+        db_session,
+        review_id=first.review_id,
+        head_sha=_V1,
+        fingerprint=_F1,
+        attempt=1,
+        verdicts=_VERDICTS,
+        evidence=_EVIDENCE,
+        answers_complete=True,
+    )
+
+    fresh = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_F2
+    )
+
+    assert fresh.claimed is True
+    assert fresh.review.verdicts is None
+
+
+async def test_a_zombie_from_older_definitions_writes_nothing(db_session) -> None:
+    """The takeover keeps the commit and resets the attempt to 1, so id, commit, RUNNING and
+    attempt all still match the zombie's claim — only the fingerprint stops its late write."""
+    user, app = await _app(db_session)
+    old_run = await _claimed(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    newer = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_F2
+    )
+    assert newer.claimed is True
+    assert (newer.review.review_id, newer.review.attempt) == (old_run.review_id, 1)
+
+    late = await store.succeed(
+        db_session,
+        review_id=old_run.review_id,
+        head_sha=_V1,
+        fingerprint=_F1,
+        attempt=1,
+        verdicts=_VERDICTS,
+        evidence=_EVIDENCE,
+        answers_complete=True,
+    )
+
+    assert late is False
+    row = await store.get_for_app(db_session, app_id=app.id)
+    assert row is not None
+    assert row.status is ClassificationReviewStatus.RUNNING
+    assert row.definitions_fingerprint == _F2
+    assert row.verdicts is None
+
+
+async def test_a_row_from_before_fingerprints_is_replaced_by_the_next_claim(db_session) -> None:
+    user, app = await _app(db_session)
+    legacy = await _claimed(db_session, app_id=app.id, user_id=user.id, head_sha=_V1)
+    await db_session.execute(
+        sa.update(ClassificationReview)
+        .where(ClassificationReview.id == legacy.review_id)
+        .values(status=ClassificationReviewStatus.COMPLETE, definitions_fingerprint=None)
+    )
+    await db_session.commit()
+
+    fresh = await store.claim(
+        db_session, app_id=app.id, user_id=user.id, head_sha=_V1, fingerprint=_F1
+    )
+
+    assert fresh.claimed is True
+    assert fresh.review.definitions_fingerprint == _F1
+    assert fresh.review.attempt == 1

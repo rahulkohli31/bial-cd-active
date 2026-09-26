@@ -1,23 +1,17 @@
 """The model-free credential scan over an extracted snapshot.
 
-Runs FIRST, before the model; hits go into the review's prompt as directed evidence — a
-path, pattern family and line, structurally never a value (`CredentialHit` has nowhere to
-carry one). Fast and deterministic, so it sits on the critical path by choice. The walk
-mirrors the read tools' jail (`IGNORED_DIRS`/`IGNORED_FILES`, no symlink descent) since it
-does not go through the model's tools — the tree came from a bundle the citizen's AI drove,
-so a planted link must not lead the scan out of the extraction.
+Runs FIRST, before the model; while the credentials class is active its hits go into the
+review's prompt as directed evidence for that class — a path, pattern family and line,
+structurally never a value (`CredentialHit` has nowhere to carry one). A hit never routes an app
+by itself; the reviewer's answer decides. The walk mirrors the read tools' jail (`IGNORED_DIRS`,
+no symlink descent) since it does not go through the model's tools — the tree came from a bundle
+the citizen's AI drove, so a planted link must not lead the scan out of the extraction.
 
-WHY THIS EXISTS: TRUNCATION IS INCOMPLETENESS, NEVER CLEANLINESS. `SCAN_INPUT_MAX_CHARS` is
-a per-file ceiling; an over-ceiling file is scanned only on its prefix and marked
-`truncated`, which marks the WHOLE sweep `incomplete` — the runner treats that as the
-credentials floor unsatisfied, because a truncated scan reading as a clean no-hit would
-silently turn the one un-appealable answer into an appeal nobody made. The read is bounded
-at `SCAN_INPUT_MAX_CHARS * 4 + 4` bytes: UTF-8 spends at most 4 bytes/char, so that many
-bytes always decode to strictly more characters than the ceiling when the file holds more —
-the detector flags its own truncation from the one place that owns the ceiling.
-
-Everything — walk, reads, regex sweep — runs off the event loop (the `snapshot_read.py`
-convention for filesystem work not "fast enough to inline")."""
+Truncation is incompleteness, never cleanliness: an over-ceiling file is scanned only on its
+prefix and marks the whole sweep `incomplete`. The read is bounded at
+`SCAN_INPUT_MAX_CHARS * 4 + 4` bytes: UTF-8 spends at most 4 bytes/char, so that many bytes
+always decode to more characters than the ceiling when the file holds more, and the detector
+flags its own truncation. Walk, reads and sweep all run off the event loop."""
 
 from __future__ import annotations
 
@@ -47,8 +41,7 @@ _EXTRACT_READY_MARKER = ".bial-extract-ok"
 class CredentialSweep:
     """One whole-tree scan. `hits` are prompt-ready located findings in deterministic
     path order; `incomplete=True` means at least one file was truncated at the per-file
-    ceiling — the sweep saw a prefix of the app, and the runner must not let the
-    credentials floor rest on it."""
+    ceiling, so the sweep saw only a prefix of the app."""
 
     hits: tuple[LocatedHit, ...]
     incomplete: bool

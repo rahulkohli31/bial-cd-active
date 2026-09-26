@@ -9,7 +9,7 @@
  * anyone looks, and the counter simply reads zero forever while every test stays green. The only
  * moment that drift is catchable is here.
  *
- * Same shape as `deployApi.classification-parity.test.ts` and `nginx-apps-routing.test.ts`: read
+ * Same shape as `nginx-apps-routing.test.ts`: read
  * the real file on the other side, parse the invariant out of it, and anchor on `process.cwd()`
  * because `import.meta.url` is a jsdom http URL under this config.
  *

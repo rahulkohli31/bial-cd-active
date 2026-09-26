@@ -175,19 +175,18 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     # citizen may legitimately move it (publish routes REJECTED->PENDING, withdraw moves
     # PENDING->DRAFT); this answers "has a human refused it", and ONLY an administrator
     # clears it — `reject` raises it, `approve` lowers it, nothing on the citizen's side
-    # touches it. Ladder rule 5 reads THIS, never the status: reading a durable policy
+    # touches it. The publish gate reads THIS, never the status: reading a durable policy
     # fact off mutable lifecycle state is what let a reject->publish->withdraw round trip
     # launder a rejection and publish unattended.
     rejection_standing: Mapped[bool] = mapped_column(
         sa.Boolean, nullable=False, server_default=sa.false()
     )
 
-    # What the publish flow attached at submit: both answer sets (the citizen's and the
-    # review's), the per-question differences, and the citizen's REDACTED explanation — the
-    # payload the administrator's review screen leads with. JSONB for the same reason
-    # `deployments.classification` is: the questionnaire is expected to be reworded and
-    # reweighted, and a typed shape would make that a migration every time. Written by the
-    # publish-flow submit, cleared by withdraw; NULL on a row queued without one (the review
-    # screen says so rather than rendering blanks). Never contains evidence locations —
-    # internal evidence stays internal.
+    # The publish gate's last decision and everything it was decided under: the policy, a
+    # snapshot of the classes, the reviewer's and the owner's answers, both scores, and the
+    # owner's REDACTED note — the payload the administrator's review screen leads with. JSONB
+    # because administrators add, reword and reweight classes, and a typed shape would make
+    # that a migration every time. Written by every gate decision, cleared by withdraw; NULL
+    # on a row that never had one (the review screen says so rather than rendering blanks).
+    # Never contains evidence locations — internal evidence stays internal.
     declaration: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)

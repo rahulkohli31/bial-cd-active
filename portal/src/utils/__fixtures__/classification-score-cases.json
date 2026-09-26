@@ -1,0 +1,628 @@
+{
+  "_comment": "The publish score, shared by the backend gate's test and the portal's score mirror. Each case gives the active classes, whether owners may change the reviewer's answers, both answer sets and the two scores the server computes: the share of the active scored weight answered Yes, out of 100, rounded half up, or 0 when that weight totals 0. The owner's answers count only for scored classes and only while owners may change answers.",
+  "cases": [
+    {
+      "name": "every class No scores 0",
+      "classes": [
+        {
+          "key": "pii",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "financial_data",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "credentials_keys",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "confidential_business_data",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "ai_usage",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "integrations",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "public_data",
+          "kind": "scored",
+          "weight": 20
+        }
+      ],
+      "ownersCanChangeAnswers": true,
+      "reviewerAnswers": {
+        "pii": false,
+        "financial_data": false,
+        "credentials_keys": false,
+        "confidential_business_data": false,
+        "ai_usage": false,
+        "integrations": false,
+        "public_data": false
+      },
+      "ownerAnswers": {},
+      "reviewerScore": 0,
+      "score": 0
+    },
+    {
+      "name": "a hard block answered Yes adds nothing to the score",
+      "classes": [
+        {
+          "key": "pii",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "financial_data",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "credentials_keys",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "confidential_business_data",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "ai_usage",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "integrations",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "public_data",
+          "kind": "scored",
+          "weight": 20
+        }
+      ],
+      "ownersCanChangeAnswers": true,
+      "reviewerAnswers": {
+        "pii": true,
+        "financial_data": true,
+        "credentials_keys": false,
+        "confidential_business_data": false,
+        "ai_usage": false,
+        "integrations": false,
+        "public_data": false
+      },
+      "ownerAnswers": {},
+      "reviewerScore": 0,
+      "score": 0
+    },
+    {
+      "name": "three of five equal scored classes Yes scores 60, and the owner turning Integrations to No brings it to 40",
+      "classes": [
+        {
+          "key": "pii",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "financial_data",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "credentials_keys",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "confidential_business_data",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "ai_usage",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "integrations",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "public_data",
+          "kind": "scored",
+          "weight": 20
+        }
+      ],
+      "ownersCanChangeAnswers": true,
+      "reviewerAnswers": {
+        "pii": false,
+        "financial_data": false,
+        "credentials_keys": false,
+        "confidential_business_data": true,
+        "ai_usage": true,
+        "integrations": true,
+        "public_data": false
+      },
+      "ownerAnswers": {
+        "integrations": false
+      },
+      "reviewerScore": 60,
+      "score": 40
+    },
+    {
+      "name": "with owners unable to change answers, the owner's answers are ignored and 60 stays 60",
+      "classes": [
+        {
+          "key": "pii",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "financial_data",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "credentials_keys",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "confidential_business_data",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "ai_usage",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "integrations",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "public_data",
+          "kind": "scored",
+          "weight": 20
+        }
+      ],
+      "ownersCanChangeAnswers": false,
+      "reviewerAnswers": {
+        "pii": false,
+        "financial_data": false,
+        "credentials_keys": false,
+        "confidential_business_data": true,
+        "ai_usage": true,
+        "integrations": true,
+        "public_data": false
+      },
+      "ownerAnswers": {
+        "integrations": false,
+        "ai_usage": false
+      },
+      "reviewerScore": 60,
+      "score": 60
+    },
+    {
+      "name": "a class the owner leaves out keeps the reviewer's answer",
+      "classes": [
+        {
+          "key": "pii",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "financial_data",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "credentials_keys",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "confidential_business_data",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "ai_usage",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "integrations",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "public_data",
+          "kind": "scored",
+          "weight": 20
+        }
+      ],
+      "ownersCanChangeAnswers": true,
+      "reviewerAnswers": {
+        "pii": false,
+        "financial_data": false,
+        "credentials_keys": false,
+        "confidential_business_data": false,
+        "ai_usage": true,
+        "integrations": false,
+        "public_data": true
+      },
+      "ownerAnswers": {
+        "public_data": false
+      },
+      "reviewerScore": 40,
+      "score": 20
+    },
+    {
+      "name": "the owner can turn a No into a Yes",
+      "classes": [
+        {
+          "key": "pii",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "financial_data",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "credentials_keys",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "confidential_business_data",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "ai_usage",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "integrations",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "public_data",
+          "kind": "scored",
+          "weight": 20
+        }
+      ],
+      "ownersCanChangeAnswers": true,
+      "reviewerAnswers": {
+        "pii": false,
+        "financial_data": false,
+        "credentials_keys": false,
+        "confidential_business_data": false,
+        "ai_usage": false,
+        "integrations": false,
+        "public_data": false
+      },
+      "ownerAnswers": {
+        "credentials_keys": true
+      },
+      "reviewerScore": 0,
+      "score": 20
+    },
+    {
+      "name": "an owner answer for a hard block is ignored",
+      "classes": [
+        {
+          "key": "pii",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "financial_data",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "credentials_keys",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "confidential_business_data",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "ai_usage",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "integrations",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "public_data",
+          "kind": "scored",
+          "weight": 20
+        }
+      ],
+      "ownersCanChangeAnswers": true,
+      "reviewerAnswers": {
+        "pii": true,
+        "financial_data": false,
+        "credentials_keys": false,
+        "confidential_business_data": false,
+        "ai_usage": false,
+        "integrations": false,
+        "public_data": false
+      },
+      "ownerAnswers": {
+        "pii": false,
+        "financial_data": true
+      },
+      "reviewerScore": 0,
+      "score": 0
+    },
+    {
+      "name": "every scored class Yes scores 100",
+      "classes": [
+        {
+          "key": "pii",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "financial_data",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "credentials_keys",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "confidential_business_data",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "ai_usage",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "integrations",
+          "kind": "scored",
+          "weight": 20
+        },
+        {
+          "key": "public_data",
+          "kind": "scored",
+          "weight": 20
+        }
+      ],
+      "ownersCanChangeAnswers": true,
+      "reviewerAnswers": {
+        "pii": false,
+        "financial_data": false,
+        "credentials_keys": true,
+        "confidential_business_data": true,
+        "ai_usage": true,
+        "integrations": true,
+        "public_data": true
+      },
+      "ownerAnswers": {},
+      "reviewerScore": 100,
+      "score": 100
+    },
+    {
+      "name": "a total scored weight of 0 scores 0",
+      "classes": [
+        {
+          "key": "pii",
+          "kind": "hard_block",
+          "weight": null
+        },
+        {
+          "key": "ai_usage",
+          "kind": "scored",
+          "weight": 0
+        },
+        {
+          "key": "public_data",
+          "kind": "scored",
+          "weight": 0
+        }
+      ],
+      "ownersCanChangeAnswers": true,
+      "reviewerAnswers": {
+        "pii": false,
+        "ai_usage": true,
+        "public_data": true
+      },
+      "ownerAnswers": {},
+      "reviewerScore": 0,
+      "score": 0
+    },
+    {
+      "name": "no scored class at all scores 0",
+      "classes": [
+        {
+          "key": "pii",
+          "kind": "hard_block",
+          "weight": null
+        }
+      ],
+      "ownersCanChangeAnswers": true,
+      "reviewerAnswers": {
+        "pii": true
+      },
+      "ownerAnswers": {},
+      "reviewerScore": 0,
+      "score": 0
+    },
+    {
+      "name": "12.5 rounds up to 13",
+      "classes": [
+        {
+          "key": "small",
+          "kind": "scored",
+          "weight": 1
+        },
+        {
+          "key": "large",
+          "kind": "scored",
+          "weight": 7
+        }
+      ],
+      "ownersCanChangeAnswers": true,
+      "reviewerAnswers": {
+        "small": true,
+        "large": false
+      },
+      "ownerAnswers": {},
+      "reviewerScore": 13,
+      "score": 13
+    },
+    {
+      "name": "12.49 rounds down to 12",
+      "classes": [
+        {
+          "key": "yes_100",
+          "kind": "scored",
+          "weight": 100
+        },
+        {
+          "key": "yes_57",
+          "kind": "scored",
+          "weight": 57
+        },
+        {
+          "key": "no_01",
+          "kind": "scored",
+          "weight": 100
+        },
+        {
+          "key": "no_02",
+          "kind": "scored",
+          "weight": 100
+        },
+        {
+          "key": "no_03",
+          "kind": "scored",
+          "weight": 100
+        },
+        {
+          "key": "no_04",
+          "kind": "scored",
+          "weight": 100
+        },
+        {
+          "key": "no_05",
+          "kind": "scored",
+          "weight": 100
+        },
+        {
+          "key": "no_06",
+          "kind": "scored",
+          "weight": 100
+        },
+        {
+          "key": "no_07",
+          "kind": "scored",
+          "weight": 100
+        },
+        {
+          "key": "no_08",
+          "kind": "scored",
+          "weight": 100
+        },
+        {
+          "key": "no_09",
+          "kind": "scored",
+          "weight": 100
+        },
+        {
+          "key": "no_10",
+          "kind": "scored",
+          "weight": 100
+        },
+        {
+          "key": "no_11",
+          "kind": "scored",
+          "weight": 100
+        }
+      ],
+      "ownersCanChangeAnswers": true,
+      "reviewerAnswers": {
+        "yes_100": true,
+        "yes_57": true,
+        "no_01": false,
+        "no_02": false,
+        "no_03": false,
+        "no_04": false,
+        "no_05": false,
+        "no_06": false,
+        "no_07": false,
+        "no_08": false,
+        "no_09": false,
+        "no_10": false,
+        "no_11": false
+      },
+      "ownerAnswers": {},
+      "reviewerScore": 12,
+      "score": 12
+    },
+    {
+      "name": "unequal weights: 30 of 70 is 42.86, rounded to 43",
+      "classes": [
+        {
+          "key": "a",
+          "kind": "scored",
+          "weight": 30
+        },
+        {
+          "key": "b",
+          "kind": "scored",
+          "weight": 40
+        },
+        {
+          "key": "hb",
+          "kind": "hard_block",
+          "weight": null
+        }
+      ],
+      "ownersCanChangeAnswers": true,
+      "reviewerAnswers": {
+        "a": true,
+        "b": false,
+        "hb": false
+      },
+      "ownerAnswers": {},
+      "reviewerScore": 43,
+      "score": 43
+    }
+  ]
+}

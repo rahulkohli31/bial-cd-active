@@ -6,7 +6,9 @@ Create Date: 2026-09-26
 
 The classes the reviewer answers and the policy the gate scores with move into two tables, seeded
 here with the launch set so a first deploy starts configured. `classification_reviews` gains a
-nullable `definitions_fingerprint`; every existing row keeps NULL.
+nullable `definitions_fingerprint`; every existing row keeps NULL. `deployments` drops its
+per-attempt `classification` and `classification_score`: the declaration on the app row and in the
+gate's audit row records what each decision was made under.
 
 The labels, the rules and the seed text are literals, never imported — a migration is a historical
 record (ADR-0008) — and the enum type's lifecycle is explicit because dropping a table does not
@@ -230,11 +232,20 @@ def upgrade() -> None:
         "classification_reviews",
         sa.Column("definitions_fingerprint", sa.String(length=64), nullable=True),
     )
+    # Every decision's declaration lives on the app row and in its audit row; nothing reads
+    # these two, so they go. A downgrade brings them back empty.
+    op.drop_column("deployments", "classification_score")
+    op.drop_column("deployments", "classification")
     op.execute("SET LOCAL lock_timeout = DEFAULT")
 
 
 def downgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
+    op.add_column(
+        "deployments",
+        sa.Column("classification", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+    )
+    op.add_column("deployments", sa.Column("classification_score", sa.Integer(), nullable=True))
     op.drop_column("classification_reviews", "definitions_fingerprint")
     op.execute("SET LOCAL lock_timeout = DEFAULT")
     # Each table's own indexes go with it.

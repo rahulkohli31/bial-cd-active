@@ -6,8 +6,7 @@ going fine, the citizen would retry, and the second claim would 409. The 503 mat
 a provider that RAISED when unconfigured would surface as a 500 in the wrong envelope.
 
 THE DECISION ITSELF LIVES IN `test_publish_gate.py`. Every test here seeds a clean stored
-review so the ladder lands on rule 7 (publish), and a failure in this file is never the
-gate quietly routing."""
+review so the gate publishes, and a failure in this file is never the gate quietly routing."""
 
 from __future__ import annotations
 
@@ -27,7 +26,7 @@ from src.api.v1.build_sessions.deps import (
 from src.api.v1.deploy.deps import deploy_service_or_none
 from src.db.models.app_registry import AppStatus
 from src.services.classification import store as review_store
-from src.services.deploy.classification import CLASSIFICATION_KEYS
+from src.services.classification.config import load_live_config
 from src.services.deploy.service import DeployNotPossibleError, StartedDeploy
 from src.services.storage import StorageError, snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
@@ -39,46 +38,10 @@ _STATUS = "/v1/projects/{pid}/deployment"
 _HEAD_SHA = "7e" * 20
 
 
-def _answers(**overrides: object) -> dict[str, object]:
-    """A data-classification declaration, all-No by default (score 0).
-
-    camelCase keys: asserting through the alias is the only way these tests would catch a
-    `CamelModel` misconfiguration that `populate_by_name` would let a snake_case body past."""
-    body: dict[str, object] = {
-        "credentialsSecrets": False,
-        "healthData": False,
-        "personalInformation": False,
-        "financialData": False,
-        "confidentialBusinessData": False,
-        "publicData": False,
-    }
-    body.update(overrides)
-    return body
-
-
-def _body(**overrides: object) -> dict[str, object]:
-    """A whole deploy request about the saved version. The answers are NESTED under
-    `answers` — a flat body is a 422, which is the shape a client that forgot the
-    questionnaire entirely would send."""
-    return {"commitSha": _HEAD_SHA, "answers": _answers(**overrides)}
-
-
-# All-No, score 0 — the ONE shape of declaration that auto-deploys (LOW score = safe =
-# auto-deploy, HIGH score = needs a human; see classification.py). Every test that is NOT
-# about the gate sends this, so a failure elsewhere is never the gate quietly refusing.
-#
-# Carries a voluntary explanation (still scores 0) so
-# `test_the_declaration_is_handed_to_the_service_to_record` can assert `notes` reaches
-# `service.start()` — `_NEEDS_REVIEW` can't cover that, since it 409s before `start()` runs.
-_QUALIFIES: dict[str, object] = _body(notes="Reads the public flight board only.")
-
-# 40 + 15 = 55, well above AUTO_DEPLOY_MAX_SCORE (0) — the case the gate tests below
-# exercise a refusal with.
-_NEEDS_REVIEW: dict[str, object] = _body(
-    credentialsSecrets=True,
-    confidentialBusinessData=True,
-    notes="Holds the vendor API key used by the nightly sync.",
-)
+# A request about the saved version, over the clean review `_owner_with_app` seeds: the gate
+# publishes it. camelCase keys, so a `CamelModel` misconfiguration that `populate_by_name`
+# would let a snake_case body past is caught here.
+_QUALIFIES: dict[str, object] = {"commitSha": _HEAD_SHA, "answers": {"public_data": False}}
 
 
 class FakeService:
@@ -96,8 +59,6 @@ class FakeService:
         app_id,
         project_id,
         conversation_id,
-        classification=None,
-        classification_score=None,
         expected_commit_sha=None,
         bundle_key=None,
     ) -> StartedDeploy:
@@ -108,8 +69,6 @@ class FakeService:
                 "user_id": user_id,
                 "app_id": app_id,
                 "conversation_id": conversation_id,
-                "classification": classification,
-                "classification_score": classification_score,
                 "expected_commit_sha": expected_commit_sha,
                 "bundle_key": bundle_key,
             }
@@ -128,45 +87,43 @@ def wire(app: FastAPI):
     return SimpleNamespace(app=app, service=service, store=store)
 
 
-async def _owner_with_app(db, wire=None):
-    """An owner and their app, saved at `_HEAD_SHA` with a CLEAN stored review for it.
+async def _owner_with_app(db, wire=None, *, yes: tuple[str, ...] = ()):
+    """An owner and their app, saved at `_HEAD_SHA` with a stored review for it — all No unless
+    `yes` names classes.
 
-    Seeding the review is what keeps this file about the plumbing: all-No lands the ladder
-    on rule 7 and publishes, so a 202 here means the route worked, not the gate bypassed.
-    Tests that never reach the gate (owner scoping, CSRF) pass `wire=None` and skip it."""
+    Seeding a clean review is what keeps this file about the plumbing: the gate publishes, so a
+    202 here means the route worked, not the gate bypassed. Tests that never reach the gate
+    (owner scoping, CSRF) pass `wire=None` and skip it."""
     user = await UserFactory.create(db)
     app_row = await AppRegistryFactory.create(db, user_id=user.id)
     if wire is not None:
         key = snapshot_key(app_row.id)
         wire.store.objects[key] = a_git_bundle(_HEAD_SHA)
         wire.store.meta[key] = {"head_sha": _HEAD_SHA}
+        config = await load_live_config(db)
         outcome = await review_store.claim(
-            db, app_id=app_row.id, user_id=user.id, head_sha=_HEAD_SHA
+            db,
+            app_id=app_row.id,
+            user_id=user.id,
+            head_sha=_HEAD_SHA,
+            fingerprint=config.fingerprint,
         )
         await review_store.succeed(
             db,
             review_id=outcome.review.review_id,
             head_sha=_HEAD_SHA,
+            fingerprint=config.fingerprint,
             attempt=outcome.review.attempt,
             verdicts={
-                "source": "review",
-                "questions": {
-                    key: {
-                        "verdict": "no",
-                        "reason": "Nothing of this kind found.",
-                        "agreed_with_scan": None,
-                        "downgraded_from_yes": False,
+                "classes": {
+                    entry.key: {
+                        "verdict": "yes" if entry.key in yes else "no",
+                        "reason": "What the reviewer found.",
                     }
-                    for key in CLASSIFICATION_KEYS
-                },
-                "scan": {
-                    "tier_a_hit": False,
-                    "tier_b_hit": False,
-                    "incomplete": False,
-                    "tier_a_dispute": False,
-                },
+                    for entry in config.classes
+                }
             },
-            evidence={"questions": {}, "scan_hits": [], "downgraded": []},
+            evidence={"classes": {}, "scan_hits": []},
             answers_complete=True,
         )
     return user, app_row
@@ -285,44 +242,19 @@ async def test_publishing_unconfigured_is_a_503_with_the_right_envelope(
     assert "message" in resp.json()["error"]
 
 
-# --- the retired terminal refusal ----------------------------------------------------
+# --- a routed send --------------------------------------------------------------------
 
 
-async def test_the_terminal_classification_refusal_is_gone(wire, client, db_session) -> None:
-    """A GUARD, not a deletion. The retired 409 `classification_below_threshold` was a dead
-    end: nothing queued, nobody notified. The same declaration is now ROUTED, so that 409
-    must not come back — and it must not answer 403 either, since `chatErrors.ts` reads a
-    403 on this surface as "your session lapsed". The ladder's own outcomes are pinned in
-    `test_publish_gate.py`."""
-    user, app_row = await _owner_with_app(db_session, wire)
+async def test_a_routed_send_is_a_200_outcome_never_a_refusal(wire, client, db_session) -> None:
+    """A route is an outcome: never a 409 (nothing queued, nobody notified) and never a 403,
+    which `chatErrors.ts` reads on this surface as "your session lapsed". The app waits at
+    exactly the version examined, and nothing publishes."""
+    user, app_row = await _owner_with_app(db_session, wire, yes=("pii",))
 
     resp = await client.post(
         _DEPLOY.format(pid=app_row.project_id),
         headers=auth_headers(user),
-        json=_body(confidentialBusinessData=True, notes="Vendor contact list only."),
-    )
-
-    assert resp.status_code != 409
-    assert resp.status_code != 403
-    assert resp.json().get("error", {}).get("code") != "classification_below_threshold"
-    # It ROUTED (the review is clean but the citizen's own weighted Yes stands), so
-    # the pipeline was correctly not started.
-    assert resp.status_code == 200
-    assert resp.json()["outcome"] == "routed_for_review"
-    assert wire.service.started == []
-
-
-async def test_a_routed_deploy_leaves_the_app_queued_at_the_version_examined(
-    wire, client, db_session
-) -> None:
-    """A routed deploy leaves the app queued at exactly the version examined, and publishes
-    nothing."""
-    user, app_row = await _owner_with_app(db_session, wire)
-
-    resp = await client.post(
-        _DEPLOY.format(pid=app_row.project_id),
-        headers=auth_headers(user),
-        json=_body(confidentialBusinessData=True, notes="Vendor contact list only."),
+        json={"commitSha": _HEAD_SHA, "note": "Visitor passes need the ID photo."},
     )
 
     assert resp.status_code == 200
@@ -331,29 +263,22 @@ async def test_a_routed_deploy_leaves_the_app_queued_at_the_version_examined(
     assert wire.service.started == []
 
 
-async def test_a_weighted_declaration_without_an_explanation_is_still_a_422(
-    wire, client, db_session
-) -> None:
-    """Incomplete, not refused. This fires inside the ladder, on the MERGED answers — the
-    only place the review can be taken into account — but the distinction still holds: an
-    unexplained sensitive declaration is an incomplete submission, never a rejected one."""
-    user, app_row = await _owner_with_app(db_session, wire)
+async def test_a_routed_send_without_a_note_is_a_422(wire, client, db_session) -> None:
+    """Incomplete, not refused: the owner's answers are fine, the note is missing."""
+    user, app_row = await _owner_with_app(db_session, wire, yes=("pii",))
 
     resp = await client.post(
         _DEPLOY.format(pid=app_row.project_id),
         headers=auth_headers(user),
-        json=_body(credentialsSecrets=True, confidentialBusinessData=True),
+        json={"commitSha": _HEAD_SHA},
     )
 
     assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == "explanation_required"
+    assert resp.json()["error"]["code"] == "note_required"
     assert wire.service.started == []
 
 
-async def test_a_deploy_with_no_answers_at_all_is_rejected(wire, client, db_session) -> None:
-    """What makes the questionnaire a gate rather than a prompt: there is no shape of this
-    request that deploys without a declaration, so a caller cannot reach the pipeline by
-    simply never rendering the modal."""
+async def test_a_deploy_request_naming_no_commit_is_rejected(wire, client, db_session) -> None:
     user, app_row = await _owner_with_app(db_session)
 
     resp = await client.post(
@@ -362,27 +287,6 @@ async def test_a_deploy_with_no_answers_at_all_is_rejected(wire, client, db_sess
 
     assert resp.status_code == 422
     assert wire.service.started == []
-
-
-async def test_the_declaration_is_handed_to_the_service_to_record(
-    wire, client, db_session
-) -> None:
-    """The score that authorised the deploy travels with it — it is stored, never recomputed
-    later, because the weights are policy and policy changes."""
-    user, app_row = await _owner_with_app(db_session, wire)
-
-    resp = await client.post(
-        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_QUALIFIES
-    )
-
-    assert resp.status_code == 202
-    (started,) = wire.service.started
-    assert started["classification_score"] == 0
-    declared = started["classification"]
-    assert isinstance(declared, dict)
-    assert declared["credentials_secrets"] is False
-    assert declared["personal_information"] is False
-    assert declared["notes"] == "Reads the public flight board only."
 
 
 # --- reading the status ------------------------------------------------------------

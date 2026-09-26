@@ -12,59 +12,38 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field
 
 from src.db.models.app_registry import AppRegistry, AppStatus
+from src.db.models.classification_config import MAX_CLASS_KEY
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.schemas import CamelModel
-from src.services.deploy.classification import CLASSIFICATION_KEYS
 from src.services.deploy.service import (
     FAIL_RESTART,
     FAIL_RESTART_NOT_READY,
     FAIL_ROUTED_FOR_REVIEW,
 )
 
-
-class DataClassificationAnswers(CamelModel):
-    """What the citizen declares their app handles, answered fresh at every deploy.
-    All six are required booleans — the portal only builds this once every question is
-    answered, so a default would let a caller under-declare by omission.
-    NO REVIEW FIELD, BY CONSTRUCTION: the platform's own review is read from the store
-    inside the publish request, and `CamelModel`'s `extra="ignore"` drops any unknown key
-    — no request body can put words in the review's mouth. The notes gate lives in the
-    deploy route (`deploy/router.py`), which reads the MERGED answers this schema cannot see."""
-
-    credentials_secrets: bool
-    health_data: bool
-    personal_information: bool
-    financial_data: bool
-    confidential_business_data: bool
-    public_data: bool
-    # Bounded at the boundary the way admin's `RejectRequest.note` is — an over-long
-    # explanation is rejected, never silently truncated into a record that misrepresents
-    # what was said.
-    notes: str | None = Field(default=None, max_length=1000)
-
-    def classification_flags(self) -> dict[str, bool]:
-        """The six answers as the plain mapping the policy module scores.
-
-        Built from `CLASSIFICATION_KEYS` rather than a literal dict so a question added to
-        the questionnaire cannot be silently dropped here — it would fail loudly at the
-        `getattr` instead of quietly scoring as No.
-        """
-        return {key: bool(getattr(self, key)) for key in CLASSIFICATION_KEYS}
+ClassKey = Annotated[str, Field(min_length=1, max_length=MAX_CLASS_KEY)]
 
 
 class DeployRequest(CamelModel):
     """`commitSha` names the version the owner acted on: the saved version they reviewed, or
     the approved commit, which republishes the approved copy. Any other commit is refused.
-    `answers` is required for the saved version and ignored for the approved commit, whose
-    approval already decided it."""
+
+    `answers` are the owner's Yes/No answers keyed by class key. They count only for scored
+    classes, only while owners may change the reviewer's answers, and a class left out keeps
+    the reviewer's answer; a key that is no active class is refused. There is no review field:
+    the gate reads the stored review, and unknown body keys are dropped. `note` is required
+    whenever the send goes to an administrator."""
 
     commit_sha: str = Field(min_length=1, max_length=64)
-    answers: DataClassificationAnswers | None = None
+    answers: dict[ClassKey, bool] = Field(default_factory=dict)
+    # Bounded at the boundary the way admin's `RejectRequest.note` is — an over-long note is
+    # rejected, never silently truncated into a record that misrepresents what was said.
+    note: str | None = Field(default=None, max_length=1000)
 
 
 class DeployStartedResponse(CamelModel):
@@ -82,8 +61,8 @@ class DeployStartedResponse(CamelModel):
 
 class DeployRoutedResponse(CamelModel):
     """The 200 body when the publish gate ROUTES the app to an administrator instead
-    of deploying (no current review, a standing rejection, or a weighted Yes on the
-    merged answers).
+    of deploying (a hard block answered Yes, an unfinished review, a standing rejection, or
+    a score over the threshold).
     An OUTCOME, not a failure — this renders as an informational state (the app is
     waiting in the queue, pinned to `commit_sha`) and must never paint the red failure
     badge over it: the platform did exactly what it said it would. Wire shape
