@@ -64,7 +64,7 @@ function renderHandoff({ chatId = 'build-X', prompt = 'build me a gate tracker' 
   return render(
     <MemoryRouter initialEntries={[{ pathname: `/chat/${chatId}`, search: '?projectId=p1&kind=build', state: { prompt, theme: 'bial' } }]}>
       <Routes>
-        {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="VIP Movement" />} />)}
+        {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" />} />)}
         <Route path="/projects/:projectId" element={<div>project home</div>} />
         <Route path="/projects" element={<div data-testid="projects-index">projects index</div>} />
       </Routes>
@@ -221,7 +221,7 @@ describe('BuilderPage — a refine turn', () => {
     render(
       <MemoryRouter initialEntries={['/chat/build-X']}>
         <Routes>
-          {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="VIP Movement" />} />)}
+          {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" />} />)}
         </Routes>
       </MemoryRouter>,
     )
@@ -294,7 +294,7 @@ describe('BuilderPage — the preview is handed the first-view stop-clock', () =
 describe('BuilderPage — the composer is not shared across a chat navigation', () => {
   function BuilderHost() {
     const { chatId } = useParams()
-    return <ConversationSurface kind="build" chatId={chatId} projectId="p1" projectName="P" />
+    return <ConversationSurface kind="build" chatId={chatId} projectId="p1" />
   }
   function GoToB() {
     const navigate = useNavigate()
@@ -357,7 +357,7 @@ describe('BuilderPage — the StrictMode load strand', () => {
       <StrictMode>
         <MemoryRouter initialEntries={['/chat/build-X']}>
           <Routes>
-            {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="P" />} />)}
+            {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" />} />)}
           </Routes>
         </MemoryRouter>
       </StrictMode>,
@@ -371,7 +371,7 @@ describe('BuilderPage — the StrictMode load strand', () => {
       <StrictMode>
         <MemoryRouter initialEntries={[{ pathname: '/chat/build-X', search: '?projectId=p1&kind=build', state: { prompt: 'build me a gate tracker', theme: 'bial' } }]}>
           <Routes>
-            {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="VIP" />} />)}
+            {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" />} />)}
           </Routes>
         </MemoryRouter>
       </StrictMode>,
@@ -396,7 +396,7 @@ describe('BuilderPage — a send blocked by an in-flight reply explains itself',
     render(
       <MemoryRouter initialEntries={['/chat/build-X']}>
         <Routes>
-          {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" projectName="P" />} />)}
+          {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" />} />)}
         </Routes>
       </MemoryRouter>,
     )
@@ -433,7 +433,7 @@ describe('BuilderPage — the hand-off does not replay on reload', () => {
           {inWorkspace(
             <Route
               path="/chat/:chatId"
-              element={<ConversationSurface kind="build" projectId="p1" projectName="VIP Movement" />}
+              element={<ConversationSurface kind="build" projectId="p1" />}
             />,
           )}
           <Route path="/projects" element={<div data-testid="projects-index">projects index</div>} />

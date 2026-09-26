@@ -535,7 +535,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     scriptedBuild()
     const { rerender } = render(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-A" projectId="pA" projectName="Project A" /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-A" projectId="pA" /> />)}</Routes>
       </MemoryRouter>,
     )
     await screen.findByPlaceholderText(/ask for another change/i)
@@ -547,7 +547,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
 
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId={CHAT_A_LIVE} projectId="pA" projectName="Project A" />
+        <ConversationSurface chatId={CHAT_A_LIVE} projectId="pA" />
       </MemoryRouter>,
     )
     await awaitBuildTurn(BUILD_TURN_ID, CHAT_A_LIVE)
@@ -558,7 +558,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     h.readTurnStream.mockImplementation(turnStreaming(planReply('A sibling plan.', 'opt-S')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-B" projectId="pA" projectName="Project A" /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-B" projectId="pA" /> />)}</Routes>
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -588,7 +588,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     const turn = scriptedBuild()
     const { rerender } = render(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-A" projectId="pA" projectName="Project A" /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-A" projectId="pA" /> />)}</Routes>
       </MemoryRouter>,
     )
     // Build + frame a preview in project A.
@@ -603,7 +603,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     // bare `<ConversationSurface>` has no host to frame the preview into.
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId={CHAT_A_LIVE} projectId="pA" projectName="Project A" /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId={CHAT_A_LIVE} projectId="pA" /> />)}</Routes>
       </MemoryRouter>,
     )
     await awaitBuildTurn(BUILD_TURN_ID, CHAT_A_LIVE)
@@ -622,7 +622,7 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works',
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Build B, please.', 'opt-B')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-B" projectId="pB" projectName="Project B" /> />)}</Routes>
+        <Routes>{inWorkspace(<Route path="*" element=<ConversationSurface chatId="chat-B" projectId="pB" /> />)}</Routes>
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))

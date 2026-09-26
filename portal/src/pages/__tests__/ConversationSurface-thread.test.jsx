@@ -61,7 +61,7 @@ function renderThread({ state, chatId = 'thread-1' } = {}) {
       <Routes>
         <Route
           path="/chat/:chatId"
-          element={<ConversationSurface projectId="p1" projectName="VIP Movement" />}
+          element={<ConversationSurface projectId="p1" />}
         />
       </Routes>
     </MemoryRouter>,

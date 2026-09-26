@@ -65,6 +65,14 @@ vi.mock('../../../utils/deployApi', async (importOriginal) => ({
 vi.mock('../RailComposer', () => ({
   default: () => <div data-testid="rail-composer" />,
 }))
+// The toolbar menu's two dialogs have suites of their own; here they only say which project
+// they were opened on.
+vi.mock('../../projects/AppSettingsDialog', () => ({
+  default: ({ project }: { project: Project }) => <div role="dialog" aria-label={`Settings for ${project.name}`} />,
+}))
+vi.mock('../../projects/SharePanel', () => ({
+  default: ({ projectName }: { projectName: string }) => <div role="dialog" aria-label={`Share ${projectName}`} />,
+}))
 
 const APP_URL = 'https://app-a.example.azurecontainerapps.io/'
 
@@ -933,6 +941,34 @@ describe('★ the save control is the whole of what the workspace says about sav
     expect(railComposer()).toBeTruthy()
     expect(screen.queryByTestId('save-project')).toBeNull()
     expect(screen.queryByTestId('save-state')).toBeNull()
+  })
+})
+
+describe('the toolbar menu opens this project’s dialogs', () => {
+  /** `ProjectPage`'s share of the screen: the heading that tells the row a project loaded. */
+  function HeadedSurface() {
+    usePublishHeading({ projectId: PROJECT.id, projectName: PROJECT.name, chatTitle: null, chatKind: null })
+    return <Surface />
+  }
+
+  it.each([
+    ['Settings…', 'Settings for VIP Movement'],
+    ['Share…', 'Share VIP Movement'],
+  ])('%s opens its dialog on the project', async (item, dialog) => {
+    render(
+      <MemoryRouter initialEntries={['/projects/pA']}>
+        <Routes>
+          <Route element={<WorkspaceShell />}>
+            <Route path="/projects/:projectId" element={<HeadedSurface />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    fireEvent.pointerDown(await screen.findByTestId('workspace-menu'))
+    fireEvent.click(await screen.findByRole('menuitem', { name: item }))
+
+    expect(await screen.findByRole('dialog', { name: dialog })).toBeTruthy()
   })
 })
 

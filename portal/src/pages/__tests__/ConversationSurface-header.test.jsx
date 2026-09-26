@@ -62,13 +62,13 @@ function ProjectPageStub() {
   return <div data-testid="project-page">project page: {pid}</div>
 }
 
-function renderBuilder({ chatId = 'thread-1', projectId = 'p1', projectName = 'VIP Movement' } = {}) {
+function renderBuilder({ chatId = 'thread-1', projectId = 'p1' } = {}) {
   return render(
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <Routes>
         <Route
           path="/chat/:chatId"
-          element={<ConversationSurface projectId={projectId} projectName={projectName} />}
+          element={<ConversationSurface projectId={projectId} />}
         />
         <Route path="/projects/:pid" element={<ProjectPageStub />} />
       </Routes>

@@ -61,7 +61,7 @@ import {
 function renderAt(chatId, projectId = 'p1') {
   return render(
     <MemoryRouter initialEntries={['/x']}>
-      <ConversationSurface chatId={chatId} projectId={projectId} projectName="VIP Movement" />
+      <ConversationSurface chatId={chatId} projectId={projectId} />
     </MemoryRouter>,
   )
 }
@@ -246,7 +246,7 @@ describe('an in-flight turn belongs to ONE chat', () => {
     h.readTurnStream.mockImplementation(turnStreaming(planReply('B plan', 'opt-B')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" />
+        <ConversationSurface chatId="chat-B" projectId="p1" />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -282,7 +282,7 @@ describe('an in-flight turn belongs to ONE chat', () => {
     })
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" />
+        <ConversationSurface chatId="chat-B" projectId="p1" />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -322,7 +322,7 @@ describe('a typed draft survives', () => {
       h.getBuild.mockResolvedValue({ id: chatId, kind: 'build', messages: [] })
       rerender(
         <MemoryRouter initialEntries={['/x']}>
-          <ConversationSurface chatId={chatId} projectId="p1" projectName="VIP Movement" />
+          <ConversationSurface chatId={chatId} projectId="p1" />
         </MemoryRouter>,
       )
       await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith(chatId))
@@ -401,7 +401,7 @@ describe('a finished build offers no canned follow-ups (2026-07-30)', () => {
     })
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId={NEW_BUILD_CHAT} projectId="p1" projectName="VIP Movement" />
+        <ConversationSurface chatId={NEW_BUILD_CHAT} projectId="p1" />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith(NEW_BUILD_CHAT))
@@ -527,7 +527,7 @@ describe('cross-chat build scoping and reload fidelity', () => {
 
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId={LIVE_BUILD_CHAT} projectId="p1" projectName="VIP Movement" />
+        <ConversationSurface chatId={LIVE_BUILD_CHAT} projectId="p1" />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith(LIVE_BUILD_CHAT))
@@ -544,7 +544,7 @@ describe('cross-chat build scoping and reload fidelity', () => {
     h.getBuild.mockResolvedValue({ id: 'chat-B', kind: 'build', messages: [] })
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="chat-B" projectId="p1" projectName="VIP Movement" />
+        <ConversationSurface chatId="chat-B" projectId="p1" />
       </MemoryRouter>,
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
@@ -739,12 +739,12 @@ describe('a refused send leaves the citizen holding their message', () => {
     // Away and back while the refusal is in flight.
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="build-Y" projectId="p1" projectName="VIP Movement" />
+        <ConversationSurface chatId="build-Y" projectId="p1" />
       </MemoryRouter>,
     )
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="build-X" projectId="p1" projectName="VIP Movement" />
+        <ConversationSurface chatId="build-X" projectId="p1" />
       </MemoryRouter>,
     )
     await waitForGateOpen()
@@ -775,7 +775,7 @@ describe('a refused send leaves the citizen holding their message', () => {
 
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="build-Y" projectId="p1" projectName="VIP Movement" />
+        <ConversationSurface chatId="build-Y" projectId="p1" />
       </MemoryRouter>,
     )
     await waitForGateOpen()
@@ -815,7 +815,7 @@ describe('a refused send leaves the citizen holding their message', () => {
 
     rerender(
       <MemoryRouter initialEntries={['/x']}>
-        <ConversationSurface chatId="build-Y" projectId="p1" projectName="VIP Movement" />
+        <ConversationSurface chatId="build-Y" projectId="p1" />
       </MemoryRouter>,
     )
     await waitForGateOpen()

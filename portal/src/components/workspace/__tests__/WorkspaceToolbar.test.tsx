@@ -845,17 +845,41 @@ describe('the back control, and the menu that replaced two controls', () => {
     expect(screen.getByTestId('where').textContent).toBe('/projects')
   })
 
-  it('★ the deliberate "Your project" fallback on a chat is untouched', () => {
-    /* NOT PART OF THE DEFECT, and deliberately left as it is. A project deleted out from under
-       an open chat leaves the breadcrumb with no name, and the row deliberately says "Your project"
-       rather than leaving a gap that shifts the layout when a fetch lands. The menu gate is
-       allowed to read the same `null`; it is not allowed to change what the slot says. */
+  it.each([
+    ['Settings…', 'settings'],
+    ['Share…', 'share'],
+  ] as const)('a chat over a loaded project offers the menu, and %s presses the published action', async (label, key) => {
+    const press = vi.fn()
+    render(
+      <Workspace
+        entry="/chat/c1"
+        chat={{ heading: CHAT_HEADING, actions: { save: null, settings: null, share: null, [key]: press } }}
+      />,
+    )
+    await openMenu()
+    fireEvent.click(screen.getByRole('menuitem', { name: label }))
+    expect(press).toHaveBeenCalledTimes(1)
+  })
+
+  it('a chat whose project failed to load keeps the fallback name and offers no menu', () => {
+    /* A project deleted out from under an open chat leaves the breadcrumb with no name. The row
+       says "Your application" rather than leaving a gap that shifts the layout when a fetch
+       lands; the menu gate reads the same `null` without changing what the slot says. */
     render(<Workspace entry="/chat/c1" chat={{ heading: { ...CHAT_HEADING, projectName: null } }} />)
 
     expect(row().textContent).toContain('Your application')
     expect(title().textContent).toBe('Add an out-time column')
     expect(screen.getByRole('button', { name: 'Back to the application' })).toBeTruthy()
-    // The menu is about the APPLICATION; a chat address never had it, name or no name.
+    expect(screen.queryByTestId('workspace-menu')).toBeNull()
+  })
+
+  it('a chat that has not resolved yet offers no menu, even once its project has loaded', () => {
+    /* The chat's surface is what answers Settings and Share, and it mounts when the chat
+       resolves. A project that loads first must not put up a menu whose presses land nowhere. */
+    render(<Workspace entry="/chat/c1" chat={{ heading: { ...CHAT_HEADING, chatKind: null, chatTitle: null } }} />)
+
+    expect(row().textContent).toContain('Visitor Log — Airport Office')
+    expect(screen.getByRole('button', { name: 'Back to the application' })).toBeTruthy()
     expect(screen.queryByTestId('workspace-menu')).toBeNull()
   })
 })

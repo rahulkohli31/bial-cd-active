@@ -30,6 +30,7 @@ import ScrollToLatest from './ScrollToLatest'
 import TurnBanner from './TurnBanner'
 import { createConversation, discardNoticeText, listProjectConversations } from '../../utils/conversationApi'
 import type { ConversationHeader } from '../../utils/conversationApi'
+import type { Project } from '../../utils/projectApi'
 import { markAppVisible } from '../../utils/observe'
 import { isConversationGone } from '../../utils/chatErrors'
 
@@ -81,6 +82,7 @@ import { resolvePlanOptions } from '../../utils/turnStreamApi'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../../utils/attachmentStore'
 import { validateConversationAttachmentCap } from '../../utils/attachmentInput'
 import { announceDeploymentChanged } from '../../hooks/usePublishState'
+import { useProjectDialogs } from '../../hooks/useProjectDialogs'
 
 import { loadBuilds, getBuild, deriveTitle } from '../../utils/builderHistory'
 import { outcomeSummary, outcomeWorthAnnouncing } from '../../utils/messageTypes'
@@ -127,9 +129,12 @@ const welcomeMessage = (): ChatMessage => ({ id: 'welcome', ephemeral: true, rol
 export interface ConversationSurfaceProps {
   chatId?: string
   projectId?: string | null
-  /** Carried by the route. Nothing on this surface reads it — the toolbar row's project name is
-   *  published straight to the channel by `ChatRoute`, which is its one author. */
-  projectName?: string | null
+  /** The chat's project once its fetch has landed, `null` while it loads or after it failed. It
+   *  is what the toolbar's Settings and Share open on; the row's project name is still published
+   *  by `ChatRoute`, its one author. */
+  project?: Project | null
+  /** Told when the settings dialog changes the project, so the route that owns it redraws. */
+  onProjectUpdate: (project: Project) => void
   /**
    * THE TITLE THIS SURFACE DERIVES, HANDED BACK UP. Derived from the first message, the
    * moment the row is created — the toolbar heading otherwise learns it from a GET that
@@ -330,7 +335,7 @@ function putStep(sink: TurnSink, toolCallId: string, step: StepItem): void {
   else sink.parts[at] = { kind: 'step', toolCallId, step }
 }
 
-export default function ConversationSurface({ chatId: chatIdProp, kind, projectId = null, projectHasSavedBuild = null, onTitleDerived }: ConversationSurfaceProps) {
+export default function ConversationSurface({ chatId: chatIdProp, kind, projectId = null, project = null, onProjectUpdate, projectHasSavedBuild = null, onTitleDerived }: ConversationSurfaceProps) {
   // THE ONE THING THE KIND DECIDES ON THIS SURFACE. A Plan chat shows no app pane; a
   // Build chat shows it.
   const isPlanChat = kind === 'plan'
@@ -779,9 +784,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   const turnRunningHere =
     generatingChatId !== null &&
     (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
+  const projectDialogs = useProjectDialogs(project, onProjectUpdate)
   usePublishSave(
     { dirty: saveDirty, saving, error: saveError, discarding, replying: turnRunningHere, hasSavedVersion },
-    { save: handleSave, discard: handleDiscard, settings: null, share: null },
+    { save: handleSave, discard: handleDiscard, settings: projectDialogs.settings, share: projectDialogs.share },
   )
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
   // aborts it before resubscribing, but nothing did on unmount, leaking the reader (and its
@@ -2763,6 +2769,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         </div>
       </div>
       </ChatRuntimeProvider>
+      {projectDialogs.dialogs}
     </div>
   )
 }

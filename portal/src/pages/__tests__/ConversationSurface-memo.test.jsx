@@ -49,7 +49,7 @@ import { primeTurn } from './_builderSession.jsx'
 function renderAt(chatId, projectId = 'p1') {
   return render(
     <MemoryRouter initialEntries={['/x']}>
-      <ConversationSurface chatId={chatId} projectId={projectId} projectName="VIP Movement" />
+      <ConversationSurface chatId={chatId} projectId={projectId} />
     </MemoryRouter>,
   )
 }

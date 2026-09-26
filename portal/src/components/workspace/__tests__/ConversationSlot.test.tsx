@@ -32,11 +32,13 @@ vi.mock('../../chat/ConversationSurface', () => ({
   ),
 }))
 
+const noop = () => {}
+
 const conversation = (over: Partial<MountedConversation> = {}): MountedConversation => ({
   chatId: 'chat-1',
   kind: 'plan',
   projectId: 'p1',
-  projectName: 'VIP Movement',
+  project: null,
   projectHasSavedBuild: null,
   ...over,
 })
@@ -44,7 +46,7 @@ const conversation = (over: Partial<MountedConversation> = {}): MountedConversat
 const renderSlot = (over?: Partial<MountedConversation>, hidden = false) =>
   render(
     <MemoryRouter>
-      <ConversationSlot conversation={conversation(over)} hidden={hidden} />
+      <ConversationSlot conversation={conversation(over)} hidden={hidden} onProjectUpdate={noop} />
     </MemoryRouter>,
   )
 
@@ -87,7 +89,7 @@ describe('ConversationSlot — one body, whatever the kind', () => {
       return (
         <MemoryRouter>
           <button type="button" onClick={() => setKind('build')}>to builder</button>
-          <ConversationSlot conversation={conversation({ kind })} />
+          <ConversationSlot conversation={conversation({ kind })} onProjectUpdate={noop} />
         </MemoryRouter>
       )
     }
@@ -110,7 +112,7 @@ describe('ConversationSlot — hidden means mounted, out of reach, and out of th
       return (
         <MemoryRouter>
           <button type="button" onClick={() => setHidden(!hidden)}>toggle</button>
-          <ConversationSlot conversation={conversation()} hidden={hidden} />
+          <ConversationSlot conversation={conversation()} hidden={hidden} onProjectUpdate={noop} />
         </MemoryRouter>
       )
     }

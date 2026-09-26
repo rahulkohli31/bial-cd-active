@@ -8,6 +8,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { useLayoutEffect, type ReactNode } from 'react'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useLocation, useNavigate, useParams } from 'react-router-dom'
+import type { Project } from '../../utils/projectApi'
 
 const h = vi.hoisted(() => ({
   getConversation: vi.fn(),
@@ -46,22 +47,25 @@ vi.mock('../../utils/projectApi', async (importOriginal) => ({
 vi.mock('../../components/workspace/ConversationSlot', () => ({
   default: function ConversationSlotStub({
     conversation,
+    onProjectUpdate,
     onTitleDerived,
   }: {
-    conversation: { chatId: string; kind: string; projectId: string | null; projectName: string | null }
+    conversation: { chatId: string; kind: string; projectId: string | null; project: Project | null }
+    onProjectUpdate: (project: Project) => void
     // The surface derives a title from the first message of a chat whose row had none, and hands
     // it BACK to this route — see `onTitleDerived` in `ChatRoute`. Accepted here so the merge is
     // reachable from a test at all; a stub that omits it drops the call silently.
     onTitleDerived?: (title: string) => void
   }) {
     const navigate = useNavigate()
-    const { chatId, kind, projectId, projectName } = conversation
+    const { chatId, kind, projectId, project } = conversation
     return (
       <div data-testid="conversation-slot" data-kind={kind}>
-        {`${kind}|${chatId}|${projectId}|${projectName}`}
+        {`${kind}|${chatId}|${projectId}|${project?.name ?? null}`}
         <button onClick={() => navigate(`/chat/${chatId}`, { replace: true })}>drop query</button>
         <button onClick={() => navigate('/chat/c2')}>go to c2</button>
         <button onClick={() => onTitleDerived?.('Add an out-time column')}>derive a title</button>
+        {project && <button onClick={() => onProjectUpdate({ ...project, name: 'Visitor Log' })}>rename the project</button>}
       </div>
     )
   },
@@ -356,20 +360,31 @@ describe('ChatRoute — the GET that cannot succeed', () => {
 })
 
 describe('ChatRoute — the project breadcrumb', () => {
-  it('passes projectName down once getProject resolves', async () => {
+  it('passes the project down once getProject resolves', async () => {
     h.getConversation.mockResolvedValue(conversation())
     renderRoute('/chat/c1')
     await waitFor(() => expect(screen.getByTestId('conversation-slot').textContent).toContain('VIP Movement'))
     expect(h.getProject).toHaveBeenCalledWith('p1')
   })
 
-  it('passes projectName: null and does NOT redirect when the project 404s', async () => {
+  it('passes no project and does NOT redirect when the project 404s', async () => {
     // A chat whose project vanished should still render its transcript.
     h.getConversation.mockResolvedValue(conversation())
     h.getProject.mockRejectedValue(new Error('gone'))
     renderRoute('/chat/c1')
     await waitFor(() => expect(screen.getByTestId('conversation-slot').textContent).toContain('|null'))
     expect(screen.queryByTestId('projects-index')).toBeNull()
+  })
+
+  it('redraws the heading with a change the chat’s settings made to the project', async () => {
+    h.getConversation.mockResolvedValue(conversation({ kind: 'build', title: 'Add an out-time column' }))
+    renderRoute('/chat/c1')
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|build|Add an out-time column'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'rename the project' }))
+
+    await waitFor(() => expect(heading()).toBe('p1|Visitor Log|build|Add an out-time column'))
+    expect(screen.getByTestId('conversation-slot').textContent).toContain('|p1|Visitor Log')
   })
 
   it('falls back to the query projectId when the conversation carries none', async () => {
