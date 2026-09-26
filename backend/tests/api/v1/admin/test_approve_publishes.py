@@ -475,6 +475,33 @@ async def test_an_approved_copy_that_will_not_build_writes_no_chat_card_and_is_n
     assert status["approvedRetryCommit"] is None
 
 
+async def test_sending_the_approved_commit_after_it_would_not_build_goes_through_the_gate(
+    wire, client, db_session
+) -> None:
+    """The owner saved nothing since, so the dialog sends the approved commit itself. It must be
+    decided as the saved version, not republished as the copy that just failed to build."""
+    owner, app_row, submission_id = await _submitted_for_review(wire, client, db_session)
+    wire.images.error = ImageBuildError("the registry refused the build", log_tail=None)
+    await _approve(client, db_session, app_row, submission_id)
+    await _settle(wire)
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(owner),
+        json={
+            "commitSha": wire.submitted[1],
+            "note": "The approved version will not build; please look again.",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["outcome"] == "routed_for_review"
+    await _settle(wire)
+    (row,) = await _deployments(db_session, app_row.id)
+    assert row.failure_code == "build_failed"
+    assert wire.extracted_from == [submission_key(app_row.id, submission_id)]
+
+
 async def _registry_row(client, admin, app_row: AppRegistry) -> dict[str, Any]:
     resp = await client.get("/v1/admin/apps", headers=auth_headers(admin))
     assert resp.status_code == 200, resp.text

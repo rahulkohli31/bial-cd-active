@@ -11,13 +11,14 @@ style choice: a deploy runs for minutes and the edge gateway times out at twenty
 
 THE PUBLISH GATE IS A PRECEDENCE LADDER. The request names the commit the owner acted on.
 `deploy_project` refuses a disabled or waiting app, republishes the approved copy when the
-request names the approved commit, and refuses any commit that is not the saved version. For the
-saved version, `deploy/gate.py` decides from the platform's stored review, the live
-configuration and the owner's answers: a hard block, an unfinished review, a standing rejection
-or a score over the threshold ROUTES into the admin queue, and anything else PUBLISHES. A route
-needs the owner's note. THE INVARIANT ON A ROUTE: the app is queued at exactly the version
-examined, and nothing publishes. Approving it publishes that copy (`admin/router.py`'s
-`approve`); the approved commit named here republishes it, which is the owner's Try again.
+request names the approved commit while the copy is on offer, and refuses any commit that is not
+the saved version. For the saved version, `deploy/gate.py` decides from the platform's stored
+review, the live configuration and the owner's answers: a hard block, an unfinished review, a
+standing rejection or a score over the threshold ROUTES into the admin queue, and anything else
+PUBLISHES. A route needs the owner's note. THE INVARIANT ON A ROUTE: the app is queued at exactly
+the version examined, and nothing publishes. Approving it publishes that copy
+(`admin/router.py`'s `approve`); the approved commit named here republishes it, which is the
+owner's Try again.
 
 NO AUTHENTICATION ON THE PUBLISHED APP, deliberately out of scope: until that lands, anyone
 with the URL can open any deployed app. `ingress` is `external` (`deploy/config.py`); whether
@@ -259,7 +260,7 @@ async def deploy_project(
     #
     #   1.  disabled                                     -> refuse
     #   2.  pending                                      -> refuse: waiting
-    #   3.  approved AND the commit is the approved one  -> PUBLISH the approved submission copy
+    #   3.  the approved commit, while it is on offer    -> PUBLISH the approved submission copy
     #   4.  the commit is not H                          -> refuse: snapshot_moved
     #   5+. `gate.decide`: an unfinished review for (H, the live class definitions), a hard
     #       block answered Yes, a standing rejection, or a score over the threshold -> ROUTE,
@@ -342,21 +343,25 @@ async def deploy_project(
 
     # --- rule 3: the approved copy ----------------------------------------------------
     # The approval is the decision for that commit: no review, no answers, and nothing saved
-    # since can change what ships, because the copy is immutable.
+    # since can change what ships, because the copy is immutable. It holds exactly while the
+    # status route offers the copy; once the copy has failed in itself, its commit falls through
+    # and is decided as the saved version like any other.
     copy = approved_copy(app_row)
     if copy is not None and body.commit_sha == copy.commit_sha:
-        return await _start_pipeline(
-            db,
-            service=service,
-            user=user,
-            app_row=app_row,
-            project_id=project_id,
-            declaration=app_row.declaration,
-            records_decision=False,
-            expected_commit_sha=copy.commit_sha,
-            bundle_key=submission_key(app_row.id, copy.submission_id),
-            rule="approved_override",
-        )
+        latest = await deployment_for_app(db, app_id=app_row.id)
+        if await _approved_retry(db, app_row, latest) == copy.commit_sha:
+            return await _start_pipeline(
+                db,
+                service=service,
+                user=user,
+                app_row=app_row,
+                project_id=project_id,
+                declaration=app_row.declaration,
+                records_decision=False,
+                expected_commit_sha=copy.commit_sha,
+                bundle_key=submission_key(app_row.id, copy.submission_id),
+                rule="approved_override",
+            )
 
     head_sha, saved_at = await _shipping_head(storage, app_row.id)
 
@@ -447,6 +452,19 @@ async def deploy_project(
 
 
 # --- the ladder's machinery ----------------------------------------------------------
+
+
+async def _approved_retry(
+    db: AsyncSession, app_row: AppRegistry, latest: Deployment | None
+) -> str | None:
+    """`approved_retry_commit` for the newest attempt, asked the same way by the status route
+    and by rule 3 so the button and the ladder cannot disagree about the approved copy. The last
+    publish is read only for the rare row that cannot say for itself whether the copy went live."""
+    approved_went_live = False
+    if retry_needs_last_publish(app_row, latest):
+        published = await store.latest_published(db, app_id=app_row.id)
+        approved_went_live = published_since_approval(app_row, published)
+    return approved_retry_commit(app_row, latest, approved_went_live=approved_went_live)
 
 
 async def _shipping_head(
@@ -807,13 +825,7 @@ async def latest_deployment(
         raise saved_or_error
     row, saved = row_or_error, saved_or_error
     publish_state = compute_publish_state(app_row, row, saved.head)
-    # One more read, and only on the rare row that cannot say for itself whether the approved
-    # copy already went live — the poll's ordinary path stays at the queries above.
-    approved_went_live = False
-    if retry_needs_last_publish(app_row, row):
-        published = await store.latest_published(db, app_id=app_row.id)
-        approved_went_live = published_since_approval(app_row, published)
-    retry_commit = approved_retry_commit(app_row, row, approved_went_live=approved_went_live)
+    retry_commit = await _approved_retry(db, app_row, row)
     if row is None:
         return DeploymentResponse(
             app_id=str(app_row.id),

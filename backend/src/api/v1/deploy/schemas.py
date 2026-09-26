@@ -26,10 +26,12 @@ from src.services.deploy.service import (
     FAIL_INTERNAL,
     FAIL_NO_SNAPSHOT,
     FAIL_NOT_HEALTHY,
+    FAIL_NOT_READY,
     FAIL_PROVISION,
     FAIL_RESTART,
     FAIL_RESTART_NOT_READY,
     FAIL_ROUTED_FOR_REVIEW,
+    FAIL_SNAPSHOT_CORRUPT,
     FAIL_SNAPSHOT_MOVED,
     FAIL_SNAPSHOT_UNREADABLE,
     FAIL_STORAGE,
@@ -395,12 +397,19 @@ def compute_registry_status(app: AppRegistry, deployment: Deployment | None) -> 
 # the one button acts on the saved version instead, which is where the owner can send a fix.
 # Restarts and older routed rows are neither: they are not failed publishes.
 _RETRYABLE_FAILURE_CODES: frozenset[str] = frozenset(
-    {INTERRUPTED, FAIL_INTERNAL, FAIL_PROVISION, FAIL_STORAGE}
+    {
+        INTERRUPTED,
+        FAIL_INTERNAL,
+        FAIL_PROVISION,
+        FAIL_STORAGE,
+        FAIL_SNAPSHOT_UNREADABLE,
+        FAIL_NOT_READY,
+    }
 )
 _NON_RETRYABLE_FAILURE_CODES: frozenset[str] = frozenset(
     {
         FAIL_NO_SNAPSHOT,
-        FAIL_SNAPSHOT_UNREADABLE,
+        FAIL_SNAPSHOT_CORRUPT,
         FAIL_SNAPSHOT_MOVED,
         FAIL_CONTEXT_TOO_LARGE,
         FAIL_BUILD,
@@ -445,10 +454,11 @@ def approved_retry_commit(
 
     That is while the copy has not gone live since its approval — nothing attempted yet, or an
     attempt at it failed for a reason a retry can fix — and when the version taken offline is the
-    approved one. A failed attempt that shipped some other commit is retried through the gate
-    instead; one that failed before naming a commit is an attempt at the copy only if nothing has
-    gone live since the approval (`approved_went_live`, asked for when `retry_needs_last_publish`
-    says so)."""
+    approved one and did not fail in itself. A failed attempt that shipped some other commit is
+    retried through the gate instead; one that failed before naming a commit is an attempt at the
+    copy only if nothing has gone live since the approval (`approved_went_live`, asked for when
+    `retry_needs_last_publish` says so). The publish route takes the approved-copy rung exactly
+    when this offers the commit it was sent."""
     copy = approved_copy(app)
     if copy is None:
         return None
@@ -456,7 +466,10 @@ def approved_retry_commit(
     if deployment is None or not _attempted_since_approval(app, deployment):
         return approved
     if deployment.unpublished_at is not None:
-        return approved if deployment.head_sha == approved else None
+        # A takedown stamps the newest attempt whatever its ending, including a copy that failed
+        # in itself, which is not offered back.
+        failed_in_itself = deployment.failure_code in _NON_RETRYABLE_FAILURE_CODES
+        return approved if deployment.head_sha == approved and not failed_in_itself else None
     if not _retryable_failure(deployment):
         return None
     if deployment.head_sha == approved:

@@ -413,6 +413,28 @@ def test_an_approved_copy_that_fails_in_itself_is_not_offered_again(code: str) -
         assert approved_retry_commit(app, failed, approved_went_live=False) is None
 
 
+@pytest.mark.parametrize(
+    ("code", "offered"),
+    [
+        ("snapshot_unreadable", True),
+        ("revision_not_ready", True),
+        ("snapshot_corrupt", False),
+        ("revision_unhealthy", False),
+    ],
+)
+def test_reading_and_starting_the_copy_tell_the_platform_s_faults_from_the_copy_s(
+    code: str, offered: bool
+) -> None:
+    """A bundle that could not be read and an app slow to start are the platform's faults; a
+    malformed bundle and a revision that failed are the copy's, and would fail the same way."""
+    app = _approved(_SUBMITTED_SHA)
+    for head in (_SUBMITTED_SHA, None):
+        failed = _deployment(status=DeploymentStatus.FAILED, failure_code=code, head_sha=head)
+
+        retry = approved_retry_commit(app, failed, approved_went_live=False)
+        assert retry == (_SUBMITTED_SHA if offered else None), head
+
+
 def test_every_failure_code_is_sorted_into_exactly_one_set() -> None:
     """Whether the one button retries the approved copy after a failure is decided per code, so
     a code the pipeline gains must be placed before it ships."""
@@ -431,6 +453,42 @@ def test_every_failure_code_is_sorted_into_exactly_one_set() -> None:
     ]
 
     assert sorted(placed) == sorted(codes)
+
+
+@pytest.mark.parametrize(
+    ("retry", "stamped"),
+    [
+        pytest.param(_SUBMITTED_SHA, {"head_sha": _SUBMITTED_SHA}, id="the copy was live"),
+        pytest.param(
+            _SUBMITTED_SHA,
+            {
+                "status": DeploymentStatus.FAILED,
+                "failure_code": FAIL_RESTART,
+                "head_sha": _SUBMITTED_SHA,
+            },
+            id="a restart of the live copy had failed",
+        ),
+        pytest.param(
+            None,
+            {
+                "status": DeploymentStatus.FAILED,
+                "failure_code": "build_failed",
+                "head_sha": _SUBMITTED_SHA,
+            },
+            id="the copy had failed in itself",
+        ),
+    ],
+)
+def test_a_takedown_offers_the_approved_copy_back_unless_it_failed_in_itself(
+    retry: str | None, stamped: dict[str, object]
+) -> None:
+    """A takedown stamps the newest attempt whatever its ending. Putting back a copy that never
+    built would fail the same way, so the button acts on the saved version instead."""
+    app = _approved(_SUBMITTED_SHA)
+    deployment = _deployment(unpublished_at=datetime(2026, 9, 21, tzinfo=UTC), **stamped)
+
+    assert compute_publish_state(app, deployment, _SAVED_SHA) is PublishState.TAKEN_OFFLINE
+    assert approved_retry_commit(app, deployment, approved_went_live=False) == retry
 
 
 def test_only_a_nameless_failed_attempt_since_approval_asks_what_went_live() -> None:

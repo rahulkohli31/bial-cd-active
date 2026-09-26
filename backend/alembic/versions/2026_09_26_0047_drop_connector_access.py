@@ -50,6 +50,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     connector_request_status.create(op.get_bind(), checkfirst=True)
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.create_table(
         "connector_access_requests",
         sa.Column("id", sa.Uuid(), server_default=sa.text("uuidv7()"), nullable=False),
@@ -81,6 +82,7 @@ def downgrade() -> None:
         sa.ForeignKeyConstraint(["decided_by_id"], ["users.id"], ondelete="SET NULL"),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.execute("SET LOCAL lock_timeout = DEFAULT")
     op.create_index(
         op.f("ix_connector_access_requests_user_id"),
         "connector_access_requests",

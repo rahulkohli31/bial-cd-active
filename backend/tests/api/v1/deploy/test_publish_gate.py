@@ -31,6 +31,7 @@ from src.db.models.classification_config import (
     ClassificationPolicy,
 )
 from src.db.models.classification_review import ClassificationReview
+from src.db.models.deployment import Deployment, DeploymentStatus
 from src.services.classification import store as review_store
 from src.services.classification.config import load_live_config
 from src.services.classification.constants import REVIEW_WALL_CLOCK_CEILING_S
@@ -782,6 +783,101 @@ async def test_the_saved_version_of_an_approved_app_goes_through_the_gate(
     assert resp.status_code == 200
     assert resp.json()["outcome"] == "routed_for_review"
     assert wire.pipeline.started == []
+
+
+_APPROVED_AT = datetime(2026, 9, 25, 9, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    "attempt",
+    [
+        pytest.param(
+            {"status": DeploymentStatus.SUCCEEDED, "head_sha": _OLDER_SHA},
+            id="nothing attempted since the approval",
+        ),
+        pytest.param(
+            {
+                "status": DeploymentStatus.FAILED,
+                "failure_code": "provision_failed",
+                "head_sha": _SHA,
+                "created_at": _APPROVED_AT + timedelta(hours=1),
+            },
+            id="the copy failed for a reason a retry can fix",
+        ),
+        pytest.param(
+            {
+                "status": DeploymentStatus.FAILED,
+                "failure_code": "interrupted",
+                "created_at": _APPROVED_AT + timedelta(hours=1),
+            },
+            id="the copy was interrupted before it named a commit",
+        ),
+        pytest.param(
+            {
+                "status": DeploymentStatus.SUCCEEDED,
+                "head_sha": _SHA,
+                "created_at": _APPROVED_AT + timedelta(hours=1),
+                "unpublished_at": _APPROVED_AT + timedelta(hours=2),
+            },
+            id="the approved version was taken offline",
+        ),
+    ],
+)
+async def test_the_approved_commit_republishes_the_copy_while_it_is_on_offer(
+    wire, client, db_session, attempt: dict[str, Any]
+) -> None:
+    user, app_row = await _owner_with_saved_app(
+        db_session, wire.store, **_approved(_SHA, approved_at=_APPROVED_AT)
+    )
+    db_session.add(
+        Deployment(
+            app_id=app_row.id,
+            user_id=user.id,
+            **{"created_at": _APPROVED_AT - timedelta(days=1), **attempt},
+        )
+    )
+    await db_session.commit()
+
+    resp = await _post(client, user, app_row, _body())
+
+    assert resp.status_code == 202, resp.text
+    (started,) = wire.pipeline.started
+    assert app_row.approved_submission_id is not None
+    assert started["bundle_key"] == submission_key(app_row.id, app_row.approved_submission_id)
+    (row,) = await _gate_rows(db_session, app_row.id)
+    assert row.detail is not None
+    assert row.detail["rule"] == "approved_override"
+
+
+async def test_an_approved_copy_that_failed_in_itself_is_decided_as_the_saved_version(
+    wire, client, db_session
+) -> None:
+    """Republishing the copy would fail the same way again, so its commit, still the saved one,
+    goes through the gate: here no review exists, so it routes with the owner's note."""
+    user, app_row = await _owner_with_saved_app(
+        db_session, wire.store, **_approved(_SHA, approved_at=_APPROVED_AT)
+    )
+    db_session.add(
+        Deployment(
+            app_id=app_row.id,
+            user_id=user.id,
+            status=DeploymentStatus.FAILED,
+            failure_code="build_failed",
+            head_sha=_SHA,
+            created_at=_APPROVED_AT + timedelta(hours=1),
+        )
+    )
+    await db_session.commit()
+
+    resp = await _post(client, user, app_row, _body(note=_NOTE))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["outcome"] == "routed_for_review"
+    assert wire.pipeline.started == []
+    (row,) = await _gate_rows(db_session, app_row.id)
+    assert row.detail is not None
+    assert (row.detail["decision"], row.detail["rule"]) == ("routed", "review_unfinished")
+    assert row.detail["declaration"]["note"] == _NOTE
 
 
 async def test_an_approval_with_no_stored_copy_is_not_an_approved_copy(

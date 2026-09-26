@@ -31,7 +31,7 @@ from src.services.deploy.config import DeployConfig
 from src.services.deploy.images import BuiltImage, ImageBuildError
 from src.services.deploy.names import published_app_name
 from src.services.deploy.service import DeployNotPossibleError, DeployService
-from src.services.storage import submission_key
+from src.services.storage import BundleValidationError, submission_key
 from src.services.storage.snapshot_read import ExtractedSnapshot, NoAppYet
 from tests.factories import AppRegistryFactory, ConversationFactory, UserFactory
 
@@ -415,12 +415,33 @@ async def test_an_unhealthy_revision_fails_the_deploy(wire, db_session) -> None:
 
 
 async def test_a_revision_that_never_becomes_healthy_is_bounded(wire, db_session) -> None:
+    """An expired budget is not a verdict, so it settles under a code of its own: a slow app is
+    worth trying again, where one that failed is not."""
     user, app, _conversation = await _project(db_session)
     wire.aca._healthy = False
 
     _started, row = await _run(wire, db_session, user, app)
 
-    assert row.failure_code == "revision_unhealthy"
+    assert row.status is DeploymentStatus.FAILED
+    assert row.failure_code == "revision_not_ready"
+
+
+async def test_a_malformed_bundle_settles_as_corrupt_rather_than_a_crash(
+    wire, db_session, monkeypatch
+) -> None:
+    """Read as a crash it would be offered again on every press, and the same bytes would fail
+    the same way each time."""
+
+    async def _malformed(app_id, *, bundle_key=None):
+        raise BundleValidationError("not a v2 git bundle (bad or missing header magic)")
+
+    monkeypatch.setattr(service_module, "extract_snapshot", _malformed)
+    user, app, _conversation = await _project(db_session)
+
+    _started, row = await _run(wire, db_session, user, app)
+
+    assert row.status is DeploymentStatus.FAILED
+    assert row.failure_code == "snapshot_corrupt"
 
 
 async def test_an_unexpected_crash_still_settles_the_row(wire, db_session, monkeypatch) -> None:

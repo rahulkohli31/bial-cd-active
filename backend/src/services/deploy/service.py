@@ -47,6 +47,7 @@ from src.services.deploy.names import image_reference, revision_name
 from src.services.deploy.outcome import write_deploy_outcome
 from src.services.orchestrator.errors import from_next_build, is_dependency_failure
 from src.services.sandbox.aca import AcaError
+from src.services.storage.bundle import BundleValidationError
 from src.services.storage.snapshot_read import (
     NoAppYet,
     SnapshotExtractionError,
@@ -71,11 +72,18 @@ STEP_RESTARTING: Final = "restarting"
 # have to match on prose that a copy edit can change.
 FAIL_NO_SNAPSHOT: Final = "no_saved_build"
 FAIL_SNAPSHOT_UNREADABLE: Final = "snapshot_unreadable"
+FAIL_SNAPSHOT_CORRUPT: Final = "snapshot_corrupt"
+"""The stored bundle itself is malformed. Unlike `snapshot_unreadable`, reading it again cannot
+help: the same bytes fail the same way."""
 FAIL_CONTEXT_TOO_LARGE: Final = "context_too_large"
 FAIL_BUILD: Final = "build_failed"
 FAIL_STORAGE: Final = "storage_unavailable"
 FAIL_PROVISION: Final = "provision_failed"
 FAIL_NOT_HEALTHY: Final = "revision_unhealthy"
+FAIL_NOT_READY: Final = "revision_not_ready"
+"""The readiness budget expired with no verdict either way, kept apart from `revision_unhealthy`
+for the reason `restart_not_ready` is kept apart from `restart_failed`: a slow app is not a
+broken one."""
 FAIL_INTERNAL: Final = "internal_error"
 
 FAIL_RESTART: Final = "restart_failed"
@@ -118,6 +126,10 @@ _REVISION_POLL_S: Final = 3.0
 # A failure detail that reaches the citizen. Bounded and redacted before it is stored: a
 # build log is attacker-influenced text from a workspace the citizen's AI drove.
 _DETAIL_MAX_CHARS: Final = 4_000
+
+_UNREADABLE_SNAPSHOT: Final = (
+    "Your saved app could not be read. This is a platform problem — please tell an administrator."
+)
 
 
 class DeployNotPossibleError(Exception):
@@ -355,12 +367,11 @@ class DeployService:
             extracted = await extract_snapshot(app_id, bundle_key=bundle_key)
         except SnapshotExtractionError as exc:
             raise _DeployFailedError(
-                FAIL_SNAPSHOT_UNREADABLE,
-                detail=str(exc),
-                citizen_message=(
-                    "Your saved app could not be read. This is a platform problem — "
-                    "please tell an administrator."
-                ),
+                FAIL_SNAPSHOT_UNREADABLE, detail=str(exc), citizen_message=_UNREADABLE_SNAPSHOT
+            ) from exc
+        except BundleValidationError as exc:
+            raise _DeployFailedError(
+                FAIL_SNAPSHOT_CORRUPT, detail=str(exc), citizen_message=_UNREADABLE_SNAPSHOT
             ) from exc
         if isinstance(extracted, NoAppYet):
             raise _DeployFailedError(
@@ -483,7 +494,7 @@ class DeployService:
                 "running. This is usually a problem in the app itself — ask the assistant "
                 "to check it."
             ),
-            timeout_code=FAIL_NOT_HEALTHY,
+            timeout_code=FAIL_NOT_READY,
             timeout_detail="the revision did not become healthy in time",
             timeout_message=(
                 "Your app was built but did not start in time. Your previous version is "
