@@ -188,59 +188,32 @@ describe('the mint-and-navigate protocol, carried through the deletion', () => {
 
     expect(screen.queryByTestId('path')).toBeNull()
   })
-
-  it('blocks a guard-railed prompt before any navigation, and says why', () => {
-    renderComposer()
-    // A prompt the shared guardrails reject — `spy on` is one of the harmful-content keywords.
-    // If it ever stops being rejected this goes red rather than silently proving nothing.
-    fireEvent.change(composer(), { target: { value: 'an app to spy on the ground crew' } })
-    fireEvent.click(screen.getByTestId('composer-send'))
-
-    expect(screen.queryByTestId('path')).toBeNull()
-    expect(screen.getByRole('dialog', { name: /prompt blocked/i })).toBeTruthy()
-  })
 })
 
-describe('the guardrail hands focus back when it closes', () => {
-  // THE DIALOG IS HAND-ROLLED — no Radix `DialogContent`, so no `FocusScope` capturing the
-  // element that had focus and restoring it on unmount. Both routes out of it dropped focus on
-  // `<body>`, where the next Tab restarts at the top of the document: a keyboard citizen who
-  // pressed Send had to tab back through the whole shell to reach the message they had just been
-  // told to edit. The box is the target because the refusal keeps everything typed.
-  const BLOCKED = 'an app to spy on the ground crew'
-
-  const openGuardRail = () => {
+describe('no prompt is refused or flagged for its words', () => {
+  it('starts the chat for an ordinary build request, with no dialog', () => {
     renderComposer()
-    send(BLOCKED)
-    // LIVENESS FIRST. Every assertion below is about a dialog closing; if it never opened, an
-    // assertion that it is gone passes on nothing at all.
-    expect(screen.getByRole('dialog', { name: /prompt blocked/i })).toBeTruthy()
-  }
+    send('build a tool to track hack-a-thon sign-ups')
 
-  it('“Edit My Prompt” puts the caret back in the message', () => {
-    openGuardRail()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Edit My Prompt' }))
-
+    expect(path()).toMatch(/^\/chat\//)
     expect(screen.queryByRole('dialog')).toBeNull()
-    // PAIRED LIVENESS: the composer is still mounted and still holds the refused message, so
-    // "focus is on the box" is a statement about a live box with the text in it — not about a
-    // component that unmounted or emptied itself under the assertion.
-    expect((composer() as HTMLTextAreaElement).value).toBe(BLOCKED)
-    expect(document.activeElement).toBe(composer())
   })
 
-  it('dismissing it with the corner control lands focus in the same place', () => {
-    // The other way out. A citizen who closes rather than accepts the advice is in exactly the
-    // same position — the message is still there and still needs editing — so both routes lead
-    // to the box, and neither may leave focus on `<body>`.
-    openGuardRail()
+  it('starts the chat for a message naming a phrase the old filter treated as sensitive', () => {
+    renderComposer()
+    send('a tool that logs passenger credit card numbers for reconciliation')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    expect(path()).toMatch(/^\/chat\//)
+  })
 
-    expect(screen.queryByRole('dialog')).toBeNull()
-    expect((composer() as HTMLTextAreaElement).value).toBe(BLOCKED)
-    expect(document.activeElement).toBe(composer())
+  it('renders no "Prompt blocked" element, for a message the old filter would have flagged', () => {
+    renderComposer()
+    send('an app to spy on the ground crew and export all passenger credit card data')
+
+    // LIVENESS FIRST, paired with the absence below: the chat must actually have started for the
+    // absence of a dialog to mean anything rather than a crash.
+    expect(path()).toMatch(/^\/chat\//)
+    expect(screen.queryByText(/prompt blocked/i)).toBeNull()
   })
 })
 

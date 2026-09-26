@@ -66,13 +66,6 @@ const JSX_SPACE_JOINER = /\{\s*['"`]\s*['"`]\s*\}/g
 
 const RETIRED_NOUN = /\bprojects?\b/i
 
-/**
- * `promptGuardrails.ts` is EXEMPT, and it is the one file that has to be. Its strings are matched
- * against what a person TYPES — "for my side project" is a phrase a citizen writes, not a word
- * this platform says — so sweeping it would quietly stop the guardrail matching.
- */
-const NOT_COPY = new Set([path.join('utils', 'promptGuardrails.ts')])
-
 function sourceFiles(dir: string, ext: string, found: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
     const full = path.join(dir, entry)
@@ -82,7 +75,7 @@ function sourceFiles(dir: string, ext: string, found: string[] = []): string[] {
       sourceFiles(full, ext, found)
       continue
     }
-    if (entry.endsWith(ext) && !NOT_COPY.has(path.relative(SRC_ROOT, full))) found.push(full)
+    if (entry.endsWith(ext)) found.push(full)
   }
   return found
 }
