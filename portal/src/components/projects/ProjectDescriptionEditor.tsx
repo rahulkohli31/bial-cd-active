@@ -10,7 +10,7 @@
  *
  * REQUIRED AND WORD-BOUNDED (#191): a description can no longer be saved blank — the server
  * rejects both an explicit clear and a whitespace-only write (R11), so Save is gated on the same
- * 15–120 word rule the create form enforces. A project written before #191 that has no
+ * word rule the create form enforces. A project written before #191 that has no
  * description at all still opens normally (R14); it simply cannot be SAVED again until the text
  * clears the bar.
  */

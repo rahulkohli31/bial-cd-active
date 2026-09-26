@@ -1208,11 +1208,11 @@ async def hard_delete(
     storage-unavailable copy to answer with. Storage missing here is a deploy bug, and a 500 is
     the honest answer to one; inventing a 503 would be inventing a contract.
 
-    IT REQUIRES A REASON, in 5-50 words. Destroying somebody else's work with no undo is the
-    harshest lever on this router and was the only one that asked for nothing — the browser
-    `window.confirm` behind it could not have collected an answer if it wanted to. The reason
-    rides the `app:delete` row below, which is written before destruction and has no foreign key
-    to the app, so it is still readable by app id long after the app is gone (`read_audit` says
+    IT REQUIRES A REASON, within the delete-reason word bound. Destroying somebody else's work with
+    no undo is the harshest lever on this router and was the only one that asked for nothing — the
+    browser `window.confirm` behind it could not have collected an answer if it wanted to. The
+    reason rides the `app:delete` row below, which is written before destruction and has no foreign
+    key to the app, so it is still readable by app id long after the app is gone (`read_audit` says
     so outright: no existence pre-check)."""
     # Contrast `approve` / `bundle-url` / `reconcile-storage` above, which all promise a 503 and
     # so must take `OptionalStorage`.

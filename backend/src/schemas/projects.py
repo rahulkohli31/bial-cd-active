@@ -66,7 +66,7 @@ def _clean_description(value: str) -> str:
     """The ONE description rule (#191), shared by `ProjectCreate` and `ProjectPatch` the same
     way `_clean_name` is — one change covers create and edit both.
 
-    A description is required and WORD-bounded — 15 to 120 (#191 R12) — following
+    A description is required and WORD-bounded by the `project` model's constants, following
     `clean_stated_reason`'s shape (char-cap backstop first, then the word-count checks
     each with their own message), NOT `_clean_name`'s (which only ever checks a maximum).
     The minimum exists because a one-line description embeds into a single vector for
@@ -159,9 +159,10 @@ class ProjectPatch(CamelModel):
 
 
 def clean_stated_reason(value: str, *, say_why: str) -> str:
-    """A reason the platform REQUIRES a person to state, in their own words — 5 to 50 WORDS,
-    with a character paste backstop. `say_why` is the one sentence the caller supplies: what
-    the surface asks for, echoed back when the field is blank.
+    """A reason the platform REQUIRES a person to state, in their own words — word-bounded by
+    `MIN_DELETE_REMARK_WORDS` and `MAX_DELETE_REMARK_WORDS`, with a character paste backstop.
+    `say_why` is the one sentence the caller supplies: what the surface asks for, echoed back when
+    the field is blank.
 
     The lower bound is the unusual half, and it is deliberate: the reason exists so whoever
     reads it later learns something, and a field that can be dismissed in one word will be.
@@ -179,8 +180,8 @@ def clean_stated_reason(value: str, *, say_why: str) -> str:
     # The paste backstop, which a person should never meet.
     if len(value) > MAX_DELETE_REMARK_CHARS:
         # The character cap fires on something a WORD cap cannot express: a 40-word paste of
-        # long words, URLs or a non-English script can clear 2000 characters while genuinely
-        # under 50 words, and telling that person to get under a bound they are already under
+        # long words, URLs or a non-English script can clear the character cap while genuinely
+        # under the word cap, and telling that person to get under a bound they are already under
         # is not actionable. Matches `_clean_name`'s own character-cap message for the same
         # reason.
         raise ValueError(
@@ -188,9 +189,9 @@ def clean_stated_reason(value: str, *, say_why: str) -> str:
         )
     words = count_words(value)
     if words < MIN_DELETE_REMARK_WORDS:
-        raise ValueError("Give a little more detail — at least 5 words.")
+        raise ValueError(f"Give a little more detail — at least {MIN_DELETE_REMARK_WORDS} words.")
     if words > MAX_DELETE_REMARK_WORDS:
-        raise ValueError("Keep the reason under 50 words.")
+        raise ValueError(f"Keep the reason under {MAX_DELETE_REMARK_WORDS} words.")
     return value
 
 

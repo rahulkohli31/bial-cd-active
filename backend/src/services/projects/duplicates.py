@@ -103,7 +103,7 @@ def _tsquery(search: str) -> sa.Function[Any]:
     """OR-joined lexeme tsquery for description-AGAINST-description matching (R31) — NOT
     `websearch_to_tsquery`, the marketplace search box's own helper (`marketplace/router.py`),
     which ANDs every significant term. That is correct for a short search-box query; it is
-    the wrong shape here, where the input is the citizen's own 15-120 WORD description: an
+    the wrong shape here, where the input is the citizen's own word-bounded description: an
     AND-query only matches a stored description containing every one of those stemmed terms
     — near-verbatim copy-paste — so any real second author describing the same app in their
     own words left the keyword arm permanently EMPTY (review of #191, agc129 — measured: a

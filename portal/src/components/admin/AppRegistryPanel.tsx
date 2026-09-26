@@ -579,7 +579,7 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   }
   // THE DELETE ASKS WHY, AND A `window.confirm` COULD NOT.
   //
-  // The route now REQUIRES a 5-50 word reason, so a confirm-and-send would 422 every time. The
+  // The route now REQUIRES a word-bounded reason, so a confirm-and-send would 422 every time. The
   // reason rides the `app:delete` audit row, which is written before destruction and has no
   // foreign key to the app — so it outlives the thing it describes, which is the whole point.
   //
@@ -771,7 +771,7 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
  * rendered conditionally like the rest.
  *
  * A `window.confirm` stood here before that. It could not collect anything, and the route now
- * REQUIRES a 5-50 word justification — so the old control would 422 on every press. The words ride the
+ * REQUIRES a word-bounded justification — so the old control would 422 on every press. The words ride the
  * `app:delete` audit row, which is written before destruction and carries no foreign key to
  * the app, so it is still readable long after what it describes is gone.
  *

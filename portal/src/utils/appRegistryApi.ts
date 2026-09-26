@@ -254,7 +254,7 @@ export async function enableApp(appId: string, deps: AuthFetchDeps = {}): Promis
 /**
  * Hard-delete an app, with the administrator's justification.
  *
- * THE REASON IS REQUIRED BY THE ROUTE — 5-50 words, validated server-side — because
+ * THE REASON IS REQUIRED BY THE ROUTE — word-bounded, validated server-side — because
  * an administrator destroying somebody else's work with no undo and no export should have to
  * say why, and the `window.confirm` this used to go through could not collect it. It rides the
  * `app:delete` audit row, which is written before destruction and has no foreign key to the

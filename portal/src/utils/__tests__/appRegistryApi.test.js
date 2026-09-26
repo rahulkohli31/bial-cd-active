@@ -87,7 +87,7 @@ describe('deleteApp', () => {
   /**
    * ★ THE REQUEST SHAPE, not a mock of it.
    *
-   * `DELETE /v1/admin/apps/{id}` REQUIRES a 5-50 word reason. This client used to send
+   * `DELETE /v1/admin/apps/{id}` REQUIRES a word-bounded reason. This client used to send
    * `{ method: 'DELETE' }` with no body while the route already required one, so every admin
    * delete through the SPA answered 422 — and the panel suite never caught it, because it
    * mocks `deleteApp` wholesale. Both sides were green while disagreeing. This test is the
@@ -110,7 +110,7 @@ describe('deleteApp', () => {
   })
 
   it('surfaces the server’s refusal rather than swallowing it', async () => {
-    const fetchImpl = vi.fn(async () => fail(422, { detail: 'Say why in 5 to 50 words.' }))
+    const fetchImpl = vi.fn(async () => fail(422, { detail: 'Say why in 2 to 50 words.' }))
     await expect(registry.deleteApp('app-7', 'too short', deps(fetchImpl))).rejects.toThrow()
   })
 })

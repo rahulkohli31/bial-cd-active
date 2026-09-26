@@ -259,7 +259,7 @@ RejectionNote = Annotated[
 
 
 def _clean_app_delete_reason(value: str) -> str:
-    """The admin app-delete's binding of the shared 5-50 word stated-reason rule. The sentence
+    """The admin app-delete's binding of the shared word-bounded stated-reason rule. The sentence
     is byte-identical to the one that rule used to build from `subject="app"`."""
     return clean_stated_reason(value, say_why="Say why you are deleting this app.")
 
@@ -280,11 +280,11 @@ class AppDeleteRequest(CamelModel):
     `window.confirm` it went through could not have collected it.
 
     The reason rides the `app:delete` audit row this path already writes BEFORE destruction,
-    which has no foreign key to the app and so outlives it. Same 5-50 word bounds and the same
+    which has no foreign key to the app and so outlives it. Same word bounds and the same
     validator as the project delete, so the two dialogs cannot disagree about what a word is.
 
     IT TAKES A BODY ON A DELETE, like `DELETE /v1/projects/{id}` and for the same reason: a
-    50-word reason does not belong in a query string. RFC 9110 leaves content on a DELETE
+    paragraph-long reason does not belong in a query string. RFC 9110 leaves content on a DELETE
     undefined and httpx declines to offer `json=` on `.delete()` for that reason — tests use
     `.request("DELETE", ...)` — but nginx and the container ingress both forward it and the
     admin SPA is the only client.

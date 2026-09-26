@@ -567,7 +567,7 @@ describe('create and delete', () => {
     await screen.findByText('Alpha')
 
     await deleteFromSettings()
-    // The dialog gates on a 5-50 word reason, which the page forwards to the
+    // The dialog gates on a word-bounded reason, which the page forwards to the
     // API. Its own bounds are asserted in ProjectDeleteDialog.test.tsx; here it just has to
     // be valid so the delete runs.
     fireEvent.change(await screen.findByLabelText(/why are you deleting/i), {

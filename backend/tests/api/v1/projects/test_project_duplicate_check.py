@@ -108,7 +108,7 @@ async def test_a_differently_worded_near_duplicate_is_found_by_the_keyword_arm_a
     client, db_session
 ) -> None:
     # R31 vs blocker #6 (review of #191, agc129, round 2): `_tsquery` used to AND every term
-    # in the citizen's own 15-120 word description, so it only matched a stored description
+    # in the citizen's own word-bounded description, so it only matched a stored description
     # containing EVERY one of those stemmed words — near-verbatim copy-paste. This app shares
     # SOME but not all of `_VALID_DESCRIPTION`'s vocabulary (VIP, movement, terminal,
     # supervisor, approve/approves) and is otherwise worded differently — exactly the "real

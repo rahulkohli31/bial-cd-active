@@ -1,6 +1,6 @@
 /**
  * ONE definition of "a word" for the client, mirroring `backend/src/core/words.py`. Two
- * surfaces count words — project title (max 8), delete reason (5–50) — and client/server
+ * surfaces count words — project title (max 8), delete reason (2–50) — and client/server
  * must split identically, or a message that passes in the browser gets refused by the API
  * with no way to tell what it disliked (counter reads `8/8`, Create enabled, API 422s).
  * Python: `len(value.split())`. TypeScript: `value.split(PY_WHITESPACE).filter(Boolean).length`
@@ -41,11 +41,11 @@ export const MAX_PROJECT_NAME_WORDS = 8
  *  description has a MINIMUM: a one-line description embeds into a single vector for
  *  semantic search (slice 3), so one too short to say anything embeds to nothing worth
  *  matching. */
-export const MIN_PROJECT_DESCRIPTION_WORDS = 15
+export const MIN_PROJECT_DESCRIPTION_WORDS = 5
 export const MAX_PROJECT_DESCRIPTION_WORDS = 120
 
 /** The delete-reason bounds (#158 §13.2). */
-export const MIN_DELETE_REASON_WORDS = 5
+export const MIN_DELETE_REASON_WORDS = 2
 export const MAX_DELETE_REASON_WORDS = 50
 
 /** THE COLUMN'S PASTE BACKSTOP, not the rule anybody is told about — that is the word count.

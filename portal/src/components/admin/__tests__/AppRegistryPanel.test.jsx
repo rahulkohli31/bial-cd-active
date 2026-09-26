@@ -980,7 +980,7 @@ describe('AppRegistryPanel — switching an app off', () => {
 
 describe('★ the admin delete collects a reason', () => {
   // A `window.confirm` stood here and could collect nothing, while the route already REQUIRED a
-  // 5-50 word justification — so every delete through this panel answered 422. It shipped green
+  // word-bounded justification — so every delete through this panel answered 422. It shipped green
   // because `deleteApp` is mocked wholesale in this file: both halves passed while disagreeing.
   // These tests assert what the panel actually hands the client.
   const REASON = 'Duplicate app created in error during onboarding, owner asked for removal'
@@ -1047,7 +1047,7 @@ describe('★ the admin delete collects a reason', () => {
 
   it('keeps the words on screen when the server refuses them', async () => {
     h.listApps.mockResolvedValue([APPROVED])
-    h.deleteApp.mockRejectedValue(new Error('Say why in 5 to 50 words.'))
+    h.deleteApp.mockRejectedValue(new Error('Say why in 2 to 50 words.'))
     render(<AppRegistryPanel onToast={vi.fn()} />)
     await screen.findByText(APPROVED.name)
 

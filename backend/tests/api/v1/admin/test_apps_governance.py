@@ -19,6 +19,7 @@ from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.config import settings
 from src.db.models.app_registry import MAX_DEPLOYED_URL, AppRegistry, ApprovalRoute, AppStatus
 from src.db.models.audit import AuditLog
+from src.db.models.deleted_project import MIN_DELETE_REMARK_WORDS
 from src.db.models.deployment import Deployment
 from src.db.models.project import Project
 from src.db.models.project_database import ProjectDatabase
@@ -1250,6 +1251,23 @@ async def test_hard_delete_without_a_reason_is_refused(client, db_session, app) 
     assert too_short.status_code == 422
     # LIVENESS: nothing was destroyed by either refusal.
     assert await db_session.get(AppRegistry, row.id) is not None
+
+
+async def test_hard_delete_shares_the_project_deletes_word_bound(client, db_session, app) -> None:
+    """The harsher act — destroying somebody else's app — takes the same reason bound as the
+    citizen's own project delete (`MIN_DELETE_REMARK_WORDS`), not a looser one."""
+    _wire_storage(app)
+    row = await _app(db_session, **_pending())
+    await db_session.flush()
+    headers = await _admin(db_session)
+
+    reason = " ".join(f"w{i}" for i in range(MIN_DELETE_REMARK_WORDS))
+    resp = await client.request(
+        "DELETE", f"/v1/admin/apps/{row.id}", headers=headers, json={"reason": reason}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert await db_session.get(AppRegistry, row.id) is None
 
 
 async def test_hard_delete_sweeps_every_retained_submission(client, db_session, app) -> None:
