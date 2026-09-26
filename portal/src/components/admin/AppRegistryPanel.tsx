@@ -1,17 +1,19 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import type { RefObject } from 'react'
+import type { ColumnDef, Row, Table as TanStackTable } from '@tanstack/react-table'
 import {
-  AlertCircle, RefreshCw, Box, CheckCircle, XCircle, X,
-  ShieldCheck, ShieldOff, Power, Trash2, ScrollText, ShieldAlert,
+  AlertCircle, RefreshCw, CheckCircle, XCircle, X, ShieldCheck, ShieldOff, ShieldAlert,
+  MoreHorizontal, PanelRightOpen, Power, Trash2,
 } from 'lucide-react'
 import { BusyGlyph } from '../ui/Waiting'
 import {
-  listApps, approveApp, rejectApp, patchApp, disableApp, enableApp,
-  deleteApp, fetchAudit, fetchAppStatusCounts,
+  listApps, approveApp, rejectApp, patchApp, disableApp, enableApp, deleteApp, fetchAudit,
 } from '../../utils/appRegistryApi'
-import type { RegistryApp, AppStatus, AuditEvent } from '../../utils/appRegistryApi'
+import type {
+  RegistryApp, RegistryList, RegistryStatus, AppStatus, AuditEvent, LiveVersion,
+} from '../../utils/appRegistryApi'
 import { ApiError } from '../../utils/apiError'
-import WaitingCountBadge from './WaitingCountBadge'
-import { relativeTimeVerbose } from '../../utils/relativeTime'
+import { MONTHS } from '../../utils/monthNames'
 import { readDeclaration, shortSha, MIN_REJECTION_NOTE } from './declaration'
 import type { ReadDeclaration } from './declaration'
 import { auditLabel } from './auditLabels'
@@ -21,28 +23,18 @@ import {
   MAX_DELETE_REASON_WORDS,
   MAX_DELETE_REASON_CHARS,
 } from '../../utils/words'
+import { cn } from '../../lib/utils'
+import { Badge } from '../ui/badge'
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../ui/dropdown-menu'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select'
 import { Textarea } from '../ui/textarea'
+import AdminDataTable from './AdminDataTable'
 
 /** What to call an app on screen. The internal id used to stand in for a missing name, but
  *  a UUID is not a name — it identifies the row for the platform, not the app for a person,
  *  and an administrator cannot do anything with it. An untitled app says so instead. */
 const appLabel = (app: RegistryApp): string => app.name || '(untitled app)'
-
-// Registry status vocabulary (NOT the old mock active/under_review/flagged set).
-const STATUS: Record<AppStatus, { label: string; cls: string }> = {
-  draft: { label: 'Draft', cls: 'bg-gray-100 text-gray-500' },
-  pending: { label: 'Pending Review', cls: 'bg-amber-100 text-amber-700' },
-  approved: { label: 'Approved', cls: 'bg-green-100 text-green-700' },
-  rejected: { label: 'Rejected', cls: 'bg-red-100 text-red-700' },
-  disabled: { label: 'Disabled', cls: 'bg-gray-200 text-gray-600' },
-}
-// Draft used to be hidden here as "builder-side", which was true of the REVIEW flow and
-// false of the ops one: a self-published app is a draft (one-click deploy never writes a
-// status), so the ordinary live app in the marketplace had no row on this screen at all —
-// and the kill switch below can now reach it. A lever nobody can get to is not a
-// lever. Pending stays the default tab; this only adds a place to stand.
-const TABS: AppStatus[] = ['pending', 'draft', 'approved', 'rejected', 'disabled']
 
 // `STATUS_TRANSITIONS[DISABLED]` on the server (`db/models/app_registry.py`), mirrored so
 // the control appears exactly where the transition is legal. PENDING is absent on purpose:
@@ -59,15 +51,6 @@ const fmtWhen = (iso: string | null): string => {
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString()
 }
-/** The queue's Submitted cell: the visible age, with the exact moment riding underneath
- *  as a `title` and a machine-readable `datetime`. `fmtWhen` owns the one question that
- *  decides whether an age exists at all — a row whose submittedAt is missing or
- *  unparseable takes its guarded placeholder rather than an age counted from 1970. */
-function SubmittedCell({ iso }: { iso: string | null }) {
-  const exact = fmtWhen(iso)
-  if (iso === null || exact === '—') return <>—</>
-  return <time dateTime={iso} title={exact}>{relativeTimeVerbose(iso)}</time>
-}
 
 // Advisory on-disk size of the app's own database. Null is a real value —
 // "no number to show" (never provisioned, not yet ready, or the cluster was unreachable) —
@@ -80,11 +63,335 @@ const fmtBytes = (n: number | null): string => {
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`
   return `${(b / 1024 / 1024).toFixed(1)} MB`
 }
-function StatusBadge({ status }: { status: AppStatus }) {
-  const s = STATUS[status] || STATUS.draft
-  return <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${s.cls}`}>{s.label}</span>
+
+const ALL = 'all'
+const SEARCHABLE = new Set(['name', 'owner'])
+
+const QUIET = 'border-gray-500/20 bg-surface-muted text-neutral'
+const STOPPED = 'border-slate-600/20 bg-slate-100 text-slate-600'
+const FAILED = 'border-red-700/20 bg-red-50 text-red-700'
+
+const REGISTRY_BADGE: Record<RegistryStatus, { label: string; className: string }> = {
+  draft: { label: 'Draft', className: QUIET },
+  not_published: { label: 'Not published', className: QUIET },
+  waiting_for_review: { label: 'Waiting for review', className: 'border-amber-600/25 bg-amber-50 text-amber-700' },
+  rejected: { label: 'Rejected', className: FAILED },
+  publish_failed: { label: 'Publish failed', className: FAILED },
+  publishing: { label: 'Publishing', className: 'border-primary/25 bg-[#F0F9FA] text-primary' },
+  live: { label: 'Live', className: 'border-emerald-600/20 bg-emerald-50 text-emerald-700' },
+  taken_offline: { label: 'Taken offline', className: STOPPED },
+  disabled: { label: 'Disabled', className: STOPPED },
 }
 
+interface StatusFilter {
+  key: string
+  label: string
+  statuses: readonly RegistryStatus[]
+}
+
+const STATUS_FILTERS: readonly StatusFilter[] = [
+  { key: 'waiting_for_review', label: 'Waiting for review', statuses: ['waiting_for_review'] },
+  { key: 'live', label: 'Live', statuses: ['live'] },
+  { key: 'not_live', label: 'Not live', statuses: ['publishing', 'publish_failed', 'not_published', 'taken_offline'] },
+  { key: 'draft', label: 'Draft', statuses: ['draft'] },
+  { key: 'rejected', label: 'Rejected', statuses: ['rejected'] },
+  { key: 'disabled', label: 'Disabled', statuses: ['disabled'] },
+]
+
+function matchesStatusFilter(row: Row<RegistryApp>, _columnId: string, value: unknown): boolean {
+  const filter = STATUS_FILTERS.find((f) => f.key === value)
+  return filter === undefined || filter.statuses.includes(row.original.registryStatus)
+}
+
+function matchesOwner(row: Row<RegistryApp>, _columnId: string, value: unknown): boolean {
+  return value === undefined || row.original.ownerUsername === value
+}
+
+function parsed(iso: string): Date | null {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+const dayMonth = (d: Date): string => `${d.getDate()} ${MONTHS[d.getMonth()]}`
+const twoDigits = (n: number): string => String(n).padStart(2, '0')
+
+/** `26 Sep, 14:10`, in the reader's own time zone. */
+function fmtActivity(iso: string): string {
+  const d = parsed(iso)
+  return d === null ? '—' : `${dayMonth(d)}, ${twoDigits(d.getHours())}:${twoDigits(d.getMinutes())}`
+}
+
+/** An owner by the part of their address before the @, the way the list names people. */
+const ownerHandle = (email: string): string => email.split('@')[0]
+
+function RegistryBadge({ status }: { status: RegistryStatus }) {
+  const { label, className } = REGISTRY_BADGE[status]
+  return (
+    <Badge variant="outline" className={cn('px-[9px]', className)}>
+      {label}
+    </Badge>
+  )
+}
+
+function LiveVersionCell({ live }: { live: LiveVersion | null }) {
+  if (live === null) return <span className="text-neutral">—</span>
+  const since = live.since === null ? null : parsed(live.since)
+  return (
+    <div className="font-semibold text-tertiary">
+      <code className="rounded bg-[#EEF2F6] px-1 py-px text-[11.5px]">{shortSha(live.commitSha)}</code>
+      {since !== null && <div className="mt-0.5 text-[11px] font-normal text-neutral">since {dayMonth(since)}</div>}
+    </div>
+  )
+}
+
+function StatusFilterPills({ table, apps, selectedRef }: {
+  table: TanStackTable<RegistryApp>
+  apps: RegistryApp[]
+  /** The selected pill: where focus lands when the row that opened something has left the list. */
+  selectedRef: RefObject<HTMLButtonElement>
+}) {
+  const column = table.getColumn('status')
+  const value = column?.getFilterValue()
+  const selected = typeof value === 'string' ? value : ALL
+  const pills = [
+    { key: ALL, label: 'All', count: apps.length },
+    ...STATUS_FILTERS.map((f) => ({
+      key: f.key,
+      label: f.label,
+      count: apps.filter((app) => f.statuses.includes(app.registryStatus)).length,
+    })),
+  ]
+  return (
+    <div role="group" aria-label="Filter by status" className="flex items-center gap-0.5 rounded-[9px] bg-bial-bg p-[3px]">
+      {pills.map(({ key, label, count }) => {
+        const pressed = key === selected
+        return (
+          <button
+            key={key}
+            ref={pressed ? selectedRef : undefined}
+            type="button"
+            aria-pressed={pressed}
+            data-testid={`filter-${key}`}
+            onClick={() => column?.setFilterValue(key === ALL ? undefined : key)}
+            className={cn(
+              'flex h-[30px] items-center gap-1.5 rounded-[7px] px-2.5 text-[12.5px] transition',
+              pressed ? 'bg-white font-bold text-primary shadow-[inset_0_0_0_1px_#E2E8F0]' : 'font-medium text-neutral hover:text-primary',
+            )}
+          >
+            {label}
+            <Badge
+              variant="outline"
+              data-testid={`filter-count-${key}`}
+              className={cn(
+                'border-transparent px-1.5 py-0 text-[10.5px] leading-4',
+                key === 'waiting_for_review' && count > 0 ? 'bg-amber-700 text-white' : 'bg-bial-border text-slate-600',
+              )}
+            >
+              {count}
+            </Badge>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+function OwnerFilter({ table, owners }: { table: TanStackTable<RegistryApp>; owners: string[] }) {
+  const column = table.getColumn('owner')
+  const value = column?.getFilterValue()
+  return (
+    <Select
+      value={typeof value === 'string' ? value : ALL}
+      onValueChange={(next: string) => column?.setFilterValue(next === ALL ? undefined : next)}
+    >
+      <SelectTrigger aria-label="Owner" data-testid="owner-filter" className="h-[34px] w-[160px] rounded-lg px-2.5 py-0 text-[13px] font-medium">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value={ALL}>All owners</SelectItem>
+        {owners.map((email) => (
+          <SelectItem key={email} value={email}>
+            {ownerHandle(email)}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )
+}
+
+interface RowHandlers {
+  busyIds: ReadonlySet<string>
+  /** `opener` is where focus returns once whatever opened has closed. */
+  onOpen: (app: RegistryApp, opener: HTMLElement | null) => void
+  onToggleLogin: (app: RegistryApp) => void
+  onDisable: (app: RegistryApp) => void
+  onEnable: (app: RegistryApp) => void
+  onDelete: (app: RegistryApp, opener: HTMLElement | null) => void
+}
+
+// The cells reach the panel through context so the columns can be a constant: the table renders
+// each `cell` as a component, and a column list rebuilt per render would remount every row.
+const RowHandlersContext = createContext<RowHandlers | null>(null)
+
+function useRowHandlers(): RowHandlers {
+  const handlers = useContext(RowHandlersContext)
+  if (handlers === null) throw new Error('A registry row rendered outside the App Registry panel.')
+  return handlers
+}
+
+function AppNameCell({ app }: { app: RegistryApp }) {
+  const { onOpen } = useRowHandlers()
+  return (
+    <button
+      type="button"
+      onClick={(e) => onOpen(app, e.currentTarget)}
+      // The stretched `::after` makes the whole row this button, so a row click opens the app.
+      className="text-left text-[13.5px] font-semibold text-tertiary decoration-1 underline-offset-2 transition after:absolute after:inset-0 hover:text-primary hover:underline focus-visible:underline focus-visible:outline-none"
+    >
+      {appLabel(app)}
+    </button>
+  )
+}
+
+function LoginCell({ app }: { app: RegistryApp }) {
+  const { busyIds, onToggleLogin } = useRowHandlers()
+  return (
+    <button
+      onClick={() => onToggleLogin(app)}
+      disabled={busyIds.has(app.appId)}
+      title="Toggle required login"
+      className={`relative z-10 inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-lg border transition disabled:opacity-50 ${app.loginRequired ? 'border-primary/30 text-primary bg-primary/5' : 'border-bial-border text-neutral'}`}
+    >
+      {app.loginRequired ? <ShieldCheck size={12} /> : <ShieldOff size={12} />}
+      {app.loginRequired ? 'Required' : 'Off'}
+    </button>
+  )
+}
+
+const menuItem = 'gap-2 rounded-sm px-2 py-1.5 text-sm text-primary-900 focus:bg-surface-muted'
+
+function RowActions({ app }: { app: RegistryApp }) {
+  const { busyIds, onOpen, onDisable, onEnable, onDelete } = useRowHandlers()
+  const trigger = useRef<HTMLButtonElement>(null)
+  const busy = busyIds.has(app.appId)
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          ref={trigger}
+          type="button"
+          data-testid={`actions-${app.appId}`}
+          aria-label={`Actions for ${appLabel(app)}`}
+          className="relative z-10 flex h-[30px] w-[30px] items-center justify-center rounded-lg text-neutral transition hover:bg-surface-muted hover:text-primary-900 data-[state=open]:bg-surface-muted data-[state=open]:text-primary-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+        >
+          <MoreHorizontal size={16} />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-[160px] rounded-md border-bial-border bg-white p-1 shadow-lg">
+        <DropdownMenuItem className={menuItem} onSelect={() => onOpen(app, trigger.current)}>
+          <PanelRightOpen size={15} /> Open
+        </DropdownMenuItem>
+        {CAN_DISABLE.includes(app.status) && (
+          <DropdownMenuItem className={menuItem} disabled={busy} onSelect={() => onDisable(app)}>
+            <Power size={15} /> Disable
+          </DropdownMenuItem>
+        )}
+        {app.status === 'disabled' && (
+          <DropdownMenuItem className={menuItem} disabled={busy} onSelect={() => onEnable(app)}>
+            <Power size={15} /> Enable
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem
+          className={cn(menuItem, 'text-red-600 focus:text-red-700')}
+          disabled={busy}
+          onSelect={() => onDelete(app, trigger.current)}
+        >
+          <Trash2 size={15} /> Delete
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+const COLUMNS: ColumnDef<RegistryApp>[] = [
+  {
+    id: 'name',
+    accessorFn: appLabel,
+    header: 'App',
+    cell: ({ row }) => <AppNameCell app={row.original} />,
+  },
+  {
+    id: 'owner',
+    accessorFn: (app) => app.ownerUsername ?? '',
+    header: 'Owner',
+    filterFn: matchesOwner,
+    meta: { className: 'w-[160px]' },
+    cell: ({ row: { original: app } }) =>
+      app.ownerUsername === null ? (
+        <span className="text-neutral">—</span>
+      ) : (
+        <span title={app.ownerUsername} className="whitespace-nowrap text-[12.5px] text-neutral">
+          {ownerHandle(app.ownerUsername)}
+        </span>
+      ),
+  },
+  {
+    id: 'login',
+    header: 'Login',
+    enableSorting: false,
+    meta: { className: 'w-[100px]' },
+    cell: ({ row }) => <LoginCell app={row.original} />,
+  },
+  {
+    id: 'status',
+    accessorFn: (app) => REGISTRY_BADGE[app.registryStatus].label,
+    header: 'Status',
+    filterFn: matchesStatusFilter,
+    meta: { className: 'w-[150px]' },
+    cell: ({ row }) => <RegistryBadge status={row.original.registryStatus} />,
+  },
+  {
+    id: 'liveVersion',
+    accessorFn: (app) => app.liveVersion?.since ?? '',
+    header: 'Live version',
+    meta: { className: 'w-[140px]' },
+    cell: ({ row }) => <LiveVersionCell live={row.original.liveVersion} />,
+  },
+  {
+    id: 'classification',
+    header: 'Classification',
+    enableSorting: false,
+    meta: { className: 'w-[120px]' },
+    cell: () => <span className="text-neutral">—</span>,
+  },
+  {
+    id: 'updatedAt',
+    accessorFn: (app) => app.updatedAt,
+    header: 'Last activity',
+    meta: { className: 'w-[130px] whitespace-nowrap' },
+    cell: ({ row }) => (
+      <span className="whitespace-nowrap text-[12.5px] tabular-nums text-neutral">{fmtActivity(row.original.updatedAt)}</span>
+    ),
+  },
+  {
+    id: 'databaseBytes',
+    accessorFn: (app) => app.databaseBytes ?? -1,
+    header: 'DB',
+    meta: { className: 'w-[70px]' },
+    cell: ({ row: { original: app } }) => (
+      <span data-testid={`db-bytes-${app.appId}`} className="whitespace-nowrap text-[12.5px] tabular-nums text-neutral">
+        {fmtBytes(app.databaseBytes)}
+      </span>
+    ),
+  },
+  {
+    id: 'actions',
+    header: () => <span className="sr-only">Actions</span>,
+    enableSorting: false,
+    meta: { className: 'w-[36px] py-0' },
+    cell: ({ row }) => <RowActions app={row.original} />,
+  },
+]
 /** The one thing this screen is for, said out loud. An administrator who thinks
  *  they are code-reviewing will either approve everything or block everything. */
 const THE_CRITERION =
@@ -404,10 +711,9 @@ function AuditDrawer({ app, onClose }: AuditDrawerProps) {
 }
 
 /**
- * Admin "App Registry" panel — the real apps surface (replaces the mock AppTable).
- * Status sub-tabs over the registry vocabulary; approve / reject / disable /
- * enable / toggle-login / delete / view-audit, all backed by
- * the admin-gated /api/admin/apps endpoints. Loads via useCallback+useEffect.
+ * Admin "App Registry" panel: every app on the shared admin table, filtered by the status the
+ * backend derives, by owner and by search. Open, disable, enable, toggle login and delete are
+ * all backed by the admin-gated /api/admin/apps endpoints.
  */
 export interface AppRegistryPanelProps {
   // severity is optional (default 'ok' on the AdminPage side) so a plain confirmation
@@ -416,9 +722,7 @@ export interface AppRegistryPanelProps {
 }
 
 export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
-  const [tab, setTab] = useState<AppStatus>('pending')
-  const [apps, setApps] = useState<RegistryApp[]>([])
-  const [loading, setLoading] = useState(true)
+  const [list, setList] = useState<RegistryList | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [review, setReview] = useState<RegistryApp | null>(null)
   /** The app awaiting a delete reason, or null. See `onDelete`. */
@@ -428,83 +732,55 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   // whenever a different item is opened, so one race can never haunt the next review.
   const [withdrawn, setWithdrawn] = useState<string | null>(null)
   const [auditing, setAuditing] = useState<RegistryApp | null>(null)
-  // The waiting count, mirrored from the nav badge onto the Pending tab. `null` =
-  // not asked yet or the ask failed; never rendered as a number.
-  const [waiting, setWaiting] = useState<number | null>(null)
   // A SET of in-flight app ids, not one shared lock: acting on row A must never
   // re-enable row B's still-pending buttons (which a single busyId did, opening the
   // door to duplicate concurrent mutations + duplicate audit rows).
   const [busyIds, setBusyIds] = useState<Set<string>>(() => new Set())
-  // Staleness guard for overlapping loads (tab-switch / Refresh clobber): a stale
-  // response must not overwrite fresher state. Ref-token variant of the `let live`
-  // idiom, since `load` is also called imperatively (Refresh, act's reload).
+  // Staleness guard for overlapping loads: a stale response must not overwrite fresher state.
   const loadSeq = useRef(0)
-  // The queue's own tab — the nearest stable, always-mounted landmark on this panel, and
-  // the fallback for the review below when the row that opened it is gone.
-  const queueTabRef = useRef<HTMLButtonElement>(null)
-  // The Review control that opened the modal, CAPTURED AT PRESS TIME rather than read back
-  // off `document.activeElement`: a click focuses the button in a browser but not under
-  // `fireEvent`, so reading it back would make the restore untestable and — worse — silently
-  // correct in the suite while landing on `<body>` for the citizen. Doubles as the "a review
-  // was opened at some point" flag the effect below keys off.
-  const reviewTriggerRef = useRef<HTMLButtonElement | null>(null)
+  // Captured when something opens, rather than read back off `document.activeElement`: a click
+  // focuses the control in a browser but not under `fireEvent`.
+  const openerRef = useRef<HTMLElement | null>(null)
+  const selectedFilterRef = useRef<HTMLButtonElement>(null)
 
   /**
-   * PUT FOCUS SOMEWHERE REAL WHEN THE REVIEW CLOSES.
+   * Put focus back on the control that opened the review, the audit trail or the delete dialog
+   * once it closes, or on the selected status filter when that row has left the list. The first
+   * two are hand-rolled, and the dialog opens from a menu item that is gone when it closes.
    *
-   * The review modal is hand-rolled — no Radix `DialogContent`, so no `FocusScope`, so nothing
-   * captures the element that had focus and nothing restores it. Closing it dropped focus on
-   * `<body>`, where the next Tab restarts at the top of the document.
-   *
-   * IT RESTORES THE ROW'S OWN Review BUTTON, which is where an administrator who dismissed a
-   * review belongs — three rows down a queue of forty, not back at the top of it.
-   *
-   * AND IT FALLS BACK, because approving or rejecting DESTROYS that button: the app leaves the
-   * pending queue, so the reload this panel does on success takes the whole row with it. That is
-   * the same detached-trigger case `ProjectsPage`'s delete path documents, and it takes the same
-   * remedy — the nearest stable landmark, here the queue's own tab.
-   *
-   * IN AN EFFECT, NOT IN THE CLOSE HANDLERS, AND THE SUITE CANNOT TELL THE TWO APART — which is
-   * exactly why this note exists. Success closes the modal from an async continuation, and both
-   * of the questions asked below are questions about the DOM: whether the trigger is still
-   * attached, and whether the tab is there to fall back to. In a browser that continuation is a
-   * microtask and React's commit is a scheduled task, so the answers describe the PREVIOUS render
-   * — mid-reload, where `loading` has replaced this whole panel with a spinner, that is a
-   * detached trigger AND a null tab ref, and focus stays on `<body>`. An effect runs after the
-   * commit, so it asks the DOM the citizen actually has. Under RTL both readings pass, because
-   * `act` flushes the commit before the continuation resumes: moving this into `settleReview`
-   * leaves the tests green and the browser broken.
+   * In an effect, not in the close handlers: approving closes the review from an async
+   * continuation, and whether the opener is still attached is a question about the DOM after
+   * React commits. The suite cannot tell the two apart, because RTL's `act` flushes first.
    */
   useEffect(() => {
-    if (review !== null) return
-    const trigger = reviewTriggerRef.current
-    if (trigger === null) return // no review has been opened yet — nothing to restore
-    reviewTriggerRef.current = null
-    if (document.contains(trigger)) trigger.focus()
-    else queueTabRef.current?.focus()
-  }, [review])
+    if (review !== null || auditing !== null || deleting !== null) return
+    const opener = openerRef.current
+    if (opener === null) return
+    openerRef.current = null
+    if (opener.isConnected) opener.focus()
+    else selectedFilterRef.current?.focus()
+  }, [review, auditing, deleting])
 
   const load = useCallback(async () => {
     const seq = ++loadSeq.current
-    setLoading(true); setError(null)
+    setError(null)
     try {
-      const rows = await listApps(tab)
-      if (loadSeq.current === seq) setApps(rows)
-      // The tab badge rides the same load the table does, so acting on a row updates
-      // both. Its own failure must not fail the queue — a missing count renders as no
-      // badge, which is the honest reading of "we don't know".
-      const counts = await fetchAppStatusCounts().catch(() => null)
-      if (loadSeq.current === seq) setWaiting(counts === null ? null : counts.pending)
+      const next = await listApps()
+      if (loadSeq.current === seq) setList(next)
     } catch (e) {
       if (loadSeq.current === seq) setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      // Only the freshest load owns the spinner — a stale one resolving late must not
-      // flip `loading` off under a newer in-flight fetch.
-      if (loadSeq.current === seq) setLoading(false)
     }
-  }, [tab])
+  }, [])
 
   useEffect(() => { load() }, [load])
+
+  const owners = useMemo(
+    () =>
+      [...new Set((list?.apps ?? []).flatMap((app) => (app.ownerUsername === null ? [] : [app.ownerUsername])))].sort(
+        (a, b) => ownerHandle(a).localeCompare(ownerHandle(b)),
+      ),
+    [list],
+  )
 
   // Run a mutating action with a per-row busy lock + toast, then reload. Returns the FAILURE,
   // or null on success — never a bare boolean, because the withdrawal race needs the error's
@@ -540,6 +816,12 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   const onToggleLogin = (app: RegistryApp) => act(app.appId, () => patchApp(app.appId, { loginRequired: !app.loginRequired }), `Login ${app.loginRequired ? 'disabled' : 'required'} for “${appLabel(app)}”`)
   const onDisable = (app: RegistryApp) => act(app.appId, () => disableApp(app.appId), `“${appLabel(app)}” disabled`)
   const onEnable = (app: RegistryApp) => act(app.appId, () => enableApp(app.appId), `“${appLabel(app)}” re-enabled`)
+  // A pending app opens on its review; any other app on its audit trail.
+  const onOpen = (app: RegistryApp, opener: HTMLElement | null) => {
+    openerRef.current = opener
+    if (app.status === 'pending') { setWithdrawn(null); setReview(app) }
+    else setAuditing(app)
+  }
   // THE DELETE ASKS WHY, AND A `window.confirm` COULD NOT.
   //
   // The route now REQUIRES a word-bounded reason, so a confirm-and-send would 422 every time. The
@@ -549,7 +831,8 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   // It uses the SAME word rule as the citizen's own project delete (`utils/words.ts`, mirrored
   // at `src/core/words.py`), because the harsher act — destroying somebody else's work — should
   // not ask for less than the gentler one.
-  const onDelete = (app: RegistryApp) => {
+  const onDelete = (app: RegistryApp, opener: HTMLElement | null) => {
+    openerRef.current = opener
     // THE REASON IS PER-APP AND MUST NOT TRAVEL. `deleteReason` lives on the panel, so a
     // justification typed for one app and abandoned would open pre-filled on the next one —
     // and if it happened to be valid, one press away from destroying a different citizen's
@@ -559,16 +842,6 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
     setDeleting(app)
   }
 
-  // Pending is the only tab that is a REVIEW QUEUE — the only one ordered oldest-first,
-  // and the only one whose rows carry a submittedAt (it is null everywhere else). One
-  // <thead>/<tbody> serves all four tabs, so both the Submitted column and the ordering
-  // caption hang off this: on Approved, an "oldest first" caption would be a lie and a
-  // Submitted column would be a stripe of em-dashes.
-  const isQueue = tab === 'pending'
-
-  if (loading) {
-    return <div className="flex items-center justify-center gap-2 py-16 text-neutral text-sm"><BusyGlyph size={16} /> Loading apps…</div>
-  }
   if (error) {
     return (
       <div className="text-center py-16">
@@ -579,112 +852,29 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
       </div>
     )
   }
+  if (list === null) {
+    return <div className="flex items-center justify-center gap-2 py-16 text-neutral text-sm"><BusyGlyph size={16} /> Loading apps…</div>
+  }
 
   return (
     <>
-      <div className="flex items-center gap-1 mb-4 bg-bial-bg rounded-lg p-1 w-fit">
-        {TABS.map((t) => (
-          <button
-            key={t}
-            // The review can only be opened from the queue, so the queue's tab is the landmark
-            // focus comes back to when the row it was opened from is gone.
-            ref={t === 'pending' ? queueTabRef : undefined}
-            data-testid={`apps-tab-${t}`}
-            onClick={() => setTab(t)}
-            className={`text-xs font-medium px-3 py-1.5 rounded-md transition inline-flex items-center gap-1.5 ${tab === t ? 'bg-white text-primary shadow-sm border border-bial-border' : 'text-neutral hover:text-primary'}`}
-          >
-            {STATUS[t].label}
-            {/* Mirrors the nav badge, same component and same accessible name. */}
-            {t === 'pending' && <WaitingCountBadge count={waiting} where="tab" />}
-          </button>
-        ))}
-        <button onClick={load} title="Refresh" className="ml-1 p-1.5 text-neutral hover:text-primary"><RefreshCw size={13} /></button>
-      </div>
-
-      {apps.length === 0 ? (
-        <div className="text-center py-16">
-          <div className="w-12 h-12 rounded-2xl bg-bial-bg flex items-center justify-center mx-auto mb-3"><Box size={20} className="text-neutral" /></div>
-          <p className="text-sm text-neutral">No {STATUS[tab].label.toLowerCase()} apps.</p>
+      <RowHandlersContext.Provider value={{ busyIds, onOpen, onToggleLogin, onDisable, onEnable, onDelete }}>
+        {/* Positions each row, so the app name's stretched overlay covers its row and no other. */}
+        <div className="[&_tbody_tr]:relative">
+          <AdminDataTable<RegistryApp>
+            columns={COLUMNS}
+            rows={list.apps}
+            getRowId={(app) => app.appId}
+            searchable={SEARCHABLE}
+            searchLabel="Search apps"
+            searchPlaceholder="Search apps or owners…"
+            emptyMessage="No apps yet."
+            truncated={list.truncated}
+            toolbarStart={(table) => <StatusFilterPills table={table} apps={list.apps} selectedRef={selectedFilterRef} />}
+            toolbarEnd={(table) => <OwnerFilter table={table} owners={owners} />}
+          />
         </div>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            {/* The ordering is a GUARANTEE the backend makes and pins with a test,
-                and until now it was invisible: nothing on screen told an administrator
-                that top means oldest, so the queue read as an arbitrary list. Said out
-                loud, the position becomes information. Deliberately NOT a sort control —
-                a handle that let someone reorder the review queue would turn a reporting
-                gap into a real defect. Pending only: every other tab is newest-first. */}
-            {isQueue && (
-              <caption data-testid="queue-order-note" className="caption-top text-left text-xs text-neutral pb-3">
-                Oldest first — the next app to review is at the top.
-              </caption>
-            )}
-            <thead>
-              <tr className="border-b border-bial-border">
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">App</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Owner</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Login</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Status</th>
-                {isQueue && <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Submitted</th>}
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Database</th>
-                <th className="pb-3 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-bial-border">
-              {apps.map((app) => {
-                const busy = busyIds.has(app.appId)
-                return (
-                  <tr key={app.appId} data-testid={`app-row-${app.appId}`} className="hover:bg-bial-bg/50 transition">
-                    <td className="py-3 pr-6">
-                      <div className="flex items-center gap-2">
-                        <div className="w-7 h-7 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0"><Box size={13} className="text-primary" /></div>
-                        <div>
-                          <p className="font-semibold text-tertiary whitespace-nowrap">{appLabel(app)}</p>
-                        </div>
-                      </div>
-                    </td>
-                    <td className="py-3 pr-6 text-tertiary whitespace-nowrap">{app.ownerUsername || '—'}</td>
-                    <td className="py-3 pr-6">
-                      <button
-                        onClick={() => onToggleLogin(app)}
-                        disabled={busy}
-                        title="Toggle required login"
-                        className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-lg border transition disabled:opacity-50 ${app.loginRequired ? 'border-primary/30 text-primary bg-primary/5' : 'border-bial-border text-neutral'}`}
-                      >
-                        {app.loginRequired ? <ShieldCheck size={12} /> : <ShieldOff size={12} />}
-                        {app.loginRequired ? 'Required' : 'Off'}
-                      </button>
-                    </td>
-                    <td className="py-3 pr-6"><StatusBadge status={app.status} /></td>
-                    {isQueue && (
-                      <td data-testid={`submitted-${app.appId}`} className="py-3 pr-6 text-neutral whitespace-nowrap">
-                        <SubmittedCell iso={app.submittedAt} />
-                      </td>
-                    )}
-                    <td data-testid={`db-bytes-${app.appId}`} className="py-3 pr-6 text-neutral whitespace-nowrap">{fmtBytes(app.databaseBytes)}</td>
-                    <td className="py-3">
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        {app.status === 'pending' && (
-                          <button data-testid={`review-${app.appId}`} onClick={(e) => { reviewTriggerRef.current = e.currentTarget; setWithdrawn(null); setReview(app) }} disabled={busy} className="px-2.5 py-1.5 rounded-lg bg-primary/10 text-primary hover:bg-primary/20 transition text-xs font-medium disabled:opacity-50">Review</button>
-                        )}
-                        {CAN_DISABLE.includes(app.status) && (
-                          <button data-testid={`disable-${app.appId}`} onClick={() => onDisable(app)} disabled={busy} title="Disable (kill switch)" className="p-1.5 rounded-lg border border-bial-border text-amber-600 hover:bg-amber-50 transition disabled:opacity-50"><Power size={13} /></button>
-                        )}
-                        {app.status === 'disabled' && (
-                          <button data-testid={`enable-${app.appId}`} onClick={() => onEnable(app)} disabled={busy} title="Re-enable" className="p-1.5 rounded-lg border border-bial-border text-green-600 hover:bg-green-50 transition disabled:opacity-50"><Power size={13} /></button>
-                        )}
-                        <button data-testid={`audit-${app.appId}`} onClick={() => setAuditing(app)} disabled={busy} title="View audit" className="p-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition disabled:opacity-50"><ScrollText size={13} /></button>
-                        <button data-testid={`delete-${app.appId}`} onClick={() => onDelete(app)} disabled={busy} title="Delete app" className="p-1.5 rounded-lg border border-bial-border text-red-600 hover:bg-red-50 transition disabled:opacity-50"><Trash2 size={13} /></button>
-                      </div>
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
+      </RowHandlersContext.Provider>
 
       {review && <ReviewModal app={review} withdrawn={withdrawn} onClose={() => { setReview(null); setWithdrawn(null) }} onApprove={() => onApprove(review)} onReject={(note) => onReject(review, note)} />}
       {auditing && <AuditDrawer app={auditing} onClose={() => setAuditing(null)} />}
@@ -714,13 +904,11 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
  * ON THE VENDORED RADIX `Dialog`, like every other dialog in this portal — and this one was
  * hand-rolled when it first landed, which reintroduced in the admin panel the exact defect a
  * vendored dialog exists to close: a `fixed inset-0` div with `role="dialog"` gives no focus
- * trap, no Escape, and no focus restored to the trash control that opened it. Its sibling
- * review modal in this same file carries an explicit `reviewTriggerRef` restore for that
- * reason. The most destructive control on this screen must not be the one with the weakest
- * keyboard contract. Radix gives the trap, Escape and the overlay click (both routed through
- * `onOpenChange`, so `busy` guards them the way the hand-rolled overlay only guarded its own
- * click), and the restore — via `useFocusBackstop` in `ui/dialog.tsx`, because this dialog is
- * rendered conditionally like the rest.
+ * trap, no Escape, and no focus restored to the control that opened it. The most destructive
+ * control on this screen must not be the one with the weakest keyboard contract. Radix gives
+ * the trap, Escape and the overlay click (both routed through `onOpenChange`, so `busy` guards
+ * them the way the hand-rolled overlay only guarded its own click). The restore is the panel's,
+ * because the dialog opens from a menu item that is gone by the time it closes.
  *
  * A `window.confirm` stood here before that. It could not collect anything, and the route now
  * REQUIRES a word-bounded justification — so the old control would 422 on every press. The words ride the

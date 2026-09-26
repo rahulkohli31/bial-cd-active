@@ -13,10 +13,19 @@ from typing import Annotated, Any
 
 from pydantic import AfterValidator, Field, field_validator
 
+from src.api.v1.deploy.schemas import RegistryStatus
 from src.db.models.app_registry import AppStatus
 from src.schemas import CamelModel, clean_stated_reason
 
 # --- governance (`/admin/apps`) ------------------------------------------------
+
+
+class LiveVersion(CamelModel):
+    """The version serving now: its commit, and when the attempt that put it there finished.
+    Either can be null on a row that never recorded it."""
+
+    commit_sha: str | None
+    since: datetime | None
 
 
 class AdminAppOut(CamelModel):
@@ -30,6 +39,9 @@ class AdminAppOut(CamelModel):
     # (`AppRegistryPanel` reads `ownerUsername`); the raw `ownerId` uuid is not user-facing.
     owner_username: str | None
     status: AppStatus
+    registry_status: RegistryStatus
+    # Null when nothing is serving. An app waiting for review can still have an older version live.
+    live_version: LiveVersion | None
     login_required: bool
     # Derived from the approved pin (`approved_submission_id is not None`) — the old
     # JSX-snapshot derivation is gone with the column it read.
@@ -62,13 +74,11 @@ class AdminAppOut(CamelModel):
 
 
 class AppListResponse(CamelModel):
-    """One page of the registry listing, plus whether it IS the whole set.
+    """The registry listing, most recently active first, plus whether it is the whole set.
 
     `truncated` exists because the badge and list come from different queries: the count is
-    an uncapped `GROUP BY`, the listing stops at `LISTING_CAP`. Past the cap the badge advertised
-    a number the list refused to show — and since the pending tab sorts OLDEST FIRST, the rows
-    that vanished were the NEWEST submissions, invisible to every administrator who looked.
-    Pagination stays deferred; making the cap VISIBLE stops the two surfaces disagreeing."""
+    an uncapped `GROUP BY`, the listing stops at `LISTING_CAP`. Making the cap visible stops the
+    two surfaces disagreeing with nothing on screen admitting it."""
 
     apps: list[AdminAppOut]
     truncated: bool = False

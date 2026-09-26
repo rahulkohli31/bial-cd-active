@@ -21,14 +21,20 @@ import pytest
 
 from src.api.v1.deploy.schemas import (
     PublishState,
+    RegistryStatus,
     approved_retry_commit,
     compute_publish_state,
+    compute_registry_status,
     published_since_approval,
     retry_needs_last_publish,
 )
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
-from src.services.deploy.service import FAIL_ROUTED_FOR_REVIEW
+from src.services.deploy.service import (
+    FAIL_RESTART,
+    FAIL_RESTART_NOT_READY,
+    FAIL_ROUTED_FOR_REVIEW,
+)
 
 _LIVE_SHA = "aa" * 20
 _SAVED_SHA = "bb" * 20
@@ -521,3 +527,154 @@ def test_a_failed_restart_with_no_head_claims_nothing_about_a_version() -> None:
         status=DeploymentStatus.FAILED, failure_code="restart_failed", head_sha=None
     )
     assert compute_publish_state(app, deployment, _LIVE_SHA) is PublishState.DID_NOT_START
+
+
+# --- the App Registry's status: the same reading, told apart where an administrator needs it ---
+
+_TAKEN_DOWN_AT = datetime(2026, 9, 21, tzinfo=UTC)
+
+_REGISTRY_CASES = [
+    pytest.param(
+        RegistryStatus.DISABLED,
+        _app(status=AppStatus.DISABLED),
+        _deployment(head_sha=_LIVE_SHA),
+        id="disabled: switched off, whatever is still on its deployment row",
+    ),
+    pytest.param(
+        RegistryStatus.WAITING_FOR_REVIEW,
+        _app(status=AppStatus.PENDING),
+        _deployment(head_sha=_LIVE_SHA),
+        id="waiting for review: sent, with an older version still serving",
+    ),
+    pytest.param(
+        RegistryStatus.REJECTED,
+        _app(status=AppStatus.REJECTED),
+        None,
+        id="rejected",
+    ),
+    pytest.param(
+        RegistryStatus.NOT_PUBLISHED,
+        _approved(_SUBMITTED_SHA),
+        None,
+        id="not published: approved, and nothing has tried to publish the copy",
+    ),
+    pytest.param(
+        RegistryStatus.NOT_PUBLISHED,
+        _approved(_SUBMITTED_SHA),
+        _deployment(head_sha=_LIVE_SHA, created_at=_BEFORE_APPROVAL),
+        id="not published: the only row predates the approval",
+    ),
+    pytest.param(
+        RegistryStatus.NOT_PUBLISHED,
+        _approved(_SUBMITTED_SHA),
+        _deployment(
+            status=DeploymentStatus.FAILED,
+            failure_code=FAIL_ROUTED_FOR_REVIEW,
+            created_at=_BEFORE_APPROVAL,
+        ),
+        id="not published: an older routing row gives way to the approval",
+    ),
+    pytest.param(
+        RegistryStatus.DRAFT,
+        _app(status=AppStatus.DRAFT),
+        None,
+        id="draft: never published",
+    ),
+    pytest.param(
+        RegistryStatus.DRAFT,
+        _app(status=AppStatus.APPROVED, approved_commit_sha=_LIVE_SHA, approved_at=_APPROVED_AT),
+        None,
+        id="draft: approved before copies were kept, so there is nothing to publish",
+    ),
+    pytest.param(
+        RegistryStatus.PUBLISHING,
+        _approved(_SUBMITTED_SHA),
+        _deployment(status=DeploymentStatus.RUNNING, created_at=_APPROVED_AT),
+        id="publishing: the attempt the approval started",
+    ),
+    pytest.param(
+        RegistryStatus.PUBLISHING,
+        _app(status=AppStatus.DRAFT),
+        _deployment(status=DeploymentStatus.RUNNING),
+        id="publishing: an owner's publish in flight",
+    ),
+    pytest.param(
+        RegistryStatus.TAKEN_OFFLINE,
+        _app(status=AppStatus.DRAFT),
+        _deployment(head_sha=_LIVE_SHA, unpublished_at=_TAKEN_DOWN_AT),
+        id="taken offline",
+    ),
+    pytest.param(
+        RegistryStatus.LIVE,
+        _approved(_SUBMITTED_SHA),
+        _deployment(head_sha=_SUBMITTED_SHA),
+        id="live: the approved copy went live",
+    ),
+    pytest.param(
+        RegistryStatus.LIVE,
+        _app(status=AppStatus.DRAFT, source_commit_sha=_SUBMITTED_SHA),
+        _deployment(head_sha=_LIVE_SHA),
+        id="live: newer work sent since, which the list does not look for",
+    ),
+    pytest.param(
+        RegistryStatus.LIVE,
+        _app(status=AppStatus.DRAFT, source_commit_sha=None),
+        _deployment(head_sha=_LIVE_SHA),
+        id="live: whether newer work exists is unknown",
+    ),
+    pytest.param(
+        RegistryStatus.LIVE,
+        _app(status=AppStatus.DRAFT),
+        _deployment(status=DeploymentStatus.FAILED, failure_code=FAIL_RESTART, head_sha=_LIVE_SHA),
+        id="live: a failed restart leaves the version it restarted serving",
+    ),
+    pytest.param(
+        RegistryStatus.LIVE,
+        _app(status=AppStatus.DRAFT),
+        _deployment(
+            status=DeploymentStatus.FAILED,
+            failure_code=FAIL_RESTART_NOT_READY,
+            head_sha=_LIVE_SHA,
+        ),
+        id="live: a restart that did not come back ready leaves its version serving",
+    ),
+    pytest.param(
+        RegistryStatus.PUBLISH_FAILED,
+        _approved(_SUBMITTED_SHA),
+        _deployment(
+            status=DeploymentStatus.FAILED, failure_code="build_failed", head_sha=_SUBMITTED_SHA
+        ),
+        id="publish failed: the attempt at the approved copy failed",
+    ),
+    pytest.param(
+        RegistryStatus.PUBLISH_FAILED,
+        _app(status=AppStatus.DRAFT),
+        _deployment(status=DeploymentStatus.FAILED, failure_code="revision_unhealthy"),
+        id="publish failed: an owner's publish failed",
+    ),
+    pytest.param(
+        RegistryStatus.PUBLISH_FAILED,
+        _app(status=AppStatus.DRAFT),
+        _deployment(status=DeploymentStatus.FAILED, failure_code=FAIL_RESTART, head_sha=None),
+        id="publish failed: a failed restart that names no version claims none is serving",
+    ),
+    pytest.param(
+        RegistryStatus.WAITING_FOR_REVIEW,
+        _app(status=AppStatus.DRAFT),
+        _deployment(status=DeploymentStatus.FAILED, failure_code=FAIL_ROUTED_FOR_REVIEW),
+        id="waiting for review: an older row that routed to an administrator",
+    ),
+]
+
+
+@pytest.mark.parametrize(("expected", "app", "deployment"), _REGISTRY_CASES)
+def test_each_app_reads_one_registry_status(
+    expected: RegistryStatus, app: AppRegistry, deployment: Deployment | None
+) -> None:
+    assert compute_registry_status(app, deployment) is expected
+
+
+def test_every_registry_status_has_a_case() -> None:
+    reached = {case.values[0] for case in _REGISTRY_CASES}
+
+    assert reached == set(RegistryStatus)

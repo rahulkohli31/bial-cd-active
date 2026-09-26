@@ -55,9 +55,7 @@ const jsonOpts = (method: string, body?: unknown) => ({
 // ── Admin ──────────────────────────────────────────────────────────────────
 
 /** The registry status vocabulary, re-exported from the one module that declares it
- * (`projectApi`) so the admin screen keeps importing it from its own client. `draft` is
- * builder-side and never shown in AppRegistryPanel's admin tabs, but is a real value the
- * status field can hold. */
+ * (`projectApi`) so the admin screen keeps importing it from its own client. */
 export type { AppStatus }
 
 export const APP_STATUSES: readonly AppStatus[] = [
@@ -70,6 +68,46 @@ export const APP_STATUSES: readonly AppStatus[] = [
 
 function isAppStatus(value: unknown): value is AppStatus {
   return APP_STATUSES.some((status) => status === value)
+}
+
+/** The App Registry's status column, as the backend's `RegistryStatus` sends it. */
+export type RegistryStatus =
+  | 'draft'
+  | 'waiting_for_review'
+  | 'rejected'
+  | 'not_published'
+  | 'publishing'
+  | 'live'
+  | 'publish_failed'
+  | 'taken_offline'
+  | 'disabled'
+
+const REGISTRY_STATUSES: readonly RegistryStatus[] = [
+  'draft',
+  'waiting_for_review',
+  'rejected',
+  'not_published',
+  'publishing',
+  'live',
+  'publish_failed',
+  'taken_offline',
+  'disabled',
+]
+
+function isRegistryStatus(value: unknown): value is RegistryStatus {
+  return REGISTRY_STATUSES.some((status) => status === value)
+}
+
+/** The version serving now. Either half is null on a row that never recorded it. */
+export interface LiveVersion {
+  commitSha: string | null
+  since: string | null
+}
+
+function toLiveVersion(value: unknown): LiveVersion | null {
+  return isRecord(value)
+    ? { commitSha: asStringOrNull(value.commitSha), since: asStringOrNull(value.since) }
+    : null
 }
 
 /**
@@ -97,6 +135,9 @@ export interface RegistryApp {
   ownerId: string
   ownerUsername: string | null
   status: AppStatus
+  registryStatus: RegistryStatus
+  /** Null when nothing is serving. */
+  liveVersion: LiveVersion | null
   loginRequired: boolean
   hasApprovedSnapshot: boolean
   submissionId: string | null
@@ -134,6 +175,8 @@ function toRegistryApp(value: unknown): RegistryApp {
     ownerId: asString(value.ownerId),
     ownerUsername: asStringOrNull(value.ownerUsername),
     status: isAppStatus(value.status) ? value.status : 'draft',
+    registryStatus: isRegistryStatus(value.registryStatus) ? value.registryStatus : 'draft',
+    liveVersion: toLiveVersion(value.liveVersion),
     loginRequired: value.loginRequired === true,
     hasApprovedSnapshot: value.hasApprovedSnapshot === true,
     submissionId: asStringOrNull(value.submissionId),
@@ -153,12 +196,20 @@ function toRegistryApp(value: unknown): RegistryApp {
   }
 }
 
-/** List registry apps, optionally filtered by status. */
-export async function listApps(status?: string, deps: AuthFetchDeps = {}): Promise<RegistryApp[]> {
-  const q = status ? `?status=${encodeURIComponent(status)}` : ''
-  const body = await readBody(await authFetch(`/api/admin/apps${q}`, {}, deps), 'Failed to load apps')
+export interface RegistryList {
+  apps: RegistryApp[]
+  /** The server stopped at its cap, so these are not every app. */
+  truncated: boolean
+}
+
+/** Every registry app up to the server's cap, most recently active first. */
+export async function listApps(deps: AuthFetchDeps = {}): Promise<RegistryList> {
+  const body = await readBody(await authFetch('/api/admin/apps', {}, deps), 'Failed to load apps')
   const apps = isRecord(body) ? body.apps : null
-  return Array.isArray(apps) ? apps.map(toRegistryApp) : []
+  return {
+    apps: Array.isArray(apps) ? apps.map(toRegistryApp) : [],
+    truncated: isRecord(body) && body.truncated === true,
+  }
 }
 
 /** How many apps sit in each registry status — the waiting-count badge's source. */

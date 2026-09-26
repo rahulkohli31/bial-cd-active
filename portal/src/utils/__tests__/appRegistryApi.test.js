@@ -26,6 +26,50 @@ describe('owner-surface retirement (inertness guard)', () => {
   )
 })
 
+describe('listApps', () => {
+  it('asks for every app, with no status filter', async () => {
+    const fetchImpl = vi.fn(async () => ok({ apps: [], truncated: false }))
+    await registry.listApps(deps(fetchImpl))
+
+    expect(fetchImpl.mock.calls[0][0]).toBe('/api/admin/apps')
+  })
+
+  it('reads each row’s registry status and live version, and whether the list was cut short', async () => {
+    const fetchImpl = vi.fn(async () =>
+      ok({
+        apps: [
+          {
+            appId: 'a1',
+            status: 'approved',
+            registryStatus: 'live',
+            liveVersion: { commitSha: 'f0e1d2c3b4', since: '2026-09-25T16:40:00Z' },
+          },
+          { appId: 'a2', status: 'pending', registryStatus: 'waiting_for_review', liveVersion: null },
+        ],
+        truncated: true,
+      }),
+    )
+
+    const list = await registry.listApps(deps(fetchImpl))
+
+    expect(list.truncated).toBe(true)
+    expect(list.apps.map((a) => [a.registryStatus, a.liveVersion])).toEqual([
+      ['live', { commitSha: 'f0e1d2c3b4', since: '2026-09-25T16:40:00Z' }],
+      ['waiting_for_review', null],
+    ])
+  })
+
+  it('reads an unknown registry status as a draft, and a missing flag as a whole list', async () => {
+    const fetchImpl = vi.fn(async () => ok({ apps: [{ appId: 'a1', registryStatus: 'teleported' }] }))
+
+    const list = await registry.listApps(deps(fetchImpl))
+
+    expect(list.apps[0].registryStatus).toBe('draft')
+    expect(list.apps[0].liveVersion).toBeNull()
+    expect(list.truncated).toBe(false)
+  })
+})
+
 describe('approveApp', () => {
   it('POSTs the REVIEWED submission id', async () => {
     const fetchImpl = vi.fn(async () => ok({ appId: 'a1', status: 'approved' }))

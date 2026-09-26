@@ -241,7 +241,7 @@ for delete) (`test_apps_governance.py:139-175`):
 | `POST /v1/admin/apps/{id}/disable` | — | `status": "disabled"` (requires APPROVED, else **409**) |
 | `POST /v1/admin/apps/{id}/enable` | — | `status": "approved"` (requires DISABLED, else **409**) |
 | `PATCH /v1/admin/apps/{id}` | `{"loginRequired": true}` | loginRequired flip is audited (`config:loginRequired`); the app name is project-sourced and no longer settable — a stray `{"name": ...}` key is ignored |
-| `GET /v1/admin/apps?status=approved` | — | `{"apps": [{"appId","status","hasApprovedSnapshot","submissionId","commitSha",...}]}` — never leaks `appKey` or a signed URL; `?status=pending` orders by `submittedAt` (review queue) |
+| `GET /v1/admin/apps` | — | `{"apps": [{"appId","status","registryStatus","liveVersion","hasApprovedSnapshot","submissionId","commitSha",...}], "truncated"}` — every app, most recent activity first; never leaks `appKey` or a signed URL |
 | `GET /v1/admin/apps/{id}/bundle-url` | — | `{"url","submissionId","commitSha","expiresInSeconds"}` — short-TTL signed download, audited `bundle:download` (needs a storage override, §6) |
 | `DELETE /v1/admin/apps/{id}` | — | `{"ok": True}` — sweeps the app's blobs, drops the registry row, and post-commit salts the project's database, audited `app:delete` + `db:drop` (needs a storage override, §6) |
 

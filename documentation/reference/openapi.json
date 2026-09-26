@@ -145,6 +145,16 @@
             "title": "Hasapprovedsnapshot",
             "type": "boolean"
           },
+          "liveVersion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LiveVersion"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "loginRequired": {
             "title": "Loginrequired",
             "type": "boolean"
@@ -168,6 +178,9 @@
               }
             ],
             "title": "Ownerusername"
+          },
+          "registryStatus": {
+            "$ref": "#/components/schemas/RegistryStatus"
           },
           "rejectionNote": {
             "anyOf": [
@@ -219,6 +232,8 @@
           "ownerId",
           "ownerUsername",
           "status",
+          "registryStatus",
+          "liveVersion",
           "loginRequired",
           "hasApprovedSnapshot",
           "submissionId",
@@ -283,7 +298,7 @@
         "type": "object"
       },
       "AppListResponse": {
-        "description": "One page of the registry listing, plus whether it IS the whole set.\n\n`truncated` exists because the badge and list come from different queries: the count is\nan uncapped `GROUP BY`, the listing stops at `LISTING_CAP`. Past the cap the badge advertised\na number the list refused to show — and since the pending tab sorts OLDEST FIRST, the rows\nthat vanished were the NEWEST submissions, invisible to every administrator who looked.\nPagination stays deferred; making the cap VISIBLE stops the two surfaces disagreeing.",
+        "description": "The registry listing, most recently active first, plus whether it is the whole set.\n\n`truncated` exists because the badge and list come from different queries: the count is\nan uncapped `GROUP BY`, the listing stops at `LISTING_CAP`. Making the cap visible stops the\ntwo surfaces disagreeing with nothing on screen admitting it.",
         "properties": {
           "apps": {
             "items": {
@@ -2689,6 +2704,40 @@
         "title": "LimitsPatchResponse",
         "type": "object"
       },
+      "LiveVersion": {
+        "description": "The version serving now: its commit, and when the attempt that put it there finished.\nEither can be null on a row that never recorded it.",
+        "properties": {
+          "commitSha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commitsha"
+          },
+          "since": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Since"
+          }
+        },
+        "required": [
+          "commitSha",
+          "since"
+        ],
+        "title": "LiveVersion",
+        "type": "object"
+      },
       "LogoutResponse": {
         "description": "Body returned once logout has cleared the client cookies.",
         "properties": {
@@ -3525,6 +3574,22 @@
         ],
         "title": "RefreshResponse",
         "type": "object"
+      },
+      "RegistryStatus": {
+        "description": "The App Registry's status column. An **API** StrEnum like `PublishState`: nothing\npersists it, and the wire value equals the member's own string.",
+        "enum": [
+          "draft",
+          "waiting_for_review",
+          "rejected",
+          "not_published",
+          "publishing",
+          "live",
+          "publish_failed",
+          "taken_offline",
+          "disabled"
+        ],
+        "title": "RegistryStatus",
+        "type": "string"
       },
       "RejectRequest": {
         "properties": {
@@ -4955,24 +5020,6 @@
     "/v1/admin/apps": {
       "get": {
         "operationId": "list_apps_v1_admin_apps_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "status",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Status"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "content": {
@@ -4983,16 +5030,6 @@
               }
             },
             "description": "Successful Response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Invalid status filter"
           },
           "401": {
             "content": {
@@ -5013,16 +5050,6 @@
               }
             },
             "description": "Super-admin privileges required"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           },
           "500": {
             "content": {

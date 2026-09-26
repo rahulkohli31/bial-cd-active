@@ -1,7 +1,5 @@
 /**
- * The waiting-count badge — how many apps sit in the review queue. It exists as ONE component,
- * not a span per mount, because it appears in two places (the admin nav entry and the app
- * registry's Pending tab) which must never disagree about the number or how it's announced.
+ * The waiting-count badge on the admin nav entry — how many apps sit in the review queue.
  *
  * ACCESSIBILITY: the visible numeral is `aria-hidden`; the real accessible name is the
  * visually-hidden sentence beside it, so the count is announced once, with its meaning, not
@@ -14,7 +12,7 @@
 interface Props {
   /** The pending count, or `null` when it is unknown (not yet fetched, or the fetch failed). */
   count: number | null
-  /** Distinguishes the mounts in the DOM (`nav`, `tab`) — one testid each. */
+  /** The testid suffix for this mount (`nav`). */
   where: string
   /**
    * A dot instead of a numeral, for the collapsed navigation rail.

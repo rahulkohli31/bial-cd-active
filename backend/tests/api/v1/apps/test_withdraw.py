@@ -134,15 +134,18 @@ async def test_withdraw_removes_the_item_from_the_admin_queue(
     app_row, _receipt = await _submitted_app(db_session, user, fake_storage)
     _, admin_headers = await _auth_user(db_session, email="admin@bial.com")
 
-    before = await client.get("/v1/admin/apps?status=pending", headers=admin_headers)
-    assert str(app_row.id) in [a["appId"] for a in before.json()["apps"]]
+    async def _registry_status() -> str:
+        listed = await client.get("/v1/admin/apps", headers=admin_headers)
+        row = next(a for a in listed.json()["apps"] if a["appId"] == str(app_row.id))
+        return str(row["registryStatus"])
+
+    assert await _registry_status() == "waiting_for_review"
 
     assert (
         await client.post(f"/v1/apps/{app_row.id}/withdraw", headers=headers)
     ).status_code == 200
 
-    after = await client.get("/v1/admin/apps?status=pending", headers=admin_headers)
-    assert str(app_row.id) not in [a["appId"] for a in after.json()["apps"]]
+    assert await _registry_status() == "draft"
 
 
 async def test_withdraw_then_approve_conflicts_the_existing_guard_holds(

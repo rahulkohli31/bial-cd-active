@@ -101,7 +101,9 @@ describe('JSX-era deploy retirement', () => {
     // `stepLabel` translated the pipeline's phase tokens into citizen words in the
     // browser. The whole vocabulary is DELETED rather than restyled — while a publish runs
     // the chip says "Starting up" and stops there. `Live` and `Publish again` are
-    // deliberately NOT in this list: they are labels the new chip renders.
+    // deliberately NOT in this list: they are labels the new chip renders. The admin
+    // registry is not a citizen surface: its status column says "Waiting for review".
+    const ADMIN = path.join('components', 'admin') + path.sep
     const RETIRED_PHASES = [
       'Getting ready',
       'Packaging your app',
@@ -114,7 +116,7 @@ describe('JSX-era deploy retirement', () => {
     const offenders: string[] = []
     for (const file of walk(SRC_ROOT)) {
       const rel = path.relative(SRC_ROOT, file)
-      if (ALLOWLIST.has(rel)) continue
+      if (ALLOWLIST.has(rel) || rel.startsWith(ADMIN)) continue
       const text = readFileSync(file, 'utf8')
       for (const phrase of RETIRED_PHASES) {
         if (text.includes(phrase)) offenders.push(`${rel}: ${phrase}`)

@@ -25,11 +25,11 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, cast
+from typing import Any, cast
 
 import sqlalchemy as sa
 import structlog
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, status
 from pydantic.alias_generators import to_camel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import make_url
@@ -63,6 +63,7 @@ from src.api.v1.admin.schemas import (
     HarnessCountersResponse,
     LimitFields,
     LimitsPatchResponse,
+    LiveVersion,
     PatchAppRequest,
     PrefixReconcileCounts,
     RejectRequest,
@@ -77,6 +78,7 @@ from src.api.v1.admin.schemas import (
 )
 from src.api.v1.build_sessions.deps import OptionalSandbox
 from src.api.v1.deploy.deps import OptionalDeployService
+from src.api.v1.deploy.schemas import RegistryStatus, compute_registry_status
 from src.api.v1.pagination import (
     DEFAULT_PAGE_SIZE,
     CursorQuery,
@@ -98,6 +100,7 @@ from src.db.models.app_registry import (
 )
 from src.db.models.attachment import Attachment
 from src.db.models.audit import AuditLog
+from src.db.models.deployment import Deployment
 from src.db.models.feedback import Feedback
 from src.db.models.harness_counter import HarnessCount
 from src.db.models.project import Project
@@ -133,6 +136,7 @@ from src.services.build_sessions.inventory import (
     take_sandbox_inventory,
 )
 from src.services.deploy.aca_publish import DeployNotConfiguredError, get_published_apps
+from src.services.deploy.liveness import last_success_deployment
 from src.services.deploy.reconcile import reconcile_stalled_deployments
 from src.services.deploy.service import DeployNotPossibleError
 from src.services.rbac.roles import is_super_duper_admin, role_for
@@ -190,18 +194,24 @@ def _project(
     project_name: str,
     owner_username: str | None = None,
     *,
+    newest: Deployment | None,
+    live: LiveVersion | None,
     database_bytes: int | None = None,
 ) -> AdminAppOut:
     # `database_bytes` is keyword-only WITH a default because this projection is shared with
     # `patch_app`, which re-reads one strict `(AppRegistry, name, email)` tuple and has no
     # size to hand over. A required parameter here would have forced a cluster probe into a
     # flag-flip endpoint that has no business talking to the maintenance engine at all.
+    registry_status = compute_registry_status(app, newest)
     return AdminAppOut(
         app_id=app.id,
         name=project_name,
         owner_id=app.user_id,
         owner_username=owner_username,
         status=app.status,
+        registry_status=registry_status,
+        # A disabled app has lost its data, so nothing it serves counts as a version.
+        live_version=None if registry_status is RegistryStatus.DISABLED else live,
         login_required=app.login_required,
         has_approved_snapshot=app.approved_submission_id is not None,
         submission_id=app.source_submission_id,
@@ -374,41 +384,49 @@ async def _advisory_sizes(db: DbSession, project_ids: Sequence[uuid.UUID]) -> di
     return {row[0]: by_name[row[1]] for row in claims if row[1] in by_name}
 
 
+async def _publish_facts(
+    db: DbSession, app_ids: Sequence[uuid.UUID]
+) -> tuple[dict[uuid.UUID, Deployment], dict[uuid.UUID, LiveVersion]]:
+    """Each app's newest deploy attempt, which its status reads, and the version it is serving:
+    its newest successful publish, unless a takedown landed at or after it. Unlike the
+    marketplace's `live_app_ids`, a rejection does not hide it: the app still answers at its
+    address. Two queries however many apps."""
+    if not app_ids:
+        return {}, {}
+    newest = await db.scalars(
+        sa.select(Deployment)
+        .where(Deployment.app_id.in_(app_ids))
+        .distinct(Deployment.app_id)
+        .order_by(Deployment.app_id, Deployment.id.desc())
+    )
+    serving = last_success_deployment()
+    live = await db.execute(
+        sa.select(serving.app_id, serving.head_sha, serving.finished_at).where(
+            serving.app_id.in_(app_ids),
+            ~sa.exists().where(
+                Deployment.app_id == serving.app_id,
+                Deployment.unpublished_at.is_not(None),
+                Deployment.id >= serving.id,
+            ),
+        )
+    )
+    return (
+        {row.app_id: row for row in newest},
+        {app_id: LiveVersion(commit_sha=sha, since=since) for app_id, sha, since in live},
+    )
+
+
 # --- endpoints -----------------------------------------------------------------
 
 
-@router.get(
-    "",
-    responses=error_responses((400, ErrorEnvelope, "Invalid status filter"), *_ADMIN_AUTH),
-)
-async def list_apps(
-    admin: CurrentSuperadmin,
-    db: DbSession,
-    status_filter: Annotated[str | None, Query(alias="status")] = None,
-) -> AppListResponse:
-    where = []
-    valid = {member.value for member in AppStatus}
-    if status_filter is not None and status_filter not in valid:
-        # Reject an unknown ?status= rather than silently ignoring it and returning
-        # every app (fail-open) — Express filtered and yielded an empty set.
-        raise AppApiError(400, "Invalid status filter.")
-    if status_filter in valid:
-        where.append(AppRegistry.status == AppStatus(status_filter))
-    # The pending list is a REVIEW QUEUE: oldest submission first, so the
-    # next app to review is on top — `created_at` is the wrong axis (it dates the
-    # provision, not the submission). Every other view stays newest-created-first.
-    order_by = (
-        AppRegistry.submitted_at.asc()
-        if status_filter == AppStatus.PENDING.value
-        else AppRegistry.created_at.desc()
-    )
+@router.get("", responses=error_responses(*_ADMIN_AUTH))
+async def list_apps(admin: CurrentSuperadmin, db: DbSession) -> AppListResponse:
     rows = (
         await db.execute(
             sa.select(AppRegistry, Project.name, User.email)
             .join(User, AppRegistry.user_id == User.id)
             .join(Project, AppRegistry.project_id == Project.id)
-            .where(*where)
-            .order_by(order_by)
+            .order_by(AppRegistry.updated_at.desc(), AppRegistry.id.desc())
             # One past the cap: the extra row is never projected, it only answers
             # "is there more?" without a second COUNT query.
             .limit(LISTING_CAP + 1)
@@ -416,12 +434,20 @@ async def list_apps(
     ).all()
     truncated = len(rows) > LISTING_CAP
     rows = rows[:LISTING_CAP]
+    newest, live = await _publish_facts(db, [app.id for app, _name, _email in rows])
     # One probe for the whole page (never per row): the size column is advisory, so a
     # cluster that will not answer leaves it blank rather than failing the queue.
     sizes = await _advisory_sizes(db, [app.project_id for app, _name, _email in rows])
     return AppListResponse(
         apps=[
-            _project(app, project_name, owner_email, database_bytes=sizes.get(app.project_id))
+            _project(
+                app,
+                project_name,
+                owner_email,
+                newest=newest.get(app.id),
+                live=live.get(app.id),
+                database_bytes=sizes.get(app.project_id),
+            )
             for app, project_name, owner_email in rows
         ],
         truncated=truncated,
@@ -671,7 +697,10 @@ async def patch_app(
             .where(AppRegistry.id == app_id)
         )
     ).one()
-    return _project(app, project_name, owner_email)
+    newest, live = await _publish_facts(db, [app_id])
+    return _project(
+        app, project_name, owner_email, newest=newest.get(app_id), live=live.get(app_id)
+    )
 
 
 @router.post(

@@ -22,7 +22,6 @@ const h = vi.hoisted(() => ({
   enableApp: vi.fn(),
   deleteApp: vi.fn(),
   fetchAudit: vi.fn(),
-  fetchAppStatusCounts: vi.fn(),
 }))
 
 vi.mock('../../utils/auth', () => ({ getStoredUser: h.getStoredUser }))
@@ -46,6 +45,8 @@ const PENDING = {
   name: 'Gate Tool',
   ownerUsername: 'alice',
   status: 'pending',
+  registryStatus: 'waiting_for_review',
+  liveVersion: null,
   loginRequired: false,
   hasApprovedSnapshot: false,
   submissionId: 'sub-1',
@@ -57,8 +58,7 @@ const PENDING = {
 beforeEach(() => {
   vi.clearAllMocks()
   h.getStoredUser.mockReturnValue(ADMIN)
-  h.listApps.mockResolvedValue([PENDING])
-  h.fetchAppStatusCounts.mockResolvedValue({ draft: 0, pending: 1, approved: 0, rejected: 0, disabled: 0 })
+  h.listApps.mockResolvedValue({ apps: [PENDING], truncated: false })
 })
 afterEach(() => cleanup())
 
@@ -72,7 +72,7 @@ const renderAdmin = () =>
 /** Open the one pending row's review modal and press Approve — the exact path
  *  `AppRegistryPanel.act()` reports back through `onToast`. */
 const openReviewAndApprove = () => {
-  fireEvent.click(screen.getByTestId('review-app-1'))
+  fireEvent.click(screen.getByRole('button', { name: 'Gate Tool' }))
   fireEvent.click(screen.getByTestId('approve-btn'))
 }
 
@@ -148,7 +148,7 @@ describe('a confirmation and a failure are visually distinguishable without read
   it('carry different severity markers, not merely different words', async () => {
     // Fail first: `act()` leaves the review modal OPEN on a non-withdrawal failure (the
     // admin still needs the submission metadata), so `approve-btn` is still on screen —
-    // no second `review-app-1` click needed to retry the SAME action.
+    // no second row click needed to retry the SAME action.
     h.approveApp.mockRejectedValueOnce(new Error('Could not reach the registry.'))
     renderAdmin()
     await screen.findByText('Gate Tool')

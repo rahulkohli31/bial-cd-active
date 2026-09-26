@@ -193,7 +193,7 @@ async def test_admin_apps_list_exposes_owner_username_for_spa(client, db_session
     owner = await UserFactory.create(db_session, email="owner-cell@rvaiglobal.com")
     app = await _owned_app(db_session, owner, **_pending_seed())
 
-    listed = await client.get("/v1/admin/apps?status=pending", headers=admin_headers)
+    listed = await client.get("/v1/admin/apps", headers=admin_headers)
     assert listed.status_code == 200
     row = next(a for a in listed.json()["apps"] if a["appId"] == str(app.id))
 

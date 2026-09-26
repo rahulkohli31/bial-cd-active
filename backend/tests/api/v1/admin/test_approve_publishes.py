@@ -484,6 +484,43 @@ async def test_a_failed_approved_publish_writes_no_chat_card_and_offers_the_copy
     assert status["approvedRetryCommit"] == wire.submitted[1]
 
 
+async def _registry_row(client, admin, app_row: AppRegistry) -> dict[str, Any]:
+    resp = await client.get("/v1/admin/apps", headers=auth_headers(admin))
+    assert resp.status_code == 200, resp.text
+    row: dict[str, Any] = next(a for a in resp.json()["apps"] if a["appId"] == str(app_row.id))
+    return row
+
+
+async def test_the_registry_shows_the_approval_publishing_then_live(
+    wire, client, db_session
+) -> None:
+    _owner, app_row, submission_id = await _submitted_for_review(wire, client, db_session)
+
+    admin = await _approve(client, db_session, app_row, submission_id)
+
+    publishing = await _registry_row(client, admin, app_row)
+    assert publishing["registryStatus"] == "publishing"
+    assert publishing["liveVersion"] is None
+    await _settle(wire)
+    live = await _registry_row(client, admin, app_row)
+    assert live["registryStatus"] == "live"
+    assert live["liveVersion"]["commitSha"] == wire.submitted[1]
+
+
+async def test_the_registry_shows_an_approval_whose_publish_failed(
+    wire, client, db_session
+) -> None:
+    _owner, app_row, submission_id = await _submitted_for_review(wire, client, db_session)
+    wire.images.error = ImageBuildError("the registry refused the build", log_tail=None)
+
+    admin = await _approve(client, db_session, app_row, submission_id)
+    await _settle(wire)
+
+    row = await _registry_row(client, admin, app_row)
+    assert row["registryStatus"] == "publish_failed"
+    assert row["liveVersion"] is None
+
+
 def _counting_selects() -> tuple[list[str], Any]:
     statements: list[str] = []
 

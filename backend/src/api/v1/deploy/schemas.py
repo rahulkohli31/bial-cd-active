@@ -362,6 +362,45 @@ def compute_publish_state(
     return _live_state(app, deployment, saved_head)
 
 
+class RegistryStatus(StrEnum):
+    """The App Registry's status column. An **API** StrEnum like `PublishState`: nothing
+    persists it, and the wire value equals the member's own string."""
+
+    DRAFT = "draft"
+    WAITING_FOR_REVIEW = "waiting_for_review"
+    REJECTED = "rejected"
+    NOT_PUBLISHED = "not_published"
+    PUBLISHING = "publishing"
+    LIVE = "live"
+    PUBLISH_FAILED = "publish_failed"
+    TAKEN_OFFLINE = "taken_offline"
+    DISABLED = "disabled"
+
+
+# No `NOTHING_BUILT`: that state is a project with no app row, and this reads an app row.
+_REGISTRY_STATUS_OF: dict[PublishState, RegistryStatus] = {
+    PublishState.DRAFT: RegistryStatus.DRAFT,
+    PublishState.IN_REVIEW: RegistryStatus.WAITING_FOR_REVIEW,
+    PublishState.CHANGES_REQUESTED: RegistryStatus.REJECTED,
+    PublishState.STARTING_UP: RegistryStatus.PUBLISHING,
+    PublishState.LIVE_CURRENT: RegistryStatus.LIVE,
+    PublishState.LIVE_DRIFT_UNKNOWN: RegistryStatus.LIVE,
+    PublishState.LIVE_NEWER_WORK: RegistryStatus.LIVE,
+    PublishState.TAKEN_OFFLINE: RegistryStatus.TAKEN_OFFLINE,
+    PublishState.SWITCHED_OFF: RegistryStatus.DISABLED,
+    PublishState.DID_NOT_START: RegistryStatus.PUBLISH_FAILED,
+}
+
+
+def compute_registry_status(app: AppRegistry, deployment: Deployment | None) -> RegistryStatus:
+    """The owner's publish state, read with no saved head, since every live reading is Live
+    here. The owner sees one did-not-start state where an administrator sees two: an approved
+    copy nobody has tried to publish yet, and a publish that failed."""
+    if approved_copy(app) is not None and not _attempted_since_approval(app, deployment):
+        return RegistryStatus.NOT_PUBLISHED
+    return _REGISTRY_STATUS_OF[compute_publish_state(app, deployment, saved_head=None)]
+
+
 def _failed_attempt(deployment: Deployment) -> bool:
     """A publish that failed — not a restart, which leaves its version serving, and not an
     older row's routing."""

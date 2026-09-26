@@ -6,7 +6,7 @@ the artifact-exists pin check and the audited bundle download. That approving pu
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pytest
 import sqlalchemy as sa
@@ -185,7 +185,7 @@ def test_admin_routes_document_error_codes_in_openapi() -> None:
     paths = create_app().openapi()["paths"]
     approve = set(paths["/v1/admin/apps/{app_id}/approve"]["post"]["responses"])
     assert {"404", "409", "503", "401", "403", "500"} <= approve
-    assert {"400", "401", "403", "500"} <= set(paths["/v1/admin/apps"]["get"]["responses"])
+    assert {"401", "403", "500"} <= set(paths["/v1/admin/apps"]["get"]["responses"])
     bundle = set(paths["/v1/admin/apps/{app_id}/bundle-url"]["get"]["responses"])
     assert {"404", "409", "503", "401", "403", "500"} <= bundle
 
@@ -566,11 +566,11 @@ async def test_an_app_disabled_before_the_column_existed_re_enables_to_approved(
 # --- the queue projection -----------------------------------------------
 
 
-async def test_list_and_status_filter(client, db_session) -> None:
+async def test_the_list_projects_no_key_and_no_signed_url(client, db_session) -> None:
     await _app(db_session, **_pending())
     approved = await _app(db_session, **_approved())
     headers = await _admin(db_session)
-    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
+    listed = await client.get("/v1/admin/apps", headers=headers)
     ids = [a["appId"] for a in listed.json()["apps"]]
     assert str(approved.id) in ids
     # The projection never leaks the app key or mints a signed URL.
@@ -601,28 +601,10 @@ async def test_list_sources_the_display_name_from_the_owning_project(client, db_
     assert by_id[str(approved.id)]["name"] == "Gate Roster"
 
 
-async def test_unknown_status_filter_is_400(client, db_session) -> None:
-    headers = await _admin(db_session)
-    resp = await client.get("/v1/admin/apps?status=bogus", headers=headers)
-    assert resp.status_code == 400  # fail-closed, never a silent full list
-
-
-async def test_pending_queue_is_ordered_by_submitted_at(client, db_session) -> None:
-    # The pending list is a REVIEW QUEUE — oldest submission first. created_at
-    # (provision time) is deliberately not the axis.
-    now = datetime.now(UTC)
-    newer = await _app(db_session, **_pending(submitted_at=now))
-    older = await _app(db_session, **_pending(submitted_at=now - timedelta(hours=2)))
-    headers = await _admin(db_session)
-    listed = await client.get("/v1/admin/apps?status=pending", headers=headers)
-    ids = [a["appId"] for a in listed.json()["apps"]]
-    assert ids.index(str(older.id)) < ids.index(str(newer.id))
-
-
 async def test_pending_row_carries_the_review_payload(client, db_session) -> None:
     app = await _app(db_session, **_pending())
     headers = await _admin(db_session)
-    listed = await client.get("/v1/admin/apps?status=pending", headers=headers)
+    listed = await client.get("/v1/admin/apps", headers=headers)
     row = next(a for a in listed.json()["apps"] if a["appId"] == str(app.id))
     assert row["submissionId"] == str(app.source_submission_id)
     assert row["commitSha"] == _SHA
@@ -636,7 +618,7 @@ async def test_the_admin_row_carries_no_route_or_hand_recorded_deployment(
     app = await _app(db_session, **_approved())
     headers = await _admin(db_session)
 
-    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
+    listed = await client.get("/v1/admin/apps", headers=headers)
 
     row = next(a for a in listed.json()["apps"] if a["appId"] == str(app.id))
     assert row["approvedSubmissionId"] == str(app.approved_submission_id)
@@ -741,7 +723,7 @@ async def test_an_approved_app_projects_its_declaration_verbatim(client, app, db
     )
     assert resp.status_code == 200
 
-    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
+    listed = await client.get("/v1/admin/apps", headers=headers)
     projected = next(a for a in listed.json()["apps"] if a["appId"] == str(row.id))
     assert projected["declaration"] == _DECLARATION
 

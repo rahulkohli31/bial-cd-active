@@ -40,7 +40,7 @@ renders the `—` fallback and no admin can tell whose app it is.
 
 | # | Assertion the test must make | Status | Evidence |
 |---|------------------------------|--------|----------|
-| 2.1 | `GET /v1/admin/apps?status=pending` → each `apps[]` carries a human owner identifier the SPA reads as `ownerUsername` (owner's email/display name), non-null for a real owner. | **BROKEN-captures-bug** — `AdminAppOut` projects `owner_id` only (`ownerId`); no `ownerUsername`/`ownerEmail`. | SPA read: `portal/src/components/admin/AppRegistryPanel.tsx:296`, `:54`; back schema: `backend/src/api/v1/admin/router.py:55-73`, projection `:141-159` |
+| 2.1 | `GET /v1/admin/apps` → each `apps[]` carries a human owner identifier the SPA reads as `ownerUsername` (owner's email/display name), non-null for a real owner. | **BROKEN-captures-bug** — `AdminAppOut` projects `owner_id` only (`ownerId`); no `ownerUsername`/`ownerEmail`. | SPA read: `portal/src/components/admin/AppRegistryPanel.tsx:296`, `:54`; back schema: `backend/src/api/v1/admin/router.py:55-73`, projection `:141-159` |
 | 2.2 | The list is admin-gated: a non-superadmin caller → **403** (RBAC at the API). | OK — keep as the gate guard. | back: `admin/router.py:187-189` (`CurrentSuperadmin`) |
 
 ---
