@@ -17,7 +17,9 @@ import { renderHook, act, cleanup, waitFor } from '@testing-library/react'
 
 import { usePublishState } from '../usePublishState'
 import { ApiError } from '../../utils/apiError'
+import * as buildSessionApi from '../../utils/buildSessionApi'
 import * as deployApi from '../../utils/deployApi'
+import type { SaveState } from '../../utils/buildSessionApi'
 import type { DataClassificationAnswers, DeploymentView, PublishState } from '../../utils/deployApi'
 
 vi.mock('../../utils/deployApi', async () => {
@@ -25,9 +27,22 @@ vi.mock('../../utils/deployApi', async () => {
   return { ...actual, getDeployment: vi.fn(), startDeploy: vi.fn() }
 })
 vi.mock('../../utils/approvalApi', () => ({ withdrawSubmission: vi.fn() }))
+vi.mock('../../utils/buildSessionApi', async () => {
+  const actual = await vi.importActual<typeof buildSessionApi>('../../utils/buildSessionApi')
+  return { ...actual, fetchSaveState: vi.fn(), saveProject: vi.fn() }
+})
 
 const getDeployment = vi.mocked(deployApi.getDeployment)
 const startDeploy = vi.mocked(deployApi.startDeploy)
+const fetchSaveState = vi.mocked(buildSessionApi.fetchSaveState)
+const saveProject = vi.mocked(buildSessionApi.saveProject)
+
+const saveState = (dirty: boolean | null): SaveState => ({
+  appId: 'app-1',
+  dirty,
+  containerHead: null,
+  savedHead: null,
+})
 
 const SHA = 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0'
 
@@ -45,6 +60,7 @@ const view = (publishState: PublishState, over: Partial<DeploymentView> = {}): D
   unpublishedAt: null,
   approval: null,
   publishState,
+  approvedRetryCommit: null,
   savedHead: null,
   savedAt: null,
   // `null` is "the server did not say", which keeps the saved row — the neutral default
@@ -82,6 +98,8 @@ const ROUTED = {
 beforeEach(() => {
   vi.clearAllMocks()
   getDeployment.mockResolvedValue(view('live_current'))
+  fetchSaveState.mockResolvedValue(saveState(false))
+  saveProject.mockResolvedValue({ appId: 'app-1', headSha: SHA })
 })
 afterEach(cleanup)
 
@@ -189,15 +207,27 @@ describe('a press, and what came back', () => {
 
     let outcome
     await act(async () => {
-      outcome = await result.current.onConfirm(ANSWERS)
+      outcome = await result.current.onConfirm(SHA, ANSWERS)
     })
     expect(outcome).toEqual(STARTED)
 
     startDeploy.mockResolvedValueOnce(ROUTED)
     await act(async () => {
-      outcome = await result.current.onConfirm(ANSWERS)
+      outcome = await result.current.onConfirm(SHA, ANSWERS)
     })
     expect(outcome).toEqual(ROUTED)
+  })
+
+  it('sends the commit the dialog reviewed, with its answers', async () => {
+    startDeploy.mockResolvedValueOnce(STARTED)
+    const { result } = renderHook(() => usePublishState('p1'))
+    await waitFor(() => expect(result.current.deployment).not.toBeNull())
+
+    await act(async () => {
+      await result.current.onConfirm(SHA, ANSWERS)
+    })
+
+    expect(startDeploy).toHaveBeenCalledWith('p1', { commitSha: SHA, answers: ANSWERS })
   })
 
   it('re-reads after a press, so the chip moves without waiting for a poll', async () => {
@@ -207,75 +237,155 @@ describe('a press, and what came back', () => {
     getDeployment.mockClear()
 
     await act(async () => {
-      await result.current.onConfirm(ANSWERS)
+      await result.current.onConfirm(SHA, ANSWERS)
     })
 
     expect(getDeployment).toHaveBeenCalled()
   })
 
-  it('treats unsaved work as a QUESTION with a second answer, not as a failure', async () => {
-    // The one refusal that is not a failure. It must not throw — a thrown 409 would render
-    // in red beside the button as though the citizen had done something wrong.
-    startDeploy.mockRejectedValueOnce(
-      new ApiError('You have changes that are not saved yet.', 409, 'unsaved_changes'),
-    )
-    const { result } = renderHook(() => usePublishState('p1'))
-    await waitFor(() => expect(result.current.deployment).not.toBeNull())
-
-    let outcome: unknown = 'unset'
-    await act(async () => {
-      outcome = await result.current.onConfirm(ANSWERS)
-    })
-
-    expect(outcome).toBeNull()
-    expect(result.current.unsaved).toBe('You have changes that are not saved yet.')
-  })
-
-  it('re-sends the SAME declaration on Save and publish, with saveFirst set', async () => {
-    // The guarantee: the retry publishes what the citizen actually declared. Re-asking, or
-    // sending a fresh/empty declaration, would put a different answer through the gate than
-    // the one they read and agreed to.
-    //
-    // Mutation receipt: clear `pendingAnswers.current` before the retry, or pass `false`
-    // for saveFirst, and this goes red.
-    startDeploy.mockRejectedValueOnce(
-      new ApiError('You have changes that are not saved yet.', 409, 'unsaved_changes'),
-    )
-    startDeploy.mockResolvedValueOnce(STARTED)
-    const { result } = renderHook(() => usePublishState('p1'))
-    await waitFor(() => expect(result.current.deployment).not.toBeNull())
-
-    await act(async () => {
-      await result.current.onConfirm(ANSWERS)
-    })
-    await act(async () => {
-      await result.current.saveAndPublish()
-    })
-
-    expect(startDeploy).toHaveBeenCalledTimes(2)
-    expect(startDeploy.mock.calls[0]?.[1]).toEqual({ answers: ANSWERS, saveFirst: false })
-    expect(startDeploy.mock.calls[1]?.[1]).toEqual({ answers: ANSWERS, saveFirst: true })
-    expect(result.current.unsaved).toBeNull()
-  })
-
-  it('re-reads before it rethrows any other refusal', async () => {
+  it('re-reads before it rethrows a refusal', async () => {
     // A 409 here is usually the server telling this surface something it did not know yet —
-    // most often that a version is already in the queue, routed from another tab. Rethrowing
-    // alone left the surface showing state the server had already contradicted.
+    // most often a save that landed after the dialog opened. Rethrowing alone left the surface
+    // showing state the server had already contradicted.
     startDeploy.mockRejectedValueOnce(
-      new ApiError('This version is already waiting for review.', 409, 'waiting_for_review'),
+      new ApiError('Your app was saved again.', 409, 'snapshot_moved'),
     )
     const { result } = renderHook(() => usePublishState('p1'))
     await waitFor(() => expect(result.current.deployment).not.toBeNull())
     getDeployment.mockClear()
 
     await act(async () => {
-      await expect(result.current.onConfirm(ANSWERS)).rejects.toThrow(/already waiting/)
+      await expect(result.current.onConfirm(SHA, ANSWERS)).rejects.toThrow(/saved again/)
     })
 
     await waitFor(() => expect(getDeployment).toHaveBeenCalled())
-    // Not a question — the questionnaire renders this one itself, beside its own button.
-    expect(result.current.unsaved).toBeNull()
+  })
+})
+
+describe('the one button saves first, then hands over the dialog', () => {
+  it('★ saves a dirty workspace, re-reads, and only then asks for the dialog', async () => {
+    // The dialog must be about the version that will ship, so the save lands before the
+    // review starts. Nothing is sent: sending is the dialog's.
+    const order: string[] = []
+    fetchSaveState.mockImplementation(async () => {
+      order.push('save-state')
+      return saveState(true)
+    })
+    saveProject.mockImplementation(async () => {
+      order.push('save')
+      return { appId: 'app-1', headSha: SHA }
+    })
+    getDeployment.mockResolvedValue(view('draft'))
+    const { result } = renderHook(() => usePublishState('p1'))
+    await waitFor(() => expect(result.current.deployment).not.toBeNull())
+    getDeployment.mockImplementation(async () => {
+      order.push('re-read')
+      return view('draft')
+    })
+
+    let next: unknown
+    await act(async () => {
+      next = await result.current.publish()
+    })
+
+    expect(next).toBe('review')
+    expect(order).toEqual(['save-state', 'save', 're-read'])
+    expect(startDeploy).not.toHaveBeenCalled()
+    expect(result.current.publishError).toBeNull()
+  })
+
+  it('does not save a clean workspace, or one nobody could check', async () => {
+    getDeployment.mockResolvedValue(view('draft'))
+    for (const dirty of [false, null]) {
+      fetchSaveState.mockResolvedValueOnce(saveState(dirty))
+      const { result } = renderHook(() => usePublishState('p1'))
+      await waitFor(() => expect(result.current.deployment).not.toBeNull())
+
+      let next: unknown
+      await act(async () => {
+        next = await result.current.publish()
+      })
+
+      expect(next, String(dirty)).toBe('review')
+      expect(fetchSaveState, String(dirty)).toHaveBeenCalledWith('p1')
+      cleanup()
+    }
+    expect(saveProject).not.toHaveBeenCalled()
+  })
+
+  it('★ opens no dialog when the save fails, and says why', async () => {
+    fetchSaveState.mockResolvedValueOnce(saveState(true))
+    saveProject.mockRejectedValueOnce(
+      new ApiError('Your workspace is not running, so there was nothing to save.', 409),
+    )
+    getDeployment.mockResolvedValue(view('draft'))
+    const { result } = renderHook(() => usePublishState('p1'))
+    await waitFor(() => expect(result.current.deployment).not.toBeNull())
+
+    let next: unknown = 'unset'
+    await act(async () => {
+      next = await result.current.publish()
+    })
+
+    expect(next).toBeNull()
+    expect(result.current.publishError).toBe(
+      'Your workspace is not running, so there was nothing to save.',
+    )
+    expect(startDeploy).not.toHaveBeenCalled()
+    expect(result.current.publishPhase).toBeNull()
+  })
+
+  it('★ posts the approved commit straight away when the server hands one back', async () => {
+    // No save, no review, no dialog: the approval already decided this version.
+    const RETRY = 'f9e8d7c6b5a4f9e8d7c6b5a4f9e8d7c6b5a4f9e8'
+    getDeployment.mockResolvedValue(view('did_not_start', { approvedRetryCommit: RETRY }))
+    startDeploy.mockResolvedValueOnce(STARTED)
+    const { result } = renderHook(() => usePublishState('p1'))
+    await waitFor(() => expect(result.current.deployment).not.toBeNull())
+
+    let next: unknown
+    await act(async () => {
+      next = await result.current.publish()
+    })
+
+    expect(next).toEqual(STARTED)
+    expect(startDeploy).toHaveBeenCalledWith('p1', { commitSha: RETRY })
+    expect(fetchSaveState).not.toHaveBeenCalled()
+    expect(saveProject).not.toHaveBeenCalled()
+  })
+
+  it('names what it is waiting on while it works, and lets go afterwards', async () => {
+    let release: () => void = () => {}
+    fetchSaveState.mockResolvedValueOnce(saveState(true))
+    saveProject.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve({ appId: 'app-1', headSha: SHA })
+        }),
+    )
+    getDeployment.mockResolvedValue(view('draft'))
+    const { result } = renderHook(() => usePublishState('p1'))
+    await waitFor(() => expect(result.current.deployment).not.toBeNull())
+
+    let pending: Promise<unknown> = Promise.resolve()
+    act(() => {
+      pending = result.current.publish()
+    })
+    await waitFor(() => expect(result.current.publishPhase).toBe('saving'))
+
+    // A second press while the first is in flight does nothing.
+    let second: unknown = 'unset'
+    await act(async () => {
+      second = await result.current.publish()
+    })
+    expect(second).toBeNull()
+    expect(saveProject).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      release()
+      await pending
+    })
+    expect(result.current.publishPhase).toBeNull()
   })
 })
 

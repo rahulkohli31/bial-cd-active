@@ -4,8 +4,9 @@
  * so the decision (which words, colour, action, row) lives here as pure functions over one
  * server-computed field, and each surface only renders it.
  *
- * `presentationFor` switches on `publishState` and on NOTHING ELSE. A client that recombines a
- * server decision from parts has produced this same bug four times — most recently promising an
+ * `presentationFor` switches on `publishState`, and reads `approvedRetryCommit` only to say what its
+ * button publishes — both server-authored, NOTHING recombined. A client that recombines a server
+ * decision from parts has produced this same bug four times — most recently promising an
  * auto-publish moment before the server routed the app to an administrator. `status`,
  * `unpublishedAt`, `failureCode`, the approval lineage and the pin stay on the wire only for the
  * version ROWS to render.
@@ -15,14 +16,13 @@ import { MONTHS } from './monthNames'
 import type { ApprovalState, DeploymentView, PublishState } from './deployApi'
 
 /**
- * What a press will ATTEMPT. Every one of these except `take_it_back` is the same request
- * through the same questionnaire — the ladder requires a completed declaration on every
- * attempt, so there is no second path and no client-side threshold check. They differ only
- * in what the button honestly promises.
+ * What a press will ATTEMPT. Every one of these except `take_it_back` is a publish of one named
+ * version: the saved one, through the questionnaire, or — where the server hands back an
+ * approved commit — the approved copy, directly. There is no client-side threshold check. They
+ * differ only in what the button honestly promises.
  */
 export type ActionKind =
   | 'send_for_review'
-  | 'publish'
   | 'send_update_for_review'
   | 'publish_again'
   | 'try_again'
@@ -30,7 +30,6 @@ export type ActionKind =
 
 export const ACTION_LABEL: Record<ActionKind, string> = {
   send_for_review: 'Send for review',
-  publish: 'Publish',
   send_update_for_review: 'Send update for review',
   publish_again: 'Publish again',
   try_again: 'Try again',
@@ -80,12 +79,15 @@ export const RESTART_FAILED_CODES: ReadonlySet<string> = new Set([
 
 /**
  * THE map: one publish state in, one presentation out, ending in `assertNever` so an unlabelled
- * state is a COMPILE error. TWO STATES DELIBERATELY SHARE THE LABEL "Approved" (the difference
- * is on the button/sentence); every other pair differs in words, so the CLOSED chip stays a
- * complete answer — "Live", "Live · newer work saved" and "Live · couldn't check" are three
- * different things, and the last never reads as "nothing of yours is waiting".
+ * state is a COMPILE error. Every pair differs in words, so the CLOSED chip stays a complete
+ * answer — "Live", "Live · newer work saved" and "Live · couldn't check" are three different
+ * things, and the last never reads as "nothing of yours is waiting".
  *
- * THE STATE VOCABULARY IS NOT THIS REDESIGN'S TO EXTEND: thirteen states, owned by the product's
+ * `approvedRetryCommit` is the server saying the one button republishes the approved copy; the
+ * state's sentence then says so, because an owner with newer saved work must not be surprised
+ * that it is not what goes live.
+ *
+ * THE STATE VOCABULARY IS NOT THIS REDESIGN'S TO EXTEND: eleven states, owned by the product's
  * lifecycle. A redesign may relabel a state or move where it is drawn; adding or removing one
  * changes what the product MEANS rather than how it is laid out.
  *
@@ -93,7 +95,10 @@ export const RESTART_FAILED_CODES: ReadonlySet<string> = new Set([
  * That notice covers the application that is STILL SERVING — where a restart left nothing
  * running, the state word is the only thing said about it.
  */
-export function presentationFor(state: PublishState): Presentation {
+export function presentationFor(
+  state: PublishState,
+  approvedRetryCommit: string | null,
+): Presentation {
   switch (state) {
     case 'nothing_built':
       // Canvas, verbatim.
@@ -151,33 +156,6 @@ export function presentationFor(state: PublishState): Presentation {
         sentence: 'An administrator asked for changes. Make them, then send it again.',
         action: 'send_for_review',
         version: 'submitted_with_note',
-      }
-    case 'approved_ready_to_publish':
-      // NO ARTBOARD. Adapted from the retired review card's approved arm with its
-      // lineage promise removed: it says an administrator approved this version and that
-      // pressing Publish is the next step, and it does NOT say whether that will publish
-      // or route. That is the discipline, and it is not pedantry — the decision is
-      // taken inside the request, against a tree a `saveFirst` can move first, so no read
-      // taken before the press can honestly promise either outcome.
-      return {
-        label: 'Approved',
-        sentence:
-          'An administrator approved this version. Publishing it is the next step, ' +
-          'and it is yours to take.',
-        action: 'publish',
-        version: 'approved',
-      }
-    case 'approved_needs_review_again':
-      // NO ARTBOARD. Its whole job is to say that THIS version goes back to an
-      // administrator, without implying anything about what the other approved state's
-      // press would do.
-      return {
-        label: 'Approved',
-        sentence:
-          'An administrator approved an earlier version of this app. What you have now ' +
-          'goes back to an administrator before it can go live.',
-        action: 'send_for_review',
-        version: 'approved',
       }
     case 'starting_up':
       // Canvas, with two DEPARTURES. Its opening "Approved." goes: an app published
@@ -286,6 +264,16 @@ export function presentationFor(state: PublishState): Presentation {
         version: 'none',
       }
     case 'did_not_start':
+      if (approvedRetryCommit !== null) {
+        return {
+          label: "Didn't start",
+          sentence:
+            'The version an administrator approved has not gone live yet. Trying again ' +
+            'publishes that version — not anything you have saved since.',
+          action: 'try_again',
+          version: 'approved',
+        }
+      }
       // Canvas, minus BOTH of its assertions, and the same fact retires them both: an app
       // that published unattended under ladder rule 7 was never seen by an administrator,
       // and `approved_commit_sha` is NULL for every one of them — the common case.
@@ -427,12 +415,10 @@ export function versionRowData(
 
 /**
  * THE STATE COLOURS (`StatusCardStates`) — previously all one grey pill; now an explicit
- * text/ground pair + dot each. SIX FAMILIES COVER THIRTEEN STATES: three pairs share a look and
- * differ only in their words, and four of the portal's states have no board at all. `approved_*`
- * takes GREEN (platform said yes; the difference is on the button); `live_drift_unknown` stays
- * GREEN like the other live states (the uncertainty is in the label, not an amber that would
- * wrongly say something broke); `taken_offline` shares `switched_off`'s off-grey (only one has a
- * remedy, again on the button).
+ * text/ground pair + dot each. SIX FAMILIES COVER ELEVEN STATES: states in one family share a look
+ * and differ in their words. `live_drift_unknown` stays GREEN like the other live states (the
+ * uncertainty is in the label, not an amber that would wrongly say something broke);
+ * `taken_offline` shares `switched_off`'s off-grey (only one has a remedy, on the button).
  */
 export interface StateLook {
   /** Tailwind classes for the pill: its text and its ground. */
@@ -459,8 +445,6 @@ export function lookFor(state: PublishState): StateLook {
     case 'changes_requested':
     case 'did_not_start':
       return RED
-    case 'approved_ready_to_publish':
-    case 'approved_needs_review_again':
     case 'starting_up':
     case 'live_current':
     case 'live_newer_work':
@@ -585,9 +569,7 @@ export function provenanceRows(
    * NO APPROVAL MEANS NO APPROVED ROW, not an APPROVED row saying "cannot tell". An unattended
    * ladder-rule-7 publish is the COMMON case with `approved_at`/`approved_commit_sha` both NULL —
    * rendering the row anyway would read as an approval whose record got lost, which never happened.
-   * Either field answers it (server always writes both together). The two `approved_*` states keep
-   * the row unconditionally: those states ASSERT an approval, so a missing stamp there is a genuine
-   * "cannot tell" about a real event.
+   * Either field answers it (server always writes both together).
    */
   const wasApproved = (approval?.approvedAt ?? approval?.approvedCommitSha ?? null) !== null
 
@@ -625,8 +607,13 @@ export function provenanceRows(
     case 'switched_off':
       return []
     case 'draft':
-    case 'did_not_start':
       return saved('LAST SAVED', 'ink')
+    // WHICH VERSION TRY AGAIN PUBLISHES, where the server says it is the approved one.
+    case 'did_not_start':
+      return [
+        ...(deployment?.approvedRetryCommit == null ? [] : [approved]),
+        ...saved('LAST SAVED', 'ink'),
+      ]
     // THE NOTE COMES FIRST, and that ordering is the requirement rather than a preference:
     // every row here renders above the state's action, so a note capped at 1,000 characters
     // in a 360px rail must not be able to push "Send for review" below the fold. It is
@@ -636,9 +623,6 @@ export function provenanceRows(
       return [...(rejection === null ? [] : [rejection]), ...saved('LAST SAVED', 'ink')]
     case 'in_review':
       return [submitted, ...saved('LAST SAVED', 'ink')]
-    case 'approved_ready_to_publish':
-    case 'approved_needs_review_again':
-      return [approved, ...saved('LAST SAVED', 'ink')]
     // THE ROWS THE BOARD DRAWS — three where an administrator approved the version, two where
     // nobody did (see `wasApproved`) — and the one that is amber. Only `live_newer_work` is
     // KNOWN to have drifted: `live_current` knows the two agree, and `live_drift_unknown` is

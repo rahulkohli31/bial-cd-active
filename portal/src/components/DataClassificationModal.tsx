@@ -4,9 +4,11 @@
  *
  * WHY THIS EXISTS
  * Opening the dialog ensures a review exists for that version; while one runs, the
- * citizen can already answer. Confirm posts the answers to the deploy route, where the
- * SERVER re-reads the stored review and merges, taking the stricter of the two — nothing
- * this dialog computes rides in as authority. The running total shown here decides
+ * citizen can already answer. Confirm posts the answers, naming the version this dialog
+ * reviewed, to the deploy route, where the SERVER re-reads the stored review and merges,
+ * taking the stricter of the two — nothing this dialog computes rides in as authority. A save
+ * that lands after the dialog asked is refused there (`snapshot_moved`), and the dialog asks
+ * again about the version saved now. The running total shown here decides
  * nothing: it only drives the action's label, the explanation gate, and the score line.
  * MERGE, NEVER CLOBBER: a review verdict lands only on an untouched question, never
  * overwriting an answer the citizen already gave — a touched question instead shows the
@@ -31,6 +33,7 @@ import { BusyGlyph } from './ui/Waiting'
 import {
   AUTO_DEPLOY_MAX_SCORE,
   DATA_CLASSIFICATION_QUESTIONS,
+  SNAPSHOT_MOVED,
   totalWeight,
   type DataClassificationAnswers,
 } from '../utils/deployApi'
@@ -118,21 +121,14 @@ interface Props {
    * nothing to say — a caller passing `undefined` gets the same nothing.
    */
   rejectionNote?: string | null
-  /**
-   * An administrator has already approved the version this dialog asks about, so the
-   * server publishes it whatever the answers score — the approval pins that exact commit
-   * and outranks the declaration. The dialog has to know, or it promises a review the
-   * server will not perform and compels an explanation for a decision already taken.
-   */
-  alreadyApproved?: boolean
-  onConfirm: (answers: DataClassificationAnswers) => Promise<void>
+  /** Sends the answers about `commitSha`, the version this dialog reviewed. */
+  onConfirm: (commitSha: string, answers: DataClassificationAnswers) => Promise<void>
   onCancel: () => void
 }
 
 export default function DataClassificationModal({
   projectId,
   rejectionNote = null,
-  alreadyApproved = false,
   onConfirm,
   onCancel,
 }: Props): React.ReactElement {
@@ -145,8 +141,10 @@ export default function DataClassificationModal({
   const firstQuestionRef = useRef<HTMLButtonElement>(null)
 
   // The version stamp this dialog asked about, latched from each ensure-POST response.
-  // Poll responses are filtered against it — see the module comment's stamp rule.
+  // Poll responses are filtered against it — see the module comment's stamp rule — and it is
+  // the commit Confirm sends. The state twin is what the render reads.
   const askedShaRef = useRef<string | null>(null)
+  const [askedSha, setAskedSha] = useState<string | null>(null)
   // Questions the citizen has clicked. A review's verdicts land only on the others.
   const touchedRef = useRef<Set<CategoryKey>>(new Set())
   // One generation per mount; bumped on unmount and on every fresh ask, so a stale
@@ -185,6 +183,7 @@ export default function DataClassificationModal({
       const first = await ensureClassificationReview(projectId)
       if (generation.current !== mine) return
       askedShaRef.current = first.headSha
+      setAskedSha(first.headSha)
       applyReview(first)
     } catch (err) {
       if (generation.current !== mine) return
@@ -219,8 +218,8 @@ export default function DataClassificationModal({
           const next = await getClassificationReview(projectId)
           if (generation.current !== mine || tick <= applied) return
           if (next.reviewedSha !== askedShaRef.current) {
-            // The app's ONE review row was re-stamped for another version — a second tab,
-            // another device, or the deploy pipeline's own drift re-check. The review this
+            // The app's ONE review row was re-stamped for another version — a second tab or
+            // another device. The review this
             // dialog is waiting for no longer exists and never will, so polling on was an
             // immortal spinner: Confirm stayed disabled because the review read as
             // pending, and "Check again" never appeared because the status was not
@@ -291,15 +290,13 @@ export default function DataClassificationModal({
   // A weighted Yes anywhere means this submission is a review request, not a publish —
   // the action's label says so, and the same condition compels the explanation: a routed
   // app is never unexplained, and an explanation is never compelled on a declaration
-  // that was going to pass anyway. An APPROVAL OF THIS VERSION outranks the score, exactly
-  // as the server does: it publishes the pinned commit, so routing it again is an outcome
-  // this dialog cannot deliver and must not name.
-  const sensitiveRecorded = total > AUTO_DEPLOY_MAX_SCORE
-  const sendForReview = sensitiveRecorded && !alreadyApproved
+  // that was going to pass anyway.
+  const sendForReview = total > AUTO_DEPLOY_MAX_SCORE
   const notesRequired = sendForReview
   const notesBlank = notes.trim() === ''
+  // No version named, nothing to send: the server decides about the commit it is given.
   const confirmDisabled =
-    busy || reviewPending || !allAnswered || (notesRequired && notesBlank)
+    busy || reviewPending || askedSha === null || !allAnswered || (notesRequired && notesBlank)
 
   // What the live region says. One sentence per state; the transitions running→complete
   // (arrival) and running→failed (fall-through) are announced by the text changing.
@@ -371,10 +368,20 @@ export default function DataClassificationModal({
     setBusy(true)
     setError(null)
     try {
-      // Safe: `confirmDisabled` already proved every category is non-null.
-      await onConfirm({ ...(answers as Record<CategoryKey, boolean>), notes: notes.trim() || null })
+      // Safe: `confirmDisabled` already proved the version and every category are non-null.
+      await onConfirm(askedSha, {
+        ...(answers as Record<CategoryKey, boolean>),
+        notes: notes.trim() || null,
+      })
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not publish. Please try again.')
+      if (e instanceof ApiError && e.code === SNAPSHOT_MOVED) {
+        // The answers were about a version that is no longer the saved one: start again on
+        // the version saved now, keeping only the explanation.
+        touchedRef.current = new Set()
+        setAnswers(UNANSWERED)
+        void ask()
+      }
     } finally {
       setBusy(false)
     }
@@ -389,10 +396,6 @@ export default function DataClassificationModal({
   if (allAnswered) {
     if (notesRequired) {
       warning = "This app handles sensitive data — please explain how it's handled below."
-    } else if (sensitiveRecorded) {
-      // Approved, and the data is still sensitive: saying nothing was flagged would
-      // contradict the Yes answers on the same screen.
-      warning = 'This app handles sensitive data, and an administrator approved this version.'
     } else {
       // "Nothing flagged" has to be true of the RECORDED answers, not just the
       // developer's: the check's own Yes verdicts count, and this line used to say
@@ -608,15 +611,12 @@ export default function DataClassificationModal({
             <p data-testid="dc-score" className="mt-4 flex items-baseline gap-2 text-xs text-neutral">
               <span className="text-lg font-bold text-tertiary tabular-nums">{total}</span>
               <span>
-                {/* The SAME predicates the action label and the explanation prompt use —
-                    read off `sendForReview`/`sensitiveRecorded` rather than re-compared
-                    against the threshold, so this sentence cannot end up contradicting the
-                    button two rows below it if the rule ever moves. */}
+                {/* The SAME predicate the action label and the explanation prompt use — read
+                    off `sendForReview` rather than re-compared against the threshold, so this
+                    sentence cannot end up contradicting the button two rows below it. */}
                 {sendForReview
                   ? 'sensitive data recorded — this app will be sent to an administrator for review'
-                  : sensitiveRecorded
-                    ? 'sensitive data recorded — an administrator approved this version, so it publishes'
-                    : 'nothing sensitive recorded — this can publish without review'}
+                  : 'nothing sensitive recorded — this can publish without review'}
               </span>
             </p>
           )}

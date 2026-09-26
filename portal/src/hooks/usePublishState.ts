@@ -23,7 +23,6 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  UNSAVED_CHANGES,
   getDeployment,
   startDeploy,
   type ApprovalState,
@@ -32,6 +31,7 @@ import {
   type DeploymentView,
 } from '../utils/deployApi'
 import { withdrawSubmission } from '../utils/approvalApi'
+import { fetchSaveState, saveProject } from '../utils/buildSessionApi'
 import { ApiError } from '../utils/apiError'
 
 /** How often to ask where the deploy has got to. Five seconds: the pipeline's phases last
@@ -78,6 +78,10 @@ export function announceDeploymentChanged(projectId: string): void {
   dispatchDeploymentChanged(projectId, NO_MOUNT)
 }
 
+/** What the one button is waiting on while it works: a save before the dialog, or the approved
+ *  copy being sent. */
+export type PublishPhase = 'saving' | 'publishing'
+
 /**
  * NOTHING HERE MAY GROW A PREDICATE BACK. `running`, `waitingForReview`, `routed` — derived
  * booleans the browser used to compute from raw fields — are gone: each was the browser
@@ -96,23 +100,24 @@ export interface UsePublishState {
    *  itself failed — a chip that rendered nothing there would be indistinguishable from
    *  a broken page. */
   refresh: () => Promise<void>
-  /** The server's `unsaved_changes` message, or null. Non-null means the "Save and publish"
-   *  choice is outstanding. */
-  unsaved: string | null
-  saving: boolean
-  /** Hand to the modal's `onConfirm`. Throws so the modal renders the refusal itself.
+  /**
+   * THE ONE BUTTON, for every action but taking a submission back. Where the server hands back
+   * `approvedRetryCommit` it posts that commit — no save, no review, no dialog — and resolves
+   * with the outcome. Otherwise it saves any unsaved work and resolves `'review'`: the caller
+   * opens the dialog, which reviews the version saved now. `null` when that failed, with the
+   * reason in `publishError` and no dialog.
+   */
+  publish: () => Promise<DeployOutcome | 'review' | null>
+  publishPhase: PublishPhase | null
+  publishError: string | null
+  /** Hand to the dialog's `onConfirm`: sends the commit it reviewed. Throws so the dialog
+   *  renders the refusal itself.
    *
-   *  RESOLVES WITH THE OUTCOME, because the two successes are two different answers and
-   *  only the caller can say them: `202 started` and `200 routed_for_review` both resolve,
-   *  and a surface that could not tell them apart would have to guess which of the
-   *  server's two sentences to speak. `null` means the request became the
-   *  `unsaved_changes` QUESTION rather than an outcome — the one refusal that is not a
-   *  failure and is therefore not thrown. */
-  onConfirm: (answers: DataClassificationAnswers) => Promise<DeployOutcome | null>
-  /** The second answer to that question. Same two outcomes; `null` when it failed, in
-   *  which case the failure is already in `unsaved`. */
-  saveAndPublish: () => Promise<DeployOutcome | null>
-  dismissUnsaved: () => void
+   *  RESOLVES WITH THE OUTCOME, because the two successes are two different answers and only
+   *  the caller can say them: `202 started` and `200 routed_for_review` both resolve, and a
+   *  surface that could not tell them apart would have to guess which of the server's two
+   *  sentences to speak. */
+  onConfirm: (commitSha: string, answers: DataClassificationAnswers) => Promise<DeployOutcome>
   /** Pull the owner's own pending submission back out of the queue. */
   withdraw: () => Promise<void>
   withdrawing: boolean
@@ -122,13 +127,13 @@ export interface UsePublishState {
 export function usePublishState(projectId: string): UsePublishState {
   const [deployment, setDeployment] = useState<DeploymentView | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [unsaved, setUnsaved] = useState<string | null>(null)
-  const [saving, setSaving] = useState(false)
+  const [publishPhase, setPublishPhase] = useState<PublishPhase | null>(null)
+  const [publishError, setPublishError] = useState<string | null>(null)
   const [withdrawing, setWithdrawing] = useState(false)
   const [withdrawError, setWithdrawError] = useState<string | null>(null)
-  // Held here, not in the modal, so the "Save and publish" retry resends exactly what was
-  // already declared instead of reopening the questionnaire.
-  const pendingAnswers = useRef<DataClassificationAnswers | null>(null)
+  // The press itself, read and written synchronously: two presses inside one frame both see
+  // the same `publishPhase`, and only a ref settles that race.
+  const pressing = useRef(false)
 
   // One generation token per mount+project. Every async write checks it, so a response for a
   // project the user has already navigated away from can never paint over the current one —
@@ -182,9 +187,8 @@ export function usePublishState(projectId: string): UsePublishState {
     generation.current += 1
     everRead.current = false
     setDeployment(null)
-    setUnsaved(null)
+    setPublishError(null)
     setWithdrawError(null)
-    pendingAnswers.current = null
     void refresh()
 
     const onVisible = (): void => {
@@ -233,71 +237,64 @@ export function usePublishState(projectId: string): UsePublishState {
     return () => window.clearInterval(timer)
   }, [inFlight, refresh])
 
-  const send = useCallback(
-    async (answers: DataClassificationAnswers, saveFirst: boolean): Promise<DeployOutcome> => {
-      // TWO success shapes. Routing is not an error and must not be thrown: the
-      // modal would render it in red beside the button, and the citizen would read "your
-      // app was sent for review" as a failure of the thing they just asked for.
-      const outcome = await startDeploy(projectId, { answers, saveFirst })
-      pendingAnswers.current = null
-      setUnsaved(null)
-      await refresh()
-      announce()
-      return outcome
-    },
-    [projectId, refresh, announce],
-  )
+  const approvedRetryCommit = deployment?.approvedRetryCommit ?? null
+  const publish = useCallback(async (): Promise<DeployOutcome | 'review' | null> => {
+    if (pressing.current) return null
+    pressing.current = true
+    setPublishError(null)
+    try {
+      if (approvedRetryCommit !== null) {
+        setPublishPhase('publishing')
+        const outcome = await startDeploy(projectId, { commitSha: approvedRetryCommit })
+        await refresh()
+        announce()
+        return outcome
+      }
+      // SAVE FIRST, so the review and the send are both about the version that will ship.
+      // Unknown is not dirty: with no live workspace the saved version is the only version.
+      const saveState = await fetchSaveState(projectId)
+      if (saveState.dirty === true) {
+        setPublishPhase('saving')
+        await saveProject(projectId)
+        await refresh()
+        announce()
+      }
+      return 'review'
+    } catch (err) {
+      setPublishError(
+        err instanceof ApiError ? err.message : 'That did not work. Please try again.',
+      )
+      void refresh()
+      return null
+    } finally {
+      pressing.current = false
+      setPublishPhase(null)
+    }
+  }, [approvedRetryCommit, projectId, refresh, announce])
 
-  // Errors propagate to the modal, which renders them beside the button while the answers are
-  // still on screen. `unsaved_changes` is the exception: not a reason to fail, but a question
-  // with a second answer, so it is surfaced as a choice instead.
+  // TWO success shapes, and routing is not an error: thrown, the dialog would render "your app
+  // was sent for review" in red beside the button, as a failure of the thing just asked for.
   //
-  // EVERY OTHER ERROR REFRESHES BEFORE IT RETHROWS. A 409 here is usually the server
-  // telling this surface something it did not know yet — most often `waiting_for_review`,
-  // where another tab (or the other publish control, mounted on a different page) already
-  // routed a version while this one still showed the button enabled. The disabled waiting
-  // state stops a second submit, but that state is only as fresh as the
-  // last poll. Rethrowing alone left the modal open on state the server had already
-  // contradicted, until the next tick happened to correct it.
+  // EVERY REFUSAL REFRESHES BEFORE IT RETHROWS. A 409 here is usually the server telling this
+  // surface something it did not know yet — `waiting_for_review` from another tab, or
+  // `snapshot_moved` from a save after the dialog opened — and the dialog should not sit on
+  // state the server already contradicted until the next poll.
   const onConfirm = useCallback(
-    async (answers: DataClassificationAnswers): Promise<DeployOutcome | null> => {
-      pendingAnswers.current = answers
+    async (commitSha: string, answers: DataClassificationAnswers): Promise<DeployOutcome> => {
       try {
-        return await send(answers, false)
+        const outcome = await startDeploy(projectId, { commitSha, answers })
+        await refresh()
+        announce()
+        return outcome
       } catch (err) {
-        if (err instanceof ApiError && err.code === UNSAVED_CHANGES) {
-          setUnsaved(err.message)
-          return null
-        }
         // Fire-and-forget on purpose: the caller is about to see the error either way, and
         // making them wait on a second round trip to read it would be worse.
         void refresh()
         throw err
       }
     },
-    [send, refresh],
+    [projectId, refresh, announce],
   )
-
-  const saveAndPublish = useCallback(async (): Promise<DeployOutcome | null> => {
-    const answers = pendingAnswers.current
-    if (!answers) return null
-    setSaving(true)
-    try {
-      return await send(answers, true)
-    } catch (err) {
-      setUnsaved(
-        err instanceof ApiError ? err.message : 'Could not save and publish. Please try again.',
-      )
-      return null
-    } finally {
-      setSaving(false)
-    }
-  }, [send])
-
-  const dismissUnsaved = useCallback(() => {
-    setUnsaved(null)
-    pendingAnswers.current = null
-  }, [])
 
   // The app id comes off the status response, not a prop: the toolbar surface never had
   // one, and taking it from the same read that says the app is pending is what keeps the
@@ -326,11 +323,10 @@ export function usePublishState(projectId: string): UsePublishState {
     approval,
     loadError,
     refresh,
-    unsaved,
-    saving,
+    publish,
+    publishPhase,
+    publishError,
     onConfirm,
-    saveAndPublish,
-    dismissUnsaved,
     withdraw,
     withdrawing,
     withdrawError,

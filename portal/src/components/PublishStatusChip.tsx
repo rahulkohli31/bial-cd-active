@@ -8,8 +8,7 @@
  * bug four times, most recently promising "this can publish automatically" beside a Publish
  * button moments before the server routed the app to an administrator. Nine labels were nine
  * assertions about server behaviour; they now have one source (`presentationFor`, switching
- * on `publishState` alone — see its call site below). Publishing behaviour itself is
- * unchanged: the seven-rule ladder, the questionnaire and the two successes are as they were.
+ * on `publishState` — see its call site below).
  *
  * THE CONTRACT A FUTURE WORKSPACE HEADER INHERITS, so it can re-parent this component
  * without reading its internals: takes a project id only (no router/rail/chat state);
@@ -68,11 +67,10 @@ export default function PublishStatusChip({
     deployment,
     approval,
     loadError,
-    unsaved,
-    saving,
+    publish,
+    publishPhase,
+    publishError,
     onConfirm,
-    saveAndPublish,
-    dismissUnsaved,
     refresh,
     withdraw,
     withdrawing,
@@ -85,11 +83,11 @@ export default function PublishStatusChip({
   const [answer, setAnswer] = useState<string | null>(null)
   const headingId = useId()
 
-  // An answer, or the unsaved-work question, must not land behind a closed popover: the
-  // citizen pressed something and is owed what happened.
+  // An answer, or a press that failed, must not land behind a closed popover: the citizen
+  // pressed something and is owed what happened.
   useEffect(() => {
-    if (answer !== null || unsaved !== null) setOpen(true)
-  }, [answer, unsaved])
+    if (answer !== null || publishError !== null) setOpen(true)
+  }, [answer, publishError])
 
   // A fresh press starts from a clean slate, and closing the popover retires an answer
   // that has already been read.
@@ -105,22 +103,27 @@ export default function PublishStatusChip({
   )
 
   const state: PublishState | null = deployment?.publishState ?? null
-  // THE ONE RULE: `presentationFor` switches on `publishState` alone — no status, no
-  // `unpublishedAt`, no failure code, no approval lineage, no pin. Other response fields
-  // are still read, but only to fill a version row the state already asked for, never to
-  // decide which state it is.
-  const presentation = state === null ? null : presentationFor(state)
+  // THE ONE RULE: `presentationFor` switches on `publishState` — no status, no
+  // `unpublishedAt`, no failure code, no approval lineage, no pin. `approvedRetryCommit` is
+  // the server's own word for what the button publishes. Other response fields are still
+  // read, but only to fill a version row the state already asked for.
+  const presentation =
+    state === null ? null : presentationFor(state, deployment?.approvedRetryCommit ?? null)
   // The pill's own colour pair, from the same one field. `lookFor` is exhaustive over the
   // union, so a state the server adds is a compile error rather than an unpainted chip.
   const look = state === null ? null : lookFor(state)
   const version =
     presentation === null ? null : versionRowData(presentation.version, deployment, approval)
-  const busy = saving || withdrawing
-  const busyReason = withdrawing ? 'Taking it back…' : saving ? 'Saving and publishing…' : undefined
+  const busy = publishPhase !== null || withdrawing
+  const busyReason = withdrawing
+    ? 'Taking it back…'
+    : publishPhase === 'saving'
+      ? 'Saving…'
+      : publishPhase === 'publishing'
+        ? 'Publishing…'
+        : undefined
 
-  const speak = useCallback((outcome: DeployOutcome | null): void => {
-    // `null` is the unsaved-work question, which speaks for itself below.
-    if (outcome === null) return
+  const speak = useCallback((outcome: DeployOutcome): void => {
     setAnswer(
       outcome.outcome === 'routed_for_review'
         ? // The server's OWN sentence. Both publish surfaces said the same words before
@@ -131,28 +134,30 @@ export default function PublishStatusChip({
     )
   }, [])
 
-  const pressAction = useCallback((): void => {
+  const pressAction = useCallback(async (): Promise<void> => {
     if (busy) return
     setAnswer(null)
     if (presentation?.action === 'take_it_back') {
       setConfirmingWithdraw(true)
       return
     }
-    // Every other action is the same request through the same questionnaire.
-    setShowModal(true)
-    setOpen(false)
-  }, [busy, presentation])
+    // Every other action is `publish`: the approved copy is sent and answered here; anything
+    // else is saved and reviewed in the questionnaire.
+    const next = await publish()
+    if (next === null) return
+    if (next === 'review') {
+      setShowModal(true)
+      setOpen(false)
+      return
+    }
+    speak(next)
+  }, [busy, presentation, publish, speak])
 
   const doWithdraw = useCallback(async (): Promise<void> => {
     if (withdrawing) return
     await withdraw()
     setConfirmingWithdraw(false)
   }, [withdraw, withdrawing])
-
-  const doSaveAndPublish = useCallback(async (): Promise<void> => {
-    if (saving) return
-    speak(await saveAndPublish())
-  }, [saving, saveAndPublish, speak])
 
   /**
    * ONE permanently-mounted, initially-empty polite live region (see `LivePreview.tsx` for
@@ -170,9 +175,8 @@ export default function PublishStatusChip({
   // THE WAIT ITSELF SPEAKS, and it takes precedence while it is running. `busyReason`
   // existed and was rendered ONLY as a `title` attribute — which is neither visible text nor an
   // exposed busy state, and is unreachable to a keyboard or a touch screen. So the one thing
-  // this component said out loud was the publish OUTCOME: a citizen who pressed Save and
-  // publish heard nothing at all until it finished, on an operation that force-drops nothing
-  // but does upload a bundle, claim a deployment row and start a container.
+  // this component said out loud was the publish OUTCOME: a citizen whose press saved their
+  // work first heard nothing at all until it finished.
   //
   // ENTERING AND LEAVING BOTH ANNOUNCE, which is what the region already gives for free: this
   // string replaces the outcome while busy, and the outcome replaces it when the wait ends.
@@ -328,47 +332,22 @@ export default function PublishStatusChip({
             </div>
           )}
 
-          {/* The unsaved-work QUESTION, not a failure: the one refusal that has a second
-              answer. It re-sends the answers already declared rather than reopening the
-              questionnaire. */}
-          {unsaved !== null && (
-            <div data-testid="publish-unsaved" className="mt-3 border-t border-bial-border pt-2.5">
-              <p className="text-xs leading-relaxed text-neutral">{unsaved}</p>
-              <div className="mt-2 flex gap-2">
-                <button
-                  type="button"
-                  data-testid="publish-save-and-publish"
-                  onClick={() => void doSaveAndPublish()}
-                  // Marked unavailable, never hard-disabled. Disabling a control
-                  // that has focus blurs it to `document.body`, which is how a
-                  // keyboard user loses their place mid-flight. `doSaveAndPublish` is the
-                  // enforcement; this is affordance only.
-                  aria-disabled={saving}
-                  title={saving ? 'Saving and publishing…' : undefined}
-                  className={`flex-1 rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-white transition ${
-                    saving ? 'cursor-default opacity-40' : 'hover:bg-primary-600'
-                  }`}
-                >
-                  Save and publish
-                </button>
-                <button
-                  type="button"
-                  data-testid="publish-unsaved-cancel"
-                  onClick={dismissUnsaved}
-                  className="rounded-lg border border-bial-border px-3 py-1.5 text-xs font-semibold text-neutral transition hover:bg-surface-muted"
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
-          )}
-
           {answer !== null && (
             <p
               data-testid="publish-answer"
               className="mt-3 border-t border-bial-border pt-2.5 text-xs leading-relaxed text-neutral"
             >
               {answer}
+            </p>
+          )}
+
+          {publishError !== null && (
+            <p
+              data-testid="publish-error"
+              role="alert"
+              className="mt-3 text-xs leading-relaxed text-danger"
+            >
+              {publishError}
             </p>
           )}
 
@@ -386,11 +365,11 @@ export default function PublishStatusChip({
               disabled one. "Mark unavailable rather than switch off" governs a
               control that is temporarily away and will come back, which is a different
               thing from a state where nothing can be done. */}
-          {presentation.action !== null && unsaved === null && !confirmingWithdraw && (
+          {presentation.action !== null && !confirmingWithdraw && (
             <button
               type="button"
               data-testid="publish-action"
-              onClick={pressAction}
+              onClick={() => void pressAction()}
               aria-disabled={busy}
               // `aria-busy` is the PROPERTY that says a control is working — `aria-disabled`
               // only says it will not respond, which is also true of a state with nothing to
@@ -405,9 +384,8 @@ export default function PublishStatusChip({
                   : 'bg-primary text-white'
               } ${busy ? 'cursor-default opacity-40' : SECONDARY_ACTIONS.has(presentation.action) ? 'hover:border-primary hover:text-primary' : 'hover:bg-primary-600'}`}
             >
-              {/* THE WAIT IS READABLE, not a tooltip. `busyReason` was rendered only as
-                  `title`, so what the button said while it worked was still "Save and publish"
-                  — a control that looks pressable, reads pressable, and is doing the thing. */}
+              {/* THE WAIT IS READABLE, not a tooltip: a control that says its own label while it
+                  works looks pressable, reads pressable, and is doing the thing. */}
               {busyReason ?? ACTION_LABEL[presentation.action]}
             </button>
           )}
@@ -454,14 +432,10 @@ export default function PublishStatusChip({
           // happens — the note belongs in the flow they are actually in, not only on a
           // panel beside it that they may never open.
           rejectionNote={approval?.status === 'rejected' ? approval.rejectionNote : null}
-          // The one state where the approval pins what is saved; the server publishes it
-          // whatever the declaration scores.
-          alreadyApproved={state === 'approved_ready_to_publish'}
-          onConfirm={async (answers) => {
+          onConfirm={async (commitSha, answers) => {
             // Refusals THROW and the modal renders them itself, beside the button, with
-            // the answers still on screen. Only the two successes and the unsaved-work
-            // question reach this line.
-            speak(await onConfirm(answers))
+            // the answers still on screen. Only the two successes reach this line.
+            speak(await onConfirm(commitSha, answers))
             setShowModal(false)
           }}
           onCancel={() => setShowModal(false)}

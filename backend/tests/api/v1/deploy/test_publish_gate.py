@@ -28,12 +28,12 @@ from src.api.v1.deploy.deps import deploy_service_or_none
 from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.classification_review import ClassificationReview
-from src.services.build_sessions.manager import SaveOutcome, SessionManager
+from src.services.build_sessions.manager import SessionManager
 from src.services.classification import store as review_store
 from src.services.classification.constants import REVIEW_WALL_CLOCK_CEILING_S
 from src.services.deploy.classification import CLASSIFICATION_KEYS
-from src.services.deploy.service import StartedDeploy, VersionRecheck
-from src.services.storage import snapshot_key
+from src.services.deploy.service import StartedDeploy
+from src.services.storage import snapshot_key, submission_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import AppRegistryFactory, UserFactory
 from tests.fakes import FakeStorage, a_git_bundle
@@ -47,11 +47,8 @@ _OLDER_SHA = "cd" * 20
 
 
 class _RecordingPipeline:
-    """The deploy service, recording instead of reaching Azure.
-
-    `expected_commit_sha` and `recheck` are a later widening: the gate hands the pipeline the
-    commit it decided about on EVERY branch, and the drift branch additionally hands it the
-    order to re-check that version before packing."""
+    """The deploy service, recording instead of reaching Azure: the commit the gate decided
+    about, and the bundle it named when that is not the saved snapshot."""
 
     def __init__(self) -> None:
         self.started: list[dict[str, Any]] = []
@@ -67,15 +64,16 @@ class _RecordingPipeline:
         classification: dict[str, Any] | None = None,
         classification_score: int | None = None,
         expected_commit_sha: str | None = None,
-        recheck: VersionRecheck | None = None,
+        bundle_key: str | None = None,
     ) -> StartedDeploy:
         self.started.append(
             {
                 "app_id": app_id,
+                "conversation_id": conversation_id,
                 "classification": classification,
                 "classification_score": classification_score,
                 "expected_commit_sha": expected_commit_sha,
-                "recheck": recheck,
+                "bundle_key": bundle_key,
             }
         )
         return StartedDeploy(deployment_id=uuid.uuid4(), app_id=app_id)
@@ -89,21 +87,11 @@ class _Wiring:
 
 
 @pytest.fixture
-def wire(app: FastAPI, db_session) -> _Wiring:
+def wire(app: FastAPI) -> _Wiring:
     store = FakeStorage()
     pipeline = _RecordingPipeline()
-
-    @contextlib.asynccontextmanager
-    async def _session():
-        yield db_session
-
     app.dependency_overrides[storage_or_none_dependency] = lambda: store
     app.dependency_overrides[deploy_service_or_none] = lambda: pipeline
-    # No live workspace: nothing can be dirty, so the saved version IS the version.
-    app.dependency_overrides[sandbox_or_none_dependency] = lambda: None
-    app.dependency_overrides[session_manager_dependency] = lambda: SessionManager(
-        session_factory=lambda: _session()
-    )
     return _Wiring(app, store, pipeline)
 
 
@@ -120,14 +108,12 @@ def _answers(**yes: object) -> dict[str, object]:
     return body
 
 
-def _body(*, notes: str | None = None, save_first: bool = False, **yes: object) -> dict[str, Any]:
+def _body(*, commit: str = _SHA, notes: str | None = None, **yes: object) -> dict[str, Any]:
+    """A request about `commit` — by default the version `_owner_with_saved_app` saved."""
     answers = _answers(**yes)
     if notes is not None:
         answers["notes"] = notes
-    request: dict[str, Any] = {"answers": answers}
-    if save_first:
-        request["saveFirst"] = True
-    return request
+    return {"commitSha": commit, "answers": answers}
 
 
 _CLEAN = _body()
@@ -577,47 +563,89 @@ async def test_an_approval_is_what_lifts_a_standing_rejection(wire, client, db_s
     assert resp.json()["outcome"] == "started"  # publishes, no human needed
 
 
-# --- rule 3: the approval override -----------------------------------------
+# --- rule 3: the approved copy ---------------------------------------------------------
 
 
-async def test_an_approval_pinning_this_exact_version_publishes(wire, client, db_session) -> None:
-    """The citizen publishes the approved version themselves, and it goes live
-    rather than routing back. Weighted-Yes answers, no fresh explanation, no review
-    needed: the approval IS the decision for this commit."""
+def _approved(sha: str, **extra: object) -> dict[str, Any]:
+    submission_id = uuid.uuid4()
+    return {
+        "status": AppStatus.APPROVED,
+        "approval_route": ApprovalRoute.SELF_PUBLISH,
+        "source_submission_id": submission_id,
+        "source_commit_sha": sha,
+        "approved_submission_id": submission_id,
+        "approved_commit_sha": sha,
+        "declaration": {"citizen": {"answers": {}, "explanation": "As submitted."}},
+        **extra,
+    }
+
+
+async def test_the_approved_commit_publishes_the_approved_copy(wire, client, db_session) -> None:
+    """The approval IS the decision for that commit: weighted-Yes answers, no review and no
+    explanation change nothing, and what ships is the submission copy, pinned to the commit."""
+    user, app_row = await _owner_with_saved_app(db_session, wire.store, **_approved(_SHA))
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(user),
+        json=_body(personalInformation=True),
+    )
+
+    assert resp.status_code == 202
+    (started,) = wire.pipeline.started
+    assert started["expected_commit_sha"] == _SHA
+    assert app_row.approved_submission_id is not None
+    assert started["bundle_key"] == submission_key(app_row.id, app_row.approved_submission_id)
+    (row,) = await _gate_rows(db_session, app_row.id)
+    assert row.detail is not None
+    assert row.detail["decision"] == "published"
+    assert row.detail["rule"] == "approved_override"
+    assert row.detail["declaration"] == app_row.declaration
+
+
+async def test_the_approved_commit_needs_no_answers(wire, client, db_session) -> None:
+    user, app_row = await _owner_with_saved_app(db_session, wire.store, **_approved(_SHA))
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(user),
+        json={"commitSha": _SHA},
+    )
+
+    assert resp.status_code == 202
+    (started,) = wire.pipeline.started
+    assert started["classification"] is None
+    assert started["classification_score"] is None
+
+
+async def test_the_approved_commit_republishes_the_copy_while_newer_work_is_saved(
+    wire, client, db_session
+) -> None:
+    """Try again after an approved publish failed: the saved version has moved on, and the
+    request names the approved commit. The copy ships, not the saved head."""
     user, app_row = await _owner_with_saved_app(
-        db_session,
-        wire.store,
-        status=AppStatus.APPROVED,
-        approval_route=ApprovalRoute.SELF_PUBLISH,
-        approved_submission_id=uuid.uuid4(),
-        approved_commit_sha=_SHA,
+        db_session, wire.store, sha=_SHA, **_approved(_OLDER_SHA)
     )
 
     resp = await client.post(
         _DEPLOY.format(pid=app_row.project_id),
         headers=auth_headers(user),
-        json=_body(personalInformation=True, notes="Traveller names, as approved."),
+        json={"commitSha": _OLDER_SHA},
     )
 
     assert resp.status_code == 202
-    assert len(wire.pipeline.started) == 1
-    (row,) = await _gate_rows(db_session, app_row.id)
-    assert row.detail is not None
-    assert row.detail["rule"] == "approved_override"
+    (started,) = wire.pipeline.started
+    assert started["expected_commit_sha"] == _OLDER_SHA
+    assert started["bundle_key"] is not None
 
 
-async def test_an_approval_of_an_earlier_version_does_not_cover_a_later_save(
+async def test_the_saved_version_of_an_approved_app_goes_through_the_gate(
     wire, client, db_session
 ) -> None:
-    """Any later Save produces a version the earlier approval does not cover.
-    The pin is compared to the commit ACTUALLY shipping, so a moved head routes."""
+    """A later save is a version the approval does not cover: naming it runs the ladder, and
+    with no review for it, it routes."""
     user, app_row = await _owner_with_saved_app(
-        db_session,
-        wire.store,
-        status=AppStatus.APPROVED,
-        approval_route=ApprovalRoute.SELF_PUBLISH,
-        approved_submission_id=uuid.uuid4(),
-        approved_commit_sha=_OLDER_SHA,  # approved the PREVIOUS commit
+        db_session, wire.store, sha=_SHA, **_approved(_OLDER_SHA)
     )
 
     resp = await client.post(
@@ -631,56 +659,116 @@ async def test_an_approval_of_an_earlier_version_does_not_cover_a_later_save(
     assert wire.pipeline.started == []
 
 
-async def test_an_approval_predating_this_feature_is_inert_and_routes(
+async def test_an_approval_on_the_manual_route_republishes_its_copy_too(
     wire, client, db_session
 ) -> None:
-    """A runbook-lineage approval was granted for an out-of-band code review,
-    which is a different decision. The 0030 backfill marked every pre-feature row
-    `runbook`, and rule 3 requires `self_publish`, so those approvals authorise the
-    manual go-live runbook and nothing here."""
+    """The approval route is not read: an approved copy is an approved copy."""
+    user, app_row = await _owner_with_saved_app(
+        db_session, wire.store, **_approved(_SHA, approval_route=ApprovalRoute.RUNBOOK)
+    )
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(user),
+        json={"commitSha": _SHA},
+    )
+
+    assert resp.status_code == 202
+    assert len(wire.pipeline.started) == 1
+
+
+async def test_an_approval_with_no_stored_copy_is_not_an_approved_copy(
+    wire, client, db_session
+) -> None:
     user, app_row = await _owner_with_saved_app(
         db_session,
         wire.store,
-        status=AppStatus.APPROVED,
-        approval_route=ApprovalRoute.RUNBOOK,
-        approved_submission_id=uuid.uuid4(),
-        approved_commit_sha=_SHA,  # the RIGHT commit — only the lineage is wrong
+        sha=_SHA,
+        **_approved(_OLDER_SHA, approved_submission_id=None),
     )
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(user),
+        json={"commitSha": _OLDER_SHA},
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "snapshot_moved"
+    assert wire.pipeline.started == []
+
+
+# --- rule 4: the request is about the saved version or nothing -------------------------
+
+
+async def test_a_commit_that_is_neither_saved_nor_approved_is_refused(
+    wire, client, db_session
+) -> None:
+    """A save landed after the dialog opened: the request still names the version it
+    reviewed, which is no longer the saved one. Nothing is decided, queued or started."""
+    user, app_row = await _owner_with_saved_app(db_session, wire.store)
+    await _seed_review(db_session, app_id=app_row.id, user_id=user.id, sha=_OLDER_SHA)
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(user),
+        json=_body(commit=_OLDER_SHA),
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "snapshot_moved"
+    assert wire.pipeline.started == []
+    assert await _gate_rows(db_session, app_row.id) == []
+    fresh = await db_session.get(AppRegistry, app_row.id, populate_existing=True)
+    assert fresh is not None
+    assert fresh.status is AppStatus.DRAFT
+
+
+async def test_a_bundle_with_no_stamped_commit_can_be_named_by_no_request(
+    wire, client, db_session
+) -> None:
+    """The review routes present an unstamped bundle as unreadable and name no version, so the
+    publish route refuses it the same way it refuses a moved save."""
+    user, app_row = await _owner_with_saved_app(db_session, wire.store)
+    wire.store.meta[snapshot_key(app_row.id)] = {}
 
     resp = await client.post(
         _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_CLEAN
     )
 
-    assert resp.status_code == 200
-    assert resp.json()["outcome"] == "routed_for_review"
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "snapshot_moved"
     assert wire.pipeline.started == []
 
 
-# --- rule 3a: the save-and-publish defer ---------------------------------------
+async def test_the_saved_version_without_answers_is_incomplete(wire, client, db_session) -> None:
+    user, app_row = await _owner_with_saved_app(db_session, wire.store)
+    await _seed_review(db_session, app_id=app_row.id, user_id=user.id)
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(user),
+        json={"commitSha": _SHA},
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "answers_required"
+    assert wire.pipeline.started == []
 
 
-async def test_save_and_publish_over_an_older_stamped_review_defers_to_the_pipeline(
-    app, client, db_session
+async def test_a_dirty_workspace_at_send_time_does_not_stop_the_saved_version(
+    app, wire, client, db_session
 ) -> None:
-    """The save mints a NEW commit, so the stored review is stamped the
-    previous one. Without rule 3a, rule 4 would route every single save-and-publish and
-    rule 3a would be unreachable. This branch neither routes nor refuses: it returns 202 and
-    lets the pipeline's own re-check decide."""
-    store = FakeStorage()
-    pipeline = _RecordingPipeline()
-    saved: list[uuid.UUID] = []
+    """The saved version is what publishes; newer edits in the workspace stay newer work. The
+    workspace is not consulted at all, so a dirty one is no refusal."""
+    user, app_row = await _owner_with_saved_app(db_session, wire.store)
+    await _seed_review(db_session, app_id=app_row.id, user_id=user.id)
 
     class _Dirty:
         dirty = True
 
     async def _dirty() -> _Dirty:
         return _Dirty()
-
-    async def _save(self, db, user, project_id, *, sandbox_client) -> SaveOutcome:
-        saved.append(project_id)
-        # The save mints a new commit: the stamp moves to _SHA, off the review's _OLDER_SHA,
-        # and the save reports the commit it landed at (the expected commit).
-        return SaveOutcome(app_id=uuid.uuid4(), head_sha=_SHA)
 
     @contextlib.asynccontextmanager
     async def _session():
@@ -692,90 +780,18 @@ async def test_save_and_publish_over_an_older_stamped_review_defers_to_the_pipel
             "project_save_state",
             lambda self, db, user, project_id, *, sandbox_client: _dirty(),
         )
-        patch.setattr(SessionManager, "save_project_snapshot", _save)
-        app.dependency_overrides[storage_or_none_dependency] = lambda: store
-        app.dependency_overrides[deploy_service_or_none] = lambda: pipeline
         app.dependency_overrides[sandbox_or_none_dependency] = lambda: object()
         app.dependency_overrides[session_manager_dependency] = lambda: SessionManager(
             session_factory=lambda: _session()
         )
-
-        user, app_row = await _owner_with_saved_app(db_session, store)
-        await _seed_review(db_session, app_id=app_row.id, user_id=user.id, sha=_OLDER_SHA)
-
         resp = await client.post(
-            _DEPLOY.format(pid=app_row.project_id),
-            headers=auth_headers(user),
-            json=_body(save_first=True),
+            _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_CLEAN
         )
 
-    assert saved == [app_row.project_id]
-    # DEFERRED: the pipeline started, nothing routed, nothing refused.
     assert resp.status_code == 202
-    assert resp.json()["outcome"] == "started"
-    assert len(pipeline.started) == 1
-    fresh = await db_session.get(AppRegistry, app_row.id, populate_existing=True)
-    assert fresh is not None
-    assert fresh.status is AppStatus.DRAFT
-    (row,) = await _gate_rows(db_session, app_row.id)
-    assert row.detail is not None
-    assert row.detail["decision"] == "deferred_to_pipeline"
-    assert row.detail["rule"] == "saved_over_stale_review"
-    # The recheck seam: the commit examined and the stale stamp are both on record, so the
-    # in-pipeline review knows which version it must re-check and which it supersedes.
-    assert row.detail["declaration"]["commits"]["shipping"] == _SHA
-    assert row.detail["staleReviewSha"] == _OLDER_SHA
-
-
-async def test_a_pending_app_cannot_defer_by_saving_first(app, client, db_session) -> None:
-    """Rule 3a is narrow BECAUSE rules 1, 2 and 5 are evaluated before the save: a
-    disabled, pending or rejected app must never reach the pipeline by this door."""
-    store = FakeStorage()
-    pipeline = _RecordingPipeline()
-
-    class _Dirty:
-        dirty = True
-
-    async def _dirty() -> _Dirty:
-        return _Dirty()
-
-    saved: list[uuid.UUID] = []
-
-    async def _save(self, db, user, project_id, *, sandbox_client) -> None:
-        saved.append(project_id)
-
-    @contextlib.asynccontextmanager
-    async def _session():
-        yield db_session
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(
-            SessionManager,
-            "project_save_state",
-            lambda self, db, user, project_id, *, sandbox_client: _dirty(),
-        )
-        patch.setattr(SessionManager, "save_project_snapshot", _save)
-        app.dependency_overrides[storage_or_none_dependency] = lambda: store
-        app.dependency_overrides[deploy_service_or_none] = lambda: pipeline
-        app.dependency_overrides[sandbox_or_none_dependency] = lambda: object()
-        app.dependency_overrides[session_manager_dependency] = lambda: SessionManager(
-            session_factory=lambda: _session()
-        )
-
-        user, app_row = await _owner_with_saved_app(
-            db_session, store, status=AppStatus.PENDING, source_commit_sha=_OLDER_SHA
-        )
-        resp = await client.post(
-            _DEPLOY.format(pid=app_row.project_id),
-            headers=auth_headers(user),
-            json=_body(save_first=True),
-        )
-
-    assert resp.status_code == 409
-    assert resp.json()["error"]["code"] == "waiting_for_review"
-    # Refused BEFORE the save — the plain refusals still change nothing.
-    assert saved == []
-    assert pipeline.started == []
+    (started,) = wire.pipeline.started
+    assert started["expected_commit_sha"] == _SHA
+    assert started["bundle_key"] is None
 
 
 # --- rules 1 and 2: the plain refusals ------------------------------------------------
@@ -840,17 +856,8 @@ async def test_routing_works_with_the_deploy_service_unbound(app, client, db_ses
     never the deploy service. With the pipeline unbound, a weighted Yes still reaches the
     queue."""
     store = FakeStorage()
-
-    @contextlib.asynccontextmanager
-    async def _session():
-        yield db_session
-
     app.dependency_overrides[storage_or_none_dependency] = lambda: store
     app.dependency_overrides[deploy_service_or_none] = lambda: None  # UNBOUND
-    app.dependency_overrides[sandbox_or_none_dependency] = lambda: None
-    app.dependency_overrides[session_manager_dependency] = lambda: SessionManager(
-        session_factory=lambda: _session()
-    )
 
     user, app_row = await _owner_with_saved_app(db_session, store)
     await _seed_review(
@@ -879,17 +886,8 @@ async def test_publishing_still_503s_when_the_deploy_service_is_unbound(
     """The other half of moving the 503 down: a branch that genuinely needs the pipeline
     still refuses with the documented status and envelope."""
     store = FakeStorage()
-
-    @contextlib.asynccontextmanager
-    async def _session():
-        yield db_session
-
     app.dependency_overrides[storage_or_none_dependency] = lambda: store
     app.dependency_overrides[deploy_service_or_none] = lambda: None
-    app.dependency_overrides[sandbox_or_none_dependency] = lambda: None
-    app.dependency_overrides[session_manager_dependency] = lambda: SessionManager(
-        session_factory=lambda: _session()
-    )
 
     user, app_row = await _owner_with_saved_app(db_session, store)
     await _seed_review(db_session, app_id=app_row.id, user_id=user.id)

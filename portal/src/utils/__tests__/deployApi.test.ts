@@ -292,6 +292,52 @@ describe('getDeployment parses the one publish state, and refuses to guess it', 
   })
 })
 
+const SHA = 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0'
+
+describe('startDeploy names the version it is about', () => {
+  const started = { outcome: 'started', deploymentId: 'd1', appId: 'a1', status: 'running' }
+  const sent = (fetchImpl: ReturnType<typeof vi.fn>): unknown =>
+    JSON.parse((fetchImpl.mock.calls[0][1] as { body: string }).body)
+
+  it('sends the reviewed commit with the answers, and nothing else', async () => {
+    const fetchImpl = vi.fn(async () => ok(started))
+    const answers: DataClassificationAnswers = {
+      credentialsSecrets: false,
+      healthData: false,
+      personalInformation: true,
+      financialData: false,
+      confidentialBusinessData: false,
+      publicData: false,
+      notes: 'Traveller names only.',
+    }
+
+    await startDeploy('p1', { commitSha: SHA, answers }, deps(fetchImpl))
+
+    expect(sent(fetchImpl)).toEqual({ commitSha: SHA, answers })
+  })
+
+  it('sends the approved commit alone, with no answers to invent', async () => {
+    const fetchImpl = vi.fn(async () => ok(started))
+
+    await startDeploy('p1', { commitSha: SHA }, deps(fetchImpl))
+
+    expect(sent(fetchImpl)).toEqual({ commitSha: SHA })
+  })
+})
+
+describe('getDeployment carries the commit the one button republishes', () => {
+  it('parses it when the server sets it, and reads its absence as null', async () => {
+    const set = await getDeployment(
+      'p1',
+      deps(vi.fn(async () => ok({ ...BODY, publishState: 'did_not_start', approvedRetryCommit: SHA }))),
+    )
+    expect(set.approvedRetryCommit).toBe(SHA)
+
+    const absent = await getDeployment('p1', deps(vi.fn(async () => ok(BODY))))
+    expect(absent.approvedRetryCommit).toBeNull()
+  })
+})
+
 describe('startDeploy has two success shapes, discriminated by outcome', () => {
   const answers: DataClassificationAnswers = {
     credentialsSecrets: false,
@@ -306,7 +352,7 @@ describe('startDeploy has two success shapes, discriminated by outcome', () => {
   it('parses the 202 started shape', async () => {
     const started = await startDeploy(
       'p1',
-      { answers },
+      { commitSha: SHA, answers },
       deps(vi.fn(async () => ok({ outcome: 'started', deploymentId: 'd1', appId: 'a1', status: 'running' }))),
     )
 
@@ -321,7 +367,7 @@ describe('startDeploy has two success shapes, discriminated by outcome', () => {
     // `toDeployOutcome` and this goes red on a thrown ApiError.
     const routed = await startDeploy(
       'p1',
-      { answers },
+      { commitSha: SHA, answers },
       deps(
         vi.fn(async () =>
           ok({
@@ -345,7 +391,7 @@ describe('startDeploy has two success shapes, discriminated by outcome', () => {
   it('throws when a routed body is missing the version it pinned', async () => {
     const call = startDeploy(
       'p1',
-      { answers },
+      { commitSha: SHA, answers },
       deps(
         vi.fn(async () =>
           ok({

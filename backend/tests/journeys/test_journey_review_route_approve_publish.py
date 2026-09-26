@@ -1,12 +1,11 @@
-"""The journey that makes the publish flow TERMINATE: route -> approve -> publish.
+"""The journey that makes the publish flow TERMINATE: route -> approve -> live.
 
-No isolated unit test can prove this: ladder rule 6 routes any weighted Yes forever
-unless rule 3 (the approval override, above rule 6) breaks the loop once a version is
-approved. This drives it end to end through the real composition root:
+A weighted Yes routes every time it is sent, so the flow ends only because approving
+publishes. This drives it end to end through the real composition root:
 
 1. a citizen's publish ROUTES (review found financial data the citizen did not declare);
-2. an administrator approves that exact version;
-3. the SAME answers now PUBLISH, unchanged — rule 3 satisfied, no second queue entry.
+2. an administrator approves that exact version, and that starts the publish — as the
+   owner, from the submission copy, with no second click and no second queue entry.
 
 Only object storage and the deploy pipeline are faked; the classification review is the
 REAL service, so a mock cannot green this file.
@@ -14,7 +13,6 @@ REAL service, so a mock cannot green this file.
 
 from __future__ import annotations
 
-import contextlib
 import uuid
 from typing import Any
 
@@ -22,15 +20,13 @@ import sqlalchemy as sa
 from fastapi import FastAPI
 
 from src.api.deps import storage_or_none_dependency
-from src.api.v1.build_sessions.deps import sandbox_or_none_dependency, session_manager_dependency
 from src.api.v1.deploy.deps import deploy_service_or_none
 from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
 from src.db.models.audit import AuditLog
-from src.services.build_sessions.manager import SessionManager
 from src.services.classification import store as review_store
 from src.services.deploy.classification import CLASSIFICATION_KEYS
 from src.services.deploy.service import StartedDeploy
-from src.services.storage import snapshot_key
+from src.services.storage import snapshot_key, submission_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import AppRegistryFactory, UserFactory
 from tests.fakes import FakeStorage, a_git_bundle
@@ -56,16 +52,18 @@ class _RecordingDeployService:
         classification: dict[str, Any] | None = None,
         classification_score: int | None = None,
         expected_commit_sha: str | None = None,
-        recheck: object | None = None,
+        bundle_key: str | None = None,
     ) -> StartedDeploy:
         self.started.append(
             {
                 "user_id": user_id,
                 "app_id": app_id,
+                "project_id": project_id,
+                "conversation_id": conversation_id,
                 "classification": classification,
                 "classification_score": classification_score,
                 "expected_commit_sha": expected_commit_sha,
-                "recheck": recheck,
+                "bundle_key": bundle_key,
             }
         )
         return StartedDeploy(deployment_id=uuid.uuid4(), app_id=app_id)
@@ -126,18 +124,8 @@ async def _seed_complete_review(
 async def test_route_approve_publish_terminates(app: FastAPI, client, db_session) -> None:
     store = FakeStorage()
     pipeline = _RecordingDeployService()
-
-    @contextlib.asynccontextmanager
-    async def _session():
-        yield db_session
-
     app.dependency_overrides[storage_or_none_dependency] = lambda: store
     app.dependency_overrides[deploy_service_or_none] = lambda: pipeline
-    # No live workspace: nothing to be dirty against, so the saved version IS the version.
-    app.dependency_overrides[sandbox_or_none_dependency] = lambda: None
-    app.dependency_overrides[session_manager_dependency] = lambda: SessionManager(
-        session_factory=lambda: _session()
-    )
 
     # --- the app, its saved version, and the REAL review service's stored row --------
     citizen = await UserFactory.create(db_session, email="citizen@rvaiglobal.com")
@@ -156,10 +144,11 @@ async def test_route_approve_publish_terminates(app: FastAPI, client, db_session
 
     declared = _answers(personalInformation=True)
     body = {
+        "commitSha": _SHA,
         "answers": {
             **declared,
             "notes": "Stores traveller names so the pickup desk can match bookings.",
-        }
+        },
     }
 
     # --- 1. the weighted Yes ROUTES: a queue entry, not a refusal and not a deploy ---
@@ -189,7 +178,7 @@ async def test_route_approve_publish_terminates(app: FastAPI, client, db_session
     assert declaration["review"]["available"] is True
     assert declaration["commits"]["shipping"] == _SHA
 
-    # --- 2. an administrator approves EXACTLY that version ---------------------
+    # --- 2. an administrator approves EXACTLY that version, and that publishes it --
     admin = await UserFactory.create(db_session, email="admin@bial.com")
     approved = await client.post(
         f"/v1/admin/apps/{app_row.id}/approve",
@@ -199,16 +188,14 @@ async def test_route_approve_publish_terminates(app: FastAPI, client, db_session
     assert approved.status_code == 200
     assert approved.json()["status"] == "approved"
 
-    # --- 3. the SAME answers now PUBLISH: rule 3 sits above rule 6, so the flow ends -
-    published = await client.post(
-        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(citizen), json=body
-    )
-    assert published.status_code == 202
-    assert published.json()["status"] == "running"
     (started,) = pipeline.started
     assert started["app_id"] == app_row.id
+    assert started["user_id"] == citizen.id
+    assert started["project_id"] == app_row.project_id
+    assert started["conversation_id"] is None
+    assert started["expected_commit_sha"] == _SHA
+    assert started["bundle_key"] == submission_key(app_row.id, uuid.UUID(submission_id))
 
-    # No second queue entry: the approval was CONSUMED by publishing, not re-litigated.
     final = await db_session.get(AppRegistry, app_row.id, populate_existing=True)
     assert final is not None
     assert final.status is AppStatus.APPROVED
@@ -227,13 +214,16 @@ async def test_route_approve_publish_terminates(app: FastAPI, client, db_session
     )
     actions = [row.action for row in rows]
     assert "submit" in actions
-    assert "approve" in actions
+    (approve_row,) = [row for row in rows if row.action == "approve"]
+    assert approve_row.actor_id == admin.id
+    assert approve_row.detail is not None
+    assert approve_row.detail["publishing"] == "started"
     gate_rows = [row for row in rows if row.action == "publish_gate"]
     decisions = [row.detail["decision"] for row in gate_rows if row.detail is not None]
-    assert decisions == ["routed", "published"]
-    for row in gate_rows:
-        assert row.detail is not None
-        # The actor reference nulls when a user is removed; the email keeps the trail
-        # saying WHO, and the declaration keeps it saying WHAT was decided on.
-        assert row.detail["email"] == "citizen@rvaiglobal.com"
-        assert row.detail["declaration"]["citizen"]["answers"]["personal_information"] is True
+    assert decisions == ["routed"]
+    (gate_row,) = gate_rows
+    assert gate_row.detail is not None
+    # The actor reference nulls when a user is removed; the email keeps the trail
+    # saying WHO, and the declaration keeps it saying WHAT was decided on.
+    assert gate_row.detail["email"] == "citizen@rvaiglobal.com"
+    assert gate_row.detail["declaration"]["citizen"]["answers"]["personal_information"] is True

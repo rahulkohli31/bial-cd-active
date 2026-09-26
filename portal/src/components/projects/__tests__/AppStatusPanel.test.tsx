@@ -12,14 +12,32 @@
  * that a state with nothing to do gets no button rather than a dead one.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
-import type { ApprovalState, DeploymentView, PublishState } from '../../../utils/deployApi'
+import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react'
+import type {
+  ApprovalState,
+  DataClassificationAnswers,
+  DeploymentView,
+  PublishState,
+} from '../../../utils/deployApi'
 import type { UsePublishState } from '../../../hooks/usePublishState'
+import { presentationFor } from '../../../utils/publishPresentation'
 
-const h = vi.hoisted(() => ({ usePublishState: vi.fn() }))
+const h = vi.hoisted(() => ({
+  usePublishState: vi.fn(),
+  modal: {
+    current: null as null | {
+      onConfirm: (commitSha: string, answers: DataClassificationAnswers) => Promise<void>
+    },
+  },
+}))
 vi.mock('../../../hooks/usePublishState', () => ({ usePublishState: h.usePublishState }))
 vi.mock('../../DataClassificationModal', () => ({
-  default: () => <div data-testid="data-classification-modal" />,
+  default: (props: {
+    onConfirm: (commitSha: string, answers: DataClassificationAnswers) => Promise<void>
+  }) => {
+    h.modal.current = props
+    return <div data-testid="data-classification-modal" />
+  },
 }))
 
 const AppStatusPanel = (await import('../AppStatusPanel')).default
@@ -52,6 +70,7 @@ const view = (publishState: PublishState, over: Partial<DeploymentView> = {}): D
   unpublishedAt: null,
   approval: null,
   publishState,
+  approvedRetryCommit: null,
   savedHead: null,
   savedAt: null,
   // `null` is "the server did not say", which keeps the saved row — the neutral default
@@ -66,11 +85,12 @@ const hook = (over: Partial<UsePublishState> = {}): UsePublishState =>
     approval: null,
     loadError: null,
     refresh: vi.fn(async () => {}),
-    unsaved: null,
-    saving: false,
-    onConfirm: vi.fn(async () => null),
-    saveAndPublish: vi.fn(async () => null),
-    dismissUnsaved: vi.fn(),
+    publish: vi.fn(async () => 'review' as const),
+    publishPhase: null,
+    publishError: null,
+    onConfirm: vi.fn(async () => {
+      throw new Error('onConfirm was not wired for this test')
+    }),
     withdraw: vi.fn(async () => {}),
     withdrawing: false,
     withdrawError: null,
@@ -472,19 +492,22 @@ describe('the action', () => {
     expect(send.className).toMatch(/bg-primary/)
   })
 
-  it('takes a submission back directly, and opens the declaration for everything else', () => {
+  it('takes a submission back directly, and opens the declaration for everything else', async () => {
     const withdraw = vi.fn(async () => {})
-    wire({ deployment: view('in_review'), withdraw })
+    const publish = vi.fn(async () => 'review' as const)
+    wire({ deployment: view('in_review'), withdraw, publish })
     mount()
     fireEvent.click(screen.getByTestId('status-action'))
     expect(withdraw).toHaveBeenCalledTimes(1)
+    expect(publish).not.toHaveBeenCalled()
     expect(screen.queryByTestId('data-classification-modal')).toBeNull()
 
     cleanup()
-    wire({ deployment: view('draft') })
+    wire({ deployment: view('draft'), publish })
     mount()
     fireEvent.click(screen.getByTestId('status-action'))
-    expect(screen.getByTestId('data-classification-modal')).toBeTruthy()
+    expect(await screen.findByTestId('data-classification-modal')).toBeTruthy()
+    expect(publish).toHaveBeenCalledTimes(1)
   })
 
   it('★ says so when the withdrawal is refused, rather than looking like nothing happened', () => {
@@ -516,9 +539,10 @@ describe('the action', () => {
   })
 
   it('renders no control with a real disabled attribute', () => {
-    wire({ deployment: view('draft'), saving: true })
+    wire({ deployment: view('draft'), publishPhase: 'saving' })
     mount()
     for (const el of screen.getAllByRole('button')) expect(el.hasAttribute('disabled')).toBe(false)
+    expect(screen.getByTestId('status-action').textContent).toBe('Saving…')
   })
 })
 
@@ -543,39 +567,117 @@ describe('when the read itself fails', () => {
   })
 })
 
-describe('the unsaved-work question', () => {
-  it('offers the second answer the server asks for', async () => {
-    const saveAndPublish = vi.fn(async () => null)
+/**
+ * ★ ONE STATUS, ONE BUTTON. Every state the server can send, walked: the panel draws exactly the
+ * one action its state names, or none — never a second control beside it, and no banner.
+ */
+describe('one button per state', () => {
+  const EVERY_STATE: Record<PublishState, null> = {
+    nothing_built: null,
+    draft: null,
+    in_review: null,
+    changes_requested: null,
+    starting_up: null,
+    live_current: null,
+    live_newer_work: null,
+    live_drift_unknown: null,
+    taken_offline: null,
+    switched_off: null,
+    did_not_start: null,
+  }
+  const RETRY = 'f9e8d7c6b5a4f9e8d7c6b5a4f9e8d7c6b5a4f9e8'
+  const cases = (Object.keys(EVERY_STATE) as PublishState[]).flatMap((state) => [
+    [state, null] as const,
+    [state, RETRY] as const,
+  ])
+
+  it.each(cases)('%s (approved retry %s) draws the one action it names', (state, retry) => {
+    wire({ deployment: view(state, { approvedRetryCommit: retry }) })
+    mount()
+
+    const expected = presentationFor(state, retry).action
+    const buttons = screen.queryAllByRole('button')
+    expect(buttons.length).toBe(expected === null ? 0 : 1)
+    if (expected !== null) expect(buttons[0].getAttribute('data-testid')).toBe('status-action')
+    // Liveness: the panel drew its state, so zero buttons is an omission, not a crash.
+    expect(screen.getByTestId('status-pill').textContent).toBe(presentationFor(state, retry).label)
+  })
+
+  it('★ saves first and then opens the dialog, with no banner and no second button', async () => {
+    const publish = vi.fn(async () => 'review' as const)
+    wire({ deployment: view('draft', { savedState: 'saved' }), publish })
+    mount()
+
+    fireEvent.click(screen.getByTestId('status-action'))
+
+    expect(await screen.findByTestId('data-classification-modal')).toBeTruthy()
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect(screen.getAllByTestId('status-action')).toHaveLength(1)
+    expect(panel().textContent).not.toMatch(/not saved yet/i)
+  })
+
+  it('★ opens no dialog when the save fails, and shows why', async () => {
+    const publish = vi.fn(async () => null)
     wire({
       deployment: view('draft'),
-      unsaved: 'Your workspace has changes that are not saved yet.',
-      saveAndPublish,
+      publish,
+      publishError: 'Your workspace is not running, so there was nothing to save.',
     })
     mount()
 
-    expect(screen.getByTestId('status-unsaved').textContent).toMatch(/not saved yet/i)
-    fireEvent.click(screen.getByTestId('status-save-and-publish'))
-    await waitFor(() => expect(saveAndPublish).toHaveBeenCalledTimes(1))
+    fireEvent.click(screen.getByTestId('status-action'))
+    await waitFor(() => expect(publish).toHaveBeenCalledTimes(1))
+
+    expect(screen.getByTestId('status-publish-error').textContent).toMatch(/nothing to save/)
+    expect(screen.queryByTestId('data-classification-modal')).toBeNull()
   })
 
-  it('★ the question is per-mount, which is what keeps it from going stale', () => {
-    // It used to live behind a rail that stayed MOUNTED while hidden, so the question and its
-    // live button could sit unseen while the chip beside the project name offered "Send for
-    // review" as though nothing were outstanding — and the panel had to retire it by hand on the
-    // collapse. Radix unmounts an unchosen tab, so leaving Production and coming back asks the
-    // server again; there is no hidden-but-mounted state left for a stale question to live in.
-    const first = { ...hook({ deployment: view('draft'), unsaved: 'Not saved yet.' }) }
-    h.usePublishState.mockReturnValue(first)
-    const { unmount } = mount()
-    expect(screen.getByTestId('status-unsaved')).toBeTruthy()
-
-    unmount()
-    // A FRESH MOUNT ASKS AGAIN, and this time the server says there is nothing outstanding.
-    wire({ deployment: view('draft'), unsaved: null })
+  it('★ Try again on an approved copy sends it straight away — no dialog', async () => {
+    const publish = vi.fn(async () => ({
+      outcome: 'started' as const,
+      deploymentId: 'd1',
+      appId: 'app-1',
+      status: 'running',
+    }))
+    wire({ deployment: view('did_not_start', { approvedRetryCommit: 'abc' }), publish })
     mount()
-    // Liveness beside the absence: the panel really rendered and really named the state.
-    expect(screen.getByTestId('status-pill').textContent).toContain('Draft')
-    expect(screen.queryByTestId('status-unsaved')).toBeNull()
+
+    const action = screen.getByTestId('status-action')
+    expect(action.textContent).toBe('Try again')
+    fireEvent.click(action)
+    await waitFor(() => expect(publish).toHaveBeenCalledTimes(1))
+
+    expect(screen.queryByTestId('data-classification-modal')).toBeNull()
+    expect(panel().textContent).toMatch(/version an administrator approved/i)
+  })
+
+  it('hands the dialog\'s reviewed commit through to the send', async () => {
+    const onConfirm = vi.fn(async () => ({
+      outcome: 'started' as const,
+      deploymentId: 'd1',
+      appId: 'app-1',
+      status: 'running',
+    }))
+    wire({ deployment: view('draft'), onConfirm })
+    mount()
+    fireEvent.click(screen.getByTestId('status-action'))
+    await screen.findByTestId('data-classification-modal')
+
+    const answers = {
+      credentialsSecrets: false,
+      healthData: false,
+      personalInformation: false,
+      financialData: false,
+      confidentialBusinessData: false,
+      publicData: false,
+      notes: null,
+    }
+    await act(async () => {
+      await h.modal.current?.onConfirm('abc123', answers)
+    })
+
+    expect(onConfirm).toHaveBeenCalledWith('abc123', answers)
+    expect(screen.queryByTestId('data-classification-modal')).toBeNull()
   })
 })
 

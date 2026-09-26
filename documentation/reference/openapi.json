@@ -504,7 +504,7 @@
         "type": "string"
       },
       "ApprovalState": {
-        "description": "The app's APPROVAL lifecycle, carried on the deploy status response.\nRIDES HERE, NOT A SECOND CALL: the toolbar publish surface has a project id and no\napp id, so an app-scoped read isn't addressable there. Both surfaces poll this\nresponse through one hook, so hanging approval off it means inheriting that hook's\nstaleness/refresh handling, not growing a second, fetch-once-and-rot lifetime.\n`submitted_sha`/`submitted_at` describe what's in the QUEUE; `approved_commit_sha` +\n`approval_route` are what ladder rule 3 consumes — a `runbook` approval never\nself-publishes, so a client rendering \"you may publish\" must read the lineage too.",
+        "description": "The app's APPROVAL lifecycle, carried on the deploy status response.\nRIDES HERE, NOT A SECOND CALL: the toolbar publish surface has a project id and no\napp id, so an app-scoped read isn't addressable there. Both surfaces poll this\nresponse through one hook, so hanging approval off it means inheriting that hook's\nstaleness/refresh handling, not growing a second, fetch-once-and-rot lifetime.\n`submitted_sha`/`submitted_at` describe what's in the QUEUE; `approved_commit_sha` is the\nversion the administrator approved.",
         "properties": {
           "approvalRoute": {
             "anyOf": [
@@ -1856,7 +1856,7 @@
         "type": "object"
       },
       "DataClassificationAnswers": {
-        "description": "What the citizen declares their app handles, answered fresh at every deploy.\nAll six are required booleans — the portal only builds this once every question is\nanswered, so a default would let a caller under-declare by omission.\nNO REVIEW FIELD, BY CONSTRUCTION: the platform's own review is read from the store\ninside the publish request, and `CamelModel`'s `extra=\"ignore\"` drops any unknown key\n— no request body can put words in the review's mouth. The notes gate lives at ladder\nrule 6 (`deploy/router.py`), which reads the MERGED answers this schema cannot see.",
+        "description": "What the citizen declares their app handles, answered fresh at every deploy.\nAll six are required booleans — the portal only builds this once every question is\nanswered, so a default would let a caller under-declare by omission.\nNO REVIEW FIELD, BY CONSTRUCTION: the platform's own review is read from the store\ninside the publish request, and `CamelModel`'s `extra=\"ignore\"` drops any unknown key\n— no request body can put words in the review's mouth. The notes gate lives in the\ndeploy route (`deploy/router.py`), which reads the MERGED answers this schema cannot see.",
         "properties": {
           "confidentialBusinessData": {
             "title": "Confidentialbusinessdata",
@@ -2038,25 +2038,33 @@
         "type": "object"
       },
       "DeployRequest": {
-        "description": "`saveFirst` is the citizen's explicit \"save and deploy\". Default False, the safe\ndefault: a deploy ships the last SAVED version, so deploying over unsaved work without\nbeing asked would publish something they never chose, with no way to notice.\n`answers` is REQUIRED — no shape of this request deploys without a declaration, so no\ncaller reaches the pipeline by skipping the modal. Re-answered every deploy, never\nremembered on the app, since the agent edits it between deploys and an old declaration\nis not evidence about what's shipping now; a redeploy client may prefill the form, but\nit still arrives here as a fresh declaration.",
+        "description": "`commitSha` names the version the owner acted on: the saved version they reviewed, or\nthe approved commit, which republishes the approved copy. Any other commit is refused.\n`answers` is required for the saved version and ignored for the approved commit, whose\napproval already decided it.",
         "properties": {
           "answers": {
-            "$ref": "#/components/schemas/DataClassificationAnswers"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DataClassificationAnswers"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
-          "saveFirst": {
-            "default": false,
-            "title": "Savefirst",
-            "type": "boolean"
+          "commitSha": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Commitsha",
+            "type": "string"
           }
         },
         "required": [
-          "answers"
+          "commitSha"
         ],
         "title": "DeployRequest",
         "type": "object"
       },
       "DeployRoutedResponse": {
-        "description": "The 200 body when the publish gate ROUTES the app to an administrator instead\nof deploying (ladder rules 4-6: no current review, a standing rejection, or a\nweighted Yes on the merged answers).\nAn OUTCOME, not a failure — this renders as an informational state (the app is\nwaiting in the queue, pinned to `commit_sha`) and must never paint the red failure\nbadge over it: the platform did exactly what it said it would. Wire shape\n(camelCase): `{\"outcome\": \"routed_for_review\", \"appId\", \"submissionId\",\n\"commitSha\", \"submittedAt\", \"message\"}`.",
+        "description": "The 200 body when the publish gate ROUTES the app to an administrator instead\nof deploying (no current review, a standing rejection, or a weighted Yes on the\nmerged answers).\nAn OUTCOME, not a failure — this renders as an informational state (the app is\nwaiting in the queue, pinned to `commit_sha`) and must never paint the red failure\nbadge over it: the platform did exactly what it said it would. Wire shape\n(camelCase): `{\"outcome\": \"routed_for_review\", \"appId\", \"submissionId\",\n\"commitSha\", \"submittedAt\", \"message\"}`.",
         "properties": {
           "appId": {
             "title": "Appid",
@@ -2149,6 +2157,17 @@
                 "type": "null"
               }
             ]
+          },
+          "approvedRetryCommit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approvedretrycommit"
           },
           "deploymentId": {
             "anyOf": [
@@ -2295,6 +2314,7 @@
         },
         "required": [
           "publishState",
+          "approvedRetryCommit",
           "savedHead",
           "savedAt",
           "savedState"
@@ -3506,14 +3526,12 @@
         "type": "object"
       },
       "PublishState": {
-        "description": "THE single publish state the status chip renders — thirteen values, authored here\nand nowhere else, so no client recombines `status` + `unpublished_at` + `failure_code`\n+ the approval route + the pin to guess at a state the server already knows. An\n**API** StrEnum, like `PreviewLifeState`: nothing persists it, the wire value equals\nthe member's own string, and the chip's narrowing throws on anything it doesn't\nrecognise — so this is the one place a new member gets added.\nUNKNOWN IS NEVER \"UP TO DATE\" — `LIVE_DRIFT_UNKNOWN` covers a storage HEAD that could\nnot answer, the same tri-state discipline `SaveState.dirty` uses (`null` != clean).",
+        "description": "THE single publish state the status chip renders — eleven values, authored here\nand nowhere else, so no client recombines `status` + `unpublished_at` + `failure_code`\n+ the approval route + the pin to guess at a state the server already knows. An\n**API** StrEnum, like `PreviewLifeState`: nothing persists it, the wire value equals\nthe member's own string, and the chip's narrowing throws on anything it doesn't\nrecognise — so this is the one place a new member gets added.\nUNKNOWN IS NEVER \"UP TO DATE\" — `LIVE_DRIFT_UNKNOWN` covers a storage HEAD that could\nnot answer, the same tri-state discipline `SaveState.dirty` uses (`null` != clean).",
         "enum": [
           "nothing_built",
           "draft",
           "in_review",
           "changes_requested",
-          "approved_ready_to_publish",
-          "approved_needs_review_again",
           "starting_up",
           "live_current",
           "live_drift_unknown",
@@ -5716,7 +5734,7 @@
     },
     "/v1/admin/apps/{app_id}/approve": {
       "post": {
-        "description": "Pin EXACTLY the submission the admin reviewed: the request carries the\nreviewed submission id, and the guarded UPDATE adds it as a predicate — a\nre-submit between review and this click updates zero rows → 409.",
+        "description": "Approve EXACTLY the submission the admin reviewed, and publish it: the request carries\nthe reviewed submission id, and the guarded UPDATE adds it as a predicate — a re-submit\nbetween review and this click updates zero rows → 409. The approval stands even when\npublishing cannot start; the owner is then offered Try again.",
         "operationId": "approve_v1_admin_apps__app_id__approve_post",
         "parameters": [
           {
@@ -5789,7 +5807,7 @@
                 }
               }
             },
-            "description": "Not pending, withdrawn, re-submitted since review, artifact missing, or a runbook-lineage item that must be re-submitted"
+            "description": "Not pending, withdrawn, re-submitted since review, or artifact missing"
           },
           "422": {
             "content": {
@@ -12526,7 +12544,7 @@
     },
     "/v1/projects/{project_id}/deploy": {
       "post": {
-        "description": "Publish, or route to a person — THE PRECEDENCE LADDER. Returns 202 with the id to poll\nwhen the pipeline started, 200 with the routed outcome when the app went to the admin queue.\n\nA 202 IS NOT A PROMISE TO PUBLISH — read it as \"the id to watch\". UNSAVED WORK IS REFUSED BY\nDEFAULT: a deploy ships the last SAVED version, and `saveFirst` is the explicit \"save and\ndeploy\" the citizen opts into. `dirty` is TRI-STATE and unknown is not dirty: with no live\nworkspace there is nothing to compare against, and the saved version is the only version.",
+        "description": "Publish, or route to a person — THE PRECEDENCE LADDER. Returns 202 with the id to poll\nwhen the pipeline started, 200 with the routed outcome when the app went to the admin queue.\n\nA 202 IS NOT A PROMISE TO PUBLISH — read it as \"the id to watch\". The decision is about\nthe commit the request names: the saved version, or the approved commit.",
         "operationId": "deploy_project_v1_projects__project_id__deploy_post",
         "parameters": [
           {
@@ -12617,7 +12635,7 @@
                 }
               }
             },
-            "description": "Disabled (`app_disabled`), already waiting for review (`waiting_for_review`, the pending state in `error.detail`), nothing saved to deploy, unsaved changes (`unsaved_changes`), a build running for this app (`build_in_flight` — wait and retry), already deploying (`deploy_in_flight`), or a save landed mid-request (`snapshot_moved`)"
+            "description": "Disabled (`app_disabled`), already waiting for review (`waiting_for_review`, the pending state in `error.detail`), nothing saved to deploy, a build running for this app (`build_in_flight` — wait and retry), already deploying (`deploy_in_flight`), or a commit that is neither the saved version nor the approved one (`snapshot_moved`)"
           },
           "422": {
             "content": {
@@ -12627,7 +12645,7 @@
                 }
               }
             },
-            "description": "A weighted Yes on the merged answers with no explanation (`explanation_required`); an incomplete body is FastAPI's own validation 422 with the `{\"detail\": [...]}` shape instead"
+            "description": "The saved version sent without answers (`answers_required`), or a weighted Yes on the merged answers with no explanation (`explanation_required`); an incomplete body is FastAPI's own validation 422 with the `{\"detail\": [...]}` shape instead"
           },
           "500": {
             "content": {

@@ -2,9 +2,8 @@
 audited, the exact state machine, the reviewed-submission-id approve guard,
 the artifact-exists pin check, the audited bundle download, the
 mark-deployed marker and the deployed URL it records — plus the
-approval LINEAGE: runbook-lineage queue items get no new
-approvals, and self-publish-lineage apps get neither the deploy-needed prompt nor
-the mark-deployed marker."""
+approval LINEAGE: self-publish-lineage apps get neither the deploy-needed prompt nor
+the mark-deployed marker. That approving publishes is `test_approve_publishes.py`'s."""
 
 from __future__ import annotations
 
@@ -1055,31 +1054,6 @@ async def test_approving_someone_elses_app_stays_the_plain_action(client, app, d
 
     assert resp.status_code == 200
     assert await _audited_actions(db_session, row.id) == ["approve"]
-
-
-async def test_approve_refuses_a_runbook_lineage_queue_item(client, app, db_session) -> None:
-    # The cutover's named dead end: a queue item outstanding at release was
-    # backfilled runbook, and approving it would burn the admin's decision on an app
-    # its owner still could not publish. The copy tells the admin what to DO (have
-    # the citizen re-submit through the publish flow) — and the refusal writes
-    # nothing: no promotion, no pin, no audit row for a non-event.
-    store = _wire_storage(app)
-    row = await _app(db_session, **_pending(approval_route=ApprovalRoute.RUNBOOK))
-    _stage_bundle(store, row)  # the artifact EXISTS — only the lineage refuses
-    headers = await _admin(db_session)
-
-    resp = await client.post(
-        f"/v1/admin/apps/{row.id}/approve", json=_approve_body(row), headers=headers
-    )
-    assert resp.status_code == 409
-    message = resp.json()["error"]["message"]
-    assert "re-submit" in message and "Publish" in message  # names the way out
-
-    fresh = await db_session.get(AppRegistry, row.id)
-    await db_session.refresh(fresh)
-    assert fresh.status is AppStatus.PENDING  # nothing promoted
-    assert fresh.approved_submission_id is None  # nothing pinned
-    assert await _audited_actions(db_session, row.id) == []
 
 
 async def test_mark_deployed_refuses_a_self_publish_app(client, db_session) -> None:

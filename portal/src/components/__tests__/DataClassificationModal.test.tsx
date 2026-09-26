@@ -104,9 +104,8 @@ const NOTHING_SAVED: ClassificationReview = {
 }
 
 interface RenderProps {
-  onConfirm?: (answers: DataClassificationAnswers) => Promise<void>
+  onConfirm?: (commitSha: string, answers: DataClassificationAnswers) => Promise<void>
   onCancel?: () => void
-  alreadyApproved?: boolean
 }
 
 /** Render with the mount-time ensure-POST settled, so gating reflects a landed review. */
@@ -114,7 +113,6 @@ async function renderModal(props: RenderProps = {}): Promise<ReturnType<typeof r
   const utils = render(
     <DataClassificationModal
       projectId="p1"
-      alreadyApproved={props.alreadyApproved ?? false}
       onConfirm={props.onConfirm ?? vi.fn()}
       onCancel={props.onCancel ?? vi.fn()}
     />,
@@ -221,27 +219,6 @@ describe('DataClassificationModal', () => {
     expect(confirmButton().disabled).toBe(false)
   })
 
-  it('an approved version publishes whatever the answers score, and says so', async () => {
-    // The approval pins this exact commit and the server honours it over the score, so a
-    // label promising review names an outcome that cannot happen. The unapproved case is
-    // the Credentials/Secrets test above; mutation check: drop `&& !alreadyApproved` and
-    // this one goes red while that one stays green.
-    await renderModal({ alreadyApproved: true })
-    answerAll('no', ['credentialsSecrets'])
-    fireEvent.click(screen.getByTestId('dc-question-credentialsSecrets-yes'))
-
-    const button = confirmButton()
-    expect(button.textContent).toContain('Publish')
-    expect(button.textContent).not.toContain('Send for review')
-    expect(button.disabled).toBe(false) // the explanation is blank, and not demanded
-
-    expect(screen.getByTestId('dc-notes').getAttribute('aria-required')).toBe('false')
-    expect(screen.getByTestId('dc-score').textContent).toMatch(/an administrator approved this version/i)
-    expect(screen.getByTestId('dc-warning').textContent).toMatch(
-      /handles sensitive data, and an administrator approved/i,
-    )
-  })
-
   it('with no weighted Yes the action reads Publish and no explanation is demanded', async () => {
     await renderModal()
     answerAll('no')
@@ -278,7 +255,7 @@ describe('DataClassificationModal', () => {
     fireEvent.click(confirmButton())
 
     await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1))
-    expect(onConfirm).toHaveBeenCalledWith({
+    expect(onConfirm).toHaveBeenCalledWith(SHA, {
       credentialsSecrets: false,
       healthData: false,
       personalInformation: false,
@@ -287,6 +264,52 @@ describe('DataClassificationModal', () => {
       publicData: false,
       notes: null,
     })
+  })
+
+  it('★ names no version, so sends nothing, when the check could not name one', async () => {
+    // A bundle saved before versions were stamped: the check answers without a version, and
+    // the server decides about the commit it is given, so there is nothing to send.
+    ensureReview.mockResolvedValue({ ...FAILED_UNANSWERED, headSha: null, reviewedSha: null })
+    const onConfirm = vi.fn()
+    await renderModal({ onConfirm })
+    answerAll('no')
+
+    expect(confirmButton().disabled).toBe(true)
+    fireEvent.click(confirmButton())
+    expect(onConfirm).not.toHaveBeenCalled()
+    // Liveness: the questions rendered and were answered — only the version is missing.
+    expect(screen.getByTestId('dc-score').textContent).toContain('0')
+  })
+
+  it('★ a save after the dialog opened sends it back to the version saved now', async () => {
+    const NEWER = 'f0e1d2c3b4a59687'
+    const onConfirm = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new ApiError('Your app was saved again while this request was being decided.', 409, 'snapshot_moved'),
+      )
+      .mockResolvedValueOnce(undefined)
+    await renderModal({ onConfirm })
+    fireEvent.change(screen.getByTestId('dc-notes'), { target: { value: 'Vendor contacts.' } })
+    answerAll('yes')
+    ensureReview.mockResolvedValue({ ...FAILED_UNANSWERED, headSha: NEWER, reviewedSha: NEWER })
+
+    fireEvent.click(confirmButton())
+
+    expect((await screen.findByRole('alert')).textContent).toMatch(/saved again/)
+    await waitFor(() => expect(ensureReview).toHaveBeenCalledTimes(2))
+    await waitFor(() =>
+      expect(screen.getByTestId('dc-review-version').textContent).toContain(NEWER.slice(0, 7)),
+    )
+    // A fresh set of answers for the new version; the explanation is kept.
+    expect(confirmButton().disabled).toBe(true)
+    expect((screen.getByTestId('dc-notes') as HTMLTextAreaElement).value).toBe('Vendor contacts.')
+
+    answerAll('no')
+    fireEvent.click(confirmButton())
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(2))
+    expect(onConfirm.mock.calls[0][0]).toBe(SHA)
+    expect(onConfirm.mock.calls[1][0]).toBe(NEWER)
   })
 
   it('a rejected Confirm keeps the modal open and shows the error, answers intact', async () => {
@@ -778,9 +801,14 @@ describe('the failure buckets', () => {
       "We can't reach your saved app right now.",
     )
     expect(screen.getByTestId('dc-recheck')).toBeTruthy()
-    // The citizen can still answer by hand — an unreachable check never blocks the form.
+    // The citizen can still answer by hand, but nothing is sent until a version is named:
+    // the server decides about the commit it is given, and the ask never named one.
     answerAll('no')
-    expect(confirmButton().disabled).toBe(false)
+    expect(confirmButton().disabled).toBe(true)
+
+    ensureReview.mockResolvedValue(FAILED_UNANSWERED)
+    fireEvent.click(screen.getByTestId('dc-recheck'))
+    await waitFor(() => expect(confirmButton().disabled).toBe(false))
   })
 })
 

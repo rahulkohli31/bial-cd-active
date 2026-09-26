@@ -122,24 +122,31 @@ destroying look atomic to the person waiting.
 
 ## Publishing
 
-Asking to publish does not publish. The request runs a gate that merges two independent judgements
-about the exact commit being shipped — the platform's own review of it, and the author's answers to
-what they are asked to declare — taking the stricter of the two wherever they disagree. It produces
-one of four outcomes: refuse, publish, wait for a re-check that is already running, or route the
-application into an administrator's queue. A request that is routed publishes nothing and leaves the
-application queued at exactly the version that was examined.
+Asking to publish does not publish. The request names the version the author reviewed, and the gate
+decides about exactly that version: the saved one. A request about any other version is refused, so
+a save that lands after the author looked cannot slip into production under their answers. The gate
+merges two independent judgements about the version — the platform's own review of it, and the
+author's answers to what they are asked to declare — taking the stricter of the two wherever they
+disagree. It produces one of three outcomes: refuse, publish, or route the application into an
+administrator's queue. A request that is routed publishes nothing and leaves the application queued
+at exactly the version that was examined.
 
-**An approval is pinned to a commit, not to an application.** Approving a version approves that
-version. Work continued afterwards is unapproved until it is submitted and cleared in its own right,
-which is what stops an approval becoming a standing permission to ship anything later.
+Saving happens before the review, never at send time. Opening the publish dialog saves any unsaved
+work first, the review runs on that saved version, and the dialog asks about that version and no
+other. Edits made afterwards are newer work, not part of what is being sent.
+
+**An approval is pinned to a commit, not to an application.** Routing keeps an immutable copy of the
+version examined, and approving publishes that copy — as its author, whatever they have saved since.
+Work continued afterwards is unapproved until it is submitted and cleared in its own right, which is
+what stops an approval becoming a standing permission to ship anything later. When publishing cannot
+start at the moment of approval, the approval still stands, and the author's one action republishes
+the approved copy without a second review.
 
 A deploy takes minutes, far longer than an HTTP request may wait, so the request returns as soon as
 the work is accepted and the interface polls for the result.
 
-There are two publishing lineages in the system: an older one where an administrator ran a
-procedure by hand, and the current one where the author publishes and the gate above is what stands
-in their way. The older lineage still governs applications that entered through it and takes no new
-entrants.
+An older lineage, where an administrator went live by hand, still describes applications that went
+live that way. Approving a queued version publishes it whichever lineage it entered through.
 
 **Deployed applications carry no authentication of their own.** Anyone who can reach the address of
 a deployed application can open it. Whether that address is reachable beyond the corporate network

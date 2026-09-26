@@ -17,10 +17,9 @@ promote an unvetted pending app past the approve gate); `approve` carries the mi
 `status==pending` guard (without it, an admin could approve a kill-switched DISABLED app
 directly).
 
-Approvals carry a LINEAGE: `runbook` items get no new approvals (the citizen must re-submit
-through the publish flow), and `self_publish` apps get neither the deploy-needed prompt nor
-the mark-deployed marker — their owner publishes the approved version themselves, so a
-runbook record here would describe a deployment nobody performed."""
+Approving publishes: `approve` starts the pipeline on the approved submission copy, as the
+owner. `self_publish` apps get neither the deploy-needed prompt nor the mark-deployed marker,
+so a runbook record here would describe a deployment nobody performed."""
 
 from __future__ import annotations
 
@@ -80,6 +79,7 @@ from src.api.v1.admin.schemas import (
     UsersResponse,
 )
 from src.api.v1.build_sessions.deps import OptionalSandbox
+from src.api.v1.deploy.deps import OptionalDeployService
 from src.api.v1.pagination import (
     DEFAULT_PAGE_SIZE,
     CursorQuery,
@@ -138,6 +138,7 @@ from src.services.build_sessions.inventory import (
 )
 from src.services.deploy.aca_publish import DeployNotConfiguredError, get_published_apps
 from src.services.deploy.reconcile import reconcile_stalled_deployments
+from src.services.deploy.service import DeployNotPossibleError
 from src.services.rbac.roles import is_super_duper_admin, role_for
 from src.services.redis import build_coordination_or_503, coordination_is_gone, get_redis
 from src.services.sandbox import SandboxError
@@ -323,19 +324,9 @@ _NOT_DISABLABLE = (
 # clean one, so an unreachable cluster is a retryable failure, not an empty tally.
 _DB_CLUSTER_UNREACHABLE = "The app-database cluster could not be reached. Please try again."
 
-# The lineage refusals. Both NAME the dead end instead of looping in it —
-# the administrator reading these is non-technical, so the copy says what to DO, not
-# which column disagreed. The first is the cutover's cost made visible: a queue item that
-# predates the publish flow was backfilled `runbook`, and approving it would burn the
-# admin's approval on an app its owner still could not publish (they would need a SECOND
-# approval once they re-submitted properly). The second is mark-deployed's: recording a
-# runbook deployment nobody performed, on an app whose owner publishes it themselves,
-# would be a lie in the registry.
-_RUNBOOK_ITEM_MUST_RESUBMIT = (
-    "This submission predates the publish flow, and approving it would not let the "
-    "developer publish. Ask them to re-submit from the app's Publish button — it "
-    "returns to this queue with their declaration attached."
-)
+# Mark-deployed's lineage refusal, which names the dead end instead of looping in it:
+# recording a runbook deployment nobody performed, on an app whose owner publishes it
+# themselves, would be a lie in the registry.
 _SELF_PUBLISHED_HAS_NO_RUNBOOK = (
     "This app is on the self-publish route — the developer publishes it themselves, "
     "and there is no runbook deployment to record."
@@ -502,8 +493,7 @@ async def app_counts(admin: CurrentSuperadmin, db: DbSession) -> AppCountsRespon
         (
             409,
             ErrorEnvelope,
-            "Not pending, withdrawn, re-submitted since review, artifact missing, "
-            "or a runbook-lineage item that must be re-submitted",
+            "Not pending, withdrawn, re-submitted since review, or artifact missing",
         ),
         (503, ErrorEnvelope, "Storage temporarily unavailable"),
         *_ADMIN_AUTH,
@@ -515,10 +505,12 @@ async def approve(
     admin: CurrentSuperadmin,
     db: DbSession,
     storage: OptionalStorage,
+    service: OptionalDeployService,
 ) -> AdminAppStatusResponse:
-    """Pin EXACTLY the submission the admin reviewed: the request carries the
-    reviewed submission id, and the guarded UPDATE adds it as a predicate — a
-    re-submit between review and this click updates zero rows → 409."""
+    """Approve EXACTLY the submission the admin reviewed, and publish it: the request carries
+    the reviewed submission id, and the guarded UPDATE adds it as a predicate — a re-submit
+    between review and this click updates zero rows → 409. The approval stands even when
+    publishing cannot start; the owner is then offered Try again."""
     app = await _get_app_or_404(db, app_id)
     # Load-bearing PENDING-only pre-check — the mirror image of `enable`'s
     # DISABLED-only guard: →approved also permits DISABLED, and a kill-switched
@@ -529,39 +521,28 @@ async def approve(
         raise AppApiError(409, _SUBMISSION_WITHDRAWN, code=_WITHDRAWN_CODE)
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be approved.")
-    # The runbook lineage gets no new approvals, by cutover design. This item was in the
-    # queue before the publish flow became the only route in — approving it would grant
-    # nothing the citizen can use (the gate's self-publish rule needs the self_publish
-    # lineage), wasting the admin's decision and looping the citizen back here for a
-    # second one. A pre-check with NO atomic-guard twin, deliberately: unlike the
-    # re-submit race below, `runbook` has no runtime writer (the 0030 backfill wrote it
-    # once, in the migration; the publish flow only ever writes `self_publish`), so the
-    # value read here cannot move under us. NULL passes — an interim row submitted
-    # before the publish-flow writer lands keeps today's behaviour.
-    if app.approval_route is ApprovalRoute.RUNBOOK:
-        raise AppApiError(409, _RUNBOOK_ITEM_MUST_RESUBMIT)
     # Captured BEFORE any commit (never read ORM attributes across one). If a
     # re-submit lands after this read, the guarded UPDATE below refuses — and
     # submission ids are never reused, so on success this SHA belongs to the
-    # reviewed submission. The owner id travels the same way, for the
-    # self-approval check at the audit call below.
+    # reviewed submission.
     commit_sha = app.source_commit_sha
-    app_user_id = app.user_id
+    owner_id = app.user_id
+    project_id = app.project_id
 
     # Verify the reviewed artifact still exists before pinning it, so an app can never reach
-    # APPROVED with a bundle that 404s at runbook time. Fail closed: a storage ERROR is
+    # APPROVED with a bundle that 404s when it is published. Fail closed: a storage ERROR is
     # ambiguity, not absence (503, not 409), and an UNCONFIGURED store is the same ambiguity —
     # with nothing to verify against, approving would pin an artifact nobody checked.
     if storage is None:
         raise AppApiError(503, "Storage is temporarily unavailable. Please try again.")
+    bundle_key = submission_key(app_id, body.submission_id)
     try:
-        artifact = await storage.head(submission_key(app_id, body.submission_id))
+        artifact = await storage.head(bundle_key)
     except StorageError as exc:
         raise AppApiError(503, "Storage is temporarily unavailable. Please try again.") from exc
     if artifact is None:
         raise AppApiError(409, "The reviewed submission's artifact is missing — re-review.")
 
-    now = datetime.now(UTC)
     moved = await _transition(
         db,
         app_id,
@@ -576,7 +557,9 @@ async def approve(
         approved_submission_id=body.submission_id,
         approved_commit_sha=commit_sha,
         approved_by=admin.id,
-        approved_at=now,
+        # The transaction's own clock, which the claim below stamps on the deployment it
+        # starts: the owner's status reads that attempt as the one made since approval.
+        approved_at=sa.func.now(),
         # Lifting the standing rejection is an ADMINISTRATOR'S act and this is the only
         # place it happens. An approval is exactly the "an administrator lifts it"
         # half of the rule, so it clears unconditionally rather than only when raised.
@@ -586,6 +569,29 @@ async def approve(
         raise AppApiError(
             409, "This app was re-submitted since you reviewed it — please re-review."
         )
+
+    # The claim commits, and the approval with it, whether or not a slot was free; the task
+    # is detached in the same call that claims, so a claimed row always has a pipeline to
+    # settle it. The owner's app, the owner's project, no conversation — as a restart runs.
+    publishing: dict[str, str] = {"publishing": "not_started"}
+    if service is None:
+        publishing["reason"] = "publishing_unavailable"
+    else:
+        try:
+            started = await service.start(
+                db,
+                user_id=owner_id,
+                app_id=app_id,
+                project_id=project_id,
+                conversation_id=None,
+                expected_commit_sha=commit_sha,
+                bundle_key=bundle_key,
+            )
+        except DeployNotPossibleError as exc:
+            publishing["reason"] = exc.code
+        else:
+            publishing = {"publishing": "started", "deploymentId": str(started.deployment_id)}
+
     # A SUPERADMIN APPROVING THEIR OWN APP IS RECORDED DISTINGUISHABLY, not
     # forbidden. RBAC has two computed roles and no concept of a second approver, and
     # the missing separation of duties is already an accepted risk — so
@@ -595,16 +601,17 @@ async def approve(
     # `config:loginRequired`) and the vocabulary is deliberately open, so no
     # migration is involved. Both rows carry identical detail: only the action word
     # differs, which is exactly what makes "list every self-approval" one predicate.
-    self_approved = app_user_id == admin.id
+    self_approved = owner_id == admin.id
     await append_audit(
         db,
         actor_id=admin.id,
         action="approve:self" if self_approved else "approve",
         resource_type="app",
         resource_id=str(app_id),
-        detail={"submissionId": str(body.submission_id), "commitSha": commit_sha},
+        detail={"submissionId": str(body.submission_id), "commitSha": commit_sha, **publishing},
     )
     await db.commit()
+    _log.info("app_approved", app_id=str(app_id), **publishing)
     return AdminAppStatusResponse(app_id=app_id, status=AppStatus.APPROVED)
 
 

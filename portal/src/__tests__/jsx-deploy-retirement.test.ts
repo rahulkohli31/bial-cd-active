@@ -4,8 +4,10 @@
  * deliberate and reviewed rather than a drive-by import.
  *
  * Also guards the three publish controls and four client predicates retired when publishing
- * collapsed onto one chip reading one server-computed field — added in the SAME commit that
- * deleted them, since a guard lagging a deletion is a failure this repo has already had.
+ * collapsed onto one chip reading one server-computed field, and the save-at-send path and the
+ * two approved states retired when saving moved before the dialog and approval began to publish
+ * — each added in the SAME commit that deleted them, since a guard lagging a deletion is a
+ * failure this repo has already had.
  *
  * Deliberately absent: the publish hook's old name. It was RENAMED, not retired, and banning
  * a renamed symbol guards nothing — it would only stop a comment from explaining the rename.
@@ -46,6 +48,19 @@ const RETIRED_TOKENS = [
   'isRoutedForReview',
   'ROUTED_FAILURE_CODES',
   'stepLabel',
+  // The server-side save at send time, its second button and its banner: saving now happens
+  // before the dialog opens, and one status has one button.
+  'saveFirst',
+  'UNSAVED_CHANGES',
+  'saveAndPublish',
+  'dismissUnsaved',
+  'save-and-publish',
+  'status-unsaved',
+  'publish-unsaved',
+  // The two approved states: approving publishes, so nothing waits on an "Approved" button.
+  'approved_ready_to_publish',
+  'approved_needs_review_again',
+  'alreadyApproved',
 ] as const
 
 function walk(dir: string): string[] {
@@ -103,6 +118,22 @@ describe('JSX-era deploy retirement', () => {
       const text = readFileSync(file, 'utf8')
       for (const phrase of RETIRED_PHASES) {
         if (text.includes(phrase)) offenders.push(`${rel}: ${phrase}`)
+      }
+    }
+    expect(offenders).toEqual([])
+  })
+
+  it('names no button the product does not have', () => {
+    // Case-insensitive on purpose: a sentence that starts with the phrase is still a promise
+    // of a control that is gone.
+    const RETIRED_BUTTONS = [/save and deploy/i, /save and publish/i]
+    const offenders: string[] = []
+    for (const file of walk(SRC_ROOT)) {
+      const rel = path.relative(SRC_ROOT, file)
+      if (ALLOWLIST.has(rel)) continue
+      const text = readFileSync(file, 'utf8')
+      for (const phrase of RETIRED_BUTTONS) {
+        if (phrase.test(text)) offenders.push(`${rel}: ${phrase.source}`)
       }
     }
     expect(offenders).toEqual([])

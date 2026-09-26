@@ -23,25 +23,17 @@ import pytest
 import sqlalchemy as sa
 from pydantic import SecretStr
 
-from src.core.errors import AppApiError
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
-from src.db.models.audit import AuditLog
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
-from src.services.approvals import submit as submit_module
-from src.services.classification import store as review_store
-from src.services.classification.service import ReviewReadout
 from src.services.deploy import service as service_module
 from src.services.deploy.aca_publish import RevisionState, _state_of
-from src.services.deploy.classification import CLASSIFICATION_KEYS
 from src.services.deploy.config import DeployConfig
 from src.services.deploy.images import BuiltImage, ImageBuildError
 from src.services.deploy.names import published_app_name
-from src.services.deploy.service import DeployNotPossibleError, DeployService, VersionRecheck
-from src.services.storage import snapshot_key
+from src.services.deploy.service import DeployNotPossibleError, DeployService
+from src.services.storage import submission_key
 from src.services.storage.snapshot_read import ExtractedSnapshot, NoAppYet
 from tests.factories import AppRegistryFactory, ConversationFactory, UserFactory
-from tests.fakes import FakeStorage, a_git_bundle
 
 _DIGEST = "sha256:" + "cd" * 32
 _HEAD = "a" * 40
@@ -83,98 +75,6 @@ class FakeImages:
         return None
 
 
-class ScriptedReviewer:
-    """The review runner's two verbs, over the REAL review store.
-
-    No model, no detached task — the run settles inside `start` — but every row read back is
-    written through `classification/store`, in its real document shape, so a reviewer that just
-    returned a dataclass would prove nothing about how a stored review is actually read.
-
-    Records what it was ASKED: the extraction root it was handed, and the deployment's step at
-    that moment (the re-check runs under its own phase)."""
-
-    def __init__(self) -> None:
-        self.verdicts: dict[str, Any] | None = None
-        self.fail_code: str | None = None
-        self.asked: list[dict[str, Any]] = []
-
-    async def start(self, db, *, app_id, user_id, head_sha, extracted=None):
-        self.asked.append(
-            {
-                "head_sha": head_sha,
-                "root": None if extracted is None else extracted.root,
-                "step": await db.scalar(
-                    sa.select(Deployment.step).where(Deployment.app_id == app_id)
-                ),
-            }
-        )
-        outcome = await review_store.claim(db, app_id=app_id, user_id=user_id, head_sha=head_sha)
-        if self.fail_code is not None:
-            await review_store.fail(
-                db,
-                review_id=outcome.review.review_id,
-                head_sha=head_sha,
-                attempt=outcome.review.attempt,
-                code=self.fail_code,
-            )
-        else:
-            await review_store.succeed(
-                db,
-                review_id=outcome.review.review_id,
-                head_sha=head_sha,
-                attempt=outcome.review.attempt,
-                verdicts=self.verdicts if self.verdicts is not None else review_doc(),
-                evidence={"questions": {}, "scan_hits": [], "downgraded": []},
-                answers_complete=True,
-            )
-        return outcome.review
-
-    async def read(self, db, *, app_id):
-        record = await review_store.get_for_app(db, app_id=app_id)
-        return None if record is None else ReviewReadout(review=record, aged_out=False)
-
-
-def review_doc(**by_key: str) -> dict[str, Any]:
-    """A stored verdicts document in `classification/store`'s exact shape, all-No unless told
-    otherwise."""
-    return {
-        "source": "review",
-        "questions": {
-            key: {
-                "verdict": by_key.get(key, "no"),
-                "reason": f"Plain-language reason for {key}.",
-                "agreed_with_scan": None,
-                "downgraded_from_yes": False,
-            }
-            for key in CLASSIFICATION_KEYS
-        },
-        "scan": {
-            "tier_a_hit": False,
-            "tier_b_hit": False,
-            "incomplete": False,
-            "tier_a_dispute": False,
-        },
-    }
-
-
-def declaration(*, citizen_yes: tuple[str, ...] = (), merged_yes: tuple[str, ...] = ()):
-    """The gate's declaration for a submitted decision, in `deploy/gate`'s shape — only
-    the two blocks the re-check reads back (the citizen's answers, and the merged answers
-    that are its baseline for "was this Yes already there")."""
-    return {
-        "commits": {"shipping": _HEAD, "reviewed": None},
-        "citizen": {
-            "answers": {key: key in citizen_yes for key in CLASSIFICATION_KEYS},
-            "explanation": "Reads the public flight board only.",
-        },
-        "merged": {
-            "answers": {key: key in merged_yes for key in CLASSIFICATION_KEYS},
-            "anyWeightedYes": bool(merged_yes),
-        },
-        "differences": {},
-    }
-
-
 class FakeAca:
     """Records every provision, and reports whatever revision state it is told to."""
 
@@ -214,8 +114,10 @@ def wire(db_session, monkeypatch, tmp_path):
     tree = tmp_path / "tree"
     tree.mkdir()
     (tree / "package.json").write_text("{}")
+    extracted_from: list[str | None] = []
 
-    async def _extract(app_id, *, cache_root=None):
+    async def _extract(app_id, *, bundle_key=None):
+        extracted_from.append(bundle_key)
         return ExtractedSnapshot(app_id=app_id, head_sha=_HEAD, root=tree)
 
     monkeypatch.setattr(service_module, "extract_snapshot", _extract)
@@ -235,27 +137,18 @@ def wire(db_session, monkeypatch, tmp_path):
     async def _session():
         yield db_session
 
-    # The queue the drift re-check routes into reads the snapshot through the storage
-    # accessor, not through a dependency — the pipeline has no request to hang one on.
-    store = FakeStorage()
-    monkeypatch.setattr(service_module, "get_storage", lambda: store)
-    monkeypatch.setattr(service_module, "_REVIEW_POLL_S", 0.01)
-
     images = FakeImages()
     aca = FakeAca()
-    reviewer = ScriptedReviewer()
     return SimpleNamespace(
         service=DeployService(
             session_factory=lambda: _session(),
             image_builder=images,
             published_apps=aca,
-            reviewer=reviewer,
         ),
         images=images,
         aca=aca,
-        reviewer=reviewer,
-        store=store,
         tree=tree,
+        extracted_from=extracted_from,
     )
 
 
@@ -283,24 +176,6 @@ async def _run(wire, db, user, app, conversation_id=None, **extra):
     row = await db.get(Deployment, started.deployment_id)
     await db.refresh(row)
     return started, row
-
-
-async def _saved_bundle(wire, app, sha: str = _HEAD) -> None:
-    """The immutable copy the queue forks is made from the app's saved bundle, so a routed
-    re-check needs a real one in the store."""
-    wire.store.objects[snapshot_key(app.id)] = a_git_bundle(sha)
-    wire.store.meta[snapshot_key(app.id)] = {"head_sha": sha}
-
-
-async def _gate_rows(db, app_id) -> list[AuditLog]:
-    rows = await db.execute(
-        sa.select(AuditLog).where(
-            AuditLog.resource_type == "app",
-            AuditLog.resource_id == str(app_id),
-            AuditLog.action == "publish_gate",
-        )
-    )
-    return list(rows.scalars().all())
 
 
 async def test_a_settle_that_itself_fails_does_not_escape_the_pipeline(
@@ -514,7 +389,7 @@ async def test_nothing_saved_yet_is_a_named_outcome(wire, db_session, monkeypatc
     """ "Never built" is a normal state, not a crash — and it must not read the same as a
     bundle that exists but cannot be parsed."""
 
-    async def _absent(app_id, *, cache_root=None):
+    async def _absent(app_id, *, bundle_key=None):
         return NoAppYet(app_id=app_id)
 
     monkeypatch.setattr(service_module, "extract_snapshot", _absent)
@@ -552,7 +427,7 @@ async def test_an_unexpected_crash_still_settles_the_row(wire, db_session, monke
     """A pipeline that raised would leave the row `running` until the stale window expires —
     half an hour of a Deploy button that 409s, with nothing to explain it."""
 
-    async def _boom(app_id, *, cache_root=None):
+    async def _boom(app_id, *, bundle_key=None):
         raise RuntimeError("something nobody anticipated")
 
     monkeypatch.setattr(service_module, "extract_snapshot", _boom)
@@ -612,326 +487,66 @@ async def test_the_expected_commit_matching_the_tree_publishes_normally(wire, db
     assert row.head_sha == _HEAD
 
 
-async def test_a_publish_with_no_drift_never_asks_for_a_review(wire, db_session) -> None:
-    """No unsaved work means no drift, so the ladder already had a current review and the
-    pipeline skips the re-check entirely — no model, no extra step, no cost."""
+async def test_a_publish_reads_the_saved_snapshot_unless_told_otherwise(wire, db_session) -> None:
     user, app, _conversation = await _project(db_session)
+
+    await _run(wire, db_session, user, app, expected_commit_sha=_HEAD)
+
+    assert wire.extracted_from == [None]
+
+
+async def test_an_approved_publish_ships_the_bundle_it_names(wire, db_session) -> None:
+    """The submission copy an administrator reviewed, never the snapshot a later save moved —
+    and the pin still asserts the copy's head is the approved commit."""
+    user, app, _conversation = await _project(db_session)
+    copy = submission_key(app.id, uuid.uuid4())
+
+    _started, row = await _run(
+        wire, db_session, user, app, expected_commit_sha=_HEAD, bundle_key=copy
+    )
+
+    assert wire.extracted_from == [copy]
+    assert row.status is DeploymentStatus.SUCCEEDED
+    assert row.head_sha == _HEAD
+
+
+async def test_an_approved_copy_whose_head_is_not_the_approved_commit_fails_closed(
+    wire, db_session
+) -> None:
+    user, app, _conversation = await _project(db_session)
+
+    _started, row = await _run(
+        wire,
+        db_session,
+        user,
+        app,
+        expected_commit_sha=_OLDER,
+        bundle_key=submission_key(app.id, uuid.uuid4()),
+    )
+
+    assert row.failure_code == "snapshot_moved"
+    assert wire.images.contexts == []
+
+
+async def test_a_publish_goes_straight_from_the_saved_code_to_packing(
+    wire, db_session, monkeypatch
+) -> None:
+    """No phase stands between extracting the version and packing it: nothing is reviewed
+    inside the pipeline."""
+    user, app, _conversation = await _project(db_session)
+    steps: list[str] = []
+    advance = DeployService._advance
+
+    async def _recording(self, deployment_id, step, **fields):
+        steps.append(step)
+        await advance(self, deployment_id, step, **fields)
+
+    monkeypatch.setattr(DeployService, "_advance", _recording)
 
     _started, row = await _run(wire, db_session, user, app, expected_commit_sha=_HEAD)
 
-    assert wire.reviewer.asked == []
     assert row.status is DeploymentStatus.SUCCEEDED
-
-
-# --- the drift re-check ------------------------------------------------------
-
-
-async def test_a_re_checked_version_the_review_agrees_with_goes_live(wire, db_session) -> None:
-    """The save-and-publish happy path. The new version's review raises nothing the
-    submitted answers did not already carry, so publishing continues to a live URL."""
-    user, app, _conversation = await _project(db_session)
-    await _saved_bundle(wire, app)
-
-    _started, row = await _run(
-        wire,
-        db_session,
-        user,
-        app,
-        expected_commit_sha=_HEAD,
-        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
-    )
-
-    assert row.status is DeploymentStatus.SUCCEEDED
-    assert row.url == f"https://citizenapps.bialairport.com/a/{published_app_name(app.id)}"
-    fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
-    assert fresh.status is AppStatus.DRAFT  # never entered the queue
-
-
-async def test_the_re_check_reads_the_tree_the_pipeline_already_extracted(
-    wire, db_session
-) -> None:
-    """The review does not download and clone a second copy of the same commit in the same
-    minute — it is handed the pipeline's own root. And because it never deletes a root it
-    did not create, that root is still there to be packed afterwards."""
-    user, app, _conversation = await _project(db_session)
-    await _saved_bundle(wire, app)
-
-    await _run(
-        wire,
-        db_session,
-        user,
-        app,
-        expected_commit_sha=_HEAD,
-        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
-    )
-
-    assert wire.reviewer.asked[0]["root"] == wire.tree
-    assert wire.reviewer.asked[0]["head_sha"] == _HEAD
-    assert wire.tree.exists()
-    assert wire.images.contexts  # the packing step still had its files
-
-
-async def test_the_re_check_runs_under_a_step_of_its_own(wire, db_session) -> None:
-    """The progress control must be able to NAME the wait. `checking` is advanced before
-    the review is asked and before anything is packed, so the citizen is not left watching
-    a generic label (or the previous phase) through the longest part of the deploy."""
-    user, app, _conversation = await _project(db_session)
-    await _saved_bundle(wire, app)
-
-    await _run(
-        wire,
-        db_session,
-        user,
-        app,
-        expected_commit_sha=_HEAD,
-        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
-    )
-
-    assert wire.reviewer.asked[0]["step"] == service_module.STEP_CHECKING
-    # Its own phase, distinct from every other one — a duplicate would render as the
-    # wrong sentence rather than as a missing one.
-    assert service_module.STEP_CHECKING not in {
-        service_module.STEP_PACKING,
-        service_module.STEP_BUILDING,
-        service_module.STEP_PROVISIONING,
-        service_module.STEP_STARTING,
-    }
-
-
-async def test_a_new_yes_stops_publishing_and_queues_that_exact_version(wire, db_session) -> None:
-    """The re-check raises a weighted Yes the submitted answers lacked. Publishing
-    stops, the app is queued at the commit that was examined, and the citizen is told what
-    changed in the words they saw on the form."""
-    user, app, conversation = await _project(db_session)
-    await _saved_bundle(wire, app)
-    wire.reviewer.verdicts = review_doc(health_data="yes")
-
-    _started, row = await _run(
-        wire,
-        db_session,
-        user,
-        app,
-        conversation.id,
-        expected_commit_sha=_HEAD,
-        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
-    )
-
-    assert row.status is DeploymentStatus.FAILED
-    assert row.failure_code == "routed_for_review"
-    assert row.url is None
-    assert wire.images.contexts == []  # stopped BEFORE packing
-    assert wire.aca.created == []
-
-    fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
-    assert fresh.status is AppStatus.PENDING
-    assert fresh.source_commit_sha == _HEAD  # the version examined, not a later one
-    assert fresh.approval_route is ApprovalRoute.SELF_PUBLISH
-
-    message = await db_session.scalar(
-        sa.select(Message).where(Message.conversation_id == conversation.id)
-    )
-    assert "Health Data" in message.payload[0]["parts"][0]["content"]
-
-
-async def test_the_queued_declaration_carries_the_drift_facts(wire, db_session) -> None:
-    """The review screen renders the distinction this block exists for: the citizen's answers —
-    and the mandatory explanation — were written about ANOTHER commit, and nobody was at the
-    form when this version was examined."""
-    user, app, _conversation = await _project(db_session)
-    await _saved_bundle(wire, app)
-    wire.reviewer.verdicts = review_doc(health_data="yes")
-
-    await _run(
-        wire,
-        db_session,
-        user,
-        app,
-        expected_commit_sha=_HEAD,
-        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
-    )
-
-    fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
-    drift = fresh.declaration["drift"]
-    assert drift["answeredAbout"] == _OLDER
-    assert drift["shipping"] == _HEAD
-    assert drift["newlyRaised"] == ["health_data"]
-    assert drift["routedBy"] == "pipeline_recheck"
-    # The shape is kept whole, and `reviewed` is now the version actually reviewed.
-    assert fresh.declaration["commits"] == {"shipping": _HEAD, "reviewed": _HEAD}
-    assert fresh.declaration["merged"]["answers"]["health_data"] is True
-    assert fresh.declaration["citizen"]["explanation"] is not None
-    # From THIS re-check: the row they're read from is overwritten by the citizen's next
-    # save, so the admin screen has no other correct source for them.
-    assert fresh.declaration["review"]["reasons"]["health_data"] == (
-        "Plain-language reason for health_data."
-    )
-
-
-async def test_the_pipeline_records_its_own_gate_decision(wire, db_session) -> None:
-    """Every gate decision is on record, including the ones made minutes after the
-    request that started them, under the same action and the same actor."""
-    user, app, _conversation = await _project(db_session)
-    await _saved_bundle(wire, app)
-    wire.reviewer.verdicts = review_doc(health_data="yes")
-
-    _started, _row = await _run(
-        wire,
-        db_session,
-        user,
-        app,
-        expected_commit_sha=_HEAD,
-        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
-    )
-
-    (audit,) = await _gate_rows(db_session, app.id)
-    assert audit.detail is not None
-    assert audit.actor_id == user.id
-    assert audit.detail["decision"] == "routed"
-    assert audit.detail["rule"] == "recheck_weighted_yes"
-    assert audit.detail["commitSha"] == _HEAD
-    assert audit.detail["declaration"]["drift"]["newlyRaised"] == ["health_data"]
-
-
-async def test_a_review_that_clears_a_yes_the_citizen_declared_still_routes(
-    wire, db_session
-) -> None:
-    """A review No does not clear a citizen Yes: the merge table only ever ADDS routing —
-    citizen Yes + review No merges to Yes, recorded as `citizen_yes_over_review_no` — and
-    this branch stands in for ladder rule 6. Publishing here would put a weighted Yes on a
-    live URL with no administrator, so it routes and the disagreement travels with it."""
-    user, app, conversation = await _project(db_session)
-    await _saved_bundle(wire, app)
-    wire.reviewer.verdicts = review_doc()  # the review now says No to everything
-
-    _started, row = await _run(
-        wire,
-        db_session,
-        user,
-        app,
-        conversation.id,
-        expected_commit_sha=_HEAD,
-        recheck=VersionRecheck(
-            answered_about=_OLDER,
-            declaration=declaration(citizen_yes=("health_data",), merged_yes=("health_data",)),
-        ),
-    )
-
-    assert row.status is DeploymentStatus.FAILED
-    assert row.failure_code == "routed_for_review"
-    fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
-    assert fresh.status is AppStatus.PENDING
-    # The citizen's Yes stands and the merge says so, with the disagreement recorded.
-    assert fresh.declaration["merged"]["answers"]["health_data"] is True
-    assert fresh.declaration["differences"]["health_data"] == ["citizen_yes_over_review_no"]
-    # Nothing NEW was raised — it routed on what was already declared, and the drift block
-    # says exactly that rather than inventing a finding.
-    assert fresh.declaration["drift"]["newlyRaised"] == []
-    # And the citizen is told the truth: the check found nothing they had not covered, so
-    # the sentence must name what the app HANDLES, never claim a discovery.
-    told = await db_session.scalar(
-        sa.select(Message).where(Message.conversation_id == conversation.id)
-    )
-    said = told.payload[0]["parts"][0]["content"]
-    assert "Health Data" in said
-    assert "had not covered" not in said
-
-
-async def test_a_failed_re_check_routes_rather_than_publishing(wire, db_session) -> None:
-    """Ladder rule 4, standing on the far side of the 202: no genuinely-complete review for
-    this version is exactly the "unavailable" state the gate routes on. Letting it publish
-    because a failed review names no categories would make failure the cheapest way
-    through the gate."""
-    user, app, conversation = await _project(db_session)
-    await _saved_bundle(wire, app)
-    wire.reviewer.fail_code = "review_failed"
-
-    _started, row = await _run(
-        wire,
-        db_session,
-        user,
-        app,
-        conversation.id,
-        expected_commit_sha=_HEAD,
-        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
-    )
-
-    assert row.failure_code == "routed_for_review"
-    fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
-    assert fresh.status is AppStatus.PENDING
-    assert fresh.declaration["drift"]["newlyRaised"] == []
-    (audit,) = await _gate_rows(db_session, app.id)
-    assert audit.detail is not None
-    assert audit.detail["rule"] == "recheck_review_not_current"
-    message = await db_session.scalar(
-        sa.select(Message).where(Message.conversation_id == conversation.id)
-    )
-    assert "could not be completed" in message.payload[0]["parts"][0]["content"]
-
-
-async def test_a_refused_routing_is_recorded_and_leaves_nothing_half_submitted(
-    wire, db_session, monkeypatch
-) -> None:
-    """A guard inside the queue refusing (here: a build session went live while the review
-    ran) must reach the citizen. The pipeline never raises out, so if this were swallowed
-    the deploy would simply stop with no explanation anywhere — and the app must not be
-    left half-submitted either."""
-    user, app, conversation = await _project(db_session)
-    await _saved_bundle(wire, app)
-    wire.reviewer.verdicts = review_doc(health_data="yes")
-
-    async def _live(user_id, *, conflict_message, app_id=None) -> None:
-        raise AppApiError(409, conflict_message)
-
-    monkeypatch.setattr(submit_module, "refuse_while_build_session_live", _live)
-
-    _started, row = await _run(
-        wire,
-        db_session,
-        user,
-        app,
-        conversation.id,
-        expected_commit_sha=_HEAD,
-        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
-    )
-
-    assert row.status is DeploymentStatus.FAILED
-    assert row.failure_code == "route_refused"
-    assert "build session" in (row.failure_detail or "")
-    fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
-    assert fresh.status is AppStatus.DRAFT  # not pending, not half-submitted
-    assert fresh.source_commit_sha is None
-    message = await db_session.scalar(
-        sa.select(Message).where(Message.conversation_id == conversation.id)
-    )
-    assert "not published" in message.payload[0]["parts"][0]["content"]
-
-
-async def test_the_queue_copy_is_pinned_to_the_commit_the_pipeline_asserted(
-    wire, db_session
-) -> None:
-    """The last gap: the submit forks whatever the mutable snapshot holds NOW, so a save
-    landing while the review ran would queue a version nobody examined. Refused, and the
-    savepoint leaves no half-submitted row behind."""
-    user, app, _conversation = await _project(db_session)
-    # The savepoint rollback expires the instance, so read the id while it is still cheap.
-    app_id = app.id
-    # The store holds a LATER version than the tree the pipeline extracted and reviewed.
-    await _saved_bundle(wire, app, sha=_OLDER)
-    wire.reviewer.verdicts = review_doc(health_data="yes")
-
-    _started, row = await _run(
-        wire,
-        db_session,
-        user,
-        app,
-        expected_commit_sha=_HEAD,
-        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
-    )
-
-    assert row.failure_code == "route_refused"
-    fresh = await db_session.get(AppRegistry, app_id, populate_existing=True)
-    assert fresh.status is AppStatus.DRAFT
-    assert fresh.declaration is None
+    assert steps == ["packing", "building", "provisioning", "starting"]
 
 
 # --- concurrency ------------------------------------------------------------------

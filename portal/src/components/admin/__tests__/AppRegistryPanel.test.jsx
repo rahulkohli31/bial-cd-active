@@ -679,23 +679,23 @@ describe('the self-publish lineage has no runbook', () => {
     expect(screen.getByTestId('audit-app-2')).toBeTruthy() // the row's other controls survive
   })
 
-  it('the review copy tells a self-publish admin NOT to run a runbook', async () => {
-    h.listApps.mockResolvedValue([{ ...PENDING, approvalRoute: 'self_publish' }])
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await openReview()
-    expect(screen.getByTestId('review-self-publish-note').textContent)
-      .toMatch(/publishes this approved version themselves/i)
-    expect(screen.queryByTestId('review-runbook-note')).toBeNull()
-    expect(document.body.textContent).not.toMatch(/Mark deployed/)
-  })
+})
 
-  it('a runbook-lineage submission keeps the runbook copy', async () => {
-    h.listApps.mockResolvedValue([{ ...PENDING, approvalRoute: 'runbook' }])
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await openReview()
-    expect(screen.getByTestId('review-runbook-note').textContent).toMatch(/go-live runbook/i)
-    expect(screen.queryByTestId('review-self-publish-note')).toBeNull()
-  })
+describe('approving publishes, and the review says so', () => {
+  it.each(['self_publish', 'runbook'])(
+    'a %s submission is approved and published by one button',
+    async (approvalRoute) => {
+      h.listApps.mockResolvedValue([{ ...PENDING, approvalRoute }])
+      render(<AppRegistryPanel onToast={() => {}} />)
+      await openReview()
+
+      expect(screen.getByTestId('approve-btn').textContent).toContain('Approve and publish')
+      expect(screen.getByTestId('review-publish-note').textContent).toMatch(/approving publishes it/i)
+      // Nothing left over from the manual route or the developer's second click.
+      expect(document.body.textContent).not.toMatch(/go-live runbook/i)
+      expect(document.body.textContent).not.toMatch(/publishes this approved version themselves/i)
+    },
+  )
 })
 
 describe('the waiting count is mirrored on the pending tab', () => {

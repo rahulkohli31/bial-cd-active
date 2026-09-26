@@ -7,8 +7,9 @@ and a detached PIPELINE that runs for minutes — extract, pack, build, provisio
 the revision, record the result — opening its own short database sessions rather than
 borrowing the request's, exactly as the turn engine does.
 
-The pipeline pins the commit it ships to the one the gate decided about, and on the drift
-path stands in for the approval ladder's rules 4-7 — see `VersionRecheck` and `_recheck`.
+The pipeline pins the commit it ships to the one the gate decided about. It reads the saved
+snapshot, or — for an approved publish — the immutable submission copy the administrator
+reviewed.
 
 WHY THIS EXISTS: THE PIPELINE NEVER TOUCHES A SANDBOX — not the lock, the registry,
 `provision_new`, or `restore_from_snapshot`. `restore` tears a container down BEFORE
@@ -28,50 +29,25 @@ import uuid
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass
-from typing import Any, Final, Protocol
+from typing import Any, Final
 
-import sqlalchemy as sa
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
-from src.core.errors import AppApiError
 from src.core.redaction import redact_and_cap
-from src.db.models.app_registry import AppRegistry, ApprovalRoute
-from src.db.models.classification_review import ClassificationReviewStatus
 from src.db.models.deployment import Deployment
-from src.db.models.user import User
-from src.services.approvals.submit import submit_app_for_review
-from src.services.classification.constants import REVIEW_WALL_CLOCK_CEILING_S
-from src.services.classification.merge import merge_questions
-from src.services.classification.service import (
-    ReviewReadout,
-    get_classification_review_service,
-)
-from src.services.classification.store import ReviewRecord
 from src.services.deploy import store
 from src.services.deploy.aca_publish import PublishedAppProvisioner
-from src.services.deploy.classification import labels_for
 from src.services.deploy.config import DeployConfig
 from src.services.deploy.context import ContextTooLargeError, build_context_async
 from src.services.deploy.env import PublishedStorageError, build_published_env
-from src.services.deploy.gate import (
-    DriftFacts,
-    answers_in,
-    append_gate_audit,
-    declaration_document,
-    explanation_in,
-    merge_inputs,
-    review_at_head,
-)
 from src.services.deploy.images import ImageBuilder, ImageBuildError
 from src.services.deploy.names import image_reference, revision_name
 from src.services.deploy.outcome import write_deploy_outcome
 from src.services.orchestrator.errors import from_next_build, is_dependency_failure
 from src.services.sandbox.aca import AcaError
-from src.services.storage import StorageError, get_storage
 from src.services.storage.snapshot_read import (
-    ExtractedSnapshot,
     NoAppYet,
     SnapshotExtractionError,
     extract_snapshot,
@@ -83,11 +59,8 @@ _log = structlog.get_logger()
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 # Phase labels. Display only — never branched on, which is why `step` is a plain String.
-# `checking` runs BEFORE packing and only on the drift path; it exists as a phase of its
-# own so the progress control can name the re-check ("Checking your app") instead of
-# falling through to its generic label while the citizen waits on a model. `restarting` is
-# how a recycled revision is told apart from a fresh publish, since both are a `running` row.
-STEP_CHECKING: Final = "checking"
+# `restarting` is how a recycled revision is told apart from a fresh publish, since both are
+# a `running` row.
 STEP_PACKING: Final = "packing"
 STEP_BUILDING: Final = "building"
 STEP_PROVISIONING: Final = "provisioning"
@@ -125,39 +98,15 @@ for it. Fails closed: publishing an unexamined tree is the one outcome this feat
 exists to prevent."""
 
 FAIL_ROUTED_FOR_REVIEW: Final = "routed_for_review"
-"""NOT A FAILURE OF THE PLATFORM, AND NOT RED. The drift re-check landed on an
-answer only an administrator can give — a weighted category on the merged answers, or no
-usable review of this version — so it went into the queue instead of going live. Note that
-this says nothing about whether the finding was NEW: an app routes here on a category its
-own developer declared, just as it does on one the check discovered. Modelled as the
-existing FAILED terminal state with its own code rather than a
-fourth `DeploymentStatus` — that enum change would move what `uq_deployments_one_in_flight`
-covers, a real schema decision — and named to match the route's own 200 `outcome`
-discriminator, since the citizen ends up in exactly the same place either way. The portal
-renders it as an informational state; anything painting `status == failed` red must
-special-case this code."""
+"""A code older deployment rows carry: that attempt sent its version to an administrator
+instead of publishing it. Nothing writes it now; readers still present it as in review,
+never as a red failure."""
 
-FAIL_ROUTE_REFUSED: Final = "route_refused"
-"""The re-check decided to route and the QUEUE would not take it — a build session went
-live, storage stopped answering, the app changed status underneath. Distinct from
-`routed_for_review` on purpose: nothing was published AND nothing is waiting for an
-administrator, so this one really is red, and the citizen is told which guard refused."""
-
-_ROUTED_CODES: Final = frozenset({FAIL_ROUTED_FOR_REVIEW})
-"""Settlements that are an OUTCOME rather than a breakage, and whose stored `detail` is
-therefore the citizen's sentence instead of the operator's. Mirrors the portal's own
-`ROUTED_FAILURE_CODES` (`deployApi.ts`), which decides the informational presentation over
-the red failure badge — the two sets answer the same question on either side of the wire.
-`route_refused` is deliberately NOT here: it really is red, and its operator detail names
-the guard that refused."""
-
-_ROW_SPEAKS_TO_THE_CITIZEN: Final = _ROUTED_CODES | {FAIL_RESTART, FAIL_RESTART_NOT_READY}
+_ROW_SPEAKS_TO_THE_CITIZEN: Final = frozenset({FAIL_RESTART, FAIL_RESTART_NOT_READY})
 """Settlements whose stored `detail` is the citizen's sentence rather than the operator's,
 because nothing else will say it. A restart writes no chat card — it changes no code, so
 there is nothing to tell the conversation — which leaves the deployment row as the only
-surface a person reads a failed restart from. The operator's text still reaches the log.
-A SUPERSET, not a rename: `_ROUTED_CODES` keeps answering the presentation question its two
-mirrors ask (`deploy/schemas.py`, the portal's `deployApi.ts`), which is a different one."""
+surface a person reads a failed restart from. The operator's text still reaches the log."""
 
 # How often the running pipeline renews its liveness stamp. Comfortably inside the
 # staleness window so a slow ARM call never looks like a crash.
@@ -165,17 +114,6 @@ _HEARTBEAT_S: Final = store.HEARTBEAT_CADENCE_S
 
 # How long to wait for the new revision to report healthy, and how often to ask.
 _REVISION_POLL_S: Final = 3.0
-
-# How often the drift re-check asks whether the review has landed. The review service is a
-# two-verb contract (start, read) whose run is detached, so waiting on it means reading the
-# row — there is no task to await from here, and reaching for one would couple the pipeline
-# to the runner's internals. Coarse on purpose: the run takes tens of seconds.
-_REVIEW_POLL_S: Final = 2.0
-
-# The belt-and-braces bound on that poll. The review's own wall-clock ceiling settles a
-# stuck row as aged-out, which is what actually ends the loop; this is the answer to "and
-# what if it doesn't" — a re-check that never resolves must not hold a deploy open forever.
-_REVIEW_WAIT_MARGIN_S: Final = 60.0
 
 # A failure detail that reaches the citizen. Bounded and redacted before it is stored: a
 # build log is attacker-influenced text from a workspace the citizen's AI drove.
@@ -209,43 +147,6 @@ class LiveRevision:
     head_sha: str | None
 
 
-@dataclass(frozen=True)
-class VersionRecheck:
-    """THE DRIFT PATH'S ORDER TO THE PIPELINE: review the version about to ship, then
-    decide, because the request could not. Set only by rule 3a, stamped to the commit
-    before this request's save — everything the post-review decision needs, since a
-    detached task cannot ask the request anything afterwards.
-    `answered_about` names whose question the explanation answers. `declaration`'s merged
-    answers are the re-merge BASELINE: a weighted Yes already there is not news, so
-    sending it back to the queue that just approved it is exactly the loop rule 3 breaks.
-    """
-
-    answered_about: str | None
-    declaration: dict[str, Any]
-
-
-class VersionReviewer(Protocol):
-    """The review runner's two-verb contract, as the pipeline needs it — start a review
-    for this version, read the result for this version.
-
-    A Protocol rather than the concrete service so this module depends on the contract the
-    review's own docstring advertises, and so a test can drive the drift path with a
-    scripted reviewer instead of a model. `ClassificationReviewService` satisfies it
-    structurally; nothing here knows about detached tasks, budgets or Foundry."""
-
-    async def start(
-        self,
-        db: AsyncSession,
-        *,
-        app_id: uuid.UUID,
-        user_id: uuid.UUID,
-        head_sha: str,
-        extracted: ExtractedSnapshot | None = None,
-    ) -> ReviewRecord: ...
-
-    async def read(self, db: AsyncSession, *, app_id: uuid.UUID) -> ReviewReadout | None: ...
-
-
 class DeployService:
     """Owns the in-flight pipeline tasks. One process-wide instance."""
 
@@ -255,16 +156,10 @@ class DeployService:
         session_factory: SessionFactory,
         image_builder: ImageBuilder,
         published_apps: PublishedAppProvisioner,
-        reviewer: VersionReviewer | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._images = image_builder
         self._aca = published_apps
-        # The drift re-check's reviewer. `None` means "the process-wide one", resolved at
-        # use rather than at construction: this service is built by its own accessor, and
-        # building the review singleton here would tie a deploy service's existence to a
-        # review service's — including in the tests that build one with no model at all.
-        self._reviewer = reviewer
         # Strong references: a task the loop can garbage-collect mid-flight would abandon a
         # half-provisioned container app with nothing left to reconcile against.
         self._tasks: set[asyncio.Task[None]] = set()
@@ -282,7 +177,7 @@ class DeployService:
         classification: dict[str, Any] | None = None,
         classification_score: int | None = None,
         expected_commit_sha: str | None = None,
-        recheck: VersionRecheck | None = None,
+        bundle_key: str | None = None,
     ) -> StartedDeploy:
         """Claim the slot and detach the pipeline. Fast — the caller holds an HTTP request
         open and the edge gives it twenty seconds.
@@ -290,8 +185,8 @@ class DeployService:
         the route's job, done before any side effect, so scoring twice would let two
         policy copies disagree about a deploy already in flight. `expected_commit_sha` is
         the one exception: an assertion, not a gate, that the tree extracted minutes later
-        is the tree the gate decided about. `recheck` runs the drift path's ladder half;
-        see `VersionRecheck`."""
+        is the tree the gate decided about. `bundle_key` names the bundle to ship when it
+        is not the saved snapshot — an approved submission copy."""
         deployment_id = await store.claim(
             db,
             app_id=app_id,
@@ -313,7 +208,7 @@ class DeployService:
                 user_id=user_id,
                 conversation_id=conversation_id,
                 expected_commit_sha=expected_commit_sha,
-                recheck=recheck,
+                bundle_key=bundle_key,
             )
         )
         self._tasks.add(task)
@@ -376,17 +271,12 @@ class DeployService:
         user_id: uuid.UUID,
         conversation_id: uuid.UUID | None,
         expected_commit_sha: str | None = None,
-        recheck: VersionRecheck | None = None,
+        bundle_key: str | None = None,
         live: LiveRevision | None = None,
     ) -> None:
         """The detached pipeline. NEVER raises: an escaping exception leaves the row
         `running` until the stale-claim window expires, and the citizen staring at a
-        Deploy button that 409s for half an hour.
-        THE ROUTED OUTCOME LEAVES THROUGH THE FAILURE FUNNEL on purpose, with no branch of
-        its own: it's a terminal state with a code and a citizen sentence, exactly what
-        `_DeployFailedError`/`_fail` already carry. A third arm would just duplicate the
-        guarded terminal write for a case that only differs in the colour a client paints
-        it."""
+        Deploy button that 409s for half an hour."""
         async with self._beating(deployment_id):
             # THE PROMISE IN THE DOCSTRING, MADE TRUE RATHER THAN INTENDED. The arms below
             # settle the row by WRITING to it, and a write is exactly what fails when the
@@ -417,7 +307,7 @@ class DeployService:
                             project_id=project_id,
                             user_id=user_id,
                             expected_commit_sha=expected_commit_sha,
-                            recheck=recheck,
+                            bundle_key=bundle_key,
                         )
                 except _DeployFailedError as failure:
                     await self._fail(
@@ -469,15 +359,13 @@ class DeployService:
         project_id: uuid.UUID,
         user_id: uuid.UUID,
         expected_commit_sha: str | None = None,
-        recheck: VersionRecheck | None = None,
+        bundle_key: str | None = None,
     ) -> str:
-        """The happy path. Every failure leaves by raising `_DeployFailedError` — including
-        the routed outcome, which is a terminal state with a code, not an exception to the
-        rule."""
+        """The happy path. Every failure leaves by raising `_DeployFailedError`."""
         # 1 — the saved code. `NoAppYet` is a NORMAL outcome (nobody has built yet), not an
         # error; an unreadable bundle is the opposite and must never read the same.
         try:
-            extracted = await extract_snapshot(app_id)
+            extracted = await extract_snapshot(app_id, bundle_key=bundle_key)
         except SnapshotExtractionError as exc:
             raise _DeployFailedError(
                 FAIL_SNAPSHOT_UNREADABLE,
@@ -511,21 +399,6 @@ class DeployService:
                     "was published — the version that was checked is not the version that "
                     "would have gone live. Press Deploy again to publish what is saved now."
                 ),
-            )
-
-        # 1b — THE DRIFT RE-CHECK, before anything is packed or built: on this path
-        # the citizen's answers describe the version BEFORE the save this request made, so
-        # the platform reviews the one actually leaving and decides on the far side of the
-        # 202 the route already sent. Returns to continue publishing, or raises with the
-        # queue entry already made.
-        if recheck is not None:
-            await self._recheck(
-                deployment_id=deployment_id,
-                app_id=app_id,
-                project_id=project_id,
-                user_id=user_id,
-                extracted=extracted,
-                recheck=recheck,
             )
 
         await self._advance(deployment_id, STEP_PACKING, head_sha=extracted.head_sha)
@@ -784,288 +657,6 @@ class DeployService:
         )
         return settings.app_url(self._aca_name(app_id))
 
-    # --- the drift re-check ------------------------------------------------------
-
-    async def _recheck(
-        self,
-        *,
-        deployment_id: uuid.UUID,
-        app_id: uuid.UUID,
-        project_id: uuid.UUID,
-        user_id: uuid.UUID,
-        extracted: ExtractedSnapshot,
-        recheck: VersionRecheck,
-    ) -> None:
-        """Review the version leaving, then stand in for ladder rules 4-7: no complete
-        review -> ROUTE (rule 4); any weighted category on the MERGED answers -> ROUTE
-        (rule 6); else -> PUBLISH (rule 7). Returns to continue; raises
-        `_DeployFailedError` (`routed_for_review` or `route_refused`) otherwise.
-        RULE 6 IS ABSOLUTE, NOT DIFFERENTIAL: a past revision routed only on a NEW weighted
-        Yes, so a citizen's own already-declared Yes could dodge it by leaving the
-        workspace dirty and pressing Deploy. `newly_raised` is record-keeping only — which
-        categories the citizen's explanation doesn't cover — never a decision input."""
-        await self._advance(deployment_id, STEP_CHECKING, head_sha=extracted.head_sha)
-
-        readout = await self._review_of(app_id=app_id, user_id=user_id, extracted=extracted)
-        review = review_at_head(readout, extracted.head_sha)
-
-        # The citizen's own answers are re-merged against the NEW verdicts — they are still
-        # the citizen's answers, and stricter-of still applies. What changes is the review
-        # half of the merge, which is the entire point of re-checking.
-        citizen = answers_in(recheck.declaration, "citizen")
-        submitted = answers_in(recheck.declaration, "merged")
-        merged = merge_questions(merge_inputs(citizen, review))
-        # The categories behind the decision: the same per-question predicate that
-        # `merged.any_weighted_yes` — ladder rule 6 itself — is the `any()` of, so the two
-        # cannot disagree. The decision below branches on the named predicate; this list
-        # exists to say WHICH categories in the log and to the citizen.
-        routing = tuple(question.key for question in merged.questions if question.weighted_yes)
-        # RECORD-KEEPING, NOT THE DECISION (see the docstring): which of those the citizen's
-        # answers — and so their explanation — never spoke to.
-        newly_raised = tuple(key for key in routing if not submitted.get(key))
-
-        if review.complete and not merged.any_weighted_yes:
-            _log.info(
-                "deploy_recheck_agreed",
-                deployment_id=str(deployment_id),
-                app_id=str(app_id),
-                head_sha=extracted.head_sha,
-                answered_about=recheck.answered_about,
-            )
-            return
-
-        # ROUTING. The declaration is rebuilt around the NEW review — it is what the
-        # administrator will read — and carries the drift block that says whose question
-        # the citizen's explanation actually answered.
-        declaration = declaration_document(
-            head_sha=extracted.head_sha,
-            citizen=citizen,
-            explanation=explanation_in(recheck.declaration),
-            review=review,
-            merged=merged,
-            drift=DriftFacts(answered_about=recheck.answered_about, newly_raised=newly_raised),
-        )
-        # Named for the ladder rung this stood in for, in the route's own vocabulary
-        # (`weighted_yes`, `review_not_current`), so one query over `publish_gate` reads
-        # the same way whichever side of the 202 decided.
-        rule = "recheck_weighted_yes" if review.complete else "recheck_review_not_current"
-        submission_id = await self._route_to_queue(
-            deployment_id=deployment_id,
-            app_id=app_id,
-            project_id=project_id,
-            user_id=user_id,
-            head_sha=extracted.head_sha,
-            declaration=declaration,
-            rule=rule,
-        )
-        _log.info(
-            "deploy_routed_after_recheck",
-            deployment_id=str(deployment_id),
-            app_id=str(app_id),
-            rule=rule,
-            head_sha=extracted.head_sha,
-            routing=list(routing),
-            newly_raised=list(newly_raised),
-        )
-        if not review.complete:
-            citizen_message = (
-                "You saved changes, so the platform tried to check the new version before "
-                "publishing it, and that check could not be completed. Your app was not "
-                "published; this exact version was sent to an administrator for review "
-                "instead, and you can publish it once it is approved."
-            )
-        elif newly_raised:
-            # The sharper sentence, and only when it is TRUE: these categories are ones the
-            # citizen's own answers never claimed, so the check is telling them something.
-            changed = ", ".join(labels_for(newly_raised))
-            citizen_message = (
-                "You saved changes, so the platform checked the new version before "
-                f"publishing it — and it found something your answers had not covered: "
-                f"{changed}. Your app was not published; this exact version was sent to "
-                "an administrator for review, and you can publish it once it is approved."
-            )
-        else:
-            # Nothing new: the app routed on what the citizen already declared. Saying "it
-            # found something you had not covered" here would be a plain lie, and the
-            # honest version is also the more useful one — it names why a Yes still routes.
-            declared = ", ".join(labels_for(routing))
-            citizen_message = (
-                "You saved changes, so the platform checked the new version before "
-                f"publishing it. It handles {declared}, which needs an administrator's "
-                "approval — so your app was not published and this exact version was sent "
-                "for review. You can publish it once it is approved."
-            )
-        raise _DeployFailedError(
-            FAIL_ROUTED_FOR_REVIEW,
-            detail=(
-                f"submitted for review as {submission_id} at {extracted.head_sha}"
-                + (f"; routed on: {', '.join(routing)}" if routing else "")
-                + (f"; newly raised: {', '.join(newly_raised)}" if newly_raised else "")
-            ),
-            citizen_message=citizen_message,
-        )
-
-    async def _review_of(
-        self, *, app_id: uuid.UUID, user_id: uuid.UUID, extracted: ExtractedSnapshot
-    ) -> ReviewReadout | None:
-        """Start a review of the extracted version and wait for it to settle.
-
-        THE TREE IS HANDED OVER, NOT RE-DOWNLOADED — the review's contract uses a
-        caller-owned root and never deletes it, so this neither clones a second copy nor
-        starves packing of its files. Waiting POLLS, since the runner's two-verb contract
-        runs detached with no task to grab; it stops when the row leaves RUNNING or ages
-        past its own ceiling — the deadline below only guards the case where neither
-        happens."""
-        reviewer = (
-            self._reviewer if self._reviewer is not None else get_classification_review_service()
-        )
-        async with self._session_factory() as db:
-            await reviewer.start(
-                db,
-                app_id=app_id,
-                user_id=user_id,
-                head_sha=extracted.head_sha,
-                extracted=extracted,
-            )
-        deadline = (
-            asyncio.get_running_loop().time() + REVIEW_WALL_CLOCK_CEILING_S + _REVIEW_WAIT_MARGIN_S
-        )
-        while True:
-            async with self._session_factory() as db:
-                readout = await reviewer.read(db, app_id=app_id)
-            if (
-                readout is None
-                or readout.aged_out
-                or readout.review.status is not ClassificationReviewStatus.RUNNING
-            ):
-                return readout
-            if asyncio.get_running_loop().time() >= deadline:
-                # Neither settled nor aged out inside its own ceiling plus a margin. Hand
-                # back the RUNNING row: `review_at_head` reads it as not-complete, which
-                # routes — the fail-safe direction, and the same answer rule 4 gives.
-                _log.warning(
-                    "deploy_recheck_review_never_settled",
-                    app_id=str(app_id),
-                    head_sha=extracted.head_sha,
-                )
-                return readout
-            await asyncio.sleep(_REVIEW_POLL_S)
-
-    async def _route_to_queue(
-        self,
-        *,
-        deployment_id: uuid.UUID,
-        app_id: uuid.UUID,
-        project_id: uuid.UUID,
-        user_id: uuid.UUID,
-        head_sha: str,
-        declaration: dict[str, Any],
-        rule: str,
-    ) -> uuid.UUID:
-        """Submit this exact version into the admin queue — the same submit the request
-        path uses, reached from the pipeline instead. Returns the submission id.
-        PINNED TO THE COMMIT THE PIPELINE ASSERTED, not the mutable snapshot's current head
-        — a save landing in this gap would queue an unexamined version, the same race the
-        expected-commit assertion guards earlier. Runs inside a SAVEPOINT: a refusal leaves
-        no half-submitted row (the orphaned blob is the submit service's own documented
-        class). Every guard failure becomes the deployment's failure DETAIL, the only
-        citizen-facing explanation — this pipeline never raises out to a live request."""
-        try:
-            storage = get_storage()
-        except StorageError as exc:
-            raise _DeployFailedError(
-                FAIL_ROUTE_REFUSED,
-                detail=str(exc),
-                citizen_message=(
-                    "Your app was not published: the platform could not reach your saved "
-                    "app to send this version for review. Please try again in a moment."
-                ),
-            ) from exc
-
-        async with self._session_factory() as db:
-            # Owner-scoped read even though the pipeline resolved this app from
-            # the citizen's own request: the submit service re-checks ownership fail-closed
-            # for the same reason, and a service that trusts its caller with the predicate
-            # is one refactor away from a cross-user write.
-            app_row = (
-                await db.execute(
-                    sa.select(AppRegistry).where(
-                        AppRegistry.id == app_id, AppRegistry.user_id == user_id
-                    )
-                )
-            ).scalar_one_or_none()
-            if app_row is None:
-                raise _DeployFailedError(
-                    FAIL_ROUTE_REFUSED,
-                    detail="the app row was gone by the time the review finished",
-                    citizen_message=(
-                        "Your app was not published, and it could not be sent for review "
-                        "either — it no longer exists."
-                    ),
-                )
-
-            savepoint = await db.begin_nested()
-            try:
-                receipt = await submit_app_for_review(
-                    db,
-                    storage,
-                    user_id=user_id,
-                    app=app_row,
-                    declaration=declaration,
-                    route=ApprovalRoute.SELF_PUBLISH,
-                )
-            except AppApiError as exc:
-                await savepoint.rollback()
-                raise _DeployFailedError(
-                    FAIL_ROUTE_REFUSED,
-                    detail=exc.message,
-                    citizen_message=(
-                        "Your app was not published, and this version could not be sent "
-                        f"for review either: {exc.message}"
-                    ),
-                ) from exc
-            if receipt.commit_sha != head_sha:
-                await savepoint.rollback()
-                _log.warning(
-                    "deploy_recheck_snapshot_moved_mid_route",
-                    app_id=str(app_id),
-                    examined=head_sha,
-                    copied=receipt.commit_sha,
-                )
-                raise _DeployFailedError(
-                    FAIL_ROUTE_REFUSED,
-                    detail=f"examined {head_sha} but the queue copy was {receipt.commit_sha}",
-                    citizen_message=(
-                        "Your app was saved again while it was being checked, so nothing "
-                        "was published and nothing was sent for review. Press Deploy again "
-                        "to publish the version that is saved now."
-                    ),
-                )
-            await savepoint.commit()
-
-            # The record of THIS decision, written by the pipeline that made it — same
-            # action, same shape, same actor as the ladder's own rows, so "what did the
-            # gate decide for this app" stays one query. The email is denormalised because
-            # the actor reference nulls when a user is removed.
-            email = await db.scalar(sa.select(User.email).where(User.id == user_id))
-            await append_gate_audit(
-                db,
-                actor_id=user_id,
-                email=email,
-                app_id=app_id,
-                project_id=project_id,
-                decision="routed",
-                rule=rule,
-                declaration=declaration,
-                extra={
-                    "deploymentId": str(deployment_id),
-                    "submissionId": str(receipt.submission_id),
-                    "commitSha": receipt.commit_sha,
-                },
-            )
-            await db.commit()
-        return receipt.submission_id
-
     # --- terminals --------------------------------------------------------------
 
     async def _succeed(
@@ -1112,13 +703,6 @@ class DeployService:
         # The same redactor and the same ceiling as the operator detail: this string now reaches
         # a model holding a shell, which is a harder egress than the deployment row.
         safe_for_the_model = redact_and_cap(model_detail, _DETAIL_MAX_CHARS)
-        # A ROUTED settlement is not a breakage, and the row's `detail` is the only thing
-        # the citizen's publish banner has to render on this path: the 202 already returned,
-        # so the surface has no routed response to read and falls through to `failureDetail`.
-        # Storing the operator string there showed them
-        # `submitted for review as <uuid> at <40-hex>; routed on: personal_information` —
-        # raw identifiers and internal field names — where the re-check's three
-        # purpose-written sentences belong. The operator string stays, in the log below.
         stored = citizen_message if code in _ROW_SPEAKS_TO_THE_CITIZEN else safe
         async with self._session_factory() as db:
             settled = await store.fail(db, deployment_id, code=code, detail=stored)

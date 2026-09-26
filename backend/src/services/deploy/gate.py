@@ -1,20 +1,13 @@
-"""The publish gate's shared reading: one stored review + one answer set -> one record.
+"""The publish gate's reading: one stored review + one answer set -> one record.
 
-THE ROUTE STILL OWNS THE LADDER. `deploy/router.py` decides which rung answers; this
-module holds what that decision is *written in* — reading a stored review against the
-shipping commit, handing sources to the merge, and the declaration document every
-outcome records. It lives here because the DETACHED PIPELINE (the drift re-check) is a
-second writer that cannot import the route, and two copies of a route-owned contract is
-how `differences` quietly stops meaning the same thing in both places an admin reads it.
-
-Nothing here decides anything: it reads, merges, formats. Both callers keep their own
-decision.
+`deploy/router.py` decides which rung answers; this module holds what that decision is
+*written in* — reading a stored review against the shipping commit, handing sources to the
+merge, the declaration document every outcome records, and the one audit action.
 """
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,8 +26,7 @@ from src.services.classification.store import ReviewRecord
 from src.services.deploy.classification import DATA_CLASSIFICATION_QUESTIONS
 
 GATE_AUDIT_ACTION = "publish_gate"
-"""The one audit action every gate outcome writes, whoever decided it — the route's
-ladder and the pipeline's post-re-check decision alike. See `append_gate_audit`."""
+"""The one audit action every gate outcome writes. See `append_gate_audit`."""
 
 
 @dataclass(frozen=True)
@@ -156,33 +148,6 @@ def merge_inputs(flags: dict[str, bool], review: ReviewAtHead) -> list[QuestionM
     return inputs
 
 
-@dataclass(frozen=True)
-class DriftFacts:
-    """WHY THIS QUEUE ITEM LOOKS LIKE AN ANSWER TO A DIFFERENT QUESTION.
-
-    Set only on the save-and-publish path, where the citizen answered the form about one
-    commit and the pipeline then re-checked another. Nobody is at the form when that
-    decision lands, so the citizen's explanation — if there is one at all — was written
-    about `answered_about`, not about the version an administrator is being asked to
-    approve. These are the facts that make that distinction renderable.
-    """
-
-    answered_about: str | None
-    """The commit the citizen's answers and explanation were written about: the stamp on
-    the review that pre-filled the form. None when no stored review informed them."""
-
-    newly_raised: tuple[str, ...]
-    """The weighted questionnaire keys that routed this version and that the submitted
-    answer set did NOT already carry — the ones the citizen's explanation cannot be an
-    answer to, because they were not among the things it was written about.
-
-    NOT the reason publishing stopped, and it must not be read as one: that reason is the
-    merged answer set having any weighted Yes at all (rule 6). An item can route with this
-    list EMPTY — the citizen declared the category themselves and the re-check simply
-    agreed — and a screen that renders "nothing new was found" as "nothing was found"
-    would tell an administrator the opposite of the truth."""
-
-
 def declaration_document(
     *,
     head_sha: str | None,
@@ -190,7 +155,6 @@ def declaration_document(
     explanation: str | None,
     review: ReviewAtHead,
     merged: MergeOutcome,
-    drift: DriftFacts | None = None,
 ) -> dict[str, Any]:
     """THE DECLARATION — the one payload every branch records and the queue carries.
 
@@ -199,13 +163,12 @@ def declaration_document(
     provenance. `differences` carries `DisagreementKind` VALUES verbatim — renaming one
     is a data migration. Evidence locations are structurally absent; only the
     plain-language `reasons` ships, carried HERE because the review store is overwritten
-    by the next run. `drift`, present only on the drift path, is itself the signal."""
+    by the next run."""
     document: dict[str, Any] = {
         "commits": {
             "shipping": head_sha,
-            # What the recorded verdicts are actually ABOUT. Equal to shipping whenever a
-            # review informed the decision; null when none did. The drift path is what
-            # makes these two legitimately differ.
+            # What the recorded verdicts are actually ABOUT: null when no review informed
+            # the decision.
             "reviewed": head_sha if review.available else None,
         },
         "citizen": {"answers": dict(citizen), "explanation": explanation},
@@ -244,46 +207,7 @@ def declaration_document(
             if question.recorded
         },
     }
-    if drift is not None:
-        document["drift"] = {
-            "answeredAbout": drift.answered_about,
-            "shipping": head_sha,
-            "newlyRaised": list(drift.newly_raised),
-            "routedBy": "pipeline_recheck",
-        }
     return document
-
-
-# --- reading one back ---------------------------------------------------------------
-#
-# THE READERS LIVE BESIDE THE WRITER, deliberately. A declaration written here and taken
-# apart somewhere else is the two-copies-of-a-contract failure this module's docstring
-# exists to prevent: rename a section above and the only thing that tells you is a queue
-# item that quietly reads every category as a new one. The single caller is the drift
-# re-check, which is handed the gate's own document and must re-merge what is in it.
-
-
-def answers_in(declaration: Mapping[str, Any], section: str) -> dict[str, bool]:
-    """One answer block out of a declaration document.
-
-    Read defensively — missing key, wrong type, a section that predates a question — and
-    the missing answer is False, which is the policy table's own reading of an omitted key
-    (`classification.total_weight`). Every direction of that leniency ADDS routing rather
-    than removing it: an unreadable submitted baseline makes every Yes look new."""
-    block = declaration.get(section)
-    answers = block.get("answers") if isinstance(block, dict) else None
-    if not isinstance(answers, dict):
-        return {}
-    return {str(key): bool(value) for key, value in answers.items()}
-
-
-def explanation_in(declaration: Mapping[str, Any]) -> str | None:
-    """The citizen's explanation, already redacted by the gate that stored it. On the
-    drift path it was written about the EARLIER version — carried forward unchanged rather
-    than dropped, with `drift.answeredAbout` naming the version it answers."""
-    citizen = declaration.get("citizen")
-    explanation = citizen.get("explanation") if isinstance(citizen, dict) else None
-    return explanation if isinstance(explanation, str) else None
 
 
 async def append_gate_audit(
@@ -304,8 +228,7 @@ async def append_gate_audit(
     id, invisible to the admin app audit drawer (`resource_id`/`detail->>'appId'`). One
     action with a `decision` field, not four, so one query answers "what did the gate
     decide for this app". `email` is denormalised because the actor REFERENCE is nulled
-    on user removal. TWO CALLERS — the route's ladder and the detached pipeline's drift
-    re-check — write the same shape under the same actor, so one query still covers both."""
+    on user removal."""
     detail: dict[str, Any] = {
         "appId": str(app_id),
         "projectId": str(project_id),

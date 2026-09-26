@@ -11,7 +11,6 @@ gate quietly routing."""
 
 from __future__ import annotations
 
-import contextlib
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -24,18 +23,16 @@ from src.api.deps import storage_or_none_dependency
 from src.api.v1.build_sessions.deps import (
     sandbox_dependency,
     sandbox_or_none_dependency,
-    session_manager_dependency,
 )
 from src.api.v1.deploy.deps import deploy_service_or_none
 from src.db.models.app_registry import ApprovalRoute, AppStatus
-from src.services.build_sessions.manager import SaveOutcome, SessionManager
 from src.services.classification import store as review_store
 from src.services.deploy.classification import CLASSIFICATION_KEYS
 from src.services.deploy.service import DeployNotPossibleError, StartedDeploy
 from src.services.storage import StorageError, snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
-from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
+from tests.fakes import FakeStorage, a_git_bundle
 
 _DEPLOY = "/v1/projects/{pid}/deploy"
 _STATUS = "/v1/projects/{pid}/deployment"
@@ -59,13 +56,11 @@ def _answers(**overrides: object) -> dict[str, object]:
     return body
 
 
-def _body(*, save_first: bool = False, **overrides: object) -> dict[str, object]:
-    """A whole deploy request. The answers are NESTED under `answers` — a flat body is a
-    422, which is the shape a client that forgot the questionnaire entirely would send."""
-    request: dict[str, object] = {"answers": _answers(**overrides)}
-    if save_first:
-        request["saveFirst"] = True
-    return request
+def _body(**overrides: object) -> dict[str, object]:
+    """A whole deploy request about the saved version. The answers are NESTED under
+    `answers` — a flat body is a 422, which is the shape a client that forgot the
+    questionnaire entirely would send."""
+    return {"commitSha": _HEAD_SHA, "answers": _answers(**overrides)}
 
 
 # All-No, score 0 — the ONE shape of declaration that auto-deploys (LOW score = safe =
@@ -104,7 +99,7 @@ class FakeService:
         classification=None,
         classification_score=None,
         expected_commit_sha=None,
-        recheck=None,
+        bundle_key=None,
     ) -> StartedDeploy:
         if self._refuse is not None:
             raise self._refuse
@@ -116,46 +111,21 @@ class FakeService:
                 "classification": classification,
                 "classification_score": classification_score,
                 "expected_commit_sha": expected_commit_sha,
-                "recheck": recheck,
+                "bundle_key": bundle_key,
             }
         )
         return StartedDeploy(deployment_id=uuid.uuid4(), app_id=app_id)
 
 
-class CleanSaveState:
-    """A save-state view with nothing outstanding, at the version the store holds."""
-
-    dirty = False
-    saved_head = _HEAD_SHA
-
-
 @pytest.fixture
-def wire(app: FastAPI, db_session, monkeypatch):
-    @contextlib.asynccontextmanager
-    async def _session():
-        yield db_session
-
-    manager = SessionManager(session_factory=lambda: _session())
-    monkeypatch.setattr(
-        SessionManager,
-        "project_save_state",
-        lambda self, db, user, project_id, *, sandbox_client: _clean(),
-    )
-    sbx = FakeSandboxClient()
+def wire(app: FastAPI):
     service = FakeService()
     store = FakeStorage()
-    app.dependency_overrides[session_manager_dependency] = lambda: manager
-    app.dependency_overrides[sandbox_dependency] = lambda: sbx
-    app.dependency_overrides[sandbox_or_none_dependency] = lambda: sbx
     app.dependency_overrides[deploy_service_or_none] = lambda: service
     # The gate reads the stored review off the snapshot blob's metadata stamp, so storage
     # is no longer optional plumbing — an unbound store is a documented 503 on every branch.
     app.dependency_overrides[storage_or_none_dependency] = lambda: store
-    return SimpleNamespace(app=app, service=service, manager=manager, store=store)
-
-
-async def _clean() -> CleanSaveState:
-    return CleanSaveState()
+    return SimpleNamespace(app=app, service=service, store=store)
 
 
 async def _owner_with_app(db, wire=None):
@@ -267,27 +237,11 @@ async def test_an_app_with_nothing_ever_saved_is_refused_with_the_same_code(
     assert resp.json()["error"]["code"] == "no_saved_build"
 
 
-async def test_a_deploy_already_in_flight_is_a_409(
-    wire, app, client, db_session, monkeypatch
-) -> None:
+async def test_a_deploy_already_in_flight_is_a_409(wire, app, client, db_session) -> None:
     """The claim's own refusal, surfaced with its code. Built on `wire` so the ladder
     reaches the pipeline at all, then swaps in a refusing service — the 409 has to come
     from the CLAIM, not from the gate declining to get that far."""
     user, app_row = await _owner_with_app(db_session, wire)
-
-    @contextlib.asynccontextmanager
-    async def _session():
-        yield db_session
-
-    monkeypatch.setattr(
-        SessionManager,
-        "project_save_state",
-        lambda self, db, user, project_id, *, sandbox_client: _clean(),
-    )
-    app.dependency_overrides[session_manager_dependency] = lambda: SessionManager(
-        session_factory=lambda: _session()
-    )
-    app.dependency_overrides[sandbox_or_none_dependency] = lambda: FakeSandboxClient()
     app.dependency_overrides[deploy_service_or_none] = lambda: FakeService(
         refuse=DeployNotPossibleError("already deploying", code="deploy_in_flight")
     )
@@ -298,44 +252,6 @@ async def test_a_deploy_already_in_flight_is_a_409(
 
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "deploy_in_flight"
-
-
-async def test_unsaved_work_is_refused_unless_save_first_is_asked_for(
-    app, client, db_session, monkeypatch
-) -> None:
-    """A deploy ships the last SAVED version. Publishing while the workspace is ahead of it
-    would ship something the citizen never chose, with no way to notice."""
-    user, app_row = await _owner_with_app(db_session)
-
-    class Dirty:
-        dirty = True
-
-    async def _dirty() -> Dirty:
-        return Dirty()
-
-    @contextlib.asynccontextmanager
-    async def _session():
-        yield db_session
-
-    monkeypatch.setattr(
-        SessionManager,
-        "project_save_state",
-        lambda self, db, user, project_id, *, sandbox_client: _dirty(),
-    )
-    app.dependency_overrides[session_manager_dependency] = lambda: SessionManager(
-        session_factory=lambda: _session()
-    )
-    app.dependency_overrides[sandbox_or_none_dependency] = lambda: FakeSandboxClient()
-    service = FakeService()
-    app.dependency_overrides[deploy_service_or_none] = lambda: service
-
-    resp = await client.post(
-        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_QUALIFIES
-    )
-
-    assert resp.status_code == 409
-    assert resp.json()["error"]["code"] == "unsaved_changes"
-    assert service.started == []
 
 
 async def test_csrf_is_required(wire, client, db_session) -> None:
@@ -397,64 +313,22 @@ async def test_the_terminal_classification_refusal_is_gone(wire, client, db_sess
 
 
 async def test_a_routed_deploy_leaves_the_app_queued_at_the_version_examined(
-    app, client, db_session, monkeypatch
+    wire, client, db_session
 ) -> None:
-    """The gate's ordering is deliberate: the ladder's version-dependent rules must run
-    against the POST-save commit, so a save-and-publish saves first, before the gate runs.
-
-    What that buys the citizen: a routed deploy leaves the app queued at exactly the
-    version examined, and publishes nothing. The save is the thing they asked for, not a
-    side effect of a declined request."""
-    user, app_row = await _owner_with_app(db_session)
-    saved: list[uuid.UUID] = []
-    store = FakeStorage()
-    key = snapshot_key(app_row.id)
-    store.objects[key] = a_git_bundle(_HEAD_SHA)
-    store.meta[key] = {"head_sha": _HEAD_SHA}
-
-    class Dirty:
-        dirty = True
-
-    async def _dirty() -> Dirty:
-        return Dirty()
-
-    async def _record_save(self, db, user, project_id, *, sandbox_client) -> SaveOutcome:
-        saved.append(project_id)
-        # The save reports the commit it landed at, which is what the route threads into
-        # the pipeline as the expected commit. The store's stamp is the same one.
-        return SaveOutcome(app_id=app_row.id, head_sha=_HEAD_SHA)
-
-    @contextlib.asynccontextmanager
-    async def _session():
-        yield db_session
-
-    monkeypatch.setattr(
-        SessionManager,
-        "project_save_state",
-        lambda self, db, user, project_id, *, sandbox_client: _dirty(),
-    )
-    monkeypatch.setattr(SessionManager, "save_project_snapshot", _record_save)
-    app.dependency_overrides[session_manager_dependency] = lambda: SessionManager(
-        session_factory=lambda: _session()
-    )
-    app.dependency_overrides[sandbox_or_none_dependency] = lambda: FakeSandboxClient()
-    app.dependency_overrides[storage_or_none_dependency] = lambda: store
-    service = FakeService()
-    app.dependency_overrides[deploy_service_or_none] = lambda: service
+    """A routed deploy leaves the app queued at exactly the version examined, and publishes
+    nothing."""
+    user, app_row = await _owner_with_app(db_session, wire)
 
     resp = await client.post(
         _DEPLOY.format(pid=app_row.project_id),
         headers=auth_headers(user),
-        json=_body(
-            confidentialBusinessData=True, save_first=True, notes="Vendor contact list only."
-        ),
+        json=_body(confidentialBusinessData=True, notes="Vendor contact list only."),
     )
 
-    assert saved == [app_row.project_id]
     assert resp.status_code == 200
     assert resp.json()["outcome"] == "routed_for_review"
     assert resp.json()["commitSha"] == _HEAD_SHA
-    assert service.started == []
+    assert wire.service.started == []
 
 
 async def test_a_weighted_declaration_without_an_explanation_is_still_a_422(

@@ -204,11 +204,10 @@ async def fail(
     """Write the terminal failure. True iff this call was the one that settled the row.
 
     NOT EVERY FAILED ROW IS A BROKEN DEPLOY, and `code` is the only thing that tells them apart.
-    The drift re-check's `routed_for_review` settles here too: that deploy did exactly what it
-    should — it stopped and put the version in front of an administrator, so a reader (or a
-    dashboard) that treats `status = failed` as "something went wrong" will mis-report it.
-    Adding a fourth `DeploymentStatus` instead would move what `uq_deployments_one_in_flight`'s
-    partial index covers, which is a real schema decision this outcome does not need to make."""
+    A failed restart leaves the version it restarted still serving, and older rows carry
+    `routed_for_review` for an attempt that went to an administrator instead of publishing — so
+    a reader (or a dashboard) that treats `status = failed` as "something went wrong" will
+    mis-report both."""
     return await _finish(
         db,
         deployment_id,

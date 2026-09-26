@@ -25,7 +25,7 @@ this file — split across config and code, they could drift into a combination 
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 
 # The questionnaire, in the order the citizen sees it. `(key, label, weight)` — `key` is
 # the field name on the request schema AND the JSONB key persisted on the deployment row,
@@ -97,19 +97,6 @@ def qualifies_for_deploy(flags: Mapping[str, bool]) -> bool:
     return total_weight(flags) <= AUTO_DEPLOY_MAX_SCORE
 
 
-def labels_for(keys: Iterable[str]) -> tuple[str, ...]:
-    """The questionnaire labels for `keys`, in order — the ONE reader of the key→label
-    pairing. Any sentence naming what an app handles gets its words from here, so a
-    reworded question cannot leave a message naming something no longer on screen; the
-    deploy pipeline's routed-for-review copy is the live caller.
-
-    An unknown key falls back to itself rather than raising: a stored answer set can
-    predate a rename, and a bare key still names the question meant — a sentence is not
-    worth a 500."""
-    labels = {key: label for key, label, _weight in DATA_CLASSIFICATION_QUESTIONS}
-    return tuple(labels.get(key, key) for key in keys)
-
-
 def declared_categories(flags: Mapping[str, bool]) -> tuple[str, ...]:
     """The labels of the weighted categories answered Yes, most significant first. Lets the
     citizen see which categories an answer set DID declare and check whether that's right,
@@ -117,8 +104,7 @@ def declared_categories(flags: Mapping[str, bool]) -> tuple[str, ...]:
     moves the score, so listing it would be noise as advice.
 
     `refusal_message`, this projection's original consumer, was retired with the terminal
-    refusal it explained (a weighted Yes now ROUTES to the admin queue). A caller that
-    already holds the KEYS it wants named should ask `labels_for` instead."""
-    return labels_for(
-        key for key, _label, weight in DATA_CLASSIFICATION_QUESTIONS if weight and flags.get(key)
+    refusal it explained (a weighted Yes now ROUTES to the admin queue)."""
+    return tuple(
+        label for key, label, weight in DATA_CLASSIFICATION_QUESTIONS if weight and flags.get(key)
     )

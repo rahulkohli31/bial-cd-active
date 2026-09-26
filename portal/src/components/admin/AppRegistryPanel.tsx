@@ -284,20 +284,10 @@ function ReviewModal({ app, withdrawn, onClose, onApprove, onReject }: ReviewMod
             Approving pins exactly this submission: if it's been re-submitted since you opened
             this review, the server refuses the approval rather than silently promoting a build
             you never saw.{' '}
-            {app.approvalRoute === 'self_publish' ? (
-              // For this lineage there IS no runbook, and the previous copy sent the
-              // administrator to run one — exactly the mistake corrected here.
-              <span data-testid="review-self-publish-note">
-                Approving does not publish it — the developer publishes this approved version
-                themselves, and there is no go-live runbook for you to run.
-              </span>
-            ) : (
-              <span data-testid="review-runbook-note">
-                Approving does not deploy it — this submission is on the manual go-live route, so
-                the row shows <strong>Deploy needed</strong> until an admin runs the go-live
-                runbook and clicks <strong>Mark deployed</strong>.
-              </span>
-            )}
+            <span data-testid="review-publish-note">
+              Approving publishes it: this exact submission goes live for its developer, with
+              nothing more for you or them to do.
+            </span>
           </p>
         </div>
 
@@ -348,7 +338,7 @@ function ReviewModal({ app, withdrawn, onClose, onApprove, onReject }: ReviewMod
                 {mode !== 'reject' ? (
                   <>
                     <button data-testid="approve-btn" disabled={busy} onClick={() => run(onApprove)} className="flex-1 flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-white font-semibold py-2.5 rounded-xl transition text-sm disabled:opacity-50">
-                      {busy ? <BusyGlyph size={15} /> : <CheckCircle size={15} />} Approve
+                      {busy ? <BusyGlyph size={15} /> : <CheckCircle size={15} />} Approve and publish
                     </button>
                     <button data-testid="reject-btn" onClick={() => setMode('reject')} className="flex-1 flex items-center justify-center gap-2 border border-bial-border hover:border-red-300 hover:text-red-600 text-tertiary font-semibold py-2.5 rounded-xl transition text-sm">
                       <XCircle size={15} /> Reject

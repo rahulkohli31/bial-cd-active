@@ -110,9 +110,7 @@ export interface ApprovalState {
    *  recognises. Null exactly when `approvedCommitSha` is — the two are written together
    *  in one place server-side and are never apart. */
   approvedAt: string | null
-  /** WHICH lineage the current submission entered through. A `runbook` approval
-   *  authorises the manual go-live runbook and never self-publishing, so anything
-   *  rendering "you may publish this" reads the lineage as well as the pin. */
+  /** WHICH lineage the current submission entered through. */
   approvalRoute: ApprovalRoute | null
   rejectionNote: string | null
   submittedSha: string | null
@@ -134,8 +132,6 @@ export type PublishState =
   | 'draft'
   | 'in_review'
   | 'changes_requested'
-  | 'approved_ready_to_publish'
-  | 'approved_needs_review_again'
   | 'starting_up'
   | 'live_current'
   | 'live_newer_work'
@@ -179,6 +175,12 @@ export interface DeploymentView {
    */
   publishState: PublishState
   /**
+   * The commit the one button posts when it republishes the version an administrator
+   * approved — no save, no review, no dialog. Null whenever the button acts on the saved
+   * version instead. The server authors it; nothing here compares it with another commit.
+   */
+  approvedRetryCommit: string | null
+  /**
    * THE CITIZEN'S OWN LAST SAVE. The server reuses the ONE object-store metadata HEAD that
    * computes `publishState`'s drift — no second call, no container needed (works on a
    * stopped workspace). The two fields are INDEPENDENTLY NULL: a pre-metadata-stamp bundle
@@ -205,8 +207,8 @@ export interface DeploymentView {
  * server that authors it, not a new helper here.
  */
 
-/** The 409 raised when the workspace is ahead of the last save; retry with `saveFirst`. */
-export const UNSAVED_CHANGES = 'unsaved_changes'
+/** The 409 raised when the request names a version that is no longer the saved one. */
+export const SNAPSHOT_MOVED = 'snapshot_moved'
 
 function readString(value: unknown, field: string): string {
   if (typeof value !== 'string' || value.length === 0) {
@@ -302,8 +304,6 @@ const PUBLISH_STATES: ReadonlySet<string> = new Set<PublishState>([
   'draft',
   'in_review',
   'changes_requested',
-  'approved_ready_to_publish',
-  'approved_needs_review_again',
   'starting_up',
   'live_current',
   'live_newer_work',
@@ -319,10 +319,9 @@ const PUBLISH_STATES: ReadonlySet<string> = new Set<PublishState>([
 // client does not mirror the decision — it consumes it — so below is everything it could
 // never have seen, and why each gap costs only a press, never a wrong promise.
 //
-// 1. SAVE TIMING. `saveFirst` can write a new snapshot inside this same request (ladder
-//    rule 3a defers to the pipeline), so the commit judged need not exist when this read is
-//    taken. One-directional: the button states a ceiling on the attempt, never the outcome
-//    — publishing directly beats what it promised, never contradicts it.
+// 1. THE SAVED VERSION. The request names the commit the dialog reviewed, and the server
+//    compares it with what is saved now, refusing a mismatch (`snapshot_moved`). This client
+//    never compares the two; a save it did not see costs a reopened dialog, never a publish.
 // 2. MERGED CLASSIFICATION SCORE. The server merges the stored review with submitted
 //    answers and scores in-request; the local weights (see file header) drive only the
 //    running tally, never withhold the button — a server refusal-with-explanation is
@@ -393,6 +392,7 @@ function toDeploymentView(body: unknown): DeploymentView {
     unpublishedAt: optionalString(body.unpublishedAt),
     approval: toApprovalState(body.approval),
     publishState: toPublishState(body.publishState),
+    approvedRetryCommit: optionalString(body.approvedRetryCommit),
     savedHead: optionalString(body.savedHead),
     savedAt: optionalString(body.savedAt),
     savedState: toSavedState(body.savedState),
@@ -400,20 +400,20 @@ function toDeploymentView(body: unknown): DeploymentView {
 }
 
 export interface StartDeployRequest {
-  answers: DataClassificationAnswers
-  /** The citizen's explicit "save and deploy". Default false is the safe default: a deploy
-   *  ships the last SAVED version, so deploying over unsaved work unasked publishes
-   *  something they never chose. */
-  saveFirst?: boolean
+  /** The version this press is about: the saved version the dialog reviewed, or the
+   *  server's `approvedRetryCommit`. */
+  commitSha: string
+  /** Required for the saved version; the approved commit needs none. */
+  answers?: DataClassificationAnswers
 }
 
 /**
  * Ask to publish. Two success shapes via `outcome`: `started` (202, poll the id) or
  * `routed_for_review` (200, queued pinned to `commitSha`) — an OUTCOME, not a failure, and
  * both surfaces render it informationally. Throws `ApiError` otherwise: 409
- * `app_disabled`/`unsaved_changes`/`snapshot_moved`, 409 `waiting_for_review`
- * (`error.detail` carries the pending state, no second call needed), 422
- * `explanation_required`, 503 `storage_unavailable`.
+ * `app_disabled`/`snapshot_moved`, 409 `waiting_for_review` (`error.detail` carries the
+ * pending state, no second call needed), 422 `answers_required`/`explanation_required`,
+ * 503 `storage_unavailable`.
  */
 export async function startDeploy(
   projectId: string,
@@ -425,7 +425,7 @@ export async function startDeploy(
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answers: request.answers, saveFirst: request.saveFirst ?? false }),
+      body: JSON.stringify({ commitSha: request.commitSha, answers: request.answers }),
     },
     deps,
   )

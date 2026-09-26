@@ -113,6 +113,7 @@ const deployment = (publishState: PublishState = 'draft', over: Partial<Deployme
   unpublishedAt: null,
   approval: null,
   publishState,
+  approvedRetryCommit: null,
   savedHead: null,
   savedAt: null,
   // `null` is "the server did not say", which keeps the saved row — the neutral default
