@@ -78,7 +78,8 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # kinds which must have a project from losing one. 0045_conversation_touch follows it with
     # the repo's first database trigger, which advances a conversation's `updated_at` when a
     # message is appended to it. 0046_conversation_updated_at indexes that column, which the
-    # retention pass filters and orders by on every tick.
+    # retention pass filters and orders by on every tick. 0047_drop_connector_access drops the
+    # per-person connector access table and its enum.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0046_conversation_updated_at"]
+    assert heads == ["0047_drop_connector_access"]
