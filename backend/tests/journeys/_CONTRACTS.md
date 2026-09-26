@@ -45,23 +45,6 @@ renders the `—` fallback and no admin can tell whose app it is.
 
 ---
 
-## Journey 3 — Admin Audit drawer for one app
-
-`AuditDrawer` renders each event via `ev._id` (React key), `ev.at` (timestamp), `ev.username`
-(actor), and `ev.recordId` / `ev.count` (detail). `AuditEventOut` emits `id`, `createdAt`,
-`actorId` (raw uuid), `resourceId`, and a nested `detail` object — **none** of the four SPA keys.
-Every audit row therefore renders with an undefined React key, a `—` time, and `anonymous`.
-
-| # | Assertion the test must make | Status | Evidence |
-|---|------------------------------|--------|----------|
-| 3.1 | `GET /v1/admin/apps/{C}/audit` → each `events[]` has an `_id` the SPA keys on (not only `id`). | **BROKEN-captures-bug** — schema field is `id`; SPA reads `ev._id`. | SPA: `AppRegistryPanel.tsx:173`; back: `admin/router.py:124-132`, emit `:445-457` |
-| 3.2 | Each event carries a timestamp the SPA reads as `ev.at` (renderable by `fmtWhen`). | **BROKEN-captures-bug** — schema field is `createdAt`; `fmtWhen(ev.at)` → `—`. | SPA: `AppRegistryPanel.tsx:176`, `:22-25`; back: `admin/router.py:131` |
-| 3.3 | Each event carries a human actor as `ev.username` (resolved from the actor, not a raw uuid). | **BROKEN-captures-bug** — schema exposes `actorId` (uuid) only; SPA falls back to `anonymous`. | SPA: `AppRegistryPanel.tsx:179`; back: `admin/router.py:126` |
-| 3.4 | A record/count-bearing event (e.g. `clear-data`, `config:loginRequired`) surfaces `ev.recordId` and/or `ev.count` where the SPA reads them (top-level), for at least the count. | **BROKEN-captures-bug** — count lives in `detail.count`, no `recordId`; SPA reads `ev.recordId`/`ev.count` top-level. | SPA: `AppRegistryPanel.tsx:179`; back detail nesting: `admin/router.py:128`, `:277-279`, `:367-374` |
-| 3.5 | Audit is admin-gated: non-superadmin → **403**. | OK — keep as the gate guard. | back: `admin/router.py:427-429` (`CurrentSuperadmin`) |
-
----
-
 ## Journey 4 — Conversation / build persistence (chat + builder history)
 
 The SPA writes turns and reads them back through `conversationApi.ts`, normalizing the server's

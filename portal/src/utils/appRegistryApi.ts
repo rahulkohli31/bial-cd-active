@@ -2,7 +2,7 @@
  * App Registry data access — ADMIN-side thin wrappers over the registry endpoints
  * (/api/admin/apps/*, admin-gated server-side), all via authFetch (Bearer +
  * refresh-and-retry): list / approve / reject / patch / disable / enable /
- * delete / audit.
+ * delete / history.
  * Each throws an Error with a user-ready message on failure.
  *
  * The OWNER group (provision/submit/status/source) is RETIRED: the open-sandbox
@@ -98,15 +98,25 @@ function isRegistryStatus(value: unknown): value is RegistryStatus {
   return REGISTRY_STATUSES.some((status) => status === value)
 }
 
-/** The version serving now. Either half is null on a row that never recorded it. */
+/** The version serving now: the number of the send that put it there, its commit, and when
+ *  that send first went live. Any of them is null when nothing recorded it. */
 export interface LiveVersion {
+  number: number | null
   commitSha: string | null
   since: string | null
 }
 
+function asNumberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
 function toLiveVersion(value: unknown): LiveVersion | null {
   return isRecord(value)
-    ? { commitSha: asStringOrNull(value.commitSha), since: asStringOrNull(value.since) }
+    ? {
+        number: asNumberOrNull(value.number),
+        commitSha: asStringOrNull(value.commitSha),
+        since: asStringOrNull(value.since),
+      }
     : null
 }
 
@@ -290,42 +300,167 @@ export async function deleteApp(appId: string, reason: string, deps: AuthFetchDe
   )
 }
 
-/** Mirrors the backend's `AuditEventOut` (`backend/src/api/v1/admin/schemas.py`,
- * `CamelModel`-based). `resourceType` and `detail` are part of the real row but
- * have no reader in AppRegistryPanel.jsx today. */
-export interface AuditEvent {
-  id: string
-  actorId: string | null
-  username: string | null
-  action: string
-  resourceType: string
-  resourceId: string | null
-  detail: Record<string, unknown> | null
-  count: number | null
-  createdAt: string
+/** What was decided about one sent version, as the backend's `DecisionKind` sends it. */
+export type DecisionKind = 'waiting' | 'published' | 'approved' | 'rejected' | 'withdrawn' | 'not_recorded'
+
+const DECISION_KINDS: readonly DecisionKind[] = ['waiting', 'published', 'approved', 'rejected', 'withdrawn', 'not_recorded']
+
+/** Where one sent version stands now, as the backend's `VersionState` sends it. */
+export type VersionState =
+  | 'waiting'
+  | 'live'
+  | 'replaced'
+  | 'taken_offline'
+  | 'publishing'
+  | 'publish_failed'
+  | 'not_published'
+  | 'rejected'
+  | 'withdrawn'
+  | 'not_recorded'
+
+const VERSION_STATES: readonly VersionState[] = [
+  'waiting',
+  'live',
+  'replaced',
+  'taken_offline',
+  'publishing',
+  'publish_failed',
+  'not_published',
+  'rejected',
+  'withdrawn',
+  'not_recorded',
+]
+
+export type AttemptStatus = 'running' | 'succeeded' | 'failed'
+
+const ATTEMPT_STATUSES: readonly AttemptStatus[] = ['running', 'succeeded', 'failed']
+
+export interface HistoryAttempt {
+  status: AttemptStatus
+  startedAt: string
+  finishedAt: string | null
+  failureCode: string | null
 }
 
-/** Narrow one untrusted audit row. Unlike an app row there is no id the UI acts on —
- *  the drawer only renders — so an unreadable row degrades field-by-field rather than
- *  failing the whole trail. `id` still has to be something: it is the React key. */
-function toAuditEvent(value: unknown): AuditEvent {
-  const row = isRecord(value) ? value : {}
+export interface HistoryDecision {
+  kind: DecisionKind
+  by: string | null
+  at: string | null
+  note: string | null
+}
+
+/** One send for publishing, numbered in the order it was sent. */
+export interface HistoryVersion {
+  kind: 'version'
+  number: number
+  commitSha: string | null
+  submissionId: string | null
+  sentAt: string
+  sentBy: string | null
+  /** The declaration stored with this send's decision, or null when none was. */
+  declaration: SubmittedDeclaration | null
+  decision: HistoryDecision
+  attempts: HistoryAttempt[]
+  state: VersionState
+  publishedAt: string | null
+  replacedBy: number | null
+  replacedAt: string | null
+}
+
+/** Something done to the app outside any send; a disable carries the enable that ended it. */
+export interface HistoryEvent {
+  kind: 'event'
+  action: string
+  at: string
+  by: string | null
+  reenabledAt: string | null
+}
+
+export type HistoryEntry = HistoryVersion | HistoryEvent
+
+export interface AppHistory {
+  /** Newest first. */
+  entries: HistoryEntry[]
+  live: LiveVersion | null
+  liveUrl: string | null
+  /** The server read only its newest records, so the oldest entries may be missing. */
+  truncated: boolean
+}
+
+function oneOf<T extends string>(allowed: readonly T[], value: unknown, fallback: T): T {
+  return allowed.find((member) => member === value) ?? fallback
+}
+
+function toAttempt(value: unknown): HistoryAttempt | null {
+  if (!isRecord(value)) return null
+  const status = ATTEMPT_STATUSES.find((member) => member === value.status)
+  if (status === undefined || typeof value.startedAt !== 'string') return null
   return {
-    id: typeof row.id === 'string' && row.id !== '' ? row.id : `unreadable-${asString(row.action)}`,
-    actorId: asStringOrNull(row.actorId),
-    username: asStringOrNull(row.username),
-    action: asString(row.action),
-    resourceType: asString(row.resourceType),
-    resourceId: asStringOrNull(row.resourceId),
-    detail: isRecord(row.detail) ? row.detail : null,
-    count: typeof row.count === 'number' ? row.count : null,
-    createdAt: asString(row.createdAt),
+    status,
+    startedAt: value.startedAt,
+    finishedAt: asStringOrNull(value.finishedAt),
+    failureCode: asStringOrNull(value.failureCode),
   }
 }
 
-/** The app's audit trail (data mutations + admin actions), newest-first. */
-export async function fetchAudit(appId: string, deps: AuthFetchDeps = {}): Promise<AuditEvent[]> {
-  const body = await readBody(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/audit`, {}, deps), 'Failed to load audit')
-  const events = isRecord(body) ? body.events : null
-  return Array.isArray(events) ? events.map(toAuditEvent) : []
+function toDecision(value: unknown): HistoryDecision {
+  const row = isRecord(value) ? value : {}
+  return {
+    kind: oneOf(DECISION_KINDS, row.kind, 'not_recorded'),
+    by: asStringOrNull(row.by),
+    at: asStringOrNull(row.at),
+    note: asStringOrNull(row.note),
+  }
+}
+
+/** Narrow one untrusted History entry. An entry this client cannot place in time or number is
+ *  dropped rather than drawn as a blank card; any other unreadable field takes its absent meaning. */
+function toHistoryEntry(value: unknown): HistoryEntry | null {
+  if (!isRecord(value)) return null
+  if (value.kind === 'event') {
+    if (typeof value.at !== 'string') return null
+    return {
+      kind: 'event',
+      action: asString(value.action),
+      at: value.at,
+      by: asStringOrNull(value.by),
+      reenabledAt: asStringOrNull(value.reenabledAt),
+    }
+  }
+  if (value.kind !== 'version' || typeof value.number !== 'number' || typeof value.sentAt !== 'string') return null
+  return {
+    kind: 'version',
+    number: value.number,
+    commitSha: asStringOrNull(value.commitSha),
+    submissionId: asStringOrNull(value.submissionId),
+    sentAt: value.sentAt,
+    sentBy: asStringOrNull(value.sentBy),
+    declaration: isRecord(value.declaration) ? value.declaration : null,
+    decision: toDecision(value.decision),
+    attempts: Array.isArray(value.attempts)
+      ? value.attempts.map(toAttempt).filter((a): a is HistoryAttempt => a !== null)
+      : [],
+    state: oneOf(VERSION_STATES, value.state, 'not_recorded'),
+    publishedAt: asStringOrNull(value.publishedAt),
+    replacedBy: asNumberOrNull(value.replacedBy),
+    replacedAt: asStringOrNull(value.replacedAt),
+  }
+}
+
+/** The app's History: every version its owner sent for publishing, and the app's other events
+ *  between them, newest first. */
+export async function fetchHistory(appId: string, deps: AuthFetchDeps = {}): Promise<AppHistory> {
+  const body = await readBody(
+    await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/history`, {}, deps),
+    'Failed to load the history',
+  )
+  const row = isRecord(body) ? body : {}
+  return {
+    entries: Array.isArray(row.entries)
+      ? row.entries.map(toHistoryEntry).filter((e): e is HistoryEntry => e !== null)
+      : [],
+    live: toLiveVersion(row.live),
+    liveUrl: asStringOrNull(row.liveUrl),
+    truncated: row.truncated === true,
+  }
 }

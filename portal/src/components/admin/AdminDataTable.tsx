@@ -42,6 +42,9 @@ const pagerButton = 'h-[30px] min-w-[30px] rounded-md border border-bial-border 
 const currentPage = 'border-0 !bg-primary font-bold text-white hover:text-white'
 const stepButton = 'px-0 text-neutral [&>span]:sr-only'
 
+/** Elements whose clicks belong to themselves, not to the row they sit in. */
+const ROW_CONTROLS = 'a, button, input, label, select, textarea'
+
 export interface ServerSearch {
   value: string
   onChange: (value: string) => void
@@ -75,6 +78,13 @@ export type AdminDataTableProps<TRow> = SearchSource & {
   loading?: boolean
   rowSelection?: RowSelectionState
   onRowSelectionChange?: OnChangeFn<RowSelectionState>
+  /** A click anywhere on a row outside its own controls. Keyboard users need a control in the row
+   *  that does the same, since a row takes no focus. */
+  onRowClick?: (row: TRow, element: HTMLTableRowElement) => void
+  /** The row whose panel is open, drawn highlighted. */
+  selectedRowId?: string | null
+  /** The sort the table opens with. */
+  initialSorting?: SortingState
 }
 
 /** Every page when there are few; otherwise the first, the last and the current page's neighbours. `null` is a gap. */
@@ -115,9 +125,12 @@ export default function AdminDataTable<TRow>({
   loading = false,
   rowSelection,
   onRowSelectionChange,
+  onRowClick,
+  selectedRowId = null,
+  initialSorting = [],
 }: AdminDataTableProps<TRow>) {
   const searchId = useId()
-  const [sorting, setSorting] = useState<SortingState>([])
+  const [sorting, setSorting] = useState<SortingState>(initialSorting)
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([])
   const [globalFilter, setGlobalFilter] = useState('')
   const [pagination, setPagination] = useState<PaginationState>({ pageIndex: 0, pageSize: PAGE_SIZES[0] })
@@ -243,7 +256,26 @@ export default function AdminDataTable<TRow>({
               </TableHeader>
               <TableBody>
                 {table.getRowModel().rows.map((row) => (
-                  <TableRow key={row.id} data-testid={`row-${row.id}`} className="hover:bg-bial-bg/50">
+                  <TableRow
+                    key={row.id}
+                    data-testid={`row-${row.id}`}
+                    aria-current={row.id === selectedRowId ? 'true' : undefined}
+                    onClick={
+                      onRowClick &&
+                      ((e) => {
+                        // Portaled menus bubble their clicks through the row that opened them.
+                        const target = e.target
+                        if (!(target instanceof Element) || !e.currentTarget.contains(target)) return
+                        if (target.closest(ROW_CONTROLS) !== null) return
+                        onRowClick(row.original, e.currentTarget)
+                      })
+                    }
+                    className={cn(
+                      'hover:bg-bial-bg/50',
+                      onRowClick && 'cursor-pointer',
+                      row.id === selectedRowId && 'bg-[#E6F2F2] hover:bg-[#E6F2F2]',
+                    )}
+                  >
                     {row.getVisibleCells().map((cell) => (
                       <TableCell key={cell.id} className={cn('px-4 py-[11px]', cell.column.columnDef.meta?.className)}>
                         {flexRender(cell.column.columnDef.cell, cell.getContext())}

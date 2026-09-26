@@ -21,7 +21,7 @@ const h = vi.hoisted(() => ({
   disableApp: vi.fn(),
   enableApp: vi.fn(),
   deleteApp: vi.fn(),
-  fetchAudit: vi.fn(),
+  fetchHistory: vi.fn(),
 }))
 
 vi.mock('../../utils/auth', () => ({ getStoredUser: h.getStoredUser }))
@@ -59,6 +59,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   h.getStoredUser.mockReturnValue(ADMIN)
   h.listApps.mockResolvedValue({ apps: [PENDING], truncated: false })
+  h.fetchHistory.mockResolvedValue({ entries: [], live: null, liveUrl: null, truncated: false })
 })
 afterEach(() => cleanup())
 
@@ -69,7 +70,7 @@ const renderAdmin = () =>
     </MemoryRouter>,
   )
 
-/** Open the one pending row's review modal and press Approve — the exact path
+/** Open the one pending row's panel and press Approve — the exact path
  *  `AppRegistryPanel.act()` reports back through `onToast`. */
 const openReviewAndApprove = () => {
   fireEvent.click(screen.getByRole('button', { name: 'Gate Tool' }))

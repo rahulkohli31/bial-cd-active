@@ -2,28 +2,32 @@
 
 All request/response models for the two admin routers (`/admin/apps` governance and `/admin`
 users/limits/feedback), on the shared `CamelModel` base — camelCase over the wire, matching the
-admin SPA panels (`AppRegistryPanel`, `AuditDrawer`, …).
+admin SPA panels (`AppRegistryPanel`, `AppSheet`, …).
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Annotated, Any
+from enum import StrEnum
+from typing import Annotated, Any, Literal
 
 from pydantic import AfterValidator, Field, field_validator
 
 from src.api.v1.deploy.schemas import RegistryStatus
 from src.db.models.app_registry import AppStatus
+from src.db.models.deployment import DeploymentStatus
 from src.schemas import CamelModel, clean_stated_reason
 
 # --- governance (`/admin/apps`) ------------------------------------------------
 
 
 class LiveVersion(CamelModel):
-    """The version serving now: its commit, and when the attempt that put it there finished.
-    Either can be null on a row that never recorded it."""
+    """The version serving now: the number of the send that put it there, its commit, and when
+    that send first went live. `number` is null when no recorded send owns the serving attempt,
+    and `since` is then when that attempt finished. Any field is null when nothing recorded it."""
 
+    number: int | None
     commit_sha: str | None
     since: datetime | None
 
@@ -82,6 +86,93 @@ class AppListResponse(CamelModel):
 
     apps: list[AdminAppOut]
     truncated: bool = False
+
+
+class DecisionKind(StrEnum):
+    """What was decided about one sent version."""
+
+    WAITING = "waiting"
+    PUBLISHED = "published"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    WITHDRAWN = "withdrawn"
+    NOT_RECORDED = "not_recorded"
+
+
+class VersionState(StrEnum):
+    """Where one sent version stands now."""
+
+    WAITING = "waiting"
+    LIVE = "live"
+    REPLACED = "replaced"
+    TAKEN_OFFLINE = "taken_offline"
+    PUBLISHING = "publishing"
+    PUBLISH_FAILED = "publish_failed"
+    NOT_PUBLISHED = "not_published"
+    REJECTED = "rejected"
+    WITHDRAWN = "withdrawn"
+    NOT_RECORDED = "not_recorded"
+
+
+class HistoryDecision(CamelModel):
+    """Who decided and when; `note` is a rejection's note. A version published by itself has
+    no `by` or `at`, and a field the records never held is null."""
+
+    kind: DecisionKind
+    by: str | None
+    at: datetime | None
+    note: str | None
+
+
+class HistoryAttempt(CamelModel):
+    """One publish attempt of a version, oldest first."""
+
+    status: DeploymentStatus
+    started_at: datetime
+    finished_at: datetime | None
+    failure_code: str | None
+
+
+class HistoryVersion(CamelModel):
+    """One send for publishing. `declaration` is the one stored with that send's decision, null
+    when none was. `replacedBy` is the number of the version that went live after it."""
+
+    kind: Literal["version"] = "version"
+    number: int
+    commit_sha: str | None
+    submission_id: uuid.UUID | None
+    sent_at: datetime
+    sent_by: str | None
+    declaration: dict[str, Any] | None
+    decision: HistoryDecision
+    attempts: list[HistoryAttempt]
+    state: VersionState
+    published_at: datetime | None
+    replaced_by: int | None
+    replaced_at: datetime | None
+
+
+class HistoryEvent(CamelModel):
+    """Something done to the app outside any send. A disable carries the enable that ended it."""
+
+    kind: Literal["event"] = "event"
+    action: str
+    at: datetime
+    by: str | None
+    reenabled_at: datetime | None
+
+
+HistoryEntry = Annotated[HistoryVersion | HistoryEvent, Field(discriminator="kind")]
+
+
+class AppHistoryResponse(CamelModel):
+    """An app's versions and events, newest first. `live` reads the same numbering as the App
+    Registry's live version. `truncated` says the oldest records were not read."""
+
+    entries: list[HistoryEntry]
+    live: LiveVersion | None
+    live_url: str | None
+    truncated: bool
 
 
 class AppStatusCounts(CamelModel):
@@ -381,25 +472,6 @@ class DeployReconcileResponse(CamelModel):
     throttled request read as "gone" would eventually mark a live app failed. Counts only."""
 
     resolved: int
-
-
-class AuditEventOut(CamelModel):
-    id: uuid.UUID
-    actor_id: uuid.UUID | None
-    # The actor's human handle (email), resolved from `actor_id`, so the admin AuditDrawer can
-    # name the actor instead of showing a raw uuid or "anonymous". None if the actor was deleted.
-    username: str | None
-    action: str
-    resource_type: str
-    resource_id: str | None
-    detail: dict[str, Any] | None
-    # The count-bearing detail (flag flips, reconcile tallies) surfaced top-level for the UI.
-    count: int | None
-    created_at: datetime
-
-
-class AuditListResponse(CamelModel):
-    events: list[AuditEventOut]
 
 
 # --- users / limits / feedback (`/admin`) --------------------------------------

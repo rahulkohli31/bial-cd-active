@@ -13,7 +13,7 @@ const h = vi.hoisted(() => ({
   disableApp: vi.fn(),
   enableApp: vi.fn(),
   deleteApp: vi.fn(),
-  fetchAudit: vi.fn(),
+  fetchHistory: vi.fn(),
 }))
 vi.mock('../../../utils/appRegistryApi', () => h)
 
@@ -48,7 +48,7 @@ const APPROVED = {
   registryStatus: 'live',
   hasApprovedSnapshot: true,
   // Built from local parts, so the day the row prints is the same in every time zone.
-  liveVersion: { commitSha: LIVE_SHA, since: new Date(2026, 8, 25, 16, 40).toISOString() },
+  liveVersion: { number: 4, commitSha: LIVE_SHA, since: new Date(2026, 8, 25, 16, 40).toISOString() },
 }
 
 const DRAFT = {
@@ -63,6 +63,8 @@ const REJECTED = { ...PENDING, appId: 'app-5', name: 'Turned Down Tool', status:
 const DISABLED = { ...PENDING, appId: 'app-6', name: 'Switched Off Tool', status: 'disabled', registryStatus: 'disabled' }
 
 const listOf = (...apps) => ({ apps, truncated: false })
+
+const NO_HISTORY = { entries: [], live: null, liveUrl: null, truncated: false }
 
 /**
  * A declaration in the shape the publish gate writes
@@ -115,9 +117,10 @@ afterEach(cleanup)
 beforeEach(() => {
   for (const fn of Object.values(h)) fn.mockReset()
   h.listApps.mockResolvedValue(listOf(PENDING))
+  h.fetchHistory.mockResolvedValue(NO_HISTORY)
 })
 
-/** Open the review modal for the one pending row, the way a row click does. */
+/** Open the side panel for the one pending row from its name. */
 const openReview = async () => {
   fireEvent.click(await screen.findByRole('button', { name: 'Gate Tool' }))
 }
@@ -212,7 +215,7 @@ describe('AppRegistryPanel — one list, every app', () => {
     await openReview()
     fireEvent.click(screen.getByTestId('approve-btn'))
     await waitFor(() => expect(onToast).toHaveBeenCalledWith(copy, 'problem'))
-    // The modal stays OPEN on the 409: act() reports failure, so onApprove never nulls the review.
+    // The panel stays OPEN on the 409: act() reports failure, so onApprove never closes it.
     expect(screen.getByTestId('approve-btn')).toBeTruthy()
   })
 
@@ -299,14 +302,28 @@ describe('each row says where the app stands', () => {
     expect(shown.sort()).toEqual(['row-s-failed', 'row-s-offline', 'row-s-publishing', 'row-s-unpublished'])
   })
 
-  it('shows the live version’s short commit and the day it went live, and a dash when nothing is live', async () => {
-    h.listApps.mockResolvedValue(listOf(PENDING, APPROVED))
+  it('shows the live version’s number, short commit and the day it went live, and a dash when nothing is live', async () => {
+    const unnumbered = { ...APPROVED, appId: 'app-3', name: 'Old Tool', liveVersion: { ...APPROVED.liveVersion, number: null } }
+    h.listApps.mockResolvedValue(listOf(PENDING, APPROVED, unnumbered))
     render(<AppRegistryPanel onToast={() => {}} />)
     await screen.findByText('Live Tool')
 
-    const liveCell = within(screen.getByTestId('row-app-2')).getAllByRole('cell')[4]
-    expect(liveCell.textContent).toBe('7a3c9e0since 25 Sep')
-    expect(within(screen.getByTestId('row-app-1')).getAllByRole('cell')[4].textContent).toBe('—')
+    const liveCell = (appId) => within(screen.getByTestId(`row-${appId}`)).getAllByRole('cell')[4].textContent
+    expect(liveCell('app-2')).toBe('v4 · 7a3c9e0since 25 Sep')
+    expect(liveCell('app-3')).toBe('7a3c9e0since 25 Sep')
+    expect(liveCell('app-1')).toBe('—')
+  })
+
+  it('opens sorted by last activity, newest first', async () => {
+    h.listApps.mockResolvedValue(listOf(
+      { ...APPROVED, appId: 'older', name: 'Older', updatedAt: '2026-09-20T09:00:00Z' },
+      { ...APPROVED, appId: 'newer', name: 'Newer', updatedAt: '2026-09-26T09:00:00Z' },
+    ))
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Newer')
+
+    expect(screen.getAllByRole('row').slice(1).map((row) => row.getAttribute('data-testid'))).toEqual(['row-newer', 'row-older'])
+    expect(screen.getByTestId('sort-updatedAt').closest('th').getAttribute('aria-sort')).toBe('descending')
   })
 
   it('shows the last activity as day, month and time, and a dash for the classification', async () => {
@@ -371,33 +388,71 @@ describe('finding one app among many', () => {
 })
 
 describe('the row menu', () => {
-  it('Open on a waiting app opens its review', async () => {
+  it('Open on a waiting app opens its panel on Review', async () => {
     render(<AppRegistryPanel onToast={() => {}} />)
     await openMenu('app-1')
     await pickMenuItem('Open')
 
     expect(await screen.findByTestId('approve-btn')).toBeTruthy()
+    expect(screen.getByRole('tab', { name: 'Review' }).getAttribute('aria-selected')).toBe('true')
   })
 
-  it('Open on any other app opens its audit trail', async () => {
+  it('Open on any other app opens its panel on History alone', async () => {
     h.listApps.mockResolvedValue(listOf(APPROVED))
-    h.fetchAudit.mockResolvedValue([])
     render(<AppRegistryPanel onToast={() => {}} />)
     await openMenu('app-2')
     await pickMenuItem('Open')
 
-    expect(await screen.findByText('Audit — Live Tool')).toBeTruthy()
-    expect(screen.queryByTestId('approve-btn')).toBeNull()
-    expect(h.fetchAudit).toHaveBeenCalledWith('app-2')
+    const panel = await screen.findByRole('dialog', { name: 'Live Tool' })
+    expect(within(panel).getByRole('heading', { name: 'History' })).toBeTruthy()
+    expect(within(panel).queryByRole('tab')).toBeNull()
+    expect(within(panel).queryByTestId('approve-btn')).toBeNull()
+    expect(h.fetchHistory).toHaveBeenCalledWith('app-2')
   })
 
-  it('a click on the row opens what Open does', async () => {
-    h.listApps.mockResolvedValue(listOf(APPROVED))
-    h.fetchAudit.mockResolvedValue([])
+  it('a click anywhere on a row opens its panel, and the row stays highlighted while it is open', async () => {
+    h.listApps.mockResolvedValue(listOf(APPROVED, { ...APPROVED, appId: 'app-9', name: 'Other Tool' }))
     render(<AppRegistryPanel onToast={() => {}} />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Live Tool' }))
+    const row = await screen.findByTestId('row-app-2')
+    expect(row.getAttribute('aria-current')).toBeNull()
 
-    expect(await screen.findByText('Audit — Live Tool')).toBeTruthy()
+    fireEvent.click(within(row).getAllByRole('cell')[1])
+
+    expect(await screen.findByRole('dialog', { name: 'Live Tool' })).toBeTruthy()
+    expect(row.getAttribute('aria-current')).toBe('true')
+    expect(screen.getByTestId('row-app-9').getAttribute('aria-current')).toBeNull()
+  })
+
+  it('the row’s own controls, and its menu’s items, do not open its panel', async () => {
+    h.listApps.mockResolvedValue(listOf(APPROVED))
+    h.patchApp.mockResolvedValue({})
+    h.disableApp.mockResolvedValue({})
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Live Tool')
+
+    fireEvent.click(screen.getByTitle('Toggle required login'))
+    fireEvent.click(screen.getByTestId('actions-app-2'))
+    await openMenu('app-2')
+    await pickMenuItem('Disable')
+
+    // Liveness: each control really acted, so no panel means the row held back.
+    await waitFor(() => expect(h.patchApp).toHaveBeenCalled())
+    await waitFor(() => expect(h.disableApp).toHaveBeenCalledWith('app-2'))
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('Escape closes the panel and puts focus back on the row that opened it', async () => {
+    h.listApps.mockResolvedValue(listOf(APPROVED))
+    render(<AppRegistryPanel onToast={() => {}} />)
+    const row = await screen.findByTestId('row-app-2')
+    fireEvent.click(within(row).getAllByRole('cell')[1])
+    const panel = await screen.findByRole('dialog', { name: 'Live Tool' })
+
+    fireEvent.keyDown(panel, { key: 'Escape' })
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(row.getAttribute('aria-current')).toBeNull()
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Live Tool' }))
   })
 
   it('an enabled app offers Disable, a disabled one Enable, and a waiting one neither', async () => {
@@ -659,9 +714,10 @@ describe('the scroll contract — Approve and Reject stay reachable', () => {
     // pixel assertion here would be theatre — containment is the real mechanism.
     expect(scroller.contains(approve)).toBe(false)
     expect(scroller.contains(reject)).toBe(false)
+    expect(scroller.parentElement.contains(approve)).toBe(true)
     expect(scroller.className).toMatch(/overflow-y-auto/)
     expect(scroller.className).toMatch(/min-h-0/)
-    expect(scroller.parentElement.className).toMatch(/max-h-\[90vh\]/)
+    expect(scroller.parentElement.className).toMatch(/min-h-0/)
     expect(scroller.parentElement.className).toMatch(/flex-col/)
   })
 })
@@ -717,7 +773,7 @@ describe('the rejection note is required, with a floor', () => {
   })
 })
 
-describe('a submission withdrawn while the modal was open', () => {
+describe('a submission withdrawn while the panel was open', () => {
   it('renders the withdrawal message IN PLACE OF the actions', async () => {
     h.approveApp.mockRejectedValue(new ApiError(
       'The developer withdrew this submission, so there is nothing left to decide.',
@@ -753,15 +809,10 @@ describe('a submission withdrawn while the modal was open', () => {
 })
 
 describe('closing the review puts focus somewhere real', () => {
-  // THE MODAL IS HAND-ROLLED — no Radix `DialogContent`, so no `FocusScope` capturing the
-  // element that had focus and restoring it on unmount. Every route out of it dropped focus on
-  // `<body>`, where the next Tab restarts at the top of the document rather than at the list
-  // the administrator is working through.
-
   it('dismissing it returns focus to the row that opened it', async () => {
     render(<AppRegistryPanel onToast={() => {}} />)
     await openReview()
-    // LIVENESS FIRST: the modal really opened, so "it is gone" below is a close rather than an
+    // LIVENESS FIRST: the panel really opened, so "it is gone" below is a close rather than an
     // assertion that ran before anything rendered.
     expect(screen.getByTestId('approve-btn')).toBeTruthy()
 
@@ -806,19 +857,13 @@ describe('approving publishes, and the review says so', () => {
     await openReview()
 
     expect(screen.getByTestId('approve-btn').textContent).toContain('Approve and publish')
-    expect(screen.getByTestId('review-publish-note').textContent).toMatch(/approving publishes it/i)
+    expect(screen.getByTestId('review-publish-note').textContent).toBe(`Approving publishes exactly ${SHA.slice(0, 7)}.`)
     // Nothing left over from the manual route or the developer's second click.
     expect(document.body.textContent).not.toMatch(/go-live runbook/i)
     expect(document.body.textContent).not.toMatch(/publishes this approved version themselves/i)
   })
 })
 
-/**
- * The two surfaces that used to put internal identifiers in front of an administrator: the
- * row under every app name, and the audit trail, which rendered the stored action token
- * verbatim. Neither is something an administrator can act on, and `publish_gate` names a
- * column rather than an event.
- */
 describe('internal identifiers stay out of the administrator’s way', () => {
   it('names the app in the table without its internal id', async () => {
     render(<AppRegistryPanel onToast={() => {}} />)
@@ -833,41 +878,6 @@ describe('internal identifiers stay out of the administrator’s way', () => {
     render(<AppRegistryPanel onToast={() => {}} />)
     expect(await screen.findByText('(untitled app)')).toBeTruthy()
     expect(screen.queryByText('app-1')).toBeNull()
-  })
-
-  it('the audit trail says what happened, not which column it was written to', async () => {
-    h.listApps.mockResolvedValue(listOf(APPROVED))
-    h.fetchAudit.mockResolvedValue([
-      { id: 'e1', action: 'classification_review', username: 'alice', createdAt: '2026-07-16T09:00:00Z', resourceId: 'app-2', count: null },
-      { id: 'e2', action: 'publish_gate', username: 'alice', createdAt: '2026-07-16T09:01:00Z', resourceId: 'app-2', count: null },
-      { id: 'e3', action: 'reject', username: 'admin', createdAt: '2026-07-16T09:02:00Z', resourceId: 'app-2', count: null },
-    ])
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await openMenu('app-2')
-    await pickMenuItem('Open')
-
-    expect(await screen.findByText('Automatic data check')).toBeTruthy()
-    expect(screen.getByText('Publish decision')).toBeTruthy()
-    expect(screen.getByText('Sent back for changes')).toBeTruthy()
-    // The raw tokens are gone, and so is the app id repeated on every single row — every
-    // event in this drawer is about the one app already named in the header.
-    expect(screen.queryByText('classification_review')).toBeNull()
-    expect(screen.queryByText('publish_gate')).toBeNull()
-    expect(screen.queryByText(/· app-2/)).toBeNull()
-  })
-
-  it('explains each entry rather than leaving the title to carry it', async () => {
-    h.listApps.mockResolvedValue(listOf(APPROVED))
-    h.fetchAudit.mockResolvedValue([
-      { id: 'e1', action: 'publish_gate', username: 'alice', createdAt: '2026-07-16T09:00:00Z', resourceId: 'app-2', count: null },
-    ])
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await openMenu('app-2')
-    await pickMenuItem('Open')
-
-    expect(await screen.findByText(/decided whether the app could go live or needed a person/i)).toBeTruthy()
-    // The actor is still on record — the trail's whole job — just not the row's id.
-    expect(screen.getByText(/by alice/)).toBeTruthy()
   })
 })
 

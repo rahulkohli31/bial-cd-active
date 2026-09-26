@@ -34,8 +34,21 @@ describe('audit actions read as English', () => {
   it('says who the decision belongs to on the two that are a human choice', () => {
     expect(auditLabel('approve').description).toMatch(/administrator/i)
     expect(auditLabel('reject').description).toMatch(/administrator/i)
-    // And the developer is told what happens next, since approval is not publication.
-    expect(auditLabel('approve').description).toMatch(/developer publishes/i)
+  })
+
+  it('says that approving publishes the version that was reviewed', () => {
+    expect(auditLabel('approve').description).toMatch(/publishes the version they reviewed/i)
+    expect(auditLabel('approve').description).not.toMatch(/developer publishes/i)
+  })
+
+  it('names each event History shows between versions as it happened', () => {
+    expect(['disable', 'enable', 'takedown', 'unpublish', 'restart'].map((action) => auditLabel(action).title)).toEqual([
+      'Disabled',
+      'Re-enabled',
+      'Taken offline',
+      'Taken offline',
+      'Restarted',
+    ])
   })
 
   it('distinguishes an administrator approving their OWN app', () => {

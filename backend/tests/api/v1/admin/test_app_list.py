@@ -151,7 +151,11 @@ async def test_the_live_version_is_the_commit_serving_and_when_it_went_live(
     row = (await _rows(client, headers))[str(app.id)]
 
     assert row["registryStatus"] == "live"
-    assert row["liveVersion"] == {"commitSha": _LIVE_SHA, "since": "2026-09-25T16:40:00Z"}
+    assert row["liveVersion"] == {
+        "number": None,
+        "commitSha": _LIVE_SHA,
+        "since": "2026-09-25T16:40:00Z",
+    }
 
 
 async def test_an_app_waiting_for_review_shows_the_version_still_serving(
@@ -183,7 +187,11 @@ async def test_a_failed_restart_keeps_the_version_it_restarted_live(client, db_s
     row = (await _rows(client, headers))[str(app.id)]
 
     assert row["registryStatus"] == "live"
-    assert row["liveVersion"] == {"commitSha": _LIVE_SHA, "since": "2026-09-25T16:40:00Z"}
+    assert row["liveVersion"] == {
+        "number": None,
+        "commitSha": _LIVE_SHA,
+        "since": "2026-09-25T16:40:00Z",
+    }
 
 
 async def test_a_live_row_always_names_the_version_it_serves(client, db_session) -> None:

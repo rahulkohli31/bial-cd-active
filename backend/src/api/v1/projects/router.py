@@ -1423,9 +1423,8 @@ async def delete_project(
             resource_id=str(project_id),
         )
         if handles is not None:
-            # NAMES only — never the DSN. `appId` is what makes this project-scoped
-            # row visible in the app's audit drawer (`admin.read_audit` matches on it); an
-            # app-less project simply has no app to file it under.
+            # NAMES only — never the DSN. `appId` ties this project-scoped row to the app
+            # the database served; an app-less project simply has no app to file it under.
             detail: dict[str, str] = {"dbName": handles.db_name, "roleName": handles.role_name}
             if app_id is not None:
                 detail["appId"] = str(app_id)

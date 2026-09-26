@@ -29,7 +29,7 @@ const TABS = [
 ]
 
 /**
- * Admin Console — App Registry (approve/reject/disable/delete/audit, backed
+ * Admin Console — App Registry (approve/reject/disable/delete/history, backed
  * by the real /api/admin/apps endpoints), per-user usage limits, and feedback.
  * Each tab is a self-contained, API-backed panel.
  */

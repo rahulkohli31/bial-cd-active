@@ -297,6 +297,65 @@
         "title": "AppDeleteRequest",
         "type": "object"
       },
+      "AppHistoryResponse": {
+        "description": "An app's versions and events, newest first. `live` reads the same numbering as the App\nRegistry's live version. `truncated` says the oldest records were not read.",
+        "properties": {
+          "entries": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "event": "#/components/schemas/HistoryEvent",
+                  "version": "#/components/schemas/HistoryVersion"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/HistoryVersion"
+                },
+                {
+                  "$ref": "#/components/schemas/HistoryEvent"
+                }
+              ]
+            },
+            "title": "Entries",
+            "type": "array"
+          },
+          "live": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LiveVersion"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "liveUrl": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Liveurl"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "entries",
+          "live",
+          "liveUrl",
+          "truncated"
+        ],
+        "title": "AppHistoryResponse",
+        "type": "object"
+      },
       "AppListResponse": {
         "description": "The registry listing, most recently active first, plus whether it is the whole set.\n\n`truncated` exists because the badge and list come from different queries: the count is\nan uncapped `GROUP BY`, the listing stops at `LISTING_CAP`. Making the cap visible stops the\ntwo surfaces disagreeing with nothing on screen admitting it.",
         "properties": {
@@ -696,114 +755,6 @@
           "attachmentId"
         ],
         "title": "AttachmentRefItem",
-        "type": "object"
-      },
-      "AuditEventOut": {
-        "properties": {
-          "action": {
-            "title": "Action",
-            "type": "string"
-          },
-          "actorId": {
-            "anyOf": [
-              {
-                "format": "uuid",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Actorid"
-          },
-          "count": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Count"
-          },
-          "createdAt": {
-            "format": "date-time",
-            "title": "Createdat",
-            "type": "string"
-          },
-          "detail": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Detail"
-          },
-          "id": {
-            "format": "uuid",
-            "title": "Id",
-            "type": "string"
-          },
-          "resourceId": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Resourceid"
-          },
-          "resourceType": {
-            "title": "Resourcetype",
-            "type": "string"
-          },
-          "username": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Username"
-          }
-        },
-        "required": [
-          "id",
-          "actorId",
-          "username",
-          "action",
-          "resourceType",
-          "resourceId",
-          "detail",
-          "count",
-          "createdAt"
-        ],
-        "title": "AuditEventOut",
-        "type": "object"
-      },
-      "AuditListResponse": {
-        "properties": {
-          "events": {
-            "items": {
-              "$ref": "#/components/schemas/AuditEventOut"
-            },
-            "title": "Events",
-            "type": "array"
-          }
-        },
-        "required": [
-          "events"
-        ],
-        "title": "AuditListResponse",
         "type": "object"
       },
       "BannerItem": {
@@ -1933,6 +1884,19 @@
         "title": "DatabaseReconcileResponse",
         "type": "object"
       },
+      "DecisionKind": {
+        "description": "What was decided about one sent version.",
+        "enum": [
+          "waiting",
+          "published",
+          "approved",
+          "rejected",
+          "withdrawn",
+          "not_recorded"
+        ],
+        "title": "DecisionKind",
+        "type": "string"
+      },
       "DeployCredentialResponse": {
         "description": "The long-lived per-app Blob credential a deployed container runs with, as\n`BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS`. `sas` is a 365-day bearer\ncredential: the admin pastes it straight into an ACA secret and it is NEVER logged, NEVER\nwritten to the audit trail (the audit row carries the expiry, not the token), and never part\nof any list projection. `expiresAt` comes from the app's stored access policy — deleting that\npolicy revokes this credential.",
         "properties": {
@@ -2269,6 +2233,16 @@
         ],
         "title": "DeploymentResponse",
         "type": "object"
+      },
+      "DeploymentStatus": {
+        "description": "Three states, deliberately. The step-by-step phase (`packing`, `building`,\n`starting`, …) is display and lives in `step` as a plain string — adding a phase must\nnever need a migration, while adding a STATUS would change what the partial index\ncovers and is therefore a real schema decision. `unpublished_at` (below) is the same\nreasoning applied to \"is it live right now\" — a second axis, not a fourth\nstatus.",
+        "enum": [
+          "running",
+          "succeeded",
+          "failed"
+        ],
+        "title": "DeploymentStatus",
+        "type": "string"
       },
       "DetailBody": {
         "description": "`{\"detail\": str}` — bare-`HTTPException` deps (401/403) and the unhandled 500.",
@@ -2661,6 +2635,281 @@
         "title": "HealthStatus",
         "type": "object"
       },
+      "HistoryAttempt": {
+        "description": "One publish attempt of a version, oldest first.",
+        "properties": {
+          "failureCode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failurecode"
+          },
+          "finishedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finishedat"
+          },
+          "startedAt": {
+            "format": "date-time",
+            "title": "Startedat",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/DeploymentStatus"
+          }
+        },
+        "required": [
+          "status",
+          "startedAt",
+          "finishedAt",
+          "failureCode"
+        ],
+        "title": "HistoryAttempt",
+        "type": "object"
+      },
+      "HistoryDecision": {
+        "description": "Who decided and when; `note` is a rejection's note. A version published by itself has\nno `by` or `at`, and a field the records never held is null.",
+        "properties": {
+          "at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At"
+          },
+          "by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "By"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DecisionKind"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          }
+        },
+        "required": [
+          "kind",
+          "by",
+          "at",
+          "note"
+        ],
+        "title": "HistoryDecision",
+        "type": "object"
+      },
+      "HistoryEvent": {
+        "description": "Something done to the app outside any send. A disable carries the enable that ended it.",
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "at": {
+            "format": "date-time",
+            "title": "At",
+            "type": "string"
+          },
+          "by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "By"
+          },
+          "kind": {
+            "const": "event",
+            "default": "event",
+            "title": "Kind",
+            "type": "string"
+          },
+          "reenabledAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reenabledat"
+          }
+        },
+        "required": [
+          "action",
+          "at",
+          "by",
+          "reenabledAt"
+        ],
+        "title": "HistoryEvent",
+        "type": "object"
+      },
+      "HistoryVersion": {
+        "description": "One send for publishing. `declaration` is the one stored with that send's decision, null\nwhen none was. `replacedBy` is the number of the version that went live after it.",
+        "properties": {
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/HistoryAttempt"
+            },
+            "title": "Attempts",
+            "type": "array"
+          },
+          "commitSha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commitsha"
+          },
+          "decision": {
+            "$ref": "#/components/schemas/HistoryDecision"
+          },
+          "declaration": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Declaration"
+          },
+          "kind": {
+            "const": "version",
+            "default": "version",
+            "title": "Kind",
+            "type": "string"
+          },
+          "number": {
+            "title": "Number",
+            "type": "integer"
+          },
+          "publishedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Publishedat"
+          },
+          "replacedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replacedat"
+          },
+          "replacedBy": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replacedby"
+          },
+          "sentAt": {
+            "format": "date-time",
+            "title": "Sentat",
+            "type": "string"
+          },
+          "sentBy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sentby"
+          },
+          "state": {
+            "$ref": "#/components/schemas/VersionState"
+          },
+          "submissionId": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Submissionid"
+          }
+        },
+        "required": [
+          "number",
+          "commitSha",
+          "submissionId",
+          "sentAt",
+          "sentBy",
+          "declaration",
+          "decision",
+          "attempts",
+          "state",
+          "publishedAt",
+          "replacedBy",
+          "replacedAt"
+        ],
+        "title": "HistoryVersion",
+        "type": "object"
+      },
       "LimitFields": {
         "properties": {
           "contextHardLimit": {
@@ -2723,7 +2972,7 @@
         "type": "object"
       },
       "LiveVersion": {
-        "description": "The version serving now: its commit, and when the attempt that put it there finished.\nEither can be null on a row that never recorded it.",
+        "description": "The version serving now: the number of the send that put it there, its commit, and when\nthat send first went live. `number` is null when no recorded send owns the serving attempt,\nand `since` is then when that attempt finished. Any field is null when nothing recorded it.",
         "properties": {
           "commitSha": {
             "anyOf": [
@@ -2735,6 +2984,17 @@
               }
             ],
             "title": "Commitsha"
+          },
+          "number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Number"
           },
           "since": {
             "anyOf": [
@@ -2750,6 +3010,7 @@
           }
         },
         "required": [
+          "number",
           "commitSha",
           "since"
         ],
@@ -4926,6 +5187,23 @@
         "title": "ValidationError",
         "type": "object"
       },
+      "VersionState": {
+        "description": "Where one sent version stands now.",
+        "enum": [
+          "waiting",
+          "live",
+          "replaced",
+          "taken_offline",
+          "publishing",
+          "publish_failed",
+          "not_published",
+          "rejected",
+          "withdrawn",
+          "not_recorded"
+        ],
+        "title": "VersionState",
+        "type": "string"
+      },
       "WithdrawResponse": {
         "properties": {
           "appId": {
@@ -5447,7 +5725,7 @@
     },
     "/v1/admin/apps/{app_id}": {
       "delete": {
-        "description": "Hard-delete an app and sweep its artifacts.\n\nThe ONLY storage route on this router that keeps the raising `Storage`, deliberately: it\nneither documents a 503 nor maps `StorageError`. `nuke_app` requires a real store (its\nsubmissions ENUMERATION raises rather than strand blobs nobody can find), and it has no\nstorage-unavailable copy to answer with. Storage missing here is a deploy bug, and a 500 is\nthe honest answer to one; inventing a 503 would be inventing a contract.\n\nIT REQUIRES A REASON, within the delete-reason word bound. Destroying somebody else's work with\nno undo is the harshest lever on this router and was the only one that asked for nothing — the\nbrowser `window.confirm` behind it could not have collected an answer if it wanted to. The\nreason rides the `app:delete` row below, which is written before destruction and has no foreign\nkey to the app, so it is still readable by app id long after the app is gone (`read_audit` says\nso outright: no existence pre-check).",
+        "description": "Hard-delete an app and sweep its artifacts.\n\nThe ONLY storage route on this router that keeps the raising `Storage`, deliberately: it\nneither documents a 503 nor maps `StorageError`. `nuke_app` requires a real store (its\nsubmissions ENUMERATION raises rather than strand blobs nobody can find), and it has no\nstorage-unavailable copy to answer with. Storage missing here is a deploy bug, and a 500 is\nthe honest answer to one; inventing a 503 would be inventing a contract.\n\nIT REQUIRES A REASON, within the delete-reason word bound. Destroying somebody else's work with\nno undo is the harshest lever on this router and was the only one that asked for nothing — the\nbrowser `window.confirm` behind it could not have collected an answer if it wanted to. The\nreason rides the `app:delete` row below, which is written before destruction and has no foreign\nkey to the app, so it is still readable by app id long after the app is gone.",
         "operationId": "hard_delete_v1_admin_apps__app_id__delete",
         "parameters": [
           {
@@ -5739,79 +6017,6 @@
           }
         },
         "summary": "Approve",
-        "tags": [
-          "admin"
-        ]
-      }
-    },
-    "/v1/admin/apps/{app_id}/audit": {
-      "get": {
-        "operationId": "read_audit_v1_admin_apps__app_id__audit_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "app_id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "title": "App Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AuditListResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Not authenticated"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Super-admin privileges required"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Internal server error"
-          }
-        },
-        "summary": "Read Audit",
         "tags": [
           "admin"
         ]
@@ -6322,6 +6527,90 @@
           }
         },
         "summary": "Enable",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/admin/apps/{app_id}/history": {
+      "get": {
+        "description": "The app's History, newest first: one numbered version per time its owner sent it for\npublishing, each with its own decision and publish attempts, and the app's other events\nbetween them by date. Read from the audit trail and deploy attempts only, up to a cap that\n`truncated` reports.",
+        "operationId": "read_history_v1_admin_apps__app_id__history_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppHistoryResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Super-admin privileges required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "App not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Read History",
         "tags": [
           "admin"
         ]

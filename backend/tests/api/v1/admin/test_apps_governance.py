@@ -778,10 +778,15 @@ async def test_governance_actions_are_audited_with_artifact_detail(
     _stage_bundle(store, row)
     headers = await _admin(db_session)
     await client.post(f"/v1/admin/apps/{row.id}/approve", json=_approve_body(row), headers=headers)
-    events = await client.get(f"/v1/admin/apps/{row.id}/audit", headers=headers)
-    approve_event = next(e for e in events.json()["events"] if e["action"] == "approve")
-    assert approve_event["detail"]["submissionId"] == str(row.source_submission_id)
-    assert approve_event["detail"]["commitSha"] == _SHA
+    detail = (
+        await db_session.execute(
+            sa.select(AuditLog.detail).where(
+                AuditLog.resource_id == str(row.id), AuditLog.action == "approve"
+            )
+        )
+    ).scalar_one()
+    assert detail["submissionId"] == str(row.source_submission_id)
+    assert detail["commitSha"] == _SHA
 
 
 async def _audited_actions(db_session, app_id) -> list[str]:
@@ -854,7 +859,7 @@ async def test_hard_delete_purges_everything(client, db_session, app) -> None:
     # `detail=` kwarg deletable with the suite still green — and that kwarg IS the
     # administrator's justification, on the one row that outlives what it destroyed. Read by
     # APP ID after the app row is gone, which is the property `audit_logs` is chosen for (no
-    # foreign key, `resource_id` a plain string, `read_audit` does no existence pre-check).
+    # foreign key, `resource_id` a plain string).
     audited = (
         await db_session.execute(
             sa.select(AuditLog).where(
@@ -1098,15 +1103,10 @@ async def test_hard_delete_records_a_database_that_outlived_it(
     assert recorded == {
         "count": 1,
         "survived": [{"artefact": "app_database", "id": "bialdb_stubborn"}],
-        # ★ AND IT IS FINDABLE. The row's `resource_id` is the PROJECT, but `read_audit` looks
-        # up by app id — `resource_id == app_id` OR `detail["appId"]` — so without this field
-        # the record would exist and never appear in the drawer an administrator opens right
-        # after the delete, which is the only place they would think to look. Proved through
-        # the ROUTE below, not by re-reading the table.
+        # The row's `resource_id` is the PROJECT, so the app id rides in the detail: the only
+        # handle from this record back to the app it was about.
         "appId": str(row.id),
     }
-    events = (await client.get(f"/v1/admin/apps/{row.id}/audit", headers=headers)).json()
-    assert "project:teardown-incomplete" in {event["action"] for event in events["events"]}
 
 
 async def test_hard_delete_writes_no_teardown_row_when_nothing_survived(

@@ -284,3 +284,71 @@ describe('AdminDataTable — toolbar and selection', () => {
     expect(seen.at(-1)).toEqual({ i1: true, i2: true, i3: true })
   })
 })
+
+describe('AdminDataTable — opening a row', () => {
+  const withButton: ColumnDef<Item>[] = [
+    ...columns.slice(0, 4),
+    { id: 'actions', header: 'Actions', cell: ({ row }) => <button type="button">Act on {row.original.name}</button> },
+  ]
+
+  it('hands a click anywhere on a row to the handler, with the row and its element', () => {
+    const onRowClick = vi.fn()
+    renderTable([item(1), item(2)], { onRowClick })
+
+    fireEvent.click(within(screen.getByTestId('row-i2')).getByText('owner2'))
+
+    expect(onRowClick).toHaveBeenCalledTimes(1)
+    expect(onRowClick.mock.calls[0][0]).toEqual(item(2))
+    expect(onRowClick.mock.calls[0][1]).toBe(screen.getByTestId('row-i2'))
+  })
+
+  it('leaves a click on one of the row’s own controls to that control', () => {
+    const onRowClick = vi.fn()
+    const onAct = vi.fn()
+    render(
+      <AdminDataTable<Item>
+        columns={[
+          ...columns.slice(0, 4),
+          { id: 'actions', header: 'Actions', cell: () => <button type="button" onClick={onAct}>Act</button> },
+        ]}
+        rows={[item(1)]}
+        getRowId={(r) => r.id}
+        searchable={SEARCHABLE}
+        searchLabel="Search items"
+        searchPlaceholder="Search items or owners…"
+        emptyMessage="No items yet."
+        onRowClick={onRowClick}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Act' }))
+
+    expect(onAct).toHaveBeenCalledTimes(1)
+    expect(onRowClick).not.toHaveBeenCalled()
+  })
+
+  it('draws the selected row highlighted, and only that row', () => {
+    renderTable([item(1), item(2)], { onRowClick: vi.fn(), selectedRowId: 'i2' })
+
+    expect(screen.getByTestId('row-i2').getAttribute('aria-current')).toBe('true')
+    expect(screen.getByTestId('row-i2').className).toContain('bg-[#E6F2F2]')
+    expect(screen.getByTestId('row-i1').getAttribute('aria-current')).toBeNull()
+  })
+
+  it('opens on the sort it is given, drawn as the sorted column', () => {
+    renderTable([item(1), item(3), item(2)], { initialSorting: [{ id: 'size', desc: true }] })
+
+    expect(visibleIds()).toEqual(['row-i3', 'row-i2', 'row-i1'])
+    expect(screen.getByTestId('sort-size').closest('th')?.getAttribute('aria-sort')).toBe('descending')
+  })
+
+  it('keeps a table without these props exactly as it was: unsorted, and no row is clickable', () => {
+    renderTable([item(2), item(1)], { columns: withButton })
+
+    expect(visibleIds()).toEqual(['row-i2', 'row-i1'])
+    const row = screen.getByTestId('row-i2')
+    expect(row.className).not.toContain('cursor-pointer')
+    expect(row.getAttribute('aria-current')).toBeNull()
+    expect(screen.getByTestId('sort-size').closest('th')?.getAttribute('aria-sort')).toBe('none')
+  })
+})

@@ -520,9 +520,7 @@ assert body["messages"][0]["parts"] == [{"type": "text", "text": "hi"}]
 
 ## 9. Reading the audit trail
 
-Two ways, both used in real tests.
-
-**A) Direct DB query on the shared `db_session`** — fastest, no admin cookie
+**A direct DB query on the shared `db_session`** — no admin cookie
 (`test_lifecycle.py:95-104`, `test_records.py:158-169`). Columns on `AuditLog`
 (`src/db/models/audit.py`): `id, actor_id (uuid|None), action (str), resource_type (str),
 resource_id (str|None), detail (jsonb|None), created_at`. `append_audit` flushes within the
@@ -540,18 +538,6 @@ row = (
 ).scalar_one()
 assert row.action == "submit"
 assert row.actor_id == user.id
-```
-
-**B) Through the admin API** — `GET /v1/admin/apps/{id}/audit` (admin cookie),
-returns `{"events": [AuditEventOut, ...]}` newest-first, limit 200
-(`src/api/v1/admin/router.py:427-458`, `test_apps_governance.py:214-220`). Each event:
-`{id, actorId, action, resourceType, resourceId, detail, createdAt}` (camelCase). The query
-matches both `resource_id == app_id` **and** `detail.appId == app_id`.
-
-```python
-events = await client.get(f"/v1/admin/apps/{app_id}/audit", headers=admin_headers)
-actions = [e["action"] for e in events.json()["events"]]
-assert "approve" in actions
 ```
 
 ---

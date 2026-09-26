@@ -283,15 +283,11 @@ async def test_disable_audits_the_names_and_never_the_credential(
     assert detail is not None
     assert detail["dbName"] == record.db_name
     assert detail["roleName"] == record.role_name
-    # Project-scoped row, and `appId` is what keeps it visible in the app's audit drawer.
+    # Project-scoped row, and `appId` is what ties it back to the app.
     assert revoked[0].resource_type == "project"
     assert revoked[0].resource_id == str(row.project_id)
     assert detail["appId"] == str(row.id)
     assert password not in json.dumps(detail)
-
-    # The drawer really does surface it (`read_audit` matches `detail["appId"]`).
-    events = (await client.get(f"/v1/admin/apps/{row.id}/audit", headers=headers)).json()
-    assert "db:revoke" in {event["action"] for event in events["events"]}
 
 
 async def test_disable_for_an_app_with_no_database_is_a_clean_no_op(

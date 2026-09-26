@@ -37,18 +37,18 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from src.api.deps import ContainerStore, DbSession, OptionalStorage, Storage
 from src.api.deps_rbac import CurrentSuperadmin
+from src.api.v1.admin.history import app_history, live_versions
 from src.api.v1.admin.schemas import (
     MAX_DAILY_TOKEN_LIMIT,
     AdminAppOut,
     AdminAppStatusResponse,
     AppCountsResponse,
     AppDeleteRequest,
+    AppHistoryResponse,
     AppListResponse,
     ApproveRequest,
     AppStatusCounts,
     AttachmentReclaimSummary,
-    AuditEventOut,
-    AuditListResponse,
     BulkLimitsRequest,
     BulkLimitsResponse,
     BundleUrlResponse,
@@ -99,7 +99,6 @@ from src.db.models.app_registry import (
     app_status_enum,
 )
 from src.db.models.attachment import Attachment
-from src.db.models.audit import AuditLog
 from src.db.models.deployment import Deployment
 from src.db.models.feedback import Feedback
 from src.db.models.harness_counter import HarnessCount
@@ -278,9 +277,8 @@ _RESTORE_TARGET = sa.func.coalesce(
 
 
 # The `db:*` levers all act on a PROJECT-scoped resource (the database is keyed by project,
-# not by app), which is why every one of them carries `appId` in its `detail`: `read_audit`
-# finds a row by `resource_id == app_id` OR `detail["appId"]`, so without it the whole
-# database half of the trail would be invisible in the app's audit drawer.
+# not by app), which is why every one of them carries `appId` in its `detail`: it is the row's
+# only handle back to the app.
 def _db_detail(app_id: uuid.UUID, handles: TeardownHandles) -> dict[str, Any]:
     """Audit `detail` for a database lever: NAMES only.
 
@@ -384,24 +382,13 @@ async def _advisory_sizes(db: DbSession, project_ids: Sequence[uuid.UUID]) -> di
     return {row[0]: by_name[row[1]] for row in claims if row[1] in by_name}
 
 
-async def _publish_facts(
-    db: DbSession, app_ids: Sequence[uuid.UUID]
-) -> tuple[dict[uuid.UUID, Deployment], dict[uuid.UUID, LiveVersion]]:
-    """Each app's newest deploy attempt, which its status reads, and the version it is serving:
-    its newest successful publish, unless a takedown landed at or after it. Unlike the
-    marketplace's `live_app_ids`, a rejection does not hide it: the app still answers at its
-    address. Two queries however many apps."""
-    if not app_ids:
-        return {}, {}
-    newest = await db.scalars(
-        sa.select(Deployment)
-        .where(Deployment.app_id.in_(app_ids))
-        .distinct(Deployment.app_id)
-        .order_by(Deployment.app_id, Deployment.id.desc())
-    )
+async def _serving(db: DbSession, app_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, Deployment]:
+    """The deployment each app is serving: its newest successful publish, unless a takedown
+    landed at or after it. Unlike the marketplace's `live_app_ids`, a rejection does not hide it:
+    the app still answers at its address. One query however many apps."""
     serving = last_success_deployment()
-    live = await db.execute(
-        sa.select(serving.app_id, serving.head_sha, serving.finished_at).where(
+    rows = await db.scalars(
+        sa.select(serving).where(
             serving.app_id.in_(app_ids),
             ~sa.exists().where(
                 Deployment.app_id == serving.app_id,
@@ -410,10 +397,24 @@ async def _publish_facts(
             ),
         )
     )
-    return (
-        {row.app_id: row for row in newest},
-        {app_id: LiveVersion(commit_sha=sha, since=since) for app_id, sha, since in live},
+    return {row.app_id: row for row in rows}
+
+
+async def _publish_facts(
+    db: DbSession, app_ids: Sequence[uuid.UUID]
+) -> tuple[dict[uuid.UUID, Deployment], dict[uuid.UUID, LiveVersion]]:
+    """Each app's newest deploy attempt, which its status reads, and the version it is serving,
+    numbered as its History numbers it. Four queries however many apps."""
+    if not app_ids:
+        return {}, {}
+    newest = await db.scalars(
+        sa.select(Deployment)
+        .where(Deployment.app_id.in_(app_ids))
+        .distinct(Deployment.app_id)
+        .order_by(Deployment.app_id, Deployment.id.desc())
     )
+    newest_by_app = {row.app_id: row for row in newest}
+    return newest_by_app, await live_versions(db, await _serving(db, app_ids))
 
 
 # --- endpoints -----------------------------------------------------------------
@@ -627,6 +628,7 @@ async def reject(
         raise AppApiError(409, _SUBMISSION_WITHDRAWN, code=_WITHDRAWN_CODE)
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be rejected.")
+    submission_id = app.source_submission_id
     # Both ends are enforced by `RejectRequest.note` (422 at the boundary) — no silent
     # slice here, and no `or ""` either: the note is required and non-blank, so
     # the citizen can never be handed a rejection with nothing in it.
@@ -655,8 +657,14 @@ async def reject(
     )
     if not moved:
         raise AppApiError(409, "Could not reject in the current state.")
+    # The administrator's own words about the decision, which History shows beside it.
     await append_audit(
-        db, actor_id=admin.id, action="reject", resource_type="app", resource_id=str(app_id)
+        db,
+        actor_id=admin.id,
+        action="reject",
+        resource_type="app",
+        resource_id=str(app_id),
+        detail={"submissionId": str(submission_id), "note": body.note},
     )
     await db.commit()
     return AdminAppStatusResponse(app_id=app_id, status=AppStatus.REJECTED)
@@ -1116,8 +1124,7 @@ async def hard_delete(
     no undo is the harshest lever on this router and was the only one that asked for nothing — the
     browser `window.confirm` behind it could not have collected an answer if it wanted to. The
     reason rides the `app:delete` row below, which is written before destruction and has no foreign
-    key to the app, so it is still readable by app id long after the app is gone (`read_audit` says
-    so outright: no existence pre-check)."""
+    key to the app, so it is still readable by app id long after the app is gone."""
     # Contrast `approve` / `bundle-url` / `reconcile-storage` above, which all promise a 503 and
     # so must take `OptionalStorage`.
     #
@@ -1592,45 +1599,22 @@ async def reconcile_deploys(admin: CurrentSuperadmin, db: DbSession) -> DeployRe
 
 
 @router.get(
-    "/{app_id}/audit",
-    # No 404: read_audit queries the audit log directly (no app existence pre-check),
-    # so an unknown app id returns an empty event list (documented as-is).
-    responses=error_responses(*_ADMIN_AUTH),
+    "/{app_id}/history",
+    responses=error_responses((404, ErrorEnvelope, "App not found"), *_ADMIN_AUTH),
 )
-async def read_audit(
+async def read_history(
     app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
-) -> AuditListResponse:
-    app_str = str(app_id)
-    rows = (
-        await db.execute(
-            sa.select(AuditLog, User.email)
-            .outerjoin(User, AuditLog.actor_id == User.id)
-            .where(
-                sa.or_(
-                    AuditLog.resource_id == app_str,
-                    AuditLog.detail["appId"].astext == app_str,
-                )
-            )
-            .order_by(AuditLog.created_at.desc())
-            .limit(200)
-        )
-    ).all()
-    return AuditListResponse(
-        events=[
-            AuditEventOut(
-                id=row.id,
-                actor_id=row.actor_id,
-                username=email,
-                action=row.action,
-                resource_type=row.resource_type,
-                resource_id=row.resource_id,
-                detail=row.detail,
-                count=row.detail.get("count") if isinstance(row.detail, dict) else None,
-                created_at=row.created_at,
-            )
-            for row, email in rows
-        ]
-    )
+) -> AppHistoryResponse:
+    """The app's History, newest first: one numbered version per time its owner sent it for
+    publishing, each with its own decision and publish attempts, and the app's other events
+    between them by date. Read from the audit trail and deploy attempts only, up to a cap that
+    `truncated` reports."""
+    app = await _get_app_or_404(db, app_id)
+    # A disabled app has lost its data, so nothing it serves counts as a version, as in the list.
+    serving = None
+    if app.status is not AppStatus.DISABLED:
+        serving = (await _serving(db, [app_id])).get(app_id)
+    return await app_history(db, app, serving)
 
 
 # ==============================================================================
