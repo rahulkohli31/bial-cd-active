@@ -14,7 +14,7 @@
  * line pin the clock and the source of chance instead of hoping.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom'
 import { MotionGlobalConfig } from 'motion/react'
 
@@ -694,6 +694,93 @@ describe('a turn the server refuses leaves nothing behind that says it was sent'
 
     await waitFor(() => expect(screen.getByTestId('turn-banner')).toBeTruthy())
     expect(screen.queryByTestId('assistant-turn-retry')).toBeNull()
+  })
+})
+
+describe('the composer empties the moment the server takes the message', () => {
+  /** A reply that has not said a word yet, held open until the test ends or breaks it. */
+  function holdTheStreamOpen() {
+    let release: () => void = () => {}
+    let fail: (err: Error) => void = () => {}
+    h.readTurnStream.mockImplementation(
+      () =>
+        new Promise((resolve, reject) => {
+          release = () => resolve('completed')
+          fail = reject
+        }),
+    )
+    return { release: () => release(), fail: (err: Error) => fail(err) }
+  }
+
+  it.each([
+    ['Enter', () => fireEvent.keyDown(box(), { key: 'Enter' })],
+    ['the Send button', () => fireEvent.click(send())],
+  ])('★ empties on %s while the reply has not said a word', async (_door, press) => {
+    const stream = holdTheStreamOpen()
+    mount()
+    fireEvent.change(box(), { target: { value: 'how many stands are free tonight' } })
+    press()
+
+    await waitFor(() => expect(box().value).toBe(''))
+    // The reply is still open: the turn can be stopped and nothing of the answer has arrived. The
+    // message itself is on screen, so an empty box here is not a screen that failed to render.
+    expect(await screen.findByTestId('stop-turn')).toBeTruthy()
+    expect(screen.queryAllByTestId('assistant-message')).toHaveLength(0)
+    expect(screen.getByText('how many stands are free tonight')).toBeTruthy()
+    stream.release()
+  })
+
+  it('★ keeps the words when the server refuses the turn', async () => {
+    h.startTurn.mockRejectedValue(
+      new TurnStartError(409, 'This conversation is already replying.', 'conversation_busy', null),
+    )
+    mount()
+    type('how many stands are free tonight')
+
+    await waitFor(() =>
+      expect(screen.getByTestId('turn-banner').textContent).toMatch(/already replying/i),
+    )
+    expect(box().value).toBe('how many stands are free tonight')
+  })
+
+  it('★ a reply that breaks after the server took the message does not put the words back', async () => {
+    // The app chat's rule: the database holds the message, so the box has nothing to give back.
+    const stream = holdTheStreamOpen()
+    mount()
+    type('how many stands are free tonight')
+    await waitFor(() => expect(box().value).toBe(''))
+
+    stream.fail(new Error('the stream died'))
+
+    // Told exactly as before: the banner, the announcement and the retry for a turn the server took.
+    expect(await screen.findByTestId('assistant-turn-retry')).toBeTruthy()
+    expect(screen.getByTestId('turn-banner').textContent).not.toBe('')
+    expect(screen.getByTestId('activity-announcer').textContent).toMatch(/reply failed/i)
+    expect(box().value).toBe('')
+    expect(screen.getByText('how many stands are free tonight')).toBeTruthy()
+  })
+})
+
+describe('the transcript scrolls at the pane edge and reads in a centred column', () => {
+  it('★ the scroller spans the pane, and the message column alone carries the measure', async () => {
+    // jsdom lays nothing out, so this pins the mechanism. A measure on any box between the pane
+    // and the thread's viewport narrows the scroller with the text, and its scrollbar lands beside
+    // the prose instead of at the pane's edge — and so does inheriting the column's gutter.
+    mount('/assistant/c1')
+    const viewport = await screen.findByTestId('thread-viewport')
+    const transcript = screen.getByTestId('assistant-transcript')
+
+    expect(transcript.contains(viewport)).toBe(true)
+    expect(viewport.className).toContain('overflow-y-auto')
+    expect(viewport.className).not.toContain('max-w-thread')
+    expect(transcript.className).not.toContain('max-w-thread')
+    expect(screen.getByTestId('assistant-column').className).toMatch(/(^|\s)px-6(\s|$)/)
+    expect(transcript.className).toMatch(/(^|\s)-mx-6(\s|$)/)
+    expect(transcript.className).toContain('self-stretch')
+
+    const messageColumn = within(viewport).getByTestId('thread-messages').parentElement
+    expect(messageColumn?.className).toContain('max-w-thread')
+    expect(messageColumn?.className).toContain('mx-auto')
   })
 })
 

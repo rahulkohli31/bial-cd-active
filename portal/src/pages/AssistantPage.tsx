@@ -389,8 +389,15 @@ export default function AssistantPage() {
       id: string,
       text: string,
       attachmentIds: string[],
-      /** What to undo if the server refuses the turn at the door — see the catch below. */
-      onRefused?: () => void,
+      {
+        onAccepted,
+        onRefused,
+      }: {
+        /** The server holds the message; the reply is still to come. */
+        onAccepted?: () => void
+        /** What to undo if the server refuses the turn at the door — see the catch below. */
+        onRefused?: () => void
+      } = {},
     ) => {
       const controller = new AbortController()
       abortRef.current = controller
@@ -411,6 +418,8 @@ export default function AssistantPage() {
           attachmentIds,
         })
         posted = true
+        // Before the liveness guard, because settling the send is not a paint decision.
+        onAccepted?.()
         if (!aliveRef.current) return
         setTurnId(started.turnId)
         setContextTokens(started.contextTokens)
@@ -502,23 +511,29 @@ export default function AssistantPage() {
       setMessages((held) => [...held, { id: userId, role: 'user', parts, seq: userSeq }])
       const attachmentIds = wireMessageFromParts(parts).attachmentIds ?? []
 
-      let refused = false
-      await runTurn(id, text, attachmentIds, () => {
-        // THE SERVER PERSISTED NOTHING. A turn refused at the door — the daily cap, a
-        // conversation already busy, a model that is not configured — leaves a bubble on screen
-        // that the database disagrees with: it looks sent, and it disappears at the next reload.
-        // So the optimistic message goes back and the seq with it, and the files it named are
-        // released, because no message will ever reference them and they still count against
-        // this conversation's attachment allowance.
-        refused = true
-        setMessages((held) => held.filter((m) => m.id !== userId))
-        seqRef.current = userSeq
-        releaseUploadedAttachments(parts)
+      // RESOLVED WHEN THE SERVER HAS THE MESSAGE, not when the reply finishes, because the composer
+      // empties on the resolve. The reply keeps streaming after this settles, and a stream that
+      // breaks later is told by `runTurn`'s banner; it cannot hand back words the database holds.
+      await new Promise<void>((resolve, reject) => {
+        void runTurn(id, text, attachmentIds, {
+          onAccepted: resolve,
+          onRefused: () => {
+            // THE SERVER PERSISTED NOTHING. A turn refused at the door — the daily cap, a
+            // conversation already busy, a model that is not configured — leaves a bubble on
+            // screen that the database disagrees with: it looks sent, and it disappears at the
+            // next reload. So the optimistic message goes back and the seq with it, and the files
+            // it named are released, because no message will ever reference them and they still
+            // count against this conversation's attachment allowance.
+            setMessages((held) => held.filter((m) => m.id !== userId))
+            seqRef.current = userSeq
+            releaseUploadedAttachments(parts)
+            // AND THE COMPOSER KEEPS THE WORDS, because the bubble that was holding them is gone.
+            // Silent: the banner runTurn writes is the account of this, and a second sentence
+            // about one refusal is a contradiction rather than more information.
+            reject(new SendRefusal('', { silent: true }))
+          },
+        })
       })
-      // AND THE COMPOSER KEEPS THE WORDS, because the bubble that was holding them is gone.
-      // Silent: the banner runTurn wrote is the account of this, and a second sentence about
-      // one refusal is a contradiction rather than more information.
-      if (refused) throw new SendRefusal('', { silent: true })
     },
     [chatId, navigate, routedId, runTurn],
   )
@@ -670,7 +685,11 @@ export default function AssistantPage() {
               // matches on the `tabIndex={-1}` container and Chromium paints its own 1px ring right
               // round the transcript — in its blue, not the portal's. The move exists to carry a
               // screen reader to the reply, and that is unaffected by dropping the ring.
-              className="mb-3 w-full max-w-thread min-h-0 flex-1 overflow-hidden focus:outline-none"
+              //
+              // NO MEASURE AND NO GUTTER: `-mx-6 self-stretch` spans the whole pane. The thread's
+              // viewport inside is the scroller, so this box's right edge is where its scrollbar
+              // sits; the thread centres its own message column.
+              className="-mx-6 mb-3 min-h-0 flex-1 self-stretch overflow-hidden focus:outline-none"
             >
               {phase === 'loading' ? (
                 <div
