@@ -4,8 +4,8 @@
  * THE ROW IS ABOUT ONE APPLICATION, AND IT IS ALWAYS THE SURFACE'S OWN. Its only mount is
  * Settings › Integrations, which draws one per registry connector — so the row is named for the
  * CONNECTOR and both controls say `in this application`, because the application is the dialog
- * they are in. That mount also passes `leading` (the connector's teal tile), `detail` (its state
- * sentence), and, for the two states with no switch to offer, `trailing` (an inert read-out).
+ * they are in. That mount also passes `leading` (the connector's teal tile) and `detail` (its
+ * state sentence).
  *
  * IT OWNS ITS WRITE, NOT ITS TRUTH. The row holds no fetch and no list; the mount site passes
  * `onSet` and gets `onSettled` back. What the row DOES own is the mechanics of one write — the
@@ -54,11 +54,6 @@ export interface ProjectConnectorRowProps {
   leading?: React.ReactNode
   /** A sentence under the label — the settings tab's project-state line. */
   detail?: React.ReactNode
-  /**
-   * Replaces the chip and the switch entirely. The two states with no access have no switch to
-   * offer; a row with no access must not draw a control that would be refused.
-   */
-  trailing?: React.ReactNode
   enabled: boolean
   /** `null` for a project this connector was never switched on in — an em dash, not an empty chip. */
   window: ConnectorWindow | null
@@ -88,7 +83,6 @@ export default function ProjectConnectorRow({
   connectorName,
   leading,
   detail,
-  trailing,
   enabled,
   window,
   onSet,
@@ -174,39 +168,35 @@ export default function ProjectConnectorRow({
         {detail}
       </div>
 
-      {trailing ?? (
-        <>
-          {shown.enabled && shown.window !== null ? (
-            <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
-              {/* The announced name carries the subject AND the value the eye sees — `1 – 30
-                  Sep` alone says nothing about which of five projects it belongs to. */}
-              <WindowChip
-                window={shown.window}
-                accessibleName={`Days ${connectorName} reads in this application: ${formatWindowLabel(shown.window)}`}
-              />
-              {popoverOpen && (
-                <WindowPopover
-                  connectorName={connectorName}
-                  window={shown.window}
-                  onApply={apply}
-                  onCancel={() => setPopoverOpen(false)}
-                />
-              )}
-            </Popover>
-          ) : (
-            <span aria-hidden className="flex-shrink-0 text-[10.5px] text-canvas-placeholder">
-              —
-            </span>
-          )}
-
-          <Switch
-            checked={shown.enabled}
-            aria-disabled={switchBusy}
-            aria-label={`Read ${connectorName} in this application`}
-            onCheckedChange={toggle}
+      {shown.enabled && shown.window !== null ? (
+        <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
+          {/* The announced name carries the subject AND the value the eye sees — `1 – 30
+              Sep` alone says nothing about which of five projects it belongs to. */}
+          <WindowChip
+            window={shown.window}
+            accessibleName={`Days ${connectorName} reads in this application: ${formatWindowLabel(shown.window)}`}
           />
-        </>
+          {popoverOpen && (
+            <WindowPopover
+              connectorName={connectorName}
+              window={shown.window}
+              onApply={apply}
+              onCancel={() => setPopoverOpen(false)}
+            />
+          )}
+        </Popover>
+      ) : (
+        <span aria-hidden className="flex-shrink-0 text-[10.5px] text-canvas-placeholder">
+          —
+        </span>
       )}
+
+      <Switch
+        checked={shown.enabled}
+        aria-disabled={switchBusy}
+        aria-label={`Read ${connectorName} in this application`}
+        onCheckedChange={toggle}
+      />
     </li>
   )
 }

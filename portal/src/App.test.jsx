@@ -292,12 +292,11 @@ describe('App — addresses outside a project get no workspace frame', () => {
     expect(shell()).toBeNull()
   })
 
-  it('★ /integrations resolves — it was a dialog with two doors and no address', () => {
-    // Nobody could link to it, and neither door was reachable from the other's screen. One
-    // route, outside the workspace frame, like every other list address.
+  it('/integrations no longer resolves — it falls through to the catch-all', () => {
+    // A connector is switched on in each application's own settings; there is no page for it.
     renderAt('/integrations')
-    expect(screen.getByTestId('integrations-page')).toBeTruthy()
-    expect(shell()).toBeNull()
+    expect(screen.getByTestId('login')).toBeTruthy()
+    expect(window.location.pathname).toBe('/login')
   })
 })
 

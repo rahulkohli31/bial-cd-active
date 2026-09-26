@@ -27,14 +27,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.core.connectors import CONNECTORS
-from src.db.models.connector_access import ConnectorRequestStatus
 from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
 from src.services.build_sessions.appconnector_env import build_connector_env
 from src.services.lake.config import LakeConfig
 from src.services.lake.env import connector_env_names, identity_resource_id_for_env
 from src.services.sandbox.aca import AcaControlPlane
 from src.services.sandbox.config import SandboxConfig
-from tests.api.v1.connectors.conftest import KEY, seed_decision
+from tests.api.v1.connectors.conftest import KEY
 from tests.factories import ProjectFactory, UserFactory
 
 _LAKE_URL: Final = "https://alakeaccount.blob.core.windows.net/acontainer/AOS/reports/"
@@ -58,15 +57,12 @@ def lake_configured(monkeypatch: pytest.MonkeyPatch) -> LakeConfig:
 async def _project(
     db: AsyncSession,
     *,
-    access: ConnectorRequestStatus | None = ConnectorRequestStatus.APPROVED,
     enabled: bool = True,
     with_row: bool = True,
     email: str = "citizen@rvaiglobal.com",
 ) -> tuple[uuid.UUID, uuid.UUID]:
     user = await UserFactory.create(db, email=email)
     project = await ProjectFactory.create(db, user_id=user.id)
-    if access is not None:
-        await seed_decision(db, user.id, access, None)
     if with_row:
         db.add(
             ProjectConnector(
@@ -84,7 +80,7 @@ async def _project(
 # --- the two values -------------------------------------------------------------------------
 
 
-async def test_an_approved_switched_on_project_gets_exactly_two_values(
+async def test_a_switched_on_project_gets_exactly_two_values(
     db_session: AsyncSession, lake_configured: LakeConfig
 ) -> None:
     """★ TWO, AND NO WINDOW DATES. An earlier draft sent the resolved pair so the rail's
@@ -170,30 +166,19 @@ def test_azures_own_identity_pair_is_on_the_allowlist_too() -> None:
 
 
 @pytest.mark.parametrize(
-    ("access", "enabled", "with_row"),
-    [
-        (ConnectorRequestStatus.APPROVED, False, True),
-        (ConnectorRequestStatus.PENDING, True, True),
-        (ConnectorRequestStatus.DECLINED, True, True),
-        (ConnectorRequestStatus.CANCELLED, True, True),
-        (None, True, True),
-        (ConnectorRequestStatus.APPROVED, True, False),
-    ],
-    ids=["switched-off", "pending", "declined", "cancelled", "never-asked", "never-switched-on"],
+    ("enabled", "with_row"),
+    [(False, True), (True, False)],
+    ids=["switched-off", "never-switched-on"],
 )
 async def test_a_connector_that_is_not_effectively_on_yields_nothing(
     db_session: AsyncSession,
     lake_configured: LakeConfig,
-    access: ConnectorRequestStatus | None,
     enabled: bool,
     with_row: bool,
 ) -> None:
-    """One branch reached six ways — the switch AND the approval, read off `resolve_window` as a
-    single `effectively_on`. Written as one parametrised test because writing them separately
-    reads as six behaviours and drifts into six rules."""
-    user_id, project_id = await _project(
-        db_session, access=access, enabled=enabled, with_row=with_row
-    )
+    """One branch reached two ways — the switch, read off `resolve_window` as a single
+    `effectively_on`. No row and a lowered switch are different facts with the same answer."""
+    user_id, project_id = await _project(db_session, enabled=enabled, with_row=with_row)
 
     assert await build_connector_env(db_session, user_id=user_id, project_id=project_id) == {}
 
@@ -214,11 +199,10 @@ async def test_another_persons_project_yields_nothing(
     db_session: AsyncSession, lake_configured: LakeConfig
 ) -> None:
     """★ THE ISOLATION PREDICATE. `project_connectors` carries no user column of its own, so the
-    ownership claim rides a join on `projects` in the same WHERE clause. Drop it and an approved
-    citizen's build would be handed the coordinates another citizen's project was granted."""
+    ownership claim rides a join on `projects` in the same WHERE clause. Drop it and one
+    citizen's build would be handed the coordinates another citizen's project switched on."""
     _owner, project_id = await _project(db_session)
     stranger = await UserFactory.create(db_session, email="stranger@rvaiglobal.com")
-    await seed_decision(db_session, stranger.id, ConnectorRequestStatus.APPROVED, None)
 
     assert await build_connector_env(db_session, user_id=stranger.id, project_id=project_id) == {}
 
@@ -251,9 +235,9 @@ def _envelope(env: dict[str, str]) -> aca_models.ContainerApp:
     """The container spec ARM would actually receive for a container born with `env`.
 
     Built through `__new__` so no ARM client and no `DefaultAzureCredential` is constructed —
-    `_envelope` is pure, which is exactly what makes the approval gate assertable with no Azure
-    at all. The `identity_resource_id` is derived here the same way `client.py` derives it, from
-    the coordinates in `env`, because THAT derivation is half of what is under test."""
+    `_envelope` is pure, which is exactly what makes the gate assertable with no Azure at all.
+    The `identity_resource_id` is derived here the same way `client.py` derives it, from the
+    coordinates in `env`, because THAT derivation is half of what is under test."""
     plane = AcaControlPlane.__new__(AcaControlPlane)
     plane._config = SandboxConfig(  # noqa: SLF001
         subscription_id="s",
@@ -272,7 +256,7 @@ def _envelope(env: dict[str, str]) -> aca_models.ContainerApp:
     )
 
 
-def test_an_approved_project_gets_the_identity_block(lake_configured: LakeConfig) -> None:
+def test_a_switched_on_project_gets_the_identity_block(lake_configured: LakeConfig) -> None:
     """★ THE ONE LINE THAT MAKES ANY OF IT WORK. Without it the coordinates are inert and the
     failure reads as a role-assignment problem."""
     url_name, client_id_name = connector_env_names(KEY)
@@ -286,19 +270,19 @@ def test_an_approved_project_gets_the_identity_block(lake_configured: LakeConfig
 def test_a_container_without_coordinates_gets_no_identity_at_all(
     lake_configured: LakeConfig,
 ) -> None:
-    """★ THE ASSERTION THAT STOPS THE APPROVAL GATE BECOMING DECORATIVE.
+    """★ THE ASSERTION THAT STOPS THE PER-PROJECT SWITCH BECOMING DECORATIVE.
 
     The lake is CONFIGURED here — the platform could attach an identity — and the container still
     gets none, because this env carries no coordinates. Attaching whenever a lake is merely
     configured platform-wide would hand every citizen's build on the platform a credential to
-    BIAL's flight data and defeat the approval gate the whole connector feature exists to enforce.
-    Testing only the coordinate builder would pass while exactly that shipped."""
+    BIAL's flight data, switched on or not. Testing only the coordinate builder would pass while
+    exactly that shipped."""
     envelope = _envelope({"BIAL_APP_ID": str(uuid.uuid4())})
 
     assert envelope.identity is None
 
 
-def test_an_unapproved_projects_spec_is_byte_identical_to_one_with_no_lake(
+def test_a_switched_off_projects_spec_is_byte_identical_to_one_with_no_lake(
     lake_configured: LakeConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """★ ASSERTED AS AN EQUALITY, not as a list of fields that happen to match — which is why

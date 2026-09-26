@@ -72,10 +72,8 @@ export function requiredString(value: unknown, subject: string, field: string): 
  * A nullable COUNT off an untrusted body — and `null` is not `0`.
  *
  * Both answers are real and they mean different things: `0` is "none", `null` is "we did not
- * count". The connector surfaces depend on that split (`onProjectCount` is null in every state
- * but `approved`; `usingItIn` is null on a declined row), which is why this does NOT collapse to
- * zero the way a plain count reader would — a row whose control IS a count must not render "0
- * projects" for a person nobody counted.
+ * count" — which is why this does NOT collapse to zero the way a plain count reader would. A
+ * caller that wants zero for an absent count says so with `?? 0`.
  */
 export function optionalCount(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : null

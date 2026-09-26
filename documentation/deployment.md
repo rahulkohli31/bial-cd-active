@@ -92,10 +92,13 @@ have, so they are the ones to start first.
   permission to create and delete container apps in the one resource group that holds them.
   `reference/` carries both role definitions with the scope left unbound; choosing the scope is
   part of the assignment.
-- **Permission for the platform's identity to attach a managed identity** to the container apps it
-  creates, if generated applications are to read tenant data sources. Without it, container
-  creation fails outright for those projects while everything else keeps working — a failure that
-  looks like a platform bug and is not.
+- **The tenant data source generated applications read, and the managed identity allowed to read
+  it.** The control plane refuses to start in production without both: an owner switching the data
+  on for a project is the only step between that project and the data, so an unconfigured source
+  would leave the switch silently doing nothing.
+- **Permission for the platform's identity to attach that managed identity** to the container apps
+  it creates. Without it, container creation fails outright for projects that switch the data on
+  while everything else keeps working — a failure that looks like a platform bug and is not.
 - **Network reachability to the database server** from the container apps environment, for both
   sandboxes and deployed applications. Each reaches its own database directly; without this their
   data layer is dead while the rest of the platform looks healthy.

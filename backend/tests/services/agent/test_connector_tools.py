@@ -272,8 +272,8 @@ async def test_the_toolset_registers_exactly_one_tool_under_the_shared_name() ->
 async def test_the_description_tells_the_model_when_to_call_it_and_what_not_to_copy() -> None:
     """★ THE THREE THINGS THIS COPY HAS TO DO, and the third is a disclosure rule.
 
-    A deployed app is listed org-wide, which is a wider audience than the one person whose access
-    an administrator approved — so KPI formulas and SLA targets are for writing the query with,
+    A deployed app is listed org-wide, which is a wider audience than the one person who switched
+    the data on — so KPI formulas and SLA targets are for writing the query with,
     never for reproducing in source or on screen."""
     description = await _registered_description()
     lowered = description.lower()

@@ -2,104 +2,36 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { X } from 'lucide-react'
 import { listProjectConnectors, setProjectConnector } from '../../utils/connectorApi'
 import type { ProjectConnectorEntry, WindowChoice } from '../../utils/connectorApi'
-import { assertNever } from '../../utils/assertNever'
 import { errorText } from '../../utils/apiError'
-import { ConnectorGlyph, dayMonth } from '../connectors/connectorPresentation'
+import { ConnectorGlyph } from '../connectors/connectorPresentation'
 import ProjectConnectorRow from '../connectors/ProjectConnectorRow'
 
 /**
- * SETTINGS › INTEGRATIONS — the BIAL data this one application may read.
- *
- * THE SAME SWITCH AS THE INTEGRATIONS PAGE, ONE WRITE BEHIND BOTH. This tab and the page's
- * disclosure are two views of `project_connectors`, and neither holds a cache: both re-read from
- * the server, so a switch flipped in one is what the other's next read returns. Nothing here
- * derives a switch position from anything else.
+ * SETTINGS › INTEGRATIONS — the BIAL data this one application may read, and the switch that
+ * decides it. The switch is the whole of access: nobody else is asked.
  *
  * THE ROW IS `ProjectConnectorRow`, MOUNTED — NOT FORKED, which is what keeps the optimistic
  * flip, the rollback, the in-flight lock and the write stamp in one implementation.
- *
- * THE TWO STATES WITH NO SWITCH TO OFFER SAY SO. A citizen an administrator has not approved, and
- * one still waiting, get a read-out where the switch would be: a control that exists in order to
- * be refused teaches somebody to distrust the screen. Asking is a person-level act and it lives
- * on the Integrations page, which is where the decline, its date and the administrator's words
- * are — this tab is about one application.
  *
  * A SKELETON, NEVER A BLANK GAP. The read fires when the tab is chosen, so the pre-load moment is
  * guaranteed rather than an edge case, and an empty box between two hairlines reads as "nothing
  * is connected" — a different and false statement.
  */
 
-/** The board's own footer — it is the whole explanation of what the switch beside it does not do. */
-const FOOTER =
-  'The switch controls this application only. Access itself is granted once, by an administrator.'
-
-/**
- * …AND WHAT TO SAY WHERE THERE IS NO SWITCH TO EXPLAIN. Every row can be a read-out — nothing
- * approved yet, or everything still waiting — and the sentence above then names a control that is
- * not on the panel, beside rows offering no way to change that. This says the one thing a citizen
- * in that state can act on, and where.
- */
-const FOOTER_NO_SWITCH =
-  'No data is connected to this application yet. Access is granted once, by an administrator — ask ' +
-  'for it under Integrations, and it then covers every application you own.'
+/** The board's own footer — what the switch beside it does and does not reach. */
+const FOOTER = 'The switch controls this application only.'
 
 const LABEL = 'The BIAL data this application may read'
 
 /**
- * Which of the four project states one row is in.
- *
- * `declined` LANDS IN `noAccess` WITH `neverAsked`, and that is the honest arm: what a declined
- * citizen has, on this application, is no access. The whole answer — the date, who decided and
- * their words — is on the Integrations page, which is the surface that owns person-level facts.
+ * The sentence under the connector's name. `effectivelyOn`, not `enabled`: "can this application
+ * see the data" is the resolver's answer. The window is checked beside it because the sentence
+ * COUNTS it.
  */
-type RowView =
-  | { kind: 'on'; days: number }
-  | { kind: 'off' }
-  | { kind: 'noAccess' }
-  | { kind: 'waiting'; askedAt: string | null }
-
-function viewOf(entry: ProjectConnectorEntry): RowView {
-  switch (entry.state) {
-    case 'pending':
-      return { kind: 'waiting', askedAt: entry.askedAt }
-    case 'approved':
-      // `effectivelyOn`, not `enabled`: "can this application see the data" is the resolver's
-      // answer and this must not become a second home for that conjunction. The window is checked
-      // beside it because the sentence COUNTS it.
-      return entry.effectivelyOn && entry.window !== null
-        ? { kind: 'on', days: entry.window.days }
-        : { kind: 'off' }
-    case 'neverAsked':
-    case 'declined':
-      return { kind: 'noAccess' }
-    default:
-      return assertNever(entry.state)
-  }
-}
-
-/** The sentence under the connector's name, and the ink it is set in. */
-function stateLine(entry: ProjectConnectorEntry, view: RowView): { text: string; tone: string } {
-  switch (view.kind) {
-    case 'on':
-      return { text: `Reading ${view.days} days of ${entry.dataNoun}`, tone: 'text-neutral' }
-    case 'off':
-      return { text: `Switch it on when a chat needs ${entry.dataNoun}`, tone: 'text-neutral' }
-    case 'noAccess':
-      // THE CONNECTOR IS NAMED FROM THE WIRE. A literal here would be the one place in the
-      // feature that has to change for a second connector.
-      return { text: `You do not have access to ${entry.displayName} yet`, tone: 'text-neutral' }
-    case 'waiting':
-      return {
-        text:
-          view.askedAt === null
-            ? 'You asked for access — waiting on an administrator'
-            : `You asked for access on ${dayMonth(view.askedAt)} — waiting on an administrator`,
-        // A wait is not a failure and must not be set in the grey of a settled state.
-        tone: 'text-status-amber-fg',
-      }
-    default:
-      return assertNever(view)
-  }
+function stateLine(entry: ProjectConnectorEntry): string {
+  return entry.effectivelyOn && entry.window !== null
+    ? `Reading ${entry.window.days} days of ${entry.dataNoun}`
+    : `Switch it on when a chat needs ${entry.dataNoun}`
 }
 
 export interface IntegrationsTabProps {
@@ -136,7 +68,7 @@ export default function IntegrationsTab({ projectId }: IntegrationsTabProps): Re
    *
    * The row is handed back the whole server entry — `ProjectConnectorEntry` is a superset of the
    * state it asked for — so its switch and its chip settle from the same object this tab draws
-   * the sentence from, and no `enabled && approved` exists anywhere in this file.
+   * the sentence from.
    */
   const write = useCallback(
     async (
@@ -221,51 +153,27 @@ export default function IntegrationsTab({ projectId }: IntegrationsTabProps): Re
           data-testid="integrations-tab-list"
           className="divide-y divide-bial-border overflow-hidden rounded-[11px] border border-bial-border bg-white"
         >
-          {entries.map((entry) => {
-            const view = viewOf(entry)
-            const line = stateLine(entry, view)
-            return (
-              <ProjectConnectorRow
-                key={entry.key}
-                testId={`app-connector-${entry.key}`}
-                connectorName={entry.displayName}
-                leading={<ConnectorGlyph />}
-                detail={
-                  <div className="mt-0.5">
-                    <span className={`text-[10.5px] leading-[1.45] ${line.tone}`}>{line.text}</span>
-                  </div>
-                }
-                trailing={
-                  // READ-OUTS, NOT CONTROLS. `<span>` rather than a disabled button on purpose:
-                  // there is nothing here to press, and asking is a person-level act that lives
-                  // on the Integrations page.
-                  view.kind === 'noAccess' ? (
-                    <span className="flex-shrink-0 text-[10.5px] font-bold text-canvas-placeholder">
-                      No access
-                    </span>
-                  ) : view.kind === 'waiting' ? (
-                    <span className="flex-shrink-0 text-[10.5px] font-bold text-status-amber-fg">
-                      Waiting
-                    </span>
-                  ) : undefined
-                }
-                enabled={entry.enabled}
-                window={entry.window}
-                onSet={(update) => write(entry.key, update)}
-                onError={setFailure}
-              />
-            )
-          })}
+          {entries.map((entry) => (
+            <ProjectConnectorRow
+              key={entry.key}
+              testId={`app-connector-${entry.key}`}
+              connectorName={entry.displayName}
+              leading={<ConnectorGlyph />}
+              detail={
+                <div className="mt-0.5">
+                  <span className="text-[10.5px] leading-[1.45] text-neutral">{stateLine(entry)}</span>
+                </div>
+              }
+              enabled={entry.enabled}
+              window={entry.window}
+              onSet={(update) => write(entry.key, update)}
+              onError={setFailure}
+            />
+          ))}
         </ul>
       )}
 
-      <p className="m-0 text-[11px] leading-[1.6] text-neutral">
-        {/* While the read is still out, `entries` is null and nothing is known — say the
-            general thing rather than claim an absence that may be about to be disproved. */}
-        {entries !== null && !entries.some((entry) => entry.state === 'approved')
-          ? FOOTER_NO_SWITCH
-          : FOOTER}
-      </p>
+      <p className="m-0 text-[11px] leading-[1.6] text-neutral">{FOOTER}</p>
     </div>
   )
 }

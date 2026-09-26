@@ -1,8 +1,8 @@
 """The seam between a build starting and a window's files reaching Redis.
 
 ONE FUNCTION THE BUILD PATH CALLS, and it answers the whole question for itself: is a lake
-configured, is this connector switched on for this project, has its owner been approved, which
-dates does it read, which files are those, and are they already held. Every one of those has an
+configured, is this connector switched on for this project, which dates does it read, which files
+are those, and are they already held. Every one of those has an
 answer meaning "do nothing", and every one of them returns quietly.
 
 IT OPENS ITS OWN SESSION AND OWNS ITS OWN LIFETIME. It runs as a detached task fired after a
@@ -34,7 +34,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.connectors import CONNECTORS, ResolvedWindow, resolve_window
 from src.db.models.project import Project
 from src.db.models.project_connector import ProjectConnector
-from src.services.connectors.access import current_access
 from src.services.lake.client import get_lake
 from src.services.lake.transfer import TransferReport, transfer_window_or_log
 from src.services.lake.window import select_files
@@ -86,14 +85,13 @@ async def plan_window_copies(
         return ()  # no lake configured — the supported dev/test posture
     plans: list[tuple[str, ResolvedWindow]] = []
     for connector_key, connector in CONNECTORS.items():
-        access = await current_access(db, user_id=user_id, connector_key=connector_key)
         stored = await _window_for(
             db, user_id=user_id, project_id=project_id, connector_key=connector_key
         )
-        window = resolve_window(connector, stored, access.request_status)
-        # `effectively_on` IS the conjunction (the switch AND the approval), read off the resolver
-        # rather than spelled again here. A second place that decides whether a connector reads is
-        # a second place that can disagree with the rail the citizen is looking at.
+        window = resolve_window(connector, stored)
+        # `effectively_on` is read off the resolver rather than decided again here. A second place
+        # that decides whether a connector reads is a second place that can disagree with the
+        # switch the citizen is looking at.
         if window is None or not window.effectively_on:
             continue
         plans.append((connector_key, window))

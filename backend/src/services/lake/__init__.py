@@ -9,8 +9,8 @@ would make `DefaultAzureCredential` ambiguous exactly where it must not be; mirr
 costs one package and keeps both unambiguous.
 
 WHY IT IS `services/lake/` AND NOT `services/connectors/lake/`, which is where a reader would
-first look. `services/connectors/` is the ACCESS-LEDGER package: its `__init__` re-exports
-`current_access`, which reaches `src/db/models/`, which reaches `src/db/base.py`, which imports
+first look. `services/connectors/`'s `__init__` re-exports `connected_systems_for_project`,
+which reaches `src/db/models/`, which reaches `src/db/base.py`, which imports
 `src.config` at module scope. `src/settings/api.py` has to import this package's `LakeConfig` to
 declare the settings field — and Python runs a parent package's `__init__` before any submodule,
 so nesting the lake under `connectors/` would close a

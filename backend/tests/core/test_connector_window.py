@@ -26,7 +26,6 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from src.core.connectors import CONNECTORS, Connector, ResolvedWindow, resolve_window
-from src.db.models.connector_access import ConnectorRequestStatus
 from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
 from src.services.usage import ist_today
 
@@ -228,7 +227,7 @@ def _stored_length(stored: ProjectConnector) -> int:
 
 
 def _resolve(case: _Case) -> ResolvedWindow:
-    resolved = resolve_window(_DICE, case.stored, ConnectorRequestStatus.APPROVED, now=case.now)
+    resolved = resolve_window(_DICE, case.stored, now=case.now)
     assert resolved is not None, "a stored row must always resolve to a window"
     return resolved
 
@@ -352,23 +351,15 @@ def test_the_cap_is_read_off_the_registry_entry_it_is_handed() -> None:
     seven_day_system = Connector(
         display_name="A SHORTER-LIVED SYSTEM",
         subtitle="keeps one week",
-        ask_subtitle="A SHORTER-LIVED SYSTEM keeps one week of history.",
         data_noun="test data",
         max_window_days=7,
         # A LIVE connector — nothing to wait for overnight, so its newest day IS today. This is
         # the posture the day-late rule must not impose on every connector, and the assertions
         # below are what prove it does not: they read the reading day itself as the ceiling.
         freshness_lag_days=0,
-        consent_lines_requester=(),
-        consent_lines_approver=(),
     )
 
-    resolved = resolve_window(
-        seven_day_system,
-        _absolute(_d(1, 1), _d(12, 31)),
-        ConnectorRequestStatus.APPROVED,
-        now=_ON_8_SEP,
-    )
+    resolved = resolve_window(seven_day_system, _absolute(_d(1, 1), _d(12, 31)), now=_ON_8_SEP)
 
     assert resolved is not None
     assert (resolved.earliest, resolved.latest) == (_d(9, 2), _d(9, 8))
@@ -386,17 +377,12 @@ def test_the_freshness_lag_is_read_off_the_registry_entry_it_is_handed() -> None
     a_slow_system = Connector(
         display_name="A SLOWER SYSTEM",
         subtitle="loads every third day",
-        ask_subtitle="A SLOWER SYSTEM publishes three days behind.",
         data_noun="test data",
         max_window_days=30,
         freshness_lag_days=3,
-        consent_lines_requester=(),
-        consent_lines_approver=(),
     )
 
-    resolved = resolve_window(
-        a_slow_system, _relative(7), ConnectorRequestStatus.APPROVED, now=_ON_8_SEP
-    )
+    resolved = resolve_window(a_slow_system, _relative(7), now=_ON_8_SEP)
 
     assert resolved is not None
     assert (resolved.earliest, resolved.latest) == (_d(8, 7), _d(9, 5))
@@ -409,39 +395,20 @@ def test_the_freshness_lag_is_read_off_the_registry_entry_it_is_handed() -> None
 
 def test_a_project_that_never_switched_it_on_has_no_window_at_all() -> None:
     """No row is a different fact from `switched off`, and it resolves to nothing to render."""
-    assert resolve_window(_DICE, None, ConnectorRequestStatus.APPROVED, now=_ON_8_SEP) is None
+    assert resolve_window(_DICE, None, now=_ON_8_SEP) is None
 
 
-def test_the_switch_and_the_approval_must_both_be_true() -> None:
+def test_the_switch_alone_decides_whether_it_reads_and_off_still_has_a_window() -> None:
+    """The project's switch is the whole of whether a connector reads. A lowered switch keeps its
+    window: the popover still opens on the range the citizen chose."""
     enabled = _relative(7)
     switched_off = _relative(7)
     switched_off.enabled = False
 
-    on = resolve_window(_DICE, enabled, ConnectorRequestStatus.APPROVED, now=_ON_8_SEP)
-    off = resolve_window(_DICE, switched_off, ConnectorRequestStatus.APPROVED, now=_ON_8_SEP)
+    on = resolve_window(_DICE, enabled, now=_ON_8_SEP)
+    off = resolve_window(_DICE, switched_off, now=_ON_8_SEP)
 
     assert on is not None and on.effectively_on is True
     assert off is not None and off.effectively_on is False
-
-
-@pytest.mark.parametrize(
-    "access",
-    [
-        None,  # never asked
-        ConnectorRequestStatus.PENDING,
-        ConnectorRequestStatus.DECLINED,
-        ConnectorRequestStatus.CANCELLED,
-    ],
-    ids=["never-asked", "pending", "declined", "cancelled"],
-)
-def test_an_unapproved_owner_is_not_effectively_on_but_still_gets_a_window(
-    access: ConnectorRequestStatus | None,
-) -> None:
-    """States c and d on `ConnectorStates` still draw a calendar chip. Losing the window here
-    would render them as a broken row rather than as `Ask an administrator`."""
-    resolved = resolve_window(_DICE, _relative(7), access, now=_ON_8_SEP)
-
-    assert resolved is not None
-    assert resolved.effectively_on is False
-    assert (resolved.start, resolved.end) == (_d(9, 1), _LATEST)
-    assert resolved.days == 7
+    assert (off.start, off.end) == (_d(9, 1), _LATEST)
+    assert off.days == 7

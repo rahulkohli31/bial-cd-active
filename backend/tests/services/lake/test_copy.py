@@ -1,20 +1,18 @@
 """The seam between a build starting and a window's files reaching Redis — and its gate.
 
-WHAT THIS FILE IS FOR. `copy_window_for_project` answers six questions for itself, and five of the
-six answers mean "do nothing": no lake configured, no Redis configured, the connector was never
-switched on for this project, the switch is down, the owner is not approved. Each of those is a
-supported state — a developer machine, a deployment without a lake, a citizen who never asked —
-and each must end in a build that provisions normally and a lake that was never contacted.
+WHAT THIS FILE IS FOR. `copy_window_for_project` answers five questions for itself, and four of
+the five answers mean "do nothing": no lake configured, no Redis configured, the connector was
+never switched on for this project, the switch is down. Each of those is a supported state — a
+developer machine, a deployment without a lake, a project that never switched it on — and each
+must end in a build that provisions normally and a lake that was never contacted.
 
 THE ONE ASSERTION THAT IS NOT ABOUT REDIS. Every off-state is asserted on the LAKE, not on the key
-count: the point is that an unapproved project's window is never LISTED, not merely that nothing
+count: the point is that a switched-off project's window is never LISTED, not merely that nothing
 was written. A version that listed first and refused later would pass a key-count assertion while
-reading a container the citizen has no right to.
+reading a container the project has no right to.
 
-The on-ness conjunction is read off `resolve_window`, never spelled again here. A second place
-that decides whether a connector reads is a second place that can disagree with the rail the
-citizen is looking at — which is why the approved/enabled matrix below is parametrised over the
-states rather than written as separate tests that could each drift.
+Whether a connector reads is read off `resolve_window`, never spelled again here. A second place
+that decides it is a second place that can disagree with the switch the citizen is looking at.
 """
 
 from __future__ import annotations
@@ -27,7 +25,6 @@ import fakeredis.aioredis
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models.connector_access import ConnectorRequestStatus
 from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
 from src.services.lake import client as lake_client
 from src.services.lake import copy as lake_copy
@@ -38,7 +35,7 @@ from src.services.lake.transfer import _digest
 from src.services.redis import client as redis_client
 from src.services.redis.keys import lake_file_key
 from src.services.usage import ist_today
-from tests.api.v1.connectors.conftest import KEY, seed_decision
+from tests.api.v1.connectors.conftest import KEY
 from tests.factories import ProjectFactory, UserFactory
 
 _ROOT = "AOS/tb_flight_fact_report/"
@@ -104,14 +101,11 @@ async def redis_bytes() -> AsyncIterator[fakeredis.aioredis.FakeRedis]:
 async def _project_with(
     db,
     *,
-    access: ConnectorRequestStatus | None,
     enabled: bool = True,
     window_days: int = 7,
 ) -> tuple[uuid.UUID, uuid.UUID]:
     user = await UserFactory.create(db)
     project = await ProjectFactory.create(db, user_id=user.id)
-    if access is not None:
-        await seed_decision(db, user.id, access, None)
     db.add(
         ProjectConnector(
             project_id=project.id,
@@ -128,9 +122,9 @@ async def _project_with(
 # --- the happy path -----------------------------------------------------------------------------
 
 
-async def test_an_approved_switched_on_project_copies_its_window(db_session, lake, redis_bytes):
+async def test_a_switched_on_project_copies_its_window(db_session, lake, redis_bytes):
     """★ The one state in which anything happens at all."""
-    user_id, project_id = await _project_with(db_session, access=ConnectorRequestStatus.APPROVED)
+    user_id, project_id = await _project_with(db_session)
 
     report = await lake_copy.copy_window_for_project(
         db_session, user_id=user_id, project_id=project_id
@@ -145,7 +139,7 @@ async def test_an_approved_switched_on_project_copies_its_window(db_session, lak
 
 async def test_a_second_copy_of_the_same_window_downloads_nothing(db_session, lake, redis_bytes):
     """Fired on every birth, so the skip is what stops a relaunch re-downloading the window."""
-    user_id, project_id = await _project_with(db_session, access=ConnectorRequestStatus.APPROVED)
+    user_id, project_id = await _project_with(db_session)
     await lake_copy.copy_window_for_project(db_session, user_id=user_id, project_id=project_id)
     lake.downloaded.clear()
 
@@ -160,28 +154,11 @@ async def test_a_second_copy_of_the_same_window_downloads_nothing(db_session, la
 # --- the gate -----------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("access", "enabled"),
-    [
-        (None, True),
-        (ConnectorRequestStatus.PENDING, True),
-        (ConnectorRequestStatus.DECLINED, True),
-        (ConnectorRequestStatus.CANCELLED, True),
-        (ConnectorRequestStatus.APPROVED, False),
-    ],
-    ids=["never-asked", "pending", "declined", "cancelled", "switched-off"],
-)
-async def test_a_connector_that_is_not_effectively_on_never_reaches_the_lake(
-    db_session, lake, redis_bytes, access, enabled
-):
-    """★ ASSERTED ON THE LAKE, NOT ON THE KEY COUNT. The claim is that an unapproved project's
+async def test_a_switched_off_connector_never_reaches_the_lake(db_session, lake, redis_bytes):
+    """★ ASSERTED ON THE LAKE, NOT ON THE KEY COUNT. The claim is that a switched-off project's
     container is never LISTED — a version that listed first and refused afterwards would pass a
-    "nothing was written" assertion while reading data the citizen has no right to.
-
-    Five states, one branch: the switch AND the approval, read off `resolve_window` as a single
-    `effectively_on`. Written as one parametrised test because they ARE one branch reached five
-    ways; separate tests would read as five behaviours and drift into five rules."""
-    user_id, project_id = await _project_with(db_session, access=access, enabled=enabled)
+    "nothing was written" assertion while reading data the project has no right to."""
+    user_id, project_id = await _project_with(db_session, enabled=False)
 
     report = await lake_copy.copy_window_for_project(
         db_session, user_id=user_id, project_id=project_id
@@ -199,7 +176,6 @@ async def test_a_project_that_never_switched_it_on_has_no_row_and_reaches_nothin
     Reached by every project on the platform that has never touched this feature."""
     user = await UserFactory.create(db_session)
     project = await ProjectFactory.create(db_session, user_id=user.id)
-    await seed_decision(db_session, user.id, ConnectorRequestStatus.APPROVED, None)
 
     report = await lake_copy.copy_window_for_project(
         db_session, user_id=user.id, project_id=project.id
@@ -211,11 +187,10 @@ async def test_a_project_that_never_switched_it_on_has_no_row_and_reaches_nothin
 
 async def test_another_persons_project_row_is_not_reachable(db_session, lake, redis_bytes):
     """★ THE ISOLATION PREDICATE. `project_connectors` carries no user column of its own, so the
-    ownership claim rides a join on `projects` in the same WHERE clause. Drop it and an approved
+    ownership claim rides a join on `projects` in the same WHERE clause. Drop it and one
     citizen's build would copy somebody else's project's window."""
-    owner_id, project_id = await _project_with(db_session, access=ConnectorRequestStatus.APPROVED)
+    owner_id, project_id = await _project_with(db_session)
     stranger = await UserFactory.create(db_session, email="stranger@rvaiglobal.com")
-    await seed_decision(db_session, stranger.id, ConnectorRequestStatus.APPROVED, None)
 
     report = await lake_copy.copy_window_for_project(
         db_session, user_id=stranger.id, project_id=project_id
@@ -231,7 +206,7 @@ async def test_another_persons_project_row_is_not_reachable(db_session, lake, re
 async def test_no_lake_configured_is_a_quiet_no_op(db_session, redis_bytes):
     """The developer-machine posture, and the deployment that has not been given a lake. Binds no
     lake fixture on purpose: with one bound this branch is unreachable by construction."""
-    user_id, project_id = await _project_with(db_session, access=ConnectorRequestStatus.APPROVED)
+    user_id, project_id = await _project_with(db_session)
 
     assert lake_client._lake_singleton is None
     assert (
@@ -243,7 +218,7 @@ async def test_no_lake_configured_is_a_quiet_no_op(db_session, redis_bytes):
 async def test_no_redis_configured_is_a_quiet_no_op(db_session, lake):
     """Binds no Redis fixture, so `get_redis_bytes()` raises `RedisNotConfiguredError` — which is
     an ANSWER here, not a failure, and a build still provisions."""
-    user_id, project_id = await _project_with(db_session, access=ConnectorRequestStatus.APPROVED)
+    user_id, project_id = await _project_with(db_session)
 
     assert (
         await lake_copy.copy_window_for_project(db_session, user_id=user_id, project_id=project_id)
@@ -259,7 +234,7 @@ async def test_a_lake_failure_never_escapes_the_detached_copy(db_session, lake, 
     """★ Nothing reads this copy, so a citizen must never lose a build to it. The guarded entry
     point swallows the lake's and Redis's failures; the detached wrapper catches everything else.
     Asserted through the wrapper, because that is the one a build path actually calls."""
-    user_id, project_id = await _project_with(db_session, access=ConnectorRequestStatus.APPROVED)
+    user_id, project_id = await _project_with(db_session)
 
     async def _explode() -> tuple[LakeEntry, ...]:
         raise LakeError("the lake refused this identity")

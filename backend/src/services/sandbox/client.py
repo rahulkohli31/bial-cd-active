@@ -1094,8 +1094,8 @@ class AcaSandboxClient(SandboxClient):
         )
         # WHETHER THIS CONTAINER MAY READ A CONNECTOR'S DATA, read back out of the environment
         # the caller built rather than decided again here. The access question — a lake
-        # configured, the connector switched on for this project, the owner approved — was
-        # answered once by `build_connector_env`, and the presence of its coordinates IS that
+        # configured, the connector switched on for this project — was answered once by
+        # `build_connector_env`, and the presence of its coordinates IS that
         # answer; deriving it again would be a second place the platform decides who may read
         # BIAL's flight data. `None` means no identity block at all, so a container that was not
         # granted anything gets a spec byte-identical to the one this platform sent before

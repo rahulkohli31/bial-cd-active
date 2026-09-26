@@ -11,8 +11,6 @@ from src.db.models.classification_review import ClassificationReview as Classifi
 from src.db.models.classification_review import (
     ClassificationReviewStatus as ClassificationReviewStatus,
 )
-from src.db.models.connector_access import ConnectorAccessRequest as ConnectorAccessRequest
-from src.db.models.connector_access import ConnectorRequestStatus as ConnectorRequestStatus
 from src.db.models.conversation import Conversation as Conversation
 from src.db.models.deleted_project import DeletedProject as DeletedProject
 from src.db.models.deployment import Deployment as Deployment

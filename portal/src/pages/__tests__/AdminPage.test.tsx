@@ -193,3 +193,14 @@ describe('two messages in quick succession', () => {
     })
   })
 })
+
+describe('the console tabs', () => {
+  it('has no Integrations tab, and no people-waiting badge', async () => {
+    renderAdmin()
+    await screen.findByText('Gate Tool')
+    expect(screen.getByRole('button', { name: 'App Registry' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Users & Limits' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Integrations/ })).toBeNull()
+    expect(screen.queryByTestId('waiting-count-integrations-tab')).toBeNull()
+  })
+})

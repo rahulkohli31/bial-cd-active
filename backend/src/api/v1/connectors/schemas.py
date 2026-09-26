@@ -1,170 +1,18 @@
-"""The citizen-facing connector wire shapes.
+"""The connector wire shapes: what one project reads, and the one body that sets it.
 
-`ConnectorEntry` IS THE `ConnectorStates` BOARD'S "THE PERSON" HALF, one object per registry
-entry: the connector's name and subtitle, which of the four person states the caller is in, and
-the facts that state needs rendered beside it. Fields outside the caller's own state are `null` —
-`approvedByName` on a declined row would be a second answer to "who decided", and the board draws
-one.
-
-WHY THE APPROVED AND DECLINED TIMESTAMPS ARE TWO FIELDS OVER ONE COLUMN. `decided_at` carries
-both, but the board's two sentences are `Approved for you 2 Sep · Rahul Menon` and
-`Declined 2 Sep · Rahul Menon`, and a client that had to read `decidedAt` and then consult
-`state` to learn which sentence it belongs to is one `if` away from writing "Approved" over a
-decline. The state selects the field; the field names the sentence.
-
-EVERY NAME FIELD IS `str | None`, AND NOT BECAUSE THE NAME MIGHT BE BLANK. The server already
-falls back to the decider's email when `users.display_name` is null (see
-`services/connectors/access.PersonAccess`), so a present decider always has a non-empty handle.
-`None` means there is no decider to name at all: nobody has decided, or the administrator who did
-has since been deleted (`decided_by_id` is `ON DELETE SET NULL`, so the decision outlives them).
-
-THE SECOND HALF OF THIS MODULE IS THE PROJECT'S, not the person's — the switch, the days, and the
-one body that writes both. `ConnectorStates` draws the two as separate state machines on purpose;
-see the section comment below them for why they nevertheless share this file.
+Every shape here is about a PROJECT — its switch and the days it reads. The switch alone decides
+whether a project reads a connector, so nothing here says anything about the person who owns it.
 """
 
 from __future__ import annotations
 
-import uuid
-from datetime import date, datetime
+from datetime import date
 from typing import Annotated, Literal, Self
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, model_validator
 
 from src.db.models.project_connector import ConnectorWindowKind
-from src.schemas import CamelModel, clean_stated_reason
-from src.services.connectors import ConnectorPersonState
-
-
-def _clean_request_remarks(value: str) -> str:
-    """The connector access request's binding of the shared 5-50 word stated-reason rule.
-
-    THE SAME RULE THE DELETE REASON USES, by owner decision — not a note type of its own.
-    Both surfaces count words with `portal/src/utils/words.ts`, so a browser counter can never
-    let through something this API refuses, and `Give a little more detail — at least 5 words.`
-    is something a person can act on where a character floor is not.
-
-    The empty-field sentence is the `AskAccess` board's own helper text, which is what makes it
-    read as an instruction rather than as a complaint about a form."""
-    return clean_stated_reason(value, say_why="Say what you need the data for.")
-
-
-class AccessRequestBody(CamelModel):
-    """The body `POST /v1/connectors/{connector_key}/request` requires.
-
-    THE REMARK IS THE WHOLE OF WHAT THE ADMINISTRATOR DECIDES ON — the decide dialog leads with
-    it — which is why it is required here and NOT NULL on the row. WHO is asking is stamped from
-    the authenticated session and never carried in the body; an extra key is ignored, as Pydantic
-    ignores any unknown key."""
-
-    remarks: str
-
-    _v_remarks = field_validator("remarks")(_clean_request_remarks)
-
-
-class ConsentLine(CamelModel):
-    """One ticked line of the `WHAT AN APPROVAL GIVES YOU` panel: the bold lead, then the body.
-
-    TWO FIELDS RATHER THAN ONE JOINED STRING, mirroring `core.connectors.ConsentLine` exactly.
-    The boards set the lead in `font-weight:700` and the body in the panel's ordinary grey, so a
-    pre-joined sentence would force the browser to guess the split at the first full stop — and
-    the approver's `Read access to the Flight Fact Report.` breaks that guess outright, its body
-    starting lowercase and mid-sentence on purpose. Sending the pair costs one nesting level and
-    removes the guess."""
-
-    lead: str
-    body: str
-
-
-class ConnectorOnProject(CamelModel):
-    """One project behind the Integrations card's disclosure — a name, and nothing else.
-
-    NO WINDOW, NO RECORD COUNT, NO LAST-READ DATE. The page answers who may read the data, never
-    what was read or for how long, so a window has no place on this shape — putting one here would
-    be a usage-shaped fact on a page that is not allowed to state one. The days a project reads
-    are set where the switch is, in that project's own settings.
-
-    NO `enabled` EITHER. Every project on this list has the switch up — that is the list's whole
-    definition — so a field that is always `true` would be a second, weaker statement of it."""
-
-    project_id: uuid.UUID
-    name: str
-
-
-class ConnectorEntry(CamelModel):
-    """One registry connector as the asking person sees it. See the module docblock.
-
-    THE ASK PANEL'S COPY RIDES THIS OBJECT. `askSubtitle` and `consentLinesRequester` are
-    the two things `AskAccess` says about a connector that no client can derive from a name: what
-    the system holds, and what an approval does and does not give you. They come off the registry
-    entry, which is where the same sentences already live for the administrator's panel. Without
-    them a browser would have to carry one connector's dataset facts in a component, and "add a
-    second connector" would stop being a registry entry and become a component change.
-
-    BOTH ARE REGISTRY FACTS, NOT PER-CALLER FACTS, which is why they are non-null in EVERY state
-    while the fields below them go null outside their own. The dialog draws the ask panel from a
-    row the person has not asked about yet — that is the only state it is reachable from — so a
-    state-conditional copy field would arrive null exactly when it is needed."""
-
-    #: The stored `connector_key`. Stable, lowercase, and never rendered — the display name is.
-    key: str
-    display_name: str
-    subtitle: str
-    #: The `AskAccess` board's own sentence under its title — a whole sentence, and NOT
-    #: `subtitle` (the row's four-word label). Neither is derivable from the other.
-    ask_subtitle: str
-    #: `AskAccess`'s three ticked promises, in board order. Consent copy, binding in substance,
-    #: and the approver's differently-voiced set never travels to the citizen.
-    consent_lines_requester: list[ConsentLine]
-    state: ConnectorPersonState
-    #: `pending` only: when they asked. The board reads `Asked 5 Sep, 08:30 · waiting on an
-    #: administrator`, so the time of day is part of the sentence and this is not a date.
-    asked_at: datetime | None = None
-    #: `approved` only.
-    approved_at: datetime | None = None
-    approved_by_name: str | None = None
-    #: `approved` only: how many of the caller's own projects have this connector switched on,
-    #: for `On in 2 projects ›`. `None` — not `0` — in every other state: "we did not count"
-    #: and "none" are different answers, and only one of them belongs on a row with no access.
-    #: It is the LENGTH of `on_projects`, never a second count of the same rows, so the sentence
-    #: and the list under it cannot disagree.
-    on_project_count: int | None = None
-    #: The caller's own projects with this connector switched on — the Integrations card's
-    #: disclosure, listed rather than counted.
-    #:
-    #: IT IS A FACT ABOUT THE PROJECTS, NOT ABOUT THE PERSON, so it is present in every state and
-    #: filters on the project's own switch alone — never on `effectivelyOn`, which folds the
-    #: person's approval in. Were a grant withdrawn while switches stayed up, those projects stay
-    #: listed and `state` is the one place that says access is gone; rows vanishing instead would
-    #: leave the page silently short for a reason it never gives. A person who has never been
-    #: approved has switched nothing on, so their list is empty as a CONSEQUENCE of the filter
-    #: rather than as a special case.
-    on_projects: list[ConnectorOnProject]
-    #: `declined` only. The administrator's words reach the citizen VERBATIM and are rendered as
-    #: plain text on every surface, never through a markdown component: one user writes this and
-    #: another reads it.
-    decided_at: datetime | None = None
-    decided_by_name: str | None = None
-    decision_remarks: str | None = None
-
-
-class ConnectorListResponse(CamelModel):
-    """Every registry connector, in registry order.
-
-    AN ENVELOPE RATHER THAN A BARE ARRAY, matching `MarketplaceListResponse`: a top-level JSON
-    array cannot grow a field, and this list is the one the Integrations dialog renders whole."""
-
-    connectors: list[ConnectorEntry]
-
-
-# --- the project's switch and its days ------------------------------------------
-#
-# A SECOND FAMILY IN THIS MODULE, ON PURPOSE. `ConnectorEntry` above answers "where does this
-# PERSON stand"; everything below answers "what does this PROJECT read". `ConnectorStates` draws
-# them as two state machines side by side and says why (`Access is yours. The days are the
-# project's.`), and the split is the whole reason one administrator's answer covers every project
-# somebody owns. They share a module because they share a domain and a wire vocabulary, not
-# because either is derivable from the other.
+from src.schemas import CamelModel
 
 
 class StoredWindow(CamelModel):
@@ -221,39 +69,27 @@ class ConnectorWindow(CamelModel):
 
 
 class ProjectConnectorEntry(CamelModel):
-    """One registry connector as ONE PROJECT sees it — the rail's DATA row, whole.
+    """One registry connector as ONE PROJECT sees it — the settings row, whole.
 
-    THE FOUR PROJECT STATES OF `ConnectorStates` ARE READ OFF `state` AND `enabled` TOGETHER:
-    `approved` + on is state a (the chip and the sentence), `approved` + off is state b,
-    `pending` is state d (`You asked for access on 5 Sep — waiting on an administrator`, which is
-    what `askedAt` is here for), and `neverAsked` / `declined` are state c (`You do not have
-    access to … yet`, with `Request →`). Two of the four are read-outs of where the PERSON
-    stands, so a project never looks broken without saying why.
+    `enabled` IS THE SWITCH POSITION AND `effectivelyOn` IS WHETHER IT READS. The switch renders
+    `enabled`, and everything that means "this project can see the data" reads `effectivelyOn`,
+    straight off `resolve_window` — a client never works that answer out for itself.
 
-    `enabled` IS THE SWITCH POSITION AND `effectivelyOn` IS WHETHER IT READS. They are different
-    facts and both ship: the switch renders `enabled`, and everything that means "this project
-    can see flight data" — the DATA counter included — reads `effectivelyOn`. A client that
-    computed `enabled && state == 'approved'` for itself would be a second home for the
-    conjunction that `resolve_window` owns, and the two would eventually disagree.
-
-    NO `subtitle`. The dialog's connector row draws one under the name; the rail's row draws the
-    project state sentence in that place instead, so the field would ship with no reader."""
+    NO `subtitle`. The row draws the project's state sentence under the name instead, so the field
+    would ship with no reader."""
 
     #: The stored `connector_key`. Stable, lowercase, and never rendered — the display name is.
     key: str
     display_name: str
-    #: What this connector's data is CALLED, lowercase, for the rail's two state sentences:
-    #: `Reading N days of {dataNoun}` and `Switch it on when a chat needs {dataNoun}`. It rides
-    #: the wire for the same reason `askSubtitle` does — the sentence is the board's, the noun
-    #: inside it is the connector's, and a second connector must not cost a component edit.
+    #: What this connector's data is CALLED, lowercase, for the row's two state sentences:
+    #: `Reading N days of {dataNoun}` and `Switch it on when a chat needs {dataNoun}`. The
+    #: sentence is the board's, the noun inside it is the connector's, and a second connector must
+    #: not cost a component edit.
     data_noun: str
-    state: ConnectorPersonState
-    #: `pending` only: when this person asked. The rail's state-d sentence names the date.
-    asked_at: datetime | None = None
     #: The project's own switch, as stored. `false` when the connector was never switched on
     #: here — no row is `off`, and the rail draws them identically.
     enabled: bool
-    #: `enabled` AND the owner is approved, straight off the resolver. `false` with no row.
+    #: Whether this project reads the connector, straight off the resolver. `false` with no row.
     effectively_on: bool
     #: `null` when this connector was never switched on for this project — there is no window to
     #: render, which is a different fact from a window that exists behind a lowered switch.

@@ -1,34 +1,21 @@
 /**
- * The waiting-count badge — how many things sit in a review queue. It exists as ONE component,
- * not a span per mount, because it now appears in three places (the admin nav entry, the app
- * registry's Pending tab, and the Integrations tab) which must never disagree about the number
- * or how it's announced.
+ * The waiting-count badge — how many apps sit in the review queue. It exists as ONE component,
+ * not a span per mount, because it appears in two places (the admin nav entry and the app
+ * registry's Pending tab) which must never disagree about the number or how it's announced.
  *
  * ACCESSIBILITY: the visible numeral is `aria-hidden`; the real accessible name is the
  * visually-hidden sentence beside it, so the count is announced once, with its meaning, not
  * twice without it.
  *
- * WHAT IS REUSED HERE IS THE ZERO HANDLING, NOT THE WORDS. The two app mounts announce "N apps
- * waiting for review"; the connector queue counts PEOPLE asking for data access, and announcing
- * three of them as three apps would be a sentence that is simply untrue on a governance screen.
- * So `subject` selects the sentence and DEFAULTS to the app wording — neither existing mount
- * changes, and neither call site had to be touched to keep working.
- *
  * ZERO AND `null` BOTH RENDER NOTHING: an empty queue has nothing to say (a "0" badge would
  * train an administrator to ignore this pixel), and an unknown count must never claim a number.
  */
 
-/** Which queue is being counted, which is which sentence gets announced. */
-export type WaitingSubject = 'apps' | 'people'
-
 interface Props {
   /** The pending count, or `null` when it is unknown (not yet fetched, or the fetch failed). */
   count: number | null
-  /** Distinguishes the mounts in the DOM (`nav`, `tab`, `integrations-tab`) — one testid each. */
+  /** Distinguishes the mounts in the DOM (`nav`, `tab`) — one testid each. */
   where: string
-  /** The sentence to announce. Omitted means the app review queue's, so the two older mounts
-   *  keep the exact words they shipped with. */
-  subject?: WaitingSubject
   /**
    * A dot instead of a numeral, for the collapsed navigation rail.
    *
@@ -40,18 +27,14 @@ interface Props {
   compact?: boolean
 }
 
-/** The accessible sentences. Singular is not pedantry — "1 apps waiting" is the kind of
+/** The accessible sentence. Singular is not pedantry — "1 apps waiting" is the kind of
  *  thing that makes a person trust the rest of the screen slightly less. */
 // Module-local: the badge's own sr-only label below is the only caller.
 function waitingForReviewLabel(count: number): string {
   return `${count} ${count === 1 ? 'app' : 'apps'} waiting for review`
 }
 
-function waitingForAccessLabel(count: number): string {
-  return `${count} ${count === 1 ? 'person' : 'people'} waiting for access`
-}
-
-export default function WaitingCountBadge({ count, where, subject = 'apps', compact = false }: Props) {
+export default function WaitingCountBadge({ count, where, compact = false }: Props) {
   if (count === null || count <= 0) return null
   return (
     <span
@@ -66,9 +49,7 @@ export default function WaitingCountBadge({ count, where, subject = 'apps', comp
       }
     >
       {!compact && <span aria-hidden="true">{count}</span>}
-      <span className="sr-only">
-        {subject === 'people' ? waitingForAccessLabel(count) : waitingForReviewLabel(count)}
-      </span>
+      <span className="sr-only">{waitingForReviewLabel(count)}</span>
     </span>
   )
 }

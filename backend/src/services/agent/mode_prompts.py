@@ -45,7 +45,7 @@ class PromptContext:
     project row's description, absent when the user never wrote/generated one.
 
     `connected_systems` is what this project may actually read from outside the platform,
-    resolved once at the router (`services/connectors/access.connected_systems_for_project`).
+    resolved once at the router (`services/connectors.connected_systems_for_project`).
     Empty is the ordinary case. The SAME value decides the turn's tool surface, which is why it
     rides the prompt context rather than being resolved again wherever it is needed.
 

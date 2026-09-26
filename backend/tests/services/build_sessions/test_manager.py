@@ -2221,14 +2221,12 @@ async def test_save_still_succeeds_while_the_app_is_switched_off(
 # all and is not a birth, which is why there is no third case here.
 
 
-async def _approved_connector_project(db: AsyncSession, email: str) -> tuple[User, uuid.UUID]:
-    """A citizen an administrator has approved, with the connector switched on for one project."""
-    from src.db.models.connector_access import ConnectorRequestStatus
+async def _switched_on_connector_project(db: AsyncSession, email: str) -> tuple[User, uuid.UUID]:
+    """A citizen with the connector switched on for one project."""
     from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
-    from tests.api.v1.connectors.conftest import KEY, seed_decision
+    from tests.api.v1.connectors.conftest import KEY
 
     user, project_id = await _mk(db, email)
-    await seed_decision(db, user.id, ConnectorRequestStatus.APPROVED, None)
     db.add(
         ProjectConnector(
             project_id=project_id,
@@ -2274,7 +2272,7 @@ async def test_the_turn_start_birth_arm_carries_the_connector_coordinates(
     fake_storage: FakeStorage,
     _lake_configured: None,
 ) -> None:
-    user, project_id = await _approved_connector_project(db_session, "cx1@rvaiglobal.com")
+    user, project_id = await _switched_on_connector_project(db_session, "cx1@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
 
@@ -2294,7 +2292,7 @@ async def test_the_relaunch_birth_arm_carries_them_too(
     fake_storage: FakeStorage,
     _lake_configured: None,
 ) -> None:
-    user, project_id = await _approved_connector_project(db_session, "cx2@rvaiglobal.com")
+    user, project_id = await _switched_on_connector_project(db_session, "cx2@rvaiglobal.com")
     manager = SessionManager()
     client = _RelaunchRecorder()
     await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
@@ -2307,15 +2305,15 @@ async def test_the_relaunch_birth_arm_carries_them_too(
     assert client.restore_env[client_id_name] == _LAKE_CLIENT_ID
 
 
-async def test_an_unapproved_project_is_born_with_nothing_extra(
+async def test_a_project_that_never_switched_it_on_is_born_with_nothing_extra(
     db_session: AsyncSession,
     fake_redis: aioredis.Redis,
     fake_storage: FakeStorage,
     _lake_configured: None,
 ) -> None:
-    """The lake is CONFIGURED and the container still gets nothing, because this citizen was
-    never approved. Asserted on the birth env rather than on the envelope so the two halves of
-    the gate — coordinates and identity — each have their own failing test."""
+    """The lake is CONFIGURED and the container still gets nothing, because this project never
+    switched the connector on. Asserted on the birth env rather than on the envelope so the two
+    halves of the gate — coordinates and identity — each have their own failing test."""
     user, project_id = await _mk(db_session, "cx3@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
@@ -2354,14 +2352,14 @@ async def test_both_birth_arms_schedule_the_window_copy(
         lambda user_id, project_id: fired.append((user_id, project_id)),
     )
 
-    user, project_id = await _approved_connector_project(db_session, "cx4@rvaiglobal.com")
+    user, project_id = await _switched_on_connector_project(db_session, "cx4@rvaiglobal.com")
     manager = SessionManager()
     await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=FakeSandboxClient(), may_write=True
     )
     assert fired == [(user.id, project_id)], "the turn-start birth arm did not start the copy"
 
-    other, other_project = await _approved_connector_project(db_session, "cx5@rvaiglobal.com")
+    other, other_project = await _switched_on_connector_project(db_session, "cx5@rvaiglobal.com")
     await _seed_app_with_bundle(db_session, other, other_project, fake_storage)
     await _relaunched(manager, db_session, other, other_project, _RelaunchRecorder())
     assert fired[-1] == (other.id, other_project), "the relaunch birth arm did not start the copy"
@@ -2383,7 +2381,7 @@ async def test_attaching_to_a_live_container_does_not_re_copy_the_window(
     taken the BIRTH arm, or failed before reaching either, would satisfy the absence for entirely
     the wrong reason. `client.provisioned` staying empty is what proves this went through attach.
     """
-    user, project_id = await _approved_connector_project(db_session, "cx6@rvaiglobal.com")
+    user, project_id = await _switched_on_connector_project(db_session, "cx6@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
     app_id = await resolve_app_for_project(db_session, user.id, project_id)

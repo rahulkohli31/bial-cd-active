@@ -75,6 +75,12 @@ _APP_DB: dict[str, str] = {
     # Fernet wants 32 url-safe-base64-encoded bytes; any well-formed key satisfies construction.
     "APP_DB__ENCRYPTION_KEY": "dGVzdC1lbmNyeXB0aW9uLWtleS0zMi1ieXRlcy1sb25nISE=",
 }
+_LAKE: dict[str, str] = {
+    "CONNECTOR_LAKE__URL": "https://lake.blob.core.windows.net/data/flights/",
+    "CONNECTOR_LAKE__IDENTITY_CLIENT_ID": "33333333-3333-3333-3333-333333333333",
+    "CONNECTOR_LAKE__IDENTITY_RESOURCE_ID": "/subscriptions/0/resourcegroups/rg/providers/"
+    "Microsoft.ManagedIdentity/userAssignedIdentities/lake-reader",
+}
 
 # Required of the WORKER with no default, for the same reason as the three blocks above it: this
 # process is the one that deletes citizens' conversations, so a deployment that has not decided
@@ -226,7 +232,7 @@ def test_the_api_profile_still_boots_without_the_optional_integrations() -> None
 
 
 def test_the_api_production_gates_still_fire() -> None:
-    """The seven prod gates are the API's existing contract and must survive the split."""
+    """The prod gates are the API's existing contract and must survive the split."""
     env = {**_API_ENV, "ENVIRONMENT": "production", "FRONTEND_URL": "https://portal.example"}
     with pytest.raises(ValidationError) as excinfo:
         _boot(ApiSettings, env)
@@ -255,6 +261,11 @@ _PROD_GATES: list[tuple[str, dict[str, str], str]] = [
         "app_db",
         {**_STORE, "REDIS__URL": "rediss://localhost:6380/0", **_SANDBOX},
         "per-project databases must be configured in production",
+    ),
+    (
+        "connector_lake",
+        {**_STORE, "REDIS__URL": "rediss://localhost:6380/0", **_SANDBOX, **_APP_DB},
+        "the connector lake must be configured in production",
     ),
 ]
 
@@ -288,6 +299,7 @@ def test_the_frontend_url_gate_rejects_the_dev_default_in_production() -> None:
         "REDIS__URL": "rediss://localhost:6380/0",
         **_SANDBOX,
         **_APP_DB,
+        **_LAKE,
         "ENVIRONMENT": "production",
         # FRONTEND_URL deliberately omitted -> the http://localhost:5173 default applies.
     }

@@ -1,20 +1,14 @@
 /**
- * The connector client's PARSE contract, for the fields no component test can reach.
+ * The connector client's routes and PARSE contract, for the parts no component test can reach —
+ * every component test mocks these functions, so a wrong path or a tolerant parse would ship green.
  *
- * WHY THIS MODULE IS STRICTER THAN `marketplaceApi`, and where the line sits. The catalog drops
- * an unreadable row and renders the rest, because one bad app must not blank a list of hundreds.
- * This list is the WHOLE of what Integrations offers: dropping its only row would render
- * "nothing is connected", which is false. So a row we cannot read throws — and these tests pin
- * exactly WHICH fields make a row unreadable, because the module deliberately does not treat
- * them all alike (`subtitle` is a label and may be absent; the ask panel's copy may not be).
- *
- * THE COPY FIELDS ARE THE POINT. `askSubtitle` and `consentLinesRequester` carry what the ask
- * panel says about a system, so that adding a second connector is a registry entry and not a
- * component change. A tolerant parse would trade a loud contract break for a silent one: a
- * consent box with a heading and no promises under it, in front of somebody about to ask.
+ * WHY THIS MODULE IS STRICTER THAN `marketplaceApi`. The catalog drops an unreadable row and
+ * renders the rest, because one bad app must not blank a list of hundreds. This list is the WHOLE
+ * of what an application can read: dropping its only row would render "nothing is connected",
+ * which is false. So a row we cannot read throws.
  */
 import { describe, it, expect, vi } from 'vitest'
-import { cancelConnectorRequest, listConnectors } from '../connectorApi'
+import { listProjectConnectors, setProjectConnector } from '../connectorApi'
 import { ApiError } from '../apiError'
 
 const deps = (fetchImpl: unknown) =>
@@ -27,128 +21,46 @@ const res = (init: Record<string, unknown>): Record<string, unknown> => ({
 })
 const ok = (json: unknown) => res({ ok: true, status: 200, json: async () => json })
 
-const CONSENT = [
-  { lead: 'Read-only.', body: 'Nothing you build can change ORBIT data.' },
-  { lead: 'One dataset.', body: 'The Flight Fact Report. Nothing else in ORBIT.' },
-]
-
 const ENTRY = {
   key: 'orbit',
   displayName: 'ORBIT',
-  subtitle: 'Airport operations',
-  askSubtitle: 'ORBIT is BIAL’s airport operations data. An administrator decides who may read it.',
-  consentLinesRequester: CONSENT,
-  state: 'neverAsked',
-  askedAt: null,
-  approvedAt: null,
-  approvedByName: null,
-  onProjectCount: null,
-  onProjects: [],
-  decidedAt: null,
-  decidedByName: null,
-  decisionRemarks: null,
+  dataNoun: 'stand and gate data',
+  enabled: false,
+  effectivelyOn: false,
+  window: null,
 }
 
-const listWith = async (entry: Record<string, unknown>): Promise<unknown> =>
-  listConnectors(deps(vi.fn(async () => ok({ connectors: [entry] }))))
+describe('reading what one application reads', () => {
+  it('asks for this application and keeps exactly the project facts', async () => {
+    const fetchImpl = vi.fn(async () => ok({ connectors: [{ ...ENTRY, state: 'approved' }] }))
 
-describe('the ask panel copy survives the parse intact', () => {
-  it('carries the subtitle and every consent line, in the order the server sent them', async () => {
-    const [row] = await listConnectors(
-      deps(vi.fn(async () => ok({ connectors: [ENTRY] }))),
-    )
+    const [row] = await listProjectConnectors('p1', deps(fetchImpl))
 
-    expect(row.askSubtitle).toBe(ENTRY.askSubtitle)
-    expect(row.consentLinesRequester).toEqual(CONSENT)
-    // The row's own four-word label is a DIFFERENT field, not a truncation of the sentence.
-    expect(row.subtitle).toBe('Airport operations')
+    const [url] = fetchImpl.mock.calls[0] as unknown as [string]
+    expect(url).toBe('/api/projects/p1/connectors')
+    // Whatever else the wire carries, the switch is the whole of access: a person-level field
+    // riding along must not reach a component that could start branching on it.
+    expect(row).toEqual(ENTRY)
+  })
+
+  it('throws on a row it cannot read rather than rendering a thinner one', async () => {
+    const { effectivelyOn: _gone, ...unreadable } = ENTRY
+    await expect(
+      listProjectConnectors('p1', deps(vi.fn(async () => ok({ connectors: [unreadable] })))),
+    ).rejects.toBeInstanceOf(ApiError)
   })
 })
 
-describe('withdrawing your own waiting request', () => {
-  it('posts to the cancel route and reads the state the server settled on', async () => {
-    // THE ROUTE IS PINNED HERE BECAUSE NOTHING ELSE PINS IT. Every component test mocks this
-    // function, so a cancel posted at the ask route would withdraw nothing, earn a 409 from a
-    // route that means the opposite, and ship green.
-    const fetchImpl = vi.fn(async () => ok({ ...ENTRY, state: 'neverAsked' }))
-    const row = await cancelConnectorRequest('orbit', deps(fetchImpl))
+describe('switching a connector on', () => {
+  it('puts the switch at this application and connector, and reads back what the server resolved', async () => {
+    const fetchImpl = vi.fn(async () => ok({ ...ENTRY, enabled: true, effectivelyOn: true }))
+
+    const row = await setProjectConnector('p1', 'orbit', { enabled: true }, deps(fetchImpl))
 
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit]
-    expect(url).toBe('/api/connectors/orbit/cancel')
-    expect(init.method).toBe('POST')
-    // Through the same parse as every other answer: the state is a derivation over the person's
-    // remaining rows, so it is read back rather than assumed.
-    expect(row.state).toBe('neverAsked')
-  })
-})
-
-describe('the applications behind the disclosure', () => {
-  it('carries each one as a name and an id, and nothing else', async () => {
-    const [row] = await listConnectors(
-      deps(
-        vi.fn(async () =>
-          ok({
-            connectors: [
-              {
-                ...ENTRY,
-                onProjects: [
-                  { projectId: 'a1', name: 'Flight Delay Reason Capture', enabled: true, window: null },
-                ],
-              },
-            ],
-          }),
-        ),
-      ),
-    )
-
-    // The wire may carry more; this client keeps only what the page is allowed to state. A
-    // spread here would let a window or a record count reach a surface that must not show one.
-    expect(row.onProjects).toEqual([{ projectId: 'a1', name: 'Flight Delay Reason Capture' }])
-  })
-
-  it('throws when the list is absent — "nothing is switched on" is a statement, not a default', async () => {
-    const { onProjects: _gone, ...noList } = ENTRY
-    await expect(listWith(noList)).rejects.toBeInstanceOf(ApiError)
-  })
-
-  it('throws on an application with no name rather than listing a blank row', async () => {
-    await expect(
-      listWith({ ...ENTRY, onProjects: [{ projectId: 'a1' }] }),
-    ).rejects.toBeInstanceOf(ApiError)
-  })
-
-  it('reads an empty list as an empty list — that one IS an answer', async () => {
-    const [row] = await listConnectors(
-      deps(vi.fn(async () => ok({ connectors: [{ ...ENTRY, onProjects: [] }] }))),
-    )
-    expect(row.onProjects).toEqual([])
-  })
-})
-
-describe('a row whose copy cannot be read is a contract break, not a thinner row', () => {
-  it('throws when the ask subtitle is missing — unlike the subtitle, which may be', async () => {
-    // The contrast IS the test: both are strings on the same object and the module treats them
-    // differently on purpose. A parse that made `askSubtitle` optional would ship a panel whose
-    // opening sentence is blank, which says nothing about what is being asked for.
-    const { askSubtitle: _dropped, ...noSubtitleSentence } = ENTRY
-    await expect(listWith(noSubtitleSentence)).rejects.toBeInstanceOf(ApiError)
-
-    const { subtitle: _label, ...noLabel } = ENTRY
-    const [row] = await listConnectors(
-      deps(vi.fn(async () => ok({ connectors: [noLabel] }))),
-    )
-    expect(row.subtitle).toBe('')
-  })
-
-  it('throws on an EMPTY consent list — a heading with no promises under it is not a panel', async () => {
-    await expect(listWith({ ...ENTRY, consentLinesRequester: [] })).rejects.toBeInstanceOf(ApiError)
-  })
-
-  it('throws on a half-formed line rather than rendering the promises that did arrive', async () => {
-    // Dropping the bad line would leave the citizen reading one promise of two with nothing on
-    // screen admitting the other went missing — the failure mode strictness exists to prevent.
-    await expect(
-      listWith({ ...ENTRY, consentLinesRequester: [CONSENT[0], { lead: 'One dataset.' }] }),
-    ).rejects.toBeInstanceOf(ApiError)
+    expect(url).toBe('/api/projects/p1/connectors/orbit')
+    expect(init.method).toBe('PUT')
+    expect(JSON.parse(String(init.body))).toEqual({ enabled: true })
+    expect(row.effectivelyOn).toBe(true)
   })
 })

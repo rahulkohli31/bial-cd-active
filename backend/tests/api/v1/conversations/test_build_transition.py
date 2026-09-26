@@ -32,7 +32,6 @@ from src.api.v1.conversations._shared import MAX_MESSAGE_TEXT_CHARS
 from src.api.v1.conversations.transition import NO_PLAN_CODE, PLAN_TOO_LONG_CODE
 from src.config import settings
 from src.core.connectors import CONNECTORS
-from src.db.models.connector_access import ConnectorAccessRequest, ConnectorRequestStatus
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageVisibility
 from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
@@ -296,18 +295,10 @@ async def test_the_handoff_resolves_the_projects_connected_data_for_the_build_it
     attach on the fixture's already-committed transaction and never reaches the model, which is
     why no test in this file inspects `AgentInfo`.
 
-    The rows are seeded BEFORE the plan turn: that turn runs through the real route and commits,
+    The row is seeded BEFORE the plan turn: that turn runs through the real route and commits,
     closing the fixture transaction, so a write after it raises rather than seeding anything."""
     user = await UserFactory.create(db_session)
     conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.PLAN)
-    db_session.add(
-        ConnectorAccessRequest(
-            user_id=user.id,
-            connector_key=_CONNECTOR_KEY,
-            status=ConnectorRequestStatus.APPROVED,
-            requester_remarks="The stand board needs on-block times.",
-        )
-    )
     db_session.add(
         ProjectConnector(
             project_id=conv.project_id,

@@ -9,11 +9,11 @@ behaviour (normalize to NULL) before #191 made it required; the column itself st
 regardless, so a project written before #191 with no description is untouched.
 
 ONE FUNCTION HERE IS NOT ABOUT PROJECTS. `clean_stated_reason` is the platform's shared "say
-why" rule, and its callers now reach past this domain — the admin app-delete and the connector
-access request. It stays in this module because this is where it was written, tested and
-shipped, and because every caller reaches it through `src/schemas/__init__.py` rather than
-through this file's path; moving a shipped validator's home is a larger change than widening it
-was, and would buy nothing a reader of the re-export can see.
+why" rule, and one of its callers reaches past this domain — the admin app-delete. It stays in
+this module because this is where it was written, tested and shipped, and because every caller
+reaches it through `src/schemas/__init__.py` rather than through this file's path; moving a
+shipped validator's home is a larger change than widening it was, and would buy nothing a reader
+of the re-export can see.
 """
 
 from __future__ import annotations
@@ -166,11 +166,10 @@ def clean_stated_reason(value: str, *, say_why: str) -> str:
     The lower bound is the unusual half, and it is deliberate: the reason exists so whoever
     reads it later learns something, and a field that can be dismissed in one word will be.
 
-    ONE RULE, THREE SURFACES — deleting your own project, destroying somebody else's app, and
-    asking an administrator for connector access. All three dialogs count with
-    `portal/src/utils/words.ts` and this counts with `count_words`, both pinned against the
-    same inputs; a second copy of these four checks is how two surfaces end up disagreeing
-    about what a word is. The bounds keep their delete-flavoured names on purpose —
+    ONE RULE, TWO SURFACES — deleting your own project and destroying somebody else's app. Both
+    dialogs count with `portal/src/utils/words.ts` and this counts with `count_words`, both
+    pinned against the same inputs; a second copy of these four checks is how two surfaces end up
+    disagreeing about what a word is. The bounds keep their delete-flavoured names on purpose —
     `MIN_DELETE_REMARK_*` are the deleted-project table's own numbers, and a parallel set of
     aliases would be two names for one number.
     """

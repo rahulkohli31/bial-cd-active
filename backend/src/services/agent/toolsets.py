@@ -284,16 +284,14 @@ def toolsets_for_kind[DepsT](
 
     AND IT NOW GATES ON A SECOND AXIS: THE PROJECT. `connected_systems` is what this project may
     actually read from outside the platform, resolved once at the router off
-    `resolve_window(...).effectively_on` — the project's switch AND the owner's approval. Empty is
-    the ordinary case and adds nothing, so a project with no connector pays nothing for this
-    feature on any turn.
+    `resolve_window(...).effectively_on` — the project's switch. Empty is the ordinary case and
+    adds nothing, so a project with no connector pays nothing for this feature on any turn.
 
     THE GATE IS REGISTRATION, NOT REFUSAL, and that is the whole reason it lives here rather than
-    inside the tool. The platform already has a flow whose purpose is to say no to a project — an
-    administrator declining the request, or a revocation flipping `effectively_on` back — and a
-    surface that ignored it would leave the model to discover the refusal by spending a round
+    inside the tool. A project whose switch is down must not be offered the tool at all, and a
+    surface that offered it would leave the model to discover the refusal by spending a round
     trip. Absent instead: a forged call meets the runtime's unknown-tool rejection, exactly as a
-    Build tool does in a Plan chat. Toolsets are built per run, so a revoked approval takes the
+    Build tool does in a Plan chat. Toolsets are built per run, so a switch turned off takes the
     tool away on the citizen's next turn with no invalidation step anywhere.
 
     `app_state_of` IS THE ONE ACCESSOR THAT MAY ANSWER `None`, and `check_the_app` is registered
@@ -432,7 +430,7 @@ from. No second endpoint, no second wording."""
 # --- Reading the registry back, without running any of it ----------------------------------
 #
 # The gating rules above are only as good as something that can ask what a kind actually
-# registers: that Plan is offered no write tool, that a project with no approved connector is
+# registers: that Plan is offered no write tool, that a project with no switched-on connector is
 # offered no connector tool. Those guards read this, and they have to be able to run with no
 # workspace, no sandbox and no model — so every accessor here raises if it is ever called.
 

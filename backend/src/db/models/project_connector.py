@@ -1,10 +1,9 @@
 """The `project_connectors` table — one row per project that has ever switched a connector on,
 carrying that project's switch and the days it reads.
 
-THE DAYS BELONG TO THE PROJECT. Access is answered once for a person
-(`connector_access_requests`); after that a project only ever answers two questions of its own —
-is this switched on here, and how far back does it read — and neither needs anybody's permission.
-A departures board and a six-month trend want different history, so the window is per project.
+THE SWITCH AND THE DAYS BELONG TO THE PROJECT. A project answers two questions of its own — is
+this switched on here, and how far back does it read — and neither needs anybody's permission. A
+departures board and a six-month trend want different history, so the window is per project.
 
 WHY THIS EXISTS AS A TABLE. Same shape as `project_databases`, and for the same reasons: absence is
 clean (no row = this connector was never switched on here, which is a different fact from "switched
@@ -19,13 +18,8 @@ new call.
 
 THE ROW IS KEPT ON SWITCH-OFF. `enabled = false` means "switched off, and the days you picked are
 still here"; deleting the row would destroy the stored window, which must survive, for
-no saving. Switching a connector off is not spending the approval, and switching it back on must
-not silently re-pick `Last 30 days` over the range the citizen chose.
-
-STORED STATE IS NOT EFFECTIVE STATE. `enabled = true` on this row means the project's
-switch is up — nothing more. Whether the connector actually reads is `enabled AND the owner is
-approved`, and that conjunction is computed in exactly ONE place, the resolver in
-`src/core/connectors.py`. Nothing may read `enabled` and call it "on".
+no saving. Switching a connector back on must not silently re-pick `Last 30 days` over the range
+the citizen chose.
 
 WINDOWS STORE THEIR KIND, and one CHECK constraint keeps the columns honest. The alternative —
 inferring `relative` vs `absolute` from which columns happen to be null — needs the same constraint
@@ -55,7 +49,14 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
 from src.db.mixins import TimestampMixin, UUIDv7PrimaryKeyMixin
-from src.db.models.connector_access import MAX_CONNECTOR_KEY
+
+# The stored width of a `connector_key`. Declared HERE rather than on the registry in
+# `src/core/connectors.py` — the semantically better home — because that module imports
+# `ist_today` from `src.services.usage`, and `src.services.usage` re-exports from
+# `src.db.models.token_usage`; a model importing the registry would close a
+# models → core → services → models loop. `tests/db/test_connector_models.py` asserts every
+# registry key fits this width, so the two cannot drift apart unnoticed.
+MAX_CONNECTOR_KEY = 32
 
 
 class ConnectorWindowKind(StrEnum):
