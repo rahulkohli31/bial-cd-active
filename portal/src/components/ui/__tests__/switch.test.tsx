@@ -54,3 +54,42 @@ describe('Switch', () => {
     expect(onCheckedChange).toHaveBeenCalledTimes(1)
   })
 })
+
+const thumbOf = (control: HTMLElement): HTMLElement => {
+  const thumb = control.firstElementChild
+  if (!(thumb instanceof HTMLElement)) throw new Error('the switch rendered no thumb')
+  return thumb
+}
+
+describe('Switch size', () => {
+  it('size="lg" renders the 38×22 track with an 18px thumb and 16px of travel', () => {
+    render(<Switch size="lg" checked aria-label="Active" />)
+    const control = screen.getByRole('switch', { name: 'Active' })
+
+    expect(control.className).toContain('h-[22px]')
+    expect(control.className).toContain('w-[38px]')
+    expect(control.className).toContain('p-px')
+    expect(control.className).not.toContain('w-8')
+
+    const thumb = thumbOf(control)
+    expect(thumb.className).toContain('h-[18px]')
+    expect(thumb.className).toContain('w-[18px]')
+    expect(thumb.className).toContain('data-[state=checked]:translate-x-[16px]')
+    expect(thumb.className).not.toContain('translate-x-[14px]')
+  })
+
+  it('the default size keeps the 32×18 track with a 14px thumb', () => {
+    render(<Switch checked aria-label="Read ORBIT" />)
+    const control = screen.getByRole('switch', { name: 'Read ORBIT' })
+
+    expect(control.className).toContain('h-[18px]')
+    expect(control.className).toContain('w-8')
+    expect(control.className).toContain('p-0.5')
+    expect(control.className).not.toContain('w-[38px]')
+
+    const thumb = thumbOf(control)
+    expect(thumb.className).toContain('h-3.5')
+    expect(thumb.className).toContain('data-[state=checked]:translate-x-[14px]')
+    expect(thumb.className).not.toContain('h-[18px]')
+  })
+})

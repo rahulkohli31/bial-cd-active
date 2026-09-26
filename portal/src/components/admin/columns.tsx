@@ -1,6 +1,7 @@
 import type { ColumnDef, Column, Row } from '@tanstack/react-table'
 import { Pencil, UserX, UserCheck, ShieldCheck, ArrowUpDown, RotateCcw } from 'lucide-react'
 import { BusyGlyph } from '../ui/Waiting'
+import { Badge } from '../ui/badge'
 import { tableHeadLabelClass } from '../ui/table'
 import type { LimitFields } from '../../utils/admin'
 
@@ -25,13 +26,13 @@ function LimitCell({ value, overridden }: { value: number | null | undefined; ov
     <div className="flex items-center gap-1.5 whitespace-nowrap">
       <span className="text-tertiary font-medium tabular-nums">{fmt(value ?? 0)}</span>
       {overridden ? (
-        <span className="text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-primary/10 text-primary">
+        <Badge variant="outline" className="border-transparent px-1.5 text-[9px] uppercase tracking-wide bg-primary/10 text-primary">
           custom
-        </span>
+        </Badge>
       ) : (
-        <span className="text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-gray-100 text-neutral">
+        <Badge variant="outline" className="border-transparent px-1.5 text-[9px] font-semibold uppercase tracking-wide bg-gray-100 text-neutral">
           default
-        </span>
+        </Badge>
       )}
     </div>
   )
@@ -40,19 +41,13 @@ function LimitCell({ value, overridden }: { value: number | null | undefined; ov
 /** Active / Suspended pill driven purely by `suspendedAt` (null = active). */
 function SuspensionBadge({ email, suspendedAt }: { email: string; suspendedAt: string | null }) {
   return suspendedAt ? (
-    <span
-      data-testid={`status-${email}`}
-      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-red-100 text-red-700"
-    >
+    <Badge data-testid={`status-${email}`} variant="outline" className="border-transparent font-semibold bg-red-100 text-red-700">
       Suspended
-    </span>
+    </Badge>
   ) : (
-    <span
-      data-testid={`status-${email}`}
-      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-green-100 text-green-700"
-    >
+    <Badge data-testid={`status-${email}`} variant="outline" className="border-transparent font-semibold bg-green-100 text-green-700">
       Active
-    </span>
+    </Badge>
   )
 }
 
@@ -87,7 +82,7 @@ interface CreateUserColumnsArgs {
 
 /** A sortable column header — shares TableHead's own label styling (tableHeadLabelClass) so the two can't drift.
  *  Generic over the row: the header needs nothing off one, only the column handle. */
-function SortHeader<TRow>({ label, column }: { label: string; column: Column<TRow, unknown> }) {
+export function SortHeader<TRow>({ label, column }: { label: string; column: Column<TRow, unknown> }) {
   const sorted = column.getIsSorted()
   return (
     <button
@@ -122,7 +117,7 @@ export function createUserColumns({
     {
       id: 'user',
       accessorFn: (row) => row.displayName || row.email,
-      header: ({ column }) => <SortHeader label="User" column={column} />,
+      header: 'User',
       cell: ({ row }) => {
         const u = row.original
         return (
@@ -136,21 +131,21 @@ export function createUserColumns({
     {
       id: 'role',
       accessorFn: (row) => row.role,
-      header: ({ column }) => <SortHeader label="Role" column={column} />,
+      header: 'Role',
       cell: ({ row }) => <span className="capitalize text-neutral whitespace-nowrap">{roleLabel(row.original.role)}</span>,
       filterFn: equalsOrAll,
     },
     {
       id: 'status',
       accessorFn: (row) => (row.suspendedAt ? 'suspended' : 'active'),
-      header: ({ column }) => <SortHeader label="Status" column={column} />,
+      header: 'Status',
       cell: ({ row }) => <SuspensionBadge email={row.original.email} suspendedAt={row.original.suspendedAt} />,
       filterFn: equalsOrAll,
     },
     {
       id: 'usageToday',
       accessorFn: (row) => row.usageToday ?? 0,
-      header: ({ column }) => <SortHeader label="Used today" column={column} />,
+      header: 'Used today',
       cell: ({ getValue }) => (
         <span className="text-tertiary tabular-nums whitespace-nowrap">{fmt(getValue() as number)}</span>
       ),
@@ -158,7 +153,7 @@ export function createUserColumns({
     {
       id: 'dailyTokenLimit',
       accessorFn: (row) => row.effectiveLimits?.dailyTokenLimit ?? 0,
-      header: ({ column }) => <SortHeader label="Daily tokens" column={column} />,
+      header: 'Daily tokens',
       cell: ({ row }) => (
         <LimitCell
           value={row.original.effectiveLimits?.dailyTokenLimit}
@@ -169,7 +164,7 @@ export function createUserColumns({
     {
       id: 'contextSoftLimit',
       accessorFn: (row) => row.effectiveLimits?.contextSoftLimit ?? 0,
-      header: ({ column }) => <SortHeader label="Per-conv warn" column={column} />,
+      header: 'Per-conv warn',
       cell: ({ row }) => (
         <LimitCell
           value={row.original.effectiveLimits?.contextSoftLimit}
@@ -180,7 +175,7 @@ export function createUserColumns({
     {
       id: 'contextHardLimit',
       accessorFn: (row) => row.effectiveLimits?.contextHardLimit ?? 0,
-      header: ({ column }) => <SortHeader label="Per-conv max" column={column} />,
+      header: 'Per-conv max',
       cell: ({ row }) => (
         <LimitCell
           value={row.original.effectiveLimits?.contextHardLimit}

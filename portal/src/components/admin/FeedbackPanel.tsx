@@ -1,18 +1,61 @@
 import { useState, useEffect, useCallback } from 'react'
-import { AlertCircle, RefreshCw, MessageSquare } from 'lucide-react'
+import type { ColumnDef } from '@tanstack/react-table'
+import { AlertCircle, RefreshCw } from 'lucide-react'
 import { BusyGlyph } from '../ui/Waiting'
 import { fetchFeedback } from '../../utils/admin'
 import type { FeedbackItem } from '../../utils/admin'
+import AdminDataTable from './AdminDataTable'
 
 const fmtWhen = (iso: string): string => {
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString()
 }
 
+const SEARCHABLE = new Set(['email', 'message', 'page'])
+
+const columns: ColumnDef<FeedbackItem>[] = [
+  {
+    id: 'email',
+    accessorFn: (f) => f.email,
+    header: 'User',
+    cell: ({ row }) => <span className="whitespace-nowrap text-tertiary font-medium">{row.original.email}</span>,
+  },
+  {
+    id: 'message',
+    accessorFn: (f) => f.message,
+    header: 'Message',
+    // Plain text, clamped: messages can run to 4000 bytes. Full text in the title tooltip; never whitespace-nowrap.
+    cell: ({ row }) => (
+      <p className="max-w-md text-tertiary line-clamp-2 break-words" title={row.original.message}>
+        {row.original.message}
+      </p>
+    ),
+  },
+  {
+    id: 'page',
+    accessorFn: (f) => f.page,
+    header: 'Page',
+    cell: ({ row }) =>
+      row.original.page ? (
+        <span className="text-[11px] font-mono text-neutral bg-surface-muted border border-bial-border rounded px-1.5 py-0.5">
+          {row.original.page}
+        </span>
+      ) : (
+        <span className="text-neutral">—</span>
+      ),
+  },
+  {
+    id: 'createdAt',
+    accessorFn: (f) => f.createdAt,
+    header: 'When',
+    cell: ({ row }) => <span className="whitespace-nowrap text-neutral">{fmtWhen(row.original.createdAt)}</span>,
+  },
+]
+
 /**
  * Admin "Feedback" panel — read-only list of submitted feedback, newest first.
- * Near-clone of UsersLimitsPanel: fetch-on-mount with loading/error/retry, a
- * Tailwind table, and an empty state. Backed by the admin-gated
+ * Fetch-on-mount with loading/error/retry, then the shared admin table with search, sort
+ * and paging over the loaded rows. Backed by the admin-gated
  * /api/admin/feedback endpoint. Feedback is rendered as PLAIN, React-escaped text
  * (no markdown, no raw HTML) — it is untrusted free input (Decision 10). The
  * `page` chip is plain text, never a link (Decision 4).
@@ -65,61 +108,15 @@ export default function FeedbackPanel() {
     )
   }
 
-  if (feedback.length === 0) {
-    return (
-      <div className="text-center py-16">
-        <div className="w-12 h-12 rounded-2xl bg-bial-bg flex items-center justify-center mx-auto mb-3">
-          <MessageSquare size={20} className="text-neutral" />
-        </div>
-        <p className="text-sm text-neutral">No feedback yet.</p>
-      </div>
-    )
-  }
-
   return (
-    <>
-      {total > feedback.length && (
-        <p className="text-xs text-neutral mb-4">
-          Showing newest {feedback.length} of {total.toLocaleString('en-US')} — older feedback needs pagination
-          (deferred).
-        </p>
-      )}
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-bial-border">
-              <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">User</th>
-              <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Message</th>
-              <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Page</th>
-              <th className="pb-3 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">When</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-bial-border">
-            {feedback.map((f, i) => (
-              <tr key={`${f.createdAt}-${i}`} className="hover:bg-bial-bg/50 transition align-top">
-                <td className="py-3 pr-6 whitespace-nowrap text-tertiary font-medium">{f.email}</td>
-                <td className="py-3 pr-6">
-                  {/* Plain text, clamped: messages can run to 4000 bytes. Full text
-                      in the title tooltip; never whitespace-nowrap. */}
-                  <p className="max-w-md text-tertiary line-clamp-2 break-words" title={f.message}>
-                    {f.message}
-                  </p>
-                </td>
-                <td className="py-3 pr-6">
-                  {f.page ? (
-                    <span className="text-[11px] font-mono text-neutral bg-surface-muted border border-bial-border rounded px-1.5 py-0.5">
-                      {f.page}
-                    </span>
-                  ) : (
-                    <span className="text-neutral">—</span>
-                  )}
-                </td>
-                <td className="py-3 text-neutral whitespace-nowrap">{fmtWhen(f.createdAt)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </>
+    <AdminDataTable<FeedbackItem>
+      columns={columns}
+      rows={feedback}
+      searchable={SEARCHABLE}
+      searchLabel="Search feedback"
+      searchPlaceholder="Search user, message or page…"
+      emptyMessage="No feedback yet."
+      truncated={total > feedback.length}
+    />
   )
 }
