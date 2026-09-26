@@ -33,10 +33,14 @@ async def test_the_launch_set_loads_in_key_order_with_the_seeded_policy(db_sessi
         key="public_data",
         title="Public data",
         description=(
-            "Yes only if the app shows or publishes information that is already public to other "
-            "people, such as published flight schedules or public reference lists. An app that "
+            "Yes if the app shows or publishes information that is already public, such as "
+            "published flight schedules or public reference lists. The app may hold other data as "
+            "well; judge the public part on its own. Results worked out from what the user types, "
+            "constants built into a tool, and pick-lists on a form do not count, so an app that "
             "handles no data answers No. Yes: a page of the airport's published shop opening "
-            "hours. No: a calculator."
+            "hours. Yes: a list of public holidays. Yes: a dashboard showing the published flight "
+            "schedule beside internal targets. No: a calculator. No: a unit converter. No: a "
+            "complaint form with a drop-down of terminals."
         ),
         kind=ClassificationKind.SCORED,
         weight=20,
