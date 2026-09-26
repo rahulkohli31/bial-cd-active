@@ -184,7 +184,7 @@ def test_migrations_gate_the_server_start() -> None:
 def test_the_config_default_and_the_dockerfile_arg_name_the_same_base() -> None:
     """The two base-image defaults must not drift apart unnoticed: `config.py`'s value SHIPS
     (sent as the NODE_IMAGE build arg on every platform build), while the Dockerfile's own
-    default only applies to a hand-run `docker build`, the go-live runbook path. Drift means
+    default only applies to a hand-run `docker build`. Drift means
     the operator-built artifact and the platform-built one differ in base image with nothing
     reporting it.
 

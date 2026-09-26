@@ -49,7 +49,6 @@ const approval = (over: Partial<ApprovalState> = {}): ApprovalState => ({
   status: 'draft',
   approvedCommitSha: null,
   approvedAt: null,
-  approvalRoute: null,
   rejectionNote: null,
   submittedSha: null,
   submittedAt: null,

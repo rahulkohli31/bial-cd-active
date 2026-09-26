@@ -16,7 +16,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.schemas import CamelModel
 from src.services.deploy.classification import CLASSIFICATION_KEYS
@@ -145,8 +145,7 @@ class ApprovalState(CamelModel):
     version the administrator approved."""
 
     status: AppStatus
-    # NULL is a real state, not a gap: a never-approved app has no pin, and a
-    # never-submitted draft has no lineage (see `ApprovalRoute`'s NULL semantics).
+    # NULL is a real state, not a gap: a never-approved app has no pin.
     approved_commit_sha: str | None = None
     # WHEN the administrator approved, beside WHICH commit they approved. The pin alone
     # cannot be rendered to a citizen — the status chip names the date first and mutes
@@ -156,7 +155,6 @@ class ApprovalState(CamelModel):
     # approved, exactly as `approved_commit_sha` does — the two are written together in
     # one place (`admin/router.py`'s `approve`) and are never apart.
     approved_at: datetime | None = None
-    approval_route: ApprovalRoute | None = None
     rejection_note: str | None = None
     submitted_sha: str | None = None
     submitted_at: datetime | None = None
@@ -167,7 +165,6 @@ class ApprovalState(CamelModel):
             status=row.status,
             approved_commit_sha=row.approved_commit_sha,
             approved_at=row.approved_at,
-            approval_route=row.approval_route,
             rejection_note=row.rejection_note,
             submitted_sha=row.source_commit_sha,
             submitted_at=row.submitted_at,
@@ -177,7 +174,7 @@ class ApprovalState(CamelModel):
 class PublishState(StrEnum):
     """THE single publish state the status chip renders — eleven values, authored here
     and nowhere else, so no client recombines `status` + `unpublished_at` + `failure_code`
-    + the approval route + the pin to guess at a state the server already knows. An
+    + the pin to guess at a state the server already knows. An
     **API** StrEnum, like `PreviewLifeState`: nothing persists it, the wire value equals
     the member's own string, and the chip's narrowing throws on anything it doesn't
     recognise — so this is the one place a new member gets added.

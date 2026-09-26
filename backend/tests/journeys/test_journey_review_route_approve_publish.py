@@ -21,7 +21,7 @@ from fastapi import FastAPI
 
 from src.api.deps import storage_or_none_dependency
 from src.api.v1.deploy.deps import deploy_service_or_none
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.services.classification import store as review_store
 from src.services.deploy.classification import CLASSIFICATION_KEYS
@@ -165,7 +165,6 @@ async def test_route_approve_publish_terminates(app: FastAPI, client, db_session
     fresh = await db_session.get(AppRegistry, app_row.id, populate_existing=True)
     assert fresh is not None
     assert fresh.status is AppStatus.PENDING
-    assert fresh.approval_route is ApprovalRoute.SELF_PUBLISH
     assert fresh.source_commit_sha == _SHA
     declaration = fresh.declaration
     assert declaration is not None

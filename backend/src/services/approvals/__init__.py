@@ -2,7 +2,7 @@
 
 `submit` — the app-scoped build-session guard, the fail-closed bundle read, the
 blob-first-row-second copy, and the guarded UPDATE that moves the app to pending
-carrying its lineage and declaration.
+carrying its declaration.
 
 INVARIANT, checkable by grep: no code path outside this package writes `AppStatus.PENDING`.
 There is deliberately no citizen-callable submit route — a queue item that arrived by one

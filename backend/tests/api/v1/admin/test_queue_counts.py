@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.api.v1.admin.router import LISTING_CAP
 from src.config import settings
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.storage import submission_key
@@ -70,7 +70,6 @@ def _pending(**extra: Any) -> dict[str, Any]:
         "source_submission_id": uuid.uuid4(),
         "source_commit_sha": _SHA,
         "submitted_at": datetime.now(UTC),
-        "approval_route": ApprovalRoute.SELF_PUBLISH,
         **extra,
     }
 

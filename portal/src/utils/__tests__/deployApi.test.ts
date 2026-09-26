@@ -93,7 +93,6 @@ describe('getDeployment parses the APPROVAL state riding on the same response', 
     status: 'pending',
     approvedCommitSha: null,
     approvedAt: null,
-    approvalRoute: 'self_publish',
     rejectionNote: 'Explain where the vendor key is stored.',
     submittedSha: 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0',
     submittedAt: '2026-08-19T10:00:00Z',
@@ -126,38 +125,6 @@ describe('getDeployment parses the APPROVAL state riding on the same response', 
 
     expect(err).toBeInstanceOf(ApiError)
     expect((err as ApiError).status).toBe(500)
-  })
-
-  it('answers an unknown approval LINEAGE with null — never with self-publish', async () => {
-    // An unrecognised lineage must not be READ as self_publish — the one value authorising
-    // the citizen to publish an approved version themselves — so null is the conservative
-    // answer: every consumer branches on `=== 'self_publish'`, and "no claim" withholds the
-    // affordance rather than granting it.
-    //
-    // It deliberately does NOT throw: that used to blank the whole Publish card over a field
-    // the gate re-decides server-side anyway — strictly worse than declining to claim.
-    const view = await getDeployment(
-      'p1',
-      deps(vi.fn(async () => ok({ ...BODY, approval: { ...APPROVAL, approvalRoute: 'vibes' } }))),
-    )
-
-    expect(view.approval?.approvalRoute).toBeNull()
-    // the rest of the card still parses — the point of not throwing
-    expect(view.approval?.status).toBe(APPROVAL.status)
-    expect(view.deploymentId).toBe('d1')
-  })
-
-  it('accepts a null lineage — a never-submitted draft genuinely has none', async () => {
-    const view = await getDeployment(
-      'p1',
-      deps(
-        vi.fn(async () =>
-          ok({ ...BODY, approval: { ...APPROVAL, status: 'draft', approvalRoute: null } }),
-        ),
-      ),
-    )
-
-    expect(view.approval?.approvalRoute).toBeNull()
   })
 
   it('carries WHEN it was approved beside WHICH commit was', async () => {
@@ -235,7 +202,6 @@ describe('getDeployment parses the one publish state, and refuses to guess it', 
         status: 'draft',
         approvedCommitSha: null,
         approvedAt: null,
-        approvalRoute: null,
         rejectionNote: null,
         submittedSha: null,
         submittedAt: null,
@@ -280,7 +246,7 @@ describe('getDeployment parses the one publish state, and refuses to guess it', 
   })
 
   it('★ reads an unrecognised or missing reason as NO CLAIM, never as "never saved"', async () => {
-    // The conservative reading `toApprovalRoute` already documents, and the direction matters:
+    // The conservative reading, and the direction matters:
     // the one value that DELETES a row must never be reachable by accident, so a server that
     // grows a fifth member fails towards saying too little.
     for (const wire of [{ savedState: 'never_saved_probably' }, { savedState: null }, {}]) {

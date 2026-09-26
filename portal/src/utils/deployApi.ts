@@ -12,7 +12,7 @@
  */
 import { ApiError, isRecord, optionalString, readApiError } from './apiError'
 import { authFetch } from './api.js'
-import type { AppStatus, ApprovalRoute, AuthFetchDeps } from './projectApi'
+import type { AppStatus, AuthFetchDeps } from './projectApi'
 
 /** The six declared categories plus the optional explanation. */
 export interface DataClassificationAnswers {
@@ -110,8 +110,6 @@ export interface ApprovalState {
    *  recognises. Null exactly when `approvedCommitSha` is — the two are written together
    *  in one place server-side and are never apart. */
   approvedAt: string | null
-  /** WHICH lineage the current submission entered through. */
-  approvalRoute: ApprovalRoute | null
   rejectionNote: string | null
   submittedSha: string | null
   submittedAt: string | null
@@ -234,18 +232,6 @@ function toAppStatus(value: unknown): AppStatus {
   throw new ApiError('The server sent an app status we could not read.', 500)
 }
 
-function toApprovalRoute(value: unknown): ApprovalRoute | null {
-  // NULL is a real state — a never-submitted draft has no lineage — and an UNKNOWN
-  // literal answers null too, which is the conservative reading rather than the lax one:
-  // every consumer branches on `=== 'self_publish'`, so "no claim" withholds the
-  // self-publish affordance instead of granting it. Throwing here (the earlier policy)
-  // was strictly worse — it propagated through the deploy hook's loadError and blanked
-  // the citizen's whole Publish card over a field the gate re-decides server-side
-  // anyway. This matches the admin client's documented policy for the same wire value.
-  if (value === 'runbook' || value === 'self_publish') return value
-  return null
-}
-
 /** Null only when the project has no app yet — parse-don't-validate at the boundary so
  *  no consumer downstream ever re-checks a raw record. */
 function toApprovalState(value: unknown): ApprovalState | null {
@@ -257,7 +243,6 @@ function toApprovalState(value: unknown): ApprovalState | null {
     status: toAppStatus(value.status),
     approvedCommitSha: optionalString(value.approvedCommitSha),
     approvedAt: optionalString(value.approvedAt),
-    approvalRoute: toApprovalRoute(value.approvalRoute),
     rejectionNote: optionalString(value.rejectionNote),
     submittedSha: optionalString(value.submittedSha),
     submittedAt: optionalString(value.submittedAt),
@@ -288,9 +273,8 @@ const SAVED_STATES: ReadonlySet<string> = new Set<SavedState>([
 ])
 
 /**
- * NULL IS THE CONSERVATIVE READING, and it is `toApprovalRoute`'s policy rather than
- * `toPublishState`'s: an unrecognised value must not blank the citizen's whole status panel
- * over a supplementary field. It must also not be read as `never_saved` — the one value
+ * NULL IS THE CONSERVATIVE READING, not `toPublishState`'s throw: an unrecognised value must
+ * not blank the citizen's whole status panel over a supplementary field. It must also not be read as `never_saved` — the one value
  * that REMOVES a row. "No claim" keeps the row and its honest "could not tell", so a server
  * that grows a fifth member fails towards saying too little rather than towards telling a
  * citizen their save was never made.

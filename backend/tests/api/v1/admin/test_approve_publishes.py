@@ -27,7 +27,7 @@ from sqlalchemy import event
 
 from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.api.v1.deploy.deps import deploy_service_or_none
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.db.models.message import Message
@@ -323,42 +323,23 @@ async def test_approval_with_publishing_unconfigured_still_commits_and_says_why(
     assert row.head_sha == wire.submitted[1]
 
 
-async def test_approving_a_manual_route_queue_item_publishes_it(wire, client, db_session) -> None:
-    owner, app_row, submission_id = await _submitted_for_review(wire, client, db_session)
-    await db_session.execute(
-        sa.update(AppRegistry)
-        .where(AppRegistry.id == app_row.id)
-        .values(approval_route=ApprovalRoute.RUNBOOK)
-    )
-    await db_session.commit()
-
-    await _approve(client, db_session, app_row, submission_id)
-    await _settle(wire)
-
-    (row,) = await _deployments(db_session, app_row.id)
-    assert row.status is DeploymentStatus.SUCCEEDED
-    assert row.head_sha == wire.submitted[1]
-    assert (await _status(client, owner, app_row))["publishState"] == "live_current"
-
-
 async def _approved_earlier(wire, db_session, **overrides):
     """An app an administrator approved before approving published anything: its copy is
     in the store, nothing has been attempted since, and newer work is saved."""
     owner = await UserFactory.create(db_session)
     submission_id = uuid.uuid4()
     data, sha = wire.submitted
+    fields: dict[str, Any] = {
+        "status": AppStatus.APPROVED,
+        "source_submission_id": submission_id,
+        "source_commit_sha": sha,
+        "approved_submission_id": submission_id,
+        "approved_commit_sha": sha,
+        "approved_at": datetime.now(UTC) - timedelta(days=3),
+        "declaration": {"citizen": {"answers": {}, "explanation": None}},
+    }
     app_row = await AppRegistryFactory.create(
-        db_session,
-        user_id=owner.id,
-        status=AppStatus.APPROVED,
-        approval_route=ApprovalRoute.SELF_PUBLISH,
-        source_submission_id=submission_id,
-        source_commit_sha=sha,
-        approved_submission_id=submission_id,
-        approved_commit_sha=sha,
-        approved_at=datetime.now(UTC) - timedelta(days=3),
-        declaration={"citizen": {"answers": {}, "explanation": None}},
-        **overrides,
+        db_session, user_id=owner.id, **{**fields, **overrides}
     )
     wire.store.objects[submission_key(app_row.id, submission_id)] = data
     _save(wire, app_row.id, wire.later)
@@ -398,6 +379,32 @@ async def test_an_app_approved_before_this_release_offers_try_again_for_its_copy
     fresh = await db_session.get(AppRegistry, app_row.id, populate_existing=True)
     assert fresh is not None
     assert fresh.status is AppStatus.APPROVED
+
+
+async def test_an_app_once_marked_live_by_hand_publishes_its_approved_copy_on_the_platform(
+    wire, client, db_session
+) -> None:
+    owner, app_row, submission_id = await _approved_earlier(
+        wire, db_session, declaration=None, approved_at=datetime.now(UTC) - timedelta(days=90)
+    )
+
+    status = await _status(client, owner, app_row)
+    assert status["publishState"] == "did_not_start"
+    assert status["approvedRetryCommit"] == wire.submitted[1]
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(owner),
+        json={"commitSha": status["approvedRetryCommit"]},
+    )
+    assert resp.status_code == 202, resp.text
+    await _settle(wire)
+
+    (row,) = await _deployments(db_session, app_row.id)
+    assert row.status is DeploymentStatus.SUCCEEDED
+    assert row.head_sha == wire.submitted[1]
+    assert wire.extracted_from == [submission_key(app_row.id, submission_id)]
+    assert (await _status(client, owner, app_row))["publishState"] == "live_newer_work"
 
 
 async def test_an_approved_app_with_no_stored_copy_presents_as_a_draft(

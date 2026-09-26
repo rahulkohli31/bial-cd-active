@@ -413,7 +413,7 @@ async def test_reveal_hands_a_superadmin_a_working_dsn(
     body = resp.json()
     assert body["dbName"] == record.db_name
     assert body["roleName"] == record.role_name
-    # The `BIAL_DATABASE_URL` form the runbook pastes: node-postgres cannot parse
+    # The `BIAL_DATABASE_URL` form a deployed app is given: node-postgres cannot parse
     # SQLAlchemy's `postgresql+asyncpg://` driver selector.
     assert body["dsn"].startswith("postgresql://")
     assert "+asyncpg" not in body["dsn"]

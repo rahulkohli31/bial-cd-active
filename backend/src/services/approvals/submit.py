@@ -31,7 +31,6 @@ from src.core.errors import AppApiError
 from src.db.models.app_registry import (
     STATUS_TRANSITIONS,
     AppRegistry,
-    ApprovalRoute,
     AppStatus,
 )
 from src.services.audit.log import append_audit
@@ -80,10 +79,9 @@ async def submit_app_for_review(
     user_id: uuid.UUID,
     app: AppRegistry,
     declaration: dict[str, Any],
-    route: ApprovalRoute,
 ) -> SubmissionReceipt:
     """Fork an immutable copy of the app's bundle and move it to pending (audited),
-    carrying `route` + `declaration` onto the row. Commit-less — the caller commits.
+    carrying `declaration` onto the row. Commit-less — the caller commits.
 
     `app` is the row the caller already resolved through its own owner-scoped 404;
     `declaration` is opaque here — the publish gate assembles it.
@@ -160,9 +158,8 @@ async def submit_app_for_review(
             source_submission_id=submission_id,
             source_commit_sha=commit_sha,
             submitted_at=now,
-            # The queue item carries how it got here and what was declared — this
-            # service is the only writer of either column.
-            approval_route=route,
+            # The queue item carries what was declared — this service is the only
+            # writer of the column.
             declaration=declaration,
             # A stale "rejected because X" note must not survive the re-submit —
             # `read_status` returns it straight to the citizen.
@@ -189,7 +186,6 @@ async def submit_app_for_review(
         detail={
             "submissionId": str(submission_id),
             "commitSha": commit_sha,
-            "route": route.value,
         },
     )
     return SubmissionReceipt(submission_id=submission_id, commit_sha=commit_sha, submitted_at=now)

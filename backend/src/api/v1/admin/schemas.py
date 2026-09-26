@@ -11,38 +11,10 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any
 
-from pydantic import AfterValidator, AnyUrl, Field, UrlConstraints, field_validator
+from pydantic import AfterValidator, Field, field_validator
 
-from src.db.models.app_registry import MAX_DEPLOYED_URL, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppStatus
 from src.schemas import CamelModel, clean_stated_reason
-
-
-def _fits_the_column(url: AnyUrl) -> AnyUrl:
-    """Bound the SERIALIZED url — the value that reaches `varchar(MAX_DEPLOYED_URL)`.
-
-    `UrlConstraints(max_length=…)` measures the INPUT string, but pydantic normalizes a
-    path-less `https://…` with a trailing `/` on parse — so a 2083-char input could clear
-    the constraint and still hand 2084 chars to the column (an uncaught asyncpg 500 where
-    the admin deserves a 422). Re-measuring the parse OUTPUT is what makes 0019's "a URL
-    that parses at the boundary always fits" true by validation, not luck.
-    """
-    if len(str(url)) > MAX_DEPLOYED_URL:
-        raise ValueError(f"URL must be at most {MAX_DEPLOYED_URL} characters")
-    return url
-
-
-# The deployed-app address, parsed at the boundary ("parse, don't validate"): a
-# real URL, `https` ONLY. Rejecting `http` is not pedantry — the recorded URL becomes
-# a link the owner clicks, and this is the one place a typo'd or plaintext address can
-# be caught before it is handed to a user. `javascript:`/`data:` and free-text junk
-# fall out of the same parse (422), so no handler ever re-checks the string. The length
-# is bounded TWICE by necessity: `UrlConstraints` on the way in, `_fits_the_column` on
-# what the parse actually produced (the only value the column ever sees).
-HttpsUrl = Annotated[
-    AnyUrl,
-    UrlConstraints(max_length=MAX_DEPLOYED_URL, allowed_schemes=["https"]),
-    AfterValidator(_fits_the_column),
-]
 
 # --- governance (`/admin/apps`) ------------------------------------------------
 
@@ -67,36 +39,17 @@ class AdminAppOut(CamelModel):
     submission_id: uuid.UUID | None
     commit_sha: str | None
     submitted_at: datetime | None
-    # The approved pin: the artifact the runbook operator deploys — the SHA is
-    # their identity check after cloning the downloaded bundle.
+    # The approved pin: the submission the administrator approved.
     approved_submission_id: uuid.UUID | None
     approved_commit_sha: str | None
     approved_by: uuid.UUID | None
     approved_at: datetime | None
-    # The manual-runbook marker: `redeploy_needed` is exact —
-    # `approved_submission_id != deployed_submission_id` — so an approved-but-
-    # undeployed app and a re-approved-since-deploy app both surface it.
-    deployed_at: datetime | None
-    # The recorded live address — read back as a plain string, never re-parsed:
-    # a value already in the column was parsed when it was written, and re-validating
-    # it here would turn one bad legacy row into a 500 on the whole admin queue.
-    deployed_url: str | None
-    # ALWAYS false for the self-publish lineage, whatever the pins say: the flag
-    # is a runbook prompt, and a self-published app has no runbook step for anyone to
-    # perform. For every other lineage it stays the exact id comparison above.
-    redeploy_needed: bool
-    # Which lineage the current submission entered through: `runbook`,
-    # `self_publish`, or null (never submitted, or an interim pre-publish-flow row —
-    # null keeps today's behaviour everywhere). The admin SPA keys the runbook
-    # affordances off this: a `self_publish` row renders neither "Deploy needed" nor
-    # "Mark deployed" — and the server refuses the latter regardless.
-    approval_route: ApprovalRoute | None
     # What the publish flow attached at submit: both answer sets, the
     # per-question differences, and the citizen's REDACTED explanation — so the review
     # screen can lead with the disagreement without a second call. Shape is
     # deliberately untyped here (the questionnaire is expected to be reworded); null
-    # for runbook-lineage and pre-feature rows, and the screen says so rather than
-    # rendering blanks. Never contains evidence locations.
+    # on a row queued without one, and the screen says so rather than rendering blanks.
+    # Never contains evidence locations.
     declaration: dict[str, Any] | None
     # On-disk size of the project's own database, or null when it has none —
     # never provisioned, not yet ready, or the cluster was unreachable when the page
@@ -174,35 +127,13 @@ class BundleUrlResponse(CamelModel):
     expires_in_seconds: int
 
 
-class MarkDeployedRequest(CamelModel):
-    """The optional deployed-URL payload. The whole BODY is optional (the admin SPA already
-    posts `{}`), and so is the field: an admin who ran the runbook but has no URL to hand
-    still records the marker.
-
-    OMITTING `deployedUrl` means "leave the recorded URL as it is" (fail-first's optional-knob
-    exception): a re-deploy of the same app keeps the same address, so a bare re-mark must not
-    blank out the Live link the owner is already using. Recording a *different* URL just passes
-    the new one."""
-
-    deployed_url: HttpsUrl | None = None
-
-
-class MarkDeployedResponse(CamelModel):
-    app_id: uuid.UUID
-    deployed_submission_id: uuid.UUID
-    deployed_at: datetime
-    # Echoed back so the admin SPA can show what is now recorded — including the
-    # carried-forward URL when this mark did not supply one.
-    deployed_url: str | None
-
-
 class DeployCredentialResponse(CamelModel):
-    """The long-lived per-app Blob credential the go-live runbook injects into the deployed
-    container as `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS`. `sas` is a 365-day bearer
+    """The long-lived per-app Blob credential a deployed container runs with, as
+    `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS`. `sas` is a 365-day bearer
     credential: the admin pastes it straight into an ACA secret and it is NEVER logged, NEVER
     written to the audit trail (the audit row carries the expiry, not the token), and never part
     of any list projection. `expiresAt` comes from the app's stored access policy — deleting that
-    policy revokes this credential (the runbook's incident-response lever)."""
+    policy revokes this credential."""
 
     container_url: str
     sas: str
@@ -210,8 +141,8 @@ class DeployCredentialResponse(CamelModel):
 
 
 class DatabaseCredentialResponse(CamelModel):
-    """The project database's connection string, for the go-live runbook's
-    `BIAL_DATABASE_URL`. `dsn` embeds the app role's password, so it is the same
+    """The project database's connection string, a deployed app's `BIAL_DATABASE_URL`.
+    `dsn` embeds the app role's password, so it is the same
     kind of object as `DeployCredentialResponse.sas`: returned in this body and nowhere else
     — never logged, never in the audit `detail` (which records `roleName` + `host` instead),
     never in a list projection.

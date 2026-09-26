@@ -12,7 +12,6 @@ const h = vi.hoisted(() => ({
   patchApp: vi.fn(),
   disableApp: vi.fn(),
   enableApp: vi.fn(),
-  markDeployed: vi.fn(),
   deleteApp: vi.fn(),
   fetchAudit: vi.fn(),
   fetchAppStatusCounts: vi.fn(),
@@ -34,8 +33,6 @@ const PENDING = {
   submissionId: 'sub-1',
   commitSha: SHA,
   submittedAt: '2026-07-16T09:00:00Z',
-  redeployNeeded: false,
-  approvalRoute: 'self_publish',
   declaration: null,
 }
 
@@ -45,10 +42,6 @@ const APPROVED = {
   name: 'Live Tool',
   status: 'approved',
   hasApprovedSnapshot: true,
-  redeployNeeded: true,
-  // The runbook lineage is what still HAS a go-live step; the self-publish assertions
-  // below override this deliberately.
-  approvalRoute: 'runbook',
 }
 
 /**
@@ -124,36 +117,6 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     expect(screen.getAllByText('Pending Review').length).toBeGreaterThan(0) // tab + badge
   })
 
-  it('warns that rejecting a LIVE app de-lists it, and says how to actually take it down', async () => {
-    // Rejecting sets a standing rejection the marketplace query reads: the app vanishes
-    // from the catalog while its URL keeps serving, and only the owner can undo it.
-    h.listApps.mockResolvedValue([{ ...PENDING, deployedUrl: 'https://live.example/' }])
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Gate Tool')
-    fireEvent.click(screen.getByTestId('review-app-1'))
-    fireEvent.click(screen.getByTestId('reject-btn'))
-
-    const warning = screen.getByTestId('reject-delists-warning')
-    expect(warning.textContent).toMatch(/removes it from the Marketplace/i)
-    expect(warning.textContent).toMatch(/only its owner can undo/i)
-    // The actionable half: the lever that really takes an app down is Unpublish.
-    expect(warning.textContent).toMatch(/Unpublish/i)
-  })
-
-  it('does NOT warn about de-listing when the app was never deployed', async () => {
-    // The other direction, so the assertion above cannot pass by always rendering. A
-    // never-deployed app is in no catalog, so the warning would be noise on the common case.
-    h.listApps.mockResolvedValue([{ ...PENDING, deployedUrl: null }])
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Gate Tool')
-    fireEvent.click(screen.getByTestId('review-app-1'))
-    fireEvent.click(screen.getByTestId('reject-btn'))
-
-    // Liveness: the reject pane really is open, so the absence below is meaningful.
-    expect(screen.getByTestId('reject-confirm')).toBeTruthy()
-    expect(screen.queryByTestId('reject-delists-warning')).toBeNull()
-  })
-
   it('the review modal shows submission METADATA (SHA, submitted-at) and no internal ids', async () => {
     render(<AppRegistryPanel onToast={() => {}} />)
     await screen.findByText('Gate Tool')
@@ -207,66 +170,6 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     await waitFor(() => expect(onToast).toHaveBeenCalledWith(copy, 'problem'))
     // The modal stays OPEN on the 409: act() reports failure, so onApprove never nulls the review.
     expect(screen.getByTestId('approve-btn')).toBeTruthy()
-  })
-
-  it('an approved app shows the deploy-needed indicator and Mark deployed records the runbook run + URL', async () => {
-    const live = 'https://apps.bial.example.com/gate-ops'
-    const prompted = vi.spyOn(window, 'prompt').mockReturnValue(`  ${live}  `)
-    h.listApps.mockResolvedValue([APPROVED])
-    h.markDeployed.mockResolvedValue({ appId: 'app-2', deployedUrl: live })
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Live Tool')
-    expect(screen.getByTestId('redeploy-needed-app-2')).toBeTruthy()
-    fireEvent.click(screen.getByTestId('mark-deployed-app-2'))
-    // Pasted URLs pick up stray whitespace — trimmed before it can 422 at the server.
-    await waitFor(() => expect(h.markDeployed).toHaveBeenCalledWith('app-2', live))
-    await waitFor(() => expect(h.listApps).toHaveBeenCalledTimes(2)) // reload reflects the marker
-    prompted.mockRestore()
-  })
-
-  it('the URL prompt defaults to the recorded one and a blank answer keeps it', async () => {
-    const live = 'https://apps.bial.example.com/gate-ops'
-    const prompted = vi.spyOn(window, 'prompt').mockReturnValue('')
-    h.listApps.mockResolvedValue([{ ...APPROVED, deployedUrl: live }])
-    h.markDeployed.mockResolvedValue({ appId: 'app-2', deployedUrl: live })
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Live Tool')
-    fireEvent.click(screen.getByTestId('mark-deployed-app-2'))
-
-    // The already-recorded address is pre-filled, so a routine re-deploy is one Enter…
-    expect(prompted.mock.calls[0][1]).toBe(live)
-    // …and a blank answer still marks the deploy, sending no URL (server keeps it).
-    await waitFor(() => expect(h.markDeployed).toHaveBeenCalledWith('app-2', ''))
-    prompted.mockRestore()
-  })
-
-  it('cancelling the URL prompt marks nothing at all', async () => {
-    const prompted = vi.spyOn(window, 'prompt').mockReturnValue(null)
-    h.listApps.mockResolvedValue([APPROVED])
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Live Tool')
-    fireEvent.click(screen.getByTestId('mark-deployed-app-2'))
-    expect(h.markDeployed).not.toHaveBeenCalled()
-    prompted.mockRestore()
-  })
-
-  it('surfaces the server 422 for a bad URL as a toast (no client-side URL check)', async () => {
-    const prompted = vi.spyOn(window, 'prompt').mockReturnValue('http://insecure.example.com')
-    const onToast = vi.fn()
-    h.listApps.mockResolvedValue([APPROVED])
-    h.markDeployed.mockRejectedValue(new Error('URL scheme should be https'))
-    render(<AppRegistryPanel onToast={onToast} />)
-    await screen.findByText('Live Tool')
-    fireEvent.click(screen.getByTestId('mark-deployed-app-2'))
-    await waitFor(() => expect(onToast).toHaveBeenCalledWith('URL scheme should be https', 'problem'))
-    prompted.mockRestore()
-  })
-
-  it('a deployed-and-current app shows NO deploy-needed indicator', async () => {
-    h.listApps.mockResolvedValue([{ ...APPROVED, redeployNeeded: false }])
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Live Tool')
-    expect(screen.queryByTestId('redeploy-needed-app-2')).toBeNull()
   })
 
   it('renders the advisory database size column, human-formatted, and "—" when null', async () => {
@@ -402,11 +305,12 @@ describe('the review screen without a review, and without a declaration', () => 
   })
 
   it('an app queued BEFORE this feature renders fine and says its declaration is unavailable', async () => {
-    h.listApps.mockResolvedValue([{ ...PENDING, approvalRoute: 'runbook', declaration: null }])
+    h.listApps.mockResolvedValue([{ ...PENDING, declaration: null }])
     render(<AppRegistryPanel onToast={() => {}} />)
     await openReview()
 
     expect(screen.getByTestId('review-no-declaration').textContent).toMatch(/no data declaration/i)
+    expect(screen.getByTestId('review-no-declaration').textContent).not.toMatch(/go-live/i)
     expect(screen.queryByTestId('review-disputes')).toBeNull()
     expect(screen.queryByTestId('review-citizen-answers')).toBeNull()
     expect(screen.getByTestId('approve-btn')).toBeTruthy()
@@ -668,34 +572,32 @@ describe('closing the review puts focus somewhere real', () => {
   })
 })
 
-describe('the self-publish lineage has no runbook', () => {
-  it('an approved self-publish app shows neither Deploy needed nor Mark deployed', async () => {
-    h.listApps.mockResolvedValue([{ ...APPROVED, approvalRoute: 'self_publish', redeployNeeded: false }])
+describe('there is no way to record a deployment by hand', () => {
+  it('an approved app carries only the ops controls, and no deploy prompt', async () => {
+    h.listApps.mockResolvedValue([APPROVED])
     render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Live Tool') // liveness: the row rendered
+    await screen.findByText('Live Tool')
 
-    expect(screen.queryByTestId('redeploy-needed-app-2')).toBeNull()
-    expect(screen.queryByTestId('mark-deployed-app-2')).toBeNull()
-    expect(screen.getByTestId('audit-app-2')).toBeTruthy() // the row's other controls survive
+    const row = screen.getByTestId('audit-app-2').closest('tr')
+    const controls = [...row.querySelectorAll('button[data-testid], span[data-testid]')]
+      .map((el) => el.getAttribute('data-testid'))
+    expect(controls).toEqual(['disable-app-2', 'audit-app-2', 'delete-app-2'])
+    expect(row.textContent).not.toMatch(/deploy needed/i)
   })
-
 })
 
 describe('approving publishes, and the review says so', () => {
-  it.each(['self_publish', 'runbook'])(
-    'a %s submission is approved and published by one button',
-    async (approvalRoute) => {
-      h.listApps.mockResolvedValue([{ ...PENDING, approvalRoute }])
-      render(<AppRegistryPanel onToast={() => {}} />)
-      await openReview()
+  it('a submission is approved and published by one button', async () => {
+    h.listApps.mockResolvedValue([PENDING])
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await openReview()
 
-      expect(screen.getByTestId('approve-btn').textContent).toContain('Approve and publish')
-      expect(screen.getByTestId('review-publish-note').textContent).toMatch(/approving publishes it/i)
-      // Nothing left over from the manual route or the developer's second click.
-      expect(document.body.textContent).not.toMatch(/go-live runbook/i)
-      expect(document.body.textContent).not.toMatch(/publishes this approved version themselves/i)
-    },
-  )
+    expect(screen.getByTestId('approve-btn').textContent).toContain('Approve and publish')
+    expect(screen.getByTestId('review-publish-note').textContent).toMatch(/approving publishes it/i)
+    // Nothing left over from the manual route or the developer's second click.
+    expect(document.body.textContent).not.toMatch(/go-live runbook/i)
+    expect(document.body.textContent).not.toMatch(/publishes this approved version themselves/i)
+  })
 })
 
 describe('the waiting count is mirrored on the pending tab', () => {

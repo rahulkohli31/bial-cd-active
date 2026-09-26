@@ -84,7 +84,7 @@ export interface CitizenAnswer {
 }
 
 export interface ReadDeclaration {
-  /** False for a runbook-lineage row, or one queued before this feature shipped. */
+  /** False for a row queued without a declaration. */
   present: boolean
   /** The commit that was submitted. */
   shippingCommit: string | null
@@ -136,8 +136,8 @@ const NOTHING: ReadDeclaration = {
 /**
  * Narrow one submitted declaration into what the review screen renders.
  *
- * `declaration` arrives as whatever the server had on the row: `null` for a pre-feature
- * or runbook-lineage item, and otherwise a document this function is the only reader of.
+ * `declaration` arrives as whatever the server had on the row: `null` for an item queued
+ * without one, and otherwise a document this function is the only reader of.
  * Every field is optional to this function; none of them can throw.
  */
 export function readDeclaration(declaration: Record<string, unknown> | null): ReadDeclaration {

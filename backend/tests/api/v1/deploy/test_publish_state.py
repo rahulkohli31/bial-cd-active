@@ -26,7 +26,7 @@ from src.api.v1.deploy.schemas import (
     published_since_approval,
     retry_needs_last_publish,
 )
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.services.deploy.service import FAIL_ROUTED_FOR_REVIEW
 
@@ -54,7 +54,6 @@ def _approved(sha: str = _SAVED_SHA, **overrides: object) -> AppRegistry:
     """Approved, with the reviewed submission copy on record."""
     return _app(
         status=AppStatus.APPROVED,
-        approval_route=ApprovalRoute.SELF_PUBLISH,
         approved_submission_id=uuid.uuid4(),
         approved_commit_sha=sha,
         approved_at=_APPROVED_AT,
@@ -103,7 +102,7 @@ def _approved(sha: str = _SAVED_SHA, **overrides: object) -> AppRegistry:
         ),
         pytest.param(
             PublishState.LIVE_CURRENT,
-            _app(status=AppStatus.APPROVED, approval_route=ApprovalRoute.SELF_PUBLISH),
+            _app(status=AppStatus.APPROVED),
             _deployment(status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA),
             _LIVE_SHA,
             id="live_current: the saved head matches the commit that went live",
@@ -117,14 +116,14 @@ def _approved(sha: str = _SAVED_SHA, **overrides: object) -> AppRegistry:
         ),
         pytest.param(
             PublishState.LIVE_NEWER_WORK,
-            _app(status=AppStatus.APPROVED, approval_route=ApprovalRoute.SELF_PUBLISH),
+            _app(status=AppStatus.APPROVED),
             _deployment(status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA),
             _SAVED_SHA,
             id="live_newer_work: the saved head differs from what went live",
         ),
         pytest.param(
             PublishState.TAKEN_OFFLINE,
-            _app(status=AppStatus.APPROVED, approval_route=ApprovalRoute.SELF_PUBLISH),
+            _app(status=AppStatus.APPROVED),
             _deployment(
                 status=DeploymentStatus.SUCCEEDED,
                 head_sha=_LIVE_SHA,
@@ -172,7 +171,6 @@ def test_a_live_app_with_four_saves_and_no_new_submission_reads_live_newer_work(
     HAS moved (four Saves since), and that is the signal that must win."""
     app = _app(
         status=AppStatus.APPROVED,
-        approval_route=ApprovalRoute.SELF_PUBLISH,
         approved_commit_sha=_LIVE_SHA,
         source_commit_sha=_LIVE_SHA,  # unchanged since approval
     )
@@ -454,7 +452,7 @@ def test_switched_off_and_taken_offline_are_told_apart() -> None:
     still_running = _deployment(status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA)
     assert compute_publish_state(disabled, still_running, _LIVE_SHA) is PublishState.SWITCHED_OFF
 
-    live_app = _app(status=AppStatus.APPROVED, approval_route=ApprovalRoute.SELF_PUBLISH)
+    live_app = _app(status=AppStatus.APPROVED)
     unpublished = _deployment(
         status=DeploymentStatus.SUCCEEDED,
         head_sha=_LIVE_SHA,

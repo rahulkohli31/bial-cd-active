@@ -1,9 +1,7 @@
 """Admin app-registry governance: super-admin-only +
 audited, the exact state machine, the reviewed-submission-id approve guard,
-the artifact-exists pin check, the audited bundle download, the
-mark-deployed marker and the deployed URL it records — plus the
-approval LINEAGE: self-publish-lineage apps get neither the deploy-needed prompt nor
-the mark-deployed marker. That approving publishes is `test_approve_publishes.py`'s."""
+the artifact-exists pin check and the audited bundle download. That approving publishes is
+`test_approve_publishes.py`'s."""
 
 from __future__ import annotations
 
@@ -16,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.config import settings
-from src.db.models.app_registry import MAX_DEPLOYED_URL, AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.deleted_project import MIN_DELETE_REMARK_WORDS
 from src.db.models.deployment import Deployment
@@ -32,10 +30,6 @@ from tests.fakes import FakeStorage
 
 _TTL = settings.auth.access_ttl_seconds
 _SHA = "1f" * 20  # 40 lowercase hex chars — the shape the bundle parser guarantees
-# The address a runbook operator pastes at mark-deployed. Already normalized
-# (scheme + host + path, no trailing-slash ambiguity), so it round-trips byte-for-byte
-# through pydantic's URL parse and the assertions can compare it verbatim.
-_LIVE_URL = "https://apps.bial.example.com/gate-ops"
 # A rejection note that clears the floor (20 chars, trimmed). The floor itself and
 # every way of failing it are pinned in `test_queue_counts.py`; here the note is just a
 # valid input, so the state-machine tests stay about the state machine.
@@ -152,9 +146,6 @@ async def test_citizen_is_forbidden(client, db_session) -> None:
     assert (
         await client.get(f"/v1/admin/apps/{app.id}/bundle-url", headers=headers)
     ).status_code == 403
-    assert (
-        await client.post(f"/v1/admin/apps/{app.id}/mark-deployed", headers=headers)
-    ).status_code == 403
     # ★ THE THREE DESTRUCTIVE LEVERS, which this list was missing. The delete's body contract
     # changed on this branch and the kill switch widened to draft and rejected apps, so both are
     # exactly the moment to pin who may reach them. The delete is sent WITHOUT a reason on
@@ -169,7 +160,7 @@ async def test_citizen_is_forbidden(client, db_session) -> None:
     assert (
         await client.post(f"/v1/admin/apps/{app.id}/enable", headers=headers)
     ).status_code == 403
-    # LIVENESS: the app is untouched by all seven refusals.
+    # LIVENESS: the app is untouched by all six refusals.
     assert await db_session.get(AppRegistry, app.id) is not None
 
 
@@ -197,8 +188,17 @@ def test_admin_routes_document_error_codes_in_openapi() -> None:
     assert {"400", "401", "403", "500"} <= set(paths["/v1/admin/apps"]["get"]["responses"])
     bundle = set(paths["/v1/admin/apps/{app_id}/bundle-url"]["get"]["responses"])
     assert {"404", "409", "503", "401", "403", "500"} <= bundle
-    deployed = set(paths["/v1/admin/apps/{app_id}/mark-deployed"]["post"]["responses"])
-    assert {"404", "409", "401", "403", "500"} <= deployed
+
+
+async def test_there_is_no_way_to_mark_an_app_deployed_by_hand(client, db_session) -> None:
+    app = await _app(db_session, **_approved())
+    headers = await _admin(db_session)
+
+    resp = await client.post(f"/v1/admin/apps/{app.id}/mark-deployed", headers=headers)
+
+    assert resp.status_code == 404
+    assert (await client.get("/v1/admin/apps", headers=headers)).status_code == 200
+    assert not any(path.endswith("/mark-deployed") for path in create_app().openapi()["paths"])
 
 
 # --- approve pins exactly the reviewed submission ---------------------
@@ -254,7 +254,7 @@ async def test_approve_race_resubmitted_since_review_is_409(client, app, db_sess
 
 async def test_approve_missing_artifact_is_409_and_no_pin(client, app, db_session) -> None:
     # The reviewed submission's blob is gone (or never existed) → refuse, so an
-    # app can never reach APPROVED with an artifact that 404s at runbook time.
+    # app can never reach APPROVED with an artifact that 404s at publish time.
     _wire_storage(app)  # empty store — no blob staged
     row = await _app(db_session, **_pending())
     headers = await _admin(db_session)
@@ -628,7 +628,19 @@ async def test_pending_row_carries_the_review_payload(client, db_session) -> Non
     assert row["commitSha"] == _SHA
     assert row["submittedAt"] is not None
     assert row["hasApprovedSnapshot"] is False
-    assert row["redeployNeeded"] is False  # never approved → nothing to deploy
+
+
+async def test_the_admin_row_carries_no_route_or_hand_recorded_deployment(
+    client, db_session
+) -> None:
+    app = await _app(db_session, **_approved())
+    headers = await _admin(db_session)
+
+    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
+
+    row = next(a for a in listed.json()["apps"] if a["appId"] == str(app.id))
+    assert row["approvedSubmissionId"] == str(app.approved_submission_id)
+    assert not {"approvalRoute", "deployedAt", "deployedUrl", "redeployNeeded"} & set(row)
 
 
 # --- the audited bundle download ---------------------------------------------
@@ -705,245 +717,7 @@ async def test_bundle_url_without_submission_is_409_and_unaudited(client, app, d
     assert rows == []
 
 
-# --- mark-deployed --------------------------------------------------------------
-
-
-async def test_mark_deployed_stamps_marker_and_audits(client, db_session) -> None:
-    app = await _app(db_session, **_approved())
-    headers = await _admin(db_session)
-
-    resp = await client.post(f"/v1/admin/apps/{app.id}/mark-deployed", headers=headers)
-    assert resp.status_code == 200
-    assert resp.json()["deployedSubmissionId"] == str(app.approved_submission_id)
-
-    fresh = await db_session.get(AppRegistry, app.id)
-    await db_session.refresh(fresh)
-    assert fresh.status is AppStatus.APPROVED  # a marker, NOT a status transition
-    assert fresh.deployed_submission_id == fresh.approved_submission_id
-    assert fresh.deployed_at is not None
-
-    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
-    row = next(a for a in listed.json()["apps"] if a["appId"] == str(app.id))
-    assert row["redeployNeeded"] is False  # deployed == approved
-
-    audit = (
-        await db_session.execute(
-            sa.select(AuditLog).where(
-                AuditLog.resource_id == str(app.id), AuditLog.action == "mark-deployed"
-            )
-        )
-    ).scalar_one()
-    assert audit.detail["submissionId"] == str(app.approved_submission_id)
-
-
-async def test_mark_deployed_refuses_unapproved(client, db_session) -> None:
-    app = await _app(db_session, **_pending())
-    headers = await _admin(db_session)
-    resp = await client.post(f"/v1/admin/apps/{app.id}/mark-deployed", headers=headers)
-    assert resp.status_code == 409
-    fresh = await db_session.get(AppRegistry, app.id)
-    await db_session.refresh(fresh)
-    assert fresh.deployed_submission_id is None  # nothing written
-
-
-# --- deployed URL: the address the runbook operator pastes ----------------------
-
-
-async def test_mark_deployed_records_the_url_and_projects_it(client, db_session) -> None:
-    app = await _app(db_session, **_approved())
-    headers = await _admin(db_session)
-
-    resp = await client.post(
-        f"/v1/admin/apps/{app.id}/mark-deployed",
-        json={"deployedUrl": _LIVE_URL},
-        headers=headers,
-    )
-    assert resp.status_code == 200
-    assert resp.json()["deployedUrl"] == _LIVE_URL
-
-    fresh = await db_session.get(AppRegistry, app.id)
-    await db_session.refresh(fresh)
-    assert fresh.deployed_url == _LIVE_URL
-
-    # The admin queue surfaces it (the SPA's prompt default on the next re-mark).
-    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
-    row = next(a for a in listed.json()["apps"] if a["appId"] == str(app.id))
-    assert row["deployedUrl"] == _LIVE_URL
-
-    # The URL is the app's public address, not a credential — it belongs in the trail.
-    audit = (
-        await db_session.execute(
-            sa.select(AuditLog).where(
-                AuditLog.resource_id == str(app.id), AuditLog.action == "mark-deployed"
-            )
-        )
-    ).scalar_one()
-    assert audit.detail["deployedUrl"] == _LIVE_URL
-
-
-async def test_mark_deployed_without_a_url_still_marks(client, db_session) -> None:
-    # Back-compat, twice over: the endpoint shipped bodiless and the SPA posts a bare
-    # `{}`. Both must still stamp the marker and simply leave `deployed_url` unset.
-    app = await _app(db_session, **_approved())
-    headers = await _admin(db_session)
-
-    resp = await client.post(f"/v1/admin/apps/{app.id}/mark-deployed", json={}, headers=headers)
-    assert resp.status_code == 200
-    assert resp.json()["deployedUrl"] is None
-
-    fresh = await db_session.get(AppRegistry, app.id)
-    await db_session.refresh(fresh)
-    assert fresh.deployed_at is not None  # the marker landed…
-    assert fresh.deployed_url is None  # …with no address to show
-
-
-async def test_a_bare_remark_keeps_the_recorded_url(client, db_session) -> None:
-    # A re-deploy of the same app keeps the same address: omitting `deployedUrl` means
-    # "leave it alone", NOT "blank it". Getting this wrong would silently kill the Live
-    # link the owner is already using, on the most routine admin action there is.
-    app = await _app(db_session, **_approved())
-    headers = await _admin(db_session)
-    await client.post(
-        f"/v1/admin/apps/{app.id}/mark-deployed", json={"deployedUrl": _LIVE_URL}, headers=headers
-    )
-
-    remark = await client.post(f"/v1/admin/apps/{app.id}/mark-deployed", json={}, headers=headers)
-    assert remark.status_code == 200
-    assert remark.json()["deployedUrl"] == _LIVE_URL
-
-    fresh = await db_session.get(AppRegistry, app.id)
-    await db_session.refresh(fresh)
-    assert fresh.deployed_url == _LIVE_URL
-
-    # …and a NEW url is simply passed: re-recording overwrites.
-    moved = "https://apps.bial.example.com/gate-ops-v2"
-    await client.post(
-        f"/v1/admin/apps/{app.id}/mark-deployed", json={"deployedUrl": moved}, headers=headers
-    )
-    await db_session.refresh(fresh)
-    assert fresh.deployed_url == moved
-
-
-async def test_mark_deployed_rejects_a_non_https_or_junk_url(client, db_session) -> None:
-    """The boundary parse (422) is the whole validation story — the recorded URL becomes
-    a link the OWNER clicks, so plaintext http, a `javascript:` payload and free text all
-    die here rather than reaching a user. Each rejection writes nothing at all."""
-    app = await _app(db_session, **_approved())
-    headers = await _admin(db_session)
-
-    for bad in ("http://apps.bial.example.com/gate-ops", "javascript:alert(1)", "not-a-url", ""):
-        resp = await client.post(
-            f"/v1/admin/apps/{app.id}/mark-deployed", json={"deployedUrl": bad}, headers=headers
-        )
-        assert resp.status_code == 422, bad
-
-    fresh = await db_session.get(AppRegistry, app.id)
-    await db_session.refresh(fresh)
-    assert fresh.deployed_url is None
-    assert fresh.deployed_at is None  # a rejected body never stamps the marker either
-
-
-async def test_mark_deployed_bounds_the_url_pydantic_normalized_not_the_raw_input(
-    client, db_session
-) -> None:
-    """The overflow the input-length constraint cannot see: pydantic NORMALIZES a path-less URL
-    by appending `/`, so a 2083-char one passed `UrlConstraints(max_length=…)` and then
-    serialized to 2084 — one over `varchar(2083)`, i.e. an uncaught asyncpg error surfacing as a
-    500 where the admin deserves a 422. The bound belongs on the value that reaches the column.
-    """
-    app = await _app(db_session, **_approved())
-    headers = await _admin(db_session)
-
-    # Path-less and EXACTLY at the boundary going in — 2084 coming out.
-    host_only = "https://" + "a" * (MAX_DEPLOYED_URL - len("https://"))
-    assert len(host_only) == MAX_DEPLOYED_URL
-    resp = await client.post(
-        f"/v1/admin/apps/{app.id}/mark-deployed",
-        json={"deployedUrl": host_only},
-        headers=headers,
-    )
-    assert resp.status_code == 422  # a rejection, not a database error
-    fresh = await db_session.get(AppRegistry, app.id)
-    await db_session.refresh(fresh)
-    assert fresh.deployed_url is None
-    assert fresh.deployed_at is None  # the 422 stamped nothing
-
-    # One char shorter: normalizes to exactly MAX_DEPLOYED_URL and therefore still fits — the
-    # boundary is honoured, not merely avoided.
-    fits = host_only[:-1]
-    resp = await client.post(
-        f"/v1/admin/apps/{app.id}/mark-deployed", json={"deployedUrl": fits}, headers=headers
-    )
-    assert resp.status_code == 200
-    assert len(resp.json()["deployedUrl"]) == MAX_DEPLOYED_URL
-    await db_session.refresh(fresh)
-    assert fresh.deployed_url == fits + "/"
-
-
-async def test_citizen_cannot_record_a_deployed_url(client, db_session) -> None:
-    # The gate outranks the body: a valid URL from a non-superadmin is still 403, and
-    # the 403 must come with nothing written (RBAC at the API, never the frontend).
-    app = await _app(db_session, **_approved())
-    headers = await _citizen(db_session)
-    resp = await client.post(
-        f"/v1/admin/apps/{app.id}/mark-deployed", json={"deployedUrl": _LIVE_URL}, headers=headers
-    )
-    assert resp.status_code == 403
-    fresh = await db_session.get(AppRegistry, app.id)
-    await db_session.refresh(fresh)
-    assert fresh.deployed_url is None
-    assert fresh.deployed_at is None
-
-
-async def test_reapproval_after_deploy_surfaces_redeploy_needed(client, app, db_session) -> None:
-    # approve → mark-deployed → re-submit → re-approve: the approved pin moved past
-    # the deployed marker, so the queue must show a re-deploy is needed.
-    store = _wire_storage(app)
-    row = await _app(db_session, **_approved())
-    headers = await _admin(db_session)
-    assert (
-        await client.post(f"/v1/admin/apps/{row.id}/mark-deployed", headers=headers)
-    ).status_code == 200
-
-    new_sid = uuid.uuid4()
-    await db_session.execute(
-        sa.update(AppRegistry)
-        .where(AppRegistry.id == row.id)
-        .values(
-            status=AppStatus.PENDING,
-            source_submission_id=new_sid,
-            source_commit_sha="2e" * 20,
-            submitted_at=datetime.now(UTC),
-        )
-    )
-    await db_session.flush()
-    store.objects[submission_key(row.id, new_sid)] = b"# v2 git bundle\nB"
-    assert (
-        await client.post(
-            f"/v1/admin/apps/{row.id}/approve",
-            json={"submissionId": str(new_sid)},
-            headers=headers,
-        )
-    ).status_code == 200
-
-    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
-    projected = next(a for a in listed.json()["apps"] if a["appId"] == str(row.id))
-    assert projected["redeployNeeded"] is True  # approved pin != deployed marker
-
-
-async def test_disable_enable_do_not_disturb_the_deployed_marker(client, db_session) -> None:
-    app = await _app(db_session, **_approved())
-    headers = await _admin(db_session)
-    await client.post(f"/v1/admin/apps/{app.id}/mark-deployed", headers=headers)
-    await client.post(f"/v1/admin/apps/{app.id}/disable", headers=headers)
-    await client.post(f"/v1/admin/apps/{app.id}/enable", headers=headers)
-    fresh = await db_session.get(AppRegistry, app.id)
-    await db_session.refresh(fresh)
-    assert fresh.deployed_submission_id == fresh.approved_submission_id
-    assert fresh.deployed_at is not None
-
-
-# --- approval lineage -----------------------------------------
+# --- approval --------------------------------------------------------
 
 # The shape the submit service attaches: both answer sets, the differences, and the
 # redacted explanation. The projection must carry it VERBATIM — the review screen leads
@@ -956,65 +730,20 @@ _DECLARATION = {
 }
 
 
-async def test_self_publish_approval_projects_without_the_runbook_prompts(
-    client, app, db_session
-) -> None:
-    # A publish-flow submission (self_publish lineage + declaration) approved via the real
-    # endpoint must show NO deploy-needed prompt — the bare id derivation would say True
-    # (approved pin set, deployed marker never set), which is exactly the forever-prompt
-    # the self-publish route exists to prevent.
+async def test_an_approved_app_projects_its_declaration_verbatim(client, app, db_session) -> None:
     store = _wire_storage(app)
-    row = await _app(
-        db_session,
-        **_pending(approval_route=ApprovalRoute.SELF_PUBLISH, declaration=_DECLARATION),
-    )
+    row = await _app(db_session, **_pending(declaration=_DECLARATION))
     _stage_bundle(store, row)
     headers = await _admin(db_session)
 
     resp = await client.post(
         f"/v1/admin/apps/{row.id}/approve", json=_approve_body(row), headers=headers
     )
-    assert resp.status_code == 200  # self_publish lineage approves normally
+    assert resp.status_code == 200
 
     listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
     projected = next(a for a in listed.json()["apps"] if a["appId"] == str(row.id))
-    assert projected["approvalRoute"] == "self_publish"
-    assert projected["redeployNeeded"] is False  # suppressed, not derived
-    assert projected["declaration"] == _DECLARATION  # verbatim, for the review screen
-
-
-async def test_runbook_lineage_projects_exactly_as_today(client, db_session) -> None:
-    # Scenario 2: the manual-runbook lineage keeps its controls and its behaviour —
-    # deploy-needed until the marker lands, mark-deployed accepted, prompt cleared.
-    row = await _app(db_session, **_approved(approval_route=ApprovalRoute.RUNBOOK))
-    headers = await _admin(db_session)
-
-    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
-    projected = next(a for a in listed.json()["apps"] if a["appId"] == str(row.id))
-    assert projected["approvalRoute"] == "runbook"
-    assert projected["redeployNeeded"] is True  # approved, never deployed — as today
-
-    assert (
-        await client.post(f"/v1/admin/apps/{row.id}/mark-deployed", headers=headers)
-    ).status_code == 200
-
-    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
-    projected = next(a for a in listed.json()["apps"] if a["appId"] == str(row.id))
-    assert projected["redeployNeeded"] is False  # the marker cleared it — as today
-
-
-async def test_null_lineage_projects_and_behaves_as_today(client, db_session) -> None:
-    # The interim state: a row submitted before the publish-flow writer lands
-    # carries NO lineage. NULL means "today's behaviour everywhere" — projected as
-    # null, deploy-needed still derived, and (per the existing approve happy-path
-    # tests, whose factory rows are all NULL-lineage) approvable as before.
-    row = await _app(db_session, **_approved())
-    headers = await _admin(db_session)
-    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
-    projected = next(a for a in listed.json()["apps"] if a["appId"] == str(row.id))
-    assert projected["approvalRoute"] is None
-    assert projected["declaration"] is None
-    assert projected["redeployNeeded"] is True  # the derivation, untouched
+    assert projected["declaration"] == _DECLARATION
 
 
 async def test_a_superadmin_approving_their_own_app_is_recorded_distinguishably(
@@ -1054,53 +783,6 @@ async def test_approving_someone_elses_app_stays_the_plain_action(client, app, d
 
     assert resp.status_code == 200
     assert await _audited_actions(db_session, row.id) == ["approve"]
-
-
-async def test_mark_deployed_refuses_a_self_publish_app(client, db_session) -> None:
-    # Error path: recording a runbook deployment nobody performed. The app is
-    # APPROVED — the status guard alone would accept it — so only the lineage refuses,
-    # and the refusal stamps nothing and audits nothing.
-    row = await _app(db_session, **_approved(approval_route=ApprovalRoute.SELF_PUBLISH))
-    headers = await _admin(db_session)
-
-    resp = await client.post(
-        f"/v1/admin/apps/{row.id}/mark-deployed", json={"deployedUrl": _LIVE_URL}, headers=headers
-    )
-    assert resp.status_code == 409
-    assert "self-publish" in resp.json()["error"]["message"]
-
-    fresh = await db_session.get(AppRegistry, row.id)
-    await db_session.refresh(fresh)
-    assert fresh.deployed_submission_id is None  # no marker
-    assert fresh.deployed_at is None
-    assert fresh.deployed_url is None  # the URL was refused with the marker
-    assert await _audited_actions(db_session, row.id) == []  # no recorded non-deploy
-
-
-async def test_historical_runbook_address_survives_the_lineage_change(client, db_session) -> None:
-    # The edge case: an app runbook-deployed in its past life, later approved through the
-    # review lineage. The recorded address (and its timestamp) stay visible, the runbook
-    # PROMPT stops (no deploy-needed flag), and mark-deployed is refused rather than
-    # re-recording a runbook that must no longer be run.
-    row = await _app(
-        db_session,
-        **_approved(
-            approval_route=ApprovalRoute.SELF_PUBLISH,
-            deployed_submission_id=uuid.uuid4(),  # the OLD runbook deploy's pin
-            deployed_at=datetime.now(UTC) - timedelta(days=30),
-            deployed_url=_LIVE_URL,
-        ),
-    )
-    headers = await _admin(db_session)
-
-    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
-    projected = next(a for a in listed.json()["apps"] if a["appId"] == str(row.id))
-    assert projected["deployedUrl"] == _LIVE_URL  # history stays visible
-    assert projected["deployedAt"] is not None
-    assert projected["redeployNeeded"] is False  # pins differ, prompt still suppressed
-
-    refused = await client.post(f"/v1/admin/apps/{row.id}/mark-deployed", headers=headers)
-    assert refused.status_code == 409  # the affordance is dead server-side too
 
 
 # --- audit -------------------------------------------------------------

@@ -57,8 +57,6 @@ async def test_fresh_row_has_all_submission_refs_null(db_session) -> None:
     assert app.submitted_at is None
     assert app.approved_submission_id is None
     assert app.approved_commit_sha is None
-    assert app.deployed_submission_id is None
-    assert app.deployed_at is None
 
 
 async def test_submission_refs_roundtrip_typed(db_session) -> None:

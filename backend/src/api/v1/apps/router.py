@@ -60,7 +60,7 @@ async def withdraw(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Withd
     pending→draft through the same guarded-UPDATE shape as the admin transitions
     (`STATUS_TRANSITIONS[DRAFT]` is the source set), plus the ownership predicate the admin
     helper omits because an admin acts across owners. Zero rows updated is a refused withdrawal
-    (409), never a no-op. Clearing the submission pin, the declaration and the lineage REMOVES
+    (409), never a no-op. Clearing the submission pin and the declaration REMOVES
     the queue item; the APPROVED pin and the immutable submission blob survive, because
     withdrawal takes back the queue item, not the artifact already decided on."""
     app = await _owned_app_or_404(db, app_id, user.id)
@@ -92,7 +92,6 @@ async def withdraw(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Withd
             source_submission_id=None,
             source_commit_sha=None,
             submitted_at=None,
-            approval_route=None,
             declaration=None,
         )
         .returning(AppRegistry.id)
@@ -138,6 +137,4 @@ async def read_status(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Ap
         submission_id=app.source_submission_id,
         commit_sha=app.source_commit_sha,
         submitted_at=app.submitted_at,
-        deployed_at=app.deployed_at,
-        deployed_url=app.deployed_url,
     )

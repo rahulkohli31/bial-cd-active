@@ -145,8 +145,8 @@ the approved copy without a second review.
 A deploy takes minutes, far longer than an HTTP request may wait, so the request returns as soon as
 the work is accepted and the interface polls for the result.
 
-An older lineage, where an administrator went live by hand, still describes applications that went
-live that way. Approving a queued version publishes it whichever lineage it entered through.
+Approval is the only way a reviewed application goes live: nothing records an application as live
+by hand.
 
 **Deployed applications carry no authentication of their own.** Anyone who can reach the address of
 a deployed application can open it. Whether that address is reachable beyond the corporate network

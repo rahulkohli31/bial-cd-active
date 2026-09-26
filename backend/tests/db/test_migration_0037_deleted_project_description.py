@@ -2,7 +2,7 @@
 head against the real test database.
 
 WHY THIS EXISTS
-Mirrors `test_app_registry_deployed_url_migration.py` — programmatic `alembic.command` off the
+Mirrors `test_app_registry_submissions_migration.py` — programmatic `alembic.command` off the
 shared `alembic.ini`, database returned to head in a `finally` so a failed assertion cannot
 poison the rest of the suite — and pins the two things that are decisions rather than defaults:
 

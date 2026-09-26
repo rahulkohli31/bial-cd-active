@@ -20,7 +20,6 @@ const h = vi.hoisted(() => ({
   patchApp: vi.fn(),
   disableApp: vi.fn(),
   enableApp: vi.fn(),
-  markDeployed: vi.fn(),
   deleteApp: vi.fn(),
   fetchAudit: vi.fn(),
   fetchAppStatusCounts: vi.fn(),
@@ -52,8 +51,6 @@ const PENDING = {
   submissionId: 'sub-1',
   commitSha: 'f0e1d2c3b4a5f0e1d2c3b4a5f0e1d2c3b4a5f0e1',
   submittedAt: '2026-07-16T09:00:00Z',
-  redeployNeeded: false,
-  approvalRoute: 'self_publish',
   declaration: null,
 }
 

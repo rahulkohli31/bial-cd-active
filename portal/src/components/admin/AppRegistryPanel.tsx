@@ -1,12 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   AlertCircle, RefreshCw, Box, CheckCircle, XCircle, X,
-  ShieldCheck, ShieldOff, Power, Trash2, ScrollText, Rocket, ShieldAlert,
+  ShieldCheck, ShieldOff, Power, Trash2, ScrollText, ShieldAlert,
 } from 'lucide-react'
 import { BusyGlyph } from '../ui/Waiting'
 import {
   listApps, approveApp, rejectApp, patchApp, disableApp, enableApp,
-  markDeployed, deleteApp, fetchAudit, fetchAppStatusCounts,
+  deleteApp, fetchAudit, fetchAppStatusCounts,
 } from '../../utils/appRegistryApi'
 import type { RegistryApp, AppStatus, AuditEvent } from '../../utils/appRegistryApi'
 import { ApiError } from '../../utils/apiError'
@@ -93,8 +93,8 @@ const THE_CRITERION =
 
 const NO_DECLARATION_COPY =
   'This submission carries no data declaration — it was queued before the pre-publish ' +
-  'check existed, or it came in through the manual go-live route. Decide from the ' +
-  'submission details above, or ask the developer to re-submit from the app’s Publish button.'
+  'check existed. Decide from the submission details above, or ask the developer to ' +
+  're-submit from the app’s Publish button.'
 
 const NO_REVIEW_COPY =
   'No automatic check informed this submission — the developer’s own answers are the ' +
@@ -320,18 +320,6 @@ function ReviewModal({ app, withdrawn, onClose, onApprove, onReject }: ReviewMod
                       ? `This is the only thing the developer gets back — write at least ${MIN_REJECTION_NOTE} characters (${trimmedNote.length} so far).`
                       : 'This goes straight back to the developer.'}
                   </p>
-                  {/* Only when the app is actually SERVING. Rejecting sets a standing
-                      rejection, which the marketplace reads — so a live app vanishes from
-                      the catalog while its URL keeps working, and only the OWNER can
-                      re-submit to undo it. An admin rejecting a re-submission of an
-                      already-approved app had no way to know that. */}
-                  {app.deployedUrl && (
-                    <p data-testid="reject-delists-warning" className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mt-2">
-                      This app is live. Rejecting removes it from the Marketplace but leaves
-                      it running at its URL, and only its owner can undo that by submitting
-                      again. To take it down, use Unpublish instead.
-                    </p>
-                  )}
                 </div>
               )}
               <div className="flex gap-3">
@@ -552,21 +540,6 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   const onToggleLogin = (app: RegistryApp) => act(app.appId, () => patchApp(app.appId, { loginRequired: !app.loginRequired }), `Login ${app.loginRequired ? 'disabled' : 'required'} for “${appLabel(app)}”`)
   const onDisable = (app: RegistryApp) => act(app.appId, () => disableApp(app.appId), `“${appLabel(app)}” disabled`)
   const onEnable = (app: RegistryApp) => act(app.appId, () => enableApp(app.appId), `“${appLabel(app)}” re-enabled`)
-  // The deployed URL is DATA, not automation: the operator pastes what the go-live
-  // runbook produced. Prompting (like `onDelete`'s confirm) keeps this on the runbook's
-  // own rhythm — mark the deploy the moment it lands, address in hand. Cancel aborts
-  // entirely; a blank answer still records the deploy and leaves any existing URL alone,
-  // so a re-deploy of the same app needs no re-typing. An invalid URL comes back as the
-  // server's 422 copy through `act`'s toast — no duplicated client-side check.
-  const onMarkDeployed = (app: RegistryApp) => {
-    const answer = window.prompt(
-      `Deployed URL for “${appLabel(app)}” (https://…). Leave blank to record the deploy without changing the URL.`,
-      app.deployedUrl || '',
-    )
-    if (answer === null) return
-    const url = answer.trim()
-    return act(app.appId, () => markDeployed(app.appId, url), `Deployment recorded for “${appLabel(app)}”`)
-  }
   // THE DELETE ASKS WHY, AND A `window.confirm` COULD NOT.
   //
   // The route now REQUIRES a word-bounded reason, so a confirm-and-send would 422 every time. The
@@ -694,17 +667,6 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
                       <div className="flex items-center gap-1.5 flex-wrap">
                         {app.status === 'pending' && (
                           <button data-testid={`review-${app.appId}`} onClick={(e) => { reviewTriggerRef.current = e.currentTarget; setWithdrawn(null); setReview(app) }} disabled={busy} className="px-2.5 py-1.5 rounded-lg bg-primary/10 text-primary hover:bg-primary/20 transition text-xs font-medium disabled:opacity-50">Review</button>
-                        )}
-                        {app.status === 'approved' && app.redeployNeeded && (
-                          <span data-testid={`redeploy-needed-${app.appId}`} title="The approved build has not been deployed (or was re-approved since the last deploy) — run the go-live runbook, then mark it deployed" className="inline-flex items-center text-[11px] font-semibold px-2 py-1 rounded-lg bg-amber-100 text-amber-700">Deploy needed</span>
-                        )}
-                        {/* The self-publish lineage has NO runbook step, so it gets
-                            neither the prompt above (the server already forces
-                            `redeployNeeded` false for it) nor this control — which the
-                            server refuses anyway. An affordance whose only outcome is a
-                            refusal is a bug, not a safety net. */}
-                        {app.status === 'approved' && app.approvalRoute !== 'self_publish' && (
-                          <button data-testid={`mark-deployed-${app.appId}`} onClick={() => onMarkDeployed(app)} disabled={busy} title="Record that the go-live runbook was run for the approved build" className="inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition disabled:opacity-50"><Rocket size={12} /> Mark deployed</button>
                         )}
                         {CAN_DISABLE.includes(app.status) && (
                           <button data-testid={`disable-${app.appId}`} onClick={() => onDisable(app)} disabled={busy} title="Disable (kill switch)" className="p-1.5 rounded-lg border border-bial-border text-amber-600 hover:bg-amber-50 transition disabled:opacity-50"><Power size={13} /></button>

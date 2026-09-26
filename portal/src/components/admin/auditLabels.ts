@@ -60,10 +60,6 @@ const LABELS: Record<string, AuditLabel> = {
     title: 'Taken offline — not confirmed',
     description: 'Removal was requested, but the platform could not confirm it finished.',
   },
-  'mark-deployed': {
-    title: 'Marked as deployed',
-    description: 'An administrator recorded that the go-live runbook was run.',
-  },
   'config:loginRequired': {
     title: 'Sign-in requirement changed',
     description: 'Whether people must sign in to open this app.',

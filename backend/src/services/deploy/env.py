@@ -4,12 +4,12 @@ The values match the sandbox — same DB, same object-store container, and the s
 coordinates when the project has switched them on — so the app the citizen tested is the app that
 ships. Only the Blob CREDENTIAL differs, and it is load-bearing:
 the sandbox's builder mints a 7-day SESSION SAS, but a published app outlives that, so publish
-mints the LONG-LIVED credential instead (the one that already exists for the manual runbook;
+mints the LONG-LIVED credential instead (the one the admin `deploy-credential` lever mints;
 revocable via a per-app stored access policy rather than an inlined expiry).
 
 CONSEQUENCE: each mint REPLACES the container's whole policy set — a redeploy revokes the
-previous credential (fine, it's being replaced), but minting a runbook credential for the same
-app cuts off a live one-click deploy's storage, and vice versa. One live credential per app.
+previous credential (fine, it's being replaced), but an administrator minting one through that
+lever cuts off a live deploy's storage, and vice versa. One live credential per app.
 """
 
 from __future__ import annotations

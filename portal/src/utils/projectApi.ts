@@ -19,16 +19,6 @@ import { toEntry, type MarketplaceEntry } from './marketplaceApi'
  *  server-computed state, and this raw status is one of the parts it stopped recombining. */
 export type AppStatus = 'draft' | 'pending' | 'approved' | 'rejected' | 'disabled'
 
-/**
- * Which lineage the app's current submission entered the approve queue through, mirroring
- * the backend's `ApprovalRoute` enum (`db/models/app_registry.py`). `null` is real — never
- * submitted, or a row predating the publish flow. Lives here, beside `AppStatus`: both the
- * deploy and admin registry clients hand-mirror this enum independently, and agree only
- * until it grows a third value — what they do NOT share is handling an unrecognised one,
- * which each client's own narrower disagrees on deliberately.
- */
-export type ApprovalRoute = 'runbook' | 'self_publish'
-
 /** A project: the container that owns one app, its description, and its chats. */
 export interface Project {
   id: string

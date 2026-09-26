@@ -174,7 +174,7 @@ the publish gate calls it — a journey drives it the same way, not through `cli
 
 ```python
 from src.api.deps import storage_dependency
-from src.db.models.app_registry import AppRegistry, ApprovalRoute
+from src.db.models.app_registry import AppRegistry
 from src.services.approvals.submit import submit_app_for_review
 from src.services.storage import snapshot_key, submission_key
 from tests.fakes import FakeStorage
@@ -193,7 +193,6 @@ receipt = await submit_app_for_review(
     user_id=owner.id,
     app=app_row,
     declaration={"citizen": {}, "review": {}, "differences": [], "explanation": ""},
-    route=ApprovalRoute.SELF_PUBLISH,
 )
 await db_session.commit()
 # receipt == SubmissionReceipt(submission_id, commit_sha, submitted_at)
@@ -242,9 +241,8 @@ for delete) (`test_apps_governance.py:139-175`):
 | `POST /v1/admin/apps/{id}/disable` | — | `status": "disabled"` (requires APPROVED, else **409**) |
 | `POST /v1/admin/apps/{id}/enable` | — | `status": "approved"` (requires DISABLED, else **409**) |
 | `PATCH /v1/admin/apps/{id}` | `{"loginRequired": true}` | loginRequired flip is audited (`config:loginRequired`); the app name is project-sourced and no longer settable — a stray `{"name": ...}` key is ignored |
-| `GET /v1/admin/apps?status=approved` | — | `{"apps": [{"appId","status","hasApprovedSnapshot","submissionId","commitSha","redeployNeeded",...}]}` — never leaks `appKey` or a signed URL; `?status=pending` orders by `submittedAt` (review queue) |
+| `GET /v1/admin/apps?status=approved` | — | `{"apps": [{"appId","status","hasApprovedSnapshot","submissionId","commitSha",...}]}` — never leaks `appKey` or a signed URL; `?status=pending` orders by `submittedAt` (review queue) |
 | `GET /v1/admin/apps/{id}/bundle-url` | — | `{"url","submissionId","commitSha","expiresInSeconds"}` — short-TTL signed download, audited `bundle:download` (needs a storage override, §6) |
-| `POST /v1/admin/apps/{id}/mark-deployed` | — | `{"appId","deployedSubmissionId","deployedAt"}` (requires APPROVED, else **409**), audited `mark-deployed` |
 | `DELETE /v1/admin/apps/{id}` | — | `{"ok": True}` — sweeps the app's blobs, drops the registry row, and post-commit salts the project's database, audited `app:delete` + `db:drop` (needs a storage override, §6) |
 
 ### 3e. shortcut: seed an already-approved app (skip the chain)
@@ -583,7 +581,7 @@ assert resp.status_code == 500
 import uuid
 import sqlalchemy as sa
 from src.config import settings
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.services.approvals.submit import submit_app_for_review
 from src.services.auth.session_jwt import mint_session_jwt
@@ -621,7 +619,6 @@ async def test_owner_builds_admin_approves(client, app, db_session):
         user_id=owner.id,
         app=app_row,
         declaration={"citizen": {}, "review": {}, "differences": [], "explanation": ""},
-        route=ApprovalRoute.SELF_PUBLISH,
     )
     await db_session.commit()
     assert receipt.commit_sha == _SHA

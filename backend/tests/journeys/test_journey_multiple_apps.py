@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.config import settings
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.conversation import ChatKind
 from src.services.approvals.submit import submit_app_for_review
 from src.services.auth.session_jwt import mint_session_jwt
@@ -119,7 +119,6 @@ async def test_one_user_fans_out_into_two_independent_apps(client, app, db_sessi
         user_id=user.id,
         app=refetched_a,
         declaration=declaration,
-        route=ApprovalRoute.SELF_PUBLISH,
     )
     sub_b = await submit_app_for_review(
         db_session,
@@ -127,7 +126,6 @@ async def test_one_user_fans_out_into_two_independent_apps(client, app, db_sessi
         user_id=user.id,
         app=row_b,
         declaration=declaration,
-        route=ApprovalRoute.SELF_PUBLISH,
     )
     await db_session.commit()
     assert sub_a.submission_id != sub_b.submission_id

@@ -56,9 +56,8 @@ class AuditLog(UUIDv7PrimaryKeyMixin, TimestampMixin, Base):
     # thing that was acted on.
     #
     # What this protects is the SUBJECT's data, not the actor's: text the ACTOR authored ABOUT
-    # the act is metadata, and belongs here when it is the whole point of the row. Two such
-    # fields exist today, both admin-authored and both deliberate: `app:delete`'s `reason` (the
-    # justification for destroying somebody else's work, on the one row that survives it) and
-    # `mark-deployed`'s `deployedUrl`. The subject's own content stays out, and identifiers stay
-    # identifiers.
+    # the act is metadata, and belongs here when it is the whole point of the row:
+    # `app:delete`'s `reason` is one, admin-authored and deliberate (the justification for
+    # destroying somebody else's work, on the one row that survives it). The subject's own
+    # content stays out, and identifiers stay identifiers.
     detail: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)

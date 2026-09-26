@@ -1,7 +1,7 @@
 """The admin-configured publish classification: classes, one policy row, a review fingerprint
 
 Revision ID: 0049_classification_config
-Revises: 0047_drop_connector_access
+Revises: 0048_drop_manual_go_live
 Create Date: 2026-09-26
 
 The classes the reviewer answers and the policy the gate scores with move into two tables, seeded
@@ -23,7 +23,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision: str = "0049_classification_config"
-down_revision: str | None = "0047_drop_connector_access"
+down_revision: str | None = "0048_drop_manual_go_live"
 branch_labels: str | None = None
 depends_on: str | None = None
 

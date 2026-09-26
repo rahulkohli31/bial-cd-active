@@ -63,7 +63,7 @@ from src.api.v1.deploy.schemas import (
 from src.api.v1.live_build import refuse_while_build_session_live
 from src.core.errors import AppApiError
 from src.core.redaction import redact_secrets
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.deployment import Deployment
 from src.db.models.user import User
 from src.schemas import ADMIN_AUTH, AUTH_401, ErrorEnvelope, error_responses
@@ -189,7 +189,7 @@ async def _owned_app_row(
     unlike 409s — so the answer is returned rather than raised; what must not be spelled four
     times is the scoping, where a dropped predicate is a cross-user leak rather than a style
     nit. The whole row, not `deploy_target`'s two-column projection: the ladder reads status,
-    the approval pin, the lineage and the rejection note."""
+    the approval pin and the rejection note."""
     return (
         await db.execute(
             sa.select(AppRegistry).where(
@@ -537,7 +537,6 @@ async def _route_to_review(
         user_id=user.id,
         app=app_row,
         declaration=declaration,
-        route=ApprovalRoute.SELF_PUBLISH,
     )
     if head_sha is not None and receipt.commit_sha != head_sha:
         # The bundle moved between the metadata read and the copy: the queue item would

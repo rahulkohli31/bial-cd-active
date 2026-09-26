@@ -25,7 +25,7 @@ from fastapi import FastAPI
 from src.api.deps import storage_or_none_dependency
 from src.api.v1.build_sessions.deps import sandbox_or_none_dependency, session_manager_dependency
 from src.api.v1.deploy.deps import deploy_service_or_none
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.classification_review import ClassificationReview
 from src.services.build_sessions.manager import SessionManager
@@ -278,7 +278,6 @@ async def test_a_review_yes_routes_and_carries_both_answer_sets(wire, client, db
     fresh = await db_session.get(AppRegistry, app_row.id, populate_existing=True)
     assert fresh is not None
     assert fresh.status is AppStatus.PENDING
-    assert fresh.approval_route is ApprovalRoute.SELF_PUBLISH
     declaration = fresh.declaration
     assert declaration is not None
     assert declaration["citizen"]["answers"]["personal_information"] is False
@@ -570,7 +569,6 @@ def _approved(sha: str, **extra: object) -> dict[str, Any]:
     submission_id = uuid.uuid4()
     return {
         "status": AppStatus.APPROVED,
-        "approval_route": ApprovalRoute.SELF_PUBLISH,
         "source_submission_id": submission_id,
         "source_commit_sha": sha,
         "approved_submission_id": submission_id,
@@ -657,24 +655,6 @@ async def test_the_saved_version_of_an_approved_app_goes_through_the_gate(
     assert resp.status_code == 200
     assert resp.json()["outcome"] == "routed_for_review"
     assert wire.pipeline.started == []
-
-
-async def test_an_approval_on_the_manual_route_republishes_its_copy_too(
-    wire, client, db_session
-) -> None:
-    """The approval route is not read: an approved copy is an approved copy."""
-    user, app_row = await _owner_with_saved_app(
-        db_session, wire.store, **_approved(_SHA, approval_route=ApprovalRoute.RUNBOOK)
-    )
-
-    resp = await client.post(
-        _DEPLOY.format(pid=app_row.project_id),
-        headers=auth_headers(user),
-        json={"commitSha": _SHA},
-    )
-
-    assert resp.status_code == 202
-    assert len(wire.pipeline.started) == 1
 
 
 async def test_an_approval_with_no_stored_copy_is_not_an_approved_copy(

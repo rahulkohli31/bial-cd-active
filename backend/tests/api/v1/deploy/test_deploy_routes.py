@@ -25,7 +25,7 @@ from src.api.v1.build_sessions.deps import (
     sandbox_or_none_dependency,
 )
 from src.api.v1.deploy.deps import deploy_service_or_none
-from src.db.models.app_registry import ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppStatus
 from src.services.classification import store as review_store
 from src.services.deploy.classification import CLASSIFICATION_KEYS
 from src.services.deploy.service import DeployNotPossibleError, StartedDeploy
@@ -424,7 +424,6 @@ async def test_the_status_carries_the_apps_approval_state(wire, client, db_sessi
     app_row.status = AppStatus.PENDING
     app_row.source_commit_sha = _HEAD_SHA
     app_row.submitted_at = submitted
-    app_row.approval_route = ApprovalRoute.SELF_PUBLISH
     app_row.rejection_note = "Explain where the vendor key is stored."
     await db_session.commit()
 
@@ -438,7 +437,6 @@ async def test_the_status_carries_the_apps_approval_state(wire, client, db_sessi
         # Asserted as an exact dict on purpose — a field added to the wire should have to
         # come through here.
         "approvedAt": None,
-        "approvalRoute": "self_publish",
         "rejectionNote": "Explain where the vendor key is stored.",
         "submittedSha": _HEAD_SHA,
         "submittedAt": "2026-08-19T10:00:00Z",
@@ -479,7 +477,6 @@ async def test_a_never_submitted_app_still_reports_its_draft_lifecycle(
     assert approval["submittedSha"] is None
     assert approval["approvedCommitSha"] is None
     assert approval["approvedAt"] is None
-    assert approval["approvalRoute"] is None
     assert resp.json()["publishState"] == "draft"
 
 
@@ -498,7 +495,6 @@ async def test_the_approval_carries_when_it_was_approved_not_only_which_commit(
     app_row.status = AppStatus.APPROVED
     app_row.approved_commit_sha = _HEAD_SHA
     app_row.approved_at = approved
-    app_row.approval_route = ApprovalRoute.SELF_PUBLISH
     await db_session.commit()
 
     resp = await client.get(_STATUS.format(pid=app_row.project_id), headers=auth_headers(user))
@@ -751,7 +747,6 @@ async def test_the_published_approved_and_saved_rows_arrive_together(
     app_row.status = AppStatus.APPROVED
     app_row.approved_commit_sha = _HEAD_SHA
     app_row.approved_at = datetime(2026, 8, 24, 9, 0, tzinfo=UTC)
-    app_row.approval_route = ApprovalRoute.SELF_PUBLISH
     await db_session.commit()
     key = snapshot_key(app_row.id)
     wire.store.objects[key] = a_git_bundle(_SAVED_SHA)

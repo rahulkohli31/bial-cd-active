@@ -18,8 +18,7 @@ promote an unvetted pending app past the approve gate); `approve` carries the mi
 directly).
 
 Approving publishes: `approve` starts the pipeline on the approved submission copy, as the
-owner. `self_publish` apps get neither the deploy-needed prompt nor the mark-deployed marker,
-so a runbook record here would describe a deployment nobody performed."""
+owner."""
 
 from __future__ import annotations
 
@@ -64,8 +63,6 @@ from src.api.v1.admin.schemas import (
     HarnessCountersResponse,
     LimitFields,
     LimitsPatchResponse,
-    MarkDeployedRequest,
-    MarkDeployedResponse,
     PatchAppRequest,
     PrefixReconcileCounts,
     RejectRequest,
@@ -96,7 +93,6 @@ from src.db.base import async_session_factory
 from src.db.models.app_registry import (
     STATUS_TRANSITIONS,
     AppRegistry,
-    ApprovalRoute,
     AppStatus,
     app_status_enum,
 )
@@ -215,26 +211,8 @@ def _project(
         approved_commit_sha=app.approved_commit_sha,
         approved_by=app.approved_by,
         approved_at=app.approved_at,
-        # Historical runbook fields stay projected UNCONDITIONALLY: an app that later
-        # moved to the self-publish lineage keeps its recorded runbook address visible
-        # to the administrator (the older of its two addresses, labelled by the SPA) —
-        # lineage suppresses the PROMPT below, never the history.
-        deployed_at=app.deployed_at,
-        deployed_url=app.deployed_url,
-        # Exact and clock-skew-free: ids, not timestamps. False for a
-        # never-approved app (None == None); True for approved-but-undeployed —
-        # UNLESS the lineage is self-publish: the flag is a runbook
-        # prompt, a self-published app never sets `deployed_submission_id`, and the
-        # bare derivation would therefore read "Deploy needed" forever, prompting an
-        # administrator to run a runbook that must not be run.
-        redeploy_needed=(
-            app.approval_route is not ApprovalRoute.SELF_PUBLISH
-            and app.approved_submission_id != app.deployed_submission_id
-        ),
-        # The lineage itself — what the SPA keys the runbook affordances off
-        # — and the submitted declaration, so the review screen can lead with
-        # the disagreement without a second call.
-        approval_route=app.approval_route,
+        # The submitted declaration, so the review screen can lead with the disagreement
+        # without a second call.
         declaration=app.declaration,
         database_bytes=database_bytes,
         rejection_note=app.rejection_note,
@@ -323,14 +301,6 @@ _NOT_DISABLABLE = (
 # one app's database — and a sweep must never answer with a partial report dressed as a
 # clean one, so an unreachable cluster is a retryable failure, not an empty tally.
 _DB_CLUSTER_UNREACHABLE = "The app-database cluster could not be reached. Please try again."
-
-# Mark-deployed's lineage refusal, which names the dead end instead of looping in it:
-# recording a runbook deployment nobody performed, on an app whose owner publishes it
-# themselves, would be a lie in the registry.
-_SELF_PUBLISHED_HAS_NO_RUNBOOK = (
-    "This app is on the self-publish route — the developer publishes it themselves, "
-    "and there is no runbook deployment to record."
-)
 
 # The withdrawal race — the moment a citizen's own withdraw call hands over. An
 # administrator can be reading a submission at the instant its owner pulls it back:
@@ -726,7 +696,7 @@ async def disable(
     PENDING stays out: an app waiting for review is REJECTED, not switched off, and the copy
     below says so rather than leaving the administrator to guess which lever they wanted.
 
-    NOT severed here, deliberately and per the runbook: the app's deploy Blob SAS (see
+    NOT severed here, deliberately: the app's deploy Blob SAS (see
     `mint_deploy_credential`). Revoking that means deleting the container's stored access
     policy, which is an operator step — do not read this response as "the files are locked"."""
     # The sever, not merely the status, because the shared-table plane and its per-request
@@ -977,13 +947,12 @@ async def mint_deploy_credential(
     db: DbSession,
     container_store: ContainerStore,
 ) -> DeployCredentialResponse:
-    """Mint the deployed app's long-lived, container-scoped Blob credential — the runbook's
-    step-5 `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS` pair.
+    """Mint the deployed app's long-lived, container-scoped Blob credential — the
+    `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS` pair.
 
     Deliberately independent: the credential reaches the app's own container DIRECTLY, so a
     deployed app never proxies file traffic through the control-plane. That independence cuts
-    both ways and the runbook says so — `disable` kill-switches the DATA plane but does NOT
-    revoke this SAS."""
+    both ways — `disable` kill-switches the DATA plane but does NOT revoke this SAS."""
     # Like `bundle-url`, the minted token is a bearer credential: audited as an EVENT (who,
     # which app, when it dies) with the SAS value itself never logged and never in the audit
     # `detail`. Not part of any list projection — a mint is always an explicit, recorded act.
@@ -1032,16 +1001,15 @@ async def mint_deploy_credential(
 async def reveal_database_credential(
     app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
 ) -> DatabaseCredentialResponse:
-    """Reveal the project database's connection string — the go-live runbook's
+    """Reveal the project database's connection string — the deployed app's
     `BIAL_DATABASE_URL`, byte-for-byte the value the sandbox is injected with.
 
     There is no rotation lever here on purpose: one role serves both the sandbox and the
     deployed container, so a reset would cut a live deployment off. Leak response is a
     deliberate, separate operator story."""
-    # The database is keyed by PROJECT while this router is keyed by app, and that is fine
-    # rather than merely tolerable: the runbook only ever reveals for an APPROVED app, so an app
-    # row always exists and `app.project_id` is the resolution. The audit row is project-scoped
-    # and carries `appId` so it still shows up in the app's trail.
+    # The database is keyed by PROJECT while this router is keyed by app, so `app.project_id`
+    # is the resolution. The audit row is project-scoped and carries `appId` so it still shows
+    # up in the app's trail.
     #
     # Modelled on `mint_deploy_credential`, including the parts that are security decisions
     # rather than style: the secret is returned in the RESPONSE BODY ONLY, it is never part of
@@ -1092,106 +1060,6 @@ def _dsn_host(dsn: str) -> str:
     url = make_url(dsn)
     host = url.host or ""
     return f"{host}:{url.port}" if url.port else host
-
-
-@router.post(
-    "/{app_id}/mark-deployed",
-    responses=error_responses(
-        (404, ErrorEnvelope, "App not found"),
-        (
-            409,
-            ErrorEnvelope,
-            "Not approved, or a self-published app with no runbook deployment to record",
-        ),
-        *_ADMIN_AUTH,
-    ),
-)
-async def mark_deployed(
-    app_id: uuid.UUID,
-    admin: CurrentSuperadmin,
-    db: DbSession,
-    body: MarkDeployedRequest | None = None,
-) -> MarkDeployedResponse:
-    """Record that a human ran the go-live runbook for the approved pin, and — optionally —
-    WHERE the app now lives.
-
-    A MARKER, not a status: `STATUS_TRANSITIONS` is untouched. The URL is DATA, not automation:
-    whatever the runbook operator pastes is what the owner's Live link points at — the platform
-    never derives, probes, or verifies it. The body (and the field) stay optional, so a bare
-    `{}` still marks a deploy."""
-    # Still a guarded UPDATE, so a marker can never attach to an unapproved app, and it pins the
-    # approved submission ATOMICALLY (`deployed := approved` inside the UPDATE, so a racing
-    # re-approval cannot tear the pair). `redeploy_needed` derives as
-    # `approved_submission_id != deployed_submission_id` in the projection.
-    #
-    # `.returning()` gives the stamped values as detached scalars: nothing ORM-shaped crosses the
-    # `commit()` below, so nothing has to be re-fetched from an expired instance afterwards.
-    app = await _get_app_or_404(db, app_id)
-    # A self-published app has NO runbook step: its owner publishes the
-    # approved version themselves, so a marker here would record a deployment nobody
-    # performed — and `deployed := approved` would then read as redeploy-not-needed on
-    # a runbook nobody is meant to run. Refuse with copy naming the lineage; the
-    # guarded UPDATE below carries the atomic twin.
-    if app.approval_route is ApprovalRoute.SELF_PUBLISH:
-        raise AppApiError(409, _SELF_PUBLISHED_HAS_NO_RUNBOOK)
-    recorded_url = None if body is None else body.deployed_url
-    stamped_values: dict[str, Any] = {
-        "deployed_submission_id": AppRegistry.approved_submission_id,
-        "deployed_at": sa.func.now(),
-    }
-    # Absent URL => leave the column alone (see `MarkDeployedRequest`), which is why
-    # this is a conditional key and not `deployed_url=recorded_url`: the latter would
-    # blank the live link on every URL-less re-mark.
-    if recorded_url is not None:
-        stamped_values["deployed_url"] = str(recorded_url)
-    stamped = (
-        await db.execute(
-            sa.update(AppRegistry)
-            .where(
-                AppRegistry.id == app_id,
-                AppRegistry.status == AppStatus.APPROVED,
-                # Belt over braces: approve is the only path to APPROVED and always
-                # pins, but a marker referencing NO submission would be a lie.
-                AppRegistry.approved_submission_id.is_not(None),
-                # The lineage pre-check's atomic twin. Reachable only through a
-                # double race (a re-submit through the publish flow AND a re-approval,
-                # both between our read and this UPDATE), but the cost of a miss is a
-                # recorded deployment nobody performed — belt over braces again.
-                # IS DISTINCT FROM, not !=: a NULL lineage must pass.
-                AppRegistry.approval_route.is_distinct_from(ApprovalRoute.SELF_PUBLISH),
-            )
-            .values(**stamped_values)
-            .returning(
-                AppRegistry.deployed_submission_id,
-                AppRegistry.deployed_at,
-                AppRegistry.deployed_url,
-                AppRegistry.approved_commit_sha,
-            )
-        )
-    ).first()
-    if stamped is None:
-        raise AppApiError(409, "Only an approved app can be marked deployed.")
-    await append_audit(
-        db,
-        actor_id=admin.id,
-        action="mark-deployed",
-        resource_type="app",
-        resource_id=str(app_id),
-        detail={
-            "submissionId": str(stamped.deployed_submission_id),
-            "commitSha": stamped.approved_commit_sha,
-            # The app's public address — not a credential (unlike the SAS its
-            # `deploy-credential` sibling deliberately keeps out of the trail).
-            "deployedUrl": stamped.deployed_url,
-        },
-    )
-    await db.commit()
-    return MarkDeployedResponse(
-        app_id=app_id,
-        deployed_submission_id=stamped.deployed_submission_id,
-        deployed_at=stamped.deployed_at,
-        deployed_url=stamped.deployed_url,
-    )
 
 
 @router.delete(
