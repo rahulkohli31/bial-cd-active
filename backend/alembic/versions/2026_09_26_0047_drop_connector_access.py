@@ -41,8 +41,10 @@ connector_request_status = postgresql.ENUM(
 
 
 def upgrade() -> None:
-    # The table's own indexes go with it.
+    # The table's own indexes go with it. Dropping its foreign keys also locks `users`.
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.drop_table("connector_access_requests")
+    op.execute("SET LOCAL lock_timeout = DEFAULT")
     connector_request_status.drop(op.get_bind(), checkfirst=True)
 
 

@@ -39,18 +39,22 @@ approval_route = postgresql.ENUM(
 
 
 def upgrade() -> None:
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.drop_column("app_registry", "approval_route")
     op.drop_column("app_registry", "deployed_url")
     op.drop_column("app_registry", "deployed_at")
     op.drop_column("app_registry", "deployed_submission_id")
+    op.execute("SET LOCAL lock_timeout = DEFAULT")
     approval_route.drop(op.get_bind(), checkfirst=True)
 
 
 def downgrade() -> None:
     approval_route.create(op.get_bind(), checkfirst=True)
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.add_column("app_registry", sa.Column("deployed_submission_id", sa.Uuid(), nullable=True))
     op.add_column(
         "app_registry", sa.Column("deployed_at", sa.DateTime(timezone=True), nullable=True)
     )
     op.add_column("app_registry", sa.Column("deployed_url", sa.String(length=2083), nullable=True))
     op.add_column("app_registry", sa.Column("approval_route", approval_route, nullable=True))
+    op.execute("SET LOCAL lock_timeout = DEFAULT")
