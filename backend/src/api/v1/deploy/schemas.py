@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Final, Literal
 
 from pydantic import Field
 
@@ -22,6 +22,7 @@ from src.db.models.deployment import Deployment, DeploymentStatus
 from src.schemas import CamelModel
 from src.services.deploy.service import (
     FAIL_BUILD,
+    FAIL_BUILD_UNAVAILABLE,
     FAIL_CONTEXT_TOO_LARGE,
     FAIL_INTERNAL,
     FAIL_NO_SNAPSHOT,
@@ -43,7 +44,8 @@ ClassKey = Annotated[str, Field(min_length=1, max_length=MAX_CLASS_KEY)]
 
 class DeployRequest(CamelModel):
     """`commitSha` names the version the owner acted on: the saved version they reviewed, or
-    the approved commit, which republishes the approved copy. Any other commit is refused.
+    the approved commit while its copy is on offer (`approvedRetryCommit`), which republishes
+    the copy. Any other commit is refused.
 
     `answers` are the owner's Yes/No answers keyed by class key. They count only for scored
     classes, only while owners may change the reviewer's answers, and a class left out keeps
@@ -403,6 +405,7 @@ _RETRYABLE_FAILURE_CODES: frozenset[str] = frozenset(
         FAIL_PROVISION,
         FAIL_STORAGE,
         FAIL_SNAPSHOT_UNREADABLE,
+        FAIL_BUILD_UNAVAILABLE,
         FAIL_NOT_READY,
     }
 )
@@ -416,6 +419,13 @@ _NON_RETRYABLE_FAILURE_CODES: frozenset[str] = frozenset(
         FAIL_NOT_HEALTHY,
     }
 )
+# Every code a failed publish settles under.
+PUBLISH_FAILURE_CODES: frozenset[str] = _RETRYABLE_FAILURE_CODES | _NON_RETRYABLE_FAILURE_CODES
+
+# Failed publishes of the approved copy after which it is no longer offered: a copy's own fault
+# misread as the platform's would otherwise be offered for ever. Past the cap the one button acts
+# on the saved version, as after the copy's own fault.
+MAX_APPROVED_COPY_ATTEMPTS: Final = 3
 
 
 def _retryable_failure(deployment: Deployment) -> bool:
@@ -426,17 +436,26 @@ def _retryable_failure(deployment: Deployment) -> bool:
     )
 
 
-def retry_needs_last_publish(app: AppRegistry, deployment: Deployment | None) -> bool:
-    """Whether `approved_retry_commit` has to know if the approved copy went live: the newest
-    attempt since approval failed, for a reason a retry can fix, before it could name the commit
-    it was shipping, so it may have been the approved copy, or a later version sent after the
-    copy went live."""
+def retry_needs_copy_failures(app: AppRegistry, deployment: Deployment | None) -> bool:
+    """Whether `approved_retry_commit` has to know how many publishes of the approved copy have
+    failed since approval: the newest attempt since then failed for a reason a retry can fix."""
     return (
         approved_copy(app) is not None
         and deployment is not None
         and _attempted_since_approval(app, deployment)
         and deployment.unpublished_at is None
         and _retryable_failure(deployment)
+    )
+
+
+def retry_needs_last_publish(app: AppRegistry, deployment: Deployment | None) -> bool:
+    """Whether `approved_retry_commit` has to know if the approved copy went live: the newest
+    attempt since approval failed, for a reason a retry can fix, before it could name the commit
+    it was shipping, so it may have been the approved copy, or a later version sent after the
+    copy went live."""
+    return (
+        retry_needs_copy_failures(app, deployment)
+        and deployment is not None
         and deployment.head_sha is None
     )
 
@@ -448,17 +467,20 @@ def published_since_approval(app: AppRegistry, published: Deployment | None) -> 
 
 
 def approved_retry_commit(
-    app: AppRegistry, deployment: Deployment | None, *, approved_went_live: bool
+    app: AppRegistry,
+    deployment: Deployment | None,
+    *,
+    approved_went_live: bool,
+    copy_failures: int,
 ) -> str | None:
     """The approved commit when the one button republishes the approved copy, else None.
 
-    That is while the copy has not gone live since its approval — nothing attempted yet, or an
-    attempt at it failed for a reason a retry can fix — and when the version taken offline is the
-    approved one and did not fail in itself. A failed attempt that shipped some other commit is
-    retried through the gate instead; one that failed before naming a commit is an attempt at the
-    copy only if nothing has gone live since the approval (`approved_went_live`, asked for when
-    `retry_needs_last_publish` says so). The publish route takes the approved-copy rung exactly
-    when this offers the commit it was sent."""
+    That is while the copy has not gone live since approval — nothing attempted yet, or a failure
+    a retry can fix while fewer than `MAX_APPROVED_COPY_ATTEMPTS` publishes of it have failed
+    (`copy_failures`) — and when the version taken offline is the approved one and did not fail in
+    itself. A failure that named another commit goes through the gate; one that named none is an
+    attempt at the copy only if nothing went live since approval (`approved_went_live`). Rule 3
+    republishes exactly when this offers the commit it was sent."""
     copy = approved_copy(app)
     if copy is None:
         return None
@@ -470,7 +492,7 @@ def approved_retry_commit(
         # in itself, which is not offered back.
         failed_in_itself = deployment.failure_code in _NON_RETRYABLE_FAILURE_CODES
         return approved if deployment.head_sha == approved and not failed_in_itself else None
-    if not _retryable_failure(deployment):
+    if not _retryable_failure(deployment) or copy_failures >= MAX_APPROVED_COPY_ATTEMPTS:
         return None
     if deployment.head_sha == approved:
         return approved

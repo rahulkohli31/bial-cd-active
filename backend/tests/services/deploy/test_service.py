@@ -28,7 +28,7 @@ from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.deploy import service as service_module
 from src.services.deploy.aca_publish import RevisionState, _state_of
 from src.services.deploy.config import DeployConfig
-from src.services.deploy.images import BuiltImage, ImageBuildError
+from src.services.deploy.images import BuiltImage, ImageBuildError, ImageBuildTransientError
 from src.services.deploy.names import published_app_name
 from src.services.deploy.service import DeployNotPossibleError, DeployService
 from src.services.storage import BundleValidationError, submission_key
@@ -383,6 +383,26 @@ async def test_a_build_failure_with_no_log_still_reports_something_useful(
 
     assert row.failure_code == "build_failed"
     assert "timed out" in (row.failure_detail or "")
+
+
+async def test_a_platform_fault_in_the_build_is_not_reported_as_the_app_s_own(
+    wire, db_session
+) -> None:
+    """Settled as a build failure it would withdraw an approved copy and send the owner and the
+    assistant looking for a fault in code that is fine."""
+    user, app, conversation = await _project(db_session)
+    wire.images.error = ImageBuildTransientError("the image build did not finish within 900s")
+
+    _started, row = await _run(wire, db_session, user, app, conversation.id)
+
+    assert row.status is DeploymentStatus.FAILED
+    assert row.failure_code == "build_unavailable"
+    message = await db_session.scalar(
+        sa.select(Message).where(Message.conversation_id == conversation.id)
+    )
+    text = message.payload[0]["parts"][0]["content"]
+    assert "platform problem" in text
+    assert "try again" in text
 
 
 async def test_nothing_saved_yet_is_a_named_outcome(wire, db_session, monkeypatch) -> None:

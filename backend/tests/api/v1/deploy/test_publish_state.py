@@ -30,6 +30,7 @@ from src.api.v1.deploy.schemas import (
     compute_publish_state,
     compute_registry_status,
     published_since_approval,
+    retry_needs_copy_failures,
     retry_needs_last_publish,
 )
 from src.db.models.app_registry import AppRegistry, AppStatus
@@ -232,7 +233,10 @@ def test_an_approved_copy_never_attempted_reads_did_not_start_and_offers_itself(
     app = _approved(_SUBMITTED_SHA)
 
     assert compute_publish_state(app, None, _SAVED_SHA) is PublishState.DID_NOT_START
-    assert approved_retry_commit(app, None, approved_went_live=False) == _SUBMITTED_SHA
+    assert (
+        approved_retry_commit(app, None, approved_went_live=False, copy_failures=0)
+        == _SUBMITTED_SHA
+    )
 
 
 def test_a_row_older_than_the_approval_is_not_an_attempt_at_it() -> None:
@@ -249,7 +253,10 @@ def test_a_row_older_than_the_approval_is_not_an_attempt_at_it() -> None:
         ),
     ):
         assert compute_publish_state(app, older, _SAVED_SHA) is PublishState.DID_NOT_START
-        assert approved_retry_commit(app, older, approved_went_live=False) == _SUBMITTED_SHA
+        assert (
+            approved_retry_commit(app, older, approved_went_live=False, copy_failures=0)
+            == _SUBMITTED_SHA
+        )
 
 
 def test_the_attempt_the_approval_starts_counts_as_since_approval() -> None:
@@ -259,7 +266,7 @@ def test_the_attempt_the_approval_starts_counts_as_since_approval() -> None:
     running = _deployment(status=DeploymentStatus.RUNNING, created_at=_APPROVED_AT)
 
     assert compute_publish_state(app, running, _SAVED_SHA) is PublishState.STARTING_UP
-    assert approved_retry_commit(app, running, approved_went_live=False) is None
+    assert approved_retry_commit(app, running, approved_went_live=False, copy_failures=0) is None
 
 
 @pytest.mark.parametrize(
@@ -362,7 +369,9 @@ def test_once_attempted_the_attempt_speaks_for_the_approved_copy(
     app = _approved(_SUBMITTED_SHA)
 
     assert compute_publish_state(app, deployment, saved_head) is expected
-    assert approved_retry_commit(app, deployment, approved_went_live=False) == retry
+    assert (
+        approved_retry_commit(app, deployment, approved_went_live=False, copy_failures=1) == retry
+    )
 
 
 def test_approved_then_try_again_failed_then_succeeded_reads_live() -> None:
@@ -371,13 +380,16 @@ def test_approved_then_try_again_failed_then_succeeded_reads_live() -> None:
         status=DeploymentStatus.FAILED, failure_code="provision_failed", head_sha=_SUBMITTED_SHA
     )
     assert compute_publish_state(app, failed, _SUBMITTED_SHA) is PublishState.DID_NOT_START
-    assert approved_retry_commit(app, failed, approved_went_live=False) == _SUBMITTED_SHA
+    assert (
+        approved_retry_commit(app, failed, approved_went_live=False, copy_failures=1)
+        == _SUBMITTED_SHA
+    )
 
     succeeded = _deployment(
         head_sha=_SUBMITTED_SHA, created_at=_SINCE_APPROVAL + timedelta(minutes=5)
     )
     assert compute_publish_state(app, succeeded, _SUBMITTED_SHA) is PublishState.LIVE_CURRENT
-    assert approved_retry_commit(app, succeeded, approved_went_live=False) is None
+    assert approved_retry_commit(app, succeeded, approved_went_live=False, copy_failures=0) is None
 
 
 def test_a_nameless_failure_after_the_copy_went_live_goes_back_through_the_gate() -> None:
@@ -389,7 +401,7 @@ def test_a_nameless_failure_after_the_copy_went_live_goes_back_through_the_gate(
 
     assert compute_publish_state(app, failed, _SAVED_SHA) is PublishState.DID_NOT_START
     assert retry_needs_last_publish(app, failed)
-    assert approved_retry_commit(app, failed, approved_went_live=True) is None
+    assert approved_retry_commit(app, failed, approved_went_live=True, copy_failures=1) is None
 
 
 def test_a_nameless_failure_with_nothing_live_since_approval_retries_the_copy() -> None:
@@ -397,7 +409,10 @@ def test_a_nameless_failure_with_nothing_live_since_approval_retries_the_copy() 
     failed = _deployment(status=DeploymentStatus.FAILED, failure_code="interrupted")
 
     assert retry_needs_last_publish(app, failed)
-    assert approved_retry_commit(app, failed, approved_went_live=False) == _SUBMITTED_SHA
+    assert (
+        approved_retry_commit(app, failed, approved_went_live=False, copy_failures=1)
+        == _SUBMITTED_SHA
+    )
 
 
 @pytest.mark.parametrize("code", sorted(_NON_RETRYABLE_FAILURE_CODES))
@@ -410,29 +425,49 @@ def test_an_approved_copy_that_fails_in_itself_is_not_offered_again(code: str) -
 
         assert compute_publish_state(app, failed, _SAVED_SHA) is PublishState.DID_NOT_START
         assert not retry_needs_last_publish(app, failed)
-        assert approved_retry_commit(app, failed, approved_went_live=False) is None
+        assert (
+            approved_retry_commit(app, failed, approved_went_live=False, copy_failures=1) is None
+        )
 
 
 @pytest.mark.parametrize(
     ("code", "offered"),
     [
         ("snapshot_unreadable", True),
+        ("build_unavailable", True),
         ("revision_not_ready", True),
         ("snapshot_corrupt", False),
+        ("build_failed", False),
         ("revision_unhealthy", False),
     ],
 )
-def test_reading_and_starting_the_copy_tell_the_platform_s_faults_from_the_copy_s(
+def test_reading_building_and_starting_the_copy_tell_the_platform_s_faults_from_the_copy_s(
     code: str, offered: bool
 ) -> None:
-    """A bundle that could not be read and an app slow to start are the platform's faults; a
-    malformed bundle and a revision that failed are the copy's, and would fail the same way."""
+    """A bundle that could not be read, a build the platform could not run and an app slow to
+    start are the platform's faults; a malformed bundle, a build that failed and a revision that
+    failed are the copy's, and would fail the same way."""
     app = _approved(_SUBMITTED_SHA)
     for head in (_SUBMITTED_SHA, None):
         failed = _deployment(status=DeploymentStatus.FAILED, failure_code=code, head_sha=head)
 
-        retry = approved_retry_commit(app, failed, approved_went_live=False)
+        retry = approved_retry_commit(app, failed, approved_went_live=False, copy_failures=1)
         assert retry == (_SUBMITTED_SHA if offered else None), head
+
+
+def test_a_platform_failure_offers_the_copy_again_only_below_the_cap() -> None:
+    """A copy's own fault misread as the platform's would otherwise be offered for ever. The
+    third attempt is still offered after two failures; after three, the saved version is."""
+    app = _approved(_SUBMITTED_SHA)
+    failed = _deployment(
+        status=DeploymentStatus.FAILED, failure_code="revision_not_ready", head_sha=_SUBMITTED_SHA
+    )
+
+    assert retry_needs_copy_failures(app, failed)
+    assert not retry_needs_copy_failures(app, _deployment(head_sha=_SUBMITTED_SHA))
+    below = approved_retry_commit(app, failed, approved_went_live=False, copy_failures=2)
+    at_cap = approved_retry_commit(app, failed, approved_went_live=False, copy_failures=3)
+    assert (below, at_cap) == (_SUBMITTED_SHA, None)
 
 
 def test_every_failure_code_is_sorted_into_exactly_one_set() -> None:
@@ -488,7 +523,9 @@ def test_a_takedown_offers_the_approved_copy_back_unless_it_failed_in_itself(
     deployment = _deployment(unpublished_at=datetime(2026, 9, 21, tzinfo=UTC), **stamped)
 
     assert compute_publish_state(app, deployment, _SAVED_SHA) is PublishState.TAKEN_OFFLINE
-    assert approved_retry_commit(app, deployment, approved_went_live=False) == retry
+    assert (
+        approved_retry_commit(app, deployment, approved_went_live=False, copy_failures=0) == retry
+    )
 
 
 def test_only_a_nameless_failed_attempt_since_approval_asks_what_went_live() -> None:
@@ -539,7 +576,7 @@ def test_an_approval_with_no_stored_copy_is_a_draft_again() -> None:
     app = _app(status=AppStatus.APPROVED, approved_commit_sha=_LIVE_SHA, approved_at=_APPROVED_AT)
 
     assert compute_publish_state(app, None, _SAVED_SHA) is PublishState.DRAFT
-    assert approved_retry_commit(app, None, approved_went_live=False) is None
+    assert approved_retry_commit(app, None, approved_went_live=False, copy_failures=0) is None
 
 
 def test_no_state_but_an_approved_one_carries_a_retry_commit() -> None:
@@ -550,7 +587,9 @@ def test_no_state_but_an_approved_one_carries_a_retry_commit() -> None:
             approved_commit_sha=_SUBMITTED_SHA,
             approved_at=_APPROVED_AT,
         )
-        assert approved_retry_commit(app, None, approved_went_live=False) is None, status
+        assert (
+            approved_retry_commit(app, None, approved_went_live=False, copy_failures=0) is None
+        ), status
 
 
 def test_a_non_routed_failure_code_reads_did_not_start() -> None:

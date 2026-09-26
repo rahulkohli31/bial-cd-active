@@ -74,7 +74,8 @@ class ImageBuildError(Exception):
 
 
 class ImageBuildTransientError(ImageBuildError):
-    """A retryable failure reaching ARM — not a failure of the build itself."""
+    """A retryable platform failure — ARM unreachable, the wait for the run expired, or a run
+    that reported success with no image — not a failure of the app's own build."""
 
 
 @dataclass(frozen=True)
@@ -258,7 +259,7 @@ class AcrImageBuilder:
                 break
             if asyncio.get_running_loop().time() >= deadline:
                 # The run may still be going; the platform has simply stopped waiting.
-                raise ImageBuildError(
+                raise ImageBuildTransientError(
                     f"the image build did not finish within {self._config.build_timeout_s}s"
                 )
             await asyncio.sleep(self._config.build_poll_interval_s)
@@ -272,7 +273,7 @@ class AcrImageBuilder:
         if digest is None:
             # A build that reports success but produced no image is a platform problem, not
             # a user one — never report it as "your code failed to build".
-            raise ImageBuildError(
+            raise ImageBuildTransientError(
                 "the image build succeeded but produced no image digest",
                 log_tail=await self._log_tail(run_id),
             )

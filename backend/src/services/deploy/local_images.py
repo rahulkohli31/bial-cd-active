@@ -91,7 +91,9 @@ class LocalDockerImageBuilder:
         except TimeoutError:
             proc.kill()
             await proc.wait()
-            raise ImageBuildError(f"the build exceeded {timeout:.0f}s and was killed") from None
+            raise ImageBuildTransientError(
+                f"the build exceeded {timeout:.0f}s and was killed"
+            ) from None
         return proc.returncode or 0, out.decode("utf-8", errors="replace")
 
     async def _login(self) -> None:
@@ -175,7 +177,7 @@ class LocalDockerImageBuilder:
 
             digest = _digest_of(metadata)
             if digest is None:
-                raise ImageBuildError(
+                raise ImageBuildTransientError(
                     "the build reported success but wrote no image digest", log_tail=_tail(out)
                 )
 

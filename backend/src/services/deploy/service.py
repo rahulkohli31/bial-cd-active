@@ -42,7 +42,7 @@ from src.services.deploy.aca_publish import PublishedAppProvisioner
 from src.services.deploy.config import DeployConfig
 from src.services.deploy.context import ContextTooLargeError, build_context_async
 from src.services.deploy.env import PublishedStorageError, build_published_env
-from src.services.deploy.images import ImageBuilder, ImageBuildError
+from src.services.deploy.images import ImageBuilder, ImageBuildError, ImageBuildTransientError
 from src.services.deploy.names import image_reference, revision_name
 from src.services.deploy.outcome import write_deploy_outcome
 from src.services.orchestrator.errors import from_next_build, is_dependency_failure
@@ -77,6 +77,9 @@ FAIL_SNAPSHOT_CORRUPT: Final = "snapshot_corrupt"
 help: the same bytes fail the same way."""
 FAIL_CONTEXT_TOO_LARGE: Final = "context_too_large"
 FAIL_BUILD: Final = "build_failed"
+FAIL_BUILD_UNAVAILABLE: Final = "build_unavailable"
+"""The platform could not produce the image: the registry was unreachable, the wait for the run
+expired, or a run that reported success left no image. Not the app's own build failing."""
 FAIL_STORAGE: Final = "storage_unavailable"
 FAIL_PROVISION: Final = "provision_failed"
 FAIL_NOT_HEALTHY: Final = "revision_unhealthy"
@@ -422,6 +425,15 @@ class DeployService:
             built = await self._images.build(
                 app_id=app_id, deployment_id=deployment_id, context=context
             )
+        except ImageBuildTransientError as exc:
+            raise _DeployFailedError(
+                FAIL_BUILD_UNAVAILABLE,
+                detail=str(exc),
+                citizen_message=(
+                    "Your app could not be built because of a platform problem, so it was not "
+                    "deployed. Your previous version is still running. Please try again."
+                ),
+            ) from exc
         except ImageBuildError as exc:
             raise _DeployFailedError.from_build(exc) from exc
 

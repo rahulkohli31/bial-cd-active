@@ -1937,7 +1937,7 @@
         "type": "object"
       },
       "DeployRequest": {
-        "description": "`commitSha` names the version the owner acted on: the saved version they reviewed, or\nthe approved commit, which republishes the approved copy. Any other commit is refused.\n\n`answers` are the owner's Yes/No answers keyed by class key. They count only for scored\nclasses, only while owners may change the reviewer's answers, and a class left out keeps\nthe reviewer's answer; a key that is no active class is refused. There is no review field:\nthe gate reads the stored review, and unknown body keys are dropped. `note` is required\nwhenever the send goes to an administrator.",
+        "description": "`commitSha` names the version the owner acted on: the saved version they reviewed, or\nthe approved commit while its copy is on offer (`approvedRetryCommit`), which republishes\nthe copy. Any other commit is refused.\n\n`answers` are the owner's Yes/No answers keyed by class key. They count only for scored\nclasses, only while owners may change the reviewer's answers, and a class left out keeps\nthe reviewer's answer; a key that is no active class is refused. There is no review field:\nthe gate reads the stored review, and unknown body keys are dropped. `note` is required\nwhenever the send goes to an administrator.",
         "properties": {
           "answers": {
             "additionalProperties": {
@@ -12711,7 +12711,7 @@
                 }
               }
             },
-            "description": "Disabled (`app_disabled`), already waiting for review (`waiting_for_review`, the pending state in `error.detail`), nothing saved to deploy, a build running for this app (`build_in_flight` — wait and retry), already deploying (`deploy_in_flight`), or a commit that is neither the saved version nor the approved one (`snapshot_moved`)"
+            "description": "Disabled (`app_disabled`), already waiting for review (`waiting_for_review`, the pending state in `error.detail`), nothing saved to deploy, a build running for this app (`build_in_flight` — wait and retry), already deploying (`deploy_in_flight`), or a commit that is neither the saved version nor an approved copy on offer (`snapshot_moved`)"
           },
           "422": {
             "content": {

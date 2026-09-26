@@ -502,6 +502,83 @@ async def test_sending_the_approved_commit_after_it_would_not_build_goes_through
     assert wire.extracted_from == [submission_key(app_row.id, submission_id)]
 
 
+async def _failed_attempts(db_session, owner, app_row: AppRegistry, *attempts) -> None:
+    """Failed rows in the order given, each `(code, commit, hours after the approval)`."""
+    assert app_row.approved_at is not None
+    for code, commit, hours in attempts:
+        db_session.add(
+            Deployment(
+                app_id=app_row.id,
+                user_id=owner.id,
+                status=DeploymentStatus.FAILED,
+                failure_code=code,
+                head_sha=commit,
+                created_at=app_row.approved_at + timedelta(hours=hours),
+            )
+        )
+        await db_session.flush()
+    await db_session.commit()
+
+
+async def test_after_two_failed_publishes_of_the_copy_the_third_is_still_offered(
+    wire, client, db_session
+) -> None:
+    owner, app_row, _submission_id = await _approved_earlier(wire, db_session)
+    approved = wire.submitted[1]
+    await _failed_attempts(
+        db_session, owner, app_row, ("provision_failed", approved, 1), ("interrupted", None, 2)
+    )
+
+    status = await _status(client, owner, app_row)
+
+    assert status["approvedRetryCommit"] == approved
+
+
+async def test_after_three_failed_publishes_of_the_copy_the_button_acts_on_the_saved_version(
+    wire, client, db_session
+) -> None:
+    """Each failure read as the platform's, but three in a row is past what a retry is offered
+    for: the copy may be failing in itself."""
+    owner, app_row, _submission_id = await _approved_earlier(wire, db_session)
+    approved = wire.submitted[1]
+    await _failed_attempts(
+        db_session,
+        owner,
+        app_row,
+        ("provision_failed", approved, 1),
+        ("interrupted", None, 2),
+        ("revision_not_ready", approved, 3),
+    )
+
+    status = await _status(client, owner, app_row)
+
+    assert status["publishState"] == "did_not_start"
+    assert status["approvedRetryCommit"] is None
+
+
+async def test_only_failed_publishes_of_the_copy_since_approval_count_toward_the_cap(
+    wire, client, db_session
+) -> None:
+    """Two failures count here. Counting any one of the others — a failure before the approval,
+    a failed restart, a failure of another version — would reach the cap."""
+    owner, app_row, _submission_id = await _approved_earlier(wire, db_session)
+    approved, later = wire.submitted[1], wire.later[1]
+    await _failed_attempts(
+        db_session,
+        owner,
+        app_row,
+        ("provision_failed", approved, -1),
+        ("provision_failed", approved, 1),
+        ("restart_failed", approved, 2),
+        ("provision_failed", later, 3),
+        ("provision_failed", approved, 4),
+    )
+
+    status = await _status(client, owner, app_row)
+
+    assert status["approvedRetryCommit"] == approved
+
+
 async def _registry_row(client, admin, app_row: AppRegistry) -> dict[str, Any]:
     resp = await client.get("/v1/admin/apps", headers=auth_headers(admin))
     assert resp.status_code == 200, resp.text
@@ -587,8 +664,9 @@ async def test_a_newer_version_failing_before_it_names_a_commit_is_not_the_copy_
 
     assert status["publishState"] == "did_not_start"
     assert status["approvedRetryCommit"] is None
-    # The one extra read that decided it — this row could not say for itself.
-    assert len(statements) == 4, statements
+    # Two extra reads: the count of failed copies, and the last publish, which decided it —
+    # this row could not say for itself.
+    assert len(statements) == 5, statements
 
 
 async def test_a_first_attempt_failing_before_it_names_a_commit_retries_the_copy(
@@ -612,7 +690,7 @@ async def test_a_first_attempt_failing_before_it_names_a_commit_retries_the_copy
     assert status["approvedRetryCommit"] == wire.submitted[1]
 
 
-async def test_a_row_that_names_its_commit_costs_the_poll_no_extra_read(
+async def test_a_row_that_names_its_commit_costs_the_poll_no_last_publish_read(
     wire, client, db_session, test_engine
 ) -> None:
     owner, app_row, _submission_id = await _approved_earlier(wire, db_session)
@@ -636,4 +714,5 @@ async def test_a_row_that_names_its_commit_costs_the_poll_no_extra_read(
         event.remove(test_engine.sync_engine, "before_cursor_execute", record)
 
     assert status["approvedRetryCommit"] == wire.submitted[1]
-    assert len(statements) == 3, statements
+    # One extra read, the count of failed copies; the row names its commit, so no last publish.
+    assert len(statements) == 4, statements

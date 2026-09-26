@@ -849,6 +849,32 @@ async def test_the_approved_commit_republishes_the_copy_while_it_is_on_offer(
     assert row.detail["rule"] == "approved_override"
 
 
+async def test_the_approved_commit_is_refused_while_an_attempt_since_approval_runs(
+    wire, client, db_session
+) -> None:
+    """A running attempt is not on offer, and without the refusal a second tab's Try again
+    would be decided as the saved version, and could even send the app back to review."""
+    user, app_row = await _owner_with_saved_app(
+        db_session, wire.store, **_approved(_SHA, approved_at=_APPROVED_AT)
+    )
+    db_session.add(
+        Deployment(
+            app_id=app_row.id,
+            user_id=user.id,
+            status=DeploymentStatus.RUNNING,
+            created_at=_APPROVED_AT + timedelta(hours=1),
+        )
+    )
+    await db_session.commit()
+
+    resp = await _post(client, user, app_row, _body(note=_NOTE))
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "deploy_in_flight"
+    assert wire.pipeline.started == []
+    assert await _gate_rows(db_session, app_row.id) == []
+
+
 async def test_an_approved_copy_that_failed_in_itself_is_decided_as_the_saved_version(
     wire, client, db_session
 ) -> None:

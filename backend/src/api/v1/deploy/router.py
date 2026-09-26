@@ -44,6 +44,7 @@ from src.api.v1.build_sessions.deps import RequireCsrf
 from src.api.v1.classification.deps import ReviewService
 from src.api.v1.deploy.deps import OptionalDeployService, OptionalPublishedAppRemover
 from src.api.v1.deploy.schemas import (
+    PUBLISH_FAILURE_CODES,
     ApprovalState,
     DeploymentResponse,
     DeployRequest,
@@ -58,13 +59,14 @@ from src.api.v1.deploy.schemas import (
     approved_retry_commit,
     compute_publish_state,
     published_since_approval,
+    retry_needs_copy_failures,
     retry_needs_last_publish,
 )
 from src.api.v1.live_build import refuse_while_build_session_live
 from src.core.errors import AppApiError
 from src.core.redaction import redact_secrets
 from src.db.models.app_registry import AppRegistry, AppStatus
-from src.db.models.deployment import Deployment
+from src.db.models.deployment import Deployment, DeploymentStatus
 from src.db.models.user import User
 from src.schemas import ADMIN_AUTH, AUTH_401, ErrorEnvelope, error_responses
 from src.services.approvals.submit import submit_app_for_review
@@ -219,7 +221,7 @@ async def _owned_app_row(
                 "(`waiting_for_review`, the pending state in `error.detail`), nothing "
                 "saved to deploy, a build running for this app (`build_in_flight` — wait "
                 "and retry), already deploying (`deploy_in_flight`), or a commit that is "
-                "neither the saved version nor the approved one (`snapshot_moved`)",
+                "neither the saved version nor an approved copy on offer (`snapshot_moved`)",
             ),
             (
                 422,
@@ -349,6 +351,10 @@ async def deploy_project(
     copy = approved_copy(app_row)
     if copy is not None and body.commit_sha == copy.commit_sha:
         latest = await deployment_for_app(db, app_id=app_row.id)
+        # Refused here rather than left to the claim: an attempt in flight is not on offer, so
+        # the request would fall through and be decided as the saved version.
+        if latest is not None and latest.status is DeploymentStatus.RUNNING:
+            raise AppApiError(status.HTTP_409_CONFLICT, _BUSY_MSG, code="deploy_in_flight")
         if await _approved_retry(db, app_row, latest) == copy.commit_sha:
             return await _start_pipeline(
                 db,
@@ -458,13 +464,35 @@ async def _approved_retry(
     db: AsyncSession, app_row: AppRegistry, latest: Deployment | None
 ) -> str | None:
     """`approved_retry_commit` for the newest attempt, asked the same way by the status route
-    and by rule 3 so the button and the ladder cannot disagree about the approved copy. The last
-    publish is read only for the rare row that cannot say for itself whether the copy went live."""
+    and by rule 3 so the button and the ladder cannot disagree about the approved copy. Both extra
+    reads run only after a failure a retry can fix: how many publishes of the copy have failed,
+    and, for a row that cannot say for itself, whether the copy went live."""
+    copy_failures = 0
+    if retry_needs_copy_failures(app_row, latest):
+        copy_failures = (
+            await db.scalar(
+                sa.select(sa.func.count())
+                .select_from(Deployment)
+                .where(
+                    Deployment.app_id == app_row.id,
+                    Deployment.status == DeploymentStatus.FAILED,
+                    Deployment.failure_code.in_(PUBLISH_FAILURE_CODES),
+                    Deployment.created_at >= app_row.approved_at,
+                    sa.or_(
+                        Deployment.head_sha == app_row.approved_commit_sha,
+                        Deployment.head_sha.is_(None),
+                    ),
+                )
+            )
+            or 0
+        )
     approved_went_live = False
     if retry_needs_last_publish(app_row, latest):
         published = await store.latest_published(db, app_id=app_row.id)
         approved_went_live = published_since_approval(app_row, published)
-    return approved_retry_commit(app_row, latest, approved_went_live=approved_went_live)
+    return approved_retry_commit(
+        app_row, latest, approved_went_live=approved_went_live, copy_failures=copy_failures
+    )
 
 
 async def _shipping_head(

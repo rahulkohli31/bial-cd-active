@@ -255,6 +255,7 @@ async def test_a_failed_build_carries_the_log_back() -> None:
 
     assert "failed" in str(caught.value)
     assert caught.value.log_tail == "the build log"
+    assert not isinstance(caught.value, ImageBuildTransientError)
     await builder.aclose()
 
 
@@ -264,7 +265,7 @@ async def test_a_build_that_pushes_nothing_is_not_reported_as_the_users_fault() 
     calls: list[httpx.Request] = []
     builder = _builder(_happy(calls, digest=None))
 
-    with pytest.raises(ImageBuildError) as caught:
+    with pytest.raises(ImageBuildTransientError) as caught:
         await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
     assert "no image digest" in str(caught.value)
     await builder.aclose()
@@ -296,10 +297,12 @@ async def test_an_unfetchable_log_does_not_replace_the_real_error() -> None:
 
 
 async def test_a_run_that_never_finishes_is_bounded() -> None:
+    """The run may still be going when the platform stops waiting, so it says nothing about
+    the app's own build."""
     calls: list[httpx.Request] = []
     builder = _builder(_happy(calls, status="Running"), build_timeout_s=1)
 
-    with pytest.raises(ImageBuildError) as caught:
+    with pytest.raises(ImageBuildTransientError) as caught:
         await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
     assert "did not finish" in str(caught.value)
     await builder.aclose()
