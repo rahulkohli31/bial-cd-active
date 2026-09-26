@@ -1,10 +1,16 @@
 import { useState } from 'react'
-import { ShieldAlert } from 'lucide-react'
+import type { ReactNode } from 'react'
+import { AlertTriangle, ShieldAlert } from 'lucide-react'
 import type { RegistryApp } from '../../utils/appRegistryApi'
+import { assertNever } from '../../utils/assertNever'
+import { cn } from '../../lib/utils'
+import { Alert, AlertDescription, AlertTitle } from '../ui/alert'
 import { Button } from '../ui/button'
 import { Textarea } from '../ui/textarea'
 import { BusyGlyph } from '../ui/Waiting'
-import { readDeclaration, shortSha, MIN_REJECTION_NOTE } from './declaration'
+import { AnswersTable, dayMonth, dayMonthTime, handle } from './AppHistoryTab'
+import { agentFinding, readDeclaration, shortSha, MIN_REJECTION_NOTE } from './declaration'
+import type { ClassDeclaration } from './declaration'
 
 /** The one thing this screen is for, said out loud. An administrator who thinks
  *  they are code-reviewing will either approve everything or block everything. */
@@ -37,6 +43,184 @@ const fmtWhen = (iso: string | null): string => {
   return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString()
 }
 
+const SECTION_LABEL = 'text-[10.5px] font-bold uppercase tracking-[0.6px] text-neutral'
+
+function Commit({ number, sha }: { number: number | null; sha: string | null }) {
+  return (
+    <>
+      {number !== null && `v${number} · `}
+      <code className="rounded bg-[#EEF2F6] px-[5px] py-px text-xs">{shortSha(sha)}</code>
+    </>
+  )
+}
+
+function Fact({ label, value, detail }: { label: string; value: ReactNode; detail: string | null }) {
+  return (
+    <div className="px-3.5 py-2.5">
+      <div className={SECTION_LABEL}>{label}</div>
+      <div className="mt-[3px] text-[13px] font-semibold text-tertiary">{value}</div>
+      {detail !== null && <div className="mt-0.5 text-[11.5px] text-neutral">{detail}</div>}
+    </div>
+  )
+}
+
+/** When the version under review was sent and by whom, which version it is and when it was saved,
+ *  when the agent checked it, and what is live. A time the declaration did not record is left out. */
+function VersionFacts({ app, number, declaration }: { app: RegistryApp; number: number | null; declaration: ClassDeclaration }) {
+  const live = app.liveVersion
+  const { savedAt, checkedAt } = declaration
+  return (
+    <div
+      data-testid="review-version"
+      className={cn(
+        'grid divide-x divide-bial-border rounded-[10px] border border-bial-border bg-surface-muted',
+        checkedAt === null ? 'grid-cols-3' : 'grid-cols-4',
+      )}
+    >
+      <Fact
+        label="Sent"
+        value={app.submittedAt === null ? '—' : dayMonthTime(app.submittedAt)}
+        detail={app.ownerUsername === null ? null : `by ${handle(app.ownerUsername)}`}
+      />
+      <Fact
+        label="Version"
+        value={<Commit number={number} sha={app.commitSha} />}
+        detail={savedAt === null ? null : `Saved ${dayMonthTime(savedAt)}`}
+      />
+      {checkedAt !== null && <Fact label="Checked" value={dayMonthTime(checkedAt)} detail="by the agent" />}
+      {live === null ? (
+        <Fact label="Live now" value="Not live yet" detail={number === 1 ? 'First version' : null} />
+      ) : (
+        <Fact
+          label="Live now"
+          value={<Commit number={live.number} sha={live.commitSha} />}
+          detail={live.since === null ? null : `since ${dayMonth(live.since)}`}
+        />
+      )}
+    </div>
+  )
+}
+
+interface Why {
+  blocked: boolean
+  title: string
+  details: string[]
+}
+
+function whyItIsHere(declaration: ClassDeclaration): Why | null {
+  const { reason, found, score, threshold } = declaration
+  switch (reason) {
+    case null:
+      return null
+    case 'hard_block':
+      return {
+        blocked: true,
+        title: agentFinding(declaration),
+        details: found.flatMap((entry) =>
+          entry.reason === null ? [] : [found.length === 1 ? `Agent: ${entry.reason}` : `Agent, on ${entry.title}: ${entry.reason}`],
+        ),
+      }
+    case 'over_threshold':
+      return {
+        blocked: false,
+        title: score === null || threshold === null ? 'Score over the threshold' : `Score ${score}/100 is over ${threshold}`,
+        details: [],
+      }
+    case 'review_unfinished':
+      return {
+        blocked: false,
+        title: "The agent's review did not finish",
+        details: ['No answers were recorded, so there is no score.'],
+      }
+    case 'rejection_standing':
+      return {
+        blocked: false,
+        title: 'An earlier version was rejected',
+        details: ['A rejection stands until an administrator approves a version.'],
+      }
+    default:
+      return assertNever(reason)
+  }
+}
+
+function WhyItIsHere({ why }: { why: Why }) {
+  const ink = why.blocked ? 'text-red-900' : 'text-amber-900'
+  return (
+    <Alert
+      data-testid="review-why"
+      className={cn(
+        'rounded-[10px] border-0 px-3.5 py-[11px] [&>svg]:left-3.5 [&>svg]:top-3 [&>svg~*]:pl-[30px]',
+        why.blocked
+          ? 'bg-red-50 shadow-[inset_0_0_0_1px_rgba(185,28,28,0.2)] [&>svg]:text-red-700'
+          : 'bg-amber-50 shadow-[inset_0_0_0_1px_rgba(217,119,6,0.25)] [&>svg]:text-amber-700',
+      )}
+    >
+      <AlertTriangle size={18} aria-hidden />
+      <AlertTitle className={cn('mb-0 text-[13.5px] font-bold leading-[normal] tracking-normal', ink)}>
+        Why it is here: {why.title}
+      </AlertTitle>
+      {why.details.map((detail) => (
+        <AlertDescription key={detail} className={cn('mt-[3px] whitespace-pre-wrap break-words text-xs leading-normal', ink)}>
+          {detail}
+        </AlertDescription>
+      ))}
+    </Alert>
+  )
+}
+
+function ScoreLine({ declaration }: { declaration: ClassDeclaration }) {
+  const { reviewerScore, score, threshold, ownersCanChangeAnswers, decidedAt } = declaration
+  let scored = 'not recorded'
+  if (reviewerScore !== null) {
+    scored =
+      ownersCanChangeAnswers === true && score !== null
+        ? `agent ${reviewerScore} · owner ${score} (of 100)`
+        : `agent ${reviewerScore} (of 100)`
+  }
+  const owners = ownersCanChangeAnswers === null ? '—' : ownersCanChangeAnswers ? 'Yes' : 'No'
+  return (
+    <div data-testid="review-score" className="flex flex-wrap gap-5 text-xs text-neutral">
+      <div>
+        <b className="text-primary-900">Score</b> {scored}
+      </div>
+      <div>
+        <b className="text-primary-900">Publish without review up to</b> {threshold ?? '—'}
+      </div>
+      <div>
+        <b className="text-primary-900">Owners can change answers</b> {owners}
+      </div>
+      {decidedAt !== null && <div className="ml-auto">Policy as of {dayMonthTime(decidedAt)}</div>}
+    </div>
+  )
+}
+
+/** A version decided by the classes, read from the declaration stored with that decision. */
+function ClassReview({ app, number, declaration }: { app: RegistryApp; number: number | null; declaration: ClassDeclaration }) {
+  const why = whyItIsHere(declaration)
+  return (
+    <>
+      <VersionFacts app={app} number={number} declaration={declaration} />
+      {why !== null && <WhyItIsHere why={why} />}
+      {declaration.note !== null && (
+        <div>
+          <h4 className={cn(SECTION_LABEL, 'mb-1.5')}>Owner's note</h4>
+          <p
+            data-testid="review-note"
+            className="whitespace-pre-wrap break-words rounded-[10px] border border-bial-border bg-surface-muted px-3.5 py-2.5 text-[13px] leading-relaxed text-primary-900"
+          >
+            {declaration.note}
+          </p>
+        </div>
+      )}
+      <div>
+        <h4 className={cn(SECTION_LABEL, 'mb-1.5')}>Answers</h4>
+        <AnswersTable classes={declaration.classes} />
+      </div>
+      <ScoreLine declaration={declaration} />
+    </>
+  )
+}
+
 interface AppReviewTabProps {
   app: RegistryApp
   /** The number of the send under review, once History has said. */
@@ -50,10 +234,10 @@ interface AppReviewTabProps {
 }
 
 /**
- * The pending submission's review: disputes first, then the automatic check's reasoning, then the
- * developer's explanation, above a footer that is always in reach. Approve sends the submission id
- * on display, so a re-submit since this review is refused instead of promoting an unseen build.
- * Evidence locations are never rendered: they live in a document no call reaching this screen makes.
+ * The pending submission's review, above a footer that is always in reach. A version decided by the
+ * classes reads as the agent and the owner answered it; a six-question declaration reads as it was
+ * sent. Approve sends the submission id on display, so a re-submit since this review is refused
+ * instead of promoting an unseen build. No evidence location reaches this screen.
  */
 export default function AppReviewTab({ app, number, withdrawn, onClose, onApprove, onReject }: AppReviewTabProps) {
   const [rejecting, setRejecting] = useState(false)
@@ -78,12 +262,14 @@ export default function AppReviewTab({ app, number, withdrawn, onClose, onApprov
   return (
     <>
       <div data-testid="review-scroll" className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-6 py-4">
-        <p
-          data-testid="review-criterion"
-          className="rounded-xl border border-bial-border bg-bial-bg px-3 py-2.5 text-xs leading-relaxed text-tertiary"
-        >
-          {THE_CRITERION}
-        </p>
+        {declaration.version === 1 && (
+          <p
+            data-testid="review-criterion"
+            className="rounded-xl border border-bial-border bg-bial-bg px-3 py-2.5 text-xs leading-relaxed text-tertiary"
+          >
+            {THE_CRITERION}
+          </p>
+        )}
 
         <div data-testid="review-status" role="status" aria-live="polite" className="empty:hidden">
           {withdrawn !== null && (
@@ -95,19 +281,21 @@ export default function AppReviewTab({ app, number, withdrawn, onClose, onApprov
               {withdrawn}
             </p>
           )}
-          {withdrawn === null && !declaration.present && (
+          {withdrawn === null && declaration.version === 1 && !declaration.present && (
             <p data-testid="review-no-declaration" className="text-xs leading-relaxed text-neutral">
               {NO_DECLARATION_COPY}
             </p>
           )}
-          {withdrawn === null && declaration.present && declaration.noReviewAtAll && (
+          {withdrawn === null && declaration.version === 1 && declaration.present && declaration.noReviewAtAll && (
             <p data-testid="review-no-review" className="text-xs leading-relaxed text-amber-700">
               {NO_REVIEW_COPY}
             </p>
           )}
         </div>
 
-        {declaration.present && (
+        {declaration.version === 2 && <ClassReview app={app} number={number} declaration={declaration} />}
+
+        {declaration.version === 1 && declaration.present && (
           <>
             {declaration.disputes.length > 0 ? (
               <div data-testid="review-disputes">
@@ -198,20 +386,22 @@ export default function AppReviewTab({ app, number, withdrawn, onClose, onApprov
           </>
         )}
 
-        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 border-t border-bial-border pt-4 text-xs">
-          <dt className="text-neutral">Submitted</dt>
-          <dd data-testid="review-submitted-at" className="text-tertiary">
-            {fmtWhen(app.submittedAt)}
-          </dd>
-          <dt className="text-neutral">Build</dt>
-          <dd>
-            <code data-testid="review-commit-sha" className="rounded bg-bial-bg px-1 py-0.5 text-tertiary">
-              {(app.commitSha || '').slice(0, 12) || '—'}
-            </code>
-          </dd>
-          <dt className="text-neutral">Login</dt>
-          <dd className="text-tertiary">{app.loginRequired ? 'Required' : 'Off'} — adjust it from the row before approving if needed.</dd>
-        </dl>
+        {declaration.version === 1 && (
+          <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 border-t border-bial-border pt-4 text-xs">
+            <dt className="text-neutral">Submitted</dt>
+            <dd data-testid="review-submitted-at" className="text-tertiary">
+              {fmtWhen(app.submittedAt)}
+            </dd>
+            <dt className="text-neutral">Build</dt>
+            <dd>
+              <code data-testid="review-commit-sha" className="rounded bg-bial-bg px-1 py-0.5 text-tertiary">
+                {(app.commitSha || '').slice(0, 12) || '—'}
+              </code>
+            </dd>
+            <dt className="text-neutral">Login</dt>
+            <dd className="text-tertiary">{app.loginRequired ? 'Required' : 'Off'} — adjust it from the row before approving if needed.</dd>
+          </dl>
+        )}
       </div>
 
       <div className="flex-shrink-0 border-t border-bial-border bg-white px-6 py-3.5">

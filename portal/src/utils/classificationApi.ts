@@ -26,9 +26,6 @@ export type ClassificationReviewStatus =
   | 'complete'
   | 'failed'
 
-/** The verdicts a six-question declaration stored before classes were configurable can carry. */
-export type ReviewVerdict = 'yes' | 'no' | 'unanswered'
-
 export type ClassKind = 'hard_block' | 'scored'
 
 /** One active class as the dialog renders and scores it. The title is all an owner is shown. */

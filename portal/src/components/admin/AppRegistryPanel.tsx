@@ -9,10 +9,10 @@ import {
   listApps, approveApp, rejectApp, patchApp, disableApp, enableApp, deleteApp,
 } from '../../utils/appRegistryApi'
 import type {
-  RegistryApp, RegistryList, RegistryStatus, AppStatus, LiveVersion,
+  RegistryApp, RegistryList, RegistryStatus, AppStatus, LiveVersion, SubmittedDeclaration,
 } from '../../utils/appRegistryApi'
 import { ApiError } from '../../utils/apiError'
-import { shortSha } from './declaration'
+import { readDeclaration, shortSha } from './declaration'
 import AppSheet from './AppSheet'
 import { dayMonth, dayMonthTime, handle } from './AppHistoryTab'
 import {
@@ -114,6 +114,31 @@ function LiveVersionCell({ live }: { live: LiveVersion | null }) {
       {live.since !== null && <div className="mt-0.5 text-[11px] font-normal text-neutral">since {dayMonth(live.since)}</div>}
     </div>
   )
+}
+
+/** The hard block that routed the app, or its score, from the row's own declaration. */
+function ClassificationCell({ declaration }: { declaration: SubmittedDeclaration | null }) {
+  const read = readDeclaration(declaration)
+  if (read.version === 2 && read.found.length > 0) {
+    return (
+      <div className="flex flex-wrap gap-1">
+        {read.found.map((entry) => (
+          <Badge key={entry.key} variant="outline" className="border-red-700/20 bg-red-50 text-red-700">
+            {entry.title}
+          </Badge>
+        ))}
+      </div>
+    )
+  }
+  if (read.version === 2 && read.score !== null) {
+    return (
+      <span className="text-[12.5px]">
+        <span className="font-semibold tabular-nums">{read.score}</span>
+        <span className="text-neutral">/100</span>
+      </span>
+    )
+  }
+  return <span className="text-neutral">—</span>
 }
 
 function StatusFilterPills({ table, apps, selectedRef }: {
@@ -334,7 +359,7 @@ const COLUMNS: ColumnDef<RegistryApp>[] = [
     header: 'Classification',
     enableSorting: false,
     meta: { className: 'w-[120px]' },
-    cell: () => <span className="text-neutral">—</span>,
+    cell: ({ row }) => <ClassificationCell declaration={row.original.declaration} />,
   },
   {
     id: 'updatedAt',

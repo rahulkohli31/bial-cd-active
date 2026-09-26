@@ -75,10 +75,10 @@ next dialog runs a fresh review, with a fresh allowance of attempts. A weight, k
 owners' switch change leaves reviews current and applies from the next send.
 
 **Every decision is recorded with what it was decided under.** Publish or route, the gate stores a
-declaration on the app and in the decision's audit row: the commit and the decision time, the
-policy, a snapshot of each class's key, title, kind and weight, the reviewer's answers and
-reasons, the owner's answers when they counted, both scores, the outcome and its reason, and the
-note. Declarations stored before this shape stay readable as they were written. The deployment
+declaration on the app and in the decision's audit row: the commit, when it was saved and the
+decision time, the policy, a snapshot of each class's key, title, kind and weight, the reviewer's
+answers and reasons and when it finished, the owner's answers when they counted, both scores, the
+outcome and its reason, and the note. Declarations stored before this shape stay readable as they were written. The deployment
 record no longer carries a copy of the answers.
 
 **The credential scan is evidence, never a verdict.** Its findings reach the reviewer only while

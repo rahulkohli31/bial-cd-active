@@ -326,7 +326,7 @@ describe('each row says where the app stands', () => {
     expect(screen.getByTestId('sort-updatedAt').closest('th').getAttribute('aria-sort')).toBe('descending')
   })
 
-  it('shows the last activity as day, month and time, and a dash for the classification', async () => {
+  it('shows the last activity as day, month and time, and a dash for an app with no declaration', async () => {
     h.listApps.mockResolvedValue(listOf({ ...APPROVED, updatedAt: new Date(2026, 8, 26, 14, 10).toISOString() }))
     render(<AppRegistryPanel onToast={() => {}} />)
     await screen.findByText('Live Tool')
@@ -334,6 +334,36 @@ describe('each row says where the app stands', () => {
     const cells = within(screen.getByTestId('row-app-2')).getAllByRole('cell')
     expect(cells[6].textContent).toBe('26 Sep, 14:10')
     expect(cells[5].textContent).toBe('—')
+  })
+
+  it('reads each row’s classification from its own declaration', async () => {
+    const classes = [
+      { key: 'pii', title: 'PII', kind: 'hard_block', weight: null },
+      { key: 'integrations', title: 'Integrations', kind: 'scored', weight: 20 },
+    ]
+    const judged = (overrides) => ({
+      version: 2,
+      classes,
+      reviewerAnswers: { pii: false, integrations: false },
+      reviewerScore: 0,
+      score: 0,
+      reason: null,
+      ...overrides,
+    })
+    h.listApps.mockResolvedValue(listOf(
+      { ...PENDING, appId: 'blocked', name: 'Visitor ID Pass', declaration: judged({ reviewerAnswers: { pii: true, integrations: false }, reason: 'hard_block' }) },
+      { ...APPROVED, appId: 'scored', name: 'Vendor Rates Board', declaration: judged({ reviewerAnswers: { pii: false, integrations: true }, reviewerScore: 60, score: 60 }) },
+      { ...APPROVED, appId: 'unfinished', name: 'Half Checked', declaration: judged({ reviewerAnswers: null, reviewerScore: null, score: null, reason: 'review_unfinished' }) },
+      { ...APPROVED, appId: 'legacy', name: 'Six Questions', declaration: declaration({ citizen: { ...ALL_NO, personal_information: true } }) },
+    ))
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Visitor ID Pass')
+
+    const classification = (appId) => within(screen.getByTestId(`row-${appId}`)).getAllByRole('cell')[5]
+    expect(classification('blocked').textContent).toBe('PII')
+    expect(classification('scored').textContent).toBe('60/100')
+    expect(classification('unfinished').textContent).toBe('—')
+    expect(classification('legacy').textContent).toBe('—')
   })
 
   it('names an owner by the part of their address before the @', async () => {

@@ -356,7 +356,7 @@ async def deploy_project(
             rule="approved_override",
         )
 
-    head_sha = await _shipping_head(storage, app_row.id)
+    head_sha, saved_at = await _shipping_head(storage, app_row.id)
 
     # --- rule 4: the request is about a version that is not the saved one ---------------
     # An unstamped bundle names no commit, so no request can match it.
@@ -412,6 +412,7 @@ async def deploy_project(
 
     declaration = declaration_document(
         head_sha=head_sha,
+        saved_at=saved_at,
         decided_at=datetime.now(UTC),
         config=config,
         review=review,
@@ -446,13 +447,17 @@ async def deploy_project(
 # --- the ladder's machinery ----------------------------------------------------------
 
 
-async def _shipping_head(storage: ObjectStorage, app_id: uuid.UUID) -> str | None:
-    """H — the saved version, from the snapshot blob's metadata stamp.
+async def _shipping_head(
+    storage: ObjectStorage, app_id: uuid.UUID
+) -> tuple[str | None, datetime | None]:
+    """H — the saved version, from the snapshot blob's metadata stamp — and when it was saved,
+    from the same blob's last-modified.
 
     One `head()`, never an extraction: the extract helper downloads the whole bundle before
-    consulting its cache, and the pipeline re-derives the real head from the tree anyway. None
-    means the saved bundle predates the stamp, which no request can name. A store that will NOT
-    answer is the documented 503, never "no stamp": unknown must not read as a state."""
+    consulting its cache, and the pipeline re-derives the real head from the tree anyway. A None
+    head means the saved bundle predates the stamp, which no request can name; a None time is a
+    store that did not report one. A store that will NOT answer is the documented 503, never "no
+    stamp": unknown must not read as a state."""
     try:
         meta = await storage.head(snapshot_key(app_id))
     except StorageError as exc:
@@ -465,7 +470,7 @@ async def _shipping_head(storage: ObjectStorage, app_id: uuid.UUID) -> str | Non
         # Coded, same string as the other "nothing saved" site above — see the comment
         # there.
         raise AppApiError(status.HTTP_409_CONFLICT, _NOTHING_TO_DEPLOY, code=FAIL_NO_SNAPSHOT)
-    return head_sha_from_metadata(meta.metadata)
+    return head_sha_from_metadata(meta.metadata), meta.last_modified
 
 
 async def _route_to_review(

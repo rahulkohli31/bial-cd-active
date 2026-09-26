@@ -995,6 +995,7 @@ def _would_route(verdicts: dict[str, str], config: LiveConfig) -> bool:
         failure_code=None,
         answers={key: verdict == "yes" for key, verdict in verdicts.items()},
         reasons={},
+        checked_at=None,
     )
     decision = decide(config=config, review=review, owner_answers={}, rejection_standing=False)
     return decision.reason is not None

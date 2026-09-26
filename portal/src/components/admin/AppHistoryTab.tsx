@@ -6,7 +6,6 @@ import type {
   HistoryDecision,
   HistoryEvent,
   HistoryVersion,
-  SubmittedDeclaration,
   VersionState,
 } from '../../utils/appRegistryApi'
 import { assertNever } from '../../utils/assertNever'
@@ -15,10 +14,11 @@ import { cn } from '../../lib/utils'
 import { Alert, AlertDescription } from '../ui/alert'
 import { Badge } from '../ui/badge'
 import { Card } from '../ui/card'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../ui/table'
 import { BusyGlyph } from '../ui/Waiting'
 import { auditLabel } from './auditLabels'
-import { readDeclaration, shortSha } from './declaration'
-import type { ReviewVerdict } from './declaration'
+import { agentFinding, readDeclaration, shortSha } from './declaration'
+import type { JudgedClass, QuestionDeclaration, ReviewVerdict } from './declaration'
 
 function parsed(iso: string): Date | null {
   const d = new Date(iso)
@@ -126,10 +126,9 @@ function verdictWord(verdict: ReviewVerdict | null): string {
   return '—'
 }
 
-/** One version's answers, read from its own stored declaration: the Yes answers, then where the
- *  agent and the owner disagreed, then how many classes were No. */
-function answerChips(declaration: SubmittedDeclaration | null): { tone: Tone; text: string }[] {
-  const read = readDeclaration(declaration)
+/** A six-question version's answers: the Yes answers, then where the agent and the owner
+ *  disagreed, then how many questions were No. */
+function answerChips(read: QuestionDeclaration): { tone: Tone; text: string }[] {
   if (read.citizenAnswers.length === 0 && read.disputes.length === 0) {
     return [{ tone: 'rest', text: 'Answers not recorded' }]
   }
@@ -148,6 +147,50 @@ function answerChips(declaration: SubmittedDeclaration | null): { tone: Tone; te
   ]
 }
 
+const ANSWER_HEAD = 'py-2 pr-3 tracking-[0.6px]'
+const ANSWER_CELL = 'py-2 pr-3'
+
+function Answer({ yes, className }: { yes: boolean | null; className?: string }) {
+  if (yes === null) return <span className="text-neutral">—</span>
+  return <span className={cn(yes && 'font-bold', className)}>{yes ? 'Yes' : 'No'}</span>
+}
+
+/** Each class as it was judged, the agent's answer beside the owner's. The owner's column is a
+ *  dash for a hard block, and for every class when owners could not change answers. */
+export function AnswersTable({ classes }: { classes: JudgedClass[] }) {
+  return (
+    <div className="overflow-hidden rounded-[10px] border border-bial-border">
+      <Table className="table-fixed text-[12.5px] leading-[normal] text-primary-900">
+        <TableHeader className="bg-bial-bg/60">
+          <TableRow className="border-b border-bial-border">
+            <TableHead className={cn(ANSWER_HEAD, 'pl-3.5')}>Class</TableHead>
+            <TableHead className={cn(ANSWER_HEAD, 'w-[122px]')}>Kind</TableHead>
+            <TableHead className={cn(ANSWER_HEAD, 'w-[102px]')}>Agent</TableHead>
+            <TableHead className={cn(ANSWER_HEAD, 'w-[104px] pr-3.5')}>Owner</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {classes.map((entry) => (
+            <TableRow key={entry.key} data-testid={`answer-${entry.key}`} className={cn(entry.changed && 'bg-amber-50')}>
+              <TableCell className={cn(ANSWER_CELL, 'pl-3.5 font-semibold text-tertiary')}>{entry.title}</TableCell>
+              <TableCell className={cn(ANSWER_CELL, 'text-neutral')}>
+                {entry.kind === 'hard_block' ? 'Hard block' : `Scored${entry.weight === null ? '' : ` · ${entry.weight}`}`}
+              </TableCell>
+              <TableCell className={ANSWER_CELL}>
+                <Answer yes={entry.agent} className={cn(entry.kind === 'hard_block' && entry.agent && 'text-red-700')} />
+              </TableCell>
+              <TableCell className={cn(ANSWER_CELL, 'pr-3.5')}>
+                <Answer yes={entry.owner} className={cn(entry.changed && 'font-bold text-amber-700')} />
+                {entry.changed && <span className="sr-only">changed by the owner</span>}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  )
+}
+
 function Row({ label, children }: { label: string; children: string }) {
   return (
     <div className="grid grid-cols-[110px_minmax(0,1fr)] gap-2.5 py-[3px] text-[12.5px]">
@@ -163,6 +206,7 @@ function VersionCard({ version }: { version: HistoryVersion }) {
   const live = version.state === 'live'
   const badge = STATE_BADGE[version.state]
   const published = publishedText(version)
+  const read = readDeclaration(version.declaration)
   return (
     <Card
       data-testid={`version-${version.number}`}
@@ -191,15 +235,22 @@ function VersionCard({ version }: { version: HistoryVersion }) {
       <Row label="Sent">
         {`${dayMonthTime(version.sentAt)}${version.sentBy === null ? '' : ` by ${handle(version.sentBy)}`}`}
       </Row>
+      {read.version === 2 && <Row label="Agent">{agentFinding(read)}</Row>}
       <Row label="Decision">{decisionText(version.decision)}</Row>
       {published !== null && <Row label="Published">{published}</Row>}
       {open && (
-        <div id={answersId} className="mt-2 flex flex-wrap gap-1.5 border-t border-dashed border-bial-border pt-2">
-          {answerChips(version.declaration).map(({ tone, text }) => (
-            <span key={text} className={cn('rounded-md px-2 py-[3px] text-[11.5px]', CHIP_TONE[tone])}>
-              {text}
-            </span>
-          ))}
+        <div id={answersId} className="mt-2 border-t border-dashed border-bial-border pt-2">
+          {read.version === 2 ? (
+            <AnswersTable classes={read.classes} />
+          ) : (
+            <div className="flex flex-wrap gap-1.5">
+              {answerChips(read).map(({ tone, text }) => (
+                <span key={text} className={cn('rounded-md px-2 py-[3px] text-[11.5px]', CHIP_TONE[tone])}>
+                  {text}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </Card>

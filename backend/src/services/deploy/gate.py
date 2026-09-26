@@ -46,21 +46,30 @@ class ReviewAtHead:
     """The stored review, situated against the commit being sent and the live class definitions.
 
     `current` is the gate's one question about it: a COMPLETE row that answered every live class,
-    for exactly this commit and fingerprint, not aged out. Answers and reasons are carried only
-    when it is current; an answer about another version or other definitions is never read."""
+    for exactly this commit and fingerprint, not aged out. Answers, reasons and the time it
+    finished are carried only when it is current; an answer about another version or other
+    definitions is never read."""
 
     current: bool
     status: str | None
     failure_code: str | None
     answers: dict[str, bool]
     reasons: dict[str, str]
+    checked_at: datetime | None
 
 
 def review_at_head(
     readout: ReviewReadout | None, *, head_sha: str, config: LiveConfig
 ) -> ReviewAtHead:
     if readout is None:
-        return ReviewAtHead(current=False, status=None, failure_code=None, answers={}, reasons={})
+        return ReviewAtHead(
+            current=False,
+            status=None,
+            failure_code=None,
+            answers={},
+            reasons={},
+            checked_at=None,
+        )
     record = readout.review
     stored = record.verdicts.get("classes") if record.verdicts is not None else None
     if not (
@@ -77,6 +86,7 @@ def review_at_head(
             failure_code=record.failure_code,
             answers={},
             reasons={},
+            checked_at=None,
         )
     return ReviewAtHead(
         current=True,
@@ -84,6 +94,7 @@ def review_at_head(
         failure_code=record.failure_code,
         answers={key: entry["verdict"] == "yes" for key, entry in stored.items()},
         reasons={key: str(entry["reason"]) for key, entry in stored.items()},
+        checked_at=record.finished_at,
     )
 
 
@@ -164,6 +175,7 @@ def decide(
 def declaration_document(
     *,
     head_sha: str,
+    saved_at: datetime | None,
     decided_at: datetime,
     config: LiveConfig,
     review: ReviewAtHead,
@@ -178,6 +190,7 @@ def declaration_document(
     return {
         "version": DECLARATION_VERSION,
         "commit": head_sha,
+        "savedAt": saved_at.isoformat() if saved_at is not None else None,
         "decidedAt": decided_at.isoformat(),
         "policy": {
             "threshold": config.threshold,
@@ -196,6 +209,7 @@ def declaration_document(
             "current": review.current,
             "status": review.status,
             "failureCode": review.failure_code,
+            "checkedAt": review.checked_at.isoformat() if review.checked_at is not None else None,
         },
         "reviewerAnswers": dict(review.answers) if review.current else None,
         "reviewerReasons": dict(review.reasons),

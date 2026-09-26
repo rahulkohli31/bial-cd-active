@@ -1,52 +1,169 @@
 /**
- * Reads the submitted data-classification declaration for the admin review screen.
+ * Reads a stored publish declaration for the admin screens. Two shapes exist, told apart by the
+ * `version` field: the class declaration every gate decision writes (`version: 2`), and the older
+ * six-question shape, which has none and renders as it was sent.
  *
- * STORED DATA, not a wire schema: the publish gate writes it once
- * (`backend/src/api/v1/deploy/router.py::_declaration`) and the questionnaire it is keyed
- * by is expected to be reworded, so this module narrows defensively at every step instead
- * of typing the document — an unrecognised key renders as nothing, never a crash and never
- * a blank row read as "nothing was flagged".
- *
- * The admin decides whether this app's DATA is acceptable to publish, not whether the code
- * is correct. Evidence locations are structurally absent here — a separate `evidence`
- * document holds them — so this module has no branch to get wrong; rendered reasons were
- * redacted before storage.
- *
- * DRIFT comes from the `drift` block, not from comparing `commits`: `answeredAbout` is the
- * commit the citizen's answers describe, and when it differs from `commits.shipping` the
- * screen names both and marks newly-raised categories unexplained.
- *
- * WHY THIS EXISTS: an earlier version derived drift from `commits.shipping !==
- * commits.reviewed`, which was dead — the writer sets `reviewed` to the same `head_sha` it
- * writes to `shipping`, so the pair is only ever equal or half-null. `reviewed === null` is
- * the separate, common case of no review at all.
+ * Both are stored data, not a wire schema, so each reader narrows defensively: an unrecognised
+ * field renders as nothing, never a crash. A class declaration carries its own snapshot of the
+ * classes and the policy, so nothing here reads the live configuration. Neither shape carries an
+ * evidence location.
  */
 import { isRecord } from '../../utils/apiError'
-import { DATA_CLASSIFICATION_QUESTIONS } from '../../utils/deployApi'
-import type { ReviewVerdict } from '../../utils/classificationApi'
-
-/** The questionnaire, in the order the citizen answered it, under the snake_case keys the
- *  declaration document is stored with (it is stored data, not a camelCase wire body).
- *
- *  DERIVED, not re-typed: the labels an administrator reads here are the same six the
- *  citizen answered on the form, and the one thing worse than a reworded question is a
- *  reworded question that only half the product agrees with. `deployApi` carries both
- *  spellings of each key precisely so this list can be projected rather than maintained. */
-export const CLASSIFICATION_CATEGORIES: ReadonlyArray<readonly [key: string, label: string]> =
-  DATA_CLASSIFICATION_QUESTIONS.map(([, label, , storedKey]) => [storedKey, label] as const)
+import type { ClassKind } from '../../utils/classificationApi'
 
 /** The rejection note's floor, mirroring `MIN_REJECTION_NOTE` in
  *  `backend/src/api/v1/admin/schemas.py`. The server is the gate (422); this copy only
  *  spares an administrator discovering the floor by hitting it. */
 export const MIN_REJECTION_NOTE = 20
 
-/** One verdict, from the same union the citizen's review client narrows the live wire
- *  into — the stored document records exactly what that surface showed. */
-export type { ReviewVerdict }
+function record(parent: Record<string, unknown>, key: string): Record<string, unknown> {
+  const child = parent[key]
+  return isRecord(child) ? child : {}
+}
 
-/** What the merge put on record for one category, in plain language. Mirrors
- *  `DisagreementKind` in `backend/src/services/classification/merge.py`; an unrecognised
- *  value is dropped rather than shown raw — a snake_case token is not an explanation. */
+function shaOrNull(value: unknown): string | null {
+  return typeof value === 'string' && value !== '' ? value : null
+}
+
+function textOrNull(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() !== '' ? value : null
+}
+
+/** A stored time, or null when it is absent or not a time at all. */
+function timeOrNull(value: unknown): string | null {
+  return typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? value : null
+}
+
+function booleanOrNull(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+// --- the class declaration ---
+
+/** Why a send went to an administrator, as the gate stored it. */
+export type RouteReason = 'hard_block' | 'over_threshold' | 'review_unfinished' | 'rejection_standing'
+
+const ROUTE_REASONS: readonly RouteReason[] = ['hard_block', 'over_threshold', 'review_unfinished', 'rejection_standing']
+
+/** One class, as it was judged. */
+export interface JudgedClass {
+  key: string
+  title: string
+  kind: ClassKind
+  /** Null exactly for a hard block. */
+  weight: number | null
+  /** Null when the agent's review did not finish. */
+  agent: boolean | null
+  /** The agent's short reason, when it recorded one. */
+  reason: string | null
+  /** The answer the final score counted for the owner. Null for a hard block, and for every
+   *  class when owners could not change answers. */
+  owner: boolean | null
+  /** The owner's answer differs from the agent's. */
+  changed: boolean
+}
+
+export interface ClassDeclaration {
+  version: 2
+  commit: string | null
+  /** When the version was saved; null when the store did not report it. */
+  savedAt: string | null
+  /** When the agent finished the review the decision read; null when that review was not current. */
+  checkedAt: string | null
+  /** When the gate decided, which is when its policy snapshot was taken. */
+  decidedAt: string | null
+  threshold: number | null
+  ownersCanChangeAnswers: boolean | null
+  /** Hard blocks first, then scored classes, each in the order the snapshot holds them. */
+  classes: JudgedClass[]
+  /** The hard blocks the agent answered Yes. */
+  found: JudgedClass[]
+  reviewerScore: number | null
+  score: number | null
+  /** Null for a send that published by itself. */
+  reason: RouteReason | null
+  note: string | null
+}
+
+function readClasses(declaration: Record<string, unknown>): ClassDeclaration {
+  const policy = record(declaration, 'policy')
+  const agentAnswers = isRecord(declaration.reviewerAnswers) ? declaration.reviewerAnswers : null
+  const ownerAnswers = isRecord(declaration.ownerAnswers) ? declaration.ownerAnswers : null
+  const reasons = record(declaration, 'reviewerReasons')
+  const snapshot = Array.isArray(declaration.classes) ? declaration.classes : []
+
+  const judged = snapshot.flatMap((entry: unknown): JudgedClass[] => {
+    if (!isRecord(entry) || typeof entry.key !== 'string' || typeof entry.title !== 'string') return []
+    const kind = entry.kind === 'hard_block' || entry.kind === 'scored' ? entry.kind : null
+    if (kind === null) return []
+    const agent = booleanOrNull(agentAnswers?.[entry.key])
+    // An owner answer absent from a scored class counted as the agent's.
+    const owner = kind === 'hard_block' || ownerAnswers === null ? null : (booleanOrNull(ownerAnswers[entry.key]) ?? agent)
+    return [
+      {
+        key: entry.key,
+        title: entry.title,
+        kind,
+        weight: numberOrNull(entry.weight),
+        agent,
+        reason: textOrNull(reasons[entry.key]),
+        owner,
+        changed: owner !== null && agent !== null && owner !== agent,
+      },
+    ]
+  })
+  const classes = [
+    ...judged.filter((entry) => entry.kind === 'hard_block'),
+    ...judged.filter((entry) => entry.kind === 'scored'),
+  ]
+
+  return {
+    version: 2,
+    commit: shaOrNull(declaration.commit),
+    savedAt: timeOrNull(declaration.savedAt),
+    checkedAt: timeOrNull(record(declaration, 'review').checkedAt),
+    decidedAt: timeOrNull(declaration.decidedAt),
+    threshold: numberOrNull(policy.threshold),
+    ownersCanChangeAnswers: booleanOrNull(policy.ownersCanChangeAnswers),
+    classes,
+    found: classes.filter((entry) => entry.kind === 'hard_block' && entry.agent === true),
+    reviewerScore: numberOrNull(declaration.reviewerScore),
+    score: numberOrNull(declaration.score),
+    reason: ROUTE_REASONS.find((reason) => reason === declaration.reason) ?? null,
+    note: textOrNull(declaration.note),
+  }
+}
+
+const LIST = new Intl.ListFormat('en', { type: 'conjunction' })
+
+/** What the agent found, in the words History and the review panel share. */
+export function agentFinding(declaration: ClassDeclaration): string {
+  if (declaration.found.length > 0) return `${LIST.format(declaration.found.map((entry) => entry.title))} found (hard block)`
+  if (declaration.reviewerScore !== null) return `No hard block · score ${declaration.reviewerScore}/100`
+  return 'Review did not finish'
+}
+
+// --- the six-question declaration ---
+
+/** The six questions, under their stored keys, in the order the owner answered them. */
+const QUESTIONS: ReadonlyArray<readonly [key: string, label: string]> = [
+  ['credentials_secrets', 'Credentials / Secrets'],
+  ['health_data', 'Health Data'],
+  ['personal_information', 'Personal Information (PII)'],
+  ['financial_data', 'Financial Data'],
+  ['confidential_business_data', 'Confidential Business Data'],
+  ['public_data', 'Public Data'],
+]
+
+/** One stored verdict of the automatic check. */
+export type ReviewVerdict = 'yes' | 'no' | 'unanswered'
+
+/** What the merge put on record for one question, in plain language. An unrecognised value is
+ *  dropped rather than shown raw — a snake_case token is not an explanation. */
 const DISAGREEMENT_COPY: Record<string, string> = {
   review_yes_over_citizen_no:
     'The automatic check found this kind of data; the developer answered No. The Yes stands.',
@@ -83,7 +200,8 @@ export interface CitizenAnswer {
   yes: boolean
 }
 
-export interface ReadDeclaration {
+export interface QuestionDeclaration {
+  version: 1
   /** False for a row queued without a declaration. */
   present: boolean
   /** The commit that was submitted. */
@@ -106,22 +224,14 @@ export interface ReadDeclaration {
   explanation: string | null
 }
 
-function record(parent: Record<string, unknown>, key: string): Record<string, unknown> {
-  const child = parent[key]
-  return isRecord(child) ? child : {}
-}
-
-function shaOrNull(value: unknown): string | null {
-  return typeof value === 'string' && value !== '' ? value : null
-}
-
 function verdictOrNull(value: unknown): ReviewVerdict | null {
   return value === 'yes' || value === 'no' || value === 'unanswered' ? value : null
 }
 
 /** An empty reading — what a row with no declaration produces, and what the screen turns
  *  into "this app's declaration is unavailable" rather than six blank rows. */
-const NOTHING: ReadDeclaration = {
+const NOTHING: QuestionDeclaration = {
+  version: 1,
   present: false,
   shippingCommit: null,
   reviewedCommit: null,
@@ -133,14 +243,7 @@ const NOTHING: ReadDeclaration = {
   explanation: null,
 }
 
-/**
- * Narrow one submitted declaration into what the review screen renders.
- *
- * `declaration` arrives as whatever the server had on the row: `null` for an item queued
- * without one, and otherwise a document this function is the only reader of.
- * Every field is optional to this function; none of them can throw.
- */
-export function readDeclaration(declaration: Record<string, unknown> | null): ReadDeclaration {
+function readQuestions(declaration: Record<string, unknown> | null): QuestionDeclaration {
   if (declaration === null || Object.keys(declaration).length === 0) return NOTHING
 
   const commits = record(declaration, 'commits')
@@ -162,9 +265,8 @@ export function readDeclaration(declaration: Record<string, unknown> | null): Re
   const disputes: DisputedCategory[] = []
   const answers: CitizenAnswer[] = []
 
-  for (const [key, label] of CLASSIFICATION_CATEGORIES) {
-    const citizenYes =
-      typeof citizenAnswers[key] === 'boolean' ? (citizenAnswers[key] as boolean) : null
+  for (const [key, label] of QUESTIONS) {
+    const citizenYes = booleanOrNull(citizenAnswers[key])
     if (citizenYes !== null) answers.push({ key, label, yes: citizenYes })
 
     const recorded = differences[key]
@@ -189,25 +291,28 @@ export function readDeclaration(declaration: Record<string, unknown> | null): Re
     })
   }
 
-  const explanation =
-    typeof citizen.explanation === 'string' && citizen.explanation.trim() !== ''
-      ? citizen.explanation
-      : null
-
   return {
+    version: 1,
     present: true,
     shippingCommit,
     reviewedCommit,
     noReviewAtAll: reviewedCommit === null,
     answeredAbout,
-    // The citizen answered about a DIFFERENT commit than the one shipping. Read from the
-    // `drift` block because that is the only place the two ever differ — see the module
-    // docstring for why the `commits` pair cannot express this.
+    // Read from the `drift` block, not the `commits` pair: the writer set `reviewed` from the
+    // same commit as `shipping`, so that pair is only ever equal or half-null.
     drift: answeredAbout !== null && shippingCommit !== null && answeredAbout !== shippingCommit,
     disputes,
     citizenAnswers: answers,
-    explanation,
+    explanation: textOrNull(citizen.explanation),
   }
+}
+
+export type Declaration = ClassDeclaration | QuestionDeclaration
+
+/** Narrow one stored declaration: `null` for a row queued without one, and otherwise a document
+ *  this module is the only reader of. Never throws. */
+export function readDeclaration(declaration: Record<string, unknown> | null): Declaration {
+  return declaration !== null && declaration.version === 2 ? readClasses(declaration) : readQuestions(declaration)
 }
 
 /** Moved to `utils/shortSha.ts` and re-exported here so this module's consumers keep their

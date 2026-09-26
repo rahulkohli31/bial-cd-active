@@ -13,22 +13,6 @@ import { ApiError, isRecord, optionalString, readApiError } from './apiError'
 import { authFetch } from './api.js'
 import type { AppStatus, AuthFetchDeps } from './projectApi'
 
-/**
- * `(key, label, weight, storedKey)` — the six questions publish declarations were stored against
- * before classes were configurable. The admin review's reader for those declarations derives its
- * labels from this table (`components/admin/declaration.ts`).
- */
-export const DATA_CLASSIFICATION_QUESTIONS: ReadonlyArray<
-  readonly [key: string, label: string, weight: number, storedKey: string]
-> = [
-  ['credentialsSecrets', 'Credentials / Secrets', 40, 'credentials_secrets'],
-  ['healthData', 'Health Data', 25, 'health_data'],
-  ['personalInformation', 'Personal Information (PII)', 20, 'personal_information'],
-  ['financialData', 'Financial Data', 20, 'financial_data'],
-  ['confidentialBusinessData', 'Confidential Business Data', 15, 'confidential_business_data'],
-  ['publicData', 'Public Data', 0, 'public_data'],
-]
-
 /** What the owner sends about the saved version: a Yes/No per class key, and the note an
  *  administrator reads when the send goes to them. */
 export interface PublishAnswers {

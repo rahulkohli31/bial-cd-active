@@ -44,6 +44,7 @@ _DEPLOY = "/v1/projects/{pid}/deploy"
 _SHA = "ab" * 20
 _OLDER_SHA = "cd" * 20
 _NOTE = "It shows the public flight board to the gate staff."
+_SAVED_AT = datetime(2026, 9, 26, 11, 45, tzinfo=UTC)
 
 
 # --- wiring --------------------------------------------------------------------------
@@ -114,6 +115,7 @@ async def _owner_with_saved_app(db, store: FakeStorage, *, sha: str = _SHA, **ov
     app_row = await AppRegistryFactory.create(db, user_id=user.id, **overrides)
     store.objects[snapshot_key(app_row.id)] = a_git_bundle(sha)
     store.meta[snapshot_key(app_row.id)] = {"head_sha": sha}
+    store.mtimes[snapshot_key(app_row.id)] = _SAVED_AT
     return user, app_row
 
 
@@ -199,6 +201,15 @@ async def _gate_rows(db, app_id: uuid.UUID) -> list[AuditLog]:
     )
 
 
+async def _review_finished_at(db, app_id: uuid.UUID) -> datetime:
+    query = sa.select(ClassificationReview.finished_at).where(
+        ClassificationReview.app_id == app_id
+    )
+    finished = (await db.execute(query)).scalar_one()
+    assert finished is not None
+    return finished
+
+
 async def _declaration(db, app_id: uuid.UUID) -> dict[str, Any]:
     fresh = await db.get(AppRegistry, app_id, populate_existing=True)
     assert fresh is not None
@@ -233,6 +244,9 @@ async def test_every_class_no_publishes_with_no_note_and_stores_the_declaration(
     declaration = await _declaration(db_session, app_row.id)
     assert declaration["version"] == 2
     assert declaration["commit"] == _SHA
+    assert declaration["savedAt"] == _SAVED_AT.isoformat()
+    checked_at = await _review_finished_at(db_session, app_row.id)
+    assert declaration["review"]["checkedAt"] == checked_at.isoformat()
     assert (declaration["outcome"], declaration["reason"]) == ("published", None)
     assert (declaration["reviewerScore"], declaration["score"]) == (0, 0)
     assert declaration["policy"] == {"threshold": 100, "ownersCanChangeAnswers": True}
@@ -347,6 +361,9 @@ async def test_a_hard_block_with_a_note_routes_carrying_the_note_and_the_reason(
     declaration = await _declaration(db_session, app_row.id)
     assert (declaration["outcome"], declaration["reason"]) == ("routed", "hard_block")
     assert declaration["note"] == _NOTE
+    assert declaration["savedAt"] == _SAVED_AT.isoformat()
+    checked_at = await _review_finished_at(db_session, app_row.id)
+    assert declaration["review"]["checkedAt"] == checked_at.isoformat()
     assert declaration["reviewerAnswers"]["pii"] is True
     assert declaration["reviewerReasons"]["pii"] == "What the reviewer found about pii."
     (row,) = await _gate_rows(db_session, app_row.id)
@@ -463,7 +480,13 @@ async def test_no_review_at_all_routes_as_unfinished(wire, client, db_session) -
     assert routed.status_code == 200
     declaration = await _declaration(db_session, app_row.id)
     assert declaration["reason"] == "review_unfinished"
-    assert declaration["review"] == {"current": False, "status": None, "failureCode": None}
+    assert declaration["review"] == {
+        "current": False,
+        "status": None,
+        "failureCode": None,
+        "checkedAt": None,
+    }
+    assert declaration["savedAt"] == _SAVED_AT.isoformat()
     assert declaration["reviewerAnswers"] is None
     assert declaration["score"] is None
 
@@ -484,6 +507,7 @@ async def test_three_failed_reviews_route_every_send_even_at_score_zero(
         "current": False,
         "status": "failed",
         "failureCode": "review_failed",
+        "checkedAt": None,
     }
 
 

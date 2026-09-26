@@ -40,6 +40,8 @@ FIXTURE = (
 )
 
 _SHA = "ab" * 20
+_CHECKED_AT = datetime(2026, 9, 26, 11, 50, tzinfo=UTC)
+_SAVED_AT = datetime(2026, 9, 26, 11, 45, tzinfo=UTC)
 
 
 def _class(key: str, kind: str, weight: int | None) -> LiveClass:
@@ -76,11 +78,17 @@ def _current(config: LiveConfig, **yes: bool) -> ReviewAtHead:
         failure_code=None,
         answers={entry.key: yes.get(entry.key, False) for entry in config.classes},
         reasons={entry.key: f"Why {entry.key}." for entry in config.classes},
+        checked_at=_CHECKED_AT,
     )
 
 
 _UNFINISHED = ReviewAtHead(
-    current=False, status="failed", failure_code="review_failed", answers={}, reasons={}
+    current=False,
+    status="failed",
+    failure_code="review_failed",
+    answers={},
+    reasons={},
+    checked_at=None,
 )
 
 
@@ -104,6 +112,7 @@ def test_the_server_reproduces_every_row_of_the_shared_score_fixture(case: dict[
         failure_code=None,
         answers=case["reviewerAnswers"],
         reasons={},
+        checked_at=_CHECKED_AT,
     )
 
     decision = decide(
@@ -349,12 +358,15 @@ def _readout(
 def test_a_complete_review_of_this_commit_under_these_definitions_is_current() -> None:
     config = _config()
 
-    review = review_at_head(_readout(config), head_sha=_SHA, config=config)
+    readout = _readout(config)
+
+    review = review_at_head(readout, head_sha=_SHA, config=config)
 
     assert review.current is True
     assert review.answers["pii"] is True
     assert review.answers["ai_usage"] is False
     assert review.reasons["pii"] == "Why."
+    assert review.checked_at == readout.review.finished_at
 
 
 @pytest.mark.parametrize(
@@ -385,6 +397,7 @@ def test_any_other_review_is_not_current_and_carries_no_answers(overrides: dict[
 
     assert review.current is False
     assert review.answers == {}
+    assert review.checked_at is None
     assert review.status is not None
 
 
@@ -401,7 +414,7 @@ def test_no_review_at_all_is_not_current() -> None:
     review = review_at_head(None, head_sha=_SHA, config=_config())
 
     assert review == ReviewAtHead(
-        current=False, status=None, failure_code=None, answers={}, reasons={}
+        current=False, status=None, failure_code=None, answers={}, reasons={}, checked_at=None
     )
 
 
@@ -421,6 +434,7 @@ def test_the_declaration_records_the_decision_and_everything_it_was_made_under()
 
     document = declaration_document(
         head_sha=_SHA,
+        saved_at=_SAVED_AT,
         decided_at=decided_at,
         config=config,
         review=review,
@@ -430,6 +444,7 @@ def test_the_declaration_records_the_decision_and_everything_it_was_made_under()
 
     assert document["version"] == DECLARATION_VERSION == 2
     assert document["commit"] == _SHA
+    assert document["savedAt"] == _SAVED_AT.isoformat()
     assert document["decidedAt"] == decided_at.isoformat()
     assert document["policy"] == {"threshold": 50, "ownersCanChangeAnswers": True}
     assert document["classes"][0] == {
@@ -444,7 +459,12 @@ def test_the_declaration_records_the_decision_and_everything_it_was_made_under()
     assert document["ownerAnswers"] == {"integrations": False}
     assert (document["reviewerScore"], document["score"]) == (60, 40)
     assert (document["outcome"], document["reason"], document["note"]) == ("published", None, None)
-    assert document["review"] == {"current": True, "status": "complete", "failureCode": None}
+    assert document["review"] == {
+        "current": True,
+        "status": "complete",
+        "failureCode": None,
+        "checkedAt": _CHECKED_AT.isoformat(),
+    }
 
 
 def test_an_unfinished_review_declares_no_answers_and_no_scores() -> None:
@@ -454,6 +474,7 @@ def test_an_unfinished_review_declares_no_answers_and_no_scores() -> None:
 
     document = declaration_document(
         head_sha=_SHA,
+        saved_at=_SAVED_AT,
         decided_at=datetime.now(UTC),
         config=_config(),
         review=_UNFINISHED,
@@ -467,4 +488,25 @@ def test_an_unfinished_review_declares_no_answers_and_no_scores() -> None:
     assert document["ownerAnswers"] is None
     assert document["score"] is None
     assert document["review"]["failureCode"] == "review_failed"
+    assert document["review"]["checkedAt"] is None
+    assert document["savedAt"] == _SAVED_AT.isoformat()
     assert document["note"] == "Please look at this one."
+
+
+def test_a_save_time_the_store_did_not_report_is_declared_null() -> None:
+    config = _config()
+    review = _current(config)
+    decision = decide(config=config, review=review, owner_answers={}, rejection_standing=False)
+
+    document = declaration_document(
+        head_sha=_SHA,
+        saved_at=None,
+        decided_at=datetime.now(UTC),
+        config=config,
+        review=review,
+        decision=decision,
+        note=None,
+    )
+
+    assert document["savedAt"] is None
+    assert document["review"]["checkedAt"] == _CHECKED_AT.isoformat()

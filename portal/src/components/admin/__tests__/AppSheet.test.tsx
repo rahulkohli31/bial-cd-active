@@ -4,7 +4,7 @@
  * between versions and each version's own answers.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent, within } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react'
 import type { AppHistory, HistoryVersion, RegistryApp } from '../../../utils/appRegistryApi'
 
 const h = vi.hoisted(() => ({ fetchHistory: vi.fn() }))
@@ -49,6 +49,49 @@ const answered = (commit: string, answers: Record<string, boolean>) => ({
   citizen: { answers },
 })
 
+const CLASSES = [
+  { key: 'pii', title: 'PII', kind: 'hard_block', weight: null },
+  { key: 'financial_data', title: 'Financial data', kind: 'hard_block', weight: null },
+  { key: 'credentials_keys', title: 'Credentials & keys', kind: 'scored', weight: 20 },
+  { key: 'confidential_business_data', title: 'Confidential business data', kind: 'scored', weight: 20 },
+  { key: 'ai_usage', title: 'AI usage', kind: 'scored', weight: 20 },
+  { key: 'integrations', title: 'Integrations', kind: 'scored', weight: 20 },
+  { key: 'public_data', title: 'Public data', kind: 'scored', weight: 20 },
+]
+
+const ALL_NO = Object.fromEntries(CLASSES.map((entry) => [entry.key, false]))
+
+const SCORED_NO = Object.fromEntries(CLASSES.filter((entry) => entry.kind === 'scored').map((entry) => [entry.key, false]))
+
+/** A declaration in the shape the publish gate stores with every decision. */
+const judged = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+  version: 2,
+  commit: C4,
+  savedAt: local(17, 11, 5),
+  decidedAt: local(26, 9, 30),
+  policy: { threshold: 50, ownersCanChangeAnswers: true },
+  classes: CLASSES,
+  review: { current: true, status: 'complete', failureCode: null, checkedAt: local(17, 11, 6) },
+  reviewerAnswers: ALL_NO,
+  reviewerReasons: {},
+  ownerAnswers: SCORED_NO,
+  reviewerScore: 0,
+  score: 0,
+  outcome: 'published',
+  reason: null,
+  note: null,
+  ...overrides,
+})
+
+const PII_FOUND = judged({
+  reviewerAnswers: { ...ALL_NO, pii: true },
+  reviewerReasons: { pii: 'stores a photo of each visitor’s government ID (the upload on the visitor form).' },
+  ownerAnswers: {},
+  outcome: 'routed',
+  reason: 'hard_block',
+  note: 'Security asks us to keep an ID copy for every visitor entering airside, for 30 days.',
+})
+
 const version = (overrides: Partial<HistoryVersion> & Pick<HistoryVersion, 'number'>): HistoryVersion => ({
   kind: 'version',
   commitSha: null,
@@ -76,7 +119,12 @@ const LOST_AND_FOUND: AppHistory = {
       sentAt: local(25, 16, 2),
       attempts: [{ status: 'succeeded', startedAt: local(25, 16, 2), finishedAt: local(25, 16, 40), failureCode: null }],
       publishedAt: local(25, 16, 40),
-      declaration: answered(C4, { personal_information: false, financial_data: false }),
+      declaration: judged({
+        reviewerAnswers: { ...ALL_NO, integrations: true },
+        ownerAnswers: SCORED_NO,
+        reviewerScore: 20,
+        score: 0,
+      }),
     }),
     { kind: 'event', action: 'restart', at: local(23, 10, 12), by: 'kavya.n@bialairport.com', reenabledAt: null },
     version({
@@ -90,7 +138,7 @@ const LOST_AND_FOUND: AppHistory = {
       publishedAt: local(18, 9, 12),
       replacedBy: 4,
       replacedAt: local(25, 16, 40),
-      declaration: answered(C3, { personal_information: true, financial_data: false, public_data: false }),
+      declaration: { ...PII_FOUND, commit: C3 },
     }),
     version({
       number: 2,
@@ -162,6 +210,8 @@ function open(app: RegistryApp, onClose = vi.fn()) {
 
 const card = (number: number) => screen.getByTestId(`version-${number}`)
 
+const cellsOf = (row: HTMLElement) => within(row).getAllByRole('cell').map((cell) => cell.textContent)
+
 afterEach(cleanup)
 beforeEach(() => {
   h.fetchHistory.mockReset()
@@ -224,6 +274,22 @@ describe('History reads newest first, with the events between the versions', () 
     expect(card(1).textContent).toContain(
       '5 Sep, 15:02, on the second attempt (the first failed to build) · replaced by v3 on 18 Sep',
     )
+  })
+
+  it('says what the agent found on each version decided by the classes, in the board’s words', async () => {
+    open(APP)
+    await screen.findByTestId('version-4')
+
+    expect(card(4).textContent).toContain('AgentNo hard block · score 20/100')
+    expect(card(3).textContent).toContain('AgentPII found (hard block)')
+  })
+
+  it('gives a version decided by the six questions no agent line', async () => {
+    open(APP)
+    await screen.findByTestId('version-2')
+
+    expect(within(card(2)).getByText('Sent')).toBeTruthy()
+    expect(within(card(2)).queryByText('Agent')).toBeNull()
   })
 
   it('draws a version rejected before it could be published with no publishing line', async () => {
@@ -291,28 +357,43 @@ describe('each version’s Answers', () => {
     fireEvent.click(answers3)
 
     expect(answers3.getAttribute('aria-expanded')).toBe('true')
-    expect(card(3).textContent).toContain('Personal Information (PII) · Yes')
-    expect(card(3).textContent).toContain('2 other classes No')
-    expect(card(2).textContent).not.toContain('Personal Information (PII) · Yes')
+    expect(cellsOf(within(card(3)).getByTestId('answer-pii'))).toEqual(['PII', 'Hard block', 'Yes', '—'])
+    expect(within(card(2)).queryByTestId('answer-pii')).toBeNull()
 
     fireEvent.click(answers3)
 
     expect(answers3.getAttribute('aria-expanded')).toBe('false')
-    expect(card(3).textContent).not.toContain('Personal Information (PII) · Yes')
+    expect(within(card(3)).queryByTestId('answer-pii')).toBeNull()
     expect(within(card(3)).getByText('Approved by adiseshu, 18 Sep, 09:05')).toBeTruthy()
   })
 
   it('shows two versions their own, different answers', async () => {
     open(APP)
+    await screen.findByTestId('version-3')
+
+    fireEvent.click(within(card(4)).getByRole('button', { name: 'Answers' }))
+    fireEvent.click(within(card(3)).getByRole('button', { name: 'Answers' }))
+
+    expect(cellsOf(within(card(4)).getByTestId('answer-integrations'))).toEqual([
+      'Integrations',
+      'Scored · 20',
+      'Yes',
+      'Nochanged by the owner',
+    ])
+    expect(cellsOf(within(card(4)).getByTestId('answer-pii'))).toEqual(['PII', 'Hard block', 'No', '—'])
+    expect(cellsOf(within(card(3)).getByTestId('answer-pii'))).toEqual(['PII', 'Hard block', 'Yes', '—'])
+    expect(cellsOf(within(card(3)).getByTestId('answer-integrations'))).toEqual(['Integrations', 'Scored · 20', 'No', 'No'])
+  })
+
+  it('reads a version decided by the six questions through its own questions', async () => {
+    open(APP)
     await screen.findByTestId('version-2')
 
-    fireEvent.click(within(card(3)).getByRole('button', { name: 'Answers' }))
     fireEvent.click(within(card(2)).getByRole('button', { name: 'Answers' }))
 
-    expect(card(3).textContent).toContain('Personal Information (PII) · Yes')
-    expect(card(3).textContent).not.toContain('Financial Data · Yes')
     expect(card(2).textContent).toContain('Financial Data · Yes')
-    expect(card(2).textContent).not.toContain('Personal Information (PII) · Yes')
+    expect(card(2).textContent).toContain('1 other class No')
+    expect(within(card(2)).queryByRole('table')).toBeNull()
   })
 
   it('says a version with no stored declaration has no answers on record', async () => {
@@ -364,6 +445,178 @@ describe('an app waiting for a decision', () => {
     // Liveness: the rejection form really opened.
     expect(screen.getByTestId('reject-note')).toBeTruthy()
     expect(screen.queryByTestId('reject-delists-warning')).toBeNull()
+  })
+})
+
+describe('the review of a version decided by the classes', () => {
+  beforeEach(() => {
+    h.fetchHistory.mockResolvedValue(WAITING)
+  })
+
+  const review = (declaration: Record<string, unknown>) => open({ ...PENDING, declaration })
+
+  it('leads with the hard block and the agent’s reason, then the owner’s note, then the answers', () => {
+    review(PII_FOUND)
+
+    const why = screen.getByTestId('review-why')
+    expect(why.textContent).toContain('Why it is here: PII found (hard block)')
+    expect(why.textContent).toContain(
+      'Agent: stores a photo of each visitor’s government ID (the upload on the visitor form).',
+    )
+    expect(screen.getByTestId('review-note').textContent).toBe(
+      'Security asks us to keep an ID copy for every visitor entering airside, for 30 days.',
+    )
+    expect(cellsOf(screen.getByTestId('answer-pii'))).toEqual(['PII', 'Hard block', 'Yes', '—'])
+    expect(cellsOf(screen.getByTestId('answer-credentials_keys'))).toEqual(['Credentials & keys', 'Scored · 20', 'No', 'No'])
+
+    const body = screen.getByTestId('review-scroll').textContent ?? ''
+    const whyAt = body.indexOf('Why it is here')
+    const noteAt = body.indexOf("Owner's note")
+    const answersAt = body.indexOf('Answers')
+    expect(whyAt).toBeGreaterThan(-1)
+    expect(whyAt).toBeLessThan(noteAt)
+    expect(noteAt).toBeLessThan(answersAt)
+  })
+
+  it('shows when the version was sent and by whom, which version it is, and what is live', async () => {
+    review(PII_FOUND)
+
+    const grid = screen.getByTestId('review-version')
+    expect(grid.textContent).toContain('Sent17 Sep, 11:20by kavya.n')
+    expect(grid.textContent).toContain('Checked17 Sep, 11:06by the agent')
+    expect(grid.textContent).toContain('Live nowNot live yet')
+    await waitFor(() => expect(grid.textContent).toContain('Versionv1 · 3f2a9c1Saved 17 Sep, 11:05'))
+    expect(grid.textContent).toContain('First version')
+  })
+
+  it('shows no saved or checked time the declaration did not record', () => {
+    review(
+      judged({
+        savedAt: null,
+        review: { current: false, status: 'failed', failureCode: 'timeout' },
+        reviewerAnswers: null,
+        ownerAnswers: null,
+        reviewerScore: null,
+        score: null,
+        outcome: 'routed',
+        reason: 'review_unfinished',
+        note: 'The check kept timing out.',
+      }),
+    )
+
+    const grid = screen.getByTestId('review-version')
+    expect(grid.textContent).toContain('Sent17 Sep, 11:20by kavya.n')
+    expect(grid.textContent).not.toContain('Saved')
+    expect(grid.textContent).not.toContain('Checked')
+  })
+
+  it('names the version live now beside the one under review', () => {
+    open({ ...PENDING, declaration: PII_FOUND, liveVersion: { number: 3, commitSha: C3, since: local(18, 9, 12) } })
+
+    expect(screen.getByTestId('review-version').textContent).toContain('Live nowv3 · 51bd2f8since 18 Sep')
+  })
+
+  it('gives an over-threshold send its score line, and marks the answers the owner changed', () => {
+    review(
+      judged({
+        policy: { threshold: 30, ownersCanChangeAnswers: true },
+        reviewerAnswers: { ...ALL_NO, credentials_keys: true, ai_usage: true, integrations: true },
+        ownerAnswers: { ...SCORED_NO, credentials_keys: true, ai_usage: true },
+        reviewerScore: 60,
+        score: 40,
+        outcome: 'routed',
+        reason: 'over_threshold',
+        note: 'The rates are already public on the vendor portal.',
+      }),
+    )
+
+    expect(screen.getByTestId('review-why').textContent).toContain('Why it is here: Score 40/100 is over 30')
+    const line = screen.getByTestId('review-score').textContent
+    expect(line).toContain('Score agent 60 · owner 40 (of 100)')
+    expect(line).toContain('Publish without review up to 30')
+    expect(line).toContain('Owners can change answers Yes')
+    expect(line).toContain('Policy as of 26 Sep, 09:30')
+
+    const changed = screen.getByTestId('answer-integrations')
+    expect(cellsOf(changed)).toEqual(['Integrations', 'Scored · 20', 'Yes', 'Nochanged by the owner'])
+    expect(changed.className).toContain('bg-amber-50')
+    expect(within(changed).getByText('changed by the owner').className).toContain('sr-only')
+    const kept = screen.getByTestId('answer-ai_usage')
+    expect(cellsOf(kept)).toEqual(['AI usage', 'Scored · 20', 'Yes', 'Yes'])
+    expect(kept.className).not.toContain('bg-amber-50')
+  })
+
+  it('shows a dash in every owner cell when owners could not change answers', () => {
+    review(
+      judged({
+        policy: { threshold: 50, ownersCanChangeAnswers: false },
+        reviewerAnswers: { ...ALL_NO, integrations: true, ai_usage: true, public_data: true },
+        ownerAnswers: null,
+        reviewerScore: 60,
+        score: 60,
+        outcome: 'routed',
+        reason: 'over_threshold',
+        note: 'Needed for the vendor desk.',
+      }),
+    )
+
+    const owners = screen.getAllByTestId(/^answer-/).map((row) => cellsOf(row)[3])
+    expect(owners).toHaveLength(CLASSES.length)
+    expect(new Set(owners)).toEqual(new Set(['—']))
+    expect(screen.getByTestId('review-score').textContent).toContain('Score agent 60 (of 100)')
+    expect(screen.getByTestId('review-score').textContent).toContain('Owners can change answers No')
+  })
+
+  it('shows a class under the title it was judged by, whatever it is called now', () => {
+    review(
+      judged({
+        ...PII_FOUND,
+        classes: [{ key: 'pii', title: 'Personal data (as judged)', kind: 'hard_block', weight: null }, ...CLASSES.slice(1)],
+      }),
+    )
+
+    expect(screen.getByTestId('review-why').textContent).toContain('Personal data (as judged) found (hard block)')
+    expect(cellsOf(screen.getByTestId('answer-pii'))[0]).toBe('Personal data (as judged)')
+  })
+
+  it('says an unfinished review left no answers and no score', () => {
+    review(
+      judged({
+        review: { current: false, status: 'failed', failureCode: 'timeout' },
+        reviewerAnswers: null,
+        ownerAnswers: null,
+        reviewerScore: null,
+        score: null,
+        outcome: 'routed',
+        reason: 'review_unfinished',
+        note: 'The check kept timing out.',
+      }),
+    )
+
+    expect(screen.getByTestId('review-why').textContent).toContain("Why it is here: The agent's review did not finish")
+    expect(cellsOf(screen.getByTestId('answer-integrations'))).toEqual(['Integrations', 'Scored · 20', '—', '—'])
+    expect(screen.getByTestId('review-score').textContent).toContain('Score not recorded')
+  })
+
+  it('says a standing rejection is why it is here', () => {
+    review(judged({ outcome: 'routed', reason: 'rejection_standing', note: 'The passport field is gone now.' }))
+
+    expect(screen.getByTestId('review-why').textContent).toContain('Why it is here: An earlier version was rejected')
+  })
+
+  it('renders a six-question declaration in the queue as it was sent', () => {
+    review({
+      commits: { shipping: PENDING.commitSha, reviewed: PENDING.commitSha },
+      citizen: { answers: { personal_information: false, public_data: true }, explanation: 'Staff names only.' },
+      review: { answers: { personal_information: 'yes' }, reasons: { personal_information: 'Stores staff names.' } },
+      merged: { answers: { personal_information: true, public_data: true } },
+      differences: { personal_information: ['review_yes_over_citizen_no'] },
+    })
+
+    expect(screen.getByTestId('dispute-personal_information').textContent).toContain('Developer said No')
+    expect(screen.getByTestId('review-explanation').textContent).toBe('Staff names only.')
+    expect(screen.queryByTestId('review-why')).toBeNull()
+    expect(screen.queryByTestId('review-score')).toBeNull()
   })
 })
 
