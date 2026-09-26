@@ -25,6 +25,7 @@ import { shortSha } from '../../utils/shortSha'
 import { ClipboardRefused, copyToClipboard } from '../../utils/clipboard'
 import {
   ACTION_LABEL,
+  busyLabel,
   formatStamp,
   lookFor,
   presentationFor,
@@ -339,13 +340,7 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
               : 'bg-primary text-white hover:bg-primary-600'
           }`}
         >
-          {withdrawing
-            ? 'Taking it back…'
-            : publishPhase === 'saving'
-              ? 'Saving…'
-              : publishPhase === 'publishing'
-                ? 'Publishing…'
-                : ACTION_LABEL[presentation.action]}
+          {busyLabel(withdrawing, publishPhase) ?? ACTION_LABEL[presentation.action]}
         </button>
       )}
 

@@ -40,7 +40,7 @@ import {
   type PublishAnswers,
 } from '../utils/deployApi'
 import { getProject } from '../utils/projectApi'
-import { dayMonth } from '../utils/projectDates'
+import { dayMonth, dayMonthTime, timeOfDay } from '../utils/projectDates'
 import { canBeRestarted } from '../utils/publishPresentation'
 import { shortSha } from '../utils/shortSha'
 
@@ -80,21 +80,16 @@ function outOfDate(review: ClassificationReview): boolean {
   return review.status !== 'running' && review.status !== 'nothing_to_review' && !review.current
 }
 
-function clock(iso: string): string {
-  const at = new Date(iso)
-  return `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
-}
-
 function sameDay(a: string, b: string): boolean {
   return new Date(a).toDateString() === new Date(b).toDateString()
 }
 
 function savedLine(review: ClassificationReview | null, answered: boolean): string | null {
   if (review?.savedAt == null) return null
-  const saved = `Saved ${dayMonth(review.savedAt)}, ${clock(review.savedAt)}`
+  const saved = `Saved ${dayMonthTime(review.savedAt)}`
   const checked = answered ? review.checkedAt : null
   if (checked === null) return saved
-  return `${saved} · checked ${sameDay(checked, review.savedAt) ? clock(checked) : `${dayMonth(checked)}, ${clock(checked)}`}`
+  return `${saved} · checked ${sameDay(checked, review.savedAt) ? timeOfDay(checked) : dayMonthTime(checked)}`
 }
 
 interface LiveNow {
@@ -240,10 +235,9 @@ export default function PublishDialog({
   const [serverReason, setServerReason] = useState<NoteRequiredReason | null>(null)
   const [appName, setAppName] = useState<string | null>(null)
 
-  // The version the dialog asked about, latched from each POST. Polls are filtered against it,
-  // and it is the commit a send names.
+  // The version the dialog asked about, latched from each POST. Polls and re-reads are filtered
+  // against it, so the review a send is made from is always about this version.
   const askedShaRef = useRef<string | null>(null)
-  const [askedSha, setAskedSha] = useState<string | null>(null)
   // Bumped on unmount and on every fresh ask, so a stale response never paints over a newer one.
   const generation = useRef(0)
   useEffect(
@@ -275,7 +269,6 @@ export default function PublishDialog({
       const first = await ensureClassificationReview(projectId)
       if (generation.current !== mine) return
       askedShaRef.current = first.headSha
-      setAskedSha(first.headSha)
       setPhase({ kind: 'ready', review: first })
     } catch (err) {
       if (generation.current !== mine) return
@@ -320,6 +313,7 @@ export default function PublishDialog({
   }, [polling, projectId, ask])
 
   const review = phase.kind === 'ready' ? phase.review : null
+  const headSha = review?.headSha ?? null
   const classes = review?.classes ?? []
   const verdicts = review?.status === 'complete' && review.current ? review.verdicts : null
   const answered = verdicts !== null
@@ -350,7 +344,7 @@ export default function PublishDialog({
 
   const noteBlank = note.trim() === ''
   const canSend =
-    !busy && askedSha !== null && (answered || outOfAttempts) && (reason === null || !noteBlank)
+    !busy && headSha !== null && (answered || outOfAttempts) && (reason === null || !noteBlank)
   const name = appName ?? 'your app'
   const panel = answered && !blocked ? scorePanel(threshold, owners, reason) : null
 
@@ -400,13 +394,13 @@ export default function PublishDialog({
   }
 
   const send = async (): Promise<void> => {
-    if (!canSend || askedSha === null) return
+    if (!canSend || headSha === null) return
     setBusy(true)
     setError(null)
     const answers =
       answered && owners && !blocked ? Object.fromEntries(scored.map((c) => [c.key, shownYes(c.key)])) : {}
     try {
-      await onConfirm(askedSha, { answers, note: reason === null ? null : note.trim() })
+      await onConfirm(headSha, { answers, note: reason === null ? null : note.trim() })
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Could not publish. Please try again.'
       const refusal = noteRequiredReason(err)

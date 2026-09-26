@@ -11,7 +11,7 @@
  */
 import { authFetch } from './api'
 import type { AuthFetchDeps } from './api'
-import { ApiError, isRecord, readApiError } from './apiError'
+import { ApiError, isRecord, optionalNumber, readApiError } from './apiError'
 import type { AppStatus } from './projectApi'
 
 /**
@@ -44,6 +44,10 @@ function asStringOrNull(value: unknown): string | null {
 /** A count is a count: anything that is not a finite number is 0, never NaN in a badge. */
 function asCount(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0
+}
+
+function oneOf<T extends string>(allowed: readonly T[], value: unknown, fallback: T): T {
+  return allowed.find((member) => member === value) ?? fallback
 }
 
 const jsonOpts = (method: string, body?: unknown) => ({
@@ -94,10 +98,6 @@ const REGISTRY_STATUSES: readonly RegistryStatus[] = [
   'disabled',
 ]
 
-function isRegistryStatus(value: unknown): value is RegistryStatus {
-  return REGISTRY_STATUSES.some((status) => status === value)
-}
-
 /** The version serving now: the number of the send that put it there, its commit, and when
  *  that send first went live. Any of them is null when nothing recorded it. */
 export interface LiveVersion {
@@ -106,14 +106,10 @@ export interface LiveVersion {
   since: string | null
 }
 
-function asNumberOrNull(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null
-}
-
 function toLiveVersion(value: unknown): LiveVersion | null {
   return isRecord(value)
     ? {
-        number: asNumberOrNull(value.number),
+        number: optionalNumber(value.number),
         commitSha: asStringOrNull(value.commitSha),
         since: asStringOrNull(value.since),
       }
@@ -185,7 +181,7 @@ function toRegistryApp(value: unknown): RegistryApp {
     ownerId: asString(value.ownerId),
     ownerUsername: asStringOrNull(value.ownerUsername),
     status: isAppStatus(value.status) ? value.status : 'draft',
-    registryStatus: isRegistryStatus(value.registryStatus) ? value.registryStatus : 'draft',
+    registryStatus: oneOf(REGISTRY_STATUSES, value.registryStatus, 'draft'),
     liveVersion: toLiveVersion(value.liveVersion),
     loginRequired: value.loginRequired === true,
     hasApprovedSnapshot: value.hasApprovedSnapshot === true,
@@ -387,10 +383,6 @@ export interface AppHistory {
   truncated: boolean
 }
 
-function oneOf<T extends string>(allowed: readonly T[], value: unknown, fallback: T): T {
-  return allowed.find((member) => member === value) ?? fallback
-}
-
 function toAttempt(value: unknown): HistoryAttempt | null {
   if (!isRecord(value)) return null
   const status = ATTEMPT_STATUSES.find((member) => member === value.status)
@@ -442,7 +434,7 @@ function toHistoryEntry(value: unknown): HistoryEntry | null {
       : [],
     state: oneOf(VERSION_STATES, value.state, 'not_recorded'),
     publishedAt: asStringOrNull(value.publishedAt),
-    replacedBy: asNumberOrNull(value.replacedBy),
+    replacedBy: optionalNumber(value.replacedBy),
     replacedAt: asStringOrNull(value.replacedAt),
   }
 }

@@ -12,7 +12,7 @@ import {
   updateClassificationPolicy,
 } from '../../utils/adminClassificationApi'
 import type { ClassFields, ClassificationClass, ClassificationConfig } from '../../utils/adminClassificationApi'
-import { MONTHS } from '../../utils/monthNames'
+import { dayMonth } from '../../utils/projectDates'
 import { Badge } from '../ui/badge'
 import { Button } from '../ui/button'
 import { Input } from '../ui/input'
@@ -30,9 +30,7 @@ const OWNERS = 'owners'
 const dash = <span className="text-neutral">—</span>
 
 function lastChanged(c: ClassificationClass): string {
-  const d = new Date(c.updatedAt)
-  const day = Number.isNaN(d.getTime()) ? '' : `${d.getDate()} ${MONTHS[d.getMonth()]}`
-  return [day, c.updatedByName].filter(Boolean).join(' · ')
+  return [dayMonth(c.updatedAt), c.updatedByName].filter(Boolean).join(' · ')
 }
 
 function classColumns({

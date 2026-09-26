@@ -14,6 +14,8 @@ import type { LimitFields } from '../../utils/admin'
 // no panel<->columns cycle — columns.tsx never imports from the panel.
 export const fmt = (n: number): string => Number(n).toLocaleString('en-US')
 export const roleLabel = (role: string): string => (role === 'super_admin' ? 'Super admin' : 'Citizen')
+/** A person by the part of their address before the @, the way the admin screens name people. */
+export const handle = (email: string): string => email.split('@')[0]
 
 /** One numeric limit cell: the effective value + a "default" pill when not overridden.
  * `value` defaults to 0 (matching the column's accessorFn) so a row missing

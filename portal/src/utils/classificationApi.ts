@@ -10,7 +10,7 @@
  * under the live class definitions, and answers ride only on a current, complete review.
  * THE BROWSER IS NEVER THE SOURCE: the publish request re-reads the stored review server-side.
  */
-import { ApiError, isRecord, optionalString, readApiError } from './apiError'
+import { ApiError, isRecord, optionalString, readApiError, requiredInteger, requiredString } from './apiError'
 import { authFetch } from './api.js'
 import type { AuthFetchDeps } from './projectApi'
 
@@ -93,20 +93,10 @@ function readStatus(value: unknown): ClassificationReviewStatus {
   throw invalid('status')
 }
 
-function readInteger(value: unknown, field: string): number {
-  if (typeof value !== 'number' || !Number.isInteger(value)) throw invalid(field)
-  return value
-}
-
-function readText(value: unknown, field: string): string {
-  if (typeof value !== 'string' || value.length === 0) throw invalid(field)
-  return value
-}
-
 function readPolicy(value: unknown): ReviewPolicy {
   if (!isRecord(value) || typeof value.ownersCanChangeAnswers !== 'boolean') throw invalid('policy')
   return {
-    threshold: readInteger(value.threshold, 'policy.threshold'),
+    threshold: requiredInteger(value.threshold, 'review', 'policy.threshold'),
     ownersCanChangeAnswers: value.ownersCanChangeAnswers,
   }
 }
@@ -117,10 +107,10 @@ function readClass(value: unknown): ReviewClass {
   const { kind } = value
   if (kind !== 'hard_block' && kind !== 'scored') throw invalid('class.kind')
   return {
-    key: readText(value.key, 'class.key'),
-    title: readText(value.title, 'class.title'),
+    key: requiredString(value.key, 'review', 'class.key'),
+    title: requiredString(value.title, 'review', 'class.title'),
     kind,
-    weight: kind === 'scored' ? readInteger(value.weight, 'class.weight') : null,
+    weight: kind === 'scored' ? requiredInteger(value.weight, 'review', 'class.weight') : null,
   }
 }
 

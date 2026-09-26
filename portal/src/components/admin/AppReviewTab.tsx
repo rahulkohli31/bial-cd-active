@@ -3,13 +3,15 @@ import type { ReactNode } from 'react'
 import { AlertTriangle, ShieldAlert } from 'lucide-react'
 import type { RegistryApp } from '../../utils/appRegistryApi'
 import { assertNever } from '../../utils/assertNever'
+import { dayMonth, dayMonthTime } from '../../utils/projectDates'
 import { cn } from '../../lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '../ui/alert'
 import { Button } from '../ui/button'
 import { Textarea } from '../ui/textarea'
 import { BusyGlyph } from '../ui/Waiting'
-import { AnswersTable, dayMonth, dayMonthTime, handle } from './AppHistoryTab'
-import { agentFinding, readDeclaration, shortSha, MIN_REJECTION_NOTE } from './declaration'
+import AnswersTable from './AnswersTable'
+import { handle } from './columns'
+import { agentFinding, readDeclaration, shortSha, verdictWord, MIN_REJECTION_NOTE } from './declaration'
 import type { ClassDeclaration } from './declaration'
 
 /** The one thing this screen is for, said out loud. An administrator who thinks
@@ -35,13 +37,6 @@ const NOTHING_IN_DISPUTE_COPY =
 const LIVE_REJECTION_COPY =
   'This app is live. Rejecting removes it from the Marketplace but leaves it running at its URL, ' +
   'and only its owner can undo that by submitting again. To take it down, use Unpublish instead.'
-
-const fmtWhen = (iso: string | null): string => {
-  // Null is its own answer: `new Date(0)` would print the epoch as if it were a fact.
-  if (iso === null) return '—'
-  const d = new Date(iso)
-  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString()
-}
 
 const SECTION_LABEL = 'text-[10.5px] font-bold uppercase tracking-[0.6px] text-neutral'
 
@@ -79,7 +74,7 @@ function VersionFacts({ app, number, declaration }: { app: RegistryApp; number: 
     >
       <Fact
         label="Sent"
-        value={app.submittedAt === null ? '—' : dayMonthTime(app.submittedAt)}
+        value={dayMonthTime(app.submittedAt)}
         detail={app.ownerUsername === null ? null : `by ${handle(app.ownerUsername)}`}
       />
       <Fact
@@ -314,14 +309,7 @@ export default function AppReviewTab({ app, number, withdrawn, onClose, onApprov
                       <p className="mt-1 text-[11px] text-neutral">
                         Developer said {row.citizenYes === null ? '—' : row.citizenYes ? 'Yes' : 'No'}
                         {' · '}
-                        Automatic check said{' '}
-                        {row.reviewVerdict === null
-                          ? 'nothing'
-                          : row.reviewVerdict === 'unanswered'
-                            ? 'it could not tell'
-                            : row.reviewVerdict === 'yes'
-                              ? 'Yes'
-                              : 'No'}
+                        Automatic check said {verdictWord(row.reviewVerdict, 'review')}
                       </p>
                       {row.notes.map((copy) => (
                         <p key={copy} className="mt-1 text-[11px] leading-relaxed text-tertiary">
@@ -390,12 +378,12 @@ export default function AppReviewTab({ app, number, withdrawn, onClose, onApprov
           <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 border-t border-bial-border pt-4 text-xs">
             <dt className="text-neutral">Submitted</dt>
             <dd data-testid="review-submitted-at" className="text-tertiary">
-              {fmtWhen(app.submittedAt)}
+              {dayMonthTime(app.submittedAt)}
             </dd>
             <dt className="text-neutral">Build</dt>
             <dd>
               <code data-testid="review-commit-sha" className="rounded bg-bial-bg px-1 py-0.5 text-tertiary">
-                {(app.commitSha || '').slice(0, 12) || '—'}
+                {shortSha(app.commitSha)}
               </code>
             </dd>
             <dt className="text-neutral">Login</dt>

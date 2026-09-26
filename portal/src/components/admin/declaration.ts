@@ -8,7 +8,7 @@
  * classes and the policy, so nothing here reads the live configuration. Neither shape carries an
  * evidence location.
  */
-import { isRecord } from '../../utils/apiError'
+import { isRecord, optionalNumber } from '../../utils/apiError'
 import type { ClassKind } from '../../utils/classificationApi'
 
 /** The rejection note's floor, mirroring `MIN_REJECTION_NOTE` in
@@ -36,10 +36,6 @@ function timeOrNull(value: unknown): string | null {
 
 function booleanOrNull(value: unknown): boolean | null {
   return typeof value === 'boolean' ? value : null
-}
-
-function numberOrNull(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
 // --- the class declaration ---
@@ -108,7 +104,7 @@ function readClasses(declaration: Record<string, unknown>): ClassDeclaration {
         key: entry.key,
         title: entry.title,
         kind,
-        weight: numberOrNull(entry.weight),
+        weight: optionalNumber(entry.weight),
         agent,
         reason: textOrNull(reasons[entry.key]),
         owner,
@@ -127,12 +123,12 @@ function readClasses(declaration: Record<string, unknown>): ClassDeclaration {
     savedAt: timeOrNull(declaration.savedAt),
     checkedAt: timeOrNull(record(declaration, 'review').checkedAt),
     decidedAt: timeOrNull(declaration.decidedAt),
-    threshold: numberOrNull(policy.threshold),
+    threshold: optionalNumber(policy.threshold),
     ownersCanChangeAnswers: booleanOrNull(policy.ownersCanChangeAnswers),
     classes,
     found: classes.filter((entry) => entry.kind === 'hard_block' && entry.agent === true),
-    reviewerScore: numberOrNull(declaration.reviewerScore),
-    score: numberOrNull(declaration.score),
+    reviewerScore: optionalNumber(declaration.reviewerScore),
+    score: optionalNumber(declaration.score),
     reason: ROUTE_REASONS.find((reason) => reason === declaration.reason) ?? null,
     note: textOrNull(declaration.note),
   }
@@ -161,6 +157,17 @@ const QUESTIONS: ReadonlyArray<readonly [key: string, label: string]> = [
 
 /** One stored verdict of the automatic check. */
 export type ReviewVerdict = 'yes' | 'no' | 'unanswered'
+
+/** A verdict in words, by where it is read: after "agent" in a History chip, or after
+ *  "Automatic check said" in the review's dispute line. */
+const VERDICT_WORDS: Record<'history' | 'review', Record<ReviewVerdict | 'none', string>> = {
+  history: { yes: 'Yes', no: 'No', unanswered: 'could not tell', none: '—' },
+  review: { yes: 'Yes', no: 'No', unanswered: 'it could not tell', none: 'nothing' },
+}
+
+export function verdictWord(verdict: ReviewVerdict | null, use: 'history' | 'review'): string {
+  return VERDICT_WORDS[use][verdict ?? 'none']
+}
 
 /** What the merge put on record for one question, in plain language. An unrecognised value is
  *  dropped rather than shown raw — a snake_case token is not an explanation. */
@@ -315,8 +322,5 @@ export function readDeclaration(declaration: Record<string, unknown> | null): De
   return declaration !== null && declaration.version === 2 ? readClasses(declaration) : readQuestions(declaration)
 }
 
-/** Moved to `utils/shortSha.ts` and re-exported here so this module's consumers keep their
- *  one import. It left because it stopped being an admin detail: the two citizen surfaces
- *  that disagreed with it — showing 12 where this screen showed 7 — are retired, and the
- *  one publish chip that replaced them shares this. */
+/** Lives in `utils/shortSha.ts`; re-exported so this module's consumers keep one import. */
 export { shortSha } from '../../utils/shortSha'

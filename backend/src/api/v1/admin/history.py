@@ -274,6 +274,22 @@ def _derive(
         ):
             send.attempts.append(attempt)
 
+    def apply_gate_record(detail: Mapping[str, Any]) -> None:
+        """A gate row that is not a send: the approved copy's republish adds an attempt to the
+        approved send, and a deferred send's own routed row marks that send routed."""
+        if detail.get("rule") == _APPROVED_COPY and approved is not None:
+            attach(approved, detail.get("deploymentId"))
+            return
+        if detail.get("decision") != "routed":
+            return
+        deployment = _uuid(detail.get("deploymentId"))
+        deferred = by_deployment.get(deployment) if deployment is not None else None
+        submission = _uuid(detail.get("submissionId"))
+        if deferred is not None and submission is not None:
+            deferred.routed = True
+            deferred.submission = submission
+            by_submission[submission] = deferred
+
     for record in ordered:
         detail = record.detail
         if record.number is not None:
@@ -291,16 +307,7 @@ def _derive(
                 by_deployment[deployment] = send
             attach(send, detail.get("deploymentId"))
         elif record.action == GATE_AUDIT_ACTION:
-            if detail.get("rule") == _APPROVED_COPY and approved is not None:
-                attach(approved, detail.get("deploymentId"))
-            elif detail.get("decision") == "routed":
-                deployment = _uuid(detail.get("deploymentId"))
-                deferred = by_deployment.get(deployment) if deployment is not None else None
-                submission = _uuid(detail.get("submissionId"))
-                if deferred is not None and submission is not None:
-                    deferred.routed = True
-                    deferred.submission = submission
-                    by_submission[submission] = deferred
+            apply_gate_record(detail)
         elif record.action in (*_APPROVALS, _REJECT, _WITHDRAW):
             submission = _uuid(detail.get("submissionId"))
             decided = by_submission.get(submission) if submission is not None else None

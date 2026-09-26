@@ -157,8 +157,9 @@ describe('AppRegistryPanel — one list, every app', () => {
   it('the review modal shows submission METADATA (SHA, submitted-at) and no internal ids', async () => {
     render(<AppRegistryPanel onToast={() => {}} />)
     await openReview()
-    expect(screen.getByTestId('review-commit-sha').textContent).toContain(SHA.slice(0, 12))
-    expect(screen.getByTestId('review-submitted-at').textContent).not.toContain('—')
+    expect(screen.getByTestId('review-commit-sha').textContent).toBe(SHA.slice(0, 7))
+    // The day-first form every other date on the admin screens uses, never the runtime locale's.
+    expect(screen.getByTestId('review-submitted-at').textContent).toMatch(/^\d{1,2} Jul, \d{2}:\d{2}$/)
 
     // The submission's own id is what the approval PINS, and it is still sent with the
     // approval — but it is an internal identifier no administrator can act on, so it is
@@ -654,7 +655,7 @@ describe('the review screen without a review, and without a declaration', () => 
     expect(screen.getByTestId('approve-btn')).toBeTruthy()
     // "Decide from the submission details above" has to mean something: with no
     // declaration, the build is the only fact about the version on the screen.
-    expect(screen.getByTestId('review-commit-sha').textContent).toContain(SHA.slice(0, 12))
+    expect(screen.getByTestId('review-commit-sha').textContent).toBe(SHA.slice(0, 7))
   })
 })
 

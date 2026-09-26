@@ -15,18 +15,9 @@ from src.db.models.project_connector import ProjectConnector
 async def connected_systems_for_project(
     db: AsyncSession, *, user_id: uuid.UUID, project_id: uuid.UUID
 ) -> tuple[ConnectedSystem, ...]:
-    """Every connector this project may ACTUALLY read, resolved once for a turn. `()` is the
-    ordinary case and is never an error.
-
-    ONE FACT, RESOLVED ONCE, TWO CONSUMERS. The turn's prompt names what is connected and the
-    turn's tool surface registers the schema tool for the same set (`services/agent/toolsets.py`),
-    both off this one return value. A second resolution is a second answer waiting to disagree
-    with the first, and the disagreement that matters is the one where the prompt says a system is
-    connected and the tool to read it was never registered.
-
-    WHETHER A CONNECTOR READS IS READ OFF `resolve_window`, NEVER DECIDED AGAIN HERE — the same
-    value the settings row shows the citizen and the same one `build_connector_env` gates the data
-    plane on.
+    """Every connector this project may ACTUALLY read, resolved once for a turn so the prompt and
+    the tool surface name the same set. `()` is the ordinary case and is never an error. Whether a
+    connector reads comes from `resolve_window`, never decided again here.
 
     SCOPED BY THE OWNING `user_id` THROUGH A JOIN ON `projects`, in the same WHERE clause.
     `project_connectors` carries no user column of its own, so `projects` is its ownership anchor

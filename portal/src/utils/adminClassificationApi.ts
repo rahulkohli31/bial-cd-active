@@ -8,9 +8,18 @@
  */
 import { authFetch } from './api'
 import type { AuthFetchDeps } from './api'
-import { ApiError, isRecord, optionalString, readApiError, requiredString } from './apiError'
+import {
+  ApiError,
+  isRecord,
+  optionalString,
+  readApiError,
+  requiredBoolean,
+  requiredInteger,
+  requiredString,
+} from './apiError'
+import type { ClassKind } from './classificationApi'
 
-export type ClassKind = 'hard_block' | 'scored'
+export type { ClassKind }
 
 export interface ClassificationPolicy {
   threshold: number
@@ -50,18 +59,10 @@ export const MAX_DESCRIPTION = 1000
 export const MAX_WEIGHT = 100
 export const MAX_THRESHOLD = 100
 
+const SETTING = 'classification setting'
+
 function unreadable(field: string): ApiError {
-  return new ApiError(`The server sent a classification setting we could not read (${field}).`, 500)
-}
-
-function readNumber(value: unknown, field: string): number {
-  if (typeof value !== 'number' || !Number.isInteger(value)) throw unreadable(field)
-  return value
-}
-
-function readBoolean(value: unknown, field: string): boolean {
-  if (typeof value !== 'boolean') throw unreadable(field)
-  return value
+  return new ApiError(`The server sent a ${SETTING} we could not read (${field}).`, 500)
 }
 
 function toClass(value: unknown): ClassificationClass {
@@ -73,8 +74,8 @@ function toClass(value: unknown): ClassificationClass {
     title: requiredString(value.title, 'class', 'title'),
     description: requiredString(value.description, 'class', 'description'),
     kind,
-    weight: kind === 'scored' ? readNumber(value.weight, 'weight') : null,
-    active: readBoolean(value.active, 'active'),
+    weight: kind === 'scored' ? requiredInteger(value.weight, SETTING, 'weight') : null,
+    active: requiredBoolean(value.active, SETTING, 'active'),
     updatedAt: requiredString(value.updatedAt, 'class', 'updatedAt'),
     updatedByName: optionalString(value.updatedByName),
   }
@@ -84,8 +85,8 @@ function toConfig(value: unknown): ClassificationConfig {
   if (!isRecord(value) || !isRecord(value.policy) || !Array.isArray(value.classes)) throw unreadable('configuration')
   return {
     policy: {
-      threshold: readNumber(value.policy.threshold, 'threshold'),
-      ownersCanChangeAnswers: readBoolean(value.policy.ownersCanChangeAnswers, 'ownersCanChangeAnswers'),
+      threshold: requiredInteger(value.policy.threshold, SETTING, 'threshold'),
+      ownersCanChangeAnswers: requiredBoolean(value.policy.ownersCanChangeAnswers, SETTING, 'ownersCanChangeAnswers'),
     },
     classes: value.classes.map(toClass),
   }

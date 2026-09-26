@@ -192,16 +192,24 @@ async def _free_key(db: DbSession, title: str) -> str:
     return f"{stem}_{suffix}"
 
 
-def _duplicate_title(title: str) -> AppApiError:
-    return AppApiError(
-        status.HTTP_409_CONFLICT,
-        f"A class called “{title}” already exists.",
-        code="duplicate_title",
-    )
+async def _write_class(db: DbSession, statement: sa.Insert | sa.Update, *, title: str) -> None:
+    """Run one class insert or update in a savepoint. A title another class holds, in any letter
+    case, is `409 duplicate_title`; any other integrity failure propagates."""
+    try:
+        async with db.begin_nested():
+            await db.execute(statement)
+    except IntegrityError as exc:
+        if _TITLE_INDEX not in str(exc.orig):
+            raise
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            f"A class called “{title}” already exists.",
+            code="duplicate_title",
+        ) from None
 
 
 def _class_state(
-    title: str, description: str, kind: ClassificationKind, weight: int | None, active: bool
+    *, title: str, description: str, kind: ClassificationKind, weight: int | None, active: bool
 ) -> dict[str, Any]:
     return {
         "title": title,
@@ -328,23 +336,19 @@ async def add_classification_class(
     configuration."""
     weight = _weight_for(body.kind, body.weight)
     key = await _free_key(db, body.title)
-    try:
-        async with db.begin_nested():
-            await db.execute(
-                sa.insert(ClassificationClass).values(
-                    key=key,
-                    title=body.title,
-                    description=body.description,
-                    kind=body.kind,
-                    weight=weight,
-                    active=body.active,
-                    updated_by=admin.id,
-                )
-            )
-    except IntegrityError as exc:
-        if _TITLE_INDEX not in str(exc.orig):
-            raise
-        raise _duplicate_title(body.title) from None
+    await _write_class(
+        db,
+        sa.insert(ClassificationClass).values(
+            key=key,
+            title=body.title,
+            description=body.description,
+            kind=body.kind,
+            weight=weight,
+            active=body.active,
+            updated_by=admin.id,
+        ),
+        title=body.title,
+    )
     await append_audit(
         db,
         actor_id=admin.id,
@@ -353,7 +357,13 @@ async def add_classification_class(
         resource_id=key,
         detail={
             "before": None,
-            "after": _class_state(body.title, body.description, body.kind, weight, body.active),
+            "after": _class_state(
+                title=body.title,
+                description=body.description,
+                kind=body.kind,
+                weight=weight,
+                active=body.active,
+            ),
         },
     )
     await db.commit()
@@ -401,24 +411,20 @@ async def edit_classification_class(
         kind, body.weight if "weight" in body.model_fields_set else current.weight
     )
     active = current.active if body.active is None else body.active
-    try:
-        async with db.begin_nested():
-            await db.execute(
-                sa.update(ClassificationClass)
-                .where(ClassificationClass.key == key)
-                .values(
-                    title=title,
-                    description=description,
-                    kind=kind,
-                    weight=weight,
-                    active=active,
-                    updated_by=admin.id,
-                )
-            )
-    except IntegrityError as exc:
-        if _TITLE_INDEX not in str(exc.orig):
-            raise
-        raise _duplicate_title(title) from None
+    await _write_class(
+        db,
+        sa.update(ClassificationClass)
+        .where(ClassificationClass.key == key)
+        .values(
+            title=title,
+            description=description,
+            kind=kind,
+            weight=weight,
+            active=active,
+            updated_by=admin.id,
+        ),
+        title=title,
+    )
     await append_audit(
         db,
         actor_id=admin.id,
@@ -427,9 +433,15 @@ async def edit_classification_class(
         resource_id=key,
         detail={
             "before": _class_state(
-                current.title, current.description, current.kind, current.weight, current.active
+                title=current.title,
+                description=current.description,
+                kind=current.kind,
+                weight=current.weight,
+                active=current.active,
             ),
-            "after": _class_state(title, description, kind, weight, active),
+            "after": _class_state(
+                title=title, description=description, kind=kind, weight=weight, active=active
+            ),
         },
     )
     await db.commit()

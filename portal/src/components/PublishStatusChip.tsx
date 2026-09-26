@@ -31,6 +31,7 @@ import { usePublishState } from '../hooks/usePublishState'
 import { shortSha } from '../utils/shortSha'
 import {
   ACTION_LABEL,
+  busyLabel,
   formatStamp,
   lookFor,
   presentationFor,
@@ -115,13 +116,7 @@ export default function PublishStatusChip({
   const version =
     presentation === null ? null : versionRowData(presentation.version, deployment, approval)
   const busy = publishPhase !== null || withdrawing
-  const busyReason = withdrawing
-    ? 'Taking it back…'
-    : publishPhase === 'saving'
-      ? 'Saving…'
-      : publishPhase === 'publishing'
-        ? 'Publishing…'
-        : undefined
+  const busyReason = busyLabel(withdrawing, publishPhase) ?? undefined
 
   const speak = useCallback((outcome: DeployOutcome): void => {
     setAnswer(

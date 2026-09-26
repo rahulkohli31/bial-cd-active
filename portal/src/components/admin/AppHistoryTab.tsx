@@ -9,38 +9,17 @@ import type {
   VersionState,
 } from '../../utils/appRegistryApi'
 import { assertNever } from '../../utils/assertNever'
-import { MONTHS } from '../../utils/monthNames'
+import { dayMonth, dayMonthTime } from '../../utils/projectDates'
 import { cn } from '../../lib/utils'
 import { Alert, AlertDescription } from '../ui/alert'
 import { Badge } from '../ui/badge'
 import { Card } from '../ui/card'
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../ui/table'
 import { BusyGlyph } from '../ui/Waiting'
+import AnswersTable from './AnswersTable'
 import { auditLabel } from './auditLabels'
-import { agentFinding, readDeclaration, shortSha } from './declaration'
-import type { JudgedClass, QuestionDeclaration, ReviewVerdict } from './declaration'
-
-function parsed(iso: string): Date | null {
-  const d = new Date(iso)
-  return Number.isNaN(d.getTime()) ? null : d
-}
-
-const twoDigits = (n: number): string => String(n).padStart(2, '0')
-
-/** `25 Sep`, in the reader's own time zone. */
-export function dayMonth(iso: string): string {
-  const d = parsed(iso)
-  return d === null ? '—' : `${d.getDate()} ${MONTHS[d.getMonth()]}`
-}
-
-/** `25 Sep, 16:40`, in the reader's own time zone. */
-export function dayMonthTime(iso: string): string {
-  const d = parsed(iso)
-  return d === null ? '—' : `${dayMonth(iso)}, ${twoDigits(d.getHours())}:${twoDigits(d.getMinutes())}`
-}
-
-/** A person by the part of their address before the @, the way the admin screens name people. */
-export const handle = (email: string): string => email.split('@')[0]
+import { handle } from './columns'
+import { agentFinding, readDeclaration, shortSha, verdictWord } from './declaration'
+import type { QuestionDeclaration } from './declaration'
 
 const STATE_BADGE: Record<VersionState, { label: string; className: string }> = {
   waiting: { label: 'Waiting for review', className: 'border-amber-600/25 bg-amber-50 text-amber-700' },
@@ -82,26 +61,30 @@ function decisionText(decision: HistoryDecision): string {
   }
 }
 
+/** How many failed attempts came before the first that succeeded; nothing when it was the first. */
+function retriedText(attempts: HistoryAttempt[], first: number): string {
+  if (first === 0) return ''
+  const failed = attempts.slice(0, first)
+  const which = failed.length === 1 ? `the first ${failedWords(failed[0])}` : `the first ${failed.length} failed`
+  return `, on the ${ORDINALS[first] ?? `number ${first + 1}`} attempt (${which})`
+}
+
+/** What became of a published version since: replaced, taken offline, or nothing yet. */
+function afterText(version: HistoryVersion): string {
+  if (version.replacedBy !== null && version.replacedAt !== null) {
+    return ` · replaced by v${version.replacedBy} on ${dayMonth(version.replacedAt)}`
+  }
+  if (version.state === 'taken_offline') return ' · no longer live'
+  return ''
+}
+
 /** When the version went live and what replaced it, or where its publishing stands. Null when
  *  nothing was ever to be published, as for a version rejected or withdrawn. */
 function publishedText(version: HistoryVersion): string | null {
   const { attempts } = version
   const first = attempts.findIndex((attempt) => attempt.status === 'succeeded')
   if (first >= 0 && version.publishedAt !== null) {
-    const failed = attempts.slice(0, first)
-    const retried =
-      first === 0
-        ? ''
-        : `, on the ${ORDINALS[first] ?? `number ${first + 1}`} attempt (${
-            failed.length === 1 ? `the first ${failedWords(failed[0])}` : `the first ${failed.length} failed`
-          })`
-    const after =
-      version.replacedBy !== null && version.replacedAt !== null
-        ? ` · replaced by v${version.replacedBy} on ${dayMonth(version.replacedAt)}`
-        : version.state === 'taken_offline'
-          ? ' · no longer live'
-          : ''
-    return `${dayMonthTime(version.publishedAt)}${retried}${after}`
+    return `${dayMonthTime(version.publishedAt)}${retriedText(attempts, first)}${afterText(version)}`
   }
   const last = attempts.at(-1)
   if (last?.status === 'running') return `Not yet: publishing since ${dayMonthTime(last.startedAt)}`
@@ -119,13 +102,6 @@ const CHIP_TONE: Record<Tone, string> = {
   rest: 'bg-slate-100 text-slate-600',
 }
 
-function verdictWord(verdict: ReviewVerdict | null): string {
-  if (verdict === 'yes') return 'Yes'
-  if (verdict === 'no') return 'No'
-  if (verdict === 'unanswered') return 'could not tell'
-  return '—'
-}
-
 /** A six-question version's answers: the Yes answers, then where the agent and the owner
  *  disagreed, then how many questions were No. */
 function answerChips(read: QuestionDeclaration): { tone: Tone; text: string }[] {
@@ -139,56 +115,12 @@ function answerChips(read: QuestionDeclaration): { tone: Tone; text: string }[] 
     ...settled.filter((row) => row.yes).map((row) => ({ tone: 'yes' as const, text: `${row.label} · Yes` })),
     ...read.disputes.map((row) => ({
       tone: 'changed' as const,
-      text: `${row.label} · agent ${verdictWord(row.reviewVerdict)}, owner ${
+      text: `${row.label} · agent ${verdictWord(row.reviewVerdict, 'history')}, owner ${
         row.citizenYes === null ? '—' : row.citizenYes ? 'Yes' : 'No'
       }`,
     })),
     ...(noCount === 0 ? [] : [{ tone: 'rest' as const, text: `${noCount} other ${noCount === 1 ? 'class' : 'classes'} No` }]),
   ]
-}
-
-const ANSWER_HEAD = 'py-2 pr-3 tracking-[0.6px]'
-const ANSWER_CELL = 'py-2 pr-3'
-
-function Answer({ yes, className }: { yes: boolean | null; className?: string }) {
-  if (yes === null) return <span className="text-neutral">—</span>
-  return <span className={cn(yes && 'font-bold', className)}>{yes ? 'Yes' : 'No'}</span>
-}
-
-/** Each class as it was judged, the agent's answer beside the owner's. The owner's column is a
- *  dash for a hard block, and for every class when owners could not change answers. */
-export function AnswersTable({ classes }: { classes: JudgedClass[] }) {
-  return (
-    <div className="overflow-hidden rounded-[10px] border border-bial-border">
-      <Table className="table-fixed text-[12.5px] leading-[normal] text-primary-900">
-        <TableHeader className="bg-bial-bg/60">
-          <TableRow className="border-b border-bial-border">
-            <TableHead className={cn(ANSWER_HEAD, 'pl-3.5')}>Class</TableHead>
-            <TableHead className={cn(ANSWER_HEAD, 'w-[122px]')}>Kind</TableHead>
-            <TableHead className={cn(ANSWER_HEAD, 'w-[102px]')}>Agent</TableHead>
-            <TableHead className={cn(ANSWER_HEAD, 'w-[104px] pr-3.5')}>Owner</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {classes.map((entry) => (
-            <TableRow key={entry.key} data-testid={`answer-${entry.key}`} className={cn(entry.changed && 'bg-amber-50')}>
-              <TableCell className={cn(ANSWER_CELL, 'pl-3.5 font-semibold text-tertiary')}>{entry.title}</TableCell>
-              <TableCell className={cn(ANSWER_CELL, 'text-neutral')}>
-                {entry.kind === 'hard_block' ? 'Hard block' : `Scored${entry.weight === null ? '' : ` · ${entry.weight}`}`}
-              </TableCell>
-              <TableCell className={ANSWER_CELL}>
-                <Answer yes={entry.agent} className={cn(entry.kind === 'hard_block' && entry.agent && 'text-red-700')} />
-              </TableCell>
-              <TableCell className={cn(ANSWER_CELL, 'pr-3.5')}>
-                <Answer yes={entry.owner} className={cn(entry.changed && 'font-bold text-amber-700')} />
-                {entry.changed && <span className="sr-only">changed by the owner</span>}
-              </TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </div>
-  )
 }
 
 function Row({ label, children }: { label: string; children: string }) {

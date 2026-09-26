@@ -14,6 +14,7 @@
 import { assertNever } from './assertNever'
 import { MONTHS } from './monthNames'
 import type { ApprovalState, DeploymentView, PublishState } from './deployApi'
+import type { PublishPhase } from '../hooks/usePublishState'
 
 /**
  * What a press will ATTEMPT. Every one of these except `take_it_back` is a publish of one named
@@ -44,6 +45,14 @@ export const ACTION_LABEL: Record<ActionKind, string> = {
  * the rail panel and the chip's popover — so the two cannot disagree.
  */
 export const SECONDARY_ACTIONS: ReadonlySet<ActionKind> = new Set<ActionKind>(['take_it_back'])
+
+/** What the action button says while its press is working, or null when nothing is. */
+export function busyLabel(withdrawing: boolean, publishPhase: PublishPhase | null): string | null {
+  if (withdrawing) return 'Taking it back…'
+  if (publishPhase === 'saving') return 'Saving…'
+  if (publishPhase === 'publishing') return 'Publishing…'
+  return null
+}
 
 /**
  * Which version this state is ABOUT — the ONE version the chip's popover names, drawn from

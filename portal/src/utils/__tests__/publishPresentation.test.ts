@@ -17,6 +17,7 @@ import path from 'node:path'
 import { stripComments } from '../../__tests__/_stripComments'
 import {
   ACTION_LABEL,
+  busyLabel,
   canBeRestarted,
   formatStamp,
   lookFor,
@@ -447,5 +448,20 @@ describe('a published date reads the same on every machine', () => {
 
   it('hands an unreadable instant back unchanged rather than printing the words', () => {
     expect(formatStamp('not-a-date')).toBe('not-a-date')
+  })
+})
+
+describe('the action button says what its press is doing, on both surfaces', () => {
+  it('names the wait, taking a submission back first', () => {
+    // Withdrawing and publishing never overlap in practice; the order only decides which word
+    // wins if they ever did, and it is the chip's and the panel's alike.
+    expect(busyLabel(true, null)).toBe('Taking it back…')
+    expect(busyLabel(true, 'publishing')).toBe('Taking it back…')
+    expect(busyLabel(false, 'saving')).toBe('Saving…')
+    expect(busyLabel(false, 'publishing')).toBe('Publishing…')
+  })
+
+  it('is null when nothing is working, so each surface keeps its own resting label', () => {
+    expect(busyLabel(false, null)).toBeNull()
   })
 })

@@ -28,7 +28,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final
+from typing import Final, TypedDict
 
 import structlog
 from fastapi import APIRouter, Depends, Response, status
@@ -165,13 +165,22 @@ async def _saved_version(storage: ObjectStorage, app_id: uuid.UUID) -> _SavedVer
     )
 
 
+class _Scoring(TypedDict):
+    policy: ReviewPolicy
+    classes: list[ReviewClass]
+
+
+def _scoring(config: LiveConfig) -> _Scoring:
+    """The live policy and classes every response carries, for the dialog to score with."""
+    return {
+        "policy": ReviewPolicy.of(config),
+        "classes": ReviewClass.in_display_order(config.classes),
+    }
+
+
 def _nothing_to_review(config: LiveConfig) -> ClassificationReviewResponse:
     """No saved code — no answers, and nothing for a review to read."""
-    return ClassificationReviewResponse(
-        status="nothing_to_review",
-        policy=ReviewPolicy.of(config),
-        classes=ReviewClass.in_display_order(config.classes),
-    )
+    return ClassificationReviewResponse(status="nothing_to_review", **_scoring(config))
 
 
 def _unreadable_stamp(
@@ -185,8 +194,7 @@ def _unreadable_stamp(
     _log.warning("classification_review_bundle_has_no_stamp", app_id=str(app_id))
     return ClassificationReviewResponse(
         status="failed",
-        policy=ReviewPolicy.of(config),
-        classes=ReviewClass.in_display_order(config.classes),
+        **_scoring(config),
         saved_at=saved.saved_at,
         failure_code=FAIL_BUNDLE_UNREADABLE,
         failure_message=_FAILURE_SENTENCES[FAIL_BUNDLE_UNREADABLE],
@@ -206,13 +214,11 @@ def _presented(
     current = saved.head_sha is not None and is_for(
         record, head_sha=saved.head_sha, fingerprint=config.fingerprint
     )
-    policy = ReviewPolicy.of(config)
-    classes = ReviewClass.in_display_order(config.classes)
+    scoring = _scoring(config)
     if record.status is ClassificationReviewStatus.RUNNING and not aged_out:
         return ClassificationReviewResponse(
             status="running",
-            policy=policy,
-            classes=classes,
+            **scoring,
             head_sha=saved.head_sha,
             saved_at=saved.saved_at,
             reviewed_sha=record.head_sha,
@@ -225,8 +231,7 @@ def _presented(
             raise RuntimeError(f"complete review {record.review_id} has no verdicts document")
         return ClassificationReviewResponse(
             status="complete",
-            policy=policy,
-            classes=classes,
+            **scoring,
             head_sha=saved.head_sha,
             saved_at=saved.saved_at,
             reviewed_sha=record.head_sha,
@@ -239,8 +244,7 @@ def _presented(
         raise RuntimeError(f"failed review {record.review_id} carries no failure code")
     return ClassificationReviewResponse(
         status="failed",
-        policy=policy,
-        classes=classes,
+        **scoring,
         head_sha=saved.head_sha,
         saved_at=saved.saved_at,
         reviewed_sha=record.head_sha,
@@ -365,8 +369,7 @@ async def read_review(
         # what claims one), answered with the version facts and no verdicts.
         return ClassificationReviewResponse(
             status="not_reviewed",
-            policy=ReviewPolicy.of(config),
-            classes=ReviewClass.in_display_order(config.classes),
+            **_scoring(config),
             head_sha=saved.head_sha,
             saved_at=saved.saved_at,
         )

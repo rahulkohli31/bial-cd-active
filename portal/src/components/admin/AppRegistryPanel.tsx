@@ -12,9 +12,10 @@ import type {
   RegistryApp, RegistryList, RegistryStatus, AppStatus, LiveVersion, SubmittedDeclaration,
 } from '../../utils/appRegistryApi'
 import { ApiError } from '../../utils/apiError'
+import { dayMonth, dayMonthTime } from '../../utils/projectDates'
 import { readDeclaration, shortSha } from './declaration'
 import AppSheet from './AppSheet'
-import { dayMonth, dayMonthTime, handle } from './AppHistoryTab'
+import { handle } from './columns'
 import {
   countWords,
   MIN_DELETE_REASON_WORDS,
@@ -586,26 +587,14 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
 }
 
 /**
- * THE ADMIN DELETE'S REASON.
+ * The admin delete's reason, on the vendored Radix `Dialog`: it gives the focus trap, Escape and
+ * the overlay click, and routes the last two through `onOpenChange`, where `busy` holds the dialog
+ * open mid-request. The panel restores focus, because the dialog opens from a menu item that is
+ * gone by the time it closes.
  *
- * ON THE VENDORED RADIX `Dialog`, like every other dialog in this portal — and this one was
- * hand-rolled when it first landed, which reintroduced in the admin panel the exact defect a
- * vendored dialog exists to close: a `fixed inset-0` div with `role="dialog"` gives no focus
- * trap, no Escape, and no focus restored to the control that opened it. The most destructive
- * control on this screen must not be the one with the weakest keyboard contract. Radix gives
- * the trap, Escape and the overlay click (both routed through `onOpenChange`, so `busy` guards
- * them the way the hand-rolled overlay only guarded its own click). The restore is the panel's,
- * because the dialog opens from a menu item that is gone by the time it closes.
- *
- * A `window.confirm` stood here before that. It could not collect anything, and the route now
- * REQUIRES a word-bounded justification — so the old control would 422 on every press. The words ride the
- * `app:delete` audit row, which is written before destruction and carries no foreign key to
- * the app, so it is still readable long after what it describes is gone.
- *
- * SAME WORD RULE AS THE CITIZEN'S OWN DELETE, from the shared `utils/words.ts` (mirrored at
- * `src/core/words.py`): the harsher act — an administrator destroying work that is not theirs,
- * with no undo and no export — should not ask for less than the gentler one. The client keeps
- * the person inside the bounds; the server is what enforces them.
+ * The reason is word-bounded by the same rule as the citizen's own delete (`utils/words.ts`,
+ * mirrored at `src/core/words.py`) and rides the `app:delete` audit row, which outlives the app.
+ * The client keeps the person inside the bounds; the server enforces them.
  */
 function DeleteAppDialog({ app, reason, onReason, busy, onClose, onConfirm }: {
   app: RegistryApp
