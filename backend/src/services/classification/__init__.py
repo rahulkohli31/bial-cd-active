@@ -6,6 +6,7 @@ Module map (mirrors `services/deploy`'s layout; consumers import the module they
 `from src.services.classification import store`):
 
 * `store` — the one-row-per-app review row: claim-or-return, guarded terminal writes.
+* `config` — the live configuration: the active classes and the policy, read together.
 * `agent` — the module-level review agent: no bound model, tool-calling structured
   output, the thinking-off guard, and `run_review` (the entry the runner calls).
 * `schema` — the structured output: six verdicts in evidence → reason → verdict order,

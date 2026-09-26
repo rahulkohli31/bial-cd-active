@@ -171,6 +171,7 @@ _EXPECTED_COLUMNS = frozenset(
         "user_id",
         "app_id",
         "head_sha",
+        "definitions_fingerprint",
         "status",
         "attempt",
         "verdicts",

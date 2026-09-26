@@ -1137,6 +1137,253 @@
         "title": "ChatKindInfo",
         "type": "object"
       },
+      "ClassificationClassCreate": {
+        "description": "A new class. A hard block ignores `weight`; a scored class needs one.",
+        "properties": {
+          "active": {
+            "default": true,
+            "title": "Active",
+            "type": "boolean"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ClassificationKind"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "weight": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight"
+          }
+        },
+        "required": [
+          "title",
+          "description",
+          "kind"
+        ],
+        "title": "ClassificationClassCreate",
+        "type": "object"
+      },
+      "ClassificationClassOut": {
+        "description": "One class, with who last changed it. `updatedByName` is null on a seeded class nobody has\nedited, and after that administrator's account is deleted.",
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ClassificationKind"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "updatedAt": {
+            "format": "date-time",
+            "title": "Updatedat",
+            "type": "string"
+          },
+          "updatedByName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updatedbyname"
+          },
+          "weight": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight"
+          }
+        },
+        "required": [
+          "key",
+          "title",
+          "description",
+          "kind",
+          "weight",
+          "active",
+          "updatedAt",
+          "updatedByName"
+        ],
+        "title": "ClassificationClassOut",
+        "type": "object"
+      },
+      "ClassificationClassUpdate": {
+        "description": "Any of a class's fields but its key. A field left out keeps its value. Switching to hard\nblock clears the weight; switching to scored needs one.",
+        "properties": {
+          "active": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ClassificationKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "weight": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight"
+          }
+        },
+        "title": "ClassificationClassUpdate",
+        "type": "object"
+      },
+      "ClassificationConfigResponse": {
+        "description": "The policy and every class, active or not: hard blocks first, then scored classes by\nweight, highest first.",
+        "properties": {
+          "classes": {
+            "items": {
+              "$ref": "#/components/schemas/ClassificationClassOut"
+            },
+            "title": "Classes",
+            "type": "array"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/ClassificationPolicyOut"
+          }
+        },
+        "required": [
+          "policy",
+          "classes"
+        ],
+        "title": "ClassificationConfigResponse",
+        "type": "object"
+      },
+      "ClassificationKind": {
+        "description": "A hard block routes the app to review on a Yes whatever the score. A scored class adds\nits weight to the score on a Yes.",
+        "enum": [
+          "hard_block",
+          "scored"
+        ],
+        "title": "ClassificationKind",
+        "type": "string"
+      },
+      "ClassificationPolicyOut": {
+        "description": "The two settings every send is scored with.",
+        "properties": {
+          "ownersCanChangeAnswers": {
+            "title": "Ownerscanchangeanswers",
+            "type": "boolean"
+          },
+          "threshold": {
+            "title": "Threshold",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "threshold",
+          "ownersCanChangeAnswers"
+        ],
+        "title": "ClassificationPolicyOut",
+        "type": "object"
+      },
+      "ClassificationPolicyUpdate": {
+        "description": "Either setting, or both. A setting left out keeps its value.",
+        "properties": {
+          "ownersCanChangeAnswers": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ownerscanchangeanswers"
+          },
+          "threshold": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Threshold"
+          }
+        },
+        "title": "ClassificationPolicyUpdate",
+        "type": "object"
+      },
       "ClassificationReviewResponse": {
         "description": "What the dialog knows: the version on record, what the review said about it (or\nwhy it could not say), and nothing an administrator sees that a citizen must not.\n\nTWO STAMPS, deliberately. `head_sha` is the CURRENT saved version (read from the\nsnapshot blob's metadata at answer time) and `reviewed_sha` is the version the\nstored review examined. They differ exactly when a Save landed after the review —\nthe dialog filters by the stamp it asked for, so a second tab's newer review can never\npaint answers for a version this dialog never named.",
         "properties": {
@@ -6477,6 +6724,315 @@
           }
         },
         "summary": "Unpublish",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/admin/classification": {
+      "get": {
+        "description": "The publish classification configuration: the policy, and every class with its\ndescription, kind, weight, whether it is active, and who changed it last and when.",
+        "operationId": "read_classification_config_v1_admin_classification_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClassificationConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Super-admin privileges required"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Read Classification Config",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/admin/classification/classes": {
+      "post": {
+        "description": "Add a class. Its key is made from the title, with a numeric suffix when that is taken,\nand never changes. A title another class holds, in any letter case, is `409\nduplicate_title`. Writes one `classification:config` audit row and answers with the whole\nconfiguration.",
+        "operationId": "add_classification_class_v1_admin_classification_classes_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClassificationClassCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClassificationConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Super-admin privileges required, or the CSRF check failed (`csrf_failed`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Another class has this title (`duplicate_title`)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A scored class with no weight (`weight_required`), or a body that fails validation"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Add Classification Class",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/admin/classification/classes/{key}": {
+      "patch": {
+        "description": "Change a class's title, description, kind, weight or whether it is active. The key never\nchanges. Turning a class off takes it out of every review and score from the next send.\nWrites one `classification:config` audit row and answers with the whole configuration.",
+        "operationId": "edit_classification_class_v1_admin_classification_classes__key__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "title": "Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClassificationClassUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClassificationConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Super-admin privileges required, or the CSRF check failed (`csrf_failed`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No class has this key (`class_not_found`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Another class has this title (`duplicate_title`)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A scored class with no weight (`weight_required`), or a body that fails validation"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Edit Classification Class",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/admin/classification/policy": {
+      "patch": {
+        "description": "Change the threshold (a whole number from 0 to 100), whether owners can change the\nreviewer's answers, or both. Applies to apps sent for publishing after it. Writes one\n`classification:config` audit row and answers with the whole configuration.",
+        "operationId": "update_classification_policy_v1_admin_classification_policy_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClassificationPolicyUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClassificationConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Super-admin privileges required, or the CSRF check failed (`csrf_failed`)"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Update Classification Policy",
         "tags": [
           "admin"
         ]

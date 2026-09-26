@@ -78,6 +78,10 @@ class ClassificationReview(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMix
     # be exactly the un-datable answer this table exists to prevent.
     head_sha: Mapped[str] = mapped_column(sa.String(40), nullable=False)
 
+    # The class-definition fingerprint the review read. A row without one predates fingerprints
+    # and is never current.
+    definitions_fingerprint: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+
     status: Mapped[ClassificationReviewStatus] = mapped_column(
         classification_review_status_enum,
         nullable=False,
