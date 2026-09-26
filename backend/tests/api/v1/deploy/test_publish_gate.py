@@ -869,6 +869,42 @@ async def test_a_pending_app_is_refused_with_the_state_the_surfaces_must_render(
     assert wire.pipeline.started == []
 
 
+@pytest.mark.parametrize(
+    ("rule", "overrides"),
+    [
+        pytest.param("disabled", {"status": AppStatus.DISABLED}, id="disabled"),
+        pytest.param(
+            "pending",
+            {
+                "status": AppStatus.PENDING,
+                "source_submission_id": uuid.uuid4(),
+                "source_commit_sha": _OLDER_SHA,
+                "submitted_at": datetime(2026, 9, 25, tzinfo=UTC),
+            },
+            id="pending",
+        ),
+    ],
+)
+async def test_a_refusal_records_the_refusal_and_not_the_owner_answers(
+    wire, client, db_session, rule: str, overrides: dict[str, Any]
+) -> None:
+    """No decision read the answers, and the request does not bound how many it carries, so
+    storing them would let any owner of a refused app grow the audit trail at will."""
+    user, app_row = await _owner_with_saved_app(db_session, wire.store, **overrides)
+
+    resp = await _post(
+        client, user, app_row, _body(note=_NOTE, answers={"integrations": False, "ai_usage": True})
+    )
+
+    assert resp.status_code == 409
+    (row,) = await _gate_rows(db_session, app_row.id)
+    assert row.detail is not None
+    assert (row.detail["decision"], row.detail["rule"]) == ("refused", rule)
+    assert row.detail["note"] == _NOTE
+    assert "ownerAnswers" not in row.detail
+    assert "declaration" not in row.detail
+
+
 # --- properties that hold across the rungs -------------------------------------------
 
 

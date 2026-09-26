@@ -238,6 +238,16 @@ export function presentationFor(
       // owner's own take-down as well as by an administrator's, and telling an owner that an
       // administrator did what they just did themselves is worse than saying nothing about who.
       // What does not change is the remedy, which is the half that matters.
+      if (approvedRetryCommit !== null) {
+        return {
+          label: 'Taken offline',
+          sentence:
+            'This app is not running in production. Publishing again puts the version an ' +
+            'administrator approved back at the same address — not anything you have saved since.',
+          action: 'publish_again',
+          version: 'approved',
+        }
+      }
       return {
         label: 'Taken offline',
         sentence:

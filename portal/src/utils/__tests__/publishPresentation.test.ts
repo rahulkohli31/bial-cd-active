@@ -24,6 +24,7 @@ import {
   presentationFor,
   provenanceRows,
   savedRow,
+  versionRowData,
 } from '../publishPresentation'
 import type { ApprovalState, DeploymentView, PublishState } from '../deployApi'
 
@@ -374,6 +375,39 @@ describe('the state vocabulary is the product\'s, not a surface\'s', () => {
     const plain = presentationFor('did_not_start', null)
     expect(plain.label).toBe("Didn't start")
     expect(plain.action).toBe('try_again')
+  })
+
+  it('★ an approved copy the server will not retry is not what Try again promises', () => {
+    // After the approved copy fails in itself the server hands back no approved commit, and the
+    // button sends the saved version through the dialog instead.
+    const plain = presentationFor('did_not_start', null)
+    expect(plain.action).toBe('try_again')
+    expect(plain.version).toBe('none')
+    expect(plain.sentence).not.toMatch(/approved|saved since/i)
+  })
+
+  it('★ Publish again after the approved version came down says that version is what goes back', () => {
+    const again = presentationFor('taken_offline', SHA)
+    expect(again.label).toBe('Taken offline')
+    expect(again.action).toBe('publish_again')
+    expect(again.sentence).toMatch(/version an administrator approved/i)
+    expect(again.sentence).toMatch(/not anything you have saved since/i)
+    expect(again.version).toBe(presentationFor('did_not_start', SHA).version)
+
+    const approved = approval({ approvedAt: '2026-09-20T09:00:00Z', approvedCommitSha: SHA })
+    expect(versionRowData(again.version, view({ headSha: SHA }), approved)).toMatchObject({
+      heading: 'Approved version',
+      sha: SHA,
+    })
+  })
+
+  it('★ Publish again after a takedown with no approved copy says what it always said', () => {
+    expect(presentationFor('taken_offline', null)).toEqual({
+      label: 'Taken offline',
+      sentence: 'This app is not running in production. Publishing again puts it back at the same address.',
+      action: 'publish_again',
+      version: 'last_published',
+    })
   })
 
   it('★ no state anywhere in the table answers with a restart-specific label', () => {

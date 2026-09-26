@@ -449,9 +449,11 @@ async def test_the_approved_version_taken_offline_publishes_again_without_review
     assert wire.extracted_from == [submission_key(app_row.id, submission_id)]
 
 
-async def test_a_failed_approved_publish_writes_no_chat_card_and_offers_the_copy_again(
+async def test_an_approved_copy_that_will_not_build_writes_no_chat_card_and_is_not_offered_again(
     wire, client, db_session
 ) -> None:
+    """Try again would rebuild the same copy and fail the same way, so the owner's one button
+    acts on the saved version, where a fix can be sent."""
     owner, app_row, submission_id = await _submitted_for_review(wire, client, db_session)
     await ConversationFactory.create(
         db_session, user_id=owner.id, project_id=app_row.project_id, id=app_row.conversation_id
@@ -470,7 +472,7 @@ async def test_a_failed_approved_publish_writes_no_chat_card_and_offers_the_copy
     assert cards.all() == []
     status = await _status(client, owner, app_row)
     assert status["publishState"] == "did_not_start"
-    assert status["approvedRetryCommit"] == wire.submitted[1]
+    assert status["approvedRetryCommit"] is None
 
 
 async def _registry_row(client, admin, app_row: AppRegistry) -> dict[str, Any]:
@@ -542,7 +544,7 @@ async def test_a_newer_version_failing_before_it_names_a_commit_is_not_the_copy_
                 app_id=app_row.id,
                 user_id=owner.id,
                 status=DeploymentStatus.FAILED,
-                failure_code="snapshot_moved",
+                failure_code="interrupted",
                 created_at=datetime.now(UTC) - timedelta(hours=1),
             ),
         ]
@@ -571,7 +573,7 @@ async def test_a_first_attempt_failing_before_it_names_a_commit_retries_the_copy
             app_id=app_row.id,
             user_id=owner.id,
             status=DeploymentStatus.FAILED,
-            failure_code="snapshot_unreadable",
+            failure_code="internal_error",
             created_at=datetime.now(UTC) - timedelta(hours=1),
         )
     )
@@ -592,7 +594,7 @@ async def test_a_row_that_names_its_commit_costs_the_poll_no_extra_read(
             app_id=app_row.id,
             user_id=owner.id,
             status=DeploymentStatus.FAILED,
-            failure_code="build_failed",
+            failure_code="provision_failed",
             head_sha=wire.submitted[1],
             created_at=datetime.now(UTC) - timedelta(hours=1),
         )

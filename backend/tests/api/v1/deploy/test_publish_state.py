@@ -20,6 +20,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from src.api.v1.deploy.schemas import (
+    _NON_RETRYABLE_FAILURE_CODES,
+    _RESTART_FAILURE_CODES,
+    _RETRYABLE_FAILURE_CODES,
+    _ROUTED_FAILURE_CODES,
     PublishState,
     RegistryStatus,
     approved_retry_commit,
@@ -30,11 +34,13 @@ from src.api.v1.deploy.schemas import (
 )
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
+from src.services.deploy import service as deploy_service
 from src.services.deploy.service import (
     FAIL_RESTART,
     FAIL_RESTART_NOT_READY,
     FAIL_ROUTED_FOR_REVIEW,
 )
+from src.services.deploy.store import INTERRUPTED
 
 _LIVE_SHA = "aa" * 20
 _SAVED_SHA = "bb" * 20
@@ -271,11 +277,22 @@ def test_the_attempt_the_approval_starts_counts_as_since_approval() -> None:
             _SUBMITTED_SHA,
             _deployment(
                 status=DeploymentStatus.FAILED,
-                failure_code="build_failed",
+                failure_code="provision_failed",
                 head_sha=_SUBMITTED_SHA,
             ),
             _SAVED_SHA,
             id="did_not_start: the attempt at the approved copy failed; try it again",
+        ),
+        pytest.param(
+            PublishState.DID_NOT_START,
+            None,
+            _deployment(
+                status=DeploymentStatus.FAILED,
+                failure_code="build_failed",
+                head_sha=_SUBMITTED_SHA,
+            ),
+            _SAVED_SHA,
+            id="did_not_start: the approved copy will not build; act on the saved version",
         ),
         pytest.param(
             PublishState.DID_NOT_START,
@@ -288,7 +305,9 @@ def test_the_attempt_the_approval_starts_counts_as_since_approval() -> None:
             PublishState.DID_NOT_START,
             None,
             _deployment(
-                status=DeploymentStatus.FAILED, failure_code="build_failed", head_sha=_SAVED_SHA
+                status=DeploymentStatus.FAILED,
+                failure_code="provision_failed",
+                head_sha=_SAVED_SHA,
             ),
             _SAVED_SHA,
             id="did_not_start: a later version failed; that one is retried through the gate",
@@ -349,7 +368,7 @@ def test_once_attempted_the_attempt_speaks_for_the_approved_copy(
 def test_approved_then_try_again_failed_then_succeeded_reads_live() -> None:
     app = _approved(_SUBMITTED_SHA)
     failed = _deployment(
-        status=DeploymentStatus.FAILED, failure_code="revision_unhealthy", head_sha=_SUBMITTED_SHA
+        status=DeploymentStatus.FAILED, failure_code="provision_failed", head_sha=_SUBMITTED_SHA
     )
     assert compute_publish_state(app, failed, _SUBMITTED_SHA) is PublishState.DID_NOT_START
     assert approved_retry_commit(app, failed, approved_went_live=False) == _SUBMITTED_SHA
@@ -366,7 +385,7 @@ def test_a_nameless_failure_after_the_copy_went_live_goes_back_through_the_gate(
     commit. Try again retries that later version through the gate — republishing the copy
     already serving would ignore what the owner just sent."""
     app = _approved(_SUBMITTED_SHA)
-    failed = _deployment(status=DeploymentStatus.FAILED, failure_code="snapshot_moved")
+    failed = _deployment(status=DeploymentStatus.FAILED, failure_code="internal_error")
 
     assert compute_publish_state(app, failed, _SAVED_SHA) is PublishState.DID_NOT_START
     assert retry_needs_last_publish(app, failed)
@@ -375,10 +394,43 @@ def test_a_nameless_failure_after_the_copy_went_live_goes_back_through_the_gate(
 
 def test_a_nameless_failure_with_nothing_live_since_approval_retries_the_copy() -> None:
     app = _approved(_SUBMITTED_SHA)
-    failed = _deployment(status=DeploymentStatus.FAILED, failure_code="snapshot_unreadable")
+    failed = _deployment(status=DeploymentStatus.FAILED, failure_code="interrupted")
 
     assert retry_needs_last_publish(app, failed)
     assert approved_retry_commit(app, failed, approved_went_live=False) == _SUBMITTED_SHA
+
+
+@pytest.mark.parametrize("code", sorted(_NON_RETRYABLE_FAILURE_CODES))
+def test_an_approved_copy_that_fails_in_itself_is_not_offered_again(code: str) -> None:
+    """It would fail the same way on every press, and the owner could never send the fix: the
+    one button acts on the saved version instead, named commit or not."""
+    app = _approved(_SUBMITTED_SHA)
+    for head in (_SUBMITTED_SHA, None):
+        failed = _deployment(status=DeploymentStatus.FAILED, failure_code=code, head_sha=head)
+
+        assert compute_publish_state(app, failed, _SAVED_SHA) is PublishState.DID_NOT_START
+        assert not retry_needs_last_publish(app, failed)
+        assert approved_retry_commit(app, failed, approved_went_live=False) is None
+
+
+def test_every_failure_code_is_sorted_into_exactly_one_set() -> None:
+    """Whether the one button retries the approved copy after a failure is decided per code, so
+    a code the pipeline gains must be placed before it ships."""
+    codes = {value for name, value in vars(deploy_service).items() if name.startswith("FAIL_")} | {
+        INTERRUPTED
+    }
+    placed = [
+        code
+        for group in (
+            _RETRYABLE_FAILURE_CODES,
+            _NON_RETRYABLE_FAILURE_CODES,
+            _RESTART_FAILURE_CODES,
+            _ROUTED_FAILURE_CODES,
+        )
+        for code in group
+    ]
+
+    assert sorted(placed) == sorted(codes)
 
 
 def test_only_a_nameless_failed_attempt_since_approval_asks_what_went_live() -> None:

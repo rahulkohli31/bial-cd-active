@@ -282,6 +282,8 @@ async def deploy_project(
     note = redact_secrets(body.note.strip()) if body.note and body.note.strip() else None
 
     # --- rules 1 and 2: plain refusals ----------------------------------------------
+    # A refusal row leaves out the owner's answers: no decision read them, and the body does not
+    # bound how many it carries.
     if app_row.status is AppStatus.DISABLED:
         await _audit_gate(
             db,
@@ -290,7 +292,7 @@ async def deploy_project(
             project_id=project_id,
             decision="refused",
             rule="disabled",
-            extra={"ownerAnswers": body.answers, "note": note},
+            extra={"note": note},
         )
         await db.commit()
         raise AppApiError(status.HTTP_409_CONFLICT, _DISABLED_MSG, code="app_disabled")
@@ -314,7 +316,7 @@ async def deploy_project(
             project_id=project_id,
             decision="refused",
             rule="pending",
-            extra={"ownerAnswers": body.answers, "note": note},
+            extra={"note": note},
         )
         await db.commit()
         raise AppApiError(
@@ -391,7 +393,7 @@ async def deploy_project(
         _log.warning(
             "publish_gate_owner_answers_ignored",
             app_id=str(app_row.id),
-            keys=sorted(body.answers),
+            count=len(body.answers),
         )
     decision = decide(
         config=config,

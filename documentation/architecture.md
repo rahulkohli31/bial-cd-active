@@ -149,8 +149,10 @@ other. Edits made afterwards are newer work, not part of what is being sent.
 version examined, and approving publishes that copy — as its author, whatever they have saved since.
 Work continued afterwards is unapproved until it is submitted and cleared in its own right, which is
 what stops an approval becoming a standing permission to ship anything later. When publishing cannot
-start at the moment of approval, the approval still stands, and the author's one action republishes
-the approved copy without a second review.
+start at the moment of approval, the approval still stands. Where the platform failed, the author's
+one action republishes the approved copy without a second review. Where the copy itself failed, a
+retry would fail the same way, so that action sends the author's saved version instead, and a fix
+can go out.
 
 A deploy takes minutes, far longer than an HTTP request may wait, so the request returns as soon as
 the work is accepted and the interface polls for the result.
