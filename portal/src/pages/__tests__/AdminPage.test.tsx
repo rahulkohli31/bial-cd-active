@@ -6,7 +6,7 @@
  *
  * `AppRegistryPanel` (the 'apps' tab, default) renders for REAL here, only its API module mocked —
  * this tests what AdminPage does with a callback a real panel actually invokes, not a synthetic
- * one. The other three tabs are stubbed (see below for why).
+ * one. The other tabs are stubbed (see below for why).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
@@ -33,6 +33,10 @@ vi.mock('../../utils/appRegistryApi', () => h)
 vi.mock('../../components/admin/UsersLimitsPanel', () => ({ default: () => null }))
 vi.mock('../../components/admin/GlobalLimitsPanel', () => ({ default: () => null }))
 vi.mock('../../components/admin/FeedbackPanel', () => ({ default: () => null }))
+// Its toasts are covered by its own suite; here it only has to prove the tab opens it.
+vi.mock('../../components/admin/ClassificationPanel', () => ({
+  default: () => <p>Classification settings</p>,
+}))
 
 import AdminPage from '../AdminPage'
 
@@ -202,5 +206,17 @@ describe('the console tabs', () => {
     expect(screen.getByRole('button', { name: 'Users & Limits' })).toBeTruthy()
     expect(screen.queryByRole('button', { name: /Integrations/ })).toBeNull()
     expect(screen.queryByTestId('waiting-count-integrations-tab')).toBeNull()
+  })
+
+  it('ends the tab row with Deployment Classification, which opens its panel', async () => {
+    renderAdmin()
+    await screen.findByText('Gate Tool')
+
+    const tabs = ['App Registry', 'Users & Limits', 'Global Limits', 'Feedback', 'Deployment Classification']
+    const row = screen.getByRole('button', { name: 'App Registry' }).parentElement
+    expect([...(row?.children ?? [])].map((tab) => tab.textContent)).toEqual(tabs)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Deployment Classification' }))
+    expect(screen.getByText('Classification settings')).toBeTruthy()
   })
 })

@@ -4,6 +4,7 @@ import UsersLimitsPanel from '../components/admin/UsersLimitsPanel'
 import GlobalLimitsPanel from '../components/admin/GlobalLimitsPanel'
 import FeedbackPanel from '../components/admin/FeedbackPanel'
 import AppRegistryPanel from '../components/admin/AppRegistryPanel'
+import ClassificationPanel from '../components/admin/ClassificationPanel'
 import { Info, Lock, AlertCircle } from 'lucide-react'
 import { getStoredUser } from '../utils/auth'
 
@@ -24,6 +25,7 @@ const TABS = [
   { id: 'users', label: 'Users & Limits' },
   { id: 'globalLimits', label: 'Global Limits' },
   { id: 'feedback', label: 'Feedback' },
+  { id: 'classification', label: 'Deployment Classification' },
 ]
 
 /**
@@ -109,6 +111,7 @@ export default function AdminPage() {
             {activeTab === 'users' && <UsersLimitsPanel onToast={showToast} />}
             {activeTab === 'globalLimits' && <GlobalLimitsPanel onToast={showToast} />}
             {activeTab === 'feedback' && <FeedbackPanel />}
+            {activeTab === 'classification' && <ClassificationPanel onToast={showToast} />}
           </div>
         </div>
       </div>

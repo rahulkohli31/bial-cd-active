@@ -239,6 +239,15 @@ describe('AdminDataTable — toolbar and selection', () => {
     expect(visibleIds()).toEqual(['row-i1'])
   })
 
+  it('the action closes the toolbar after the search, and the summary replaces the "Showing" line', () => {
+    renderTable([item(1), item(2)], { action: <button type="button">Add item</button>, summary: '2 items in all' })
+
+    const toolbar = search().parentElement
+    expect(toolbar?.lastElementChild?.textContent).toBe('Add item')
+    expect(screen.getByText('2 items in all')).toBeTruthy()
+    expect(screen.queryByText(/^Showing/)).toBeNull()
+  })
+
   it('row selection is TanStack state the panel owns, keyed by row id', () => {
     const seen: RowSelectionState[] = []
     const selectColumn: ColumnDef<Item> = {

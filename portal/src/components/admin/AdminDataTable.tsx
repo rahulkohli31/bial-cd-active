@@ -63,8 +63,12 @@ export type AdminDataTableProps<TRow> = SearchSource & {
   getRowId?: (row: TRow) => string
   /** The start of the toolbar: status filter tabs, a selection count. */
   toolbarStart?: (table: TanStackTable<TRow>) => ReactNode
-  /** Just before the search box, which closes the toolbar: owner, role or status selects. */
+  /** Just before the search box: owner, role or status selects. */
   toolbarEnd?: (table: TanStackTable<TRow>) => ReactNode
+  /** After the search box, closing the toolbar: the table's one primary action. */
+  action?: ReactNode
+  /** Takes the place of the "Showing a–b of N" line in the footer. */
+  summary?: ReactNode
   /** The server stopped at its cap, so these rows are not the whole list. */
   truncated?: boolean
   /** Rows are still arriving: an empty table shows the loading line, not the empty state. */
@@ -105,6 +109,8 @@ export default function AdminDataTable<TRow>({
   getRowId,
   toolbarStart,
   toolbarEnd,
+  action,
+  summary,
   truncated = false,
   loading = false,
   rowSelection,
@@ -186,6 +192,7 @@ export default function AdminDataTable<TRow>({
           placeholder={searchPlaceholder}
           className="h-[34px] w-[230px] rounded-lg bg-white px-3 text-[13px] text-tertiary shadow-none md:text-[13px]"
         />
+        {action}
       </div>
 
       {truncated && (
@@ -249,7 +256,7 @@ export default function AdminDataTable<TRow>({
           </div>
 
           <div className="flex flex-wrap items-center gap-3 text-xs text-neutral">
-            <p className="flex-grow">{`Showing ${fmt(firstShown)}–${fmt(lastShown)} of ${fmt(matched)}`}</p>
+            <p className="flex-grow">{summary ?? `Showing ${fmt(firstShown)}–${fmt(lastShown)} of ${fmt(matched)}`}</p>
             <span>Rows per page</span>
             <Select
               value={String(pageSize)}
