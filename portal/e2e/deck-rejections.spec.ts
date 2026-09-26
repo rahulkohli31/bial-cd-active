@@ -95,21 +95,21 @@ test.describe('deck attachment rejections (client-side)', () => {
     expect(model.count(), 'a rejected attachment must never reach the model').toBe(0)
   })
 
-  test('an oversize attachment (> 4 MB) is rejected and generates no assistant turn', async ({ page }) => {
+  test('an oversize PDF (> 20 MB) is rejected and generates no assistant turn', async ({ page }) => {
     const model = watchModelCalls(page)
     await openComposer(page)
 
     // A PDF, not the .pptx this used to use: with decks off the allowlist check fires
-    // BEFORE the size check, so an oversize .pptx never reaches the 4 MB cap and this test
+    // BEFORE the size check, so an oversize .pptx never reaches the size cap and this test
     // silently stopped exercising it. A PDF is accepted at any flag setting, so the cap is
     // genuinely the thing being tested again.
     await attachFile(page, {
       name: 'oversize.pdf',
       mimeType: 'application/pdf',
-      buffer: Buffer.alloc(4 * 1024 * 1024 + 128 * 1024), // ~4.1 MB > 4 MB cap
+      buffer: Buffer.alloc(20 * 1024 * 1024 + 128 * 1024), // just over the 20 MB PDF limit
     })
 
-    await expect(page.getByText('exceeds the 4 MB limit')).toBeVisible()
+    await expect(page.getByText('exceeds the 20 MB limit')).toBeVisible()
     await expect(page.getByText('oversize.pdf')).toHaveCount(0)
     expect(model.count(), 'a rejected attachment must never reach the model').toBe(0)
   })

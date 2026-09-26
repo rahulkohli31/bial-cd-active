@@ -43,9 +43,11 @@ PPTX_MEDIA_TYPE: Final = (
 CSV_MEDIA_TYPE: Final = "text/csv"
 TSV_MEDIA_TYPE: Final = "text/tab-separated-values"
 
-MODEL_LANE_MEDIA: Final[frozenset[str]] = frozenset(
-    {"image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"}
+_IMAGE_MEDIA: Final[frozenset[str]] = frozenset(
+    {"image/png", "image/jpeg", "image/gif", "image/webp"}
 )
+
+MODEL_LANE_MEDIA: Final[frozenset[str]] = _IMAGE_MEDIA | {"application/pdf"}
 """THE MODEL LANE, NAMED FOR REUSE — the same five formats as `magic.ALLOWED_MEDIA`'s keys,
 spelled here as a lane-membership set so a caller that only needs "is this the model's own lane"
 is not left reconstructing it from `CODE_LANE_MEDIA`'s negation. Cannot import `ALLOWED_MEDIA`
@@ -71,6 +73,27 @@ _DELIMITED: Final[dict[str, tuple[str, ...]]] = {
 }
 
 CODE_LANE_MEDIA: Final[frozenset[str]] = frozenset(_OPC_PART) | frozenset(_DELIMITED)
+
+# ONE SIZE LIMIT PER LANE, in MiB, with images split from PDFs inside the model lane. The upload
+# route is the only place they are enforced, and every refusal that names a size interpolates
+# them. The portal mirrors all three in `attachmentInput.ts`, and a test holds the two equal.
+IMAGE_MAX_MB: Final = 7
+"""The provider caps an image at 10 MB of base64, which is about 7.5 MB of file."""
+PDF_MAX_MB: Final = 20
+"""Base64 of a file this size is 28 MB, inside the provider's 32 MB request cap."""
+CODE_LANE_MAX_MB: Final = 30
+"""Code in the workspace reads these and the model never receives the bytes, so no provider cap
+applies."""
+
+
+def max_mb_for(media_type: str) -> int:
+    """The largest file of this media type the upload door stores, in MiB."""
+    if media_type in _IMAGE_MEDIA:
+        return IMAGE_MAX_MB
+    if media_type in MODEL_LANE_MEDIA:
+        return PDF_MAX_MB
+    return CODE_LANE_MAX_MB
+
 
 # THE SUFFIX THE READER DISPATCHES ON — not a display detail.
 #
@@ -171,7 +194,7 @@ the PDF 1.5+ form the dictionary that carries `/Encrypt` is the header of a cros
 and its compressed payload sits between that dictionary and the end of the file — for a
 thousand-page document that payload is kilobytes, so a four-kilobyte window would fall short of
 the dictionary and report every large encrypted document as unlocked. Sixty-four kilobytes is
-0.6% of the size cap and a few microseconds to scan."""
+0.3% of the PDF limit and a few microseconds to scan."""
 
 # `/Encrypt` is a trailer KEY, and the spec requires its value to be an indirect reference — so it
 # is always `/Encrypt <num> <gen> R`. Matching the reference rather than the bare word is what

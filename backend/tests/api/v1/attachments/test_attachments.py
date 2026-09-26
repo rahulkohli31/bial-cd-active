@@ -11,15 +11,15 @@ import struct
 import time
 import uuid
 import zipfile
+from collections.abc import Callable
 
+import pytest
 from openpyxl import Workbook
 from sqlalchemy import select
 from structlog.testing import capture_logs
 
 from src.api.v1.attachments.router import (
     ATTACHMENT_LANES_SENTENCE,
-    ATTACHMENT_MAX_BYTES,
-    ATTACHMENT_MAX_MB,
     MAX_ATTACHMENTS_PER_CONVERSATION,
 )
 from src.config import settings
@@ -73,6 +73,30 @@ def _zip_with(entries: dict[str, bytes]) -> bytes:
 
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
+
+
+_MIB = 1024 * 1024
+
+
+def _png_of(size: int) -> bytes:
+    return _PNG + b"\x00" * (size - len(_PNG))
+
+
+def _pdf_of(size: int) -> bytes:
+    """A one-page PDF padded to exactly `size` bytes by a comment line ahead of its first object.
+    The door reads a PDF's head and tail only, so the offsets the padding moves are not under
+    test."""
+    first = _PDF.index(b"1 0 obj")
+    return _PDF[:first] + b"%" + b"0" * (size - len(_PDF) - 2) + b"\n" + _PDF[first:]
+
+
+def _workbook_of(size: int) -> bytes:
+    """A workbook archive of exactly `size` bytes: its OPC part plus one stored padding entry."""
+
+    def archive(padding: int) -> bytes:
+        return _zip_with({"xl/workbook.xml": b"<workbook/>", "xl/media/pad.bin": bytes(padding)})
+
+    return archive(size - len(archive(0)))
 
 
 def _cookie(jwt: str) -> dict[str, str]:
@@ -319,94 +343,81 @@ async def test_missing_media_type_rejected(client, db_session) -> None:
     assert resp.json() == {"error": {"message": "mediaType is required."}}
 
 
-async def test_exactly_at_the_size_cap_is_accepted_and_one_byte_over_is_not(
-    client, db_session, fake_storage
+@pytest.mark.parametrize(
+    ("media_type", "build", "limit_mb"),
+    [
+        pytest.param("image/png", _png_of, 7, id="image"),
+        pytest.param("application/pdf", _pdf_of, 20, id="pdf"),
+        pytest.param(EXCEL_MEDIA_TYPE, _workbook_of, 30, id="workbook"),
+    ],
+)
+async def test_each_file_type_is_accepted_at_its_own_limit_and_refused_one_byte_over_it(
+    client,
+    db_session,
+    fake_storage,
+    media_type: str,
+    build: Callable[[int], bytes],
+    limit_mb: int,
 ) -> None:
-    """★ THE BOUNDARY, ON BOTH SIDES, AND THE NUMBER READ FROM THE CONSTANT.
-
-    This test used to spell "4 MB" into its own assertion, so the day the cap moved it went red
-    for the right reason with completely the wrong message — and it is not findable by grepping
-    for the symbol, which is how a hardcoded figure survives a rename. Sized and asserted from
-    `ATTACHMENT_MAX_BYTES` now, so the boundary follows the cap wherever it goes.
-
-    The accepted side matters as much as the refused one: an off-by-one that refuses a file
-    exactly at the cap is the same defect wearing the other sign.
-    """
+    """An off-by-one that refuses a file exactly at its limit is the same defect as one that
+    admits a byte more. The workbook is also the largest legal request body, so its accepted half
+    is what proves the request ceiling clears a legal file encoded as base64 JSON."""
     headers, _, conv = await _auth(db_session)
-    at_cap = b"\x89PNG\r\n\x1a\n" + b"\x00" * (ATTACHMENT_MAX_BYTES - 8)
-    ok = await client.post(
-        "/v1/attachments",
-        headers=headers,
-        json={
-            "conversationId": str(conv.id),
-            "attachmentId": "att_at_cap",
-            "mediaType": "image/png",
-            "base64": _b64(at_cap),
-        },
-    )
-    assert ok.status_code == 201
+    at_limit = build(limit_mb * _MIB)
+    assert len(at_limit) == limit_mb * _MIB
 
-    resp = await client.post(
+    accepted = await client.post(
         "/v1/attachments",
         headers=headers,
         json={
             "conversationId": str(conv.id),
-            "attachmentId": "att_big",
-            "mediaType": "image/png",
-            "base64": _b64(at_cap + b"\x00"),
+            "attachmentId": "att_at_limit",
+            "name": "at-limit",
+            "mediaType": media_type,
+            "base64": _b64(at_limit),
         },
     )
-    assert resp.status_code == 413
-    assert resp.json() == {
-        "error": {"message": f"Attachment is too large (max {ATTACHMENT_MAX_MB} MB)."}
+    assert accepted.status_code == 201, accepted.text
+
+    refused = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={
+            "conversationId": str(conv.id),
+            "attachmentId": "att_over_limit",
+            "name": "over-limit",
+            "mediaType": media_type,
+            "base64": _b64(at_limit + b"\x00"),
+        },
+    )
+    assert refused.status_code == 413
+    assert refused.json() == {
+        "error": {"message": f"Attachment is too large (max {limit_mb} MB)."}
     }
 
 
-async def test_a_request_body_over_the_wire_ceiling_is_refused_before_it_is_buffered(
+async def test_a_request_body_over_the_wire_ceiling_is_refused_before_it_is_read(
     client, db_session
 ) -> None:
-    """★ A BRANCH NOTHING COVERED, on a constant this work moved.
-
-    The wire ceiling is a different question from the size cap: it fires on the declared
-    Content-Length before the body is read at all, so it is what stops a hostile request being
-    buffered into memory. It therefore has to clear base64 of a legal file — 10 MiB encodes to
-    13,981,016 bytes — and a ceiling set too low would refuse files the door means to accept,
-    with a sentence about the REQUEST rather than about the file, and no test to say so.
-
-    Sent with a Content-Length header and a tiny body: the branch reads the header, so the test
-    does not have to move fifteen megabytes to reach it.
-    """
+    """The ceiling reads the declared Content-Length, so a tiny body is enough to reach both sides
+    of it: at the ceiling the route goes on to parse the body, one byte over it refuses the
+    request without reading any of it."""
     headers, _, conv = await _auth(db_session)
-    resp = await client.post(
+    at_ceiling = await client.post(
         "/v1/attachments",
-        headers={**headers, "content-length": str(64 * 1024 * 1024)},
+        headers={**headers, "content-length": str(44 * _MIB)},
         content=b"{}",
     )
-    assert resp.status_code == 413
-    assert resp.json() == {"error": {"message": "Attachment request is too large."}}
+    assert at_ceiling.status_code == 400
+    assert at_ceiling.json() == {"error": {"message": "Invalid attachment id."}}
 
-
-async def test_the_wire_ceiling_clears_a_legal_file_encoded(
-    client, db_session, fake_storage
-) -> None:
-    """The other side of the same constant, and the one that would fail silently: a cap-sized file
-    base64-encodes to about 13.3 MB on the wire, so a ceiling below that refuses every maximum
-    upload before it is even decoded."""
-    headers, _, conv = await _auth(db_session)
-    at_cap = b"\x89PNG\r\n\x1a\n" + b"\x00" * (ATTACHMENT_MAX_BYTES - 8)
-    body = _b64(at_cap)
-    assert len(body) > ATTACHMENT_MAX_BYTES  # base64 really is bigger than the file
-    resp = await client.post(
+    over = await client.post(
         "/v1/attachments",
-        headers=headers,
-        json={
-            "conversationId": str(conv.id),
-            "attachmentId": "att_wire",
-            "mediaType": "image/png",
-            "base64": body,
-        },
+        headers={**headers, "content-length": str(44 * _MIB + 1)},
+        content=b"{}",
     )
-    assert resp.status_code == 201
+    assert over.status_code == 413
+    assert over.json() == {"error": {"message": "Attachment request is too large."}}
 
 
 async def test_a_zip_bomb_is_refused_on_the_upload_lane(client, db_session, fake_storage) -> None:

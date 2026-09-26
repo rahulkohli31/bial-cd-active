@@ -1,13 +1,14 @@
-"""The two lane sentences, pinned across the stack.
+"""The two lane sentences and the three size limits, pinned across the stack.
 
 A citizen reads one of these in the composer and the other in a refusal, often in the same
 minute, so both halves have to carry the same words to the byte. Nothing compiles across the
 two languages: the backend constants are IMPORTED and the portal's are READ OFF ITS SOURCE,
 because deriving both from one place would let a mutation agree with itself.
 
-THE READER UNDERSTANDS ONE FORM: quoted string literals joined by `+`. Rewrite either
-declaration as a template literal or a call, or reach for a backslash escape outside the few
-below, and this goes red naming the declaration it could not read — a reformat, not a drift.
+THE READER UNDERSTANDS ONE FORM PER KIND: quoted string literals joined by `+` for a sentence, a
+bare integer literal for a limit. Rewrite a declaration in any other form, or reach for a
+backslash escape outside the few below, and this goes red naming the declaration it could not
+read — a reformat, not a drift.
 """
 
 from __future__ import annotations
@@ -16,10 +17,13 @@ import re
 from pathlib import Path
 from typing import Final
 
+import pytest
+
 from src.api.v1.attachments.router import (
     ATTACHMENT_LANES_SENTENCE,
     GENERIC_ATTACHMENT_LANES_SENTENCE,
 )
+from src.services.media.lanes import CODE_LANE_MAX_MB, IMAGE_MAX_MB, PDF_MAX_MB
 
 _ATTACHMENT_INPUT: Final = (
     Path(__file__).resolve().parents[5] / "portal" / "src" / "utils" / "attachmentInput.ts"
@@ -89,3 +93,28 @@ def test_the_generic_lane_sentence_is_the_portal_s_word_for_word() -> None:
     """The generic chat promises less because it can do less, and the browser refuses the
     file before the server ever sees it — so the two sides are each other's only witness."""
     assert _sentence("GENERIC_ATTACHMENT_LANES_SENTENCE") == GENERIC_ATTACHMENT_LANES_SENTENCE
+
+
+def _limit(name: str) -> int:
+    """The portal's value for `name`, written as a bare integer literal."""
+    source = _ATTACHMENT_INPUT.read_text(encoding="utf-8")
+    found = re.search(rf"^export const {name} = (\d+)$", source, re.MULTILINE)
+    assert found is not None, (
+        f"`{_ATTACHMENT_INPUT.name}` no longer exports `{name}` as a bare integer literal, so "
+        "this reader cannot see its value and the comparison below would be vacuous"
+    )
+    return int(found.group(1))
+
+
+@pytest.mark.parametrize(
+    ("name", "server_limit"),
+    [
+        ("IMAGE_MAX_MB", IMAGE_MAX_MB),
+        ("PDF_MAX_MB", PDF_MAX_MB),
+        ("CODE_LANE_MAX_MB", CODE_LANE_MAX_MB),
+    ],
+)
+def test_each_size_limit_is_the_portal_s_number_for_number(name: str, server_limit: int) -> None:
+    """The browser refuses an oversized file before it uploads. Set lower than the server's, it
+    refuses files the server takes; set higher, a citizen waits out an upload that is refused."""
+    assert _limit(name) == server_limit
