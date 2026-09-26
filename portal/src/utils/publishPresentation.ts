@@ -17,7 +17,7 @@ import type { ApprovalState, DeploymentView, PublishState } from './deployApi'
 
 /**
  * What a press will ATTEMPT. Every one of these except `take_it_back` is a publish of one named
- * version: the saved one, through the questionnaire, or — where the server hands back an
+ * version: the saved one, through the publish dialog, or — where the server hands back an
  * approved commit — the approved copy, directly. There is no client-side threshold check. They
  * differ only in what the button honestly promises.
  */

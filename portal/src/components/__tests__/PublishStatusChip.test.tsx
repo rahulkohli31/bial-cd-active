@@ -9,16 +9,16 @@
  * now.
  *
  * The hook is mocked at the module boundary (see
- * `usePublishState.reconciliation.test.tsx`); the questionnaire is stubbed too
- * (`DataClassificationModal.test.tsx` owns it).
+ * `usePublishState.reconciliation.test.tsx`); the publish dialog is stubbed too
+ * (`PublishDialog.test.tsx` owns it).
  */
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react'
 
 import type {
   ApprovalState,
-  DataClassificationAnswers,
   DeploymentView,
+  PublishAnswers,
   PublishState,
 } from '../../utils/deployApi'
 import type { UsePublishState } from '../../hooks/usePublishState'
@@ -26,23 +26,25 @@ import { lookFor, presentationFor } from '../../utils/publishPresentation'
 
 const h = vi.hoisted(() => ({
   usePublishState: vi.fn(),
-  // The stub records what the chip handed the questionnaire, so a test can drive either
-  // success back through the real `onConfirm` the chip supplied.
+  // The stub records what the chip handed the dialog, so a test can drive either success
+  // back through the real `onConfirm` the chip supplied.
   modal: {
     current: null as null | {
+      deployment: DeploymentView | null
       rejectionNote?: string | null
-      onConfirm: (commitSha: string, answers: DataClassificationAnswers) => Promise<void>
+      onConfirm: (commitSha: string, send: PublishAnswers) => Promise<void>
     },
   },
 }))
 vi.mock('../../hooks/usePublishState', () => ({ usePublishState: h.usePublishState }))
-vi.mock('../DataClassificationModal', () => ({
+vi.mock('../PublishDialog', () => ({
   default: (props: {
+    deployment: DeploymentView | null
     rejectionNote?: string | null
-    onConfirm: (commitSha: string, answers: DataClassificationAnswers) => Promise<void>
+    onConfirm: (commitSha: string, send: PublishAnswers) => Promise<void>
   }) => {
     h.modal.current = props
-    return <div data-testid="data-classification-modal" />
+    return <div data-testid="publish-dialog" />
   },
 }))
 
@@ -640,21 +642,21 @@ describe('the popover explains the state and offers at most one thing to do', ()
 })
 
 describe('one press, one request, and the server says which success it was', () => {
-  it('opens the questionnaire and hands it the note when there is one', async () => {
-    wire(
-      view('changes_requested', {
-        approval: approval({ status: 'rejected', rejectionNote: 'Say more about the data.' }),
-      }),
-    )
+  it('opens the publish dialog and hands it the note and the status read', async () => {
+    const read = view('changes_requested', {
+      approval: approval({ status: 'rejected', rejectionNote: 'Say more about the data.' }),
+    })
+    wire(read)
     mount()
     await openChip()
     fireEvent.click(screen.getByTestId('publish-action'))
 
-    expect(await screen.findByTestId('data-classification-modal')).toBeTruthy()
+    expect(await screen.findByTestId('publish-dialog')).toBeTruthy()
     expect(h.modal.current?.rejectionNote).toBe('Say more about the data.')
+    expect(h.modal.current?.deployment).toBe(read)
   })
 
-  it('saves first, then opens the questionnaire — no second button, no banner', async () => {
+  it('saves first, then opens the publish dialog — no second button, no banner', async () => {
     const publish = vi.fn(async () => 'review' as const)
     wire(view('draft', { savedState: 'saved' }), { publish })
     mount()
@@ -663,12 +665,12 @@ describe('one press, one request, and the server says which success it was', () 
 
     fireEvent.click(screen.getByTestId('publish-action'))
 
-    expect(await screen.findByTestId('data-classification-modal')).toBeTruthy()
+    expect(await screen.findByTestId('publish-dialog')).toBeTruthy()
     expect(publish).toHaveBeenCalledTimes(1)
     expect(document.body.textContent ?? '').not.toMatch(/not saved yet/i)
   })
 
-  it('opens no questionnaire when the save fails, and says why in the popover', async () => {
+  it('opens no publish dialog when the save fails, and says why in the popover', async () => {
     const publish = vi.fn(async () => null)
     wire(view('draft'), {
       publish,
@@ -680,10 +682,10 @@ describe('one press, one request, and the server says which success it was', () 
     expect(within(pop).getByTestId('publish-error').textContent).toMatch(/nothing to save/)
     fireEvent.click(screen.getByTestId('publish-action'))
     await waitFor(() => expect(publish).toHaveBeenCalledTimes(1))
-    expect(screen.queryByTestId('data-classification-modal')).toBeNull()
+    expect(screen.queryByTestId('publish-dialog')).toBeNull()
   })
 
-  it('★ Try again on an approved copy sends it and says so — no questionnaire', async () => {
+  it('★ Try again on an approved copy sends it and says so — no publish dialog', async () => {
     const publish = vi.fn(async () => ({
       outcome: 'started' as const,
       deploymentId: 'd1',
@@ -699,7 +701,7 @@ describe('one press, one request, and the server says which success it was', () 
       expect(screen.getByTestId('publish-announce').textContent).toMatch(/publishing now/i)
     })
     expect(publish).toHaveBeenCalledTimes(1)
-    expect(screen.queryByTestId('data-classification-modal')).toBeNull()
+    expect(screen.queryByTestId('publish-dialog')).toBeNull()
   })
 
   it('announces the started sentence when the deploy actually began', async () => {
@@ -713,7 +715,7 @@ describe('one press, one request, and the server says which success it was', () 
     mount()
     await openChip()
     fireEvent.click(screen.getByTestId('publish-action'))
-    await screen.findByTestId('data-classification-modal')
+    await screen.findByTestId('publish-dialog')
 
     await h.modal.current!.onConfirm(SHA, {} as never)
 
@@ -737,7 +739,7 @@ describe('one press, one request, and the server says which success it was', () 
     mount()
     await openChip()
     fireEvent.click(screen.getByTestId('publish-action'))
-    await screen.findByTestId('data-classification-modal')
+    await screen.findByTestId('publish-dialog')
 
     await h.modal.current!.onConfirm(SHA, {} as never)
 
@@ -762,7 +764,7 @@ describe('one press, one request, and the server says which success it was', () 
     await openChip()
     expect(screen.getByTestId('publish-action').textContent).toBe('Send update for review')
     fireEvent.click(screen.getByTestId('publish-action'))
-    await screen.findByTestId('data-classification-modal')
+    await screen.findByTestId('publish-dialog')
 
     await h.modal.current!.onConfirm(SHA, {} as never)
 
@@ -772,7 +774,7 @@ describe('one press, one request, and the server says which success it was', () 
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('hands the questionnaire\'s reviewed commit through to the send', async () => {
+  it('hands the publish dialog\'s reviewed commit through to the send', async () => {
     const onConfirm = vi.fn(async () => ({
       outcome: 'started' as const,
       deploymentId: 'd1',
@@ -783,7 +785,7 @@ describe('one press, one request, and the server says which success it was', () 
     mount()
     await openChip()
     fireEvent.click(screen.getByTestId('publish-action'))
-    await screen.findByTestId('data-classification-modal')
+    await screen.findByTestId('publish-dialog')
 
     await h.modal.current!.onConfirm(SHA, {} as never)
 

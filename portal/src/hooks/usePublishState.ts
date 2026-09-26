@@ -26,9 +26,9 @@ import {
   getDeployment,
   startDeploy,
   type ApprovalState,
-  type DataClassificationAnswers,
   type DeployOutcome,
   type DeploymentView,
+  type PublishAnswers,
 } from '../utils/deployApi'
 import { withdrawSubmission } from '../utils/approvalApi'
 import { fetchSaveState, saveProject } from '../utils/buildSessionApi'
@@ -117,7 +117,7 @@ export interface UsePublishState {
    *  the caller can say them: `202 started` and `200 routed_for_review` both resolve, and a
    *  surface that could not tell them apart would have to guess which of the server's two
    *  sentences to speak. */
-  onConfirm: (commitSha: string, answers: DataClassificationAnswers) => Promise<DeployOutcome>
+  onConfirm: (commitSha: string, send: PublishAnswers) => Promise<DeployOutcome>
   /** Pull the owner's own pending submission back out of the queue. */
   withdraw: () => Promise<void>
   withdrawing: boolean
@@ -280,9 +280,9 @@ export function usePublishState(projectId: string): UsePublishState {
   // `snapshot_moved` from a save after the dialog opened — and the dialog should not sit on
   // state the server already contradicted until the next poll.
   const onConfirm = useCallback(
-    async (commitSha: string, answers: DataClassificationAnswers): Promise<DeployOutcome> => {
+    async (commitSha: string, send: PublishAnswers): Promise<DeployOutcome> => {
       try {
-        const outcome = await startDeploy(projectId, { commitSha, answers })
+        const outcome = await startDeploy(projectId, { commitSha, ...send })
         await refresh()
         announce()
         return outcome

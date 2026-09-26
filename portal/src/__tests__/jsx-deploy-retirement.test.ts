@@ -86,8 +86,7 @@ describe('JSX-era deploy retirement', () => {
 
   it('nothing points at the review-status anchor, which no longer exists', () => {
     // Asserted on the anchor's identifier and its HREF FORM, never on the bare substring
-    // `review-status` — that legitimately survives in two files: the admin
-    // registry panel's own live region and the questionnaire's `dc-review-status`.
+    // `review-status`, which other test ids may legitimately contain.
     const offenders: string[] = []
     for (const file of walk(SRC_ROOT)) {
       const rel = path.relative(SRC_ROOT, file)

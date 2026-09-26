@@ -15,8 +15,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react'
 import type {
   ApprovalState,
-  DataClassificationAnswers,
   DeploymentView,
+  PublishAnswers,
   PublishState,
 } from '../../../utils/deployApi'
 import type { UsePublishState } from '../../../hooks/usePublishState'
@@ -26,17 +26,19 @@ const h = vi.hoisted(() => ({
   usePublishState: vi.fn(),
   modal: {
     current: null as null | {
-      onConfirm: (commitSha: string, answers: DataClassificationAnswers) => Promise<void>
+      deployment: DeploymentView | null
+      onConfirm: (commitSha: string, send: PublishAnswers) => Promise<void>
     },
   },
 }))
 vi.mock('../../../hooks/usePublishState', () => ({ usePublishState: h.usePublishState }))
-vi.mock('../../DataClassificationModal', () => ({
+vi.mock('../../PublishDialog', () => ({
   default: (props: {
-    onConfirm: (commitSha: string, answers: DataClassificationAnswers) => Promise<void>
+    deployment: DeploymentView | null
+    onConfirm: (commitSha: string, send: PublishAnswers) => Promise<void>
   }) => {
     h.modal.current = props
-    return <div data-testid="data-classification-modal" />
+    return <div data-testid="publish-dialog" />
   },
 }))
 
@@ -354,7 +356,7 @@ describe('the reviewer\'s reason on the rail', () => {
     const note = screen.getByTestId('status-row-rejection-note')
     expect(note.textContent).toBe(NOTE)
     // The whole point of "without opening anything": no dialog, no popover, no press.
-    expect(screen.queryByTestId('data-classification-modal')).toBeNull()
+    expect(screen.queryByTestId('publish-dialog')).toBeNull()
     // And it is not the dialog rendered early — the panel's own row carries it.
     expect(screen.getByTestId('status-row-rejection').textContent).toMatch(/WHY/)
   })
@@ -499,13 +501,13 @@ describe('the action', () => {
     fireEvent.click(screen.getByTestId('status-action'))
     expect(withdraw).toHaveBeenCalledTimes(1)
     expect(publish).not.toHaveBeenCalled()
-    expect(screen.queryByTestId('data-classification-modal')).toBeNull()
+    expect(screen.queryByTestId('publish-dialog')).toBeNull()
 
     cleanup()
     wire({ deployment: view('draft'), publish })
     mount()
     fireEvent.click(screen.getByTestId('status-action'))
-    expect(await screen.findByTestId('data-classification-modal')).toBeTruthy()
+    expect(await screen.findByTestId('publish-dialog')).toBeTruthy()
     expect(publish).toHaveBeenCalledTimes(1)
   })
 
@@ -609,7 +611,7 @@ describe('one button per state', () => {
 
     fireEvent.click(screen.getByTestId('status-action'))
 
-    expect(await screen.findByTestId('data-classification-modal')).toBeTruthy()
+    expect(await screen.findByTestId('publish-dialog')).toBeTruthy()
     expect(publish).toHaveBeenCalledTimes(1)
     expect(screen.getAllByTestId('status-action')).toHaveLength(1)
     expect(panel().textContent).not.toMatch(/not saved yet/i)
@@ -628,7 +630,7 @@ describe('one button per state', () => {
     await waitFor(() => expect(publish).toHaveBeenCalledTimes(1))
 
     expect(screen.getByTestId('status-publish-error').textContent).toMatch(/nothing to save/)
-    expect(screen.queryByTestId('data-classification-modal')).toBeNull()
+    expect(screen.queryByTestId('publish-dialog')).toBeNull()
   })
 
   it('★ Try again on an approved copy sends it straight away — no dialog', async () => {
@@ -646,7 +648,7 @@ describe('one button per state', () => {
     fireEvent.click(action)
     await waitFor(() => expect(publish).toHaveBeenCalledTimes(1))
 
-    expect(screen.queryByTestId('data-classification-modal')).toBeNull()
+    expect(screen.queryByTestId('publish-dialog')).toBeNull()
     expect(panel().textContent).toMatch(/version an administrator approved/i)
   })
 
@@ -660,23 +662,15 @@ describe('one button per state', () => {
     wire({ deployment: view('draft'), onConfirm })
     mount()
     fireEvent.click(screen.getByTestId('status-action'))
-    await screen.findByTestId('data-classification-modal')
+    await screen.findByTestId('publish-dialog')
 
-    const answers = {
-      credentialsSecrets: false,
-      healthData: false,
-      personalInformation: false,
-      financialData: false,
-      confidentialBusinessData: false,
-      publicData: false,
-      notes: null,
-    }
+    const send: PublishAnswers = { answers: { ai_usage: false }, note: null }
     await act(async () => {
-      await h.modal.current?.onConfirm('abc123', answers)
+      await h.modal.current?.onConfirm('abc123', send)
     })
 
-    expect(onConfirm).toHaveBeenCalledWith('abc123', answers)
-    expect(screen.queryByTestId('data-classification-modal')).toBeNull()
+    expect(onConfirm).toHaveBeenCalledWith('abc123', send)
+    expect(screen.queryByTestId('publish-dialog')).toBeNull()
   })
 })
 

@@ -19,7 +19,7 @@
  */
 import { useEffect, useMemo, useState } from 'react'
 import { Check, Copy, ExternalLink } from 'lucide-react'
-import DataClassificationModal from '../DataClassificationModal'
+import PublishDialog from '../PublishDialog'
 import { usePublishState } from '../../hooks/usePublishState'
 import { shortSha } from '../../utils/shortSha'
 import { ClipboardRefused, copyToClipboard } from '../../utils/clipboard'
@@ -390,15 +390,16 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
       })}
 
       {showModal && (
-        <DataClassificationModal
+        <PublishDialog
           projectId={projectId}
+          deployment={deployment}
           // A citizen who presses after a rejection reads WHY before anything else happens —
           // the note belongs in the flow they are in, not only on a panel beside it.
           rejectionNote={approval?.status === 'rejected' ? approval.rejectionNote : null}
-          onConfirm={async (commitSha, answers) => {
-            // Refusals THROW and the modal renders them itself, beside the button, with the
+          onConfirm={async (commitSha, send) => {
+            // Refusals THROW and the dialog renders them itself, beside the button, with the
             // answers still on screen. Only the two successes reach this line.
-            await onConfirm(commitSha, answers)
+            await onConfirm(commitSha, send)
             setShowModal(false)
           }}
           onCancel={() => setShowModal(false)}

@@ -2,40 +2,24 @@
  * Typed client for one-click deploy (`/api/projects/:projectId/{deploy,deployment}`), mirroring
  * `projectApi.ts`: responses arrive as `unknown` through a narrower that throws `ApiError`.
  *
- * ONE CALL DECIDES, THEN PUBLISHES OR QUEUES: answers are merged and scored server-side in one
- * request, so `DeployOutcome` is either started or routed to the admin queue at the version
- * examined. `getDeployment` polls a detached job — the deploy outruns the gateway's 20s budget —
- * and that poll ALSO carries approval state, since the toolbar publish surface has a project id
- * and no app id. The pre-publish review only pre-fills; the publish re-reads the STORED review
- * server-side, so nothing the browser learned there is authoritative. The weights below decide
- * nothing — see `totalWeight`.
+ * ONE CALL DECIDES, THEN PUBLISHES OR QUEUES: the server scores the owner's answers against the
+ * STORED review in the request, so `DeployOutcome` is either started or routed to the admin
+ * queue at the version examined, and nothing the browser learned from the review is
+ * authoritative. `getDeployment` polls a detached job — the deploy outruns the gateway's 20s
+ * budget — and that poll ALSO carries approval state, since the toolbar publish surface has a
+ * project id and no app id.
  */
 import { ApiError, isRecord, optionalString, readApiError } from './apiError'
 import { authFetch } from './api.js'
 import type { AppStatus, AuthFetchDeps } from './projectApi'
 
-/** The six declared categories plus the optional explanation. */
-export interface DataClassificationAnswers {
-  credentialsSecrets: boolean
-  healthData: boolean
-  personalInformation: boolean
-  financialData: boolean
-  confidentialBusinessData: boolean
-  publicData: boolean
-  notes: string | null
-}
-
-export type ClassificationKey = keyof Omit<DataClassificationAnswers, 'notes'>
-
 /**
- * `(key, label, weight, storedKey)` — THE questionnaire on this side of the wire, mirroring the
- * backend's `DATA_CLASSIFICATION_QUESTIONS` (`services/deploy/classification.py`). Keep in sync
- * by hand, as ONE table — `components/admin/declaration.ts` derives its list from this one.
- * `storedKey` is the same question's snake_case spelling in the stored declaration document,
- * carried here so the pairing is checkable in one place instead of inferred at a call site.
+ * `(key, label, weight, storedKey)` — the six questions publish declarations were stored against
+ * before classes were configurable. The admin review's reader for those declarations derives its
+ * labels from this table (`components/admin/declaration.ts`).
  */
 export const DATA_CLASSIFICATION_QUESTIONS: ReadonlyArray<
-  readonly [key: ClassificationKey, label: string, weight: number, storedKey: string]
+  readonly [key: string, label: string, weight: number, storedKey: string]
 > = [
   ['credentialsSecrets', 'Credentials / Secrets', 40, 'credentials_secrets'],
   ['healthData', 'Health Data', 25, 'health_data'],
@@ -45,27 +29,15 @@ export const DATA_CLASSIFICATION_QUESTIONS: ReadonlyArray<
   ['publicData', 'Public Data', 0, 'public_data'],
 ]
 
-/** AT OR BELOW this total the server deploys without a human — 0, so only a fully-clean
- *  declaration ever auto-publishes; any weighted category at all needs a person (the gate
- *  previously ran the other way, auto-publishing the MORE sensitive declarations). Also
- *  the explanation threshold — any total ABOVE this both needs a person AND is obliged to
- *  say why, never one without the other. Shown to set expectations — never used to disable
- *  the deploy button, because then the client would be the gate. */
-export const AUTO_DEPLOY_MAX_SCORE = 0
-
-/**
- * The weighted total for a possibly-partial answer set; unanswered categories don't count.
- *
- * This copy of the weights DECIDES NOTHING — it drives the running total and the prompt, and the
- * deploy button stays enabled even at a high local total, because a server refusal is the correct
- * outcome, never a UI failure to prevent.
- */
-export function totalWeight(answers: Partial<Record<string, boolean | null>>): number {
-  return DATA_CLASSIFICATION_QUESTIONS.reduce(
-    (sum, [key, , weight]) => (answers[key] === true ? sum + weight : sum),
-    0,
-  )
+/** What the owner sends about the saved version: a Yes/No per class key, and the note an
+ *  administrator reads when the send goes to them. */
+export interface PublishAnswers {
+  answers: Record<string, boolean>
+  note: string | null
 }
+
+/** The note's ceiling, mirroring `DeployRequest.note` server-side: a longer note is refused. */
+export const MAX_NOTE = 1000
 
 /** The 202 body: the deploy has barely begun and this is the id to poll. */
 export interface StartedDeploy {
@@ -208,6 +180,34 @@ export interface DeploymentView {
 /** The 409 raised when the request names a version that is no longer the saved one. */
 export const SNAPSHOT_MOVED = 'snapshot_moved'
 
+/**
+ * Why a send that goes to an administrator was refused for want of a note. `unknown` is a reason
+ * this client does not recognise: the send still needs a note.
+ */
+export type NoteRequiredReason =
+  | 'hard_block'
+  | 'over_threshold'
+  | 'review_unfinished'
+  | 'rejection_standing'
+  | 'unknown'
+
+const NOTE_REQUIRED_REASONS: ReadonlySet<string> = new Set<NoteRequiredReason>([
+  'hard_block',
+  'over_threshold',
+  'review_unfinished',
+  'rejection_standing',
+])
+
+/** The reason off a `422 note_required` refusal, or null for any other failure. */
+export function noteRequiredReason(err: unknown): NoteRequiredReason | null {
+  if (!(err instanceof ApiError) || err.code !== 'note_required') return null
+  const detail = err.details?.detail
+  const reason = isRecord(detail) ? detail.reason : null
+  return typeof reason === 'string' && NOTE_REQUIRED_REASONS.has(reason)
+    ? (reason as NoteRequiredReason)
+    : 'unknown'
+}
+
 function readString(value: unknown, field: string): string {
   if (typeof value !== 'string' || value.length === 0) {
     throw new ApiError(`The server sent a deployment we could not read (${field}).`, 500)
@@ -306,10 +306,10 @@ const PUBLISH_STATES: ReadonlySet<string> = new Set<PublishState>([
 // 1. THE SAVED VERSION. The request names the commit the dialog reviewed, and the server
 //    compares it with what is saved now, refusing a mismatch (`snapshot_moved`). This client
 //    never compares the two; a save it did not see costs a reopened dialog, never a publish.
-// 2. MERGED CLASSIFICATION SCORE. The server merges the stored review with submitted
-//    answers and scores in-request; the local weights (see file header) drive only the
-//    running tally, never withhold the button — a server refusal-with-explanation is
-//    correct, never a UI failure to prevent.
+// 2. THE PUBLISH DECISION. The dialog mirrors the score from the review readout's live
+//    classes and policy (`classificationScore.ts`, held to the server by a shared fixture),
+//    but a standing rejection is not on that readout. A send the dialog expected to publish
+//    comes back `note_required`, and the dialog asks for the note then.
 // 3. THE SAVED SNAPSHOT'S HEAD. The server spends its one metadata HEAD on the drift
 //    comparison and serves the ANSWER, not the head — this client cannot compute drift,
 //    so it cannot quietly resolve `live_drift_unknown` to `live_current`.
@@ -383,12 +383,10 @@ function toDeploymentView(body: unknown): DeploymentView {
   }
 }
 
-export interface StartDeployRequest {
+export interface StartDeployRequest extends Partial<PublishAnswers> {
   /** The version this press is about: the saved version the dialog reviewed, or the
-   *  server's `approvedRetryCommit`. */
+   *  server's `approvedRetryCommit`, which needs no answers and no note. */
   commitSha: string
-  /** Required for the saved version; the approved commit needs none. */
-  answers?: DataClassificationAnswers
 }
 
 /**
@@ -396,8 +394,8 @@ export interface StartDeployRequest {
  * `routed_for_review` (200, queued pinned to `commitSha`) — an OUTCOME, not a failure, and
  * both surfaces render it informationally. Throws `ApiError` otherwise: 409
  * `app_disabled`/`snapshot_moved`, 409 `waiting_for_review` (`error.detail` carries the
- * pending state, no second call needed), 422 `answers_required`/`explanation_required`,
- * 503 `storage_unavailable`.
+ * pending state, no second call needed), 422 `note_required` (see `noteRequiredReason`) or
+ * `unknown_class`, 503 `storage_unavailable`.
  */
 export async function startDeploy(
   projectId: string,
@@ -409,7 +407,11 @@ export async function startDeploy(
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ commitSha: request.commitSha, answers: request.answers }),
+      body: JSON.stringify({
+        commitSha: request.commitSha,
+        answers: request.answers,
+        note: request.note,
+      }),
     },
     deps,
   )

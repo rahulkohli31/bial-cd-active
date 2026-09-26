@@ -26,7 +26,7 @@ import { useCallback, useEffect, useId, useState } from 'react'
 import { ChevronDown, ExternalLink } from 'lucide-react'
 
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover'
-import DataClassificationModal from './DataClassificationModal'
+import PublishDialog from './PublishDialog'
 import { usePublishState } from '../hooks/usePublishState'
 import { shortSha } from '../utils/shortSha'
 import {
@@ -50,7 +50,7 @@ import type { DeployOutcome, PublishState } from '../utils/deployApi'
  * The answer to a press: exactly ONE treatment, because there is only one kind of thing
  * here — a success (both ladder outcomes, `202 started` and `200 routed_for_review`,
  * resolve; review-routing is a success, not a failure of what the citizen asked for). Every
- * REFUSAL throws instead and the questionnaire renders it beside its own button. So this
+ * REFUSAL throws instead and the publish dialog renders it beside its own button. So this
  * region is never red and never carries an alert role — not a styling choice, but a
  * property three retired tests pinned.
  */
@@ -142,7 +142,7 @@ export default function PublishStatusChip({
       return
     }
     // Every other action is `publish`: the approved copy is sent and answered here; anything
-    // else is saved and reviewed in the questionnaire.
+    // else is saved and reviewed in the publish dialog.
     const next = await publish()
     if (next === null) return
     if (next === 'review') {
@@ -426,16 +426,17 @@ export default function PublishStatusChip({
       </Popover>
 
       {showModal && (
-        <DataClassificationModal
+        <PublishDialog
           projectId={projectId}
+          deployment={deployment}
           // A citizen who presses after a rejection reads WHY before anything else
           // happens — the note belongs in the flow they are actually in, not only on a
           // panel beside it that they may never open.
           rejectionNote={approval?.status === 'rejected' ? approval.rejectionNote : null}
-          onConfirm={async (commitSha, answers) => {
-            // Refusals THROW and the modal renders them itself, beside the button, with
+          onConfirm={async (commitSha, send) => {
+            // Refusals THROW and the dialog renders them itself, beside the button, with
             // the answers still on screen. Only the two successes reach this line.
-            speak(await onConfirm(commitSha, answers))
+            speak(await onConfirm(commitSha, send))
             setShowModal(false)
           }}
           onCancel={() => setShowModal(false)}

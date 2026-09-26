@@ -20,7 +20,7 @@ import { ApiError } from '../../utils/apiError'
 import * as buildSessionApi from '../../utils/buildSessionApi'
 import * as deployApi from '../../utils/deployApi'
 import type { SaveState } from '../../utils/buildSessionApi'
-import type { DataClassificationAnswers, DeploymentView, PublishState } from '../../utils/deployApi'
+import type { DeploymentView, PublishAnswers, PublishState } from '../../utils/deployApi'
 
 vi.mock('../../utils/deployApi', async () => {
   const actual = await vi.importActual<typeof deployApi>('../../utils/deployApi')
@@ -69,14 +69,9 @@ const view = (publishState: PublishState, over: Partial<DeploymentView> = {}): D
   ...over,
 })
 
-const ANSWERS: DataClassificationAnswers = {
-  credentialsSecrets: false,
-  healthData: false,
-  personalInformation: true,
-  financialData: false,
-  confidentialBusinessData: false,
-  publicData: false,
-  notes: 'Staff names only.',
+const ANSWERS: PublishAnswers = {
+  answers: { ai_usage: false, public_data: true },
+  note: 'Staff names only.',
 }
 
 const STARTED = {
@@ -218,7 +213,7 @@ describe('a press, and what came back', () => {
     expect(outcome).toEqual(ROUTED)
   })
 
-  it('sends the commit the dialog reviewed, with its answers', async () => {
+  it('sends the commit the dialog reviewed, with its answers and its note', async () => {
     startDeploy.mockResolvedValueOnce(STARTED)
     const { result } = renderHook(() => usePublishState('p1'))
     await waitFor(() => expect(result.current.deployment).not.toBeNull())
@@ -227,7 +222,11 @@ describe('a press, and what came back', () => {
       await result.current.onConfirm(SHA, ANSWERS)
     })
 
-    expect(startDeploy).toHaveBeenCalledWith('p1', { commitSha: SHA, answers: ANSWERS })
+    expect(startDeploy).toHaveBeenCalledWith('p1', {
+      commitSha: SHA,
+      answers: { ai_usage: false, public_data: true },
+      note: 'Staff names only.',
+    })
   })
 
   it('re-reads after a press, so the chip moves without waiting for a poll', async () => {
