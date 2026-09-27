@@ -50,6 +50,25 @@ describe('the waiting count follows the review queue in this tab', () => {
     expect(screen.getByTestId('nav-admin')).toBeTruthy()
   })
 
+  it('keeps the newest count when two reads overlap and the older one answers last', async () => {
+    let answerOlder: (value: ReturnType<typeof counts>) => void = () => {}
+    h.fetchAppStatusCounts.mockReset()
+    h.fetchAppStatusCounts
+      .mockResolvedValueOnce(counts(2))
+      .mockReturnValueOnce(new Promise((resolve) => { answerOlder = resolve }))
+      .mockResolvedValueOnce(counts(0))
+    mount()
+    expect((await screen.findByTestId('waiting-count-nav')).textContent).toContain('2')
+
+    act(() => announceReviewQueueChanged())
+    act(() => announceReviewQueueChanged())
+    await waitFor(() => expect(screen.queryByTestId('waiting-count-nav')).toBeNull())
+    await act(async () => answerOlder(counts(1)))
+
+    expect(screen.getByTestId('nav-admin')).toBeTruthy()
+    expect(screen.queryByTestId('waiting-count-nav')).toBeNull()
+  })
+
   it('stops listening once it unmounts', async () => {
     const nav = mount()
     await screen.findByTestId('waiting-count-nav')

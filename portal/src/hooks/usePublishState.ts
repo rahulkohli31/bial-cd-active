@@ -31,6 +31,7 @@ import {
   type PublishAnswers,
 } from '../utils/deployApi'
 import { withdrawSubmission } from '../utils/approvalApi'
+import { announceReviewQueueChanged } from '../utils/appRegistryApi'
 import { fetchSaveState, saveProject } from '../utils/buildSessionApi'
 import { ApiError } from '../utils/apiError'
 
@@ -285,6 +286,8 @@ export function usePublishState(projectId: string): UsePublishState {
         const outcome = await startDeploy(projectId, { commitSha, ...send })
         await refresh()
         announce()
+        // An administrator who sends their own app changes the queue their nav counts.
+        if (outcome.outcome === 'routed_for_review') announceReviewQueueChanged()
         return outcome
       } catch (err) {
         // Fire-and-forget on purpose: the caller is about to see the error either way, and
@@ -308,6 +311,7 @@ export function usePublishState(projectId: string): UsePublishState {
       await withdrawSubmission(appId)
       await refresh()
       announce()
+      announceReviewQueueChanged()
     } catch (err) {
       // A 409 means an administrator got there first; the server's copy says so.
       setWithdrawError(

@@ -17,6 +17,7 @@ import { renderHook, act, cleanup, waitFor } from '@testing-library/react'
 
 import { usePublishState } from '../usePublishState'
 import { ApiError } from '../../utils/apiError'
+import { REVIEW_QUEUE_CHANGED } from '../../utils/appRegistryApi'
 import * as buildSessionApi from '../../utils/buildSessionApi'
 import * as deployApi from '../../utils/deployApi'
 import type { SaveState } from '../../utils/buildSessionApi'
@@ -211,6 +212,25 @@ describe('a press, and what came back', () => {
       outcome = await result.current.onConfirm(SHA, ANSWERS)
     })
     expect(outcome).toEqual(ROUTED)
+  })
+
+  it('tells the review queue when a send was routed to an administrator, and only then', async () => {
+    const heard = vi.fn()
+    window.addEventListener(REVIEW_QUEUE_CHANGED, heard)
+    try {
+      const { result } = renderHook(() => usePublishState('p1'))
+      await waitFor(() => expect(result.current.deployment).not.toBeNull())
+
+      startDeploy.mockResolvedValueOnce(STARTED)
+      await act(async () => { await result.current.onConfirm(SHA, ANSWERS) })
+      expect(heard).not.toHaveBeenCalled()
+
+      startDeploy.mockResolvedValueOnce(ROUTED)
+      await act(async () => { await result.current.onConfirm(SHA, ANSWERS) })
+      expect(heard).toHaveBeenCalledTimes(1)
+    } finally {
+      window.removeEventListener(REVIEW_QUEUE_CHANGED, heard)
+    }
   })
 
   it('sends the commit the dialog reviewed, with its answers and its note', async () => {
@@ -456,6 +476,23 @@ describe('taking a submission back out of the queue', () => {
     expect(vi.mocked(withdrawSubmission)).toHaveBeenCalledWith('app-42')
     expect(getDeployment).toHaveBeenCalled()
     expect(result.current.withdrawError).toBeNull()
+  })
+
+  it('tells the review queue it lost an entry', async () => {
+    const heard = vi.fn()
+    window.addEventListener(REVIEW_QUEUE_CHANGED, heard)
+    try {
+      getDeployment.mockResolvedValue(view('in_review', { appId: 'app-42' }))
+      const { result } = renderHook(() => usePublishState('p1'))
+      await waitFor(() => expect(result.current.deployment).not.toBeNull())
+
+      await act(async () => { await result.current.withdraw() })
+
+      expect(result.current.withdrawError).toBeNull()
+      expect(heard).toHaveBeenCalledTimes(1)
+    } finally {
+      window.removeEventListener(REVIEW_QUEUE_CHANGED, heard)
+    }
   })
 
   it('renders a refused withdrawal in the server own words', async () => {

@@ -68,10 +68,13 @@ export default function NavItems({ onNavigate, onItemFocus, collapsed = false }:
   useEffect(() => {
     if (!isAdmin || !isAuthenticated()) return undefined
     let active = true
+    // Reads can overlap, so only the newest one sent may set the count.
+    let latest = 0
     const read = () => {
+      const mine = ++latest
       void fetchAppStatusCounts()
-        .then((counts) => { if (active) setWaiting(counts.pending) })
-        .catch(() => { if (active) setWaiting(null) })
+        .then((counts) => { if (active && mine === latest) setWaiting(counts.pending) })
+        .catch(() => { if (active && mine === latest) setWaiting(null) })
     }
     read()
     // RE-READ WHEN THE TAB COMES BACK rather than polling. The queue changes underneath this
