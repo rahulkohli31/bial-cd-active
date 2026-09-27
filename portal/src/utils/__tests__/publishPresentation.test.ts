@@ -17,6 +17,7 @@ import path from 'node:path'
 import { stripComments } from '../../__tests__/_stripComments'
 import {
   ACTION_LABEL,
+  answerFor,
   busyLabel,
   canBeRestarted,
   formatStamp,
@@ -26,7 +27,7 @@ import {
   savedRow,
   versionRowData,
 } from '../publishPresentation'
-import type { ApprovalState, DeploymentView, PublishState } from '../deployApi'
+import type { ApprovalState, DeployOutcome, DeploymentView, PublishState } from '../deployApi'
 
 /**
  * Every value the union can hold — as a RECORD KEYED BY THE UNION, which is what makes the claim
@@ -497,5 +498,24 @@ describe('the action button says what its press is doing, on both surfaces', () 
 
   it('is null when nothing is working, so each surface keeps its own resting label', () => {
     expect(busyLabel(false, null)).toBeNull()
+  })
+})
+
+describe('a press that went through says what happened, on both surfaces', () => {
+  it('speaks the server\'s own sentence when the app was sent to an administrator', () => {
+    const routed: DeployOutcome = {
+      outcome: 'routed_for_review',
+      appId: 'app-1',
+      submissionId: 's1',
+      commitSha: 'a'.repeat(40),
+      submittedAt: '2026-09-20T10:00:00Z',
+      message: 'Your app was sent to an administrator for review.',
+    }
+    expect(answerFor(routed)).toBe('Your app was sent to an administrator for review.')
+  })
+
+  it('says the publish has started when it did', () => {
+    const started: DeployOutcome = { outcome: 'started', deploymentId: 'd1', appId: 'app-1', status: 'running' }
+    expect(answerFor(started)).toBe('Publishing now — this takes a few minutes.')
   })
 })

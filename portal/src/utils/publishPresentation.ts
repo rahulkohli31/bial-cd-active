@@ -13,7 +13,7 @@
  */
 import { assertNever } from './assertNever'
 import { MONTHS } from './monthNames'
-import type { ApprovalState, DeploymentView, PublishState } from './deployApi'
+import type { ApprovalState, DeployOutcome, DeploymentView, PublishState } from './deployApi'
 import type { PublishPhase } from '../hooks/usePublishState'
 
 /**
@@ -52,6 +52,16 @@ export function busyLabel(withdrawing: boolean, publishPhase: PublishPhase | nul
   if (publishPhase === 'saving') return 'Saving…'
   if (publishPhase === 'publishing') return 'Publishing…'
   return null
+}
+
+const STARTED_ANSWER = 'Publishing now — this takes a few minutes.'
+
+/**
+ * What a publish that went through says. Routed to an administrator, it is the server's OWN
+ * sentence: a success rendered in anyone else's words is a success the citizen has to translate.
+ */
+export function answerFor(outcome: DeployOutcome): string {
+  return outcome.outcome === 'routed_for_review' ? outcome.message : STARTED_ANSWER
 }
 
 /**

@@ -15,12 +15,13 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react'
 import type {
   ApprovalState,
+  DeployOutcome,
   DeploymentView,
   PublishAnswers,
   PublishState,
 } from '../../../utils/deployApi'
 import type { UsePublishState } from '../../../hooks/usePublishState'
-import { presentationFor } from '../../../utils/publishPresentation'
+import { answerFor, presentationFor } from '../../../utils/publishPresentation'
 
 const h = vi.hoisted(() => ({
   usePublishState: vi.fn(),
@@ -671,6 +672,83 @@ describe('one button per state', () => {
 
     expect(onConfirm).toHaveBeenCalledWith('abc123', send)
     expect(screen.queryByTestId('publish-dialog')).toBeNull()
+    expect(screen.getByTestId('status-answer').textContent).toBe('Publishing now — this takes a few minutes.')
+  })
+})
+
+/**
+ * ★ A DIRECT REPUBLISH SAYS WHAT HAPPENED. The approved copy is sent with no dialog, so without a
+ * line here the press looks like it did nothing — the chip beside the title says the same
+ * sentence for the same press.
+ */
+describe('the answer to a press that sent the approved copy', () => {
+  const STARTED: DeployOutcome = {
+    outcome: 'started',
+    deploymentId: 'd1',
+    appId: 'app-1',
+    status: 'running',
+  }
+  const ROUTED: DeployOutcome = {
+    outcome: 'routed_for_review',
+    appId: 'app-1',
+    submissionId: 's1',
+    commitSha: SHA,
+    submittedAt: '2026-09-20T10:00:00Z',
+    message: 'Your app was sent to an administrator for review.',
+  }
+  const answer = () => screen.getByTestId('status-answer')
+  const retrying = (publish: UsePublishState['publish']) =>
+    wire({ deployment: view('did_not_start', { approvedRetryCommit: SHA }), publish })
+
+  it('says the publish started, in a polite region that was there before the press', async () => {
+    retrying(vi.fn(async () => STARTED))
+    mount()
+    // The region exists, empty, before it has anything to say: text injected together with its
+    // region is often not announced.
+    expect(answer().getAttribute('aria-live')).toBe('polite')
+    expect(answer().textContent).toBe('')
+
+    fireEvent.click(screen.getByTestId('status-action'))
+
+    await waitFor(() => expect(answer().textContent).toBe(answerFor(STARTED)))
+    expect(screen.queryByTestId('publish-dialog')).toBeNull()
+  })
+
+  it('speaks the server\'s own sentence when the send was routed to an administrator', async () => {
+    retrying(vi.fn(async () => ROUTED))
+    mount()
+
+    fireEvent.click(screen.getByTestId('status-action'))
+
+    await waitFor(() => expect(answer().textContent).toBe(ROUTED.message))
+    expect(answer().getAttribute('role')).toBe('status')
+  })
+
+  it('says nothing when the press opened the dialog instead', async () => {
+    wire({ deployment: view('draft'), publish: vi.fn(async () => 'review' as const) })
+    mount()
+
+    fireEvent.click(screen.getByTestId('status-action'))
+
+    // Liveness: the press ran to completion and opened the dialog.
+    expect(await screen.findByTestId('publish-dialog')).toBeTruthy()
+    expect(answer().textContent).toBe('')
+  })
+
+  it('clears the answer when the button is pressed again', async () => {
+    const publish = vi
+      .fn<UsePublishState['publish']>()
+      .mockResolvedValueOnce(STARTED)
+      .mockReturnValueOnce(new Promise(() => {}))
+    retrying(publish)
+    mount()
+    fireEvent.click(screen.getByTestId('status-action'))
+    await waitFor(() => expect(answer().textContent).toBe(answerFor(STARTED)))
+
+    fireEvent.click(screen.getByTestId('status-action'))
+
+    expect(publish).toHaveBeenCalledTimes(2)
+    expect(answer().textContent).toBe('')
   })
 })
 

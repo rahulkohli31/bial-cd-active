@@ -31,6 +31,7 @@ import { usePublishState } from '../hooks/usePublishState'
 import { shortSha } from '../utils/shortSha'
 import {
   ACTION_LABEL,
+  answerFor,
   busyLabel,
   formatStamp,
   lookFor,
@@ -46,16 +47,6 @@ import type { DeployOutcome, PublishState } from '../utils/deployApi'
    make the fuller of the two surfaces. Neither renders the other; both read the same decision,
    so the panel and this chip cannot say different things about one app. The colour map and the
    provenance rows are new there and belong to the same decision. */
-
-/**
- * The answer to a press: exactly ONE treatment, because there is only one kind of thing
- * here — a success (both ladder outcomes, `202 started` and `200 routed_for_review`,
- * resolve; review-routing is a success, not a failure of what the citizen asked for). Every
- * REFUSAL throws instead and the publish dialog renders it beside its own button. So this
- * region is never red and never carries an alert role — not a styling choice, but a
- * property three retired tests pinned.
- */
-const STARTED_ANSWER = 'Publishing now — this takes a few minutes.'
 
 export interface PublishStatusChipProps {
   projectId: string
@@ -118,15 +109,15 @@ export default function PublishStatusChip({
   const busy = publishPhase !== null || withdrawing
   const busyReason = busyLabel(withdrawing, publishPhase) ?? undefined
 
+  /**
+   * The answer to a press: exactly ONE treatment, because there is only one kind of thing
+   * here — a success (both ladder outcomes, `202 started` and `200 routed_for_review`,
+   * resolve; review-routing is a success, not a failure of what the citizen asked for). Every
+   * REFUSAL throws instead and the publish dialog renders it beside its own button. So this
+   * region is never red and never carries an alert role.
+   */
   const speak = useCallback((outcome: DeployOutcome): void => {
-    setAnswer(
-      outcome.outcome === 'routed_for_review'
-        ? // The server's OWN sentence. Both publish surfaces said the same words before
-          // there was one of them, and a success rendered in anyone else's words is a
-          // success the citizen has to translate.
-          outcome.message
-        : STARTED_ANSWER,
-    )
+    setAnswer(answerFor(outcome))
   }, [])
 
   const pressAction = useCallback(async (): Promise<void> => {

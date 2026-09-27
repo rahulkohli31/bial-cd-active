@@ -25,6 +25,7 @@ import { shortSha } from '../../utils/shortSha'
 import { ClipboardRefused, copyToClipboard } from '../../utils/clipboard'
 import {
   ACTION_LABEL,
+  answerFor,
   busyLabel,
   formatStamp,
   lookFor,
@@ -240,6 +241,7 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
     withdrawError,
   } = usePublishState(projectId)
   const [showModal, setShowModal] = useState(false)
+  const [answer, setAnswer] = useState<string | null>(null)
 
   const state = deployment?.publishState ?? null
   const approvedRetryCommit = deployment?.approvedRetryCommit ?? null
@@ -326,12 +328,14 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
           aria-disabled={busy}
           onClick={() => {
             if (busy) return
+            setAnswer(null)
             if (presentation.action === 'take_it_back') {
               void withdraw()
               return
             }
             void publish().then((next) => {
               if (next === 'review') setShowModal(true)
+              else if (next !== null) setAnswer(answerFor(next))
             })
           }}
           className={`mt-2.5 w-full rounded-[9px] px-3 py-2.5 text-[12.5px] font-bold transition ${
@@ -343,6 +347,18 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
           {busyLabel(withdrawing, publishPhase) ?? ACTION_LABEL[presentation.action]}
         </button>
       )}
+
+      {/* Outside the button's condition and mounted before it has anything to say: a sent copy
+          usually leaves a state with no button, and text injected together with its region is
+          often not announced. */}
+      <p
+        data-testid="status-answer"
+        role="status"
+        aria-live="polite"
+        className={`text-[11.5px] leading-relaxed text-neutral ${answer === null ? '' : 'mt-2.5'}`}
+      >
+        {answer}
+      </p>
 
       {/* A SAVE OR A SEND THAT FAILED BEFORE ANY DIALOG, in the server's own words — without
           it the press would look like it did nothing. */}
@@ -394,7 +410,7 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
           onConfirm={async (commitSha, send) => {
             // Refusals THROW and the dialog renders them itself, beside the button, with the
             // answers still on screen. Only the two successes reach this line.
-            await onConfirm(commitSha, send)
+            setAnswer(answerFor(await onConfirm(commitSha, send)))
             setShowModal(false)
           }}
           onCancel={() => setShowModal(false)}
