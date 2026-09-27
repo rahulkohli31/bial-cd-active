@@ -117,7 +117,7 @@ export default function PublishStatusChip({
    * region is never red and never carries an alert role.
    */
   const speak = useCallback((outcome: DeployOutcome): void => {
-    setAnswer(answerFor(outcome))
+    setAnswer(answerFor(outcome).text)
   }, [])
 
   const pressAction = useCallback(async (): Promise<void> => {

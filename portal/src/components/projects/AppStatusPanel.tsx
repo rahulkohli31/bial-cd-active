@@ -33,7 +33,7 @@ import {
   provenanceRows,
   SECONDARY_ACTIONS,
 } from '../../utils/publishPresentation'
-import type { ProvenanceRow } from '../../utils/publishPresentation'
+import type { ProvenanceRow, PublishAnswer } from '../../utils/publishPresentation'
 import type { PublishState } from '../../utils/deployApi'
 
 export interface AppStatusPanelProps {
@@ -241,9 +241,12 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
     withdrawError,
   } = usePublishState(projectId)
   const [showModal, setShowModal] = useState(false)
-  const [answer, setAnswer] = useState<string | null>(null)
+  const [answer, setAnswer] = useState<PublishAnswer | null>(null)
 
   const state = deployment?.publishState ?? null
+  // Said only while the app is still where the answer left it: a poll that finds it live, or
+  // failed, or taken down, retires the line without anyone pressing anything.
+  const said = answer !== null && answer.heldWhile === state ? answer.text : null
   const approvedRetryCommit = deployment?.approvedRetryCommit ?? null
   const presentation = useMemo(
     () => (state === null ? null : presentationFor(state, approvedRetryCommit)),
@@ -355,9 +358,9 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
         data-testid="status-answer"
         role="status"
         aria-live="polite"
-        className={`text-[11.5px] leading-relaxed text-neutral ${answer === null ? '' : 'mt-2.5'}`}
+        className={`text-[11.5px] leading-relaxed text-neutral ${said === null ? '' : 'mt-2.5'}`}
       >
-        {answer}
+        {said}
       </p>
 
       {/* A SAVE OR A SEND THAT FAILED BEFORE ANY DIALOG, in the server's own words — without

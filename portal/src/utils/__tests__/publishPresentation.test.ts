@@ -511,11 +511,11 @@ describe('a press that went through says what happened, on both surfaces', () =>
       submittedAt: '2026-09-20T10:00:00Z',
       message: 'Your app was sent to an administrator for review.',
     }
-    expect(answerFor(routed)).toBe('Your app was sent to an administrator for review.')
+    expect(answerFor(routed)).toEqual({ text: 'Your app was sent to an administrator for review.', heldWhile: 'in_review' })
   })
 
   it('says the publish has started when it did', () => {
     const started: DeployOutcome = { outcome: 'started', deploymentId: 'd1', appId: 'app-1', status: 'running' }
-    expect(answerFor(started)).toBe('Publishing now — this takes a few minutes.')
+    expect(answerFor(started)).toEqual({ text: 'Publishing now — this takes a few minutes.', heldWhile: 'starting_up' })
   })
 })

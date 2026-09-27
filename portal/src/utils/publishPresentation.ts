@@ -54,14 +54,25 @@ export function busyLabel(withdrawing: boolean, publishPhase: PublishPhase | nul
   return null
 }
 
-const STARTED_ANSWER = 'Publishing now — this takes a few minutes.'
+export interface PublishAnswer {
+  text: string
+  /** The state the answer describes; once the app has moved on from it, the answer is stale. */
+  heldWhile: PublishState
+}
 
 /**
  * What a publish that went through says. Routed to an administrator, it is the server's OWN
  * sentence: a success rendered in anyone else's words is a success the citizen has to translate.
  */
-export function answerFor(outcome: DeployOutcome): string {
-  return outcome.outcome === 'routed_for_review' ? outcome.message : STARTED_ANSWER
+export function answerFor(outcome: DeployOutcome): PublishAnswer {
+  switch (outcome.outcome) {
+    case 'routed_for_review':
+      return { text: outcome.message, heldWhile: 'in_review' }
+    case 'started':
+      return { text: 'Publishing now — this takes a few minutes.', heldWhile: 'starting_up' }
+    default:
+      return assertNever(outcome)
+  }
 }
 
 /**

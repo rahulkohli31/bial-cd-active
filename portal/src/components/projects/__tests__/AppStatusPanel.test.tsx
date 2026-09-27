@@ -21,7 +21,7 @@ import type {
   PublishState,
 } from '../../../utils/deployApi'
 import type { UsePublishState } from '../../../hooks/usePublishState'
-import { answerFor, presentationFor } from '../../../utils/publishPresentation'
+import { presentationFor } from '../../../utils/publishPresentation'
 
 const h = vi.hoisted(() => ({
   usePublishState: vi.fn(),
@@ -654,12 +654,11 @@ describe('one button per state', () => {
   })
 
   it('hands the dialog\'s reviewed commit through to the send', async () => {
-    const onConfirm = vi.fn(async () => ({
-      outcome: 'started' as const,
-      deploymentId: 'd1',
-      appId: 'app-1',
-      status: 'running',
-    }))
+    const onConfirm = vi.fn(async () => {
+      // The real hook has refreshed by the time the send resolves.
+      wire({ deployment: view('starting_up'), onConfirm })
+      return { outcome: 'started' as const, deploymentId: 'd1', appId: 'app-1', status: 'running' }
+    })
     wire({ deployment: view('draft'), onConfirm })
     mount()
     fireEvent.click(screen.getByTestId('status-action'))
@@ -696,12 +695,21 @@ describe('the answer to a press that sent the approved copy', () => {
     submittedAt: '2026-09-20T10:00:00Z',
     message: 'Your app was sent to an administrator for review.',
   }
+  const STARTED_TEXT = 'Publishing now — this takes a few minutes.'
   const answer = () => screen.getByTestId('status-answer')
-  const retrying = (publish: UsePublishState['publish']) =>
+  /** The press sends the approved copy, and the real hook has refreshed by the time it resolves,
+   *  so the state the answer describes is already on screen when the answer lands. */
+  const retrying = (outcome: DeployOutcome, after: PublishState) => {
+    const publish = vi.fn(async () => {
+      wire({ deployment: view(after), publish })
+      return outcome
+    })
     wire({ deployment: view('did_not_start', { approvedRetryCommit: SHA }), publish })
+    return publish
+  }
 
   it('says the publish started, in a polite region that was there before the press', async () => {
-    retrying(vi.fn(async () => STARTED))
+    retrying(STARTED, 'starting_up')
     mount()
     // The region exists, empty, before it has anything to say: text injected together with its
     // region is often not announced.
@@ -710,12 +718,12 @@ describe('the answer to a press that sent the approved copy', () => {
 
     fireEvent.click(screen.getByTestId('status-action'))
 
-    await waitFor(() => expect(answer().textContent).toBe(answerFor(STARTED)))
+    await waitFor(() => expect(answer().textContent).toBe(STARTED_TEXT))
     expect(screen.queryByTestId('publish-dialog')).toBeNull()
   })
 
   it('speaks the server\'s own sentence when the send was routed to an administrator', async () => {
-    retrying(vi.fn(async () => ROUTED))
+    retrying(ROUTED, 'in_review')
     mount()
 
     fireEvent.click(screen.getByTestId('status-action'))
@@ -736,18 +744,28 @@ describe('the answer to a press that sent the approved copy', () => {
   })
 
   it('clears the answer when the button is pressed again', async () => {
-    const publish = vi
-      .fn<UsePublishState['publish']>()
-      .mockResolvedValueOnce(STARTED)
-      .mockReturnValueOnce(new Promise(() => {}))
-    retrying(publish)
+    retrying(ROUTED, 'in_review')
     mount()
     fireEvent.click(screen.getByTestId('status-action'))
-    await waitFor(() => expect(answer().textContent).toBe(answerFor(STARTED)))
+    await waitFor(() => expect(answer().textContent).toBe(ROUTED.message))
 
+    // In review, the one button takes the send back.
     fireEvent.click(screen.getByTestId('status-action'))
 
-    expect(publish).toHaveBeenCalledTimes(2)
+    expect(answer().textContent).toBe('')
+  })
+
+  it('retires the answer once the app has moved on from the state it described', async () => {
+    retrying(STARTED, 'starting_up')
+    const { rerender } = mount()
+    fireEvent.click(screen.getByTestId('status-action'))
+    await waitFor(() => expect(answer().textContent).toBe(STARTED_TEXT))
+
+    wire({ deployment: view('live_current') })
+    rerender(<AppStatusPanel projectId="p1" />)
+
+    // Liveness: the panel re-rendered on the new state.
+    expect(screen.getByTestId('status-pill').textContent).toContain('Live')
     expect(answer().textContent).toBe('')
   })
 })
