@@ -723,8 +723,11 @@ async def patch_app(
 async def disable(
     app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
 ) -> AdminAppStatusResponse:
-    """THE kill switch. Flipping the status stops the platform serving the app; SEVERING its
-    database is what stops the app's own running container reaching data.
+    """THE kill switch for an app's data. Flipping the status stops the platform acting for the
+    app — its owner cannot publish, restart or build it, and it stops counting as live — and
+    SEVERING its database is what stops the app's own running container reaching data. It does
+    not take a published container down: the apps edge proxies straight to it, so its address
+    keeps answering until the owner's takedown or `unpublish` removes it.
 
     REACHES DRAFT AND REJECTED APPS TOO, not approved ones only. The ordinary member of the
     marketplace catalog is a DRAFT — one-click deploy never writes a status — so the
@@ -734,8 +737,9 @@ async def disable(
     below says so rather than leaving the administrator to guess which lever they wanted.
 
     NOT severed here, deliberately: the app's deploy Blob SAS (see
-    `mint_deploy_credential`). Revoking that means deleting the container's stored access
-    policy, which is an operator step — do not read this response as "the files are locked"."""
+    `mint_deploy_credential`). A re-mint revokes it, because each mint replaces the container's
+    one stored access policy under a fresh id; deleting that policy by hand means looking the id
+    up first. Either is an operator step — do not read this response as "the files are locked"."""
     # The sever, not merely the status, because the shared-table plane and its per-request
     # app-key 403 are gone: a deployed container holds a real credential and answers to nobody
     # but PostgreSQL.
