@@ -22,6 +22,7 @@ const h = vi.hoisted(() => ({
   enableApp: vi.fn(),
   deleteApp: vi.fn(),
   fetchHistory: vi.fn(),
+  announceReviewQueueChanged: vi.fn(),
 }))
 
 vi.mock('../../utils/auth', () => ({ getStoredUser: h.getStoredUser }))

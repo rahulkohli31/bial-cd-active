@@ -36,7 +36,8 @@ const NOTHING_IN_DISPUTE_COPY =
 
 const LIVE_REJECTION_COPY =
   'This app is live. Rejecting removes it from the Marketplace but leaves it running at its URL, ' +
-  'and only its owner can undo that by submitting again. To take it down, use Unpublish instead.'
+  'and only its owner can undo that by submitting again. To take it down as well, disable it ' +
+  'from its row’s menu after rejecting.'
 
 const SECTION_LABEL = 'text-[10.5px] font-bold uppercase tracking-[0.6px] text-neutral'
 

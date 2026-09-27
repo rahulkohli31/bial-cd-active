@@ -2,11 +2,11 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import type { RefObject } from 'react'
 import type { ColumnDef, Row, SortingState, Table as TanStackTable } from '@tanstack/react-table'
 import {
-  AlertCircle, RefreshCw, ShieldCheck, ShieldOff, MoreHorizontal, PanelRightOpen, Power, Trash2,
+  AlertCircle, AlertTriangle, RefreshCw, ShieldCheck, ShieldOff, MoreHorizontal, PanelRightOpen, Power, Trash2,
 } from 'lucide-react'
 import { BusyGlyph } from '../ui/Waiting'
 import {
-  listApps, approveApp, rejectApp, patchApp, disableApp, enableApp, deleteApp,
+  listApps, approveApp, rejectApp, patchApp, disableApp, enableApp, deleteApp, announceReviewQueueChanged,
 } from '../../utils/appRegistryApi'
 import type {
   RegistryApp, RegistryList, RegistryStatus, AppStatus, LiveVersion, SubmittedDeclaration,
@@ -410,6 +410,8 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   /** The app awaiting a delete reason, or null. See `onDelete`. */
   const [deleting, setDeleting] = useState<RegistryApp | null>(null)
   const [deleteReason, setDeleteReason] = useState('')
+  // Why the last Delete failed. Said inside the dialog, for the same reason as `problem`.
+  const [deleteProblem, setDeleteProblem] = useState<string | null>(null)
   // Non-null once the developer withdraws the submission under review. Cleared
   // whenever a different item is opened, so one race can never haunt the next review.
   const [withdrawn, setWithdrawn] = useState<string | null>(null)
@@ -466,13 +468,17 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
     [list],
   )
 
-  // Run a mutating action with a per-row busy lock, then reload. Returns the FAILURE, or null on
-  // success — never a bare boolean, because the withdrawal race needs the error's `code`. A 409
-  // means the app changed elsewhere, so the list reloads on that failure too.
+  // Run a mutating action with a per-row busy lock, then reload the list and nudge the nav's
+  // waiting count. Returns the FAILURE, or null on success — never a bare boolean, because the
+  // withdrawal race needs the error's `code`. A 409 means the app changed elsewhere, so both
+  // re-read on that failure too.
   const run = async (appId: string, fn: () => Promise<unknown>, okMsg?: string): Promise<unknown> => {
     setBusyIds((s) => new Set(s).add(appId))
-    try { await fn(); if (okMsg) onToast(okMsg) ; await load(); return null }
-    catch (e) { if (e instanceof ApiError && e.status === 409) await load(); return e }
+    try { await fn(); if (okMsg) onToast(okMsg) ; await load(); announceReviewQueueChanged(); return null }
+    catch (e) {
+      if (e instanceof ApiError && e.status === 409) { await load(); announceReviewQueueChanged() }
+      return e
+    }
     finally { setBusyIds((s) => { const n = new Set(s); n.delete(appId); return n }) }
   }
 
@@ -528,6 +534,7 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
     // work under words that were never about it. Cleared on OPEN rather than only on close,
     // because close is the path a mid-flight failure deliberately does not take.
     setDeleteReason('')
+    setDeleteProblem(null)
     setDeleting(app)
   }
 
@@ -581,15 +588,18 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
         <DeleteAppDialog
           app={deleting}
           reason={deleteReason}
-          onReason={setDeleteReason}
+          onReason={(value) => { setDeleteReason(value); setDeleteProblem(null) }}
+          problem={deleteProblem}
           busy={busyIds.has(deleting.appId)}
           onClose={() => { setDeleting(null); setDeleteReason('') }}
           onConfirm={async () => {
             const target = deleting
-            const outcome = await act(target.appId, () => deleteApp(target.appId, deleteReason), `“${appLabel(target)}” deleted`)
+            setDeleteProblem(null)
+            const failure = await run(target.appId, () => deleteApp(target.appId, deleteReason), `“${appLabel(target)}” deleted`)
             // Close only on success — a 422 on the reason must leave the words on screen to fix,
             // not throw them away behind a dialog that has already gone.
-            if (!(outcome instanceof Error)) { setDeleting(null); setDeleteReason('') }
+            if (failure === null) { setDeleting(null); setDeleteReason('') }
+            else setDeleteProblem(failure instanceof Error ? failure.message : String(failure))
           }}
         />
       )}
@@ -607,10 +617,12 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
  * mirrored at `src/core/words.py`) and rides the `app:delete` audit row, which outlives the app.
  * The client keeps the person inside the bounds; the server enforces them.
  */
-function DeleteAppDialog({ app, reason, onReason, busy, onClose, onConfirm }: {
+function DeleteAppDialog({ app, reason, onReason, problem, busy, onClose, onConfirm }: {
   app: RegistryApp
   reason: string
   onReason: (value: string) => void
+  /** Why the last Delete failed, said beside the actions it came from. */
+  problem: string | null
   busy: boolean
   onClose: () => void
   onConfirm: () => void
@@ -662,6 +674,16 @@ function DeleteAppDialog({ app, reason, onReason, busy, onClose, onConfirm }: {
             {words}/{MAX_DELETE_REASON_WORDS} words
           </span>
         </label>
+        {problem !== null && (
+          <p
+            data-testid="admin-delete-problem"
+            role="alert"
+            className="mt-4 flex items-start gap-1.5 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs leading-relaxed text-red-700"
+          >
+            <AlertTriangle size={13} className="mt-0.5 flex-shrink-0" aria-hidden />
+            {problem}
+          </p>
+        )}
         <div className="flex gap-3 mt-5">
           <button
             type="button"

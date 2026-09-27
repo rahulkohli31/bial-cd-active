@@ -3,7 +3,7 @@ import { useLocation, useNavigate } from 'react-router-dom'
 import { motion } from 'motion/react'
 import { Bot, LayoutGrid, Users, Store, ShieldCheck } from 'lucide-react'
 import { getStoredUser, isAuthenticated } from '../../utils/auth'
-import { fetchAppStatusCounts } from '../../utils/appRegistryApi'
+import { fetchAppStatusCounts, REVIEW_QUEUE_CHANGED } from '../../utils/appRegistryApi'
 import { projectsListHref } from '../../utils/projectsListMemory'
 import WaitingCountBadge from '../admin/WaitingCountBadge'
 import { highlightTransition } from '../../lib/motion'
@@ -77,14 +77,17 @@ export default function NavItems({ onNavigate, onItemFocus, collapsed = false }:
     // RE-READ WHEN THE TAB COMES BACK rather than polling. The queue changes underneath this
     // badge — an administrator approves, a citizen withdraws, a pipeline routes a drifted
     // version — and a fetch-once badge sits on a number the admin panel has already corrected.
-    // Nothing here is urgent enough to wake an idle tab for.
+    // Nothing here is urgent enough to wake an idle tab for. An admin acting in THIS tab never
+    // changes focus, so the registry raises `REVIEW_QUEUE_CHANGED` for that case.
     const refresh = () => { if (document.visibilityState === 'visible') read() }
     window.addEventListener('focus', refresh)
     document.addEventListener('visibilitychange', refresh)
+    window.addEventListener(REVIEW_QUEUE_CHANGED, read)
     return () => {
       active = false
       window.removeEventListener('focus', refresh)
       document.removeEventListener('visibilitychange', refresh)
+      window.removeEventListener(REVIEW_QUEUE_CHANGED, read)
     }
   }, [isAdmin])
 

@@ -240,6 +240,16 @@ export async function fetchAppStatusCounts(deps: AuthFetchDeps = {}): Promise<Ap
   }
 }
 
+/** The same-tab nudge the nav's waiting count listens for. An event on `window` rather than a
+ *  store: there is one fact to share ("read the count again"), and the read already exists. */
+export const REVIEW_QUEUE_CHANGED = 'bial:review-queue-changed'
+
+/** Something in this tab changed the review queue. Focus and visibility never fire for an
+ *  administrator who stays on the tab they acted in, so this is what reaches the nav there. */
+export function announceReviewQueueChanged(): void {
+  window.dispatchEvent(new Event(REVIEW_QUEUE_CHANGED))
+}
+
 /** Approve a pending app, pinning EXACTLY the reviewed submission: the server
  * refuses (409) when the app was re-submitted since the admin reviewed it. */
 export async function approveApp(appId: string, submissionId: string, deps: AuthFetchDeps = {}): Promise<unknown> {

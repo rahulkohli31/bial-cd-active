@@ -14,6 +14,7 @@ const h = vi.hoisted(() => ({
   enableApp: vi.fn(),
   deleteApp: vi.fn(),
   fetchHistory: vi.fn(),
+  announceReviewQueueChanged: vi.fn(),
 }))
 vi.mock('../../../utils/appRegistryApi', () => h)
 
@@ -240,6 +241,26 @@ describe('AppRegistryPanel — one list, every app', () => {
     expect((await screen.findByTestId('review-problem')).textContent).toContain(copy)
     expect(onToast).not.toHaveBeenCalled()
     await waitFor(() => expect(h.listApps).toHaveBeenCalledTimes(2))
+  })
+
+  it('★ tells the nav\'s waiting count after an approve, so its badge stops counting this app', async () => {
+    h.approveApp.mockResolvedValue({})
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await openReview()
+    fireEvent.click(screen.getByTestId('approve-btn'))
+
+    await waitFor(() => expect(h.announceReviewQueueChanged).toHaveBeenCalledTimes(1))
+    expect(h.listApps).toHaveBeenCalledTimes(2)
+  })
+
+  it('tells the nav\'s waiting count after a conflict too, because the queue moved elsewhere', async () => {
+    h.approveApp.mockRejectedValue(new ApiError('This app is no longer waiting for review.', 409, 'not_pending'))
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await openReview()
+    fireEvent.click(screen.getByTestId('approve-btn'))
+
+    await screen.findByTestId('review-problem')
+    await waitFor(() => expect(h.announceReviewQueueChanged).toHaveBeenCalledTimes(1))
   })
 
   it('a failure that is no conflict leaves the list as it was, and the next open starts clean', async () => {
@@ -594,6 +615,17 @@ describe('the row menu', () => {
     await pickMenuItem('Enable')
 
     await waitFor(() => expect(h.enableApp).toHaveBeenCalledWith('app-6'))
+  })
+
+  it('★ tells the nav\'s waiting count after a disable, once the list has re-read', async () => {
+    h.listApps.mockResolvedValue(listOf(DRAFT))
+    h.disableApp.mockResolvedValue({ status: 'disabled' })
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await openMenu('app-4')
+    await pickMenuItem('Disable')
+
+    await waitFor(() => expect(h.announceReviewQueueChanged).toHaveBeenCalledTimes(1))
+    expect(h.listApps).toHaveBeenCalledTimes(2)
   })
 
   it('an approved app carries no deploy prompt and no way to record a deployment by hand', async () => {
@@ -1041,18 +1073,58 @@ describe('★ the admin delete collects a reason', () => {
     await waitFor(() => expect(document.activeElement).toBe(trigger))
   })
 
-  it('keeps the words on screen when the server refuses them', async () => {
+  const REFUSAL = 'Say why in 5 to 50 words.'
+
+  it('★ says why the server refused inside the dialog, keeps the words, and raises no toast', async () => {
     h.listApps.mockResolvedValue(listOf(APPROVED))
-    h.deleteApp.mockRejectedValue(new Error('Say why in 2 to 50 words.'))
-    render(<AppRegistryPanel onToast={vi.fn()} />)
+    h.deleteApp.mockRejectedValue(new ApiError(REFUSAL, 422, 'validation_error'))
+    const onToast = vi.fn()
+    render(<AppRegistryPanel onToast={onToast} />)
     await openDelete()
 
     fireEvent.change(await screen.findByTestId('admin-delete-reason'), { target: { value: REASON } })
     fireEvent.click(screen.getByTestId('admin-delete-confirm'))
 
+    const problem = await screen.findByTestId('admin-delete-problem')
+    expect(problem.getAttribute('role')).toBe('alert')
+    expect(problem.textContent).toContain(REFUSAL)
+    // Inside the dialog, where the admin is looking: the page's toast renders beneath it.
+    expect(screen.getByRole('dialog').contains(problem)).toBe(true)
+    expect(onToast).not.toHaveBeenCalled()
     // A refusal must not close the dialog and throw the typed words away — there is nothing to
     // fix if the text is gone.
-    await waitFor(() => expect(h.deleteApp).toHaveBeenCalled())
     expect(screen.getByTestId('admin-delete-reason').value).toBe(REASON)
+  })
+
+  it('drops the refusal once the reason is edited', async () => {
+    h.listApps.mockResolvedValue(listOf(APPROVED))
+    h.deleteApp.mockRejectedValue(new ApiError(REFUSAL, 422, 'validation_error'))
+    render(<AppRegistryPanel onToast={vi.fn()} />)
+    await openDelete()
+    fireEvent.change(await screen.findByTestId('admin-delete-reason'), { target: { value: REASON } })
+    fireEvent.click(screen.getByTestId('admin-delete-confirm'))
+    await screen.findByTestId('admin-delete-problem')
+
+    fireEvent.change(screen.getByTestId('admin-delete-reason'), { target: { value: `${REASON} again` } })
+
+    expect(screen.queryByTestId('admin-delete-problem')).toBeNull()
+    expect(screen.getByTestId('admin-delete-reason').value).toBe(`${REASON} again`)
+  })
+
+  it('the next open starts clean', async () => {
+    h.listApps.mockResolvedValue(listOf(APPROVED))
+    h.deleteApp.mockRejectedValue(new ApiError(REFUSAL, 422, 'validation_error'))
+    render(<AppRegistryPanel onToast={vi.fn()} />)
+    await openDelete()
+    fireEvent.change(await screen.findByTestId('admin-delete-reason'), { target: { value: REASON } })
+    fireEvent.click(screen.getByTestId('admin-delete-confirm'))
+    await screen.findByTestId('admin-delete-problem')
+
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByTestId('admin-delete-reason')).toBeNull())
+    await openDelete()
+
+    expect((await screen.findByTestId('admin-delete-reason')).value).toBe('')
+    expect(screen.queryByTestId('admin-delete-problem')).toBeNull()
   })
 })

@@ -36,7 +36,10 @@ vi.mock('../../../utils/auth', () => ({
   logout: h.logout,
 }))
 vi.mock('../../../utils/attachmentApi', () => ({ revokeAllAttachmentUrls: vi.fn() }))
-vi.mock('../../../utils/appRegistryApi', () => ({ fetchAppStatusCounts: h.fetchAppStatusCounts }))
+vi.mock('../../../utils/appRegistryApi', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../utils/appRegistryApi')>()),
+  fetchAppStatusCounts: h.fetchAppStatusCounts,
+}))
 vi.mock('../../../utils/projectsListMemory', () => ({
   projectsListHref: h.projectsListHref,
   rememberProjectsSearch: h.rememberProjectsSearch,

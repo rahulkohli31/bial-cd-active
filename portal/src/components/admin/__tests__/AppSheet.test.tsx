@@ -434,7 +434,7 @@ describe('an app waiting for a decision', () => {
     fireEvent.click(screen.getByTestId('reject-btn'))
 
     expect(screen.getByTestId('reject-delists-warning').textContent).toBe(
-      'This app is live. Rejecting removes it from the Marketplace but leaves it running at its URL, and only its owner can undo that by submitting again. To take it down, use Unpublish instead.',
+      'This app is live. Rejecting removes it from the Marketplace but leaves it running at its URL, and only its owner can undo that by submitting again. To take it down as well, disable it from its row’s menu after rejecting.',
     )
   })
 
