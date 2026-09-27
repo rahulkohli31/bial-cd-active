@@ -20,9 +20,12 @@ interface AppSheetProps {
   title: string
   /** The app's registry status, as its row draws it. */
   status: ReactNode
-  withdrawn: string | null
+  /** The review can no longer be acted on, in the server's words, or null. */
+  overtaken: string | null
   /** Why the last Approve or Reject failed, or null. */
   problem: string | null
+  /** An Approve or Reject for this app is in flight. */
+  busy: boolean
   onClose: () => void
   onApprove: () => Promise<void>
   onReject: (note: string) => Promise<void>
@@ -35,7 +38,7 @@ interface AppSheetProps {
  * Focus lands on the panel itself rather than its first control, and Radix's own restore is off:
  * the panel is unmounted rather than closed, and the list puts focus back on the row that opened it.
  */
-export default function AppSheet({ app, title, status, withdrawn, problem, onClose, onApprove, onReject }: AppSheetProps) {
+export default function AppSheet({ app, title, status, overtaken, problem, busy, onClose, onApprove, onReject }: AppSheetProps) {
   const [history, setHistory] = useState<AppHistory | null>(null)
   const [error, setError] = useState<string | null>(null)
   const panel = useRef<HTMLDivElement>(null)
@@ -105,8 +108,9 @@ export default function AppSheet({ app, title, status, withdrawn, problem, onClo
               <AppReviewTab
                 app={app}
                 number={reviewed?.number ?? null}
-                withdrawn={withdrawn}
+                overtaken={overtaken}
                 problem={problem}
+                busy={busy}
                 onClose={onClose}
                 onApprove={onApprove}
                 onReject={onReject}

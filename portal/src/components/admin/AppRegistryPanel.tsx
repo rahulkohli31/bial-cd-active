@@ -93,6 +93,17 @@ function matchesStatusFilter(row: Row<RegistryApp>, _columnId: string, value: un
   return filter === undefined || filter.statuses.includes(row.original.registryStatus)
 }
 
+/** What an action answered, and the app it was about. */
+interface Settled {
+  appId: string
+  message: string
+}
+
+/** The app changed underneath the action: gone (404), or withdrawn, re-submitted or decided elsewhere (409). */
+function changedElsewhere(failure: unknown): boolean {
+  return failure instanceof ApiError && (failure.status === 404 || failure.status === 409)
+}
+
 function matchesOwner(row: Row<RegistryApp>, _columnId: string, value: unknown): boolean {
   return value === undefined || row.original.ownerUsername === value
 }
@@ -397,8 +408,8 @@ const COLUMNS: ColumnDef<RegistryApp>[] = [
  * all backed by the admin-gated /api/admin/apps endpoints.
  */
 export interface AppRegistryPanelProps {
-  // severity is optional (default 'ok' on the AdminPage side) so a plain confirmation
-  // call reads exactly as it always has — only a failed `act()` below passes 'problem'.
+  // severity is optional (default 'ok' on the AdminPage side) so a plain confirmation needs no
+  // second argument — only a failed `act()` below passes 'problem'.
   onToast: (msg: string, severity?: 'ok' | 'problem') => void
 }
 
@@ -412,12 +423,12 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   const [deleteReason, setDeleteReason] = useState('')
   // Why the last Delete failed. Said inside the dialog, for the same reason as `problem`.
   const [deleteProblem, setDeleteProblem] = useState<string | null>(null)
-  // Non-null once the developer withdraws the submission under review. Cleared
-  // whenever a different item is opened, so one race can never haunt the next review.
-  const [withdrawn, setWithdrawn] = useState<string | null>(null)
-  // Why the panel's last Approve or Reject failed. Said inside the panel: the page's toast
-  // renders beneath it.
-  const [problem, setProblem] = useState<string | null>(null)
+  // What an Approve or Reject answered, kept with the app it was about: a result can land after
+  // the panel moved to another app, and must not speak in that app's review. `overtaken` means
+  // the review can no longer be acted on; `problem` is a failure worth retrying. Said inside the
+  // panel, because the page's toast renders beneath it.
+  const [overtaken, setOvertaken] = useState<Settled | null>(null)
+  const [problem, setProblem] = useState<Settled | null>(null)
   // A SET of in-flight app ids, not one shared lock: acting on row A must never
   // re-enable row B's still-pending buttons (which a single busyId did, opening the
   // door to duplicate concurrent mutations + duplicate audit rows).
@@ -469,14 +480,14 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   )
 
   // Run a mutating action with a per-row busy lock, then reload the list and nudge the nav's
-  // waiting count. Returns the FAILURE, or null on success — never a bare boolean, because the
-  // withdrawal race needs the error's `code`. A 409 means the app changed elsewhere, so both
-  // re-read on that failure too.
+  // waiting count. Returns the FAILURE, or null on success — never a bare boolean, because callers
+  // tell a conflict from a failure worth retrying. A 404 or 409 means the app changed elsewhere,
+  // so both re-read on that failure too.
   const run = async (appId: string, fn: () => Promise<unknown>, okMsg?: string): Promise<unknown> => {
     setBusyIds((s) => new Set(s).add(appId))
     try { await fn(); if (okMsg) onToast(okMsg) ; await load(); announceReviewQueueChanged(); return null }
     catch (e) {
-      if (e instanceof ApiError && e.status === 409) { await load(); announceReviewQueueChanged() }
+      if (changedElsewhere(e)) { await load(); announceReviewQueueChanged() }
       return e
     }
     finally { setBusyIds((s) => { const n = new Set(s); n.delete(appId); return n }) }
@@ -492,28 +503,29 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
     return failure
   }
 
-  /** Close the panel on success; on a failure keep it open and say why inside it — on the 409
-   *  the admin still needs the submission metadata. The withdrawal race replaces the actions. */
-  const settleReview = (failure: unknown): void => {
-    if (failure === null) { setOpenApp(null); setWithdrawn(null); return }
-    const message = failure instanceof Error ? failure.message : String(failure)
-    if (failure instanceof ApiError && failure.code === 'submission_withdrawn') setWithdrawn(message)
-    else setProblem(message)
+  /** On success the app's panel closes, if it is still the one open. A conflict — withdrawn,
+   *  re-submitted or decided elsewhere — replaces its actions with the server's sentence: the list
+   *  behind has re-read, and the admin reopens the row to review what is there now. Any other
+   *  failure keeps the actions for a retry. */
+  const settleReview = (appId: string, failure: unknown): void => {
+    if (failure === null) { setOpenApp((current) => (current?.appId === appId ? null : current)); return }
+    const settled = { appId, message: failure instanceof Error ? failure.message : String(failure) }
+    if (changedElsewhere(failure)) setOvertaken(settled)
+    else setProblem(settled)
   }
 
-  // Approve sends the on-display submission id (the reviewed-id guard's input); a stale review
-  // 409s with copy the panel shows verbatim, and the panel closes only on success so a 409 leaves
-  // the metadata visible to re-review. `submissionId` is nullable in the schema but always present
-  // once an app is 'pending' — the `as string` below is an unchecked pass-through matching
-  // pre-migration behavior, not a missed null check.
-  const onApprove = (app: RegistryApp) => { setProblem(null); return run(app.appId, () => approveApp(app.appId, app.submissionId as string), `“${appLabel(app)}” approved`).then(settleReview) }
-  const onReject = (app: RegistryApp, note: string) => { setProblem(null); return run(app.appId, () => rejectApp(app.appId, note), `“${appLabel(app)}” rejected`).then(settleReview) }
+  // Approve sends the on-display submission id (the reviewed-id guard's input), so a review of a
+  // version since replaced is refused rather than promoting a build nobody saw. `submissionId` is
+  // nullable in the schema but always present once an app is pending, so the `as string` is a
+  // pass-through, not a missed null check.
+  const onApprove = (app: RegistryApp) => { setProblem(null); return run(app.appId, () => approveApp(app.appId, app.submissionId as string), `“${appLabel(app)}” approved`).then((failure) => settleReview(app.appId, failure)) }
+  const onReject = (app: RegistryApp, note: string) => { setProblem(null); return run(app.appId, () => rejectApp(app.appId, note), `“${appLabel(app)}” rejected`).then((failure) => settleReview(app.appId, failure)) }
   const onToggleLogin = (app: RegistryApp) => act(app.appId, () => patchApp(app.appId, { loginRequired: !app.loginRequired }), `Login ${app.loginRequired ? 'disabled' : 'required'} for “${appLabel(app)}”`)
   const onDisable = (app: RegistryApp) => act(app.appId, () => disableApp(app.appId), `“${appLabel(app)}” disabled`)
   const onEnable = (app: RegistryApp) => act(app.appId, () => enableApp(app.appId), `“${appLabel(app)}” re-enabled`)
   const onOpen = (app: RegistryApp, opener: HTMLElement | null) => {
     openerRef.current = opener
-    setWithdrawn(null)
+    setOvertaken(null)
     setProblem(null)
     setOpenApp(app)
   }
@@ -577,9 +589,10 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
           app={openApp}
           title={appLabel(openApp)}
           status={<RegistryBadge status={openApp.registryStatus} />}
-          withdrawn={withdrawn}
-          problem={problem}
-          onClose={() => { setOpenApp(null); setWithdrawn(null) }}
+          overtaken={overtaken?.appId === openApp.appId ? overtaken.message : null}
+          problem={problem?.appId === openApp.appId ? problem.message : null}
+          busy={busyIds.has(openApp.appId)}
+          onClose={() => setOpenApp(null)}
           onApprove={() => onApprove(openApp)}
           onReject={(note) => onReject(openApp, note)}
         />
@@ -596,9 +609,12 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
             const target = deleting
             setDeleteProblem(null)
             const failure = await run(target.appId, () => deleteApp(target.appId, deleteReason), `“${appLabel(target)}” deleted`)
-            // Close only on success — a 422 on the reason must leave the words on screen to fix,
-            // not throw them away behind a dialog that has already gone.
-            if (failure === null) { setDeleting(null); setDeleteReason('') }
+            // Close on success, or when the app is already gone. A 422 on the reason must leave the
+            // words on screen to fix, not throw them away behind a dialog that has already gone.
+            if (failure === null || (failure instanceof ApiError && failure.status === 404)) {
+              setDeleting(null)
+              setDeleteReason('')
+            }
             else setDeleteProblem(failure instanceof Error ? failure.message : String(failure))
           }}
         />

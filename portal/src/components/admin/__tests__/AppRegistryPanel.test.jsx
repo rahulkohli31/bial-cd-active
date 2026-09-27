@@ -209,7 +209,7 @@ describe('AppRegistryPanel — one list, every app', () => {
     expect(within(row).queryByText('Waiting for review')).toBeNull()
   })
 
-  it('an approve 409 says the re-submitted-since-review copy inside the panel, and reloads the list', async () => {
+  it('an approve 409 says the re-submitted-since-review copy inside the panel, in place of the actions, and reloads the list', async () => {
     const copy = 'This app was re-submitted since you reviewed it — please re-review.'
     h.approveApp.mockRejectedValue(new ApiError(copy, 409, 'conflict'))
     const onToast = vi.fn()
@@ -217,14 +217,16 @@ describe('AppRegistryPanel — one list, every app', () => {
     await openReview()
     fireEvent.click(screen.getByTestId('approve-btn'))
 
-    const problem = await screen.findByTestId('review-problem')
-    expect(problem.getAttribute('role')).toBe('alert')
-    expect(problem.textContent).toContain(copy)
+    const message = await screen.findByTestId('review-overtaken')
+    expect(message.textContent).toContain(copy)
     // Inside the panel, where the admin is looking: the page's toast renders beneath it.
-    expect(screen.getByRole('dialog').contains(problem)).toBe(true)
+    expect(screen.getByRole('dialog').contains(message)).toBe(true)
     expect(onToast).not.toHaveBeenCalled()
-    // The panel stays OPEN on the 409, and the list behind it re-reads what changed elsewhere.
-    expect(screen.getByTestId('approve-btn')).toBeTruthy()
+    // Neither action survives: a second Approve could only fail, and a Reject would land on a
+    // version nobody reviewed. The list behind re-reads what changed.
+    expect(screen.queryByTestId('approve-btn')).toBeNull()
+    expect(screen.queryByTestId('reject-btn')).toBeNull()
+    expect(screen.getByTestId('overtaken-close')).toBeTruthy()
     await waitFor(() => expect(h.listApps).toHaveBeenCalledTimes(2))
   })
 
@@ -238,9 +240,70 @@ describe('AppRegistryPanel — one list, every app', () => {
     fireEvent.change(screen.getByTestId('reject-note'), { target: { value: 'Please remove the passport field first.' } })
     fireEvent.click(screen.getByTestId('reject-confirm'))
 
-    expect((await screen.findByTestId('review-problem')).textContent).toContain(copy)
+    expect((await screen.findByTestId('review-overtaken')).textContent).toContain(copy)
+    expect(screen.queryByTestId('reject-confirm')).toBeNull()
     expect(onToast).not.toHaveBeenCalled()
     await waitFor(() => expect(h.listApps).toHaveBeenCalledTimes(2))
+  })
+
+  it('an app deleted elsewhere is a conflict too: the panel says so and the list re-reads', async () => {
+    h.approveApp.mockRejectedValue(new ApiError('App not found', 404, 'not_found'))
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await openReview()
+    fireEvent.click(screen.getByTestId('approve-btn'))
+
+    expect((await screen.findByTestId('review-overtaken')).textContent).toContain('App not found')
+    await waitFor(() => expect(h.listApps).toHaveBeenCalledTimes(2))
+  })
+
+  it('a result that lands after the admin moved to another app leaves that app\'s panel alone', async () => {
+    const OTHER = { ...PENDING, appId: 'app-9', name: 'Other Tool', submissionId: 'sub-9' }
+    h.listApps.mockResolvedValue(listOf(PENDING, OTHER))
+    let settle
+    h.approveApp.mockReturnValue(new Promise((_resolve, reject) => { settle = reject }))
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await openReview()
+    fireEvent.click(screen.getByTestId('approve-btn'))
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Close' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Other Tool' }))
+    await screen.findByRole('dialog', { name: 'Other Tool' })
+
+    settle(new ApiError('This app is no longer waiting for review.', 409, 'not_pending'))
+
+    await waitFor(() => expect(h.listApps).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('dialog', { name: 'Other Tool' })).toBeTruthy()
+    expect(screen.getByTestId('approve-btn')).toBeTruthy()
+    expect(screen.queryByTestId('review-overtaken')).toBeNull()
+  })
+
+  it('a success that lands after the admin moved to another app does not close that app\'s panel', async () => {
+    const OTHER = { ...PENDING, appId: 'app-9', name: 'Other Tool', submissionId: 'sub-9' }
+    h.listApps.mockResolvedValue(listOf(PENDING, OTHER))
+    let settle
+    h.approveApp.mockReturnValue(new Promise((resolve) => { settle = resolve }))
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await openReview()
+    fireEvent.click(screen.getByTestId('approve-btn'))
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Close' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Other Tool' }))
+    await screen.findByRole('dialog', { name: 'Other Tool' })
+
+    settle({})
+
+    await waitFor(() => expect(h.listApps).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('dialog', { name: 'Other Tool' })).toBeTruthy()
+  })
+
+  it('reopening an app mid-approve keeps its actions locked', async () => {
+    h.approveApp.mockReturnValue(new Promise(() => {}))
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await openReview()
+    fireEvent.click(screen.getByTestId('approve-btn'))
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Close' }))
+    await openReview()
+
+    expect(screen.getByTestId('approve-btn').hasAttribute('disabled')).toBe(true)
+    expect(h.approveApp).toHaveBeenCalledTimes(1)
   })
 
   it('★ tells the nav\'s waiting count after an approve, so its badge stops counting this app', async () => {
@@ -259,7 +322,7 @@ describe('AppRegistryPanel — one list, every app', () => {
     await openReview()
     fireEvent.click(screen.getByTestId('approve-btn'))
 
-    await screen.findByTestId('review-problem')
+    await screen.findByTestId('review-overtaken')
     await waitFor(() => expect(h.announceReviewQueueChanged).toHaveBeenCalledTimes(1))
   })
 
@@ -911,26 +974,24 @@ describe('a submission withdrawn while the panel was open', () => {
     await openReview()
     fireEvent.click(screen.getByTestId('approve-btn'))
 
-    const message = await screen.findByTestId('review-withdrawn')
+    const message = await screen.findByTestId('review-overtaken')
     expect(message.textContent).toMatch(/withdrew this submission/i)
     // In PLACE OF: neither action survives, so there is nothing left to click twice.
     expect(screen.queryByTestId('approve-btn')).toBeNull()
     expect(screen.queryByTestId('reject-btn')).toBeNull()
-    expect(screen.getByTestId('withdrawn-close')).toBeTruthy()
+    expect(screen.getByTestId('overtaken-close')).toBeTruthy()
     // It announces: the block is a polite live region, not a silent swap.
     expect(screen.getByTestId('review-status').getAttribute('aria-live')).toBe('polite')
   })
 
-  it('a DIFFERENT 409 leaves the actions alone — only withdrawal replaces them', async () => {
-    const copy = 'This app was re-submitted since you reviewed it — please re-review.'
-    h.approveApp.mockRejectedValue(new ApiError(copy, 409, null))
-    const onToast = vi.fn()
-    render(<AppRegistryPanel onToast={onToast} />)
+  it('a failure that is no conflict keeps the actions, for a retry', async () => {
+    h.approveApp.mockRejectedValue(new ApiError('The registry could not be reached.', 503, null))
+    render(<AppRegistryPanel onToast={() => {}} />)
     await openReview()
     fireEvent.click(screen.getByTestId('approve-btn'))
 
-    expect((await screen.findByTestId('review-problem')).textContent).toContain(copy)
-    expect(screen.queryByTestId('review-withdrawn')).toBeNull()
+    expect((await screen.findByTestId('review-problem')).textContent).toContain('could not be reached')
+    expect(screen.queryByTestId('review-overtaken')).toBeNull()
     expect(screen.getByTestId('approve-btn')).toBeTruthy()
   })
 })

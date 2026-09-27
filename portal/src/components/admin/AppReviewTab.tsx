@@ -221,11 +221,14 @@ interface AppReviewTabProps {
   app: RegistryApp
   /** The number of the send under review, once History has said. */
   number: number | null
-  /** The owner pulled this submission back while the panel was open. Non-null replaces the
-   *  actions: there is nothing left to decide, and a button that can only fail is worse. */
-  withdrawn: string | null
+  /** The submission was withdrawn, re-submitted or decided elsewhere while the panel was open.
+   *  Non-null replaces the actions: there is nothing left to decide here, and a button that can
+   *  only fail, or act on a version nobody reviewed, is worse. */
+  overtaken: string | null
   /** Why the last Approve or Reject failed, said beside the actions it came from. */
   problem: string | null
+  /** An Approve or Reject for this app is in flight, even if it began before this tab mounted. */
+  busy: boolean
   onClose: () => void
   onApprove: () => Promise<void>
   onReject: (note: string) => Promise<void>
@@ -237,25 +240,13 @@ interface AppReviewTabProps {
  * sent. Approve sends the submission id on display, so a re-submit since this review is refused
  * instead of promoting an unseen build. No evidence location reaches this screen.
  */
-export default function AppReviewTab({ app, number, withdrawn, problem, onClose, onApprove, onReject }: AppReviewTabProps) {
+export default function AppReviewTab({ app, number, overtaken, problem, busy, onClose, onApprove, onReject }: AppReviewTabProps) {
   const [rejecting, setRejecting] = useState(false)
   const [note, setNote] = useState('')
-  const [busy, setBusy] = useState(false)
   const declaration = readDeclaration(app.declaration)
   const trimmedNote = note.trim()
   const noteTooShort = trimmedNote.length < MIN_REJECTION_NOTE
   const version = `${number === null ? '' : `v${number} · `}${shortSha(app.commitSha)}`
-
-  // `onApprove`/`onReject` never reject — the panel owns every failure and says it here — so
-  // this only drives the button's spinner.
-  const run = async (fn: () => Promise<void>) => {
-    setBusy(true)
-    try {
-      await fn()
-    } finally {
-      setBusy(false)
-    }
-  }
 
   return (
     <>
@@ -270,21 +261,21 @@ export default function AppReviewTab({ app, number, withdrawn, problem, onClose,
         )}
 
         <div data-testid="review-status" role="status" aria-live="polite" className="empty:hidden">
-          {withdrawn !== null && (
+          {overtaken !== null && (
             <p
-              data-testid="review-withdrawn"
+              data-testid="review-overtaken"
               className="flex items-start gap-1.5 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-relaxed text-amber-700"
             >
               <ShieldAlert size={13} className="mt-0.5 flex-shrink-0" />
-              {withdrawn}
+              {overtaken}
             </p>
           )}
-          {withdrawn === null && declaration.version === 1 && !declaration.present && (
+          {overtaken === null && declaration.version === 1 && !declaration.present && (
             <p data-testid="review-no-declaration" className="text-xs leading-relaxed text-neutral">
               {NO_DECLARATION_COPY}
             </p>
           )}
-          {withdrawn === null && declaration.version === 1 && declaration.present && declaration.noReviewAtAll && (
+          {overtaken === null && declaration.version === 1 && declaration.present && declaration.noReviewAtAll && (
             <p data-testid="review-no-review" className="text-xs leading-relaxed text-amber-700">
               {NO_REVIEW_COPY}
             </p>
@@ -396,9 +387,9 @@ export default function AppReviewTab({ app, number, withdrawn, problem, onClose,
       </div>
 
       <div className="flex-shrink-0 border-t border-bial-border bg-white px-6 py-3.5">
-        {withdrawn !== null ? (
+        {overtaken !== null ? (
           <div className="flex justify-end">
-            <Button data-testid="withdrawn-close" variant="outline" onClick={onClose} className="h-9 rounded-lg border-bial-border px-4 text-[13.5px] font-semibold text-tertiary">
+            <Button data-testid="overtaken-close" variant="outline" onClick={onClose} className="h-9 rounded-lg border-bial-border px-4 text-[13.5px] font-semibold text-tertiary">
               Close
             </Button>
           </div>
@@ -454,7 +445,7 @@ export default function AppReviewTab({ app, number, withdrawn, problem, onClose,
                   <Button
                     data-testid="reject-confirm"
                     disabled={busy || noteTooShort}
-                    onClick={() => run(() => onReject(trimmedNote))}
+                    onClick={() => void onReject(trimmedNote)}
                     className="h-9 rounded-lg bg-red-600 px-[18px] text-[13.5px] font-semibold text-white hover:bg-red-700"
                   >
                     Send rejection
@@ -473,7 +464,7 @@ export default function AppReviewTab({ app, number, withdrawn, problem, onClose,
                   <Button
                     data-testid="approve-btn"
                     disabled={busy}
-                    onClick={() => run(onApprove)}
+                    onClick={() => void onApprove()}
                     className="h-9 rounded-lg px-[18px] text-[13.5px] font-semibold shadow-none"
                   >
                     {busy && <BusyGlyph size={15} />} Approve and publish
