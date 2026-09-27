@@ -192,14 +192,60 @@ def test_a_live_app_with_four_saves_and_no_new_submission_reads_live_newer_work(
     assert compute_publish_state(app, deployment, _SAVED_SHA) is PublishState.LIVE_NEWER_WORK
 
 
-def test_an_unreadable_saved_head_still_reads_newer_work_off_the_submitted_commit() -> None:
+def test_an_unreadable_saved_head_reads_newer_work_off_a_submission_made_since() -> None:
     """The secondary positive signal (`source_commit_sha`) fires on its own when the
     primary one (the saved head) could not be read at all — it must not be swallowed
     into `live_drift_unknown` just because the stronger signal is missing."""
-    app = _app(status=AppStatus.APPROVED, source_commit_sha=_SUBMITTED_SHA)
-    deployment = _deployment(status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA)
+    app = _app(
+        status=AppStatus.APPROVED,
+        source_commit_sha=_SUBMITTED_SHA,
+        submitted_at=_SINCE_APPROVAL + timedelta(hours=1),
+    )
+    deployment = _deployment(
+        status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA, created_at=_SINCE_APPROVAL
+    )
 
     assert compute_publish_state(app, deployment, None) is PublishState.LIVE_NEWER_WORK
+
+
+def test_a_submission_older_than_the_live_version_says_nothing_about_newer_work() -> None:
+    """The approved version was followed by one the gate published without an
+    administrator, which never moves the submitted commit. That commit differs from what
+    is live because it is OLDER, so with the saved head unreadable the honest answer is
+    unknown, never newer work."""
+    app = _approved(
+        _SUBMITTED_SHA, source_commit_sha=_SUBMITTED_SHA, submitted_at=_BEFORE_APPROVAL
+    )
+    deployment = _deployment(
+        status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA, created_at=_SINCE_APPROVAL
+    )
+
+    assert compute_publish_state(app, deployment, None) is PublishState.LIVE_DRIFT_UNKNOWN
+
+
+@pytest.mark.parametrize(
+    ("saved_head", "expected"),
+    [
+        pytest.param(_LIVE_SHA, PublishState.LIVE_CURRENT, id="saved head is what went live"),
+        pytest.param(_SAVED_SHA, PublishState.LIVE_NEWER_WORK, id="saved head moved past it"),
+    ],
+)
+@pytest.mark.parametrize(
+    "submitted_at",
+    [
+        pytest.param(_BEFORE_APPROVAL, id="submitted before going live"),
+        pytest.param(_SINCE_APPROVAL + timedelta(hours=1), id="submitted after going live"),
+    ],
+)
+def test_a_readable_saved_head_decides_whenever_the_submission_was_made(
+    saved_head: str, expected: PublishState, submitted_at: datetime
+) -> None:
+    app = _approved(_SUBMITTED_SHA, source_commit_sha=_SUBMITTED_SHA, submitted_at=submitted_at)
+    deployment = _deployment(
+        status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA, created_at=_SINCE_APPROVAL
+    )
+
+    assert compute_publish_state(app, deployment, saved_head) is expected
 
 
 def test_an_unattended_publish_reads_live_off_the_saved_head_never_the_pin() -> None:

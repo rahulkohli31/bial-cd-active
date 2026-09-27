@@ -256,18 +256,23 @@ def _live_state(app: AppRegistry, deployment: Deployment, saved_head: str | None
 
     AGAINST THE COMMIT THAT ACTUALLY WENT LIVE, never `approved_commit_sha`: that pin is NULL
     for every app published unattended, with no administrator, so comparing against it would read
-    every one of those apps as unknown. `saved_head` is the primary signal; `source_commit_sha`
-    (the last SUBMITTED commit, moved only by submit/withdraw, never by a Save) is the secondary
-    one that still fires `live_newer_work` even when the saved head could not be read at all —
-    four saves and no new submission is exactly the case a submitted-commit check alone reads as
-    unknown."""
+    every one of those apps as unknown. `saved_head` is the primary signal. When it cannot be
+    read, `source_commit_sha` (the last SUBMITTED commit, moved only by submit/withdraw — never by
+    a Save, nor by a version the gate publishes without an administrator) reads as newer work
+    only when it was submitted after this deployment was created. An older submission differs
+    from what is live because it is older, and says nothing about newer work."""
     if saved_head is not None:
         return (
             PublishState.LIVE_CURRENT
             if saved_head == deployment.head_sha
             else PublishState.LIVE_NEWER_WORK
         )
-    if app.source_commit_sha is not None and app.source_commit_sha != deployment.head_sha:
+    if (
+        app.source_commit_sha is not None
+        and app.source_commit_sha != deployment.head_sha
+        and app.submitted_at is not None
+        and app.submitted_at > deployment.created_at
+    ):
         return PublishState.LIVE_NEWER_WORK
     return PublishState.LIVE_DRIFT_UNKNOWN
 
