@@ -3,6 +3,7 @@ import type { AriaAttributes, ReactNode } from 'react'
 import {
   flexRender,
   getCoreRowModel,
+  getFacetedRowModel,
   getFilteredRowModel,
   getPaginationRowModel,
   getSortedRowModel,
@@ -176,6 +177,7 @@ export default function AdminDataTable<TRow>({
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
+    getFacetedRowModel: getFacetedRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
   })
 

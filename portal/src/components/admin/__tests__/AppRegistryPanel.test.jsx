@@ -328,6 +328,34 @@ describe('each row says where the app stands', () => {
     }
   })
 
+  it('the counts follow the owner filter and the search, whichever status is chosen', async () => {
+    h.listApps.mockResolvedValue(listOf(
+      { ...PENDING, appId: 'm-1', name: 'Visitor ID Pass', ownerUsername: 'meera.k@bial.com' },
+      { ...APPROVED, appId: 'm-2', name: 'Lost and Found Register', ownerUsername: 'meera.k@bial.com' },
+      { ...APPROVED, appId: 'm-3', name: 'Feedback Form', ownerUsername: 'ravi.s@bial.com' },
+      { ...DRAFT, appId: 'm-4', name: 'Design Tracker', ownerUsername: 'ravi.s@bial.com' },
+      { ...PENDING, appId: 'm-5', name: 'Gate Roster', ownerUsername: 'ravi.s@bial.com' },
+    ))
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Gate Roster')
+    const counts = () => ['all', 'waiting_for_review', 'live', 'draft'].map((key) => screen.getByTestId(`filter-count-${key}`).textContent)
+    expect(counts()).toEqual(['5', '2', '2', '1'])
+
+    fireEvent.click(screen.getByTestId('owner-filter'))
+    fireEvent.click(await screen.findByRole('option', { name: 'meera.k' }))
+    await waitFor(() => expect(counts()).toEqual(['2', '1', '1', '0']))
+
+    // Choosing a status narrows the rows, never the counts on the other filters.
+    fireEvent.click(screen.getByTestId('filter-live'))
+    expect(screen.getAllByRole('row')).toHaveLength(2)
+    expect(counts()).toEqual(['2', '1', '1', '0'])
+
+    fireEvent.click(screen.getByTestId('owner-filter'))
+    fireEvent.click(await screen.findByRole('option', { name: 'All owners' }))
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search apps' }), { target: { value: 'gate' } })
+    await waitFor(() => expect(counts()).toEqual(['1', '1', '0', '0']))
+  })
+
   it('Not live gathers publishing, failed, never-published and taken-offline apps', async () => {
     h.listApps.mockResolvedValue(listOf(...EVERY_STATUS))
     render(<AppRegistryPanel onToast={() => {}} />)

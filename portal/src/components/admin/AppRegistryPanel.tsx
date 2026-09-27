@@ -142,15 +142,16 @@ function ClassificationCell({ declaration }: { declaration: SubmittedDeclaration
   return <span className="text-neutral">—</span>
 }
 
-function StatusFilterPills({ table, apps, selectedRef }: {
+/** Each count is of the apps the owner filter and the search leave, whichever status is chosen. */
+function StatusFilterPills({ table, selectedRef }: {
   table: TanStackTable<RegistryApp>
-  apps: RegistryApp[]
   /** The selected pill: where focus lands when the row that opened something has left the list. */
   selectedRef: RefObject<HTMLButtonElement>
 }) {
   const column = table.getColumn('status')
   const value = column?.getFilterValue()
   const selected = typeof value === 'string' ? value : ALL
+  const apps = column?.getFacetedRowModel().rows.map((row) => row.original) ?? []
   const pills = [
     { key: ALL, label: 'All', count: apps.length },
     ...STATUS_FILTERS.map((f) => ({
@@ -559,7 +560,7 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
           initialSorting={INITIAL_SORT}
           onRowClick={(app, row) => onOpen(app, row.querySelector<HTMLElement>('[data-row-opener]'))}
           selectedRowId={openApp?.appId ?? null}
-          toolbarStart={(table) => <StatusFilterPills table={table} apps={list.apps} selectedRef={selectedFilterRef} />}
+          toolbarStart={(table) => <StatusFilterPills table={table} selectedRef={selectedFilterRef} />}
           toolbarEnd={(table) => <OwnerFilter table={table} owners={owners} />}
         />
       </RowHandlersContext.Provider>
