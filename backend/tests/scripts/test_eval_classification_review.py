@@ -655,9 +655,13 @@ def test_the_golden_set_holds_the_expectations_the_seeded_descriptions_must_meet
     assert _golden("event sign-up").expect == {"pii": "no"}
     assert _golden("also asks for an Aadhaar number").expect == {"pii": "yes"}
     assert _golden("uploads a copy of each Aadhaar card").expect == {"pii": "yes"}
+    assert _golden("photo of each visitor for the badge").expect == {"pii": "no"}
     assert _golden("Zoho CRM").expect == {"integrations": "yes"}
-    assert _golden("outside language model").expect == {"ai_usage": "yes", "integrations": "yes"}
-    assert _golden("platform's flight data connection").expect == {"integrations": "no"}
+    assert _golden("outside language model").expect == {"ai_usage": "yes", "integrations": "no"}
+    assert _golden("platform's flight data connection").expect == {
+        "integrations": "no",
+        "public_data": "no",
+    }
     assert _golden("platform's file storage").expect == {"integrations": "no"}
 
 
@@ -692,14 +696,13 @@ def test_a_golden_run_reports_every_miss(tmp_path: Path) -> None:
     assert calculator["expected"] == dict.fromkeys(_KEYS, "no")
     assert all(calculator["expected_met"].values())
     assert summary["golden_total"] == len(eval_script.GOLDEN_SCENARIOS)
-    assert summary["golden_passed"] == 5
+    assert summary["golden_passed"] == 6
     assert sorted((f["scenario"], f["class"]) for f in summary["golden_failures"]) == sorted(
         [
             ("feedback form that also asks for an Aadhaar number", "pii"),
             ("visitor pass app that uploads a copy of each Aadhaar card", "pii"),
             ("Zoho CRM account reader", "integrations"),
             ("comment summariser that calls an outside language model", "ai_usage"),
-            ("comment summariser that calls an outside language model", "integrations"),
         ]
     )
     assert all('<class key="pii">' in instructions for instructions in seen)

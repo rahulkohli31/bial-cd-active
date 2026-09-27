@@ -440,6 +440,58 @@ GOLDEN_SCENARIOS: Final[tuple[GoldenScenario, ...]] = (
         expect={"pii": "yes"},
     ),
     GoldenScenario(
+        name="visitor pass app that takes a photo of each visitor for the badge",
+        files={
+            **_PLATFORM_DB,
+            **_PLATFORM_STORAGE,
+            "app/page.tsx": (
+                '"use client";\n'
+                'import { useRef } from "react";\n\n'
+                "export default function Page() {\n"
+                "  const video = useRef<HTMLVideoElement>(null);\n"
+                "  async function startCamera() {\n"
+                "    video.current!.srcObject = await navigator.mediaDevices.getUserMedia({\n"
+                "      video: true,\n"
+                "    });\n"
+                "  }\n"
+                "  return (\n"
+                '    <form action="/api/visitors" method="post" encType="multipart/form-data">\n'
+                '      <label>Visitor name<input name="name" required /></label>\n'
+                '      <label>Company<input name="company" /></label>\n'
+                '      <label>Host<input name="host" required /></label>\n'
+                "      <video ref={video} autoPlay />\n"
+                '      <button type="button" onClick={startCamera}>Camera</button>\n'
+                '      <input name="photo" type="file" accept="image/*" capture="user" />\n'
+                '      <button type="submit">Print badge</button>\n'
+                "    </form>\n"
+                "  );\n"
+                "}\n"
+            ),
+            "app/api/visitors/route.ts": (
+                'import { getDb } from "@/db";\n'
+                'import { visitors } from "@/db/schema";\n'
+                'import { saveFile } from "@/lib/storage";\n\n'
+                "export async function POST(req: Request) {\n"
+                "  const form = await req.formData();\n"
+                '  const photo = form.get("photo") as File;\n'
+                "  const path = await saveFile(`badges/${crypto.randomUUID()}.jpg`, photo);\n"
+                "  await getDb().insert(visitors).values({\n"
+                '    name: String(form.get("name")),\n'
+                '    company: String(form.get("company") ?? ""),\n'
+                '    host: String(form.get("host")),\n'
+                "    photoPath: path,\n"
+                "  });\n"
+                '  return Response.redirect(new URL("/", req.url));\n'
+                "}\n"
+            ),
+            "db/schema.ts": _table(
+                "visitors",
+                [("name", True), ("company", False), ("host", True), ("photoPath", True)],
+            ),
+        },
+        expect={"pii": "no"},
+    ),
+    GoldenScenario(
         name="Zoho CRM account reader",
         files={
             "lib/zoho.ts": (
@@ -517,7 +569,7 @@ GOLDEN_SCENARIOS: Final[tuple[GoldenScenario, ...]] = (
                 "}\n"
             ),
         },
-        expect={"ai_usage": "yes", "integrations": "yes"},
+        expect={"ai_usage": "yes", "integrations": "no"},
     ),
     GoldenScenario(
         name="flight board fed by the platform's flight data connection",
@@ -527,8 +579,8 @@ GOLDEN_SCENARIOS: Final[tuple[GoldenScenario, ...]] = (
                 'import { BlobServiceClient } from "@azure/storage-blob";\n'
                 'import { ManagedIdentityCredential } from "@azure/identity";\n\n'
                 "export async function departureFiles(): Promise<string[]> {\n"
-                "  const url = process.env.BIAL_FLIGHT_DATA_URL;\n"
-                "  const clientId = process.env.BIAL_FLIGHT_DATA_CLIENT_ID;\n"
+                "  const url = process.env.BIAL_DICE_URL;\n"
+                "  const clientId = process.env.BIAL_DICE_CLIENT_ID;\n"
                 "  if (!url || !clientId) {\n"
                 '    throw new Error("The flight data connection is switched '
                 'off for this project.");\n'
@@ -560,7 +612,7 @@ GOLDEN_SCENARIOS: Final[tuple[GoldenScenario, ...]] = (
                 "}\n"
             ),
         },
-        expect={"integrations": "no"},
+        expect={"integrations": "no", "public_data": "no"},
     ),
     GoldenScenario(
         name="document library kept in the platform's file storage",
