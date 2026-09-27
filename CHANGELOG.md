@@ -4,6 +4,119 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.4] - 2026-09-27
+
+Publishing an app now runs on classes the administrators define, and approving an app publishes it.
+A review agent answers each class for the exact version about to go live. An app with nothing
+sensitive publishes by itself; personal or financial data, a score over the threshold, an
+unfinished review or a standing rejection sends it to an administrator with the owner's note. The
+App Registry lists every app with its real status, and a side panel carries the review and the
+app's history. The manual go-live path is gone.
+
+### Deploying this release
+
+- **Before migration 0048, export the links that were recorded by hand**:
+  `SELECT id, project_id, deployed_url, deployed_at, deployed_submission_id FROM app_registry WHERE deployed_url IS NOT NULL OR deployed_at IS NOT NULL`.
+  After 0048 the platform keeps no record of them, so check those containers against the export.
+- **Dump `connector_access_requests` first if its history matters.** Migration 0047 deletes every
+  connector access request, and no audit row holds them.
+- **Run migrations 0047, 0048 and 0049.** 0047 and 0048 give up after five seconds if they cannot
+  take their locks; run them again at a quieter moment. 0049 seeds the launch classes (PII and
+  Financial data as hard blocks, five scored classes) and the policy (threshold 100, owners may
+  change the agent's answers). Rolling back means downgrading the database with the image, to 0046.
+  A downgrade recreates the dropped structures empty, and one past 0049 discards any administrator
+  edits to the classes and the policy.
+- **Check the three `CONNECTOR_LAKE__` settings (`URL`, `IDENTITY_CLIENT_ID`,
+  `IDENTITY_RESOURCE_ID`) on the production API before the rollout.** They are now required there,
+  and the API refuses to start without one.
+- **Ship the backend and portal images together.** The publish request, the registry list and the
+  review readout change shape, and the mark-deployed, per-app audit and per-person connector routes
+  are gone, so an old portal fails against the new backend. Open tabs need a reload.
+- **Send a 30 MB attachment through production's front door once it is live.** Its upload body is
+  about 42 MB, and the web application firewall must let it through.
+- **Tell owners and administrators what changes for them:**
+  - Every app's first publish after the release runs a fresh review, because reviews stored before
+    it are not tied to the class definitions. Expect a burst of apps routed as "review unfinished"
+    on the first day.
+  - Apps approved but never published show their owner "Try again", which publishes the approved
+    copy with no second review.
+  - Apps marked live by hand lose their recorded link and publish through the platform.
+  - Apps already waiting for review keep their six-question answers; the admin screen shows them as
+    sent.
+  - Attachment limits change to 7 MB for images, 20 MB for PDFs and 30 MB for other files, replacing
+    the 10 MB chat attachment limit given with 1.8.3.
+
+### Added
+
+- **Administrators define what the review looks for.** A Deployment Classification tab sets the
+  threshold, whether owners may change the agent's answers, and the classes: each a hard block or a
+  weighted class, with a description the agent reads and a preview of what a Yes is worth. Every
+  change is audited. Classes are switched off, never deleted.
+- **A review agent answers every class before an app publishes**, for the exact saved version.
+  Adding, rewording or switching off a class starts a fresh review; a weight or policy change does
+  not.
+- **The publish dialog shows the agent's answers.** Hard blocks are locked results; scored classes
+  are Yes/No toggles the owner can change while the policy allows, with a live score against the
+  threshold. When the app goes to an administrator, the owner writes a note.
+- **Approving publishes the app.** Approve and publish sends exactly the version the administrator
+  reviewed, even when the owner has saved newer work since. If that publish fails for a reason a
+  retry can mend, the owner's Try again republishes the same copy with no second review.
+- **The App Registry lists every app with its real status**: Waiting for review, Not published,
+  Publishing, Live, Publish failed, Taken offline, Draft, Rejected or Disabled, with the version it
+  serves and since when. The status counts follow the owner filter and the search.
+- **An app side panel with Review and History.** Review shows why the app is there, the owner's
+  note, the agent's and the owner's answers, and the score. History lists every version sent, its
+  decision and its attempts, with disable, enable, takedown and restart between them. A rejection
+  records its note.
+- **The Settings and Share menu on chat and planning addresses.**
+
+### Changed
+
+- **Opening the publish dialog saves unsaved work first** and reviews that saved version. The
+  server never saves at send time.
+- **The seeded classes state their rule, its boundary and paired examples.** AI models and services
+  count only as AI usage. An ordinary photo of a person, such as a visitor badge photo, is not
+  personal data, while a copy of an ID card is. The platform's own data connections, database and
+  file storage are internal, never an integration or public data.
+- **Connector data is on when the project's owner switches it on.** Per-person access requests,
+  their approval and both Integrations screens are gone.
+- **Attachment limits are set per type**: 7 MB for images, 20 MB for PDFs, 30 MB for other files.
+  Every refusal names its type's limit.
+- **A project description needs five words, and a delete reason two**, in the portal and the API
+  alike.
+- **Users & Limits, Feedback and Global Limits share one admin table** with search, sorting, filters
+  and a pager.
+- **The Deployment tab says what a publish did**, in the same sentence as the toolbar chip. Take
+  down and Restart refresh the chip at once.
+- **The admin navigation's waiting count follows approvals, rejections and sends** in the same tab.
+
+### Fixed
+
+- **A failing approved copy no longer traps its owner.** After a failure in the copy itself, or
+  after three failed publishes of it, the button sends the saved version, so a fix can go out.
+- **A platform fault in the image build can be retried** (`build_unavailable`) instead of
+  withdrawing the approved copy: the registry unreachable or refusing, or a run it errored,
+  cancelled or timed out. Only a build that fails in the app's own code is `build_failed`. A
+  revision slow to become ready (`revision_not_ready`) and a corrupt bundle (`snapshot_corrupt`)
+  get codes of their own.
+- **A failed Approve, Reject or Delete says why inside its panel or dialog**, instead of in a toast
+  hidden beneath it. A conflict ends the review with the server's sentence, and a failure that
+  lands after the panel has closed is still said.
+- **"Live · newer work saved" shows only when there is newer work.**
+- **BIAL Chat clears the composer as soon as a message is accepted**, and its scrollbar sits at the
+  pane edge.
+
+### Removed
+
+- **The manual go-live path**: the Mark deployed route and button, the Deploy needed badge, the
+  published-app address backfill and its script, and the go-live runbook. Approval is the only way
+  a reviewed app goes live.
+- **The six-question publish questionnaire.**
+- **The keyword filter in the chat box** and its Prompt Blocked dialog. No prompt is refused for its
+  words.
+- **The admin audit drawer and its route**, replaced by History. Credential, bundle, sign-in and
+  database audit rows are still recorded but no longer shown in the admin screens.
+
 ## [1.8.3] - 2026-09-25
 
 An app you have built now stays up, and saving it stops counting as a change. This release fixes
