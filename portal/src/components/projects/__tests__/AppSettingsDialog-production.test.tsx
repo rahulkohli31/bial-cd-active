@@ -13,11 +13,12 @@
  * screen telling them so, which is why the sentences are asserted rather than the buttons alone.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent, waitFor, act, within } from '@testing-library/react'
+import { render, renderHook, screen, cleanup, fireEvent, waitFor, act, within } from '@testing-library/react'
 
 const h = vi.hoisted(() => ({
   restartApp: vi.fn(),
   takeAppDown: vi.fn(),
+  getDeployment: vi.fn(),
   refresh: vi.fn(),
   state: 'live_current' as string,
   failureCode: null as string | null,
@@ -28,6 +29,7 @@ vi.mock('../../../utils/deployApi', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   restartApp: h.restartApp,
   takeAppDown: h.takeAppDown,
+  getDeployment: h.getDeployment,
 }))
 
 /**
@@ -60,6 +62,7 @@ vi.mock('../AppStatusPanel', () => ({
 
 import ProductionTab from '../ProductionTab'
 import { ApiError } from '../../../utils/apiError'
+import { usePublishState } from '../../../hooks/usePublishState'
 
 const mount = (over: Partial<React.ComponentProps<typeof ProductionTab>> = {}) =>
   render(<ProductionTab projectId="p1" appName="Ramp Ops" {...over} />)
@@ -71,6 +74,7 @@ beforeEach(() => {
   h.hasServingRow = true
   h.restartApp.mockResolvedValue({ deploymentId: 'd2' })
   h.takeAppDown.mockResolvedValue({ message: 'done' })
+  h.getDeployment.mockResolvedValue({ publishState: 'live_current' })
   h.refresh.mockResolvedValue(undefined)
 })
 afterEach(() => cleanup())
@@ -146,6 +150,27 @@ describe('a live application', () => {
     fireEvent.click(screen.getByTestId('production-takedown'))
     fireEvent.click(screen.getByTestId('take-down-confirm'))
     await waitFor(() => expect(onSettled).toHaveBeenCalled())
+  })
+
+  it.each([
+    ['take-down', () => {
+      fireEvent.click(screen.getByTestId('production-takedown'))
+      fireEvent.click(screen.getByTestId('take-down-confirm'))
+    }],
+    ['restart', () => fireEvent.click(screen.getByTestId('production-restart'))],
+  ])('★ after a %s, another reader of the same project reads again', async (_which, press) => {
+    // The toolbar chip holds a publish read of its own, separate from the panel's `refresh`
+    // above, so without the shared nudge it keeps the old state until a reload.
+    const chip = renderHook(() => usePublishState('p1'))
+    await waitFor(() => expect(h.getDeployment).toHaveBeenCalledTimes(1))
+    mount()
+
+    press()
+
+    await waitFor(() => expect(h.refresh).toHaveBeenCalled())
+    await waitFor(() => expect(h.getDeployment).toHaveBeenCalledTimes(2))
+    expect(h.getDeployment).toHaveBeenLastCalledWith('p1')
+    expect(chip.result.current.deployment).not.toBeNull()
   })
 
   it('★ a second press while one is in flight starts no second operation', async () => {
