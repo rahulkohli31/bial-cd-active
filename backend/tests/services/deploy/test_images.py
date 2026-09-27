@@ -6,8 +6,9 @@ WIRE: the API version (the GA versions do not carry these routes at all, so a bu
 every build into a 404), the explicit Dockerfile path, the blob-type header the upload
 needs, and the fact that no secret is ever put in a build argument.
 
-The 403 case gets its own test because it is the single most likely first-run failure and
-no retry can fix it — the message has to name the missing grant.
+The 403 case gets its own test because it is the single most likely first-run failure — the
+message has to name the missing grant. Only a run that reports `Failed` is the app's own build;
+every other failure is the platform's, which keeps an approved copy on offer.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from src.services.deploy.config import DeployConfig
 from src.services.deploy.images import (
     AcrImageBuilder,
     ImageBuildError,
-    ImageBuildTransientError,
+    ImageBuildUnavailableError,
 )
 
 _APP_ID = uuid.UUID("11111111-2222-3333-4444-555555555555")
@@ -220,8 +221,8 @@ async def test_the_upload_declares_a_block_blob() -> None:
 
 
 async def test_a_missing_grant_names_the_missing_grant() -> None:
-    """The most likely first-run failure, and no retry can fix it. An opaque 403 hours into
-    a rollout is the worst possible message here."""
+    """The most likely first-run failure. An opaque 403 hours into a rollout is the worst
+    possible message here, and it is the platform's fault, not the app's."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={"error": {"code": "AuthorizationFailed"}})
@@ -232,14 +233,14 @@ async def test_a_missing_grant_names_the_missing_grant() -> None:
 
     assert "not authorized" in str(caught.value)
     assert "scheduleRun" in str(caught.value)
-    assert not isinstance(caught.value, ImageBuildTransientError)
+    assert isinstance(caught.value, ImageBuildUnavailableError)
     await builder.aclose()
 
 
-@pytest.mark.parametrize("status", [429, 500, 503])
-async def test_throttling_and_5xx_are_retryable(status: int) -> None:
+@pytest.mark.parametrize("status", [400, 404, 429, 500, 503])
+async def test_every_registry_refusal_is_the_platforms(status: int) -> None:
     builder = _builder(lambda request: httpx.Response(status))
-    with pytest.raises(ImageBuildTransientError):
+    with pytest.raises(ImageBuildUnavailableError):
         await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
     await builder.aclose()
 
@@ -255,7 +256,7 @@ async def test_a_failed_build_carries_the_log_back() -> None:
 
     assert "failed" in str(caught.value)
     assert caught.value.log_tail == "the build log"
-    assert not isinstance(caught.value, ImageBuildTransientError)
+    assert not isinstance(caught.value, ImageBuildUnavailableError)
     await builder.aclose()
 
 
@@ -265,7 +266,7 @@ async def test_a_build_that_pushes_nothing_is_not_reported_as_the_users_fault() 
     calls: list[httpx.Request] = []
     builder = _builder(_happy(calls, digest=None))
 
-    with pytest.raises(ImageBuildTransientError) as caught:
+    with pytest.raises(ImageBuildUnavailableError) as caught:
         await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
     assert "no image digest" in str(caught.value)
     await builder.aclose()
@@ -302,7 +303,7 @@ async def test_a_run_that_never_finishes_is_bounded() -> None:
     calls: list[httpx.Request] = []
     builder = _builder(_happy(calls, status="Running"), build_timeout_s=1)
 
-    with pytest.raises(ImageBuildTransientError) as caught:
+    with pytest.raises(ImageBuildUnavailableError) as caught:
         await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
     assert "did not finish" in str(caught.value)
     await builder.aclose()
@@ -310,7 +311,53 @@ async def test_a_run_that_never_finishes_is_bounded() -> None:
 
 async def test_a_registry_that_returns_no_upload_location_fails_clearly() -> None:
     builder = _builder(lambda request: httpx.Response(200, json={}))
-    with pytest.raises(ImageBuildError) as caught:
+    with pytest.raises(ImageBuildUnavailableError) as caught:
         await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
     assert "no source upload location" in str(caught.value)
+    await builder.aclose()
+
+
+@pytest.mark.parametrize("status", ["Error", "Canceled", "Timeout"])
+async def test_a_run_the_registry_cut_short_is_the_platforms(status: str) -> None:
+    """Only `Failed` is the app's own build. A run that errored, was cancelled or ran out of
+    time says nothing about the app, and must not withdraw an approved copy."""
+    calls: list[httpx.Request] = []
+    builder = _builder(_happy(calls, status=status))
+
+    with pytest.raises(ImageBuildUnavailableError) as caught:
+        await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
+    assert status.lower() in str(caught.value)
+    assert caught.value.log_tail == "the build log"
+    await builder.aclose()
+
+
+async def test_a_refused_upload_is_the_platforms() -> None:
+    calls: list[httpx.Request] = []
+    happy = _happy(calls)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host.endswith("blob.core.windows.net"):
+            return httpx.Response(403)
+        return happy(request)
+
+    builder = _builder(handler)
+    with pytest.raises(ImageBuildUnavailableError) as caught:
+        await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
+    assert "returned 403" in str(caught.value)
+    await builder.aclose()
+
+
+async def test_a_schedule_with_no_run_id_is_the_platforms() -> None:
+    calls: list[httpx.Request] = []
+    happy = _happy(calls)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/scheduleRun"):
+            return httpx.Response(200, json={})
+        return happy(request)
+
+    builder = _builder(handler)
+    with pytest.raises(ImageBuildUnavailableError) as caught:
+        await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
+    assert "no run id" in str(caught.value)
     await builder.aclose()

@@ -36,7 +36,7 @@ from typing import Final
 import structlog
 
 from src.services.deploy.config import DeployConfig
-from src.services.deploy.images import BuiltImage, ImageBuildError, ImageBuildTransientError
+from src.services.deploy.images import BuiltImage, ImageBuildError, ImageBuildUnavailableError
 from src.services.deploy.names import image_tag, published_app_name
 from src.services.sandbox.base import base_path_for
 
@@ -82,7 +82,7 @@ class LocalDockerImageBuilder:
         except OSError as exc:
             # No docker on PATH is a configuration error, not a build failure — say so in
             # the words an operator can act on.
-            raise ImageBuildError(
+            raise ImageBuildUnavailableError(
                 "the local docker builder is selected but docker could not be executed: "
                 "install Docker, or set DEPLOY__IMAGE_BUILDER=acr_tasks"
             ) from exc
@@ -91,7 +91,7 @@ class LocalDockerImageBuilder:
         except TimeoutError:
             proc.kill()
             await proc.wait()
-            raise ImageBuildTransientError(
+            raise ImageBuildUnavailableError(
                 f"the build exceeded {timeout:.0f}s and was killed"
             ) from None
         return proc.returncode or 0, out.decode("utf-8", errors="replace")
@@ -114,7 +114,7 @@ class LocalDockerImageBuilder:
             if code != 0:
                 # Transient: a registry that is briefly unreachable is retryable, and the
                 # caller's retry policy is the right place to decide that.
-                raise ImageBuildTransientError(
+                raise ImageBuildUnavailableError(
                     f"docker login to {c.acr_server} failed", log_tail=_tail(out)
                 )
             self._logged_in = True
@@ -146,7 +146,9 @@ class LocalDockerImageBuilder:
                 with tarfile.open(fileobj=io.BytesIO(context), mode="r:gz") as archive:
                     archive.extractall(source, filter="data")
             except (tarfile.TarError, OSError) as exc:
-                raise ImageBuildError("the build context could not be unpacked") from exc
+                raise ImageBuildUnavailableError(
+                    "the build context could not be unpacked"
+                ) from exc
 
             metadata = root / "metadata.json"
             code, out = await self._run(
@@ -177,7 +179,7 @@ class LocalDockerImageBuilder:
 
             digest = _digest_of(metadata)
             if digest is None:
-                raise ImageBuildTransientError(
+                raise ImageBuildUnavailableError(
                     "the build reported success but wrote no image digest", log_tail=_tail(out)
                 )
 

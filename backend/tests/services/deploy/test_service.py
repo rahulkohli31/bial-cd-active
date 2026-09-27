@@ -28,7 +28,7 @@ from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.deploy import service as service_module
 from src.services.deploy.aca_publish import RevisionState, _state_of
 from src.services.deploy.config import DeployConfig
-from src.services.deploy.images import BuiltImage, ImageBuildError, ImageBuildTransientError
+from src.services.deploy.images import BuiltImage, ImageBuildError, ImageBuildUnavailableError
 from src.services.deploy.names import published_app_name
 from src.services.deploy.service import DeployNotPossibleError, DeployService
 from src.services.storage import BundleValidationError, submission_key
@@ -391,7 +391,7 @@ async def test_a_platform_fault_in_the_build_is_not_reported_as_the_app_s_own(
     """Settled as a build failure it would withdraw an approved copy and send the owner and the
     assistant looking for a fault in code that is fine."""
     user, app, conversation = await _project(db_session)
-    wire.images.error = ImageBuildTransientError("the image build did not finish within 900s")
+    wire.images.error = ImageBuildUnavailableError("the image build did not finish within 900s")
 
     _started, row = await _run(wire, db_session, user, app, conversation.id)
 
@@ -409,7 +409,7 @@ async def test_a_platform_fault_in_the_build_keeps_the_registry_log_for_the_oper
     wire, db_session
 ) -> None:
     user, app, conversation = await _project(db_session)
-    wire.images.error = ImageBuildTransientError(
+    wire.images.error = ImageBuildUnavailableError(
         "the image build succeeded but produced no image digest",
         log_tail="Step 9/9 : push\nerror pushing manifest: registry unavailable\n",
     )

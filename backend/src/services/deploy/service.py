@@ -42,7 +42,7 @@ from src.services.deploy.aca_publish import PublishedAppProvisioner
 from src.services.deploy.config import DeployConfig
 from src.services.deploy.context import ContextTooLargeError, build_context_async
 from src.services.deploy.env import PublishedStorageError, build_published_env
-from src.services.deploy.images import ImageBuilder, ImageBuildError, ImageBuildTransientError
+from src.services.deploy.images import ImageBuilder, ImageBuildError, ImageBuildUnavailableError
 from src.services.deploy.names import image_reference, revision_name
 from src.services.deploy.outcome import write_deploy_outcome
 from src.services.orchestrator.errors import from_next_build, is_dependency_failure
@@ -425,7 +425,7 @@ class DeployService:
             built = await self._images.build(
                 app_id=app_id, deployment_id=deployment_id, context=context
             )
-        except ImageBuildTransientError as exc:
+        except ImageBuildUnavailableError as exc:
             log = exc.log_tail
             raise _DeployFailedError(
                 FAIL_BUILD_UNAVAILABLE,
