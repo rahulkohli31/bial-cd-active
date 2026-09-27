@@ -414,7 +414,7 @@ _RETRYABLE_FAILURE_CODES: frozenset[str] = frozenset(
         FAIL_NOT_READY,
     }
 )
-_NON_RETRYABLE_FAILURE_CODES: frozenset[str] = frozenset(
+NON_RETRYABLE_FAILURE_CODES: frozenset[str] = frozenset(
     {
         FAIL_NO_SNAPSHOT,
         FAIL_SNAPSHOT_CORRUPT,
@@ -425,7 +425,7 @@ _NON_RETRYABLE_FAILURE_CODES: frozenset[str] = frozenset(
     }
 )
 # Every code a failed publish settles under.
-PUBLISH_FAILURE_CODES: frozenset[str] = _RETRYABLE_FAILURE_CODES | _NON_RETRYABLE_FAILURE_CODES
+PUBLISH_FAILURE_CODES: frozenset[str] = _RETRYABLE_FAILURE_CODES | NON_RETRYABLE_FAILURE_CODES
 
 # Failed publishes of the approved copy, since approval or since it last went live, after which
 # it is no longer offered: a copy's own fault misread as the platform's would otherwise be offered
@@ -475,7 +475,7 @@ def approved_retry_commit(
     app: AppRegistry,
     deployment: Deployment | None,
     *,
-    approved_went_live: bool,
+    copy_ruled_out: bool,
     copy_failures: int,
 ) -> str | None:
     """The approved commit when the one button republishes the approved copy, else None.
@@ -484,9 +484,9 @@ def approved_retry_commit(
     a retry can fix while fewer than `MAX_APPROVED_COPY_ATTEMPTS` publishes of it have failed
     (`copy_failures`) — and when the version taken offline is the approved one and did not fail in
     itself. A failure that named another commit goes through the gate; one that named none is an
-    attempt at the copy only if nothing went live since approval (`approved_went_live`). The
-    publish route's approved-copy rule republishes exactly when this offers the commit it was
-    sent."""
+    attempt at the copy only if the copy has neither gone live nor failed in itself since approval
+    (`copy_ruled_out` when it has). The publish route's approved-copy rule republishes exactly when
+    this offers the commit it was sent."""
     copy = approved_copy(app)
     if copy is None:
         return None
@@ -496,13 +496,13 @@ def approved_retry_commit(
     if deployment.unpublished_at is not None:
         # A takedown stamps the newest attempt whatever its ending, including a copy that failed
         # in itself, which is not offered back.
-        failed_in_itself = deployment.failure_code in _NON_RETRYABLE_FAILURE_CODES
+        failed_in_itself = deployment.failure_code in NON_RETRYABLE_FAILURE_CODES
         return approved if deployment.head_sha == approved and not failed_in_itself else None
     if not _retryable_failure(deployment) or copy_failures >= MAX_APPROVED_COPY_ATTEMPTS:
         return None
     if deployment.head_sha == approved:
         return approved
-    if deployment.head_sha is None and not approved_went_live:
+    if deployment.head_sha is None and not copy_ruled_out:
         return approved
     return None
 

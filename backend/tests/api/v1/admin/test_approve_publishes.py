@@ -579,6 +579,23 @@ async def test_only_failed_publishes_of_the_copy_since_approval_count_toward_the
     assert status["approvedRetryCommit"] == approved
 
 
+async def test_a_copy_that_failed_in_itself_is_not_offered_after_a_later_failure_names_nothing(
+    wire, client, db_session
+) -> None:
+    """The copy failed its own build, so the owner sent a fix, and the fix failed before it could
+    name its commit. That failure is not the copy's, and the broken copy must not come back."""
+    owner, app_row, _submission_id = await _approved_earlier(wire, db_session)
+    approved = wire.submitted[1]
+    await _failed_attempts(
+        db_session, owner, app_row, ("build_failed", approved, 1), ("internal_error", None, 2)
+    )
+
+    status = await _status(client, owner, app_row)
+
+    assert status["publishState"] == "did_not_start"
+    assert status["approvedRetryCommit"] is None
+
+
 async def test_failures_before_the_copy_went_live_do_not_count_toward_the_cap(
     wire, client, db_session
 ) -> None:

@@ -202,7 +202,7 @@ def test_an_app_marked_live_by_hand_offers_try_again_after_the_drop() -> None:
         command.upgrade(config, "head")
         app = _run(_load)
         assert compute_publish_state(app, None, None) is PublishState.DID_NOT_START
-        assert approved_retry_commit(app, None, approved_went_live=False, copy_failures=0) == _SHA
+        assert approved_retry_commit(app, None, copy_ruled_out=False, copy_failures=0) == _SHA
     finally:
         _run(_cleanup(user_id))
         command.upgrade(config, "head")
