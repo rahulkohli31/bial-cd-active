@@ -2607,7 +2607,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   const hasPendingOffer = offer !== null && offer.state === 'pending'
 
   /**
-   * The return-to-latest control, rendered under the viewport.
+   * The return-to-latest control, floated over the bottom of the viewport.
    *
    * MEMOISED, because `ViewportFooter` is a component TYPE: a fresh function identity every render
    * would unmount and remount whatever it draws. This one is stateless, so a remount would only be

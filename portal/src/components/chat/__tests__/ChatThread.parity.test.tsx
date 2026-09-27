@@ -11,6 +11,7 @@
  *     the bubble's own overrides keep a pasted heading at body size;
  *   - the thread introduces exactly one scroll container, where the old surface nested five.
  */
+import type { FC } from 'react'
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, within } from '@testing-library/react'
 
@@ -31,7 +32,7 @@ const step = (over: Partial<StepItem> = {}): StepItem => ({
   ...over,
 })
 
-function mount(messages: ChatMessage[], isRunning = false) {
+function mount(messages: ChatMessage[], isRunning = false, footer?: FC) {
   return render(
     <div style={{ height: 600 }}>
       <ChatRuntimeProvider
@@ -40,7 +41,7 @@ function mount(messages: ChatMessage[], isRunning = false) {
         onNew={vi.fn().mockResolvedValue(undefined)}
         onCancel={vi.fn().mockResolvedValue(undefined)}
       >
-        <ChatThread />
+        <ChatThread footer={footer} />
       </ChatRuntimeProvider>
     </div>,
   )
@@ -130,6 +131,22 @@ describe('ChatThread — what the new host must still guarantee', () => {
     const scrollers = container.querySelectorAll('.overflow-y-auto, .overflow-y-scroll')
     expect(scrollers).toHaveLength(1)
     expect(scrollers[0]).toBe(screen.getByTestId('thread-viewport'))
+  })
+
+  it('floats the footer over the transcript, so showing it takes no height from the scroller', () => {
+    // jsdom has no layout, so this pins the mechanism: an out-of-flow layer anchored to the
+    // thread's root.
+    mount([assistant('a1', 'hello')], false, () => <div data-testid="footer-probe" />)
+
+    const viewport = screen.getByTestId('thread-viewport')
+    const layer = screen.getByTestId('footer-probe').parentElement as HTMLElement
+    expect(layer.parentElement).toBe(viewport.parentElement)
+    expect(layer.className).toMatch(/\babsolute\b/)
+    expect(layer.className).toMatch(/\bbottom-0\b/)
+    // The layer spans the transcript's full width, scrollbar included, so it must not eat the
+    // clicks and drags meant for what is underneath it.
+    expect(layer.className).toContain('pointer-events-none')
+    expect((viewport.parentElement as HTMLElement).className).toMatch(/\brelative\b/)
   })
 
   it('adds no calc(100vh …) anywhere', () => {

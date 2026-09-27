@@ -81,7 +81,10 @@ export type ThreadComponents = {
   ReasoningGroup: ComponentType<PropsWithChildren<{ group: ThreadGroupPart }>>
   /** One row inside a group. */
   ToolPart: ToolCallMessagePartComponent
-  /** Rendered above the viewport's bottom — the return control and the offer strip. */
+  /**
+   * Floated over the viewport's bottom in a click-through layer — the return control. A control
+   * drawn here takes its clicks back with `pointer-events-auto`.
+   */
   ViewportFooter?: ComponentType | undefined
   /**
    * The chips under a user message's prose. Attachments are the portal's own pipeline, so they
@@ -116,7 +119,7 @@ const ThreadRoot: FC = () => {
   const { ViewportFooter } = useThreadComponents()
 
   return (
-    <ThreadPrimitive.Root className="flex h-full min-h-0 flex-col bg-transparent">
+    <ThreadPrimitive.Root className="relative flex h-full min-h-0 flex-col bg-transparent">
       {/* `bottom`, and the choice is load-bearing rather than a default being spelled out.
           `turnAnchor="top"` pins each new user message near the top for a focused read — and it
           also makes the library default `autoScroll` to false (`autoScroll = turnAnchor !== "top"`),
@@ -139,7 +142,13 @@ const ThreadRoot: FC = () => {
           </div>
         </div>
       </ThreadPrimitive.Viewport>
-      {ViewportFooter ? <ViewportFooter /> : null}
+      {/* Over the viewport, not under it: in the column, every appearance would take its height
+          from the scroller and the transcript would jump. */}
+      {ViewportFooter ? (
+        <div className="pointer-events-none absolute inset-x-0 bottom-0">
+          <ViewportFooter />
+        </div>
+      ) : null}
     </ThreadPrimitive.Root>
   )
 }

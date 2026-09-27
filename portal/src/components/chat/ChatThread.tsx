@@ -25,7 +25,10 @@ export interface ChatThreadProps {
    * it is a fact about the turn, not about any part.
    */
   interruptedMessageIds?: ReadonlySet<string>
-  /** Rendered under the viewport — the composer, the offer strip, the return-to-latest control. */
+  /**
+   * Floated over the viewport's bottom in a click-through layer — the return-to-latest control. A
+   * control drawn here takes its clicks back with `pointer-events-auto`.
+   */
   footer?: FC | undefined
   /** Told what an activity group amounted to as it seals. */
   onGroupSealed?: ((summary: string) => void) | undefined
