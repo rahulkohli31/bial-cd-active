@@ -1,7 +1,8 @@
 """Alembic round-trip for the app_registry submissions re-shape (0018, APPROVAL):
-head → 0017 → head against the real test DB. Proves `upgrade` drops both JSX-era
-JSONB snapshot columns and adds the seven typed submission columns, that the legacy
-status reset targets EXACTLY `pending`/`approved` (sparing `disabled`/`rejected`,
+0018 → 0017 → 0018 against the real test DB, walked down from head and returned to it. Pinned
+to 0018 rather than head because later revisions drop two of its columns. Proves `upgrade`
+drops both JSX-era JSONB snapshot columns and adds the seven typed submission columns, that
+the legacy status reset targets EXACTLY `pending`/`approved` (sparing `disabled`/`rejected`,
 whose reactivation would silently re-open a refused app's data plane), and
 that `downgrade` recreates structure, never data. Mirrors
 `test_app_files_drop_migration.py`: programmatic `alembic.command` off the shared
@@ -31,6 +32,7 @@ from src.config import settings
 pytestmark = pytest.mark.destructive_migration
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
+_RESHAPE_REVISION = "0018_app_registry_submissions"
 _PRE_RESHAPE_REVISION = "0017_drop_app_files"
 _ENUM_SQL = "SELECT 1 FROM pg_type WHERE typname = 'app_status'"
 
@@ -84,28 +86,30 @@ def _snapshot() -> dict[str, Any]:
 
 def test_app_registry_submissions_round_trip() -> None:
     config = _alembic_config()
-    command.upgrade(config, "head")  # normalize: at head the re-shape is applied
-
-    at_head = _snapshot()
-    assert _NEW_COLUMNS <= at_head["columns"]
-    assert not (_DROPPED_COLUMNS & at_head["columns"])
-    # The enum is not this migration's to touch — it survives the upgrade.
-    assert at_head["enum_present"] == 1
+    command.upgrade(config, "head")
 
     try:
+        command.downgrade(config, _RESHAPE_REVISION)
+        reshaped = _snapshot()
+        assert _NEW_COLUMNS <= reshaped["columns"]
+        assert not (_DROPPED_COLUMNS & reshaped["columns"])
+        # The enum is not this migration's to touch — it survives the upgrade.
+        assert reshaped["enum_present"] == 1
+
         command.downgrade(config, _PRE_RESHAPE_REVISION)
         restored = _snapshot()
         # Structure only: the JSONB columns reappear (empty), the typed ones go.
         assert _DROPPED_COLUMNS <= restored["columns"]
         assert not (_NEW_COLUMNS & restored["columns"])
         assert restored["enum_present"] == 1
+
+        command.upgrade(config, _RESHAPE_REVISION)
+        assert _NEW_COLUMNS <= _snapshot()["columns"]
     finally:
         # ALWAYS return to head so the rest of the suite sees the re-shaped schema.
         command.upgrade(config, "head")
 
-    final = _snapshot()
-    assert _NEW_COLUMNS <= final["columns"]
-    assert not (_DROPPED_COLUMNS & final["columns"])
+    assert not (_DROPPED_COLUMNS & _snapshot()["columns"])
 
 
 def test_legacy_status_reset_is_status_scoped() -> None:
@@ -184,7 +188,7 @@ def test_legacy_status_reset_is_status_scoped() -> None:
 
     _run_sql(_seed)
     try:
-        command.upgrade(config, "head")
+        command.upgrade(config, _RESHAPE_REVISION)
         rows = _run_sql(_read_rows)
 
         # pending + approved → draft (the JSX-era in-flight rows are reset)…

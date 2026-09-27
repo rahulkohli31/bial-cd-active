@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest'
-import { ApiError, extractApiCode, extractApiMessage, isSuspended, readApiError } from '../apiError'
+import {
+  ApiError,
+  extractApiCode,
+  extractApiMessage,
+  isSuspended,
+  optionalNumber,
+  readApiError,
+  requiredBoolean,
+  requiredInteger,
+} from '../apiError'
 
 describe('extractApiMessage — envelope 1: {error:{message, code?}}', () => {
   it('returns the domain message', () => {
@@ -143,5 +152,33 @@ describe('readApiError', () => {
     )
     expect(err.message).toBe('Failed to reach service (502).')
     expect(err.status).toBe(502)
+  })
+})
+
+describe('the field readers every typed client shares', () => {
+  it('reads a whole number, and refuses anything else in the caller\'s own noun', () => {
+    expect(requiredInteger(3, 'review', 'policy.threshold')).toBe(3)
+    for (const bad of [1.5, '3', null, undefined, Number.NaN]) {
+      expect(() => requiredInteger(bad, 'review', 'policy.threshold')).toThrow(
+        'The server sent a review we could not read (policy.threshold).',
+      )
+    }
+  })
+
+  it('reads a boolean, and refuses a truthy stand-in', () => {
+    expect(requiredBoolean(false, 'classification setting', 'active')).toBe(false)
+    for (const bad of [0, 'true', null, undefined]) {
+      expect(() => requiredBoolean(bad, 'classification setting', 'active')).toThrow(
+        'The server sent a classification setting we could not read (active).',
+      )
+    }
+  })
+
+  it('reads an optional number as null whenever it is not a finite one', () => {
+    expect(optionalNumber(0)).toBe(0)
+    expect(optionalNumber(12.5)).toBe(12.5)
+    for (const absent of [null, undefined, '4', Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(optionalNumber(absent)).toBeNull()
+    }
   })
 })

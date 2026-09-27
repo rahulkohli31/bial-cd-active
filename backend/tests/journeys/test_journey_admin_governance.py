@@ -1,12 +1,10 @@
 """Journey: admin governance — the API a super-admin (email allowlist: admin@bial.com) drives
-through the review desk, matching what the portal's `AppRegistryPanel` / `AuditDrawer` / feedback
-panel render.
+through the review desk, matching what the portal's `AppRegistryPanel` and feedback panel render.
 
 Walks the lifecycle state machine (approve/reject/disable/enable), proving every gated action
-writes an audit row and that a citizen/anon caller is refused; reads the per-app audit trail and
-the cross-user feedback stream back through the admin API, checking each carries the fields the
-SPA renders — `ownerUsername` on an apps-list row, `id`/`createdAt`/`username`/`count` on an
-audit event."""
+writes an audit row and that a citizen/anon caller is refused; reads the cross-user feedback
+stream back through the admin API, checking each carries the fields the SPA renders —
+`ownerUsername` on an apps-list row."""
 
 from __future__ import annotations
 
@@ -86,8 +84,7 @@ async def test_admin_governance_walk_is_audited(client, app, db_session) -> None
     """approve -> reject -> disable -> enable; each transition writes its audit row.
 
     The accountability contract: a permission-gated action MUST leave a durable audit row
-    naming the actor. The admin audit API also reads those rows back — the data `AuditDrawer`
-    renders."""
+    naming the actor."""
     store = FakeStorage()
     app.dependency_overrides[storage_dependency] = lambda: store
     # Both storage seams to ONE store: routes that document a 503 take the None-tolerant
@@ -144,11 +141,6 @@ async def test_admin_governance_walk_is_audited(client, app, db_session) -> None
     assert enabled.json()["status"] == "approved"
     assert (await _audited_action(db_session, to_toggle.id, "enable")).actor_id == admin.id
 
-    # The admin audit API surfaces the approve row (the read path the AuditDrawer drives).
-    events = await client.get(f"/v1/admin/apps/{to_approve.id}/audit", headers=admin_headers)
-    assert events.status_code == 200
-    assert "approve" in [e["action"] for e in events.json()["events"]]
-
 
 # --- feedback stream, newest-first, with author email -----------------------------------------
 
@@ -193,43 +185,8 @@ async def test_admin_apps_list_exposes_owner_username_for_spa(client, db_session
     owner = await UserFactory.create(db_session, email="owner-cell@rvaiglobal.com")
     app = await _owned_app(db_session, owner, **_pending_seed())
 
-    listed = await client.get("/v1/admin/apps?status=pending", headers=admin_headers)
+    listed = await client.get("/v1/admin/apps", headers=admin_headers)
     assert listed.status_code == 200
     row = next(a for a in listed.json()["apps"] if a["appId"] == str(app.id))
 
     assert row.get("ownerUsername") == owner.email
-
-
-# --- audit events carry the keys the AuditDrawer reads -----------------------------------------
-
-
-async def test_admin_audit_events_carry_spa_fields(client, app, db_session) -> None:
-    """`AuditDrawer` reads `ev._id` (key), `ev.at` (time), `ev.username` (actor), `ev.count`."""
-    admin, admin_headers = await _admin(db_session)
-    owner = await UserFactory.create(db_session, email="audit-owner@rvaiglobal.com")
-    row = await _owned_app(db_session, owner, login_required=False, **_pending_seed())
-
-    # Two audited actions so the drawer has rows to render, one of them count-bearing.
-    # Approve verifies the reviewed blob exists, so stage it in a wired store.
-    store = FakeStorage()
-    app.dependency_overrides[storage_dependency] = lambda: store
-    app.dependency_overrides[storage_or_none_dependency] = lambda: store
-    _stage_bundle(store, row)
-    await client.post(
-        f"/v1/admin/apps/{row.id}/approve",
-        json={"submissionId": str(row.source_submission_id)},
-        headers=admin_headers,
-    )
-    flip = await client.patch(
-        f"/v1/admin/apps/{row.id}", json={"loginRequired": True}, headers=admin_headers
-    )
-    assert flip.status_code == 200
-
-    resp = await client.get(f"/v1/admin/apps/{row.id}/audit", headers=admin_headers)
-    assert resp.status_code == 200
-    events = resp.json()["events"]
-    assert len(events) >= 2  # the read path works and the count-bearing event is present
-    cfg = next(e for e in events if e["action"] == "config:loginRequired")
-
-    missing = [key for key in ("id", "createdAt", "username", "count") if key not in cfg]
-    assert not missing, f"audit event missing SPA-required keys: {missing}"

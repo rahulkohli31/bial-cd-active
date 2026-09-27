@@ -23,6 +23,9 @@ import { cn } from "@/lib/utils"
  *    32×18.4 with a 16px thumb. 14px of travel is that geometry, written out rather than left to
  *    the registry's `translate-x-[calc(100%-2px)]`, so the number is checkable against the board.
  *
+ * `size="lg"` IS THE ADMIN SCREENS' SWITCH: a 38×22 track with an 18px thumb. One pixel of
+ * padding inside the transparent border keeps their 2px gap round the thumb and 16px of travel.
+ *
  * `peer` EMITS NO CSS AND THAT IS NOT A MISS. It is Tailwind's marker class — it exists only so a
  * SIBLING can style itself with `peer-checked:`/`peer-focus:`, and nothing does that today. It is
  * the one class in this file absent from a real `tailwindcss` build, and it is kept because it is
@@ -37,8 +40,8 @@ import { cn } from "@/lib/utils"
  */
 const Switch = React.forwardRef<
   React.ElementRef<typeof SwitchPrimitive.Root>,
-  React.ComponentPropsWithoutRef<typeof SwitchPrimitive.Root>
->(({ className, ...props }, ref) => (
+  React.ComponentPropsWithoutRef<typeof SwitchPrimitive.Root> & { size?: "default" | "lg" }
+>(({ className, size = "default", ...props }, ref) => (
   <SwitchPrimitive.Root
     ref={ref}
     className={cn(
@@ -46,6 +49,7 @@ const Switch = React.forwardRef<
       "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-white",
       "disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-progress aria-disabled:opacity-60",
       "data-[state=checked]:bg-primary data-[state=unchecked]:bg-canvas-sendoff",
+      size === "lg" && "h-[22px] w-[38px] p-px",
       className
     )}
     {...props}
@@ -53,7 +57,8 @@ const Switch = React.forwardRef<
     <SwitchPrimitive.Thumb
       className={cn(
         "pointer-events-none block h-3.5 w-3.5 rounded-full bg-white shadow-sm ring-0 transition-transform",
-        "data-[state=checked]:translate-x-[14px] data-[state=unchecked]:translate-x-0"
+        "data-[state=checked]:translate-x-[14px] data-[state=unchecked]:translate-x-0",
+        size === "lg" && "h-[18px] w-[18px] data-[state=checked]:translate-x-[16px]"
       )}
     />
   </SwitchPrimitive.Root>

@@ -51,13 +51,11 @@ async def record_what_survived(
     published container app, its registry repository — and the project outlives an app
     hard-delete, so its id is the handle an operator still has something to look up.
 
-    …WHICH IS WHY `app_id` RIDES IN THE `detail` WHEN THERE IS ONE. `read_audit` finds a row by
-    `resource_id == app_id` OR `detail["appId"]`, and this row's `resource_id` is the PROJECT —
-    so without the field it would never appear in the audit drawer an administrator opens
-    straight after the delete, which is the only place they would look. The `db:*` levers in
-    `admin/router.py` carry `appId` for exactly this reason and say so. The citizen's own
-    project delete passes `None`: a project may own several apps, so there is no single id to
-    name, and that path's row is found by project.
+    …WHICH IS WHY `app_id` RIDES IN THE `detail` WHEN THERE IS ONE. This row's `resource_id` is
+    the PROJECT, so the field is what ties it to the app an administrator deleted; the `db:*`
+    levers in `admin/router.py` carry `appId` for the same reason. The citizen's own project
+    delete passes `None`: a project may own several apps, so there is no single id to name, and
+    that path's row is found by project.
 
     ITS OWN TRANSACTION, because the delete committed several sweeps ago. That is also why it
     swallows: a delete that genuinely succeeded must not answer 500 because the accountability

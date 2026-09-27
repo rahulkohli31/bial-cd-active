@@ -22,7 +22,7 @@ import { Calendar as CalendarIcon } from 'lucide-react'
 import type { ConnectorWindow } from '../../utils/connectorApi'
 import { Button } from '../ui/button'
 import { PopoverTrigger } from '../ui/popover'
-import { MONTHS } from './connectorPresentation'
+import { MONTHS } from '../../utils/monthNames'
 
 /** One day of milliseconds, for the two places a span is counted. */
 const DAY_MS = 86_400_000

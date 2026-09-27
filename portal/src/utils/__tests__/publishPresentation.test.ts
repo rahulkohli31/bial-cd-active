@@ -17,14 +17,17 @@ import path from 'node:path'
 import { stripComments } from '../../__tests__/_stripComments'
 import {
   ACTION_LABEL,
+  answerFor,
+  busyLabel,
   canBeRestarted,
   formatStamp,
   lookFor,
   presentationFor,
   provenanceRows,
   savedRow,
+  versionRowData,
 } from '../publishPresentation'
-import type { ApprovalState, DeploymentView, PublishState } from '../deployApi'
+import type { ApprovalState, DeployOutcome, DeploymentView, PublishState } from '../deployApi'
 
 /**
  * Every value the union can hold — as a RECORD KEYED BY THE UNION, which is what makes the claim
@@ -41,8 +44,6 @@ const ALL_STATES: Record<PublishState, null> = {
   draft: null,
   in_review: null,
   changes_requested: null,
-  approved_ready_to_publish: null,
-  approved_needs_review_again: null,
   starting_up: null,
   live_current: null,
   live_newer_work: null,
@@ -53,6 +54,8 @@ const ALL_STATES: Record<PublishState, null> = {
 }
 const EVERY_STATE = Object.keys(ALL_STATES) as readonly PublishState[]
 
+const SHA = 'f9e8d7c6b5a4f9e8d7c6b5a4f9e8d7c6b5a4f9e8'
+
 const view = (over: Partial<DeploymentView> = {}): DeploymentView =>
   ({ publishState: 'draft', savedHead: null, savedAt: null, ...over }) as DeploymentView
 const approval = (over: Partial<ApprovalState> = {}): ApprovalState => ({ status: 'draft', ...over }) as ApprovalState
@@ -60,7 +63,7 @@ const approval = (over: Partial<ApprovalState> = {}): ApprovalState => ({ status
 describe('the decision is total over every state the server can send', () => {
   it('gives each state words, a colour and rows without throwing', () => {
     for (const state of EVERY_STATE) {
-      const presentation = presentationFor(state)
+      const presentation = presentationFor(state, null)
       expect(presentation.label.length, state).toBeGreaterThan(0)
       expect(presentation.sentence.length, state).toBeGreaterThan(0)
       if (presentation.action !== null) expect(ACTION_LABEL[presentation.action], state).toBeTruthy()
@@ -113,16 +116,17 @@ describe('the decision is total over every state the server can send', () => {
     expect(provenanceRows('live_current', view(), dateOnly).map((row) => row.key)).toContain('approved')
   })
 
-  it('★ still says "we could not tell" where the state itself asserts an approval', () => {
-    // The counterweight to the rule above. `approved_ready_to_publish` MEANS an administrator
-    // approved this version, so a missing stamp there is a genuine gap in the record and the row
-    // has to stay and say so — dropping it would hide the one case the "cannot tell" rendering
-    // exists for.
-    for (const state of ['approved_ready_to_publish', 'approved_needs_review_again'] as const) {
-      const row = provenanceRows(state, view(), approval()).find((r) => r.key === 'approved')
-      expect(row, state).toBeTruthy()
-      expect(row?.stamp ?? null, state).toBeNull()
-    }
+  it('★ names the approved version where Try again is about to publish it', () => {
+    // The server says the button republishes the approved copy, so the row it publishes is on
+    // the panel — dated, with its build id — above the owner's newer save.
+    const approved = approval({ approvedAt: '2026-09-20T09:00:00Z', approvedCommitSha: SHA })
+    const retry = provenanceRows('did_not_start', view({ approvedRetryCommit: SHA }), approved)
+    expect(retry.map((row) => row.key)).toEqual(['approved', 'saved'])
+    expect(retry[0].sha).toBe(SHA)
+
+    // …and not where Try again goes back through the gate.
+    const plain = provenanceRows('did_not_start', view({ approvedRetryCommit: null }), approved)
+    expect(plain.map((row) => row.key)).toEqual(['saved'])
   })
 
   it('★ shows no version row for a state that has no version to date', () => {
@@ -139,7 +143,7 @@ describe('a switched-off app is told what it cannot do', () => {
     // been published — the ordinary case, since one-click deploy never writes a status — that
     // sentence named a consequence they were not pursuing and left the one they are hitting
     // unsaid: their workspace will not start and no message they send will run.
-    const { sentence } = presentationFor('switched_off')
+    const { sentence } = presentationFor('switched_off', null)
 
     expect(sentence).toContain('An administrator switched this app off')
     expect(sentence).toContain('cannot make changes')
@@ -150,8 +154,8 @@ describe('a switched-off app is told what it cannot do', () => {
     // Only an administrator can undo this. An action here would send the citizen round a loop
     // that cannot end — which is why `taken_offline`, whose remedy IS the owner's to take,
     // keeps its action while this one does not.
-    expect(presentationFor('switched_off').action).toBeNull()
-    expect(presentationFor('taken_offline').action).not.toBeNull()
+    expect(presentationFor('switched_off', null).action).toBeNull()
+    expect(presentationFor('taken_offline', null).action).not.toBeNull()
   })
 })
 
@@ -304,7 +308,7 @@ describe('neither surface holds a second copy of the decision', () => {
    */
   const read = (rel: string) => readFileSync(path.resolve(__dirname, '..', '..', rel), 'utf8')
 
-  const LABELS = EVERY_STATE.map((state) => presentationFor(state).label)
+  const LABELS = EVERY_STATE.map((state) => presentationFor(state, null).label)
 
   it('the chip and the panel spell no state label of their own', () => {
     for (const file of ['components/PublishStatusChip.tsx', 'components/projects/AppStatusPanel.tsx']) {
@@ -330,33 +334,87 @@ describe('neither surface holds a second copy of the decision', () => {
  * allowed to change what states the product HAS — that is a change to what the application means,
  * and it belongs to whoever owns the lifecycle, not to whoever is moving a panel.
  *
- * So the count is the guard: thirteen states, no more. Where a failed restart needs explaining,
+ * So the count is the guard: eleven states, no more. Where a failed restart needs explaining,
  * the Deployment panel's notice explains it rather than the vocabulary naming it.
  */
 describe('the state vocabulary is the product\'s, not a surface\'s', () => {
-  it('★ answers from the publish state and from nothing else handed alongside it', () => {
-    // NOT `presentationFor.length`: it reads 1 whether a second parameter is absent or merely
-    // defaulted, so an arity check cannot tell the two apart and passes against the mutation it
-    // would be written to catch. Behaviour is the enforceable half — a second input must not
-    // move any answer.
-    const extra = presentationFor as unknown as (s: PublishState, code?: string | null) => unknown
+  it('★ answers from the publish state and the server\'s retry commit, and nothing else', () => {
+    // NOT `presentationFor.length`: arity cannot tell an absent parameter from a defaulted one.
+    // Behaviour is the enforceable half — a third input must not move any answer.
+    const extra = presentationFor as unknown as (
+      s: PublishState,
+      retry: string | null,
+      code?: string | null,
+    ) => unknown
     for (const state of EVERY_STATE) {
       for (const code of ['restart_failed', 'restart_not_ready', 'build_failed', null]) {
-        expect(extra(state, code), state).toEqual(presentationFor(state))
+        expect(extra(state, null, code), state).toEqual(presentationFor(state, null))
       }
     }
   })
 
+  it('★ no state, with or without an approved retry, is labelled "Approved"', () => {
+    const labels = EVERY_STATE.flatMap((state) => [
+      presentationFor(state, null).label,
+      presentationFor(state, SHA).label,
+    ])
+    expect(labels.length).toBe(EVERY_STATE.length * 2)
+    expect(labels).toContain("Didn't start")
+    expect(labels.filter((label) => /approved/i.test(label))).toEqual([])
+  })
+
+  it('★ an approved Try again says it publishes the version the administrator approved', () => {
+    const retry = presentationFor('did_not_start', SHA)
+    expect(retry.label).toBe("Didn't start")
+    expect(retry.action).toBe('try_again')
+    expect(retry.sentence).toMatch(/version an administrator approved/i)
+    expect(retry.sentence).toMatch(/not anything you have saved since/i)
+    expect(presentationFor('did_not_start', null).sentence).not.toMatch(/approved/i)
+  })
+
   it('★ a first deploy that never came up says what it has always said', () => {
-    const plain = presentationFor('did_not_start')
+    const plain = presentationFor('did_not_start', null)
     expect(plain.label).toBe("Didn't start")
     expect(plain.action).toBe('try_again')
+  })
+
+  it('★ an approved copy the server will not retry is not what Try again promises', () => {
+    // After the approved copy fails in itself the server hands back no approved commit, and the
+    // button sends the saved version through the dialog instead.
+    const plain = presentationFor('did_not_start', null)
+    expect(plain.action).toBe('try_again')
+    expect(plain.version).toBe('none')
+    expect(plain.sentence).not.toMatch(/approved|saved since/i)
+  })
+
+  it('★ Publish again after the approved version came down says that version is what goes back', () => {
+    const again = presentationFor('taken_offline', SHA)
+    expect(again.label).toBe('Taken offline')
+    expect(again.action).toBe('publish_again')
+    expect(again.sentence).toMatch(/version an administrator approved/i)
+    expect(again.sentence).toMatch(/not anything you have saved since/i)
+    expect(again.version).toBe(presentationFor('did_not_start', SHA).version)
+
+    const approved = approval({ approvedAt: '2026-09-20T09:00:00Z', approvedCommitSha: SHA })
+    expect(versionRowData(again.version, view({ headSha: SHA }), approved)).toMatchObject({
+      heading: 'Approved version',
+      sha: SHA,
+    })
+  })
+
+  it('★ Publish again after a takedown with no approved copy says what it always said', () => {
+    expect(presentationFor('taken_offline', null)).toEqual({
+      label: 'Taken offline',
+      sentence: 'This app is not running in production. Publishing again puts it back at the same address.',
+      action: 'publish_again',
+      version: 'last_published',
+    })
   })
 
   it('★ no state anywhere in the table answers with a restart-specific label', () => {
     // The paired liveness: the loop must actually be reading labels, or an empty table would
     // satisfy the absence check for ever.
-    const labels = EVERY_STATE.map((state) => presentationFor(state).label)
+    const labels = EVERY_STATE.map((state) => presentationFor(state, null).label)
     expect(labels.length).toBe(EVERY_STATE.length)
     expect(labels).toContain("Didn't start")
     expect(labels).not.toContain('Could not restart')
@@ -425,5 +483,39 @@ describe('a published date reads the same on every machine', () => {
 
   it('hands an unreadable instant back unchanged rather than printing the words', () => {
     expect(formatStamp('not-a-date')).toBe('not-a-date')
+  })
+})
+
+describe('the action button says what its press is doing, on both surfaces', () => {
+  it('names the wait, taking a submission back first', () => {
+    // Withdrawing and publishing never overlap in practice; the order only decides which word
+    // wins if they ever did, and it is the chip's and the panel's alike.
+    expect(busyLabel(true, null)).toBe('Taking it back…')
+    expect(busyLabel(true, 'publishing')).toBe('Taking it back…')
+    expect(busyLabel(false, 'saving')).toBe('Saving…')
+    expect(busyLabel(false, 'publishing')).toBe('Publishing…')
+  })
+
+  it('is null when nothing is working, so each surface keeps its own resting label', () => {
+    expect(busyLabel(false, null)).toBeNull()
+  })
+})
+
+describe('a press that went through says what happened, on both surfaces', () => {
+  it('speaks the server\'s own sentence when the app was sent to an administrator', () => {
+    const routed: DeployOutcome = {
+      outcome: 'routed_for_review',
+      appId: 'app-1',
+      submissionId: 's1',
+      commitSha: 'a'.repeat(40),
+      submittedAt: '2026-09-20T10:00:00Z',
+      message: 'Your app was sent to an administrator for review.',
+    }
+    expect(answerFor(routed)).toEqual({ text: 'Your app was sent to an administrator for review.', heldWhile: 'in_review' })
+  })
+
+  it('says the publish has started when it did', () => {
+    const started: DeployOutcome = { outcome: 'started', deploymentId: 'd1', appId: 'app-1', status: 'running' }
+    expect(answerFor(started)).toEqual({ text: 'Publishing now — this takes a few minutes.', heldWhile: 'starting_up' })
   })
 })

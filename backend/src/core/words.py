@@ -2,7 +2,7 @@
 
 WHY THIS EXISTS
 Two surfaces count words: the project title (max 8) and the reason given
-for deleting a project (5-50). Client and server must split identically or
+for deleting a project. Client and server must split identically or
 a message that passes in the browser gets refused by the API, so this is
 the server's definition, and `portal/src/utils/words.ts` is the client's —
 deliberately small and deliberately equivalent:

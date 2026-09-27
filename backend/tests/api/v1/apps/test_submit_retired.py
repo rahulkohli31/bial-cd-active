@@ -66,7 +66,6 @@ async def test_the_submit_route_is_gone_even_for_the_owner_with_a_valid_bundle(
     assert row.status is AppStatus.DRAFT
     assert row.source_submission_id is None
     assert row.declaration is None
-    assert row.approval_route is None
 
 
 async def test_the_submit_route_is_gone_unauthenticated_too(client) -> None:

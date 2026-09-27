@@ -1283,11 +1283,11 @@ async def delete_project(
 ) -> OkResponse:
     """Cascade-delete the project and every child it owns.
 
-    Requires a body stating WHY, in 5-50 words, which is recorded as a tombstone. Rows are
-    deleted inside the transaction and committed; object-store blobs, each app's per-app Blob
-    container, and the project's own PostgreSQL database are torn down only AFTER the commit,
-    best-effort. A live build session for THIS project's app refuses the delete with 409
-    rather than racing it."""
+    Requires a body stating WHY, within the delete-reason word bound, which is recorded as a
+    tombstone. Rows are deleted inside the transaction and committed; object-store blobs, each
+    app's per-app Blob container, and the project's own PostgreSQL database are torn down only
+    AFTER the commit, best-effort. A live build session for THIS project's app refuses the delete
+    with 409 rather than racing it."""
     # IT TAKES A BODY, which is unusual for DELETE and worth naming. A 50-word reason does not
     # belong in a query string. RFC 9110 says content on a DELETE has no defined semantics, and
     # httpx declines to offer `json=` on `.delete()` for that reason — tests use
@@ -1423,9 +1423,8 @@ async def delete_project(
             resource_id=str(project_id),
         )
         if handles is not None:
-            # NAMES only — never the DSN. `appId` is what makes this project-scoped
-            # row visible in the app's audit drawer (`admin.read_audit` matches on it); an
-            # app-less project simply has no app to file it under.
+            # NAMES only — never the DSN. `appId` ties this project-scoped row to the app
+            # the database served; an app-less project simply has no app to file it under.
             detail: dict[str, str] = {"dbName": handles.db_name, "roleName": handles.role_name}
             if app_id is not None:
                 detail["appId"] = str(app_id)

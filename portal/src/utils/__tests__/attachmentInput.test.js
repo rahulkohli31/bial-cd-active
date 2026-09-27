@@ -5,8 +5,6 @@ import {
   resolveMediaType,
   fileToBase64,
   ACCEPT_ATTR,
-  MAX_FILE_SIZE,
-  MAX_FILE_SIZE_MB,
   MAX_FILES_PER_MESSAGE,
   MAX_ATTACHMENTS_PER_CONVERSATION,
   MODEL_LANE_MEDIA_TYPES,
@@ -34,15 +32,6 @@ describe('validateAttachmentFiles', () => {
     expect(res.error).toMatch(/isn't supported/)
   })
 
-  it('rejects a file one byte over the cap, and names the cap it enforced', () => {
-    // Asserted against the CONSTANT, never a spelled number: a refusal that says a figure the
-    // code does not enforce is the drift this interpolation exists to prevent, and a hardcoded
-    // "4 MB" here is what let the two disagree in the first place.
-    expect(validateAttachmentFiles([file('huge.png', 'image/png', MAX_FILE_SIZE)], 0)).toEqual({ ok: true })
-    const res = validateAttachmentFiles([file('huge.png', 'image/png', MAX_FILE_SIZE + 1)], 0)
-    expect(res.error).toMatch(new RegExp(`${MAX_FILE_SIZE_MB} MB`))
-  })
-
   it('rejects exceeding the per-message file cap', () => {
     const res = validateAttachmentFiles([file('a.png', 'image/png')], MAX_FILES_PER_MESSAGE)
     expect(res.error).toMatch(new RegExp(`at most ${MAX_FILES_PER_MESSAGE} files`))
@@ -51,8 +40,8 @@ describe('validateAttachmentFiles', () => {
   it('accepts the code-lane formats as ordinary uploads', () => {
     // THE INLINE-TEXT CAPS ARE GONE WITH THEIR LANE. A CSV used to be read in the browser
     // and inlined into the prompt, so it carried its own 256 KB per-file and 512 KB
-    // per-conversation budgets. Every attachment is an uploaded file now, governed by the one
-    // per-file cap — which is also what lets a chip be rebuilt on reload for every format.
+    // per-conversation budgets. Every attachment is an uploaded file now, governed by its lane's
+    // size limit — which is also what lets a chip be rebuilt on reload for every format.
     expect(validateAttachmentFiles([file('rows.csv', 'text/csv')], 0)).toEqual({ ok: true })
     expect(validateAttachmentFiles([file('rows.tsv', 'text/tab-separated-values')], 0)).toEqual({ ok: true })
     expect(validateAttachmentFiles([file('book.xlsx', XLSX)], 0)).toEqual({ ok: true })
@@ -82,28 +71,25 @@ describe('validateAttachmentFiles', () => {
     expect(validateAttachmentFiles([file('data.csv', '')], 0)).toEqual({ ok: true })
   })
 
-  it('gives every format the SAME cap — a CSV, an image and a PDF are one rule', () => {
-    // RE-POINTED TWICE. It first asserted a 256 KB cap on inlined text, which
-    // existed because a CSV's BYTES rode in the prompt on every turn. Nothing is inlined now, so
-    // it became "a CSV gets the ordinary file cap" — and the ordinary cap has since become one
-    // number for all ten formats, so what is worth asserting is that no format has its own.
-    //
-    // A citizen should never have to know which of their files the platform considers expensive,
-    // and the surest way to break that is for one format to keep a private number.
-    for (const [name, type] of [
-      ['big.csv', 'text/csv'],
-      ['big.tsv', 'text/tab-separated-values'],
-      ['photo.png', 'image/png'],
-      ['spec.pdf', 'application/pdf'],
-      ['book.xlsx', XLSX],
-      ['doc.docx', DOCX],
-      ['deck.pptx', PPTX],
-    ]) {
-      expect(validateAttachmentFiles([file(name, type, MAX_FILE_SIZE)], 0)).toEqual({ ok: true })
-      expect(validateAttachmentFiles([file(name, type, MAX_FILE_SIZE + 1)], 0).error).toMatch(
-        new RegExp(`${MAX_FILE_SIZE_MB} MB`),
-      )
-    }
+  it.each([
+    ['photo.png', 'image/png', 7],
+    ['photo.jpg', 'image/jpeg', 7],
+    ['photo.gif', 'image/gif', 7],
+    ['photo.webp', 'image/webp', 7],
+    ['spec.pdf', 'application/pdf', 20],
+    ['rows.csv', 'text/csv', 30],
+    ['rows.tsv', 'text/tab-separated-values', 30],
+    ['book.xlsx', XLSX, 30],
+    ['doc.docx', DOCX, 30],
+    ['deck.pptx', PPTX, 30],
+  ])('accepts %s at its lane limit and refuses it one byte over, naming that limit', (name, type, mb) => {
+    // Spelled numbers, on purpose: these are the limits the server enforces, and a backend test
+    // holds the module's constants to the server's. Deriving them here would let both drift together.
+    const limit = mb * 1024 * 1024
+    expect(validateAttachmentFiles([file(name, type, limit)], 0)).toEqual({ ok: true })
+    expect(validateAttachmentFiles([file(name, type, limit + 1)], 0)).toEqual({
+      error: `"${name}" exceeds the ${mb} MB limit.`,
+    })
   })
 
 

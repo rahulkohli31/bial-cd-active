@@ -309,7 +309,7 @@ async def test_mint_deploy_container_sas_signs_against_the_stored_access_policy(
 
 
 async def test_two_mints_issue_different_credentials_so_re_mint_is_real_rotation() -> None:
-    """The runbook's revoke-then-re-mint has to hand back a DIFFERENT credential.
+    """A revoke-then-re-mint has to hand back a DIFFERENT credential.
 
     The REAL `generate_container_sas` runs here — it is pure local crypto, no network — because a
     double is exactly what cannot prove this: it would only show that the double varies. A service
@@ -545,8 +545,8 @@ async def test_deploy_sas_round_trips_and_is_revocable_by_policy(
     app_container_store: AppContainerStore,
 ) -> None:
     # The deploy credential against a REAL Blob service: it provisions the container itself,
-    # round-trips rwld, and — the claim the runbook makes — DIES when the app's stored access
-    # policy is deleted, while the SAS string itself is untouched.
+    # round-trips rwld, and DIES when the app's stored access policy is deleted, while the SAS
+    # string itself is untouched.
     app_id = uuid.uuid4()
     try:
         credential = await app_container_store.mint_deploy_container_sas(app_id)

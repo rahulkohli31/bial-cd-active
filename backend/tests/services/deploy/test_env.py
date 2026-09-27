@@ -4,8 +4,8 @@ WHY THIS FILE EXISTS NOW. `build_published_env` had no tests of its own: the dep
 monkeypatches it away (correctly — it must not reach Azure there), and the envelope suite starts
 from an env dict handed to it. That was survivable while the function only assembled values every
 app gets. It stopped being survivable the moment one of those values became a grant: the
-connector coordinates are per person and per project, and an app published by somebody who never
-had access to a connector must not carry a credential to it.
+connector coordinates are per project, and an app published from a project whose connector is
+switched off must not carry a credential to it.
 
 THE ARGUMENT THAT MAKES THE GATE REAL IS `user_id`. It is threaded in rather than looked up here,
 because the caller already holds it and a second lookup is a second chance to scope it wrongly —
@@ -21,13 +21,12 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
-from src.db.models.connector_access import ConnectorRequestStatus
 from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
 from src.services.deploy.env import build_published_env
 from src.services.lake.config import LakeConfig
 from src.services.lake.env import connector_env_names
 from src.services.sandbox.config import SandboxConfig
-from tests.api.v1.connectors.conftest import KEY, seed_decision
+from tests.api.v1.connectors.conftest import KEY
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 
 _LAKE_URL = "https://alakeaccount.blob.core.windows.net/acontainer/AOS/reports/"
@@ -72,7 +71,6 @@ def lake_configured(monkeypatch: pytest.MonkeyPatch) -> None:
 async def _publishable(
     db: AsyncSession,
     *,
-    access: ConnectorRequestStatus | None = ConnectorRequestStatus.APPROVED,
     enabled: bool = True,
     email: str = "citizen@rvaiglobal.com",
 ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
@@ -80,8 +78,6 @@ async def _publishable(
     user = await UserFactory.create(db, email=email)
     project = await ProjectFactory.create(db, user_id=user.id)
     app = await AppRegistryFactory.create(db, user_id=user.id, project_id=project.id)
-    if access is not None:
-        await seed_decision(db, user.id, access, None)
     db.add(
         ProjectConnector(
             project_id=project.id,
@@ -95,7 +91,7 @@ async def _publishable(
     return user.id, project.id, app.id
 
 
-async def test_an_approved_project_publishes_with_the_coordinates(
+async def test_a_switched_on_project_publishes_with_the_coordinates(
     db_session: AsyncSession, lake_configured: None
 ) -> None:
     """★ THE SAME TWO VALUES THE BUILD GOT, so the app the citizen tested is the app that ships.
@@ -127,26 +123,13 @@ async def test_no_window_dates_reach_a_published_app(
     assert not [name for name in env if "WINDOW" in name or "DAYS" in name]
 
 
-@pytest.mark.parametrize(
-    ("access", "enabled"),
-    [
-        (ConnectorRequestStatus.APPROVED, False),
-        (ConnectorRequestStatus.PENDING, True),
-        (ConnectorRequestStatus.DECLINED, True),
-        (None, True),
-    ],
-    ids=["switched-off", "pending", "declined", "never-asked"],
-)
-async def test_an_ungranted_project_publishes_with_nothing_extra(
-    db_session: AsyncSession,
-    lake_configured: None,
-    access: ConnectorRequestStatus | None,
-    enabled: bool,
+async def test_a_switched_off_project_publishes_with_nothing_extra(
+    db_session: AsyncSession, lake_configured: None
 ) -> None:
     """The gate, at the env-building level. Its twin — that the SPEC then carries no identity
     block — lives in `test_aca_publish.py`, because a test that only covered this half would
     pass while every published app on the platform carried the credential."""
-    user_id, project_id, app_id = await _publishable(db_session, access=access, enabled=enabled)
+    user_id, project_id, app_id = await _publishable(db_session, enabled=False)
 
     env, _url = await build_published_env(
         db_session, app_id=app_id, project_id=project_id, user_id=user_id
@@ -160,13 +143,11 @@ async def test_an_ungranted_project_publishes_with_nothing_extra(
 async def test_publishing_someone_elses_project_carries_no_coordinates(
     db_session: AsyncSession, lake_configured: None
 ) -> None:
-    """★ `user_id` IS THE OWNERSHIP CLAIM. An approved stranger publishing this project — which
-    the pipeline could only reach through a bug, and which is exactly why the predicate is here
-    and not merely at the route — gets nothing."""
+    """★ `user_id` IS THE OWNERSHIP CLAIM. A stranger publishing this project — which the
+    pipeline could only reach through a bug, and which is exactly why the predicate is here and
+    not merely at the route — gets nothing."""
     _owner, project_id, app_id = await _publishable(db_session)
     stranger = await UserFactory.create(db_session, email="stranger@rvaiglobal.com")
-    await seed_decision(db_session, stranger.id, ConnectorRequestStatus.APPROVED, None)
-    await db_session.flush()
 
     env, _url = await build_published_env(
         db_session, app_id=app_id, project_id=project_id, user_id=stranger.id

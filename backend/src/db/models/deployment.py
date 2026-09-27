@@ -5,7 +5,7 @@ WHY THIS EXISTS
 One append-only row per one-click deploy attempt. A citizen presses Deploy and the app
 goes live with no admin approval, so this is the ONLY durable record of what is running:
 `head_sha` says WHICH commit went live (`app_registry`'s commit/submission columns belong
-to the manual-runbook lifecycle and stay unset while a self-deployed app is still `draft`),
+to the review lifecycle and stay unset while a self-deployed app is still `draft`),
 and `image_digest` says WHICH image is running — the reconciler's authorization to act
 (it may only promote a row whose digest matches what ARM reports as live, and must never
 delete a container app it cannot prove it created) and the rollback source (redeploying
@@ -31,15 +31,12 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
 
 import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
 from src.db.mixins import OwnedByUserMixin, TimestampMixin, UUIDv7PrimaryKeyMixin
-from src.db.models.app_registry import MAX_DEPLOYED_URL
 
 
 class DeploymentStatus(StrEnum):
@@ -83,6 +80,9 @@ MAX_STEP = 32
 
 # A stable, greppable failure identifier (`acr_build_failed`, `revision_unhealthy`, …).
 MAX_FAILURE_CODE = 64
+
+# 2083, the address-bar ceiling pydantic's own `HttpUrl` adopts as `max_length`.
+MAX_URL = 2083
 
 
 class Deployment(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base):
@@ -178,39 +178,13 @@ class Deployment(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base):
     container_app_name: Mapped[str | None] = mapped_column(sa.String(MAX_ACA_NAME), nullable=True)
     revision_name: Mapped[str | None] = mapped_column(sa.String(MAX_REVISION_NAME), nullable=True)
 
-    # Where the app answers. Platform-written, never human-typed — the opposite of
-    # `app_registry.deployed_url`, which is the manual runbook's field and is deliberately
-    # left alone by this path.
-    url: Mapped[str | None] = mapped_column(sa.String(MAX_DEPLOYED_URL), nullable=True)
+    # Where the app answers. Platform-written, never human-typed.
+    url: Mapped[str | None] = mapped_column(sa.String(MAX_URL), nullable=True)
 
     failure_code: Mapped[str | None] = mapped_column(sa.String(MAX_FAILURE_CODE), nullable=True)
     # Redacted and length-capped by the writer before it lands here: a build log is
     # attacker-influenced text from a workspace the citizen's AI drove.
     failure_detail: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
-
-    # WHAT THE CITIZEN DECLARED THIS APP HANDLES, and the score that let it through the
-    # gate. Recorded per DEPLOY rather than per app: the agent edits the app between
-    # deploys, so a declaration attached to `app_registry` would keep describing a version
-    # that is no longer running. Answering "what was this build claimed to handle" is only
-    # possible if the answer travels with the build.
-    #
-    # Nullable because rows minted before the questionnaire existed have no declaration and
-    # must not be back-filled with a guess — `NULL` reads as "never asked", which is true,
-    # while a synthesised all-False set would read as "declared to handle nothing", which
-    # is a claim nobody made.
-    #
-    # JSONB rather than six columns for the same reason `app_registry.declaration` is
-    # JSONB: the questionnaire is expected to be reworded and reweighted, and a shape that
-    # needs a migration per question would make that a schema conversation every time. The
-    # keys are pinned to `CLASSIFICATION_KEYS`, so this is a stable shape, not a free-form
-    # bag.
-    classification: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-
-    # Stored alongside the answers rather than recomputed from them. The weights are policy
-    # and policy changes: recomputing later would report what TODAY's table says about an
-    # old declaration, silently rewriting the reason a past deploy was allowed. This column
-    # is the score that actually authorised this deploy.
-    classification_score: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
 
     # Renewed by the running pipeline; the reconciler's staleness clock. NOT NULL with a
     # server default so a row is never ambiguously "never beat" vs "beat long ago".

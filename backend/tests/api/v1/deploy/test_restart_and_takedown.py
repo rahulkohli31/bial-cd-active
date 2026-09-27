@@ -157,7 +157,7 @@ async def wire(app: FastAPI, db_session, monkeypatch, tmp_path):
     (tree / "package.json").write_text("{}")
     extractions: list[uuid.UUID] = []
 
-    async def _extract(app_id, *, cache_root=None):
+    async def _extract(app_id, *, bundle_key=None):
         extractions.append(app_id)
         from src.services.storage.snapshot_read import ExtractedSnapshot
 
@@ -179,7 +179,6 @@ async def wire(app: FastAPI, db_session, monkeypatch, tmp_path):
         yield db_session
 
     store = FakeStorage()
-    monkeypatch.setattr(service_module, "get_storage", lambda: store)
 
     images = FakeImages()
     aca = FakeAca()

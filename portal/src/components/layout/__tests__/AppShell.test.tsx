@@ -36,7 +36,10 @@ vi.mock('../../../utils/auth', () => ({
   logout: h.logout,
 }))
 vi.mock('../../../utils/attachmentApi', () => ({ revokeAllAttachmentUrls: vi.fn() }))
-vi.mock('../../../utils/appRegistryApi', () => ({ fetchAppStatusCounts: h.fetchAppStatusCounts }))
+vi.mock('../../../utils/appRegistryApi', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../utils/appRegistryApi')>()),
+  fetchAppStatusCounts: h.fetchAppStatusCounts,
+}))
 vi.mock('../../../utils/projectsListMemory', () => ({
   projectsListHref: h.projectsListHref,
   rememberProjectsSearch: h.rememberProjectsSearch,
@@ -53,7 +56,8 @@ const ADMIN = { email: 'priya@bial.aero', display_name: 'Priya Nair', isAdmin: t
 const USAGE = { used: 537_102, limit: 1_000_000, remaining: 462_898, resetsAt: '' }
 const counts = (pending: number) => ({ draft: 0, pending, approved: 0, rejected: 0, disabled: 0 })
 
-/** The six destinations, in the order `NavStates.dc.html` draws them.
+/** The five destinations, in the order `NavStates.dc.html` draws them, less Integrations — a
+ *  connector is switched on in each application's own settings, so it has no destination.
  *
  *  THE ORDER TEST FILTERS THE RENDERED BUTTONS *BY* THIS LIST, so a destination missing from here
  *  is not a failure — it is dropped, and the test goes on claiming it checks the whole rail. */
@@ -62,7 +66,6 @@ const BOARD_ORDER = [
   'BIAL Chat',
   'Shared Applications',
   'App Marketplace',
-  'Integrations',
   'Admin',
 ]
 
@@ -133,13 +136,21 @@ function renderAt(path: string) {
 }
 
 describe('the navigation the boards draw', () => {
-  it('renders all six entries in board order for an administrator', async () => {
+  it('renders all five entries in board order for an administrator', async () => {
     h.getStoredUser.mockReturnValue(ADMIN)
     renderAt('/projects')
     const labels = (await screen.findAllByRole('button'))
       .map((b) => b.textContent ?? '')
       .filter((text) => BOARD_ORDER.some((label) => text.startsWith(label)))
     expect(labels.map((t) => BOARD_ORDER.find((l) => t.startsWith(l)))).toEqual(BOARD_ORDER)
+  })
+
+  it('offers no Integrations destination', async () => {
+    h.getStoredUser.mockReturnValue(ADMIN)
+    renderAt('/projects')
+    expect(await screen.findByTestId('nav-marketplace')).toBeTruthy()
+    expect(screen.queryByTestId('nav-integrations')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Integrations/ })).toBeNull()
   })
 
   it('marks exactly one entry as the current page', async () => {
@@ -220,7 +231,6 @@ describe('every destination navigates directly — no exit routine in the way', 
     ['nav-assistant', '/assistant'],
     ['nav-shared-applications', '/shared-applications'],
     ['nav-marketplace', '/marketplace'],
-    ['nav-integrations', '/integrations'],
     ['nav-admin', '/admin'],
   ])('%s navigates straight there, with nothing asked first', async (testId, expected) => {
     h.getStoredUser.mockReturnValue(ADMIN)

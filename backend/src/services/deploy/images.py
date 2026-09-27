@@ -47,8 +47,10 @@ _TASKS_API_VERSION: Final = "2019-06-01-preview"
 _ARM_BASE: Final = "https://management.azure.com"
 _ARM_SCOPE: Final = "https://management.azure.com/.default"
 
-# Terminal run statuses. `Queued`/`Started`/`Running` are the non-terminal ones.
+# Terminal run statuses. `Queued`/`Started`/`Running` are the non-terminal ones. Only `Failed`
+# is the app's own build failing; `Error`, `Canceled` and `Timeout` are the registry's.
 _SUCCEEDED: Final = "Succeeded"
+_FAILED: Final = "Failed"
 _TERMINAL_STATUSES: Final = frozenset({"Succeeded", "Failed", "Canceled", "Error", "Timeout"})
 
 # Blob upload needs this header or the PUT is rejected — the destination is a block blob.
@@ -73,8 +75,10 @@ class ImageBuildError(Exception):
         self.log_tail = log_tail
 
 
-class ImageBuildTransientError(ImageBuildError):
-    """A retryable failure reaching ARM — not a failure of the build itself."""
+class ImageBuildUnavailableError(ImageBuildError):
+    """The platform could not build the image: the registry refused or could not be reached, the
+    run errored, was cancelled or ran out of time, or it reported success with no image. Never
+    the app's own build, which is a run that reports `Failed`."""
 
 
 @dataclass(frozen=True)
@@ -137,19 +141,19 @@ class AcrImageBuilder:
                 method, url, json=json, headers=headers, timeout=_ARM_CALL_TIMEOUT_S
             )
         except httpx.HTTPError as exc:
-            raise ImageBuildTransientError(f"ARM {method} {path} failed") from exc
+            raise ImageBuildUnavailableError(f"ARM {method} {path} failed") from exc
 
         if response.status_code == 403:
-            # The single most likely first-run failure, and one no retry can fix. Say what
-            # is missing rather than surfacing an opaque 403 hours into a rollout.
-            raise ImageBuildError(
+            # The single most likely first-run failure. Say what is missing rather than
+            # surfacing an opaque 403 hours into a rollout.
+            raise ImageBuildUnavailableError(
                 "the control plane is not authorized to build images in this registry — "
                 "grant it listBuildSourceUploadUrl/scheduleRun/runs on the registry resource"
             )
-        if response.status_code == 429 or response.status_code >= 500:
-            raise ImageBuildTransientError(f"ARM {method} {path} returned {response.status_code}")
         if response.status_code >= 400:
-            raise ImageBuildError(f"ARM {method} {path} returned {response.status_code}")
+            raise ImageBuildUnavailableError(
+                f"ARM {method} {path} returned {response.status_code}"
+            )
         if not response.content:
             return {}
         payload: dict[str, Any] = response.json()
@@ -177,7 +181,7 @@ class AcrImageBuilder:
         upload_url = upload.get("uploadUrl")
         relative_path = upload.get("relativePath")
         if not upload_url or not relative_path:
-            raise ImageBuildError("the registry returned no source upload location")
+            raise ImageBuildUnavailableError("the registry returned no source upload location")
 
         await self._upload(str(upload_url), context)
 
@@ -228,7 +232,9 @@ class AcrImageBuilder:
         )
         run_id = str(run.get("name") or "")
         if not run_id:
-            raise ImageBuildError("the registry accepted the build but returned no run id")
+            raise ImageBuildUnavailableError(
+                "the registry accepted the build but returned no run id"
+            )
 
         return await self._await_run(run_id=run_id, tag=tag)
 
@@ -244,9 +250,11 @@ class AcrImageBuilder:
                 url, content=context, headers=_BLOB_TYPE_HEADER, timeout=_UPLOAD_TIMEOUT_S
             )
         except httpx.HTTPError as exc:
-            raise ImageBuildTransientError("uploading the build context failed") from exc
+            raise ImageBuildUnavailableError("uploading the build context failed") from exc
         if response.status_code >= 400:
-            raise ImageBuildError(f"uploading the build context returned {response.status_code}")
+            raise ImageBuildUnavailableError(
+                f"uploading the build context returned {response.status_code}"
+            )
 
     async def _await_run(self, *, run_id: str, tag: str) -> BuiltImage:
         """Poll to a terminal status, then either read the digest or fetch the log."""
@@ -258,21 +266,23 @@ class AcrImageBuilder:
                 break
             if asyncio.get_running_loop().time() >= deadline:
                 # The run may still be going; the platform has simply stopped waiting.
-                raise ImageBuildError(
+                raise ImageBuildUnavailableError(
                     f"the image build did not finish within {self._config.build_timeout_s}s"
                 )
             await asyncio.sleep(self._config.build_poll_interval_s)
 
+        if status == _FAILED:
+            raise ImageBuildError("the image build failed", log_tail=await self._log_tail(run_id))
         if status != _SUCCEEDED:
-            raise ImageBuildError(
-                f"the image build {status.lower()}", log_tail=await self._log_tail(run_id)
+            raise ImageBuildUnavailableError(
+                f"the image build ended {status.lower()}", log_tail=await self._log_tail(run_id)
             )
 
         digest = _digest_of(run)
         if digest is None:
             # A build that reports success but produced no image is a platform problem, not
             # a user one — never report it as "your code failed to build".
-            raise ImageBuildError(
+            raise ImageBuildUnavailableError(
                 "the image build succeeded but produced no image digest",
                 log_tail=await self._log_tail(run_id),
             )

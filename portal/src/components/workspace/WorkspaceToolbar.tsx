@@ -109,10 +109,11 @@ export default function WorkspaceToolbar({
   // WHETHER A REAL APPLICATION IS BEHIND THIS ADDRESS, which is what the `⋯` menu needs and the
   // `projectId` route param cannot answer: the param is non-null even for a mangled paste that
   // never resolved to anything. The NAME is the only field on this heading that comes from the
-  // project's own fetch, so it is what means "a project loaded" — the same test the rename
-  // control used to make before it folded into the menu. A chat is not an application screen,
-  // and its surface publishes neither action.
-  const projectActions = !isChat && heading.projectName !== null ? heading.projectName : null
+  // project's own fetch, so it is what means "a project loaded". On a chat the menu's actions come
+  // from the conversation surface, which mounts when the chat resolves — the same moment its kind
+  // is published — so a project that loads before its chat does not offer a menu with nothing
+  // behind it.
+  const menuOffered = heading.projectName !== null && (!isChat || heading.chatKind !== null)
 
   const usage = useUsageToday()
   // The panel carries a counter of its own, so the toolbar's is the STAND-IN for it — see
@@ -355,7 +356,7 @@ export default function WorkspaceToolbar({
             Settings, two steps from any list and any workspace. Send for review is not here
             either — Settings › Production is its one owner, and a second submit control would
             be a second place to disagree about whether there is anything to submit. */}
-        {projectActions !== null && (
+        {menuOffered && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button

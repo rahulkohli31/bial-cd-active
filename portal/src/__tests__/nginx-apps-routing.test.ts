@@ -228,6 +228,16 @@ describe('nginx.conf — the portal site survived the apps site (regression)', (
   })
 })
 
+describe('nginx.conf — each site declares its own request-body ceiling', () => {
+  it('sets the portal above the attachment route and leaves the apps site where it was', () => {
+    // The portal's sits above the attachment route's own request ceiling, so the route's refusal,
+    // which names the limit for the file's type, is what a citizen reads instead of nginx's bare
+    // 413. Sibling server blocks inherit nothing, so each has to carry its own.
+    expect(directiveValue(serverLevel(PORTAL), 'client_max_body_size')).toBe('45m')
+    expect(directiveValue(serverLevel(APPS), 'client_max_body_size')).toBe('40m')
+  })
+})
+
 describe('nginx.conf — the framing policy names the apps host without revoking the old one', () => {
   const CSP = /add_header[ \t]+Content-Security-Policy[ \t]+"([^"]*)"[ \t]+always[ \t]*;/g
   const declared = [...CODE.matchAll(CSP)].map((m) => m[1]!)

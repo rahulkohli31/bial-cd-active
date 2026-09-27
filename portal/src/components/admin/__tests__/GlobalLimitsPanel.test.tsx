@@ -31,6 +31,8 @@ const pageOf = (users: ReturnType<typeof user>[], over: Record<string, unknown> 
   hasMore: over.hasMore ?? false,
 })
 
+const checkbox = (name: string) => screen.getByRole('checkbox', { name })
+
 // `mode` defaults to 'all', so any test that needs the roster switches explicitly.
 const enterSelectedMode = async () => {
   fireEvent.click(screen.getByTestId('mode-selected'))
@@ -48,26 +50,29 @@ describe('GlobalLimitsPanel', () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
     await screen.findByTestId('all-users-summary')
     expect(screen.getByTestId('mode-all').getAttribute('aria-checked')).toBe('true')
-    expect(screen.queryByTestId('select-a@x.com')).toBeNull()
+    expect(screen.queryByRole('checkbox', { name: 'Select Alice' })).toBeNull()
     // Finding #6: the background roster chain only ever starts once the admin actively
     // switches to "Selected users" — defaulting to 'all' means an admin who only uses
     // this mode never triggers a single roster request.
     expect(h.fetchUsers).not.toHaveBeenCalled()
   })
 
-  it('switching to Selected users loads the roster with checkboxes', async () => {
+  it('switching to Selected users loads the roster with Radix checkboxes', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
     await enterSelectedMode()
     expect(screen.getByTestId('mode-selected').getAttribute('aria-checked')).toBe('true')
-    expect(screen.getByTestId('select-a@x.com')).toBeTruthy()
-    expect(screen.getByTestId('select-b@x.com')).toBeTruthy()
+    // Radix checkboxes: real buttons, so they take focus and toggle from the keyboard.
+    for (const box of [checkbox('Select all loaded users'), checkbox('Select Alice'), checkbox('Select Bob')]) {
+      expect(box.tagName).toBe('BUTTON')
+      expect(box.getAttribute('aria-checked')).toBe('false')
+    }
   })
 
   it('switching back to All users hides the roster and shows the system-wide summary', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
     await enterSelectedMode()
     fireEvent.click(screen.getByTestId('mode-all'))
-    expect(screen.queryByTestId('select-a@x.com')).toBeNull()
+    expect(screen.queryByRole('checkbox', { name: 'Select Alice' })).toBeNull()
     expect(screen.getByTestId('all-users-summary').textContent).toContain('every current, active user')
     expect(screen.getByTestId('all-users-summary').textContent).toContain('Suspended users are excluded')
   })
@@ -102,7 +107,7 @@ describe('GlobalLimitsPanel', () => {
     await enterSelectedMode()
     const apply = screen.getByTestId('glp-apply') as HTMLButtonElement
     expect(apply.disabled).toBe(true)
-    fireEvent.click(screen.getByTestId('select-a@x.com'))
+    fireEvent.click(checkbox('Select Alice'))
     expect(apply.disabled).toBe(false)
   })
 
@@ -115,7 +120,7 @@ describe('GlobalLimitsPanel', () => {
   it('Apply opens a confirm step and does not call the API until confirmed', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
     await enterSelectedMode()
-    fireEvent.click(screen.getByTestId('select-a@x.com'))
+    fireEvent.click(checkbox('Select Alice'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     expect(h.bulkUpdateUserLimits).not.toHaveBeenCalled()
     expect(screen.getByTestId('glp-confirm')).toBeTruthy()
@@ -126,14 +131,32 @@ describe('GlobalLimitsPanel', () => {
     const onToast = vi.fn()
     render(<GlobalLimitsPanel onToast={onToast} />)
     await enterSelectedMode()
-    fireEvent.click(screen.getByTestId('select-a@x.com'))
-    fireEvent.click(screen.getByTestId('select-b@x.com'))
+    fireEvent.click(checkbox('Select Alice'))
+    fireEvent.click(checkbox('Select Bob'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     fireEvent.click(screen.getByTestId('glp-confirm'))
 
     await waitFor(() => expect(onToast).toHaveBeenCalled())
     expect(h.bulkUpdateUserLimits).toHaveBeenCalledWith(1000000, ['u1', 'u2'], {})
     expect(onToast).toHaveBeenCalledWith(expect.stringContaining('2'))
+  })
+
+  it('a selection spans pages, and apply sends exactly the ticked users', async () => {
+    h.bulkUpdateUserLimits.mockResolvedValue({ updatedCount: 2 })
+    const roster = Array.from({ length: 12 }, (_, i) => user({ userId: `u${i}`, email: `u${i}@x.com`, displayName: i === 0 ? 'Alice' : `U${i}` }))
+    h.fetchUsers.mockResolvedValue(pageOf(roster))
+    render(<GlobalLimitsPanel onToast={() => {}} />)
+    await enterSelectedMode()
+
+    fireEvent.click(checkbox('Select U3'))
+    fireEvent.click(screen.getByRole('button', { name: '2' }))
+    fireEvent.click(checkbox('Select U11'))
+    expect(screen.getByText('2 selected')).toBeTruthy()
+
+    fireEvent.click(screen.getByTestId('glp-apply'))
+    fireEvent.click(screen.getByTestId('glp-confirm'))
+    await waitFor(() => expect(h.bulkUpdateUserLimits).toHaveBeenCalled())
+    expect(h.bulkUpdateUserLimits).toHaveBeenCalledWith(1000000, ['u3', 'u11'], {})
   })
 
   it('confirming in All users mode sends userIds=undefined (the backend resolves "all")', async () => {
@@ -150,7 +173,7 @@ describe('GlobalLimitsPanel', () => {
     h.bulkUpdateUserLimits.mockRejectedValue(new Error('Only super-admins can do this.'))
     render(<GlobalLimitsPanel onToast={() => {}} />)
     await enterSelectedMode()
-    fireEvent.click(screen.getByTestId('select-a@x.com'))
+    fireEvent.click(checkbox('Select Alice'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     fireEvent.click(screen.getByTestId('glp-confirm'))
     expect((await screen.findByTestId('apply-error')).textContent).toContain('super-admins')
@@ -159,11 +182,11 @@ describe('GlobalLimitsPanel', () => {
   it('select-all-loaded toggles every currently-loaded row on and off', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
     await enterSelectedMode()
-    fireEvent.click(screen.getByTestId('select-all-loaded'))
-    expect((screen.getByTestId('select-a@x.com') as HTMLInputElement).checked).toBe(true)
-    expect((screen.getByTestId('select-b@x.com') as HTMLInputElement).checked).toBe(true)
-    fireEvent.click(screen.getByTestId('select-all-loaded'))
-    expect((screen.getByTestId('select-a@x.com') as HTMLInputElement).checked).toBe(false)
+    fireEvent.click(checkbox('Select all loaded users'))
+    expect(checkbox('Select Alice').getAttribute('aria-checked')).toBe('true')
+    expect(checkbox('Select Bob').getAttribute('aria-checked')).toBe('true')
+    fireEvent.click(checkbox('Select all loaded users'))
+    expect(checkbox('Select Alice').getAttribute('aria-checked')).toBe('false')
   })
 
   it('select-all-loaded MERGES with a hand-picked selection made under the SAME query, never replaces it', async () => {
@@ -175,11 +198,11 @@ describe('GlobalLimitsPanel', () => {
     )
     render(<GlobalLimitsPanel onToast={() => {}} />)
     await enterSelectedMode()
-    fireEvent.click(screen.getByTestId('select-b@x.com'))
-    fireEvent.click(screen.getByTestId('select-all-loaded'))
-    expect((screen.getByTestId('select-a@x.com') as HTMLInputElement).checked).toBe(true)
-    expect((screen.getByTestId('select-b@x.com') as HTMLInputElement).checked).toBe(true)
-    expect((screen.getByTestId('select-c@x.com') as HTMLInputElement).checked).toBe(true)
+    fireEvent.click(checkbox('Select Bob'))
+    fireEvent.click(checkbox('Select all loaded users'))
+    expect(checkbox('Select Alice').getAttribute('aria-checked')).toBe('true')
+    expect(checkbox('Select Bob').getAttribute('aria-checked')).toBe('true')
+    expect(checkbox('Select Carl').getAttribute('aria-checked')).toBe('true')
   })
 
   it('`selected` is PRUNED on a query change — a stale pick can never silently outlive the search that made it visible', async () => {
@@ -190,12 +213,12 @@ describe('GlobalLimitsPanel', () => {
     })
     render(<GlobalLimitsPanel onToast={() => {}} />)
     await enterSelectedMode()
-    fireEvent.change(screen.getByTestId('glp-search'), { target: { value: 'ops' } })
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search users' }), { target: { value: 'ops' } })
     await screen.findByText('Ops')
-    fireEvent.click(screen.getByTestId('select-all-loaded'))
-    expect((screen.getByTestId('select-ops@x.com') as HTMLInputElement).checked).toBe(true)
+    fireEvent.click(checkbox('Select all loaded users'))
+    expect(checkbox('Select Ops').getAttribute('aria-checked')).toBe('true')
 
-    fireEvent.change(screen.getByTestId('glp-search'), { target: { value: 'eng' } })
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search users' }), { target: { value: 'eng' } })
     await screen.findByText('Eng')
     // The prior "ops" pick is no longer visible under this search — `selected` is
     // pruned on a query change (finding 3's other half) so the confirmed count can
@@ -217,7 +240,7 @@ describe('GlobalLimitsPanel', () => {
 
     const banner = await screen.findByTestId('loadmore-error')
     expect(banner.textContent).toContain('Network blip')
-    expect((screen.getByTestId('select-all-loaded') as HTMLInputElement).disabled).toBe(true)
+    expect((checkbox('Select all loaded users') as HTMLButtonElement).disabled).toBe(true)
     expect((screen.getByTestId('glp-apply') as HTMLButtonElement).disabled).toBe(true)
   })
 
@@ -226,7 +249,7 @@ describe('GlobalLimitsPanel', () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
     await enterSelectedMode()
     h.fetchUsers.mockClear()
-    fireEvent.click(screen.getByTestId('select-a@x.com'))
+    fireEvent.click(checkbox('Select Alice'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     fireEvent.click(screen.getByTestId('glp-confirm'))
     await waitFor(() => expect(h.fetchUsers).toHaveBeenCalled())
@@ -235,7 +258,7 @@ describe('GlobalLimitsPanel', () => {
   it('switching the preset while confirming closes the confirm step rather than showing a stale/invalid value', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
     await enterSelectedMode()
-    fireEvent.click(screen.getByTestId('select-a@x.com'))
+    fireEvent.click(checkbox('Select Alice'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     expect(screen.getByTestId('glp-confirm')).toBeTruthy()
     fireEvent.change(screen.getByTestId('preset-select'), { target: { value: 'custom' } })
@@ -256,7 +279,7 @@ describe('GlobalLimitsPanel', () => {
     const onToast = vi.fn()
     const { unmount } = render(<GlobalLimitsPanel onToast={onToast} />)
     await enterSelectedMode()
-    fireEvent.click(screen.getByTestId('select-a@x.com'))
+    fireEvent.click(checkbox('Select Alice'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     fireEvent.click(screen.getByTestId('glp-confirm'))
     unmount()
@@ -281,7 +304,7 @@ describe('GlobalLimitsPanel', () => {
       </StrictMode>,
     )
     await enterSelectedMode()
-    fireEvent.click(screen.getByTestId('select-a@x.com'))
+    fireEvent.click(checkbox('Select Alice'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     fireEvent.click(screen.getByTestId('glp-confirm'))
 
@@ -296,7 +319,7 @@ describe('GlobalLimitsPanel', () => {
       .mockImplementationOnce(() => new Promise((_, reject) => { rejectPage2 = reject }))
     render(<GlobalLimitsPanel onToast={() => {}} />)
     await enterSelectedMode()
-    fireEvent.click(screen.getByTestId('select-a@x.com'))
+    fireEvent.click(checkbox('Select Alice'))
     expect((screen.getByTestId('glp-apply') as HTMLButtonElement).disabled).toBe(false)
 
     rejectPage2(new Error('Network blip'))
@@ -307,13 +330,13 @@ describe('GlobalLimitsPanel', () => {
   it('"Yes, apply" disables if the selection drops to zero while the confirm step is still open', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
     await enterSelectedMode()
-    fireEvent.click(screen.getByTestId('select-a@x.com'))
+    fireEvent.click(checkbox('Select Alice'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     expect((screen.getByTestId('glp-confirm') as HTMLButtonElement).disabled).toBe(false)
 
-    // toggleOne doesn't call setConfirming(false) — unlike the mode buttons and the
-    // preset/custom-value editors, unticking a row leaves the confirm banner open.
-    fireEvent.click(screen.getByTestId('select-a@x.com'))
+    // Unlike the mode buttons and the preset/custom-value editors, unticking a row does not
+    // close the confirm step: the banner stays open.
+    fireEvent.click(checkbox('Select Alice'))
     expect(screen.getByTestId('glp-confirm')).toBeTruthy()
     expect((screen.getByTestId('glp-confirm') as HTMLButtonElement).disabled).toBe(true)
   })
@@ -375,7 +398,7 @@ describe('isPlainPositiveInteger (via the Exact value input)', () => {
     await enterSelectedMode()
     fireEvent.change(screen.getByTestId('preset-select'), { target: { value: 'custom' } })
     fireEvent.change(screen.getByTestId('custom-value'), { target: { value: raw } })
-    fireEvent.click(screen.getByTestId('select-a@x.com'))
+    fireEvent.click(checkbox('Select Alice'))
     expect((screen.getByTestId('glp-apply') as HTMLButtonElement).disabled).toBe(!valid)
   })
 })

@@ -1,5 +1,6 @@
 """`compute_publish_state` — a pure mapping from `(registry row, newest deployment
-row, saved head)` to one of thirteen `PublishState` values.
+row, saved head)` to one of eleven `PublishState` values — and `approved_retry_commit`, the
+commit its one button posts when it republishes an approved copy.
 
 Every case is built WITHOUT a database session and WITHOUT an event loop: the function
 reads nothing but plain columns off two ORM instances it never persists. That is the
@@ -13,18 +14,41 @@ make sense at the route, are covered where the I/O lives: `test_deploy_routes.py
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from src.api.v1.deploy.schemas import PublishState, compute_publish_state
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.api.v1.deploy.schemas import (
+    _RESTART_FAILURE_CODES,
+    _RETRYABLE_FAILURE_CODES,
+    _ROUTED_FAILURE_CODES,
+    NON_RETRYABLE_FAILURE_CODES,
+    PublishState,
+    RegistryStatus,
+    approved_retry_commit,
+    compute_publish_state,
+    compute_registry_status,
+    published_since_approval,
+    retry_needs_copy_failures,
+    retry_needs_last_publish,
+)
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
-from src.services.deploy.service import FAIL_ROUTED_FOR_REVIEW
+from src.services.deploy import service as deploy_service
+from src.services.deploy.service import (
+    FAIL_RESTART,
+    FAIL_RESTART_NOT_READY,
+    FAIL_ROUTED_FOR_REVIEW,
+)
+from src.services.deploy.store import INTERRUPTED
 
 _LIVE_SHA = "aa" * 20
 _SAVED_SHA = "bb" * 20
 _SUBMITTED_SHA = "cc" * 20
+_APPROVED_AT = datetime(2026, 9, 20, 9, 0, tzinfo=UTC)
+_BEFORE_APPROVAL = _APPROVED_AT - timedelta(hours=1)
+_SINCE_APPROVAL = _APPROVED_AT + timedelta(hours=1)
 
 
 def _app(**overrides: object) -> AppRegistry:
@@ -34,14 +58,25 @@ def _app(**overrides: object) -> AppRegistry:
 
 
 def _deployment(**overrides: object) -> Deployment:
-    data: dict[str, object] = {"status": DeploymentStatus.SUCCEEDED}
+    data: dict[str, object] = {"status": DeploymentStatus.SUCCEEDED, "created_at": _SINCE_APPROVAL}
     data.update(overrides)
     return Deployment(**data)
 
 
-# --- the thirteen values, one row combination per value --------------------------------
+def _approved(sha: str = _SAVED_SHA, **overrides: object) -> AppRegistry:
+    """Approved, with the reviewed submission copy on record."""
+    return _app(
+        status=AppStatus.APPROVED,
+        approved_submission_id=uuid.uuid4(),
+        approved_commit_sha=sha,
+        approved_at=_APPROVED_AT,
+        **overrides,
+    )
+
+
+# --- the eleven values, one row combination per value ----------------------------------
 #
-# `NOTHING_BUILT` is the thirteenth and is not here: `compute_publish_state` takes an
+# `NOTHING_BUILT` is the eleventh and is not here: `compute_publish_state` takes an
 # `AppRegistry` as a required argument, so "no app row at all" is decided in the route
 # BEFORE the function is ever called — see `test_deploy_routes.py`'s
 # `test_the_approval_state_is_null_only_when_the_project_has_no_app`.
@@ -72,28 +107,6 @@ def _deployment(**overrides: object) -> Deployment:
             id="changes_requested: rejected",
         ),
         pytest.param(
-            PublishState.APPROVED_READY_TO_PUBLISH,
-            _app(
-                status=AppStatus.APPROVED,
-                approval_route=ApprovalRoute.SELF_PUBLISH,
-                approved_commit_sha=_SAVED_SHA,
-            ),
-            None,
-            _SAVED_SHA,
-            id="approved_ready_to_publish: self-publish, pin matches, never deployed",
-        ),
-        pytest.param(
-            PublishState.APPROVED_NEEDS_REVIEW_AGAIN,
-            _app(
-                status=AppStatus.APPROVED,
-                approval_route=ApprovalRoute.RUNBOOK,
-                approved_commit_sha=_LIVE_SHA,
-            ),
-            None,
-            _LIVE_SHA,
-            id="approved_needs_review_again: the runbook lineage never self-publishes",
-        ),
-        pytest.param(
             PublishState.STARTING_UP,
             _app(status=AppStatus.DRAFT),
             _deployment(status=DeploymentStatus.RUNNING),
@@ -102,7 +115,7 @@ def _deployment(**overrides: object) -> Deployment:
         ),
         pytest.param(
             PublishState.LIVE_CURRENT,
-            _app(status=AppStatus.APPROVED, approval_route=ApprovalRoute.SELF_PUBLISH),
+            _app(status=AppStatus.APPROVED),
             _deployment(status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA),
             _LIVE_SHA,
             id="live_current: the saved head matches the commit that went live",
@@ -116,14 +129,14 @@ def _deployment(**overrides: object) -> Deployment:
         ),
         pytest.param(
             PublishState.LIVE_NEWER_WORK,
-            _app(status=AppStatus.APPROVED, approval_route=ApprovalRoute.SELF_PUBLISH),
+            _app(status=AppStatus.APPROVED),
             _deployment(status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA),
             _SAVED_SHA,
             id="live_newer_work: the saved head differs from what went live",
         ),
         pytest.param(
             PublishState.TAKEN_OFFLINE,
-            _app(status=AppStatus.APPROVED, approval_route=ApprovalRoute.SELF_PUBLISH),
+            _app(status=AppStatus.APPROVED),
             _deployment(
                 status=DeploymentStatus.SUCCEEDED,
                 head_sha=_LIVE_SHA,
@@ -148,13 +161,13 @@ def _deployment(**overrides: object) -> Deployment:
         ),
     ],
 )
-def test_each_of_the_remaining_twelve_values_is_reachable(
+def test_each_of_the_remaining_ten_values_is_reachable(
     expected: PublishState,
     app: AppRegistry,
     deployment: Deployment | None,
     saved_head: str | None,
 ) -> None:
-    """The thirteen-case table, twelve rows deep (see the module note on `NOTHING_BUILT`).
+    """The eleven-case table, ten rows deep (see the module note on `NOTHING_BUILT`).
     Each row is a row combination that can actually occur, not a synthetic corner no
     real app reaches — the parametrize id says which product situation it is."""
     assert compute_publish_state(app, deployment, saved_head) is expected
@@ -171,7 +184,6 @@ def test_a_live_app_with_four_saves_and_no_new_submission_reads_live_newer_work(
     HAS moved (four Saves since), and that is the signal that must win."""
     app = _app(
         status=AppStatus.APPROVED,
-        approval_route=ApprovalRoute.SELF_PUBLISH,
         approved_commit_sha=_LIVE_SHA,
         source_commit_sha=_LIVE_SHA,  # unchanged since approval
     )
@@ -180,18 +192,62 @@ def test_a_live_app_with_four_saves_and_no_new_submission_reads_live_newer_work(
     assert compute_publish_state(app, deployment, _SAVED_SHA) is PublishState.LIVE_NEWER_WORK
 
 
-def test_an_unreadable_saved_head_still_reads_newer_work_off_the_submitted_commit() -> None:
+def test_an_unreadable_saved_head_reads_newer_work_off_a_submission_made_since() -> None:
     """The secondary positive signal (`source_commit_sha`) fires on its own when the
     primary one (the saved head) could not be read at all — it must not be swallowed
     into `live_drift_unknown` just because the stronger signal is missing."""
-    app = _app(status=AppStatus.APPROVED, source_commit_sha=_SUBMITTED_SHA)
-    deployment = _deployment(status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA)
+    app = _app(
+        status=AppStatus.APPROVED,
+        source_commit_sha=_SUBMITTED_SHA,
+        submitted_at=_SINCE_APPROVAL + timedelta(hours=1),
+    )
+    deployment = _deployment(
+        status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA, created_at=_SINCE_APPROVAL
+    )
 
     assert compute_publish_state(app, deployment, None) is PublishState.LIVE_NEWER_WORK
 
 
-def test_ladder_rule_7_unattended_publish_reads_live_off_the_saved_head_never_the_pin() -> None:
-    """An app published unattended (ladder rule 7) has `approved_commit_sha` NULL — it
+def test_a_submission_older_than_the_live_version_says_nothing_about_newer_work() -> None:
+    """The submitted commit differs from what is live because it is older, so with the saved
+    head unreadable the honest answer is unknown, never newer work."""
+    app = _approved(
+        _SUBMITTED_SHA, source_commit_sha=_SUBMITTED_SHA, submitted_at=_BEFORE_APPROVAL
+    )
+    deployment = _deployment(
+        status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA, created_at=_SINCE_APPROVAL
+    )
+
+    assert compute_publish_state(app, deployment, None) is PublishState.LIVE_DRIFT_UNKNOWN
+
+
+@pytest.mark.parametrize(
+    ("saved_head", "expected"),
+    [
+        pytest.param(_LIVE_SHA, PublishState.LIVE_CURRENT, id="saved head is what went live"),
+        pytest.param(_SAVED_SHA, PublishState.LIVE_NEWER_WORK, id="saved head moved past it"),
+    ],
+)
+@pytest.mark.parametrize(
+    "submitted_at",
+    [
+        pytest.param(_BEFORE_APPROVAL, id="submitted before going live"),
+        pytest.param(_SINCE_APPROVAL + timedelta(hours=1), id="submitted after going live"),
+    ],
+)
+def test_a_readable_saved_head_decides_whenever_the_submission_was_made(
+    saved_head: str, expected: PublishState, submitted_at: datetime
+) -> None:
+    app = _approved(_SUBMITTED_SHA, source_commit_sha=_SUBMITTED_SHA, submitted_at=submitted_at)
+    deployment = _deployment(
+        status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA, created_at=_SINCE_APPROVAL
+    )
+
+    assert compute_publish_state(app, deployment, saved_head) is expected
+
+
+def test_an_unattended_publish_reads_live_off_the_saved_head_never_the_pin() -> None:
+    """An app published unattended has `approved_commit_sha` NULL — it
     never went through an administrator — and that column must play no part in
     deciding whether it reads as live. Deciding on the saved head against the
     deployment head, with the pin absent throughout, is the whole point."""
@@ -199,21 +255,6 @@ def test_ladder_rule_7_unattended_publish_reads_live_off_the_saved_head_never_th
     deployment = _deployment(status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA)
 
     assert compute_publish_state(app, deployment, _LIVE_SHA) is PublishState.LIVE_CURRENT
-
-
-def test_approved_with_a_matching_pin_and_no_deployment_reads_ready_to_publish() -> None:
-    """A never-published approved app is neither `draft` (it has a real, actionable
-    lifecycle) nor `starting_up` (nothing is running — approval starts no pipeline)."""
-    app = _app(
-        status=AppStatus.APPROVED,
-        approval_route=ApprovalRoute.SELF_PUBLISH,
-        approved_commit_sha=_SAVED_SHA,
-    )
-
-    state = compute_publish_state(app, None, _SAVED_SHA)
-
-    assert state is PublishState.APPROVED_READY_TO_PUBLISH
-    assert state not in (PublishState.DRAFT, PublishState.STARTING_UP)
 
 
 def test_a_routed_failure_code_resolves_above_the_failure_arm() -> None:
@@ -227,102 +268,363 @@ def test_a_routed_failure_code_resolves_above_the_failure_arm() -> None:
     assert compute_publish_state(app, deployment, None) is PublishState.IN_REVIEW
 
 
-def test_an_approval_outranks_the_failed_row_the_routing_itself_wrote() -> None:
-    """The drift re-check routes a submission by settling the claimed deployment row as
-    FAILED with a routed code, so that row is still the newest one once an administrator
-    approves. Read as a failure it says in-review, and the only action the portal offers
-    there is a withdrawal the store refuses on a non-pending app — so a citizen whose app
-    was approved is left with no way forward at all."""
-    app = _app(
-        status=AppStatus.APPROVED,
-        approval_route=ApprovalRoute.SELF_PUBLISH,
-        approved_commit_sha=_SAVED_SHA,
-    )
-    routed = _deployment(status=DeploymentStatus.FAILED, failure_code=FAIL_ROUTED_FOR_REVIEW)
-
-    assert compute_publish_state(app, routed, _SAVED_SHA) is PublishState.APPROVED_READY_TO_PUBLISH
+# --- an approved copy: its one button publishes it -------------------------------------
 
 
-def test_a_save_after_the_approval_still_needs_the_gate_again_on_that_same_row() -> None:
-    """The approval pins ONE commit. Outranking the failure arms must not also outrank
-    the pin: a Save since the approval moved the saved head off it, and one button press
-    may not publish work no administrator has seen."""
-    app = _app(
-        status=AppStatus.APPROVED,
-        approval_route=ApprovalRoute.SELF_PUBLISH,
-        approved_commit_sha=_SUBMITTED_SHA,
-    )
-    routed = _deployment(status=DeploymentStatus.FAILED, failure_code=FAIL_ROUTED_FOR_REVIEW)
+def test_an_approved_copy_never_attempted_reads_did_not_start_and_offers_itself() -> None:
+    """Approval publishes; when that could not start, the owner's one button is Try again, and
+    it posts the approved commit — whatever has been saved since."""
+    app = _approved(_SUBMITTED_SHA)
 
+    assert compute_publish_state(app, None, _SAVED_SHA) is PublishState.DID_NOT_START
     assert (
-        compute_publish_state(app, routed, _SAVED_SHA) is PublishState.APPROVED_NEEDS_REVIEW_AGAIN
+        approved_retry_commit(app, None, copy_ruled_out=False, copy_failures=0) == _SUBMITTED_SHA
     )
+
+
+def test_a_row_older_than_the_approval_is_not_an_attempt_at_it() -> None:
+    """A restart that was running when the administrator approved, the version live before
+    the new one was sent, a routing that came before: none is an attempt at the approved copy."""
+    app = _approved(_SUBMITTED_SHA)
+    for older in (
+        _deployment(status=DeploymentStatus.RUNNING, created_at=_BEFORE_APPROVAL),
+        _deployment(head_sha=_LIVE_SHA, created_at=_BEFORE_APPROVAL),
+        _deployment(
+            status=DeploymentStatus.FAILED,
+            failure_code=FAIL_ROUTED_FOR_REVIEW,
+            created_at=_BEFORE_APPROVAL,
+        ),
+    ):
+        assert compute_publish_state(app, older, _SAVED_SHA) is PublishState.DID_NOT_START
+        assert (
+            approved_retry_commit(app, older, copy_ruled_out=False, copy_failures=0)
+            == _SUBMITTED_SHA
+        )
+
+
+def test_the_attempt_the_approval_starts_counts_as_since_approval() -> None:
+    """`approve` stamps `approved_at` with its transaction's clock, the same instant its claim
+    stamps on the row it starts — equal is since, not before."""
+    app = _approved(_SUBMITTED_SHA)
+    running = _deployment(status=DeploymentStatus.RUNNING, created_at=_APPROVED_AT)
+
+    assert compute_publish_state(app, running, _SAVED_SHA) is PublishState.STARTING_UP
+    assert approved_retry_commit(app, running, copy_ruled_out=False, copy_failures=0) is None
 
 
 @pytest.mark.parametrize(
-    ("expected", "approved_commit_sha", "deployment", "saved_head"),
+    ("expected", "retry", "deployment", "saved_head"),
     [
         pytest.param(
-            PublishState.LIVE_CURRENT,
-            _SAVED_SHA,
-            _deployment(status=DeploymentStatus.SUCCEEDED, head_sha=_SAVED_SHA),
-            _SAVED_SHA,
-            id="live_current: the pin names what is saved, and that is what went live",
-        ),
-        pytest.param(
-            PublishState.LIVE_NEWER_WORK,
-            _LIVE_SHA,
-            _deployment(status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA),
-            _SAVED_SHA,
-            id="live_newer_work: saves since the approval moved the head off the pin",
-        ),
-        pytest.param(
-            PublishState.TAKEN_OFFLINE,
-            _SAVED_SHA,
-            _deployment(
-                status=DeploymentStatus.SUCCEEDED,
-                head_sha=_SAVED_SHA,
-                unpublished_at=datetime(2026, 8, 20, tzinfo=UTC),
-            ),
-            _SAVED_SHA,
-            id="taken_offline: an administrator took the approved app down",
-        ),
-        pytest.param(
             PublishState.STARTING_UP,
-            _SAVED_SHA,
+            None,
             _deployment(status=DeploymentStatus.RUNNING),
             _SAVED_SHA,
-            id="starting_up: the approved version is being published right now",
+            id="starting_up: the approved copy is being published right now",
         ),
         pytest.param(
             PublishState.DID_NOT_START,
+            _SUBMITTED_SHA,
+            _deployment(
+                status=DeploymentStatus.FAILED,
+                failure_code="provision_failed",
+                head_sha=_SUBMITTED_SHA,
+            ),
             _SAVED_SHA,
-            _deployment(status=DeploymentStatus.FAILED, failure_code="revision_unhealthy"),
+            id="did_not_start: the attempt at the approved copy failed; try it again",
+        ),
+        pytest.param(
+            PublishState.DID_NOT_START,
+            None,
+            _deployment(
+                status=DeploymentStatus.FAILED,
+                failure_code="build_failed",
+                head_sha=_SUBMITTED_SHA,
+            ),
             _SAVED_SHA,
-            id="did_not_start: the approved version was published and the publish broke",
+            id="did_not_start: the approved copy will not build; act on the saved version",
+        ),
+        pytest.param(
+            PublishState.DID_NOT_START,
+            _SUBMITTED_SHA,
+            _deployment(status=DeploymentStatus.FAILED, failure_code="internal_error"),
+            _SAVED_SHA,
+            id="did_not_start: it failed before it could name a commit",
+        ),
+        pytest.param(
+            PublishState.DID_NOT_START,
+            None,
+            _deployment(
+                status=DeploymentStatus.FAILED,
+                failure_code="provision_failed",
+                head_sha=_SAVED_SHA,
+            ),
+            _SAVED_SHA,
+            id="did_not_start: a later version failed; that one is retried through the gate",
+        ),
+        pytest.param(
+            PublishState.LIVE_NEWER_WORK,
+            None,
+            _deployment(head_sha=_SUBMITTED_SHA),
+            _SAVED_SHA,
+            id="live_newer_work: the approved copy went live, and newer work is saved",
+        ),
+        pytest.param(
+            PublishState.LIVE_CURRENT,
+            None,
+            _deployment(head_sha=_SAVED_SHA),
+            _SAVED_SHA,
+            id="live_current: a later version published unattended and is what is saved",
+        ),
+        pytest.param(
+            PublishState.TAKEN_OFFLINE,
+            _SUBMITTED_SHA,
+            _deployment(head_sha=_SUBMITTED_SHA, unpublished_at=datetime(2026, 9, 21, tzinfo=UTC)),
+            _SAVED_SHA,
+            id="taken_offline: the approved version came down; publishing again restores it",
+        ),
+        pytest.param(
+            PublishState.TAKEN_OFFLINE,
+            None,
+            _deployment(head_sha=_SAVED_SHA, unpublished_at=datetime(2026, 9, 21, tzinfo=UTC)),
+            _SAVED_SHA,
+            id="taken_offline: another version came down; it goes back through the gate",
+        ),
+        pytest.param(
+            PublishState.LIVE_CURRENT,
+            None,
+            _deployment(
+                status=DeploymentStatus.FAILED,
+                failure_code="restart_failed",
+                head_sha=_SAVED_SHA,
+            ),
+            _SAVED_SHA,
+            id="live_current: a failed restart leaves the version it restarted serving",
         ),
     ],
 )
-def test_an_approved_apps_own_deployment_row_still_speaks_for_itself(
+def test_once_attempted_the_attempt_speaks_for_the_approved_copy(
     expected: PublishState,
-    approved_commit_sha: str,
+    retry: str | None,
     deployment: Deployment,
     saved_head: str,
 ) -> None:
-    """THE BOUNDARY of the arm above: an approval outranks the ROUTED-failure arm only. A
-    matching pin is the ordinary condition of an app that published what was approved and
-    is serving it, so answering "ready to publish" off the pin alone would paint a publish
-    button over every live app — and over one mid-publish.
-
-    The last row is the other direction of the same mistake: a genuine publish failure
-    reads red and offers a retry, and an approval must not repaint it green."""
-    app = _app(
-        status=AppStatus.APPROVED,
-        approval_route=ApprovalRoute.SELF_PUBLISH,
-        approved_commit_sha=approved_commit_sha,
-    )
+    app = _approved(_SUBMITTED_SHA)
 
     assert compute_publish_state(app, deployment, saved_head) is expected
+    assert approved_retry_commit(app, deployment, copy_ruled_out=False, copy_failures=1) == retry
+
+
+def test_approved_then_try_again_failed_then_succeeded_reads_live() -> None:
+    app = _approved(_SUBMITTED_SHA)
+    failed = _deployment(
+        status=DeploymentStatus.FAILED, failure_code="provision_failed", head_sha=_SUBMITTED_SHA
+    )
+    assert compute_publish_state(app, failed, _SUBMITTED_SHA) is PublishState.DID_NOT_START
+    assert (
+        approved_retry_commit(app, failed, copy_ruled_out=False, copy_failures=1) == _SUBMITTED_SHA
+    )
+
+    succeeded = _deployment(
+        head_sha=_SUBMITTED_SHA, created_at=_SINCE_APPROVAL + timedelta(minutes=5)
+    )
+    assert compute_publish_state(app, succeeded, _SUBMITTED_SHA) is PublishState.LIVE_CURRENT
+    assert approved_retry_commit(app, succeeded, copy_ruled_out=False, copy_failures=0) is None
+
+
+def test_a_nameless_failure_after_the_copy_went_live_goes_back_through_the_gate() -> None:
+    """The approved copy went live; a later version was sent and failed before it could name its
+    commit. Try again retries that later version through the gate — republishing the copy
+    already serving would ignore what the owner just sent."""
+    app = _approved(_SUBMITTED_SHA)
+    failed = _deployment(status=DeploymentStatus.FAILED, failure_code="internal_error")
+
+    assert compute_publish_state(app, failed, _SAVED_SHA) is PublishState.DID_NOT_START
+    assert retry_needs_last_publish(app, failed)
+    assert approved_retry_commit(app, failed, copy_ruled_out=True, copy_failures=1) is None
+
+
+def test_a_nameless_failure_with_nothing_live_since_approval_retries_the_copy() -> None:
+    app = _approved(_SUBMITTED_SHA)
+    failed = _deployment(status=DeploymentStatus.FAILED, failure_code="interrupted")
+
+    assert retry_needs_last_publish(app, failed)
+    assert (
+        approved_retry_commit(app, failed, copy_ruled_out=False, copy_failures=1) == _SUBMITTED_SHA
+    )
+
+
+@pytest.mark.parametrize("code", sorted(NON_RETRYABLE_FAILURE_CODES))
+def test_an_approved_copy_that_fails_in_itself_is_not_offered_again(code: str) -> None:
+    """It would fail the same way on every press, and the owner could never send the fix: the
+    one button acts on the saved version instead, named commit or not."""
+    app = _approved(_SUBMITTED_SHA)
+    for head in (_SUBMITTED_SHA, None):
+        failed = _deployment(status=DeploymentStatus.FAILED, failure_code=code, head_sha=head)
+
+        assert compute_publish_state(app, failed, _SAVED_SHA) is PublishState.DID_NOT_START
+        assert not retry_needs_last_publish(app, failed)
+        assert approved_retry_commit(app, failed, copy_ruled_out=False, copy_failures=1) is None
+
+
+@pytest.mark.parametrize(
+    ("code", "offered"),
+    [
+        ("snapshot_unreadable", True),
+        ("build_unavailable", True),
+        ("revision_not_ready", True),
+        ("snapshot_corrupt", False),
+        ("build_failed", False),
+        ("revision_unhealthy", False),
+    ],
+)
+def test_reading_building_and_starting_the_copy_tell_the_platform_s_faults_from_the_copy_s(
+    code: str, offered: bool
+) -> None:
+    """A bundle that could not be read, a build the platform could not run and an app slow to
+    start are the platform's faults; a malformed bundle, a build that failed and a revision that
+    failed are the copy's, and would fail the same way."""
+    app = _approved(_SUBMITTED_SHA)
+    for head in (_SUBMITTED_SHA, None):
+        failed = _deployment(status=DeploymentStatus.FAILED, failure_code=code, head_sha=head)
+
+        retry = approved_retry_commit(app, failed, copy_ruled_out=False, copy_failures=1)
+        assert retry == (_SUBMITTED_SHA if offered else None), head
+
+
+def test_a_platform_failure_offers_the_copy_again_only_below_the_cap() -> None:
+    """A copy's own fault misread as the platform's would otherwise be offered for ever. The
+    third attempt is still offered after two failures; after three, the saved version is."""
+    app = _approved(_SUBMITTED_SHA)
+    failed = _deployment(
+        status=DeploymentStatus.FAILED, failure_code="revision_not_ready", head_sha=_SUBMITTED_SHA
+    )
+
+    assert retry_needs_copy_failures(app, failed)
+    assert not retry_needs_copy_failures(app, _deployment(head_sha=_SUBMITTED_SHA))
+    below = approved_retry_commit(app, failed, copy_ruled_out=False, copy_failures=2)
+    at_cap = approved_retry_commit(app, failed, copy_ruled_out=False, copy_failures=3)
+    assert (below, at_cap) == (_SUBMITTED_SHA, None)
+
+
+def test_every_failure_code_is_sorted_into_exactly_one_set() -> None:
+    """Whether the one button retries the approved copy after a failure is decided per code, so
+    a code the pipeline gains must be placed before it ships."""
+    codes = {value for name, value in vars(deploy_service).items() if name.startswith("FAIL_")} | {
+        INTERRUPTED
+    }
+    placed = [
+        code
+        for group in (
+            _RETRYABLE_FAILURE_CODES,
+            NON_RETRYABLE_FAILURE_CODES,
+            _RESTART_FAILURE_CODES,
+            _ROUTED_FAILURE_CODES,
+        )
+        for code in group
+    ]
+
+    assert sorted(placed) == sorted(codes)
+
+
+@pytest.mark.parametrize(
+    ("retry", "stamped"),
+    [
+        pytest.param(_SUBMITTED_SHA, {"head_sha": _SUBMITTED_SHA}, id="the copy was live"),
+        pytest.param(
+            _SUBMITTED_SHA,
+            {
+                "status": DeploymentStatus.FAILED,
+                "failure_code": FAIL_RESTART,
+                "head_sha": _SUBMITTED_SHA,
+            },
+            id="a restart of the live copy had failed",
+        ),
+        pytest.param(
+            None,
+            {
+                "status": DeploymentStatus.FAILED,
+                "failure_code": "build_failed",
+                "head_sha": _SUBMITTED_SHA,
+            },
+            id="the copy had failed in itself",
+        ),
+    ],
+)
+def test_a_takedown_offers_the_approved_copy_back_unless_it_failed_in_itself(
+    retry: str | None, stamped: dict[str, object]
+) -> None:
+    """A takedown stamps the newest attempt whatever its ending. Putting back a copy that never
+    built would fail the same way, so the button acts on the saved version instead."""
+    app = _approved(_SUBMITTED_SHA)
+    deployment = _deployment(unpublished_at=datetime(2026, 9, 21, tzinfo=UTC), **stamped)
+
+    assert compute_publish_state(app, deployment, _SAVED_SHA) is PublishState.TAKEN_OFFLINE
+    assert approved_retry_commit(app, deployment, copy_ruled_out=False, copy_failures=0) == retry
+
+
+def test_only_a_nameless_failed_attempt_since_approval_asks_what_went_live() -> None:
+    """Every other row answers for itself, which is what keeps the poll's ordinary path at its
+    existing queries."""
+    app = _approved(_SUBMITTED_SHA)
+    nameless = _deployment(status=DeploymentStatus.FAILED, failure_code="internal_error")
+    assert retry_needs_last_publish(app, nameless)
+
+    for deployment in (
+        None,
+        _deployment(
+            status=DeploymentStatus.FAILED, failure_code="build_failed", head_sha=_SAVED_SHA
+        ),
+        _deployment(
+            status=DeploymentStatus.FAILED, failure_code="build_failed", head_sha=_SUBMITTED_SHA
+        ),
+        _deployment(status=DeploymentStatus.FAILED, failure_code="restart_failed"),
+        _deployment(status=DeploymentStatus.RUNNING),
+        _deployment(head_sha=_SUBMITTED_SHA),
+        _deployment(
+            status=DeploymentStatus.FAILED,
+            failure_code="internal_error",
+            created_at=_BEFORE_APPROVAL,
+        ),
+        _deployment(
+            status=DeploymentStatus.FAILED,
+            failure_code="internal_error",
+            unpublished_at=datetime(2026, 9, 21, tzinfo=UTC),
+        ),
+    ):
+        assert not retry_needs_last_publish(app, deployment), deployment
+    assert not retry_needs_last_publish(_app(status=AppStatus.DRAFT), nameless)
+
+
+def test_a_publish_counts_as_the_approved_copy_going_live_only_from_the_approval_on() -> None:
+    app = _approved(_SUBMITTED_SHA)
+
+    assert published_since_approval(app, _deployment(created_at=_SINCE_APPROVAL))
+    assert published_since_approval(app, _deployment(created_at=_APPROVED_AT))
+    assert not published_since_approval(app, _deployment(created_at=_BEFORE_APPROVAL))
+    assert not published_since_approval(app, None)
+
+
+def test_an_approval_with_no_stored_copy_is_a_draft_again() -> None:
+    """Approved before copies were kept: there is nothing to republish, so the owner sends
+    for review — never Try again."""
+    app = _app(status=AppStatus.APPROVED, approved_commit_sha=_LIVE_SHA, approved_at=_APPROVED_AT)
+
+    assert compute_publish_state(app, None, _SAVED_SHA) is PublishState.DRAFT
+    assert approved_retry_commit(app, None, copy_ruled_out=False, copy_failures=0) is None
+
+
+def test_no_state_but_an_approved_one_carries_a_retry_commit() -> None:
+    for status in (AppStatus.DRAFT, AppStatus.PENDING, AppStatus.REJECTED, AppStatus.DISABLED):
+        app = _app(
+            status=status,
+            approved_submission_id=uuid.uuid4(),
+            approved_commit_sha=_SUBMITTED_SHA,
+            approved_at=_APPROVED_AT,
+        )
+        assert approved_retry_commit(app, None, copy_ruled_out=False, copy_failures=0) is None, (
+            status
+        )
 
 
 def test_a_non_routed_failure_code_reads_did_not_start() -> None:
@@ -340,7 +642,7 @@ def test_switched_off_and_taken_offline_are_told_apart() -> None:
     still_running = _deployment(status=DeploymentStatus.SUCCEEDED, head_sha=_LIVE_SHA)
     assert compute_publish_state(disabled, still_running, _LIVE_SHA) is PublishState.SWITCHED_OFF
 
-    live_app = _app(status=AppStatus.APPROVED, approval_route=ApprovalRoute.SELF_PUBLISH)
+    live_app = _app(status=AppStatus.APPROVED)
     unpublished = _deployment(
         status=DeploymentStatus.SUCCEEDED,
         head_sha=_LIVE_SHA,
@@ -409,3 +711,154 @@ def test_a_failed_restart_with_no_head_claims_nothing_about_a_version() -> None:
         status=DeploymentStatus.FAILED, failure_code="restart_failed", head_sha=None
     )
     assert compute_publish_state(app, deployment, _LIVE_SHA) is PublishState.DID_NOT_START
+
+
+# --- the App Registry's status: the same reading, told apart where an administrator needs it ---
+
+_TAKEN_DOWN_AT = datetime(2026, 9, 21, tzinfo=UTC)
+
+_REGISTRY_CASES = [
+    pytest.param(
+        RegistryStatus.DISABLED,
+        _app(status=AppStatus.DISABLED),
+        _deployment(head_sha=_LIVE_SHA),
+        id="disabled: switched off, whatever is still on its deployment row",
+    ),
+    pytest.param(
+        RegistryStatus.WAITING_FOR_REVIEW,
+        _app(status=AppStatus.PENDING),
+        _deployment(head_sha=_LIVE_SHA),
+        id="waiting for review: sent, with an older version still serving",
+    ),
+    pytest.param(
+        RegistryStatus.REJECTED,
+        _app(status=AppStatus.REJECTED),
+        None,
+        id="rejected",
+    ),
+    pytest.param(
+        RegistryStatus.NOT_PUBLISHED,
+        _approved(_SUBMITTED_SHA),
+        None,
+        id="not published: approved, and nothing has tried to publish the copy",
+    ),
+    pytest.param(
+        RegistryStatus.NOT_PUBLISHED,
+        _approved(_SUBMITTED_SHA),
+        _deployment(head_sha=_LIVE_SHA, created_at=_BEFORE_APPROVAL),
+        id="not published: the only row predates the approval",
+    ),
+    pytest.param(
+        RegistryStatus.NOT_PUBLISHED,
+        _approved(_SUBMITTED_SHA),
+        _deployment(
+            status=DeploymentStatus.FAILED,
+            failure_code=FAIL_ROUTED_FOR_REVIEW,
+            created_at=_BEFORE_APPROVAL,
+        ),
+        id="not published: an older routing row gives way to the approval",
+    ),
+    pytest.param(
+        RegistryStatus.DRAFT,
+        _app(status=AppStatus.DRAFT),
+        None,
+        id="draft: never published",
+    ),
+    pytest.param(
+        RegistryStatus.DRAFT,
+        _app(status=AppStatus.APPROVED, approved_commit_sha=_LIVE_SHA, approved_at=_APPROVED_AT),
+        None,
+        id="draft: approved before copies were kept, so there is nothing to publish",
+    ),
+    pytest.param(
+        RegistryStatus.PUBLISHING,
+        _approved(_SUBMITTED_SHA),
+        _deployment(status=DeploymentStatus.RUNNING, created_at=_APPROVED_AT),
+        id="publishing: the attempt the approval started",
+    ),
+    pytest.param(
+        RegistryStatus.PUBLISHING,
+        _app(status=AppStatus.DRAFT),
+        _deployment(status=DeploymentStatus.RUNNING),
+        id="publishing: an owner's publish in flight",
+    ),
+    pytest.param(
+        RegistryStatus.TAKEN_OFFLINE,
+        _app(status=AppStatus.DRAFT),
+        _deployment(head_sha=_LIVE_SHA, unpublished_at=_TAKEN_DOWN_AT),
+        id="taken offline",
+    ),
+    pytest.param(
+        RegistryStatus.LIVE,
+        _approved(_SUBMITTED_SHA),
+        _deployment(head_sha=_SUBMITTED_SHA),
+        id="live: the approved copy went live",
+    ),
+    pytest.param(
+        RegistryStatus.LIVE,
+        _app(status=AppStatus.DRAFT, source_commit_sha=_SUBMITTED_SHA),
+        _deployment(head_sha=_LIVE_SHA),
+        id="live: newer work sent since, which the list does not look for",
+    ),
+    pytest.param(
+        RegistryStatus.LIVE,
+        _app(status=AppStatus.DRAFT, source_commit_sha=None),
+        _deployment(head_sha=_LIVE_SHA),
+        id="live: whether newer work exists is unknown",
+    ),
+    pytest.param(
+        RegistryStatus.LIVE,
+        _app(status=AppStatus.DRAFT),
+        _deployment(status=DeploymentStatus.FAILED, failure_code=FAIL_RESTART, head_sha=_LIVE_SHA),
+        id="live: a failed restart leaves the version it restarted serving",
+    ),
+    pytest.param(
+        RegistryStatus.LIVE,
+        _app(status=AppStatus.DRAFT),
+        _deployment(
+            status=DeploymentStatus.FAILED,
+            failure_code=FAIL_RESTART_NOT_READY,
+            head_sha=_LIVE_SHA,
+        ),
+        id="live: a restart that did not come back ready leaves its version serving",
+    ),
+    pytest.param(
+        RegistryStatus.PUBLISH_FAILED,
+        _approved(_SUBMITTED_SHA),
+        _deployment(
+            status=DeploymentStatus.FAILED, failure_code="build_failed", head_sha=_SUBMITTED_SHA
+        ),
+        id="publish failed: the attempt at the approved copy failed",
+    ),
+    pytest.param(
+        RegistryStatus.PUBLISH_FAILED,
+        _app(status=AppStatus.DRAFT),
+        _deployment(status=DeploymentStatus.FAILED, failure_code="revision_unhealthy"),
+        id="publish failed: an owner's publish failed",
+    ),
+    pytest.param(
+        RegistryStatus.PUBLISH_FAILED,
+        _app(status=AppStatus.DRAFT),
+        _deployment(status=DeploymentStatus.FAILED, failure_code=FAIL_RESTART, head_sha=None),
+        id="publish failed: a failed restart that names no version claims none is serving",
+    ),
+    pytest.param(
+        RegistryStatus.WAITING_FOR_REVIEW,
+        _app(status=AppStatus.DRAFT),
+        _deployment(status=DeploymentStatus.FAILED, failure_code=FAIL_ROUTED_FOR_REVIEW),
+        id="waiting for review: an older row that routed to an administrator",
+    ),
+]
+
+
+@pytest.mark.parametrize(("expected", "app", "deployment"), _REGISTRY_CASES)
+def test_each_app_reads_one_registry_status(
+    expected: RegistryStatus, app: AppRegistry, deployment: Deployment | None
+) -> None:
+    assert compute_registry_status(app, deployment) is expected
+
+
+def test_every_registry_status_has_a_case() -> None:
+    reached = {case.values[0] for case in _REGISTRY_CASES}
+
+    assert reached == set(RegistryStatus)

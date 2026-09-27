@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertTriangle, Info, PowerOff, RotateCcw } from 'lucide-react'
 import { restartApp, takeAppDown } from '../../utils/deployApi'
 import { ApiError } from '../../utils/apiError'
+import { announceDeploymentChanged } from '../../hooks/usePublishState'
 import { canBeRestarted, canBeTakenDown, RESTART_FAILED_CODES } from '../../utils/publishPresentation'
 import { BusyGlyph } from '../ui/Waiting'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip'
@@ -111,6 +112,8 @@ export default function ProductionTab({ projectId, appName, onSettled }: Product
           if (which === 'restart') await restartApp(projectId)
           else await takeAppDown(projectId)
           await refresh()
+          // The toolbar chip holds a read of its own, which `refresh` does not reach.
+          announceDeploymentChanged(projectId)
         } catch (err) {
           // THE SERVER'S STATED REASON, NOT A GENERIC FAILURE. Every refusal on these two routes
           // names something the owner can act on — publish it again, wait for the deploy to

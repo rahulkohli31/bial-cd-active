@@ -62,7 +62,7 @@ async function renderReady(kind = 'build') {
         <Route element={<WorkspaceShell />}>
           <Route
             path="/chat/:chatId"
-            element={<ConversationSurface projectId="p1" projectName="VIP Movement" kind={kind} />}
+            element={<ConversationSurface projectId="p1" kind={kind} />}
           />
         </Route>
       </Routes>

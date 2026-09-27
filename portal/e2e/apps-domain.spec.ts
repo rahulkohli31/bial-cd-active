@@ -161,18 +161,18 @@ test.describe.serial('generated apps on the shared apps hostname (opt-in, E2E_AP
 
     await page.goto(chatUrl)
 
-    // Publish refuses on unsaved work, so save first — the same order a user is forced into.
+    // The one publish button saves unsaved work before it opens the dialog, and the reviewer
+    // then checks the version saved. Saving here first, retried, keeps a lock-held 409 on the
+    // save from surfacing as a dialog that never opens.
     //
     // WAIT FOR THE AGENT TO PUT ITS PEN DOWN FIRST: a live preview does NOT mean the build is
-    // finished, and saving while the agent keeps writing genuinely works but leaves the
-    // workspace dirty again moments later — cycling Save -> Saving… -> Save forever. The gate
-    // note is the honest "it is my turn now" signal now that the mode pill this used to watch
-    // is gone; the composer is never `disabled`, so the note is the only thing that says so.
+    // finished, and saving while the agent keeps writing leaves the workspace dirty again
+    // moments later — cycling Save -> Saving… -> Save forever. The gate note is the honest "it
+    // is my turn now" signal; the composer is never `disabled`, so the note is the only thing
+    // that says so.
     //
-    // Below: the save click is unconditional, not `if (visible)` — a skipped click here used
-    // to surface 45s later as a missing confirm button, not as a skipped step. And it's polled
-    // on the button's OWN label (Save/Saving…/Saved) rather than on a `publish-unsaved` count,
-    // which reads vacuously zero before any save has happened.
+    // Below: the save click is unconditional, not `if (visible)`, and it's polled on the
+    // button's OWN label (Save/Saving…/Saved).
     await expect(
       page.getByTestId('composer-gate-note'),
       'the build agent never released the conversation',
@@ -199,31 +199,26 @@ test.describe.serial('generated apps on the shared apps hostname (opt-in, E2E_AP
     await page.getByTestId('publish-chip').click()
     await expect(page.getByTestId('publish-popover')).toBeVisible({ timeout: 30_000 })
     await page.getByTestId('publish-action').click()
-    await expect(page.getByTestId('data-classification-modal')).toBeVisible({ timeout: 30_000 })
+    await expect(page.getByTestId('publish-dialog')).toBeVisible({ timeout: 30_000 })
 
-    // Declare nothing sensitive, so the server auto-publishes instead of routing to a human
-    // (AUTO_DEPLOY_MAX_SCORE is 0 — any weighted category needs review, and this test would
-    // then be asserting on a queue rather than an address).
-    for (const key of [
-      'credentialsSecrets', 'healthData', 'personalInformation',
-      'financialData', 'confidentialBusinessData', 'publicData',
-    ]) {
-      // RETRIED, asserted on `aria-checked` rather than the click returning: the modal
-      // re-renders while its background gate check runs, so a single click can lose the race
-      // ("element was detached from the DOM") on whichever question is under the cursor.
-      let checked = false
-      for (let attempt = 0; attempt < 8 && !checked; attempt++) {
-        const no = page.getByTestId(`dc-question-${key}-no`)
-        if (!(await no.isVisible().catch(() => false))) break
-        if ((await no.getAttribute('aria-checked').catch(() => null)) === 'true') { checked = true; break }
-        await no.click({ timeout: 5_000 }).catch(() => {})
-        checked = (await no.getAttribute('aria-checked').catch(() => null)) === 'true'
-        if (!checked) await page.waitForTimeout(750)
-      }
-      expect(checked, `could not answer "${key}"`).toBe(true)
+    // The reviewer answers every class before any answer shows. A visitor log keeps names and
+    // hosts, which is not PII, so both hard blocks come back as locked "Not found" results.
+    for (const key of ['pii', 'financial_data']) {
+      await expect(page.getByTestId(`pd-class-${key}`)).toContainText('Not found', { timeout: 5 * 60_000 })
     }
-    const confirm = page.getByTestId('dc-confirm')
-    await expect(confirm).toBeEnabled({ timeout: 30_000 })
+
+    // Every scored class to No, so the score cannot route this to an administrator and the
+    // test asserts on an address rather than a queue.
+    for (const key of [
+      'credentials_keys', 'confidential_business_data', 'ai_usage', 'integrations', 'public_data',
+    ]) {
+      const no = page.getByTestId(`pd-toggle-${key}`).getByRole('radio', { name: 'No' })
+      await no.click()
+      await expect(no).toHaveAttribute('aria-checked', 'true')
+    }
+    const confirm = page.getByTestId('pd-confirm')
+    await expect(confirm).toHaveText('Publish')
+    await expect(confirm).toBeEnabled()
     await confirm.click()
 
     const publishUrl = page.getByTestId('publish-url')

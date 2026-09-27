@@ -21,8 +21,8 @@ import { SharePanelBody } from './SharePanel'
  *
  * IT IS AN OVERLAY, NOT A DESTINATION, and that is load-bearing rather than cosmetic. Opening it
  * from inside a running application tears no sandbox down and costs no cold start — which is why
- * the per-application Integrations tab exists at all beside the Integrations page: a citizen who
- * wants their connector switch never has to leave to reach it.
+ * the Integrations tab lives here: a citizen who wants their connector switch never has to leave
+ * the application to reach it.
  *
  * IT SURVIVES THE NARROW WIDTHS THE REST OF THE PORTAL SURVIVES. This product's standing promise
  * is that every control stays reachable at 360px, and the workspace toolbar carries a

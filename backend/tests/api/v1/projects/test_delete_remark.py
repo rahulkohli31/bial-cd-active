@@ -1,6 +1,6 @@
 """What a deletion has to say for itself, and the tombstone that keeps it.
 
-`DELETE /v1/projects/{id}` takes one body field, `remark` (5-50 words); who deleted it is
+`DELETE /v1/projects/{id}` takes one body field, `remark` (2-50 words); who deleted it is
 stamped from the session, never accepted from the client, so those tests are isolation
 tests, not validation ones. Two claims are pinned: the server refuses a bad remark on its
 own (the rename path — no server-side check — is the shape not to repeat), and
@@ -68,7 +68,7 @@ async def test_a_reason_inside_the_bounds_is_accepted(client, db_session, n: int
 @pytest.mark.parametrize(
     ("n", "expected"),
     [
-        (MIN_DELETE_REMARK_WORDS - 1, "at least 5 words"),
+        (MIN_DELETE_REMARK_WORDS - 1, "at least 2 words"),
         (MAX_DELETE_REMARK_WORDS + 1, "under 50 words"),
     ],
 )

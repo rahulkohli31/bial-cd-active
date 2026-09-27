@@ -41,7 +41,7 @@ const LABELS: Record<string, AuditLabel> = {
   approve: {
     title: 'Approved',
     description:
-      'An administrator accepted the data this app holds. The developer publishes it themselves.',
+      'An administrator accepted the data this app holds, which publishes the version they reviewed.',
   },
   'approve:self': {
     title: 'Approved own app',
@@ -56,13 +56,11 @@ const LABELS: Record<string, AuditLabel> = {
   disable: { title: 'Disabled', description: 'Switched off, and stays off until re-enabled.' },
   enable: { title: 'Re-enabled', description: 'Switched back on after being disabled.' },
   unpublish: { title: 'Taken offline', description: 'The live app was removed from its address.' },
+  takedown: { title: 'Taken offline', description: 'The owner removed the live app from its address.' },
+  restart: { title: 'Restarted', description: 'The live version was started again, unchanged.' },
   'unpublish:unconfirmed': {
     title: 'Taken offline — not confirmed',
     description: 'Removal was requested, but the platform could not confirm it finished.',
-  },
-  'mark-deployed': {
-    title: 'Marked as deployed',
-    description: 'An administrator recorded that the go-live runbook was run.',
   },
   'config:loginRequired': {
     title: 'Sign-in requirement changed',

@@ -23,11 +23,7 @@
  * bypassing that guard with a second mechanism it doesn't cover.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
 import WorkspaceRail from './WorkspaceRail'
-import AppSettingsDialog from '../projects/AppSettingsDialog'
-import ProjectDeleteDialog from '../projects/ProjectDeleteDialog'
-import SharePanel from '../projects/SharePanel'
 import { useStartApp } from './startApp'
 import type { StartSinks } from './startApp'
 import { useWorkspaceState } from './useWorkspaceState'
@@ -41,10 +37,9 @@ import {
   useWorkspaceProject,
 } from './workspaceChannel'
 import { announceDeploymentChanged } from '../../hooks/usePublishState'
+import { useProjectDialogs } from '../../hooks/useProjectDialogs'
 import { resolvePreviewAddress } from '../../utils/previewAddress'
 import { discardUnsavedChanges, fetchCompileState, saveProject } from '../../utils/buildSessionApi'
-import { deleteProject } from '../../utils/projectApi'
-import { projectsListHref } from '../../utils/projectsListMemory'
 import type { CompileState } from '../../utils/compileState'
 import type { Project } from '../../utils/projectApi'
 
@@ -55,20 +50,7 @@ export interface ProjectWorkspaceProps {
 
 export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   const { project } = props
-  // THE SETTINGS DIALOG'S STATE IS HERE BECAUSE ITS DATA IS. The control is in the shell's
-  // toolbar row, which sits above the Outlet and has no project object; this surface has both
-  // the project and the update callback, so the row publishes a press upward and the editing
-  // happens down here. It is the SAME dialog the home list opens, on the same application —
-  // one surface for a name, a description, sharing, integrations and production.
-  const [settingsOpen, setSettingsOpen] = useState(false)
-  const openSettings = useCallback(() => setSettingsOpen(true), [])
-  const [deleting, setDeleting] = useState(false)
-  const navigate = useNavigate()
-  // THE SHARE PANEL'S STATE IS HERE FOR THE SAME REASON RENAME'S IS: the control that opens it
-  // lives in the shell's toolbar row, which has no project object, while this surface has the
-  // project id and name the panel needs (#198).
-  const [sharing, setSharing] = useState(false)
-  const startShare = useCallback(() => setSharing(true), [])
+  const projectDialogs = useProjectDialogs(project, props.onProjectUpdate)
 
   const workspace = useWorkspaceState({
     projectId: project.id,
@@ -343,8 +325,8 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     {
       save: workspace.save ? save : null,
       discard: workspace.save ? discard : null,
-      settings: openSettings,
-      share: startShare,
+      settings: projectDialogs.settings,
+      share: projectDialogs.share,
     },
   )
   // TWO COLUMNS ARE THE REST STATE of the project screen — not something contingent on a build
@@ -356,40 +338,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
   return (
     <>
       <WorkspaceRail project={project} />
-      {settingsOpen && (
-        <AppSettingsDialog
-          project={project}
-          onProjectUpdate={props.onProjectUpdate}
-          onClose={() => setSettingsOpen(false)}
-          // DELETING THE APPLICATION YOU ARE STANDING IN. The dialog hands off rather than
-          // deleting, exactly as it does from the list, so the confirmation is the same two
-          // steps — and the settings surface closes first, because leaving it open behind a
-          // confirmation about the thing it describes is a dialog over its own obituary.
-          onDelete={() => {
-            setSettingsOpen(false)
-            setDeleting(true)
-          }}
-        />
-      )}
-      {deleting && (
-        <ProjectDeleteDialog
-          project={project}
-          onClose={() => setDeleting(false)}
-          onConfirm={async (remark) => {
-            await deleteProject(project.id, remark)
-            // THE LIST, NOT BACK. Back would be this application's own address, which no longer
-            // names anything — the citizen would arrive at a dead page they just emptied.
-            navigate(projectsListHref(), { replace: true })
-          }}
-        />
-      )}
-      {sharing && (
-        <SharePanel
-          projectId={project.id}
-          projectName={project.name}
-          onClose={() => setSharing(false)}
-        />
-      )}
+      {projectDialogs.dialogs}
     </>
   )
 }

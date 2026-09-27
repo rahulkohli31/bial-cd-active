@@ -39,6 +39,19 @@ export function dayMonth(iso: string | null | undefined): string {
   return at === null ? NONE : `${at.getDate()} ${MONTHS[at.getMonth()]}`
 }
 
+const twoDigits = (n: number): string => String(n).padStart(2, '0')
+
+/** `16:40`, on the reader's own clock. */
+export function timeOfDay(iso: string | null | undefined): string {
+  const at = parse(iso)
+  return at === null ? NONE : `${twoDigits(at.getHours())}:${twoDigits(at.getMinutes())}`
+}
+
+/** `25 Sep, 16:40` — one em dash, not two, when the stamp is unparseable. */
+export function dayMonthTime(iso: string | null | undefined): string {
+  return parse(iso) === null ? NONE : `${dayMonth(iso)}, ${timeOfDay(iso)}`
+}
+
 /**
  * `28 Aug → 15 Sep` — the tile's foot form, both dates in the space the list gives one.
  *

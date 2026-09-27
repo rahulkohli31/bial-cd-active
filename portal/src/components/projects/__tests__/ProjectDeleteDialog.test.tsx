@@ -1,6 +1,6 @@
 /**
  * ProjectDeleteDialog — the guarantees a destructive confirm owes the user:
- *   1. The confirm button will not arm until the reason is a valid 5-50 words,
+ *   1. The confirm button will not arm until the reason is a valid 2-50 words,
  *      and the dialog NAMES the account the deletion will be recorded against
  *      without asking anyone to type it.
  *   2. It names the cascade with a real chat count, and it never flashes
@@ -60,7 +60,7 @@ describe('ProjectDeleteDialog — confirm gating', () => {
 
     expect(confirmBtn.hasAttribute('disabled')).toBe(true) // nothing written yet
 
-    fireEvent.change(reason, { target: { value: 'not needed' } }) // 2 words
+    fireEvent.change(reason, { target: { value: 'nothing' } }) // 1 word
     expect(confirmBtn.hasAttribute('disabled')).toBe(true)
 
     fireEvent.change(reason, { target: { value: 'no longer needed by ground ops' } }) // 6
@@ -130,8 +130,8 @@ describe('ProjectDeleteDialog — confirm gating', () => {
   })
 
   it('arms at EXACTLY the bounds, and disarms one word outside either', async () => {
-    // The boundaries themselves: the gating test above uses 2/6/51, so an off-by-one at either
-    // end survived it — and the server parametrises 5 and 50 directly, so a client that disagreed
+    // The boundaries themselves: the gating test above uses 1/6/51, so an off-by-one at either
+    // end survived it — and the server parametrises 2 and 50 directly, so a client that disagreed
     // here would arm a button the API then refuses.
     h.listProjectConversations.mockResolvedValue([])
     render(<ProjectDeleteDialog project={project} onClose={() => {}} onConfirm={vi.fn()} />)
@@ -140,10 +140,10 @@ describe('ProjectDeleteDialog — confirm gating', () => {
     const reason = screen.getByLabelText(/why are you deleting/i)
     const words = (n: number) => Array.from({ length: n }, (_, i) => `w${i}`).join(' ')
 
-    fireEvent.change(reason, { target: { value: words(4) } })
+    fireEvent.change(reason, { target: { value: words(1) } })
     expect(confirmBtn.hasAttribute('disabled')).toBe(true)
 
-    fireEvent.change(reason, { target: { value: words(5) } }) // the floor itself
+    fireEvent.change(reason, { target: { value: words(2) } }) // the floor itself
     expect(confirmBtn.hasAttribute('disabled')).toBe(false)
 
     fireEvent.change(reason, { target: { value: words(50) } }) // the ceiling itself
@@ -247,7 +247,7 @@ describe('ProjectDeleteDialog — the irreversible warning', () => {
 describe('★ the reason field says what it wants, and how close you are', () => {
   it('describes the textarea with the rule AND the running count', async () => {
     // The field carried only `aria-label`, so a reader heard the question and neither of the
-    // two facts printed directly under the box: the 5-50 word bound, and how many words they
+    // two facts printed directly under the box: the 2-50 word bound, and how many words they
     // have. `DialogContent`'s own `aria-describedby` stays on the cascade sentence — that is
     // what a reader should hear after the title — so this is a second association on a second
     // element, not a move.
@@ -258,7 +258,7 @@ describe('★ the reason field says what it wants, and how close you are', () =>
     expect(described.length).toBe(2)
 
     const text = described.map((id) => document.getElementById(id)?.textContent || '').join(' ')
-    expect(text).toMatch(/between 5 and 50 words/i)
+    expect(text).toMatch(/between 2 and 50 words/i)
     expect(text).toMatch(/0\/50 words/)
   })
 

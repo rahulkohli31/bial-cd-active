@@ -1,5 +1,5 @@
 /**
- * ProjectCreateModal (#191): description is now REQUIRED and word-bounded (15-120,
+ * ProjectCreateModal (#191): description is now REQUIRED and word-bounded (5-120,
  * mirroring the name's existing 8-word cap), relabelled as a question, with a live
  * counter and a keyboard-focusable, click-toggle info control showing a worked example.
  * The character caps on both fields stay as paste backstops the button also enforces
@@ -152,7 +152,7 @@ describe('ProjectCreateModal — description required + word bound (#191)', () =
 
   it('shows the word-bound rule and a live counter that turns red out of bounds', () => {
     render(<ProjectCreateModal onClose={vi.fn()} onCreated={vi.fn()} />)
-    expect(screen.getByText(/between 15 and 120 words/i)).toBeTruthy()
+    expect(screen.getByText(/between 5 and 120 words/i)).toBeTruthy()
 
     fireEvent.change(descriptionInput(), { target: { value: wordsOf(3) } })
     const counter = screen.getByText('3/120 words')
@@ -172,7 +172,7 @@ describe('ProjectCreateModal — description required + word bound (#191)', () =
 
   it('blocks an over-2000-character description client-side even though the word count is in bounds', () => {
     // 100 words of 20 characters + 99 spaces = 2099 characters — over the paste backstop,
-    // but still only 100 words (inside 15-120), so this is the character rule, not the word one.
+    // but still only 100 words (inside 5-120), so this is the character rule, not the word one.
     const value = Array.from({ length: 100 }, () => 'x'.repeat(20)).join(' ')
     render(<ProjectCreateModal onClose={vi.fn()} onCreated={vi.fn()} />)
     fireEvent.change(nameInput(), { target: { value: 'Gate Pass Log' } })

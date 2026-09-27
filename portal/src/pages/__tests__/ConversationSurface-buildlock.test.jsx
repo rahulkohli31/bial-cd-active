@@ -75,7 +75,7 @@ function renderBuilder(chatId, projectId = 'p1') {
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <BackButton />
       <Routes>
-        <Route path="/chat/:chatId" element={<ConversationSurface projectId={projectId} projectName="VIP Movement" />} />
+        <Route path="/chat/:chatId" element={<ConversationSurface projectId={projectId} />} />
       </Routes>
     </MemoryRouter>,
   )

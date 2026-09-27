@@ -36,7 +36,6 @@ from src.api.v1.conversations.schemas import (
 )
 from src.api.v1.conversations.turns import KEEPALIVE_SECONDS
 from src.core.connectors import CONNECTORS
-from src.db.models.connector_access import ConnectorAccessRequest, ConnectorRequestStatus
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
 from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
@@ -520,23 +519,15 @@ async def test_plan_kind_model_sees_no_write_tools(
 # provable by driving the route, which is what this does.
 
 
-async def _connect_the_project(db_session, user, conv) -> None:
-    """Approve the owner and switch the connector on for this conversation's project — the two
-    halves of `effectively_on`, written as rows rather than through the routes, so the test states
-    the DATABASE state it needs rather than a sequence of requests that happens to produce it."""
-    db_session.add(
-        ConnectorAccessRequest(
-            user_id=user.id,
-            connector_key=_CONNECTOR_KEY,
-            status=ConnectorRequestStatus.APPROVED,
-            requester_remarks="The stand board needs on-block times.",
-        )
-    )
+async def _connect_the_project(db_session, conv, *, enabled: bool = True) -> None:
+    """Switch the connector on for this conversation's project, written as a row rather than
+    through the route, so the test states the DATABASE state it needs rather than a sequence of
+    requests that happens to produce it."""
     db_session.add(
         ProjectConnector(
             project_id=conv.project_id,
             connector_key=_CONNECTOR_KEY,
-            enabled=True,
+            enabled=enabled,
             window_kind=ConnectorWindowKind.RELATIVE,
             window_days=7,
         )
@@ -547,9 +538,9 @@ async def _connect_the_project(db_session, user, conv) -> None:
 async def test_a_connected_project_reaches_the_model_with_the_tool_and_the_stub(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
-    """Through the REAL route, router, engine and registry: an approved, switched-on project's
-    Plan turn hands the model the connected-data tool AND tells it, in its instructions, to call
-    that tool before writing code against the data.
+    """Through the REAL route, router, engine and registry: a switched-on project's Plan turn
+    hands the model the connected-data tool AND tells it, in its instructions, to call that tool
+    before writing code against the data.
 
     BOTH HALVES IN ONE TEST ON PURPOSE. The stub and the tool list are rendered from ONE resolved
     value, and the failure this guards is them disagreeing — a prompt announcing a connected
@@ -572,7 +563,7 @@ async def test_a_connected_project_reaches_the_model_with_the_tool_and_the_stub(
         yield "noted"
 
     user, conv = await _auth_with_conversation(db_session)
-    await _connect_the_project(db_session, user, conv)
+    await _connect_the_project(db_session, conv)
     set_chat_model(FunctionModel(stream_function=_capture))
     assert (await _post_turn(client, _headers(user), conv)).status_code == 202
     await _settle(_fresh_engine, conv.id)
@@ -600,7 +591,7 @@ async def test_the_build_arm_reaches_the_model_with_the_tool_too(
         yield "noted"
 
     user, conv = await _auth_with_conversation(db_session, kind=ChatKind.BUILD)
-    await _connect_the_project(db_session, user, conv)
+    await _connect_the_project(db_session, conv)
     set_chat_model(FunctionModel(stream_function=_capture))
     assert (await _post_turn(client, _headers(user), conv)).status_code == 202
     await _settle(_fresh_engine, conv.id)
@@ -642,13 +633,12 @@ async def test_an_ordinary_project_reaches_the_model_with_neither(
     assert "CONNECTED DATA" not in seen["instructions"]
 
 
-async def test_an_approval_without_a_project_switch_reaches_the_model_with_neither(
+async def test_a_switched_off_project_reaches_the_model_with_neither(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
-    """★ THE HALF-STATE, driven through the route. The owner is approved for every project they
-    own, and this project was never switched on — so `effectively_on` is false and the tool must
-    be ABSENT rather than present-and-refusing. Asserted here as well as at the helper, because
-    this is the layer where a caller could pass the wrong half of the conjunction."""
+    """★ THE ROW WITHOUT THE SWITCH, driven through the route. The project has a stored window
+    and its switch is down — so `effectively_on` is false and the tool must be ABSENT rather than
+    present-and-refusing."""
     seen: dict[str, Any] = {}
 
     async def _capture(messages: list[ModelMessage], info: AgentInfo):
@@ -656,15 +646,7 @@ async def test_an_approval_without_a_project_switch_reaches_the_model_with_neith
         yield "noted"
 
     user, conv = await _auth_with_conversation(db_session)
-    db_session.add(
-        ConnectorAccessRequest(
-            user_id=user.id,
-            connector_key=_CONNECTOR_KEY,
-            status=ConnectorRequestStatus.APPROVED,
-            requester_remarks="Approved, but this project was never switched on.",
-        )
-    )
-    await db_session.flush()
+    await _connect_the_project(db_session, conv, enabled=False)
     set_chat_model(FunctionModel(stream_function=_capture))
     assert (await _post_turn(client, _headers(user), conv)).status_code == 202
     await _settle(_fresh_engine, conv.id)

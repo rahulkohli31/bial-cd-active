@@ -12,6 +12,7 @@
  */
 import ConversationSurface from '../chat/ConversationSurface'
 import type { ChatKind } from '../../pages/ChatRoute'
+import type { Project } from '../../utils/projectApi'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 
 /** What `ChatRoute` resolved: which conversation, of which kind, in which project. */
@@ -19,12 +20,15 @@ export interface MountedConversation {
   chatId: string
   kind: ChatKind
   projectId: string | null
-  projectName: string | null
+  /** `null` while the project loads, or after its fetch failed. */
+  project: Project | null
   projectHasSavedBuild: boolean | null
 }
 
 interface Props {
   conversation: MountedConversation
+  /** Passed through to the surface — see `ConversationSurfaceProps.onProjectUpdate`. */
+  onProjectUpdate: (project: Project) => void
   /** Passed through to the surface — see `ConversationSurfaceProps.onTitleDerived`. */
   onTitleDerived?: (title: string) => void
   /**
@@ -36,11 +40,11 @@ interface Props {
   hidden?: boolean
 }
 
-export default function ConversationSlot({ conversation, hidden = false, onTitleDerived }: Props) {
+export default function ConversationSlot({ conversation, hidden = false, onProjectUpdate, onTitleDerived }: Props) {
   // `kind` is read for one thing only: whether the surface declares the app pane visible. What a
   // turn may do to the app is the server toolset's decision — see `ConversationCreateRequest.kind`.
-  const { chatId, kind, projectId, projectName, projectHasSavedBuild } = conversation
-  const shared = { chatId, projectId, projectName }
+  const { chatId, kind, projectId, project, projectHasSavedBuild } = conversation
+  const shared = { chatId, projectId, project }
 
   return (
     <div
@@ -52,6 +56,7 @@ export default function ConversationSlot({ conversation, hidden = false, onTitle
         {...shared}
         kind={kind}
         projectHasSavedBuild={projectHasSavedBuild}
+        onProjectUpdate={onProjectUpdate}
         onTitleDerived={onTitleDerived}
       />
     </div>

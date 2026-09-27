@@ -54,7 +54,7 @@ from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions import SandboxReclaimBlockedError
 from src.services.build_sessions.counters import count
-from src.services.connectors.access import connected_systems_for_project
+from src.services.connectors import connected_systems_for_project
 from src.services.messages.store import load_rows
 from src.services.redis import build_coordination_or_503
 from src.services.turns.copy import (

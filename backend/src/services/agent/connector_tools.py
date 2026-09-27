@@ -24,10 +24,10 @@ needs was resolved once at the router and rides `PromptContext.connected_systems
 
 WHY REGISTRATION IS THE GATE AND THIS BODY IS ONLY THE BELT. `toolsets_for_kind` appends this
 toolset for a project whose connector is effectively on and for no other, so a project whose
-administrator refused the connector — or whose approval was revoked — has no tool to call, and a
-forged call meets the runtime's unknown-tool rejection rather than a policy check somebody could
-find a way past. The refusals below are the belt to that braces: they are unreachable through
-registration, and they are asserted rather than assumed.
+switch is down has no tool to call, and a forged call meets the runtime's unknown-tool rejection
+rather than a policy check somebody could find a way past. The refusals below are the belt to
+that braces: they are unreachable through registration, and they are asserted rather than
+assumed.
 
 THE CONNECTOR IS NEVER NAMED HERE. The artefact is `connector_catalogue/<key>.txt`, the key comes
 off the registry, and no literal in this module says which system it is. The model's own
@@ -176,8 +176,8 @@ async def connector_schema(ctx: RunContext[Any], system: str) -> str:
 
     Use what you learn to write correct queries. Do NOT copy KPI formulas, SLA targets or
     threshold numbers into the app's source or its on-screen text — a published app is listed to
-    everyone in the organisation, which is a wider audience than the one person whose access an
-    administrator approved.
+    everyone in the organisation, which is a wider audience than the one person who switched this
+    data on for their project.
     """
     prompt_context = getattr(ctx.deps, "prompt_context", None)
     if not isinstance(prompt_context, PromptContext) or not prompt_context.connected_systems:
@@ -196,7 +196,7 @@ async def connector_schema(ctx: RunContext[Any], system: str) -> str:
         # UNREACHABLE THROUGH REGISTRATION — `connected_systems_for_project` returns only systems
         # that are effectively on, and the toolset is registered only when that set is non-empty.
         # Asserted rather than assumed, and NOT retryable: whether this project may read a system
-        # is an administrator's decision, not something a better argument reaches.
+        # is the project's switch, not something a better argument reaches.
         return (
             f"{match.connector.display_name} is not switched on for this project, so its schema "
             "cannot be read here."

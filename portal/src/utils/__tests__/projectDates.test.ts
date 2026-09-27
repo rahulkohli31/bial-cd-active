@@ -4,7 +4,7 @@
  * that will not parse, and a range whose two ends are in different years.
  */
 import { describe, it, expect } from 'vitest'
-import { dayMonth, listDate, tileDateRange, tileDateTitle } from '../projectDates'
+import { dayMonth, dayMonthTime, listDate, tileDateRange, tileDateTitle, timeOfDay } from '../projectDates'
 
 const NOV_2025 = '2025-11-11T09:00:00Z'
 const SEP_2026 = '2026-09-14T09:00:00Z'
@@ -16,6 +16,8 @@ describe('a date that cannot be read says so, rather than printing the words', (
     // a fact nobody can act on dressed as a value, and it is what `new Date()` hands back.
     expect(listDate(bad)).toBe('—')
     expect(dayMonth(bad)).toBe('—')
+    expect(timeOfDay(bad)).toBe('—')
+    expect(dayMonthTime(bad)).toBe('—')
   })
 
   it('…and a range with one unreadable end still shows the end it has', () => {
@@ -55,5 +57,21 @@ describe('the arrow does not say which end is which, so the hover does', () => {
     expect(tileDateTitle(NOV_2025, SEP_2026)).toBe(
       'Created 11 Nov 2025 · Details updated 14 Sep 2026',
     )
+  })
+})
+
+describe('a time of day reads on the reader\'s own clock, in two-digit hours and minutes', () => {
+  // Built from local parts, so the clock the assertion reads is the same in every time zone.
+  const MORNING = new Date(2026, 8, 5, 7, 5).toISOString()
+  const AFTERNOON = new Date(2026, 8, 25, 16, 40).toISOString()
+
+  it('pads a single-digit hour and minute', () => {
+    expect(timeOfDay(MORNING)).toBe('07:05')
+    expect(timeOfDay(AFTERNOON)).toBe('16:40')
+  })
+
+  it('puts the day and month before the time', () => {
+    expect(dayMonthTime(MORNING)).toBe('5 Sep, 07:05')
+    expect(dayMonthTime(AFTERNOON)).toBe('25 Sep, 16:40')
   })
 })

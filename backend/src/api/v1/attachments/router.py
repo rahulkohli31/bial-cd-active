@@ -1,15 +1,12 @@
 """Attachment HTTP endpoints — upload / download / delete, for all ten formats.
 
 THE DOOR ASKS THREE QUESTIONS AND NOTHING DOWNSTREAM ASKS ANY OF THEM AGAIN. Is this file one of
-the ten? Is it under `ATTACHMENT_MAX_BYTES`? Is it whole and unlocked? A file that passes is
+the ten? Is it under its lane's size limit? Is it whole and unlocked? A file that passes is
 stored as itself, owner-scoped, and read where it can actually be read.
 
-ONE SIZE FOR EVERY FORMAT, AND ONE PLACE THAT ASKS. There used to be four independently-declared
-per-file byte numbers — this route's, a duplicate inside a decoder that had no callers, the
-browser's, and the supervisor's write ceiling. Four numbers for one rule is a rule that will
-disagree with itself, and it was one release away from doing so. The others are gone; the browser
-keeps a copy because a citizen should learn a file is too large before uploading it, and a test
-holds the two equal.
+ONE LIMIT PER LANE, AND THIS IS THE ONE PLACE THAT ASKS. The limits sit beside the lane sets in
+`media/lanes.py`. The browser keeps a copy because a citizen should learn a file is too large
+before uploading it, and a test holds the two equal.
 
 WHAT IS NOT ASKED, DELIBERATELY. Length. A PDF's page count used to be measured in a killable
 subprocess and capped, because a document was charged a flat figure sized to that cap. Nothing
@@ -53,6 +50,7 @@ from src.services.media import (
     is_opc_archive,
     pdf_refusal,
 )
+from src.services.media.lanes import max_mb_for
 from src.services.ratelimit import rate_limit
 from src.services.storage import (
     ObjectStorage,
@@ -70,29 +68,17 @@ router = APIRouter(prefix="/attachments", tags=["attachments"])
 # Client-minted attachment id shape (Express `ID_RE`) — a safe object-key token.
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
-ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
-"""The per-file decoded cap, and THE ONLY PLACE THE SIZE QUESTION IS ASKED.
+_MIB: Final = 1024 * 1024
 
-TEN MEGABYTES FOR EVERY FORMAT. It was four, and a second, far lower number applied to the two
-delimited formats on the browser side alone — so a citizen with a 300 KB CSV export was refused
-by a rule the server did not have and could not have explained. One number covers a photograph, a
-scanned invoice, a workbook and a deck, and a citizen never has to know which of their files the
-platform considers expensive.
-
-EVERY REFUSAL THAT NAMES A SIZE INTERPOLATES THIS CONSTANT rather than spelling a number, so the
-figure a citizen is told and the figure enforced cannot drift."""
-
-ATTACHMENT_MAX_MB = ATTACHMENT_MAX_BYTES // (1024 * 1024)
-"""The cap as a whole number of megabytes, for the sentences that have to say it out loud."""
-
-_BODY_LIMIT_BYTES = 15 * 1024 * 1024
-"""The request-body ceiling, and NOT a second opinion on the cap above.
+_BODY_LIMIT_BYTES = 44 * _MIB
+"""The request-body ceiling, and NOT a second opinion on the per-file limits.
 
 It fires on RAW WIRE BYTES before the body is decoded, which is a different question: no client
 can route around the framework's own buffering, so this is what stops a hostile body being read
-into memory at all. It must therefore clear base64 of a legal file — 10 MiB encodes to 13,981,016
-bytes — with room for the JSON around it. Set below that and the door would refuse a file it
-means to accept, with a sentence about the request rather than the file."""
+into memory at all. It must therefore clear base64 of the largest legal file — 30 MiB encodes to
+41,943,040 bytes — with room for the JSON around it. Set below that and the door would refuse a
+file it means to accept, with a sentence about the request rather than the file. The portal
+edge's own ceiling sits just above this one, so this route's refusal is the one a citizen reads."""
 
 MAX_ATTACHMENTS_PER_CONVERSATION = 20
 """How many attachments one conversation may hold, counted SERVER-SIDE.
@@ -495,8 +481,9 @@ async def upload_attachment(
         raise AppApiError(
             400, f"Attachment bytes do not match the declared type {media_type}."
         ) from None
-    if len(data) > ATTACHMENT_MAX_BYTES:
-        raise AppApiError(413, f"Attachment is too large (max {ATTACHMENT_MAX_MB} MB).")
+    max_mb = max_mb_for(media_type)
+    if len(data) > max_mb * _MIB:
+        raise AppApiError(413, f"Attachment is too large (max {max_mb} MB).")
     # AFTER the magic-byte and size checks and BEFORE the store, so a refused document leaves
     # no object and no row. Split on media type rather than run for everything because the two
     # scans read PDF syntax; an image has no trailer to look in.

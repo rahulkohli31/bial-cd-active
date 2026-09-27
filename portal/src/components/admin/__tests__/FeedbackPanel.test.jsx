@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
+import { fireEvent } from '@testing-library/react'
 import FeedbackPanel from '../FeedbackPanel.jsx'
 import { fetchFeedback } from '../../../utils/admin'
 
@@ -54,14 +55,63 @@ describe('FeedbackPanel', () => {
     expect(rows[0].textContent).toContain('staff@bial.test')
     expect(rows[0].textContent).toContain('first')
     expect(rows[0].textContent).toContain('/chat')
-    // No truncation banner when total equals the number of rows.
-    expect(container.textContent).not.toContain('Showing newest')
+    // No cap notice when total equals the number of rows.
+    expect(container.querySelector('[role="alert"]')).toBeNull()
   })
 
-  it('shows the "newest N of M" banner when total exceeds the row count', async () => {
+  it('says the list stops at the server cap when total exceeds the row count', async () => {
     fetchFeedback.mockResolvedValue({ feedback: [row()], total: 250 })
     await renderPanel()
-    expect(container.textContent).toContain('Showing newest 1 of 250')
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(1)
+    expect(container.querySelector('[role="alert"]').textContent).toContain('Only the first 1 rows are loaded')
+    expect(container.textContent).not.toContain('deferred')
+  })
+
+  it('search matches the user, the message or the page, whatever the case', async () => {
+    fetchFeedback.mockResolvedValue({
+      feedback: [
+        row({ email: 'meera@bial.test', message: 'Export is slow', page: '/projects' }),
+        row({ email: 'arjun@bial.test', message: 'love the chat', page: '/chat' }),
+        row({ email: 'kavya@bial.test', message: 'login loops', page: '/admin' }),
+      ],
+      total: 3,
+    })
+    await renderPanel()
+    const search = container.querySelector('input[type="search"]')
+    const users = () => [...container.querySelectorAll('tbody tr')].map((tr) => tr.querySelector('td').textContent)
+
+    fireEvent.change(search, { target: { value: 'ARJUN' } })
+    expect(users()).toEqual(['arjun@bial.test'])
+    fireEvent.change(search, { target: { value: 'export' } })
+    expect(users()).toEqual(['meera@bial.test'])
+    fireEvent.change(search, { target: { value: '/admin' } })
+    expect(users()).toEqual(['kavya@bial.test'])
+    fireEvent.change(search, { target: { value: '' } })
+    expect(users()).toHaveLength(3)
+  })
+
+  it('sorts by a column header, ascending then descending', async () => {
+    fetchFeedback.mockResolvedValue({
+      feedback: [row({ email: 'b@bial.test' }), row({ email: 'c@bial.test' }), row({ email: 'a@bial.test' })],
+      total: 3,
+    })
+    await renderPanel()
+    const users = () => [...container.querySelectorAll('tbody tr')].map((tr) => tr.querySelector('td').textContent)
+    fireEvent.click(container.querySelector('[data-testid="sort-email"]'))
+    expect(users()).toEqual(['a@bial.test', 'b@bial.test', 'c@bial.test'])
+    fireEvent.click(container.querySelector('[data-testid="sort-email"]'))
+    expect(users()).toEqual(['c@bial.test', 'b@bial.test', 'a@bial.test'])
+  })
+
+  it('pages the feedback ten rows at a time', async () => {
+    const twelve = Array.from({ length: 12 }, (_, i) => row({ email: `u${i}@bial.test` }))
+    fetchFeedback.mockResolvedValue({ feedback: twelve, total: 12 })
+    await renderPanel()
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(10)
+    expect(container.textContent).toContain('Showing 1–10 of 12')
+    fireEvent.click(container.querySelector('button[aria-label="Go to next page"]'))
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(2)
+    expect(container.textContent).toContain('Showing 11–12 of 12')
   })
 
   it('shows the loading state before the fetch resolves', () => {

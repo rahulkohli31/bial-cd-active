@@ -10,7 +10,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, fireEvent, createEvent, cleanup } from '@testing-library/react'
-import { MAX_FILE_SIZE, MAX_FILE_SIZE_MB } from '../../utils/attachmentInput'
+import { IMAGE_MAX_MB } from '../../utils/attachmentInput'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), getBuild: vi.fn(),
@@ -88,9 +88,9 @@ describe('BuilderPage — composer drag-and-drop', () => {
     // Sized and asserted from the CONSTANT, so a change to the cap moves the fixture and the
     // expectation together rather than turning this red for the wrong reason.
     const composer = await renderReady()
-    const big = new File([new Uint8Array(MAX_FILE_SIZE + 1)], 'huge.png', { type: 'image/png' })
+    const big = new File([new Uint8Array(IMAGE_MAX_MB * 1024 * 1024 + 1)], 'huge.png', { type: 'image/png' })
     dropFiles(composer, [big])
-    expect(await screen.findByText(new RegExp(`exceeds the ${MAX_FILE_SIZE_MB} MB limit`, 'i'))).toBeTruthy()
+    expect(await screen.findByText(new RegExp(`exceeds the ${IMAGE_MAX_MB} MB limit`, 'i'))).toBeTruthy()
     expect(screen.queryByText('huge.png')).toBeNull()
   })
 })

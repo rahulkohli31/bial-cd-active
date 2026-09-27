@@ -20,7 +20,7 @@ from tests.fakes import FakeStorage
 DELETE_BODY = {"remark": "No longer needed by the ground operations team"}
 
 # A DESCRIPTION THAT CLEARS THE BAR, in one place, for the same reason DELETE_BODY is: #191
-# made description required and 15-120 words, and most tests in this directory that create a
+# made description required and word-bounded, and most tests in this directory that create a
 # project via the live endpoint don't care what the description says — they care about
 # something else and just need a valid one to get past create. The issue's own worked example
 # (#191 R16) doubles as this constant, so it is also exercised as ordinary product copy rather

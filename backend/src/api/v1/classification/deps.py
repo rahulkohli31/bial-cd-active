@@ -1,7 +1,7 @@
 """Dependency seam for the classification review routes.
 
 The review service is ALWAYS constructible — an unconfigured Foundry surfaces at RUN time
-inside the detached task (review-failed bucket, Tier A floor still applied), never at
+inside the detached task (the review-failed bucket), never at
 dependency-solve time — so unlike the deploy service this provider has no `| None` flavour
 and no 503 to protect. It exists as a `Depends` seam so tests override THIS key.
 

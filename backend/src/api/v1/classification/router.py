@@ -4,12 +4,13 @@ version, and read it — the browser is never the source of what the review said
 WHY THIS EXISTS
 
 TWO PROJECT-SCOPED ROUTES, the deploy router's shape deliberately. The POST ENSURES: it
-resolves the current saved commit and hands it to the service's claim-or-return. An
-unchanged version comes back without a run; a failed attempt is re-claimed by asking again
-on this SAME route — there is no separate retry verb — to the three-runs-per-version cap;
-a new version claims a fresh run, detached. The route never waits (a review takes minutes,
-the edge gives twenty seconds): it answers the current state, 202 in flight and 200 when
-settled, and the client polls the GET, which reads and NEVER starts, downloads, or writes.
+resolves the current saved commit and the live configuration and hands both to the service's
+claim-or-return. An unchanged commit under unchanged class definitions comes back without a run;
+a failed attempt is re-claimed by asking again on this SAME route — there is no separate retry
+verb — to the three-runs cap; anything else claims a fresh run, detached. The route never waits
+(a review takes minutes, the edge gives twenty seconds): it answers the current state, 202 in
+flight and 200 when settled, and the client polls the GET, which reads and NEVER starts,
+downloads, or writes. Both carry the live policy and classes the dialog scores with.
 
 OWNERSHIP FIRST, inverting the deploy routes' unconfigured-503-first ordering: a cross-user
 project id must be a non-leaking 404 EVEN when storage is unbound.
@@ -19,16 +20,15 @@ blob's `head_sha` stamp and its `last_modified` — one `head()` call — NEVER 
 the bundle, which downloads the whole thing before consulting its SHA-keyed cache. The GET
 here is polled by a dialog open for up to a minute; only the detached runner extracts.
 
-EVIDENCE NEVER LEAVES THE ROW. The stored documents carry cited locations, the scan block,
-the per-question scan agreement and the downgrade marker — none of which the citizen may
-see. The response goes through `ReviewAnswers.of`: verdict + reason, nothing else."""
+EVIDENCE NEVER LEAVES THE ROW, and neither does a class description. The response goes through
+`ClassReview.all_of` (verdict + reason) and `ReviewClass` (key, title, kind, weight)."""
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final
+from typing import Final, TypedDict
 
 import structlog
 from fastapi import APIRouter, Depends, Response, status
@@ -36,10 +36,16 @@ from fastapi import APIRouter, Depends, Response, status
 from src.api.deps import CurrentUser, DbSession, OptionalStorage
 from src.api.deps_csrf import RequireCsrf
 from src.api.v1.classification.deps import ReviewService
-from src.api.v1.classification.schemas import ClassificationReviewResponse, ReviewAnswers
+from src.api.v1.classification.schemas import (
+    ClassificationReviewResponse,
+    ClassReview,
+    ReviewClass,
+    ReviewPolicy,
+)
 from src.core.errors import AppApiError
 from src.db.models.classification_review import ClassificationReviewStatus
 from src.schemas import AUTH_401, ErrorEnvelope, error_responses
+from src.services.classification.config import LiveConfig, load_live_config
 from src.services.classification.service import (
     FAIL_ABANDONED,
     FAIL_BUNDLE_UNREADABLE,
@@ -49,7 +55,7 @@ from src.services.classification.service import (
     FAIL_VERSION_DRIFT,
     MAX_MODEL_RUNS_PER_VERSION,
 )
-from src.services.classification.store import ReviewRecord
+from src.services.classification.store import ReviewRecord, is_for
 from src.services.deploy.resolve import deploy_target
 from src.services.projects.resolve import owned_project_or_404
 from src.services.ratelimit import rate_limit
@@ -74,10 +80,9 @@ _REVIEW_PATH = "/{project_id}/classification-review"
 # citizen who has already exhausted their build budget. Uncapped premium spend sits badly
 # against a platform whose token meter is a stated client requirement.
 #
-# A REFUSAL HERE IS NOT A GATE HOLE. It only stops a review from being STARTED; the app
-# still publishes through the same ladder, and with no complete review for the version
-# rule 4 routes it to an administrator. The failure direction is toward a human, never
-# toward an unattended publish.
+# A REFUSAL HERE IS NOT A GATE HOLE. It only stops a review from being STARTED; with no
+# complete review for the version the gate routes the app to an administrator. The failure
+# direction is toward a human, never toward an unattended publish.
 REVIEW_RATE_LIMIT = 12
 REVIEW_RATE_WINDOW_SECONDS = 15 * 60
 
@@ -98,11 +103,9 @@ _review_limiter = rate_limit(
     ),
 )
 
-# "Unavailable" is five distinct citizen-facing states plus the later-added drift code.
-# The CITIZEN sentence for each stored bucket
-# lives here — this module owns the copy, the stored `failure_code` stays the stable, greppable
-# operator string — and an unknown code fails loudly at the subscript rather than
-# rendering a sentence nobody wrote.
+# The owner sentence for each stored bucket lives here — this module owns the copy, the stored
+# `failure_code` stays the stable, greppable operator string — and an unknown code fails loudly
+# at the subscript rather than rendering a sentence nobody wrote.
 _FAILURE_SENTENCES: Final[dict[str, str]] = {
     FAIL_NO_APP: "There's nothing saved to check yet — press Save first.",
     FAIL_BUNDLE_UNREADABLE: "Your saved app couldn't be read. Tell an administrator.",
@@ -162,12 +165,27 @@ async def _saved_version(storage: ObjectStorage, app_id: uuid.UUID) -> _SavedVer
     )
 
 
-def _nothing_to_review() -> ClassificationReviewResponse:
+class _Scoring(TypedDict):
+    policy: ReviewPolicy
+    classes: list[ReviewClass]
+
+
+def _scoring(config: LiveConfig) -> _Scoring:
+    """The live policy and classes every response carries, for the dialog to score with."""
+    return {
+        "policy": ReviewPolicy.of(config),
+        "classes": ReviewClass.in_display_order(config.classes),
+    }
+
+
+def _nothing_to_review(config: LiveConfig) -> ClassificationReviewResponse:
     """No saved code — no answers, and nothing for a review to read."""
-    return ClassificationReviewResponse(status="nothing_to_review")
+    return ClassificationReviewResponse(status="nothing_to_review", **_scoring(config))
 
 
-def _unreadable_stamp(app_id: uuid.UUID, saved: _SavedVersion) -> ClassificationReviewResponse:
+def _unreadable_stamp(
+    app_id: uuid.UUID, saved: _SavedVersion, config: LiveConfig
+) -> ClassificationReviewResponse:
     """A bundle with no `head_sha` stamp (written before the stamp existed). The commit
     cannot be resolved without downloading the whole bundle — exactly what these routes
     must never do — so no review can be claimed for it. Presented as the unreadable
@@ -176,8 +194,8 @@ def _unreadable_stamp(app_id: uuid.UUID, saved: _SavedVersion) -> Classification
     _log.warning("classification_review_bundle_has_no_stamp", app_id=str(app_id))
     return ClassificationReviewResponse(
         status="failed",
+        **_scoring(config),
         saved_at=saved.saved_at,
-        verdicts=ReviewAnswers.all_unanswered(),
         failure_code=FAIL_BUNDLE_UNREADABLE,
         failure_message=_FAILURE_SENTENCES[FAIL_BUNDLE_UNREADABLE],
         retryable=False,
@@ -185,25 +203,26 @@ def _unreadable_stamp(app_id: uuid.UUID, saved: _SavedVersion) -> Classification
 
 
 def _presented(
-    record: ReviewRecord, *, saved: _SavedVersion, aged_out: bool
+    record: ReviewRecord, *, saved: _SavedVersion, config: LiveConfig, aged_out: bool
 ) -> ClassificationReviewResponse:
-    """One stored row → the citizen's view of it.
+    """One stored row → the owner's view of it.
 
     A RUNNING row past the wall-clock ceiling (`aged_out`) is presented as the review-abandoned
-    failure, never as still-in-flight. The row's own stamp rides as `reviewed_sha` even when it
-    differs from the current `head_sha`."""
-    # A restart kills the detached runner but leaves the row RUNNING, and `start` un-wedges it
-    # on the next ask — so the aged-out presentation must invite that ask rather than show an
-    # immortal spinner.
-    #
-    # Surfacing both SHAs is what lets the client ignore an answer about a version this dialog
-    # never named: it filters by the stamp it asked for.
+    failure, never as still-in-flight, so the next ask un-wedges it. The row's own stamp rides
+    as `reviewed_sha` even when it differs from the current `head_sha`; answers ride only on a
+    current, complete review."""
+    current = saved.head_sha is not None and is_for(
+        record, head_sha=saved.head_sha, fingerprint=config.fingerprint
+    )
+    scoring = _scoring(config)
     if record.status is ClassificationReviewStatus.RUNNING and not aged_out:
         return ClassificationReviewResponse(
             status="running",
+            **scoring,
             head_sha=saved.head_sha,
             saved_at=saved.saved_at,
             reviewed_sha=record.head_sha,
+            current=current,
         )
     if record.status is ClassificationReviewStatus.COMPLETE:
         if record.verdicts is None:
@@ -212,30 +231,25 @@ def _presented(
             raise RuntimeError(f"complete review {record.review_id} has no verdicts document")
         return ClassificationReviewResponse(
             status="complete",
+            **scoring,
             head_sha=saved.head_sha,
             saved_at=saved.saved_at,
             reviewed_sha=record.head_sha,
-            verdicts=ReviewAnswers.of(record.verdicts["questions"]),
+            checked_at=record.finished_at,
+            current=current,
+            verdicts=ClassReview.all_of(record.verdicts["classes"]) if current else None,
         )
     code = FAIL_ABANDONED if aged_out else record.failure_code
     if code is None:
         raise RuntimeError(f"failed review {record.review_id} carries no failure code")
-    # A failed row usually carries no verdicts (a failure is never stored as an answer)
-    # and presents as six unanswered questions. The one exception is the Tier A
-    # floor: the model never returned, but a complete scan holds a high-confidence
-    # credential hit strong enough to stand as the credentials answer — stored on the
-    # row, projected here like any other answer set.
-    verdicts = (
-        ReviewAnswers.of(record.verdicts["questions"])
-        if record.verdicts is not None
-        else ReviewAnswers.all_unanswered()
-    )
     return ClassificationReviewResponse(
         status="failed",
+        **scoring,
         head_sha=saved.head_sha,
         saved_at=saved.saved_at,
         reviewed_sha=record.head_sha,
-        verdicts=verdicts,
+        checked_at=record.finished_at,
+        current=current,
         failure_code=code,
         failure_message=_FAILURE_SENTENCES[code],
         retryable=_RETRYABLE[code] and record.attempt < MAX_MODEL_RUNS_PER_VERSION,
@@ -270,15 +284,14 @@ async def ensure_review(
 ) -> ClassificationReviewResponse:
     """Ensure a review exists for the app's current saved version, and answer with it.
 
-    Opening the publish dialog calls this. An unchanged version gets the stored answers back
-    with no run; a version the stored row does not match claims a fresh run, detached; a failed
-    attempt is re-claimed by calling this same route again, until the service's per-version
-    attempt cap returns the stored failure instead. 202 says a run is in flight (poll the GET);
-    200 says the enclosed state is settled."""
+    Opening the publish dialog calls this. An unchanged version under unchanged class
+    definitions gets the stored answers back with no run; anything else claims a fresh run,
+    detached; a failed attempt is re-claimed by calling this same route again, until the
+    service's attempt cap returns the stored failure instead. 202 says a run is in flight (poll
+    the GET); 200 says the enclosed state is settled."""
     # The service resolves nothing itself: the CALLER owns the version question, answered here
-    # from the blob's metadata stamp — and if a Save lands between this read and the runner's
-    # extraction, the runner fails closed with `version_drift` rather than reviewing a tree
-    # this route never named.
+    # from the blob's metadata stamp and one configuration read — and if a Save lands between
+    # this read and the runner's extraction, the runner fails closed with `version_drift`.
     # Ownership before anything — a cross-user id is a non-leaking 404 even when
     # storage is unbound, so no storage (or service) question may precede this read.
     await owned_project_or_404(db, user.id, project_id)
@@ -288,23 +301,24 @@ async def ensure_review(
             _FAILURE_SENTENCES[FAIL_STORAGE],
             code=FAIL_STORAGE,
         )
+    config = await load_live_config(db)
     # Read-only resolution, deliberately (the build path's resolver UPSERTS a draft
     # app row; a review request must not mint one).
     target = await deploy_target(db, user_id=user.id, project_id=project_id)
     if target is None:
-        return _nothing_to_review()
+        return _nothing_to_review(config)
     saved = await _saved_version(storage, target.app_id)
     if saved is None:
-        return _nothing_to_review()
+        return _nothing_to_review(config)
     if saved.head_sha is None:
-        return _unreadable_stamp(target.app_id, saved)
+        return _unreadable_stamp(target.app_id, saved, config)
 
     record = await service.start(
-        db, app_id=target.app_id, user_id=user.id, head_sha=saved.head_sha
+        db, app_id=target.app_id, user_id=user.id, head_sha=saved.head_sha, config=config
     )
     # `start` renews `started_at` on every claim, so a record it hands back cannot be
     # aged out; a stale RUNNING row on this path was already settled and re-claimed.
-    presented = _presented(record, saved=saved, aged_out=False)
+    presented = _presented(record, saved=saved, config=config, aged_out=False)
     if presented.status == "running":
         response.status_code = status.HTTP_202_ACCEPTED
     return presented
@@ -339,20 +353,24 @@ async def read_review(
             _FAILURE_SENTENCES[FAIL_STORAGE],
             code=FAIL_STORAGE,
         )
+    config = await load_live_config(db)
     target = await deploy_target(db, user_id=user.id, project_id=project_id)
     if target is None:
-        return _nothing_to_review()
+        return _nothing_to_review(config)
     saved = await _saved_version(storage, target.app_id)
     if saved is None:
-        return _nothing_to_review()
+        return _nothing_to_review(config)
     if saved.head_sha is None:
-        return _unreadable_stamp(target.app_id, saved)
+        return _unreadable_stamp(target.app_id, saved, config)
 
     readout = await service.read(db, app_id=target.app_id)
     if readout is None:
         # Saved code, no review ever claimed — a normal state (the dialog's POST is
         # what claims one), answered with the version facts and no verdicts.
         return ClassificationReviewResponse(
-            status="not_reviewed", head_sha=saved.head_sha, saved_at=saved.saved_at
+            status="not_reviewed",
+            **_scoring(config),
+            head_sha=saved.head_sha,
+            saved_at=saved.saved_at,
         )
-    return _presented(readout.review, saved=saved, aged_out=readout.aged_out)
+    return _presented(readout.review, saved=saved, config=config, aged_out=readout.aged_out)

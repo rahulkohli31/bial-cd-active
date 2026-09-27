@@ -17,7 +17,7 @@ import pytest
 
 from src.services.storage import snapshot_read
 from src.services.storage.bundle import BundleValidationError
-from src.services.storage.keys import snapshot_key
+from src.services.storage.keys import snapshot_key, submission_key
 from src.services.storage.snapshot_read import (
     ExtractedSnapshot,
     NoAppYet,
@@ -147,6 +147,61 @@ async def test_second_call_hits_the_cache_without_cloning(
     assert isinstance(second, ExtractedSnapshot)
     assert second.root == first.root
     assert clones["n"] == 0  # the immutable SHA dir served the read
+
+
+async def test_a_named_bundle_is_extracted_instead_of_the_snapshot(
+    tmp_path: Path, app_id: uuid.UUID, storage: FakeStorage
+) -> None:
+    copy, copy_sha = _make_bundle(tmp_path / "submitted")
+    storage.objects[snapshot_key(app_id)] = b"a newer save that must not be read"
+    key = submission_key(app_id, uuid.uuid4())
+    storage.objects[key] = copy
+
+    extracted = await extract_snapshot(app_id, bundle_key=key, cache_root=tmp_path / "cache")
+
+    assert isinstance(extracted, ExtractedSnapshot)
+    assert extracted.head_sha == copy_sha
+    assert (extracted.root / "app" / "page.tsx").read_text() == _PAGE_CONTENT
+
+
+async def test_a_named_bundle_with_the_snapshots_head_reuses_its_extraction(
+    tmp_path: Path,
+    app_id: uuid.UUID,
+    storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data, _ = _make_bundle(tmp_path)
+    storage.objects[snapshot_key(app_id)] = data
+    key = submission_key(app_id, uuid.uuid4())
+    storage.objects[key] = data
+    first = await extract_snapshot(app_id, cache_root=tmp_path / "cache")
+    assert isinstance(first, ExtractedSnapshot)
+
+    clones = {"n": 0}
+    real_spawn = snapshot_read._spawn_no_shell
+
+    async def counting_spawn(*args: Any, **kwargs: Any) -> Any:
+        clones["n"] += 1
+        return await real_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(snapshot_read, "_spawn_no_shell", counting_spawn)
+    second = await extract_snapshot(app_id, bundle_key=key, cache_root=tmp_path / "cache")
+
+    assert isinstance(second, ExtractedSnapshot)
+    assert second.root == first.root
+    assert clones["n"] == 0
+
+
+async def test_a_missing_named_bundle_is_a_typed_no_app_yet(
+    app_id: uuid.UUID, storage: FakeStorage
+) -> None:
+    storage.objects[snapshot_key(app_id)] = b"the snapshot exists; the named copy does not"
+    outcome = await extract_snapshot(
+        app_id,
+        bundle_key=submission_key(app_id, uuid.uuid4()),
+        cache_root=Path("/nonexistent-root-never-touched"),
+    )
+    assert isinstance(outcome, NoAppYet)
 
 
 async def test_no_snapshot_is_a_typed_no_app_yet(app_id: uuid.UUID, storage: FakeStorage) -> None:

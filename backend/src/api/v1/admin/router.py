@@ -17,21 +17,19 @@ promote an unvetted pending app past the approve gate); `approve` carries the mi
 `status==pending` guard (without it, an admin could approve a kill-switched DISABLED app
 directly).
 
-Approvals carry a LINEAGE: `runbook` items get no new approvals (the citizen must re-submit
-through the publish flow), and `self_publish` apps get neither the deploy-needed prompt nor
-the mark-deployed marker — their owner publishes the approved version themselves, so a
-runbook record here would describe a deployment nobody performed."""
+Approving publishes: `approve` starts the pipeline on the approved submission copy, as the
+owner."""
 
 from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, cast
+from typing import Any, cast
 
 import sqlalchemy as sa
 import structlog
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, status
 from pydantic.alias_generators import to_camel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import make_url
@@ -39,18 +37,18 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from src.api.deps import ContainerStore, DbSession, OptionalStorage, Storage
 from src.api.deps_rbac import CurrentSuperadmin
+from src.api.v1.admin.history import app_history, live_versions
 from src.api.v1.admin.schemas import (
     MAX_DAILY_TOKEN_LIMIT,
     AdminAppOut,
     AdminAppStatusResponse,
     AppCountsResponse,
     AppDeleteRequest,
+    AppHistoryResponse,
     AppListResponse,
     ApproveRequest,
     AppStatusCounts,
     AttachmentReclaimSummary,
-    AuditEventOut,
-    AuditListResponse,
     BulkLimitsRequest,
     BulkLimitsResponse,
     BundleUrlResponse,
@@ -65,8 +63,7 @@ from src.api.v1.admin.schemas import (
     HarnessCountersResponse,
     LimitFields,
     LimitsPatchResponse,
-    MarkDeployedRequest,
-    MarkDeployedResponse,
+    LiveVersion,
     PatchAppRequest,
     PrefixReconcileCounts,
     RejectRequest,
@@ -80,6 +77,8 @@ from src.api.v1.admin.schemas import (
     UsersResponse,
 )
 from src.api.v1.build_sessions.deps import OptionalSandbox
+from src.api.v1.deploy.deps import OptionalDeployService
+from src.api.v1.deploy.schemas import RegistryStatus, compute_registry_status
 from src.api.v1.pagination import (
     DEFAULT_PAGE_SIZE,
     CursorQuery,
@@ -96,12 +95,11 @@ from src.db.base import async_session_factory
 from src.db.models.app_registry import (
     STATUS_TRANSITIONS,
     AppRegistry,
-    ApprovalRoute,
     AppStatus,
     app_status_enum,
 )
 from src.db.models.attachment import Attachment
-from src.db.models.audit import AuditLog
+from src.db.models.deployment import Deployment
 from src.db.models.feedback import Feedback
 from src.db.models.harness_counter import HarnessCount
 from src.db.models.project import Project
@@ -137,7 +135,9 @@ from src.services.build_sessions.inventory import (
     take_sandbox_inventory,
 )
 from src.services.deploy.aca_publish import DeployNotConfiguredError, get_published_apps
+from src.services.deploy.liveness import last_success_deployment
 from src.services.deploy.reconcile import reconcile_stalled_deployments
+from src.services.deploy.service import DeployNotPossibleError
 from src.services.rbac.roles import is_super_duper_admin, role_for
 from src.services.redis import build_coordination_or_503, coordination_is_gone, get_redis
 from src.services.sandbox import SandboxError
@@ -193,18 +193,24 @@ def _project(
     project_name: str,
     owner_username: str | None = None,
     *,
+    newest: Deployment | None,
+    live: LiveVersion | None,
     database_bytes: int | None = None,
 ) -> AdminAppOut:
     # `database_bytes` is keyword-only WITH a default because this projection is shared with
     # `patch_app`, which re-reads one strict `(AppRegistry, name, email)` tuple and has no
     # size to hand over. A required parameter here would have forced a cluster probe into a
     # flag-flip endpoint that has no business talking to the maintenance engine at all.
+    registry_status = compute_registry_status(app, newest)
     return AdminAppOut(
         app_id=app.id,
         name=project_name,
         owner_id=app.user_id,
         owner_username=owner_username,
         status=app.status,
+        registry_status=registry_status,
+        # A disabled app has lost its data, so nothing it serves counts as a version.
+        live_version=None if registry_status is RegistryStatus.DISABLED else live,
         login_required=app.login_required,
         has_approved_snapshot=app.approved_submission_id is not None,
         submission_id=app.source_submission_id,
@@ -214,26 +220,8 @@ def _project(
         approved_commit_sha=app.approved_commit_sha,
         approved_by=app.approved_by,
         approved_at=app.approved_at,
-        # Historical runbook fields stay projected UNCONDITIONALLY: an app that later
-        # moved to the self-publish lineage keeps its recorded runbook address visible
-        # to the administrator (the older of its two addresses, labelled by the SPA) —
-        # lineage suppresses the PROMPT below, never the history.
-        deployed_at=app.deployed_at,
-        deployed_url=app.deployed_url,
-        # Exact and clock-skew-free: ids, not timestamps. False for a
-        # never-approved app (None == None); True for approved-but-undeployed —
-        # UNLESS the lineage is self-publish: the flag is a runbook
-        # prompt, a self-published app never sets `deployed_submission_id`, and the
-        # bare derivation would therefore read "Deploy needed" forever, prompting an
-        # administrator to run a runbook that must not be run.
-        redeploy_needed=(
-            app.approval_route is not ApprovalRoute.SELF_PUBLISH
-            and app.approved_submission_id != app.deployed_submission_id
-        ),
-        # The lineage itself — what the SPA keys the runbook affordances off
-        # — and the submitted declaration, so the review screen can lead with
-        # the disagreement without a second call.
-        approval_route=app.approval_route,
+        # The submitted declaration, so the review screen can lead with the disagreement
+        # without a second call.
         declaration=app.declaration,
         database_bytes=database_bytes,
         rejection_note=app.rejection_note,
@@ -289,9 +277,8 @@ _RESTORE_TARGET = sa.func.coalesce(
 
 
 # The `db:*` levers all act on a PROJECT-scoped resource (the database is keyed by project,
-# not by app), which is why every one of them carries `appId` in its `detail`: `read_audit`
-# finds a row by `resource_id == app_id` OR `detail["appId"]`, so without it the whole
-# database half of the trail would be invisible in the app's audit drawer.
+# not by app), which is why every one of them carries `appId` in its `detail`: it is the row's
+# only handle back to the app.
 def _db_detail(app_id: uuid.UUID, handles: TeardownHandles) -> dict[str, Any]:
     """Audit `detail` for a database lever: NAMES only.
 
@@ -322,24 +309,6 @@ _NOT_DISABLABLE = (
 # one app's database — and a sweep must never answer with a partial report dressed as a
 # clean one, so an unreachable cluster is a retryable failure, not an empty tally.
 _DB_CLUSTER_UNREACHABLE = "The app-database cluster could not be reached. Please try again."
-
-# The lineage refusals. Both NAME the dead end instead of looping in it —
-# the administrator reading these is non-technical, so the copy says what to DO, not
-# which column disagreed. The first is the cutover's cost made visible: a queue item that
-# predates the publish flow was backfilled `runbook`, and approving it would burn the
-# admin's approval on an app its owner still could not publish (they would need a SECOND
-# approval once they re-submitted properly). The second is mark-deployed's: recording a
-# runbook deployment nobody performed, on an app whose owner publishes it themselves,
-# would be a lie in the registry.
-_RUNBOOK_ITEM_MUST_RESUBMIT = (
-    "This submission predates the publish flow, and approving it would not let the "
-    "developer publish. Ask them to re-submit from the app's Publish button — it "
-    "returns to this queue with their declaration attached."
-)
-_SELF_PUBLISHED_HAS_NO_RUNBOOK = (
-    "This app is on the self-publish route — the developer publishes it themselves, "
-    "and there is no runbook deployment to record."
-)
 
 # The withdrawal race — the moment a citizen's own withdraw call hands over. An
 # administrator can be reading a submission at the instant its owner pulls it back:
@@ -413,41 +382,52 @@ async def _advisory_sizes(db: DbSession, project_ids: Sequence[uuid.UUID]) -> di
     return {row[0]: by_name[row[1]] for row in claims if row[1] in by_name}
 
 
+async def _serving(db: DbSession, app_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, Deployment]:
+    """The deployment each app is serving: its newest successful publish, unless a takedown
+    landed at or after it. Unlike the marketplace's `live_app_ids`, a rejection does not hide it:
+    the app still answers at its address. One query however many apps."""
+    serving = last_success_deployment()
+    rows = await db.scalars(
+        sa.select(serving).where(
+            serving.app_id.in_(app_ids),
+            ~sa.exists().where(
+                Deployment.app_id == serving.app_id,
+                Deployment.unpublished_at.is_not(None),
+                Deployment.id >= serving.id,
+            ),
+        )
+    )
+    return {row.app_id: row for row in rows}
+
+
+async def _publish_facts(
+    db: DbSession, app_ids: Sequence[uuid.UUID]
+) -> tuple[dict[uuid.UUID, Deployment], dict[uuid.UUID, LiveVersion]]:
+    """Each app's newest deploy attempt, which its status reads, and the version it is serving,
+    numbered as its History numbers it. Four queries however many apps."""
+    if not app_ids:
+        return {}, {}
+    newest = await db.scalars(
+        sa.select(Deployment)
+        .where(Deployment.app_id.in_(app_ids))
+        .distinct(Deployment.app_id)
+        .order_by(Deployment.app_id, Deployment.id.desc())
+    )
+    newest_by_app = {row.app_id: row for row in newest}
+    return newest_by_app, await live_versions(db, await _serving(db, app_ids))
+
+
 # --- endpoints -----------------------------------------------------------------
 
 
-@router.get(
-    "",
-    responses=error_responses((400, ErrorEnvelope, "Invalid status filter"), *_ADMIN_AUTH),
-)
-async def list_apps(
-    admin: CurrentSuperadmin,
-    db: DbSession,
-    status_filter: Annotated[str | None, Query(alias="status")] = None,
-) -> AppListResponse:
-    where = []
-    valid = {member.value for member in AppStatus}
-    if status_filter is not None and status_filter not in valid:
-        # Reject an unknown ?status= rather than silently ignoring it and returning
-        # every app (fail-open) — Express filtered and yielded an empty set.
-        raise AppApiError(400, "Invalid status filter.")
-    if status_filter in valid:
-        where.append(AppRegistry.status == AppStatus(status_filter))
-    # The pending list is a REVIEW QUEUE: oldest submission first, so the
-    # next app to review is on top — `created_at` is the wrong axis (it dates the
-    # provision, not the submission). Every other view stays newest-created-first.
-    order_by = (
-        AppRegistry.submitted_at.asc()
-        if status_filter == AppStatus.PENDING.value
-        else AppRegistry.created_at.desc()
-    )
+@router.get("", responses=error_responses(*_ADMIN_AUTH))
+async def list_apps(admin: CurrentSuperadmin, db: DbSession) -> AppListResponse:
     rows = (
         await db.execute(
             sa.select(AppRegistry, Project.name, User.email)
             .join(User, AppRegistry.user_id == User.id)
             .join(Project, AppRegistry.project_id == Project.id)
-            .where(*where)
-            .order_by(order_by)
+            .order_by(AppRegistry.updated_at.desc(), AppRegistry.id.desc())
             # One past the cap: the extra row is never projected, it only answers
             # "is there more?" without a second COUNT query.
             .limit(LISTING_CAP + 1)
@@ -455,12 +435,20 @@ async def list_apps(
     ).all()
     truncated = len(rows) > LISTING_CAP
     rows = rows[:LISTING_CAP]
+    newest, live = await _publish_facts(db, [app.id for app, _name, _email in rows])
     # One probe for the whole page (never per row): the size column is advisory, so a
     # cluster that will not answer leaves it blank rather than failing the queue.
     sizes = await _advisory_sizes(db, [app.project_id for app, _name, _email in rows])
     return AppListResponse(
         apps=[
-            _project(app, project_name, owner_email, database_bytes=sizes.get(app.project_id))
+            _project(
+                app,
+                project_name,
+                owner_email,
+                newest=newest.get(app.id),
+                live=live.get(app.id),
+                database_bytes=sizes.get(app.project_id),
+            )
             for app, project_name, owner_email in rows
         ],
         truncated=truncated,
@@ -502,8 +490,7 @@ async def app_counts(admin: CurrentSuperadmin, db: DbSession) -> AppCountsRespon
         (
             409,
             ErrorEnvelope,
-            "Not pending, withdrawn, re-submitted since review, artifact missing, "
-            "or a runbook-lineage item that must be re-submitted",
+            "Not pending, withdrawn, re-submitted since review, or artifact missing",
         ),
         (503, ErrorEnvelope, "Storage temporarily unavailable"),
         *_ADMIN_AUTH,
@@ -515,10 +502,12 @@ async def approve(
     admin: CurrentSuperadmin,
     db: DbSession,
     storage: OptionalStorage,
+    service: OptionalDeployService,
 ) -> AdminAppStatusResponse:
-    """Pin EXACTLY the submission the admin reviewed: the request carries the
-    reviewed submission id, and the guarded UPDATE adds it as a predicate — a
-    re-submit between review and this click updates zero rows → 409."""
+    """Approve EXACTLY the submission the admin reviewed, and publish it: the request carries
+    the reviewed submission id, and the guarded UPDATE adds it as a predicate — a re-submit
+    between review and this click updates zero rows → 409. The approval stands even when
+    publishing cannot start; the owner is then offered Try again."""
     app = await _get_app_or_404(db, app_id)
     # Load-bearing PENDING-only pre-check — the mirror image of `enable`'s
     # DISABLED-only guard: →approved also permits DISABLED, and a kill-switched
@@ -529,39 +518,28 @@ async def approve(
         raise AppApiError(409, _SUBMISSION_WITHDRAWN, code=_WITHDRAWN_CODE)
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be approved.")
-    # The runbook lineage gets no new approvals, by cutover design. This item was in the
-    # queue before the publish flow became the only route in — approving it would grant
-    # nothing the citizen can use (the gate's self-publish rule needs the self_publish
-    # lineage), wasting the admin's decision and looping the citizen back here for a
-    # second one. A pre-check with NO atomic-guard twin, deliberately: unlike the
-    # re-submit race below, `runbook` has no runtime writer (the 0030 backfill wrote it
-    # once, in the migration; the publish flow only ever writes `self_publish`), so the
-    # value read here cannot move under us. NULL passes — an interim row submitted
-    # before the publish-flow writer lands keeps today's behaviour.
-    if app.approval_route is ApprovalRoute.RUNBOOK:
-        raise AppApiError(409, _RUNBOOK_ITEM_MUST_RESUBMIT)
     # Captured BEFORE any commit (never read ORM attributes across one). If a
     # re-submit lands after this read, the guarded UPDATE below refuses — and
     # submission ids are never reused, so on success this SHA belongs to the
-    # reviewed submission. The owner id travels the same way, for the
-    # self-approval check at the audit call below.
+    # reviewed submission.
     commit_sha = app.source_commit_sha
-    app_user_id = app.user_id
+    owner_id = app.user_id
+    project_id = app.project_id
 
     # Verify the reviewed artifact still exists before pinning it, so an app can never reach
-    # APPROVED with a bundle that 404s at runbook time. Fail closed: a storage ERROR is
+    # APPROVED with a bundle that 404s when it is published. Fail closed: a storage ERROR is
     # ambiguity, not absence (503, not 409), and an UNCONFIGURED store is the same ambiguity —
     # with nothing to verify against, approving would pin an artifact nobody checked.
     if storage is None:
         raise AppApiError(503, "Storage is temporarily unavailable. Please try again.")
+    bundle_key = submission_key(app_id, body.submission_id)
     try:
-        artifact = await storage.head(submission_key(app_id, body.submission_id))
+        artifact = await storage.head(bundle_key)
     except StorageError as exc:
         raise AppApiError(503, "Storage is temporarily unavailable. Please try again.") from exc
     if artifact is None:
         raise AppApiError(409, "The reviewed submission's artifact is missing — re-review.")
 
-    now = datetime.now(UTC)
     moved = await _transition(
         db,
         app_id,
@@ -576,7 +554,9 @@ async def approve(
         approved_submission_id=body.submission_id,
         approved_commit_sha=commit_sha,
         approved_by=admin.id,
-        approved_at=now,
+        # The transaction's own clock, which the claim below stamps on the deployment it
+        # starts: the owner's status reads that attempt as the one made since approval.
+        approved_at=sa.func.now(),
         # Lifting the standing rejection is an ADMINISTRATOR'S act and this is the only
         # place it happens. An approval is exactly the "an administrator lifts it"
         # half of the rule, so it clears unconditionally rather than only when raised.
@@ -586,6 +566,29 @@ async def approve(
         raise AppApiError(
             409, "This app was re-submitted since you reviewed it — please re-review."
         )
+
+    # The claim commits, and the approval with it, whether or not a slot was free; the task
+    # is detached in the same call that claims, so a claimed row always has a pipeline to
+    # settle it. The owner's app, the owner's project, no conversation — as a restart runs.
+    publishing: dict[str, str] = {"publishing": "not_started"}
+    if service is None:
+        publishing["reason"] = "publishing_unavailable"
+    else:
+        try:
+            started = await service.start(
+                db,
+                user_id=owner_id,
+                app_id=app_id,
+                project_id=project_id,
+                conversation_id=None,
+                expected_commit_sha=commit_sha,
+                bundle_key=bundle_key,
+            )
+        except DeployNotPossibleError as exc:
+            publishing["reason"] = exc.code
+        else:
+            publishing = {"publishing": "started", "deploymentId": str(started.deployment_id)}
+
     # A SUPERADMIN APPROVING THEIR OWN APP IS RECORDED DISTINGUISHABLY, not
     # forbidden. RBAC has two computed roles and no concept of a second approver, and
     # the missing separation of duties is already an accepted risk — so
@@ -595,16 +598,17 @@ async def approve(
     # `config:loginRequired`) and the vocabulary is deliberately open, so no
     # migration is involved. Both rows carry identical detail: only the action word
     # differs, which is exactly what makes "list every self-approval" one predicate.
-    self_approved = app_user_id == admin.id
+    self_approved = owner_id == admin.id
     await append_audit(
         db,
         actor_id=admin.id,
         action="approve:self" if self_approved else "approve",
         resource_type="app",
         resource_id=str(app_id),
-        detail={"submissionId": str(body.submission_id), "commitSha": commit_sha},
+        detail={"submissionId": str(body.submission_id), "commitSha": commit_sha, **publishing},
     )
     await db.commit()
+    _log.info("app_approved", app_id=str(app_id), **publishing)
     return AdminAppStatusResponse(app_id=app_id, status=AppStatus.APPROVED)
 
 
@@ -624,6 +628,7 @@ async def reject(
         raise AppApiError(409, _SUBMISSION_WITHDRAWN, code=_WITHDRAWN_CODE)
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be rejected.")
+    submission_id = app.source_submission_id
     # Both ends are enforced by `RejectRequest.note` (422 at the boundary) — no silent
     # slice here, and no `or ""` either: the note is required and non-blank, so
     # the citizen can never be handed a rejection with nothing in it.
@@ -652,8 +657,14 @@ async def reject(
     )
     if not moved:
         raise AppApiError(409, "Could not reject in the current state.")
+    # The administrator's own words about the decision, which History shows beside it.
     await append_audit(
-        db, actor_id=admin.id, action="reject", resource_type="app", resource_id=str(app_id)
+        db,
+        actor_id=admin.id,
+        action="reject",
+        resource_type="app",
+        resource_id=str(app_id),
+        detail={"submissionId": str(submission_id), "note": body.note},
     )
     await db.commit()
     return AdminAppStatusResponse(app_id=app_id, status=AppStatus.REJECTED)
@@ -694,7 +705,10 @@ async def patch_app(
             .where(AppRegistry.id == app_id)
         )
     ).one()
-    return _project(app, project_name, owner_email)
+    newest, live = await _publish_facts(db, [app_id])
+    return _project(
+        app, project_name, owner_email, newest=newest.get(app_id), live=live.get(app_id)
+    )
 
 
 @router.post(
@@ -719,7 +733,7 @@ async def disable(
     PENDING stays out: an app waiting for review is REJECTED, not switched off, and the copy
     below says so rather than leaving the administrator to guess which lever they wanted.
 
-    NOT severed here, deliberately and per the runbook: the app's deploy Blob SAS (see
+    NOT severed here, deliberately: the app's deploy Blob SAS (see
     `mint_deploy_credential`). Revoking that means deleting the container's stored access
     policy, which is an operator step — do not read this response as "the files are locked"."""
     # The sever, not merely the status, because the shared-table plane and its per-request
@@ -970,13 +984,12 @@ async def mint_deploy_credential(
     db: DbSession,
     container_store: ContainerStore,
 ) -> DeployCredentialResponse:
-    """Mint the deployed app's long-lived, container-scoped Blob credential — the runbook's
-    step-5 `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS` pair.
+    """Mint the deployed app's long-lived, container-scoped Blob credential — the
+    `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS` pair.
 
     Deliberately independent: the credential reaches the app's own container DIRECTLY, so a
     deployed app never proxies file traffic through the control-plane. That independence cuts
-    both ways and the runbook says so — `disable` kill-switches the DATA plane but does NOT
-    revoke this SAS."""
+    both ways — `disable` kill-switches the DATA plane but does NOT revoke this SAS."""
     # Like `bundle-url`, the minted token is a bearer credential: audited as an EVENT (who,
     # which app, when it dies) with the SAS value itself never logged and never in the audit
     # `detail`. Not part of any list projection — a mint is always an explicit, recorded act.
@@ -1025,16 +1038,15 @@ async def mint_deploy_credential(
 async def reveal_database_credential(
     app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
 ) -> DatabaseCredentialResponse:
-    """Reveal the project database's connection string — the go-live runbook's
+    """Reveal the project database's connection string — the deployed app's
     `BIAL_DATABASE_URL`, byte-for-byte the value the sandbox is injected with.
 
     There is no rotation lever here on purpose: one role serves both the sandbox and the
     deployed container, so a reset would cut a live deployment off. Leak response is a
     deliberate, separate operator story."""
-    # The database is keyed by PROJECT while this router is keyed by app, and that is fine
-    # rather than merely tolerable: the runbook only ever reveals for an APPROVED app, so an app
-    # row always exists and `app.project_id` is the resolution. The audit row is project-scoped
-    # and carries `appId` so it still shows up in the app's trail.
+    # The database is keyed by PROJECT while this router is keyed by app, so `app.project_id`
+    # is the resolution. The audit row is project-scoped and carries `appId` so it still shows
+    # up in the app's trail.
     #
     # Modelled on `mint_deploy_credential`, including the parts that are security decisions
     # rather than style: the secret is returned in the RESPONSE BODY ONLY, it is never part of
@@ -1087,106 +1099,6 @@ def _dsn_host(dsn: str) -> str:
     return f"{host}:{url.port}" if url.port else host
 
 
-@router.post(
-    "/{app_id}/mark-deployed",
-    responses=error_responses(
-        (404, ErrorEnvelope, "App not found"),
-        (
-            409,
-            ErrorEnvelope,
-            "Not approved, or a self-published app with no runbook deployment to record",
-        ),
-        *_ADMIN_AUTH,
-    ),
-)
-async def mark_deployed(
-    app_id: uuid.UUID,
-    admin: CurrentSuperadmin,
-    db: DbSession,
-    body: MarkDeployedRequest | None = None,
-) -> MarkDeployedResponse:
-    """Record that a human ran the go-live runbook for the approved pin, and — optionally —
-    WHERE the app now lives.
-
-    A MARKER, not a status: `STATUS_TRANSITIONS` is untouched. The URL is DATA, not automation:
-    whatever the runbook operator pastes is what the owner's Live link points at — the platform
-    never derives, probes, or verifies it. The body (and the field) stay optional, so a bare
-    `{}` still marks a deploy."""
-    # Still a guarded UPDATE, so a marker can never attach to an unapproved app, and it pins the
-    # approved submission ATOMICALLY (`deployed := approved` inside the UPDATE, so a racing
-    # re-approval cannot tear the pair). `redeploy_needed` derives as
-    # `approved_submission_id != deployed_submission_id` in the projection.
-    #
-    # `.returning()` gives the stamped values as detached scalars: nothing ORM-shaped crosses the
-    # `commit()` below, so nothing has to be re-fetched from an expired instance afterwards.
-    app = await _get_app_or_404(db, app_id)
-    # A self-published app has NO runbook step: its owner publishes the
-    # approved version themselves, so a marker here would record a deployment nobody
-    # performed — and `deployed := approved` would then read as redeploy-not-needed on
-    # a runbook nobody is meant to run. Refuse with copy naming the lineage; the
-    # guarded UPDATE below carries the atomic twin.
-    if app.approval_route is ApprovalRoute.SELF_PUBLISH:
-        raise AppApiError(409, _SELF_PUBLISHED_HAS_NO_RUNBOOK)
-    recorded_url = None if body is None else body.deployed_url
-    stamped_values: dict[str, Any] = {
-        "deployed_submission_id": AppRegistry.approved_submission_id,
-        "deployed_at": sa.func.now(),
-    }
-    # Absent URL => leave the column alone (see `MarkDeployedRequest`), which is why
-    # this is a conditional key and not `deployed_url=recorded_url`: the latter would
-    # blank the live link on every URL-less re-mark.
-    if recorded_url is not None:
-        stamped_values["deployed_url"] = str(recorded_url)
-    stamped = (
-        await db.execute(
-            sa.update(AppRegistry)
-            .where(
-                AppRegistry.id == app_id,
-                AppRegistry.status == AppStatus.APPROVED,
-                # Belt over braces: approve is the only path to APPROVED and always
-                # pins, but a marker referencing NO submission would be a lie.
-                AppRegistry.approved_submission_id.is_not(None),
-                # The lineage pre-check's atomic twin. Reachable only through a
-                # double race (a re-submit through the publish flow AND a re-approval,
-                # both between our read and this UPDATE), but the cost of a miss is a
-                # recorded deployment nobody performed — belt over braces again.
-                # IS DISTINCT FROM, not !=: a NULL lineage must pass.
-                AppRegistry.approval_route.is_distinct_from(ApprovalRoute.SELF_PUBLISH),
-            )
-            .values(**stamped_values)
-            .returning(
-                AppRegistry.deployed_submission_id,
-                AppRegistry.deployed_at,
-                AppRegistry.deployed_url,
-                AppRegistry.approved_commit_sha,
-            )
-        )
-    ).first()
-    if stamped is None:
-        raise AppApiError(409, "Only an approved app can be marked deployed.")
-    await append_audit(
-        db,
-        actor_id=admin.id,
-        action="mark-deployed",
-        resource_type="app",
-        resource_id=str(app_id),
-        detail={
-            "submissionId": str(stamped.deployed_submission_id),
-            "commitSha": stamped.approved_commit_sha,
-            # The app's public address — not a credential (unlike the SAS its
-            # `deploy-credential` sibling deliberately keeps out of the trail).
-            "deployedUrl": stamped.deployed_url,
-        },
-    )
-    await db.commit()
-    return MarkDeployedResponse(
-        app_id=app_id,
-        deployed_submission_id=stamped.deployed_submission_id,
-        deployed_at=stamped.deployed_at,
-        deployed_url=stamped.deployed_url,
-    )
-
-
 @router.delete(
     "/{app_id}",
     status_code=status.HTTP_200_OK,
@@ -1208,12 +1120,11 @@ async def hard_delete(
     storage-unavailable copy to answer with. Storage missing here is a deploy bug, and a 500 is
     the honest answer to one; inventing a 503 would be inventing a contract.
 
-    IT REQUIRES A REASON, in 5-50 words. Destroying somebody else's work with no undo is the
-    harshest lever on this router and was the only one that asked for nothing — the browser
-    `window.confirm` behind it could not have collected an answer if it wanted to. The reason
-    rides the `app:delete` row below, which is written before destruction and has no foreign key
-    to the app, so it is still readable by app id long after the app is gone (`read_audit` says
-    so outright: no existence pre-check)."""
+    IT REQUIRES A REASON, within the delete-reason word bound. Destroying somebody else's work with
+    no undo is the harshest lever on this router and was the only one that asked for nothing — the
+    browser `window.confirm` behind it could not have collected an answer if it wanted to. The
+    reason rides the `app:delete` row below, which is written before destruction and has no foreign
+    key to the app, so it is still readable by app id long after the app is gone."""
     # Contrast `approve` / `bundle-url` / `reconcile-storage` above, which all promise a 503 and
     # so must take `OptionalStorage`.
     #
@@ -1688,45 +1599,22 @@ async def reconcile_deploys(admin: CurrentSuperadmin, db: DbSession) -> DeployRe
 
 
 @router.get(
-    "/{app_id}/audit",
-    # No 404: read_audit queries the audit log directly (no app existence pre-check),
-    # so an unknown app id returns an empty event list (documented as-is).
-    responses=error_responses(*_ADMIN_AUTH),
+    "/{app_id}/history",
+    responses=error_responses((404, ErrorEnvelope, "App not found"), *_ADMIN_AUTH),
 )
-async def read_audit(
+async def read_history(
     app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
-) -> AuditListResponse:
-    app_str = str(app_id)
-    rows = (
-        await db.execute(
-            sa.select(AuditLog, User.email)
-            .outerjoin(User, AuditLog.actor_id == User.id)
-            .where(
-                sa.or_(
-                    AuditLog.resource_id == app_str,
-                    AuditLog.detail["appId"].astext == app_str,
-                )
-            )
-            .order_by(AuditLog.created_at.desc())
-            .limit(200)
-        )
-    ).all()
-    return AuditListResponse(
-        events=[
-            AuditEventOut(
-                id=row.id,
-                actor_id=row.actor_id,
-                username=email,
-                action=row.action,
-                resource_type=row.resource_type,
-                resource_id=row.resource_id,
-                detail=row.detail,
-                count=row.detail.get("count") if isinstance(row.detail, dict) else None,
-                created_at=row.created_at,
-            )
-            for row, email in rows
-        ]
-    )
+) -> AppHistoryResponse:
+    """The app's History, newest first: one numbered version per time its owner sent it for
+    publishing, each with its own decision and publish attempts, and the app's other events
+    between them by date. Read from the audit trail and deploy attempts only, up to a cap that
+    `truncated` reports."""
+    app = await _get_app_or_404(db, app_id)
+    # A disabled app has lost its data, so nothing it serves counts as a version, as in the list.
+    serving = None
+    if app.status is not AppStatus.DISABLED:
+        serving = (await _serving(db, [app_id])).get(app_id)
+    return await app_history(db, app, serving)
 
 
 # ==============================================================================

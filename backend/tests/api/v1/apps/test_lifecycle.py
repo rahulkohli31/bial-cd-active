@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import uuid
 
-import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
-from src.db.models.app_registry import AppRegistry, ApprovalRoute
+from src.db.models.app_registry import AppRegistry
 from src.main import create_app
 from src.services.approvals.submit import submit_app_for_review
 from src.services.auth.session_jwt import mint_session_jwt
@@ -59,7 +58,6 @@ async def _submit_via_service(db_session, user, app_id: str):
         user_id=user.id,
         app=app_row,
         declaration={"citizen": {}, "review": {}, "differences": [], "explanation": ""},
-        route=ApprovalRoute.SELF_PUBLISH,
     )
     await db_session.commit()
     return receipt
@@ -78,46 +76,16 @@ async def test_status_surfaces_submission_metadata(client, db_session) -> None:
     assert body["submittedAt"] is not None
 
 
-async def test_status_surfaces_the_deployed_url_and_marker(client, db_session) -> None:
-    """Owner side of the deploy marker: once an admin records the deploy, the owner's
-    status read carries `deployedAt` + `deployedUrl`. The citizen route never writes
-    them, it projects them."""
+async def test_the_owner_status_read_carries_no_hand_recorded_deployment(
+    client, db_session
+) -> None:
     user, headers = await _auth_user(db_session, email="liveowner@rvaiglobal.com")
     app_id = await _provision_app(db_session, user)
 
-    fresh_read = await client.get(f"/v1/apps/{app_id}/status", headers=headers)
-    assert fresh_read.json()["deployedAt"] is None
-    assert fresh_read.json()["deployedUrl"] is None
-
-    # The admin's mark-deployed, simulated at the row (the endpoint itself is proven
-    # in the admin governance suite — this asserts the OWNER's projection of it).
-    live_url = "https://apps.bial.example.com/gate-ops"
-    await db_session.execute(
-        sa.update(AppRegistry)
-        .where(AppRegistry.id == uuid.UUID(app_id))
-        .values(deployed_at=sa.func.now(), deployed_url=live_url)
-    )
-    await db_session.flush()
-
     body = (await client.get(f"/v1/apps/{app_id}/status", headers=headers)).json()
-    assert body["deployedUrl"] == live_url
-    assert body["deployedAt"] is not None
 
-
-async def test_deployed_url_does_not_leak_across_users(client, db_session) -> None:
-    owner, _owner_headers = await _auth_user(db_session, email="liveowner2@rvaiglobal.com")
-    app_id = await _provision_app(db_session, owner)
-    await db_session.execute(
-        sa.update(AppRegistry)
-        .where(AppRegistry.id == uuid.UUID(app_id))
-        .values(deployed_at=sa.func.now(), deployed_url="https://apps.bial.example.com/secret-ops")
-    )
-    await db_session.flush()
-
-    _, stranger_headers = await _auth_user(db_session, email="livestranger@rvaiglobal.com")
-    denied = await client.get(f"/v1/apps/{app_id}/status", headers=stranger_headers)
-    assert denied.status_code == 404
-    assert denied.json() == {"error": {"message": "App not found."}}
+    assert body["appId"] == app_id
+    assert not {"deployedAt", "deployedUrl"} & set(body)
 
 
 async def test_status_read_is_owner_scoped(client, db_session) -> None:

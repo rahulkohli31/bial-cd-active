@@ -13,7 +13,7 @@ every query over a project is scoped by the owning `user_id`, and a project and 
 children must share that `user_id` (a user cannot file work under another user's
 project). There is NO `org_id` — the user IS the isolation boundary.
 
-`description` is REQUIRED ON CREATE and word-bounded (15-120 words, #191), and doubles as
+`description` is REQUIRED ON CREATE and word-bounded (#191), and doubles as
 shared grounding injected into every chat in the project (R16, U8) and as the marketplace's
 listing/search text (#145). NULL is still a legal column value — a project created before
 #191 keeps working with none, and the rule is enforced at the Pydantic write boundary
@@ -58,7 +58,7 @@ MAX_PROJECT_DESCRIPTION = 2000
 # a long multi-topic description embeds to a vector that matches everything weakly, and
 # `ts_rank_cd` has no document-length normalisation, so a rambling description can out-rank
 # a precise one purely by containing more terms.
-MIN_PROJECT_DESCRIPTION_WORDS = 15
+MIN_PROJECT_DESCRIPTION_WORDS = 5
 MAX_PROJECT_DESCRIPTION_WORDS = 120
 # The marketplace's search text configuration (#145, migration 0034), named ONCE here —
 # where the generated column it must match lives — and imported by the marketplace router

@@ -1,26 +1,20 @@
-"""The citizen's connectors: what the registry offers, where they stand, what each project reads.
+"""What each project reads from the connector catalogue: the switch, and the days.
 
-TWO ROUTERS, TWO MOUNT POINTS, ONE DOMAIN. `router` hangs off `/v1/connectors` and answers for
-the PERSON — the catalogue, their state, asking, and withdrawing the ask. `project_router` hangs
-off `/v1/projects/{project_id}/connectors` and answers for the PROJECT — which connectors it
-reads and over which days. `ConnectorStates` draws the two as separate state machines and says
-why: an administrator answers once, about a person, and after that a project only ever answers
-"switched on here?" and "how far back?".
+Hangs off `/v1/projects/{project_id}/connectors`. The project's switch alone decides whether it
+reads a connector — nobody else is asked — and a change reaches the app the next time its
+container starts.
 
 THE OWNERSHIP CHECK A REVIEWER SHOULD BE ABLE TO MAKE BY READING TOP TO BOTTOM. There is no
-cross-user read among these five routes. Every statement that touches `connector_access_requests`
-carries `user_id == user.id` in its WHERE clause, and every statement that touches
-`project_connectors` reaches it through a join on `projects` whose `user_id` predicate is in the
-same clause (that table deliberately carries no `user_id` of its own — `projects` is its
-ownership anchor). The only rows-free read is the registry itself, which is a module constant,
-identical for everybody, and holds no user data.
+cross-user read among these routes. `project_connectors` deliberately carries no `user_id` of its
+own — `projects` is its ownership anchor — so every statement reaches it through a join on
+`projects` whose `user_id` predicate sits in the same WHERE clause, and both routes prove
+ownership with a `SELECT ... WHERE id = :id AND user_id = :me` before they read or write anything.
+A project somebody else owns and a project that does not exist get the SAME 404: a 403 would
+confirm the row exists, which is precisely the probe the 404 refuses to answer.
 
-NO WRITE HERE IS AUDITED, and that is a decision rather than an omission. The
-citizen is acting on their OWN row: an audit entry would carry the same actor and the same
-timestamp `connector_access_requests` already holds, so it would be a second copy of the row it
-describes. The project switch is the same argument — `project_connectors` is its own record of
-who set what, and `updated_at` dates it. Approve and decline — one person acting on another — DO
-write one, in `src/api/v1/admin/connectors.py`.
+NO WRITE HERE IS AUDITED, and that is a decision rather than an omission. The citizen is acting
+on their OWN project, and `project_connectors` is its own record of what was set — `updated_at`
+dates it — so an audit entry would be a second copy of the row it describes.
 
 Errors use the data-plane `{"error": {"message", "code"}}` envelope (`AppApiError`), not the auth
 endpoints' `{"detail": ...}`; the SPA already branches on `error.code`.
@@ -43,12 +37,7 @@ from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
 from src.api.v1.connectors.schemas import (
     AbsoluteWindowChoice,
-    AccessRequestBody,
-    ConnectorEntry,
-    ConnectorListResponse,
-    ConnectorOnProject,
     ConnectorWindow,
-    ConsentLine,
     ProjectConnectorEntry,
     ProjectConnectorListResponse,
     ProjectConnectorUpdate,
@@ -58,7 +47,6 @@ from src.api.v1.connectors.schemas import (
 from src.api.v1.live_build import the_live_session_is_this_app
 from src.core.connectors import CONNECTORS, Connector, resolve_window
 from src.core.errors import AppApiError
-from src.db.models.connector_access import ConnectorAccessRequest, ConnectorRequestStatus
 from src.db.models.project import Project
 from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
 from src.schemas import AUTH_401, ErrorEnvelope, error_responses
@@ -69,17 +57,14 @@ from src.services.build_sessions.locks import (
     read_starting_marker,
 )
 from src.services.build_sessions.manager import existing_app_id
-from src.services.connectors import ConnectorPersonState, PersonAccess, current_access
 from src.services.redis import get_redis
 from src.services.redis.client import RedisNotConfiguredError
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
 
-router = APIRouter(prefix="/connectors", tags=["connectors"])
+router = APIRouter(prefix="/projects/{project_id}/connectors", tags=["connectors"])
 
 _NO_SUCH_CONNECTOR = "That connector is not available."
-_ALREADY_ASKED = "You have already asked for access to this. An administrator is looking at it."
-_ALREADY_DECIDED = "An administrator has already answered this request."
-_NOTHING_TO_CANCEL = "There is no waiting request to cancel."
+_PROJECT_NOT_FOUND = "Application not found."
 
 # A CONTAINER RECEIVES ITS ENVIRONMENT EXACTLY ONCE, AT BIRTH, so a connector switched on
 # while a build or a conversation is running would leave the rail saying "on" over a container
@@ -106,11 +91,6 @@ _SESSION_IS_LIVE = (
 # about what is stored; what the lock prevents is the state where a citizen watches a running
 # build and is told it is reading data it demonstrably cannot reach.
 
-# A state that must have a row behind it arrived without one. Unreachable while `current_access`
-# is the only producer of a `PersonAccess`; raised rather than papered over because the
-# alternative is an entry that claims `approved` and renders a blank date and a blank name.
-_STATE_WITHOUT_ITS_ROW = "a decided connector state arrived with no request row behind it"
-
 
 def _known_connector(connector_key: str) -> Connector:
     """The registry is the catalogue — there is no `connectors` table, so an unknown key is
@@ -121,295 +101,10 @@ def _known_connector(connector_key: str) -> Connector:
     return CONNECTORS[connector_key]
 
 
-# HOW MANY OF THEM THE DISCLOSURE WILL ACTUALLY DRAW. Nothing about the switch bounds this:
-# one row per project a person has turned the connector on for, in a response that is otherwise
-# a fixed handful of registry strings. The number on the card is a COUNT rather than this list's
-# length, so the cap shortens the list without ever making the card lie about the total — and a
-# client that receives fewer rows than the count can say so.
-_ON_PROJECTS_CAP: Final = 200
-
-
-async def _on_projects(
-    db: DbSession, user_id: uuid.UUID, connector_key: str
-) -> list[ConnectorOnProject]:
-    """This person's projects with the connector switched on — the Integrations card's
-    disclosure, capped at `_ON_PROJECTS_CAP`. The number on the card is `_on_project_count`.
-
-    Scoped through `projects`, which is `project_connectors`' ownership anchor: the `user_id`
-    predicate is on the join target, and dropping it would list every citizen's projects.
-
-    THE FILTER IS `enabled` AND DELIBERATELY NOT EFFECTIVE STATE. Effective on is
-    `enabled AND the owner is approved` (`core.connectors.resolve_window`); folding approval in
-    here would make a withdrawn grant silently empty this list while the projects it named still
-    read the connector's switch as up. The card's `state` is the one place the person-level fact
-    is stated, so the rows stay and say what they are.
-
-    Newest project first — `id` is a UUIDv7 — the order the projects listing uses, so the same
-    projects do not reshuffle between screens."""
-    rows = await db.execute(
-        sa.select(Project.id, Project.name)
-        .join(ProjectConnector, ProjectConnector.project_id == Project.id)
-        .where(
-            Project.user_id == user_id,
-            ProjectConnector.connector_key == connector_key,
-            ProjectConnector.enabled.is_(True),
-        )
-        .order_by(Project.id.desc())
-        .limit(_ON_PROJECTS_CAP)
-    )
-    return [
-        ConnectorOnProject(project_id=project_id, name=name) for project_id, name in rows.all()
-    ]
-
-
-async def _on_project_count(db: DbSession, user_id: uuid.UUID, connector_key: str) -> int:
-    """How many there are, which is NOT the length of the list above once the cap bites.
-
-    Read only where it is sent — an approved person — because it is the only state whose card
-    carries the number."""
-    total = await db.scalar(
-        sa.select(sa.func.count())
-        .select_from(Project)
-        .join(ProjectConnector, ProjectConnector.project_id == Project.id)
-        .where(
-            Project.user_id == user_id,
-            ProjectConnector.connector_key == connector_key,
-            ProjectConnector.enabled.is_(True),
-        )
-    )
-    return int(total or 0)
-
-
-def _consent_lines(connector: Connector) -> list[ConsentLine]:
-    """The registry's requester consent tuple, as wire objects, in board order.
-
-    A COPY OF THE ORDER AND NOTHING ELSE. No filtering, no joining, no re-voicing: the panel that
-    renders these is a renderer, and the sentences are binding consent copy pinned byte-exact
-    in `tests/db/test_connector_models.py`. The approver's set stays where it is — it is third
-    person and it names the day cap, and it belongs to the admin queue, not to this list."""
-    return [
-        ConsentLine(lead=line.lead, body=line.body) for line in connector.consent_lines_requester
-    ]
-
-
-async def _entry(
-    db: DbSession, user_id: uuid.UUID, connector_key: str, connector: Connector
-) -> ConnectorEntry:
-    """One connector as this person sees it — the ONE place an entry is assembled.
-
-    Both writes report their result through this rather than asserting the state they intended:
-    the answer is a derivation over the person's remaining rows (`current_access`), and a route
-    hard-coding `pending` after an insert or `neverAsked` after a cancel would be a second copy
-    of that rule, correct only for as long as nobody adds a fifth status."""
-    access = await current_access(db, user_id=user_id, connector_key=connector_key)
-    state = access.state
-    # Read in every state, because it is a fact about the projects rather than about the person
-    # — see `ConnectorEntry.on_projects`. Only the COUNT beside it is state-conditional.
-    on_projects = await _on_projects(db, user_id, connector_key)
-    if state is ConnectorPersonState.NEVER_ASKED:
-        return ConnectorEntry(
-            key=connector_key,
-            display_name=connector.display_name,
-            subtitle=connector.subtitle,
-            ask_subtitle=connector.ask_subtitle,
-            consent_lines_requester=_consent_lines(connector),
-            state=state,
-            on_projects=on_projects,
-        )
-
-    row = access.request
-    if row is None:
-        raise ValueError(_STATE_WITHOUT_ITS_ROW)
-
-    asked_at = row.created_at if state is ConnectorPersonState.PENDING else None
-    approved = state is ConnectorPersonState.APPROVED
-    declined = state is ConnectorPersonState.DECLINED
-    return ConnectorEntry(
-        key=connector_key,
-        display_name=connector.display_name,
-        subtitle=connector.subtitle,
-        # Registry facts, identical in all four states — see `ConnectorEntry`'s docblock for why
-        # they are NOT narrowed to the state the ask panel happens to be reachable from.
-        ask_subtitle=connector.ask_subtitle,
-        consent_lines_requester=_consent_lines(connector),
-        state=state,
-        asked_at=asked_at,
-        approved_at=row.decided_at if approved else None,
-        approved_by_name=access.decided_by_name if approved else None,
-        on_projects=on_projects,
-        on_project_count=(
-            await _on_project_count(db, user_id, connector_key) if approved else None
-        ),
-        decided_at=row.decided_at if declined else None,
-        decided_by_name=access.decided_by_name if declined else None,
-        decision_remarks=row.decision_remarks if declined else None,
-    )
-
-
-@router.get("", responses=error_responses(AUTH_401))
-async def list_connectors(user: CurrentUser, db: DbSession) -> ConnectorListResponse:
-    """Every system this platform can connect to, and where you stand with each one.
-
-    One entry per catalogue connector, always — a connector you have never asked about is
-    present with the state `neverAsked`, because this list is the whole of what Integrations
-    offers, not a list of your grants. Each entry carries only the fields its own state needs:
-    `askedAt` while you wait, `approvedAt` / `approvedByName` / `onProjectCount` once an
-    administrator has said yes, and `decidedAt` / `decidedByName` / `decisionRemarks` if they
-    said no. Access is granted to a PERSON, so one answer covers every project you own,
-    including the ones you have not made yet.
-
-    `onProjects` rides this same read rather than a second route — a card and its disclosure are
-    one round trip, and there is no second endpoint to keep in step. It names the projects with
-    the connector switched on, and that is ALL it names: no record counts, no last-read dates,
-    no windows. This read says who may reach the data, never what was read or for how long."""
-    return ConnectorListResponse(
-        connectors=[
-            await _entry(db, user.id, key, connector) for key, connector in CONNECTORS.items()
-        ]
-    )
-
-
-@router.post(
-    "/{connector_key}/request",
-    status_code=status.HTTP_201_CREATED,
-    dependencies=[RequireCsrf],
-    responses=error_responses(
-        AUTH_401,
-        (403, ErrorEnvelope, "CSRF check failed"),
-        (404, ErrorEnvelope, "No such connector"),
-        (409, ErrorEnvelope, "Already waiting on an administrator, or already answered"),
-    ),
-)
-async def request_access(
-    connector_key: str, body: AccessRequestBody, user: CurrentUser, db: DbSession
-) -> ConnectorEntry:
-    """Ask an administrator for access to a connector, for yourself.
-
-    `remarks` is required and is the whole of what the administrator has to go on: 5 to 50 words,
-    the same rule the platform applies to every reason it asks you to state.
-
-    Refused with `409 already_pending` if you are already waiting on an administrator, and with
-    `409 already_decided` if one has already answered — a decline is FINAL for now, and an
-    approval you already hold is not improved by asking again. Returns the connector in its new
-    state."""
-    connector = _known_connector(connector_key)
-
-    # THE HONEST-COPY PRE-CHECK; the insert below is the real gate for the pending case.
-    # `approved` is refused for a reason beyond tidiness: a second pending row would become the
-    # most recent non-cancelled row, so the person's state would fall back to `pending` and the
-    # resolver would switch their connector OFF in every project until an administrator acted.
-    access = await current_access(db, user_id=user.id, connector_key=connector_key)
-    if access.state in (ConnectorPersonState.APPROVED, ConnectorPersonState.DECLINED):
-        raise AppApiError(status.HTTP_409_CONFLICT, _ALREADY_DECIDED, code="already_decided")
-    if access.state is ConnectorPersonState.PENDING:
-        raise AppApiError(status.HTTP_409_CONFLICT, _ALREADY_ASKED, code="already_pending")
-
-    # ON CONFLICT DO NOTHING, INFERRED AGAINST THE PARTIAL PENDING INDEX. A plain
-    # check-then-insert loses the race that the portal makes ordinary rather than exotic:
-    # `ComposerBox.tsx` records that `aria-disabled` "says so; it does not do so", so `Ask an
-    # administrator` stays clickable while the first request is in flight, both clicks clear the
-    # pre-check above, and the second violates `uq_connector_access_requests_one_pending` — a 500
-    # where this route promises a 409.
-    #
-    # `index_elements` + `index_where` rather than `constraint=`: a PARTIAL index cannot be named
-    # as an `ON CONSTRAINT` target. The predicate stays the LITERAL `status = 'pending'` the
-    # model's `postgresql_where` uses — written as a bound parameter it would stop matching the
-    # index from the sixth execution on a pooled connection, once Postgres switches to a generic
-    # plan.
-    inserted = await db.execute(
-        pg_insert(ConnectorAccessRequest)
-        .values(
-            user_id=user.id,
-            connector_key=connector_key,
-            status=ConnectorRequestStatus.PENDING,
-            requester_remarks=body.remarks,
-        )
-        .on_conflict_do_nothing(
-            index_elements=["user_id", "connector_key"],
-            index_where=sa.text("status = 'pending'"),
-        )
-        .returning(ConnectorAccessRequest.id)
-    )
-    if inserted.first() is None:
-        # The citizen's other click landed between the pre-check and here — same person, two
-        # requests in flight. Same refusal and same code as the pre-check: they asked twice and
-        # are waiting once, which is the outcome they wanted.
-        raise AppApiError(status.HTTP_409_CONFLICT, _ALREADY_ASKED, code="already_pending")
-
-    await db.commit()
-    return await _entry(db, user.id, connector_key, connector)
-
-
-@router.post(
-    "/{connector_key}/cancel",
-    dependencies=[RequireCsrf],
-    responses=error_responses(
-        AUTH_401,
-        (403, ErrorEnvelope, "CSRF check failed"),
-        (404, ErrorEnvelope, "No such connector"),
-        (409, ErrorEnvelope, "Nothing is waiting on an administrator"),
-    ),
-)
-async def cancel_access_request(
-    connector_key: str, user: CurrentUser, db: DbSession
-) -> ConnectorEntry:
-    """Withdraw your own waiting request for a connector.
-
-    Only a request that is still waiting can be withdrawn — one an administrator has already
-    answered is refused with `409 nothing_pending`, never silently accepted. Cancelling leaves
-    the row as history and returns you to `neverAsked`, free to ask again. Returns the connector
-    in its new state."""
-    connector = _known_connector(connector_key)
-
-    # THE GUARDED UPDATE IS THE WHOLE GATE — no pre-check, no read-then-write. Zero rows means
-    # there was nothing pending (or an administrator decided it a moment ago), and that is a
-    # refusal rather than a no-op: a `Cancel` that reports success while the request sails on
-    # into the queue is the one outcome worse than an error. `user_id` is in the predicate, so a
-    # crafted request naming somebody else's connector cancels nothing.
-    #
-    # ADR-0008: both status values go through the mapped ORM column, which types the binds as the
-    # native enum — asyncpg will not cast `varchar` to an enum implicitly.
-    cancelled = await db.execute(
-        sa.update(ConnectorAccessRequest)
-        .where(
-            ConnectorAccessRequest.user_id == user.id,
-            ConnectorAccessRequest.connector_key == connector_key,
-            ConnectorAccessRequest.status == ConnectorRequestStatus.PENDING,
-        )
-        .values(status=ConnectorRequestStatus.CANCELLED)
-        .returning(ConnectorAccessRequest.id)
-    )
-    if cancelled.first() is None:
-        raise AppApiError(status.HTTP_409_CONFLICT, _NOTHING_TO_CANCEL, code="nothing_pending")
-
-    await db.commit()
-    return await _entry(db, user.id, connector_key, connector)
-
-
-# A SECOND ROUTER IN THE SAME MODULE, and the mount points are why. Everything above hangs off
-# `/v1/connectors` because access belongs to the PERSON. The two routes below hang off
-# `/v1/projects/{project_id}/connectors` instead, because the switch and the days belong to the
-# PROJECT (`ConnectorStates`: `Access is yours. The days are the project's.`). One `APIRouter`
-# cannot carry two prefixes, and splitting the file would put one domain's five routes and its
-# shared `_known_connector` in two places.
-#
-# THE OWNERSHIP CLAIM EXTENDS UNCHANGED. `project_connectors` carries no `user_id` of its own —
-# `projects` is its ownership anchor — so every statement below reaches it through a join on
-# `projects` whose `user_id` predicate sits in the same WHERE clause, and the two project-scoped
-# routes prove ownership with a `SELECT ... WHERE id = :id AND user_id = :me` before they read or
-# write anything. A project somebody else owns and a project that does not exist get the SAME
-# 404: a 403 would confirm the row exists, which is precisely the probe the 404 refuses to
-# answer.
-
-project_router = APIRouter(prefix="/projects/{project_id}/connectors", tags=["connectors"])
-
 # The three presets the `DateRange` popover draws, in the board's order. They are the OFFER, not
 # the rule: `_offered_days` filters them against the connector's own retention before any of them
 # reaches a row. See that function for why the filter is not decoration.
 _BOARD_PRESET_DAYS: Final = (7, 14, 30)
-
-_PROJECT_NOT_FOUND = "Application not found."
-_NEEDS_APPROVAL = "You do not have access to {name} yet. Ask for it under Integrations."
 
 # `resolve_window` answers `None` for exactly one input — a missing row — so a `None` beside a row
 # that is demonstrably present means the resolver grew a second absent case. Raised rather than
@@ -558,21 +253,16 @@ async def _owned_project_or_404(db: DbSession, project_id: uuid.UUID, user_id: u
 
 
 def _resolved(
-    connector: Connector,
-    stored: ProjectConnector | None,
-    owner_access_state: ConnectorRequestStatus | None,
+    connector: Connector, stored: ProjectConnector | None
 ) -> tuple[bool, ConnectorWindow | None]:
     """`(effectivelyOn, window)` for one project's row — the ONE place either is assembled.
 
     NO ROW IS NOT `enabled = false`. A project this connector was never switched on in has no
-    window to render and nothing to read, so the pair is a literal `False` and `None`. That
-    literal is deliberate and must stay literal: the moment it is written as
-    `stored is not None and stored.enabled and approved` there are two homes for the on-ness
-    conjunction — this line and `resolve_window` — and the two will drift. Every OTHER path here
-    takes `effectively_on` off the resolver without restating it."""
+    window to render and nothing to read, so the pair is a literal `False` and `None`. Every
+    OTHER path here takes `effectively_on` off the resolver without restating it."""
     if stored is None:
         return False, None
-    window = resolve_window(connector, stored, owner_access_state)
+    window = resolve_window(connector, stored)
     if window is None:
         raise ValueError(_RESOLVER_LOST_ITS_ROW)
     return window.effectively_on, ConnectorWindow(
@@ -592,39 +282,31 @@ def _resolved(
 
 
 def _project_entry(
-    connector_key: str,
-    connector: Connector,
-    access: PersonAccess,
-    stored: ProjectConnector | None,
+    connector_key: str, connector: Connector, stored: ProjectConnector | None
 ) -> ProjectConnectorEntry:
-    """One DATA row: where the person stands, where this project's switch stands, and the days."""
-    effectively_on, window = _resolved(connector, stored, access.request_status)
-    asked = access.request if access.state is ConnectorPersonState.PENDING else None
+    """One settings row: where this project's switch stands, and the days."""
+    effectively_on, window = _resolved(connector, stored)
     return ProjectConnectorEntry(
         key=connector_key,
         display_name=connector.display_name,
         data_noun=connector.data_noun,
-        state=access.state,
-        asked_at=None if asked is None else asked.created_at,
         enabled=stored is not None and stored.enabled,
         effectively_on=effectively_on,
         window=window,
     )
 
 
-@project_router.get(
+@router.get(
     "",
     responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
 )
 async def list_project_connectors(
     project_id: uuid.UUID, user: CurrentUser, db: DbSession
 ) -> ProjectConnectorListResponse:
-    """Every connector this project could read, what it reads today, and why it does not.
+    """Every connector this project could read, and what it reads today.
 
-    One entry per catalogue connector, always. Each carries where YOU stand with that connector
-    (`state`, and `askedAt` while an administrator has your request), this project's own switch
-    (`enabled`), whether it actually reads (`effectivelyOn` — the switch AND your approval), and
-    the days it reads (`window`).
+    One entry per catalogue connector, always. Each carries this project's own switch
+    (`enabled`), whether it actually reads (`effectivelyOn`), and the days it reads (`window`).
 
     `window` is `null` for a connector this project has never switched on. When it is present it
     is RESOLVED for today: `start`, `end` and `days` are what the app can actually see, a preset
@@ -651,23 +333,18 @@ async def list_project_connectors(
 
     return ProjectConnectorListResponse(
         connectors=[
-            _project_entry(
-                key,
-                connector,
-                await current_access(db, user_id=user.id, connector_key=key),
-                stored_by_key.get(key),
-            )
+            _project_entry(key, connector, stored_by_key.get(key))
             for key, connector in CONNECTORS.items()
         ]
     )
 
 
-@project_router.put(
+@router.put(
     "/{connector_key}",
     dependencies=[RequireCsrf],
     responses=error_responses(
         AUTH_401,
-        (403, ErrorEnvelope, "CSRF check failed, or your access is not approved"),
+        (403, ErrorEnvelope, "CSRF check failed"),
         (404, ErrorEnvelope, "No such connector, or no such project"),
         (409, ErrorEnvelope, "A chat or build is running, so the settings are locked"),
         (422, ErrorEnvelope, "The window is not one this connector offers"),
@@ -689,36 +366,17 @@ async def set_project_connector(
     for a preset, `{"kind": "absolute", "start": "2026-09-01", "end": "2026-09-30"}` for a fixed
     range whose first date is on or before its last.
 
-    Refused with `403 access_not_approved` unless an administrator has approved YOUR access to
-    this connector — waiting, declined and never-asked all refuse, and nothing is written.
-    Refused with `404 project_not_found` for a project you do not own, and `404
-    unknown_connector` for a connector that is not in the catalogue. Refused with `409
-    session_is_live` while you have a chat or a build running: a container is given its
-    environment once, when it starts, so a change made mid-session would leave the rail
-    promising data the running app cannot reach.
+    A change reaches the app the next time its container starts. Refused with `404
+    project_not_found` for a project you do not own, and `404 unknown_connector` for a connector
+    that is not in the catalogue. Refused with `409 session_is_live` while you have a chat or a
+    build running: a container is given its environment once, when it starts, so a change made
+    mid-session would leave the settings promising data the running app cannot reach.
 
     A stored range is never bounds-checked on the way in and never rewritten afterwards: it is
     clamped on every READ instead, so it ages out on its own. Returns this project's connector in
     its new state, resolved exactly as the read returns it."""
     connector = _known_connector(connector_key)
     project_name = await _owned_project_or_404(db, project_id, user.id)
-
-    # APPROVAL IS ENFORCED HERE, NOT IN THE FORM. The switch is only drawn for an approved person,
-    # so nobody meets this through the product — which is the whole reason it has to exist on the
-    # server. Read through `current_access` rather than a status comparison of our own: the
-    # person's state is a derivation over their remaining rows, and a second copy of that rule
-    # would be correct only until somebody cancels and asks again.
-    access = await current_access(db, user_id=user.id, connector_key=connector_key)
-    if access.state is not ConnectorPersonState.APPROVED:
-        raise AppApiError(
-            status.HTTP_403_FORBIDDEN,
-            _NEEDS_APPROVAL.format(name=connector.display_name),
-            code="access_not_approved",
-        )
-
-    # AFTER the approval check and BEFORE anything is written. Ordered that way on
-    # purpose: an unapproved citizen gets the 403 they would always have got, rather than a
-    # confusing "stop your build" for a setting they were never allowed to change.
     await _refuse_while_a_session_is_live(db, user.id, project_id, project_name, connector)
 
     window = body.window
@@ -797,6 +455,6 @@ async def set_project_connector(
         window_end=written.window_end,
     )
     # Assembled BEFORE the commit, so nothing reads an ORM attribute across one.
-    entry = _project_entry(connector_key, connector, access, stored)
+    entry = _project_entry(connector_key, connector, stored)
     await db.commit()
     return entry

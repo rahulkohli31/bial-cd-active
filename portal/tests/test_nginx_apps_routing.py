@@ -296,6 +296,49 @@ def test_apps_host_does_not_serve_the_spa(router: Router) -> None:
 
 
 # --------------------------------------------------------------------------------------
+# request-body ceilings
+# --------------------------------------------------------------------------------------
+
+_MIB = 1024 * 1024
+
+
+def test_the_portal_site_passes_a_body_at_the_attachment_routes_own_ceiling(
+    router: Router,
+) -> None:
+    """The attachment route refuses above 44 MiB with a sentence naming the file's own limit, so
+    the edge has to let that much through or a citizen reads nginx's bare 413 instead. This
+    harness has no backend: a body past the ceiling ends at the unreachable upstream."""
+    status, _, _ = router.request(
+        "/api/attachments",
+        host="portal.bial.test",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        body=b"x" * (44 * _MIB),
+    )
+    assert status == 502
+
+
+@pytest.mark.parametrize(
+    ("host", "target", "ceiling_mib"),
+    [
+        ("portal.bial.test", "/api/attachments", 45),
+        (APPS_HOSTNAME, f"/a/{SBX_KEY}/submit", 40),
+    ],
+)
+def test_each_site_refuses_a_body_over_its_own_ceiling(
+    router: Router, host: str, target: str, ceiling_mib: int
+) -> None:
+    """Only the length is declared: nginx refuses on the header without reading any body."""
+    status, _, _ = router.request(
+        target,
+        host=host,
+        method="POST",
+        headers={"Content-Length": str(ceiling_mib * _MIB + 1)},
+    )
+    assert status == 413
+
+
+# --------------------------------------------------------------------------------------
 # the keyless arm
 # --------------------------------------------------------------------------------------
 

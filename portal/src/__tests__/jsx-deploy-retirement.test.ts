@@ -4,8 +4,10 @@
  * deliberate and reviewed rather than a drive-by import.
  *
  * Also guards the three publish controls and four client predicates retired when publishing
- * collapsed onto one chip reading one server-computed field — added in the SAME commit that
- * deleted them, since a guard lagging a deletion is a failure this repo has already had.
+ * collapsed onto one chip reading one server-computed field, and the save-at-send path and the
+ * two approved states retired when saving moved before the dialog and approval began to publish
+ * — each added in the SAME commit that deleted them, since a guard lagging a deletion is a
+ * failure this repo has already had.
  *
  * Deliberately absent: the publish hook's old name. It was RENAMED, not retired, and banning
  * a renamed symbol guards nothing — it would only stop a comment from explaining the rename.
@@ -46,6 +48,19 @@ const RETIRED_TOKENS = [
   'isRoutedForReview',
   'ROUTED_FAILURE_CODES',
   'stepLabel',
+  // The server-side save at send time, its second button and its banner: saving now happens
+  // before the dialog opens, and one status has one button.
+  'saveFirst',
+  'UNSAVED_CHANGES',
+  'saveAndPublish',
+  'dismissUnsaved',
+  'save-and-publish',
+  'status-unsaved',
+  'publish-unsaved',
+  // The two approved states: approving publishes, so nothing waits on an "Approved" button.
+  'approved_ready_to_publish',
+  'approved_needs_review_again',
+  'alreadyApproved',
 ] as const
 
 function walk(dir: string): string[] {
@@ -71,8 +86,7 @@ describe('JSX-era deploy retirement', () => {
 
   it('nothing points at the review-status anchor, which no longer exists', () => {
     // Asserted on the anchor's identifier and its HREF FORM, never on the bare substring
-    // `review-status` — that legitimately survives in two files: the admin
-    // registry panel's own live region and the questionnaire's `dc-review-status`.
+    // `review-status`, which other test ids may legitimately contain.
     const offenders: string[] = []
     for (const file of walk(SRC_ROOT)) {
       const rel = path.relative(SRC_ROOT, file)
@@ -86,7 +100,9 @@ describe('JSX-era deploy retirement', () => {
     // `stepLabel` translated the pipeline's phase tokens into citizen words in the
     // browser. The whole vocabulary is DELETED rather than restyled — while a publish runs
     // the chip says "Starting up" and stops there. `Live` and `Publish again` are
-    // deliberately NOT in this list: they are labels the new chip renders.
+    // deliberately NOT in this list: they are labels the new chip renders. The admin
+    // registry is not a citizen surface: its status column says "Waiting for review".
+    const ADMIN = path.join('components', 'admin') + path.sep
     const RETIRED_PHASES = [
       'Getting ready',
       'Packaging your app',
@@ -99,10 +115,26 @@ describe('JSX-era deploy retirement', () => {
     const offenders: string[] = []
     for (const file of walk(SRC_ROOT)) {
       const rel = path.relative(SRC_ROOT, file)
-      if (ALLOWLIST.has(rel)) continue
+      if (ALLOWLIST.has(rel) || rel.startsWith(ADMIN)) continue
       const text = readFileSync(file, 'utf8')
       for (const phrase of RETIRED_PHASES) {
         if (text.includes(phrase)) offenders.push(`${rel}: ${phrase}`)
+      }
+    }
+    expect(offenders).toEqual([])
+  })
+
+  it('names no button the product does not have', () => {
+    // Case-insensitive on purpose: a sentence that starts with the phrase is still a promise
+    // of a control that is gone.
+    const RETIRED_BUTTONS = [/save and deploy/i, /save and publish/i]
+    const offenders: string[] = []
+    for (const file of walk(SRC_ROOT)) {
+      const rel = path.relative(SRC_ROOT, file)
+      if (ALLOWLIST.has(rel)) continue
+      const text = readFileSync(file, 'utf8')
+      for (const phrase of RETIRED_BUTTONS) {
+        if (phrase.test(text)) offenders.push(`${rel}: ${phrase.source}`)
       }
     }
     expect(offenders).toEqual([])

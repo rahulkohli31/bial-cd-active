@@ -1,7 +1,7 @@
 /**
  * Delete-a-project confirmation. Owes the user two things before the trigger: it names the whole cascade out
  * loud — project, app, its own Postgres DB and files, every filed chat, counted via `listProjectConversations`
- * (fallback logic in the docstring below) — and asks WHY in 5-50 words, split the same way as
+ * (fallback logic in the docstring below) — and asks WHY, within the word bound, split the same way as
  * `src/core/words.py`, gating confirm. WHO it's recorded against is shown, never collected (see `getStoredUser`
  * below); the retyped-name gate this replaced is gone in favour of that reason (see the helper-text comment
  * below for what the `deleted_projects` tombstone supports today).
@@ -187,7 +187,7 @@ export default function ProjectDeleteDialog({
           <div className="flex items-baseline justify-between mt-1">
             {/* SAYS ONLY WHAT IS TRUE TODAY. This read "An administrator can see this",
                 and nothing reads `deleted_projects` — there is no route, no schema and no
-                screen. Every deletion collects a mandatory 5-50 word justification, so a
+                screen. Every deletion collects a mandatory justification, so a
                 promise about who reads it is a promise to a user, not an internal TODO. The
                 read surface is tracked separately; when it lands, the stronger sentence becomes
                 true again and this reverts. Until then the copy says what the platform

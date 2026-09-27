@@ -87,6 +87,10 @@ class ApiSettings(CoreSettings):
     redis: RedisConfig | None = None
     sandbox: SandboxConfig | None = None
     app_db: AppDatabaseSettings | None = None
+    # WHERE A CONNECTOR'S DATA LIVES, and which managed identity may read it. Required in
+    # production because the owner's switch in Settings is the only gate on the data: with no lake
+    # configured, a switched-on project would silently read nothing.
+    connector_lake: LakeConfig | None = None
 
     # ============================================================ FEATURE SWITCH
     # `X | None = None` with NO gate. Unset means the feature is simply OFF, and that is a
@@ -102,18 +106,6 @@ class ApiSettings(CoreSettings):
     # Azure AI Foundry access. Genuinely optional: dev/test exercise the agent harness with
     # Pydantic AI's TestModel and make no live call, and None means "AI chat not configured".
     foundry: FoundryConfig | None = None
-
-    # WHERE A CONNECTOR'S DATA ACTUALLY LIVES, and which managed identity may read it. Unset
-    # means no build and no published app is handed the coordinates or the identity, and the
-    # control plane copies nothing — every path in that feature already answers `{}` or `None`
-    # for an unconfigured lake, because a developer machine has none.
-    #
-    # A FEATURE SWITCH RATHER THAN A PRODUCTION GATE, and the reason is the same one `deploy`
-    # gives two fields above: the switch here is the ADMINISTRATOR'S approval, not this
-    # variable. A production gate would make the backend refuse to boot the moment this merged,
-    # which is an outage for a capability whose real gate is a person saying yes. Add the gate
-    # in the same change that makes an approved connector unconditionally readable.
-    connector_lake: LakeConfig | None = None
 
     # Built React/Vite SPA directory served by FastAPI when it runs as the whole stack. None =
     # FastAPI serves NO SPA, correct for two-process local dev where Vite serves it on :5173. A
@@ -235,6 +227,15 @@ class ApiSettings(CoreSettings):
             raise ValueError(
                 "per-project databases must be configured in production: set "
                 "APP_DB__MAINTENANCE_DSN and APP_DB__ENCRYPTION_KEY."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_connector_lake_in_production(self) -> Self:
+        if self.is_production and self.connector_lake is None:
+            raise ValueError(
+                "the connector lake must be configured in production: set CONNECTOR_LAKE__URL, "
+                "CONNECTOR_LAKE__IDENTITY_CLIENT_ID and CONNECTOR_LAKE__IDENTITY_RESOURCE_ID."
             )
         return self
 

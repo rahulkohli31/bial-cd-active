@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.api.v1.admin.router import LISTING_CAP
 from src.config import settings
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.storage import submission_key
@@ -70,7 +70,6 @@ def _pending(**extra: Any) -> dict[str, Any]:
         "source_submission_id": uuid.uuid4(),
         "source_commit_sha": _SHA,
         "submitted_at": datetime.now(UTC),
-        "approval_route": ApprovalRoute.SELF_PUBLISH,
         **extra,
     }
 
@@ -260,11 +259,9 @@ async def test_the_listing_reports_when_it_hit_the_cap_so_the_badge_cannot_disag
     client, db_session
 ) -> None:
     """The badge counts with an uncapped GROUP BY; the listing stops at LISTING_CAP. Past
-    the cap the badge advertised a number the list refused to show, and because the
-    pending tab sorts OLDEST FIRST the rows that vanished were the NEWEST submissions — a
-    citizen's app could sit in the queue, be counted, and be invisible to every
-    administrator who looked. `truncated` is what makes the cap visible; pagination stays
-    deferred.
+    the cap the badge advertised a number the list refused to show — a citizen's app could
+    sit in the queue, be counted, and be invisible to every administrator who looked.
+    `truncated` is what makes the cap visible.
 
     Seeds exactly one row past the cap: the cheapest set that can tell a >= from a >."""
     admin = await _admin(db_session)
@@ -272,7 +269,7 @@ async def test_the_listing_reports_when_it_hit_the_cap_so_the_badge_cannot_disag
         await _app(db_session, **_pending())
     await db_session.commit()
 
-    listing = await client.get("/v1/admin/apps?status=pending", headers=admin)
+    listing = await client.get("/v1/admin/apps", headers=admin)
     counts = await client.get("/v1/admin/apps/counts", headers=admin)
 
     body = listing.json()
@@ -287,7 +284,7 @@ async def test_a_listing_inside_the_cap_is_not_marked_truncated(client, db_sessi
     await _app(db_session, **_pending())
     await db_session.commit()
 
-    body = (await client.get("/v1/admin/apps?status=pending", headers=admin)).json()
+    body = (await client.get("/v1/admin/apps", headers=admin)).json()
 
     assert body["truncated"] is False
     assert len(body["apps"]) == 1

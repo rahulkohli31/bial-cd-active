@@ -65,60 +65,27 @@ def _rows_touched(result: object) -> int:
     return int(getattr(result, "rowcount", 0) or 0)
 
 
-async def claim(
-    db: AsyncSession,
-    *,
-    app_id: uuid.UUID,
-    user_id: uuid.UUID,
-    classification: dict[str, Any] | None = None,
-    classification_score: int | None = None,
-) -> uuid.UUID | None:
+async def claim(db: AsyncSession, *, app_id: uuid.UUID, user_id: uuid.UUID) -> uuid.UUID | None:
     """Claim the one in-flight deploy slot for `app_id`; `None` if one is genuinely running.
-    Commits. The classification that cleared the gate is written by the SAME insert that
-    claims the slot, so a row cannot exist without its authorising answers — a second UPDATE
-    could let a crash leave a running deploy unjustified, the first thing a post-incident
-    review checks. Two attempts at most: plain claim, then one retry only if a stale row was
-    taken over; unbounded retries against a row a live pipeline keeps beating would spin.
+    Commits. Two attempts at most: plain claim, then one retry only if a stale row was taken
+    over; unbounded retries against a row a live pipeline keeps beating would spin.
     """
-    claimed = await _try_claim(
-        db,
-        app_id=app_id,
-        user_id=user_id,
-        classification=classification,
-        classification_score=classification_score,
-    )
+    claimed = await _try_claim(db, app_id=app_id, user_id=user_id)
     if claimed is not None:
         return claimed
 
     if not await _take_over_stale(db, app_id=app_id):
         return None
 
-    return await _try_claim(
-        db,
-        app_id=app_id,
-        user_id=user_id,
-        classification=classification,
-        classification_score=classification_score,
-    )
+    return await _try_claim(db, app_id=app_id, user_id=user_id)
 
 
 async def _try_claim(
-    db: AsyncSession,
-    *,
-    app_id: uuid.UUID,
-    user_id: uuid.UUID,
-    classification: dict[str, Any] | None,
-    classification_score: int | None,
+    db: AsyncSession, *, app_id: uuid.UUID, user_id: uuid.UUID
 ) -> uuid.UUID | None:
     stmt = (
         pg_insert(Deployment)
-        .values(
-            app_id=app_id,
-            user_id=user_id,
-            step="claimed",
-            classification=classification,
-            classification_score=classification_score,
-        )
+        .values(app_id=app_id, user_id=user_id, step="claimed")
         .on_conflict_do_nothing(
             index_elements=[Deployment.app_id],
             index_where=_IN_FLIGHT_PREDICATE,
@@ -204,11 +171,10 @@ async def fail(
     """Write the terminal failure. True iff this call was the one that settled the row.
 
     NOT EVERY FAILED ROW IS A BROKEN DEPLOY, and `code` is the only thing that tells them apart.
-    The drift re-check's `routed_for_review` settles here too: that deploy did exactly what it
-    should — it stopped and put the version in front of an administrator, so a reader (or a
-    dashboard) that treats `status = failed` as "something went wrong" will mis-report it.
-    Adding a fourth `DeploymentStatus` instead would move what `uq_deployments_one_in_flight`'s
-    partial index covers, which is a real schema decision this outcome does not need to make."""
+    A failed restart leaves the version it restarted still serving, and older rows carry
+    `routed_for_review` for an attempt that went to an administrator instead of publishing — so
+    a reader (or a dashboard) that treats `status = failed` as "something went wrong" will
+    mis-report both."""
     return await _finish(
         db,
         deployment_id,

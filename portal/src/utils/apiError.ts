@@ -51,6 +51,15 @@ export function optionalString(value: unknown): string | null {
   return typeof value === 'string' ? value : null
 }
 
+/** A nullable finite number off an untrusted body: absent, null, NaN or the wrong type read as `null`. */
+export function optionalNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function unreadable(subject: string, field: string): ApiError {
+  return new ApiError(`The server sent a ${subject} we could not read (${field}).`, 500)
+}
+
 /**
  * A REQUIRED string off an untrusted body, or a throw. Absent, empty, or the wrong type is the
  * server breaking its own contract — not an absent value — so it raises here rather than
@@ -62,9 +71,19 @@ export function optionalString(value: unknown): string | null {
  * difference was that word, which is the shape a shared rule drifts apart in.
  */
 export function requiredString(value: unknown, subject: string, field: string): string {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new ApiError(`The server sent a ${subject} we could not read (${field}).`, 500)
-  }
+  if (typeof value !== 'string' || value.length === 0) throw unreadable(subject, field)
+  return value
+}
+
+/** A REQUIRED whole number off an untrusted body, or a throw, on `requiredString`'s terms. */
+export function requiredInteger(value: unknown, subject: string, field: string): number {
+  if (typeof value !== 'number' || !Number.isInteger(value)) throw unreadable(subject, field)
+  return value
+}
+
+/** A REQUIRED boolean off an untrusted body, or a throw, on `requiredString`'s terms. */
+export function requiredBoolean(value: unknown, subject: string, field: string): boolean {
+  if (typeof value !== 'boolean') throw unreadable(subject, field)
   return value
 }
 
@@ -72,10 +91,8 @@ export function requiredString(value: unknown, subject: string, field: string): 
  * A nullable COUNT off an untrusted body — and `null` is not `0`.
  *
  * Both answers are real and they mean different things: `0` is "none", `null` is "we did not
- * count". The connector surfaces depend on that split (`onProjectCount` is null in every state
- * but `approved`; `usingItIn` is null on a declined row), which is why this does NOT collapse to
- * zero the way a plain count reader would — a row whose control IS a count must not render "0
- * projects" for a person nobody counted.
+ * count" — which is why this does NOT collapse to zero the way a plain count reader would. A
+ * caller that wants zero for an absent count says so with `?? 0`.
  */
 export function optionalCount(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : null

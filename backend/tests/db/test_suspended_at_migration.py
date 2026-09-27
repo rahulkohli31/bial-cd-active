@@ -78,7 +78,11 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # kinds which must have a project from losing one. 0045_conversation_touch follows it with
     # the repo's first database trigger, which advances a conversation's `updated_at` when a
     # message is appended to it. 0046_conversation_updated_at indexes that column, which the
-    # retention pass filters and orders by on every tick.
+    # retention pass filters and orders by on every tick. 0047_drop_connector_access drops the
+    # per-person connector access table and its enum. 0048_drop_manual_go_live drops the manual
+    # go-live route's four `app_registry` columns and its enum. 0049_classification_config adds
+    # the publish classification classes and their one policy row, seeded with the launch set,
+    # and the review's class-definition fingerprint column.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0046_conversation_updated_at"]
+    assert heads == ["0049_classification_config"]

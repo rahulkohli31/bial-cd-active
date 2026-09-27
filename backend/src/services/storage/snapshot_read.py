@@ -96,19 +96,21 @@ def _git_env(scratch_home: Path) -> dict[str, str]:
 
 
 async def extract_snapshot(
-    app_id: uuid.UUID, *, cache_root: Path | None = None
+    app_id: uuid.UUID, *, bundle_key: str | None = None, cache_root: Path | None = None
 ) -> ExtractedSnapshot | NoAppYet:
-    """Resolve the app's current snapshot to a local extraction dir, cached by HEAD SHA.
+    """Resolve the app's current snapshot — or the bundle at `bundle_key`, such as a
+    submission copy — to a local extraction dir, cached by HEAD SHA.
 
     Cache layout: `<root>/<app_id.hex>/<head_sha>/` containing the checked-out tree (plus
-    its `.git`, which the read tools' ignore set hides). Concurrent extraction of the same
-    SHA is safe: each attempt clones into a unique tmp dir and the loser of the final
-    rename discards its copy.
+    its `.git`, which the read tools' ignore set hides). The key is the SHA, not the source,
+    so a submission copy and a snapshot with the same head share one extraction. Concurrent
+    extraction of the same SHA is safe: each attempt clones into a unique tmp dir and the
+    loser of the final rename discards its copy.
     """
     root = cache_root if cache_root is not None else _DEFAULT_CACHE_ROOT
     storage = get_storage()
     try:
-        data = await storage.get(snapshot_key(app_id))
+        data = await storage.get(bundle_key if bundle_key is not None else snapshot_key(app_id))
     except StorageNotFoundError:
         return NoAppYet(app_id=app_id)
     # A malformed stored bundle raises BundleValidationError here — corrupt platform

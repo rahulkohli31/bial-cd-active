@@ -9,37 +9,42 @@
  * now.
  *
  * The hook is mocked at the module boundary (see
- * `usePublishState.reconciliation.test.tsx`); the questionnaire is stubbed too
- * (`DataClassificationModal.test.tsx` owns it).
+ * `usePublishState.reconciliation.test.tsx`); the publish dialog is stubbed too
+ * (`PublishDialog.test.tsx` owns it).
  */
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react'
 
-import type { ApprovalState, DeploymentView, PublishState } from '../../utils/deployApi'
+import type {
+  ApprovalState,
+  DeploymentView,
+  PublishAnswers,
+  PublishState,
+} from '../../utils/deployApi'
 import type { UsePublishState } from '../../hooks/usePublishState'
 import { lookFor, presentationFor } from '../../utils/publishPresentation'
 
 const h = vi.hoisted(() => ({
   usePublishState: vi.fn(),
-  // The stub records what the chip handed the questionnaire, so a test can drive either
-  // success back through the real `onConfirm` the chip supplied.
+  // The stub records what the chip handed the dialog, so a test can drive either success
+  // back through the real `onConfirm` the chip supplied.
   modal: {
     current: null as null | {
+      deployment: DeploymentView | null
       rejectionNote?: string | null
-      alreadyApproved?: boolean
-      onConfirm: (a: never) => Promise<void>
+      onConfirm: (commitSha: string, send: PublishAnswers) => Promise<void>
     },
   },
 }))
 vi.mock('../../hooks/usePublishState', () => ({ usePublishState: h.usePublishState }))
-vi.mock('../DataClassificationModal', () => ({
+vi.mock('../PublishDialog', () => ({
   default: (props: {
+    deployment: DeploymentView | null
     rejectionNote?: string | null
-    alreadyApproved?: boolean
-    onConfirm: (a: never) => Promise<void>
+    onConfirm: (commitSha: string, send: PublishAnswers) => Promise<void>
   }) => {
     h.modal.current = props
-    return <div data-testid="data-classification-modal" />
+    return <div data-testid="publish-dialog" />
   },
 }))
 
@@ -67,7 +72,6 @@ const approval = (over: Partial<ApprovalState> = {}): ApprovalState => ({
   status: 'draft',
   approvedCommitSha: null,
   approvedAt: null,
-  approvalRoute: null,
   rejectionNote: null,
   submittedSha: null,
   submittedAt: null,
@@ -88,6 +92,7 @@ const view = (publishState: PublishState, over: Partial<DeploymentView> = {}): D
   unpublishedAt: null,
   approval: approval(),
   publishState,
+  approvedRetryCommit: null,
   savedHead: null,
   savedAt: null,
   // `null` is "the server did not say", which keeps the saved row — the neutral default
@@ -102,11 +107,10 @@ const wire = (deployment: DeploymentView | null, over: Partial<UsePublishState> 
     approval: deployment?.approval ?? null,
     loadError: null,
     refresh: vi.fn(),
-    unsaved: null,
-    saving: false,
+    publish: vi.fn(async () => 'review' as const),
+    publishPhase: null,
+    publishError: null,
     onConfirm: vi.fn(),
-    saveAndPublish: vi.fn(),
-    dismissUnsaved: vi.fn(),
     withdraw: vi.fn(),
     withdrawing: false,
     withdrawError: null,
@@ -138,8 +142,6 @@ const LABELS = rowsFor({
   draft: 'Draft',
   in_review: 'In review',
   changes_requested: 'Changes requested',
-  approved_ready_to_publish: 'Approved',
-  approved_needs_review_again: 'Approved',
   starting_up: 'Starting up',
   live_current: 'Live',
   live_newer_work: 'Live · newer work saved',
@@ -165,8 +167,6 @@ const EXPECTED_LOOK = rowsFor({
   in_review: 'amber',
   changes_requested: 'red',
   did_not_start: 'red',
-  approved_ready_to_publish: 'green',
-  approved_needs_review_again: 'green',
   starting_up: 'green',
   live_current: 'green',
   live_newer_work: 'green',
@@ -201,14 +201,11 @@ describe('the chip is coloured by its state, with a leading dot', () => {
       const { pill } = lookFor(state)
       const family = /bg-status-([a-z]+)-bg/.exec(pill)?.[1] ?? pill
       families.add(family)
-      const key = `${family}|${presentationFor(state).label}`
-      const clash = seen.get(key)
-      // The two `Approved` states DO share both, deliberately — they are the same state to a
-      // citizen and the difference is on the button. Nothing else may.
-      if (clash) expect([clash, state].sort()).toEqual(['approved_needs_review_again', 'approved_ready_to_publish'])
+      const key = `${family}|${presentationFor(state, null).label}`
+      expect(seen.get(key), state).toBeUndefined()
       seen.set(key, state)
     }
-    expect(seen.size).toBe(LABELS.length - 1)
+    expect(seen.size).toBe(LABELS.length)
     expect(families.size).toBeGreaterThan(4)
   })
 
@@ -221,7 +218,7 @@ describe('the chip is coloured by its state, with a leading dot', () => {
 })
 
 describe('the chip names the state, and the closed chip is a complete answer', () => {
-  it('gives every value its own words, and the two approved values share one on purpose', () => {
+  it('gives every value its own words, and none of them is "Approved"', () => {
     for (const [state, label] of LABELS) {
       wire(view(state))
       mount()
@@ -229,12 +226,10 @@ describe('the chip names the state, and the closed chip is a complete answer', (
       cleanup()
     }
 
-    // The approved pair is the ONE deliberate sharing — both are "their app is
-    // approved" to a citizen, and the difference is put on the button, not the label.
-    // Every other pair is distinct, which is what makes the closed chip complete.
+    // Every pair is distinct, which is what makes the closed chip complete.
     const spoken = LABELS.map(([, label]) => label)
-    const shared = spoken.filter((l, i) => spoken.indexOf(l) !== i)
-    expect(shared).toEqual(['Approved'])
+    expect(spoken.filter((l, i) => spoken.indexOf(l) !== i)).toEqual([])
+    expect(spoken).not.toContain('Approved')
   })
 
   it('the drift is in the chip itself, with the popover closed', () => {
@@ -361,8 +356,6 @@ describe('the popover explains the state and offers at most one thing to do', ()
       'draft',
       'in_review',
       'changes_requested',
-      'approved_ready_to_publish',
-      'approved_needs_review_again',
       'live_newer_work',
       'live_drift_unknown',
       'taken_offline',
@@ -432,12 +425,12 @@ describe('the popover explains the state and offers at most one thing to do', ()
     expect(screen.getByTestId('publish-action').textContent).toBe('Send update for review')
   })
 
-  it('promises nothing about routing on an approved app', async () => {
+  it('names the approved version where Try again publishes it', async () => {
     wire(
-      view('approved_ready_to_publish', {
+      view('did_not_start', {
+        approvedRetryCommit: APPROVED_SHA,
         approval: approval({
           status: 'approved',
-          approvalRoute: 'self_publish',
           approvedCommitSha: APPROVED_SHA,
           approvedAt: '2026-08-19T10:00:00Z',
         }),
@@ -445,33 +438,12 @@ describe('the popover explains the state and offers at most one thing to do', ()
     )
     mount()
     const pop = await openChip()
-    const text = pop.textContent ?? ''
 
-    expect(screen.getByTestId('publish-action').textContent).toBe('Publish')
-    // Both phrasings the retired control used, and neither may come back.
-    expect(text).not.toMatch(/publish it yourself/i)
-    expect(text).not.toMatch(/sent for approval once more/i)
+    expect(screen.getByTestId('publish-chip').textContent).toContain("Didn't start")
+    expect(screen.getByTestId('publish-action').textContent).toBe('Try again')
+    expect(pop.textContent).toMatch(/version an administrator approved/i)
     expect(screen.getByTestId('publish-version').textContent).toContain('Approved version')
     expect(screen.getByTestId('publish-version-sha').textContent).toBe(APPROVED_SHA.slice(0, 7))
-  })
-
-  it('tells the two approved states apart on the button and the sentence, not the label', async () => {
-    wire(
-      view('approved_needs_review_again', {
-        approval: approval({
-          status: 'approved',
-          approvalRoute: 'runbook',
-          approvedCommitSha: APPROVED_SHA,
-          approvedAt: '2026-08-19T10:00:00Z',
-        }),
-      }),
-    )
-    mount()
-
-    expect(screen.getByTestId('publish-chip').textContent).toContain('Approved')
-    const pop = await openChip()
-    expect(screen.getByTestId('publish-action').textContent).toBe('Send for review')
-    expect(pop.textContent).toContain('goes back to an administrator')
   })
 
   it('does not link a taken-down address, and does not borrow the switched-off sentence', async () => {
@@ -549,17 +521,18 @@ describe('the popover explains the state and offers at most one thing to do', ()
 
   it('still names the administrator in the states that genuinely have one', async () => {
     // The paired positive, so the rule above cannot be satisfied by scrubbing the word
-    // everywhere. These three are only reachable THROUGH an administrator. `taken_offline` is
+    // everywhere. These three are only reachable THROUGH an administrator — the last only when
+    // the server says Try again republishes an approved copy. `taken_offline` is
     // deliberately not among them: an owner can now take their own application down, so naming
     // an administrator there would tell them somebody else did what they just did.
     const ADMIN_STATES: ReadonlyArray<readonly [PublishState, RegExp]> = [
       ['in_review', /with an administrator/i],
       ['changes_requested', /an administrator asked/i],
-      ['approved_ready_to_publish', /an administrator approved/i],
+      ['did_not_start', /an administrator approved/i],
     ]
 
     for (const [state, phrase] of ADMIN_STATES) {
-      wire(view(state))
+      wire(view(state, { approvedRetryCommit: state === 'did_not_start' ? APPROVED_SHA : null }))
       mount()
       expect((await openChip()).textContent ?? '').toMatch(phrase)
       cleanup()
@@ -597,8 +570,6 @@ describe('the popover explains the state and offers at most one thing to do', ()
       ['draft', null],
       ['in_review', 'Sent for review'],
       ['changes_requested', 'Sent for review'],
-      ['approved_ready_to_publish', 'Approved version'],
-      ['approved_needs_review_again', 'Approved version'],
       ['starting_up', null],
       ['live_current', 'Live now'],
       ['live_newer_work', 'Live now'],
@@ -671,41 +642,66 @@ describe('the popover explains the state and offers at most one thing to do', ()
 })
 
 describe('one press, one request, and the server says which success it was', () => {
-  it('opens the questionnaire and hands it the note when there is one', async () => {
-    wire(
-      view('changes_requested', {
-        approval: approval({ status: 'rejected', rejectionNote: 'Say more about the data.' }),
-      }),
-    )
+  it('opens the publish dialog and hands it the note and the status read', async () => {
+    const read = view('changes_requested', {
+      approval: approval({ status: 'rejected', rejectionNote: 'Say more about the data.' }),
+    })
+    wire(read)
     mount()
     await openChip()
     fireEvent.click(screen.getByTestId('publish-action'))
 
-    expect(await screen.findByTestId('data-classification-modal')).toBeTruthy()
+    expect(await screen.findByTestId('publish-dialog')).toBeTruthy()
     expect(h.modal.current?.rejectionNote).toBe('Say more about the data.')
+    expect(h.modal.current?.deployment).toBe(read)
   })
 
-  it('tells the questionnaire when an approval already pins what is saved', async () => {
-    // Only this state means the press publishes; the sibling approved state sends the
-    // current work back. Mutation check: hardcode either value and one half goes red.
-    wire(view('approved_ready_to_publish', { approval: approval({ status: 'approved', approvedCommitSha: SHA }) }))
+  it('saves first, then opens the publish dialog — no second button, no banner', async () => {
+    const publish = vi.fn(async () => 'review' as const)
+    wire(view('draft', { savedState: 'saved' }), { publish })
     mount()
-    await openChip()
-    fireEvent.click(screen.getByTestId('publish-action'))
-    await screen.findByTestId('data-classification-modal')
-    expect(h.modal.current?.alreadyApproved).toBe(true)
+    const pop = await openChip()
+    expect(within(pop).getAllByRole('button')).toHaveLength(1)
 
-    cleanup()
-    wire(
-      view('approved_needs_review_again', {
-        approval: approval({ status: 'approved', approvedCommitSha: APPROVED_SHA }),
-      }),
-    )
+    fireEvent.click(screen.getByTestId('publish-action'))
+
+    expect(await screen.findByTestId('publish-dialog')).toBeTruthy()
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect(document.body.textContent ?? '').not.toMatch(/not saved yet/i)
+  })
+
+  it('opens no publish dialog when the save fails, and says why in the popover', async () => {
+    const publish = vi.fn(async () => null)
+    wire(view('draft'), {
+      publish,
+      publishError: 'Your workspace is not running, so there was nothing to save.',
+    })
+    mount()
+
+    const pop = await screen.findByTestId('publish-popover')
+    expect(within(pop).getByTestId('publish-error').textContent).toMatch(/nothing to save/)
+    fireEvent.click(screen.getByTestId('publish-action'))
+    await waitFor(() => expect(publish).toHaveBeenCalledTimes(1))
+    expect(screen.queryByTestId('publish-dialog')).toBeNull()
+  })
+
+  it('★ Try again on an approved copy sends it and says so — no publish dialog', async () => {
+    const publish = vi.fn(async () => ({
+      outcome: 'started' as const,
+      deploymentId: 'd1',
+      appId: 'app-1',
+      status: 'running',
+    }))
+    wire(view('did_not_start', { approvedRetryCommit: APPROVED_SHA }), { publish })
     mount()
     await openChip()
     fireEvent.click(screen.getByTestId('publish-action'))
-    await screen.findByTestId('data-classification-modal')
-    expect(h.modal.current?.alreadyApproved).toBe(false)
+
+    await waitFor(() => {
+      expect(screen.getByTestId('publish-announce').textContent).toMatch(/publishing now/i)
+    })
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect(screen.queryByTestId('publish-dialog')).toBeNull()
   })
 
   it('announces the started sentence when the deploy actually began', async () => {
@@ -719,9 +715,9 @@ describe('one press, one request, and the server says which success it was', () 
     mount()
     await openChip()
     fireEvent.click(screen.getByTestId('publish-action'))
-    await screen.findByTestId('data-classification-modal')
+    await screen.findByTestId('publish-dialog')
 
-    await h.modal.current!.onConfirm({} as never)
+    await h.modal.current!.onConfirm(SHA, {} as never)
 
     await waitFor(() => {
       expect(screen.getByTestId('publish-announce').textContent).toMatch(/publishing now/i)
@@ -743,9 +739,9 @@ describe('one press, one request, and the server says which success it was', () 
     mount()
     await openChip()
     fireEvent.click(screen.getByTestId('publish-action'))
-    await screen.findByTestId('data-classification-modal')
+    await screen.findByTestId('publish-dialog')
 
-    await h.modal.current!.onConfirm({} as never)
+    await h.modal.current!.onConfirm(SHA, {} as never)
 
     const answer = await screen.findByTestId('publish-answer')
     expect(answer.textContent).toContain('sent to an administrator for review')
@@ -756,8 +752,7 @@ describe('one press, one request, and the server says which success it was', () 
 
   it('reads a direct publish as a success even where the button said review', async () => {
     // The one thing this surface is deliberately not trusted to predict: which of the two
-    // successes a press produces. The decision is taken inside the request, against a tree
-    // a `saveFirst` can move first.
+    // successes a press produces. The decision is taken inside the request.
     const onConfirm = vi.fn(async () => ({
       outcome: 'started' as const,
       deploymentId: 'd1',
@@ -769,9 +764,9 @@ describe('one press, one request, and the server says which success it was', () 
     await openChip()
     expect(screen.getByTestId('publish-action').textContent).toBe('Send update for review')
     fireEvent.click(screen.getByTestId('publish-action'))
-    await screen.findByTestId('data-classification-modal')
+    await screen.findByTestId('publish-dialog')
 
-    await h.modal.current!.onConfirm({} as never)
+    await h.modal.current!.onConfirm(SHA, {} as never)
 
     await waitFor(() => {
       expect(screen.getByTestId('publish-announce').textContent).toMatch(/publishing now/i)
@@ -779,40 +774,37 @@ describe('one press, one request, and the server says which success it was', () 
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('offers Save and publish, and re-sends without reopening the questionnaire', async () => {
-    const saveAndPublish = vi.fn(async () => null)
-    wire(view('draft'), {
-      unsaved: 'You have changes that are not saved yet.',
-      saveAndPublish,
-    })
+  it('hands the publish dialog\'s reviewed commit through to the send', async () => {
+    const onConfirm = vi.fn(async () => ({
+      outcome: 'started' as const,
+      deploymentId: 'd1',
+      appId: 'app-1',
+      status: 'running',
+    }))
+    wire(view('draft'), { onConfirm })
     mount()
+    await openChip()
+    fireEvent.click(screen.getByTestId('publish-action'))
+    await screen.findByTestId('publish-dialog')
 
-    // The question opens the popover itself — an answer the citizen is owed must not land
-    // behind a closed one.
-    const pop = await screen.findByTestId('publish-popover')
-    expect(within(pop).getByTestId('publish-unsaved').textContent).toContain('not saved yet')
-    fireEvent.click(screen.getByTestId('publish-save-and-publish'))
+    await h.modal.current!.onConfirm(SHA, {} as never)
 
-    expect(saveAndPublish).toHaveBeenCalledTimes(1)
-    expect(screen.queryByTestId('data-classification-modal')).toBeNull()
-    expect(screen.queryByTestId('publish-action')).toBeNull()
+    expect(onConfirm).toHaveBeenCalledWith(SHA, {})
   })
 
   it('marks an in-flight action unavailable with a reason, and never hard-disables it', async () => {
     // Disabling a control that has focus blurs it to `document.body`, which is how a
     // keyboard user loses their place mid-flight.
-    wire(view('draft'), { unsaved: 'You have changes that are not saved yet.', saving: true })
+    wire(view('draft'), { publishPhase: 'saving' })
     mount()
-    await screen.findByTestId('publish-popover')
+    await openChip()
 
-    const button = screen.getByTestId('publish-save-and-publish')
+    const button = screen.getByTestId('publish-action')
     button.focus()
 
     expect(button.isConnected).toBe(true)
     expect(button.getAttribute('aria-disabled')).toBe('true')
     expect(button.hasAttribute('disabled')).toBe(false)
-    expect(button.getAttribute('title')).toBeTruthy()
-    expect(button.textContent).toBe('Save and publish')
     expect(document.activeElement).toBe(button)
   })
 })
@@ -1030,7 +1022,7 @@ describe('guarantees carried over from the controls this chip replaces', () => {
       wire(view(state, { status: 'running' }))
       mount()
       const chip = screen.getByTestId('publish-chip')
-      // A HEIGHT ONLY: every one of the thirteen words is already wider than 44px inside the
+      // A HEIGHT ONLY: every one of the eleven words is already wider than 44px inside the
       // pill's padding, and `min-h` leaves the 999px radius, the dot and the chevron exactly as
       // the board draws them at every width above the threshold.
       expect(chip.className).toContain('narrow:min-h-[44px]')
@@ -1045,7 +1037,7 @@ describe('guarantees carried over from the controls this chip replaces', () => {
   })
 
   it('★ …and so does the chip the read-failure branch draws, which is the only way to retry', () => {
-    // The branch a walk over the thirteen states cannot reach: `loadError` replaces the pill
+    // The branch a walk over the eleven states cannot reach: `loadError` replaces the pill
     // entirely, and the button it replaces it with is the only route to "Check again".
     wire(null, { loadError: 'The publish status could not be read.' })
     mount()
@@ -1057,24 +1049,26 @@ describe('guarantees carried over from the controls this chip replaces', () => {
 })
 
 describe('★ the publish wait says what it is doing', () => {
-  // `busyReason` existed and was rendered ONLY as a `title` attribute — neither visible text
-  // nor an exposed busy state, and unreachable to a keyboard or a touch screen. So the one
-  // thing this component announced was the publish OUTCOME: press Save and publish, and hear
-  // nothing at all until it is over, on an operation that uploads a bundle, claims a
-  // deployment row and starts a container.
+  // A wait rendered only as a `title` attribute is neither visible text nor an exposed busy
+  // state, and is unreachable to a keyboard or a touch screen.
 
   it('names the wait in the button, in the region, and as a busy state', async () => {
-    wire(view('draft'), { saving: true })
-    mount()
-    await openChip()
+    for (const [phase, words] of [
+      ['saving', 'Saving'],
+      ['publishing', 'Publishing'],
+    ] as const) {
+      wire(view('draft'), { publishPhase: phase })
+      mount()
+      await openChip()
 
-    const action = screen.getByTestId('publish-action')
-    // VISIBLE TEXT, not a tooltip. Under the defect the label still read "Save and publish"
-    // while it was already saving — a control that looks pressable and is doing the thing.
-    expect(action.textContent).toContain('Saving and publishing')
-    expect(action.getAttribute('aria-busy')).toBe('true')
-    // ANNOUNCED, through the region that previously only ever spoke the outcome.
-    expect(screen.getByTestId('publish-announce').textContent).toContain('Saving and publishing')
+      const action = screen.getByTestId('publish-action')
+      // VISIBLE TEXT, not a tooltip: a control that says its label while it works looks
+      // pressable and is doing the thing.
+      expect(action.textContent, phase).toContain(words)
+      expect(action.getAttribute('aria-busy'), phase).toBe('true')
+      expect(screen.getByTestId('publish-announce').textContent, phase).toContain(words)
+      cleanup()
+    }
   })
 
   it('names a take-back the same way, and gives the label back when the wait ends', async () => {

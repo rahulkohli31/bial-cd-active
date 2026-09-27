@@ -5,8 +5,9 @@ raises and outlives the request. A restart still strands the row RUNNING — tha
 `_aged_out` and the `FAIL_ABANDONED` settle exist to recover, not a case that cannot happen.
 
 WHY THIS EXISTS
-`head_sha` is always the CALLER's to resolve — this service fails closed on version
-drift rather than trusting a second, possibly stale, read of its own. Review spend is
+The version is always the CALLER's to resolve: the commit and the live configuration it hands
+to `start`. The run reviews against exactly the classes it was claimed under, and fails closed on
+commit drift rather than trusting a second, possibly stale, read of its own. Review spend is
 metered but deliberately excluded from the citizen's daily token gate (`kind=REVIEW`;
 `enforce_daily_limit` is never called here) — a heavy build day must not block
 publishing, nor must opening the publish dialog spend budget the citizen never chose
@@ -37,21 +38,21 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.redaction import Tier, redact_and_cap, redact_secrets
+from src.core.redaction import redact_and_cap, redact_secrets
 from src.db.models.classification_review import ClassificationReviewStatus
 from src.db.models.token_usage import TokenUsageKind
 from src.db.models.user import User
 from src.services.audit.log import append_audit
 from src.services.classification import store
 from src.services.classification.agent import run_review
+from src.services.classification.config import LiveClass, LiveConfig
 from src.services.classification.constants import (
     REVIEW_REQUEST_BUDGET,
     REVIEW_WALL_CLOCK_CEILING_S,
 )
 from src.services.classification.scan import CredentialSweep, scan_snapshot
-from src.services.classification.schema import Completeness, ReviewOutput, Verdict
-from src.services.classification.store import ReviewRecord
-from src.services.deploy.classification import CLASSIFICATION_KEYS
+from src.services.classification.schema import ReviewOutput
+from src.services.classification.store import ReviewRecord, is_for
 from src.services.storage.bundle import BundleValidationError
 from src.services.storage.errors import StorageError
 from src.services.storage.snapshot_read import (
@@ -75,8 +76,8 @@ FAIL_BUNDLE_UNREADABLE: Final = "bundle_unreadable"
 FAIL_STORAGE: Final = "storage_unavailable"
 """Object storage is down or unconfigured — publishing itself is equally unavailable."""
 FAIL_REVIEW: Final = "review_failed"
-"""The model never produced a usable answer: model/API error, malformed output, a double
-truncation, a quota refusal, a partial completeness signal, or an internal crash."""
+"""The model never produced a usable answer: model/API error, output that never answered exactly
+its classes Yes or No, a double truncation, a quota refusal, or an internal crash."""
 FAIL_ABANDONED: Final = "review_abandoned"
 """Over the wall-clock ceiling (measured from the ROW's `started_at`), or a row a
 restart orphaned that aged out."""
@@ -86,9 +87,10 @@ between the caller's metadata read and the extraction. Failed closed; the citize
 open claims a fresh review for the real version."""
 
 MAX_MODEL_RUNS_PER_VERSION: Final = 3
-"""The attempt cap that makes the token-gate carve-out honest: at most three model runs
-per version, counted on the review row. A fourth start returns the stored failure without
-touching the model, and the app routes to an administrator either way."""
+"""The attempt cap that makes the token-gate carve-out honest: at most three model runs per
+(commit, class-definition fingerprint) pair, counted on the review row. A fourth start returns
+the stored failure without touching the model, and the app routes to an administrator either
+way."""
 
 AUDIT_ACTION: Final = "classification_review"
 """The audit action. App-scoped (`resource_type="app"`, `resource_id=str(app_id)`) with
@@ -103,17 +105,8 @@ _DETAIL_MAX_CHARS: Final = 2_000
 # and every tool exchange, so nothing is repeated here.
 _TRUNCATION_NUDGE: Final = (
     "Your previous answer was cut off at the output token limit and has been discarded. "
-    "Record the complete six-question review again, and keep it short: at most one "
-    "sentence per reason, and only the single strongest evidence location per question."
-)
-
-# Canned floor copy — plain language, no locations, no values.
-_FLOOR_CREDENTIALS_REASON: Final = (
-    "The automatic check could not finish, but a pattern scan found what looks like a "
-    "real credential written into the app's saved code."
-)
-_FLOOR_UNANSWERED_REASON: Final = (
-    "The automatic check could not finish, so this question needs your own answer."
+    "Record the complete review again, and keep it short: at most one sentence per "
+    "reason, and only the single strongest evidence location per class."
 )
 
 
@@ -188,10 +181,8 @@ class _ReviewFailedError(Exception):
 
 @dataclass
 class _RunScratch:
-    """What the failure path needs from however far the run got: the sweep (the Tier A
-    floor reads it) and the meter (usage is recorded whether the run succeeded or not)."""
+    """The meter, however far the run got: usage is recorded whether it succeeded or not."""
 
-    sweep: CredentialSweep | None = None
     metered: _MeteredModel | None = None
 
 
@@ -209,8 +200,7 @@ class ReviewReadout:
 
 class ReviewModelUnavailableError(RuntimeError):
     """Foundry is not configured, so no review model can be built. Raised from the
-    model factory at RUN time — after the scan — so the failure lands in the
-    review-failed bucket with the Tier A floor still applied."""
+    model factory at RUN time, so the failure lands in the review-failed bucket."""
 
 
 def _make_throwaway_root() -> Path:
@@ -251,9 +241,9 @@ class ClassificationReviewService:
         # and the trail counts RUNS, not rows — the store keeps one row per app and
         # overwrites it, so that trail is the only place a re-run is recorded. Cancelling
         # trades a recorded run for a silent one. Its WRITE is already harmless: the
-        # store's compare-and-swap settles only a run's own claim (id + running + head_sha
-        # + attempt), and since `_bounded` every phase is inside the wall-clock ceiling, so
-        # a superseded run cannot outlive it either.
+        # store's compare-and-swap settles only a run's own claim (id + running + commit +
+        # fingerprint + attempt), and every phase is inside the wall-clock ceiling, so a
+        # superseded run cannot outlive it either.
         self._tasks: set[asyncio.Task[None]] = set()
 
     # --- the start verb ---------------------------------------------------------
@@ -265,17 +255,15 @@ class ClassificationReviewService:
         app_id: uuid.UUID,
         user_id: uuid.UUID,
         head_sha: str,
-        extracted: ExtractedSnapshot | None = None,
+        config: LiveConfig,
     ) -> ReviewRecord:
-        """Ensure a review exists for this app at `head_sha` and return its row: the
-        stored answer when the version is unchanged, the stored failure when the
-        attempt cap is spent, or a fresh RUNNING row with the run detached.
-
-        `extracted` is for the drift path only — a tree the CALLER extracted and
-        still owns; the run uses it and never deletes it. Every other caller leaves it
-        None and the run extracts (and unconditionally removes) its own copy."""
+        """Ensure a review exists for this app at `head_sha` under `config`'s class definitions
+        and return its row: the stored answer when that pair is unchanged, the stored failure
+        when the pair's attempt cap is spent, or a fresh RUNNING row with the run detached. The
+        run reviews against exactly `config.classes`, never a later read."""
+        fingerprint = config.fingerprint
         stored = await store.get_for_app(db, app_id=app_id)
-        if stored is not None and stored.head_sha == head_sha:
+        if stored is not None and is_for(stored, head_sha=head_sha, fingerprint=fingerprint):
             if _aged_out(stored):
                 # A restart orphaned this run: the task died, the row hung RUNNING.
                 # Settle it as abandoned so it can be re-claimed — a restart must age
@@ -284,6 +272,7 @@ class ClassificationReviewService:
                     db,
                     review_id=stored.review_id,
                     head_sha=stored.head_sha,
+                    fingerprint=fingerprint,
                     attempt=stored.attempt,
                     code=FAIL_ABANDONED,
                     detail="the run aged out past the wall-clock ceiling with no runner alive",
@@ -300,7 +289,7 @@ class ClassificationReviewService:
                 stored = await store.get_for_app(db, app_id=app_id)
             if (
                 stored is not None
-                and stored.head_sha == head_sha
+                and is_for(stored, head_sha=head_sha, fingerprint=fingerprint)
                 and stored.status is ClassificationReviewStatus.FAILED
                 and stored.attempt >= MAX_MODEL_RUNS_PER_VERSION
             ):
@@ -309,11 +298,13 @@ class ClassificationReviewService:
                 # routes to an administrator either way.
                 return stored
 
-        outcome = await store.claim(db, app_id=app_id, user_id=user_id, head_sha=head_sha)
+        outcome = await store.claim(
+            db, app_id=app_id, user_id=user_id, head_sha=head_sha, fingerprint=fingerprint
+        )
         if not outcome.claimed:
             return outcome.review
 
-        task = asyncio.create_task(self._run(review=outcome.review, extracted=extracted))
+        task = asyncio.create_task(self._run(review=outcome.review, classes=config.classes))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return outcome.review
@@ -331,14 +322,14 @@ class ClassificationReviewService:
 
     # --- the detached run -------------------------------------------------------
 
-    async def _run(self, *, review: ReviewRecord, extracted: ExtractedSnapshot | None) -> None:
+    async def _run(self, *, review: ReviewRecord, classes: tuple[LiveClass, ...]) -> None:
         """The detached run. NEVER raises: an escaping exception would leave the row
         RUNNING until it ages out, with the citizen staring at a spinner the whole
         ceiling long."""
         scratch = _RunScratch()
         try:
             verdicts, evidence = await self._review(
-                review=review, extracted=extracted, scratch=scratch
+                review=review, classes=classes, scratch=scratch
             )
         except _ReviewFailedError as failure:
             await self._settle(self._settle_failed(review, failure=failure, scratch=scratch))
@@ -365,12 +356,11 @@ class ClassificationReviewService:
     async def _settle(self, write: Coroutine[Any, Any, None]) -> None:
         """The terminal write, guarded so `_run`'s "NEVER raises" is true on every exit.
 
-        A transient Postgres error here (dropped connection, timeout, deadlock) used to
+        A transient Postgres error here (dropped connection, timeout, deadlock) would otherwise
         escape the detached task on the SUCCESS path, which nothing awaits: the review
-        had actually succeeded but the row never learned it, so the citizen sat out the
-        ceiling and was told it failed — with the spend already paid. Swallowing is the
-        lesser harm (the row ages out and `start` re-claims it) but is logged loudly.
-        `CancelledError` is NOT caught: shutdown must keep propagating."""
+        succeeded but the row never learns it. Swallowing is the lesser harm (the row ages out
+        and `start` re-claims it) but is logged loudly. `CancelledError` is NOT caught:
+        shutdown must keep propagating."""
         try:
             await write
         except asyncio.CancelledError:
@@ -382,15 +372,12 @@ class ClassificationReviewService:
         self,
         *,
         review: ReviewRecord,
-        extracted: ExtractedSnapshot | None,
+        classes: tuple[LiveClass, ...],
         scratch: _RunScratch,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Extraction ownership, and nothing else. A caller-owned tree is used and
-        NEVER deleted; otherwise the run extracts into a throwaway root of its own and
-        removes it in the `finally` — unconditionally: success, every failure bucket,
-        the wall-clock ceiling, and cancellation."""
-        if extracted is not None:
-            return await self._examine(review=review, extracted=extracted, scratch=scratch)
+        """Extraction ownership, and nothing else. The run extracts into a throwaway root of
+        its own and removes it in the `finally` — unconditionally: success, every failure
+        bucket, the wall-clock ceiling, and cancellation."""
         # Never the shared SHA-keyed cache: verdicts live in a row, so reuse buys nothing,
         # and a private root can never delete a directory another request is mid-read on.
         own_root = await asyncio.to_thread(_make_throwaway_root)
@@ -400,7 +387,9 @@ class ClassificationReviewService:
                 self._extract(review.app_id, cache_root=own_root),
                 phase="the snapshot extraction",
             )
-            return await self._examine(review=review, extracted=extracted, scratch=scratch)
+            return await self._examine(
+                review=review, extracted=extracted, classes=classes, scratch=scratch
+            )
         finally:
             await asyncio.to_thread(shutil.rmtree, own_root, ignore_errors=True)
 
@@ -409,6 +398,7 @@ class ClassificationReviewService:
         *,
         review: ReviewRecord,
         extracted: ExtractedSnapshot,
+        classes: tuple[LiveClass, ...],
         scratch: _RunScratch,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """The happy path over an extracted tree; every failure leaves by raising
@@ -423,28 +413,23 @@ class ClassificationReviewService:
                 f"claimed {review.head_sha} but extracted {extracted.head_sha}",
             )
 
-        # The scan FIRST: model-free, fast, and its hits become the prompt's
-        # directed evidence. From here on the Tier A floor is armed via `scratch`.
+        # The scan FIRST: model-free, fast, and its hits become the prompt's directed
+        # evidence while the credentials class is active.
         sweep = await self._bounded(
             review, scan_snapshot(extracted.root), phase="the credential scan"
         )
-        scratch.sweep = sweep
 
-        # The model is built AFTER the scan on purpose: an unconfigured Foundry is
-        # a review-failed WITH the floor applied, not a floorless crash.
         metered = _MeteredModel(self._model_factory())
         scratch.metered = metered
 
         result = await self._call_model(
-            metered, review=review, snapshot_root=extracted.root, sweep=sweep
+            metered,
+            review=review,
+            snapshot_root=extracted.root,
+            classes=classes,
+            sweep=sweep,
         )
-
-        output = result.output
-        if output.completeness is Completeness.PARTIAL:
-            # The model itself says it was cut short. Stored as a FAILURE, never as
-            # six abstentions — the ambiguity the signal exists to remove.
-            raise _ReviewFailedError(FAIL_REVIEW, "the model reported a partial review")
-        return _build_record(output, root=extracted.root, sweep=sweep)
+        return _build_record(result.output, sweep=sweep)
 
     async def _extract(self, app_id: uuid.UUID, *, cache_root: Path) -> ExtractedSnapshot:
         """Extract the saved bundle into the run's own root, mapping every way storage
@@ -494,6 +479,7 @@ class ClassificationReviewService:
         *,
         review: ReviewRecord,
         snapshot_root: Path,
+        classes: tuple[LiveClass, ...],
         sweep: CredentialSweep,
     ) -> AgentRunResult[ReviewOutput]:
         """The model phase under the wall-clock ceiling, with the one guided
@@ -507,7 +493,11 @@ class ClassificationReviewService:
         try:
             async with asyncio.timeout(remaining):
                 return await self._run_with_truncation_retry(
-                    metered, review=review, snapshot_root=snapshot_root, sweep=sweep
+                    metered,
+                    review=review,
+                    snapshot_root=snapshot_root,
+                    classes=classes,
+                    sweep=sweep,
                 )
         except TimeoutError:
             raise _ReviewFailedError(
@@ -520,8 +510,8 @@ class ClassificationReviewService:
             # sentence is the same either way.
             raise _ReviewFailedError(FAIL_REVIEW, str(exc)) from exc
         except (UnexpectedModelBehavior, ModelAPIError) as exc:
-            # Malformed output past the agent's retries, a quota refusal, any provider
-            # error — one bucket, distinguished by the stored detail.
+            # Output that never answered exactly its classes past the agent's retries, a quota
+            # refusal, any provider error — one bucket, distinguished by the stored detail.
             raise _ReviewFailedError(FAIL_REVIEW, str(exc)) from exc
 
     async def _run_with_truncation_retry(
@@ -530,6 +520,7 @@ class ClassificationReviewService:
         *,
         review: ReviewRecord,
         snapshot_root: Path,
+        classes: tuple[LiveClass, ...],
         sweep: CredentialSweep,
     ) -> AgentRunResult[ReviewOutput]:
         try:
@@ -537,6 +528,7 @@ class ClassificationReviewService:
                 model=metered,
                 user_id=review.user_id,
                 snapshot_root=snapshot_root,
+                classes=classes,
                 scan_hits=sweep.hits,
                 usage_limits=UsageLimits(request_limit=REVIEW_REQUEST_BUDGET),
             )
@@ -556,6 +548,7 @@ class ClassificationReviewService:
                     model=metered,
                     user_id=review.user_id,
                     snapshot_root=snapshot_root,
+                    classes=classes,
                     prompt=_TRUNCATION_NUDGE,
                     message_history=first.history,
                     usage_limits=UsageLimits(request_limit=budget_left),
@@ -583,6 +576,7 @@ class ClassificationReviewService:
                 db,
                 review_id=review.review_id,
                 head_sha=review.head_sha,
+                fingerprint=_claimed_fingerprint(review),
                 attempt=review.attempt,
                 verdicts=verdicts,
                 evidence=evidence,
@@ -610,21 +604,15 @@ class ClassificationReviewService:
         failure: _ReviewFailedError,
         scratch: _RunScratch,
     ) -> None:
-        # The model never returned, but a COMPLETE sweep with a Tier A hit is strong
-        # enough to stand in as the credentials answer. The row is still FAILED (it still
-        # routes) — the verdicts just carry the floor.
-        floor = _floor_record(scratch.sweep)
-        verdicts, evidence = floor if floor is not None else (None, None)
         async with self._session_factory() as db:
             settled = await store.fail(
                 db,
                 review_id=review.review_id,
                 head_sha=review.head_sha,
+                fingerprint=_claimed_fingerprint(review),
                 attempt=review.attempt,
                 code=failure.code,
                 detail=redact_and_cap(failure.detail, _DETAIL_MAX_CHARS),
-                verdicts=verdicts,
-                evidence=evidence,
                 **_usage_columns(scratch),
             )
         _log.warning(
@@ -637,7 +625,7 @@ class ClassificationReviewService:
         await self._record_run(
             review,
             outcome=failure.code,
-            verdict_summary=_verdict_summary(verdicts) if verdicts is not None else None,
+            verdict_summary=None,
             scratch=scratch,
             superseded=not settled,
         )
@@ -750,126 +738,33 @@ def _usage_columns(scratch: _RunScratch) -> dict[str, int]:
     }
 
 
-def _cites_a_real_location(root: Path, rel_path: str) -> bool:
-    """The machine check behind a cited location: the path must resolve to a real FILE
-    inside the extracted tree. Resolution-jailed like the read tools — a traversal or an
-    absolute path is simply not evidence."""
-    try:
-        resolved = (root / rel_path).resolve()
-        root_resolved = root.resolve()
-    except OSError:
-        return False
-    if resolved != root_resolved and root_resolved not in resolved.parents:
-        return False
-    return resolved.is_file()
+def _claimed_fingerprint(review: ReviewRecord) -> str:
+    """The fingerprint a claim stamped; every claim writes one, so a run never holds a row
+    without it."""
+    if review.definitions_fingerprint is None:
+        raise RuntimeError(f"review {review.review_id} was claimed without a fingerprint")
+    return review.definitions_fingerprint
 
 
 def _build_record(
-    output: ReviewOutput, *, root: Path, sweep: CredentialSweep
+    output: ReviewOutput, *, sweep: CredentialSweep
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The completed output → the two stored documents: `verdicts` (citizen/admin-safe
-    — per-question verdict, REDACTED reason, scan agreement, downgrade marker, plus a
-    booleans-only `scan` summary) and `evidence` (internal — cited locations, the
-    scan's located hits, downgraded keys; never rendered to a person).
-
-    Two rules run BEFORE anything is written: a Yes with no VALID cited location is
-    downgraded to unanswered, never silently cleared; every reason passes the shared
+    """The completed output → the two stored documents: `verdicts` (owner- and admin-safe:
+    each class's verdict and its REDACTED reason) and `evidence` (internal: cited locations and
+    the scan's located hits, never rendered to a person). Every reason passes the shared
     redactor, the deterministic backstop behind the prompt's own plain-language ask."""
-    tier_a = any(located.hit.tier is Tier.A for located in sweep.hits)
-    tier_b = any(located.hit.tier is Tier.B for located in sweep.hits)
-
-    questions: dict[str, Any] = {}
-    evidence_questions: dict[str, Any] = {}
-    downgraded: list[str] = []
-    tier_a_dispute = False
-
-    for question in output.questions:
-        refs = [
-            {
-                "path": ref.path,
-                "kind": ref.kind,
-                "valid": _cites_a_real_location(root, ref.path),
-            }
-            for ref in question.evidence
-        ]
-        verdict = question.verdict
-        was_downgraded = False
-        if verdict is Verdict.YES and not any(ref["valid"] for ref in refs):
-            # A Yes whose every cited location does not exist is not evidence: it becomes
-            # unanswered, handed to the citizen, and the downgrade is recorded rather than
-            # silently absorbed.
-            verdict = Verdict.UNANSWERED
-            was_downgraded = True
-            downgraded.append(question.key)
-        if question.key == "credentials_secrets" and tier_a and question.verdict is Verdict.NO:
-            # The model was SHOWN a Tier A hit and said No. Its No is the verdict
-            # — but an overrule nobody can see is the same as having no scan.
-            tier_a_dispute = True
-        questions[question.key] = {
-            "verdict": verdict.value,
-            "reason": redact_secrets(question.reason),
-            "agreed_with_scan": question.agreed_with_scan,
-            "downgraded_from_yes": was_downgraded,
-        }
-        evidence_questions[question.key] = refs
-
     verdicts_doc: dict[str, Any] = {
-        "source": "review",
-        "questions": questions,
-        "scan": {
-            "tier_a_hit": tier_a,
-            "tier_b_hit": tier_b,
-            "incomplete": sweep.incomplete,
-            "tier_a_dispute": tier_a_dispute,
-        },
+        "classes": {
+            answer.key: {"verdict": answer.verdict.value, "reason": redact_secrets(answer.reason)}
+            for answer in output.answers
+        }
     }
     evidence_doc: dict[str, Any] = {
-        "questions": evidence_questions,
-        "scan_hits": _scan_hit_refs(sweep),
-        "downgraded": downgraded,
-    }
-    return verdicts_doc, evidence_doc
-
-
-def _floor_record(sweep: CredentialSweep | None) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    """The Tier A floor's stored shape, or None when the floor does not stand.
-
-    It stands only when the sweep RAN, is COMPLETE, and holds a Tier A hit — an
-    incomplete sweep saw a prefix of the app and must not be promoted to an answer,
-    and a Tier B lead was never strong enough to answer on its own. `source:
-    "scan_floor"` is the marker a reader takes as "the Tier A floor stands" (the row's
-    status is still FAILED, so the app still routes)."""
-    if sweep is None or sweep.incomplete:
-        return None
-    if not any(located.hit.tier is Tier.A for located in sweep.hits):
-        return None
-    questions = {
-        key: {
-            "verdict": (Verdict.YES if key == "credentials_secrets" else Verdict.UNANSWERED).value,
-            "reason": (
-                _FLOOR_CREDENTIALS_REASON
-                if key == "credentials_secrets"
-                else _FLOOR_UNANSWERED_REASON
-            ),
-            "agreed_with_scan": None,
-            "downgraded_from_yes": False,
-        }
-        for key in CLASSIFICATION_KEYS
-    }
-    verdicts_doc: dict[str, Any] = {
-        "source": "scan_floor",
-        "questions": questions,
-        "scan": {
-            "tier_a_hit": True,
-            "tier_b_hit": any(located.hit.tier is Tier.B for located in sweep.hits),
-            "incomplete": False,
-            "tier_a_dispute": False,
+        "classes": {
+            answer.key: [{"path": ref.path, "kind": ref.kind} for ref in answer.evidence]
+            for answer in output.answers
         },
-    }
-    evidence_doc: dict[str, Any] = {
-        "questions": {key: [] for key in CLASSIFICATION_KEYS},
         "scan_hits": _scan_hit_refs(sweep),
-        "downgraded": [],
     }
     return verdicts_doc, evidence_doc
 
@@ -889,10 +784,10 @@ def _scan_hit_refs(sweep: CredentialSweep) -> list[dict[str, Any]]:
 
 
 def _verdict_summary(verdicts: dict[str, Any]) -> dict[str, str]:
-    """The six verdict strings alone — what the audit row carries. Reasons and
-    locations stay out of the trail; the row is about WHO ran WHAT and what came back."""
-    questions: dict[str, Any] = verdicts["questions"]
-    return {key: str(entry["verdict"]) for key, entry in questions.items()}
+    """The verdict strings alone — what the audit row carries. Reasons and locations stay out
+    of the trail; the row is about WHO ran WHAT and what came back."""
+    answers: dict[str, Any] = verdicts["classes"]
+    return {key: str(entry["verdict"]) for key, entry in answers.items()}
 
 
 # --- the process-wide singleton -----------------------------------------------------
@@ -901,8 +796,7 @@ def _verdict_summary(verdicts: dict[str, Any]) -> dict[str, str]:
 def _default_model_factory() -> Model:
     """The Foundry model for a real run, built lazily PER RUN so importing (and
     constructing) the service never requires a configured Foundry. Unconfigured
-    Foundry raises here — at run time, after the scan — landing in the review-failed
-    bucket with the Tier A floor still applied."""
+    Foundry raises here, at run time, landing in the review-failed bucket."""
     from src.config import settings
     from src.services.agent.model import build_foundry_model
 

@@ -211,7 +211,7 @@ export function renderBuilder({ projectId = 'p1', hasSavedBuild = null, initialE
     <MemoryRouter initialEntries={initialEntries}>
       <Routes>
         <Route element={<WorkspaceShell />}>
-          <Route path="/chat/:chatId" element={<ConversationSurface projectId={projectId} projectName="VIP Movement" projectHasSavedBuild={hasSavedBuild} />} />
+          <Route path="/chat/:chatId" element={<ConversationSurface projectId={projectId} projectHasSavedBuild={hasSavedBuild} />} />
         </Route>
         <Route path="/projects" element={<div>projects index</div>} />
         <Route path="/projects/:pid" element={<div>project page</div>} />
@@ -229,17 +229,15 @@ export function renderBuilder({ projectId = 'p1', hasSavedBuild = null, initialE
  * @param {{
  *   chatId?: string,
  *   projectId?: string,
- *   projectName?: string,
  *   hasSavedBuild?: boolean | null,
  * }} [opts]
  */
 export function renderBuilderAt({
   chatId = 'chat-A',
   projectId = 'pA',
-  projectName = 'VIP Movement',
   hasSavedBuild = null,
 } = {}) {
-  const at = { chatId, projectId, projectName }
+  const at = { chatId, projectId }
   const tree = () => (
     <MemoryRouter initialEntries={['/chat/routed']}>
       <Routes>
@@ -250,7 +248,6 @@ export function renderBuilderAt({
               <ConversationSurface
                 chatId={at.chatId}
                 projectId={at.projectId}
-                projectName={at.projectName}
                 projectHasSavedBuild={hasSavedBuild}
               />
             }

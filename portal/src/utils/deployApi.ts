@@ -2,70 +2,26 @@
  * Typed client for one-click deploy (`/api/projects/:projectId/{deploy,deployment}`), mirroring
  * `projectApi.ts`: responses arrive as `unknown` through a narrower that throws `ApiError`.
  *
- * ONE CALL DECIDES, THEN PUBLISHES OR QUEUES: answers are merged and scored server-side in one
- * request, so `DeployOutcome` is either started or routed to the admin queue at the version
- * examined. `getDeployment` polls a detached job — the deploy outruns the gateway's 20s budget —
- * and that poll ALSO carries approval state, since the toolbar publish surface has a project id
- * and no app id. The pre-publish review only pre-fills; the publish re-reads the STORED review
- * server-side, so nothing the browser learned there is authoritative. The weights below decide
- * nothing — see `totalWeight`.
+ * ONE CALL DECIDES, THEN PUBLISHES OR QUEUES: the server scores the owner's answers against the
+ * STORED review in the request, so `DeployOutcome` is either started or routed to the admin
+ * queue at the version examined, and nothing the browser learned from the review is
+ * authoritative. `getDeployment` polls a detached job — the deploy outruns the gateway's 20s
+ * budget — and that poll ALSO carries approval state, since the toolbar publish surface has a
+ * project id and no app id.
  */
 import { ApiError, isRecord, optionalString, readApiError } from './apiError'
 import { authFetch } from './api.js'
-import type { AppStatus, ApprovalRoute, AuthFetchDeps } from './projectApi'
+import type { AppStatus, AuthFetchDeps } from './projectApi'
 
-/** The six declared categories plus the optional explanation. */
-export interface DataClassificationAnswers {
-  credentialsSecrets: boolean
-  healthData: boolean
-  personalInformation: boolean
-  financialData: boolean
-  confidentialBusinessData: boolean
-  publicData: boolean
-  notes: string | null
+/** What the owner sends about the saved version: a Yes/No per class key, and the note an
+ *  administrator reads when the send goes to them. */
+export interface PublishAnswers {
+  answers: Record<string, boolean>
+  note: string | null
 }
 
-export type ClassificationKey = keyof Omit<DataClassificationAnswers, 'notes'>
-
-/**
- * `(key, label, weight, storedKey)` — THE questionnaire on this side of the wire, mirroring the
- * backend's `DATA_CLASSIFICATION_QUESTIONS` (`services/deploy/classification.py`). Keep in sync
- * by hand, as ONE table — `components/admin/declaration.ts` derives its list from this one.
- * `storedKey` is the same question's snake_case spelling in the stored declaration document,
- * carried here so the pairing is checkable in one place instead of inferred at a call site.
- */
-export const DATA_CLASSIFICATION_QUESTIONS: ReadonlyArray<
-  readonly [key: ClassificationKey, label: string, weight: number, storedKey: string]
-> = [
-  ['credentialsSecrets', 'Credentials / Secrets', 40, 'credentials_secrets'],
-  ['healthData', 'Health Data', 25, 'health_data'],
-  ['personalInformation', 'Personal Information (PII)', 20, 'personal_information'],
-  ['financialData', 'Financial Data', 20, 'financial_data'],
-  ['confidentialBusinessData', 'Confidential Business Data', 15, 'confidential_business_data'],
-  ['publicData', 'Public Data', 0, 'public_data'],
-]
-
-/** AT OR BELOW this total the server deploys without a human — 0, so only a fully-clean
- *  declaration ever auto-publishes; any weighted category at all needs a person (the gate
- *  previously ran the other way, auto-publishing the MORE sensitive declarations). Also
- *  the explanation threshold — any total ABOVE this both needs a person AND is obliged to
- *  say why, never one without the other. Shown to set expectations — never used to disable
- *  the deploy button, because then the client would be the gate. */
-export const AUTO_DEPLOY_MAX_SCORE = 0
-
-/**
- * The weighted total for a possibly-partial answer set; unanswered categories don't count.
- *
- * This copy of the weights DECIDES NOTHING — it drives the running total and the prompt, and the
- * deploy button stays enabled even at a high local total, because a server refusal is the correct
- * outcome, never a UI failure to prevent.
- */
-export function totalWeight(answers: Partial<Record<string, boolean | null>>): number {
-  return DATA_CLASSIFICATION_QUESTIONS.reduce(
-    (sum, [key, , weight]) => (answers[key] === true ? sum + weight : sum),
-    0,
-  )
-}
+/** The note's ceiling, mirroring `DeployRequest.note` server-side: a longer note is refused. */
+export const MAX_NOTE = 1000
 
 /** The 202 body: the deploy has barely begun and this is the id to poll. */
 export interface StartedDeploy {
@@ -110,10 +66,6 @@ export interface ApprovalState {
    *  recognises. Null exactly when `approvedCommitSha` is — the two are written together
    *  in one place server-side and are never apart. */
   approvedAt: string | null
-  /** WHICH lineage the current submission entered through. A `runbook` approval
-   *  authorises the manual go-live runbook and never self-publishing, so anything
-   *  rendering "you may publish this" reads the lineage as well as the pin. */
-  approvalRoute: ApprovalRoute | null
   rejectionNote: string | null
   submittedSha: string | null
   submittedAt: string | null
@@ -134,8 +86,6 @@ export type PublishState =
   | 'draft'
   | 'in_review'
   | 'changes_requested'
-  | 'approved_ready_to_publish'
-  | 'approved_needs_review_again'
   | 'starting_up'
   | 'live_current'
   | 'live_newer_work'
@@ -179,6 +129,12 @@ export interface DeploymentView {
    */
   publishState: PublishState
   /**
+   * The commit the one button posts when it republishes the version an administrator
+   * approved — no save, no review, no dialog. Null whenever the button acts on the saved
+   * version instead. The server authors it; nothing here compares it with another commit.
+   */
+  approvedRetryCommit: string | null
+  /**
    * THE CITIZEN'S OWN LAST SAVE. The server reuses the ONE object-store metadata HEAD that
    * computes `publishState`'s drift — no second call, no container needed (works on a
    * stopped workspace). The two fields are INDEPENDENTLY NULL: a pre-metadata-stamp bundle
@@ -205,8 +161,36 @@ export interface DeploymentView {
  * server that authors it, not a new helper here.
  */
 
-/** The 409 raised when the workspace is ahead of the last save; retry with `saveFirst`. */
-export const UNSAVED_CHANGES = 'unsaved_changes'
+/** The 409 raised when the request names a version that is no longer the saved one. */
+export const SNAPSHOT_MOVED = 'snapshot_moved'
+
+/**
+ * Why a send that goes to an administrator was refused for want of a note. `unknown` is a reason
+ * this client does not recognise: the send still needs a note.
+ */
+export type NoteRequiredReason =
+  | 'hard_block'
+  | 'over_threshold'
+  | 'review_unfinished'
+  | 'rejection_standing'
+  | 'unknown'
+
+const NOTE_REQUIRED_REASONS: ReadonlySet<string> = new Set<NoteRequiredReason>([
+  'hard_block',
+  'over_threshold',
+  'review_unfinished',
+  'rejection_standing',
+])
+
+/** The reason off a `422 note_required` refusal, or null for any other failure. */
+export function noteRequiredReason(err: unknown): NoteRequiredReason | null {
+  if (!(err instanceof ApiError) || err.code !== 'note_required') return null
+  const detail = err.details?.detail
+  const reason = isRecord(detail) ? detail.reason : null
+  return typeof reason === 'string' && NOTE_REQUIRED_REASONS.has(reason)
+    ? (reason as NoteRequiredReason)
+    : 'unknown'
+}
 
 function readString(value: unknown, field: string): string {
   if (typeof value !== 'string' || value.length === 0) {
@@ -232,18 +216,6 @@ function toAppStatus(value: unknown): AppStatus {
   throw new ApiError('The server sent an app status we could not read.', 500)
 }
 
-function toApprovalRoute(value: unknown): ApprovalRoute | null {
-  // NULL is a real state — a never-submitted draft has no lineage — and an UNKNOWN
-  // literal answers null too, which is the conservative reading rather than the lax one:
-  // every consumer branches on `=== 'self_publish'`, so "no claim" withholds the
-  // self-publish affordance instead of granting it. Throwing here (the earlier policy)
-  // was strictly worse — it propagated through the deploy hook's loadError and blanked
-  // the citizen's whole Publish card over a field the gate re-decides server-side
-  // anyway. This matches the admin client's documented policy for the same wire value.
-  if (value === 'runbook' || value === 'self_publish') return value
-  return null
-}
-
 /** Null only when the project has no app yet — parse-don't-validate at the boundary so
  *  no consumer downstream ever re-checks a raw record. */
 function toApprovalState(value: unknown): ApprovalState | null {
@@ -255,7 +227,6 @@ function toApprovalState(value: unknown): ApprovalState | null {
     status: toAppStatus(value.status),
     approvedCommitSha: optionalString(value.approvedCommitSha),
     approvedAt: optionalString(value.approvedAt),
-    approvalRoute: toApprovalRoute(value.approvalRoute),
     rejectionNote: optionalString(value.rejectionNote),
     submittedSha: optionalString(value.submittedSha),
     submittedAt: optionalString(value.submittedAt),
@@ -286,9 +257,8 @@ const SAVED_STATES: ReadonlySet<string> = new Set<SavedState>([
 ])
 
 /**
- * NULL IS THE CONSERVATIVE READING, and it is `toApprovalRoute`'s policy rather than
- * `toPublishState`'s: an unrecognised value must not blank the citizen's whole status panel
- * over a supplementary field. It must also not be read as `never_saved` — the one value
+ * NULL IS THE CONSERVATIVE READING, not `toPublishState`'s throw: an unrecognised value must
+ * not blank the citizen's whole status panel over a supplementary field. It must also not be read as `never_saved` — the one value
  * that REMOVES a row. "No claim" keeps the row and its honest "could not tell", so a server
  * that grows a fifth member fails towards saying too little rather than towards telling a
  * citizen their save was never made.
@@ -302,8 +272,6 @@ const PUBLISH_STATES: ReadonlySet<string> = new Set<PublishState>([
   'draft',
   'in_review',
   'changes_requested',
-  'approved_ready_to_publish',
-  'approved_needs_review_again',
   'starting_up',
   'live_current',
   'live_newer_work',
@@ -319,14 +287,13 @@ const PUBLISH_STATES: ReadonlySet<string> = new Set<PublishState>([
 // client does not mirror the decision — it consumes it — so below is everything it could
 // never have seen, and why each gap costs only a press, never a wrong promise.
 //
-// 1. SAVE TIMING. `saveFirst` can write a new snapshot inside this same request (ladder
-//    rule 3a defers to the pipeline), so the commit judged need not exist when this read is
-//    taken. One-directional: the button states a ceiling on the attempt, never the outcome
-//    — publishing directly beats what it promised, never contradicts it.
-// 2. MERGED CLASSIFICATION SCORE. The server merges the stored review with submitted
-//    answers and scores in-request; the local weights (see file header) drive only the
-//    running tally, never withhold the button — a server refusal-with-explanation is
-//    correct, never a UI failure to prevent.
+// 1. THE SAVED VERSION. The request names the commit the dialog reviewed, and the server
+//    compares it with what is saved now, refusing a mismatch (`snapshot_moved`). This client
+//    never compares the two; a save it did not see costs a reopened dialog, never a publish.
+// 2. THE PUBLISH DECISION. The dialog mirrors the score from the review readout's live
+//    classes and policy (`classificationScore.ts`, held to the server by a shared fixture),
+//    but a standing rejection is not on that readout. A send the dialog expected to publish
+//    comes back `note_required`, and the dialog asks for the note then.
 // 3. THE SAVED SNAPSHOT'S HEAD. The server spends its one metadata HEAD on the drift
 //    comparison and serves the ANSWER, not the head — this client cannot compute drift,
 //    so it cannot quietly resolve `live_drift_unknown` to `live_current`.
@@ -393,27 +360,26 @@ function toDeploymentView(body: unknown): DeploymentView {
     unpublishedAt: optionalString(body.unpublishedAt),
     approval: toApprovalState(body.approval),
     publishState: toPublishState(body.publishState),
+    approvedRetryCommit: optionalString(body.approvedRetryCommit),
     savedHead: optionalString(body.savedHead),
     savedAt: optionalString(body.savedAt),
     savedState: toSavedState(body.savedState),
   }
 }
 
-export interface StartDeployRequest {
-  answers: DataClassificationAnswers
-  /** The citizen's explicit "save and deploy". Default false is the safe default: a deploy
-   *  ships the last SAVED version, so deploying over unsaved work unasked publishes
-   *  something they never chose. */
-  saveFirst?: boolean
+export interface StartDeployRequest extends Partial<PublishAnswers> {
+  /** The version this press is about: the saved version the dialog reviewed, or the
+   *  server's `approvedRetryCommit`, which needs no answers and no note. */
+  commitSha: string
 }
 
 /**
  * Ask to publish. Two success shapes via `outcome`: `started` (202, poll the id) or
  * `routed_for_review` (200, queued pinned to `commitSha`) — an OUTCOME, not a failure, and
  * both surfaces render it informationally. Throws `ApiError` otherwise: 409
- * `app_disabled`/`unsaved_changes`/`snapshot_moved`, 409 `waiting_for_review`
- * (`error.detail` carries the pending state, no second call needed), 422
- * `explanation_required`, 503 `storage_unavailable`.
+ * `app_disabled`/`snapshot_moved`, 409 `waiting_for_review` (`error.detail` carries the
+ * pending state, no second call needed), 422 `note_required` (see `noteRequiredReason`) or
+ * `unknown_class`, 503 `storage_unavailable`.
  */
 export async function startDeploy(
   projectId: string,
@@ -425,7 +391,11 @@ export async function startDeploy(
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answers: request.answers, saveFirst: request.saveFirst ?? false }),
+      body: JSON.stringify({
+        commitSha: request.commitSha,
+        answers: request.answers,
+        note: request.note,
+      }),
     },
     deps,
   )

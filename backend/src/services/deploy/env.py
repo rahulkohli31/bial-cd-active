@@ -1,15 +1,15 @@
 """The environment a PUBLISHED app runs with.
 
 The values match the sandbox — same DB, same object-store container, and the same connector
-coordinates when the project has been granted them — so the app the citizen tested is the app that
+coordinates when the project has switched them on — so the app the citizen tested is the app that
 ships. Only the Blob CREDENTIAL differs, and it is load-bearing:
 the sandbox's builder mints a 7-day SESSION SAS, but a published app outlives that, so publish
-mints the LONG-LIVED credential instead (the one that already exists for the manual runbook;
+mints the LONG-LIVED credential instead (the one the admin `deploy-credential` lever mints;
 revocable via a per-app stored access policy rather than an inlined expiry).
 
 CONSEQUENCE: each mint REPLACES the container's whole policy set — a redeploy revokes the
-previous credential (fine, it's being replaced), but minting a runbook credential for the same
-app cuts off a live one-click deploy's storage, and vice versa. One live credential per app.
+previous credential (fine, it's being replaced), but an administrator minting one through that
+lever cuts off a live deploy's storage, and vice versa. One live credential per app.
 """
 
 from __future__ import annotations
@@ -43,10 +43,10 @@ async def build_published_env(
     override (which exists only so a container on a local Docker network can reach Azurite) —
     reusing it would inject a development host into production.
 
-    `user_id` IS THE OWNERSHIP CLAIM, not a convenience. The connector coordinates are granted
-    per person and per project, so the builder below needs to know whose project this is; an
-    app published by somebody who never had access to a connector must not carry a credential
-    to it. It is threaded in rather than looked up here for the reason the whole module is
+    `user_id` IS THE OWNERSHIP CLAIM, not a convenience. The connector coordinates follow the
+    project's own switch, so the builder below needs to know whose project this is; an app
+    published from somebody else's project must not carry a credential to its connector. It is
+    threaded in rather than looked up here for the reason the whole module is
     written this way: the caller already holds it, and a second lookup is a second chance to
     scope it wrongly.
 
@@ -65,9 +65,9 @@ async def build_published_env(
 
     env = build_app_env(app_id)
     env |= await provision_app_database(db, project_id)
-    # THE SAME GATE THE SANDBOX USES, through the same function: a lake configured, the
-    # connector switched on for this project, and its owner's access approved. Not inferred from
-    # the lake being configured platform-wide — that would hand every published app on the
+    # THE SAME GATE THE SANDBOX USES, through the same function: a lake configured, and the
+    # connector switched on for this project. Not inferred from the lake being configured
+    # platform-wide — that would hand every published app on the
     # platform a credential to BIAL's flight data.
     env |= await build_connector_env(db, user_id=user_id, project_id=project_id)
 

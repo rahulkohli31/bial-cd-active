@@ -28,7 +28,7 @@ import sqlalchemy as sa
 from structlog.testing import capture_logs
 
 from src.core.errors import AppApiError
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.services.approvals.submit import submit_app_for_review
 from src.services.storage import StorageError, snapshot_key, submission_key
@@ -77,9 +77,9 @@ def _staged(app_row: AppRegistry, store: FakeStorage | None = None) -> FakeStora
     return store
 
 
-async def _submit(db, store, user, app_row, *, route=ApprovalRoute.SELF_PUBLISH):
+async def _submit(db, store, user, app_row):
     return await submit_app_for_review(
-        db, store, user_id=user.id, app=app_row, declaration=_DECLARATION, route=route
+        db, store, user_id=user.id, app=app_row, declaration=_DECLARATION
     )
 
 
@@ -110,7 +110,7 @@ async def test_submit_copies_the_bundle_and_moves_draft_to_pending(db_session) -
     assert copied.startswith(b"# v")
 
 
-async def test_submit_records_the_lineage_and_the_declaration(db_session) -> None:
+async def test_submit_records_the_declaration(db_session) -> None:
     # The declaration is stored verbatim — opaque to this service, never reshaped.
     user, app_row = await _owned_app(db_session)
     store = _staged(app_row)
@@ -119,11 +119,10 @@ async def test_submit_records_the_lineage_and_the_declaration(db_session) -> Non
 
     row = await db_session.get(AppRegistry, app_row.id)
     await db_session.refresh(row)
-    assert row.approval_route is ApprovalRoute.SELF_PUBLISH
     assert row.declaration == _DECLARATION
 
 
-async def test_submit_writes_an_audit_row_with_artifact_and_route_detail(db_session) -> None:
+async def test_submit_writes_an_audit_row_with_artifact_detail(db_session) -> None:
     user, app_row = await _owned_app(db_session)
     store = _staged(app_row)
 
@@ -138,13 +137,7 @@ async def test_submit_writes_an_audit_row_with_artifact_and_route_detail(db_sess
     ).scalar_one()
     assert audit.action == "submit"
     assert audit.actor_id == user.id
-    # The detail identifies the artifact — and now also the lineage, so the
-    # trail can tell a publish-flow entry from any future admin-initiated one.
-    assert audit.detail == {
-        "submissionId": str(receipt.submission_id),
-        "commitSha": _SHA,
-        "route": "self_publish",
-    }
+    assert audit.detail == {"submissionId": str(receipt.submission_id), "commitSha": _SHA}
 
 
 async def test_submit_is_commitless_the_caller_owns_the_commit(db_session, monkeypatch) -> None:
@@ -479,7 +472,6 @@ async def test_a_caller_supplied_mismatched_user_is_a_non_leaking_404(db_session
             user_id=stranger.id,
             app=app_row,
             declaration=_DECLARATION,
-            route=ApprovalRoute.SELF_PUBLISH,
         )
     assert excinfo.value.status_code == 404
     assert excinfo.value.message == "App not found."

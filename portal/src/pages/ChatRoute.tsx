@@ -385,11 +385,12 @@ export default function ChatRoute() {
       onTitleDerived={(title) =>
         setResolution((held) => (held.status === 'ready' && !held.title ? { ...held, title } : held))
       }
+      onProjectUpdate={setProject}
       conversation={{
         chatId: resolution.chatId,
         kind: resolution.kind,
         projectId: resolution.projectId,
-        projectName: resolved?.name ?? null,
+        project: resolved,
         // Relaunch affordance derives from PROJECT-level state, so a fresh conversation in a
         // project with a saved build can still restore its preview. What travels is whether a
         // Relaunch would actually FIND something — not `appId`, which is minted at provision

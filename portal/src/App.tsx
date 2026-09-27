@@ -6,7 +6,6 @@ import ChatRoute from './pages/ChatRoute'
 import AssistantPage from './pages/AssistantPage'
 import MarketplacePage from './pages/MarketplacePage'
 import SharedApplicationsPage from './pages/SharedApplicationsPage'
-import IntegrationsPage from './pages/IntegrationsPage'
 import ProjectsPage from './pages/ProjectsPage'
 import ProjectPage from './pages/ProjectPage'
 import SharedProjectPage from './pages/SharedProjectPage'
@@ -150,9 +149,6 @@ export default function App() {
         <Route path="/assistant/:chatId" element={<Shell><AssistantPage /></Shell>} />
         {/* Cross-user by design: every signed-in BIAL user sees the same catalog. */}
         <Route path="/marketplace" element={<Shell><MarketplacePage /></Shell>} />
-        {/* ONE ROUTE REACHES INTEGRATIONS. It was a dialog with two doors and no address, so
-            nobody could link to it and neither door could be reached from the other's screen. */}
-        <Route path="/integrations" element={<Shell><IntegrationsPage /></Shell>} />
         {/* THE WORKSPACE. A pathless layout route wrapping both addresses inside a project, so
             the shell — and above all the running app it holds — is preserved across a move
             between them: React Router renders the same layout element at the same position

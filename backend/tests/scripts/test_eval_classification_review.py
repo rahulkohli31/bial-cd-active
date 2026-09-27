@@ -4,9 +4,10 @@ The script's real output is a measurement run against real bundles and live Foun
 that run happens outside the test suite, and nothing here asserts accuracy numbers.
 What IS pinned: a run against a local fixture bundle with a SCRIPTED model emits a
 report row with every field populated; a bundle that fails to extract is a failure ROW
-rather than an abort of the sweep; and argument errors exit non-zero with usage. The
-models are `FunctionModel` scripts throughout (`ALLOW_MODEL_REQUESTS = False` makes a
-real Foundry call impossible, not merely absent).
+rather than an abort of the sweep; the golden scenarios carry their expectations and every
+miss is reported; and argument errors exit non-zero with usage. The models are
+`FunctionModel` scripts throughout (`ALLOW_MODEL_REQUESTS = False` makes a real Foundry call
+impossible, not merely absent), and the class configuration is injected, never read.
 """
 
 from __future__ import annotations
@@ -23,8 +24,9 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
 from scripts import eval_classification_review as eval_script
+from src.db.models.classification_config import ClassificationKind
 from src.services.classification.agent import OUTPUT_TOOL_NAME
-from src.services.deploy.classification import CLASSIFICATION_KEYS
+from src.services.classification.config import LiveClass, LiveConfig
 
 # The row contract: every run row carries EXACTLY these keys, always — null where a
 # field could not apply. A consumer greps a field name and gets every run.
@@ -47,16 +49,15 @@ EXPECTED_ROW_KEYS = {
     "cache_read_tokens",
     "cache_write_tokens",
     "final_step_output_tokens",
-    "completeness",
     "verdicts",
-    "effective_verdicts",
-    "downgraded",
     "evidence",
     "scan",
     "seeded",
     "caught",
     "known_clean",
     "would_route",
+    "expected",
+    "expected_met",
 }
 
 # The named summary figures (and the distributions the ceilings are re-set from).
@@ -80,11 +81,42 @@ EXPECTED_SUMMARY_KEYS = {
     "tier_a_precision_gate",
     "tier_a_false_positive_paths",
     "labeled_bundles_unscanned",
+    "golden_total",
+    "golden_passed",
+    "golden_failures",
     "wall_clock_s",
     "requests",
     "tool_calls",
     "final_step_output_tokens",
 }
+
+
+def _class(key: str, kind: ClassificationKind, weight: int | None) -> LiveClass:
+    return LiveClass(
+        key=key,
+        title=key,
+        description=f"Yes if the app handles {key}. No: a calculator.",
+        kind=kind,
+        weight=weight,
+    )
+
+
+_SCORED = ClassificationKind.SCORED
+_HARD = ClassificationKind.HARD_BLOCK
+_CONFIG = LiveConfig(
+    threshold=100,
+    owners_can_change_answers=True,
+    classes=(
+        _class("ai_usage", _SCORED, 20),
+        _class("confidential_business_data", _SCORED, 20),
+        _class("credentials_keys", _SCORED, 20),
+        _class("financial_data", _HARD, None),
+        _class("integrations", _SCORED, 20),
+        _class("pii", _HARD, None),
+        _class("public_data", _SCORED, 20),
+    ),
+)
+_KEYS = [entry.key for entry in _CONFIG.classes]
 
 _TIER_A_VALUE = "sk_live_" + "a1b2c3d4e5" * 3
 _TIER_A_LINE = f'const stripeKey = "{_TIER_A_VALUE}"\n'
@@ -151,10 +183,7 @@ def _question(key: str, verdict: str = "no", **overrides: Any) -> dict[str, Any]
 
 
 def _complete_args(**per_key: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "completeness": "complete",
-        "questions": [per_key.get(key, _question(key)) for key in CLASSIFICATION_KEYS],
-    }
+    return {"answers": [per_key.get(key, _question(key)) for key in _KEYS]}
 
 
 def _usage(
@@ -232,6 +261,7 @@ def test_happy_path_emits_a_report_row_with_every_field_populated(tmp_path: Path
             str(out_path),
         ],
         model_factory=factory,
+        config=_CONFIG,
     )
 
     assert code == 0
@@ -253,10 +283,9 @@ def test_happy_path_emits_a_report_row_with_every_field_populated(tmp_path: Path
     assert row["failure_kind"] is None
     assert row["failure_detail"] is None
     assert row["wall_clock_s"] > 0
-    assert row["completeness"] == "complete"
 
     # Budgets: requests, tool calls, the four RAW token classes, and the FINAL step's
-    # output tokens separately (the 8,000 cap is later re-set from that distribution).
+    # output tokens separately (the output cap is later re-set from that distribution).
     assert row["requests"] == 2
     assert row["tool_calls"] == 1  # read_file only — the output tool is not a step
     assert row["input_tokens"] == 1_400
@@ -265,14 +294,10 @@ def test_happy_path_emits_a_report_row_with_every_field_populated(tmp_path: Path
     assert row["cache_write_tokens"] == 205
     assert row["final_step_output_tokens"] == 80  # the LAST step alone, not the sum
 
-    # Verdicts, the production downgrade, catch/miss, and routing.
-    assert set(row["verdicts"]) == set(CLASSIFICATION_KEYS)
+    # Answers, catch/miss, and routing.
+    assert set(row["verdicts"]) == set(_KEYS)
     assert row["verdicts"]["financial_data"] == "yes"
-    assert row["effective_verdicts"]["financial_data"] == "yes"  # evidence path is real
-    assert row["downgraded"] == []
-    assert row["evidence"]["financial_data"] == [
-        {"path": "app/page.tsx", "kind": "form-field", "valid": True}
-    ]
+    assert row["evidence"]["financial_data"] == [{"path": "app/page.tsx", "kind": "form-field"}]
     assert row["scan"] == {
         "tier_a_paths": [],
         "tier_b_paths": [],
@@ -282,7 +307,8 @@ def test_happy_path_emits_a_report_row_with_every_field_populated(tmp_path: Path
     assert row["seeded"] == ["financial_data"]
     assert row["caught"] == {"financial_data": True}
     assert row["known_clean"] is False
-    assert row["would_route"] is True  # a weighted Yes routes
+    assert row["would_route"] is True  # a hard block routes
+    assert row["expected"] is None and row["expected_met"] is None  # not a golden run
 
     # The summary row carries the named figures.
     assert set(summary) == EXPECTED_SUMMARY_KEYS
@@ -296,20 +322,22 @@ def test_happy_path_emits_a_report_row_with_every_field_populated(tmp_path: Path
 
 
 def test_a_seeded_finding_the_review_answers_no_is_a_miss(tmp_path: Path) -> None:
-    bundle_path, _sha = _make_bundle(tmp_path, "seeded-health")
+    bundle_path, _sha = _make_bundle(tmp_path, "seeded-ai")
     seeded_path = tmp_path / "seeded.json"
-    seeded_path.write_text(json.dumps({"seeded-health": ["health_data"]}))
+    seeded_path.write_text(json.dumps({"seeded-ai": ["ai_usage"]}))
     out_path = tmp_path / "report.jsonl"
-    factory = _factory_for(_read_then_complete())  # six No verdicts
+    factory = _factory_for(_read_then_complete())  # every class No
 
     code = eval_script.main(
         ["--bundle", str(bundle_path), "--seeded", str(seeded_path), "--out", str(out_path)],
         model_factory=factory,
+        config=_CONFIG,
     )
 
     assert code == 0
     runs, summary = _rows(out_path)
-    assert runs[0]["caught"] == {"health_data": False}
+    assert runs[0]["caught"] == {"ai_usage": False}
+    assert runs[0]["would_route"] is False  # every class No publishes
     assert summary["seeded_findings_missed"] == 1
     assert summary["miss_rate"] == 1.0
 
@@ -331,7 +359,9 @@ def test_an_unextractable_bundle_is_a_failure_row_and_the_sweep_continues(
     factory = _factory_for(_read_then_complete())  # scripted for the ONE good run only
 
     code = eval_script.main(
-        ["--bundle-dir", str(bundle_dir), "--out", str(out_path)], model_factory=factory
+        ["--bundle-dir", str(bundle_dir), "--out", str(out_path)],
+        model_factory=factory,
+        config=_CONFIG,
     )
 
     assert code == 0  # the sweep finished — the broken bundle did not abort it
@@ -346,7 +376,7 @@ def test_an_unextractable_bundle_is_a_failure_row_and_the_sweep_continues(
     assert failure["head_sha"] is None
     assert failure["requests"] is None  # the model was never touched
     assert failure["verdicts"] is None
-    assert failure["would_route"] is True  # the ladder routes every run failure
+    assert failure["would_route"] is True  # the gate routes every unfinished review
 
     good = runs[1]
     assert good["status"] == "complete"
@@ -369,6 +399,7 @@ def test_a_model_failure_is_a_failure_row_with_the_recorder_still_read(
     code = eval_script.main(
         ["--bundle", str(bundle_path), "--out", str(out_path)],
         model_factory=lambda: FunctionModel(boom),
+        config=_CONFIG,
     )
 
     assert code == 0
@@ -394,11 +425,11 @@ def test_a_known_clean_bundle_flagged_yes_drives_the_routing_rate(tmp_path: Path
     out_path = tmp_path / "report.jsonl"
     factory = _factory_for(
         _read_then_complete(
-            personal_information=_question(
-                "personal_information",
+            pii=_question(
+                "pii",
                 verdict="yes",
                 evidence=[{"path": "app/page.tsx", "kind": "form-field"}],
-                reason="The app collects visitor names and phone numbers.",
+                reason="The app stores copies of visitors' identity cards.",
             )
         )
     )
@@ -406,6 +437,7 @@ def test_a_known_clean_bundle_flagged_yes_drives_the_routing_rate(tmp_path: Path
     code = eval_script.main(
         ["--bundle", str(bundle_path), "--known-clean", str(clean_path), "--out", str(out_path)],
         model_factory=factory,
+        config=_CONFIG,
     )
 
     assert code == 0
@@ -503,7 +535,7 @@ def test_a_tier_a_false_positive_fails_the_precision_gate(tmp_path: Path) -> Non
 
 def _expect_usage_exit(argv: list[str], capsys: pytest.CaptureFixture[str]) -> str:
     with pytest.raises(SystemExit) as excinfo:
-        eval_script.main(argv)
+        eval_script.main(argv, config=_CONFIG)
     assert excinfo.value.code == 2  # non-zero, argparse's usage-error code
     captured = capsys.readouterr()
     assert "usage" in captured.err.lower()
@@ -550,7 +582,7 @@ def test_a_manifest_id_matching_no_bundle_exits_nonzero(
 ) -> None:
     bundle_path, _sha = _make_bundle(tmp_path, "visitor-log")
     seeded_path = tmp_path / "seeded.json"
-    seeded_path.write_text(json.dumps({"ghost-app": ["health_data"]}))
+    seeded_path.write_text(json.dumps({"ghost-app": ["ai_usage"]}))
     err = _expect_usage_exit(
         [
             "--bundle",
@@ -587,7 +619,7 @@ def test_a_bundle_both_seeded_and_known_clean_exits_nonzero(
 ) -> None:
     bundle_path, _sha = _make_bundle(tmp_path, "visitor-log")
     seeded_path = tmp_path / "seeded.json"
-    seeded_path.write_text(json.dumps({"visitor-log": ["health_data"]}))
+    seeded_path.write_text(json.dumps({"visitor-log": ["ai_usage"]}))
     clean_path = tmp_path / "clean.json"
     clean_path.write_text(json.dumps(["visitor-log"]))
     err = _expect_usage_exit(
@@ -604,3 +636,81 @@ def test_a_bundle_both_seeded_and_known_clean_exits_nonzero(
         capsys,
     )
     assert "seeded and known-clean" in err
+
+
+# ---------------------------------------------------------------------------------------
+# The golden scenarios
+# ---------------------------------------------------------------------------------------
+
+
+def _golden(name_part: str) -> eval_script.GoldenScenario:
+    (scenario,) = [s for s in eval_script.GOLDEN_SCENARIOS if name_part in s.name]
+    return scenario
+
+
+def test_the_golden_set_holds_the_expectations_the_seeded_descriptions_must_meet() -> None:
+    calculator = _golden("calculator")
+    assert calculator.every_class_no is True
+    assert _golden("asking for name, email and phone").expect == {"pii": "no"}
+    assert _golden("event sign-up").expect == {"pii": "no"}
+    assert _golden("also asks for an Aadhaar number").expect == {"pii": "yes"}
+    assert _golden("uploads a copy of each Aadhaar card").expect == {"pii": "yes"}
+    assert _golden("photo of each visitor for the badge").expect == {"pii": "no"}
+    assert _golden("Zoho CRM").expect == {"integrations": "yes"}
+    assert _golden("outside language model").expect == {"ai_usage": "yes", "integrations": "no"}
+    assert _golden("platform's flight data connection").expect == {
+        "integrations": "no",
+        "public_data": "no",
+    }
+    assert _golden("platform's file storage").expect == {"integrations": "no"}
+
+
+def test_a_golden_scenario_is_written_out_as_a_tree_the_review_can_read(tmp_path: Path) -> None:
+    root = eval_script._write_golden_tree(_golden("Zoho CRM"), tmp_path)
+
+    assert (root / "lib" / "zoho.ts").read_text().startswith("const ZOHO_API")
+    assert (root / "app" / "page.tsx").is_file()
+
+
+def test_a_golden_run_reports_every_miss(tmp_path: Path) -> None:
+    """A model answering No everywhere passes the No expectations and misses every Yes one; the
+    summary names each miss."""
+    out_path = tmp_path / "golden.jsonl"
+    seen: list[str] = []
+
+    async def all_no(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append(info.instructions or "")
+        return ModelResponse(parts=[ToolCallPart(OUTPUT_TOOL_NAME, _complete_args())])
+
+    code = eval_script.main(
+        ["--golden", "--out", str(out_path)],
+        model_factory=lambda: FunctionModel(all_no),
+        config=_CONFIG,
+    )
+
+    assert code == 0
+    runs, summary = _rows(out_path)
+    assert len(runs) == len(eval_script.GOLDEN_SCENARIOS)
+    assert all(row["source"] == "golden" and row["status"] == "complete" for row in runs)
+    calculator = next(row for row in runs if row["bundle_id"] == "calculator")
+    assert calculator["expected"] == dict.fromkeys(_KEYS, "no")
+    assert all(calculator["expected_met"].values())
+    assert summary["golden_total"] == len(eval_script.GOLDEN_SCENARIOS)
+    assert summary["golden_passed"] == 6
+    assert sorted((f["scenario"], f["class"]) for f in summary["golden_failures"]) == sorted(
+        [
+            ("feedback form that also asks for an Aadhaar number", "pii"),
+            ("visitor pass app that uploads a copy of each Aadhaar card", "pii"),
+            ("Zoho CRM account reader", "integrations"),
+            ("comment summariser that calls an outside language model", "ai_usage"),
+        ]
+    )
+    assert all('<class key="pii">' in instructions for instructions in seen)
+
+
+def test_golden_takes_no_bundles(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    bundle_path, _sha = _make_bundle(tmp_path, "visitor-log")
+    err = _expect_usage_exit(
+        ["--golden", "--bundle", str(bundle_path), "--out", str(tmp_path / "r.jsonl")], capsys
+    )
+    assert "--golden" in err

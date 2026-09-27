@@ -69,7 +69,7 @@ from src.services.attachments.materialize import (
 from src.services.build_sessions import SandboxReclaimBlockedError
 from src.services.build_sessions.appdata import APP_SWITCHED_OFF, APP_SWITCHED_OFF_CODE
 from src.services.build_sessions.manager import SessionManager
-from src.services.connectors.access import connected_systems_for_project
+from src.services.connectors import connected_systems_for_project
 from src.services.messages.projection import DisplayItem, project_conversation
 from src.services.messages.store import (
     AttachmentRehydrationError,

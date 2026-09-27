@@ -19,7 +19,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
-from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.main import create_app
 from src.services.approvals.submit import submit_app_for_review
@@ -69,7 +69,6 @@ async def _submitted_app(db, user, store: FakeStorage):
         user_id=user.id,
         app=app_row,
         declaration=_DECLARATION,
-        route=ApprovalRoute.SELF_PUBLISH,
     )
     await db.commit()
     return app_row, receipt
@@ -88,14 +87,12 @@ async def test_withdraw_returns_a_pending_submission_to_draft_and_clears_the_pin
     row = await db_session.get(AppRegistry, app_row.id)
     await db_session.refresh(row)
     assert row.status is AppStatus.DRAFT
-    # The pin, the declaration AND the lineage all clear: a withdrawn submission
-    # entered through a route that no longer describes it, so NULL (the documented
-    # "no current submission" state) is what the next submit builds on.
+    # The pin and the declaration clear: NULL (the documented "no current submission"
+    # state) is what the next submit builds on.
     assert row.source_submission_id is None
     assert row.source_commit_sha is None
     assert row.submitted_at is None
     assert row.declaration is None
-    assert row.approval_route is None
     # The immutable submission BLOB survives — submissions are retained and ids
     # never reused; withdrawal removes the queue item, not the artifact.
     assert submission_key(app_row.id, receipt.submission_id) in fake_storage.objects
@@ -137,15 +134,18 @@ async def test_withdraw_removes_the_item_from_the_admin_queue(
     app_row, _receipt = await _submitted_app(db_session, user, fake_storage)
     _, admin_headers = await _auth_user(db_session, email="admin@bial.com")
 
-    before = await client.get("/v1/admin/apps?status=pending", headers=admin_headers)
-    assert str(app_row.id) in [a["appId"] for a in before.json()["apps"]]
+    async def _registry_status() -> str:
+        listed = await client.get("/v1/admin/apps", headers=admin_headers)
+        row = next(a for a in listed.json()["apps"] if a["appId"] == str(app_row.id))
+        return str(row["registryStatus"])
+
+    assert await _registry_status() == "waiting_for_review"
 
     assert (
         await client.post(f"/v1/apps/{app_row.id}/withdraw", headers=headers)
     ).status_code == 200
 
-    after = await client.get("/v1/admin/apps?status=pending", headers=admin_headers)
-    assert str(app_row.id) not in [a["appId"] for a in after.json()["apps"]]
+    assert await _registry_status() == "draft"
 
 
 async def test_withdraw_then_approve_conflicts_the_existing_guard_holds(
@@ -193,7 +193,7 @@ async def test_withdraw_of_a_non_pending_app_is_refused(client, db_session) -> N
 async def test_withdraw_keeps_the_approved_pin_of_an_earlier_approval(client, db_session) -> None:
     # A re-submitted app carries BOTH the pending pin and the earlier approved pin.
     # Withdraw clears only the pending half — same rule as reject: status governs
-    # liveness, the approved pin governs WHICH artifact the runbook lineage serves.
+    # liveness, the approved pin governs WHICH artifact approval publishes.
     earlier = uuid.uuid4()
     user, headers = await _auth_user(db_session)
     app_row = await AppRegistryFactory.create(

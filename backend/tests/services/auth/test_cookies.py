@@ -44,6 +44,13 @@ _SANDBOX: dict[str, object] = {
     "image_ref": "bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
 }
 
+_LAKE: dict[str, object] = {
+    "url": "https://lake.blob.core.windows.net/data/flights/",
+    "identity_client_id": "33333333-3333-3333-3333-333333333333",
+    "identity_resource_id": "/subscriptions/0/resourcegroups/rg/providers/"
+    "Microsoft.ManagedIdentity/userAssignedIdentities/lake-reader",
+}
+
 
 def _settings(environment: str, **auth_overrides: object) -> Settings:
     # model_validate builds Settings directly from the dict, bypassing env
@@ -57,6 +64,7 @@ def _settings(environment: str, **auth_overrides: object) -> Settings:
         payload["object_store"] = _AZURE_STORE
         payload["redis"] = _REDIS
         payload["sandbox"] = _SANDBOX
+        payload["connector_lake"] = _LAKE
         # The FRONTEND_URL prod gate: production requires the portal's real https origin.
         payload["FRONTEND_URL"] = "https://portal.example"
     return Settings.model_validate(payload)

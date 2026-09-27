@@ -10,9 +10,8 @@
  * helper derives from it.
  */
 import { describe, it, expect, vi } from 'vitest'
-import { getDeployment, startDeploy } from '../deployApi'
+import { getDeployment, noteRequiredReason, startDeploy } from '../deployApi'
 import { ApiError } from '../apiError'
-import type { DataClassificationAnswers } from '../deployApi'
 
 const deps = (fetchImpl: unknown) => ({
   fetchImpl,
@@ -93,7 +92,6 @@ describe('getDeployment parses the APPROVAL state riding on the same response', 
     status: 'pending',
     approvedCommitSha: null,
     approvedAt: null,
-    approvalRoute: 'self_publish',
     rejectionNote: 'Explain where the vendor key is stored.',
     submittedSha: 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0',
     submittedAt: '2026-08-19T10:00:00Z',
@@ -126,38 +124,6 @@ describe('getDeployment parses the APPROVAL state riding on the same response', 
 
     expect(err).toBeInstanceOf(ApiError)
     expect((err as ApiError).status).toBe(500)
-  })
-
-  it('answers an unknown approval LINEAGE with null — never with self-publish', async () => {
-    // An unrecognised lineage must not be READ as self_publish — the one value authorising
-    // the citizen to publish an approved version themselves — so null is the conservative
-    // answer: every consumer branches on `=== 'self_publish'`, and "no claim" withholds the
-    // affordance rather than granting it.
-    //
-    // It deliberately does NOT throw: that used to blank the whole Publish card over a field
-    // the gate re-decides server-side anyway — strictly worse than declining to claim.
-    const view = await getDeployment(
-      'p1',
-      deps(vi.fn(async () => ok({ ...BODY, approval: { ...APPROVAL, approvalRoute: 'vibes' } }))),
-    )
-
-    expect(view.approval?.approvalRoute).toBeNull()
-    // the rest of the card still parses — the point of not throwing
-    expect(view.approval?.status).toBe(APPROVAL.status)
-    expect(view.deploymentId).toBe('d1')
-  })
-
-  it('accepts a null lineage — a never-submitted draft genuinely has none', async () => {
-    const view = await getDeployment(
-      'p1',
-      deps(
-        vi.fn(async () =>
-          ok({ ...BODY, approval: { ...APPROVAL, status: 'draft', approvalRoute: null } }),
-        ),
-      ),
-    )
-
-    expect(view.approval?.approvalRoute).toBeNull()
   })
 
   it('carries WHEN it was approved beside WHICH commit was', async () => {
@@ -235,7 +201,6 @@ describe('getDeployment parses the one publish state, and refuses to guess it', 
         status: 'draft',
         approvedCommitSha: null,
         approvedAt: null,
-        approvalRoute: null,
         rejectionNote: null,
         submittedSha: null,
         submittedAt: null,
@@ -280,7 +245,7 @@ describe('getDeployment parses the one publish state, and refuses to guess it', 
   })
 
   it('★ reads an unrecognised or missing reason as NO CLAIM, never as "never saved"', async () => {
-    // The conservative reading `toApprovalRoute` already documents, and the direction matters:
+    // The conservative reading, and the direction matters:
     // the one value that DELETES a row must never be reachable by accident, so a server that
     // grows a fifth member fails towards saying too little.
     for (const wire of [{ savedState: 'never_saved_probably' }, { savedState: null }, {}]) {
@@ -292,21 +257,79 @@ describe('getDeployment parses the one publish state, and refuses to guess it', 
   })
 })
 
+const SHA = 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0'
+
+describe('startDeploy names the version it is about', () => {
+  const started = { outcome: 'started', deploymentId: 'd1', appId: 'a1', status: 'running' }
+  const sent = (fetchImpl: ReturnType<typeof vi.fn>): unknown =>
+    JSON.parse((fetchImpl.mock.calls[0][1] as { body: string }).body)
+
+  it('sends the reviewed commit with the answers and the note, and nothing else', async () => {
+    const fetchImpl = vi.fn(async () => ok(started))
+
+    await startDeploy(
+      'p1',
+      { commitSha: SHA, answers: { ai_usage: false, public_data: true }, note: 'Reads our own list.' },
+      deps(fetchImpl),
+    )
+
+    expect(sent(fetchImpl)).toEqual({
+      commitSha: SHA,
+      answers: { ai_usage: false, public_data: true },
+      note: 'Reads our own list.',
+    })
+  })
+
+  it('sends the approved commit alone, with no answers to invent', async () => {
+    const fetchImpl = vi.fn(async () => ok(started))
+
+    await startDeploy('p1', { commitSha: SHA }, deps(fetchImpl))
+
+    expect(sent(fetchImpl)).toEqual({ commitSha: SHA })
+  })
+})
+
+describe('a send that needs a note names why', () => {
+  const refusal = (detail: unknown): ApiError =>
+    new ApiError('This app needs an administrator.', 422, 'note_required', { detail })
+
+  it('reads each reason the server gives', () => {
+    for (const reason of ['hard_block', 'over_threshold', 'review_unfinished', 'rejection_standing']) {
+      expect(noteRequiredReason(refusal({ reason }))).toBe(reason)
+    }
+  })
+
+  it('reads any other refusal as no reason', () => {
+    expect(noteRequiredReason(new ApiError('Saved again.', 409, 'snapshot_moved'))).toBeNull()
+    expect(noteRequiredReason(new Error('offline'))).toBeNull()
+  })
+
+  it('still reads a note refusal with a reason it does not know as needing a note', () => {
+    expect(noteRequiredReason(refusal({ reason: 'something_new' }))).toBe('unknown')
+    expect(noteRequiredReason(refusal(null))).toBe('unknown')
+  })
+})
+
+describe('getDeployment carries the commit the one button republishes', () => {
+  it('parses it when the server sets it, and reads its absence as null', async () => {
+    const set = await getDeployment(
+      'p1',
+      deps(vi.fn(async () => ok({ ...BODY, publishState: 'did_not_start', approvedRetryCommit: SHA }))),
+    )
+    expect(set.approvedRetryCommit).toBe(SHA)
+
+    const absent = await getDeployment('p1', deps(vi.fn(async () => ok(BODY))))
+    expect(absent.approvedRetryCommit).toBeNull()
+  })
+})
+
 describe('startDeploy has two success shapes, discriminated by outcome', () => {
-  const answers: DataClassificationAnswers = {
-    credentialsSecrets: false,
-    healthData: false,
-    personalInformation: false,
-    financialData: false,
-    confidentialBusinessData: false,
-    publicData: false,
-    notes: null,
-  }
+  const answers = { ai_usage: false }
 
   it('parses the 202 started shape', async () => {
     const started = await startDeploy(
       'p1',
-      { answers },
+      { commitSha: SHA, answers },
       deps(vi.fn(async () => ok({ outcome: 'started', deploymentId: 'd1', appId: 'a1', status: 'running' }))),
     )
 
@@ -321,7 +344,7 @@ describe('startDeploy has two success shapes, discriminated by outcome', () => {
     // `toDeployOutcome` and this goes red on a thrown ApiError.
     const routed = await startDeploy(
       'p1',
-      { answers },
+      { commitSha: SHA, answers },
       deps(
         vi.fn(async () =>
           ok({
@@ -345,7 +368,7 @@ describe('startDeploy has two success shapes, discriminated by outcome', () => {
   it('throws when a routed body is missing the version it pinned', async () => {
     const call = startDeploy(
       'p1',
-      { answers },
+      { commitSha: SHA, answers },
       deps(
         vi.fn(async () =>
           ok({

@@ -1,15 +1,15 @@
 import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { motion } from 'motion/react'
-import { Bot, LayoutGrid, Users, Store, Database, ShieldCheck } from 'lucide-react'
+import { Bot, LayoutGrid, Users, Store, ShieldCheck } from 'lucide-react'
 import { getStoredUser, isAuthenticated } from '../../utils/auth'
-import { fetchAppStatusCounts } from '../../utils/appRegistryApi'
+import { fetchAppStatusCounts, REVIEW_QUEUE_CHANGED } from '../../utils/appRegistryApi'
 import { projectsListHref } from '../../utils/projectsListMemory'
 import WaitingCountBadge from '../admin/WaitingCountBadge'
 import { highlightTransition } from '../../lib/motion'
 
 /**
- * The six destinations.
+ * The five destinations.
  *
  * THE LIST LINK CARRIES THE LIST BACK. `projectsListHref()` is read at CLICK time, not memoised
  * at render, so a search typed a moment ago on the list is what this lands on rather than a
@@ -43,7 +43,6 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
   { label: 'BIAL Chat', to: '/assistant', Icon: Bot },
   { label: 'Shared Applications', to: '/shared-applications', Icon: Users, owns: ['/shared/'] },
   { label: 'App Marketplace', to: '/marketplace', Icon: Store },
-  { label: 'Integrations', to: '/integrations', Icon: Database },
 ]
 
 export const ADMIN_DESTINATION: NavDestination = { label: 'Admin', to: '/admin', Icon: ShieldCheck }
@@ -69,23 +68,29 @@ export default function NavItems({ onNavigate, onItemFocus, collapsed = false }:
   useEffect(() => {
     if (!isAdmin || !isAuthenticated()) return undefined
     let active = true
+    // Reads can overlap, so only the newest one sent may set the count.
+    let latest = 0
     const read = () => {
+      const mine = ++latest
       void fetchAppStatusCounts()
-        .then((counts) => { if (active) setWaiting(counts.pending) })
-        .catch(() => { if (active) setWaiting(null) })
+        .then((counts) => { if (active && mine === latest) setWaiting(counts.pending) })
+        .catch(() => { if (active && mine === latest) setWaiting(null) })
     }
     read()
     // RE-READ WHEN THE TAB COMES BACK rather than polling. The queue changes underneath this
     // badge — an administrator approves, a citizen withdraws, a pipeline routes a drifted
     // version — and a fetch-once badge sits on a number the admin panel has already corrected.
-    // Nothing here is urgent enough to wake an idle tab for.
+    // Nothing here is urgent enough to wake an idle tab for. An admin acting in THIS tab never
+    // changes focus, so the registry raises `REVIEW_QUEUE_CHANGED` for that case.
     const refresh = () => { if (document.visibilityState === 'visible') read() }
     window.addEventListener('focus', refresh)
     document.addEventListener('visibilitychange', refresh)
+    window.addEventListener(REVIEW_QUEUE_CHANGED, read)
     return () => {
       active = false
       window.removeEventListener('focus', refresh)
       document.removeEventListener('visibilitychange', refresh)
+      window.removeEventListener(REVIEW_QUEUE_CHANGED, read)
     }
   }, [isAdmin])
 
@@ -150,7 +155,7 @@ export default function NavItems({ onNavigate, onItemFocus, collapsed = false }:
             )}
             <Icon size={18} className="relative shrink-0" />
             {/* FOLDED, NOT UNMOUNTED. Removing the text would take the button's accessible name
-                with it, so a screen reader on the rail would read six unnamed buttons. It is
+                with it, so a screen reader on the rail would read five unnamed buttons. It is
                 clipped to zero width instead, and the name survives the collapse. */}
             <span
               className={`relative overflow-hidden whitespace-nowrap transition-[opacity,max-width] duration-200 ${

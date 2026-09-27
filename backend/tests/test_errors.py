@@ -24,7 +24,7 @@ from tests.factories import ProjectFactory, UserFactory
 ACTOR_EMAIL = "actor.under.test@nobody.invalid"
 ACTOR_DISPLAY_NAME = "Actor Under Test"
 REMARK_WORDS = "the verification run is finished"
-# The reproducing input: a NUL byte inside an otherwise valid 5-50 word reason. Postgres
+# The reproducing input: a NUL byte inside an otherwise valid reason. Postgres
 # refuses it in a text parameter, so the tombstone INSERT fails and the request 500s.
 NUL_BYTE_REMARK = f"Deleting because\x00 {REMARK_WORDS}"
 

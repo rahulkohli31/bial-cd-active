@@ -1,7 +1,7 @@
 """A TOMBSTONE for a deleted project — a record ABOUT the deletion, never the data.
 
 WHY THIS EXISTS
-The product requires the person deleting a project to say why, in 5–50 words. The dialog
+The product requires the person deleting a project to say why, in 2–50 words. The dialog
 tells the truth that nothing is recoverable: `delete_project` calls `salt_the_earth`, which
 force-drops the project's own database and role, sweeps its blobs, and deletes its container.
 An `is_deleted` flag on `projects` would claim the opposite — a reversible delete — and would
@@ -39,7 +39,7 @@ from src.db.mixins import UUIDv7PrimaryKeyMixin
 # The remark bounds, in WORDS. `src/core/words.py` owns the splitting rule and
 # `portal/src/utils/words.ts` mirrors it, because a reason accepted by the counter the user
 # is watching must not be refused by the API.
-MIN_DELETE_REMARK_WORDS = 5
+MIN_DELETE_REMARK_WORDS = 2
 MAX_DELETE_REMARK_WORDS = 50
 # A character ceiling as a paste backstop only. 50 words of ordinary English is far under
 # this; a user should never meet it, and the word rule is the one they are told about.

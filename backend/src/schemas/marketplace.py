@@ -22,8 +22,8 @@ class MarketplaceEntry(CamelModel):
     a new one. `login_required` has no enforcement reader anywhere, and a published app has
     no auth of its own — so this converts "you need the URL" into "everyone signed in has
     every URL, searchable by what the app does." No `SECURITY.md` carries that line, so it is
-    recorded here, next to `url`; mitigation: `AUTO_DEPLOY_MAX_SCORE = 0` already routes any
-    sensitive-category app through mandatory admin review first."""
+    recorded here, next to `url`; mitigation: an app answered Yes on a hard-block class always
+    goes through administrator review first."""
 
     #: The app's name. `app_registry` carries no name of its own — the owning
     #: project's name IS the app name.

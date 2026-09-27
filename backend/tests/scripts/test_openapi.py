@@ -229,6 +229,44 @@ def test_the_served_surface_does_not_depend_on_configuration() -> None:
     assert operations(create_app().openapi()) == operations(shipped_spec())
 
 
+def test_the_served_schema_carries_no_per_person_connector_access() -> None:
+    """Connector access is the project's switch alone, so the contract has no route or schema for
+    asking for, withdrawing, listing or deciding a person's access. The project routes are
+    asserted first, so a schema that lost every connector route cannot pass the absence half."""
+    from src.main import create_app
+
+    spec = create_app().openapi()
+    ops = operations(spec)
+    assert "GET /v1/projects/{project_id}/connectors" in ops
+    assert "PUT /v1/projects/{project_id}/connectors/{connector_key}" in ops
+    assert [
+        op
+        for op in ops
+        if op.split(" ", 1)[1].startswith("/v1/connectors") or "/connector-requests" in op
+    ] == []
+
+    schemas = set(spec["components"]["schemas"])
+    assert "ProjectConnectorEntry" in schemas
+    assert (
+        schemas
+        & {
+            "AccessRequestBody",
+            "ConnectorEntry",
+            "ConnectorListResponse",
+            "ConnectorOnProject",
+            "ConsentLine",
+            "ConnectorPersonState",
+            "ConnectorRequestRow",
+            "ConnectorRequestListResponse",
+            "ConnectorRequestStatus",
+            "ConnectorWaitingCountResponse",
+            "ConnectorDeclineRequest",
+            "ConnectorDecisionResponse",
+        }
+        == set()
+    )
+
+
 def test_the_production_gate_removes_the_route_and_not_the_schema() -> None:
     """Production sets `openapi_url=None`, which is why the committed copy is the only reference a
     reader has. The generator asks the application object for its schema rather than fetching that

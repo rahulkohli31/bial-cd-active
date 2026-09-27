@@ -46,9 +46,9 @@ export function relativeTime(isoString: string): string {
  * The same instant, spelled out and pluralised: `just now`, `1 minute ago`, `43 days ago`.
  *
  * NO NULL ARM, DELIBERATELY. Callers hand this a timestamp something else has already vouched
- * for (`fmtWhen` in the review queue's case). An age counted from a missing value would be
- * fifty-odd years since the epoch — the same "1/1/1970" lie in a different unit — so the
- * question of whether an age exists at all stays with the caller that can answer it.
+ * for. An age counted from a missing value would be fifty-odd years since the epoch — the same
+ * "1/1/1970" lie in a different unit — so the question of whether an age exists at all stays
+ * with the caller that can answer it.
  */
 export function relativeTimeVerbose(isoString: string): string {
   const ago = elapsed(isoString)

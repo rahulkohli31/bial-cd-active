@@ -393,7 +393,7 @@ async def test_the_same_refusal_reaches_two_different_agents_byte_for_byte(
     review_agent: Agent[ReviewDeps, str] = Agent(deps_type=ReviewDeps)
     await review_agent.run(
         "install zod",
-        deps=ReviewDeps(user_id=uuid.uuid4(), workspace=review_spy),
+        deps=ReviewDeps(user_id=uuid.uuid4(), workspace=review_spy, class_keys=()),
         model=_capturing_model(
             [tool_turn("run_command", {"command": argv}), text_turn("ok")], review_capture
         ),

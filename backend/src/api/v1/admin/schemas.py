@@ -1,66 +1,35 @@
-"""Super-admin governance + user-limits/feedback + connector-access schemas.
+"""Super-admin governance + user-limits/feedback schemas.
 
-All request/response models for the THREE admin routers (`/admin/apps` governance,
-`/admin` users/limits/feedback, and `/admin/connector-requests`), on the shared
-`CamelModel` base — camelCase over the wire, matching the admin SPA panels
-(`AppRegistryPanel`, `AuditDrawer`, `IntegrationsPanel`, …).
-
-The third router lives in its own module (`admin/connectors.py`) because `admin/router.py`
-is already ~2,500 lines; its schemas nevertheless stay here, with the other two surfaces'.
-See the section comment above them for why.
-
-THE ONE IMPORT THIS MODULE TAKES FROM ANOTHER v1 SURFACE is `ConsentLine`, off the citizen's
-`api/v1/connectors/schemas.py`. It is not a citizen-specific shape: it is the wire mirror of
-`core.connectors.ConsentLine`, a `lead` and a `body`, and BOTH consent panels — the citizen's
-`WHAT AN APPROVAL GIVES YOU` and the administrator's `WHAT APPROVING GIVES THEM` — cross the
-wire as lists of it. A second, identical Pydantic model here would be two names for one wire
-shape, free to drift the day either side gains a field, which is the exact failure both
-docblocks already exist to prevent. The dependency runs one way and closes no loop: that module
-imports from `db.models`, `schemas` and `services.connectors`, and nothing from `admin`.
+All request/response models for the two admin routers (`/admin/apps` governance and `/admin`
+users/limits/feedback), on the shared `CamelModel` base — camelCase over the wire, matching the
+admin SPA panels (`AppRegistryPanel`, `AppSheet`, …).
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Annotated, Any
+from enum import StrEnum
+from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, AnyUrl, Field, UrlConstraints, field_validator
+from pydantic import AfterValidator, Field, field_validator
 
-from src.api.v1.connectors.schemas import ConsentLine
-from src.db.models.app_registry import MAX_DEPLOYED_URL, ApprovalRoute, AppStatus
-from src.db.models.connector_access import ConnectorRequestStatus
+from src.api.v1.deploy.schemas import RegistryStatus
+from src.db.models.app_registry import AppStatus
+from src.db.models.deployment import DeploymentStatus
 from src.schemas import CamelModel, clean_stated_reason
 
-
-def _fits_the_column(url: AnyUrl) -> AnyUrl:
-    """Bound the SERIALIZED url — the value that reaches `varchar(MAX_DEPLOYED_URL)`.
-
-    `UrlConstraints(max_length=…)` measures the INPUT string, but pydantic normalizes a
-    path-less `https://…` with a trailing `/` on parse — so a 2083-char input could clear
-    the constraint and still hand 2084 chars to the column (an uncaught asyncpg 500 where
-    the admin deserves a 422). Re-measuring the parse OUTPUT is what makes 0019's "a URL
-    that parses at the boundary always fits" true by validation, not luck.
-    """
-    if len(str(url)) > MAX_DEPLOYED_URL:
-        raise ValueError(f"URL must be at most {MAX_DEPLOYED_URL} characters")
-    return url
-
-
-# The deployed-app address, parsed at the boundary ("parse, don't validate"): a
-# real URL, `https` ONLY. Rejecting `http` is not pedantry — the recorded URL becomes
-# a link the owner clicks, and this is the one place a typo'd or plaintext address can
-# be caught before it is handed to a user. `javascript:`/`data:` and free-text junk
-# fall out of the same parse (422), so no handler ever re-checks the string. The length
-# is bounded TWICE by necessity: `UrlConstraints` on the way in, `_fits_the_column` on
-# what the parse actually produced (the only value the column ever sees).
-HttpsUrl = Annotated[
-    AnyUrl,
-    UrlConstraints(max_length=MAX_DEPLOYED_URL, allowed_schemes=["https"]),
-    AfterValidator(_fits_the_column),
-]
-
 # --- governance (`/admin/apps`) ------------------------------------------------
+
+
+class LiveVersion(CamelModel):
+    """The version serving now: the number of the send that put it there, its commit, and when
+    that send first went live. `number` is null when no recorded send owns the serving attempt,
+    and `since` is then when that attempt finished. Any field is null when nothing recorded it."""
+
+    number: int | None
+    commit_sha: str | None
+    since: datetime | None
 
 
 class AdminAppOut(CamelModel):
@@ -74,6 +43,9 @@ class AdminAppOut(CamelModel):
     # (`AppRegistryPanel` reads `ownerUsername`); the raw `ownerId` uuid is not user-facing.
     owner_username: str | None
     status: AppStatus
+    registry_status: RegistryStatus
+    # Null when nothing is serving. An app waiting for review can still have an older version live.
+    live_version: LiveVersion | None
     login_required: bool
     # Derived from the approved pin (`approved_submission_id is not None`) — the old
     # JSX-snapshot derivation is gone with the column it read.
@@ -83,36 +55,17 @@ class AdminAppOut(CamelModel):
     submission_id: uuid.UUID | None
     commit_sha: str | None
     submitted_at: datetime | None
-    # The approved pin: the artifact the runbook operator deploys — the SHA is
-    # their identity check after cloning the downloaded bundle.
+    # The approved pin: the submission the administrator approved.
     approved_submission_id: uuid.UUID | None
     approved_commit_sha: str | None
     approved_by: uuid.UUID | None
     approved_at: datetime | None
-    # The manual-runbook marker: `redeploy_needed` is exact —
-    # `approved_submission_id != deployed_submission_id` — so an approved-but-
-    # undeployed app and a re-approved-since-deploy app both surface it.
-    deployed_at: datetime | None
-    # The recorded live address — read back as a plain string, never re-parsed:
-    # a value already in the column was parsed when it was written, and re-validating
-    # it here would turn one bad legacy row into a 500 on the whole admin queue.
-    deployed_url: str | None
-    # ALWAYS false for the self-publish lineage, whatever the pins say: the flag
-    # is a runbook prompt, and a self-published app has no runbook step for anyone to
-    # perform. For every other lineage it stays the exact id comparison above.
-    redeploy_needed: bool
-    # Which lineage the current submission entered through: `runbook`,
-    # `self_publish`, or null (never submitted, or an interim pre-publish-flow row —
-    # null keeps today's behaviour everywhere). The admin SPA keys the runbook
-    # affordances off this: a `self_publish` row renders neither "Deploy needed" nor
-    # "Mark deployed" — and the server refuses the latter regardless.
-    approval_route: ApprovalRoute | None
     # What the publish flow attached at submit: both answer sets, the
     # per-question differences, and the citizen's REDACTED explanation — so the review
     # screen can lead with the disagreement without a second call. Shape is
     # deliberately untyped here (the questionnaire is expected to be reworded); null
-    # for runbook-lineage and pre-feature rows, and the screen says so rather than
-    # rendering blanks. Never contains evidence locations.
+    # on a row queued without one, and the screen says so rather than rendering blanks.
+    # Never contains evidence locations.
     declaration: dict[str, Any] | None
     # On-disk size of the project's own database, or null when it has none —
     # never provisioned, not yet ready, or the cluster was unreachable when the page
@@ -125,16 +78,101 @@ class AdminAppOut(CamelModel):
 
 
 class AppListResponse(CamelModel):
-    """One page of the registry listing, plus whether it IS the whole set.
+    """The registry listing, most recently active first, plus whether it is the whole set.
 
     `truncated` exists because the badge and list come from different queries: the count is
-    an uncapped `GROUP BY`, the listing stops at `LISTING_CAP`. Past the cap the badge advertised
-    a number the list refused to show — and since the pending tab sorts OLDEST FIRST, the rows
-    that vanished were the NEWEST submissions, invisible to every administrator who looked.
-    Pagination stays deferred; making the cap VISIBLE stops the two surfaces disagreeing."""
+    an uncapped `GROUP BY`, the listing stops at `LISTING_CAP`. Making the cap visible stops the
+    two surfaces disagreeing with nothing on screen admitting it."""
 
     apps: list[AdminAppOut]
     truncated: bool = False
+
+
+class DecisionKind(StrEnum):
+    """What was decided about one sent version."""
+
+    WAITING = "waiting"
+    PUBLISHED = "published"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    WITHDRAWN = "withdrawn"
+    NOT_RECORDED = "not_recorded"
+
+
+class VersionState(StrEnum):
+    """Where one sent version stands now."""
+
+    WAITING = "waiting"
+    LIVE = "live"
+    REPLACED = "replaced"
+    TAKEN_OFFLINE = "taken_offline"
+    PUBLISHING = "publishing"
+    PUBLISH_FAILED = "publish_failed"
+    NOT_PUBLISHED = "not_published"
+    REJECTED = "rejected"
+    WITHDRAWN = "withdrawn"
+    NOT_RECORDED = "not_recorded"
+
+
+class HistoryDecision(CamelModel):
+    """Who decided and when; `note` is a rejection's note. A version published by itself has
+    no `by` or `at`, and a field the records never held is null."""
+
+    kind: DecisionKind
+    by: str | None
+    at: datetime | None
+    note: str | None
+
+
+class HistoryAttempt(CamelModel):
+    """One publish attempt of a version, oldest first."""
+
+    status: DeploymentStatus
+    started_at: datetime
+    finished_at: datetime | None
+    failure_code: str | None
+
+
+class HistoryVersion(CamelModel):
+    """One send for publishing. `declaration` is the one stored with that send's decision, null
+    when none was. `replacedBy` is the number of the version that went live after it."""
+
+    kind: Literal["version"] = "version"
+    number: int
+    commit_sha: str | None
+    submission_id: uuid.UUID | None
+    sent_at: datetime
+    sent_by: str | None
+    declaration: dict[str, Any] | None
+    decision: HistoryDecision
+    attempts: list[HistoryAttempt]
+    state: VersionState
+    published_at: datetime | None
+    replaced_by: int | None
+    replaced_at: datetime | None
+
+
+class HistoryEvent(CamelModel):
+    """Something done to the app outside any send. A disable carries the enable that ended it."""
+
+    kind: Literal["event"] = "event"
+    action: str
+    at: datetime
+    by: str | None
+    reenabled_at: datetime | None
+
+
+HistoryEntry = Annotated[HistoryVersion | HistoryEvent, Field(discriminator="kind")]
+
+
+class AppHistoryResponse(CamelModel):
+    """An app's versions and events, newest first. `live` reads the same numbering as the App
+    Registry's live version. `truncated` says the oldest records were not read."""
+
+    entries: list[HistoryEntry]
+    live: LiveVersion | None
+    live_url: str | None
+    truncated: bool
 
 
 class AppStatusCounts(CamelModel):
@@ -190,35 +228,13 @@ class BundleUrlResponse(CamelModel):
     expires_in_seconds: int
 
 
-class MarkDeployedRequest(CamelModel):
-    """The optional deployed-URL payload. The whole BODY is optional (the admin SPA already
-    posts `{}`), and so is the field: an admin who ran the runbook but has no URL to hand
-    still records the marker.
-
-    OMITTING `deployedUrl` means "leave the recorded URL as it is" (fail-first's optional-knob
-    exception): a re-deploy of the same app keeps the same address, so a bare re-mark must not
-    blank out the Live link the owner is already using. Recording a *different* URL just passes
-    the new one."""
-
-    deployed_url: HttpsUrl | None = None
-
-
-class MarkDeployedResponse(CamelModel):
-    app_id: uuid.UUID
-    deployed_submission_id: uuid.UUID
-    deployed_at: datetime
-    # Echoed back so the admin SPA can show what is now recorded — including the
-    # carried-forward URL when this mark did not supply one.
-    deployed_url: str | None
-
-
 class DeployCredentialResponse(CamelModel):
-    """The long-lived per-app Blob credential the go-live runbook injects into the deployed
-    container as `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS`. `sas` is a 365-day bearer
+    """The long-lived per-app Blob credential a deployed container runs with, as
+    `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS`. `sas` is a 365-day bearer
     credential: the admin pastes it straight into an ACA secret and it is NEVER logged, NEVER
     written to the audit trail (the audit row carries the expiry, not the token), and never part
     of any list projection. `expiresAt` comes from the app's stored access policy — deleting that
-    policy revokes this credential (the runbook's incident-response lever)."""
+    policy revokes this credential."""
 
     container_url: str
     sas: str
@@ -226,8 +242,8 @@ class DeployCredentialResponse(CamelModel):
 
 
 class DatabaseCredentialResponse(CamelModel):
-    """The project database's connection string, for the go-live runbook's
-    `BIAL_DATABASE_URL`. `dsn` embeds the app role's password, so it is the same
+    """The project database's connection string, a deployed app's `BIAL_DATABASE_URL`.
+    `dsn` embeds the app role's password, so it is the same
     kind of object as `DeployCredentialResponse.sas`: returned in this body and nowhere else
     — never logged, never in the audit `detail` (which records `roleName` + `host` instead),
     never in a list projection.
@@ -275,7 +291,7 @@ RejectionNote = Annotated[
 
 
 def _clean_app_delete_reason(value: str) -> str:
-    """The admin app-delete's binding of the shared 5-50 word stated-reason rule. The sentence
+    """The admin app-delete's binding of the shared word-bounded stated-reason rule. The sentence
     is byte-identical to the one that rule used to build from `subject="app"`."""
     return clean_stated_reason(value, say_why="Say why you are deleting this app.")
 
@@ -296,11 +312,11 @@ class AppDeleteRequest(CamelModel):
     `window.confirm` it went through could not have collected it.
 
     The reason rides the `app:delete` audit row this path already writes BEFORE destruction,
-    which has no foreign key to the app and so outlives it. Same 5-50 word bounds and the same
+    which has no foreign key to the app and so outlives it. Same word bounds and the same
     validator as the project delete, so the two dialogs cannot disagree about what a word is.
 
     IT TAKES A BODY ON A DELETE, like `DELETE /v1/projects/{id}` and for the same reason: a
-    50-word reason does not belong in a query string. RFC 9110 leaves content on a DELETE
+    paragraph-long reason does not belong in a query string. RFC 9110 leaves content on a DELETE
     undefined and httpx declines to offer `json=` on `.delete()` for that reason — tests use
     `.request("DELETE", ...)` — but nginx and the container ingress both forward it and the
     admin SPA is the only client.
@@ -458,25 +474,6 @@ class DeployReconcileResponse(CamelModel):
     resolved: int
 
 
-class AuditEventOut(CamelModel):
-    id: uuid.UUID
-    actor_id: uuid.UUID | None
-    # The actor's human handle (email), resolved from `actor_id`, so the admin AuditDrawer can
-    # name the actor instead of showing a raw uuid or "anonymous". None if the actor was deleted.
-    username: str | None
-    action: str
-    resource_type: str
-    resource_id: str | None
-    detail: dict[str, Any] | None
-    # The count-bearing detail (flag flips, reconcile tallies) surfaced top-level for the UI.
-    count: int | None
-    created_at: datetime
-
-
-class AuditListResponse(CamelModel):
-    events: list[AuditEventOut]
-
-
 # --- users / limits / feedback (`/admin`) --------------------------------------
 
 
@@ -601,161 +598,3 @@ class HarnessCountersResponse(CamelModel):
 
     counters: list[HarnessCounterRow]
     since: datetime
-
-
-# --- connector access requests (`/admin/connector-requests`) --------------------
-#
-# A THIRD ADMIN SURFACE WHOSE ROUTER IS A SEPARATE MODULE (`admin/connectors.py`, because
-# `admin/router.py` is already ~2,500 lines) BUT WHOSE SCHEMAS STAY HERE, with the other two
-# surfaces'. The admin SPA reads one wire vocabulary across its five tabs, and a reviewer
-# comparing this queue's row against the app registry's has both shapes in one file. Splitting
-# the schemas would buy a shorter module and cost that comparison.
-
-
-def _clean_decline_remarks(value: str) -> str:
-    """The administrator's decline remark, on the shared 5-50 word stated-reason rule.
-
-    THE SAME RULE THE CITIZEN'S REQUEST USES (an owner decision), and deliberately NOT the
-    20-character `RejectionNote` the app registry rejects with. Both connector dialogs count
-    words with `portal/src/utils/words.ts`, so one validator has to answer both sides of this
-    conversation or the browser's counter would let through something the API refuses — and
-    `RejectionNote`'s character floor is a rule that counter cannot express.
-
-    `say_why` is this surface's own sentence. It is what the administrator is asked for when the
-    box is empty, and the words they write are the WHOLE of what a refused person is told:
-    `Ask again` is not built, so a decline has no path back and no second explanation."""
-    return clean_stated_reason(value, say_why="Say why you are declining this request.")
-
-
-class ConnectorDeclineRequest(CamelModel):
-    """The body `POST /v1/admin/connector-requests/{request_id}/decline` requires.
-
-    THERE IS NO APPROVE BODY AT ALL, and that asymmetry is the `AdminReview` board's largest
-    departure. The board draws a permanent `REQUIRED` pill over `YOUR REMARKS` and the
-    sentence `Approving needs a remark as well as declining`; both come off. Approving is a
-    click that stores nothing, because an approval remark would be readable nowhere — the audit
-    row carries ids only, the citizen is never shown it, and `ALREADY DECIDED` has no remarks
-    column and no way to reopen a decided row. A write-only column is worse than no column.
-
-    WHO decided is stamped from the authenticated session and never carried in the body."""
-
-    remarks: str
-
-    _v_remarks = field_validator("remarks")(_clean_decline_remarks)
-
-
-class ConnectorRequestRow(CamelModel):
-    """One `connector_access_requests` row as the administrator's queue sees it: who asked, for
-    what, in whose words, and what was decided.
-
-    ONE SHAPE FOR BOTH TABLES. `AdminQueue` draws `WAITING ON YOU` and `ALREADY DECIDED` with
-    different columns, and the fields outside a row's own status read `null` — the same rule
-    `ConnectorEntry` follows for the citizen. Two schemas would put the person, their email and
-    the connector in two places to save four nulls in each.
-
-    `displayName` IS NEVER NULL, AND IS NOT ALWAYS `users.display_name`. That column is
-    nullable, and this server substitutes the work email exactly as
-    `services/connectors/access.PersonAccess` already does for a decider's name — one fallback,
-    written once, on the server, so no panel writes a second one and no cell can render an empty
-    string beside an authorization decision. The consequence is intended and worth stating: a
-    person with no display name renders their email on both lines of the queue's two-line cell.
-
-    `email` IS THE WORK EMAIL, IN PLACE OF THE BOARD'S `department`. `AdminQueue` draws
-    `Priya Nair` / `Ground operations`; `department` exists nowhere in this product and there is
-    no directory client behind one, so the second line carries the value the platform already
-    verifies about a person.
-
-    `decidedById` RIDES SO THE PORTAL CAN RENDER `you` FOR THE RIGHT ADMINISTRATOR. The board
-    writes `2 Sep · you` on every decided row, which is true only for the administrator it was
-    drawn for; BIAL runs two super-admins, so the console compares this id against
-    `GET /v1/auth/me`'s and falls back to `decidedByName`. Hard-coding `you` server-side would
-    put one administrator's identity on the other's screen."""
-
-    id: uuid.UUID
-    #: The person who asked. The queue is the ONE surface that reads across users, so the
-    #: subject's id is on the row rather than inferred from anything.
-    user_id: uuid.UUID
-    #: `users.display_name`, or their email when that column is null. Never empty.
-    display_name: str
-    email: str
-    #: The stored `connector_key` — stable, lowercase, never rendered.
-    connector_key: str
-    #: The catalogue's name for it, so the `CONNECTOR` column needs no second lookup and no
-    #: component has to know what any connector is called.
-    connector_display_name: str
-    #: `AdminReview`'s `WHAT APPROVING GIVES THEM` panel — the registry's THIRD-PERSON consent
-    #: set, which is a different tuple from the citizen's `consentLinesRequester` and not
-    #: derivable from it (`core.connectors` explains why they are two fields).
-    #:
-    #: ON EVERY ROW, INCLUDING THE DECIDED ONES, AND THAT REDUNDANCY IS THE POINT. The decide
-    #: dialog is handed one row and nothing else, so the row is the only object the copy can
-    #: ride; a component that reconstructed these three sentences would make "add a second
-    #: connector" a component change. Narrowing it to `waiting` rows would save a few hundred
-    #: bytes and reintroduce the state-conditional copy field `ConnectorEntry`'s docblock argues
-    #: against.
-    consent_lines_approver: list[ConsentLine]
-    #: The citizen's own words, in full. The queue renders them untruncated (board) and as plain
-    #: text on every surface, never through a markdown component: one user writes this and
-    #: another reads it.
-    requester_remarks: str
-    #: When they asked — the `ASKED` column, which names a time of day, so this is not a date.
-    asked_at: datetime
-    #: `pending`, `approved` or `declined`. A `cancelled` row is not a decision and is not in
-    #: either listing, so that value never crosses this wire.
-    status: ConnectorRequestStatus
-    #: The four decided-only fields. `null` on a waiting row.
-    decided_at: datetime | None = None
-    decided_by_id: uuid.UUID | None = None
-    #: The decider's display name, or their email. `None` when the administrator who decided has
-    #: since been deleted — `decided_by_id` is `ON DELETE SET NULL`, so a decision outlives its
-    #: decider and the row keeps its date with the decider unnamed.
-    decided_by_name: str | None = None
-    #: Written only on a decline. `null` on an approval is correct, not a missing write.
-    decision_remarks: str | None = None
-    #: `USING IT IN` — how many of THIS person's projects have THIS connector switched on.
-    #: `null` on a declined row (the board draws an em dash) and on a waiting one; `0` is a real
-    #: answer meaning an approved person who has not switched it on anywhere yet.
-    using_it_in: int | None = None
-
-
-class ConnectorRequestListResponse(CamelModel):
-    """One page of the administrator's queue, in the order that table is read in.
-
-    `truncated` EXISTS FOR THE SAME REASON `AppListResponse`'S DOES: the read stops at a cap and
-    SAYS so rather than returning a silent prefix. Nothing bounds how many people may ask for a
-    connector, and a queue that quietly hid its tail would let a request wait forever with the
-    console showing a caught-up screen."""
-
-    requests: list[ConnectorRequestRow]
-    truncated: bool = False
-
-
-class ConnectorWaitingCountResponse(CamelModel):
-    """`{ waiting: N }` — the Integrations tab badge's only source.
-
-    ONE NUMBER, AND ONLY THE WAITING ONE. The badge answers "is anybody waiting on me"; a decided
-    count has no badge to render it and would be a field with no reader. A DEDICATED route rather
-    than `len(requests)` off the listing, for the reason `AppCountsResponse` gives: the listing
-    projects up to 200 rows, joins `users` and counts each person's enabled projects, and a badge
-    polling it would pay all of that on a cadence — and pay MORE of it as the queue it reports on
-    grows, which is exactly backwards."""
-
-    waiting: int
-
-
-class ConnectorDecisionResponse(CamelModel):
-    """What approve and decline answer with: the row's new state, in the shape
-    `AdminAppStatusResponse` answers a governance transition with.
-
-    NO DECIDER NAME ON THIS BODY, deliberately. The caller IS the decider, so the console
-    renders `you` for the row it just wrote without being told; the name matters only on the
-    LISTING, where the other administrator's decisions are read, and it rides `ConnectorRequestRow`
-    there. `decidedAt` is here because it is the server's clock, not the browser's."""
-
-    request_id: uuid.UUID
-    #: The person the decision is about — the console reloads its queue by it, and a client that
-    #: kept the row in place needs to know whose row moved.
-    user_id: uuid.UUID
-    connector_key: str
-    status: ConnectorRequestStatus
-    decided_at: datetime

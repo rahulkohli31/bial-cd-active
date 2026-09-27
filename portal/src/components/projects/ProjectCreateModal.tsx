@@ -3,7 +3,7 @@
  * is corrected before a round-trip, not after a 422:
  *   - name is required and capped at 8 WORDS (#158 §14) — the server enforces the same
  *     rule with the same splitting, and 120 chars remains only as a paste backstop,
- *   - description is REQUIRED and WORD-bounded at 15-120 (#191) — the server enforces the
+ *   - description is REQUIRED and WORD-bounded by `utils/words.ts` — the server enforces the
  *     same rule with the same splitting, and 2000 chars remains only as a paste backstop.
  * The submit button stays disabled while any bound is unmet, AND the submit handler
  * re-checks, so a programmatic out-of-bounds value can never reach the network.

@@ -556,8 +556,8 @@ def test_the_prompt_states_no_tool_surface_of_its_own() -> None:
 
 
 def test_an_ordinary_projects_prompt_names_the_connected_data_tool_nowhere() -> None:
-    """★ The connected-data tool is registered only for a project whose connector an
-    administrator approved and whose owner switched on. A prompt that named it for every project
+    """★ The connected-data tool is registered only for a project whose owner switched the
+    connector on. A prompt that named it for every project
     would promise a tool the runtime then rejects as unknown — the leak registration-gating
     exists to prevent, on the one surface every project shares."""
     assert CONNECTOR_SCHEMA_TOOL not in _BUILD_PROMPT

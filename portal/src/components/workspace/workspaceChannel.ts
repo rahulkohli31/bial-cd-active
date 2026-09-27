@@ -295,8 +295,8 @@ export interface WorkspaceActions {
   /** Open this application's settings — the same dialog the home list opens, which is where the
    *  name, the description, the status and the data access all live now. */
   settings: (() => void) | null
-  /** Open the share panel — `null` wherever nothing on screen can share (a chat, or
-   *  a shared viewer's own restricted screen, which never registers this channel at all). */
+  /** Open the share panel — `null` wherever nothing on screen can share (a project that has not
+   *  loaded, or a shared viewer's own restricted screen, which never registers this channel at all). */
   share: (() => void) | null
 }
 

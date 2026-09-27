@@ -99,16 +99,15 @@ def identity_resource_id_for_env(app_env: dict[str, str]) -> str | None:
     """The ARM resource id of the identity this container should be given, or `None`.
 
     DERIVED FROM THE COORDINATES ALREADY IN THE ENVIRONMENT, and that is the whole point. The
-    access decision — a lake configured, the connector switched on for this project, the owner
-    approved — is made ONCE, by `build_connector_env`, and its answer is the presence or absence
-    of these names. Re-deriving it here would be a second place the platform decides who may read
-    BIAL's flight data, and two such places eventually disagree. Reading it back out of the env
+    access decision — a lake configured, the connector switched on for this project — is made
+    ONCE, by `build_connector_env`, and its answer is the presence or absence of these names.
+    Re-deriving it here would be a second place the platform decides who may read BIAL's flight
+    data, and two such places eventually disagree. Reading it back out of the env
     dict makes "identity attached" and "coordinates present" the same fact rather than two facts
     that have to be kept in step.
 
     Returns `None` for every container that was not given coordinates, which is every container on
-    a deployment with no lake, every project with the connector off, and every project whose owner
-    is pending, declined or has never asked.
+    a deployment with no lake and every project with the connector off.
     """
     lake = _configured_lake()
     if lake is None:

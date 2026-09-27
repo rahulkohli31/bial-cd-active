@@ -1,12 +1,12 @@
 """`GET /v1/projects/{id}/connectors` and `PUT .../{key}` — the rail's DATA section, and the one
 write that sets both the switch and the days.
 
-SIX CLAIMS THIS FILE EXISTS FOR:
+FIVE CLAIMS THIS FILE EXISTS FOR:
 
 1. **No row is not `enabled = false`.** A project this connector was never switched on in reads
    `effectivelyOn: false` and `window: null` — written as literals, never as a second spelling of
-   `enabled AND approved`. That conjunction has exactly one home, `core.connectors.resolve_window`,
-   and a second one would drift.
+   the resolver's answer. That answer has exactly one home, `core.connectors.resolve_window`, and
+   a second one would drift.
 2. **The upsert BRANCHES.** Omitting `window` keeps the stored one; sending one replaces it
    outright. The per-column `COALESCE(EXCLUDED.x, x)` that suggests itself is refused by
    `ck_project_connectors_window_shape` the first time a preset lands on a stored date pair, and
@@ -17,10 +17,9 @@ SIX CLAIMS THIS FILE EXISTS FOR:
 4. **Both bounds are on the wire.** `earliestDate` and `latestDate` come from the server because a
    browser in Bangalore and a server in UTC are 5½ hours apart; a portal written against a contract
    without them would compute its own calendar bounds.
-5. **R12 is enforced at the server.** Waiting, declined and never-asked are all refused with a 403
-   and no row, and the same person's rail read shows the state that explains why.
-6. **Stored state is not effective state.** An approval flips an already-enabled row to effectively
-   on with NOTHING written to `project_connectors` — the split is real, not a collapsed column.
+5. **The switch alone turns the data on.** A citizen with no history switches it on, nobody else
+   is asked, and the next container start carries the connector's coordinates; switching it off
+   takes them away at the next start.
 """
 
 from __future__ import annotations
@@ -33,9 +32,10 @@ import sqlalchemy as sa
 from redis.exceptions import RedisError
 
 from src.api.v1.connectors import router
+from src.config import settings
 from src.core.connectors import CONNECTORS
-from src.db.models.connector_access import ConnectorRequestStatus
 from src.db.models.project_connector import ConnectorWindowKind, ProjectConnector
+from src.services.build_sessions.appconnector_env import build_connector_env
 from src.services.build_sessions.locks import (
     acquire_lock,
     release_lock_as_holder,
@@ -43,6 +43,8 @@ from src.services.build_sessions.locks import (
     write_starting_marker,
 )
 from src.services.build_sessions.manager import app_name_for
+from src.services.lake.config import LakeConfig
+from src.services.lake.env import connector_env_names
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_STATE,
@@ -50,14 +52,7 @@ from src.services.redis.keys import (
     registry_key,
 )
 from src.services.usage import ist_today
-from tests.api.v1.connectors.conftest import (
-    DECLINE_REMARKS,
-    KEY,
-    UNKNOWN_KEY,
-    auth_headers,
-    seed_decision,
-    seed_request,
-)
+from tests.api.v1.connectors.conftest import KEY, UNKNOWN_KEY, auth_headers
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 
 _CONNECTOR = CONNECTORS[KEY]
@@ -81,11 +76,9 @@ def _switch(project_id: uuid.UUID, key: str = KEY) -> str:
     return f"/v1/projects/{project_id}/connectors/{key}"
 
 
-async def _approved(db) -> tuple:
-    """A citizen an administrator has already said yes to, and a project of theirs."""
+async def _owned(db) -> tuple:
+    """A citizen with no history at all, and a project of theirs."""
     user = await UserFactory.create(db)
-    admin = await UserFactory.create(db, email="rahul.menon@rvaiglobal.com")
-    await seed_decision(db, user.id, ConnectorRequestStatus.APPROVED, admin)
     project = await ProjectFactory.create(db, user.id)
     return user, project
 
@@ -162,7 +155,7 @@ async def test_switching_on_with_no_window_reads_the_widest_range_offered(
     """★ The happy path, and the server-side default. The client sends one field; the days come
     back resolved to concrete dates so nothing in the browser has to know what `Last 30 days`
     means or when today is."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
 
     resp = await _put(client, user, project.id, {"enabled": True})
 
@@ -170,7 +163,6 @@ async def test_switching_on_with_no_window_reads_the_widest_range_offered(
     body = resp.json()
     assert body["key"] == KEY
     assert body["displayName"] == _CONNECTOR.display_name
-    assert body["state"] == "approved"
     assert body["enabled"] is True
     assert body["effectivelyOn"] is True
 
@@ -190,7 +182,7 @@ async def test_switching_on_with_no_window_reads_the_widest_range_offered(
 async def test_the_rail_read_returns_what_the_write_returned(client, db_session) -> None:
     """The write's body and the read's entry are assembled by the same function, so a client can
     render either without branching on which call it made."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
 
     written = (await _put(client, user, project.id, {"enabled": True})).json()
     read = await _entry(client, user, project.id)
@@ -201,26 +193,24 @@ async def test_the_rail_read_returns_what_the_write_returned(client, db_session)
 async def test_a_project_with_no_row_is_off_with_no_window(client, db_session) -> None:
     """★ NO ROW IS NOT `enabled = false`, and `effectivelyOn` is a literal here.
 
-    An approved citizen who has never switched this connector on in this project gets the board's
-    state b — the switch down, nothing reading, and no window to render. If `effectivelyOn` were
-    ever written as `enabled and approved` at this boundary there would be two homes for that
-    conjunction; this row is the one that has no resolver behind it at all."""
-    user, project = await _approved(db_session)
+    A citizen who has never switched this connector on in this project gets the switch down,
+    nothing reading, and no window to render. If `effectivelyOn` were ever computed at this
+    boundary there would be two homes for the resolver's answer; this row is the one that has no
+    resolver behind it at all."""
+    user, project = await _owned(db_session)
 
     entry = await _entry(client, user, project.id)
 
-    assert entry["state"] == "approved"
     assert entry["enabled"] is False
     assert entry["effectivelyOn"] is False
     assert entry["window"] is None
-    assert entry["askedAt"] is None
     assert await _stored_rows(db_session, project.id) == []
 
 
 async def test_the_rail_lists_every_registry_connector(client, db_session) -> None:
     """One entry per catalogue entry, in registry order — the rail renders this array whole and
     counts it, so a connector missing from it is a row that silently disappears."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
 
     resp = await client.get(_rail(project.id), headers=auth_headers(user))
 
@@ -228,7 +218,7 @@ async def test_the_rail_lists_every_registry_connector(client, db_session) -> No
 
 
 async def test_the_payload_is_camel_case_on_the_wire(client, db_session) -> None:
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
     await _put(client, user, project.id, {"enabled": True})
 
     entry = await _entry(client, user, project.id)
@@ -238,16 +228,28 @@ async def test_the_payload_is_camel_case_on_the_wire(client, db_session) -> None
     assert "earliestDate" in entry["window"] and "earliest_date" not in entry["window"]
 
 
+async def test_the_entry_carries_the_project_facts_and_nothing_about_the_person(
+    client, db_session
+) -> None:
+    """The switch is the whole of connector access, so a row has nothing to say about where its
+    owner stands. Asserted as an exact key set so a person-level field coming back goes red."""
+    user, project = await _owned(db_session)
+
+    entry = await _entry(client, user, project.id)
+
+    assert set(entry) == {"key", "displayName", "dataNoun", "enabled", "effectivelyOn", "window"}
+
+
 # --- the window survives the switch ---------------------------------------------
 
 
 async def test_switching_off_keeps_the_window_and_on_returns_it(client, db_session) -> None:
     """★ MUTANT: delete the row on switch-off and this goes red.
 
-    Approval is not spent by switching off, and neither is the range the citizen picked. The row
-    stays with its window intact, `effectivelyOn` drops to false, and switching back on returns
-    `Last 7 days` rather than silently re-picking the default."""
-    user, project = await _approved(db_session)
+    Switching off does not spend the range the citizen picked. The row stays with its window
+    intact, `effectivelyOn` drops to false, and switching back on returns `Last 7 days` rather
+    than silently re-picking the default."""
+    user, project = await _owned(db_session)
     await _put(
         client, user, project.id, {"enabled": True, "window": {"kind": "relative", "days": 7}}
     )
@@ -279,7 +281,7 @@ async def test_enabled_only_leaves_an_absolute_window_whole(client, db_session) 
     `window_start` and `window_end` all populated at once —
     `ck_project_connectors_window_shape` refuses it, and the citizen's switch 500s. The `DO
     UPDATE` therefore branches: no window, no window columns."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
     picked_start, picked_end = date(2026, 9, 1), date(2026, 9, 3)
     await _put(
         client,
@@ -306,7 +308,7 @@ async def test_enabled_only_leaves_an_absolute_window_whole(client, db_session) 
 async def test_sending_a_preset_replaces_a_stored_date_pair_outright(client, db_session) -> None:
     """The other half of the branch: a supplied window REPLACES, so a `relative` choice must not
     leave the old dates behind it — which is the same CHECK violation from the other direction."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
     await _put(
         client,
         user,
@@ -330,7 +332,7 @@ async def test_sending_a_preset_replaces_a_stored_date_pair_outright(client, db_
 async def test_two_projects_of_one_owner_hold_their_own_windows(client, db_session) -> None:
     """The DAYS belong to the PROJECT — a departures board and a six-month trend want different
     history and the same person owns both. Writing one must not reach the other."""
-    user, first = await _approved(db_session)
+    user, first = await _owned(db_session)
     second = await ProjectFactory.create(db_session, user.id)
     await _put(
         client, user, first.id, {"enabled": True, "window": {"kind": "relative", "days": 7}}
@@ -361,7 +363,7 @@ async def test_two_projects_of_one_owner_hold_their_own_windows(client, db_sessi
 async def test_the_read_carries_both_bounds(client, db_session) -> None:
     """★ THE FIELDS THE CALENDAR GREYS AGAINST. Without them the portal has to derive its own
     floor and ceiling from a browser clock 5½ hours away from the server's."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
     await _put(client, user, project.id, {"enabled": True})
 
     window = (await _entry(client, user, project.id))["window"]
@@ -386,7 +388,7 @@ async def test_an_aged_out_range_reads_clamped_and_the_row_is_not_rewritten(
     """★ A window ages out on its own. The stored pair is what the citizen picked, forever; the
     bounds are applied on every READ, and `clamped` is how the chip says the dates moved. Read a
     second time, the row is still exactly as it was written — nothing is ever written back."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
     long_ago_start, long_ago_end = date(2026, 1, 5), date(2026, 1, 8)
     await _put(
         client,
@@ -420,52 +422,42 @@ async def test_an_aged_out_range_reads_clamped_and_the_row_is_not_rewritten(
     ]
 
 
-# --- R12: the write refuses everybody an administrator has not approved ---------
+# --- the switch alone turns the data on --------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("history", "person_state", "board_state"),
-    [
-        (None, "neverAsked", "c"),
-        (ConnectorRequestStatus.PENDING, "pending", "d"),
-        (ConnectorRequestStatus.DECLINED, "declined", "c"),
-    ],
-)
-async def test_only_an_approved_person_may_switch_a_connector_on(
-    client, db_session, history, person_state, board_state
+async def test_a_citizen_with_no_history_switches_it_on_and_the_next_start_carries_it(
+    client, db_session, monkeypatch
 ) -> None:
-    """★ R12, ENFORCED AT THE SERVER. The switch is only drawn for an approved person, which is
-    exactly why the refusal cannot live in the form. Nothing is written, and the same person's
-    rail read shows the state that explains it — `ConnectorStates` c (`You do not have access to
-    … yet`) or d (`waiting on an administrator`)."""
-    user = await UserFactory.create(db_session)
-    if history is ConnectorRequestStatus.DECLINED:
-        admin = await UserFactory.create(db_session, email="rahul.menon@rvaiglobal.com")
-        await seed_decision(db_session, user.id, history, admin, decision_remarks=DECLINE_REMARKS)
-    elif history is not None:
-        await seed_request(db_session, user.id, history)
-    project = await ProjectFactory.create(db_session, user.id)
+    """★ NOBODY ELSE IS ASKED. A brand-new citizen's first press is a 200 and a stored row, and
+    the environment the next container is born with carries the connector's coordinates. Switched
+    off, the next birth carries none."""
+    lake = LakeConfig(
+        url="https://alakeaccount.blob.core.windows.net/acontainer/reports/",
+        identity_client_id="52b74947-0621-46e2-a523-a6b466f47c33",
+        identity_resource_id="/subscriptions/s/resourcegroups/r/providers/x/an-identity",
+    )
+    monkeypatch.setattr(settings, "connector_lake", lake)
+    user, project = await _owned(db_session)
+    url_name, client_id_name = connector_env_names(KEY)
 
-    resp = await _put(client, user, project.id, {"enabled": True})
+    on = await _put(client, user, project.id, {"enabled": True})
 
-    assert resp.status_code == 403, resp.text
-    code, message = _refusal(resp)
-    assert code == "access_not_approved"
-    assert _CONNECTOR.display_name in message
-    assert await _stored_rows(db_session, project.id) == []
+    assert on.status_code == 200, on.text
+    assert on.json()["effectivelyOn"] is True
+    assert await build_connector_env(db_session, user_id=user.id, project_id=project.id) == {
+        url_name: lake.url,
+        client_id_name: lake.identity_client_id,
+    }
 
-    entry = await _entry(client, user, project.id)
-    assert entry["state"] == person_state
-    assert entry["enabled"] is False
-    assert entry["effectivelyOn"] is False
-    assert entry["window"] is None
-    # State d is the only one that draws a date, and it is the date they asked on.
-    assert (entry["askedAt"] is not None) is (board_state == "d")
+    off = await _put(client, user, project.id, {"enabled": False})
+
+    assert off.status_code == 200, off.text
+    assert await build_connector_env(db_session, user_id=user.id, project_id=project.id) == {}
 
 
 async def test_a_write_without_the_csrf_header_is_refused(client, db_session) -> None:
     """The shape a cross-site form post arrives in: the cookie rides along, the header does not."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
 
     resp = await _put(client, user, project.id, {"enabled": True}, csrf=False)
 
@@ -483,7 +475,7 @@ async def test_an_unauthenticated_read_is_refused(client) -> None:
 async def test_an_unknown_connector_is_a_404_and_writes_nothing(client, db_session) -> None:
     """The registry is the catalogue — there is no `connectors` table — so an unknown key is
     caught at the route and never by the database."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
 
     resp = await _put(client, user, project.id, {"enabled": True}, key=UNKNOWN_KEY)
 
@@ -495,7 +487,7 @@ async def test_an_unknown_connector_is_a_404_and_writes_nothing(client, db_sessi
 async def test_a_range_the_connector_does_not_offer_is_refused(client, db_session) -> None:
     """`days` is checked against the set derived from the connector's own retention, not against
     a hard-coded `{7, 14, 30}` — and the refusal names what could have been sent instead."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
 
     resp = await _put(
         client, user, project.id, {"enabled": True, "window": {"kind": "relative", "days": 5}}
@@ -511,7 +503,7 @@ async def test_a_range_the_connector_does_not_offer_is_refused(client, db_sessio
 async def test_a_backwards_date_pair_is_refused(client, db_session) -> None:
     """`window_start <= window_end` is THIS boundary's guarantee: the resolver takes it as given
     and never re-checks it, so an inverted pair must not get past here."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
 
     resp = await _put(
         client,
@@ -546,7 +538,7 @@ async def test_a_backwards_date_pair_is_refused(client, db_session) -> None:
 async def test_a_window_whose_kind_and_fields_disagree_is_refused(
     client, db_session, window, expected_type, expected_field
 ) -> None:
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
 
     resp = await _put(client, user, project.id, {"enabled": True, "window": window})
 
@@ -563,10 +555,8 @@ async def test_another_citizens_project_is_a_404_on_both_the_read_and_the_write(
 ) -> None:
     """★ A project somebody else owns and a project that does not exist answer identically. A 403
     would confirm the row exists, which is precisely the probe the 404 refuses to answer."""
-    asha, asha_project = await _approved(db_session)
+    _asha, asha_project = await _owned(db_session)
     ravi = await UserFactory.create(db_session, email="ravi@rvaiglobal.com")
-    admin = await UserFactory.create(db_session, email="admin@rvaiglobal.com")
-    await seed_decision(db_session, ravi.id, ConnectorRequestStatus.APPROVED, admin)
 
     read = await client.get(_rail(asha_project.id), headers=auth_headers(ravi))
     write = await _put(client, ravi, asha_project.id, {"enabled": True})
@@ -576,60 +566,6 @@ async def test_another_citizens_project_is_a_404_on_both_the_read_and_the_write(
     assert _refusal(read) == _refusal(write) == _refusal(missing)
     assert _refusal(read)[0] == "project_not_found"
     assert await _stored_rows(db_session, asha_project.id) == []
-
-
-# --- stored state is not effective state ----------------------------------------
-
-
-async def test_approving_a_person_switches_their_rows_on_without_writing_to_them(
-    client, db_session
-) -> None:
-    """★ THE STORED/EFFECTIVE SPLIT, PROVED. A project whose switch is up while its owner waits
-    reads `enabled: true` and `effectivelyOn: false`. The administrator's approval — a write to
-    the person's ledger and to nothing else — flips it on. If `enabled` were the collapsed
-    "is it on" column, granting access would have to walk every row the person owns.
-
-    `ctid` is the proof, and it is the only honest one available: `now()` is the TRANSACTION's
-    timestamp in PostgreSQL, so an `updated_at` comparison inside one test transaction cannot
-    tell a rewritten row from an untouched one. An UPDATE always writes a new tuple version, so
-    an unchanged `ctid` means the row was not written at all — not even with the same values."""
-    user = await UserFactory.create(db_session)
-    admin = await UserFactory.create(db_session, email="rahul.menon@rvaiglobal.com")
-    await seed_request(db_session, user.id, ConnectorRequestStatus.PENDING)
-    project = await ProjectFactory.create(db_session, user.id)
-    db_session.add(
-        ProjectConnector(
-            project_id=project.id,
-            connector_key=KEY,
-            enabled=True,
-            window_kind=ConnectorWindowKind.RELATIVE,
-            window_days=7,
-        )
-    )
-    await db_session.flush()
-
-    async def _tuple_version() -> str:
-        return str(
-            await db_session.scalar(
-                sa.text("SELECT ctid::text FROM project_connectors WHERE project_id = :p"),
-                {"p": project.id},
-            )
-        )
-
-    before_ctid = await _tuple_version()
-    waiting = await _entry(client, user, project.id)
-    # The approval, and nothing else: an append to the person's ledger (U5 writes this row).
-    await seed_decision(db_session, user.id, ConnectorRequestStatus.APPROVED, admin)
-    approved = await _entry(client, user, project.id)
-
-    assert waiting["state"] == "pending"
-    assert waiting["enabled"] is True
-    assert waiting["effectivelyOn"] is False
-    assert approved["state"] == "approved"
-    assert approved["enabled"] is True
-    assert approved["effectivelyOn"] is True
-    assert approved["window"]["days"] == 7
-    assert await _tuple_version() == before_ctid
 
 
 # --- the settings are locked while a session is live -------------------------------------
@@ -648,7 +584,7 @@ async def test_the_switch_is_refused_while_a_build_or_chat_is_running(
     client, db_session, fake_redis
 ) -> None:
     """★ Refused server-side, with a message that names what the citizen can actually do."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
     await acquire_lock(fake_redis, user.id)
 
     resp = await _put(client, user, project.id, {"enabled": True})
@@ -667,7 +603,7 @@ async def test_the_window_is_refused_while_a_session_is_live_too(
 ) -> None:
     """The switch and the days are locked together: both ride the same container environment,
     and a window changed mid-build is the same broken promise as a switch flipped mid-build."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
     await _put(client, user, project.id, {"enabled": True})
     await acquire_lock(fake_redis, user.id)
 
@@ -699,7 +635,7 @@ async def test_the_other_two_live_signals_refuse_as_well(
     refusal to the live project must not quietly narrow it to the LOCK. The lock is the only one
     of the three a per-app guard elsewhere in the tree reads, and reusing that guard whole would
     drop these two silently."""
-    user, building = await _approved(db_session)
+    user, building = await _owned(db_session)
     elsewhere = await ProjectFactory.create(db_session, user.id)
     building_app = await _app_of(db_session, user, building)
     await _app_of(db_session, user, elsewhere)
@@ -735,7 +671,7 @@ async def test_a_build_in_one_project_leaves_another_projects_settings_alone(
 ) -> None:
     """★ THE NARROWING. One person, two projects, one live session — the project that is not in
     it is settable, and the setting is actually stored rather than swallowed."""
-    user, building = await _approved(db_session)
+    user, building = await _owned(db_session)
     elsewhere = await ProjectFactory.create(db_session, user.id)
     await _registry_names(fake_redis, user, await _app_of(db_session, user, building))
     await _app_of(db_session, user, elsewhere)
@@ -754,7 +690,7 @@ async def test_the_project_the_build_is_running_in_is_still_refused(
 ) -> None:
     """★ The other half of the same state: the project whose container is being built keeps the
     refusal it always had, in the same words and under the same code."""
-    user, building = await _approved(db_session)
+    user, building = await _owned(db_session)
     await _registry_names(fake_redis, user, await _app_of(db_session, user, building))
     await acquire_lock(fake_redis, user.id)
 
@@ -777,7 +713,7 @@ async def test_the_refusal_names_the_project_whose_session_is_in_the_way(
 
     Turn red by dropping the project from the sentence: the connector name alone identifies what
     the citizen was changing, never where the work that blocks it is."""
-    user, building = await _approved(db_session)
+    user, building = await _owned(db_session)
     building.name = "Visitor Log"
     await db_session.flush()
     await _registry_names(fake_redis, user, await _app_of(db_session, user, building))
@@ -796,7 +732,7 @@ async def test_a_project_nothing_has_ever_been_built_in_is_settable_while_anothe
     """A project with no app row has never had a container of its own, so the app a live registry
     names cannot be its. Switching data on is the first thing a citizen does in a project, and it
     must not wait for a build somewhere else to finish."""
-    user, building = await _approved(db_session)
+    user, building = await _owned(db_session)
     fresh = await ProjectFactory.create(db_session, user.id)
     await _registry_names(fake_redis, user, await _app_of(db_session, user, building))
     await acquire_lock(fake_redis, user.id)
@@ -811,7 +747,7 @@ async def test_a_live_session_that_names_no_app_refuses_every_project(
     The lock is taken before the container is provisioned, so in between the registry names
     nothing and the platform cannot say whose work is starting. Ambiguity refuses — for the
     project with an app row and the one without alike."""
-    user, one = await _approved(db_session)
+    user, one = await _owned(db_session)
     another = await ProjectFactory.create(db_session, user.id)
     await _app_of(db_session, user, one)
     await acquire_lock(fake_redis, user.id)
@@ -835,7 +771,7 @@ async def test_a_redis_that_answers_badly_refuses_the_change_rather_than_allowin
 
     Turning the `raise` in that `except RedisError` into a `return` makes this test red and every
     other test in this file stay green — which is the only reason it is worth writing."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
 
     async def _redis_that_is_having_a_bad_day(*args, **kwargs):
         raise RedisError("connection reset by peer")
@@ -857,7 +793,7 @@ async def test_once_the_session_ends_the_switch_is_settable_again(
 ) -> None:
     """The lock is a PAUSE, not a permanent refusal. The next container born carries the change,
     which is the whole point of preventing the half-configured state rather than reconciling it."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
     token = await acquire_lock(fake_redis, user.id)
     assert token is not None
     assert (await _put(client, user, project.id, {"enabled": True})).status_code == 409
@@ -867,28 +803,10 @@ async def test_once_the_session_ends_the_switch_is_settable_again(
     assert (await _put(client, user, project.id, {"enabled": True})).status_code == 200
 
 
-async def test_an_unapproved_citizen_still_gets_the_403_not_the_lock_message(
-    client, db_session, fake_redis
-) -> None:
-    """★ ORDERING. The approval check runs FIRST, so somebody who was never allowed to change
-    this setting is told that — rather than being told to stop a build for a control they could
-    not have used anyway."""
-    user = await UserFactory.create(db_session, email="pending@rvaiglobal.com")
-    project = await ProjectFactory.create(db_session, user_id=user.id)
-    await seed_request(db_session, user.id, ConnectorRequestStatus.PENDING)
-    await db_session.flush()
-    await acquire_lock(fake_redis, user.id)
-
-    resp = await _put(client, user, project.id, {"enabled": True})
-
-    assert resp.status_code == 403
-    assert resp.json()["error"]["code"] == "access_not_approved"
-
-
 async def test_with_no_redis_at_all_there_is_no_session_to_protect(client, db_session) -> None:
     """No Redis means no sandbox coordination, which means no live session — a supported dev/test
     posture, and the answer is simply "not live". Binds no `fake_redis` fixture on purpose: with
     one bound this branch is unreachable by construction."""
-    user, project = await _approved(db_session)
+    user, project = await _owned(db_session)
 
     assert (await _put(client, user, project.id, {"enabled": True})).status_code == 200

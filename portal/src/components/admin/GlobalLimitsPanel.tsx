@@ -1,12 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { AlertCircle, Search } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { ColumnDef, RowSelectionState } from '@tanstack/react-table'
+import { AlertCircle } from 'lucide-react'
 import { BusyGlyph } from '../ui/Waiting'
+import { Checkbox } from '../ui/checkbox'
+import { Label } from '../ui/label'
 import { fetchUsers, bulkUpdateUserLimits } from '../../utils/admin'
 import type { UserLimitsOut } from '../../utils/admin'
 import { useKeysetList } from '../../hooks/useKeysetList'
 import type { KeysetPage } from '../../hooks/useKeysetList'
 import { fmt, roleLabel } from './columns'
-import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../ui/table'
+import AdminDataTable from './AdminDataTable'
 
 // A plain suggestion list, not an enforced enum — the endpoint that consumes a value
 // still accepts any positive integer up to MAX_DAILY_TOKEN_LIMIT (custom values stay
@@ -33,14 +36,15 @@ export interface GlobalLimitsPanelProps {
  * every user system-wide or a hand-picked subset, in one bulk request. "All
  * users" sends `userIds: null` (backend resolves the roster, covering
  * everyone); "Selected users" checks rows off the same background-loaded
- * roster `UsersLimitsPanel` uses. The value picker is one control: a preset
- * fills the number input, which stays hand-editable before applying.
+ * roster `UsersLimitsPanel` uses, held as TanStack row selection keyed by user id.
+ * The value picker is one control: a preset fills the number input, which stays
+ * hand-editable before applying.
  */
 export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
   const [mode, setMode] = useState<Mode>('all')
   const [preset, setPreset] = useState<string>(String(SUGGESTED_DAILY_TOKEN_LIMITS[2]))
   const [customValue, setCustomValue] = useState('')
-  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [rowSelection, setRowSelection] = useState<RowSelectionState>({})
   const [confirming, setConfirming] = useState(false)
   const [applying, setApplying] = useState(false)
   const [applyError, setApplyError] = useState<string | null>(null)
@@ -130,7 +134,8 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
   const valueIsValid = isPlainPositiveInteger(rawValue)
   const value = valueIsValid ? Number(rawValue) : NaN
 
-  const selectedCount = selected.size
+  const selectedIds = Object.keys(rowSelection).filter((id) => rowSelection[id])
+  const selectedCount = selectedIds.length
   const targetCount = mode === 'all' ? null : selectedCount
 
   // Closing the confirm step on any value/preset edit keeps the reviewed action and the
@@ -148,37 +153,58 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
     setConfirming(false)
   }
 
-  const toggleOne = (userId: string) =>
-    setSelected((prev) => {
-      const next = new Set(prev)
-      if (next.has(userId)) next.delete(userId)
-      else next.add(userId)
-      return next
-    })
-
-  const allLoadedSelected = users.length > 0 && users.every((u) => selected.has(u.userId))
-  // Symmetric over LOADED ids only — add every loaded id, or remove every loaded id —
-  // rather than replacing the whole map. `setSelected({})`/a full-map replace on select-
-  // all previously discarded any picks made under a DIFFERENT search: select 40 users
-  // under "ops", search "eng", click select-all-loaded, and the 40 were silently gone.
-  const toggleAllLoaded = () => {
-    setSelected((prev) => {
-      const next = new Set(prev)
-      for (const u of users) {
-        if (allLoadedSelected) next.delete(u.userId)
-        else next.add(u.userId)
-      }
-      return next
-    })
-  }
-
-  // `selected` is otherwise never reconciled with the roster: `useKeysetList` clears
-  // `items` on a query change, but nothing pruned `selected` to match — so the header
+  // The selection is otherwise never reconciled with the roster: `useKeysetList` clears
+  // `items` on a query change, but nothing pruned the selection to match — so the header
   // and confirm banner could read "42 selected" while the visible table showed zero
   // ticked rows, targeting users the admin could no longer see or review.
   useEffect(() => {
-    setSelected(new Set())
+    setRowSelection({})
   }, [appliedQuery])
+
+  // "Select all" ticks every LOADED row, on every page, and merges with picks already made;
+  // unticking it clears only the loaded rows. It stays off while a background page has failed.
+  const columns = useMemo<ColumnDef<UserLimitsOut>[]>(
+    () => [
+      {
+        id: 'select',
+        meta: { className: 'w-8' },
+        header: ({ table }) => (
+          <Checkbox
+            aria-label="Select all loaded users"
+            checked={table.getIsAllRowsSelected()}
+            disabled={isPartial}
+            onCheckedChange={(checked) => table.toggleAllRowsSelected(checked === true)}
+          />
+        ),
+        cell: ({ row }) => (
+          <Checkbox
+            aria-label={`Select ${row.original.displayName || row.original.email}`}
+            checked={row.getIsSelected()}
+            onCheckedChange={(checked) => row.toggleSelected(checked === true)}
+          />
+        ),
+      },
+      {
+        id: 'user',
+        accessorFn: (u) => u.displayName || u.email,
+        header: 'User',
+        cell: ({ row }) => (
+          <>
+            <p className="font-medium text-tertiary">{row.original.displayName || row.original.email}</p>
+            <p className="text-xs text-neutral">{row.original.email}</p>
+          </>
+        ),
+      },
+      { id: 'role', accessorFn: (u) => u.role, header: 'Role', cell: ({ row }) => roleLabel(row.original.role) },
+      {
+        id: 'dailyTokenLimit',
+        accessorFn: (u) => u.effectiveLimits.dailyTokenLimit ?? 0,
+        header: 'Current daily tokens',
+        cell: ({ row }) => <span className="tabular-nums">{fmt(row.original.effectiveLimits.dailyTokenLimit ?? 0)}</span>,
+      },
+    ],
+    [isPartial],
+  )
 
   const canApply =
     valueIsValid && (mode === 'all' || selectedCount > 0) && !applying && !(mode === 'selected' && isPartial)
@@ -189,13 +215,13 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
     try {
       const result = await bulkUpdateUserLimits(
         value,
-        mode === 'all' ? undefined : [...selected],
+        mode === 'all' ? undefined : selectedIds,
         {},
       )
       if (!isMountedRef.current) return
       onToast(`Daily limit updated for ${fmt(result.updatedCount)} user${result.updatedCount === 1 ? '' : 's'}`)
       setConfirming(false)
-      setSelected(new Set())
+      setRowSelection({})
       // The "Current daily tokens" column otherwise keeps showing pre-apply values
       // until the admin switches tabs and back — immediately after an action whose
       // entire purpose was to change that column. `refresh()` reloads page 1 under the
@@ -257,9 +283,9 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
       {/* Value picker */}
       <div className="flex flex-wrap items-end gap-3 mb-5">
         <div>
-          <label htmlFor="glp-preset" className="block text-[10px] font-bold uppercase tracking-wider text-neutral mb-1.5">
+          <Label htmlFor="glp-preset" className="block text-[10px] font-bold uppercase tracking-wider text-neutral mb-1.5">
             Daily token limit
-          </label>
+          </Label>
           <select
             id="glp-preset"
             data-testid="preset-select"
@@ -276,9 +302,9 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
           </select>
         </div>
         <div>
-          <label htmlFor="glp-custom" className="block text-[10px] font-bold uppercase tracking-wider text-neutral mb-1.5">
+          <Label htmlFor="glp-custom" className="block text-[10px] font-bold uppercase tracking-wider text-neutral mb-1.5">
             Exact value
-          </label>
+          </Label>
           <input
             id="glp-custom"
             type="number"
@@ -301,21 +327,6 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
 
       {mode === 'selected' && (
         <>
-          <div className="flex flex-wrap items-center gap-3 mb-4">
-            <div className="relative max-w-xs flex-1 min-w-[180px]">
-              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral" />
-              <input
-                type="search"
-                data-testid="glp-search"
-                value={q}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search name or email…"
-                className="w-full pl-9 pr-3 py-2 text-sm border border-bial-border rounded-xl text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition"
-              />
-            </div>
-            <span className="text-xs text-neutral">{fmt(selectedCount)} selected</span>
-          </div>
-
           {/* A failed background page must never silently vanish (fail-first), and it must
               never look like the whole roster is in when it isn't — shown above the table,
               not tucked below it. Ported from the partial-roster banner in
@@ -366,7 +377,7 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
             </div>
           )}
 
-          {users.length === 0 && (!error || isAbortError) && (loading || appliedQuery === null || isAbortError) ? (
+          {users.length === 0 && (!error || isAbortError) && (appliedQuery === null || isAbortError) ? (
             <div className="flex items-center justify-center gap-2 py-16 text-neutral text-sm">
               <BusyGlyph size={16} /> Loading users…
             </div>
@@ -384,53 +395,20 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
                 Retry
               </button>
             </div>
-          ) : users.length === 0 ? (
-            <div className="text-center py-16 text-sm text-neutral">
-              {appliedQuery ? `No users match “${appliedQuery}”.` : 'No users yet.'}
-            </div>
           ) : (
-            <Table>
-              <TableHeader>
-                <tr className="border-b border-bial-border">
-                  <TableHead className="w-8">
-                    <input
-                      type="checkbox"
-                      aria-label="Select all loaded users"
-                      data-testid="select-all-loaded"
-                      className="accent-primary w-3.5 h-3.5"
-                      checked={allLoadedSelected}
-                      disabled={isPartial}
-                      onChange={toggleAllLoaded}
-                    />
-                  </TableHead>
-                  <TableHead>User</TableHead>
-                  <TableHead>Role</TableHead>
-                  <TableHead>Current daily tokens</TableHead>
-                </tr>
-              </TableHeader>
-              <TableBody>
-                {users.map((u) => (
-                  <TableRow key={u.userId} data-testid={`glp-row-${u.email}`} className="hover:bg-bial-bg/50">
-                    <TableCell>
-                      <input
-                        type="checkbox"
-                        aria-label={`Select ${u.displayName || u.email}`}
-                        data-testid={`select-${u.email}`}
-                        className="accent-primary w-3.5 h-3.5"
-                        checked={selected.has(u.userId)}
-                        onChange={() => toggleOne(u.userId)}
-                      />
-                    </TableCell>
-                    <TableCell>
-                      <p className="font-medium text-tertiary">{u.displayName || u.email}</p>
-                      <p className="text-xs text-neutral">{u.email}</p>
-                    </TableCell>
-                    <TableCell>{roleLabel(u.role)}</TableCell>
-                    <TableCell className="tabular-nums">{fmt(u.effectiveLimits.dailyTokenLimit ?? 0)}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+            <AdminDataTable<UserLimitsOut>
+              columns={columns}
+              rows={users}
+              getRowId={(u) => u.userId}
+              serverSearch={{ value: q, onChange: setQuery }}
+              searchLabel="Search users"
+              searchPlaceholder="Search name or email…"
+              emptyMessage={appliedQuery ? `No users match “${appliedQuery}”.` : 'No users yet.'}
+              loading={loading}
+              rowSelection={rowSelection}
+              onRowSelectionChange={setRowSelection}
+              toolbarStart={() => <span className="text-xs text-neutral">{fmt(selectedCount)} selected</span>}
+            />
           )}
 
           {hasMore && !error && !isCapped && (

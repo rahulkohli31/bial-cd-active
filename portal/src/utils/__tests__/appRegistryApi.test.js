@@ -26,6 +26,111 @@ describe('owner-surface retirement (inertness guard)', () => {
   )
 })
 
+describe('listApps', () => {
+  it('asks for every app, with no status filter', async () => {
+    const fetchImpl = vi.fn(async () => ok({ apps: [], truncated: false }))
+    await registry.listApps(deps(fetchImpl))
+
+    expect(fetchImpl.mock.calls[0][0]).toBe('/api/admin/apps')
+  })
+
+  it('reads each row’s registry status and live version, and whether the list was cut short', async () => {
+    const fetchImpl = vi.fn(async () =>
+      ok({
+        apps: [
+          {
+            appId: 'a1',
+            status: 'approved',
+            registryStatus: 'live',
+            liveVersion: { number: 4, commitSha: 'f0e1d2c3b4', since: '2026-09-25T16:40:00Z' },
+          },
+          { appId: 'a2', status: 'pending', registryStatus: 'waiting_for_review', liveVersion: null },
+        ],
+        truncated: true,
+      }),
+    )
+
+    const list = await registry.listApps(deps(fetchImpl))
+
+    expect(list.truncated).toBe(true)
+    expect(list.apps.map((a) => [a.registryStatus, a.liveVersion])).toEqual([
+      ['live', { number: 4, commitSha: 'f0e1d2c3b4', since: '2026-09-25T16:40:00Z' }],
+      ['waiting_for_review', null],
+    ])
+  })
+
+  it('reads an unknown registry status as a draft, and a missing flag as a whole list', async () => {
+    const fetchImpl = vi.fn(async () => ok({ apps: [{ appId: 'a1', registryStatus: 'teleported' }] }))
+
+    const list = await registry.listApps(deps(fetchImpl))
+
+    expect(list.apps[0].registryStatus).toBe('draft')
+    expect(list.apps[0].liveVersion).toBeNull()
+    expect(list.truncated).toBe(false)
+  })
+})
+
+describe('fetchHistory', () => {
+  it('asks for one app’s history and keeps each version and event it can place', async () => {
+    const fetchImpl = vi.fn(async () =>
+      ok({
+        entries: [
+          {
+            kind: 'version',
+            number: 2,
+            commitSha: 'c09a4e1',
+            submissionId: 'sub-2',
+            sentAt: '2026-09-15T10:10:00Z',
+            sentBy: 'kavya.n@bialairport.com',
+            declaration: { commits: { shipping: 'c09a4e1' } },
+            decision: { kind: 'rejected', by: 'admin@bial.com', at: '2026-09-16T04:30:00Z', note: 'Remove the passport field.' },
+            attempts: [{ status: 'failed', startedAt: '2026-09-15T10:10:00Z', finishedAt: null, failureCode: 'build_failed' }],
+            state: 'rejected',
+            publishedAt: null,
+            replacedBy: null,
+            replacedAt: null,
+          },
+          { kind: 'event', action: 'disable', at: '2026-09-13T13:10:00Z', by: 'admin@bial.com', reenabledAt: '2026-09-14T03:32:00Z' },
+          { kind: 'version', sentAt: '2026-09-01T00:00:00Z' },
+          { kind: 'mystery' },
+        ],
+        live: { number: 1, commitSha: '2e77b10', since: '2026-09-05T09:32:00Z' },
+        liveUrl: 'https://pub.example/app',
+        truncated: true,
+      }),
+    )
+
+    const history = await registry.fetchHistory('a/1', deps(fetchImpl))
+
+    expect(fetchImpl.mock.calls[0][0]).toBe('/api/admin/apps/a%2F1/history')
+    expect(history.entries.map((entry) => entry.kind)).toEqual(['version', 'event'])
+    expect(history.entries[0].decision.note).toBe('Remove the passport field.')
+    expect(history.entries[0].attempts[0].failureCode).toBe('build_failed')
+    expect(history.entries[1].reenabledAt).toBe('2026-09-14T03:32:00Z')
+    expect(history.live).toEqual({ number: 1, commitSha: '2e77b10', since: '2026-09-05T09:32:00Z' })
+    expect(history.liveUrl).toBe('https://pub.example/app')
+    expect(history.truncated).toBe(true)
+  })
+
+  it('reads an unknown state or decision as not recorded, never as something it is not', async () => {
+    const fetchImpl = vi.fn(async () =>
+      ok({ entries: [{ kind: 'version', number: 1, sentAt: '2026-09-01T00:00:00Z', state: 'teleported', decision: { kind: 'vibes' } }] }),
+    )
+
+    const history = await registry.fetchHistory('a1', deps(fetchImpl))
+
+    expect(history.entries[0].state).toBe('not_recorded')
+    expect(history.entries[0].decision.kind).toBe('not_recorded')
+    expect(history.live).toBeNull()
+    expect(history.truncated).toBe(false)
+  })
+
+  it('no longer exports the audit list it replaced', () => {
+    expect(registry.fetchAudit).toBeUndefined()
+    expect(typeof registry.fetchHistory).toBe('function')
+  })
+})
+
 describe('approveApp', () => {
   it('POSTs the REVIEWED submission id', async () => {
     const fetchImpl = vi.fn(async () => ok({ appId: 'a1', status: 'approved' }))
@@ -46,48 +151,11 @@ describe('approveApp', () => {
   })
 })
 
-describe('markDeployed', () => {
-  const marked = (over = {}) => ok({ appId: 'a1', deployedSubmissionId: 's1', deployedAt: 'now', deployedUrl: null, ...over })
-
-  it('POSTs the marker endpoint', async () => {
-    const fetchImpl = vi.fn(async () => marked())
-    await registry.markDeployed('a1', '', deps(fetchImpl))
-    const [url, opts] = fetchImpl.mock.calls[0]
-    expect(url).toBe('/api/admin/apps/a1/mark-deployed')
-    expect(opts.method).toBe('POST')
-  })
-
-  it('sends the deployed URL when one is given', async () => {
-    const live = 'https://apps.bial.example.com/gate-ops'
-    const fetchImpl = vi.fn(async () => marked({ deployedUrl: live }))
-    const body = await registry.markDeployed('a1', live, deps(fetchImpl))
-    expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({ deployedUrl: live })
-    expect(body.deployedUrl).toBe(live)
-  })
-
-  it.each([['', 'blank'], [undefined, 'omitted']])(
-    'sends NO deployedUrl key when the url is %s (%s) — the server keeps the recorded one',
-    async (url) => {
-      // A bare `{}` is the wire shape AND the "leave the URL alone" signal.
-      // Sending `deployedUrl: ''`/`null` instead would 422 (or blank a live link).
-      const fetchImpl = vi.fn(async () => marked())
-      await registry.markDeployed('a1', url, deps(fetchImpl))
-      expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({})
-    },
-  )
-
-  it('surfaces the server 422 for a non-https url rather than pre-checking it', async () => {
-    const fetchImpl = vi.fn(async () => fail(422, { error: { message: 'URL scheme should be https' } }))
-    const err = await registry.markDeployed('a1', 'http://nope.example.com', deps(fetchImpl)).catch((e) => e)
-    expect(err.status).toBe(422)
-  })
-})
-
 describe('deleteApp', () => {
   /**
    * ★ THE REQUEST SHAPE, not a mock of it.
    *
-   * `DELETE /v1/admin/apps/{id}` REQUIRES a 5-50 word reason. This client used to send
+   * `DELETE /v1/admin/apps/{id}` REQUIRES a word-bounded reason. This client used to send
    * `{ method: 'DELETE' }` with no body while the route already required one, so every admin
    * delete through the SPA answered 422 — and the panel suite never caught it, because it
    * mocks `deleteApp` wholesale. Both sides were green while disagreeing. This test is the
@@ -110,7 +178,7 @@ describe('deleteApp', () => {
   })
 
   it('surfaces the server’s refusal rather than swallowing it', async () => {
-    const fetchImpl = vi.fn(async () => fail(422, { detail: 'Say why in 5 to 50 words.' }))
+    const fetchImpl = vi.fn(async () => fail(422, { detail: 'Say why in 2 to 50 words.' }))
     await expect(registry.deleteApp('app-7', 'too short', deps(fetchImpl))).rejects.toThrow()
   })
 })

@@ -1,7 +1,7 @@
 """The superadmin deploy-credential mint: `POST /v1/admin/apps/{appId}/deploy-credential`.
 
 The long-lived, container-scoped Blob credential a DEPLOYED app uses to reach its own storage
-directly — the runbook's step-5 env pair, and the end of its KNOWN GAP. What these tests pin:
+directly. What these tests pin:
 the gate (superadmin-only, owner-agnostic), the fail-closed 409 on a config that physically
 cannot mint one, the 503-on-ambiguity twin of `approve`/`bundle-url`, and the security contract
 — the SAS is returned to the admin ONCE and appears in neither the audit trail nor the logs.

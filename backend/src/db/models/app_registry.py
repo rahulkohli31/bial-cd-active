@@ -45,30 +45,6 @@ app_status_enum = sa.Enum(
 )
 
 
-class ApprovalRoute(StrEnum):
-    """How the CURRENT submission entered the approval queue. Values are native PG enum labels.
-
-    An EXPLICIT column, not a derivation: `redeploy_needed` derives from two columns a
-    self-published app never sets, so without it such an app would read "Deploy needed" forever
-    and prompt an administrator to run a runbook that must not be run.
-
-    `runbook` authorises the manual go-live runbook only and takes no new entrants; `self_publish`
-    pins the version the citizen may publish THEMSELVES, and its runbook levers are refused."""
-
-    RUNBOOK = "runbook"
-    SELF_PUBLISH = "self_publish"
-
-
-# Same convention as `app_status_enum` above: the migration (0030) owns CREATE/DROP
-# TYPE explicitly, so the column must not try to create the type itself.
-approval_route_enum = sa.Enum(
-    ApprovalRoute,
-    name="approval_route",
-    values_callable=lambda enum: [member.value for member in enum],
-    create_type=False,
-)
-
-
 # The lifecycle state machine (Express `ALLOWED_FROM` heritage): the KEY is the target
 # status and the value is the set of sources a transition INTO it may start from — read
 # the other way round the map says the opposite of what it means. `DRAFT: {PENDING}` is
@@ -102,12 +78,6 @@ STATUS_TRANSITIONS: dict[AppStatus, frozenset[AppStatus]] = {
 # `bial_` prefix + 32 url-safe chars. token_urlsafe(24) yields the identical shape
 # (base64url of 24 bytes, no padding). NEVER a raw UUID.
 _APP_KEY_PREFIX = "bial_"
-
-# The recorded deployed-app URL cap. 2083 is the historical IE address-bar
-# ceiling that pydantic's own `HttpUrl` adopts as `max_length` — reusing the number
-# keeps the schema boundary and the column exactly the same width, so a URL that
-# parses can never overflow the column.
-MAX_DEPLOYED_URL = 2083
 
 
 def mint_app_key() -> str:
@@ -190,24 +160,11 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     )
 
     # The pinned approved artifact: exactly the submission the admin reviewed.
-    # Absent until the first approval; a pending re-submit keeps this pin (and the
-    # runbook keeps deploying it) until re-approval — status governs liveness,
-    # the pin governs WHICH artifact, and reject deliberately does not clear it.
+    # Absent until the first approval; a pending re-submit keeps this pin until
+    # re-approval — status governs liveness, the pin governs WHICH artifact, and reject
+    # deliberately does not clear it.
     approved_submission_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
     approved_commit_sha: Mapped[str | None] = mapped_column(sa.String(40), nullable=True)
-
-    # The manual-runbook marker: a marker, NOT a status — `mark-deployed`
-    # records that a human ran the go-live runbook for this exact submission.
-    # `redeploy_needed` is derived as `approved_submission_id !=
-    # deployed_submission_id` (exact, clock-skew-free).
-    deployed_submission_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
-    deployed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
-
-    # Where the deployed app actually lives — DATA, not automation: the admin pastes the
-    # URL the manual go-live runbook produced, and the owner gets a Live link. NULL until an
-    # admin records one; mark-deployed with no URL LEAVES this alone (a re-deploy of the same
-    # app keeps the same address), so the owner's link survives every redeploy.
-    deployed_url: Mapped[str | None] = mapped_column(sa.String(MAX_DEPLOYED_URL), nullable=True)
 
     # Governance metadata (set by the admin surface).
     approved_by: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
@@ -218,31 +175,18 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     # citizen may legitimately move it (publish routes REJECTED->PENDING, withdraw moves
     # PENDING->DRAFT); this answers "has a human refused it", and ONLY an administrator
     # clears it — `reject` raises it, `approve` lowers it, nothing on the citizen's side
-    # touches it. Ladder rule 5 reads THIS, never the status: reading a durable policy
+    # touches it. The publish gate reads THIS, never the status: reading a durable policy
     # fact off mutable lifecycle state is what let a reject->publish->withdraw round trip
     # launder a rejection and publish unattended.
     rejection_standing: Mapped[bool] = mapped_column(
         sa.Boolean, nullable=False, server_default=sa.false()
     )
 
-    # The submission's lineage (see `ApprovalRoute`). NULLABLE, and NULL is a real state,
-    # not sloppiness: a never-submitted draft has no lineage, and a row the interim submit
-    # path wrote before the publish-flow submit service landed carries NULL and keeps today's
-    # behaviour everywhere — the projection treats only an explicit `self_publish` as
-    # suppressing the runbook levers, and approve refuses only an explicit `runbook`. The
-    # 0030 backfill marked every pre-feature row with an approval AND every then-outstanding
-    # pending row as `runbook`, which is what makes "approvals granted before this shipped do
-    # not authorise self-publishing" true.
-    approval_route: Mapped[ApprovalRoute | None] = mapped_column(
-        approval_route_enum, nullable=True
-    )
-
-    # What the publish flow attached at submit: both answer sets (the citizen's and the
-    # review's), the per-question differences, and the citizen's REDACTED explanation — the
-    # payload the administrator's review screen leads with. JSONB for the same reason
-    # `deployments.classification` is: the questionnaire is expected to be reworded and
-    # reweighted, and a typed shape would make that a migration every time. Written by the
-    # publish-flow submit, cleared by withdraw; NULL for every runbook-lineage and
-    # pre-feature row (the review screen says so rather than rendering blanks). Never
-    # contains evidence locations — internal evidence stays internal.
+    # The publish gate's last decision and everything it was decided under: the policy, a
+    # snapshot of the classes, the reviewer's and the owner's answers, both scores, and the
+    # owner's REDACTED note — the payload the administrator's review screen leads with. JSONB
+    # because administrators add, reword and reweight classes, and a typed shape would make
+    # that a migration every time. Written by every gate decision, cleared by withdraw; NULL
+    # on a row that never had one (the review screen says so rather than rendering blanks).
+    # Never contains evidence locations — internal evidence stays internal.
     declaration: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)

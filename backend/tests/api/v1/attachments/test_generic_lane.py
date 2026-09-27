@@ -23,8 +23,6 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import func, select
 
 from src.api.v1.attachments.router import (
-    ATTACHMENT_MAX_BYTES,
-    ATTACHMENT_MAX_MB,
     GENERIC_ATTACHMENT_LANES_SENTENCE,
     GENERIC_LANE_REFUSED_CODE,
 )
@@ -223,16 +221,14 @@ async def test_an_oversize_pdf_on_a_generic_conversation_is_refused_for_size_bef
     """A file over the ceiling is refused for size before any upload begins: the generic kind
     narrows which FORMATS are accepted, never the number of bytes."""
     user, conversation = await _conversation(db_session, ChatKind.GENERIC)
-    oversized = b"%PDF" + b"\x00" * (ATTACHMENT_MAX_BYTES - 4 + 1)
+    oversized = b"%PDF" + b"\x00" * (20 * 1024 * 1024 - 4 + 1)
 
     resp = await _upload(
         client, user, conversation.id, "att_huge", "application/pdf", oversized, name="huge.pdf"
     )
 
     assert resp.status_code == 413, resp.text
-    assert resp.json() == {
-        "error": {"message": f"Attachment is too large (max {ATTACHMENT_MAX_MB} MB)."}
-    }
+    assert resp.json() == {"error": {"message": "Attachment is too large (max 20 MB)."}}
     assert fake_storage.objects == {}
 
 

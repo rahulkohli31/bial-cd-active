@@ -413,11 +413,10 @@ async def test_the_kinds_differ_by_which_toolsets_they_are_handed_and_by_nothing
 # WHY THIS SECTION EXISTS AT ALL. `toolsets_for_kind`'s docstring has always claimed that a
 # wrong-kind tool is "absent from the model's tool list AND uncallable ... never a policy check
 # that could be bypassed". The connected-data surface extends that claim to a second axis — the
-# project — and the reason is not thrift. The platform already has a flow whose whole purpose is
-# to say no to a project: an administrator declining the access request, and a revocation that
-# flips `effectively_on` back to false. A tool surface that ignored that answer and refused inside
-# the tool body would be handing every project a way to ask, and spending a round trip on the
-# reply. So the same structural guarantee, proven the same way: in BOTH directions.
+# project — and the reason is not thrift. A project whose switch is down must not be offered the
+# tool at all. A tool surface that offered it and refused inside the tool body would be handing
+# every project a way to ask, and spending a round trip on the reply. So the same structural
+# guarantee, proven the same way: in BOTH directions.
 
 
 async def test_a_project_that_reads_no_connected_data_is_offered_none() -> None:
@@ -478,11 +477,11 @@ async def test_a_forged_connector_call_in_an_unconnected_chat_is_structurally_re
 ) -> None:
     """★ THE GATE PROVEN THE ONLY WAY THAT COUNTS — by CALLING it, not by reading the list.
 
-    A project whose administrator declined the connector, or whose approval was revoked, has no
-    tool here. A model that tries anyway meets the runtime's unknown-tool rejection, exactly as a
-    Plan chat trying `write_file` does. Asserting the absence from a name list would pass just as
-    happily against an implementation that registered the tool and refused inside its body — and
-    that implementation is the one this design exists not to be."""
+    A project whose switch is down has no tool here. A model that tries anyway meets the
+    runtime's unknown-tool rejection, exactly as a Plan chat trying `write_file` does. Asserting
+    the absence from a name list would pass just as happily against an implementation that
+    registered the tool and refused inside its body — and that implementation is the one this
+    design exists not to be."""
     seen: dict[str, Any] = {}
     agent: Agent[ReadDeps, str] = Agent(deps_type=ReadDeps)
     result = await agent.run(
@@ -511,7 +510,7 @@ async def test_the_default_is_no_connectors_and_that_default_is_the_whole_guard(
     `toolsets_for_kind`, and `test_a_project_that_reads_no_connected_data_is_offered_none` goes
     red. Run it before merging. What is asserted HERE is the property that mutation breaks — the
     signature's default is empty, in both functions that take it — because a default that drifted
-    in only one of them would hand the connector tool to a project whose administrator refused it,
+    in only one of them would hand the connector tool to a project that never switched it on,
     and the guard that reads the registry back would be reading the widened default too."""
     for function in (toolsets_for_kind, registered_tool_definitions):
         default = inspect.signature(function).parameters["connected_systems"].default

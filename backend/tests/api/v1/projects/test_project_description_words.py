@@ -4,9 +4,9 @@ Mirrors `test_project_name_words.py` exactly — same shape, same reasoning, a d
 field with a different (and unusual) rule: description has a MINIMUM as well as a maximum.
 The issue's own acceptance examples call for both directions to be pinned:
 
-    Given a create form with a five-word description, when it is submitted, then it is
+    Given a create form with a four-word description, when it is submitted, then it is
     refused with a message naming the minimum, in both the browser and the API. Given a
-    200-word description, then it is refused with a message naming the maximum.
+    121-word description, then it is refused with a message naming the maximum.
 
 Two things these tests exist to hold:
 
@@ -53,7 +53,7 @@ def _words(n: int) -> str:
 async def test_create_accepts_a_description_within_the_word_bound(
     client, db_session, n: int
 ) -> None:
-    """Both boundaries are legal — 15 and 120 words are accepted, not rejected."""
+    """Both boundaries are legal — 5 and 120 words are accepted, not rejected."""
     headers, _ = await _auth(db_session)
 
     resp = await client.post(
@@ -112,7 +112,7 @@ async def test_create_refuses_a_blank_description(client, db_session) -> None:
 async def test_the_character_backstop_still_refuses_a_value_the_word_rule_alone_would_accept(
     client, db_session
 ) -> None:
-    """100 words, each 20 characters — inside the word bound (15-120) but over the 2000
+    """100 words, each 20 characters — inside the word bound but over the 2000
     character cap. The word rule ALONE would accept this, so the character bound is not
     redundant: it is what stops long words (URLs, identifiers, a non-English script where
     `count_words` under-counts relative to length) from reaching an unbounded column, and a

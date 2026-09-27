@@ -11,10 +11,7 @@
  * read the one server `publishState` through `utils/publishPresentation.ts` — same words,
  * colour, action, rows — but hold SEPARATE reads, deliberately: they differ in shape and
  * lifetime, so sharing a component was the wrong seam. A same-tab `bial:deployment-changed`
- * nudge reconciles the two reads (one extra poll only while a publish is in flight) — but it
- * reconciles the READ, not the server's per-mount unsaved-work QUESTION, which no read carries.
- * Mounting this behind a tab is what keeps that question fresh: the panel is built when the tab
- * is chosen and torn down when it is left, so a stale declaration cannot sit behind it.
+ * nudge reconciles the two reads (one extra poll only while a publish is in flight).
  *
  * The saved row's date/id come from the SAME status read as every other row (the store's
  * metadata HEAD, no container in the path) — it must render even when the workspace is
@@ -22,19 +19,21 @@
  */
 import { useEffect, useMemo, useState } from 'react'
 import { Check, Copy, ExternalLink } from 'lucide-react'
-import DataClassificationModal from '../DataClassificationModal'
+import PublishDialog from '../PublishDialog'
 import { usePublishState } from '../../hooks/usePublishState'
 import { shortSha } from '../../utils/shortSha'
 import { ClipboardRefused, copyToClipboard } from '../../utils/clipboard'
 import {
   ACTION_LABEL,
+  answerFor,
+  busyLabel,
   formatStamp,
   lookFor,
   presentationFor,
   provenanceRows,
   SECONDARY_ACTIONS,
 } from '../../utils/publishPresentation'
-import type { ProvenanceRow } from '../../utils/publishPresentation'
+import type { ProvenanceRow, PublishAnswer } from '../../utils/publishPresentation'
 import type { PublishState } from '../../utils/deployApi'
 
 export interface AppStatusPanelProps {
@@ -233,26 +232,32 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
     approval,
     loadError,
     refresh,
+    publish,
+    publishPhase,
+    publishError,
     onConfirm,
-    saveAndPublish,
-    unsaved,
-    saving,
     withdraw,
     withdrawing,
     withdrawError,
   } = usePublishState(projectId)
   const [showModal, setShowModal] = useState(false)
+  const [answer, setAnswer] = useState<PublishAnswer | null>(null)
 
   const state = deployment?.publishState ?? null
+  // Said only while the app is still where the answer left it: a poll that finds it live, or
+  // failed, or taken down, retires the line without anyone pressing anything.
+  const said = answer !== null && answer.heldWhile === state ? answer.text : null
+  const approvedRetryCommit = deployment?.approvedRetryCommit ?? null
   const presentation = useMemo(
-    () => (state === null ? null : presentationFor(state)),
-    [state],
+    () => (state === null ? null : presentationFor(state, approvedRetryCommit)),
+    [state, approvedRetryCommit],
   )
   const look = useMemo(() => (state === null ? null : lookFor(state)), [state])
   const rows = useMemo(
     () => (state === null ? [] : provenanceRows(state, deployment, approval)),
     [state, deployment, approval],
   )
+  const busy = publishPhase !== null || withdrawing
 
   // THE READ ITSELF FAILED. Never a blank section where the status was — a panel that renders
   // nothing is indistinguishable from a broken page, and this is the surface a citizen goes to
@@ -317,20 +322,24 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
 
       {/* WHERE NOTHING CAN BE DONE THERE IS NO BUTTON, rather than one that fails when pressed —
           the board says so in as many words. `take_it_back` is the one action that is not a
-          publish attempt, so it acts directly; every other press opens the same declaration the
-          chip's does, because the ladder requires a completed one on every attempt. */}
+          publish attempt, so it acts directly; every other press is `publish`, which either
+          sends the approved copy itself or saves and hands back the declaration to open. */}
       {presentation.action !== null && (
         <button
           type="button"
           data-testid="status-action"
-          aria-disabled={saving || withdrawing}
+          aria-disabled={busy}
           onClick={() => {
-            if (saving || withdrawing) return
+            if (busy) return
+            setAnswer(null)
             if (presentation.action === 'take_it_back') {
               void withdraw()
               return
             }
-            setShowModal(true)
+            void publish().then((next) => {
+              if (next === 'review') setShowModal(true)
+              else if (next !== null) setAnswer(answerFor(next))
+            })
           }}
           className={`mt-2.5 w-full rounded-[9px] px-3 py-2.5 text-[12.5px] font-bold transition ${
             SECONDARY_ACTIONS.has(presentation.action)
@@ -338,8 +347,32 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
               : 'bg-primary text-white hover:bg-primary-600'
           }`}
         >
-          {withdrawing ? 'Taking it back…' : ACTION_LABEL[presentation.action]}
+          {busyLabel(withdrawing, publishPhase) ?? ACTION_LABEL[presentation.action]}
         </button>
+      )}
+
+      {/* Outside the button's condition and mounted before it has anything to say: a sent copy
+          usually leaves a state with no button, and text injected together with its region is
+          often not announced. */}
+      <p
+        data-testid="status-answer"
+        role="status"
+        aria-live="polite"
+        className={`text-[11.5px] leading-relaxed text-neutral ${said === null ? '' : 'mt-2.5'}`}
+      >
+        {said}
+      </p>
+
+      {/* A SAVE OR A SEND THAT FAILED BEFORE ANY DIALOG, in the server's own words — without
+          it the press would look like it did nothing. */}
+      {publishError !== null && (
+        <p
+          data-testid="status-publish-error"
+          role="alert"
+          className="mt-2.5 text-[11.5px] leading-relaxed text-danger"
+        >
+          {publishError}
+        </p>
       )}
 
       {/* A REFUSED WITHDRAWAL HAS TO BE SPOKEN, because nothing else on this panel changes when
@@ -357,26 +390,6 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
         </p>
       )}
 
-      {/* THE SAME QUESTION THE CHIP ASKS, because the server asks it of both: a workspace ahead
-          of its last save has to be answered before a publish can name a version. */}
-      {unsaved !== null && (
-        <div data-testid="status-unsaved" className="mt-2.5 border-t border-bial-border pt-2.5">
-          <p className="text-[11.5px] leading-relaxed text-neutral">{unsaved}</p>
-          <button
-            type="button"
-            data-testid="status-save-and-publish"
-            aria-disabled={saving}
-            onClick={() => {
-              if (saving) return
-              void saveAndPublish()
-            }}
-            className="mt-2 w-full rounded-[9px] bg-primary px-3 py-2 text-[12px] font-bold text-white transition hover:bg-primary-600"
-          >
-            {saving ? 'Saving and sending…' : 'Save it first, then send'}
-          </button>
-        </div>
-      )}
-
       {/* THE FOOT, where anything the owner may do to a LIVE application goes. Below the
           state's own action rather than beside it: one of them changes which version is
           serving, and the others do not. */}
@@ -391,20 +404,16 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
       })}
 
       {showModal && (
-        <DataClassificationModal
+        <PublishDialog
           projectId={projectId}
+          deployment={deployment}
           // A citizen who presses after a rejection reads WHY before anything else happens —
           // the note belongs in the flow they are in, not only on a panel beside it.
           rejectionNote={approval?.status === 'rejected' ? approval.rejectionNote : null}
-          // The one state where the approval pins what is saved; the server publishes it
-          // whatever the declaration scores.
-          alreadyApproved={state === 'approved_ready_to_publish'}
-          onConfirm={async (answers) => {
-            // Refusals THROW and the modal renders them itself, beside the button, with the
-            // answers still on screen. Only the two successes and the unsaved-work question
-            // reach this line — and the question is rendered by the block above rather than
-            // spoken here, because it is a choice rather than an answer.
-            await onConfirm(answers)
+          onConfirm={async (commitSha, send) => {
+            // Refusals THROW and the dialog renders them itself, beside the button, with the
+            // answers still on screen. Only the two successes reach this line.
+            setAnswer(answerFor(await onConfirm(commitSha, send)))
             setShowModal(false)
           }}
           onCancel={() => setShowModal(false)}

@@ -64,7 +64,7 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     expect(screen.getByText('Citizen')).toBeTruthy()
     expect(screen.getByText('4,200')).toBeTruthy() // usageToday
     expect(screen.getByText('100,000')).toBeTruthy() // effective daily limit
-    expect(within(screen.getByTestId('row-a@x.com')).getByText('Active')).toBeTruthy()
+    expect(within(screen.getByTestId('row-u1')).getByText('Active')).toBeTruthy()
   })
 
   it('renders Active for suspendedAt=null and Suspended for a timestamp', async () => {
@@ -76,8 +76,8 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     )
     render(<UsersLimitsPanel onToast={() => {}} />)
     await screen.findByText('Alice')
-    expect(within(screen.getByTestId('row-a@x.com')).getByText('Active')).toBeTruthy()
-    expect(within(screen.getByTestId('row-b@x.com')).getByText('Suspended')).toBeTruthy()
+    expect(within(screen.getByTestId('row-u1')).getByText('Active')).toBeTruthy()
+    expect(within(screen.getByTestId('row-u2')).getByText('Suspended')).toBeTruthy()
   })
 
   it('auto-loads the next keyset page in the background (no click) and keeps prior rows', async () => {
@@ -102,9 +102,9 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     render(<UsersLimitsPanel onToast={() => {}} />)
     await screen.findByText('U0')
     await waitFor(() => expect(h.fetchUsers).toHaveBeenNthCalledWith(2, expect.objectContaining({ cursor: 'c1' })))
-    await waitFor(() => expect(screen.getByText(/Page 1 of 2/)).toBeTruthy())
-    fireEvent.click(screen.getByTestId('users-next-page'))
-    expect(screen.getByTestId('row-u25@x.com')).toBeTruthy()
+    await waitFor(() => expect(screen.getByText('Showing 1–10 of 26')).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: '3' }))
+    expect(screen.getByTestId('row-u25')).toBeTruthy()
   })
 
   it('a failed background page shows an error with the rows already loaded intact, and Retry resumes it', async () => {
@@ -129,7 +129,7 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     h.fetchUsers.mockResolvedValue(pageOf([user()], { hasMore: false }))
     render(<UsersLimitsPanel onToast={() => {}} />)
     await screen.findByText('Alice')
-    fireEvent.change(screen.getByTestId('users-search'), { target: { value: 'ana' } })
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search users' }), { target: { value: 'ana' } })
     await waitFor(() =>
       expect(h.fetchUsers).toHaveBeenLastCalledWith(expect.objectContaining({ q: 'ana', cursor: null })),
     )
@@ -141,7 +141,7 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     render(<UsersLimitsPanel onToast={() => {}} />)
     await screen.findByText('Alice')
     fireEvent.click(screen.getByTestId('deactivate-a@x.com'))
-    await within(screen.getByTestId('row-a@x.com')).findByText('Suspended')
+    await within(screen.getByTestId('row-u1')).findByText('Suspended')
     expect(h.deactivateUser).toHaveBeenCalledWith('u1')
   })
 
@@ -150,7 +150,7 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     h.reactivateUser.mockResolvedValue({ userId: 'u1', suspendedAt: null })
     render(<UsersLimitsPanel onToast={() => {}} />)
     await screen.findByText('Alice')
-    const row = screen.getByTestId('row-a@x.com')
+    const row = screen.getByTestId('row-u1')
     expect(within(row).getByText('Suspended')).toBeTruthy()
     fireEvent.click(screen.getByTestId('reactivate-a@x.com'))
     await within(row).findByText('Active')
@@ -188,7 +188,7 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     fireEvent.click(screen.getByTestId('deactivate-a@x.com'))
     const banner = await screen.findByTestId('action-error')
     expect(within(banner).getByText(/super-admin cannot be suspended/i)).toBeTruthy()
-    const row = screen.getByTestId('row-a@x.com')
+    const row = screen.getByTestId('row-u1')
     await waitFor(() => expect(within(row).getByText('Active')).toBeTruthy())
     expect(screen.getByTestId('deactivate-a@x.com')).toBeTruthy()
   })
@@ -200,7 +200,7 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     render(<UsersLimitsPanel onToast={onToast} />)
     await screen.findByText('Alice')
     fireEvent.click(screen.getByTestId('deactivate-a@x.com'))
-    await within(screen.getByTestId('row-a@x.com')).findByText('Suspended')
+    await within(screen.getByTestId('row-u1')).findByText('Suspended')
     expect(screen.queryByTestId('action-error')).toBeNull()
     expect(onToast).not.toHaveBeenCalled()
   })
@@ -212,7 +212,7 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     render(<UsersLimitsPanel onToast={onToast} />)
     await screen.findByText('Alice')
     fireEvent.click(screen.getByTestId('reactivate-a@x.com'))
-    await within(screen.getByTestId('row-a@x.com')).findByText('Active')
+    await within(screen.getByTestId('row-u1')).findByText('Active')
     expect(screen.queryByTestId('action-error')).toBeNull()
     expect(onToast).not.toHaveBeenCalled()
   })
@@ -227,7 +227,7 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     render(<UsersLimitsPanel onToast={onToast} />)
     await screen.findByText('Alice')
     fireEvent.click(screen.getByTestId('deactivate-a@x.com'))
-    await waitFor(() => expect(screen.queryByTestId('row-a@x.com')).toBeNull())
+    await waitFor(() => expect(screen.queryByTestId('row-u1')).toBeNull())
     expect(screen.queryByTestId('action-error')).toBeNull()
     expect(onToast).not.toHaveBeenCalled()
   })
@@ -239,7 +239,7 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     render(<UsersLimitsPanel onToast={onToast} />)
     await screen.findByText('Alice')
     fireEvent.click(screen.getByTestId('reactivate-a@x.com'))
-    await waitFor(() => expect(screen.queryByTestId('row-a@x.com')).toBeNull())
+    await waitFor(() => expect(screen.queryByTestId('row-u1')).toBeNull())
     expect(screen.queryByTestId('action-error')).toBeNull()
     expect(onToast).not.toHaveBeenCalled()
   })
@@ -328,9 +328,9 @@ describe('UsersLimitsPanel — sort, filter, pagination', () => {
 
     const order = () => screen.getAllByTestId(/^row-/).map((el) => el.getAttribute('data-testid'))
     fireEvent.click(screen.getByText('Daily tokens'))
-    await waitFor(() => expect(order()).toEqual(['row-b@x.com', 'row-c@x.com', 'row-a@x.com']))
+    await waitFor(() => expect(order()).toEqual(['row-u2', 'row-u3', 'row-u1']))
     fireEvent.click(screen.getByText('Daily tokens'))
-    await waitFor(() => expect(order()).toEqual(['row-a@x.com', 'row-c@x.com', 'row-b@x.com']))
+    await waitFor(() => expect(order()).toEqual(['row-u1', 'row-u3', 'row-u2']))
   })
 
   it('the Role filter narrows the roster to the selected role', async () => {
@@ -344,8 +344,8 @@ describe('UsersLimitsPanel — sort, filter, pagination', () => {
     await screen.findByText('Alice')
 
     await pickSelect('role-filter', 'Super admin')
-    await waitFor(() => expect(screen.queryByTestId('row-a@x.com')).toBeNull())
-    expect(screen.getByTestId('row-admin@x.com')).toBeTruthy()
+    await waitFor(() => expect(screen.queryByTestId('row-u1')).toBeNull())
+    expect(screen.getByTestId('row-u2')).toBeTruthy()
     expect(screen.getByTestId('noguard-admin@x.com')).toBeTruthy()
   })
 
@@ -360,8 +360,32 @@ describe('UsersLimitsPanel — sort, filter, pagination', () => {
     await screen.findByText('Alice')
 
     await pickSelect('status-filter', 'Suspended')
-    await waitFor(() => expect(screen.queryByTestId('row-a@x.com')).toBeNull())
-    expect(screen.getByTestId('row-b@x.com')).toBeTruthy()
+    await waitFor(() => expect(screen.queryByTestId('row-u1')).toBeNull())
+    expect(screen.getByTestId('row-u2')).toBeTruthy()
+  })
+
+  it('the Role filter still applies to the rows a new server search brings back', async () => {
+    h.fetchUsers.mockResolvedValue(
+      pageOf([
+        user({ userId: 'u1', email: 'a@x.com', displayName: 'Alice', role: 'citizen' }),
+        user({ userId: 'u2', email: 'admin@x.com', displayName: 'Admin', role: 'super_admin' }),
+      ]),
+    )
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    await pickSelect('role-filter', 'Super admin')
+    await waitFor(() => expect(screen.queryByTestId('row-u1')).toBeNull())
+
+    h.fetchUsers.mockResolvedValue(
+      pageOf([
+        user({ userId: 'u3', email: 'ana@x.com', displayName: 'Ana', role: 'citizen' }),
+        user({ userId: 'u4', email: 'anand@x.com', displayName: 'Anand', role: 'super_admin' }),
+      ]),
+    )
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search users' }), { target: { value: 'an' } })
+    await screen.findByTestId('row-u4')
+    expect(screen.queryByTestId('row-u3')).toBeNull()
+    expect(screen.getByRole('searchbox', { name: 'Search users' }).value).toBe('an')
   })
 
   it('a row deactivated while the Status filter is "Active" drops out of view immediately', async () => {
@@ -371,40 +395,50 @@ describe('UsersLimitsPanel — sort, filter, pagination', () => {
     await screen.findByText('Alice')
 
     await pickSelect('status-filter', 'Active')
-    expect(screen.getByTestId('row-a@x.com')).toBeTruthy()
+    expect(screen.getByTestId('row-u1')).toBeTruthy()
     fireEvent.click(screen.getByTestId('deactivate-a@x.com'))
-    await waitFor(() => expect(screen.queryByTestId('row-a@x.com')).toBeNull())
+    await waitFor(() => expect(screen.queryByTestId('row-u1')).toBeNull())
   })
 
-  it('paginates 30 loaded users at 25/page with working Prev/Next', async () => {
+  it('pages 30 loaded users ten at a time with the shared pager', async () => {
     const thirty = Array.from({ length: 30 }, (_, i) => user({ userId: `u${i}`, email: `u${i}@x.com`, displayName: `U${i}` }))
     h.fetchUsers.mockResolvedValue(pageOf(thirty, { hasMore: false }))
     render(<UsersLimitsPanel onToast={() => {}} />)
     await screen.findByText('U0')
 
-    expect(screen.getAllByTestId(/^row-/)).toHaveLength(25)
-    expect(screen.getByText(/Page 1 of 2/)).toBeTruthy()
-    expect(screen.getByTestId('users-prev-page').disabled).toBe(true)
-    expect(screen.getByTestId('users-next-page').disabled).toBe(false)
+    expect(screen.getAllByTestId(/^row-/)).toHaveLength(10)
+    expect(screen.getByText('Showing 1–10 of 30')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Go to previous page' }).disabled).toBe(true)
+    expect(screen.getByRole('button', { name: 'Go to next page' }).disabled).toBe(false)
 
-    fireEvent.click(screen.getByTestId('users-next-page'))
-    await waitFor(() => expect(screen.getAllByTestId(/^row-/)).toHaveLength(5))
-    expect(screen.getByText(/Page 2 of 2/)).toBeTruthy()
-    expect(screen.getByTestId('users-next-page').disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: '3' }))
+    expect(screen.getByText('Showing 21–30 of 30')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Go to next page' }).disabled).toBe(true)
   })
 
-  it('applying a filter while on page 2 returns to page 1 instead of stranding an empty page', async () => {
+  it('pages the roster it loaded from the server, keyset page by keyset page', async () => {
+    const batch = (from, n) => Array.from({ length: n }, (_, i) => user({ userId: `u${from + i}`, email: `u${from + i}@x.com`, displayName: `U${from + i}` }))
+    h.fetchUsers
+      .mockResolvedValueOnce(pageOf(batch(0, 100), { nextCursor: 'c1', hasMore: true }))
+      .mockResolvedValueOnce(pageOf(batch(100, 20), { hasMore: false }))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('U0')
+    await waitFor(() => expect(screen.getByText('Showing 1–10 of 120')).toBeTruthy())
+    expect(h.fetchUsers).toHaveBeenNthCalledWith(2, expect.objectContaining({ cursor: 'c1', limit: 100 }))
+  })
+
+  it('applying a filter while on page 3 returns to page 1 instead of stranding an empty page', async () => {
     const thirty = Array.from({ length: 30 }, (_, i) => user({ userId: `u${i}`, email: `u${i}@x.com`, displayName: `U${i}`, role: 'citizen' }))
     h.fetchUsers.mockResolvedValue(pageOf(thirty, { hasMore: false }))
     render(<UsersLimitsPanel onToast={() => {}} />)
     await screen.findByText('U0')
 
-    fireEvent.click(screen.getByTestId('users-next-page'))
-    await waitFor(() => expect(screen.getByText(/Page 2 of 2/)).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: '3' }))
+    await waitFor(() => expect(screen.getByText('Showing 21–30 of 30')).toBeTruthy())
 
     await pickSelect('role-filter', 'Citizen')
-    await waitFor(() => expect(screen.getByText(/Page 1 of/)).toBeTruthy())
-    expect(screen.getAllByTestId(/^row-/)).toHaveLength(25)
+    await waitFor(() => expect(screen.getByText('Showing 1–10 of 30')).toBeTruthy())
+    expect(screen.getAllByTestId(/^row-/)).toHaveLength(10)
   })
 
   it('a new search resets the view back to page 1', async () => {
@@ -413,18 +447,18 @@ describe('UsersLimitsPanel — sort, filter, pagination', () => {
     render(<UsersLimitsPanel onToast={() => {}} />)
     await screen.findByText('U0')
 
-    fireEvent.click(screen.getByTestId('users-next-page'))
-    await waitFor(() => expect(screen.getByText(/Page 2 of 2/)).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: '3' }))
+    await waitFor(() => expect(screen.getByText('Showing 21–30 of 30')).toBeTruthy())
 
     h.fetchUsers.mockResolvedValueOnce(pageOf([user({ userId: 'z1', email: 'z@x.com', displayName: 'Zara' })], { hasMore: false }))
-    fireEvent.change(screen.getByTestId('users-search'), { target: { value: 'zara' } })
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search users' }), { target: { value: 'zara' } })
     await screen.findByText('Zara')
-    expect(screen.getByText(/Page 1 of 1/)).toBeTruthy()
+    expect(screen.getByText('Showing 1–1 of 1')).toBeTruthy()
   })
 })
 
 describe('UsersLimitsPanel — review-fix regressions', () => {
-  it('deactivating a user on page 2 does not bounce the view back to page 1', async () => {
+  it('deactivating a user on page 3 does not bounce the view back to page 1', async () => {
     // autoResetPageIndex defaults ON in TanStack Table; mergedUsers' identity changes
     // on every optimistic update too, not just a real sort/filter change, so the
     // default would silently return the admin to page 1 on a plain Deactivate click.
@@ -434,12 +468,12 @@ describe('UsersLimitsPanel — review-fix regressions', () => {
     render(<UsersLimitsPanel onToast={() => {}} />)
     await screen.findByText('U0')
 
-    fireEvent.click(screen.getByTestId('users-next-page'))
-    await waitFor(() => expect(screen.getByText(/Page 2 of 2/)).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: '3' }))
+    await waitFor(() => expect(screen.getByText('Showing 21–30 of 30')).toBeTruthy())
 
-    fireEvent.click(screen.getByTestId('deactivate-u25@x.com')) // u25 lives on page 2
+    fireEvent.click(screen.getByTestId('deactivate-u25@x.com')) // u25 lives on page 3
     await waitFor(() => expect(h.deactivateUser).toHaveBeenCalledWith('u25'))
-    expect(screen.getByText(/Page 2 of 2/)).toBeTruthy()
+    expect(screen.getByText('Showing 21–30 of 30')).toBeTruthy()
   })
 
   it('does not append a stale-cursor page once the search query has moved on (debounce race guard)', async () => {
@@ -455,7 +489,7 @@ describe('UsersLimitsPanel — review-fix regressions', () => {
     await screen.findByText('Alice')
 
     // The auto-chain's 2nd call (cursor: 'c1', q: '') is now in flight when the user types.
-    fireEvent.change(screen.getByTestId('users-search'), { target: { value: 'ana' } })
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search users' }), { target: { value: 'ana' } })
 
     resolveSecondPage(pageOf([user({ userId: 'u2', email: 'b@x.com', displayName: 'Bob' })], { nextCursor: 'c2', hasMore: true }))
     await screen.findByText('Bob')
@@ -544,7 +578,7 @@ describe('UsersLimitsPanel — reset usage', () => {
     await screen.findByText('4,200')
 
     fireEvent.click(screen.getByTestId('reset-usage-a@x.com'))
-    await within(screen.getByTestId('row-a@x.com')).findByText('0')
+    await within(screen.getByTestId('row-u1')).findByText('0')
     expect(h.resetUserUsage).toHaveBeenCalledWith('u1')
     await waitFor(() => expect(onToast).toHaveBeenCalledWith("Reset today's usage for Alice"))
   })
@@ -563,7 +597,7 @@ describe('UsersLimitsPanel — reset usage', () => {
     await screen.findByText('Alice')
 
     fireEvent.click(screen.getByTestId('reset-usage-a@x.com'))
-    await waitFor(() => expect(screen.queryByTestId('row-a@x.com')).toBeNull())
+    await waitFor(() => expect(screen.queryByTestId('row-u1')).toBeNull())
   })
 
   it('a failed reset reverts the optimistic zero and shows an error', async () => {
@@ -575,7 +609,7 @@ describe('UsersLimitsPanel — reset usage', () => {
     fireEvent.click(screen.getByTestId('reset-usage-a@x.com'))
     const banner = await screen.findByTestId('action-error')
     expect(within(banner).getByText('Something went wrong.')).toBeTruthy()
-    await within(screen.getByTestId('row-a@x.com')).findByText('4,200') // reverted
+    await within(screen.getByTestId('row-u1')).findByText('4,200') // reverted
   })
 })
 
@@ -594,7 +628,7 @@ describe('UsersLimitsPanel — second-round review fixes', () => {
     // Type a new search — q now diverges from appliedQuery, which is still ''. The
     // debounced fetch for it is captured but held open, simulating "still in flight".
     h.fetchUsers.mockImplementationOnce(() => new Promise((resolve) => { resolveSecondPage = resolve }))
-    fireEvent.change(screen.getByTestId('users-search'), { target: { value: 'ana' } })
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search users' }), { target: { value: 'ana' } })
     await waitFor(() => expect(retryBtn.disabled).toBe(true))
 
     // Clicking while disabled must not fire loadMore() with the stale ('') cursor context.

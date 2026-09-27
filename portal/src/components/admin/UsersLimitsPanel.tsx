@@ -1,14 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
-import {
-  useReactTable,
-  getCoreRowModel,
-  getSortedRowModel,
-  getFilteredRowModel,
-  getPaginationRowModel,
-  flexRender,
-} from '@tanstack/react-table'
-import type { SortingState, ColumnFiltersState } from '@tanstack/react-table'
-import { X, AlertCircle, Search, ChevronLeft, ChevronRight } from 'lucide-react'
+import { X, AlertCircle } from 'lucide-react'
 import { BusyGlyph } from '../ui/Waiting'
 import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser, resetUserUsage } from '../../utils/admin'
 import type { LimitFields, UserLimitsOut } from '../../utils/admin'
@@ -17,7 +8,7 @@ import { useKeysetList } from '../../hooks/useKeysetList'
 import type { KeysetPage } from '../../hooks/useKeysetList'
 import { fmt, createUserColumns } from './columns'
 import type { MergedUser } from './columns'
-import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../ui/table'
+import AdminDataTable from './AdminDataTable'
 import { Select, SelectValue, SelectTrigger, SelectContent, SelectItem } from '../ui/select'
 import { SYSTEM_PROMPT_RESERVE } from '../../utils/contextLimits'
 
@@ -46,11 +37,8 @@ const MODEL_CONTEXT_WINDOW = 1_000_000
 // they own refuses their SECOND message, and the sentence they read tells them to start a new
 // chat, which is the one thing that also fails.
 const CONTEXT_HARD_FLOOR = SYSTEM_PROMPT_RESERVE * 2
-// The wire page size (how many rows one fetchUsers call asks for — capped at the
-// server's MAX_PAGE_SIZE=100) is deliberately larger than the table's on-screen page
-// size, so bulk-loading the roster takes 1/4 the round-trips it would at 25/request.
+// How many rows one fetchUsers call asks for — the server's MAX_PAGE_SIZE.
 const FETCH_PAGE_SIZE = 100
-const TABLE_PAGE_SIZE = 25
 // A hard ceiling on the background bulk-load: past this many rows, the chain stops
 // and the UI says so instead of quietly firing hundreds of sequential requests for
 // an org-sized roster. Search still narrows the server-side candidate set first.
@@ -327,10 +315,6 @@ export default function UsersLimitsPanel({ onToast }: UsersLimitsPanelProps) {
   const [busyId, setBusyId] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
 
-  const [sorting, setSorting] = useState<SortingState>([])
-  const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([])
-  const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: TABLE_PAGE_SIZE })
-
   // An AbortError is this component's OWN cancellation, not the server's — most visibly,
   // StrictMode's mount→cleanup→remount simulation aborts the first (simulated) mount's
   // request after a fresh, live controller already replaced it, so the "failure" is stale
@@ -358,12 +342,6 @@ export default function UsersLimitsPanel({ onToast }: UsersLimitsPanelProps) {
       loadMore()
     }
   }, [loading, hasMore, error, isAbortError, appliedQuery, q, users.length, loadMore])
-
-  // The search box lives outside TanStack's own state — a new search's results
-  // must not leave the table stranded on a page index from the previous query.
-  useEffect(() => {
-    setPagination((p) => (p.pageIndex === 0 ? p : { ...p, pageIndex: 0 }))
-  }, [appliedQuery])
 
   const mergeOverride = (id: string, patch: Partial<MergedUser>) => setOverrides((o) => ({ ...o, [id]: { ...o[id], ...patch } }))
   const dropOverride = (id: string) =>
@@ -466,50 +444,12 @@ export default function UsersLimitsPanel({ onToast }: UsersLimitsPanelProps) {
     [busyId],
   )
 
-  const table = useReactTable({
-    data: mergedUsers,
-    columns,
-    state: { sorting, columnFilters, pagination },
-    onSortingChange: setSorting,
-    onColumnFiltersChange: setColumnFilters,
-    onPaginationChange: setPagination,
-    // `mergedUsers`'s identity changes on every background page append AND every
-    // optimistic suspend/reactivate/limits-save, not just on a real sort/filter
-    // change — the library's default (on) would silently bounce the user back to
-    // page 1 on a plain Deactivate click. Page-1 resets are instead driven
-    // explicitly below, only for the changes that should actually cause one.
-    autoResetPageIndex: false,
-    // Stable per-row identity (not the row's array index) so a 404 removeLocal
-    // mid-page doesn't shift every later row's key and remount them, dropping focus.
-    getRowId: (row) => row.userId,
-    getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-  })
-
-  // A new sort or filter starts the user back at page 1 — explicit, since
-  // autoResetPageIndex is off above (search-driven resets are the effect below,
-  // keyed on appliedQuery instead: search lives outside TanStack's own state).
-  useEffect(() => {
-    setPagination((p) => (p.pageIndex === 0 ? p : { ...p, pageIndex: 0 }))
-  }, [sorting, columnFilters])
-
-  // Clamp a stranded pageIndex after the row count shrinks out from under it (a 404
-  // removeLocal drops a row mid-page, or a filter narrows the set) — never leave the
-  // view parked on a page that no longer exists.
-  const pageCount = table.getPageCount()
-  useEffect(() => {
-    if (pageCount > 0 && pagination.pageIndex > pageCount - 1) {
-      setPagination((p) => ({ ...p, pageIndex: pageCount - 1 }))
-    }
-  }, [pageCount, pagination.pageIndex])
-
   // Spinner covers the in-flight first fetch, the pre-fetch tick before the mount
   // effect fires (appliedQuery still null), AND an in-flight retry-after-abort —
   // otherwise a StrictMode-cancelled first request would flash "Couldn't load
-  // users" before the auto-chain's silent retry (above) lands.
-  if (users.length === 0 && (!error || isAbortError) && (loading || appliedQuery === null || isAbortError)) {
+  // users" before the auto-chain's silent retry (above) lands. A later search keeps the
+  // table mounted, so its sort, filters and search box survive the reload.
+  if (users.length === 0 && (!error || isAbortError) && (appliedQuery === null || isAbortError)) {
     return (
       <div className="flex items-center justify-center gap-2 py-16 text-neutral text-sm">
         <BusyGlyph size={16} /> Loading users…
@@ -535,11 +475,8 @@ export default function UsersLimitsPanel({ onToast }: UsersLimitsPanelProps) {
     )
   }
 
-  const roleFilter = (table.getColumn('role')?.getFilterValue() as string | undefined) ?? 'all'
-  const statusFilter = (table.getColumn('status')?.getFilterValue() as string | undefined) ?? 'all'
-  const rows = table.getRowModel().rows
   // The background chain stopped on a failed page with more still unfetched: sort
-  // order, filters, and "Page N of M" are all silently answering from a PARTIAL
+  // order, filters, and the "Showing" count are all silently answering from a PARTIAL
   // roster until this retries — surfaced above the table, not as 12px of text below it.
   // An abort isn't a real failure (see isAbortError above) — it self-heals via the
   // auto-chain effect's own retry, so it never reaches this "give up" banner.
@@ -552,48 +489,6 @@ export default function UsersLimitsPanel({ onToast }: UsersLimitsPanelProps) {
         Each user starts on the standard plan. Raise a user’s limits to approve a higher plan, or suspend a user to
         block them immediately.
       </p>
-
-      <div className="flex flex-wrap items-center gap-3 mb-4">
-        <div className="relative max-w-xs flex-1 min-w-[180px]">
-          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral" />
-          <input
-            type="search"
-            data-testid="users-search"
-            value={q}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search name or email…"
-            className="w-full pl-9 pr-3 py-2 text-sm border border-bial-border rounded-xl text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition"
-          />
-        </div>
-
-        <Select
-          value={roleFilter}
-          onValueChange={(v: string) => table.getColumn('role')?.setFilterValue(v === 'all' ? undefined : v)}
-        >
-          <SelectTrigger data-testid="role-filter" className="w-[150px]">
-            <SelectValue placeholder="All roles" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All roles</SelectItem>
-            <SelectItem value="citizen">Citizen</SelectItem>
-            <SelectItem value="super_admin">Super admin</SelectItem>
-          </SelectContent>
-        </Select>
-
-        <Select
-          value={statusFilter}
-          onValueChange={(v: string) => table.getColumn('status')?.setFilterValue(v === 'all' ? undefined : v)}
-        >
-          <SelectTrigger data-testid="status-filter" className="w-[150px]">
-            <SelectValue placeholder="All statuses" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All statuses</SelectItem>
-            <SelectItem value="active">Active</SelectItem>
-            <SelectItem value="suspended">Suspended</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
 
       {actionError && (
         <div data-testid="action-error" className="mb-4 flex items-start gap-2 bg-red-50 border border-red-200 rounded-xl px-3 py-2.5">
@@ -617,8 +512,8 @@ export default function UsersLimitsPanel({ onToast }: UsersLimitsPanelProps) {
           </p>
           {/* No loading/"retrying…" state to wire up here: runFetch clears `error`
               (hence isPartial, hence this whole banner) in the same render pass that
-              `loading` flips true, so that state is never reachable — the pager's
-              "Loading more users…" caption takes over as the in-flight signal instead.
+              `loading` flips true, so that state is never reachable — the
+              "Loading more users…" caption below the table takes over as the in-flight signal instead.
               A duplicate click is a no-op regardless, guarded by useKeysetList's own
               loadingRef check inside loadMore().
               What IS reachable: the banner can still be showing (isPartial only checks
@@ -644,88 +539,57 @@ export default function UsersLimitsPanel({ onToast }: UsersLimitsPanelProps) {
         </p>
       )}
 
-      {users.length === 0 ? (
+      <AdminDataTable<MergedUser>
+        columns={columns}
+        rows={mergedUsers}
+        // Stable per-row identity (not the row's array index) so a 404 removeLocal
+        // mid-page doesn't shift every later row's key and remount them, dropping focus.
+        getRowId={(u) => u.userId}
+        serverSearch={{ value: q, onChange: setQuery }}
+        searchLabel="Search users"
+        searchPlaceholder="Search name or email…"
         // Read appliedQuery, not q: the live input runs 300ms ahead of the rows, so a
         // just-cleared search would claim the roster is empty while its refetch is still
         // in flight.
-        <div className="text-center py-16 text-sm text-neutral">
-          {appliedQuery ? `No users match “${appliedQuery}”.` : 'No users yet.'}
-        </div>
-      ) : rows.length === 0 ? (
-        <div className="text-center py-16 text-sm text-neutral">No users match the selected filters.</div>
-      ) : (
-        <Table>
-          <TableHeader>
-            {table.getHeaderGroups().map((headerGroup) => (
-              <tr key={headerGroup.id} className="border-b border-bial-border">
-                {headerGroup.headers.map((header) => {
-                  const sortDir = header.column.getIsSorted()
-                  const ariaSort = !header.column.getCanSort()
-                    ? undefined
-                    : sortDir === 'asc'
-                      ? 'ascending'
-                      : sortDir === 'desc'
-                        ? 'descending'
-                        : 'none'
-                  return (
-                    <TableHead key={header.id} aria-sort={ariaSort} className={header.column.columnDef.meta?.className}>
-                      {header.isPlaceholder ? null : flexRender(header.column.columnDef.header, header.getContext())}
-                    </TableHead>
-                  )
-                })}
-              </tr>
-            ))}
-          </TableHeader>
-          <TableBody>
-            {rows.map((row) => (
-              <TableRow key={row.id} data-testid={`row-${row.original.email}`} className="hover:bg-bial-bg/50">
-                {row.getVisibleCells().map((cell) => (
-                  <TableCell key={cell.id} className={cell.column.columnDef.meta?.className}>
-                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                  </TableCell>
-                ))}
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      )}
+        emptyMessage={appliedQuery ? `No users match “${appliedQuery}”.` : 'No users yet.'}
+        loading={loading}
+        toolbarEnd={(table) => (
+          <>
+            <Select
+              value={(table.getColumn('role')?.getFilterValue() as string | undefined) ?? 'all'}
+              onValueChange={(v: string) => table.getColumn('role')?.setFilterValue(v === 'all' ? undefined : v)}
+            >
+              <SelectTrigger data-testid="role-filter" className="w-[150px]">
+                <SelectValue placeholder="All roles" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All roles</SelectItem>
+                <SelectItem value="citizen">Citizen</SelectItem>
+                <SelectItem value="super_admin">Super admin</SelectItem>
+              </SelectContent>
+            </Select>
 
-      {users.length > 0 && (
-        <div className="mt-5 flex items-center justify-between text-xs text-neutral">
-          <div className="flex items-center gap-1.5">
-            {hasMore && !error && (
-              <>
-                <BusyGlyph size={12} /> Loading more users…
-              </>
-            )}
-          </div>
-          <div className="flex items-center gap-3">
-            <span>
-              {fmt(users.length)} loaded · Page {table.getState().pagination.pageIndex + 1} of{' '}
-              {Math.max(table.getPageCount(), 1)}
-            </span>
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                data-testid="users-prev-page"
-                onClick={() => table.previousPage()}
-                disabled={!table.getCanPreviousPage()}
-                className="p-1.5 rounded-lg border border-bial-border text-tertiary hover:bg-bial-bg disabled:opacity-50 disabled:cursor-not-allowed transition"
-              >
-                <ChevronLeft size={14} />
-              </button>
-              <button
-                type="button"
-                data-testid="users-next-page"
-                onClick={() => table.nextPage()}
-                disabled={!table.getCanNextPage()}
-                className="p-1.5 rounded-lg border border-bial-border text-tertiary hover:bg-bial-bg disabled:opacity-50 disabled:cursor-not-allowed transition"
-              >
-                <ChevronRight size={14} />
-              </button>
-            </div>
-          </div>
-        </div>
+            <Select
+              value={(table.getColumn('status')?.getFilterValue() as string | undefined) ?? 'all'}
+              onValueChange={(v: string) => table.getColumn('status')?.setFilterValue(v === 'all' ? undefined : v)}
+            >
+              <SelectTrigger data-testid="status-filter" className="w-[150px]">
+                <SelectValue placeholder="All statuses" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All statuses</SelectItem>
+                <SelectItem value="active">Active</SelectItem>
+                <SelectItem value="suspended">Suspended</SelectItem>
+              </SelectContent>
+            </Select>
+          </>
+        )}
+      />
+
+      {users.length > 0 && hasMore && !error && (
+        <p className="mt-3 flex items-center gap-1.5 text-xs text-neutral">
+          <BusyGlyph size={12} /> Loading more users…
+        </p>
       )}
 
       {editing && defaults && (

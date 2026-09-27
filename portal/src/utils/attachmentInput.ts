@@ -18,14 +18,13 @@ export const CODE_LANE_MEDIA_TYPES = [
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 ]
+const IMAGE_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
 /**
  * The MODEL lane — it reads these bytes itself, with no reader and no workspace involved.
  * Named as its own export because a generic conversation narrows to exactly this lane; the
  * backend mirror is `MODEL_LANE_MEDIA` in `media/lanes.py`.
  */
-export const MODEL_LANE_MEDIA_TYPES = [
-  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
-]
+export const MODEL_LANE_MEDIA_TYPES = [...IMAGE_MEDIA_TYPES, 'application/pdf']
 /**
  * THE LINE IS A RULE, NOT A LIST: every attachment uploads as itself, and its media type
  * decides which lane reads it. Nothing is converted here and nothing rides inline in the
@@ -55,11 +54,19 @@ export const ACCEPT_ATTR = [
   ...ALLOWED_MEDIA_TYPES, '.csv', '.tsv', '.tab', '.xlsx', '.docx', '.pptx',
 ].join(',')
 
-// ONE SIZE FOR EVERY FORMAT, matching the server's `ATTACHMENT_MAX_BYTES` exactly; a test
+// ONE SIZE LIMIT PER LANE, in MiB, matching `media/lanes.py` number for number; a backend test
 // holds the two equal. Measured on the original `File.size`, so a citizen learns a file is too
 // large before it is read, encoded and sent.
-export const MAX_FILE_SIZE = 10 * 1024 * 1024
-export const MAX_FILE_SIZE_MB = MAX_FILE_SIZE / (1024 * 1024)
+export const IMAGE_MAX_MB = 7
+export const PDF_MAX_MB = 20
+export const CODE_LANE_MAX_MB = 30
+
+function maxFileSizeMb(mediaType: string): number {
+  if (IMAGE_MEDIA_TYPES.includes(mediaType)) return IMAGE_MAX_MB
+  if (MODEL_LANE_MEDIA_TYPES.includes(mediaType)) return PDF_MAX_MB
+  return CODE_LANE_MAX_MB
+}
+
 export const MAX_FILES_PER_MESSAGE = 5
 // Cumulative cap across a whole conversation (all turns). Distinct from the
 // per-message cap above; checked at send time where the full conversation is visible.
@@ -165,7 +172,7 @@ export function resolveMediaType(file: File): string {
  *
  * TWO QUESTIONS, NOT THREE. A per-file text cap and a running text-byte budget used to sit here
  * for the inline lane; nothing is inlined now, so both bounded a population that is always empty.
- * Every file takes one path and one size rule.
+ * Every file takes one path, and its lane decides its size limit.
  */
 export type AttachmentValidationResult = { error: string } | { ok: true }
 
@@ -185,8 +192,9 @@ export function validateAttachmentFiles(
       return { error: unsupportedFileMessage(file.name) }
     }
     // Interpolated, never spelled: the figure a citizen is told is the figure enforced.
-    if (file.size > MAX_FILE_SIZE) {
-      return { error: `"${file.name}" exceeds the ${MAX_FILE_SIZE_MB} MB limit.` }
+    const maxMb = maxFileSizeMb(mediaType)
+    if (file.size > maxMb * 1024 * 1024) {
+      return { error: `"${file.name}" exceeds the ${maxMb} MB limit.` }
     }
   }
   return { ok: true }

@@ -53,7 +53,7 @@ describe('countWords — the shared rule', () => {
 
 describe('the shared limits', () => {
   it('carries the description bounds from #191', () => {
-    expect(MIN_PROJECT_DESCRIPTION_WORDS).toBe(15)
+    expect(MIN_PROJECT_DESCRIPTION_WORDS).toBe(5)
     expect(MAX_PROJECT_DESCRIPTION_WORDS).toBe(120)
   })
 
@@ -71,22 +71,22 @@ describe('the shared limits', () => {
   })
 
   it('carries the delete-reason bounds from §13.2', () => {
-    expect(MIN_DELETE_REASON_WORDS).toBe(5)
+    expect(MIN_DELETE_REASON_WORDS).toBe(2)
     expect(MAX_DELETE_REASON_WORDS).toBe(50)
   })
 
   it('counts EXACTLY at both delete-reason bounds', () => {
-    // The boundaries themselves, which nothing pinned: the dialog's cases were 2 / 6 / 51,
-    // so an off-by-one at either end survived. The server parametrises 5 and 50 directly, and
+    // The boundaries themselves, which nothing pinned: the dialog's gating test uses 1 / 6 / 51,
+    // so an off-by-one at either end survived. The server parametrises 2 and 50 directly, and
     // client and server disagreeing at a boundary is the one failure this module exists to
-    // prevent — the counter reads 5/50, the button arms, and the API refuses.
-    const five = Array.from({ length: MIN_DELETE_REASON_WORDS }, (_, i) => `w${i}`).join(' ')
-    const fifty = Array.from({ length: MAX_DELETE_REASON_WORDS }, (_, i) => `w${i}`).join(' ')
+    // prevent — the counter reads 2/50, the button arms, and the API refuses.
+    const min = Array.from({ length: MIN_DELETE_REASON_WORDS }, (_, i) => `w${i}`).join(' ')
+    const max = Array.from({ length: MAX_DELETE_REASON_WORDS }, (_, i) => `w${i}`).join(' ')
 
-    expect(countWords(five)).toBe(MIN_DELETE_REASON_WORDS)
-    expect(countWords(`${five} extra`)).toBe(MIN_DELETE_REASON_WORDS + 1)
-    expect(countWords(fifty)).toBe(MAX_DELETE_REASON_WORDS)
-    expect(countWords(`${fifty} extra`)).toBe(MAX_DELETE_REASON_WORDS + 1)
+    expect(countWords(min)).toBe(MIN_DELETE_REASON_WORDS)
+    expect(countWords(`${min} extra`)).toBe(MIN_DELETE_REASON_WORDS + 1)
+    expect(countWords(max)).toBe(MAX_DELETE_REASON_WORDS)
+    expect(countWords(`${max} extra`)).toBe(MAX_DELETE_REASON_WORDS + 1)
   })
 })
 

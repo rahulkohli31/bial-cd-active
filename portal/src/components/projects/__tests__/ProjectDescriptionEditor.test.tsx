@@ -2,7 +2,7 @@
  * ProjectDescriptionEditor: the field itself is the write surface — always editable, with
  * Save and Cancel appearing only once there is something to save. The load-bearing behaviour
  * is that every failure leaves the typed text exactly as the user left it, never cleared and
- * never reverted. Plus the required/word-bound gate (#191 — 15-120 words, no clear-to-null),
+ * never reverted. Plus the required/word-bound gate (#191 — 5-120 words, no clear-to-null),
  * the character backstop, the disable-during-save lock, and the parent re-sync that must not
  * clobber in-progress typing.
  *
@@ -85,7 +85,7 @@ describe('ProjectDescriptionEditor — the field is the write surface', () => {
 
     expect(textarea().value).toBe('')
     expect(textarea().placeholder).toBe('Who uses it, and what do they do with it?')
-    expect(screen.getByText('0 of 15–120 words')).toBeTruthy()
+    expect(screen.getByText('0 of 5–120 words')).toBeTruthy()
   })
 
   it('★ draws no heading of its own — the form that holds it names it', () => {
@@ -181,7 +181,7 @@ describe('ProjectDescriptionEditor — saving', () => {
 
 describe('ProjectDescriptionEditor — a failed save leaves the field exactly as typed', () => {
   it('keeps the typed text and shows what the API refused', async () => {
-    h.patchProject.mockRejectedValue(new ApiError('Description must be at least 15 words.', 422))
+    h.patchProject.mockRejectedValue(new ApiError('Description must be at least 5 words.', 422))
     const typed = wordsOf()
     render(<ProjectDescriptionEditor projectId="p1" description="stored text" onProjectUpdate={vi.fn()} />)
 
@@ -189,7 +189,7 @@ describe('ProjectDescriptionEditor — a failed save leaves the field exactly as
     fireEvent.click(saveBtn())
 
     const alert = await screen.findByRole('alert')
-    expect(alert.textContent).toBe('Description must be at least 15 words.')
+    expect(alert.textContent).toBe('Description must be at least 5 words.')
     expect(textarea().value).toBe(typed)
     expect(textarea().disabled).toBe(false)
   })
@@ -237,7 +237,7 @@ describe('ProjectDescriptionEditor — a failed save leaves the field exactly as
 describe('ProjectDescriptionEditor — character backstop', () => {
   it('saves a description inside the character cap and inside the word bound', async () => {
     // 100 words of 15 characters + 99 separating spaces = 1599 characters, well under the
-    // 2000 cap, and 100 words is inside 15-120 — the word rule and the char rule agree here.
+    // 2000 cap, and 100 words is inside 5-120 — the word rule and the char rule agree here.
     const value = Array.from({ length: 100 }, () => 'x'.repeat(15)).join(' ')
     h.patchProject.mockResolvedValue(makeProject({ description: value }))
     render(<ProjectDescriptionEditor projectId="p1" description={null} onProjectUpdate={vi.fn()} />)
@@ -251,7 +251,7 @@ describe('ProjectDescriptionEditor — character backstop', () => {
 
   it('blocks an over-2000-character description client-side even though the word count is in bounds', () => {
     // 100 words of 20 characters + 99 spaces = 2099 characters — over the cap, but still only
-    // 100 words (inside 15-120), so this is the character rule firing, not the word rule.
+    // 100 words (inside 5-120), so this is the character rule firing, not the word rule.
     const value = Array.from({ length: 100 }, () => 'x'.repeat(20)).join(' ')
     render(<ProjectDescriptionEditor projectId="p1" description={null} onProjectUpdate={vi.fn()} />)
 
@@ -322,11 +322,11 @@ describe('ProjectDescriptionEditor — required + word bound (#191)', () => {
     type(wordsOf(3))
     // THE FLOOR IS ON SCREEN, not only in the gate. A count alone leaves an owner below the
     // minimum with a dead Save and a red number that never says what would fix it.
-    expect(screen.getByText('3 of 15–120 words').className).toMatch(/text-danger/)
+    expect(screen.getByText('3 of 5–120 words').className).toMatch(/text-danger/)
 
     type(wordsOf(MIN_PROJECT_DESCRIPTION_WORDS))
     expect(
-      screen.getByText(`${MIN_PROJECT_DESCRIPTION_WORDS} of 15–120 words`).className,
+      screen.getByText(`${MIN_PROJECT_DESCRIPTION_WORDS} of 5–120 words`).className,
     ).not.toMatch(/text-danger/)
   })
 })

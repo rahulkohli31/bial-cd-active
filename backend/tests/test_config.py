@@ -78,6 +78,13 @@ _APP_DB: dict[str, object] = {
     "encryption_key": "hcaMBs3ozLPY6Ekz7VOr09gDdZ5w6EUUQhbEmr0iJHY=",
 }
 
+_LAKE: dict[str, object] = {
+    "url": "https://lake.blob.core.windows.net/data/flights/",
+    "identity_client_id": "33333333-3333-3333-3333-333333333333",
+    "identity_resource_id": "/subscriptions/0/resourcegroups/rg/providers/"
+    "Microsoft.ManagedIdentity/userAssignedIdentities/lake-reader",
+}
+
 
 def _settings(**overrides: object) -> Settings:
     return Settings.model_validate({**_BASE_ENV, **overrides})
@@ -85,7 +92,7 @@ def _settings(**overrides: object) -> Settings:
 
 def _prod_settings(**overrides: object) -> Settings:
     # A production Settings must clear every optional-integration prod gate at once
-    # (storage + redis + sandbox + app_db), so this helper always supplies all four.
+    # (storage + redis + sandbox + app_db + connector lake), so this helper supplies all five.
     # Tests that probe a single gate override just that one (e.g. `object_store=None`)
     # so the intended gate — not an incidental one — is what fires.
     prod: dict[str, object] = {
@@ -94,6 +101,7 @@ def _prod_settings(**overrides: object) -> Settings:
         "redis": _REDIS,
         "sandbox": _SANDBOX,
         "app_db": _APP_DB,
+        "connector_lake": _LAKE,
         # The FRONTEND_URL prod gate rejects the localhost dev default in production, so a
         # production Settings always supplies the real https origin (tests that probe the
         # gate override it back).
@@ -134,6 +142,11 @@ def test_production_requires_app_db() -> None:
     # silently never get a database.
     with pytest.raises(ValidationError, match="per-project databases must be configured"):
         _prod_settings(app_db=None)
+
+
+def test_production_requires_connector_lake() -> None:
+    with pytest.raises(ValidationError, match="the connector lake must be configured"):
+        _prod_settings(connector_lake=None)
 
 
 def test_app_db_optional_outside_production() -> None:

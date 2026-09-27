@@ -19,8 +19,7 @@ import ChatRuntimeProvider from '../runtime/ChatRuntimeProvider'
 import { SendRefusal } from '../sendRefusal'
 import {
   GENERIC_ATTACHMENT_LANES_SENTENCE,
-  MAX_FILE_SIZE,
-  MAX_FILE_SIZE_MB,
+  IMAGE_MAX_MB,
   MODEL_LANE_ONLY,
   type AttachmentLanes,
 } from '../../../utils/attachmentInput'
@@ -507,9 +506,9 @@ describe('★ the attachment pipeline stays ours', () => {
     // `ComposerBox.tsx` and this goes red.
     const onUrgent = vi.fn()
     draw({ onUrgent })
-    drop(new File([new Uint8Array(MAX_FILE_SIZE + 1)], 'huge.png', { type: 'image/png' }))
+    drop(new File([new Uint8Array(IMAGE_MAX_MB * 1024 * 1024 + 1)], 'huge.png', { type: 'image/png' }))
     await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
-    expect(onUrgent.mock.calls[0]?.[0]).toMatch(new RegExp(`exceeds the ${MAX_FILE_SIZE_MB} MB`, 'i'))
+    expect(onUrgent.mock.calls[0]?.[0]).toMatch(new RegExp(`exceeds the ${IMAGE_MAX_MB} MB`, 'i'))
     // …and nothing was staged.
     expect(screen.queryByTestId('composer-chips')).toBeNull()
   })
@@ -537,7 +536,7 @@ describe('★ the attachment pipeline stays ours', () => {
     // citizen can do, and that silence is indistinguishable from the file having been accepted.
     const badFormat = () => new File(['x'], 'slides.ppt', { type: 'application/vnd.ms-powerpoint' })
     const tooBig = () =>
-      new File([new Uint8Array(MAX_FILE_SIZE + 1)], 'huge.png', { type: 'image/png' })
+      new File([new Uint8Array(IMAGE_MAX_MB * 1024 * 1024 + 1)], 'huge.png', { type: 'image/png' })
 
     const PATHS = [
       ['the file picker', pick],
@@ -567,7 +566,7 @@ describe('★ the attachment pipeline stays ours', () => {
         add(tooBig())
         await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
         expect(onUrgent.mock.calls[0]?.[0]).toMatch(
-          new RegExp(`exceeds the ${MAX_FILE_SIZE_MB} MB`, 'i'),
+          new RegExp(`exceeds the ${IMAGE_MAX_MB} MB`, 'i'),
         )
         expect(screen.queryByTestId('composer-chips')).toBeNull()
       })
@@ -732,9 +731,9 @@ describe('★ a chat with no workspace offers only the lane it can honour', () =
     // cap and the per-message count — have to survive being fronted by the library's filter.
     const onUrgent = vi.fn()
     draw({ onUrgent, lanes: MODEL_LANE_ONLY })
-    pick(new File([new Uint8Array(MAX_FILE_SIZE + 1)], 'huge.png', { type: 'image/png' }))
+    pick(new File([new Uint8Array(IMAGE_MAX_MB * 1024 * 1024 + 1)], 'huge.png', { type: 'image/png' }))
     await waitFor(() => expect(onUrgent).toHaveBeenCalledTimes(1))
-    expect(onUrgent.mock.calls[0]?.[0]).toMatch(new RegExp(`exceeds the ${MAX_FILE_SIZE_MB} MB`, 'i'))
+    expect(onUrgent.mock.calls[0]?.[0]).toMatch(new RegExp(`exceeds the ${IMAGE_MAX_MB} MB`, 'i'))
     expect(screen.queryByTestId('composer-chips')).toBeNull()
   })
 })
