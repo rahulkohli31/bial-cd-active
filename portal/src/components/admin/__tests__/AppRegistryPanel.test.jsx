@@ -276,6 +276,22 @@ describe('AppRegistryPanel — one list, every app', () => {
     expect(screen.queryByTestId('review-overtaken')).toBeNull()
   })
 
+  it('a failure that lands after the admin closed the panel is said in a toast, not lost', async () => {
+    let settle
+    h.approveApp.mockReturnValue(new Promise((_resolve, reject) => { settle = reject }))
+    const onToast = vi.fn()
+    render(<AppRegistryPanel onToast={onToast} />)
+    await openReview()
+    fireEvent.click(screen.getByTestId('approve-btn'))
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Close' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+
+    settle(new Error('Network error'))
+
+    await waitFor(() => expect(onToast).toHaveBeenCalledWith('Network error', 'problem'))
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
   it('a success that lands after the admin moved to another app does not close that app\'s panel', async () => {
     const OTHER = { ...PENDING, appId: 'app-9', name: 'Other Tool', submissionId: 'sub-9' }
     h.listApps.mockResolvedValue(listOf(PENDING, OTHER))
@@ -691,6 +707,19 @@ describe('the row menu', () => {
     expect(h.listApps).toHaveBeenCalledTimes(2)
   })
 
+  it('a disable refused because the app changed elsewhere re-reads the list, tells the nav, and says why', async () => {
+    h.listApps.mockResolvedValue(listOf(DRAFT))
+    h.disableApp.mockRejectedValue(new ApiError('This app can no longer be disabled.', 409, 'conflict'))
+    const onToast = vi.fn()
+    render(<AppRegistryPanel onToast={onToast} />)
+    await openMenu('app-4')
+    await pickMenuItem('Disable')
+
+    await waitFor(() => expect(onToast).toHaveBeenCalledWith('This app can no longer be disabled.', 'problem'))
+    expect(h.listApps).toHaveBeenCalledTimes(2)
+    expect(h.announceReviewQueueChanged).toHaveBeenCalledTimes(1)
+  })
+
   it('an approved app carries no deploy prompt and no way to record a deployment by hand', async () => {
     h.listApps.mockResolvedValue(listOf(APPROVED))
     render(<AppRegistryPanel onToast={() => {}} />)
@@ -980,6 +1009,8 @@ describe('a submission withdrawn while the panel was open', () => {
     expect(screen.queryByTestId('approve-btn')).toBeNull()
     expect(screen.queryByTestId('reject-btn')).toBeNull()
     expect(screen.getByTestId('overtaken-close')).toBeTruthy()
+    // The pressed action is gone, so the keyboard lands on what replaced it, not on the page.
+    expect(document.activeElement).toBe(screen.getByTestId('overtaken-close'))
     // It announces: the block is a polite live region, not a silent swap.
     expect(screen.getByTestId('review-status').getAttribute('aria-live')).toBe('polite')
   })
@@ -1155,6 +1186,19 @@ describe('★ the admin delete collects a reason', () => {
     // A refusal must not close the dialog and throw the typed words away — there is nothing to
     // fix if the text is gone.
     expect(screen.getByTestId('admin-delete-reason').value).toBe(REASON)
+  })
+
+  it('an app already deleted elsewhere closes the dialog and re-reads the list', async () => {
+    h.listApps.mockResolvedValue(listOf(APPROVED))
+    h.deleteApp.mockRejectedValue(new ApiError('App not found', 404, 'not_found'))
+    render(<AppRegistryPanel onToast={vi.fn()} />)
+    await openDelete()
+    fireEvent.change(await screen.findByTestId('admin-delete-reason'), { target: { value: REASON } })
+    fireEvent.click(screen.getByTestId('admin-delete-confirm'))
+
+    await waitFor(() => expect(screen.queryByTestId('admin-delete-reason')).toBeNull())
+    expect(h.listApps).toHaveBeenCalledTimes(2)
+    expect(screen.queryByTestId('admin-delete-problem')).toBeNull()
   })
 
   it('drops the refusal once the reason is edited', async () => {

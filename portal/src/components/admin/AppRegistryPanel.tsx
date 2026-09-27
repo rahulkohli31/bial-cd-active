@@ -409,7 +409,7 @@ const COLUMNS: ColumnDef<RegistryApp>[] = [
  */
 export interface AppRegistryPanelProps {
   // severity is optional (default 'ok' on the AdminPage side) so a plain confirmation needs no
-  // second argument — only a failed `act()` below passes 'problem'.
+  // second argument — only a failure passes 'problem'.
   onToast: (msg: string, severity?: 'ok' | 'problem') => void
 }
 
@@ -433,6 +433,8 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   // re-enable row B's still-pending buttons (which a single busyId did, opening the
   // door to duplicate concurrent mutations + duplicate audit rows).
   const [busyIds, setBusyIds] = useState<Set<string>>(() => new Set())
+  // The app whose panel is open now, read by a result that settles after the admin moved on.
+  const openAppIdRef = useRef<string | null>(null)
   // Staleness guard for overlapping loads: a stale response must not overwrite fresher state.
   const loadSeq = useRef(0)
   // Captured when something opens, rather than read back off `document.activeElement`: a click
@@ -471,6 +473,8 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
 
   useEffect(() => { load() }, [load])
 
+  useEffect(() => { openAppIdRef.current = openApp?.appId ?? null }, [openApp])
+
   const owners = useMemo(
     () =>
       [...new Set((list?.apps ?? []).flatMap((app) => (app.ownerUsername === null ? [] : [app.ownerUsername])))].sort(
@@ -506,11 +510,13 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   /** On success the app's panel closes, if it is still the one open. A conflict — withdrawn,
    *  re-submitted or decided elsewhere — replaces its actions with the server's sentence: the list
    *  behind has re-read, and the admin reopens the row to review what is there now. Any other
-   *  failure keeps the actions for a retry. */
+   *  failure keeps the actions for a retry. A failure for an app whose panel has closed is a
+   *  toast, because nothing on screen would say it. */
   const settleReview = (appId: string, failure: unknown): void => {
     if (failure === null) { setOpenApp((current) => (current?.appId === appId ? null : current)); return }
     const settled = { appId, message: failure instanceof Error ? failure.message : String(failure) }
-    if (changedElsewhere(failure)) setOvertaken(settled)
+    if (openAppIdRef.current !== appId) onToast(settled.message, 'problem')
+    else if (changedElsewhere(failure)) setOvertaken(settled)
     else setProblem(settled)
   }
 

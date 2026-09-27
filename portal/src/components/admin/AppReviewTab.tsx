@@ -36,8 +36,8 @@ const NOTHING_IN_DISPUTE_COPY =
 
 const LIVE_REJECTION_COPY =
   'This app is live. Rejecting removes it from the Marketplace but leaves it running at its URL, ' +
-  'and only its owner can undo that by submitting again. To take it down as well, disable it ' +
-  'from its row’s menu after rejecting.'
+  'and only its owner can undo that by submitting again. Disabling it from its row’s menu cuts ' +
+  'it off from its data, but its address keeps answering until its owner takes it down.'
 
 const SECTION_LABEL = 'text-[10.5px] font-bold uppercase tracking-[0.6px] text-neutral'
 
@@ -389,7 +389,7 @@ export default function AppReviewTab({ app, number, overtaken, problem, busy, on
       <div className="flex-shrink-0 border-t border-bial-border bg-white px-6 py-3.5">
         {overtaken !== null ? (
           <div className="flex justify-end">
-            <Button data-testid="overtaken-close" variant="outline" onClick={onClose} className="h-9 rounded-lg border-bial-border px-4 text-[13.5px] font-semibold text-tertiary">
+            <Button data-testid="overtaken-close" variant="outline" autoFocus onClick={onClose} className="h-9 rounded-lg border-bial-border px-4 text-[13.5px] font-semibold text-tertiary">
               Close
             </Button>
           </div>
