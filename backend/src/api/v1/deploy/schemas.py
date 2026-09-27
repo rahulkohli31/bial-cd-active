@@ -427,9 +427,9 @@ _NON_RETRYABLE_FAILURE_CODES: frozenset[str] = frozenset(
 # Every code a failed publish settles under.
 PUBLISH_FAILURE_CODES: frozenset[str] = _RETRYABLE_FAILURE_CODES | _NON_RETRYABLE_FAILURE_CODES
 
-# Failed publishes of the approved copy after which it is no longer offered: a copy's own fault
-# misread as the platform's would otherwise be offered for ever. Past the cap the one button acts
-# on the saved version, as after the copy's own fault.
+# Failed publishes of the approved copy, since approval or since it last went live, after which
+# it is no longer offered: a copy's own fault misread as the platform's would otherwise be offered
+# for ever. Past the cap the one button acts on the saved version, as after the copy's own fault.
 MAX_APPROVED_COPY_ATTEMPTS: Final = 3
 
 
@@ -484,8 +484,9 @@ def approved_retry_commit(
     a retry can fix while fewer than `MAX_APPROVED_COPY_ATTEMPTS` publishes of it have failed
     (`copy_failures`) — and when the version taken offline is the approved one and did not fail in
     itself. A failure that named another commit goes through the gate; one that named none is an
-    attempt at the copy only if nothing went live since approval (`approved_went_live`). Rule 3
-    republishes exactly when this offers the commit it was sent."""
+    attempt at the copy only if nothing went live since approval (`approved_went_live`). The
+    publish route's approved-copy rule republishes exactly when this offers the commit it was
+    sent."""
     copy = approved_copy(app)
     if copy is None:
         return None

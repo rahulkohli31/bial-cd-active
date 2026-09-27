@@ -465,10 +465,25 @@ async def _approved_retry(
 ) -> str | None:
     """`approved_retry_commit` for the newest attempt, asked the same way by the status route
     and by rule 3 so the button and the ladder cannot disagree about the approved copy. Both extra
-    reads run only after a failure a retry can fix: how many publishes of the copy have failed,
-    and, for a row that cannot say for itself, whether the copy went live."""
+    reads run only after a failure a retry can fix: how many publishes of the copy have failed
+    since approval, or since the copy last went live, and, for a row that cannot say for itself,
+    whether the copy went live."""
     copy_failures = 0
     if retry_needs_copy_failures(app_row, latest):
+        # A copy that went live has proved it builds and runs; failures before that say nothing
+        # about it now.
+        last_live = (
+            sa.select(sa.func.max(Deployment.created_at))
+            .where(
+                Deployment.app_id == app_row.id,
+                Deployment.status == DeploymentStatus.SUCCEEDED,
+                Deployment.head_sha == app_row.approved_commit_sha,
+            )
+            .scalar_subquery()
+        )
+        counted_from = sa.func.greatest(
+            app_row.approved_at, sa.func.coalesce(last_live, app_row.approved_at)
+        )
         copy_failures = (
             await db.scalar(
                 sa.select(sa.func.count())
@@ -477,7 +492,7 @@ async def _approved_retry(
                     Deployment.app_id == app_row.id,
                     Deployment.status == DeploymentStatus.FAILED,
                     Deployment.failure_code.in_(PUBLISH_FAILURE_CODES),
-                    Deployment.created_at >= app_row.approved_at,
+                    Deployment.created_at >= counted_from,
                     sa.or_(
                         Deployment.head_sha == app_row.approved_commit_sha,
                         Deployment.head_sha.is_(None),

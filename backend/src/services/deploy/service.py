@@ -426,9 +426,12 @@ class DeployService:
                 app_id=app_id, deployment_id=deployment_id, context=context
             )
         except ImageBuildTransientError as exc:
+            log = exc.log_tail
             raise _DeployFailedError(
                 FAIL_BUILD_UNAVAILABLE,
-                detail=str(exc),
+                # The registry's log, through the same de-noiser a build failure uses, is what an
+                # operator diagnoses the platform fault from.
+                detail=f"{exc}\n\n{from_next_build(log).cleaned_stack}" if log else str(exc),
                 citizen_message=(
                     "Your app could not be built because of a platform problem, so it was not "
                     "deployed. Your previous version is still running. Please try again."

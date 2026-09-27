@@ -209,10 +209,8 @@ def test_an_unreadable_saved_head_reads_newer_work_off_a_submission_made_since()
 
 
 def test_a_submission_older_than_the_live_version_says_nothing_about_newer_work() -> None:
-    """The approved version was followed by one the gate published without an
-    administrator, which never moves the submitted commit. That commit differs from what
-    is live because it is OLDER, so with the saved head unreadable the honest answer is
-    unknown, never newer work."""
+    """The submitted commit differs from what is live because it is older, so with the saved
+    head unreadable the honest answer is unknown, never newer work."""
     app = _approved(
         _SUBMITTED_SHA, source_commit_sha=_SUBMITTED_SHA, submitted_at=_BEFORE_APPROVAL
     )

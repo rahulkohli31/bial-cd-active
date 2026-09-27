@@ -579,6 +579,35 @@ async def test_only_failed_publishes_of_the_copy_since_approval_count_toward_the
     assert status["approvedRetryCommit"] == approved
 
 
+async def test_failures_before_the_copy_went_live_do_not_count_toward_the_cap(
+    wire, client, db_session
+) -> None:
+    """The copy went live, so it builds and runs: after it is taken down, one platform failure
+    must not withdraw it because of failures from before it was proven."""
+    owner, app_row, _submission_id = await _approved_earlier(wire, db_session)
+    approved = wire.submitted[1]
+    await _failed_attempts(
+        db_session, owner, app_row, ("provision_failed", approved, 1), ("interrupted", None, 2)
+    )
+    assert app_row.approved_at is not None
+    db_session.add(
+        Deployment(
+            app_id=app_row.id,
+            user_id=owner.id,
+            status=DeploymentStatus.SUCCEEDED,
+            head_sha=approved,
+            created_at=app_row.approved_at + timedelta(hours=3),
+            unpublished_at=app_row.approved_at + timedelta(hours=4),
+        )
+    )
+    await db_session.flush()
+    await _failed_attempts(db_session, owner, app_row, ("provision_failed", approved, 5))
+
+    status = await _status(client, owner, app_row)
+
+    assert status["approvedRetryCommit"] == approved
+
+
 async def _registry_row(client, admin, app_row: AppRegistry) -> dict[str, Any]:
     resp = await client.get("/v1/admin/apps", headers=auth_headers(admin))
     assert resp.status_code == 200, resp.text

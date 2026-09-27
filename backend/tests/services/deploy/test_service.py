@@ -405,6 +405,22 @@ async def test_a_platform_fault_in_the_build_is_not_reported_as_the_app_s_own(
     assert "try again" in text
 
 
+async def test_a_platform_fault_in_the_build_keeps_the_registry_log_for_the_operator(
+    wire, db_session
+) -> None:
+    user, app, conversation = await _project(db_session)
+    wire.images.error = ImageBuildTransientError(
+        "the image build succeeded but produced no image digest",
+        log_tail="Step 9/9 : push\nerror pushing manifest: registry unavailable\n",
+    )
+
+    _started, row = await _run(wire, db_session, user, app, conversation.id)
+
+    assert row.failure_code == "build_unavailable"
+    assert (row.failure_detail or "").startswith("the image build succeeded but produced no image")
+    assert "registry unavailable" in (row.failure_detail or "")
+
+
 async def test_nothing_saved_yet_is_a_named_outcome(wire, db_session, monkeypatch) -> None:
     """ "Never built" is a normal state, not a crash — and it must not read the same as a
     bundle that exists but cannot be parsed."""
