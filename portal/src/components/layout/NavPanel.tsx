@@ -59,7 +59,7 @@ export default function NavPanel({
       data-collapsed={collapsed ? 'true' : 'false'}
     >
       <div
-        // NO SIDE PADDING AT RAIL WIDTH: the mark is 45px and a padded 56px column leaves 40,
+        // NO SIDE PADDING AT RAIL WIDTH: the mark is 41px and a padded 56px column leaves 40,
         // so it pinned to the content edge and overflowed right — off centre in the one state
         // where it is the only thing on the row.
         className={`flex shrink-0 items-center pb-4 pt-[18px] ${collapsed ? 'justify-center px-0' : 'gap-2 px-4'}`}
