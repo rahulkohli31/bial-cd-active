@@ -388,7 +388,7 @@ describe('MarketplacePage', () => {
     // empty one, and the disagreement copy must NOT appear. Without this, gating the empty
     // state on `total > 0` alone could swallow the real empty case.
     h.listMarketplace.mockResolvedValue(
-      page({ items: [], page: 1, pageSize: 10, total: 0, totalPages: 0 }),
+      page({ items: [], page: 1, pageSize: 10, total: 0, totalPages: 1 }),
     )
     renderPage()
 
