@@ -383,14 +383,14 @@ def test_auth_is_required() -> None:
 @pytest.mark.parametrize("field", ["tenant_id", "client_id", "session_secret", "redirect_uri"])
 def test_auth_inner_fields_required(field: str) -> None:
     # Each Entra credential/id carries NO default: a partial AUTH__* block never
-    # boots half-configured. (client_secret is deliberately EXCLUDED — it is optional
-    # while the app registration is a public client; see test_auth_client_secret_optional.)
+    # boots half-configured. (client_secret is deliberately EXCLUDED — the browser redeems
+    # the code, so no secret is presented; see test_auth_client_secret_optional.)
     assert AuthConfig.model_fields[field].is_required()
 
 
 def test_auth_client_secret_optional() -> None:
-    # PUBLIC-CLIENT hotfix: client_secret is optional — the backend presents no secret to a
-    # public Entra app registration. AuthConfig validates with it omitted, defaulting to None.
+    # client_secret is optional and unused: the user's browser redeems the code with the PKCE
+    # verifier and no secret. AuthConfig validates with it omitted, defaulting to None.
     partial = {k: v for k, v in _AUTH.items() if k != "client_secret"}
     auth = AuthConfig.model_validate(partial)
     assert auth.client_secret is None
@@ -425,8 +425,7 @@ def test_auth_secrets_are_masked() -> None:
     # SecretStr masks in repr/str (never leaks into logs / ValidationError).
     assert "unit-test-client-secret" not in repr(auth.client_secret)
     assert "unit-test-session-secret" not in repr(auth)
-    # ...but the plaintext is retrievable at the boundary (the test config sets it; the field is
-    # optional only because the app registration is currently a public client).
+    # ...but the plaintext is retrievable at the boundary (the test config sets it).
     assert auth.client_secret is not None
     assert auth.client_secret.get_secret_value() == "unit-test-client-secret"
 

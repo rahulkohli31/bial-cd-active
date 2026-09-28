@@ -809,6 +809,32 @@
         "title": "BannerItem",
         "type": "object"
       },
+      "Body_auth_complete_v1_auth_complete_post": {
+        "properties": {
+          "error": {
+            "default": "",
+            "title": "Error",
+            "type": "string"
+          },
+          "error_description": {
+            "default": "",
+            "title": "Error Description",
+            "type": "string"
+          },
+          "id_token": {
+            "default": "",
+            "title": "Id Token",
+            "type": "string"
+          },
+          "state": {
+            "default": "",
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "title": "Body_auth_complete_v1_auth_complete_post",
+        "type": "object"
+      },
       "BuildConflictEnvelope": {
         "description": "The 409 a shared-view launch gives when the caller's own work holds the workspace:\n`build_session_already_active` when no project can be named truthfully, or\n`sandbox_reclaim_blocked` naming the project whose turn is running\n(`projectId`/`projectName`). `code` discriminates, and a client must branch on it, since only\nthe second names a project.",
         "properties": {
@@ -8255,6 +8281,57 @@
         "responses": {
           "200": {
             "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Account suspended"
+          },
+          "500": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Auth Callback",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/complete": {
+      "post": {
+        "description": "Where the callback page posts what Entra's token endpoint gave the browser: an ID token, or\nEntra's error. Every field defaults to empty so a malformed post still ends on the login\nbanner rather than a validation error page.",
+        "operationId": "auth_complete_v1_auth_complete_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_auth_complete_v1_auth_complete_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
               "application/json": {
                 "schema": {}
               }
@@ -8271,6 +8348,16 @@
             },
             "description": "Account suspended"
           },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -8282,7 +8369,7 @@
             "description": "Internal server error"
           }
         },
-        "summary": "Auth Callback",
+        "summary": "Auth Complete",
         "tags": [
           "auth"
         ]

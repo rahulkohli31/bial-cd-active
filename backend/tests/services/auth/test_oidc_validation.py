@@ -7,7 +7,6 @@ exercised with crafted token dicts, so there is no live tenant or forged JWKS.
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urlsplit
 
 import pytest
 
@@ -87,18 +86,12 @@ def test_upn_captured_even_when_email_present() -> None:
 
 def test_registration_uses_tenant_discovery_and_s256() -> None:
     oauth = build_oauth()
-    assert oauth.entra.client_kwargs["code_challenge_method"] == "S256"
-    assert oauth.entra.client_kwargs["scope"] == "openid profile email"
-    # PUBLIC-CLIENT hotfix: no secret is presented at the token endpoint; PKCE is the sole
-    # proof of the code exchange (AADSTS700025). Revert with the confidential-client hardening.
-    assert oauth.entra.client_kwargs["token_endpoint_auth_method"] == "none"
-    # SPA-platform redemption is cross-origin: the token request carries an Origin header matching
-    # the registered SPA redirect URI's origin (AADSTS9002327). Derived from redirect_uri as
-    # scheme+host (no path/trailing slash), so it always matches the registered reply URL.
-    redirect = urlsplit(settings.auth.redirect_uri)
-    assert (
-        oauth.entra.client_kwargs["headers"]["Origin"] == f"{redirect.scheme}://{redirect.netloc}"
-    )
+    # Nothing for the token endpoint — no auth method, no Origin header: the user's browser
+    # redeems the code, so this client never calls it.
+    assert oauth.entra.client_kwargs == {
+        "scope": "openid profile email",
+        "code_challenge_method": "S256",
+    }
     # Tenant-specific discovery doc — the concrete issuer, never common/organizations.
     metadata_url = oauth.entra._server_metadata_url
     assert metadata_url == settings.auth.server_metadata_url

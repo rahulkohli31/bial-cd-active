@@ -86,8 +86,8 @@ have, so they are the ones to start first.
 
 **Needs the tenant, start early:**
 
-- **An application registration in the directory**, with the reply address matching the portal's
-  public address exactly. Sign-in fails if these differ by a character.
+- **An application registration in the directory**, with a single-page-application reply address
+  matching the portal's public address exactly. Sign-in fails if these differ by a character.
 - **Role assignments for the platform's identity** — permission to ask the registry to build, and
   permission to create and delete container apps in the one resource group that holds them.
   `reference/` carries both role definitions with the scope left unbound; choosing the scope is
