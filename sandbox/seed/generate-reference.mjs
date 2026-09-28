@@ -56,8 +56,8 @@ const HEAD = `\
 //        npm install hyparquet hyparquet-compressors @azure/identity @azure/storage-blob
 //
 //   2. Copy the whole body into \`lib/flight-data.ts\`, stripping the leading \`// \` from each
-//      line. All of it: the page pattern at the end keeps your app inside its memory, and it is
-//      built on every function above it.
+//      line. All of it: the page pattern at the end keeps your app inside its memory, and it uses
+//      the reading functions above it, so copy both.
 //
 //   3. The two environment variables are injected for you when the data connector is switched on
 //      for this project. If they are missing, the connector is off — the code says so explicitly.

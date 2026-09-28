@@ -289,6 +289,8 @@ def test_the_stub_describes_nothing_about_the_data_itself() -> None:
     # "the stub states no other number" is the whole rule in one assertion, and it cannot be
     # satisfied by rewording. The words "column" and "table" DO appear, describing what the tool's
     # answer contains; that is the instruction, not a claim about the client's data.
+    assert stub.count(_WORKSPACE_MEMORY) == 1
+    assert stub.count(_PUBLISHED_MEMORY) == 1
     about_the_data = stub.replace(_WORKSPACE_MEMORY, "").replace(_PUBLISHED_MEMORY, "")
     assert not any(character.isdigit() for character in about_the_data), stub
     for leaked in ("tb_flight", "AODB", "parquet", "lake"):

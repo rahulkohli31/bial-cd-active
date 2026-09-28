@@ -17,8 +17,8 @@
 //        npm install hyparquet hyparquet-compressors @azure/identity @azure/storage-blob
 //
 //   2. Copy the whole body into `lib/flight-data.ts`, stripping the leading `// ` from each
-//      line. All of it: the page pattern at the end keeps your app inside its memory, and it is
-//      built on every function above it.
+//      line. All of it: the page pattern at the end keeps your app inside its memory, and it uses
+//      the reading functions above it, so copy both.
 //
 //   3. The two environment variables are injected for you when the data connector is switched on
 //      for this project. If they are missing, the connector is off — the code says so explicitly.
@@ -329,28 +329,36 @@
 // }
 //
 // /**
-//  * The files that hold the current record of every flight: the newest complete copy of the table
+//  * The files that hold the current record of every flight: the latest complete copy of the table
 //  * and every file loaded after it.
 //  *
-//  * About once a week the lake receives a COMPLETE COPY — every flight since 2022 at its latest
-//  * version, around 100 MB. The daily files in between carry only that day's new and amended
-//  * flights. Everything loaded before the newest complete copy is therefore already inside it, and
+//  * Every few days to every few weeks the lake receives a COMPLETE COPY — every flight since 2022 at
+//  * its latest version, around 100 MB and growing. The small daily files in between carry only that
+//  * day's new and amended flights. Everything loaded before a complete copy is already inside it, and
 //  * reading those files again re-reads the same flights dozens of times: that is the difference
 //  * between a few seconds and several minutes.
 //  *
-//  * A complete copy is recognised by its size, which the listing gives for free: at least ten times
-//  * the typical (median) file. A lake with no such file — a new one, or a test lake of daily files
-//  * only — is read whole, which is slow but never wrong. Expects `files` oldest first, as
+//  * The copy is recognised by size, which the listing gives for free: the LARGEST file (the newest,
+//  * on a tie), provided it is at least ten times the typical (median) file. Largest rather than
+//  * latest-over-the-threshold, because the two ways of guessing wrong are not equal: starting from an
+//  * older copy only costs time, since every later file is still read and `currentRecordsOnly` keeps
+//  * each flight's latest version, while starting from an oversized partial reload silently drops
+//  * every flight it does not hold. A lake with no file that large — a new one, or a test lake of
+//  * daily files only — is read whole, which is slow but never wrong. Expects `files` oldest first, as
 //  * `listFlightFiles` returns them.
 //  */
 // export function filesToRead(files: readonly LakeFile[]): LakeFile[] {
 //   const sizes = files.map((file) => file.size).sort((a, b) => a - b)
 //   const typical = sizes[Math.floor(sizes.length / 2)] ?? 0
-//   let newestCopy = 0
+//   let start = 0
+//   let largest = 0
 //   files.forEach((file, index) => {
-//     if (file.size >= 10 * typical) newestCopy = index
+//     if (file.size >= largest) {
+//       largest = file.size
+//       start = index
+//     }
 //   })
-//   return files.slice(newestCopy)
+//   return largest >= 10 * typical ? files.slice(start) : [...files]
 // }
 //
 // /**
@@ -408,8 +416,9 @@
 // //
 // // THE SHAPE OF EVERY PAGE ON FLIGHT DATA
 // //   1. ONE shared load on the server: `sharedLoad` around `currentFlights`, declared once in a
-// //      server module that every route imports. It loads once, is reused for an hour, and two
-// //      requests that arrive together wait for the same load instead of starting two.
+// //      server module that every route imports, never in a route file. It loads once, is reused for
+// //      an hour, and two requests that arrive together wait for the same load instead of starting
+// //      two.
 // //   2. Route handlers that answer from that load: totals and chart series computed on the server,
 // //      table rows one page at a time with `pageOf`. The browser never receives the whole table.
 // //   3. Filter dropdowns built from the same load with `optionsOf`, never by reading the lake again.
@@ -419,12 +428,17 @@
 // // once, shows a loading state where the data goes, and asks for the totals and the first table
 // // page together. Changing a filter or a page asks the server again; it never loads the lake again.
 // //
-// // A route handler, end to end (`app/api/flights/route.ts`, with this file copied to
-// // `lib/flight-data.ts`):
+// // End to end, with this file copied to `lib/flight-data.ts`. The one shared load, in
+// // `lib/flights.ts`:
 // //
-// //   import { currentFlights, flightsBetween, label, pageOf, sharedLoad } from '@/lib/flight-data'
+// //   import { currentFlights, sharedLoad } from '@/lib/flight-data'
 // //
-// //   const flights = sharedLoad('flights', () => currentFlights(['AIRLINE_NAME', 'TERMINAL']))
+// //   export const flights = sharedLoad('flights', () => currentFlights(['AIRLINE_NAME', 'TERMINAL']))
+// //
+// // A table page, in `app/api/flights/route.ts`:
+// //
+// //   import { flightsBetween, label, pageOf } from '@/lib/flight-data'
+// //   import { flights } from '@/lib/flights'
 // //
 // //   export async function GET(request: Request) {
 // //     const query = new URL(request.url).searchParams
@@ -435,6 +449,19 @@
 // //       (row) => !airline || label(row.AIRLINE_NAME) === airline,
 // //     )
 // //     return Response.json(pageOf(rows, Number(query.get('page') ?? 1), 50))
+// //   }
+// //
+// // The filter dropdowns, in `app/api/filter-options/route.ts`, from the same load:
+// //
+// //   import { optionsOf } from '@/lib/flight-data'
+// //   import { flights } from '@/lib/flights'
+// //
+// //   export async function GET() {
+// //     const rows = await flights()
+// //     return Response.json({
+// //       airlines: optionsOf(rows, 'AIRLINE_NAME'),
+// //       terminals: optionsOf(rows, 'TERMINAL'),
+// //     })
 // //   }
 //
 // type Held = { loadedAt: number; value: Promise<unknown> }

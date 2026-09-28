@@ -396,6 +396,16 @@ describe('filesToRead', () => {
     expect(filesToRead(files)).toEqual(files.slice(4))
   })
 
+  it('starts from the largest file, so a later oversized partial reload cannot hide the copy', () => {
+    const files = days([2 * MB, 100 * MB, 2 * MB, 40 * MB, 2 * MB, 1 * MB])
+    expect(filesToRead(files)).toEqual(files.slice(1))
+  })
+
+  it('starts from the newer of two equally large copies', () => {
+    const files = days([2 * MB, 100 * MB, 2 * MB, 100 * MB, 1 * MB])
+    expect(filesToRead(files)).toEqual(files.slice(3))
+  })
+
   it('reads every file when none is a complete copy', () => {
     const files = days([0.8 * MB, 1.1 * MB, 0.9 * MB, 1.2 * MB, 1 * MB])
     expect(filesToRead(files)).toEqual(files)
