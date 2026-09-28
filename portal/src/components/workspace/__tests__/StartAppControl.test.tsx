@@ -172,47 +172,6 @@ describe('a start the server refused says why, in its words', () => {
 })
 
 describe('★ no refusal opens a question — the 409s are sentences, not dialogs', () => {
-  /** The server's refusal, with whichever `isSharedView` the body carried. */
-  const refusal = (isSharedView: boolean) => {
-    const err = new ApiError('“Car pool apps” is open for a colleague right now.', 409, 'sandbox_reclaim_blocked')
-    Object.assign(err, {
-      details: { projectId: 'p-other', projectName: 'Car pool apps', dirty: true, isSharedView },
-    })
-    return err
-  }
-
-  it('★ a colleague`s shared view is stated in the server`s own words, with nothing to press', async () => {
-    // Pressing start cannot move a shared view — the server refuses it whatever the citizen
-    // answers — so a dialog offering to hand it over would be a question with no true answer.
-    api.relaunchPreview.mockRejectedValue(refusal(true))
-    const report = reportSpy()
-    const { container } = renderControl(START, report)
-    fireEvent.click(button())
-
-    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalled())
-    expect(report.onStartOutcome).toHaveBeenCalledWith({
-      kind: 'failed',
-      reason: '“Car pool apps” is open for a colleague right now.',
-    })
-    expect(container.querySelector('[role="dialog"]')).toBeNull()
-  })
-
-  it('★ and a refusal claiming it is NOT a shared view renders no dialog either', async () => {
-    // The switch means this citizen's own project can no longer refuse the call, so this body is
-    // the server contradicting itself. It is reported as an ordinary start failure; what must not
-    // happen is a question being put to somebody about a conflict that should not exist.
-    api.relaunchPreview.mockRejectedValue(refusal(false))
-    const report = reportSpy()
-    const { container } = renderControl(START, report)
-    fireEvent.click(button())
-
-    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalled())
-    expect((report.onStartOutcome as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
-      kind: 'failed',
-    })
-    expect(container.querySelector('[role="dialog"]')).toBeNull()
-  })
-
   it('your own running build keeps its own sentence, not the server`s wire words', async () => {
     // Different cause, different remedy — finish or stop that build.
     api.relaunchPreview.mockRejectedValue(new BuildSessionAlreadyActiveError('already'))
@@ -227,15 +186,18 @@ describe('★ no refusal opens a question — the 409s are sentences, not dialog
     })
   })
 
-  it('an uncoded 409 is an ordinary failure too', async () => {
+  it('an uncoded 409 is an ordinary failure too, with nothing to press beside it', async () => {
+    // No refusal on this path opens a question: the server takes the workspace for whichever
+    // project was asked for, so its own sentence is the whole answer.
     api.relaunchPreview.mockRejectedValue(new ApiError('conflict', 409))
     const report = reportSpy()
-    renderControl(START, report)
+    const { container } = renderControl(START, report)
     fireEvent.click(button())
 
     await waitFor(() =>
       expect(report.onStartOutcome).toHaveBeenCalledWith({ kind: 'failed', reason: 'conflict' }),
     )
+    expect(container.querySelector('[role="dialog"]')).toBeNull()
   })
 })
 

@@ -70,14 +70,10 @@ function nothingToBringBack(err: unknown): boolean {
  * IT NEVER THROWS. The caller that must re-say a failure where the citizen is standing reads it
  * off the result; the two callers that must not be interrupted by one simply ignore it.
  *
- * NO REFUSAL OPENS A QUESTION HERE, AND `sandbox_reclaim_blocked` IS NOT AN EXCEPTION. The server
- * takes the one workspace for whichever project was asked for and tears the outgoing one down
- * behind it, so a citizen's own other project can no longer refuse this call. What still can is a
- * colleague's shared view sitting in the slot, and pressing start cannot move that — the server
- * refuses it whatever the citizen answers. So it lands where every other named refusal lands: the
- * server's own sentence, carried verbatim as a start failure with nothing to press. A refusal
- * arriving with `isSharedView` false would be the server contradicting its own switch, which is a
- * fault to fix behind the wire rather than a state to draw a screen for.
+ * NO REFUSAL OPENS A QUESTION HERE. The server takes the one workspace for whichever project was
+ * asked for and puts away whatever held it — another project of the citizen's own or a
+ * colleague's shared view — so a refusal lands as the server's own sentence, carried verbatim as
+ * a start failure with nothing to press.
  */
 export async function startApp(sinks: StartSinks): Promise<StartResult> {
   const projectId = sinks.projectId

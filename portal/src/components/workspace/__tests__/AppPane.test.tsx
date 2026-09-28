@@ -840,11 +840,10 @@ describe('★ a taken slot opens no question', () => {
     state: 'asleep', restorable: true,
   }
 
-  /** The refusal `POST /relaunch` raises when a colleague's shared view holds the one workspace. */
-  const blocked = (over: Record<string, unknown> = {}) =>
-    new ApiError('“Car pool” is open for a colleague right now.', 409, 'sandbox_reclaim_blocked', {
-      projectId: 'pA', projectName: 'Car pool', dirty: true, building: false, isSharedView: true, ...over,
-    })
+  /** A refusal `POST /relaunch` can still raise — the server's own sentence, carried verbatim
+   *  with nothing to press beside it. */
+  const blocked = () =>
+    new ApiError('Your workspace could not be started right now. Please try again shortly.', 503)
 
   const dialog = () => screen.queryByRole('dialog')
   const launch = () => screen.getByRole('button', { name: /^Launch Application$/ })
@@ -873,9 +872,9 @@ describe('★ a taken slot opens no question', () => {
     }
   })
 
-  it('★ pressing it asks THIS project`s own start, and a shared-view refusal is only SAID', async () => {
-    // A colleague's shared view genuinely cannot be taken by pressing start — the server refuses
-    // it — so the server's sentence is the whole answer and there is nothing to decide.
+  it('★ pressing it asks THIS project`s own start, and a refusal is only SAID, never asked', async () => {
+    // No refusal on this path opens a question — the server takes the workspace for whichever
+    // project was asked for, so its own sentence is the whole answer.
     api.relaunchPreview.mockRejectedValueOnce(blocked())
     const report = reportFor(reading(HELD))
     renderPane((c) => c.workspace.set(report))
@@ -886,25 +885,9 @@ describe('★ a taken slot opens no question', () => {
     await waitFor(() =>
       expect(report.onStartOutcome).toHaveBeenCalledWith({
         kind: 'failed',
-        reason: '“Car pool” is open for a colleague right now.',
+        reason: 'Your workspace could not be started right now. Please try again shortly.',
       }),
     )
-    expect(dialog()).toBeNull()
-  })
-
-  it('★ and a refusal claiming it is NOT a shared view opens no dialog either', async () => {
-    // After the switch this body is the server contradicting itself. It is reported as an ordinary
-    // start failure; what must never happen is a question being put to somebody about it.
-    api.relaunchPreview.mockRejectedValueOnce(blocked({ isSharedView: false }))
-    const report = reportFor(reading(HELD))
-    renderPane((c) => c.workspace.set(report))
-
-    fireEvent.click(launch())
-
-    await waitFor(() => expect(report.onStartOutcome).toHaveBeenCalled())
-    expect((report.onStartOutcome as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
-      kind: 'failed',
-    })
     expect(dialog()).toBeNull()
   })
 

@@ -51,11 +51,10 @@ interface Props {
 }
 
 /**
- * FOUR SITUATIONS, NOT TWO. A BUILDING project has an agent writing: no settled tree, both
- * Save and Release refused until it stops, and work-in-progress is given up. The idle case
- * splits three ways on the tri-state — `true` offers Save ("has unsaved changes"), `false`
- * is a clean stop with no Save button, `null` says "may have". Every arm leads with the app
- * being STARTED (not the one being left) and NAMES the project whose changes are lost — the
+ * TWO SITUATIONS. A BUILDING project has an agent writing: no settled tree, both Save and
+ * Release refused until it stops, and work-in-progress is given up. Otherwise its tree was not
+ * questioned, so the copy says it "may have" unsaved changes and offers Save. Both lead with the
+ * app being STARTED (not the one being left) and NAME the project whose changes are lost — the
  * other project is STOPPED, not moved, and no sentence here may imply otherwise.
  */
 function copyFor(
@@ -64,14 +63,11 @@ function copyFor(
 ): {
   title: string
   body: string
-  /** `null` when there is nothing to save — the clean arm offers no Save button at all. */
-  save: string | null
+  save: string
   discard: string
   /**
    * WHAT IS HAPPENING IN THERE RIGHT NOW, said BEFORE the citizen chooses. A separate sentence
-   * rather than a fourth arm, because `agentWorking` is orthogonal to all three: a workspace can
-   * be clean AND busy, and the clean arm's reassurance stays true while an assistant is answering
-   * a question in it.
+   * rather than a third arm, because an assistant answering a question is not a build.
    *
    * `null` on the `building` arm: that copy already says the build is running and has to stop.
    */
@@ -100,22 +96,9 @@ function copyFor(
     }
   }
 
-  if (blocked.dirty === false) {
-    // A CLEAN STOP. No unsaved-work claim, and no Save button — offering to save work that does
-    // not exist is how a person learns the dialog does not know what it is talking about.
-    return {
-      title: `Start ${starting}?`,
-      body: `${oneAtATime} ${incumbent} will stop so ${starting} can run. Everything saved in ${incumbent} stays exactly as it is, and starting it again later brings it back.`,
-      save: null,
-      discard: `Stop ${incumbent}`,
-      working,
-    }
-  }
-
-  const unsaved = blocked.dirty === true ? 'has changes that are not saved yet' : 'may have changes that are not saved yet'
   return {
     title: `Start ${starting}?`,
-    body: `${oneAtATime} ${incumbent} will stop so ${starting} can run, and it ${unsaved}. Save it first and it comes back exactly as you left it; stop without saving and those changes go.`,
+    body: `${oneAtATime} ${incumbent} will stop so ${starting} can run, and it may have changes that are not saved yet. Save it first and it comes back exactly as you left it; stop without saving and those changes go.`,
     save: `Save ${incumbent} and stop it`,
     discard: `Stop ${incumbent} without saving`,
     working,

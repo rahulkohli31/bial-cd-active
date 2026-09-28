@@ -4,6 +4,8 @@ import {
   BuildSessionAlreadyActiveError,
   asReclaimBlocked,
   releaseProject,
+  launchSharedPreview,
+  refreshSharedPreview,
   fetchPreviewState,
   fetchSaveState,
   sameSaveState,
@@ -136,16 +138,14 @@ describe('buildSessionApi — lock ops + fail-closed errors', () => {
 
 describe('asReclaimBlocked', () => {
   it('reads the occupying project off the 409', () => {
-    const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'Lost & Found', dirty: true } }
+    const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'Lost & Found' } }
     expect(asReclaimBlocked(err)).toEqual({
       projectId: 'p-a',
       projectName: 'Lost & Found',
-      dirty: true,
       building: false,
       // ABSENT READS AS FALSE — an older backend with no such field has no agent to report,
       // and defaulting true would tell every citizen their other project is busy.
       agentWorking: false,
-      isSharedView: false,
     })
   })
 
@@ -155,33 +155,11 @@ describe('asReclaimBlocked', () => {
     // wide fact the dialog needs for a different sentence.
     const err = {
       code: 'sandbox_reclaim_blocked',
-      details: { projectId: 'p-a', projectName: 'A', dirty: false, building: false, agentWorking: true },
+      details: { projectId: 'p-a', projectName: 'A', building: false, agentWorking: true },
     }
     const blocked = asReclaimBlocked(err)
     expect(blocked?.agentWorking).toBe(true)
     expect(blocked?.building).toBe(false)
-    expect(blocked?.dirty).toBe(false)
-  })
-
-  it('keeps dirty TRI-STATE — a non-boolean is unknown, never clean', () => {
-    const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'A', dirty: null } }
-    expect(asReclaimBlocked(err)?.dirty).toBeNull()
-  })
-
-  it('★ carries `isSharedView` — the client\'s one signal to skip stopActiveBuild/release', () => {
-    // A colleague's shared view names its OWNER in `projectId`/`projectName`, which the
-    // recipient never owns — `stopActiveBuild`/`release` would 404 them on that id.
-    // `isSharedView` is what routes the client to `giveUpSharedView` instead.
-    const err = {
-      code: 'sandbox_reclaim_blocked',
-      details: { projectId: 'owner-p', projectName: 'Owner App', dirty: false, isSharedView: true },
-    }
-    expect(asReclaimBlocked(err)?.isSharedView).toBe(true)
-  })
-
-  it('isSharedView absent reads as false — an older backend never produced a shared occupant', () => {
-    const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'A', dirty: false } }
-    expect(asReclaimBlocked(err)?.isSharedView).toBe(false)
   })
 
   it('ignores the OTHER 409 — a running build has no remedy the user can act on', () => {
@@ -192,10 +170,10 @@ describe('asReclaimBlocked', () => {
   })
 
   it('is STRUCTURAL, so it works on both error types the refusal arrives as', () => {
-    // ApiError from relaunchPreview, TurnStartError from startTurn — same {code, details}.
+    // ApiError from launchSharedPreview, TurnStartError from startTurn — same {code, details}.
     class TurnStartErrorLike extends Error {
       code = 'sandbox_reclaim_blocked'
-      details = { projectId: 'p-b', projectName: 'Roster', dirty: false }
+      details = { projectId: 'p-b', projectName: 'Roster' }
     }
     expect(asReclaimBlocked(new TurnStartErrorLike())?.projectId).toBe('p-b')
   })
@@ -209,86 +187,72 @@ describe('asReclaimBlocked', () => {
   // END TO END: the tests above hand-build `{code, details}` and would still pass if `postJson`
   // stopped carrying `details` at all — the exact regression that shipped once (the relaunch
   // button showed the raw error text instead of the dialog). This drives the real 409 through
-  // the real client. The body is `reclaim_blocked_response`'s output verbatim (`live_build.py`),
-  // a flat `error` object, NOT a nested `details` key — if the backend reshapes it, this goes
-  // red on the same commit.
+  // the real client, on the one call that can still receive it — the shared-view Launch/Refresh
+  // refused by the caller's own running project. The body is `reclaim_blocked_response`'s output
+  // verbatim (`live_build.py`), a flat `error` object, NOT a nested `details` key — if the
+  // backend reshapes it, this goes red on the same commit.
   const WIRE_409 = {
     error: {
-      message: '“Lost & Found” is still open and has changes that are not saved yet.',
+      message: '“Lost & Found” is still open and may have changes that are not saved yet.',
       code: 'sandbox_reclaim_blocked',
       projectId: 'p-a',
       projectName: 'Lost & Found',
-      dirty: true,
     },
   }
 
-  it('survives the round trip through postJson: relaunchPreview 409 → ReclaimBlocked', async () => {
+  it('survives the round trip through postJson: launchSharedPreview 409 → ReclaimBlocked', async () => {
     const fetchImpl = jsonFetch(409, WIRE_409)
-    const err = await relaunchPreview({ projectId: 'p-b' }, { fetchImpl }).catch((e: unknown) => e)
+    const err = await launchSharedPreview('p-b', { fetchImpl }).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(ApiError)
     expect(asReclaimBlocked(err)).toEqual({
       projectId: 'p-a',
       projectName: 'Lost & Found',
-      dirty: true,
       building: false,
       agentWorking: false,
-      isSharedView: false,
     })
   })
 
-  it('survives the round trip through postJson: releaseProject 409', async () => {
-    // The release route can 409 too — a build genuinely running for this user — and the same
-    // envelope has to reach the dialog rather than the raw message.
+  it('survives the round trip through postJson: refreshSharedPreview 409', async () => {
+    // Refresh takes the same slot as Launch, so the caller's own running project blocks it the
+    // identical way.
     const fetchImpl = jsonFetch(409, WIRE_409)
-    const err = await releaseProject('p-b', { fetchImpl }).catch((e: unknown) => e)
+    const err = await refreshSharedPreview('p-b', { fetchImpl }).catch((e: unknown) => e)
     expect(asReclaimBlocked(err)?.projectName).toBe('Lost & Found')
-  })
-
-  it('carries dirty=null through the wire as unknown, not clean', async () => {
-    const fetchImpl = jsonFetch(409, {
-      error: { ...WIRE_409.error, dirty: null, message: '“A” is still open and may have changes that are not saved yet.' },
-    })
-    const err = await relaunchPreview({ projectId: 'p-b' }, { fetchImpl }).catch((e: unknown) => e)
-    expect(asReclaimBlocked(err)?.dirty).toBeNull()
   })
 })
 
 describe('asReclaimBlocked — a project that is still being built', () => {
   it('carries `building` off the wire, so the client can offer Stop instead of Save', async () => {
-    // The refusal a mid-build switch produces. `dirty` is null and that is NOT "could not
-    // tell": the server deliberately does not probe a tree the agent is writing to.
+    // The refusal a mid-build launch produces.
     const fetchImpl = jsonFetch(409, {
       error: {
         message: '“Lost & Found” is still being built.',
         code: 'sandbox_reclaim_blocked',
         projectId: 'p-a',
         projectName: 'Lost & Found',
-        dirty: null,
         building: true,
       },
     })
-    const err = await relaunchPreview({ projectId: 'p-b' }, { fetchImpl }).catch((e: unknown) => e)
+    const err = await launchSharedPreview('p-b', { fetchImpl }).catch((e: unknown) => e)
     expect(asReclaimBlocked(err)).toEqual({
       projectId: 'p-a',
       projectName: 'Lost & Found',
-      dirty: null,
       building: true,
       agentWorking: false,
-      isSharedView: false,
     })
   })
 
   it('defaults `building` to FALSE when absent, never true', () => {
     // Erring the other way would show the stop-the-build dialog for a project nobody is
     // building — offering to kill work that does not exist.
-    const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'A', dirty: true } }
+    const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'A' } }
     expect(asReclaimBlocked(err)?.building).toBe(false)
   })
 
   it('treats a non-boolean `building` as false rather than truthy', () => {
     const err = {
       code: 'sandbox_reclaim_blocked',
-      details: { projectId: 'p-a', projectName: 'A', dirty: true, building: 'yes' },
+      details: { projectId: 'p-a', projectName: 'A', building: 'yes' },
     }
     expect(asReclaimBlocked(err)?.building).toBe(false)
   })
@@ -312,16 +276,11 @@ function fastClock() {
 }
 
 describe('handOverWorkspace — the stop → save → release ordering', () => {
-  // An ORDINARY (non-shared) occupant — `handOverWorkspace` now takes the whole
-  // `ReclaimBlocked` rather than a bare project id, so every call below hands it this instead
-  // of the string `'p-1'` it used to pass directly.
   const BLOCKED_P1: ReclaimBlocked = {
     projectId: 'p-1',
     projectName: 'P1',
-    dirty: false,
     building: false,
     agentWorking: false,
-    isSharedView: false,
   }
 
   function recordingFetch(stopState = 'stopped') {
@@ -568,60 +527,14 @@ describe('handOverWorkspace — the stop → save → release ordering', () => {
   it('carries a reclaim refusal out to the caller rather than swallowing it', async () => {
     const fetchImpl = jsonFetch(409, {
       error: {
-        message: '“Lost & Found” is still open and has changes that are not saved yet.',
+        message: '“Lost & Found” is still open and may have changes that are not saved yet.',
         code: 'sandbox_reclaim_blocked',
         projectId: 'p-a',
         projectName: 'Lost & Found',
-        dirty: true,
       },
     })
     const err = await handOverWorkspace(BLOCKED_P1, false, { fetchImpl }).catch((e: unknown) => e)
     expect(asReclaimBlocked(err)?.projectName).toBe('Lost & Found')
-  })
-
-  it('★ a SHARED occupant never touches stopActiveBuild/save/release — it goes through giveUpSharedView instead', async () => {
-    // The regression this pins: `blocked.projectId` on a shared occupant names its OWNER, who
-    // the caller never owns, so `stopActiveBuild`'s `owned_project_or_404` would 404 every one
-    // of the four surfaces that used to call this with `blocked.projectId` alone.
-    const seen: string[] = []
-    const fetchImpl = vi.fn<FetchImpl>(async (url: string) => {
-      seen.push(new URL(url, 'http://x').pathname)
-      return res(200, { released: true })
-    })
-    const sharedBlocked: ReclaimBlocked = {
-      projectId: 'owner-project-id',
-      projectName: 'Owner App',
-      dirty: false,
-      building: false,
-      agentWorking: false,
-      isSharedView: true,
-    }
-
-    await handOverWorkspace(sharedBlocked, false, { fetchImpl })
-
-    expect(seen).toEqual(['/api/build-sessions/shared-view/release'])
-    expect(seen.some((p) => p.includes('owner-project-id'))).toBe(false)
-  })
-
-  it('★ save is accepted but ignored for a shared occupant — there is nothing of theirs to save', async () => {
-    const seen: string[] = []
-    const fetchImpl = vi.fn<FetchImpl>(async (url: string) => {
-      seen.push(new URL(url, 'http://x').pathname)
-      return res(200, { released: true })
-    })
-    const sharedBlocked: ReclaimBlocked = {
-      projectId: 'owner-project-id',
-      projectName: 'Owner App',
-      dirty: false,
-      building: false,
-      agentWorking: false,
-      isSharedView: true,
-    }
-
-    await handOverWorkspace(sharedBlocked, true, { fetchImpl }) // save=true
-
-    expect(seen).toEqual(['/api/build-sessions/shared-view/release'])
-    expect(seen.some((p) => p.endsWith('/save'))).toBe(false)
   })
 })
 

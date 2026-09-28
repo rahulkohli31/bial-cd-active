@@ -98,10 +98,7 @@ async function postJson(url: string, body: unknown, fallback: string, deps: Auth
     if (res.status === 409 && code === 'build_session_already_active') {
       throw new BuildSessionAlreadyActiveError(message)
     }
-    // CARRY THE WHOLE ERROR OBJECT. This built its own ApiError and dropped everything but
-    // the message and code, so `sandbox_reclaim_blocked` arrived with no projectId — and
-    // `asReclaimBlocked` returned null, so Relaunch rendered the refusal as red text in the
-    // preview pane instead of the dialog that offers to save the other project.
+    // CARRY THE WHOLE ERROR OBJECT: `asReclaimBlocked` reads the occupying project off it.
     const details = isRecord(errBody) && isRecord(errBody.error) ? errBody.error : null
     throw new ApiError(message, res.status, code, details)
   }
@@ -223,12 +220,9 @@ function toSharedPreviewResponse(value: unknown): SharedPreviewResponse {
  * SAVED snapshot.
  *
  * IT DOES TAKE THE CALLER'S OWN ONE-PER-USER SLOT — the same slot a build occupies — via the
- * identical `_holding_user_lock` skeleton `relaunchPreview` runs under. A prior docstring here
- * said the opposite ("registers no build session... nothing here occupies the caller's own
- * slot"), which was true of the build-SESSION bookkeeping and false of the thing that actually
- * matters to a caller: whether pressing this can conflict with something else. It can — a
- * `409 sandbox_reclaim_blocked` here means exactly what it means on a relaunch, and the caller
- * has to handle it the same way (see `asReclaimBlocked` / `ReclaimBlocked.isSharedView`).
+ * identical `_holding_user_lock` skeleton `relaunchPreview` runs under, so it can conflict: a
+ * `409 sandbox_reclaim_blocked` here means one of the caller's own projects has a turn running
+ * in that slot (see `asReclaimBlocked`).
  *
  * NOT "READ-ONLY" EITHER, for the same reason the product copy already gets
  * right: the recipient can create, update and delete the owner's records through the app's own
@@ -431,21 +425,7 @@ export async function awaitStopSettled(
 /** Hand the workspace over: STOP, then optionally SAVE, then RELEASE — what the refusal
  *  dialog's buttons do to the server, in the one order that works.
  *
- *  TAKES THE WHOLE `ReclaimBlocked`, NOT A BARE PROJECT ID (#198) — the one thing that makes
- *  the branch below impossible to drop at a call site again. Four surfaces (`StartAppControl`,
- *  `ProjectWorkspace`, `ConversationSurface`, and this page itself) each used to call this with
- *  `blocked.projectId` alone, and none of them learned that a shared occupant's `projectId`
- *  names its OWNER, never the caller — so `stopActiveBuild`'s `owned_project_or_404` 404'd
- *  every one of them. Passing the whole object means the discriminant travels with the id it
- *  qualifies, in one place, rather than needing to be re-remembered at every call site.
- *
- *  A SHARED OCCUPANT NEVER REACHES `stopActiveBuild`/`saveProject`/`releaseProject` AT ALL —
- *  none of the three would even resolve the right project for it. `giveUpSharedView` is the
- *  entire remedy: no id, no ownership check, reaping under the caller's own registry key.
- *  `save` is accepted but ignored on this arm — a shared view's `dirty` is always `false`, so
- *  `ReclaimWorkspaceDialog`'s own `copyFor` never even renders a Save button for it.
- *
- *  THE ORDER ON THE ORDINARY ARM IS THE DESIGN: save and release BOTH refuse while an agent is
+ *  THE ORDER IS THE DESIGN: save and release BOTH refuse while an agent is
  *  writing, so saving first would simply fail (or, past that guard, bundle a tree caught
  *  mid-edit) — stopping settles the turn first, and only then is there a coherent tree to save.
  *
@@ -467,16 +447,6 @@ export async function handOverWorkspace(
   narrate: (step: HandoverStep) => void = () => {},
   clock: StopWaitClock = REAL_CLOCK,
 ): Promise<void> {
-  if (blocked.isSharedView) {
-    // NARRATE AFTER, NOT BEFORE. A caller that reads its OWN narration callback as a record of
-    // how far the hand-over got (`SharedProjectPage.tsx`, which infers "was anything stopped?"
-    // from the last step it observed) must see NO step at all when this throws — nothing here
-    // ever stops anything, on either outcome, so a step recorded before the call would make a
-    // rejection look exactly like a successful stop of the OWNER's app.
-    await giveUpSharedView(deps)
-    narrate('releasing')
-    return
-  }
   const projectId = blocked.projectId
   narrate('stopping')
   const asked = await stopActiveBuild(projectId, deps)
@@ -517,18 +487,10 @@ export type HandoverStep = 'stopping' | 'saving' | 'releasing' | 'starting'
 export interface ReclaimBlocked {
   projectId: string
   projectName: string
-  /** TRI-STATE like `SaveState.dirty`: `true` = known unsaved work, `null` = the server reached
-   *  the workspace but could not ask it. Both block; only the copy differs, because promising
-   *  "nothing to lose" when nobody could check is the one wrong answer available here.
-   *  Always `null` when `building` — see below. */
-  dirty: boolean | null
   /** An agent is WRITING in that project right now, so this is a different choice with a
-   *  different cost: resolving it stops work in progress, not just a container.
-   *
-   *  `dirty` is null here because the server deliberately did not ask — a `git status` taken
-   *  mid-write describes an instant nobody cares about — so the dialog must not say "unsaved
-   *  changes". And Save/Release both refuse until the build stops, which is why this variant
-   *  runs `stopActiveBuild` first instead of offering them directly. */
+   *  different cost: resolving it stops work in progress, not just a container. Save/Release
+   *  both refuse until the build stops, which is why this variant runs `stopActiveBuild` first
+   *  instead of offering them directly. */
   building: boolean
   /**
    * AN AGENT IS MID-TURN IN THERE, OF ANY KIND — deliberately wider than `building`, and a
@@ -542,17 +504,6 @@ export interface ReclaimBlocked {
    * defaulting the other way would falsely mark every citizen's other project busy.
    */
   agentWorking: boolean
-  /**
-   * WHICH REMEDY ACTUALLY WORKS (#198). `projectId`/`projectName` above name a project the
-   * CALLER OWNS when this is an ordinary build occupant — `stopActiveBuild`/`release` both
-   * gate on `owned_project_or_404`, which that caller satisfies. When `isSharedView` is true,
-   * the occupant is a colleague's shared view and `projectId` names its OWNER instead, whom a
-   * recipient never owns — those same two routes would 404 them out of their own slot. Route
-   * to `giveUpSharedView` instead, which needs no project id at all.
-   *
-   * Absent reads as false: an older backend that omits it never produced a shared occupant.
-   */
-  isSharedView: boolean
 }
 
 /** Narrow a thrown error to the refusal, or `null` for anything else.
@@ -573,33 +524,12 @@ export function asReclaimBlocked(err: unknown): ReclaimBlocked | null {
   return {
     projectId: d.projectId,
     projectName: d.projectName,
-    dirty: typeof d.dirty === 'boolean' ? d.dirty : null,
     // Absent reads as false — an older backend that does not send the field cannot have a
     // build to report, and defaulting the other way would show the stop dialog for a project
     // nobody is building.
     building: d.building === true,
     agentWorking: d.agentWorking === true,
-    isSharedView: d.isSharedView === true,
   }
-}
-
-/**
- * Give up whatever colleague's shared view currently holds the caller's OWN slot (#198,
- * requirement 24's self-service exit). No `project_id`, because a `ReclaimBlocked` naming a
- * shared occupant carries its OWNER's project — never the recipient's — so neither
- * `stopActiveBuild` nor `release` can be reached with an id that passes `owned_project_or_404`;
- * this is the one door a recipient can always use, regardless of whether they have ever built
- * anything of their own. `released: false` is a success — nothing was there to give up, or what
- * was there was the caller's own build sandbox instead (not this function's job).
- */
-export async function giveUpSharedView(deps: AuthFetchDeps = {}): Promise<boolean> {
-  const body = await postJson(
-    `${BASE}/shared-view/release`,
-    undefined,
-    'Could not close that shared app',
-    deps,
-  )
-  return isRecord(body) && body.released === true
 }
 
 /** What is (or is not) serving a project's preview right now.

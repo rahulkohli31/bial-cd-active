@@ -16,8 +16,8 @@ export class ApiError extends Error {
   readonly status: number
   readonly code: string | null
   /** The whole `error` object the backend sent, for the codes that carry more than a message.
-   *  `sandbox_reclaim_blocked` is the first: its `projectId`/`projectName`/`dirty` are what let
-   *  the client name the project holding the workspace and offer to save it. Reading them off
+   *  `sandbox_reclaim_blocked` is the first: its `projectId`/`projectName` are what let the
+   *  client name the project holding the workspace and offer to save it. Reading them off
    *  the error keeps the branch in one place instead of re-fetching the body at each call
    *  site. `null` when the response carried no structured error. */
   readonly details: Record<string, unknown> | null

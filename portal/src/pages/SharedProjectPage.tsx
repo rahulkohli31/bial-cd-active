@@ -55,13 +55,11 @@ export default function SharedProjectPage(): React.JSX.Element {
   // treats a change to as "this is a new element", forcing a real remount.
   const [frameNonce, setFrameNonce] = useState(0)
 
-  // THE HAND-OVER PROMPT (requirement 24, its frontend half). `launchSharedPreview`/
-  // `refreshSharedPreview` DO take the caller's own one-per-user slot — see their own
-  // corrected docstrings — so either can 409 `sandbox_reclaim_blocked` exactly as a relaunch
-  // can, and it must reach a citizen sitting on this standalone route the same way it reaches
-  // one inside the workspace shell. `pendingAction` remembers WHICH call to retry once the
-  // slot is freed — Launch and Refresh both funnel through here, and the dialog itself does
-  // not know or care which one asked.
+  // THE HAND-OVER PROMPT. `launchSharedPreview`/`refreshSharedPreview` take the caller's own
+  // one-per-user slot, so either can 409 `sandbox_reclaim_blocked` while one of the caller's own
+  // projects has a turn running. `pendingAction` remembers WHICH call to retry once the slot is
+  // freed — Launch and Refresh both funnel through here, and the dialog itself does not know or
+  // care which one asked.
   const [blocked, setBlocked] = useState<ReclaimBlocked | null>(null)
   const [pendingAction, setPendingAction] = useState<'launch' | 'refresh' | null>(null)
   const [step, setStep] = useState<HandoverStep | null>(null)
@@ -180,12 +178,6 @@ export default function SharedProjectPage(): React.JSX.Element {
     else launch()
   }, [pendingAction, onRefresh, launch])
 
-  // `handOverWorkspace` branches on `blocked.isSharedView` ITSELF now (taking the whole
-  // `ReclaimBlocked` rather than a bare project id) — the ONE place that decision is made,
-  // so no call site can call `stopActiveBuild`/`release` against a shared occupant's OWNER
-  // id again by forgetting to check the flag. A shared occupant's `dirty` is always `false`,
-  // so `ReclaimWorkspaceDialog`'s own `copyFor` never renders a Save button for it — `save`
-  // is accepted for symmetry with the dialog's two-button contract and is unreachable there.
   const resolveBlocked = useCallback(
     async (save: boolean): Promise<void> => {
       if (blocked === null) return
