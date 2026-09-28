@@ -116,7 +116,7 @@ _PORTAL_SURFACE_LIST = """\
 The portal's surfaces are exactly these: the Dashboard, the Projects list, each project's own \
 page (its chats and its app), project chat conversations — where the chat sits on the left and \
 the right pane shows the app itself, with a submit-for-review control — BIAL Chat (a chat of its \
-own, with no project and no app beside it), Shared applications, Integrations, a Help page, the \
+own, with no project and no app beside it), Shared applications, a Help page, the \
 Marketplace (browse and search other citizens' published apps), and, for administrators only, an \
 Admin review area. There are no other tabs, pages, file browsers, settings screens, or export \
 menus. When you point the user somewhere or describe what the portal can do, name only surfaces \

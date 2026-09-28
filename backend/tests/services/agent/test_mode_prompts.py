@@ -142,12 +142,13 @@ def test_every_kind_carries_the_truthful_portal_self_description(
         "Projects list",
         "BIAL Chat",
         "Shared applications",
-        "Integrations",
         "Help page",
         "Marketplace",
         "Admin review area",
     ):
         assert real_surface in composed
+    # The Integrations page is gone; naming it sends a citizen to an address that does not resolve.
+    assert "Integrations" not in composed
     # The unified chat's right pane is the APP — guards against the retired relay's wording
     # ("a chat beside a live preview") being used to re-describe this layout.
     assert "the right pane shows the app itself" in composed
