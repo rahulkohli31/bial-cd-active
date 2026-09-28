@@ -225,6 +225,19 @@ _RECONCILE_A_MOVED_LOCKFILE: Final = (
 )
 _REMOVE_THE_PUSHED_BUNDLE: Final = f"rm -f /tmp/bial-app.bundle {_BUNDLE_B64_NAME}"
 
+# A restore checks the saved commit out over the image's template, and a checkout only writes what
+# the commit holds: a template file the app deleted stays on disk, serves in the app's place, and
+# the next save commits it back. So an untracked file goes if the app's own history ever held it.
+# One the app never had is the image's, and stays. Skipped without an exclude file, where the baked
+# `node_modules` would read as untracked too. A name git has to quote matches no history and stays.
+_REMOVE_WHAT_THE_APP_DELETED: Final = (
+    'if excludes=$(git config --path --get core.excludesFile) && [ -f "$excludes" ]; then '
+    "git -c core.quotePath=false ls-files --others --exclude-standard | "
+    "while IFS= read -r f; do "
+    'if [ -n "$(git log -1 --format=%h HEAD -- ":(literal)$f")" ]; then rm -f -- "$f"; fi; '
+    "done; fi; "
+)
+
 _RESTORE_SCRIPT: Final = (
     "set -e; "
     + _UNPACK_THE_PUSHED_BUNDLE
@@ -232,6 +245,7 @@ _RESTORE_SCRIPT: Final = (
     + "git init -q 2>/dev/null || true; "
     "git fetch -q /tmp/bial-app.bundle HEAD; "
     "git checkout -q -f FETCH_HEAD; "
+    + _REMOVE_WHAT_THE_APP_DELETED
     + _FINGERPRINT_THE_WANTED_LOCKFILE
     + _RECONCILE_A_MOVED_LOCKFILE
     + _REMOVE_THE_PUSHED_BUNDLE
