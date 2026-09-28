@@ -4,6 +4,66 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.6] - 2026-09-28
+
+Apps made before 26 August open again instead of waiting forever. A publish the airport's image
+registry turned away is no longer blamed on the app, and an approved app keeps its Try again.
+Flight-data apps read only the files and columns they need, so their pages load in seconds instead
+of timing out, and the assistant knows how to rework an older app that still reads everything. The
+admin screen's long tables scroll inside the page again, the assistant stops sending people to the
+Integrations page, and Build turns make one fewer model call. This release is also the first to put
+1.8.5's office sign-in fix into production.
+
+### Deploying this release
+
+- **BIAL must first reopen the image registry to Azure's build service.** Nothing, this release
+  included, can be built until it does.
+- **No migration and no settings change. The sandbox image is rebuilt:** it carries the new
+  flight-data sample. It can go out with the backend; apps already built keep their own copy of the
+  sample, and the backend's prompt is what reaches them.
+- **Order: backend and worker, then the relabel, then the portal.** The relabel (owner's approval
+  on the write; local operations tree: `relabel_firewall_refusals.sql`, steps 1-3 read, step 4
+  writes) gives today's refused approved apps their Try again back. The new portal reads a
+  `build_failed` row as "your app did not build, ask the assistant to fix it", so shipping it
+  before the relabel tells those owners to change a working app. Never run the relabel while the
+  registry is still closed.
+- **Carried over from 1.8.5, whose production images predate its sign-in fix:** sign-in changes but
+  nothing in Entra does. A sign-in that is halfway through while the backend restarts fails once,
+  and signing in again works. After the rollout, sign in once from the office network and once from
+  outside it.
+- **The autosave recovery already ran (28 Sep, 3 apps copied).** Nothing to run at deploy. Two of
+  the copied apps predate 26 August and open only once this release's old-app fix is live.
+
+### Fixed
+
+- **Apps made before 26 August open again.** Reopening restored the app's own old copy of the
+  platform's Next.js config, which serves the app at the wrong address, so its first page never
+  arrived. Only those apps now get the platform's config back on reopening, and that change alone
+  does not count as unsaved work. Apps made since then keep their config, and any settings of
+  their own, exactly as saved.
+- **A publish the registry refused is the platform's failure, not the app's.** It is retryable, an
+  approved app keeps its approved copy, and the owner reads "The platform could not build your app
+  just now — this is not a problem with your app". A publish whose build log cannot be read is
+  treated the same way. An app whose own build broke reads "Your app did not build…".
+- **Flight-data apps load in seconds instead of timing out.** The sample the assistant builds from
+  downloaded every lake file whole on each request: several gigabytes, minutes per request, and
+  most of the workspace's memory. It now reads the latest complete copy of the table and the files
+  after it, downloads only the columns a page uses, keeps each flight's latest row, loads once for
+  every request, and sends the browser pages and totals.
+- **Admin tables no longer give the page a second scrollbar** or a blank area past the end.
+- **The assistant no longer names an Integrations page**, which does not exist.
+
+### Changed
+
+- **The assistant knows the memory its app runs in.** When flight data is switched on, it is told
+  the workspace's and a published app's memory, the reading rules above, and that a slow, empty or
+  out-of-memory page is that limit. An older app built from the previous sample is reworked when
+  its owner asks.
+- **Build turns are no longer reminded to look at the app before finishing**, and the end-of-turn
+  check that packed the whole app only to write a log line is gone. A Build turn that edits code
+  is still checked by the platform; one that only answers a question is no longer nudged to look
+  first.
+
 ## [1.8.5] - 2026-09-28
 
 A colleague's shared app no longer locks its viewer out of their own work, a reopened app no
