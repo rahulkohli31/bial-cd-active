@@ -49,6 +49,8 @@ from src.services.agent.agent import ChatDeps, chat_agent, static_instruction_pa
 from src.services.agent.attachment_tools import READER_PATH
 from src.services.agent.mode_prompts import (
     _PLAN_SEGMENT,
+    _PUBLISHED_MEMORY,
+    _WORKSPACE_MEMORY,
     ATTACHED_CONTENT_IS_DATA,
     ATTACHMENT_RULES,
     PromptContext,
@@ -282,14 +284,25 @@ def test_the_stub_describes_nothing_about_the_data_itself() -> None:
     block does not describe; the careful formulation that is true of both costs a sentence and two
     asserted numbers to say something the agent gets for free the moment it calls the tool."""
     stub = _connected_data_stub((a_connected_system(),))
-    # NO DIGIT ANYWHERE. Every fact the deleted summary line carried was a number — a column
-    # count, a table row count, a date — so "the stub states no number" is the whole rule in one
-    # assertion, and it cannot be satisfied by rewording. The words "column" and "table" DO
-    # appear, describing what the tool's answer contains; that is the instruction, not a claim
-    # about the client's data.
-    assert not any(character.isdigit() for character in stub), stub
+    # NO DIGIT BUT THE TWO MEMORY SIZES, which describe the container, not the data. Every fact the
+    # deleted summary line carried was a number — a column count, a table row count, a date — so
+    # "the stub states no other number" is the whole rule in one assertion, and it cannot be
+    # satisfied by rewording. The words "column" and "table" DO appear, describing what the tool's
+    # answer contains; that is the instruction, not a claim about the client's data.
+    about_the_data = stub.replace(_WORKSPACE_MEMORY, "").replace(_PUBLISHED_MEMORY, "")
+    assert not any(character.isdigit() for character in about_the_data), stub
     for leaked in ("tb_flight", "AODB", "parquet", "lake"):
         assert leaked.lower() not in stub.lower(), f"the stub described the data: {leaked!r}"
+
+
+def test_the_stub_states_the_memory_the_app_runs_in() -> None:
+    """A connected store is far bigger than the container reading it; an agent that is not told so
+    writes a reader that loads the whole store on every request."""
+    stub = _connected_data_stub((a_connected_system(),))
+    assert "2Gi of memory, shared with the dev server" in stub
+    assert "a published app gets 1Gi" in stub
+    assert "one page of rows or totals, never the whole table" in stub
+    assert "slow, fails to load its data or runs out of memory" in stub
 
 
 async def test_the_stub_names_the_tool_that_is_actually_registered() -> None:
