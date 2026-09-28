@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.7] - 2026-09-28
+
+The applications list says "Starting up" while an app is being published and updates itself when
+the publish finishes, instead of showing "Draft" until the page is reloaded.
+
+### Deploying this release
+
+- **No migration, no settings change, no sandbox rebuild.** Only the backend and the portal change,
+  and they can go out in either order: an older portal ignores the new field, and a newer portal
+  in front of an older backend shows "Draft" during a publish exactly as today.
+
+### Fixed
+
+- **The applications list shows a publish while it runs.** A row read "Draft" while its app was
+  being published, and kept reading it until the page was reloaded, while the app's own page said
+  "Starting up". The row now says "Starting up" too, the list checks again every few seconds until
+  the publish finishes and then shows "Live", and "In review, in progress or deployed" counts an
+  app while its publish runs, until it is live. A live app getting a new version reads "Starting
+  up" while it comes up, as on its own page.
+
 ## [1.8.6] - 2026-09-28
 
 Apps made before 26 August open again instead of waiting forever. A publish the airport's image
