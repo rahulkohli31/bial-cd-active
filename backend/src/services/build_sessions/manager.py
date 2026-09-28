@@ -80,7 +80,6 @@ from src.services.build_sessions.integrity import (
     holds_unsaved_work,
     workspace_integrity,
 )
-from src.services.build_sessions.liveness import flag_liveness_overpromise
 from src.services.build_sessions.locks import (
     DeadlineWriter,
     FailedStart,
@@ -3515,13 +3514,7 @@ class SessionManager:
                 # `reap_lock` clears it.
                 _log.exception("lock release failed in pardon", session_id=str(session.session_id))
 
-    async def finish_turn_sandbox(
-        self,
-        session: BuildSession,
-        sandbox_client: SandboxClient,
-        *,
-        touched: bool,
-    ) -> None:
+    async def finish_turn_sandbox(self, session: BuildSession) -> None:
         """The end of a turn: free the slot and hand the container its lease. NO SAVE — the
         saved bundle reaches Blob only on the user's explicit click; auto-snapshotting here
         (once unconditional, then on any mutating turn) quietly took that decision away, since
@@ -3549,23 +3542,11 @@ class SessionManager:
 
         # STILL NO SAVE HERE.
         #
-        # 1b. The generation-time overpromise detector, while the container is still up. A
-        #     structlog signal only — never a gate — and it swallows its own failures. Gated
-        #     on the same flag: there is nothing new to flag about a tree this turn did not
-        #     write to.
-        if session.handle is not None and touched:
-            await flag_liveness_overpromise(
-                sandbox_client,
-                session.handle,
-                app_id=session.app_id,
-                session_id=session.session_id,
-            )
-
-        # 2/3. Pardon: grant the stay while the lock is STILL HELD, then release. The order
-        #      is load-bearing (see `_pardon_the_container`) — releasing first opens a window
-        #      where a concurrent sweep sees lock-gone with no lease yet and executes the
-        #      container we just spared. The registry entry stays: it is the sweep's only map
-        #      to the container, and deleting it would orphan a live sandbox.
+        # Pardon: grant the stay while the lock is STILL HELD, then release. The order is
+        # load-bearing (see `_pardon_the_container`) — releasing first opens a window where a
+        # concurrent sweep sees lock-gone with no lease yet and executes the container we just
+        # spared. The registry entry stays: it is the sweep's only map to the container, and
+        # deleting it would orphan a live sandbox.
         try:
             await self._pardon_the_container(redis, session)
         finally:

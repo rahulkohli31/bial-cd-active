@@ -75,12 +75,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_TOKEN_REF,
     start_failure_key,
 )
-from src.services.sandbox import (
-    ExecResult,
-    SandboxClient,
-    SandboxError,
-    SandboxHandle,
-)
+from src.services.sandbox import SandboxError, SandboxHandle
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import (
     StorageAuthError,
@@ -119,15 +114,12 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-async def _end_the_turn(
-    manager: SessionManager, session: BuildSession, client: SandboxClient
-) -> None:
+async def _end_the_turn(manager: SessionManager, session: BuildSession) -> None:
     """End the session the one way production ends one: the turn that held it finishing.
 
-    `touched=True` is the write-turn arm — the recovery copy runs and the container earns the
-    full stay — which is what every caller below is about. It writes NO saved bundle: that is
-    the citizen's own Save, so a test that needs one restored takes that step explicitly."""
-    await manager.finish_turn_sandbox(session, client, touched=True)
+    It writes NO saved bundle: that is the citizen's own Save, so a test that needs one restored
+    takes that step explicitly."""
+    await manager.finish_turn_sandbox(session)
 
 
 async def _mk(db: AsyncSession, email: str) -> tuple[User, uuid.UUID]:
@@ -154,30 +146,6 @@ async def _seed_live_sandbox_state(redis: aioredis.Redis, user_id: uuid.UUID) ->
     )
     await redis.set(lock_key(user_id), "another-processes-token", ex=900)
     await write_heartbeat(redis, user_id)
-
-
-async def test_the_turns_end_runs_the_liveness_detector_while_the_container_is_up(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    # The idle detector hooks the end of a turn: its workspace collect must run there, while
-    # the workspace still exists to scan.
-    user, project_id = await _mk(db_session, "m40@rvaiglobal.com")
-    manager = SessionManager()
-    client = FakeSandboxClient()
-    cmds: list[list[str]] = []
-
-    def record(cmd: list[str]) -> ExecResult:
-        cmds.append(cmd)
-        return ExecResult(stdout="", stderr="", exit=0)
-
-    client.exec_handler = record
-    session = await manager.ensure_sandbox(
-        db_session, user, project_id, sandbox_client=client, may_write=True
-    )
-    await _end_the_turn(manager, session, client)
-
-    # The collect script (find over *.tsx/*.jsx/…) ran through the sandbox exec seam.
-    assert any("*.tsx" in part for cmd in cmds for part in cmd)
 
 
 # The one-per-user rehydrate resolution (`_resolve_sandbox`): through `ensure_sandbox` on a
@@ -469,7 +437,7 @@ async def test_clean_end_then_start_restores_from_snapshot_not_fresh(
     # Clean end: container pardoned, lock released. Then the citizen's Save, which is what
     # puts a bundle in the saved slot at all — it attaches through the registry, so the fake
     # needs a container to answer with, and it stops answering once the pardon has lapsed.
-    await _end_the_turn(manager, first, client)
+    await _end_the_turn(manager, first)
     client.attach_handle = first.handle
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
     client.attach_handle = None
@@ -789,7 +757,7 @@ async def test_start_with_object_storage_unconfigured_provisions_fresh_instead_o
     assert client.provisioned == [app_name_for(session.app_id)]  # started, and started fresh
     assert no_sleep == []  # never retried what is a permanent config fact, not a blip
     # ...and the turn still ends cleanly with no store: the recovery copy is a no-op here.
-    await _end_the_turn(manager, session, client)
+    await _end_the_turn(manager, session)
     assert manager.active_session_for(user.id) is None
     assert session.turn_finish is not None and session.turn_finish.is_set()
 
@@ -809,7 +777,7 @@ async def test_an_ended_session_leaves_the_map(
     )
     assert session.session_id in manager._sessions  # noqa: SLF001
 
-    await _end_the_turn(manager, session, client)
+    await _end_the_turn(manager, session)
 
     assert session.session_id not in manager._sessions  # noqa: SLF001
     assert manager.active_session_for(user.id) is None
@@ -819,15 +787,17 @@ async def test_an_ended_session_leaves_the_map(
 
 
 def _a_gated_closing_step(
-    entered: asyncio.Event, gate: asyncio.Event
-) -> Callable[..., Awaitable[None]]:
+    manager: SessionManager, entered: asyncio.Event, gate: asyncio.Event
+) -> Callable[[aioredis.Redis, BuildSession], Awaitable[None]]:
     """Hold `finish_turn_sandbox` open inside its closing work — the turn is over, its terminal
     is written, and the one-per-user slot is still held. That is the window a citizen's next
-    message lands in, and a container round trip is what makes it long enough to matter."""
+    message lands in. The real pardon runs once the gate opens, so the container keeps its stay."""
+    pardon = manager._pardon_the_container
 
-    async def gated(*_args: object, **_kwargs: object) -> None:
+    async def gated(redis: aioredis.Redis, session: BuildSession) -> None:
         entered.set()
         await gate.wait()
+        await pardon(redis, session)
 
     return gated
 
@@ -854,12 +824,12 @@ async def test_a_message_sent_while_a_turn_is_still_letting_go_waits_instead_of_
 
     entered, gate = asyncio.Event(), asyncio.Event()
     monkeypatch.setattr(
-        manager_module, "flag_liveness_overpromise", _a_gated_closing_step(entered, gate)
+        manager, "_pardon_the_container", _a_gated_closing_step(manager, entered, gate)
     )
 
     # DETACHED, and that is the shape rather than the convenience: the turn awaits its own
     # unwind while the next message arrives on a different request's task.
-    finishing = asyncio.create_task(manager.finish_turn_sandbox(first, client, touched=True))
+    finishing = asyncio.create_task(manager.finish_turn_sandbox(first))
     await entered.wait()
     assert manager.active_session_for(user.id) is first  # ended, and still holding the slot
 
@@ -894,11 +864,11 @@ async def test_a_turn_that_never_lets_go_of_the_slot_keeps_the_conflict(
 
     entered, gate = asyncio.Event(), asyncio.Event()
     monkeypatch.setattr(
-        manager_module, "flag_liveness_overpromise", _a_gated_closing_step(entered, gate)
+        manager, "_pardon_the_container", _a_gated_closing_step(manager, entered, gate)
     )
     monkeypatch.setattr(manager_module, "_FINALIZE_GRACE_SECONDS", 0.05)
 
-    finishing = asyncio.create_task(manager.finish_turn_sandbox(first, client, touched=True))
+    finishing = asyncio.create_task(manager.finish_turn_sandbox(first))
     await entered.wait()
 
     with pytest.raises(BuildSessionConflictError):
@@ -1505,9 +1475,9 @@ async def test_a_relaunch_while_a_turn_is_still_letting_go_waits_like_a_message_
 
     entered, gate = asyncio.Event(), asyncio.Event()
     monkeypatch.setattr(
-        manager_module, "flag_liveness_overpromise", _a_gated_closing_step(entered, gate)
+        manager, "_pardon_the_container", _a_gated_closing_step(manager, entered, gate)
     )
-    finishing = asyncio.create_task(manager.finish_turn_sandbox(session, client, touched=True))
+    finishing = asyncio.create_task(manager.finish_turn_sandbox(session))
     await entered.wait()
 
     relaunching = asyncio.create_task(
@@ -1727,7 +1697,7 @@ async def test_the_next_real_start_reaps_a_relaunched_preview_through_its_stay(
     assert REGISTRY_FIELD_PREVIEW_STAY_UNTIL not in reg_after
     assert await stay_of_execution_is_current(fake_redis, user.id) is False
 
-    await _end_the_turn(manager, session, client)
+    await _end_the_turn(manager, session)
 
 
 # --- the attach arm's own seams (the ACA call counts live in test_relaunch.py) ---------

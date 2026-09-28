@@ -1091,7 +1091,7 @@ async def test_a_cancel_during_the_sandbox_terminal_still_frees_the_conversation
     never = asyncio.Event()
 
     class HangingTerminal(SessionManager):
-        async def finish_turn_sandbox(self, session, sandbox_client, *, touched: bool) -> None:
+        async def finish_turn_sandbox(self, session) -> None:
             in_terminal.set()
             await never.wait()  # the cancel lands about here
 

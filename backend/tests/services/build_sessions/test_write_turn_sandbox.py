@@ -6,9 +6,8 @@ tree to Blob storage, and a Write turn with no reachable save point would report
 silently losing every edit to the next reaper sweep.
 
 `may_write` mirrors the turn's toolset (`toolsets_for_kind` gives the mutating `sandbox_toolset`
-only to `ChatKind.BUILD`), so `may_write=False` implies `touched=False` in production — a test
-pairing `may_write=False` with `touched=True` pins nothing. Where a scenario needs both a Save and
-a mutating turn, end the turn first and save between turns, as `save_project_snapshot` expects."""
+only to `ChatKind.BUILD`). Where a scenario needs both a Save and a mutating turn, end the turn
+first and save between turns, as `save_project_snapshot` expects."""
 
 from __future__ import annotations
 
@@ -289,7 +288,7 @@ async def test_the_turn_terminal_does_not_save_because_saving_is_the_users_call(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
 
-    await manager.finish_turn_sandbox(session, client, touched=True)
+    await manager.finish_turn_sandbox(session)
 
     assert snapshot_key(session.app_id) not in fake_storage.objects
 
@@ -305,7 +304,7 @@ async def test_the_user_clicking_save_is_what_writes_the_bundle(
     session = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(session, client, touched=True)  # slot freed, no session
+    await manager.finish_turn_sandbox(session)  # slot freed, no session
     client.attach_handle = session.handle
 
     outcome = await manager.save_project_snapshot(
@@ -430,7 +429,7 @@ async def test_the_terminal_pardons_the_container_so_the_preview_outlives_the_tu
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
 
-    await manager.finish_turn_sandbox(session, client, touched=True)
+    await manager.finish_turn_sandbox(session)
 
     assert client.torn_down == []  # still up
     assert await read_registry(fake_redis, user.id) is not None  # the sweep can still find it
@@ -455,7 +454,7 @@ async def test_a_second_message_attaches_instead_of_rebuilding_the_container(
     first = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(first, client, touched=True)  # pardoned: container stays up
+    await manager.finish_turn_sandbox(first)  # pardoned: container stays up
     client.attach_handle = first.handle  # the live container is attachable, as in production
 
     second = await manager.ensure_sandbox(
@@ -489,7 +488,7 @@ async def test_a_different_project_never_steals_the_container(
     first = await manager.ensure_sandbox(
         db_session, user, project_a, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(first, client, touched=True)
+    await manager.finish_turn_sandbox(first)
     client.attach_handle = first.handle
 
     second = await manager.ensure_sandbox(
@@ -523,7 +522,7 @@ async def test_a_clean_incumbent_is_shown_out_rather_than_asked_about(
     first = await manager.ensure_sandbox(
         db_session, user, project_a, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(first, client, touched=True)
+    await manager.finish_turn_sandbox(first)
     client.attach_handle = first.handle
     # Saved AND unchanged since: the container's HEAD is the bundle's, so `dirty` is False.
     _with_head(client, "e" * 40)
@@ -553,7 +552,7 @@ async def test_giving_up_a_project_explicitly_still_destroys_it_on_the_spot(
     first = await manager.ensure_sandbox(
         db_session, user, project_a, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(first, client, touched=True)
+    await manager.finish_turn_sandbox(first)
     client.attach_handle = first.handle
 
     released = await manager.release_project_sandbox(
@@ -584,7 +583,7 @@ async def test_the_next_write_turn_restores_the_tree_the_last_one_saved(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
     client.attach_handle = first.handle
-    await manager.finish_turn_sandbox(first, client, touched=True)
+    await manager.finish_turn_sandbox(first)
     # THE USER SAVES, after the turn. A turn ending writes nothing durable at all, so without
     # this click there would be nothing here for the next turn to restore.
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
@@ -650,30 +649,9 @@ async def test_a_finished_write_turn_writes_nothing_durable_at_all(
     session = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(session, client, touched=True)
+    await manager.finish_turn_sandbox(session)
 
     assert fake_storage.objects == {}
-
-
-async def test_a_container_that_stops_answering_never_fails_the_turn(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """A turn's ending runs against the live container, and a user must never see their message
-    fail because a closing step could not reach it."""
-    user, project_id = await _mk(db_session, "w16@rvaiglobal.com")
-    manager = SessionManager()
-    client = FakeSandboxClient()
-    session = await manager.ensure_sandbox(
-        db_session, user, project_id, sandbox_client=client, may_write=True
-    )
-
-    def explode(_cmd: list[str]) -> ExecResult:
-        raise SandboxError("the container stopped answering")
-
-    client.exec_handler = explode
-    await manager.finish_turn_sandbox(session, client, touched=True)  # must not raise
-
-    assert manager.active_session_for(user.id) is None  # the slot was freed anyway
 
 
 async def test_a_plan_only_project_does_not_block_a_real_one(
@@ -696,7 +674,7 @@ async def test_a_plan_only_project_does_not_block_a_real_one(
     plan_only = await manager.ensure_sandbox(
         db_session, user, project_a, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(plan_only, client, touched=False)  # a read-only turn
+    await manager.finish_turn_sandbox(plan_only)  # a read-only turn
     client.attach_handle = plan_only.handle
 
     real = await manager.ensure_sandbox(
@@ -727,7 +705,7 @@ async def test_a_committed_but_unsaved_workspace_is_written_back_not_abandoned(
     first = await manager.ensure_sandbox(
         db_session, user, project_a, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(first, client, touched=False)
+    await manager.finish_turn_sandbox(first)
     client.attach_handle = first.handle
 
     await manager.ensure_sandbox(
@@ -781,7 +759,7 @@ async def test_an_unreachable_incumbent_is_handed_over_rather_than_reclaimed(
     first = await manager.ensure_sandbox(
         db_session, user, project_a, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(first, client, touched=True)
+    await manager.finish_turn_sandbox(first)
 
     # Same registry, same live app — only the attach stops answering.
     blind = _with_head(_UnreachableAttach(), "d" * 40)
@@ -810,7 +788,7 @@ async def test_a_confirmed_gone_container_still_reclaims_silently(
     first = await manager.ensure_sandbox(
         db_session, user, project_a, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(first, client, touched=True)
+    await manager.finish_turn_sandbox(first)
     client.attach_handle = None  # ARM says it is gone
 
     real = await manager.ensure_sandbox(
@@ -965,7 +943,7 @@ async def test_stopping_a_project_that_is_not_building_is_a_quiet_success(
     first = await manager.ensure_sandbox(
         db_session, user, project_a, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(first, client, touched=True)  # settled, pardoned
+    await manager.finish_turn_sandbox(first)  # settled, pardoned
 
     assert (
         await manager.stop_active_work(db_session, user, project_a, sandbox_client=client)
@@ -1193,7 +1171,7 @@ async def _a_container_that_is_already_up(
         db, user, project_id, sandbox_client=client, may_write=True
     )
     # The turn terminal PARDONS the container (it is the preview on screen) and frees the slot.
-    await manager.finish_turn_sandbox(first, client, touched=True)
+    await manager.finish_turn_sandbox(first)
     assert first.handle is not None
     client.attach_handle = first.handle  # as in production: the live container is attachable
     assert client.provisioned == [app_name_for(first.app_id)]
@@ -1318,7 +1296,7 @@ async def test_a_finished_turn_leaves_the_save_button_exactly_where_it_was(
     )
     client.attach_handle = session.handle
 
-    await manager.finish_turn_sandbox(session, client, touched=True)
+    await manager.finish_turn_sandbox(session)
 
     assert snapshot_key(session.app_id) not in fake_storage.objects
     state = await manager.project_save_state(db_session, user, project_id, sandbox_client=client)
@@ -1344,14 +1322,14 @@ async def test_a_reaped_container_comes_back_with_the_work_not_the_last_save(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
     client.attach_handle = session.handle
-    await manager.finish_turn_sandbox(session, client, touched=True)
+    await manager.finish_turn_sandbox(session)
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
 
     _with_head(client, "b" * 40)  # work continues past the save, on the next turn
     second = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(second, client, touched=True)
+    await manager.finish_turn_sandbox(second)
 
     # The container is reclaimed — by the reaper, which is the only thing that ever destroys one.
     await reap_user(fake_redis, user.id, client, app_id=second.app_id)
@@ -1380,7 +1358,7 @@ async def test_a_user_who_never_saved_can_still_get_their_work_back(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
     client.attach_handle = session.handle
-    await manager.finish_turn_sandbox(session, client, touched=True)  # never saved
+    await manager.finish_turn_sandbox(session)  # never saved
     assert snapshot_key(session.app_id) not in fake_storage.objects
 
     await reap_user(fake_redis, user.id, client, app_id=session.app_id)

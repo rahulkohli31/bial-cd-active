@@ -296,7 +296,7 @@ async def test_a_late_report_does_not_resurrect_a_finished_turn(
     session = await a_live_session(wire, db_session, user, project.id)
     assert session.app_id == app.id  # the session really is holding THIS app's container
     assert wire.manager.active_session_for(user.id) is session
-    await wire.manager.finish_turn_sandbox(session, wire.sbx, touched=True)
+    await wire.manager.finish_turn_sandbox(session)
 
     late = await client.post(
         _ROUTE.format(project_id=app.project_id), json=_A_CRASH, headers=auth_headers(user)

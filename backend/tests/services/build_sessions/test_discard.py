@@ -114,7 +114,7 @@ async def _a_saved_app_with_later_work(
     session = await manager.ensure_sandbox(
         db, user, project.id, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(session, client, touched=False)
+    await manager.finish_turn_sandbox(session)
     client.attach_handle = session.handle
     await manager.save_project_snapshot(db, user, project.id, sandbox_client=client)
     client.head = LATER
@@ -327,7 +327,7 @@ async def test_with_nothing_saved_a_discard_changes_nothing(
     session = await manager.ensure_sandbox(
         db_session, user, project.id, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(session, client, touched=False)
+    await manager.finish_turn_sandbox(session)
     client.attach_handle = session.handle
 
     with pytest.raises(NothingSavedToGoBackToError):

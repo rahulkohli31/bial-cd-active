@@ -1,9 +1,10 @@
 """The cache: the breakpoints we spend, and the numbers we read back.
 
 WHY THIS FILE EXISTS
-Anthropic allows four cache breakpoints per request and answers a fifth with an HTTP 400. Our
-requests spend them like this, and the arithmetic is the reason a second marker inside long
-build turns is NOT shipped:
+Anthropic allows four cache breakpoints per request and answers a fifth with an HTTP 400. A
+request carrying the turn-scoped system message — a Plan or BIAL Chat turn's, never a Build
+turn's — spends them like this, and the arithmetic is the reason no second marker rides beside
+its pin:
 
 | slot | who takes it |
 |---|---|
@@ -169,7 +170,7 @@ async def test_the_pin_marks_the_block_before_the_sentence_and_not_the_sentence(
 
 
 async def test_a_second_message_breakpoint_is_deleted_without_a_word() -> None:
-    """★ THE GO/NO-GO FOR AN INTERMEDIATE MARKER INSIDE LONG BUILD TURNS.
+    """★ THE GO/NO-GO FOR AN INTERMEDIATE MARKER ON A REQUEST THAT CARRIES THE PIN.
 
     With the server-applied breakpoint, the tool definitions and the instructions accounted for,
     one message slot remains. This puts two markers in the messages — an earlier one, as a

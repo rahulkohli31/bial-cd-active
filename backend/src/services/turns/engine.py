@@ -983,11 +983,11 @@ class _TurnState:
     app_reading: AppState | None = None
     #: Has this turn already been handed the turn-scoped system message? ONE PER TURN is the
     #: whole cooldown: a sentence on every request inside a turn moves the bytes the next
-    #: request in that same turn has to reproduce, so a long build turn would re-break its own
-    #: prefix at every step — strictly worse than the lapse the sentence answers.
+    #: request in that same turn has to reproduce, so a turn of many tool steps would re-break
+    #: its own prefix at every step — strictly worse than the lapse the sentence answers.
     nudged_to_look: bool = False
-    #: How many model requests this turn has sent, counted across every `agent.iter` run a
-    #: self-heal loop makes rather than per run.
+    #: How many model requests this turn has sent. Counted only on the arm that carries the
+    #: turn-scoped system message, because counting is how that arm's trigger fires.
     requests_sent: int = 0
 
     def read_the_app(self, reading: AppState) -> None:
@@ -1689,12 +1689,9 @@ class TurnEngine:
                         # nothing; with one it lands after the last of these, so everything
                         # ahead of the marker is byte-identical for every citizen.
                         instructions=static_instruction_parts(state.kind),
-                        # THE TURN-SCOPED SYSTEM MESSAGE, ARMED FOR THIS TURN. The trigger and
-                        # the cooldown are the turn's, not the capability's, so the same two
-                        # methods arm the Build arm below. Plan is included rather than
-                        # excluded: a Plan chat cannot change the app, but it answers questions
-                        # about one that other chats keep changing, and `check_the_app` is on
-                        # this arm's toolset for exactly that reason.
+                        # THE TURN-SCOPED SYSTEM MESSAGE, ON THIS ARM ONLY. A Plan chat cannot
+                        # change the app, but it answers questions about one that other chats
+                        # keep changing, and nothing else on this arm reads the app.
                         capabilities=[
                             TurnScopedSystemMessage(
                                 should_send=state.another_request_and_still_no_reading,
@@ -1971,20 +1968,9 @@ class TurnEngine:
             # of the process's life. It was unreachable while the shielded body was two Redis
             # round trips; it stops being unreachable the moment that body does real work.
             try:
-                if state.write_session is not None and sandbox_client is not None:
+                if state.write_session is not None:
                     with suppress(Exception):
-                        await asyncio.shield(
-                            manager.finish_turn_sandbox(
-                                state.write_session,
-                                sandbox_client,
-                                # Only a turn that MUTATED the tree is worth bundling. A Plan
-                                # turn holds no tool that could set this, so it releases the
-                                # sandbox without paying for an upload of a tree it only read.
-                                touched=(
-                                    state.sandbox is not None and state.sandbox.workspace_touched
-                                ),
-                            )
-                        )
+                        await asyncio.shield(manager.finish_turn_sandbox(state.write_session))
             finally:
                 # AFTER the sandbox work, not before: releasing early would let the next turn in
                 # this conversation start before `finish_turn_sandbox` frees the one-per-user
@@ -1999,9 +1985,8 @@ class TurnEngine:
                 # next turn's reconcile-on-start certifies death and deletes it anyway.
                 release_conversation(state.conversation_id)
                 # The lease goes LAST, once the container has actually been handed back.
-                # Releasing it before `finish_turn_sandbox` would leave that snapshot
-                # -and-pardon sequence — which can easily outlive the 90-second heartbeat TTL
-                # — exposed to a concurrent sweep with nothing at all vouching for it.
+                # Releasing it before `finish_turn_sandbox` would leave that step exposed to a
+                # concurrent sweep with nothing at all vouching for the container.
                 await self._stop_liveness_lease(state)
                 # AND THE CORRELATION COMES OFF LAST, once every line this turn will ever
                 # write has been written. Hygiene rather than a leak fix: a task's context is
@@ -2198,11 +2183,6 @@ class TurnEngine:
         #
         # Both arms are reached precisely when a workspace came back wrong, so the citizen most
         # likely to hit this is the one already having a bad day.
-        #
-        # NOTHING IS BUNDLED BY MOVING IT. The `finally` passes `touched` from `state.sandbox`,
-        # which is still `None` on both arms (it is assigned below), so the release skips the
-        # snapshot exactly as it should — an UNRECOVERABLE turn must never make a template
-        # permanent, which is what the first hold exists to prevent in the first place.
         state.write_session = session
         # THE CONTAINER IS THE AUTHORITY ON WHICH APP THIS BUILD IS ABOUT, so the correlation
         # bound at the top of the turn is corrected here off what `ensure_sandbox` actually
@@ -2708,16 +2688,7 @@ class TurnEngine:
             # Same static contract as the Plan arm, off the same function — see the note there
             # for why a run with no static part gets no instructions breakpoint at all.
             instructions=static_instruction_parts(ChatKind.BUILD),
-            # The turn-scoped system message, as on the Plan arm. A fresh instance per self-heal
-            # round behaves as one: the cooldown it consults belongs to the turn, so a repair
-            # round re-entering here cannot send a second, and a build turn's dozens of chained
-            # requests carry one sentence between them.
-            capabilities=[
-                TurnScopedSystemMessage(
-                    should_send=state.another_request_and_still_no_reading,
-                    on_sent=state.note_the_nudge,
-                )
-            ],
+            # No turn-scoped system message here: the verify after a run that wrote reads the app.
             output_type=str,
             usage_limits=UsageLimits(request_limit=MODEL_TURN_CEILING),
             # Without `max_tokens` pydantic-ai's Anthropic default of 4096 truncates a
@@ -3600,9 +3571,9 @@ class TurnEngine:
 
         RELEASED AFTER THE SANDBOX FINALIZE, unlike `_stop_preview_watcher` (which dies first
         because a late frame is lost): releasing the lease early opens a reap window over
-        `finish_turn_sandbox`, which can outlive the 90-second heartbeat TTL that is otherwise the
-        container's only cover. Failures are swallowed — a Redis blip must not wedge the
-        conversation guard shut, and the cost of not landing is bounded by the lease's own TTL.
+        `finish_turn_sandbox`, while nothing else vouches for the container. Failures are
+        swallowed — a Redis blip must not wedge the conversation guard shut, and the cost of not
+        landing is bounded by the lease's own TTL.
 
         THE COOPERATIVE ASK DIES WITH THE TURN IT WAS AIMED AT, withdrawn below alongside the
         lease. An ask published in the seconds a turn was already unwinding is never read by the

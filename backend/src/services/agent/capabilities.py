@@ -71,10 +71,12 @@ class TurnScopedSystemMessage(AbstractCapability[ChatDeps]):
 
     THE TRIGGER IS NOT HERE, AND THAT IS DELIBERATE. `should_send` is called once per outgoing
     request and answers from the turn's own tool-call facts; `on_sent` closes the turn's
-    cooldown. Both belong to the turn rather than to this instance, so a fresh capability per
-    `agent.iter` run — which is what a self-heal loop produces — still sends once for the whole
-    turn. A sentence on every request inside a turn re-breaks the prefix at each step, which is
-    worse than the defect it addresses."""
+    cooldown. Both belong to the turn rather than to this instance, because the turn is what
+    holds the reading the trigger reads. A sentence on every request inside a turn re-breaks the
+    prefix at each step, which is worse than the defect it addresses.
+
+    PLAN AND BIAL CHAT ONLY. A Build turn is read by the verify after any run that wrote, so the
+    Build run is never armed with this."""
 
     should_send: Callable[[], bool]
     on_sent: Callable[[], None]

@@ -8,8 +8,7 @@ through even an unexpired one (covered in
 `test_manager.py::test_clean_end_then_start_restores_from_snapshot_not_fresh`).
 
 HOW THE SESSIONS GET HERE. A session is allocated by `ensure_sandbox` and ended by
-`finish_turn_sandbox` — the pair production uses, and the only pair left. `touched=True` is the
-arm that earns the full stay, which is what the lease assertions below are about.
+`finish_turn_sandbox` — the pair production uses, and the only pair left.
 """
 
 from __future__ import annotations
@@ -70,7 +69,7 @@ async def _completed_build(
     session = await manager.ensure_sandbox(
         db, user, project.id, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(session, client, touched=True)
+    await manager.finish_turn_sandbox(session)
     assert session.turn_finish is not None and session.turn_finish.is_set()
     return user, manager, session.app_id
 

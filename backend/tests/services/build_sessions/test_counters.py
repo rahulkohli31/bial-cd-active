@@ -310,7 +310,7 @@ async def test_a_turn_that_joins_a_container_already_serving_started_nothing(
     first = await manager.ensure_sandbox(
         db_session, user, project.id, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(first, client, touched=True)
+    await manager.finish_turn_sandbox(first)
     client.attach_handle = first.handle  # the live container is attachable, as in production
     second = await manager.ensure_sandbox(
         db_session, user, project.id, sandbox_client=client, may_write=True
