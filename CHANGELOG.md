@@ -6,8 +6,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.8.5] - 2026-09-28
 
-A colleague's shared app no longer locks its viewer out of their own work, and a reopened app no
-longer shows the starter screen over its own code.
+A colleague's shared app no longer locks its viewer out of their own work, a reopened app no
+longer shows the starter screen over its own code, and people on the office network can sign in
+again.
 
 ### Deploying this release
 
@@ -17,6 +18,9 @@ longer shows the starter screen over its own code.
   the existing sandbox image, which already carries the ignore list it reads.
 - **Apps already showing the starter screen are not repaired by this release.** Their saved copy
   already holds the starter page, so they open the same way until that copy is repaired.
+- **Sign-in changes, but nothing in Entra does.** The same registration and reply address are used
+  as they are. A sign-in that is halfway through while the backend restarts fails once, and signing
+  in again works. After the rollout, sign in once from the office network and once from outside it.
 
 ### Fixed
 
@@ -27,6 +31,12 @@ longer shows the starter screen over its own code.
 - **Starter files an app deleted stay deleted when it reopens.** Reopening an app restored its saved
   copy over the starter template and brought back the template's home page, which the next save
   then kept. The app opened on the starter screen with its own code intact underneath.
+- **Signing in from the office network works again.** Microsoft refused some sign-ins with an MFA
+  error (AADSTS50076) that no retry could clear. Our server swapped the sign-in code for a token
+  from its own Azure address, which Conditional Access judged as a new location for a session that
+  had not done MFA. The user's browser now makes that swap, as the app's registration expects, and
+  the backend checks the ID token it gets back: its signature, issuer, audience, expiry, and a
+  nonce tied to the sign-in that browser started.
 
 ### Changed
 

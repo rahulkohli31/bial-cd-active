@@ -10,11 +10,16 @@ corporate identity, and there is no active-org concept to carry in the session.
 **Identity is Microsoft Entra ID.** The backend itself runs the OIDC Authorization Code
 flow with PKCE, against the tenant-specific discovery document — never the generic
 `common`/`organizations` issuer, whose templated `iss` claim would defeat an exact match.
-It validates the returned identity fail-closed: the object id and subject claims must be
-present and the token's tenant claim must match the configured tenant, or no session is
-created. The Entra tokens are discarded once validated; the backend mints and trusts only
-its own session. There is no trusted proxy-asserted identity — the backend is the OIDC
-relying party.
+The application registration is a single-page-application client, so the user's own browser
+redeems the code: the callback serves a page that makes the token request and posts the ID
+token back. That keeps the token request on the network the sign-in came from, which is where
+Conditional Access evaluates it; a server redeeming the code would be judged from its own
+address. The backend validates the returned ID token fail-closed: its signature, issuer,
+audience, expiry, and a nonce bound to the sign-in this browser started; the object id and
+subject claims must be present and the token's tenant claim must match the configured tenant,
+or no session is created. The Entra tokens are discarded once validated; the backend mints and
+trusts only its own session. There is no trusted proxy-asserted identity — the backend is the
+OIDC relying party.
 
 ### Identity and provisioning
 

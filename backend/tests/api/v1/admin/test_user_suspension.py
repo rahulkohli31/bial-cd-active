@@ -24,10 +24,11 @@ from src.db.models.audit import AuditLog
 from src.db.models.refresh_token import RefreshToken
 from src.db.models.user import User
 from src.main import create_app
+from src.services.auth.cookies import csrf_cookie_name, refresh_cookie_name, session_cookie_name
 from src.services.auth.csrf import issue_csrf_token
-from src.services.auth.oidc import get_oauth
 from src.services.auth.refresh import issue_new_family
 from src.services.auth.session_jwt import mint_session_jwt
+from tests.entra import sign_in
 from tests.factories import UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
@@ -148,50 +149,23 @@ async def test_refresh_seam_rejects_suspended_user_with_live_family(client, db_s
 # --- login-callback seam ---------------------------------------------------------
 
 
-class _FakeEntra:
-    def __init__(self, token: dict[str, Any]) -> None:
-        self._token = token
-
-    async def authorize_access_token(self, request: Any) -> dict[str, Any]:
-        return self._token
-
-
-class _FakeOAuth:
-    def __init__(self, entra: _FakeEntra) -> None:
-        self.entra = entra
-
-
-def _fake_signin(app: Any, *, oid: str, email: str) -> None:
-    token = {
-        "userinfo": {
-            "oid": oid,
-            "sub": f"sub-{oid}",
-            "tid": settings.auth.tenant_id,
-            "email": email,
-            "preferred_username": email,
-        },
-        "access_token": "x",
-        "id_token": "y",
-    }
-    app.dependency_overrides[get_oauth] = lambda: _FakeOAuth(_FakeEntra(token))
-
-
 async def test_login_callback_blocks_suspended_user(app, client, db_session) -> None:
     citizen = await UserFactory.create(
         db_session, azure_oid="suspended-oid", email="blocked@rvaiglobal.com"
     )
     citizen.suspended_at = datetime.now(UTC)
     await db_session.flush()
-    _fake_signin(app, oid="suspended-oid", email="blocked@rvaiglobal.com")
-
-    resp = await client.get("/v1/auth/callback")
+    resp = await sign_in(client, oid="suspended-oid", email="blocked@rvaiglobal.com")
     assert resp.status_code == 302
     # The bounce carries the attempt's correlation id (`&ref=`), which is random per
     # request — assert the stable half exactly and the id for shape.
     base, sep, ref = resp.headers["location"].partition("&ref=")
     assert base == f"{settings.FRONTEND_URL}/login?authError=account_suspended"
     assert sep and re.fullmatch(r"[0-9a-f]{8}", ref)
-    assert resp.headers.get_list("set-cookie") == []  # no session minted
+    # No session minted: the only cookie touched is the spent sign-in state.
+    set_cookies = {raw.split("=", 1)[0] for raw in resp.headers.get_list("set-cookie")}
+    app_cookies = {session_cookie_name(), refresh_cookie_name(), csrf_cookie_name()}
+    assert set_cookies.isdisjoint(app_cookies)
     # No refresh family was issued for the refused sign-in.
     families = await db_session.scalar(
         select(func.count()).select_from(RefreshToken).where(RefreshToken.user_id == citizen.id)
@@ -209,8 +183,7 @@ async def test_reactivated_user_can_sign_in_again(app, client, db_session) -> No
     assert resp.status_code == 200
     assert resp.json()["suspendedAt"] is None
 
-    _fake_signin(app, oid="comeback-oid", email="comeback@rvaiglobal.com")
-    signin = await client.get("/v1/auth/callback")
+    signin = await sign_in(client, oid="comeback-oid", email="comeback@rvaiglobal.com")
     assert signin.status_code == 302
     assert signin.headers["location"] == settings.FRONTEND_URL  # a real sign-in again
 

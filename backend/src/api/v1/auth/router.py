@@ -1,9 +1,10 @@
 """Auth HTTP endpoints — interactive sign-in (this unit), plus /me, /refresh,
 /logout. The browser round-trip:
 
-    GET /auth/login    -> 302 to Entra (PKCE state in the oauth_transient cookie)
-    GET /auth/callback -> validate fail-closed, provision by oid, mint session,
-                          set cookies, 302 to the SPA (or /login?authError=...&ref=... )
+    GET  /auth/login    -> 302 to Entra (PKCE state in the oauth_transient cookie)
+    GET  /auth/callback -> a page that redeems the code from the user's own browser
+    POST /auth/complete -> validate the ID token fail-closed, provision by oid, mint session,
+                           set cookies, 302 to the SPA (or /login?authError=...&ref=... )
 
 The session/refresh/csrf cookies follow a fixed matrix and are ENVIRONMENT-AWARE:
 `__Host-`/`__Secure-` prefixes + `Secure` in production, relaxed over plain http in
@@ -13,18 +14,19 @@ carries them. The callback redirect_uri is the configured `AUTH__REDIRECT_URI`
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 import uuid
 from typing import Annotated, Final
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 import sqlalchemy as sa
 import structlog
 from authlib.integrations.starlette_client import OAuth, OAuthError
-from fastapi import APIRouter, Depends, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi import APIRouter, Depends, Form, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,7 +58,13 @@ from src.services.auth.errors import (
     REASON_REAUTH_REQUIRED,
     AuthError,
 )
-from src.services.auth.oidc import get_oauth, validate_entra_token
+from src.services.auth.oidc import (
+    EntraIdentity,
+    PendingRedemption,
+    get_oauth,
+    identity_from_browser,
+    pending_redemption,
+)
 from src.services.auth.refresh import (
     hash_refresh_token,
     issue_new_family,
@@ -84,6 +92,10 @@ _STEP_UP_AADSTS: Final = frozenset({"50076", "50078", "50079", "70044"})
 _AADSTS_CODE: Final = re.compile(r"AADSTS(\d+)")
 # The one-retry marker, kept in the oauth_transient session beside Authlib's PKCE state.
 _STEP_UP_MARKER: Final = "auth_step_up"
+# Everything a sign-in attempt can end on short of a session: Entra's refusal or an unknown
+# state (OAuthError), Entra out of reach (httpx), a malformed document or form (ValueError), and
+# an identity that fails validation (AuthError). Each one ends on the login bounce, never a 500.
+_SIGN_IN_FAILURES: Final = (OAuthError, httpx.HTTPError, ValueError, AuthError)
 
 
 def _step_up_code(exc: Exception) -> str | None:
@@ -178,7 +190,7 @@ async def _step_up(
     WHY THIS EXISTS: Entra will mint a code from a browser session whose MFA has expired
     (AADSTS50078); the redemption then fails, and every press of "Sign in with Microsoft" re-mints
     a code from that same session, so the retry the banner asks for can never succeed. A fresh
-    interactive sign-in is the only thing that clears it, so the callback asks for one. BOUNDED: a
+    interactive sign-in is the only thing that clears it, so the sign-in asks for one. BOUNDED: a
     rejection arriving after a forced sign-in bounces to the `reauth_required` banner instead of
     looping, and so does a step-up that cannot reach Entra."""
     if not already_forced:
@@ -221,57 +233,181 @@ async def login(request: Request, oauth: OAuthClient) -> Response:
     return response
 
 
-@router.get("/callback", name="auth_callback")
-async def callback(request: Request, db: DbSession, oauth: OAuthClient) -> Response:
+async def _refused(
+    request: Request, oauth: OAuth, exc: Exception, *, trace_id: str, already_forced: bool
+) -> Response:
+    """Every sign-in that ends without a session: logged under the attempt's `trace_id`, then a
+    step-up for a Conditional Access refusal, else the login banner."""
+    if isinstance(exc, AuthError):
+        # Wrong tenant / invalid token — reason drives the banner. `message` and `reason` are
+        # contractually non-secret (see errors.py).
+        logger.warning(
+            "auth_callback_rejected", reason=exc.reason, detail=str(exc)[:500], trace_id=trace_id
+        )
+        return _login_error_redirect(exc.reason, trace_id=trace_id)
+    # Log the exception CLASS + provider message so an operator can tell a network-reach failure
+    # (httpx.*Error) from a Microsoft rejection such as an AADSTS code (OAuthError) or a lost-state
+    # cookie (mismatching_state). An error the browser reported is Entra's own response, relayed.
+    logger.warning(
+        "auth_callback_failed",
+        error_type=type(exc).__name__,
+        detail=str(exc)[:500],
+        trace_id=trace_id,
+    )
+    step_up = _step_up_code(exc)
+    if step_up is not None:
+        return await _step_up(
+            request, oauth, code=step_up, trace_id=trace_id, already_forced=already_forced
+        )
+    return _login_error_redirect(REASON_AUTH_FAILED, trace_id=trace_id)
+
+
+# The page the callback serves. Its script redeems the code from the user's own browser, so
+# Entra's token endpoint sees the same network the sign-in came from, then posts the ID token (or
+# Entra's error) to `complete`. The form's action is relative, so it resolves beside the callback
+# behind the edge's /api prefix as well as without it. Values arrive as a JSON data block, never
+# interpolated into markup or script. The referrer policy is `same-origin`, not `no-referrer`:
+# under `no-referrer` a browser posts the form with `Origin: null`, which the cross-origin write
+# guard refuses. The code leaves the address bar before anything is sent.
+_REDEMPTION_PAGE: Final = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="referrer" content="same-origin">
+<title>Signing in</title>
+</head>
+<body>
+<p>Signing you in…</p>
+<noscript><p>Signing in needs JavaScript. Turn it on, then sign in again.</p></noscript>
+<form id="complete" method="post" action="complete">
+<input type="hidden" name="state">
+<input type="hidden" name="id_token">
+<input type="hidden" name="error">
+<input type="hidden" name="error_description">
+</form>
+<script id="redemption" type="application/json">__REDEMPTION__</script>
+<script nonce="__NONCE__">
+(async () => {
+  const r = JSON.parse(document.getElementById("redemption").textContent);
+  history.replaceState(null, "", location.pathname);
+  const fields = document.getElementById("complete").elements;
+  fields.state.value = r.state;
+  try {
+    const response = await fetch(r.token_endpoint, {
+      method: "POST",
+      body: new URLSearchParams({
+        client_id: r.client_id,
+        grant_type: "authorization_code",
+        code: r.code,
+        redirect_uri: r.redirect_uri,
+        code_verifier: r.code_verifier,
+        scope: r.scope,
+      }),
+      credentials: "omit",
+      cache: "no-store",
+      referrerPolicy: "no-referrer",
+    });
+    const body = await response.json();
+    if (typeof body.id_token === "string") {
+      fields.id_token.value = body.id_token;
+    } else {
+      fields.error.value = body.error || "invalid_response";
+      fields.error_description.value = body.error_description || "";
+    }
+  } catch (failure) {
+    fields.error.value = "token_request_failed";
+    fields.error_description.value = String(failure);
+  }
+  document.getElementById("complete").submit();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def _redemption_page(pending: PendingRedemption) -> HTMLResponse:
+    nonce = secrets.token_urlsafe(16)
+    # `<` escaped so no value can close the data block.
+    data = json.dumps(
+        {
+            "token_endpoint": pending.token_endpoint,
+            "client_id": pending.client_id,
+            "code": pending.code,
+            "redirect_uri": pending.redirect_uri,
+            "code_verifier": pending.code_verifier,
+            "scope": pending.scope,
+            "state": pending.state,
+        }
+    ).replace("<", "\\u003c")
+    token_url = urlsplit(pending.token_endpoint)
+    # No `form-action`: browsers apply it to the redirect after the post too, and that goes to the
+    # portal or back to Entra.
+    policy = (
+        f"default-src 'none'; script-src 'nonce-{nonce}'; "
+        f"connect-src {token_url.scheme}://{token_url.netloc}; "
+        "base-uri 'none'; frame-ancestors 'none'"
+    )
+    return HTMLResponse(
+        _REDEMPTION_PAGE.replace("__REDEMPTION__", data).replace("__NONCE__", nonce),
+        headers={"Content-Security-Policy": policy},
+    )
+
+
+@router.get("/callback", name="auth_callback", response_class=HTMLResponse)
+async def callback(request: Request, oauth: OAuthClient) -> Response:
     # One short correlation id per attempt, minted BEFORE anything can fail so every exit
     # path shares it. It is displayed to the user (the login banner echoes it), so it is
     # deliberately short hex rather than a UUID — and it is not a credential: it
     # authenticates nothing and is generated fresh per request.
     trace_id = secrets.token_hex(4)
+    try:
+        pending = await pending_redemption(oauth, request)
+    except _SIGN_IN_FAILURES as exc:
+        # Denied / cancelled consent, an unknown state, or discovery out of reach. The one-retry
+        # marker is spent here only because this attempt ends here; the page path leaves it for
+        # `complete`.
+        already_forced = bool(request.session.pop(_STEP_UP_MARKER, False))
+        return await _refused(
+            request, oauth, exc, trace_id=trace_id, already_forced=already_forced
+        )
+    return _redemption_page(pending)
+
+
+@router.post("/complete", name="auth_complete")
+async def complete(
+    request: Request,
+    db: DbSession,
+    oauth: OAuthClient,
+    state: Annotated[str, Form()] = "",
+    id_token: Annotated[str, Form()] = "",
+    error: Annotated[str, Form()] = "",
+    error_description: Annotated[str, Form()] = "",
+) -> Response:
+    """Where the callback page posts what Entra's token endpoint gave the browser: an ID token, or
+    Entra's error. Every field defaults to empty so a malformed post still ends on the login
+    banner rather than a validation error page."""
+    trace_id = secrets.token_hex(4)
     # Read AND clear the one-retry marker before anything can fail, so every exit — a success
     # included — leaves the next attempt its own automatic step-up.
     already_forced = bool(request.session.pop(_STEP_UP_MARKER, False))
     try:
-        token = await oauth.entra.authorize_access_token(request)
-        identity = validate_entra_token(token)
-    except (OAuthError, httpx.HTTPError, ValueError) as exc:  # fmt: skip  # py314 paren strip
-        # Denied / cancelled consent (error=access_denied, no code) and other
-        # provider-side errors (OAuthError), plus a transient httpx transport /
-        # HTTP-status failure or malformed-JSON (ValueError, incl. JSONDecodeError)
-        # reaching out to Entra's token/userinfo endpoints — all fail CLOSED to the
-        # login bounce instead of escaping as a raw 500.
-        # Log the exception CLASS + provider message (never a credential — Authlib's
-        # OAuthError / httpx str carry the AADSTS code or transport error, not the
-        # client secret or the token POST body) so an operator can distinguish a
-        # network-reach failure (httpx.*Error) from a Microsoft rejection such as
-        # invalid_client / AADSTS7000215 (OAuthError) or a lost-state cookie
-        # (mismatching_state) — otherwise every callback failure collapses to one
-        # indistinguishable `authError=auth_failed` bounce with no root cause.
-        logger.warning(
-            "auth_callback_failed",
-            error_type=type(exc).__name__,
-            detail=str(exc)[:500],
-            trace_id=trace_id,
+        identity = await identity_from_browser(
+            oauth,
+            request,
+            state=state,
+            id_token=id_token,
+            error=error,
+            error_description=error_description,
         )
-        step_up = _step_up_code(exc)
-        if step_up is not None:
-            return await _step_up(
-                request, oauth, code=step_up, trace_id=trace_id, already_forced=already_forced
-            )
-        return _login_error_redirect(REASON_AUTH_FAILED, trace_id=trace_id)
-    except AuthError as exc:
-        # Wrong tenant / invalid callback — reason drives the banner. This branch used to
-        # return WITHOUT logging, so a rejected sign-in left no server-side trace at all:
-        # the operator saw a user on ?authError=wrong_tenant and nothing in the log to
-        # match it to. `message` and `reason` are contractually non-secret (see errors.py).
-        logger.warning(
-            "auth_callback_rejected",
-            reason=exc.reason,
-            detail=str(exc)[:500],
-            trace_id=trace_id,
+    except _SIGN_IN_FAILURES as exc:
+        return await _refused(
+            request, oauth, exc, trace_id=trace_id, already_forced=already_forced
         )
-        return _login_error_redirect(exc.reason, trace_id=trace_id)
+    return await _start_session(db, identity, trace_id=trace_id)
 
+
+async def _start_session(db: AsyncSession, identity: EntraIdentity, *, trace_id: str) -> Response:
     # Provision by the stable Entra oid (never email). Inlined upsert:
     # a returning sign-in updates the mutable profile fields but PRESERVES
     # token_version (revocation state), and a brand-new row defaults it to 0.

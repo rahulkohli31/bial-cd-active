@@ -4,11 +4,15 @@
 (`{tenant_id}/v2.0`, never `common`/`organizations` — a templated issuer defeats the exact
 `iss` match), PKCE (`S256`), `openid profile email`. `get_oauth()` is the seam tests override.
 
-`validate_entra_token` is the fail-closed gate: Authlib's `authorize_access_token` does NOT
-raise when the response lacks an `id_token` — it returns a dict with no `userinfo` and ZERO
-validation performed; `userinfo` appears only AFTER signature/`iss`/`aud`/`exp`/`nonce` are
-validated, so its presence IS the proof. We hard-assert `oid`/`sub`/`tid == tenant_id` and a
-non-null email (`preferred_username` fallback) — else `AuthError`: no session, no user row.
+The app registration is a single-page-application client, so the user's own browser redeems the
+code: `pending_redemption` hands the callback page what it needs, and `identity_from_browser`
+takes back the ID token it got. Redeeming from the browser keeps the token request on the same
+network as the sign-in, which is where Conditional Access evaluates it.
+
+`validate_entra_token` is the fail-closed gate: `userinfo` exists only AFTER the signature,
+`iss`, `aud`, `exp` and `nonce` are validated, so its presence IS the proof. We hard-assert
+`oid`/`sub`/`tid == tenant_id` and a non-null email (`preferred_username` fallback) — else
+`AuthError`: no session, no user row.
 """
 
 from __future__ import annotations
@@ -17,9 +21,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
-from urllib.parse import urlsplit
 
-from authlib.integrations.starlette_client import OAuth
+from authlib.integrations.base_client import MismatchingStateError
+from authlib.integrations.starlette_client import OAuth, OAuthError
+from joserfc.errors import JoseError
+from starlette.requests import Request
 
 from src.config import settings
 from src.services.auth.errors import (
@@ -43,44 +49,104 @@ class EntraIdentity:
 
 
 def build_oauth() -> OAuth:
-    """Register the `entra` provider (tenant discovery + PKCE, public SPA client)."""
+    """Register the `entra` provider (tenant discovery + PKCE, single-page-application client)."""
     oauth = OAuth()
-    # The Entra app registration is a SINGLE-PAGE-APPLICATION (SPA) platform client, whose /token
-    # endpoint only redeems a code from a CROSS-ORIGIN request — it demands an `Origin` header that
-    # matches a registered SPA redirect URI's origin, else AADSTS9002327 ("may only be redeemed via
-    # cross-origin requests"). CORS is enforced by browsers, not by Entra, so a server that simply
-    # presents the header is accepted. We redeem server-side, so we present it explicitly. The
-    # origin is the scheme+host of the configured redirect URI (which IS the registered SPA reply
-    # URL), so it always matches — no separate config to drift out of sync.
-    redirect = urlsplit(settings.auth.redirect_uri)
-    spa_origin = f"{redirect.scheme}://{redirect.netloc}"
+    # No token-endpoint settings: this client never calls the token endpoint. The browser redeems
+    # the code with the PKCE verifier and no secret, which is all a single-page-application
+    # registration accepts.
     oauth.register(
         name="entra",
         server_metadata_url=settings.auth.server_metadata_url,
         client_id=settings.auth.client_id,
-        # PUBLIC-CLIENT — no client secret. The app registration is flagged "Allow public client
-        # flows" / SPA, so Entra rejects any secret at the token endpoint (AADSTS700025), and a
-        # secret presented ALONGSIDE the Origin header below is itself rejected (Entra forbids
-        # credentials in the presence of an Origin). We authenticate public-client style:
-        # `token_endpoint_auth_method="none"` sends `client_id` in the token-request body and NO
-        # secret; PKCE (S256) is the sole proof of the code exchange. Deliberate, temporary
-        # reduction in defense-in-depth (loses client authentication), tracked as a backlog
-        # hardening item — revert to a confidential Web-platform client (restore the secret, drop
-        # the Origin header) once the app registration is switched. alg=none is still impossible:
-        # the id_token is decoded with the discovery doc's signing algs (RS256), not our choice.
-        #
-        # `headers` is siphoned by Authlib into httpx.AsyncClient as a DEFAULT header (its
-        # HTTPX_CLIENT_KWARGS allowlist), so httpx merges the Origin with the token POST's own
-        # Content-Type — nothing is clobbered. It also rides the public discovery/JWKS GETs, which
-        # is harmless (those endpoints ignore a stray Origin).
-        client_kwargs={
-            "scope": _SCOPES,
-            "code_challenge_method": "S256",
-            "token_endpoint_auth_method": "none",
-            "headers": {"Origin": spa_origin},
-        },
+        client_kwargs={"scope": _SCOPES, "code_challenge_method": "S256"},
     )
     return oauth
+
+
+@dataclass(frozen=True, slots=True)
+class PendingRedemption:
+    """What the callback page needs to redeem the code from the user's own browser."""
+
+    token_endpoint: str
+    client_id: str
+    code: str
+    redirect_uri: str
+    code_verifier: str
+    scope: str
+    state: str
+
+
+async def pending_redemption(oauth: OAuth, request: Request) -> PendingRedemption:
+    """The redemption the callback's `code` and `state` describe, checked against this browser's
+    own sign-in state.
+
+    Raises `OAuthError` when Entra sent an error instead of a code, and `MismatchingStateError`
+    when the state is not one this browser started. The state stays in the session: `complete`
+    consumes it."""
+    error = request.query_params.get("error")
+    if error:
+        raise OAuthError(error=error, description=request.query_params.get("error_description"))
+    state = request.query_params.get("state", "")
+    code = request.query_params.get("code", "")
+    started = await oauth.entra.framework.get_state_data(request.session, state)
+    if not started:
+        raise MismatchingStateError()
+    if not code:
+        raise OAuthError(error="invalid_request", description="the callback carried no code")
+    metadata = await oauth.entra.load_server_metadata()
+    return PendingRedemption(
+        token_endpoint=str(metadata["token_endpoint"]),
+        client_id=settings.auth.client_id,
+        code=code,
+        redirect_uri=str(started["redirect_uri"]),
+        code_verifier=str(started["code_verifier"]),
+        scope=_SCOPES,
+        state=state,
+    )
+
+
+async def identity_from_browser(
+    oauth: OAuth,
+    request: Request,
+    *,
+    state: str,
+    id_token: str,
+    error: str,
+    error_description: str,
+) -> EntraIdentity:
+    """The identity in the ID token the browser redeemed, or the error it was given instead.
+
+    The state is consumed first, whatever follows, so a posted form is good for one attempt only.
+    It must be one this browser started (the SameSite=Lax transient cookie carries it), and the
+    token's nonce must be the one stored with it: together they bind the token to the sign-in
+    this browser began, which is what stops a token being planted in someone else's session."""
+    started = await oauth.entra.framework.get_state_data(request.session, state)
+    await oauth.entra.framework.clear_state_data(request.session, state)
+    if not started:
+        raise MismatchingStateError()
+    if error:
+        raise OAuthError(error=error, description=error_description)
+    nonce = started.get("nonce")
+    if not id_token or not nonce:
+        raise AuthError("the browser returned no ID token", reason=REASON_INVALID_CALLBACK)
+
+    metadata = await oauth.entra.load_server_metadata()
+    # The token arrived through the browser, so the audience is pinned exactly. Authlib on its own
+    # accepts a foreign `aud` whenever `azp` names this client.
+    claims_options = {
+        "iss": {"essential": True, "value": metadata["issuer"]},
+        "aud": {"essential": True, "value": settings.auth.client_id},
+    }
+    try:
+        userinfo = await oauth.entra.parse_id_token(
+            {"id_token": id_token}, nonce=nonce, claims_options=claims_options
+        )
+    except JoseError as exc:
+        raise AuthError(
+            f"the ID token did not validate: {type(exc).__name__}",
+            reason=REASON_INVALID_CALLBACK,
+        ) from exc
+    return validate_entra_token({"userinfo": userinfo})
 
 
 @lru_cache(maxsize=1)
