@@ -42,6 +42,7 @@ describe('listProjects', () => {
           hasRelaunchableSnapshot: null,
           hasSavedSnapshot: null,
           isServing: false,
+          isPublishing: false,
           access: 'owner',
         },
       ],
@@ -76,6 +77,13 @@ describe('getProject', () => {
     expect(fetchImpl.mock.calls[0][0]).toBe('/api/projects/p1')
     expect(project.appId).toBe('a1')
     expect(project.appStatus).toBe('approved')
+  })
+
+  it('reads isPublishing only from a literal true', async () => {
+    const publishing = await getProject('p1', deps(fetchReturning(200, { ...sampleProject, isPublishing: true })))
+    const garbled = await getProject('p1', deps(fetchReturning(200, { ...sampleProject, isPublishing: 'yes' })))
+    expect(publishing.isPublishing).toBe(true)
+    expect(garbled.isPublishing).toBe(false)
   })
 
   it('throws an ApiError carrying status 404 and the server message on not-found', async () => {

@@ -52,6 +52,11 @@ export interface Project {
    * (Even this note avoids spelling the old name.)
    */
   isServing: boolean
+  /**
+   * Is a publish running? Server-computed: true exactly when the project page's publish state
+   * reads `starting_up`, which neither `appStatus` nor `isServing` can say.
+   */
+  isPublishing: boolean
   createdAt: string
   updatedAt: string
   /**
@@ -187,6 +192,7 @@ function toProject(value: unknown): Project {
     // Absent or non-boolean means NOT live: the badge claims something, so an unknown
     // must never render as a claim.
     isServing: value.isServing === true,
+    isPublishing: value.isPublishing === true,
     createdAt: asString(value.createdAt),
     updatedAt: asString(value.updatedAt),
     access: asAccess(value.access),

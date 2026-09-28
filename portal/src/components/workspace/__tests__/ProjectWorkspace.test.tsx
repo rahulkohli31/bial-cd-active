@@ -85,6 +85,7 @@ const PROJECT: Project = {
   hasRelaunchableSnapshot: true,
   hasSavedSnapshot: null,
   isServing: false,
+  isPublishing: false,
   createdAt: '2026-07-10T00:00:00Z',
   updatedAt: '2026-07-10T00:00:00Z',
   access: 'owner',
