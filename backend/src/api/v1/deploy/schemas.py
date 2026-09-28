@@ -360,6 +360,14 @@ def compute_publish_state(
     return _live_state(app, deployment, saved_head)
 
 
+def is_starting_up(app: AppRegistry, in_flight: Deployment | None) -> bool:
+    """Whether the owner's publish state is `starting_up`, read from the app's running row
+    alone. That row is enough: `uq_deployments_one_in_flight` refuses a new claim while it
+    stands, so it is always the newest attempt, and with no running row the state cannot be
+    `starting_up`."""
+    return compute_publish_state(app, in_flight, saved_head=None) is PublishState.STARTING_UP
+
+
 class RegistryStatus(StrEnum):
     """The App Registry's status column. An **API** StrEnum like `PublishState`: nothing
     persists it, and the wire value equals the member's own string."""

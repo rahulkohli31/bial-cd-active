@@ -13,7 +13,11 @@ is not live, a draft app that did deploy is — and the count and the per-row fl
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 
+from sqlalchemy.dialects import postgresql
+
+from src.api.v1.projects.router import _IN_FLIGHT_ROW, _publishing_now
 from src.db.models.app_registry import AppStatus
 from src.db.models.deployment import Deployment, DeploymentStatus
 from tests.api.v1.projects.test_projects_crud import _auth
@@ -57,10 +61,10 @@ async def _deploy(
     return row
 
 
-async def _rows(client, headers) -> dict[str, bool]:
+async def _rows(client, headers, field: str = "isServing") -> dict[str, bool]:
     resp = await client.get(_PROJECTS, headers=headers)
     assert resp.status_code == 200, resp.text
-    return {item["name"]: item["isServing"] for item in resp.json()["items"]}
+    return {item["name"]: item[field] for item in resp.json()["items"]}
 
 
 # --- what the flag actually tracks --------------------------------------------
@@ -445,3 +449,144 @@ async def test_an_unrecognized_filter_is_refused_in_this_platforms_envelope(
 
     assert resp.status_code == 422, resp.text
     assert resp.json()["error"]["message"] == "filter must be one of: inProduction, inPipeline."
+
+
+# --- a publish still running ---------------------------------------------------
+
+
+async def test_a_first_publish_in_flight_is_publishing_and_not_live(client, db_session) -> None:
+    """A publish that needed no review never writes `status`, so without this flag the row
+    reads `draft` while the project page says Starting up."""
+    headers, user = await _auth(db_session)
+    _, app = await _project_with_app(db_session, user.id, name="Flight Dashboard")
+    await _deploy(db_session, app, user.id, status=DeploymentStatus.RUNNING, url=None)
+
+    assert (await _rows(client, headers, "isPublishing"))["Flight Dashboard"] is True
+    assert (await _rows(client, headers))["Flight Dashboard"] is False
+
+
+async def test_a_new_version_publishing_over_a_live_app_is_publishing(client, db_session) -> None:
+    headers, user = await _auth(db_session)
+    _, app = await _project_with_app(db_session, user.id, name="Visitor Log")
+    await _deploy(db_session, app, user.id)
+    await _deploy(db_session, app, user.id, status=DeploymentStatus.RUNNING, url=None)
+
+    assert (await _rows(client, headers, "isPublishing"))["Visitor Log"] is True
+    assert (await _rows(client, headers))["Visitor Log"] is True
+
+
+async def test_a_finished_publish_is_not_publishing(client, db_session) -> None:
+    headers, user = await _auth(db_session)
+    _, live = await _project_with_app(db_session, user.id, name="Went Live")
+    await _deploy(db_session, live, user.id)
+    _, failed = await _project_with_app(db_session, user.id, name="Did Not Start")
+    await _deploy(db_session, failed, user.id, status=DeploymentStatus.FAILED, url=None)
+    await ProjectFactory.create(db_session, user.id, name="Nothing Built")
+
+    assert await _rows(client, headers, "isPublishing") == {
+        "Went Live": False,
+        "Did Not Start": False,
+        "Nothing Built": False,
+    }
+
+
+async def test_a_running_row_under_review_or_switched_off_is_not_publishing(
+    client, db_session
+) -> None:
+    """The project page reads a pending submission and a kill switch before the deployment
+    row, so a running row left under either must not read as publishing here."""
+    headers, user = await _auth(db_session)
+    _, pending = await _project_with_app(
+        db_session, user.id, name="Waiting", status=AppStatus.PENDING
+    )
+    await _deploy(db_session, pending, user.id, status=DeploymentStatus.RUNNING, url=None)
+    _, disabled = await _project_with_app(
+        db_session, user.id, name="Switched Off", status=AppStatus.DISABLED
+    )
+    await _deploy(db_session, disabled, user.id, status=DeploymentStatus.RUNNING, url=None)
+
+    assert await _rows(client, headers, "isPublishing") == {
+        "Waiting": False,
+        "Switched Off": False,
+    }
+
+
+async def test_the_single_project_endpoints_report_publishing_too(client, db_session) -> None:
+    headers, user = await _auth(db_session)
+    project, app = await _project_with_app(db_session, user.id, name="Visitor Log")
+    await _deploy(db_session, app, user.id, status=DeploymentStatus.RUNNING, url=None)
+    empty = await ProjectFactory.create(db_session, user.id, name="Nothing Built")
+    await db_session.commit()
+
+    got = await client.get(f"{_PROJECTS}/{project.id}", headers=headers)
+    patched = await client.patch(
+        f"{_PROJECTS}/{project.id}", headers=headers, json={"name": "Gate Pass Log"}
+    )
+    nothing = await client.get(f"{_PROJECTS}/{empty.id}", headers=headers)
+
+    assert got.status_code == 200, got.text
+    assert got.json()["isPublishing"] is True
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["isPublishing"] is True
+    assert nothing.json()["isPublishing"] is False
+
+
+async def test_a_first_publish_counts_as_in_the_pipeline(client, db_session) -> None:
+    """Until it serves, a first publish is in progress; a new version over a live app is
+    still in production. Another citizen's publish counts for nobody else."""
+    headers, user = await _auth(db_session)
+    other_headers, other = await _auth(db_session)
+    _, first = await _project_with_app(db_session, user.id, name="First Publish")
+    await _deploy(db_session, first, user.id, status=DeploymentStatus.RUNNING, url=None)
+    _, update = await _project_with_app(db_session, user.id, name="Update")
+    await _deploy(db_session, update, user.id)
+    await _deploy(db_session, update, user.id, status=DeploymentStatus.RUNNING, url=None)
+    _, theirs = await _project_with_app(db_session, other.id, name="Theirs")
+    await _deploy(db_session, theirs, other.id, status=DeploymentStatus.RUNNING, url=None)
+
+    counts = (await client.get(_COUNTS, headers=headers)).json()
+
+    assert counts == {"inProduction": 1, "totalApplications": 2, "inPipeline": 1}
+    assert await _names(client, headers, filter="inPipeline") == {"First Publish"}
+    assert await _names(client, headers, filter="inProduction") == {"Update"}
+    assert (await client.get(_COUNTS, headers=other_headers)).json()["inPipeline"] == 1
+
+
+async def test_the_pipeline_tile_agrees_with_the_row_flag_for_every_status(
+    client, db_session
+) -> None:
+    """The tile's SQL restates part of `compute_publish_state`'s ordering. With a running row
+    under every status, a row is in the pipeline exactly when it is under review or decided,
+    or reads as publishing."""
+    headers, user = await _auth(db_session)
+    for app_status in AppStatus:
+        _, app = await _project_with_app(
+            db_session, user.id, name=app_status.value, status=app_status
+        )
+        await _deploy(db_session, app, user.id, status=DeploymentStatus.RUNNING, url=None)
+    reviewed = {AppStatus.PENDING.value, AppStatus.REJECTED.value, AppStatus.APPROVED.value}
+
+    publishing = await _rows(client, headers, "isPublishing")
+
+    assert await _names(client, headers, filter="inPipeline") == {
+        name for name, flag in publishing.items() if flag or name in reviewed
+    }
+
+
+async def test_an_app_that_no_longer_exists_is_not_publishing(db_session) -> None:
+    """A project deleted mid-request leaves no app row behind; that reads as not publishing,
+    the way `_serving_now` reads it as not serving, rather than failing the request."""
+    assert await _publishing_now(db_session, uuid.uuid4()) is False
+
+
+def test_the_in_flight_join_renders_its_status_as_a_literal() -> None:
+    """A bound status cannot use the partial index `uq_deployments_one_in_flight` under a
+    generic plan. `render_postcompile` expands the literal the driver actually prepares."""
+    compiled = str(
+        _IN_FLIGHT_ROW.compile(
+            dialect=postgresql.dialect(), compile_kwargs={"render_postcompile": True}
+        )
+    )
+
+    assert "status = 'running'" in compiled, compiled
+    assert DeploymentStatus.RUNNING.value == "running"

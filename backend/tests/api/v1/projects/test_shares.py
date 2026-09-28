@@ -23,6 +23,7 @@ from src.api.v1.build_sessions.deps import (
     session_manager_dependency,
 )
 from src.config import settings
+from src.db.models.deployment import Deployment, DeploymentStatus
 from src.db.models.project import Project
 from src.services.build_sessions import SessionManager
 from src.services.build_sessions.appdata import resolve_app_for_project
@@ -421,6 +422,47 @@ async def test_get_project_reports_no_saved_snapshot_for_a_recipient_when_it_van
     body = resp.json()
     assert body["access"] == "shared"
     assert body["hasSavedSnapshot"] is False
+
+
+async def test_get_project_reports_publishing_from_the_owners_app_for_a_recipient(
+    client, db_session, bind_store
+) -> None:
+    """The recipient has no app of their own, so a wrongly scoped read answers false here."""
+    owner_headers, owner = await _auth(db_session)
+    store = bind_store(FakeStorage())
+    created = (
+        await client.post(
+            "/v1/projects",
+            headers=owner_headers,
+            json={"name": "App", "description": _VALID_DESCRIPTION},
+        )
+    ).json()
+    project_id = created["id"]
+    app_id = await resolve_app_for_project(db_session, owner.id, uuid.UUID(project_id))
+    db_session.add(
+        Deployment(
+            app_id=app_id,
+            user_id=owner.id,
+            status=DeploymentStatus.RUNNING,
+            image_digest="sha256:" + "cd" * 32,
+            url=None,
+        )
+    )
+    await db_session.commit()
+    await store.put(snapshot_key(app_id), b"BUNDLE")
+    recipient_headers, recipient = await _auth(db_session)
+    shared = await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=owner_headers,
+        json={"sharedWithUserId": str(recipient.id)},
+    )
+    assert shared.status_code < 300, shared.text
+
+    resp = await client.get(f"/v1/projects/{project_id}", headers=recipient_headers)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["access"] == "shared"
+    assert resp.json()["isPublishing"] is True
 
 
 async def test_get_project_reports_no_saved_snapshot_field_for_an_owner(

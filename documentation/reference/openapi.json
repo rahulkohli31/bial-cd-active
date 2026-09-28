@@ -3694,6 +3694,10 @@
             "title": "Id",
             "type": "string"
           },
+          "isPublishing": {
+            "title": "Ispublishing",
+            "type": "boolean"
+          },
           "isServing": {
             "title": "Isserving",
             "type": "boolean"
@@ -3713,6 +3717,7 @@
           "name",
           "description",
           "isServing",
+          "isPublishing",
           "createdAt",
           "updatedAt"
         ],
