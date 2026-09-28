@@ -38,7 +38,6 @@ from src.db.models.project_connector import ConnectorWindowKind, ProjectConnecto
 from src.db.models.user_limit import UserLimit
 from src.services.agent.mode_prompts import PromptContext, compose_kind_prompt
 from src.services.build_sessions import SessionManager
-from src.services.build_sessions.manager import SandboxReclaimBlockedError
 from src.services.messages.projection import (
     AssistantTextItem,
     PlanOptionsItem,
@@ -834,47 +833,6 @@ async def test_a_retry_after_the_build_attached_its_sandbox_is_still_answered_id
     assert second.json()["chatId"] == str(minted)
     await _settle(_fresh_engine, minted)
     assert await _chats_with_id(db_session, minted) == 1
-
-
-async def test_unsaved_work_in_another_project_refuses_the_handoff_with_its_own_code(
-    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
-) -> None:
-    """★ The handoff's own copy of the unsaved-work refusal, distinct from the send route's
-    (tested in `test_turn_stream.py`): taking the workspace would destroy unsaved work in
-    another project. This copy went untested once — deleting it, or letting the exception
-    escape as a 500, passed the whole suite while a Build press destroyed another project's
-    live sandbox."""
-    _user, plan_chat, headers = await _plan_chat_with_offer(
-        client, db_session, set_chat_model, _fresh_engine
-    )
-
-    async def _blocked(*a: object, **k: object) -> None:
-        raise SandboxReclaimBlockedError(
-            project_id=uuid.uuid4(),
-            project_name="Visitor Log",
-            app_id=uuid.uuid4(),
-            dirty=True,
-            agent_working=True,
-        )
-
-    minted = uuid.uuid4()
-    original = SessionManager.reclaim_preflight
-    SessionManager.reclaim_preflight = _blocked  # type: ignore[method-assign]
-    try:
-        resp = await client.post(
-            _build_url(plan_chat), headers=headers, json={"chatId": str(minted)}
-        )
-    finally:
-        SessionManager.reclaim_preflight = original  # type: ignore[method-assign]
-
-    assert resp.status_code == 409
-    error = resp.json()["error"]
-    assert error["code"] == "sandbox_reclaim_blocked"  # not the generic try-again-shortly
-    assert error["projectName"] == "Visitor Log"  # it names what is in the way
-    # The 2nd of three entry points into the hand-over dialog — all route through one
-    # responder, so "correct on the one that was tested" can't happen here.
-    assert error["agentWorking"] is True
-    assert await _chats_with_id(db_session, minted) == 0
 
 
 async def test_a_minted_id_that_is_the_users_own_plan_chat_is_one_flat_409(

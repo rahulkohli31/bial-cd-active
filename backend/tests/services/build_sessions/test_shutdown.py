@@ -31,12 +31,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.pending_teardown import PendingTeardown
-from src.db.models.user import User
 from src.services.build_sessions import app_name_for, shr_name_for
 from src.services.build_sessions import shutdown as shutdown_module
 from src.services.build_sessions.alarms import REAP_FOUND_NO_REPOSITORY_EVENT
 from src.services.build_sessions.integrity import PORCELAIN_FAILED_MARK
-from src.services.build_sessions.manager import SessionManager
 from src.services.build_sessions.shutdown import (
     SANDBOX_DESTROYED_UNREAD_EVENT,
     OwedTeardown,
@@ -1054,45 +1052,6 @@ async def test_the_sweep_counts_a_debt_it_carried_forward_apart_from_one_it_sett
     # And the row is handed a fresh window, or the very next pass would re-run a teardown that
     # has only just been tried — turning a retry schedule into a tight loop against ARM.
     assert rows[0].claimed_until > datetime.now(UTC)
-
-
-# =============================================================================
-# The debt never refuses a start
-# =============================================================================
-
-
-async def test_a_container_we_owe_a_deletion_for_does_not_hold_the_citizens_workspace(
-    fake_redis: aioredis.Redis,
-    fake_storage: FakeStorage,
-    scene: _Scene,
-    db_session: AsyncSession,
-) -> None:
-    """★ THE ONE WORKSPACE COUNTS SERVING CONTAINERS. An owed deletion is the platform's failure,
-    and a citizen must never pay for it with their next project — least of all during the Azure
-    throttle that caused it, when the rows pile up fastest.
-
-    The incumbent here is REACHABLE AND DIRTY, which is the one shape that actually refuses: an
-    unreachable or clean one is waved through by arms that were already there, so a test driving
-    either would pass against no implementation at all.
-
-    Mutation check: cap owed rows and refuse past the cap, or drop the owed-row check from the
-    reclaim preflight, and this goes red — the next project cannot start."""
-    born = _born_at(40)
-    await _seed_registry(fake_redis, scene.user_id, app_name=scene.app_name, created_at=born)
-    client = _answers_by_name(_Sandbox(), scene.app_name)
-    client.attach_handle = client.by_name[scene.app_name]
-    await _owe(scene, instance_ref=born)
-    # However many more the platform owes, the answer stays the same one.
-    for _ in range(3):
-        other = await AppRegistryFactory.create(db_session, user_id=scene.user_id)
-        await _owe(scene, instance_ref=born, app_id=other.id)
-
-    user = await db_session.get(User, scene.user_id)
-    assert user is not None
-    next_project = await ProjectFactory.create(db_session, user_id=scene.user_id)
-
-    manager = SessionManager(session_factory=scene.factory)
-    await manager.reclaim_preflight(db_session, user, next_project.id)
 
 
 async def test_the_background_spawn_returns_before_the_teardown_finishes(

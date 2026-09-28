@@ -168,8 +168,8 @@ def test_the_app_still_builds_with_its_full_route_surface() -> None:
 
     # Counted so that a route added or removed is a decision rather than a side effect. None is
     # addressed by a session id: nothing can mint one for a client to name.
-    assert len(build_session_paths) == 16, (
-        f"the C3 build-session route surface changed: expected 16 paths, found "
+    assert len(build_session_paths) == 15, (
+        f"the C3 build-session route surface changed: expected 15 paths, found "
         f"{len(build_session_paths)}. If a route was deliberately added or removed, amend C3 "
         f"and update this number in the same change.\n{sorted(build_session_paths)}"
     )

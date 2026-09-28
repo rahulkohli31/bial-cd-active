@@ -810,7 +810,7 @@
         "type": "object"
       },
       "BuildConflictEnvelope": {
-        "description": "The 409 for a route that can conflict two ways: this very project's own work already\nrunning, or a COLLEAGUE'S SHARED VIEW holding the one workspace\n(`projectId`/`projectName`/`isSharedView`). `code` discriminates —\n`build_session_already_active` vs `sandbox_reclaim_blocked` — and a client must branch on\nit, since only the second names a project.\n\nA CITIZEN'S OWN OTHER PROJECT IS NOT IN THIS LIST ANY MORE. Opening one starts it and hands\nthe outgoing container to the shutdown routine, so neither code is raised for it.",
+        "description": "The 409 a shared-view launch gives when the caller's own work holds the workspace:\n`build_session_already_active` when no project can be named truthfully, or\n`sandbox_reclaim_blocked` naming the project whose turn is running\n(`projectId`/`projectName`). `code` discriminates, and a client must branch on it, since only\nthe second names a project.",
         "properties": {
           "error": {
             "anyOf": [
@@ -3746,19 +3746,6 @@
         "title": "ReapResponse",
         "type": "object"
       },
-      "ReclaimBlockedEnvelope": {
-        "description": "`{\"error\": {message, code, projectId, projectName, dirty, building, agentWorking,\nisSharedView}}` — the 409 a turn, start or relaunch returns when taking the one sandbox slot\nwould destroy another project's work.\n\nLives in this shared module rather than in one domain router because more than one router\nanswers it.",
-        "properties": {
-          "error": {
-            "$ref": "#/components/schemas/ReclaimBlockedError"
-          }
-        },
-        "required": [
-          "error"
-        ],
-        "title": "ReclaimBlockedEnvelope",
-        "type": "object"
-      },
       "ReclaimBlockedError": {
         "description": "The blocked-reclaim 409 body: the occupying project, and what is happening inside it.",
         "properties": {
@@ -3773,22 +3760,6 @@
           "code": {
             "title": "Code",
             "type": "string"
-          },
-          "dirty": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Dirty"
-          },
-          "isSharedView": {
-            "default": false,
-            "title": "Issharedview",
-            "type": "boolean"
           },
           "message": {
             "title": "Message",
@@ -3808,7 +3779,6 @@
           "code",
           "projectId",
           "projectName",
-          "dirty",
           "building",
           "agentWorking"
         ],
@@ -9873,11 +9843,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BuildConflictEnvelope"
+                  "$ref": "#/components/schemas/ConflictEnvelope"
                 }
               }
             },
-            "description": "This project's own work is already running, or a shared view holds the workspace"
+            "description": "This project's own work is already running"
           },
           "422": {
             "content": {
@@ -9911,78 +9881,6 @@
           }
         },
         "summary": "Relaunch Preview",
-        "tags": [
-          "build_sessions"
-        ]
-      }
-    },
-    "/v1/build-sessions/shared-view/release": {
-      "post": {
-        "description": "Give up whatever colleague's shared view currently holds the caller's OWN slot (#198,\nrequirement 24's self-service exit) — no `project_id`, because the caller may not own one\nthat names it. The occupant `SandboxReclaimBlockedError` reports for a shared view is its\nOWNER's project, which a recipient never owns, so `stopActiveBuild`/`release` (both gated on\n`owned_project_or_404`) can never be the hand-over dialog's remedy for this case; this route\nasks nothing but \"is a shared view sitting in my slot right now\" and needs no id to ask it.\n\n`released: false` is a success — nothing was there to give up, or what was there was the\ncaller's OWN build sandbox (`release_project_sandbox`'s job, not this one's).",
-        "operationId": "release_shared_view_v1_build_sessions_shared_view_release_post",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReleaseResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Not authenticated"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "CSRF check failed"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ConflictEnvelope"
-                }
-              }
-            },
-            "description": "A build is running in this workspace"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetailBody"
-                }
-              }
-            },
-            "description": "Internal server error"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "The sandbox or build coordination is temporarily unavailable"
-          }
-        },
-        "summary": "Release Shared View",
         "tags": [
           "build_sessions"
         ]
@@ -10913,11 +10811,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ReclaimBlockedEnvelope"
+                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             },
-            "description": "The agent is already working here, or another project holds the workspace"
+            "description": "The agent is already working in this workspace"
           },
           "413": {
             "content": {

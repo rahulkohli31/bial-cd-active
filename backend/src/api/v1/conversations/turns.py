@@ -53,7 +53,6 @@ from src.api.v1.conversations.schemas import (
     TurnStopResponse,
     TurnStreamFrame,
 )
-from src.api.v1.live_build import ReclaimBlockedEnvelope, reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.conversation import ChatKind, Conversation
@@ -66,7 +65,6 @@ from src.services.attachments.materialize import (
     AttachmentDelivery,
     code_lane_attachments,
 )
-from src.services.build_sessions import SandboxReclaimBlockedError
 from src.services.build_sessions.appdata import APP_SWITCHED_OFF, APP_SWITCHED_OFF_CODE
 from src.services.build_sessions.manager import SessionManager
 from src.services.connectors import connected_systems_for_project
@@ -78,7 +76,6 @@ from src.services.messages.store import (
     load_history,
     load_rows,
 )
-from src.services.redis import build_coordination_or_503
 from src.services.sandbox import SandboxClient
 from src.services.turns.copy import (
     ALREADY_BUILDING_HERE_CODE,
@@ -321,11 +318,7 @@ def _project_needing_a_workspace(conversation: Conversation) -> uuid.UUID | None
         AUTH_401,
         (403, ErrorEnvelope, "CSRF check failed"),
         (404, ErrorEnvelope, "Conversation not found"),
-        (
-            409,
-            ReclaimBlockedEnvelope,
-            "The agent is already working here, or another project holds the workspace",
-        ),
+        (409, ErrorEnvelope, "The agent is already working in this workspace"),
         # ONE REFUSAL ON THIS STATUS. A per-message document cap used to share it and is gone;
         # a message carrying too many files is refused by the request validator instead.
         (
@@ -452,49 +445,6 @@ async def start_turn(
         active = manager.active_session_for(user.id)
         if active is not None and not manager.is_letting_go_of_the_workspace(active):
             raise AppApiError(409, BUILD_IN_FLIGHT_MSG, code=ALREADY_BUILDING_HERE_CODE)
-
-        # BOTH KINDS, not just Build, and the guard above cannot answer this one.
-        #
-        # Two reasons it sits outside that block. `active_session_for` only sees in-process
-        # sessions, so a finished build's pardoned container — warm, holding no session, no lock
-        # and no heartbeat — is invisible to it, and that is the state a user is most often in.
-        # And `_pin_workspace` attaches the project's LIVE container for a Plan turn as well
-        # ("Resolve the turn-pinned read surface ONCE, for BOTH KINDS"), so a Plan turn in
-        # another project reclaims the incumbent's workspace exactly as a Build turn does.
-        #
-        # Gating this on the chat's kind meant a Plan send still destroyed the other project's
-        # unsaved work, and did it inside the detached turn where the only thing the user saw was
-        # "Your workspace could not be started right now" — no dialog, no named project, no way
-        # to save. Asked here so the refusal is an HTTP 409 the client turns into a choice.
-        #
-        # THE SECOND OF TWO REFUSALS, and it carries `sandbox_reclaim_blocked` where the one
-        # above carries `already_building_here`. Same status, different cause, different remedy:
-        # one is "your own other chat is using it", the other is "somebody's unsaved work in
-        # another project is in the way". A client that could only read the status told the citizen
-        # the wrong thing about half the time.
-        if sandbox is not None:
-            # The seam wraps the preflight because the guard reads the registry through the
-            # deliberately-unguarded `read_registry` (`locks.py`'s policy: an answer-bearing
-            # primitive must not swallow a `RedisError` and manufacture a certain-looking "no
-            # sandbox"). So an unreadable store arrives here as a `RedisError` and has to become
-            # the same 503 every other coordination route gives, not a 500. An UNCONFIGURED Redis
-            # skips the block and proceeds, which is right: with no coordination subsystem there is
-            # no registry, no slot, and nothing a reclaim could destroy.
-            #
-            # AND IT IS ALSO THE HAND-OVER'S PREFLIGHT, which is why the body it returns carries
-            # more than the status. The browser asks the one-workspace question BY SENDING —
-            # every refusal above this line leaves no turn row and no spent card — and draws its
-            # dialog from what comes back: `projectName` for which project holds the workspace,
-            # and `agentWorking` for whether that project's agent is mid-thought, of ANY kind
-            # (`building` stays narrow, and only marks a turn that can write — see
-            # `SandboxReclaimBlockedError`). Neither fact is obtainable from the cheap state poll,
-            # which reads only this citizen's own registry record and cannot say whose project is
-            # sitting in the slot.
-            with build_coordination_or_503():
-                try:
-                    await manager.reclaim_preflight(db, user, project_id)
-                except SandboxReclaimBlockedError as exc:
-                    return reclaim_blocked_response(exc)
 
     # SKIPPED FOR A CHAT WITH NO PROJECT, along with the two lookups further down that read
     # from it. There is nothing to load, and nothing downstream needs it: the prompt's tail

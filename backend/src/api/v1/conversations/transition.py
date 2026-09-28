@@ -46,17 +46,14 @@ from src.api.v1.conversations._shared import (
     resolve_conversation_or_404,
 )
 from src.api.v1.conversations.turns import _app_id_for_project, start_conversation_turn
-from src.api.v1.live_build import reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.project import Project
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.agent.mode_prompts import PromptContext
-from src.services.build_sessions import SandboxReclaimBlockedError
 from src.services.build_sessions.counters import count
 from src.services.connectors import connected_systems_for_project
 from src.services.messages.store import load_rows
-from src.services.redis import build_coordination_or_503
 from src.services.turns.copy import (
     ALREADY_BUILDING_HERE_CODE,
     WORKSPACE_UNAVAILABLE_CODE,
@@ -253,16 +250,10 @@ async def build_it(
             code=WORKSPACE_UNAVAILABLE_CODE,
         )
 
-    # The two refusals below, in the same order and carrying the same codes the send route uses:
-    # one workspace per user, and it is not this press's to take while any of the user's own
-    # chats holds it — or if unsaved work in a different project is in the way.
+    # The refusal the send route gives, with the same code: one workspace per user, and it is not
+    # this press's to take while any of the user's own chats holds it.
     if manager.active_session_for(user.id) is not None:
         raise AppApiError(409, BUILD_IN_FLIGHT_MSG, code=ALREADY_BUILDING_HERE_CODE)
-    with build_coordination_or_503():
-        try:
-            await manager.reclaim_preflight(db, user, project_id)
-        except SandboxReclaimBlockedError as exc:
-            return reclaim_blocked_response(exc)
 
     project = await db.get(Project, project_id)
     if project is None:  # the FK guarantees this; fail loudly if it ever breaks
@@ -347,7 +338,7 @@ async def build_it(
     #
     # AND IT IS DECIDED ON A FRESH READ, NOT ON `rows`. `rows` is the snapshot this request
     # opened with, and everything between there and here takes real time: the daily-limit read,
-    # the reclaim preflight, the insert, and a turn start that does not return until a sandbox
+    # the insert, and a turn start that does not return until a sandbox
     # is attached. A free-text send in the Plan chat from a second tab resolves this same card
     # as `refine` inside that window — and answering off the stale snapshot would put a SECOND
     # real `ToolReturnPart` on one call id, which is the hazard the comment below names.

@@ -100,7 +100,6 @@ from src.services.build_sessions.locks import (
     record_the_first_serve,
     release_lock_as_holder,
     settle_stay_once_provisioning_ends,
-    shared_view_stamp,
     stamp_is_proven,
     write_heartbeat,
     write_start_failure,
@@ -501,20 +500,15 @@ class NoSnapshotToRelaunchError(Exception):
 
 
 class SandboxReclaimBlockedError(Exception):
-    """Something that is NOT this citizen's own project holds their one sandbox slot, and
-    taking it would destroy a screen nobody asked to lose.
+    """A colleague's shared view cannot start because one of this citizen's own projects has a
+    turn running in their one sandbox slot.
 
-    A COLLEAGUE'S SHARED VIEW IS WHAT THIS MEANS NOW. A citizen's own other project no longer
-    raises it from a start: opening a second project hands the first to the shutdown routine,
-    which writes its tree back over the saved copy before destroying it, so there is nothing
-    left to warn about. A shared view has no such hand-over — it is somebody else's restore of
-    somebody else's bundle — so it is still stated, and `is_shared_view` is how the client tells
-    which dialog to draw. The shared-view LAUNCH raises it the other way round too, when the
-    recipient's own live turn holds the slot that launch needs.
+    Raised by the shared-view launch alone. Every other start takes the slot: opening a project
+    of their own hands the incumbent to the shutdown routine, and a shared view sitting in the
+    slot holds no work of its own, so the reconcile reclaims it.
 
-    The router turns this into a 409 naming the occupying project; `give_up_shared_view` and
-    `release_project_sandbox` are the only things that actually destroy a container. Nothing
-    here writes a snapshot."""
+    The router turns this into a 409 naming the occupying project. Nothing here writes a
+    snapshot."""
 
     def __init__(
         self,
@@ -522,17 +516,9 @@ class SandboxReclaimBlockedError(Exception):
         project_id: uuid.UUID,
         project_name: str,
         app_id: uuid.UUID,
-        # None is UNKNOWN and still blocks: a container we could reach but could not question,
-        # or one we could not reach at all (`SandboxUnreachableError`), is not evidence of a
-        # clean tree — guessing "clean" is the one guess that loses work.
-        dirty: bool | None,
-        # A build in progress, not just a dirty tree — a different refusal wearing the same
-        # envelope. "has unsaved changes" is the wrong copy for it: there is no settled tree to
-        # describe (`dirty` is deliberately not probed mid-build; git status against a container
-        # the agent is writing into produced a half-written snapshot in testing), and
+        # A build in progress: there is no settled tree to describe, and
         # `release_project_sandbox` refuses while a live session owns the container, so the
-        # build must be STOPPED first — a separate act with its own cost. The client needs a
-        # third choice because of it: stop-and-save, stop-and-discard, or leave it running.
+        # build must be STOPPED first — a separate act with its own cost.
         building: bool = False,
         # A broader, separate signal from `building`, kept apart on purpose: whether the OTHER
         # project's agent is mid-thought at all, which a Plan/Ask turn is exactly as much as a
@@ -541,23 +527,13 @@ class SandboxReclaimBlockedError(Exception):
         # a question. `building` decides WHICH dialog; `agent_working` decides what it says is
         # happening right now.
         agent_working: bool = False,
-        # WHICH REMEDY ACTUALLY WORKS (#198). `project_id`/`project_name` above name a project
-        # the citizen owns for a `sbx-` occupant — `stopActiveBuild`/`release` both gate on
-        # `owned_project_or_404`, which that citizen satisfies. For a `shr-` occupant the id
-        # named is the SHARED PROJECT'S OWNER, which the caller (a recipient) never owns — the
-        # same two routes would 404 them out of their own slot. `is_shared_view=True` is the
-        # client's one signal to route to the self-scoped give-up-my-shared-view endpoint
-        # instead, which needs no project id or ownership check at all.
-        is_shared_view: bool = False,
     ) -> None:
         super().__init__("another project is holding the sandbox")
         self.project_id = project_id
         self.project_name = project_name
         self.app_id = app_id
-        self.dirty = dirty
         self.building = building
         self.agent_working = agent_working
-        self.is_shared_view = is_shared_view
 
 
 @dataclass(frozen=True)
@@ -755,37 +731,6 @@ class _OutgoingTurn:
     at_its_boundary: uuid.UUID | None = None
     #: Every other kind, cancelled now: there is no boundary in a single agent run.
     cut_where_it_stands: uuid.UUID | None = None
-
-
-async def _occupying_shared_project(
-    db: AsyncSession, reg: dict[str, str]
-) -> _OccupyingProject | None:
-    """The `shr-` counterpart of `_occupying_project` above — and the reason it can be a
-    plain lookup rather than another forward-match loop (#198, requirement 24).
-
-    `_occupying_project` exists ONLY because `app_name_for` cannot be reverse-parsed, so a
-    caller's own app rows must be re-derived and matched forward one at a time. `shr_name_for`
-    is exactly as lossy, but a `shr-` occupant's slot is stamped with its owner and project at
-    Launch (`launch_shared_preview`, read back by `shared_view_stamp`) precisely so this never
-    needs to guess: the identity is read straight off the hash, not re-derived from a name.
-
-    Called BEFORE `_occupying_project`, not after — a `shr-` occupant belongs to the
-    PROJECT'S OWNER, who is almost never the caller (`user_id` in `_occupying_project`'s own
-    query), so the forward-match loop there would search the wrong person's app rows and
-    always miss. Absent fields (an ordinary build sandbox) or a project since deleted both
-    return `None` — the second is the identical 'ghost' reading `_occupying_project` gives a
-    dangling registry entry: nothing left to warn about, so the caller falls through and
-    reclaims silently."""
-    stamp = shared_view_stamp(reg)
-    if stamp is None:
-        return None
-    project_name = await db.scalar(sa.select(Project.name).where(Project.id == stamp.project_id))
-    if project_name is None:
-        return None
-    app_id = await existing_app_id(db, stamp.owner_id, stamp.project_id)
-    if app_id is None:
-        return None
-    return _OccupyingProject(app_id=app_id, project_id=stamp.project_id, project_name=project_name)
 
 
 async def _at_rest(
@@ -1522,14 +1467,10 @@ class SessionManager:
         )
         if name is None:
             return BuildSessionConflictError()
-        # `dirty` is deliberately NOT probed: `SandboxReclaimBlockedError` states why — a
-        # `git status` taken while the agent writes is true for no instant the citizen cares
-        # about.
         return SandboxReclaimBlockedError(
             project_id=blocking.project_id,
             project_name=name,
             app_id=blocking.app_id,
-            dirty=None,
             building=self._writing_session_holds(user_id, blocking.app_id),
             agent_working=self._live_session_holds(user_id, blocking.app_id),
         )
@@ -1886,84 +1827,6 @@ class SessionManager:
             saved_head=saved_head,
         )
 
-    async def _refuse_if_reclaim_would_destroy_work(
-        self,
-        db: AsyncSession,
-        user: User,
-        *,
-        spare_app: str | None,
-    ) -> None:
-        """Raise when the container holding this citizen's slot is a COLLEAGUE'S SHARED VIEW.
-
-        THE ONE REFUSAL LEFT, and the scope of what went is the point. A citizen's own other
-        project no longer earns a dialog here, whatever is in it: opening a second project hands
-        the first to the shutdown routine, which stops its turn, writes its tree back over the
-        saved copy and destroys the container in the background. Nothing is lost, so there is
-        nothing to ask about — and the arms that used to ask (an agent writing in there, a
-        container that would not answer, unsaved changes, a pristine tree) all asked about a
-        destruction that no longer happens on this path.
-
-        A SHARED VIEW HAS NO SUCH HAND-OVER. Its launch is somebody else's restore of somebody
-        else's saved bundle, automating it is out of scope, and the recipient reading it right
-        now would simply lose their screen. So this one is still stated, with the same
-        `is_shared_view` discriminator the client already branches on.
-
-        Runs BEFORE `_holding_user_lock` — once the reconcile marks the registry `ending` the
-        container can no longer be attached to or questioned."""
-        redis = get_redis()
-        # Five ways this returns silently — "nothing is being taken", not "a shared view holds
-        # it": (1) the live container is already the one we want, (2) no registry entry or it is
-        # not READY, (3) the container is one the platform has already promised to destroy, so it
-        # is closing down rather than holding anything, (4) the occupying record carries no
-        # shared-view stamp (an ordinary build sandbox — the caller's own project, or a ghost the
-        # reconcile clears), (5) the stamp names a project or an app that has since gone.
-        # Widening any of these into a raise would put up a dialog about nothing.
-        #
-        # A `shr-` OCCUPANT IS READ OFF THE HASH, never forward-matched: `shr_name_for` hashes
-        # the (app, recipient) pair exactly as lossily as `app_name_for` does, and the project
-        # belongs to somebody else, so `_occupying_project`'s search of the CALLER's own app rows
-        # could never resolve one. `launch_shared_preview` stamps the identity at Launch
-        # precisely so this never has to guess.
-        #
-        # DELIBERATELY UNGUARDED on a Redis failure — see the read below. Nothing here writes a
-        # snapshot: saving stays the user's explicit action.
-        if await _the_live_sandbox_is_already_the_one_we_want(redis, user.id, spare_app):
-            return
-        # DELIBERATELY UNGUARDED. `read_registry` is one of the answer-bearing
-        # primitives `locks.py` keeps bare on purpose: swallowing a `RedisError` here would
-        # "manufacture a certain-looking answer out of an ambiguous store" — a phantom "no
-        # sandbox" that permits the teardown. Let it propagate; the routers' existing
-        # `build_coordination_or_503` seam turns it into a 503, which is a true statement.
-        reg = await read_registry(redis, user.id)
-        if reg is None or reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_READY:
-            return
-        occupied_by = reg.get(REGISTRY_FIELD_APP_NAME)
-        if occupied_by is None or occupied_by == spare_app:
-            return
-        if await _is_already_on_its_way_out(db, user.id, occupied_by):
-            # The container this record names is already owed a deletion, so it is closing down
-            # rather than holding anybody's workspace.
-            return
-        # NEITHER `building` NOR `agent_working` APPLIES: `launch_shared_preview` mints no
-        # `BuildSession` and no chat turn ever writes into this container, so there is no
-        # session for `_writing_session_holds`/`_live_session_holds` to find regardless of
-        # which app_id is asked — reported here as a plain constant, not probed, because
-        # probing something that can never be true is a wasted round trip with an already-known
-        # answer. `dirty=False` for the identical reason: nothing here is the recipient's own
-        # unsaved work to lose, so the CLEAN-STOP dialog is the true one — "still open" and
-        # "starting it again later brings it back", both facts that hold for a shared view.
-        shared_occupying = await _occupying_shared_project(db, reg)
-        if shared_occupying is not None:
-            raise SandboxReclaimBlockedError(
-                project_id=shared_occupying.project_id,
-                project_name=shared_occupying.project_name,
-                app_id=shared_occupying.app_id,
-                dirty=False,
-                building=False,
-                agent_working=False,
-                is_shared_view=True,
-            )
-
     async def _show_the_outgoing_project_the_door(
         self,
         db: AsyncSession,
@@ -2003,9 +1866,8 @@ class SessionManager:
             return True
         occupying = await _occupying_project(db, user.id, outgoing)
         if occupying is None:
-            # A name matching no app this citizen owns: a colleague's shared view (refused
-            # above), or a ghost the reconcile is there to clear. Neither is a project of theirs
-            # whose tree there is anything to write back.
+            # A name matching no app this citizen owns: a colleague's shared view, or a ghost.
+            # Neither holds work of theirs to write back, so the reconcile below reclaims it.
             return False
         instance_ref = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
         if instance_ref is None:
@@ -2385,26 +2247,6 @@ class SessionManager:
             failed.failure if failed is not None and failed.project_id == project_id else None,
         )
 
-    async def reclaim_preflight(
-        self,
-        db: AsyncSession,
-        user: User,
-        project_id: uuid.UUID,
-    ) -> None:
-        """The guard asked BEFORE the 202 so the answer can be an HTTP 409. `ensure_sandbox`
-        runs inside the detached turn task, where a raise becomes a chat message and the
-        client has nothing to act on — no status to branch on and no project id to name. The
-        same question asked here, beside the route's other cheap synchronous gates, gives the
-        client a refusal it can render. The guard inside `ensure_sandbox` stays: this one is an
-        early, kind answer, not the enforcement — anything that changes between the two is
-        caught there.
-
-        WHAT IT CAN STILL ANSWER is one thing: a colleague's shared view is sitting in this
-        citizen's slot. Their own other project is not a refusal any more — the turn hands it
-        over and starts — so the common case for this call is now silence."""
-        spare_app = await _sandbox_name_for_existing_app(db, user.id, project_id)
-        await self._refuse_if_reclaim_would_destroy_work(db, user, spare_app=spare_app)
-
     async def release_project_sandbox(
         self,
         db: AsyncSession,
@@ -2451,36 +2293,6 @@ class SessionManager:
             # container's tree back to, and this is the one control a citizen presses that
             # destroys a container on purpose — with the Save beside it optional.
             return await reap_user(redis, user.id, sandbox_client, strict=True, app_id=app_id)
-
-    async def give_up_shared_view(
-        self, user_id: uuid.UUID, *, sandbox_client: SandboxClient
-    ) -> bool:
-        """Give up whatever shared view currently holds the caller's own slot (#198, requirement
-        24's self-service exit). NEEDS NO `project_id` AND NO OWNERSHIP CHECK — the registry this
-        reads is keyed by `user_id` alone, so whatever it names is already unambiguously theirs to
-        release, and that is the whole reason this exists: `release_project_sandbox` still
-        requires a `project_id` the caller OWNS to even ask the question, which a recipient who
-        has never built anything of their own cannot supply, and `SandboxReclaimBlockedError`'s
-        occupant for a shared view names the OWNER's project — never the recipient's — so
-        neither `stopActiveBuild` nor `release` can be reached with an id that passes
-        `owned_project_or_404`. A recipient's hand-over dialog needs a door that asks nothing but
-        "is a shared view sitting in MY slot right now", and this is it.
-
-        Returns `False`, not an error, when the slot holds nothing (already gone) or holds the
-        caller's OWN build sandbox instead (nothing of this action's business — `sbx-` names are
-        `release_project_sandbox`'s job). `strict=True` mirrors that function's own reasoning:
-        the citizen is about to retry whatever the reclaim refusal blocked, and a still-standing
-        container would walk them right back into it."""
-        redis = get_redis()
-        async with self._start_lock_for(user_id):
-            if user_id in self._active_by_user:
-                raise BuildSessionConflictError()
-            reg = await read_registry(redis, user_id)
-            if reg is None or reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_READY:
-                return False
-            if not is_a_shared_sandbox_name(reg.get(REGISTRY_FIELD_APP_NAME, "")):
-                return False
-            return await reap_user(redis, user_id, sandbox_client, strict=True)
 
     async def revoke_shared_preview(
         self,
@@ -2764,7 +2576,6 @@ class SessionManager:
             # bound until inside it, and `resolve_app_for_project` mints a DRAFT row, so it
             # cannot name the container a request that may still be refused would spare.
             spare_app = await _sandbox_name_for_existing_app(db, user_id, project_id)
-            await self._refuse_if_reclaim_would_destroy_work(db, user, spare_app=spare_app)
             incumbent_is_leaving = await self._show_the_outgoing_project_the_door(
                 db, user, spare_app=spare_app, sandbox_client=sandbox_client
             )
@@ -3074,14 +2885,6 @@ class SessionManager:
             if owner_app_id is None:
                 raise SharedProjectHasNoAppError(project.id)
             shared_name = shr_name_for(owner_app_id, recipient.id)
-            # THE GUARD ALWAYS SPARES THE RECIPIENT'S OWN INCUMBENT — Refresh included. It asks
-            # "is anything of the recipient's about to be destroyed", and their own already-live
-            # shared view is never that, whatever button they pressed to get here. Bug fixed
-            # live: passing `None` here on a forced refresh also defeated the identity check
-            # (`_the_live_sandbox_is_already_the_one_we_want`/`occupied_by == spare_app`) the
-            # guard itself runs first, so Refresh on a live view fell through to the shared-
-            # occupant branch and reported the recipient's OWN open app as blocking them.
-            await self._refuse_if_reclaim_would_destroy_work(db, recipient, spare_app=shared_name)
             # OPENING A COLLEAGUE'S PROJECT IS OPENING A DIFFERENT PROJECT, so the recipient's
             # own container leaves the way it leaves at every other door — written back over its
             # saved copy and destroyed in the background — rather than being reclaimed inline by
@@ -3091,10 +2894,7 @@ class SessionManager:
             incumbent_is_leaving = await self._show_the_outgoing_project_the_door(
                 db, recipient, spare_app=shared_name, sandbox_client=sandbox_client
             )
-            # `_holding_user_lock` asks a NARROWER question than the guard above — not "would
-            # this destroy something" but "should the reconcile below treat the live container
-            # as the one we already want, or tear it down". Those answers diverge on exactly
-            # Refresh: `spare_app=None` here is what makes the reconcile reclaim a live view
+            # `spare_app=None` on Refresh is what makes the reconcile reclaim a live view
             # unconditionally, so the restore arm always runs even though the name it would
             # produce is identical to what is already there.
             spare_app = None if force_refresh else shared_name
@@ -3294,12 +3094,11 @@ class SessionManager:
             # turn that then gets refused. No app row yet means nothing live can be ours, which
             # is the correct answer for a project's very first turn.
             spare_app = await _sandbox_name_for_existing_app(db, user_id, project_id)
-            # BOTH ABOVE THE LOCK, because the lock's reconcile is what would otherwise destroy
-            # the incumbent, and an `ending` registry can no longer be attached to or questioned.
+            # ABOVE THE LOCK, because the lock's reconcile is what would otherwise destroy the
+            # incumbent, and an `ending` registry can no longer be attached to or questioned.
             # A FIRST MESSAGE IS A DOOR: this is the only way a never-built project starts, so a
             # citizen who switches by typing has to be handed through here exactly as one who
             # pressed start is handed through the relaunch door.
-            await self._refuse_if_reclaim_would_destroy_work(db, user, spare_app=spare_app)
             incumbent_is_leaving = await self._show_the_outgoing_project_the_door(
                 db, user, spare_app=spare_app, sandbox_client=sandbox_client
             )
