@@ -79,7 +79,8 @@ FAIL_CONTEXT_TOO_LARGE: Final = "context_too_large"
 FAIL_BUILD: Final = "build_failed"
 FAIL_BUILD_UNAVAILABLE: Final = "build_unavailable"
 """The platform could not produce the image: the registry was unreachable, the wait for the run
-expired, or a run that reported success left no image. Not the app's own build failing."""
+expired, the run failed before the app's own build began, or a run that reported success left no
+image. Not the app's own build failing."""
 FAIL_STORAGE: Final = "storage_unavailable"
 FAIL_PROVISION: Final = "provision_failed"
 FAIL_NOT_HEALTHY: Final = "revision_unhealthy"

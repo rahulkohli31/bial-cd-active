@@ -4,12 +4,12 @@
  * so the decision (which words, colour, action, row) lives here as pure functions over one
  * server-computed field, and each surface only renders it.
  *
- * `presentationFor` switches on `publishState`, and reads `approvedRetryCommit` only to say what its
- * button publishes — both server-authored, NOTHING recombined. A client that recombines a server
- * decision from parts has produced this same bug four times — most recently promising an
- * auto-publish moment before the server routed the app to an administrator. `status`,
- * `unpublishedAt`, `failureCode`, the approval lineage and the pin stay on the wire only for the
- * version ROWS to render.
+ * `presentationFor` switches on `publishState`, reads `approvedRetryCommit` only to say what its
+ * button publishes, and `failureCode` only to say why a publish did not start — all
+ * server-authored, NOTHING recombined. A client that recombines a server decision from parts has
+ * produced this same bug four times — most recently promising an auto-publish moment before the
+ * server routed the app to an administrator. `status`, `unpublishedAt`, the approval lineage and
+ * the pin stay on the wire only for the version ROWS to render.
  */
 import { assertNever } from './assertNever'
 import { MONTHS } from './monthNames'
@@ -117,6 +117,10 @@ export const RESTART_FAILED_CODES: ReadonlySet<string> = new Set([
  * state's sentence then says so, because an owner with newer saved work must not be surprised
  * that it is not what goes live.
  *
+ * `failureCode` picks only `did_not_start`'s sentence, never a label, an action or a version: a
+ * platform that could not build the app and an app that did not build are one state and one
+ * button, but opposite answers to "is something wrong with my app?".
+ *
  * THE STATE VOCABULARY IS NOT THIS REDESIGN'S TO EXTEND: eleven states, owned by the product's
  * lifecycle. A redesign may relabel a state or move where it is drawn; adding or removing one
  * changes what the product MEANS rather than how it is laid out.
@@ -128,6 +132,7 @@ export const RESTART_FAILED_CODES: ReadonlySet<string> = new Set([
 export function presentationFor(
   state: PublishState,
   approvedRetryCommit: string | null,
+  failureCode: string | null,
 ): Presentation {
   switch (state) {
     case 'nothing_built':
@@ -326,12 +331,36 @@ export function presentationFor(
       // happened, which is all the citizen needs to press the button below.
       return {
         label: "Didn't start",
-        sentence: 'The publish got as far as starting your app up, and then stopped.',
+        sentence: whyItDidNotStart(failureCode),
         action: 'try_again',
         version: 'none',
       }
     default:
       return assertNever(state)
+  }
+}
+
+/**
+ * Only the two revision codes got as far as starting the app, so any code not named here gets a
+ * sentence that claims nothing about how far the publish got.
+ */
+function whyItDidNotStart(failureCode: string | null): string {
+  switch (failureCode) {
+    case 'build_unavailable':
+      return (
+        'The platform could not build your app just now — this is not a problem with your ' +
+        'app, so try again in a little while.'
+      )
+    case 'build_failed':
+      return (
+        'Your app did not build, so this version did not go live — ask the assistant to fix ' +
+        'it, then try again.'
+      )
+    case 'revision_unhealthy':
+    case 'revision_not_ready':
+      return 'The publish got as far as starting your app up, and then stopped.'
+    default:
+      return 'The publish stopped before anything new went live.'
   }
 }
 

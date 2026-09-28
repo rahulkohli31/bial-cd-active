@@ -6,12 +6,12 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from typing import Any
 
 from fastapi import FastAPI
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.manager import StopOutcome
 from tests.api.v1.build_sessions.conftest import a_live_session, auth_headers
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
@@ -101,7 +101,7 @@ async def test_stop_active_build_settles_a_live_build_so_release_can_proceed(
     assert asked.json()["state"] == "still_running"  # the ask returned; the stop is in flight
 
     # The turn unwinding — the one step that frees the slot the release is waiting on.
-    await wire.manager.finish_turn_sandbox(session, wire.sbx, touched=True)
+    await wire.manager.finish_turn_sandbox(session)
 
     # THE BARRIER. Nothing below this line runs until the status read says the work has stopped,
     # and it is a poll of the real state rather than a wait on a clock.
@@ -287,28 +287,28 @@ async def test_a_finished_turn_keeps_the_workspace_until_its_closing_work_is_don
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, monkeypatch
 ) -> None:
     """The two halves of the turn seam, over the wire and at once: the release still refuses
-    while the finished turn does its closing work against the live container, and the next
-    message waits for it instead of being refused.
+    while the finished turn does its closing work, and the next message waits for it instead of
+    being refused.
 
     The ordering is the point. Admitting the next message by freeing the slot first would buy the
-    same green test and cost the citizen the container out from under a call still using it.
+    same green test and let a claimant race the pardon for the same container.
 
-    Mutation check: move the `_active_by_user` pop above step 1b in `finish_turn_sandbox` and the
-    release below answers 200."""
+    Mutation check: move the `_active_by_user` pop above the pardon in `finish_turn_sandbox` and
+    the release below answers 200."""
     user, project = await _user_project(db_session, "ctl-finish1@rvaiglobal.com")
     session = await a_live_session(wire, db_session, user, project.id)
     wire.sbx.attach_handle = session.handle  # the pardoned container answers the next message
 
     entered, gate = asyncio.Event(), asyncio.Event()
+    pardon = wire.manager._pardon_the_container
 
-    async def gated_closing_work(*_args: object, **_kwargs: object) -> None:
+    async def gated_closing_work(*args: Any, **kwargs: Any) -> None:
         entered.set()
         await gate.wait()
+        await pardon(*args, **kwargs)
 
-    monkeypatch.setattr(manager_module, "flag_liveness_overpromise", gated_closing_work)
-    finishing = asyncio.create_task(
-        wire.manager.finish_turn_sandbox(session, wire.sbx, touched=True)
-    )
+    monkeypatch.setattr(wire.manager, "_pardon_the_container", gated_closing_work)
+    finishing = asyncio.create_task(wire.manager.finish_turn_sandbox(session))
     await entered.wait()
 
     held = await client.post(

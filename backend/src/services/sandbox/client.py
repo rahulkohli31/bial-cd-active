@@ -238,14 +238,32 @@ _REMOVE_WHAT_THE_APP_DELETED: Final = (
     "done; fi; "
 )
 
+# An app saved before its config read `BIAL_BASE_PATH` serves at `/` while the platform asks for
+# its assigned path, so it never opens. A restore sets the image's config aside before the checkout
+# and puts it back after the removal above (which would otherwise delete it from an app that once
+# dropped the file) — but only over a config that does not read the path. A config that does is
+# kept as the app saved it: publishing layers the app's own settings (images, redirects, env)
+# under the platform's, and replacing it would drop them. Discard applies the same rule. Kept in
+# `.git`, which no save bundles, no discard cleans and the agent's file tool cannot write.
+_IMAGES_NEXT_CONFIG: Final = ".git/bial-next.config.ts"
+_SET_THE_IMAGES_NEXT_CONFIG_ASIDE: Final = (
+    f"[ -f {_IMAGES_NEXT_CONFIG} ] || cp next.config.ts {_IMAGES_NEXT_CONFIG}; "
+)
+_PUT_THE_IMAGES_NEXT_CONFIG_BACK: Final = (
+    f"if [ -f {_IMAGES_NEXT_CONFIG} ] && ! grep -qs BIAL_BASE_PATH next.config.ts; then "
+    f"cp {_IMAGES_NEXT_CONFIG} next.config.ts; fi; "
+)
+
 _RESTORE_SCRIPT: Final = (
     "set -e; "
     + _UNPACK_THE_PUSHED_BUNDLE
     + _FINGERPRINT_THE_INSTALLED_LOCKFILE
     + "git init -q 2>/dev/null || true; "
-    "git fetch -q /tmp/bial-app.bundle HEAD; "
+    + _SET_THE_IMAGES_NEXT_CONFIG_ASIDE
+    + "git fetch -q /tmp/bial-app.bundle HEAD; "
     "git checkout -q -f FETCH_HEAD; "
     + _REMOVE_WHAT_THE_APP_DELETED
+    + _PUT_THE_IMAGES_NEXT_CONFIG_BACK
     + _FINGERPRINT_THE_WANTED_LOCKFILE
     + _RECONCILE_A_MOVED_LOCKFILE
     + _REMOVE_THE_PUSHED_BUNDLE
@@ -261,6 +279,7 @@ _DISCARD_SCRIPT: Final = (
     + "git fetch -q /tmp/bial-app.bundle HEAD; "
     "git reset -q --hard FETCH_HEAD; "
     "git clean -q -fd; "
+    + _PUT_THE_IMAGES_NEXT_CONFIG_BACK
     + _FINGERPRINT_THE_WANTED_LOCKFILE
     + _RECONCILE_A_MOVED_LOCKFILE
     + _REMOVE_THE_PUSHED_BUNDLE

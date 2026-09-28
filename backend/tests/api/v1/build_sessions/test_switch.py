@@ -157,7 +157,7 @@ async def _serving(
     session = await manager.ensure_sandbox(
         db, user, project_id, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(session, client, touched=True)
+    await manager.finish_turn_sandbox(session)
     client.attach_handle = session.handle
     return session.app_id
 
@@ -323,7 +323,7 @@ async def test_the_outgoing_turn_ending_late_does_not_take_the_incoming_workspac
         db_session, user, project_b, sandbox_client=client, may_write=True
     )
 
-    await manager.finish_turn_sandbox(outgoing, client, touched=True)
+    await manager.finish_turn_sandbox(outgoing)
 
     assert manager.active_session_for(user.id) is incoming
     # The outgoing session still leaves memory, though the slot it would have released is B's.

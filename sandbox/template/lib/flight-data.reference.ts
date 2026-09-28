@@ -16,8 +16,9 @@
 //
 //        npm install hyparquet hyparquet-compressors @azure/identity @azure/storage-blob
 //
-//   2. Uncomment the body (strip the leading `// ` from each line) into your own module, or copy
-//      the parts you need. Prefer copying: this is a worked example, not a library to import.
+//   2. Copy the whole body into `lib/flight-data.ts`, stripping the leading `// ` from each
+//      line. All of it: the page pattern at the end keeps your app inside its memory, and it uses
+//      the reading functions above it, so copy both.
 //
 //   3. The two environment variables are injected for you when the data connector is switched on
 //      for this project. If they are missing, the connector is off — the code says so explicitly.
@@ -36,8 +37,24 @@
 //
 // import { BlobServiceClient } from '@azure/storage-blob'
 // import { ManagedIdentityCredential } from '@azure/identity'
-// import { parquetReadObjects } from 'hyparquet'
+// import { cachedAsyncBuffer, parquetReadObjects } from 'hyparquet'
 // import { compressors } from 'hyparquet-compressors'
+//
+// // ── The limits your app runs inside ──────────────────────────────────────────────────────────
+// //
+// // Read this before you plan anything: the lake is far bigger than the machine your app runs on.
+// //
+// //   the lake          hundreds of files and several gigabytes, growing every day
+// //   this workspace    2 GB of memory, SHARED with the dev server that is serving your app
+// //   a published app   1 GB of memory
+// //   one request       must answer in seconds; one that runs for minutes is cut off by the
+// //                     platform before it answers, and the page shows an error
+// //
+// // Reading every file whole, on every request, takes minutes and holds most of the workspace's
+// // memory: it answers nowhere and is killed once published. The functions below stay inside these
+// // limits. They read only the files that hold the current data, download only the columns you
+// // name, and keep one row per flight; `sharedLoad` makes that load once for every request, and
+// // `pageOf` hands the browser one page at a time. Build on them rather than a reader of your own.
 //
 // // ── The connection ───────────────────────────────────────────────────────────────────────────
 // //
@@ -53,7 +70,7 @@
 //   if (!value) {
 //     throw new Error(
 //       `${name} is not set. The flight-data connector is not switched on for this project — ` +
-//         `turn it on under DATA in the project rail, then restart the dev server.`,
+//         `the app's owner switches it on in the app's settings, on the Integrations tab, then restart the dev server.`,
 //     )
 //   }
 //   return value
@@ -200,7 +217,7 @@
 //   ) as ArrayBuffer
 // }
 //
-// // MISTAKE 4 — reading all 408 columns.
+// // MISTAKE 4 — reading all 408 columns, or downloading whole files to read a few.
 // //
 // // This is a MEMORY bug wearing a performance costume, and the costume is why it ships.
 // //
@@ -213,10 +230,17 @@
 // // The timing is real too and much less important: on one ordinary day 8 columns took 11 ms and
 // // 27 MB, all 408 took 138 ms and 120 MB — 12.7x slower for data you then throw away.
 // //
-// // Name your columns. Always.
+// // Name your columns. Always. And fetch only them: a parquet file stores each column in its own
+// // byte ranges, so reading through ranged downloads fetches the columns you named and the file's
+// // index, not the whole file. A 100 MB file read for eight columns costs a few MB.
 // export async function readColumns<T>(file: LakeFile, columns: string[]): Promise<T[]> {
-//   const buffer = await container.getBlobClient(file.name).downloadToBuffer()
-//   return (await parquetReadObjects({ file: ownBytes(buffer), columns, compressors })) as T[]
+//   const blob = container.getBlobClient(file.name)
+//   const ranged = cachedAsyncBuffer({
+//     byteLength: file.size,
+//     slice: async (start: number, end: number = file.size) =>
+//       ownBytes(await blob.downloadToBuffer(start, end - start)),
+//   })
+//   return (await parquetReadObjects({ file: ranged, columns, compressors })) as T[]
 // }
 //
 // // ── The two rules that decide whether your numbers are right ──────────────────────────────────
@@ -305,45 +329,69 @@
 // }
 //
 // /**
-//  * Every flight scheduled between two dates, deduped, with only the columns you asked for.
+//  * The files that hold the current record of every flight: the latest complete copy of the table
+//  * and every file loaded after it.
 //  *
-//  * Measured cost of a 30-day window from outside Azure: 30 files, 26 MB, 75,551 rows, ~6.7 s
-//  * end to end, ~200 MB peak heap. Most of that is download latency and it is far lower from
-//  * inside the region. If it still feels slow, fetch the files concurrently rather than in the
-//  * sequential loop below — but read the caching note underneath first.
+//  * Every few days to every few weeks the lake receives a COMPLETE COPY — every flight since 2022 at
+//  * its latest version, around 100 MB and growing. The small daily files in between carry only that
+//  * day's new and amended flights. Everything loaded before a complete copy is already inside it, and
+//  * reading those files again re-reads the same flights dozens of times: that is the difference
+//  * between a few seconds and several minutes.
+//  *
+//  * The copy is recognised by size, which the listing gives for free: the LARGEST file (the newest,
+//  * on a tie), provided it is at least ten times the typical (median) file. Largest rather than
+//  * latest-over-the-threshold, because the two ways of guessing wrong are not equal: starting from an
+//  * older copy only costs time, since every later file is still read and `currentRecordsOnly` keeps
+//  * each flight's latest version, while starting from an oversized partial reload silently drops
+//  * every flight it does not hold. A lake with no file that large — a new one, or a test lake of
+//  * daily files only — is read whole, which is slow but never wrong. Expects `files` oldest first, as
+//  * `listFlightFiles` returns them.
 //  */
+// export function filesToRead(files: readonly LakeFile[]): LakeFile[] {
+//   const sizes = files.map((file) => file.size).sort((a, b) => a - b)
+//   const typical = sizes[Math.floor(sizes.length / 2)] ?? 0
+//   let start = 0
+//   let largest = 0
+//   files.forEach((file, index) => {
+//     if (file.size >= largest) {
+//       largest = file.size
+//       start = index
+//     }
+//   })
+//   return largest >= 10 * typical ? files.slice(start) : [...files]
+// }
+//
+// /**
+//  * Every flight at its latest version, with only the columns you asked for.
+//  *
+//  * WHICH FLIGHTS ARE IN A DATE WINDOW IS DECIDED BY ROWS, NEVER BY FILES: the load-date trap above
+//  * measured one file loaded on a single day carrying flights from July 2022 to October 2026. So
+//  * this returns every current flight, and `flightsBetween` filters the window on `SIBT_SOBT_TIME`.
+//  */
+// export async function currentFlights<T extends Row>(columns: string[]): Promise<T[]> {
+//   // Always include the three columns the correctness rules need, whatever the caller asked for.
+//   const needed = [...new Set([...columns, FLIGHT_KEY, LOAD_TIME, FLIGHT_TIME])]
+//   const rows: T[] = []
+//   for (const file of filesToRead(await listFlightFiles())) {
+//     appendAll(rows, await readColumns<T>(file, needed))
+//   }
+//   return currentRecordsOnly(rows)
+// }
+//
+// /** Every flight scheduled between two dates, deduped, with only the columns you asked for. */
 // export async function flightsScheduledBetween<T extends Row>(
 //   from: Date,
 //   to: Date,
 //   columns: string[],
 // ): Promise<T[]> {
-//   // Always include the three columns the correctness rules need, whatever the caller asked for.
-//   const needed = [...new Set([...columns, FLIGHT_KEY, LOAD_TIME, FLIGHT_TIME])]
-//
-//   const files = await listFlightFiles()
-//
-//   // WHICH FILES COULD HOLD A FLIGHT IN THIS WINDOW? ALL OF THEM — THERE IS NO ARITHMETIC ON THE
-//   // LOAD DATE THAT SAFELY RULES ONE OUT. The load-date trap above has the measurement: one file
-//   // loaded on a single day in August 2026 carried flights scheduled from July 2022 to October
-//   // 2026. A load date bounds neither end of the flights inside it, so the only honest filter is
-//   // the ROW filter, and it runs on `SIBT_SOBT_TIME` in `flightsBetween` below.
-//   //
-//   // This loop used to run over `files.filter((f) => f.loadDate >= from - 2 days)`. It emptied any
-//   // window starting more than two days after the newest load — every forward-looking question
-//   // returned `[]` with no error — and for a backward window it dropped a flight whose only
-//   // surviving record lived in an older load. Reading all of them is the honest cost of a right
-//   // answer; guessing costs a wrong one silently.
-//   const rows: T[] = []
-//   for (const file of files) appendAll(rows, await readColumns<T>(file, needed))
-//
-//   return flightsBetween(currentRecordsOnly(rows), from, to)
+//   return flightsBetween(await currentFlights<T>(columns), from, to)
 // }
 //
 // // ── What you do with the rows once you have them ──────────────────────────────────────────────
 // //
 // // `hyparquet` hands back plain JavaScript objects — one per row, one key per column you asked
-// // for. There is no dataframe here and none is wanted: grouping and aggregating a few tens of
-// // thousands of plain objects is a `Map` and a `for` loop, which this file already demonstrates
+// // for. There is no dataframe here and none is wanted: grouping and aggregating a few hundred
+// // thousand plain objects is a `Map` and a `for` loop, which this file already demonstrates
 // // twice (`currentRecordsOnly` groups by key; `label` is the normaliser you call while you group).
 // // A dashboard that counts flights per airline per day is about six lines:
 // //
@@ -359,20 +407,116 @@
 // // that has none, on an image built by a Windows host, which is exactly the class of difference
 // // that only shows up after deployment.
 //
-// // ── Caching ──────────────────────────────────────────────────────────────────────────────────
+// // ── Building a page on it ─────────────────────────────────────────────────────────────────────
 // //
-// // Do NOT reach for an external cache. The files are small and the reads are effectively free
-// // (measured: $0.0000006 per read; a whole build session hitting one file 200 times costs
-// // $0.00012). What you want is Next's own caching, so a dashboard re-render does not re-download:
+// // PLAN BEFORE YOU BUILD, then check the plan against the limits at the top of this file. Write
+// // down: the columns the page needs (named — never "all"), what it shows first, the filters it
+// // offers, how many table rows one page holds, and which numbers are totals. Then build it in the
+// // one shape below. An app that skips the plan is the app that downloads everything.
 // //
-// //   import { unstable_cache } from 'next/cache'
+// // THE SHAPE OF EVERY PAGE ON FLIGHT DATA
+// //   1. ONE shared load on the server: `sharedLoad` around `currentFlights`, declared once in a
+// //      server module that every route imports, never in a route file. It loads once, is reused for
+// //      an hour, and two requests that arrive together wait for the same load instead of starting
+// //      two.
+// //   2. Route handlers that answer from that load: totals and chart series computed on the server,
+// //      table rows one page at a time with `pageOf`. The browser never receives the whole table.
+// //   3. Filter dropdowns built from the same load with `optionsOf`, never by reading the lake again.
 // //
-// //   export const getFlights = unstable_cache(
-// //     async (from: string, to: string) =>
-// //       flightsScheduledBetween(new Date(from), new Date(to), ['AIRLINE_NAME', 'ARR_DEP_FLG_ADID']),
-// //     ['flights'],
-// //     { revalidate: 3600 },
-// //   )
+// // PAGE INITIALISATION. The first request after the server starts pays for the load, a few
+// // seconds; every request after it is answered from memory. So the page renders its layout at
+// // once, shows a loading state where the data goes, and asks for the totals and the first table
+// // page together. Changing a filter or a page asks the server again; it never loads the lake again.
 // //
-// // Keep the revalidate window short — an hour, not a week. A later load can amend a flight from
-// // months ago, so a long-lived cache serves a superseded record with no way to know it.
+// // End to end, with this file copied to `lib/flight-data.ts`. The one shared load, in
+// // `lib/flights.ts`:
+// //
+// //   import { currentFlights, sharedLoad } from '@/lib/flight-data'
+// //
+// //   export const flights = sharedLoad('flights', () => currentFlights(['AIRLINE_NAME', 'TERMINAL']))
+// //
+// // A table page, in `app/api/flights/route.ts`:
+// //
+// //   import { flightsBetween, label, pageOf } from '@/lib/flight-data'
+// //   import { flights } from '@/lib/flights'
+// //
+// //   export async function GET(request: Request) {
+// //     const query = new URL(request.url).searchParams
+// //     const from = new Date(query.get('from') ?? '2026-01-01')
+// //     const to = new Date(query.get('to') ?? Date.now())
+// //     const airline = query.get('airline')
+// //     const rows = flightsBetween(await flights(), from, to).filter(
+// //       (row) => !airline || label(row.AIRLINE_NAME) === airline,
+// //     )
+// //     return Response.json(pageOf(rows, Number(query.get('page') ?? 1), 50))
+// //   }
+// //
+// // The filter dropdowns, in `app/api/filter-options/route.ts`, from the same load:
+// //
+// //   import { optionsOf } from '@/lib/flight-data'
+// //   import { flights } from '@/lib/flights'
+// //
+// //   export async function GET() {
+// //     const rows = await flights()
+// //     return Response.json({
+// //       airlines: optionsOf(rows, 'AIRLINE_NAME'),
+// //       terminals: optionsOf(rows, 'TERMINAL'),
+// //     })
+// //   }
+//
+// type Held = { loadedAt: number; value: Promise<unknown> }
+//
+// /**
+//  * A load made once and shared by every request for `maxAgeMs`; a failed load is dropped, so the
+//  * next request tries again. An hour, not a day: a later load can amend a flight from months ago.
+//  *
+//  * Held on `globalThis`, not in a module variable: Next can give each route its own copy of a
+//  * module, and reloads modules on every edit in development, and each copy would hold its own
+//  * load of the lake. `name` keeps two different loads apart.
+//  */
+// export function sharedLoad<T>(
+//   name: string,
+//   load: () => Promise<T>,
+//   maxAgeMs: number = 60 * 60 * 1000,
+// ): () => Promise<T> {
+//   const store = globalThis as typeof globalThis & { __bialSharedLoads?: Map<string, Held> }
+//   const loads = (store.__bialSharedLoads ??= new Map<string, Held>())
+//   return () => {
+//     const held = loads.get(name)
+//     if (held && Date.now() - held.loadedAt < maxAgeMs) return held.value as Promise<T>
+//     const value = load()
+//     loads.set(name, { loadedAt: Date.now(), value })
+//     value.catch(() => {
+//       if (loads.get(name)?.value === value) loads.delete(name)
+//     })
+//     return value
+//   }
+// }
+//
+// export type Page<T> = { rows: T[]; page: number; pageSize: number; total: number; pages: number }
+//
+// /** One page of `rows`, numbered from 1. An out-of-range or missing page number is pulled back
+//  * into range, and the page size is capped at 500 so no request can ask for the whole table. */
+// export function pageOf<T>(rows: readonly T[], page: number, pageSize: number): Page<T> {
+//   const size = Math.min(500, Math.max(1, Math.floor(pageSize) || 1))
+//   const pages = Math.max(1, Math.ceil(rows.length / size))
+//   const current = Math.min(pages, Math.max(1, Math.floor(page) || 1))
+//   return {
+//     rows: rows.slice((current - 1) * size, current * size),
+//     page: current,
+//     pageSize: size,
+//     total: rows.length,
+//     pages,
+//   }
+// }
+//
+// /** The distinct values of one text column, trimmed, blanks dropped, sorted: a filter dropdown's
+//  * options, read from the rows you already hold. */
+// export function optionsOf(rows: readonly Row[], column: string): string[] {
+//   const values = new Set<string>()
+//   for (const row of rows) {
+//     const value = label(row[column])
+//     if (value !== null) values.add(value)
+//   }
+//   return [...values].sort()
+// }

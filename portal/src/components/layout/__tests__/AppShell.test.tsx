@@ -305,6 +305,27 @@ describe('where the navigation is, per route', () => {
   })
 })
 
+describe('the page scrolls inside the shell, never the document', () => {
+  // jsdom has no layout, so this pins the class; PAGE_SCROLLER says why it matters. Both layouts
+  // render their own scroller, so each is checked.
+  it.each([
+    ['docked', false],
+    ['stacked', true],
+  ])('the %s layout scrolls the page in a positioned container', async (_layout, stacked) => {
+    const realMatchMedia = window.matchMedia
+    window.matchMedia = (query: string) => ({ ...realMatchMedia(query), matches: stacked && query.includes('max-width') })
+    try {
+      renderAt('/admin')
+      await waitFor(() => expect(screen.queryByTestId('nav-docked') === null).toBe(stacked))
+      const scroller = screen.getByTestId('where').parentElement
+      expect(scroller?.className).toContain('overflow-y-auto')
+      expect(scroller?.className).toContain('relative')
+    } finally {
+      window.matchMedia = realMatchMedia
+    }
+  })
+})
+
 describe('the foot of the navigation', () => {
   it('shows the meter when usage reads, and the figures with it', async () => {
     renderAt('/projects')

@@ -184,7 +184,7 @@ async def _end_save_and_release(
     writes only the recovery copy). So the Save is what puts a bundle in the saved slot, and the
     release is what takes the pardoned container away — without it the next `ensure_sandbox`
     reattaches to a live container instead of taking the restore arm this file is about."""
-    await manager.finish_turn_sandbox(session, client, touched=True)
+    await manager.finish_turn_sandbox(session)
     # The Save attaches through the registry rather than through a session — it is the
     # BETWEEN-turns click — so the fake needs a container to answer with.
     client.attach_handle = session.handle

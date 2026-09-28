@@ -520,3 +520,50 @@ async def test_the_sentence_never_reaches_a_stored_row(
         f"the turn's tool results came back as {returns!r} — the request carrying them never "
         "reached a row, and what is here is the loader's repair of the call it orphaned"
     )
+
+
+async def test_a_build_turn_is_handed_neither_the_sentence_nor_its_pin(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """A build turn that writes is read by the verify after its run, so a sentence asking the
+    model to look first buys a model call whose answer verify replaces. The reading at the end is
+    the liveness half: verify took it instead.
+
+    Mutation check: arm `TurnScopedSystemMessage` on the Build run and this goes red."""
+    model, seen = _capturing(
+        [
+            [("write_file", '{"path": "app/page.tsx", "file_text": "x"}')],
+            [("declare_done", '{"summary": "added the column"}')],
+        ],
+        inline=True,
+    )
+    user = await UserFactory.create(db_session)
+    conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.BUILD)
+    await _fresh_engine.start_turn(
+        conversation=conv,
+        user_id=user.id,
+        prompt="add a status column",
+        history=[],
+        prompt_context=_CTX,
+        app_id=None,
+        project_id=conv.project_id,
+        manager=SessionManager(),
+        model=model,
+        session_factory=session_factory,
+        persist_user_turn=_noop_persist,
+        sandbox_client=FakeSandboxClient(),
+    )
+    state = _fresh_engine.peek(conv.id)
+    await _settle(_fresh_engine, conv.id)
+
+    assert len(seen) == 2, f"the script makes two requests; the model saw {len(seen)}"
+    assert [_system_parts(request) for request in seen] == [[], []]
+    assert not [
+        part
+        for request in seen
+        for message in request
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, UserPromptPart) and part.content == [CachePoint(ttl=CACHE_TTL)]
+    ]
+    assert state is not None and state.app_reading is not None

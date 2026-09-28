@@ -11,13 +11,8 @@ rides the USER channel, so anything stated here would be a second voice in a tur
 standing contract already speaks for.
 
 The unconditional rule that the user must see their own write without a manual reload is
-UNENFORCEABLE at generation time. The shipped static detector `flag_liveness_overpromise`
-(`src/services/build_sessions/liveness.py`) is claim-gated: its `_CLAIM_RE` only fires on a
-`.tsx`/`.jsx` file that advertises live/shared/real-time copy, so an app that makes no such
-claim and wires no refetch violates this rule silently — nothing lands in the log. Measuring
-whether the user actually saw their own write needs a JS-executing probe the frozen
-`SandboxClient` surface cannot run. That gap is accepted, not closed; relaxing `_CLAIM_RE`
-for the after-write case is a cheap follow-up, out of scope here.
+UNENFORCEABLE at generation time: checking it needs a JS-executing probe the `SandboxClient`
+surface cannot run, so nothing checks it. That gap is accepted, not closed.
 """
 
 from __future__ import annotations

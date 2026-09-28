@@ -130,6 +130,17 @@ async def test_the_answer_states_its_own_completeness_and_points_at_the_worked_e
     answer = await connector_schema(_ctx(connected=(SYSTEM,)), SYSTEM.key)
     assert "lib/flight-data.reference.ts" in answer
     assert "the whole schema for this system" in answer
+    # The reading rules themselves, not only a pointer: an app saved earlier restores an older
+    # copy of the reference file, and this answer is what reaches it.
+    for rule in (
+        "latest complete copy",
+        "a daily file's row replaces the copy's",
+        "cachedAsyncBuffer",
+        "globalThis",
+        "one page of rows",
+    ):
+        assert rule in answer, rule
+    assert "it is an older copy: follow the rules here" in answer
     # The artefact itself is untouched and comes FIRST — the sentence is a tail, not a preface.
     assert answer.startswith(SHIPPED)
 

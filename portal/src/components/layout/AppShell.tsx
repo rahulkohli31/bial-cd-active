@@ -23,6 +23,11 @@ import { NAV_RAIL_PX, NAV_WIDTH_PX } from '../../lib/motion'
  * it. A narrow screen loses the permanence, never the destinations.
  */
 
+// `relative` makes the page's one scroll container the containing block for everything absolutely
+// positioned inside it. Without it an `sr-only` label far down a long page anchors to the document
+// instead, lands below the fold, and gives the whole page a second scrollbar.
+const PAGE_SCROLLER = 'relative min-w-0 flex-1 overflow-y-auto'
+
 /** The addresses inside an application: the navigation is not on screen on these. */
 function isApplicationRoute(pathname: string): boolean {
   return pathname.startsWith('/projects/') || pathname.startsWith('/chat/')
@@ -57,7 +62,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
           <div className="flex h-12 shrink-0 items-center gap-2 border-b border-bial-border bg-white px-3">
             <NavMenuButton />
           </div>
-          <div className="min-w-0 flex-1 overflow-y-auto">{children}</div>
+          <div className={PAGE_SCROLLER}>{children}</div>
         </div>
       </NavReveal>
     )
@@ -98,7 +103,7 @@ function DockedShell({ children }: { children: ReactNode }) {
           />
         </aside>
       </div>
-      <div className="min-w-0 flex-1 overflow-y-auto">{children}</div>
+      <div className={PAGE_SCROLLER}>{children}</div>
     </div>
   )
 }

@@ -460,6 +460,15 @@ describe('the action', () => {
     }
   })
 
+  it('says why a publish did not start, in the same words the chip uses', () => {
+    wire({ deployment: view('did_not_start', { status: 'failed', failureCode: 'build_unavailable' }) })
+    mount()
+
+    expect(panel().textContent).toContain('this is not a problem with your app')
+    expect(panel().textContent).not.toContain('starting your app up')
+    expect(screen.getByTestId('status-action').textContent).toBe('Try again')
+  })
+
   it('★ gives a state with nothing to do NO button, rather than one that fails when pressed', () => {
     // The board says so in as many words. Asserted by querying for ANY button, not by one
     // label's absence.
@@ -597,12 +606,12 @@ describe('one button per state', () => {
     wire({ deployment: view(state, { approvedRetryCommit: retry }) })
     mount()
 
-    const expected = presentationFor(state, retry).action
+    const expected = presentationFor(state, retry, null).action
     const buttons = screen.queryAllByRole('button')
     expect(buttons.length).toBe(expected === null ? 0 : 1)
     if (expected !== null) expect(buttons[0].getAttribute('data-testid')).toBe('status-action')
     // Liveness: the panel drew its state, so zero buttons is an omission, not a crash.
-    expect(screen.getByTestId('status-pill').textContent).toBe(presentationFor(state, retry).label)
+    expect(screen.getByTestId('status-pill').textContent).toBe(presentationFor(state, retry, null).label)
   })
 
   it('★ saves first and then opens the dialog, with no banner and no second button', async () => {

@@ -201,7 +201,7 @@ describe('the chip is coloured by its state, with a leading dot', () => {
       const { pill } = lookFor(state)
       const family = /bg-status-([a-z]+)-bg/.exec(pill)?.[1] ?? pill
       families.add(family)
-      const key = `${family}|${presentationFor(state, null).label}`
+      const key = `${family}|${presentationFor(state, null, null).label}`
       expect(seen.get(key), state).toBeUndefined()
       seen.set(key, state)
     }
@@ -477,6 +477,16 @@ describe('the popover explains the state and offers at most one thing to do', ()
     await openChip()
 
     expect(screen.queryByTestId('publish-url')).toBeNull()
+  })
+
+  it('says a publish the platform could not build was not the app\'s fault', async () => {
+    wire(view('did_not_start', { status: 'failed', failureCode: 'build_unavailable' }))
+    mount()
+    const pop = await openChip()
+
+    expect(pop.textContent).toContain('this is not a problem with your app')
+    expect(pop.textContent).not.toContain('starting your app up')
+    expect(screen.getByTestId('publish-action').textContent).toBe('Try again')
   })
 
   it('makes no claim about whether trying again returns to an administrator', async () => {

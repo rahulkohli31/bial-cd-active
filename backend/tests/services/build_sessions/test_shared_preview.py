@@ -442,7 +442,7 @@ async def test_revoke_never_touches_the_recipients_own_build(
     session = await manager.ensure_sandbox(
         db_session, recipient, recipient_project.id, sandbox_client=build_client, may_write=True
     )
-    await manager.finish_turn_sandbox(session, build_client, touched=True)  # pardons it
+    await manager.finish_turn_sandbox(session)  # pardons it
 
     revoked = await manager.revoke_shared_preview(
         recipient.id, app_id, sandbox_client=build_client

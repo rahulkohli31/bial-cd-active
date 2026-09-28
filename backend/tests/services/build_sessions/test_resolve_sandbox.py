@@ -168,7 +168,7 @@ async def _attached(
     session = await manager.ensure_sandbox(
         db, user, project_id, sandbox_client=client, may_write=True
     )
-    await manager.finish_turn_sandbox(session, client, touched=False)
+    await manager.finish_turn_sandbox(session)
     client.attach_handle = session.handle
     return client, session.app_id
 

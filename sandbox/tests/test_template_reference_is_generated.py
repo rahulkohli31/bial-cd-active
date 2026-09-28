@@ -138,7 +138,12 @@ def test_the_seven_mistakes_all_survive_into_the_shipped_file() -> None:
         "AODB_AFTTAB_PK_URNO",  # the flight key the amendment rows collapse on
         "AKASA AIR",  # stored twice, once padded
         "tb_flight_fact_report_",  # the real object-name pattern
-        "revalidate: 3600",  # an hour, not a week
+        "60 * 60 * 1000",  # the shared load lives an hour, not a week
+        "PLAN BEFORE YOU BUILD",  # the page is planned against the limits first
+        "filesToRead(",  # the newest complete copy and the files after it, not the whole lake
+        "pageOf(",  # the browser gets one page, never the table
+        "cachedAsyncBuffer(",  # ranged downloads: the named columns, not the whole file
+        "globalThis",  # the shared load survives separate route bundles
         "ManagedIdentityCredential",  # never DefaultAzureCredential
     ):
         assert landmark in shipped, f"the shipped example no longer names {landmark!r}"

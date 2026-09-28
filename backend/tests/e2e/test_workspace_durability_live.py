@@ -5,10 +5,8 @@ Real sandbox containers, real git, real Azurite, real Redis, real PostgreSQL. Se
 WHY THIS EXISTS — `may_write` is not a free knob:
 
 `may_write` MIRRORS THE TURN'S TOOLSET. `toolsets_for_kind` hands the mutating
-`sandbox_toolset` to `ChatKind.BUILD` and nothing else, every `workspace_touched = True`
-lives inside that toolset, and `workspace_touched` is the only thing the engine derives
-`finish_turn_sandbox(touched=...)` from. So in production `may_write=False` implies
-`touched=False`, always; a read-only turn paired with `touched=True` pins nothing.
+`sandbox_toolset` to `ChatKind.BUILD` and nothing else, so a read-only session never
+writes the tree.
 
 Hence the shape used throughout: a mutating turn runs `may_write=True`, and a Save is
 taken BETWEEN turns — `finish_turn_sandbox` pops the build slot (and pardons the
@@ -194,7 +192,7 @@ async def test_an_unreadable_bundle_is_a_typed_refusal_not_a_crash(
     assert session.handle is not None
     await _write(sandbox, session.handle, "app/marker.txt", "TREE-A")
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
-    await manager.finish_turn_sandbox(session, sandbox, touched=False)
+    await manager.finish_turn_sandbox(session)
 
     await sandbox.teardown(session.handle)
     await live_redis.delete(registry_key(user.id))
@@ -226,7 +224,7 @@ async def test_the_real_reaper_sweep_writes_the_tree_back_and_the_resume_keeps_i
     )
     assert session.handle is not None
     await _write(sandbox, session.handle, "app/marker.txt", "TREE-A")
-    await manager.finish_turn_sandbox(session, sandbox, touched=True)
+    await manager.finish_turn_sandbox(session)
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
 
     await _asyncio.sleep(1.1)
@@ -237,7 +235,7 @@ async def test_the_real_reaper_sweep_writes_the_tree_back_and_the_resume_keeps_i
     # NEVER SAVED. This is the work the sweep's own write-back has to carry, and the only thing
     # standing between the citizen and losing it.
     await _write(sandbox, second.handle, "app/marker.txt", "TREE-B")
-    await manager.finish_turn_sandbox(second, sandbox, touched=True)
+    await manager.finish_turn_sandbox(second)
     container = second.handle.app_name
 
     # The user's tab is gone: the heartbeat lapses and the lease expires.

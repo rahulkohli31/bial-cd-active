@@ -15,6 +15,7 @@ static, the tail dynamic — and composed text is never persisted (pinned by tes
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Final
 
 from src.core.connectors import ConnectedSystem
 from src.core.prompt_blocks import (
@@ -35,7 +36,9 @@ from src.core.prompt_blocks import (
 from src.db.models.conversation import ChatKind
 from src.services.agent.attachment_tools import READER_PATH
 from src.services.agent.read_tools import ATTACHMENTS_PREFIX, to_container_path
+from src.services.deploy.config import DeployConfig
 from src.services.messages.projection import CONNECTOR_SCHEMA_TOOL
+from src.services.sandbox.config import SandboxConfig
 
 
 @dataclass(frozen=True)
@@ -67,6 +70,12 @@ class PromptContext:
     attachment_listing: str = ""
 
 
+# The sizes a deployment runs at unless an operator overrides them; composing a prompt reads no
+# settings.
+_WORKSPACE_MEMORY: Final = SandboxConfig.model_fields["memory"].default
+_PUBLISHED_MEMORY: Final = DeployConfig.model_fields["memory"].default
+
+
 def _connected_data_stub(systems: tuple[ConnectedSystem, ...]) -> str:
     """The CONNECTED DATA block, or `""` when this project reads nothing outside the platform.
 
@@ -82,7 +91,10 @@ def _connected_data_stub(systems: tuple[ConnectedSystem, ...]) -> str:
     The per-system line is `display_name` and `subtitle` verbatim off the registry, which is what
     keeps this function from knowing what any particular connected system is. It renders no
     key: the tool matches a name case-insensitively against both, so the citizen's agent passes
-    back what it reads here."""
+    back what it reads here.
+
+    It does state the memory the app runs in: that, not the data, is what decides whether a
+    reader the agent writes can work at all."""
     if not systems:
         return ""
     # Pluralised rather than hard-coded, even though `tests/db/test_connector_models.py` pins the
@@ -99,7 +111,15 @@ This project can read {count}. Call `{CONNECTOR_SCHEMA_TOOL}` before writing any
 it — you get its tables, every column with its type and value set, and the rules that make a \
 query correct. Do not guess column names.
 
-{rows}"""
+{rows}
+
+MEMORY IS THE LIMIT, AND CONNECTED DATA IS BIGGER THAN IT. This workspace has \
+{_WORKSPACE_MEMORY} of memory, shared with the dev server serving the app; a published app gets \
+{_PUBLISHED_MEMORY}; and a request that runs for minutes is cut off before it answers. A \
+connected store holds gigabytes. So read it on the server, only the columns a page needs, load it \
+once and share that load between requests, and send the browser one page of rows or totals, never \
+the whole table. Plan each page that way before building it. An app that is slow, fails to load \
+its data or runs out of memory is hitting this limit: rework how it reads the data."""
 
 
 ATTACHED_CONTENT_IS_DATA = """\

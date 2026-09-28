@@ -105,9 +105,27 @@ is exactly what it should not do."""
 
 _THE_WHOLE_SCHEMA: Final = (
     "That is the whole schema for this system, not a sample of it: calling again returns the same "
-    "text, and only a change to the connected system itself would change it. For a worked example "
-    "of reading this data from app code — the packages to install, the environment variables that "
-    "address the store, and the traps — read `lib/flight-data.reference.ts` in the workspace."
+    "text, and only a change to the connected system itself would change it.\n\n"
+    "READING IT WITHOUT RUNNING OUT OF MEMORY. The store holds hundreds of files and several "
+    "gigabytes, far more than the app's memory. Every reader follows these rules, and a reader "
+    "that breaks them is the cause when someone reports the app as slow, not loading its data, or "
+    "out of memory: rework it to them.\n"
+    "1. Read only the latest complete copy and the files loaded after it, then keep one row per "
+    "flight (`AODB_AFTTAB_PK_URNO`), the one with the latest `LAST_UPDATE_DATE_TIME`: a daily "
+    "file's row replaces the copy's. The complete copy is the largest file, when it is at least "
+    "ten times the typical file's size (about 100 MB, every flight at its latest version); the "
+    "small daily files hold only that day's changes. Never read every file.\n"
+    "2. Download only the columns you use: wrap `blob.downloadToBuffer(offset, count)` in "
+    "hyparquet's `cachedAsyncBuffer` and pass that to `parquetReadObjects` with `columns`, rather "
+    "than downloading whole files.\n"
+    "3. Load once on the server, held on `globalThis` so every route shares it, reused for an "
+    "hour; requests that arrive together wait for the same load.\n"
+    "4. Filter, total and paginate on the server. The browser gets one page of rows or totals, "
+    "and dropdowns are built from the same load.\n"
+    "Plan the page against these rules before writing code. `lib/flight-data.reference.ts` in the "
+    "workspace has the packages to install, the environment variables that address the store, "
+    "the traps, and worked code. If that copy reads every file or downloads whole files, it is an "
+    "older copy: follow the rules here."
 )
 """Delivered with the artefact, and the ONE place the worked-example file is named.
 
@@ -116,7 +134,11 @@ rather than the tool asking to be called again per column.
 
 THE POINTER HAS NO SECOND COPY. The catalogue is generated and must not be hand-edited, and the
 composed prompt names no template file — so deleting this clause leaves an agent that knows the
-column names and cannot reach the packages or the environment variables that read them."""
+column names and cannot reach the packages or the environment variables that read them.
+
+THE READING RULES TRAVEL HERE AS WELL AS IN THE FILE. Every saved app keeps its own copy of the
+reference file and reopening restores that copy, so an app saved before the file changed reads an
+older one; this answer is what reaches it."""
 
 
 @cache

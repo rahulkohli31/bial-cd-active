@@ -248,9 +248,10 @@ export default function AppStatusPanel({ projectId, actions }: AppStatusPanelPro
   // failed, or taken down, retires the line without anyone pressing anything.
   const said = answer !== null && answer.heldWhile === state ? answer.text : null
   const approvedRetryCommit = deployment?.approvedRetryCommit ?? null
+  const failureCode = deployment?.failureCode ?? null
   const presentation = useMemo(
-    () => (state === null ? null : presentationFor(state, approvedRetryCommit)),
-    [state, approvedRetryCommit],
+    () => (state === null ? null : presentationFor(state, approvedRetryCommit, failureCode)),
+    [state, approvedRetryCommit, failureCode],
   )
   const look = useMemo(() => (state === null ? null : lookFor(state)), [state])
   const rows = useMemo(

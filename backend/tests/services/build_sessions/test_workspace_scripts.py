@@ -20,18 +20,30 @@ import pytest
 
 from src.services.build_sessions.integrity import (
     clean_but_for_churn,
+    holds_unsaved_work,
     is_the_untouched_starter,
     parse_state,
     state_script,
 )
 from src.services.build_sessions.snapshot import _COMMIT_SCRIPT, _NO_REPOSITORY_EXIT
-from src.services.sandbox.client import _BUNDLE_B64_NAME, _INIT_REPO_SCRIPT, _RESTORE_SCRIPT
+from src.services.sandbox.client import (
+    _BUNDLE_B64_NAME,
+    _DISCARD_SCRIPT,
+    _INIT_REPO_SCRIPT,
+    _RESTORE_SCRIPT,
+)
 
 _EXCLUDE_FILE = Path(__file__).resolve().parents[4] / "sandbox" / "platform-owned.gitignore"
+
+#: The image's Next config reads the path the platform serves the app under. A saved copy from an
+#: image that predates that path does not, and serves the app at `/` instead.
+_IMAGE_NEXT_CONFIG = "export default { basePath: process.env.BIAL_BASE_PATH };\n"
+_SAVED_NEXT_CONFIG = "export default { devIndicators: false };\n"
 
 _STARTER = {
     "app/page.tsx": "export default function Page() { return null }\n",
     "package.json": '{ "name": "app" }\n',
+    "next.config.ts": _IMAGE_NEXT_CONFIG,
     "next-env.d.ts": '/// <reference types="next" />\n',
     "node_modules/next/package.json": '{ "name": "next" }\n',
 }
@@ -152,11 +164,17 @@ class _Sandbox:
         return path.read_bytes()
 
     def restore(self, bundle: bytes) -> None:
+        self._over_a_pushed_bundle(bundle, _RESTORE_SCRIPT)
+
+    def discard(self, bundle: bytes) -> None:
+        self._over_a_pushed_bundle(bundle, _DISCARD_SCRIPT)
+
+    def _over_a_pushed_bundle(self, bundle: bytes, script: str) -> None:
         """What `SandboxClient._run_over_a_pushed_bundle` does: push the base64, run the script."""
         (self.ws / _BUNDLE_B64_NAME).write_text(
             base64.b64encode(bundle).decode("ascii"), encoding="ascii"
         )
-        self.ok(_RESTORE_SCRIPT)
+        self.ok(script)
 
 
 @pytest.fixture
@@ -185,7 +203,7 @@ def test_one_save_untracks_toolchain_output_and_later_boots_mint_no_commit(
 
     sandbox.ok(_COMMIT_SCRIPT)
     cleaned = sandbox.head()
-    assert sandbox.tracked_at_head() == {"app/page.tsx", "package.json"}
+    assert sandbox.tracked_at_head() == {"app/page.tsx", "package.json", "next.config.ts"}
     for path in _TOOLCHAIN_OUTPUT:
         assert (sandbox.ws / path).is_file(), f"untracking deleted {path} from the disk"
 
@@ -441,3 +459,114 @@ def test_without_the_exclude_file_a_restore_removes_nothing(sandbox: _Sandbox) -
     fresh.restore(sandbox.bundle())
 
     assert (fresh.ws / "node_modules/next/package.json").is_file()
+
+
+def _an_app_saved_with_an_older_next_config(sandbox: _Sandbox) -> None:
+    sandbox.write({**_STARTER, "next.config.ts": _SAVED_NEXT_CONFIG})
+    sandbox.ok(_INIT_REPO_SCRIPT)
+    sandbox.write({"app/page.tsx": "the app\n"})
+    sandbox.ok(_COMMIT_SCRIPT)
+
+
+def test_a_restore_runs_the_images_next_config_not_the_saved_one(sandbox: _Sandbox) -> None:
+    """★ An app saved under an older image carries that image's Next config, which serves it at `/`
+    while the platform asks for its assigned path: the preview 404s and never opens. The file is
+    the platform's, so the restored app runs the image's copy, and the next save records it."""
+    _an_app_saved_with_an_older_next_config(sandbox)
+    fresh = sandbox.fresh_container()
+    fresh.write(_STARTER)
+
+    fresh.restore(sandbox.bundle())
+
+    assert (fresh.ws / "next.config.ts").read_text(encoding="utf-8") == _IMAGE_NEXT_CONFIG
+    assert (fresh.ws / "app/page.tsx").read_text(encoding="utf-8") == "the app\n"
+    fresh.ok(_COMMIT_SCRIPT)
+    assert fresh.changed_by_head() == {"next.config.ts"}
+
+
+def test_a_restore_puts_the_images_next_config_back_where_the_app_deleted_it(
+    sandbox: _Sandbox,
+) -> None:
+    sandbox.write(_STARTER)
+    sandbox.ok(_INIT_REPO_SCRIPT)
+    sandbox.git("rm", "-q", "next.config.ts")
+    sandbox.ok(_COMMIT_SCRIPT)
+    fresh = sandbox.fresh_container()
+    fresh.write(_STARTER)
+
+    fresh.restore(sandbox.bundle())
+
+    assert (fresh.ws / "next.config.ts").read_text(encoding="utf-8") == _IMAGE_NEXT_CONFIG
+
+
+def test_a_discard_after_a_restore_keeps_the_images_next_config(sandbox: _Sandbox) -> None:
+    """A discard before that save resets the tree to the saved commit, older config included, and
+    would take the app off its path again. An agent's edit to the file goes with the discard."""
+    _an_app_saved_with_an_older_next_config(sandbox)
+    saved = sandbox.bundle()
+    fresh = sandbox.fresh_container()
+    fresh.write(_STARTER)
+    fresh.restore(saved)
+    fresh.write({"app/page.tsx": "unsaved work\n", "next.config.ts": "export default {};\n"})
+
+    fresh.discard(saved)
+
+    assert (fresh.ws / "app/page.tsx").read_text(encoding="utf-8") == "the app\n"
+    assert (fresh.ws / "next.config.ts").read_text(encoding="utf-8") == _IMAGE_NEXT_CONFIG
+
+
+def test_a_saved_config_that_reads_the_base_path_is_kept_on_restore_and_discard(
+    sandbox: _Sandbox,
+) -> None:
+    """A later app's config already serves it under its path and may carry settings of its own,
+    which publishing keeps; replacing it would drop them and leave a change nobody made."""
+    own = (
+        "export default { basePath: process.env.BIAL_BASE_PATH, images: { unoptimized: true } };\n"
+    )
+    sandbox.write({**_STARTER, "next.config.ts": own})
+    sandbox.ok(_INIT_REPO_SCRIPT)
+    saved = sandbox.bundle()
+    fresh = sandbox.fresh_container()
+    fresh.write(_STARTER)
+
+    fresh.restore(saved)
+    assert (fresh.ws / "next.config.ts").read_text(encoding="utf-8") == own
+    assert parse_state(fresh.ok(state_script(None)).stdout).changed_paths == ()
+
+    fresh.discard(saved)
+    assert (fresh.ws / "next.config.ts").read_text(encoding="utf-8") == own
+
+
+def test_a_reopened_old_app_holds_no_unsaved_work_before_and_after_a_discard(
+    sandbox: _Sandbox,
+) -> None:
+    """The image's config the restore puts back is the platform's change, not the citizen's: the
+    save indicator must not claim unsaved work, leaving the app must not ask, and Discard must not
+    look broken by bringing the same change straight back."""
+    _an_app_saved_with_an_older_next_config(sandbox)
+    saved = sandbox.bundle()
+    fresh = sandbox.fresh_container()
+    fresh.write(_STARTER)
+    fresh.restore(saved)
+
+    after_restore = parse_state(fresh.ok(state_script(None)).stdout)
+    fresh.discard(saved)
+    after_discard = parse_state(fresh.ok(state_script(None)).stdout)
+
+    for state in (after_restore, after_discard):
+        assert state.changed_paths == ("next.config.ts",)
+        assert not holds_unsaved_work(state)
+        assert clean_but_for_churn(state)
+
+
+def test_a_discard_in_a_container_born_from_this_image_puts_the_saved_copy_back(
+    sandbox: _Sandbox,
+) -> None:
+    sandbox.write(_STARTER)
+    sandbox.ok(_INIT_REPO_SCRIPT)
+    saved = sandbox.bundle()
+    sandbox.write({"next.config.ts": "export default {};\n"})
+
+    sandbox.discard(saved)
+
+    assert (sandbox.ws / "next.config.ts").read_text(encoding="utf-8") == _IMAGE_NEXT_CONFIG

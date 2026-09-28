@@ -311,6 +311,26 @@ describe('History reads newest first, with the events between the versions', () 
     expect(screen.getByTestId('event-restart').textContent).toBe('Restarted by kavya.n23 Sep, 10:12')
   })
 
+  it('does not say an app failed to build when the platform could not build it', async () => {
+    h.fetchHistory.mockResolvedValue({
+      ...WAITING,
+      entries: [
+        version({
+          number: 1,
+          state: 'publish_failed',
+          attempts: [
+            { status: 'failed', startedAt: local(28, 8, 26), finishedAt: local(28, 8, 27), failureCode: 'build_unavailable' },
+          ],
+        }),
+      ],
+    })
+    open(APP)
+
+    const text = (await screen.findByTestId('version-1')).textContent
+    expect(text).toContain("Not yet: the attempt on 28 Sep, 08:26 failed on the platform's side")
+    expect(text).not.toContain('failed to build')
+  })
+
   it('says a rejection whose note was never recorded, rather than leaving it blank', async () => {
     h.fetchHistory.mockResolvedValue({
       ...WAITING,
