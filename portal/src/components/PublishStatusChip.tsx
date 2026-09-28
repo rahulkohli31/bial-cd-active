@@ -96,11 +96,18 @@ export default function PublishStatusChip({
 
   const state: PublishState | null = deployment?.publishState ?? null
   // THE ONE RULE: `presentationFor` switches on `publishState` — no status, no
-  // `unpublishedAt`, no failure code, no approval lineage, no pin. `approvedRetryCommit` is
-  // the server's own word for what the button publishes. Other response fields are still
-  // read, but only to fill a version row the state already asked for.
+  // `unpublishedAt`, no approval lineage, no pin. `approvedRetryCommit` is the server's own
+  // word for what the button publishes, and `failureCode` its own word for why an attempt
+  // ended. Other response fields are still read, but only to fill a version row the state
+  // already asked for.
   const presentation =
-    state === null ? null : presentationFor(state, deployment?.approvedRetryCommit ?? null)
+    state === null
+      ? null
+      : presentationFor(
+          state,
+          deployment?.approvedRetryCommit ?? null,
+          deployment?.failureCode ?? null,
+        )
   // The pill's own colour pair, from the same one field. `lookFor` is exhaustive over the
   // union, so a state the server adds is a compile error rather than an unpainted chip.
   const look = state === null ? null : lookFor(state)

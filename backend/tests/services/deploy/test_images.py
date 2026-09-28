@@ -7,8 +7,9 @@ every build into a 404), the explicit Dockerfile path, the blob-type header the 
 needs, and the fact that no secret is ever put in a build argument.
 
 The 403 case gets its own test because it is the single most likely first-run failure — the
-message has to name the missing grant. Only a run that reports `Failed` is the app's own build;
-every other failure is the platform's, which keeps an approved copy on offer.
+message has to name the missing grant. Only a run that reports `Failed` after it reached its build
+step is the app's own build; every other failure is the platform's, which keeps an approved copy
+on offer.
 """
 
 from __future__ import annotations
@@ -32,6 +33,29 @@ _APP_ID = uuid.UUID("11111111-2222-3333-4444-555555555555")
 _DEPLOY_ID = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 _DIGEST = "sha256:" + "ab" * 32
 _UPLOAD_URL = "https://acrbuildsource.blob.core.windows.net/src/x?sv=2024&sig=abc"
+
+# Both runs report `Failed` and end on the same line, which is why neither the status nor the
+# run's error message can tell them apart.
+_REFUSED_AT_LOGIN_LOG = (
+    "2026/09/28 08:26:40 Logging in to registry: bialgenaicr.azurecr.io\n"
+    "failed to login, ran out of retries: failed to set docker credentials: Error response from "
+    "daemon: Get \"https://bialgenaicr.azurecr.io/v2/\": denied: client with IP '4.213.25.162' is "
+    "not allowed access. Refer https://aka.ms/acr/firewall to grant access.\n"
+    "Run ID: cu9k failed after 6s. Error: failed during run, err: exit status 1\n"
+)
+_APP_BUILD_FAILED_LOG = (
+    "2026/09/28 09:10:04 Logging in to registry: bialgenaicr.azurecr.io\n"
+    "2026/09/28 09:10:05 Successfully logged in\n"
+    "Sending build context to Docker daemon  104.7kB\n"
+    "Step 7/14 : RUN npm run build\n"
+    "Failed to compile.\n\n"
+    "./app/page.tsx:12:5\n"
+    "Type error: Property 'foo' does not exist on type 'Item'.\n"
+    "The command '/bin/sh -c npm run build' returned a non-zero code: 1\n"
+    "2026/09/28 09:11:40 Container failed during run: build. No retries remaining.\n"
+    "failed to run step ID: build: exit status 1\n\n"
+    "Run ID: cu9m failed after 1m38s. Error: failed during run, err: exit status 1\n"
+)
 
 
 def _config(**overrides: Any) -> DeployConfig:
@@ -61,7 +85,11 @@ def _builder(handler, **config_overrides: Any) -> AcrImageBuilder:
 
 
 def _happy(
-    record: list[httpx.Request], *, status: str = "Succeeded", digest: str | None = _DIGEST
+    record: list[httpx.Request],
+    *,
+    status: str = "Succeeded",
+    digest: str | None = _DIGEST,
+    log: str = "the build log",
 ):
     """A registry that accepts an upload, schedules a run, and reports `status`."""
 
@@ -77,7 +105,7 @@ def _happy(
         if path.endswith("/listLogSasUrl"):
             return httpx.Response(200, json={"logLink": "https://logs.example/x"})
         if path.startswith("https://logs.example") or request.url.host == "logs.example":
-            return httpx.Response(200, text="the build log")
+            return httpx.Response(200, text=log)
         if "/runs/" in path:
             images = [{"digest": digest}] if digest else []
             return httpx.Response(
@@ -249,14 +277,48 @@ async def test_a_failed_build_carries_the_log_back() -> None:
     """This text is what reaches the citizen's chat — without it the message is "the build
     failed" and nothing else."""
     calls: list[httpx.Request] = []
-    builder = _builder(_happy(calls, status="Failed"))
+    builder = _builder(_happy(calls, status="Failed", log=_APP_BUILD_FAILED_LOG))
 
     with pytest.raises(ImageBuildError) as caught:
         await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
 
     assert "failed" in str(caught.value)
-    assert caught.value.log_tail == "the build log"
+    assert caught.value.log_tail == _APP_BUILD_FAILED_LOG
     assert not isinstance(caught.value, ImageBuildUnavailableError)
+    await builder.aclose()
+
+
+async def test_a_run_refused_at_the_registry_login_is_the_platforms() -> None:
+    """The registry's firewall turned the shared build agent away before the app's own build
+    began. Reported as the app's build, it told owners their app was broken and withdrew an
+    approved copy from the one button."""
+    calls: list[httpx.Request] = []
+    builder = _builder(_happy(calls, status="Failed", log=_REFUSED_AT_LOGIN_LOG))
+
+    with pytest.raises(ImageBuildUnavailableError) as caught:
+        await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
+
+    assert "before the app's own build began" in str(caught.value)
+    assert caught.value.log_tail == _REFUSED_AT_LOGIN_LOG
+    await builder.aclose()
+
+
+async def test_a_build_log_longer_than_the_kept_tail_is_still_the_apps_own_build() -> None:
+    """The sign-in line sits near the top of the log and only its end is kept, so the verdict has
+    to come from the whole log — a noisy build that failed must not read as the platform's."""
+    noisy = _APP_BUILD_FAILED_LOG.replace(
+        "Step 7/14", "npm warn deprecated some-package@1.0.0\n" * 2_000 + "Step 7/14"
+    )
+    calls: list[httpx.Request] = []
+    builder = _builder(_happy(calls, status="Failed", log=noisy))
+
+    with pytest.raises(ImageBuildError) as caught:
+        await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
+
+    assert not isinstance(caught.value, ImageBuildUnavailableError)
+    assert caught.value.log_tail is not None
+    assert "Successfully logged in" not in caught.value.log_tail
+    assert caught.value.log_tail.endswith(_APP_BUILD_FAILED_LOG[-200:])
     await builder.aclose()
 
 
@@ -292,8 +354,19 @@ async def test_an_unfetchable_log_does_not_replace_the_real_error() -> None:
     with pytest.raises(ImageBuildError) as caught:
         await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
 
-    assert "failed" in str(caught.value)
+    assert "its log could not be read" in str(caught.value)
     assert caught.value.log_tail is None
+    # With no log there is no evidence either way; the retryable platform side is the cheap error.
+    assert isinstance(caught.value, ImageBuildUnavailableError)
+    await builder.aclose()
+
+
+async def test_an_empty_build_log_is_read_the_same_as_an_unfetchable_one() -> None:
+    calls: list[httpx.Request] = []
+    builder = _builder(_happy(calls, status="Failed", log=""))
+
+    with pytest.raises(ImageBuildUnavailableError):
+        await builder.build(app_id=_APP_ID, deployment_id=_DEPLOY_ID, context=b"tar")
     await builder.aclose()
 
 
@@ -319,8 +392,8 @@ async def test_a_registry_that_returns_no_upload_location_fails_clearly() -> Non
 
 @pytest.mark.parametrize("status", ["Error", "Canceled", "Timeout"])
 async def test_a_run_the_registry_cut_short_is_the_platforms(status: str) -> None:
-    """Only `Failed` is the app's own build. A run that errored, was cancelled or ran out of
-    time says nothing about the app, and must not withdraw an approved copy."""
+    """A run that errored, was cancelled or ran out of time says nothing about the app, and
+    must not withdraw an approved copy."""
     calls: list[httpx.Request] = []
     builder = _builder(_happy(calls, status=status))
 

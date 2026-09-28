@@ -36,8 +36,16 @@ const STATE_BADGE: Record<VersionState, { label: string; className: string }> = 
 
 const ORDINALS = ['first', 'second', 'third', 'fourth', 'fifth']
 
-const failedWords = (attempt: HistoryAttempt): string =>
-  attempt.failureCode === 'build_failed' ? 'failed to build' : 'failed'
+function failedWords(attempt: HistoryAttempt): string {
+  switch (attempt.failureCode) {
+    case 'build_failed':
+      return 'failed to build'
+    case 'build_unavailable':
+      return "failed on the platform's side"
+    default:
+      return 'failed'
+  }
+}
 
 function decisionText(decision: HistoryDecision): string {
   const by = decision.by === null ? '' : ` by ${handle(decision.by)}`

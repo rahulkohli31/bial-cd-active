@@ -47,11 +47,18 @@ _TASKS_API_VERSION: Final = "2019-06-01-preview"
 _ARM_BASE: Final = "https://management.azure.com"
 _ARM_SCOPE: Final = "https://management.azure.com/.default"
 
-# Terminal run statuses. `Queued`/`Started`/`Running` are the non-terminal ones. Only `Failed`
-# is the app's own build failing; `Error`, `Canceled` and `Timeout` are the registry's.
+# Terminal run statuses. `Queued`/`Started`/`Running` are the non-terminal ones. `Error`,
+# `Canceled` and `Timeout` are the registry's; `Failed` is the app's own build only once the run
+# reached a step.
 _SUCCEEDED: Final = "Succeeded"
 _FAILED: Final = "Failed"
 _TERMINAL_STATUSES: Final = frozenset({"Succeeded", "Failed", "Canceled", "Error", "Timeout"})
+
+# The build agent logs this once it has signed in to the registry, the last of its own setup steps
+# before the app's docker build (both "Successfully logged in" and the older "Successfully logged
+# into <registry>" carry it). A `Failed` run that never logged it died in that setup — source
+# download, Docker configuration, registry login — which is the platform's, not the app's.
+_SETUP_FINISHED: Final = "Successfully logged in"
 
 # Blob upload needs this header or the PUT is rejected — the destination is a block blob.
 _BLOB_TYPE_HEADER: Final = {"x-ms-blob-type": "BlockBlob"}
@@ -60,7 +67,7 @@ _BLOB_TYPE_HEADER: Final = {"x-ms-blob-type": "BlockBlob"}
 # is a small control-plane call; the poll interval and total build budget come from config.
 _UPLOAD_TIMEOUT_S: Final = 120.0
 _ARM_CALL_TIMEOUT_S: Final = 30.0
-# Only a bounded prefix of a build log is kept: it is attacker-influenced text from a
+# Only a bounded tail of a build log is passed on: it is attacker-influenced text from a
 # workspace the citizen's AI drove, and the caller redacts and re-caps it anyway.
 _LOG_TAIL_CHARS: Final = 32_000
 
@@ -77,8 +84,9 @@ class ImageBuildError(Exception):
 
 class ImageBuildUnavailableError(ImageBuildError):
     """The platform could not build the image: the registry refused or could not be reached, the
-    run errored, was cancelled or ran out of time, or it reported success with no image. Never
-    the app's own build, which is a run that reports `Failed`."""
+    run errored, was cancelled, ran out of time or failed before its first step, or it reported
+    success with no image. Never the app's own build, which is a run that reports `Failed` after
+    it reached a step."""
 
 
 @dataclass(frozen=True)
@@ -272,10 +280,22 @@ class AcrImageBuilder:
             await asyncio.sleep(self._config.build_poll_interval_s)
 
         if status == _FAILED:
-            raise ImageBuildError("the image build failed", log_tail=await self._log_tail(run_id))
+            log = await self._run_log(run_id)
+            # Read whole, not from the tail: the sign-in line sits near the top of a long log.
+            # No log is no evidence either way, and the platform's side is the cheaper mistake:
+            # it offers a retry, and a retry of a broken app fails again with a readable log.
+            if _SETUP_FINISHED not in (log or ""):
+                raise ImageBuildUnavailableError(
+                    "the image build failed before the app's own build began"
+                    if log
+                    else "the image build failed and its log could not be read",
+                    log_tail=_tail(log),
+                )
+            raise ImageBuildError("the image build failed", log_tail=_tail(log))
         if status != _SUCCEEDED:
             raise ImageBuildUnavailableError(
-                f"the image build ended {status.lower()}", log_tail=await self._log_tail(run_id)
+                f"the image build ended {status.lower()}",
+                log_tail=_tail(await self._run_log(run_id)),
             )
 
         digest = _digest_of(run)
@@ -284,14 +304,14 @@ class AcrImageBuilder:
             # a user one — never report it as "your code failed to build".
             raise ImageBuildUnavailableError(
                 "the image build succeeded but produced no image digest",
-                log_tail=await self._log_tail(run_id),
+                log_tail=_tail(await self._run_log(run_id)),
             )
         _log.info("image_built", run_id=run_id, digest=digest)
         return BuiltImage(digest=digest, tag=tag, run_id=run_id)
 
-    async def _log_tail(self, run_id: str) -> str | None:
-        """The registry's own build log. Best-effort: a deploy that failed for a real reason
-        must not ALSO fail because the log could not be fetched — that would replace an
+    async def _run_log(self, run_id: str) -> str | None:
+        """The registry's own build log, whole. Best-effort: a deploy that failed for a real
+        reason must not ALSO fail because the log could not be fetched — that would replace an
         actionable message with a meaningless one."""
         try:
             link = await self._arm("POST", f"{self._registry_id}/runs/{run_id}/listLogSasUrl")
@@ -301,7 +321,7 @@ class AcrImageBuilder:
             response = await self._http.get(str(url), timeout=_ARM_CALL_TIMEOUT_S)
             if response.status_code >= 400:
                 return None
-            return response.text[-_LOG_TAIL_CHARS:]
+            return response.text
         except Exception:
             _log.warning("image_build_log_unavailable", run_id=run_id, exc_info=True)
             return None
@@ -311,6 +331,10 @@ class AcrImageBuilder:
         close = getattr(self._credential, "close", None)
         if close is not None:
             await asyncio.to_thread(close)
+
+
+def _tail(log: str | None) -> str | None:
+    return None if log is None else log[-_LOG_TAIL_CHARS:]
 
 
 def _digest_of(run: dict[str, Any]) -> str | None:

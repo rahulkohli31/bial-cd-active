@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 import sqlalchemy as sa
 from pydantic import SecretStr
@@ -28,7 +29,12 @@ from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.deploy import service as service_module
 from src.services.deploy.aca_publish import RevisionState, _state_of
 from src.services.deploy.config import DeployConfig
-from src.services.deploy.images import BuiltImage, ImageBuildError, ImageBuildUnavailableError
+from src.services.deploy.images import (
+    AcrImageBuilder,
+    BuiltImage,
+    ImageBuildError,
+    ImageBuildUnavailableError,
+)
 from src.services.deploy.names import published_app_name
 from src.services.deploy.service import DeployNotPossibleError, DeployService
 from src.services.storage import BundleValidationError, submission_key
@@ -145,6 +151,7 @@ def wire(db_session, monkeypatch, tmp_path):
             image_builder=images,
             published_apps=aca,
         ),
+        session_factory=_session,
         images=images,
         aca=aca,
         tree=tree,
@@ -403,6 +410,57 @@ async def test_a_platform_fault_in_the_build_is_not_reported_as_the_app_s_own(
     text = message.payload[0]["parts"][0]["content"]
     assert "platform problem" in text
     assert "try again" in text
+
+
+async def test_a_registry_that_turned_its_builder_away_is_not_the_app_s_build(
+    wire, db_session
+) -> None:
+    """The registry's run reports `Failed` here exactly as it does for a real build error; only
+    its log says the app's own build never began."""
+    log = (
+        "2026/09/28 08:26:40 Logging in to registry: bialgenaicr.azurecr.io\n"
+        "failed to login, ran out of retries: failed to set docker credentials: Error response "
+        'from daemon: Get "https://bialgenaicr.azurecr.io/v2/": denied: client with IP '
+        "'4.213.25.162' is not allowed access. "
+        "Refer https://aka.ms/acr/firewall to grant access.\n"
+        "Run ID: cu9k failed after 6s. Error: failed during run, err: exit status 1\n"
+    )
+    upload = {"uploadUrl": "https://up.example/x", "relativePath": "x"}
+
+    def registry(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/listBuildSourceUploadUrl"):
+            return httpx.Response(200, json=upload)
+        if path.endswith("/scheduleRun"):
+            return httpx.Response(200, json={"name": "cu9k"})
+        if path.endswith("/listLogSasUrl"):
+            return httpx.Response(200, json={"logLink": "https://logs.example/cu9k"})
+        if request.url.host == "logs.example":
+            return httpx.Response(200, text=log)
+        if path.endswith("/runs/cu9k"):
+            return httpx.Response(200, json={"properties": {"status": "Failed"}})
+        return httpx.Response(201)
+
+    acr = AcrImageBuilder(
+        _config(),
+        transport=httpx.MockTransport(registry),
+        credential=SimpleNamespace(get_token=lambda _scope: SimpleNamespace(token="tok")),
+    )
+    wire.service = DeployService(
+        session_factory=wire.session_factory, image_builder=acr, published_apps=wire.aca
+    )
+    user, app, conversation = await _project(db_session)
+
+    _started, row = await _run(wire, db_session, user, app, conversation.id)
+    await acr.aclose()
+
+    assert row.failure_code == "build_unavailable"
+    assert "is not allowed access" in (row.failure_detail or "")
+    message = await db_session.scalar(
+        sa.select(Message).where(Message.conversation_id == conversation.id)
+    )
+    assert "platform problem" in message.payload[0]["parts"][0]["content"]
+    assert not wire.aca.created
 
 
 async def test_a_platform_fault_in_the_build_keeps_the_registry_log_for_the_operator(
