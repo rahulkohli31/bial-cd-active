@@ -32,10 +32,14 @@ const {
   appendAll,
   classify,
   currentRecordsOnly,
+  filesToRead,
   flightsBetween,
   label,
   newestReadableDay,
+  optionsOf,
   ownBytes,
+  pageOf,
+  sharedLoad,
   splitLakeUrl,
 } = await import('./flight-data')
 
@@ -377,5 +381,109 @@ describe('ownBytes', () => {
     const bytes = ownBytes(view)
     pool.fill(0)
     expect([...new Uint8Array(bytes)]).toEqual([1, 2, 3, 4])
+  })
+})
+
+// ── Which files to read ──────────────────────────────────────────────────────────────────────
+
+describe('filesToRead', () => {
+  const MB = 1_048_576
+  const days = (sizes: number[]) =>
+    sizes.map((size, index) => lakeFile(`202609${String(index + 1).padStart(2, '0')}`, size))
+
+  it('reads the newest complete copy and every file after it, and nothing before it', () => {
+    const files = days([2 * MB, 100 * MB, 2 * MB, 3 * MB, 101 * MB, 2 * MB, 1 * MB])
+    expect(filesToRead(files)).toEqual(files.slice(4))
+  })
+
+  it('reads every file when none is a complete copy', () => {
+    const files = days([0.8 * MB, 1.1 * MB, 0.9 * MB, 1.2 * MB, 1 * MB])
+    expect(filesToRead(files)).toEqual(files)
+  })
+
+  it('reads nothing from an empty listing', () => {
+    expect(filesToRead([])).toEqual([])
+  })
+})
+
+// ── Building a page ──────────────────────────────────────────────────────────────────────────
+
+describe('pageOf', () => {
+  const rows = Array.from({ length: 120 }, (_, index) => index + 1)
+
+  it('returns one page and the totals the page needs', () => {
+    expect(pageOf(rows, 2, 50)).toEqual({
+      rows: rows.slice(50, 100),
+      page: 2,
+      pageSize: 50,
+      total: 120,
+      pages: 3,
+    })
+  })
+
+  it('pulls a missing or out-of-range page back into range', () => {
+    expect(pageOf(rows, Number.NaN, 50).page).toBe(1)
+    expect(pageOf(rows, 99, 50)).toMatchObject({ page: 3, rows: rows.slice(100) })
+    expect(pageOf([], 1, 50)).toMatchObject({ page: 1, pages: 1, total: 0, rows: [] })
+  })
+
+  it('never hands out more than 500 rows, whatever the request asks for', () => {
+    const many = Array.from({ length: 2_000 }, (_, index) => index)
+    expect(pageOf(many, 1, 1_000_000).rows).toHaveLength(500)
+  })
+})
+
+describe('optionsOf', () => {
+  it('lists each value once, trimmed, without blanks, sorted', () => {
+    const rows = [
+      { AIRLINE_NAME: 'INDIGO' },
+      { AIRLINE_NAME: 'AKASA AIR                     ' },
+      { AIRLINE_NAME: 'AKASA AIR' },
+      { AIRLINE_NAME: '' },
+      { AIRLINE_NAME: null },
+    ]
+    expect(optionsOf(rows, 'AIRLINE_NAME')).toEqual(['AKASA AIR', 'INDIGO'])
+  })
+})
+
+describe('sharedLoad', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('loads once for requests that arrive together, and reuses the load afterwards', async () => {
+    const load = vi.fn(async () => ['one flight'])
+    const flights = sharedLoad('together', load)
+    const [first, second] = await Promise.all([flights(), flights()])
+    expect(await flights()).toBe(first)
+    expect(second).toBe(first)
+    expect(load).toHaveBeenCalledTimes(1)
+  })
+
+  it('is shared by every copy of the module, through its name', async () => {
+    const load = vi.fn(async () => 'rows')
+    await sharedLoad('by-name', load)()
+    await sharedLoad('by-name', load)()
+    expect(load).toHaveBeenCalledTimes(1)
+  })
+
+  it('loads again once the held load is older than its age limit', async () => {
+    vi.useFakeTimers()
+    const load = vi.fn(async () => 'rows')
+    const flights = sharedLoad('ageing', load, 1_000)
+    await flights()
+    vi.advanceTimersByTime(1_001)
+    await flights()
+    expect(load).toHaveBeenCalledTimes(2)
+  })
+
+  it('drops a failed load, so the next request tries again', async () => {
+    const load = vi
+      .fn<() => Promise<string>>()
+      .mockRejectedValueOnce(new Error('lake unreachable'))
+      .mockResolvedValueOnce('rows')
+    const flights = sharedLoad('failing', load)
+    await expect(flights()).rejects.toThrow('lake unreachable')
+    await expect(flights()).resolves.toBe('rows')
   })
 })
