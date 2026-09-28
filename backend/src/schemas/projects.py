@@ -241,6 +241,11 @@ class ProjectResponse(CamelModel):
     # `ProjectResponse(...)` construction reintroduce exactly that bug; every call site
     # already passes it via `_to_response`.
     is_serving: bool
+    # IS A PUBLISH RUNNING? True exactly when the project page's publish state reads
+    # `starting_up`, which neither `app_status` nor `is_serving` can say: a publish that needed
+    # no review never writes the status, and nothing serves until it finishes. Required for
+    # the reason `is_serving` is.
+    is_publishing: bool
     # Whether this project has a bundle a Relaunch could actually restore.
     # THREE-STATE ON PURPOSE: `true` = there is one, `false` = confirmed there is not,
     # `null` = the object store could not be reached, so the platform declines to claim
@@ -290,10 +295,10 @@ class ProjectCountsResponse(CamelModel):
     in_production: int
     # Every application the citizen has ever created, whatever its state.
     total_applications: int
-    # Moving through the pipeline: submitted, approved-but-not-yet-live, or changes
-    # requested. Deliberately NOT "everything that is not live" — a project with nothing
-    # built yet has not entered the pipeline, and counting it would make this number read
-    # as a backlog that nobody can act on.
+    # Moving through the pipeline: submitted, approved-but-not-yet-live, changes requested, or
+    # publishing while nothing is live yet. Deliberately NOT "everything that is not live" — a
+    # project with nothing built yet has not entered the pipeline, and counting it would make
+    # this number read as a backlog that nobody can act on.
     in_pipeline: int
 
 

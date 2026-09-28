@@ -19,11 +19,13 @@ import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 from sqlalchemy.orm.exc import StaleDataError
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.attachments.router import storage_dependency
 from src.api.v1.build_sessions.deps import OptionalSandbox, SessionManagerDep
+from src.api.v1.deploy.schemas import is_starting_up
 from src.api.v1.live_build import refuse_while_build_session_live
 from src.api.v1.offset_pagination import PageQuery, clean_page
 from src.api.v1.pagination import (
@@ -39,6 +41,7 @@ from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.conversation import Conversation
 from src.db.models.deleted_project import DeletedProject
+from src.db.models.deployment import Deployment, DeploymentStatus
 from src.db.models.project import Project
 from src.db.models.project_share import ProjectShare
 from src.db.models.user import User
@@ -138,16 +141,18 @@ def _to_response(
     has_relaunchable_snapshot: bool | None = None,
     *,
     is_serving: bool,
+    is_publishing: bool,
     access: Literal["owner", "shared"] = "owner",
     has_saved_snapshot: bool | None = None,
 ) -> ProjectResponse:
     """Project a row onto the wire shape.
 
-    `is_serving` IS REQUIRED, AND KEYWORD-ONLY, because a default here is a silent wrong
-    answer. It shipped as `= False` and three of the five call sites simply never passed it,
-    so `GET /{id}` reported a live app as not serving while its own field docstring says it
-    IS the server's answer. A default is what let the omission type-check; without one, a new
-    endpoint cannot forget it, and `_serving_now` is the one way to work it out.
+    `is_serving` (and `is_publishing`, for the same reason) IS REQUIRED, AND KEYWORD-ONLY,
+    because a default here is a silent wrong answer. It shipped as `= False` and three of the
+    five call sites simply never passed it, so `GET /{id}` reported a live app as not serving
+    while its own field docstring says it IS the server's answer. A default is what let the
+    omission type-check; without one, a new endpoint cannot forget it, and `_serving_now` and
+    `_publishing_now` are the one way to work each out.
 
     `access` DOES default, unlike `is_serving` — every call site except `get_project` deals
     exclusively with the caller's own projects (#198), so defaulting to `"owner"` is the
@@ -162,6 +167,7 @@ def _to_response(
         app_status=app_status.value if app_status is not None else None,
         has_relaunchable_snapshot=has_relaunchable_snapshot,
         is_serving=is_serving,
+        is_publishing=is_publishing,
         created_at=project.created_at,
         updated_at=project.updated_at,
         access=access,
@@ -198,6 +204,34 @@ async def _serving_now(db: DbSession, app_id: uuid.UUID | None) -> bool:
         return False
     live = live_app_ids().subquery()
     return bool(await db.scalar(sa.select(sa.exists().where(live.c.app_id == app_id))))
+
+
+# Each app's running deploy attempt, if one stands (at most one: `uq_deployments_one_in_flight`).
+# The status renders as a literal for the reason `live_app_ids` gives: a bound one cannot use
+# that partial index.
+_in_flight = aliased(Deployment, name="in_flight")
+_IN_FLIGHT_ROW = sa.and_(
+    _in_flight.app_id == AppRegistry.id,
+    _in_flight.status
+    == sa.bindparam("in_flight_running", DeploymentStatus.RUNNING, literal_execute=True),
+)
+
+
+async def _publishing_now(db: DbSession, app_id: uuid.UUID | None) -> bool:
+    """Is this ONE app's publish running? The single-row form of the list's read."""
+    if app_id is None:
+        return False
+    row = (
+        await db.execute(
+            sa.select(AppRegistry, _in_flight)
+            .outerjoin(_in_flight, _IN_FLIGHT_ROW)
+            .where(AppRegistry.id == app_id)
+        )
+    ).one_or_none()
+    if row is None:
+        return False
+    app, in_flight = row
+    return is_starting_up(app, in_flight)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, responses=error_responses(AUTH_401))
@@ -252,7 +286,7 @@ async def create_project(
     await db.refresh(project)
     # A project one statement old owns no app, so nothing of its can be serving. Passed
     # explicitly rather than defaulted: this is an answer, not an omission.
-    response = _to_response(project, is_serving=False)
+    response = _to_response(project, is_serving=False, is_publishing=False)
     await _provision_database_or_shrug(db, project_id)
     return response
 
@@ -354,11 +388,16 @@ def _tile_predicate(app_filter: ProjectFilter, live: sa.Subquery) -> sa.ColumnEl
     """
     if app_filter == "inProduction":
         return live.c.app_id.is_not(None)
-    # In the pipeline: submitted or decided, but not yet serving. APPROVED belongs here only
-    # while it is NOT live — an approved app that is serving is `inProduction`, and counting it
-    # twice would make the three numbers sum to more than the citizen has.
+    # In the pipeline: submitted, decided or publishing, but not yet serving. APPROVED belongs
+    # here only while it is NOT live — an approved app that is serving is `inProduction`, and
+    # counting it twice would make the three numbers sum to more than the citizen has. A
+    # publish that needed no review leaves the status at DRAFT, so it is the running row that
+    # places it; the caller joins `_in_flight`.
     return sa.and_(
-        AppRegistry.status.in_((AppStatus.PENDING, AppStatus.REJECTED, AppStatus.APPROVED)),
+        sa.or_(
+            AppRegistry.status.in_((AppStatus.PENDING, AppStatus.REJECTED, AppStatus.APPROVED)),
+            sa.and_(AppRegistry.status == AppStatus.DRAFT, _in_flight.id.is_not(None)),
+        ),
         live.c.app_id.is_(None),
     )
 
@@ -431,7 +470,7 @@ async def list_projects(
     # >300x cost on the first screen after sign-in — see `live_app_ids`'s docstring.
     live = live_app_ids(owner_user_id=user.id).subquery()
     query = (
-        sa.select(Project, AppRegistry.id, AppRegistry.status, live.c.app_id.is_not(None))
+        sa.select(Project, AppRegistry, live.c.app_id.is_not(None), _in_flight)
         .outerjoin(
             AppRegistry,
             sa.and_(AppRegistry.project_id == Project.id, AppRegistry.user_id == user.id),
@@ -439,6 +478,7 @@ async def list_projects(
         # OUTER on the liveness side too: a project with no app, or an app that has never
         # deployed, has no row here and is simply not live — it must still be listed.
         .outerjoin(live, live.c.app_id == AppRegistry.id)
+        .outerjoin(_in_flight, _IN_FLIGHT_ROW)
         .where(Project.user_id == user.id)
     )
     if search is not None:
@@ -477,6 +517,7 @@ async def list_projects(
                 sa.and_(AppRegistry.project_id == Project.id, AppRegistry.user_id == user.id),
             )
             .outerjoin(live, live.c.app_id == AppRegistry.id)
+            .outerjoin(_in_flight, _IN_FLIGHT_ROW)
             .where(_tile_predicate(tile, live))
         )
     count_stmt = sa.select(sa.func.count()).select_from(count_query.subquery())
@@ -486,8 +527,16 @@ async def list_projects(
     ).all()
     return ProjectListResponse(
         items=[
-            _to_response(project, app_id, app_status, is_serving=is_serving)
-            for project, app_id, app_status, is_serving in rows
+            _to_response(project, is_serving=is_serving, is_publishing=False)
+            if app is None
+            else _to_response(
+                project,
+                app.id,
+                app.status,
+                is_serving=is_serving,
+                is_publishing=is_starting_up(app, in_flight),
+            )
+            for project, app, is_serving, in_flight in rows
         ],
         page=page,
         page_size=limit,
@@ -534,6 +583,7 @@ async def project_counts(user: CurrentUser, db: DbSession) -> ProjectCountsRespo
         sa.select(sa.func.count())
         .select_from(AppRegistry)
         .outerjoin(live, live.c.app_id == AppRegistry.id)
+        .outerjoin(_in_flight, _IN_FLIGHT_ROW)
         .where(AppRegistry.user_id == user.id, _tile_predicate("inPipeline", live))
     )
     return ProjectCountsResponse(
@@ -764,6 +814,7 @@ async def get_project(project_id: uuid.UUID, user: CurrentUser, db: DbSession) -
         app_status,
         relaunchable,
         is_serving=await _serving_now(db, app_id),
+        is_publishing=await _publishing_now(db, app_id),
         access=resolved.access.value,
         has_saved_snapshot=has_saved_snapshot,
     )
@@ -922,7 +973,13 @@ async def patch_project(
         raise AppApiError(status.HTTP_404_NOT_FOUND, "Project not found.") from None
     await db.refresh(project)
     app_id, app_status = await _project_app(db, user.id, project.id)
-    return _to_response(project, app_id, app_status, is_serving=await _serving_now(db, app_id))
+    return _to_response(
+        project,
+        app_id,
+        app_status,
+        is_serving=await _serving_now(db, app_id),
+        is_publishing=await _publishing_now(db, app_id),
+    )
 
 
 # Names the LIVE SESSION as the reason and the action that clears it: refuse, never

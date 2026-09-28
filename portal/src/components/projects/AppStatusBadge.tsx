@@ -13,7 +13,7 @@ export default function AppStatusBadge({
   project,
   className = '',
 }: {
-  project: Pick<Project, 'appStatus' | 'isServing'>
+  project: Pick<Project, 'appStatus' | 'isServing' | 'isPublishing'>
   className?: string
 }): React.JSX.Element {
   const status = statusFor(project)

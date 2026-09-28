@@ -34,6 +34,7 @@ const project: Project = {
   hasRelaunchableSnapshot: null,
   hasSavedSnapshot: null,
   isServing: false,
+  isPublishing: false,
   createdAt: '',
   updatedAt: '',
   access: 'owner',

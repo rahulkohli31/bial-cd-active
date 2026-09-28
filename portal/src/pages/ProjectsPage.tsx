@@ -63,11 +63,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
  */
 export const PROJECT_GONE_NOTICE = 'That application is no longer available.'
 
-/**
- * HOW OFTEN THE ACTIVITY MARKERS ARE RE-ASKED, and ONLY while at least one is showing — see the
- * effect that reads it. Exported so the suite can advance exactly this far rather than guessing
- * a number that could drift from the source.
- */
+/** How often the page is re-read while a row is publishing — the project page's own cadence. */
+export const PUBLISHING_POLL_MS = 5000
 
 /**
  * The three summary tiles, and the filter each one applies.
@@ -233,9 +230,16 @@ export default function ProjectsPage(): React.JSX.Element {
   // A REFRESH failure (there IS a last-known-good `counts`) stays silent by design — the
   // comment below explains why — but that same silence, applied to a FIRST load, left the
   // three tiles skeleton-pulsing forever over a working list: no error, no retry, and
-  // nothing but a delete (or the page list's own Retry) ever bumps `reloadNonce` again.
+  // nothing but a delete, the page list's own Retry or a running publish bumps `reloadNonce`.
   const [countsFailedCold, setCountsFailedCold] = useState(false)
   const [reloadNonce, setReloadNonce] = useState(0)
+  // Set by the publishing poll, read once by the fetch it triggers: the rows are already on
+  // screen, so that re-read is not a wait to announce.
+  const quietReload = useRef(false)
+  // True while the newest list request is waiting for its answer. A tick that finds it set is
+  // skipped: its request would replace that one, so a slow answer would never land, and a load
+  // the user started would fail silently as a quiet re-read.
+  const listInFlight = useRef(false)
   // DELETES IN FLIGHT, BY ID — not a boolean. Two overlapping deletes shared one flag, so the
   // faster one's `finally` cleared it while the slower was still running: precisely the
   // window the guard exists to cover. A set is the same treatment `requestId` already gets.
@@ -271,7 +275,10 @@ export default function ProjectsPage(): React.JSX.Element {
 
   useEffect(() => {
     const id = ++requestId.current
-    setLoading(true)
+    const quiet = quietReload.current
+    quietReload.current = false
+    listInFlight.current = true
+    if (!quiet) setLoading(true)
     listProjects({ page, limit: pageSize, q: debouncedQ || undefined, filter: filter ?? undefined })
       .then((res) => {
         if (requestId.current !== id) return
@@ -286,6 +293,8 @@ export default function ProjectsPage(): React.JSX.Element {
       })
       .catch((caught: unknown) => {
         if (requestId.current !== id) return
+        // A failed poll says nothing: the rows on screen are still right and the next tick retries.
+        if (quiet) return
         // The rows already on screen are LEFT INTACT. A later page failing must not blank
         // the list the reader is using; the message goes underneath them instead.
         setError(caught instanceof Error ? caught : new Error('Could not load your applications.'))
@@ -293,7 +302,9 @@ export default function ProjectsPage(): React.JSX.Element {
         setAppliedFilter(filter)
       })
       .finally(() => {
-        if (requestId.current === id) setLoading(false)
+        if (requestId.current !== id) return
+        listInFlight.current = false
+        setLoading(false)
       })
   }, [page, pageSize, debouncedQ, filter, reloadNonce])
 
@@ -334,6 +345,19 @@ export default function ProjectsPage(): React.JSX.Element {
     // response above changes it, which is not a real trigger for asking again.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadNonce])
+
+  // A publish is the one row state that changes on its own, so the page is re-read only while
+  // one is running — the rows and the three numbers both move when it finishes.
+  const anyPublishing = items.some((project) => project.isPublishing)
+  useEffect(() => {
+    if (!anyPublishing) return undefined
+    const timer = window.setInterval(() => {
+      if (listInFlight.current) return
+      quietReload.current = true
+      setReloadNonce((n) => n + 1)
+    }, PUBLISHING_POLL_MS)
+    return () => window.clearInterval(timer)
+  }, [anyPublishing])
 
   // Paged past the end — a delete elsewhere can shrink the list under a reader. Step back
   // rather than stranding them on a blank page with no way out.

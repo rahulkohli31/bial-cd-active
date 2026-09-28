@@ -44,7 +44,7 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
   ...(await orig<typeof import('../../utils/buildSessionApi')>()),
 }))
 
-import ProjectsPage, { PROJECT_GONE_NOTICE } from '../ProjectsPage'
+import ProjectsPage, { PROJECT_GONE_NOTICE, PUBLISHING_POLL_MS } from '../ProjectsPage'
 import { ApiError } from '../../utils/apiError'
 import type { Project } from '../../utils/projectApi'
 import { SharedAppRow, SharedAppTile } from '../../components/projects/SharedAppRow'
@@ -155,6 +155,7 @@ const mkProject = (id: string, name: string, over: Partial<Project> = {}): Proje
   description: 'A tool',
   appId: null,
   isServing: false,
+  isPublishing: false,
   appStatus: null,
   hasRelaunchableSnapshot: null,
   hasSavedSnapshot: null,
@@ -336,6 +337,184 @@ describe('a row', () => {
     // The SAME `approved` status reads differently because only one of them is serving.
     expect(screen.getByText('Approved')).toBeTruthy()
     expect(screen.getByText('Nothing built yet')).toBeTruthy()
+  })
+
+  it('says Starting up while a publish runs, over Draft and over Live alike', async () => {
+    h.listProjects.mockResolvedValue(
+      page([
+        mkProject('p1', 'First Publish', { isPublishing: true, appStatus: 'draft' }),
+        mkProject('p2', 'New Version', { isPublishing: true, isServing: true, appStatus: 'draft' }),
+      ]),
+    )
+    renderPage()
+
+    expect(await screen.findAllByText('Starting up')).toHaveLength(2)
+    expect(screen.queryByText('Draft')).toBeNull()
+    expect(screen.queryByText('Live')).toBeNull()
+  })
+
+  it('re-reads the page quietly while a row is publishing, and stops once none is', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const publishing = mkProject('p1', 'Flight Dashboard', { isPublishing: true, appStatus: 'draft' })
+    const live = mkProject('p1', 'Flight Dashboard', { isServing: true, appStatus: 'draft' })
+    let answer!: (value: ReturnType<typeof page>) => void
+    h.listProjects
+      .mockResolvedValueOnce(page([publishing]))
+      .mockReturnValueOnce(new Promise((resolve) => (answer = resolve)))
+      .mockResolvedValue(page([live]))
+    renderPage()
+    await screen.findByText('Starting up')
+    expect(h.listProjectCounts).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PUBLISHING_POLL_MS)
+    })
+    expect(h.listProjects).toHaveBeenCalledTimes(2)
+    // The rows are already on screen, so a poll in flight is not a wait to announce.
+    expect(screen.queryByText('Loading your applications…')).toBeNull()
+
+    await act(async () => {
+      answer(page([live]))
+    })
+    expect(await screen.findByText('Live')).toBeTruthy()
+    expect(h.listProjectCounts).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3 * PUBLISHING_POLL_MS)
+    })
+    expect(h.listProjects).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps a failed re-read silent and the rows on screen, then keeps polling', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    h.listProjects
+      .mockResolvedValueOnce(
+        page([mkProject('p1', 'Flight Dashboard', { isPublishing: true, appStatus: 'draft' })]),
+      )
+      .mockRejectedValueOnce(new ApiError('Gateway timed out.', 504))
+      .mockResolvedValue(page([mkProject('p1', 'Flight Dashboard', { isServing: true, appStatus: 'draft' })]))
+    renderPage()
+    await screen.findByText('Starting up')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PUBLISHING_POLL_MS)
+    })
+
+    expect(h.listProjects).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByText('Flight Dashboard')).toBeTruthy()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PUBLISHING_POLL_MS)
+    })
+    expect(h.listProjects).toHaveBeenCalledTimes(3)
+    expect(await screen.findByText('Live')).toBeTruthy()
+  })
+
+  it('does not let a tick replace a load the user started, so its failure still shows', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const publishing = mkProject('p1', 'Flight Dashboard', { isPublishing: true, appStatus: 'draft' })
+    let fail!: (reason: unknown) => void
+    h.listProjects
+      .mockResolvedValueOnce(page([publishing]))
+      .mockReturnValueOnce(new Promise((_resolve, reject) => (fail = reject)))
+      .mockResolvedValue(page([publishing]))
+    renderPage()
+    await screen.findByText('Starting up')
+
+    fireEvent.click(screen.getByRole('button', { name: /In production/ }))
+    await waitFor(() => expect(h.listProjects).toHaveBeenCalledTimes(2))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PUBLISHING_POLL_MS)
+    })
+    expect(h.listProjects).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      fail(new ApiError('Gateway timed out.', 504))
+    })
+    expect(await screen.findByRole('alert')).toBeTruthy()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PUBLISHING_POLL_MS)
+    })
+    expect(h.listProjects).toHaveBeenCalledTimes(3)
+  })
+
+  it('waits for the newest load, not an overtaken re-read, before polling again', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const publishing = mkProject('p1', 'Flight Dashboard', { isPublishing: true, appStatus: 'draft' })
+    let lateAnswer!: (value: ReturnType<typeof page>) => void
+    let userAnswer!: (value: ReturnType<typeof page>) => void
+    h.listProjects
+      .mockResolvedValueOnce(page([publishing]))
+      .mockReturnValueOnce(new Promise((resolve) => (lateAnswer = resolve)))
+      .mockReturnValueOnce(new Promise((resolve) => (userAnswer = resolve)))
+      .mockResolvedValue(page([publishing]))
+    renderPage()
+    await screen.findByText('Starting up')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PUBLISHING_POLL_MS)
+    })
+    fireEvent.click(screen.getByRole('button', { name: /In production/ }))
+    await waitFor(() => expect(h.listProjects).toHaveBeenCalledTimes(3))
+    await act(async () => {
+      lateAnswer(page([publishing]))
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PUBLISHING_POLL_MS)
+    })
+    expect(h.listProjects).toHaveBeenCalledTimes(3)
+
+    await act(async () => {
+      userAnswer(page([publishing]))
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PUBLISHING_POLL_MS)
+    })
+    expect(h.listProjects).toHaveBeenCalledTimes(4)
+  })
+
+  it('skips a tick while the last re-read is still waiting, so a slow answer still lands', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const publishing = mkProject('p1', 'Flight Dashboard', { isPublishing: true, appStatus: 'draft' })
+    let answer!: (value: ReturnType<typeof page>) => void
+    h.listProjects
+      .mockResolvedValueOnce(page([publishing]))
+      .mockReturnValueOnce(new Promise((resolve) => (answer = resolve)))
+      .mockResolvedValue(page([publishing]))
+    renderPage()
+    await screen.findByText('Starting up')
+
+    // One tick per act, so each lands in its own render the way 5s-apart ticks do.
+    for (let tick = 0; tick < 3; tick++) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(PUBLISHING_POLL_MS)
+      })
+    }
+    expect(h.listProjects).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      answer(page([publishing, mkProject('p2', 'Gate Log', { appStatus: 'draft' })]))
+    })
+    expect(await screen.findByText('Gate Log')).toBeTruthy()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PUBLISHING_POLL_MS)
+    })
+    expect(h.listProjects).toHaveBeenCalledTimes(3)
+  })
+
+  it('does not poll when nothing on the page is publishing', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    h.listProjects.mockResolvedValue(page([mkProject('p1', 'Visitor Log', { appStatus: 'draft' })]))
+    renderPage()
+    await screen.findByText('Draft')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3 * PUBLISHING_POLL_MS)
+    })
+    expect(h.listProjects).toHaveBeenCalledTimes(1)
   })
 
   it('keeps the row menu OUT of the open button', async () => {

@@ -14,6 +14,9 @@
  * therefore checked FIRST — computed server-side by `services/deploy/liveness.py`,
  * the same predicate the marketplace and dashboard's "In production" count use.
  *
+ * A PUBLISH IN FLIGHT IS A THIRD FACT, and it outranks both: `isPublishing` is true exactly
+ * when the chip reads `starting_up`, which the chip says over a live app as well as a new one.
+ *
  * Wording below is the chip's, not the board mockups' ("NOT SENT"/"LIVE") — confirmed
  * on a call to use explainable, simple language over the mocks' placeholder terms.
  */
@@ -28,6 +31,9 @@ export interface StatusLabel {
 
 /** `Nothing built yet` — a project whose app does not exist. The chip's own words. */
 const NOTHING_BUILT: StatusLabel = { label: 'Nothing built yet', tone: 'idle' }
+
+/** The chip's words and colour for `starting_up`. */
+const STARTING_UP: StatusLabel = { label: 'Starting up', tone: 'live' }
 
 const BY_STATUS: Record<AppStatus, StatusLabel> = {
   // Built, never submitted. The chip's comment records that "Draft" beat "Ready to send"
@@ -49,7 +55,10 @@ const BY_STATUS: Record<AppStatus, StatusLabel> = {
  * an approved app that is serving reads `Live`, and an approved one that never deployed
  * reads `Approved`.
  */
-export function statusFor(project: Pick<Project, 'appStatus' | 'isServing'>): StatusLabel {
+export function statusFor(
+  project: Pick<Project, 'appStatus' | 'isServing' | 'isPublishing'>,
+): StatusLabel {
+  if (project.isPublishing) return STARTING_UP
   if (project.isServing) return { label: 'Live', tone: 'live' }
   if (project.appStatus === null) return NOTHING_BUILT
   return BY_STATUS[project.appStatus] ?? NOTHING_BUILT
