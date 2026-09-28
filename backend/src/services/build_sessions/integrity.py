@@ -355,8 +355,9 @@ PORCELAIN_CAP_BYTES: Final = 200
 # empty enough to reclaim or to declare reverted; it never suppresses anything the user is
 # shown, and the Save button still offers to save these (they are legitimately part of the
 # tree). Add to it only for files the toolchain writes unprompted — never for anything a person
-# or the agent would edit.
-FRAMEWORK_CHURN: Final = frozenset({"next-env.d.ts", "tsconfig.json"})
+# or the agent would edit. `next.config.ts` is the platform's own: a restore writes the image's
+# copy over an older one the app carried, and the agent may not edit it.
+FRAMEWORK_CHURN: Final = frozenset({"next-env.d.ts", "tsconfig.json", "next.config.ts"})
 
 # THE SAME QUESTION, ASKED WHERE THE WRONG ANSWER COSTS SOMEBODY THEIR WORK.
 #
@@ -373,11 +374,12 @@ FRAMEWORK_CHURN: Final = frozenset({"next-env.d.ts", "tsconfig.json"})
 #
 # `next-env.d.ts` stays: Next regenerates it on boot, the file carries its own do-not-edit banner,
 # and it appears nowhere in the prompt's editable list -- so nothing the agent is permitted to do
-# produces a change to it.
+# produces a change to it. `next.config.ts` qualifies on the same terms: the prompt names it
+# platform-owned, and the only writer is a restore putting the image's copy back.
 #
 # THE ASYMMETRY IS THE POINT. A wrongly-dirty tree costs a save nobody needed. A wrongly-clean one
 # costs the build. Where the two cannot both be served, this side fails DIRTY.
-REGENERATED_ONLY: Final = frozenset({"next-env.d.ts"})
+REGENERATED_ONLY: Final = frozenset({"next-env.d.ts", "next.config.ts"})
 
 # A commit sha, and nothing else, may be interpolated into the script below.
 #
