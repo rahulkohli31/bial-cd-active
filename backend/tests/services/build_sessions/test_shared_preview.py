@@ -28,6 +28,7 @@ from src.services.build_sessions.manager import (
     NoSnapshotToRelaunchError,
     SandboxReclaimBlockedError,
     SessionManager,
+    app_name_for,
     shr_name_for,
 )
 from src.services.redis import registry_key
@@ -40,7 +41,7 @@ from src.services.sandbox import SandboxHandle, SandboxNotReadyError
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from tests.factories import ProjectFactory, UserFactory
-from tests.fakes import FakeSandboxClient, FakeStorage
+from tests.fakes import FakeSandboxClient, FakeStorage, detached_work_done
 
 
 @pytest.fixture(autouse=True)
@@ -337,18 +338,12 @@ async def test_revoke_is_a_noop_when_nothing_is_there(
     assert client.torn_down == []
 
 
-async def test_a_live_shared_view_earns_the_hand_over_dialog_instead_of_silent_reclaim(
+async def test_a_first_message_puts_a_live_shared_view_away_and_starts(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """Requirement 24 / #161's own mechanism, extended to a `shr-` occupant.
-
-    Before the two registry fields this slice adds (`REGISTRY_FIELD_SHARED_PROJECT_ID`/
-    `REGISTRY_FIELD_SHARED_OWNER_ID`, stamped at Launch), a `shr-` name matched no app the
-    recipient owns, so `_occupying_project` returned `None` and `_refuse_if_reclaim_would_
-    destroy_work` fell through its ghost exit — the recipient's still-open shared view was
-    torn down with no dialog at all. This pins the fix: starting a build in a DIFFERENT
-    project of the recipient's own must raise `SandboxReclaimBlockedError` naming the SHARED
-    project, not silently reclaim the slot."""
+    """★ A colleague's shared view in the recipient's slot never blocks their own project: it
+    holds no work of its own, so it is torn down and the recipient's workspace starts. Nothing
+    is written back, so the OWNER's saved copy is untouched."""
     owner, project, app_id = await _owner_with_saved_app(
         db_session, fake_storage, email="owner11@example.com"
     )
@@ -357,34 +352,45 @@ async def test_a_live_shared_view_earns_the_hand_over_dialog_instead_of_silent_r
         db_session, recipient.id, description="Recipient's own, different project"
     )
     manager = SessionManager()
-    shared_client = FakeSandboxClient()
-    await manager.launch_shared_preview(db_session, recipient, project, shared_client)
+    await manager.launch_shared_preview(db_session, recipient, project, FakeSandboxClient())
 
     build_client = FakeSandboxClient()
-    with pytest.raises(SandboxReclaimBlockedError) as caught:
-        await manager.ensure_sandbox(
-            db_session,
-            recipient,
-            recipient_project.id,
-            sandbox_client=build_client,
-            may_write=True,
-        )
+    session = await manager.ensure_sandbox(
+        db_session, recipient, recipient_project.id, sandbox_client=build_client, may_write=True
+    )
 
-    assert caught.value.project_id == project.id  # the SHARED project, not the recipient's own
-    assert caught.value.project_name == project.name
-    assert caught.value.dirty is False  # a clean stop — nothing of the recipient's own to lose
-    assert caught.value.building is False
-    assert caught.value.agent_working is False
-    # THE CLIENT'S ONE SIGNAL to route to `give_up_shared_view` rather than `stopActiveBuild`/
-    # `release` — both of which gate on `owned_project_or_404`, and `project_id` above names
-    # the SHARED project's owner, whom the recipient never owns.
-    assert caught.value.is_shared_view is True
-    assert build_client.provisioned == []  # refused before anything was destroyed
-    # The teardown that WOULD have run is `build_client`'s (whatever client `ensure_sandbox`
-    # was passed reaps the incumbent on the way in) — `shared_client` never sees a teardown
-    # call either way, so it is `build_client.torn_down` that actually pins the fix.
-    shared_name = shr_name_for(app_id, recipient.id)
-    assert shared_name not in build_client.torn_down
+    assert session.project_id == recipient_project.id
+    assert shr_name_for(app_id, recipient.id) in build_client.torn_down
+    assert build_client.provisioned, "the recipient's own workspace was started"
+    assert await fake_storage.get(snapshot_key(app_id)) == b"BUNDLE"
+
+
+async def test_opening_their_own_app_puts_a_live_shared_view_away_and_starts(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ The same for the start control: relaunching a saved app of the recipient's own
+    replaces the shared view in their slot instead of refusing."""
+    owner, project, app_id = await _owner_with_saved_app(
+        db_session, fake_storage, email="owner14@example.com"
+    )
+    recipient = await UserFactory.create(db_session, email="recipient14@example.com")
+    recipient_project = await ProjectFactory.create(
+        db_session, recipient.id, description="Recipient's own saved app"
+    )
+    own_app_id = await resolve_app_for_project(db_session, recipient.id, recipient_project.id)
+    await db_session.commit()
+    await fake_storage.put(snapshot_key(own_app_id), b"OWN-BUNDLE")
+    manager = SessionManager()
+    await manager.launch_shared_preview(db_session, recipient, project, FakeSandboxClient())
+
+    client = FakeSandboxClient()
+    started = await manager.relaunch_preview(db_session, recipient, recipient_project.id, client)
+    await detached_work_done(manager)
+
+    assert started == own_app_id
+    assert shr_name_for(app_id, recipient.id) in client.torn_down
+    assert client.restored == [app_name_for(own_app_id)]
+    assert await fake_storage.get(snapshot_key(app_id)) == b"BUNDLE"
 
 
 async def test_an_ordinary_build_disowns_a_prior_occupants_shared_stamp(
@@ -393,8 +399,8 @@ async def test_an_ordinary_build_disowns_a_prior_occupants_shared_stamp(
     """The MERGE half of the same fix: `hset(mapping=...)` only ADDS fields, so once a shared
     view is revoked and the recipient's OWN build takes the freed slot, the new registry
     record must not still carry the PRIOR occupant's `shared_project_id`/`shared_owner_id` —
-    a leftover stamp would make `_occupying_shared_project` misidentify an ordinary build
-    sandbox as somebody else's shared view."""
+    a leftover stamp would misidentify an ordinary build sandbox as somebody else's shared
+    view."""
     owner, project, app_id = await _owner_with_saved_app(
         db_session, fake_storage, email="owner3c@example.com"
     )
@@ -443,63 +449,4 @@ async def test_revoke_never_touches_the_recipients_own_build(
     )
 
     assert revoked is False
-    assert build_client.torn_down == []
-
-
-# --- SessionManager.give_up_shared_view — the recipient's own self-service exit (#198 R24) ----
-
-
-async def test_give_up_shared_view_tears_down_the_recipients_own_slot(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """The door `SandboxReclaimBlockedError.is_shared_view` points a recipient at: no
-    `project_id`, because the shared occupant's own id names its OWNER, which the recipient
-    does not own and `owned_project_or_404` would refuse."""
-    owner, project, app_id = await _owner_with_saved_app(
-        db_session, fake_storage, email="owner12@example.com"
-    )
-    recipient = await UserFactory.create(db_session, email="recipient12@example.com")
-    manager = SessionManager()
-    client = FakeSandboxClient()
-    await manager.launch_shared_preview(db_session, recipient, project, client)
-    shared_name = shr_name_for(app_id, recipient.id)
-
-    gave_up = await manager.give_up_shared_view(recipient.id, sandbox_client=client)
-
-    assert gave_up is True
-    assert shared_name in client.torn_down
-    assert await lock_is_held(fake_redis, recipient.id) is False
-
-
-async def test_give_up_shared_view_is_a_noop_when_nothing_is_there(
-    fake_redis: aioredis.Redis,
-) -> None:
-    manager = SessionManager()
-    client = FakeSandboxClient()
-
-    gave_up = await manager.give_up_shared_view(uuid.uuid4(), sandbox_client=client)
-
-    assert gave_up is False
-    assert client.torn_down == []
-
-
-async def test_give_up_shared_view_never_touches_the_recipients_own_build(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """The slot holding the recipient's OWN `sbx-` build is not this action's business —
-    `release_project_sandbox` is the door for that, and this one must not reach for it."""
-    recipient = await UserFactory.create(db_session, email="recipient13@example.com")
-    recipient_project = await ProjectFactory.create(
-        db_session, recipient.id, description="Recipient's own project"
-    )
-    manager = SessionManager()
-    build_client = FakeSandboxClient()
-    session = await manager.ensure_sandbox(
-        db_session, recipient, recipient_project.id, sandbox_client=build_client, may_write=True
-    )
-    await manager.finish_turn_sandbox(session, build_client, touched=True)  # pardons it
-
-    gave_up = await manager.give_up_shared_view(recipient.id, sandbox_client=build_client)
-
-    assert gave_up is False
     assert build_client.torn_down == []

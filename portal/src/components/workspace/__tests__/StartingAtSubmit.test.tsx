@@ -60,11 +60,10 @@ const PROJECT: Project = {
   access: 'owner',
 }
 
-/** The one refusal `POST /relaunch` can still raise: a colleague's shared view in the slot. */
-const sharedViewHolds = (over: Record<string, unknown> = {}) =>
-  new ApiError('“Car pool” is open for a colleague right now.', 409, 'sandbox_reclaim_blocked', {
-    projectId: 'pA', projectName: 'Car pool', dirty: false, building: false, isSharedView: true, ...over,
-  })
+/** A refusal `POST /relaunch` can still raise — the server's own sentence, carried verbatim
+ *  with nothing to press beside it. */
+const startRefused = () =>
+  new ApiError('Your workspace could not be started right now. Please try again shortly.', 503)
 
 function Where() {
   const loc = useLocation()
@@ -168,12 +167,11 @@ describe('★ the app is asked for BEFORE the address moves', () => {
     await waitFor(() => expect(screen.getByTestId('chat-opened')).toBeTruthy())
   })
 
-  it('★ a colleague`s shared view is REPORTED, never asked about, and keeps the message', async () => {
-    // Pressing again cannot move a shared view — the server refuses it whatever the citizen
-    // answers — so a question would be one with no true answer. The refusal is read where they
-    // are standing, their text is still theirs, and no chat opened onto a workspace they have not
-    // got.
-    api.relaunchPreview.mockRejectedValue(sharedViewHolds())
+  it('★ a named refusal is REPORTED, never asked about, and keeps the message', async () => {
+    // No refusal on this path opens a question — the server's own sentence is the whole answer,
+    // so it is read where they are standing, their text is still theirs, and no chat opened onto
+    // a workspace they have not got.
+    api.relaunchPreview.mockRejectedValue(startRefused())
     render(<Workspace />)
     type('add an out-time column')
 
@@ -227,7 +225,7 @@ describe('a project with nothing built yet — the first message anybody sends',
     // The 404-for-no-snapshot mapping must not become a way past the workspace refusal: the server
     // answers that ABOVE its snapshot gate, and a refusal it does raise must still stop the
     // address rather than opening a chat onto a workspace this citizen has not got.
-    api.relaunchPreview.mockRejectedValue(sharedViewHolds())
+    api.relaunchPreview.mockRejectedValue(startRefused())
     render(<Workspace project={NEVER_BUILT} />)
     type('an app to log visitors at the gate')
 
@@ -303,7 +301,7 @@ describe('what the navigation carries', () => {
   })
 
   it('★ a refused send keeps the message AND the file, and opens nothing', async () => {
-    api.relaunchPreview.mockRejectedValue(sharedViewHolds())
+    api.relaunchPreview.mockRejectedValue(startRefused())
     render(<Workspace />)
     type('add an out-time column')
     fireEvent.drop(screen.getByTestId('composer-dropzone'), {
@@ -435,7 +433,7 @@ describe('★ a send that arrives while the app is already starting', () => {
     api.fetchPreviewState.mockResolvedValue(SAVED_AND_ASLEEP)
     api.relaunchPreview
       .mockImplementationOnce(() => new Promise((resolve) => { finish = () => resolve(undefined) }))
-      .mockRejectedValue(sharedViewHolds())
+      .mockRejectedValue(startRefused())
     render(<Workspace />)
     await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(1))
 

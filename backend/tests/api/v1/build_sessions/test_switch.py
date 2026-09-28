@@ -37,9 +37,9 @@ from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.manager import (
-    SandboxReclaimBlockedError,
     SessionManager,
     app_name_for,
+    shr_name_for,
 )
 from src.services.build_sessions.shutdown import (
     OwedTeardown,
@@ -247,9 +247,9 @@ async def test_a_first_message_on_another_project_switches_inside_the_same_reque
 ) -> None:
     """The citizen who switches by TYPING, into a project that was never built.
 
-    This is the door `reclaim_preflight` guards and `ensure_sandbox` walks through, and it is the
-    only way a never-built project starts at all — so a switch that only works from the start
-    control leaves this citizen refused. The debt is claimed in the same call that starts B, not
+    This is the door `ensure_sandbox` walks through, and it is the only way a never-built
+    project starts at all — so a switch that only works from the start control leaves this
+    citizen refused. The debt is claimed in the same call that starts B, not
     on some later sweep: by the time the turn has a container, nothing but that row still names
     the container it displaced."""
     user, project_a, project_b = await _citizen_with_two_projects(db_session, "sw3@example.com")
@@ -532,21 +532,18 @@ async def test_the_start_returns_before_the_teardown_finishes(
     await asyncio.gather(*spawned)
 
 
-# --- the refusal that survives ---------------------------------------------------------
+# --- a colleague's shared view in the slot ----------------------------------------------
 
 
-async def test_a_colleagues_shared_view_still_refuses_with_its_dialog(
+async def test_a_colleagues_shared_view_is_put_away_without_a_write_back(
     db_session: AsyncSession,
     fake_redis: aioredis.Redis,
     fake_storage: FakeStorage,
     spawns: _Spawns,
 ) -> None:
-    """The one refusal left, and it is unchanged. A shared view is somebody else's restore of
-    somebody else's saved bundle — there is no tree of the recipient's to write back and no
-    hand-over built for it — so taking it would simply remove a colleague's screen.
-
-    `is_shared_view` is the discriminator the client branches on; after the switch landed, a
-    refusal WITHOUT it is a backend bug rather than a state to render."""
+    """★ A shared view is somebody else's restore of somebody else's saved bundle, so it holds no
+    tree of the recipient's. Opening their own project reclaims it inline — no owed row, because
+    there is nothing to write back, and never over the owner's saved copy."""
     owner = await UserFactory.create(db_session, email="sw11-owner@example.com")
     shared_project = await ProjectFactory.create(db_session, owner.id)
     owner_app = await resolve_app_for_project(db_session, owner.id, shared_project.id)
@@ -559,15 +556,14 @@ async def test_a_colleagues_shared_view_still_refuses_with_its_dialog(
     client = FakeSandboxClient()
     await manager.launch_shared_preview(db_session, recipient, shared_project, client)
 
-    with pytest.raises(SandboxReclaimBlockedError) as refusal:
-        await manager.ensure_sandbox(
-            db_session, recipient, own_project.id, sandbox_client=client, may_write=True
-        )
+    session = await manager.ensure_sandbox(
+        db_session, recipient, own_project.id, sandbox_client=client, may_write=True
+    )
 
-    assert refusal.value.is_shared_view is True
-    assert refusal.value.project_id == shared_project.id
-    assert spawns.owed == [], "a shared view is refused, never handed over"
-    assert client.torn_down == []
+    assert session.project_id == own_project.id
+    assert shr_name_for(owner_app, recipient.id) in client.torn_down
+    assert spawns.owed == [], "nothing of the recipient's to write back"
+    assert await fake_storage.get(snapshot_key(owner_app)) == b"BUNDLE"
 
 
 # --- reopening a name Azure may still be holding ---------------------------------------

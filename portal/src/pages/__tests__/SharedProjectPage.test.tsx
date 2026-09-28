@@ -18,7 +18,6 @@ const h = vi.hoisted(() => ({
   getProject: vi.fn(),
   launchSharedPreview: vi.fn(),
   refreshSharedPreview: vi.fn(),
-  giveUpSharedView: vi.fn(),
   handOverWorkspace: vi.fn(),
 }))
 
@@ -30,7 +29,6 @@ vi.mock('../../utils/buildSessionApi', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../utils/buildSessionApi')>()),
   launchSharedPreview: h.launchSharedPreview,
   refreshSharedPreview: h.refreshSharedPreview,
-  giveUpSharedView: h.giveUpSharedView,
   handOverWorkspace: h.handOverWorkspace,
 }))
 
@@ -39,10 +37,8 @@ vi.mock('../../utils/buildSessionApi', async (importOriginal) => ({
 function reclaimBlockedError(details: {
   projectId: string
   projectName: string
-  dirty: boolean | null
   building: boolean
   agentWorking: boolean
-  isSharedView: boolean
 }): ApiError {
   return new ApiError('blocked', 409, 'sandbox_reclaim_blocked', details)
 }
@@ -141,16 +137,14 @@ it('bounces a recipient off a dead share onto Shared Applications, not the owner
 
 // --- the hand-over prompt (requirement 24's frontend half) --------------------------------
 
-it('shows the hand-over dialog, not a generic failure, when the slot holds another shared view', async () => {
+it('shows the hand-over dialog, not a generic failure, when the caller`s own project holds the slot', async () => {
   h.getProject.mockResolvedValue(makeProject())
   h.launchSharedPreview.mockRejectedValue(
     reclaimBlockedError({
-      projectId: 'owner-project-id',
-      projectName: 'Someone Else’s App',
-      dirty: false,
+      projectId: 'my-other-project-id',
+      projectName: 'My Other App',
       building: false,
       agentWorking: false,
-      isSharedView: true,
     }),
   )
 
@@ -159,63 +153,18 @@ it('shows the hand-over dialog, not a generic failure, when the slot holds anoth
   // The dialog, not the generic "Couldn't open this app" card.
   expect(await screen.findByRole('dialog')).toBeTruthy()
   expect(screen.queryByText('Couldn’t open this app')).toBeNull()
-  expect(screen.getByRole('dialog').textContent).toMatch(/Someone Else’s App/)
+  expect(screen.getByRole('dialog').textContent).toMatch(/My Other App/)
 })
 
-it('routes a shared occupant through handOverWorkspace with isSharedView, never giveUpSharedView directly', async () => {
-  // `handOverWorkspace` itself owns the `isSharedView` branch (see buildSessionApi.test.ts for
-  // that branching behavior) — it is mocked at the module boundary here, so this test only
-  // pins that the PAGE hands it the whole blocked object rather than calling `giveUpSharedView`
-  // itself, which would silently reintroduce the bug of every call site needing its own check.
+it('hands over the named project on the dialog`s own button, then retries the launch', async () => {
   h.getProject.mockResolvedValue(makeProject())
   h.launchSharedPreview
     .mockRejectedValueOnce(
       reclaimBlockedError({
-        projectId: 'owner-project-id',
-        projectName: 'Someone Else’s App',
-        dirty: false,
-        building: false,
-        agentWorking: false,
-        isSharedView: true,
-      }),
-    )
-    .mockResolvedValueOnce({
-      appId: 'app-1',
-      previewUrl: 'https://app-1.example/',
-      ready: true,
-      snapshotTakenAt: null,
-    })
-  h.handOverWorkspace.mockResolvedValue(undefined)
-
-  renderAt()
-  await screen.findByRole('dialog')
-  // `dirty: false` renders the clean-stop copy, which offers ONLY the discard button.
-  fireEvent.click(screen.getByRole('button', { name: /Stop/i }))
-
-  await waitFor(() =>
-    expect(h.handOverWorkspace).toHaveBeenCalledWith(
-      expect.objectContaining({ projectId: 'owner-project-id', isSharedView: true }),
-      false,
-      expect.anything(),
-      expect.anything(),
-    ),
-  )
-  expect(h.giveUpSharedView).not.toHaveBeenCalled()
-  await waitFor(() => expect(h.launchSharedPreview).toHaveBeenCalledTimes(2)) // retried
-  expect(await screen.findByTitle('Visitor Log')).toBeTruthy() // the iframe, on retry
-})
-
-it('hands over the recipients own build (never giveUpSharedView) when the occupant is not a shared view', async () => {
-  h.getProject.mockResolvedValue(makeProject())
-  h.launchSharedPreview
-    .mockRejectedValueOnce(
-      reclaimBlockedError({
-        projectId: 'recipients-own-project-id',
+        projectId: 'my-other-project-id',
         projectName: 'My Other App',
-        dirty: true,
         building: false,
         agentWorking: false,
-        isSharedView: false,
       }),
     )
     .mockResolvedValueOnce({
@@ -232,12 +181,12 @@ it('hands over the recipients own build (never giveUpSharedView) when the occupa
 
   await waitFor(() =>
     expect(h.handOverWorkspace).toHaveBeenCalledWith(
-      expect.objectContaining({ projectId: 'recipients-own-project-id', isSharedView: false }),
+      expect.objectContaining({ projectId: 'my-other-project-id' }),
       false,
       expect.anything(),
       expect.anything(),
     ),
   )
-  expect(h.giveUpSharedView).not.toHaveBeenCalled()
   await waitFor(() => expect(h.launchSharedPreview).toHaveBeenCalledTimes(2)) // retried
+  expect(await screen.findByTitle('Visitor Log')).toBeTruthy() // the iframe, on retry
 })

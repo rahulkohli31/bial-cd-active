@@ -139,14 +139,11 @@ class ConflictEnvelope(CamelModel):
 
 
 class BuildConflictEnvelope(CamelModel):
-    """The 409 for a route that can conflict two ways: this very project's own work already
-    running, or a COLLEAGUE'S SHARED VIEW holding the one workspace
-    (`projectId`/`projectName`/`isSharedView`). `code` discriminates —
-    `build_session_already_active` vs `sandbox_reclaim_blocked` — and a client must branch on
-    it, since only the second names a project.
-
-    A CITIZEN'S OWN OTHER PROJECT IS NOT IN THIS LIST ANY MORE. Opening one starts it and hands
-    the outgoing container to the shutdown routine, so neither code is raised for it."""
+    """The 409 a shared-view launch gives when the caller's own work holds the workspace:
+    `build_session_already_active` when no project can be named truthfully, or
+    `sandbox_reclaim_blocked` naming the project whose turn is running
+    (`projectId`/`projectName`). `code` discriminates, and a client must branch on it, since only
+    the second names a project."""
 
     error: _ConflictError | ReclaimBlockedError
 
@@ -259,11 +256,7 @@ async def internal_reap(
         (403, ErrorEnvelope, "CSRF check failed"),
         AUTH_401,
         (404, ErrorEnvelope, "No saved build to relaunch"),
-        (
-            409,
-            BuildConflictEnvelope,
-            "This project's own work is already running, or a shared view holds the workspace",
-        ),
+        (409, ConflictEnvelope, "This project's own work is already running"),
         (422, ErrorEnvelope, "Invalid request body"),
         (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
     ),
@@ -293,9 +286,6 @@ async def relaunch_preview(
             # This project's own work is running — relaunch never pre-empts it (409). A
             # DIFFERENT project of theirs never reaches here: that is a switch, and it starts.
             return _conflict_response()
-        except SandboxReclaimBlockedError as exc:
-            # A colleague's shared view holds the one slot, and it has no hand-over.
-            return reclaim_blocked_response(exc)
         except NoSnapshotToRelaunchError as exc:
             # Confirmed-absent snapshot: nothing to relaunch, and there is no blank-template
             # fallback (an empty app is not a preview of the user's work). 404.
@@ -305,8 +295,7 @@ async def relaunch_preview(
             # with the same status; the rail treats "nothing saved to bring back" as a normal
             # first message and opens the chat anyway, which for the other 404 would
             # open a chat that dies a beat later instead of reporting the failure. Only this one
-            # carries `no_saved_build`, so the rail's arm can be exact — the same reason
-            # `sandbox_reclaim_blocked` names itself rather than letting a client match prose.
+            # carries `no_saved_build`, so the rail's arm can be exact rather than matching prose.
             raise AppApiError(
                 status.HTTP_404_NOT_FOUND, _NO_SAVED_BUILD_MSG, code="no_saved_build"
             ) from exc
@@ -856,47 +845,6 @@ async def refresh_shared_project(
     return await _shared_preview_or_refuse(
         project_id, user, db, sandbox, manager, force_refresh=True
     )
-
-
-@router.post(
-    "/shared-view/release",
-    response_model=ReleaseResponse,
-    dependencies=[RequireCsrf],
-    responses=error_responses(
-        (403, ErrorEnvelope, "CSRF check failed"),
-        AUTH_401,
-        (409, ConflictEnvelope, "A build is running in this workspace"),
-        (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
-    ),
-)
-async def release_shared_view(
-    user: CurrentUser,
-    manager: SessionManagerDep,
-    sandbox: OptionalSandbox,
-) -> ReleaseResponse | JSONResponse:
-    """Give up whatever colleague's shared view currently holds the caller's OWN slot (#198,
-    requirement 24's self-service exit) — no `project_id`, because the caller may not own one
-    that names it. The occupant `SandboxReclaimBlockedError` reports for a shared view is its
-    OWNER's project, which a recipient never owns, so `stopActiveBuild`/`release` (both gated on
-    `owned_project_or_404`) can never be the hand-over dialog's remedy for this case; this route
-    asks nothing but "is a shared view sitting in my slot right now" and needs no id to ask it.
-
-    `released: false` is a success — nothing was there to give up, or what was there was the
-    caller's OWN build sandbox (`release_project_sandbox`'s job, not this one's)."""
-    if sandbox is None:
-        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
-    with build_coordination_or_503():
-        try:
-            released = await manager.give_up_shared_view(user.id, sandbox_client=sandbox)
-        except BuildSessionConflictError:
-            return _conflict_response()
-        except SandboxError as exc:
-            raise AppApiError(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "Could not close that shared app just now. Please try again.",
-            ) from exc
-        return ReleaseResponse(released=released)
-    raise _coordination_is_gone()
 
 
 @router.get(

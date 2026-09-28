@@ -405,3 +405,39 @@ def test_a_restore_overlays_the_baked_tree(sandbox: _Sandbox) -> None:
 
     assert (fresh.ws / "node_modules/dep.js").read_text(encoding="utf-8") == "baked\n"
     assert (fresh.ws / "only-in-the-image.ts").is_file()
+
+
+def test_a_template_file_the_app_deleted_stays_deleted_after_a_restore(sandbox: _Sandbox) -> None:
+    """★ The app moved its home page into a route group and deleted the starter's. The image still
+    carries the starter page, so left on disk it serves `/` in place of the app's own, lights the
+    unsaved-changes indicator, and the next save commits it back."""
+    sandbox.write({**_STARTER, "app/(app)/[id]/old.tsx": "gone later\n"})
+    sandbox.ok(_INIT_REPO_SCRIPT)
+    sandbox.git("rm", "-q", "app/page.tsx", "app/(app)/[id]/old.tsx")
+    sandbox.write({"app/(app)/page.tsx": "export default function Home() { return null }\n"})
+    sandbox.ok(_COMMIT_SCRIPT)
+    fresh = sandbox.fresh_container()
+    fresh.write({**_STARTER, "app/(app)/[id]/old.tsx": "gone later\n", "new-in-image.ts": "\n"})
+
+    fresh.restore(sandbox.bundle())
+
+    assert not (fresh.ws / "app/page.tsx").exists()
+    assert not (fresh.ws / "app/(app)/[id]/old.tsx").exists()
+    assert (fresh.ws / "app/(app)/page.tsx").is_file()
+    assert (fresh.ws / "new-in-image.ts").is_file(), "a file the app never had is the image's"
+    fresh.ok(_COMMIT_SCRIPT)
+    assert fresh.changed_by_head() == {"new-in-image.ts"}
+
+
+def test_without_the_exclude_file_a_restore_removes_nothing(sandbox: _Sandbox) -> None:
+    """With no ignore rules the baked dependencies read as untracked too, and a workspace that once
+    tracked them has them in its history. Nothing is removed rather than risk them."""
+    _a_workspace_tracking_toolchain_output(sandbox)
+    sandbox.ok(_COMMIT_SCRIPT)
+    assert "node_modules/next/package.json" not in sandbox.tracked_at_head()
+    fresh = sandbox.fresh_container().with_image(None)
+    fresh.write(_STARTER)
+
+    fresh.restore(sandbox.bundle())
+
+    assert (fresh.ws / "node_modules/next/package.json").is_file()

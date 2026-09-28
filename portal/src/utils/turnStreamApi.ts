@@ -630,10 +630,7 @@ export async function startTurn(
 
 export class TurnStartError extends Error {
   readonly status: number
-  /** The backend's error code, so a caller can tell the refusals apart. A 409 is
-   *  `build_session_already_active` (nothing the user can do but wait) OR
-   *  `sandbox_reclaim_blocked` (another project holds the workspace and CAN be released) —
-   *  dropping the code made those two indistinguishable and both read as "try again later". */
+  /** The backend's error code, so a caller can tell the refusals apart. */
   readonly code: string | null
   /** The whole `error` object, for codes that carry more than a message (see `ApiError.details`). */
   readonly details: Record<string, unknown> | null

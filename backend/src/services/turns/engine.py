@@ -136,7 +136,6 @@ from src.services.build_sessions.manager import (
     BuildSession,
     BuildSessionConflictError,
     RecoveryNews,
-    SandboxReclaimBlockedError,
     SessionManager,
     SnapshotUnavailableError,
     StopOutcome,
@@ -234,7 +233,6 @@ from src.services.turns.copy import (
     WORKSPACE_UNREADABLE_REASON,
     WORKSPACE_UNRECOVERABLE_REASON,
     WRITING_UP_THE_PLAN_LABEL,
-    still_open_send_again_text,
 )
 from src.services.turns.copy import DOCUMENT_TOO_LONG_CODE as DOCUMENT_TOO_LONG_CODE
 from src.services.turns.guard import claim_conversation, release_conversation
@@ -743,15 +741,6 @@ def _sandbox_unavailable_message(exc: Exception) -> str:
         )
     if isinstance(exc, BuildSessionConflictError):
         return "Another chat is using your workspace. Finish or stop that one first."
-    if isinstance(exc, SandboxReclaimBlockedError):
-        # The route's preflight normally turns this into a 409 the client renders as a choice,
-        # so reaching here means the incumbent appeared in the window between the two. Name the
-        # project anyway: "could not be started right now" invites a retry that will fail the
-        # same way, and hides the one action — dealing with the other project — that resolves it.
-        #
-        # The same tri-state sentence `reclaim_blocked_response` sends, with the action added
-        # because this one arrives as prose with nothing to press beside it.
-        return still_open_send_again_text(exc.project_name, dirty=exc.dirty)
     return "Your workspace could not be started right now. Please try again shortly."
 
 

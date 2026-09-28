@@ -16,7 +16,6 @@ import asyncio
 import base64
 import contextlib
 import uuid
-from datetime import UTC, datetime
 
 import pytest
 import redis.asyncio as aioredis
@@ -48,7 +47,7 @@ from src.services.build_sessions.manager import (
     app_name_for,
 )
 from src.services.build_sessions.reaper import reap_user, sweep_all
-from src.services.redis import heartbeat_key, registry_key
+from src.services.redis import heartbeat_key
 from src.services.sandbox import (
     ExecResult,
     SandboxError,
@@ -890,31 +889,6 @@ async def _nothing_to_persist() -> None:
     return None
 
 
-async def test_a_project_being_built_does_not_refuse_the_next_one(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """THE REFUSAL WITH NO WAY THROUGH, retired. A citizen mid-build who opened another project
-    was told "still being built" and offered a Stop — on the project they had just left, about
-    work they had not asked to interrupt, in a dialog they had to answer before doing anything
-    else. The build is still stopped, but by the routine and at its own boundary, and the
-    citizen's next project starts while that happens.
-
-    Mutation-check: restore the writing-session arm and the preflight raises again."""
-    user, project_a = await _mk(db_session, "w21@rvaiglobal.com")
-    project_b = (await ProjectFactory.create(db_session, user.id)).id
-    manager = SessionManager()
-    client = _with_head(FakeSandboxClient(), "f" * 40)
-
-    # A WRITING session, held and not finished — the state the retired arm read.
-    await manager.ensure_sandbox(
-        db_session, user, project_a, sandbox_client=client, may_write=True
-    )
-
-    await manager.reclaim_preflight(db_session, user, project_b)
-
-    assert client.torn_down == []  # the agent keeps working until the routine stops it
-
-
 async def test_saving_a_project_mid_build_is_refused(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
@@ -1055,7 +1029,6 @@ async def test_a_read_only_turn_holding_the_workspace_refuses_nothing_either(
     )
     client.attach_handle = session.handle
 
-    await manager.reclaim_preflight(db_session, user, project_b)
     await manager.ensure_sandbox(
         db_session, user, project_b, sandbox_client=client, may_write=True
     )
@@ -1107,38 +1080,12 @@ async def test_a_read_only_turn_on_an_empty_project_blocks_nothing_at_all(
     )
     client.attach_handle = plan_only.handle
 
-    await manager.reclaim_preflight(db_session, user, project_b)
     real = await manager.ensure_sandbox(
         db_session, user, project_b, sandbox_client=client, may_write=True
     )
 
     assert real.project_id == project_b
     assert client.torn_down == []
-
-
-async def test_a_write_turn_no_longer_stops_the_citizens_next_project(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """The other side of the line, so retiring the arms cannot be mistaken for retiring the
-    distinction they drew: a Write turn genuinely holds a container with an agent that can write
-    into it, and everything that protects THAT container is still in place. It is simply not the
-    citizen's problem to arbitrate any more — the start goes through, and Save still refuses
-    mid-write, because a bundle taken mid-edit is a corrupt saved version."""
-    user, project_a = await _mk(db_session, "w29@rvaiglobal.com")
-    project_b = (await ProjectFactory.create(db_session, user.id)).id
-    manager = SessionManager()
-    client = _with_head(FakeSandboxClient(), "5" * 40)
-
-    session = await manager.ensure_sandbox(
-        db_session, user, project_a, sandbox_client=client, may_write=True
-    )
-    client.attach_handle = session.handle
-
-    await manager.reclaim_preflight(db_session, user, project_b)
-
-    # ...and Save still refuses while that agent writes.
-    with pytest.raises(BuildSessionConflictError):
-        await manager.save_project_snapshot(db_session, user, project_a, sandbox_client=client)
 
 
 async def test_stopping_still_covers_a_read_only_turn(
@@ -1444,117 +1391,11 @@ async def test_a_user_who_never_saved_can_still_get_their_work_back(
     assert client.restored_from[-1] is None
 
 
-# --------------------------------------------------------------------------------------
-# The asking is unconditional, and EXACTLY TWO EXITS WIDENED
-# --------------------------------------------------------------------------------------
-#
-# The unit's own framing: "an implementer who reads 'always ask' as 'delete the silent path'
-# produces five bugs at once." Four of the guard's other exits are not "another project holds it"
-# at all — they are "NOTHING IS BEING TAKEN" — and the fifth is a ghost registry entry with no
-# project to name, so a dialog there would render a blank where the name goes.
-#
-# The three tests above pin the two exits that DID widen. These pin the ones that must not.
-
-
-async def test_starting_the_app_that_already_holds_the_workspace_raises_nothing(
+async def test_a_citizens_own_second_project_starts_while_the_first_is_mid_build(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """THE FIRST EXIT THAT MUST NOT CHANGE, and the most common press in the product: a citizen
-    presses start on the project whose container is already up.
-
-    "The live sandbox is already the one we want" means nothing is being taken — there is no other
-    project, no hand-over and nothing to ask about. Widening this turns every ordinary reattach
-    into a dialog about the project you are already in."""
-    user, project_a = await _mk(db_session, "w94-same@rvaiglobal.com")
-    manager = SessionManager()
-    client = _with_head(FakeSandboxClient(), "a" * 40)
-
-    first = await manager.ensure_sandbox(
-        db_session, user, project_a, sandbox_client=client, may_write=True
-    )
-    await manager.finish_turn_sandbox(first, client, touched=True)
-    client.attach_handle = first.handle
-
-    # No refusal: same user, same project, same container.
-    await manager.reclaim_preflight(db_session, user, project_a)
-
-
-async def test_no_live_container_at_all_raises_nothing(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """THE SECOND EXIT THAT MUST NOT CHANGE. No registry entry means nothing is live, so a start is
-    an ordinary cold start. A dialog here would be a dialog about nothing — and it would fire on
-    the first press of every project in the product."""
-    user, project_a = await _mk(db_session, "w94-cold@rvaiglobal.com")
-    manager = SessionManager()
-
-    await manager.reclaim_preflight(db_session, user, project_a)
-
-
-async def test_a_ghost_registry_entry_raises_nothing_because_it_has_no_project_to_name(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """THE SHARP EXIT — the one the unit singles out. The registry names a container whose app maps
-    to no project this user owns: a leftover the reconcile will clear.
-
-    The dialog is required to NAME the project being stopped. There is no project here, so
-    widening this exit renders a dialog with a blank where the name goes — worse than the silence
-    it replaced, because it asks a person to make a decision about something it cannot describe."""
-    user, project_a = await _mk(db_session, "w94-ghost@rvaiglobal.com")
-    manager = SessionManager()
-
-    # A registry entry for an app name that belongs to nothing this user owns.
-    await fake_redis.hset(
-        registry_key(user.id),
-        mapping={
-            "state": "ready",
-            "app_name": app_name_for(uuid.uuid4()),
-            "fqdn": "ghost.example",
-            "token_ref": "tok",
-            "created_at": datetime.now(UTC).isoformat(),
-        },
-    )
-
-    await manager.reclaim_preflight(db_session, user, project_a)
-
-
-async def test_an_unreadable_registry_still_propagates_rather_than_being_swallowed(
-    db_session: AsyncSession,
-    fake_redis: aioredis.Redis,
-    fake_storage: FakeStorage,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The widening must not turn a DELIBERATELY unguarded read into a swallowed one.
-
-    `read_registry` is one of the answer-bearing primitives kept bare on purpose: swallowing a
-    `RedisError` here would manufacture a certain-looking answer out of an ambiguous store — a
-    phantom "no sandbox" that permits a teardown. It has to reach the routers' 503 seam, which is a
-    true statement, rather than becoming a reclaim dialog or a silent pass."""
-    user, project_a = await _mk(db_session, "w94-redis@rvaiglobal.com")
-    manager = SessionManager()
-
-    async def the_registry_will_not_answer(*_args: object, **_kwargs: object) -> dict[str, str]:
-        raise RedisError("connection reset")
-
-    # `monkeypatch.setattr` rather than a hand-rolled save/restore: it undoes itself at teardown
-    # even if the assertion below raises, and it is the one form the static gates accept for
-    # replacing a bound method on a client object.
-    monkeypatch.setattr(fake_redis, "hgetall", the_registry_will_not_answer)
-
-    with pytest.raises(RedisError):
-        await manager.reclaim_preflight(db_session, user, project_a)
-
-
-async def test_neither_refusal_code_reaches_a_citizens_own_second_project(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    """`build_session_already_active` and `sandbox_reclaim_blocked` shared a 409 and one
-    audience: a citizen being asked to arbitrate their own workspace. BOTH are gone from this
-    path, and asserting the pair together is the point — the slot claim raised the first ABOVE
-    the guard that raised the second, so retiring either alone leaves the citizen refused by the
-    other with no way to tell which.
-
-    Mutation-check: restore either arm and exactly one of these two calls raises."""
+    """A citizen is never asked to arbitrate their own workspace: the slot claim treats a
+    different project as a switch, so the start goes through."""
     user, project_a = await _mk(db_session, "w94-codes@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
@@ -1565,9 +1406,7 @@ async def test_neither_refusal_code_reaches_a_citizens_own_second_project(
     )
     client.attach_handle = session.handle
 
-    # An agent is mid-write in A — the state that used to raise `sandbox_reclaim_blocked` here
-    # and `build_session_already_active` one line into the start.
-    await manager.reclaim_preflight(db_session, user, project_b)
+    # An agent is mid-write in A.
     started = await manager.ensure_sandbox(
         db_session, user, project_b, sandbox_client=client, may_write=True
     )

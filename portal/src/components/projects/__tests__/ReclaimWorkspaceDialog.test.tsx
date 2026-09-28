@@ -7,13 +7,10 @@ afterEach(cleanup)
 const BLOCKED = {
   projectId: 'p-a',
   projectName: 'Lost & Found',
-  dirty: true as boolean | null,
   building: false, agentWorking: false,
-  isSharedView: false,
 }
-/** The refusal a project whose agent is mid-write produces: `building`, and `dirty` null
- *  because the server deliberately did not probe a tree being written to. */
-const BUILDING = { ...BLOCKED, dirty: null, building: true }
+/** The refusal a project whose agent is mid-write produces. */
+const BUILDING = { ...BLOCKED, building: true }
 
 function setup(over = {}) {
   const props = {
@@ -33,14 +30,7 @@ describe('ReclaimWorkspaceDialog — naming, both actions, and a failed save', (
   it('names the project holding the workspace, so the user knows what they are choosing about', () => {
     setup()
     expect(screen.getByRole('dialog').textContent).toMatch(/Lost & Found/)
-    expect(screen.getByRole('dialog').textContent).toMatch(/has changes that are not saved yet/i)
-  })
-
-  it('HEDGES when dirty is unknown — never claims work is safe that nobody checked', () => {
-    setup({ blocked: { ...BLOCKED, dirty: null } })
-    const text = screen.getByRole('dialog').textContent ?? ''
-    expect(text).toMatch(/may have changes that are not saved yet/i)
-    expect(text).not.toMatch(/\bhas changes that are not saved yet/i)
+    expect(screen.getByRole('dialog').textContent).toMatch(/may have changes that are not saved yet/i)
   })
 
   it('offers save-and-switch as the primary action', async () => {
@@ -190,7 +180,7 @@ describe('ReclaimWorkspaceDialog — a project that is still being built', () =>
   it('still says the ordinary thing for an idle project', () => {
     setup()
     const text = screen.getByRole('dialog').textContent ?? ''
-    expect(text).toMatch(/has changes that are not saved yet/i)
+    expect(text).toMatch(/may have changes that are not saved yet/i)
     expect(text).not.toMatch(/still being built/i)
     expect(screen.getByRole('button', { name: /^cancel$/i })).toBeTruthy()
   })
@@ -203,57 +193,6 @@ describe('ReclaimWorkspaceDialog — a project that is still being built', () =>
     await waitFor(() => expect(props.onSaveAndSwitch).toHaveBeenCalledTimes(1))
     fireEvent.click(screen.getByRole('button', { name: /stop “Lost & Found” without saving/i }))
     await waitFor(() => expect(props.onSwitchAnyway).toHaveBeenCalledTimes(1))
-  })
-})
-
-/**
- * THE CLEAN ARM — new, because the server changed. `dirty === false` could not reach this dialog
- * before (the guard reclaimed a clean incumbent silently), so the old tri-state copy
- * (`dirty === true ? 'has unsaved changes' : 'may have unsaved changes'`) becomes a lie here,
- * telling a person their confirmed-clean project "may have unsaved changes".
- */
-describe('ReclaimWorkspaceDialog — a CLEAN incumbent', () => {
-  const CLEAN = { ...BLOCKED, dirty: false as boolean | null }
-
-  it('★ claims no unsaved work, in either the definite or the hedged wording', () => {
-    // ASSERTING ONLY THAT THE DIALOG OPENS PASSES AGAINST THE WRONG COPY — that is what makes this
-    // the assertion that matters. Both retired phrasings are checked, because the ternary that
-    // produced them had two arms and only one of them was obviously wrong.
-    setup({ blocked: CLEAN })
-    const text = screen.getByRole('dialog').textContent ?? ''
-
-    expect(text).not.toMatch(/has changes that are not saved/i)
-    expect(text).not.toMatch(/may have changes that are not saved/i)
-    expect(text).not.toMatch(/unsaved/i)
-  })
-
-  it('★ offers NO Save button for work that does not exist', () => {
-    // A Save whose only possible outcome is a no-op teaches a person the dialog does not know what
-    // it is talking about.
-    setup({ blocked: CLEAN })
-
-    expect(screen.queryByRole('button', { name: /save/i })).toBeNull()
-    expect(screen.getByRole('button', { name: /stop “Lost & Found”/i })).toBeTruthy()
-  })
-
-  it('takes focus on the stop control when there is no Save to focus', async () => {
-    // The primary action moved, and focus has to move with it — otherwise a keyboard user never
-    // learns the dialog appeared, which is the whole reason focus is part of this contract.
-    setup({ blocked: CLEAN })
-    await waitFor(() =>
-      expect(document.activeElement).toBe(screen.getByRole('button', { name: /stop “Lost & Found”/i })),
-    )
-  })
-
-  it('still says the app STOPS, and never that anything moves', () => {
-    setup({ blocked: CLEAN })
-    const text = screen.getByRole('dialog').textContent ?? ''
-
-    expect(text).toMatch(/will stop/i)
-    // Nothing travels between projects, and no softener may imply it does.
-    expect(text).not.toMatch(/\bmove[ds]?\b/i)
-    expect(text).not.toMatch(/\btransfer/i)
-    expect(text).not.toMatch(/bring it with/i)
   })
 })
 

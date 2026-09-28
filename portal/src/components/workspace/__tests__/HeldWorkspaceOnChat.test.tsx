@@ -19,6 +19,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, waitFor, cleanup, fireEvent, act } from '@testing-library/react'
 import type { PreviewState } from '../../../utils/buildSessionApi'
 import { ApiError } from '../../../utils/apiError'
+import { TurnStartError } from '../../../utils/turnStreamApi'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
@@ -67,11 +68,18 @@ const HELD: PreviewState = {
   startFailure: null,
 }
 
-/** The one refusal `POST /relaunch` can still raise: a colleague's shared view in the slot. */
-const sharedViewHolds = (over: Record<string, unknown> = {}) =>
-  new ApiError('“Car pool” is open for a colleague right now.', 409, 'sandbox_reclaim_blocked', {
-    projectId: 'pA', projectName: 'Car pool', dirty: true, building: false, isSharedView: true, ...over,
-  })
+/** A refusal `POST /relaunch` can still raise — the server's own sentence, carried verbatim
+ *  with nothing to press beside it. */
+const startRefused = () =>
+  new ApiError('Your workspace could not be started right now. Please try again shortly.', 503)
+
+/** The one refusal a SEND can still raise: this same chat's own turn already running. */
+const sendRefused = () =>
+  new TurnStartError(
+    409,
+    'The assistant is building your app right now. Chat opens back up as soon as it finishes.',
+    'already_building_here',
+  )
 
 const launch = () => screen.getByRole('button', { name: /^Launch Application$/ })
 
@@ -123,23 +131,23 @@ describe('★ a taken slot asks the citizen nothing, on the chat surface too', (
     expect((composer() as HTMLTextAreaElement).value).toBe('add a filter row')
   })
 
-  it('★ a start refused for a colleague`s shared view is said, not asked', async () => {
-    // The one refusal the server can still raise, and pressing again cannot move it — so the
-    // server's own sentence is the whole answer and nothing appears to be decided.
-    h.relaunchPreview.mockRejectedValue(sharedViewHolds())
+  it('★ a start refused is said, not asked', async () => {
+    // No refusal on this path opens a question — the server's own sentence is the whole answer
+    // and nothing appears to be decided.
+    h.relaunchPreview.mockRejectedValue(startRefused())
     await blockedChat()
 
     fireEvent.click(launch())
 
     const note = await screen.findByTestId('app-pane-note')
-    expect(note.textContent).toBe('“Car pool” is open for a colleague right now.')
+    expect(note.textContent).toBe('Your workspace could not be started right now. Please try again shortly.')
     expect(screen.queryByRole('dialog')).toBeNull()
   })
 
   it('★ and a refused SEND opens no question anywhere — the text stays in the composer', async () => {
-    // The regression this file is the last guard for: this refusal used to open the hand-over
+    // The regression this file is the last guard for: a refusal here used to open the hand-over
     // dialog, whose confirm resolved the send — posting the held message as a build instruction.
-    h.startTurn.mockRejectedValue(sharedViewHolds())
+    h.startTurn.mockRejectedValue(sendRefused())
     await blockedChat()
     await waitForGateOpen()
     fireEvent.change(composer(), { target: { value: 'add a filter row' } })

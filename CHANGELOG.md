@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.5] - 2026-09-28
+
+A colleague's shared app no longer locks its viewer out of their own work, and a reopened app no
+longer shows the starter screen over its own code.
+
+### Deploying this release
+
+- **Ship the backend with or before the portal.** The 1.8.4 portal works against this backend. This
+  portal against the 1.8.4 backend still shows the old "still open" refusal.
+- **No migration, no settings change and no sandbox image rebuild.** The restore change runs inside
+  the existing sandbox image, which already carries the ignore list it reads.
+- **Apps already showing the starter screen are not repaired by this release.** Their saved copy
+  already holds the starter page, so they open the same way until that copy is repaired.
+
+### Fixed
+
+- **Opening a colleague's shared app no longer blocks your own.** With a shared view in someone's
+  one workspace, their first message in a new app and every Launch of an existing app was refused
+  as "still open". A shared view holds none of their work, so their own start now closes it and
+  carries on. Opening a shared app while one of your own is mid-build is still refused.
+- **Starter files an app deleted stay deleted when it reopens.** Reopening an app restored its saved
+  copy over the starter template and brought back the template's home page, which the next save
+  then kept. The app opened on the starter screen with its own code intact underneath.
+
+### Changed
+
+- **A Redis outage while a message is sent shows in the chat.** The message is kept and the reply
+  says the turn could not be started, instead of the request failing with a 503 before it.
+
+### Removed
+
+- The route that released a shared view, and the three-way "still open" wording. The dialog keeps
+  two cases: a build running, or changes that may not be saved yet.
+
 ## [1.8.4] - 2026-09-27
 
 Publishing an app now runs on classes the administrators define, and approving an app publishes it.

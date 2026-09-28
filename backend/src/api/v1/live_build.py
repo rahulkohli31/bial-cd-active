@@ -60,53 +60,30 @@ class ReclaimBlockedError(CamelModel):
     code: str
     project_id: str
     project_name: str
-    dirty: bool | None  # True = known unsaved work; None = we could not tell
-    # `dirty` is null whenever `building` is true, and there it means "not asked" rather than
-    # "could not tell": probing a tree mid-write produces an answer true for no instant that
-    # matters.
     building: bool
     # Wider than `building` and carried beside it, never folded in: `building` decides WHICH
     # dialog the client renders, `agentWorking` decides what that dialog says is happening now.
     agent_working: bool
-    # WHICH REMEDY WORKS (#198). `projectId` above names a project the CALLER owns for an
-    # ordinary build occupant — `stopActiveBuild`/`release` both gate on `owned_project_or_404`,
-    # which that caller satisfies. For a colleague's shared view, `projectId` names its OWNER,
-    # whom a recipient never owns, so those same two routes would 404 them out of their own
-    # slot. `True` tells the client to route to the self-scoped give-up-my-shared-view endpoint
-    # instead, which needs no project id or ownership check at all.
-    is_shared_view: bool = False
 
 
 class ReclaimBlockedEnvelope(CamelModel):
-    """`{"error": {message, code, projectId, projectName, dirty, building, agentWorking,
-    isSharedView}}` — the 409 a turn, start or relaunch returns when taking the one sandbox slot
-    would destroy another project's work.
-
-    Lives in this shared module rather than in one domain router because more than one router
-    answers it."""
+    """`{"error": {message, code, projectId, projectName, building, agentWorking}}` — the 409
+    a shared-view launch returns when one of the caller's own projects has a turn running in
+    their one sandbox slot."""
 
     error: ReclaimBlockedError
 
 
 def reclaim_blocked_response(exc: SandboxReclaimBlockedError) -> JSONResponse:
-    """Format the blocked-reclaim 409. Every entry point that can raise it comes through here,
-    so they cannot drift into differently-worded answers.
+    """Format the blocked-reclaim 409.
 
     Names the PROJECT, not the mechanism. A project whose agent is mid-build gets a sentence of
     its own: there is no settled tree to describe, and any claim about saved work would point at
-    a Save button the server refuses until the build stops. The idle answer is three-valued, and
-    its three sentences live in `turns/copy.py` with the turn ending that also says them, so
-    neither surface can be corrected alone.
-
-    The hand-over dialog needs this same answer before the citizen chooses, and asking by
-    SENDING is legitimate because every refusal on the send path is side-effect-free before
-    anything is persisted. So all three routes that can raise it — send, the plan offer's build
-    action, and relaunch — come through this one function rather than each wording its own; the
-    count moves when a call site is added or removed."""
+    a Save button the server refuses until the build stops."""
     if exc.building:
         message = f"“{exc.project_name}” is still being built."
     else:
-        message = still_open_text(exc.project_name, dirty=exc.dirty)
+        message = still_open_text(exc.project_name)
     return JSONResponse(
         status_code=status.HTTP_409_CONFLICT,
         content={
@@ -115,10 +92,8 @@ def reclaim_blocked_response(exc: SandboxReclaimBlockedError) -> JSONResponse:
                 "code": "sandbox_reclaim_blocked",
                 "projectId": str(exc.project_id),
                 "projectName": exc.project_name,
-                "dirty": exc.dirty,
                 "building": exc.building,
                 "agentWorking": exc.agent_working,
-                "isSharedView": exc.is_shared_view,
             }
         },
     )

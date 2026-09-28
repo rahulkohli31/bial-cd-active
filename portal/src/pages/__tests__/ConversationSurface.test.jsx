@@ -252,16 +252,15 @@ describe('the per-conversation guardrail reaches the composer', () => {
 
 describe('the offer\'s Build opens no question either', () => {
   it('★ reports a refusal in the server\'s own words, and puts nothing up to be answered', async () => {
-    // THE THIRD DOOR: three presses can meet a refusal about the one workspace — a rail send, the
-    // pane's start control, and this one — and this is the one of the three with no coverage
-    // elsewhere. What it proves is that it degrades the same way they do: a sentence, not a
-    // dialog, because the workspace follows whichever project asked for it.
+    // A press here can still meet a refusal about the one workspace — this project's own chat
+    // already building it — and it degrades the same way a rail send or the pane's start control
+    // does: a sentence, not a dialog.
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Here is the plan.', PLAN_CARD_ID)))
     h.buildFromPlan.mockRejectedValue(
-      Object.assign(new Error('“Car pool” is open for a colleague right now.'), {
-        code: 'sandbox_reclaim_blocked',
-        details: { projectId: 'pA', projectName: 'Car pool', dirty: false, building: false, isSharedView: true },
-      }),
+      Object.assign(
+        new Error('The assistant is building your app right now. Chat opens back up as soon as it finishes.'),
+        { code: 'already_building_here' },
+      ),
     )
     renderBuilder()
     await send('plan me a thing')
@@ -270,7 +269,7 @@ describe('the offer\'s Build opens no question either', () => {
 
     // The server's sentence reaches the citizen where they are standing…
     await waitFor(() =>
-      expect(screen.getByRole('alert').textContent).toContain('“Car pool” is open for a colleague right now.'),
+      expect(screen.getByRole('alert').textContent).toContain('The assistant is building your app right now.'),
     )
     // …and nothing was put to them to decide.
     expect(screen.queryByRole('dialog')).toBeNull()

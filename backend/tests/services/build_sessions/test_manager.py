@@ -2167,8 +2167,7 @@ async def test_save_still_succeeds_while_the_app_is_switched_off(
     work to durable storage they can ask for, and containers are ephemeral — the reaper destroys
     idle ones — so refusing a save in the one window where it matters (an administrator flips the
     switch while the owner holds unsaved work in a live container) does not contain anything.
-    It PERMANENTLY DESTROYS that work. That is the same harm
-    `_refuse_if_reclaim_would_destroy_work` exists to prevent.
+    It PERMANENTLY DESTROYS that work.
 
     The accepted trade is that a disabled app's saved bundle may advance by one commit, and
     nothing consumes it: publish still refuses, approval pins a submission rather than the
