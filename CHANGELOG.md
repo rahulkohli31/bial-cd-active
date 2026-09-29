@@ -7,16 +7,49 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [1.8.7] - 2026-09-28
 
 The applications list says "Starting up" while an app is being published and updates itself when
-the publish finishes, instead of showing "Draft" until the page is reloaded.
+the publish finishes, instead of showing "Draft" until the page is reloaded. An owner can share an
+app with a colleague who has never signed in, found in the airport's directory. While a build runs,
+the workspace says so plainly: Save and Discard wait for it, red messages clear on the next try,
+and the tokens-today counter rises as the build works.
 
 ### Deploying this release
 
-- **No migration, no settings change, no sandbox rebuild.** Only the backend and the portal change,
-  and they can go out in either order: an older portal ignores the new field, and a newer portal
-  in front of an older backend shows "Draft" during a publish exactly as today.
+- **One migration, additive: run it before the backend.** It records whether each person has ever
+  signed in; everyone already here reads as signed in. The older backend runs happily on the
+  migrated database, and the new one needs it.
+- **No settings change, no sandbox rebuild.** Backend and portal can go out in either order after
+  the migration: an older portal ignores the new fields, and a newer portal in front of an older
+  backend shares with signed-in people only and shows "Draft" during a publish, exactly as today.
+- **Sharing with people who have never signed in waits on BIAL.** The backend's own identity needs
+  permission to read users' basic profiles in the directory. Until BIAL grants it, sharing finds
+  only people who have signed in, and each search logs one warning. After the grant, restart the
+  backend so it picks the permission up, then confirm it with the read-only checks in the local
+  operations tree and one live search.
+
+### Added
+
+- **Share with a colleague who has never signed in.** The colleague search first lists people who
+  have used the platform, then fills from the airport's directory. Picking someone from the
+  directory adds them and shares with them at once; they see the app the first time they sign in,
+  and the share list and the admin's users screen say "Not signed in yet" until then. Only the
+  airport's own staff are offered directory results, and guests are never offered. If the directory
+  cannot be reached, search falls back to people who have signed in.
 
 ### Fixed
 
+- **Save and Discard wait for a build.** They are greyed while a Build chat's turn runs, and a Save
+  that fails keeps both usable. A Plan chat's reply leaves Save pressable, and Discard says it is
+  waiting for the reply.
+- **Red messages clear when they no longer apply.** Each clears on the next attempt, by Stop or by
+  Escape; the "cannot save during a build" message clears when the build ends; and each can be
+  dismissed.
+- **A build says what it is doing.** A Build chat's message box says builds take several minutes
+  and keep going if you leave. Step groups stay closed until opened, and elapsed time reads the same
+  way everywhere.
+- **The tokens-today counter rises during a build,** as each step lands, instead of only at the
+  end.
+- **The publish popover drops a stale answer** once the app has moved on from the state it
+  described.
 - **The applications list shows a publish while it runs.** A row read "Draft" while its app was
   being published, and kept reading it until the page was reloaded, while the app's own page said
   "Starting up". The row now says "Starting up" too, the list checks again every few seconds until
