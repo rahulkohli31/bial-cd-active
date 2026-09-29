@@ -10,8 +10,9 @@
  * kind is fixed at creation, and what each kind is CALLED and what it DOES come from
  * `utils/chatKind.ts`.
  */
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { X } from 'lucide-react'
 import { AssistantRuntimeProvider, useExternalStoreRuntime } from '@assistant-ui/react'
 import { ToggleGroup, ToggleGroupItem } from '../ui/toggle-group'
 import { uuidv7 } from '../../utils/conversationApi'
@@ -98,6 +99,7 @@ function RailComposerBody({ projectId }: RailComposerProps) {
   // PLAN, per the owner — see the `KINDS` docblock above for what that changes and what it costs.
   const [kind, setKind] = useState<ChatKind>('plan')
   const [urgent, setUrgent] = useState<string | null>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
 
   /**
    * ASKS FOR THE WORKSPACE BEFORE IT NAVIGATES, which is why this is not a two-line navigate.
@@ -107,6 +109,7 @@ function RailComposerBody({ projectId }: RailComposerProps) {
    */
   const startChat = useCallback(
     async ({ text, attachments }: ComposerSubmission) => {
+      setUrgent(null)
       const open = () => {
         // THROUGH THE SHARED `uuidv7`, never an inline `crypto.randomUUID()`. That mints a v4, and
         // this id becomes the conversation's PRIMARY KEY, which needs to be sortable.
@@ -154,7 +157,7 @@ function RailComposerBody({ projectId }: RailComposerProps) {
   const picked = useMemo(() => chatKindFor(kind), [kind])
 
   return (
-    <div className="font-manrope">
+    <div ref={rootRef} className="font-manrope">
       {/* THE BOARD'S SEGMENTED CONTROL: a #F0F4F8 track with a white pill on the selected item.
           No hue at all — the selection is signalled by elevation, which is what keeps it legible
           and is why the icon takes its colour from the label rather than from the kind. */}
@@ -217,6 +220,7 @@ function RailComposerBody({ projectId }: RailComposerProps) {
         // there is no turn here that could be running.
         isRunning={false}
         onUrgent={setUrgent}
+        onAttachPress={() => setUrgent(null)}
         // The rail section owns its own gutter and ground already.
         frameClassName="flex flex-col gap-1.5"
       />
@@ -224,9 +228,20 @@ function RailComposerBody({ projectId }: RailComposerProps) {
       {/* Attachment refusals and send failures, said out loud. `role="alert"` because a refused
           file is a thing the citizen has to act on before their message means what they think. */}
       {urgent && (
-        <p role="alert" className="mt-1.5 text-[11.5px] text-danger">
-          {urgent}
-        </p>
+        <div role="alert" className="mt-1.5 flex items-start gap-1.5 text-[11.5px] text-danger">
+          <p className="min-w-0 flex-1">{urgent}</p>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            onClick={() => {
+              setUrgent(null)
+              rootRef.current?.querySelector('textarea')?.focus()
+            }}
+            className="-my-1 inline-flex h-6 w-6 flex-shrink-0 items-center justify-center rounded text-danger/70 transition hover:bg-danger/10 hover:text-danger"
+          >
+            <X size={12} />
+          </button>
+        </div>
       )}
     </div>
   )

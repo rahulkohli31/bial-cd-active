@@ -21,8 +21,9 @@ import {
   createWorkspaceChannel,
   type WorkspaceReport,
 } from '../workspaceChannel'
-import { resolveWorkspaceState } from '../workspaceState'
+import { resolveWorkspaceState, type StartResult } from '../workspaceState'
 import { createStarter } from '../startApp'
+import { SendRefusal } from '../../chat/sendRefusal'
 import type { PreviewState } from '../../../utils/buildSessionApi'
 
 // THE START THIS RAIL ASKS FOR, held by the test rather than answered by the network. The rail
@@ -522,5 +523,75 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
       hold.settle()
       await Promise.resolve()
     })
+  })
+})
+
+describe('the rail\'s red line clears itself and can be dismissed', () => {
+  const REFUSED = 'Your workspace is busy with another application.'
+
+  /** The rail on a channel whose start answers one press at a time, in the order given. */
+  function railWithStarts(...answers: Promise<StartResult>[]) {
+    const channel = createWorkspaceChannel()
+    const start = vi.fn(() => answers.shift() ?? new Promise<StartResult>(() => {}))
+    channel.workspace.set({
+      projectId: 'p1',
+      settled: true,
+      state: resolveWorkspaceState({
+        preview: null,
+        projectHasSavedBuild: null,
+        startOutcome: null,
+        startInFlight: false,
+        waitHasGoneOnTooLong: false,
+      }),
+      onStartOutcome: vi.fn(),
+      onStartAdmitted: vi.fn(),
+      onStartPending: vi.fn(),
+      onRefresh: vi.fn(),
+      start,
+    })
+    render(
+      <MemoryRouter initialEntries={['/projects/p1']}>
+        <WorkspaceChannelProvider value={channel}>
+          <Routes>
+            <Route path="/projects/:projectId" element={<RailComposer projectId="p1" />} />
+            <Route path="*" element={<LocationProbe />} />
+          </Routes>
+        </WorkspaceChannelProvider>
+      </MemoryRouter>,
+    )
+    return start
+  }
+
+  const refusedOnce = () => Promise.resolve<StartResult>({ kind: 'failed', error: new SendRefusal(REFUSED) })
+
+  it('★ clears as the next send starts', async () => {
+    // Mutation check: drop the clear from `startChat` and the refusal outlives the second press.
+    const start = railWithStarts(refusedOnce())
+    send('a visitor log')
+    expect((await screen.findByRole('alert')).textContent).toContain(REFUSED)
+
+    send('a visitor log')
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(2))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(composer()).toBeTruthy()
+  })
+
+  it('clears when the attach control is pressed', async () => {
+    railWithStarts(refusedOnce())
+    send('a visitor log')
+    await screen.findByRole('alert')
+
+    fireEvent.click(screen.getByTestId('composer-attach'))
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('★ Dismiss closes it and puts the cursor back in the box', async () => {
+    railWithStarts(refusedOnce())
+    send('a visitor log')
+    await screen.findByRole('alert')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(document.activeElement).toBe(composer())
   })
 })

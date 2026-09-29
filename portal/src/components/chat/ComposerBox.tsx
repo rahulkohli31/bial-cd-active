@@ -83,6 +83,8 @@ export interface ComposerBoxProps {
   footer?: React.ReactNode
   /** Said out loud when a file is refused, and when a send is. */
   onUrgent: (message: string) => void
+  /** The attach control was pressed, before the file picker opens. */
+  onAttachPress?: () => void
 }
 
 export default function ComposerBox({
@@ -95,6 +97,7 @@ export default function ComposerBox({
   header,
   footer,
   onUrgent,
+  onAttachPress,
 }: ComposerBoxProps) {
   const aui = useAui()
   // WHAT THIS SURFACE CAN HONOUR, read from the adapter's own binding — the tooltip below
@@ -393,6 +396,7 @@ export default function ComposerBox({
             <ComposerPrimitive.AddAttachment
               data-testid="composer-attach"
               aria-label="Attach a file"
+              onClick={onAttachPress}
               title={`${lanes.sentence} Or drop files anywhere in the composer.`}
               // DIMMED WITH THE BOX, never unavailable. The board draws it at 40% while an offer
               // waits, and it stays pressable at 40%: staging a file is composing, not answering.

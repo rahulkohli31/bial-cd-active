@@ -56,6 +56,8 @@ export interface ComposerProps {
   footerNote?: ReactNode
   /** Urgent sentences go to the assertive slot the surface owns. */
   onUrgent: (message: string) => void
+  /** The attach control was pressed: a new attempt, so the last one's urgent sentence can go. */
+  onAttachPress?: () => void
   /**
    * The frame around the box. Defaults to the chat surface's, which sits the composer on the
    * transcript's own ground with its own gutter. It is a prop because the RAIL mounts this same
@@ -85,6 +87,7 @@ const Composer: FC<ComposerProps> = ({
   contextWarning,
   footerNote,
   onUrgent,
+  onAttachPress,
   frameClassName = 'flex flex-col gap-1.5 bg-bial-surface px-3 py-2.5',
   noteClassName = 'text-neutral',
 }) => {
@@ -207,6 +210,7 @@ const Composer: FC<ComposerProps> = ({
            with itself and the sibling arm never ran. */
         onAccepted={writeDraft}
         onUrgent={onUrgent}
+        onAttachPress={onAttachPress}
         header={
           offer ? (
             /* INSIDE the box, fixed to its top, which is what the board draws: "this teal strip

@@ -5,7 +5,7 @@
  * chat list crept back during the rewrite.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, waitFor, cleanup, within, fireEvent } from '@testing-library/react'
+import { act, screen, waitFor, cleanup, within, fireEvent } from '@testing-library/react'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 
@@ -565,5 +565,84 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
     expect(await screen.findByTestId('save-project')).toBeTruthy()
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(h.fetchSaveState).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('★ the red banner clears itself and can be dismissed', () => {
+  const REFUSED = 'Wait for the reply to finish, then save.'
+  const RUNNING = { type: 'snapshot', seq: 1, turnId: 'turn-7', turnStatus: 'running', items: [], parts: [], working: false }
+
+  /** A Save pressed just before a send, refused once the build is running — the one way a Save
+   *  refusal still reaches this chat now that Save is greyed during a build. */
+  async function saveRefusedDuringABuild() {
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
+    let refuse = () => {}
+    h.saveProject.mockImplementation(() => new Promise((_, reject) => { refuse = reject }))
+    const turn = scriptBuildTurn({ hold: true, opening: [RUNNING] })
+    h.readTurnStream.mockImplementation(turn.impl)
+    renderBuilder()
+    fireEvent.click(await screen.findByTestId('save-project'))
+    await send('add a date filter')
+    await screen.findByTestId('stop-turn')
+    await act(async () => refuse(new ApiError(REFUSED, 409)))
+    expect((await screen.findByTestId('urgent-banner')).textContent).toBe(REFUSED)
+    return turn
+  }
+
+  it('★ a Save refused while this chat builds is gone once the build ends', async () => {
+    // The reproduced bug. Mutation check: drop the clear from `endGenerating` and the refusal
+    // outlives the build.
+    const turn = await saveRefusedDuringABuild()
+
+    await turn.frame(T_BUILD_END({ turnId: 'turn-7' }))
+    await turn.end()
+
+    await waitFor(() => expect(screen.queryByTestId('urgent-banner')).toBeNull())
+    expect(screen.getByTestId('composer-input')).toBeTruthy()
+  })
+
+  it('★ any other sentence that replaced it outlives the build', async () => {
+    // Mutation check: clear the banner unconditionally in `endGenerating` and the stop failure goes.
+    const turn = await saveRefusedDuringABuild()
+    h.stopTurn.mockRejectedValue(new Error('the stop did not reach the server'))
+
+    fireEvent.click(screen.getByTestId('stop-turn'))
+    await waitFor(() => expect(screen.getByTestId('urgent-banner').textContent).toBe('Could not stop this. Try again.'))
+
+    await turn.frame(T_BUILD_END({ turnId: 'turn-7' }))
+    await turn.end()
+
+    await waitFor(() => expect(screen.queryByTestId('stop-turn')).toBeNull())
+    expect(screen.getByTestId('urgent-banner').textContent).toBe('Could not stop this. Try again.')
+  })
+
+  it('★ clears as the next message is sent', async () => {
+    // Mutation check: drop the clear from `handleSubmit` and the old sentence sits over the new turn.
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    h.saveProject.mockRejectedValue(new ApiError(REFUSED, 409))
+    h.readTurnStream.mockImplementation(() => new Promise(() => {}))
+    renderBuilder()
+    fireEvent.click(await screen.findByTestId('save-project'))
+    await screen.findByTestId('urgent-banner')
+
+    await send('add a date filter')
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
+    expect(screen.queryByTestId('urgent-banner')).toBeNull()
+  })
+
+  it('★ Dismiss closes it and puts the cursor back in the composer, inside a region that stays', async () => {
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    h.saveProject.mockRejectedValue(new ApiError(REFUSED, 409))
+    renderBuilder()
+    fireEvent.click(await screen.findByTestId('save-project'))
+    const banner = await screen.findByTestId('urgent-banner')
+    const region = banner.parentElement
+
+    fireEvent.click(within(banner).getByRole('button', { name: 'Dismiss' }))
+
+    expect(screen.queryByTestId('urgent-banner')).toBeNull()
+    expect(document.activeElement).toBe(screen.getByTestId('composer-input'))
+    expect(region?.isConnected).toBe(true)
+    expect(region?.getAttribute('aria-live')).toBe('assertive')
   })
 })
