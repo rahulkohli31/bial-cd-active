@@ -65,7 +65,6 @@ from src.schemas import (
     error_responses,
 )
 from src.schemas.shares import (
-    ColleagueResult,
     SharedProjectResponse,
     SharedProjectSharer,
     ShareResponse,
@@ -92,6 +91,7 @@ from src.services.projects import (
     SharedSort,
     create_share,
     delete_project_cascade,
+    find_colleagues,
     find_possible_duplicates,
     list_shared_with_me,
     list_shares_for_project,
@@ -101,7 +101,6 @@ from src.services.projects import (
     resolve_project_access,
     resweep_submission_prefixes,
     revoke_share,
-    search_colleagues,
 )
 from src.services.ratelimit import rate_limit
 from src.services.redis import build_coordination_or_503, coordination_is_gone, get_redis
@@ -650,23 +649,17 @@ async def search_project_colleagues(
     sharing one email domain would match every user in it). Returns display name + email
     local part only, at most 10 results — NOT the admin roster shape, which additionally
     carries token limits, usage and suspension state that no citizen picking a colleague to
-    share with has any business seeing.
+    share with has any business seeing. Our own users come first; when they leave room, people
+    in the organisation's directory who have no user here yet fill it, carrying `directoryId`
+    instead of `id`. A directory that cannot be reached leaves just our own users.
 
     DECLARED BEFORE `/{project_id}` — same reason `/counts` is: FastAPI matches in
     declaration order, so a static path registered after the parameterised route would be
     swallowed by it and answer 422 on a UUID parse instead of running this handler.
     """
     cleaned = _clean_colleague_query(q)
-    colleagues = await search_colleagues(db, requester_id=user.id, query=cleaned)
     return ColleagueSearchResponse(
-        colleagues=[
-            ColleagueResult(
-                id=colleague.id,
-                display_name=colleague.display_name,
-                email_local_part=colleague.email.split("@", 1)[0],
-            )
-            for colleague in colleagues
-        ]
+        colleagues=await find_colleagues(db, requester_id=user.id, query=cleaned)
     )
 
 

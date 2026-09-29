@@ -23,7 +23,9 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.project import Project
 from src.db.models.project_share import ProjectShare
 from src.db.models.user import User
+from src.schemas.shares import ColleagueResult
 from src.services.audit.log import append_audit
+from src.services.directory import search_directory
 
 #: R4 — below this, the search is refused rather than run (a 1-2 character query against an
 #: anchored match is either near-useless or, for very short strings, still wide enough to
@@ -194,6 +196,53 @@ async def search_colleagues(
         .limit(MAX_COLLEAGUE_RESULTS)
     )
     return list(rows.all())
+
+
+async def find_colleagues(
+    db: AsyncSession, *, requester_id: uuid.UUID, query: str
+) -> list[ColleagueResult]:
+    """Our own users matching `query` first, then directory people who have no user yet, up to
+    `MAX_COLLEAGUE_RESULTS` in all. The directory is asked only when the users leave room, and
+    only after the read transaction has ended, so no pooled connection waits on Graph. Anyone
+    already in `users`, the requester included, is dropped from the directory's hits before the
+    cap. A directory failure reads as no hits."""
+    found = [
+        ColleagueResult(
+            id=user.id,
+            directory_id=None,
+            display_name=user.display_name,
+            email_local_part=user.email.split("@", 1)[0],
+            signed_in=user.has_signed_in,
+        )
+        for user in await search_colleagues(db, requester_id=requester_id, query=query)
+    ]
+    slots = MAX_COLLEAGUE_RESULTS - len(found)
+    if slots == 0:
+        return found
+    # Commit, not rollback: a rollback would expire every ORM instance this request has loaded.
+    await db.commit()
+    people = await search_directory(query)
+    if not people:
+        return found
+    known = set(
+        await db.scalars(
+            sa.select(User.azure_oid).where(
+                User.azure_oid.in_([str(person.object_id) for person in people])
+            )
+        )
+    )
+    newcomers = [
+        ColleagueResult(
+            id=None,
+            directory_id=person.object_id,
+            display_name=person.display_name,
+            email_local_part=person.email.split("@", 1)[0],
+            signed_in=False,
+        )
+        for person in people
+        if str(person.object_id) not in known
+    ]
+    return found + newcomers[:slots]
 
 
 @dataclass(frozen=True)

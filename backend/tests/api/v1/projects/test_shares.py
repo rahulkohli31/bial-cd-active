@@ -35,7 +35,7 @@ from src.services.storage import snapshot_key
 from tests.api.v1.projects.conftest import _VALID_DESCRIPTION, DELETE_BODY
 from tests.api.v1.projects.test_projects_crud import _auth
 from tests.factories import ProjectFactory, ProjectShareFactory, UserFactory
-from tests.fakes import FakeSandboxClient, FakeStorage
+from tests.fakes import FakeDirectory, FakeSandboxClient, FakeStorage
 
 
 @pytest.fixture
@@ -614,6 +614,77 @@ async def test_colleague_search_never_returns_the_requester(client, db_session) 
     assert resp.status_code == 200
     ids = [c["id"] for c in resp.json()["colleagues"]]
     assert str(user.id) not in ids
+
+
+async def test_colleague_search_fills_the_page_from_the_directory_after_our_own_users(
+    client, db_session, fake_directory: FakeDirectory
+) -> None:
+    headers, _ = await _auth(db_session)
+    ada = await UserFactory.create(
+        db_session, email="quill.ada@example.com", display_name="Quill Ada"
+    )
+    never_signed_in = await UserFactory.create(
+        db_session, email="quill.bo@example.com", display_name="Quill Bo", has_signed_in=False
+    )
+    newcomers = [
+        fake_directory.add_user(f"Quill New {n}", mail=f"quill.new{n}@bial.example")
+        for n in range(3)
+    ]
+
+    resp = await client.get("/v1/projects/colleagues", headers=headers, params={"q": "Quill"})
+
+    assert resp.status_code == 200
+    assert resp.json()["colleagues"] == [
+        {
+            "id": str(ada.id),
+            "directoryId": None,
+            "displayName": "Quill Ada",
+            "emailLocalPart": "quill.ada",
+            "signedIn": True,
+        },
+        {
+            "id": str(never_signed_in.id),
+            "directoryId": None,
+            "displayName": "Quill Bo",
+            "emailLocalPart": "quill.bo",
+            "signedIn": False,
+        },
+        *(
+            {
+                "id": None,
+                "directoryId": str(oid),
+                "displayName": f"Quill New {n}",
+                "emailLocalPart": f"quill.new{n}",
+                "signedIn": False,
+            }
+            for n, oid in enumerate(newcomers)
+        ),
+    ]
+
+
+async def test_colleague_search_answers_with_our_own_users_when_the_directory_is_down(
+    client, db_session, fake_directory: FakeDirectory
+) -> None:
+    headers, _ = await _auth(db_session)
+    ada = await UserFactory.create(
+        db_session, email="quill.ada@example.com", display_name="Quill Ada"
+    )
+    fake_directory.add_user("Quill New", mail="quill.new@bial.example")
+    fake_directory.unavailable = True
+
+    resp = await client.get("/v1/projects/colleagues", headers=headers, params={"q": "Quill"})
+
+    assert resp.status_code == 200
+    assert resp.json()["colleagues"] == [
+        {
+            "id": str(ada.id),
+            "directoryId": None,
+            "displayName": "Quill Ada",
+            "emailLocalPart": "quill.ada",
+            "signedIn": True,
+        }
+    ]
+    assert len(fake_directory.requests) == 1
 
 
 async def test_colleague_search_rate_limit_enforced(client, db_session) -> None:

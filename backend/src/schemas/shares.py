@@ -23,15 +23,19 @@ class ShareRequest(CamelModel):
 
 
 class ColleagueResult(CamelModel):
-    """One search hit (R5) — display name AND the email LOCAL PART only, never the full
-    address: enough for an owner to tell two colleagues with the same name apart, not enough
-    to hand out a directory of working email addresses through a picker. NOT the admin roster
-    shape, which additionally carries token limits, usage and suspension state — none of
-    which a citizen picking a colleague to share with has any business seeing."""
+    """One search hit. Exactly one of `id` and `directoryId` is set: `id` for someone with a
+    user here, `directoryId` (their Entra object id) for someone found only in the directory.
+    Display name AND the email LOCAL PART only, never the full address: enough for an owner to
+    tell two colleagues with the same name apart, not enough to hand out a directory of working
+    email addresses through a picker. `signedIn` says whether they have ever signed in here.
+    NOT the admin roster shape, which additionally carries token limits, usage and suspension
+    state — none of which a citizen picking a colleague to share with has any business seeing."""
 
-    id: uuid.UUID
+    id: uuid.UUID | None
+    directory_id: uuid.UUID | None
     display_name: str | None
     email_local_part: str
+    signed_in: bool
 
 
 class ColleagueSearchResponse(CamelModel):
