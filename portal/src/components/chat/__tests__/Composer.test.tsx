@@ -490,3 +490,27 @@ describe('the grey the notes under the box are painted in', () => {
     }
   })
 })
+
+describe('the running line follows the kind of chat', () => {
+  const BUILD_LINE = 'Builds usually take several minutes and keep going if you leave. Keep typing if you like.'
+
+  it('★ a Build chat, running, says only that builds take minutes', () => {
+    // Mutation check: ignore `runningNote` and the generic "Replying" sentence comes back.
+    draw({ isRunning: true, runningNote: BUILD_LINE })
+    expect(screen.getAllByTestId('composer-gate-note')).toHaveLength(1)
+    expect(gateNote()?.textContent).toBe(BUILD_LINE)
+    expect(screen.queryByText(/^Replying/)).toBeNull()
+    expect(send().getAttribute('aria-disabled')).toBe('true')
+  })
+
+  it('a chat with no running line of its own keeps the composer\'s sentence', () => {
+    draw({ isRunning: true, runningNote: null })
+    expect(gateNote()?.textContent).toBe('Replying — keep typing if you like; send unlocks when it is done.')
+  })
+
+  it('says nothing while no turn runs', () => {
+    draw({ isRunning: false, runningNote: BUILD_LINE })
+    expect(screen.getByTestId('composer-input')).toBeTruthy()
+    expect(gateNote()).toBeNull()
+  })
+})

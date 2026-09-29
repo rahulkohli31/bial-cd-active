@@ -204,14 +204,15 @@ export async function sendAndConfirm(text = 'a visitor app') {
  *   projectId?: string,
  *   hasSavedBuild?: boolean | null,
  *   initialEntries?: string[],
+ *   kind?: 'plan' | 'build',
  * }} [opts]
  */
-export function renderBuilder({ projectId = 'p1', hasSavedBuild = null, initialEntries = ['/chat/build-X?projectId=p1&kind=build'] } = {}) {
+export function renderBuilder({ projectId = 'p1', hasSavedBuild = null, initialEntries = ['/chat/build-X?projectId=p1&kind=build'], kind = undefined } = {}) {
   return render(
     <MemoryRouter initialEntries={initialEntries}>
       <Routes>
         <Route element={<WorkspaceShell />}>
-          <Route path="/chat/:chatId" element={<ConversationSurface projectId={projectId} projectHasSavedBuild={hasSavedBuild} />} />
+          <Route path="/chat/:chatId" element={<ConversationSurface projectId={projectId} projectHasSavedBuild={hasSavedBuild} kind={kind} />} />
         </Route>
         <Route path="/projects" element={<div>projects index</div>} />
         <Route path="/projects/:pid" element={<div>project page</div>} />

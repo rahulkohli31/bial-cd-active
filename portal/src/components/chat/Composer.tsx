@@ -32,6 +32,8 @@ export interface ComposerProps {
   onSubmit: (submission: ComposerSubmission) => Promise<void>
   /** True while a turn is in flight — Send waits, typing does not. */
   isRunning: boolean
+  /** Said under the box while a turn runs, in place of the generic sentence. */
+  runningNote?: string | null
   /** Any other reason Send must wait, with the sentence that explains it. */
   gate?: { blocked: boolean; reason: string } | undefined
   /** The stop control, in its permanent home on this chrome. */
@@ -81,6 +83,7 @@ const Composer: FC<ComposerProps> = ({
   placeholder = 'Ask for another change…',
   onSubmit,
   isRunning,
+  runningNote,
   gate,
   stop,
   offer,
@@ -162,11 +165,13 @@ const Composer: FC<ComposerProps> = ({
     // `capState` sets `message` exactly when `over`, and naming both is how that is said without a
     // cast: a cap with nothing to say about itself is not a reason anyone could act on.
     if (cap.over && cap.message) return { reason: cap.message, fromOffer: false }
-    if (isRunning) return { reason: 'Replying — keep typing if you like; send unlocks when it is done.', fromOffer: false }
+    if (isRunning) {
+      return { reason: runningNote ?? 'Replying — keep typing if you like; send unlocks when it is done.', fromOffer: false }
+    }
     if (gate?.blocked) return { reason: gate.reason, fromOffer: false }
     if (offerPending) return { reason: OFFER_GATE_NOTE, fromOffer: true }
     return null
-  }, [offerPending, cap.over, cap.message, isRunning, gate])
+  }, [offerPending, cap.over, cap.message, isRunning, runningNote, gate])
   const unavailableReason = unavailable?.reason ?? null
   const offerLocked = unavailable?.fromOffer ?? false
 

@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
   relaunchPreview: vi.fn(),
   fetchSaveState: vi.fn(), fetchPreviewState: vi.fn(), saveProject: vi.fn(),
   discardUnsavedChanges: vi.fn(),
+  getStoredUser: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -28,6 +29,8 @@ vi.mock('../../utils/conversationApi', async (orig) => ({
   createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
 }))
+// The kind catalogue rides the signed-in profile; only the running-line seam below stands one up.
+vi.mock('../../utils/auth', async (orig) => ({ ...(await orig()), getStoredUser: (...a) => h.getStoredUser(...a) }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig()),
@@ -76,6 +79,7 @@ beforeEach(() => {
   // decides nothing, so nothing reaches a real `fetch`, re-primed by the two scenarios about it.
   h.fetchPreviewState.mockRejectedValue(new Error('the read is not this file\'s subject'))
   h.relaunchPreview.mockResolvedValue(undefined)
+  h.getStoredUser.mockReturnValue(null)
 })
 afterEach(cleanup)
 
@@ -644,5 +648,27 @@ describe('★ the red banner clears itself and can be dismissed', () => {
     expect(document.activeElement).toBe(screen.getByTestId('composer-input'))
     expect(region?.isConnected).toBe(true)
     expect(region?.getAttribute('aria-live')).toBe('assertive')
+  })
+})
+
+describe('★ a Build chat\'s composer says builds take minutes', () => {
+  it('shows the build line alone under the composer while the build runs', async () => {
+    // Mutation check: drop `runningNote` from the surface's composer and "Replying" comes back.
+    h.getStoredUser.mockReturnValue({
+      chat_kinds: [
+        { value: 'plan', name: 'Plan', description: 'Shape a plan first.' },
+        { value: 'build', name: 'Build', description: 'Change the live app.' },
+      ],
+    })
+    h.readTurnStream.mockImplementation(() => new Promise(() => {}))
+    renderBuilder({ kind: 'build' })
+    await send('add a date filter')
+
+    await waitFor(() =>
+      expect(screen.getByTestId('composer-gate-note').textContent).toBe(
+        'Builds usually take several minutes and keep going if you leave. Keep typing if you like.',
+      ),
+    )
+    expect(screen.getAllByTestId('composer-gate-note')).toHaveLength(1)
   })
 })

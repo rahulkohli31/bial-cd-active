@@ -69,6 +69,7 @@ import { useDropTransientQuery } from '../../hooks/useDropTransientQuery'
 import type { PendingAttachment } from '../../utils/attachmentInput'
 import type { ChatKind } from '../../pages/ChatRoute'
 import PlanChatWorkspaceLine from '../workspace/PlanChatWorkspaceLine'
+import { chatKindFor } from '../../utils/chatKind'
 import { startTurn, readTurnStream, buildFromPlan, stopTurn, TurnStartError } from '../../utils/turnStreamApi'
 import { isKnownFrame } from '../../utils/turnStreamApi'
 import type { CompileState } from '../../utils/compileState'
@@ -2777,6 +2778,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
             placeholder={kind === 'plan' ? 'Tell me what to change…' : 'Ask for another change…'}
             onSubmit={handleSubmit}
             isRunning={isRunning}
+            runningNote={chatKindFor(kind).composerRunningNote}
             gate={gate}
             contextWarning={contextWarning}
             footerNote={isPlanChat ? <PlanChatWorkspaceLine /> : undefined}
