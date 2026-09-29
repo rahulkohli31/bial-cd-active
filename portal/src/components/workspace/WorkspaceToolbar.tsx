@@ -409,13 +409,13 @@ export default function WorkspaceToolbar({
  * moving; a production save was measured at forty seconds.
  */
 function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () => WorkspaceActions }) {
-  const { dirty, saving, discarding, replying, error, canSave } = save
+  const { dirty, saving, discarding, building, error, canSave } = save
   // Before the early return: hooks may not sit behind a conditional, and `dirty === null` is a
   // real render path here rather than an edge case.
   const elapsed = useElapsedSeconds(saving)
   const showElapsed = elapsed * 1000 >= ELAPSED_AFTER_MS
   if (dirty === null) return null
-  const refused = saving || discarding || replying || dirty === false
+  const refused = saving || discarding || building || dirty === false
 
   const look = dirty
     ? 'border-primary bg-canvas-savedirty text-primary font-bold'
@@ -473,7 +473,7 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
           data-testid="save-project"
           // `aria-disabled`, NEVER `disabled`: a disabled control throws focus to the document body.
           aria-disabled={refused}
-          title={replying ? BUILD_RUNNING : undefined}
+          title={building ? BUILD_RUNNING : undefined}
           // THE THIRD REGISTER, and a silent one: `aria-busy` is what a reader consults when asked
           // rather than something it speaks, so it costs the wait's sentence nothing. `undefined`
           // when idle — `aria-busy={false}` would ship a permanent `aria-busy="false"` on a control
@@ -483,7 +483,7 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
             if (refused) return
             readActions().save?.()
           }}
-          className={`${shell} transition ${saving ? 'opacity-70' : replying ? 'cursor-not-allowed opacity-50' : ''}`}
+          className={`${shell} transition ${saving ? 'opacity-70' : building ? 'cursor-not-allowed opacity-50' : ''}`}
         >
           {body}
         </button>
@@ -500,10 +500,11 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
 const BUILD_RUNNING = 'Wait for the build to finish'
 
 /** Why Discard cannot be pressed right now, or `null` when it can. */
-function discardRefusal({ discarding, saving, replying, dirty, hasSavedVersion }: SaveSlot): string | null {
+function discardRefusal({ discarding, saving, building, replying, dirty, hasSavedVersion }: SaveSlot): string | null {
   if (discarding) return 'Discarding your changes'
   if (saving) return 'Wait for the save to finish'
-  if (replying) return BUILD_RUNNING
+  if (building) return BUILD_RUNNING
+  if (replying) return 'Wait for the reply to finish'
   if (dirty === false) return 'No unsaved changes'
   if (!hasSavedVersion) return 'Nothing saved yet to go back to'
   return null

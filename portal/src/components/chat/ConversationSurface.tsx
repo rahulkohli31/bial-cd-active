@@ -793,9 +793,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   const turnRunningHere =
     generatingChatId !== null &&
     (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
+  // Anything not known to be a Plan chat counts as a build, so Save waits unless it is sure.
+  const runningKind = generatingChatId === buildId ? kind : builds.find((b) => b.id === generatingChatId)?.kind
+  const buildRunningHere = turnRunningHere && runningKind !== 'plan'
   const projectDialogs = useProjectDialogs(project, onProjectUpdate)
   usePublishSave(
-    { dirty: saveDirty, saving, error: saveError, discarding, replying: turnRunningHere, hasSavedVersion },
+    { dirty: saveDirty, saving, error: saveError, discarding, replying: turnRunningHere, building: buildRunningHere, hasSavedVersion },
     { save: handleSave, discard: handleDiscard, settings: projectDialogs.settings, share: projectDialogs.share },
   )
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already

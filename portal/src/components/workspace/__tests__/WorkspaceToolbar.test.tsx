@@ -110,6 +110,7 @@ const QUIET_SAVE: Omit<SaveSlot, 'canSave' | 'canDiscard'> = {
   error: null,
   discarding: false,
   replying: false,
+  building: false,
   hasSavedVersion: false,
 }
 
@@ -527,7 +528,7 @@ describe('the Save control', () => {
   it('★ is greyed while a build runs, with the reason Discard gives, and refuses the press', () => {
     // Mutation check: drop `replying` from the Save guard and the press reaches the action.
     const onSave = vi.fn()
-    withSave({ dirty: true, saving: false, error: null, replying: true }, onSave)
+    withSave({ dirty: true, saving: false, error: null, replying: true, building: true }, onSave)
     const save = screen.getByTestId('save-project')
     expect(save.getAttribute('aria-disabled')).toBe('true')
     expect(save.getAttribute('title')).toBe('Wait for the build to finish')
@@ -537,14 +538,25 @@ describe('the Save control', () => {
     expect(onSave).not.toHaveBeenCalled()
   })
 
+  it('★ stays pressable while a Plan chat replies, since nothing is being built', () => {
+    // Mutation check: grey Save on `replying` instead of `building` and this press is refused.
+    const onSave = vi.fn()
+    withSave({ dirty: true, saving: false, error: null, replying: true, building: false }, onSave)
+    const save = screen.getByTestId('save-project')
+    expect(save.getAttribute('aria-disabled')).toBe('false')
+    expect(save.hasAttribute('title')).toBe(false)
+    fireEvent.click(save)
+    expect(onSave).toHaveBeenCalledTimes(1)
+  })
+
   it('offers itself again once the build has ended', () => {
     const onSave = vi.fn()
-    const view = withSave({ dirty: true, saving: false, error: null, replying: true }, onSave)
+    const view = withSave({ dirty: true, saving: false, error: null, replying: true, building: true }, onSave)
     view.rerender(
       <Workspace
         project={{
           heading: PROJECT_HEADING,
-          save: { dirty: true, saving: false, error: null, replying: false },
+          save: { dirty: true, saving: false, error: null, replying: false, building: false },
           actions: { save: onSave, settings: null, share: null },
         }}
       />,
@@ -653,7 +665,7 @@ describe('the Save control', () => {
 })
 
 describe('the Discard control', () => {
-  const OPEN_WORK = { dirty: true, saving: false, error: null, discarding: false, replying: false, hasSavedVersion: true }
+  const OPEN_WORK = { dirty: true, saving: false, error: null, discarding: false, replying: false, building: false, hasSavedVersion: true }
   const withDiscard = (
     save: Partial<Omit<SaveSlot, 'canSave' | 'canDiscard'>>,
     handlers: Partial<WorkspaceActions> = {},
@@ -674,7 +686,8 @@ describe('the Discard control', () => {
     ['work that was never saved', { hasSavedVersion: false }, 'Nothing saved yet to go back to'],
     ['everything saved', { dirty: false }, 'No unsaved changes'],
     ['a save running', { saving: true }, 'Wait for the save to finish'],
-    ['a build running', { replying: true }, 'Wait for the build to finish'],
+    ['a build running', { replying: true, building: true }, 'Wait for the build to finish'],
+    ['a Plan reply running', { replying: true }, 'Wait for the reply to finish'],
     ['a discard running', { discarding: true }, 'Discarding your changes'],
   ] as const)('★ with %s it sits left of Save and says whether it can be pressed', (_, save, refusal) => {
     // Mutation check: switch to a real `disabled`, or drop the saved-version gate, and a row goes red.

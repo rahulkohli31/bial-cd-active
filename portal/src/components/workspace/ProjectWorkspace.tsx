@@ -320,6 +320,7 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       discarding,
       // No reply runs on this screen; one running in a chat is refused by the server in its words.
       replying: false,
+      building: false,
       hasSavedVersion: (workspace.save?.savedHead ?? null) !== null,
     },
     {

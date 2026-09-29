@@ -501,6 +501,23 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
     expect(h.saveProject).not.toHaveBeenCalled()
   })
 
+  it('★ a Plan chat\'s reply leaves Save pressable, and Discard waits for the reply', async () => {
+    // Mutation check: publish `building` from `turnRunningHere` alone and Save is greyed here.
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
+    h.readTurnStream.mockImplementation(() => new Promise(() => {}))
+    renderBuilder({ kind: 'plan' })
+    await waitForGateOpen()
+    fireEvent.change(screen.getByTestId('composer-input'), { target: { value: 'what would a filter look like?' } })
+    fireEvent.keyDown(screen.getByTestId('composer-input'), { key: 'Enter' })
+
+    const discard = await screen.findByTestId('discard-changes')
+    await waitFor(() => expect(discard.getAttribute('title')).toBe('Wait for the reply to finish'))
+    expect(discard.getAttribute('aria-disabled')).toBe('true')
+    const save = screen.getByTestId('save-project')
+    expect(save.getAttribute('aria-disabled')).toBe('false')
+    expect(save.hasAttribute('title')).toBe(false)
+  })
+
   it('★ Stop brings Save and Discard back, showing the work the stopped build left', async () => {
     // Mutation check: drop `settleSaveState()` from `endGenerating` and the extra read never happens.
     h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
