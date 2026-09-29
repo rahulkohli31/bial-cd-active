@@ -25,4 +25,5 @@ from src.services.projects.shares import list_shared_with_me as list_shared_with
 from src.services.projects.shares import (
     list_shares_for_project as list_shares_for_project,
 )
+from src.services.projects.shares import resolve_colleague as resolve_colleague
 from src.services.projects.shares import revoke_share as revoke_share

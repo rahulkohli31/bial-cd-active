@@ -9,15 +9,32 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Self
+
+from pydantic import model_validator
 
 from src.schemas.base import CamelModel
 
 
 class ShareRequest(CamelModel):
-    """The body both `POST /v1/projects/{id}:share` and `:unshare` take — the colleague's user
-    id, resolved from a prior `:colleagues` search result, never a typed email (a citizen
-    cannot be trusted to spell a colleague's email correctly, and a share against a typo'd
-    address would silently grant nobody anything while the owner believes it worked)."""
+    """Who to share with: exactly one of `sharedWithUserId`, a user here, or `directoryId`, the
+    Entra object id of someone found only in the directory. Both come from a prior colleague
+    search, never a typed email: a share against a mistyped address would grant nobody anything
+    while the owner believes it worked."""
+
+    shared_with_user_id: uuid.UUID | None = None
+    directory_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_colleague(self) -> Self:
+        named = sum(value is not None for value in (self.shared_with_user_id, self.directory_id))
+        if named != 1:
+            raise ValueError("Choose exactly one colleague to share with.")
+        return self
+
+
+class UnshareRequest(CamelModel):
+    """The colleague whose share `POST /v1/projects/{id}:unshare` revokes, by their user id."""
 
     shared_with_user_id: uuid.UUID
 

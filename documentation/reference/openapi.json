@@ -4314,17 +4314,33 @@
         "type": "string"
       },
       "ShareRequest": {
-        "description": "The body both `POST /v1/projects/{id}:share` and `:unshare` take — the colleague's user\nid, resolved from a prior `:colleagues` search result, never a typed email (a citizen\ncannot be trusted to spell a colleague's email correctly, and a share against a typo'd\naddress would silently grant nobody anything while the owner believes it worked).",
+        "description": "Who to share with: exactly one of `sharedWithUserId`, a user here, or `directoryId`, the\nEntra object id of someone found only in the directory. Both come from a prior colleague\nsearch, never a typed email: a share against a mistyped address would grant nobody anything\nwhile the owner believes it worked.",
         "properties": {
+          "directoryId": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Directoryid"
+          },
           "sharedWithUserId": {
-            "format": "uuid",
-            "title": "Sharedwithuserid",
-            "type": "string"
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sharedwithuserid"
           }
         },
-        "required": [
-          "sharedWithUserId"
-        ],
         "title": "ShareRequest",
         "type": "object"
       },
@@ -4930,6 +4946,21 @@
           "unpublishedAt"
         ],
         "title": "UnpublishResponse",
+        "type": "object"
+      },
+      "UnshareRequest": {
+        "description": "The colleague whose share `POST /v1/projects/{id}:unshare` revokes, by their user id.",
+        "properties": {
+          "sharedWithUserId": {
+            "format": "uuid",
+            "title": "Sharedwithuserid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sharedWithUserId"
+        ],
+        "title": "UnshareRequest",
         "type": "object"
       },
       "UploadResponse": {
@@ -13153,7 +13184,7 @@
     },
     "/v1/projects/{project_id}:share": {
       "post": {
-        "description": "Share a project the caller owns with a named colleague (#198 R1). Owner-only —\n`owned_project_or_404`, never the widened `resolve_project_access`: sharing IS a mutation\nof the project's own access list, and R6 grants a recipient \"Can use\", never the ability\nto share onward. Idempotent (R3) and refused for self-share (R2) or a project with\nnothing saved yet (R10) — both enforced inside `create_share`, not duplicated here.",
+        "description": "Share a project the caller owns with a named colleague (#198 R1). Owner-only —\n`owned_project_or_404`, never the widened `resolve_project_access`: sharing IS a mutation\nof the project's own access list, and R6 grants a recipient \"Can use\", never the ability\nto share onward. Idempotent (R3) and refused for self-share (R2) or a project with\nnothing saved yet (R10) — both enforced inside `create_share`, not duplicated here.\nA `directoryId` for someone with no user here yet creates them, not yet signed in, in the\nsame transaction as the share; a directory that cannot be reached is a 503.",
         "operationId": "share_project_v1_projects__project_id__share_post",
         "parameters": [
           {
@@ -13238,6 +13269,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many shares"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -13247,6 +13288,16 @@
               }
             },
             "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The directory could not be reached"
           }
         },
         "summary": "Share Project",
@@ -13275,7 +13326,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ShareRequest"
+                "$ref": "#/components/schemas/UnshareRequest"
               }
             }
           },

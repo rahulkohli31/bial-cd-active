@@ -62,6 +62,7 @@ from src.schemas import (
     ProjectSharesResponse,
     SharedProjectListResponse,
     ShareRequest,
+    UnshareRequest,
     error_responses,
 )
 from src.schemas.shares import (
@@ -98,6 +99,7 @@ from src.services.projects import (
     log_matches_shown,
     log_resolution,
     owned_project_or_404,
+    resolve_colleague,
     resolve_project_access,
     resweep_submission_prefixes,
     revoke_share,
@@ -824,12 +826,31 @@ def _share_response(share: ProjectShare, colleague: User) -> ShareResponse:
     )
 
 
+SHARE_RATE_LIMIT = 30
+SHARE_RATE_WINDOW_SECONDS = 60
+
+
+async def _share_rate_key(user: CurrentUser) -> str:
+    return f"project-share:{user.id}"
+
+
+_share_limiter = rate_limit(
+    _share_rate_key,
+    limit=SHARE_RATE_LIMIT,
+    window_seconds=SHARE_RATE_WINDOW_SECONDS,
+    message="Too many shares. Please wait a moment and try again.",
+)
+
+
 @router.post(
     "/{project_id}:share",
+    dependencies=[Depends(_share_limiter)],
     responses=error_responses(
         AUTH_401,
         (400, ErrorEnvelope, "Self-share refused, or nothing saved to share yet"),
         (404, ErrorEnvelope, "Project or colleague not found"),
+        (429, ErrorEnvelope, "Too many shares"),
+        (503, ErrorEnvelope, "The directory could not be reached"),
     ),
 )
 async def share_project(
@@ -839,11 +860,11 @@ async def share_project(
     `owned_project_or_404`, never the widened `resolve_project_access`: sharing IS a mutation
     of the project's own access list, and R6 grants a recipient "Can use", never the ability
     to share onward. Idempotent (R3) and refused for self-share (R2) or a project with
-    nothing saved yet (R10) — both enforced inside `create_share`, not duplicated here."""
+    nothing saved yet (R10) — both enforced inside `create_share`, not duplicated here.
+    A `directoryId` for someone with no user here yet creates them, not yet signed in, in the
+    same transaction as the share; a directory that cannot be reached is a 503."""
     project = await owned_project_or_404(db, user.id, project_id)
-    colleague = await db.get(User, body.shared_with_user_id)
-    if colleague is None:
-        raise AppApiError(404, "That colleague could not be found.")
+    colleague = await resolve_colleague(db, actor_id=user.id, request=body)
     share = await create_share(db, project=project, actor_id=user.id, colleague_id=colleague.id)
     await db.commit()
     return _share_response(share, colleague)
@@ -860,7 +881,7 @@ async def share_project(
 )
 async def unshare_project(
     project_id: uuid.UUID,
-    body: ShareRequest,
+    body: UnshareRequest,
     user: CurrentUser,
     db: DbSession,
     sandbox: OptionalSandbox,

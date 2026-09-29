@@ -23,9 +23,9 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.project import Project
 from src.db.models.project_share import ProjectShare
 from src.db.models.user import User
-from src.schemas.shares import ColleagueResult
+from src.schemas.shares import ColleagueResult, ShareRequest
 from src.services.audit.log import append_audit
-from src.services.directory import search_directory
+from src.services.directory import DirectoryMiss, get_directory_person, search_directory
 
 #: R4 — below this, the search is refused rather than run (a 1-2 character query against an
 #: anchored match is either near-useless or, for very short strings, still wide enough to
@@ -46,6 +46,55 @@ async def _owners_app_id(db: AsyncSession, project: Project) -> uuid.UUID | None
         )
     )
     return app_id
+
+
+async def resolve_colleague(
+    db: AsyncSession, *, actor_id: uuid.UUID, request: ShareRequest
+) -> User:
+    """The user a share request names. A `directoryId` already keyed to a user here is that user,
+    with no directory call; otherwise the person is read back from the directory and inserted as
+    not signed in, with an audit entry. The insert never updates a row: a first sign-in that got
+    there first keeps its own profile. Nothing is committed after the directory call, so a share
+    refused later takes the new user with it."""
+    if request.directory_id is None:
+        colleague = await db.get(User, request.shared_with_user_id)
+        if colleague is None:
+            raise AppApiError(404, "That colleague could not be found.")
+        return colleague
+    azure_oid = str(request.directory_id)
+    known = await db.scalar(sa.select(User).where(User.azure_oid == azure_oid))
+    if known is not None:
+        return known
+    # Ends the read so no pooled connection waits on Graph. Commit, not rollback: a rollback
+    # would expire every ORM instance this request has loaded.
+    await db.commit()
+    person = await get_directory_person(request.directory_id)
+    if person is DirectoryMiss.UNAVAILABLE:
+        raise AppApiError(503, "Couldn't look this person up right now. Try again in a moment.")
+    if person is DirectoryMiss.NOT_FOUND:
+        raise AppApiError(404, "That colleague could not be found.")
+    created_id = await db.scalar(
+        pg_insert(User)
+        .values(
+            azure_oid=azure_oid,
+            email=person.email,
+            upn=person.upn,
+            display_name=person.display_name,
+            has_signed_in=False,
+        )
+        .on_conflict_do_nothing(index_elements=[User.azure_oid])
+        .returning(User.id)
+    )
+    colleague = (await db.scalars(sa.select(User).where(User.azure_oid == azure_oid))).one()
+    if created_id is not None:
+        await append_audit(
+            db,
+            actor_id=actor_id,
+            action="user:directory_create",
+            resource_type="user",
+            resource_id=str(created_id),
+        )
+    return colleague
 
 
 async def create_share(

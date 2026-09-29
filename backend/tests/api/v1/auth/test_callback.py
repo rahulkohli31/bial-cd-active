@@ -27,6 +27,8 @@ from src.db.session import get_db
 from src.services.auth.cookies import csrf_cookie_name, refresh_cookie_name, session_cookie_name
 from src.services.auth.oidc import get_oauth
 from src.services.auth.refresh import hash_refresh_token
+from src.services.auth.session_jwt import mint_session_jwt
+from src.services.storage import snapshot_key
 from tests.entra import (
     ABSENT,
     FOREIGN_KEY,
@@ -37,7 +39,8 @@ from tests.entra import (
     sign_in,
     start_sign_in,
 )
-from tests.factories import UserFactory
+from tests.factories import AppRegistryFactory, UserFactory
+from tests.fakes import FakeDirectory, FakeStorage
 
 
 def _set_cookies(resp: httpx.Response) -> dict[str, str]:
@@ -289,6 +292,51 @@ async def test_a_suspended_pre_created_user_is_refused_and_stays_not_signed_in(
     await db_session.refresh(pre_created)
     assert pre_created.has_signed_in is False
     assert pre_created.email == "from.directory@rvaiglobal.com"
+
+
+async def test_a_colleague_shared_with_from_the_directory_finds_the_project_on_first_sign_in(
+    client, db_session, fake_storage: FakeStorage, fake_directory: FakeDirectory
+) -> None:
+    owner = await UserFactory.create(db_session, email="owner@rvaiglobal.com")
+    app = await AppRegistryFactory.create(db_session, user_id=owner.id)
+    await fake_storage.put(snapshot_key(app.id), b"BUNDLE")
+    directory_id = fake_directory.add_user(
+        "Priya Raman", mail="priya.raman@rvaiglobal.com", upn="p.raman@rvaiglobal.com"
+    )
+    owner_jwt = mint_session_jwt(owner.id, owner.token_version, settings.auth.access_ttl_seconds)
+
+    shared = await client.post(
+        f"/v1/projects/{app.project_id}:share",
+        headers={"Cookie": f"{session_cookie_name()}={owner_jwt}"},
+        json={"directoryId": str(directory_id)},
+    )
+    assert shared.status_code == 200, shared.text
+    assert shared.json()["signedIn"] is False
+
+    resp = await sign_in(
+        client,
+        oid=str(directory_id),
+        email="priya.raman@rvaiglobal.com",
+        preferred_username="p.raman@rvaiglobal.com",
+        name="Priya Raman (Operations)",
+    )
+
+    assert resp.headers["location"] == settings.FRONTEND_URL
+    rows = (
+        await db_session.scalars(select(User).where(User.azure_oid == str(directory_id)))
+    ).all()
+    assert len(rows) == 1
+    await db_session.refresh(rows[0])
+    assert str(rows[0].id) == shared.json()["sharedWithUserId"]
+    assert rows[0].has_signed_in is True
+    assert rows[0].display_name == "Priya Raman (Operations)"
+    assert rows[0].upn == "p.raman@rvaiglobal.com"
+    session = _cookie_value(_set_cookies(resp)[session_cookie_name()])
+    mine = await client.get(
+        "/v1/projects/shared", headers={"Cookie": f"{session_cookie_name()}={session}"}
+    )
+    assert mine.status_code == 200, mine.text
+    assert [item["projectId"] for item in mine.json()["items"]] == [str(app.project_id)]
 
 
 # --- the ID token, fail-closed ----------------------------------------------------------------

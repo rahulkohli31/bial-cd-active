@@ -16,6 +16,8 @@ from datetime import UTC, datetime
 
 import pytest
 from pydantic import SecretStr
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.deps import (
     sandbox_dependency,
@@ -23,11 +25,15 @@ from src.api.v1.build_sessions.deps import (
     session_manager_dependency,
 )
 from src.config import settings
+from src.db.models.audit import AuditLog
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.db.models.project import Project
+from src.db.models.user import User
+from src.db.session import get_db
 from src.services.build_sessions import SessionManager
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.manager import shr_name_for
+from src.services.directory import client as directory_client
 from src.services.projects.shares import revoke_share
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import accessor as storage_accessor
@@ -217,6 +223,284 @@ async def test_re_sharing_is_idempotent_over_http(client, db_session, bind_store
 
     shares = await client.get(f"/v1/projects/{project_id}/shares", headers=headers)
     assert len(shares.json()["shares"]) == 1
+
+
+# --- POST /{project_id}:share with a directory pick ------------------------------
+
+
+@pytest.fixture
+def request_sessions(app, db_session) -> None:
+    """Each request gets its own savepoint session, closed uncommitted on a refusal the way
+    `get_db` closes one, so what a refused share wrote is undone here as it is in production."""
+
+    async def _request_session():
+        async with AsyncSession(
+            bind=db_session.bind, expire_on_commit=False, join_transaction_mode="create_savepoint"
+        ) as session:
+            yield session
+
+    app.dependency_overrides[get_db] = _request_session
+
+
+async def _users_keyed_to(db_session, directory_id: uuid.UUID) -> list[User]:
+    rows = await db_session.scalars(select(User).where(User.azure_oid == str(directory_id)))
+    return list(rows.all())
+
+
+async def _audit_trail(db_session, actor_id: uuid.UUID) -> list[tuple[str, str, str | None, dict]]:
+    rows = await db_session.scalars(
+        select(AuditLog).where(AuditLog.actor_id == actor_id).order_by(AuditLog.id)
+    )
+    return [(row.action, row.resource_type, row.resource_id, row.detail) for row in rows]
+
+
+async def test_sharing_with_a_directory_person_creates_them_not_yet_signed_in(
+    client, db_session, bind_store, fake_directory: FakeDirectory
+) -> None:
+    headers, owner = await _auth(db_session)
+    project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
+    directory_id = fake_directory.add_user(
+        "Priya Raman", mail="priya.raman@bial.example", upn="p.raman@bial.example"
+    )
+
+    first = await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=headers,
+        json={"directoryId": str(directory_id)},
+    )
+    again = await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=headers,
+        json={"directoryId": str(directory_id)},
+    )
+
+    assert first.status_code == 200, first.text
+    [created] = await _users_keyed_to(db_session, directory_id)
+    assert (created.email, created.upn, created.display_name, created.has_signed_in) == (
+        "priya.raman@bial.example",
+        "p.raman@bial.example",
+        "Priya Raman",
+        False,
+    )
+    body = first.json()
+    assert body["sharedWithUserId"] == str(created.id)
+    assert body["sharedWithDisplayName"] == "Priya Raman"
+    assert body["sharedWithEmailLocalPart"] == "priya.raman"
+    assert body["signedIn"] is False
+    assert again.status_code == 200
+    assert again.json()["id"] == body["id"]
+    assert len(fake_directory.requests) == 1
+    assert await _audit_trail(db_session, owner.id) == [
+        ("user:directory_create", "user", str(created.id), None),
+        (
+            "project:share_create",
+            "project",
+            project_id,
+            {"sharedWithUserId": str(created.id), "appStatus": "draft"},
+        ),
+    ]
+
+
+async def test_a_sign_in_that_lands_first_keeps_its_own_row(
+    client, db_session, bind_store, fake_directory: FakeDirectory, monkeypatch
+) -> None:
+    headers, owner = await _auth(db_session)
+    project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
+    directory_id = fake_directory.add_user("Priya Raman", mail="priya.raman@bial.example")
+    signed_in: list[User] = []
+
+    async def _sign_in_while_graph_answers(url, params, graph_headers):
+        signed_in.append(
+            await UserFactory.create(
+                db_session,
+                azure_oid=str(directory_id),
+                email="priya@bial.example",
+                display_name="Priya (signed in)",
+                token_version=4,
+            )
+        )
+        return await fake_directory(url, params, graph_headers)
+
+    monkeypatch.setattr(directory_client, "_graph_get", _sign_in_while_graph_answers)
+
+    resp = await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=headers,
+        json={"directoryId": str(directory_id)},
+    )
+
+    assert resp.status_code == 200, resp.text
+    [racer] = signed_in
+    assert resp.json()["sharedWithUserId"] == str(racer.id)
+    assert resp.json()["signedIn"] is True
+    [row] = await _users_keyed_to(db_session, directory_id)
+    await db_session.refresh(row)
+    assert (row.id, row.email, row.display_name, row.token_version, row.has_signed_in) == (
+        racer.id,
+        "priya@bial.example",
+        "Priya (signed in)",
+        4,
+        True,
+    )
+    assert [action for action, *_ in await _audit_trail(db_session, owner.id)] == [
+        "project:share_create"
+    ]
+
+
+async def test_a_directory_pick_already_keyed_to_a_user_asks_no_directory(
+    client, db_session, bind_store, fake_directory: FakeDirectory
+) -> None:
+    headers, owner = await _auth(db_session)
+    project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
+    directory_id = uuid.uuid4()
+    known = await UserFactory.create(db_session, azure_oid=str(directory_id))
+
+    resp = await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=headers,
+        json={"directoryId": str(directory_id)},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["sharedWithUserId"] == str(known.id)
+    assert fake_directory.requests == []
+
+
+async def test_a_refused_directory_share_leaves_no_user_behind(
+    client, db_session, fake_directory: FakeDirectory, request_sessions
+) -> None:
+    headers, owner = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, owner.id)
+    directory_id = fake_directory.add_user()
+
+    resp = await client.post(
+        f"/v1/projects/{project.id}:share",
+        headers=headers,
+        json={"directoryId": str(directory_id)},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "no_saved_snapshot"
+    assert len(fake_directory.requests) == 1
+    assert await _users_keyed_to(db_session, directory_id) == []
+    assert await _audit_trail(db_session, owner.id) == []
+
+
+async def test_a_directory_that_cannot_be_reached_refuses_the_pick_with_a_503(
+    client, db_session, bind_store, fake_directory: FakeDirectory
+) -> None:
+    headers, owner = await _auth(db_session)
+    project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
+    directory_id = fake_directory.add_user()
+    fake_directory.unavailable = True
+
+    resp = await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=headers,
+        json={"directoryId": str(directory_id)},
+    )
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["message"] == (
+        "Couldn't look this person up right now. Try again in a moment."
+    )
+    assert len(fake_directory.requests) == 1
+    assert await _users_keyed_to(db_session, directory_id) == []
+    shares = await client.get(f"/v1/projects/{project_id}/shares", headers=headers)
+    assert shares.json()["shares"] == []
+
+
+@pytest.mark.parametrize("who", ["absent", "guest"])
+async def test_a_directory_pick_nobody_can_be_shared_with_is_a_404(
+    client, db_session, bind_store, fake_directory: FakeDirectory, who: str
+) -> None:
+    headers, owner = await _auth(db_session)
+    project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
+    directory_id = (
+        uuid.uuid4()
+        if who == "absent"
+        else fake_directory.add_user(
+            "Guest Person", mail="guest@partner.example", upn="guest_partner#EXT#@bial.example"
+        )
+    )
+
+    resp = await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=headers,
+        json={"directoryId": str(directory_id)},
+    )
+
+    assert resp.status_code == 404
+    assert resp.json()["error"]["message"] == "That colleague could not be found."
+    assert len(fake_directory.requests) == 1
+    assert await _users_keyed_to(db_session, directory_id) == []
+
+
+_NOT_EXACTLY_ONE = {
+    "type": "value_error",
+    "loc": ["body"],
+    "msg": "Choose exactly one colleague to share with.",
+}
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {"sharedWithUserId": str(uuid.uuid4()), "directoryId": str(uuid.uuid4())},
+            _NOT_EXACTLY_ONE,
+        ),
+        ({}, _NOT_EXACTLY_ONE),
+        ({"directoryId": "not-a-uuid"}, {"type": "uuid_parsing", "loc": ["body", "directoryId"]}),
+    ],
+    ids=["both", "neither", "directory-id-not-a-uuid"],
+)
+async def test_a_share_must_name_exactly_one_valid_colleague(
+    client, db_session, fake_directory: FakeDirectory, payload: dict, expected: dict
+) -> None:
+    headers, owner = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, owner.id)
+
+    resp = await client.post(f"/v1/projects/{project.id}:share", headers=headers, json=payload)
+
+    assert resp.status_code == 422
+    [error] = resp.json()["detail"]
+    assert {key: error[key] for key in expected} == expected
+    assert fake_directory.requests == []
+
+
+async def test_a_directory_pick_on_someone_else_s_project_asks_no_directory(
+    client, db_session, bind_store, fake_directory: FakeDirectory
+) -> None:
+    owner_headers, owner = await _auth(db_session)
+    project_id = await _mint_project_with_snapshot(
+        client, owner_headers, owner, db_session, bind_store
+    )
+    stranger_headers, _ = await _auth(db_session)
+    directory_id = fake_directory.add_user()
+
+    resp = await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=stranger_headers,
+        json={"directoryId": str(directory_id)},
+    )
+
+    assert resp.status_code == 404
+    assert fake_directory.requests == []
+    assert await _users_keyed_to(db_session, directory_id) == []
+
+
+async def test_share_rate_limit_enforced(client, db_session) -> None:
+    headers, _ = await _auth(db_session)
+    body = {"sharedWithUserId": str(uuid.uuid4())}
+    for _ in range(30):
+        resp = await client.post(f"/v1/projects/{uuid.uuid4()}:share", headers=headers, json=body)
+        assert resp.status_code == 404
+    blocked = await client.post(f"/v1/projects/{uuid.uuid4()}:share", headers=headers, json=body)
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["message"] == (
+        "Too many shares. Please wait a moment and try again."
+    )
 
 
 # --- POST /{project_id}:unshare -------------------------------------------------
