@@ -14,7 +14,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { useState } from 'react'
-import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
+import { act, render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, Link, useLocation } from 'react-router-dom'
 import WorkspaceShell from '../WorkspaceShell'
 import NavReveal from '../../layout/NavReveal'
@@ -595,6 +595,19 @@ describe('the Save control', () => {
     expect(screen.queryByTestId('save-spinner')).toBeNull()
     expect(cleanChip.hasAttribute('aria-busy')).toBe(false)
     expect(cleanChip.textContent).toContain('Saved')
+  })
+
+  it('a save past a minute counts in the shared format', () => {
+    vi.useFakeTimers()
+    try {
+      withSave({ dirty: true, saving: true, error: null }, () => {})
+      act(() => {
+        vi.advanceTimersByTime(65_000)
+      })
+      expect(screen.getByTestId('save-project').textContent).toContain('1m 05s')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('★ the spinner wears the class the reduced-motion block covers — the half jsdom cannot check', () => {

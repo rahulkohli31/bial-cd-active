@@ -45,7 +45,7 @@ import {
   DropdownMenuItem,
 } from '../ui/dropdown-menu'
 import { NavMenuButton, useNavReveal } from '../layout/NavReveal'
-import { BusyGlyph, useElapsedSeconds, ELAPSED_AFTER_MS } from '../ui/Waiting'
+import { BusyGlyph, formatElapsed, useElapsedSeconds, ELAPSED_AFTER_MS } from '../ui/Waiting'
 import { usePublishState } from '../../hooks/usePublishState'
 import { chatKindFor } from '../../utils/chatKind'
 import DiscardChangesDialog from './DiscardChangesDialog'
@@ -447,7 +447,7 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
             "Saving…" is what a reader needs; the count is for the eye. */}
         {saving && showElapsed ? (
           <span aria-hidden="true" className="tabular-nums">
-            {elapsed}s
+            {formatElapsed(elapsed)}
           </span>
         ) : null}
       </span>

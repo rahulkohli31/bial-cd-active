@@ -5,10 +5,10 @@
  * against `ActivityAnatomy`'s own bordered-chip container, not the design system's
  * `tool-group` (its proportions don't fit this board); only `useScrollLock` is reused.
  *
- * A group always renders COLLAPSED, even while running — pressing it is a glance, not a new
- * resting state: one opened while running re-collapses when the turn ends, but one already
- * sealed when opened stays open until closed by hand. A failure opens the group by itself,
- * but only once terminal — never mid-turn, which would move what the reader is reading.
+ * A group always renders COLLAPSED, failures included: only the reader opens one. Opening a
+ * running group is a glance, not a new resting state — it re-collapses when the turn ends — but
+ * one already sealed when opened stays open until closed by hand. A failure shows on the closed
+ * group, in its edge and its label.
  */
 import {
   ChevronDown,
@@ -192,27 +192,22 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
     }
   }, [group.indices, parts])
 
-  // As a controlled prop with the reader's own toggle winning thereafter. `null` means "the
-  // reader has not decided", which is what lets a failure open the group once WITHOUT overriding a
-  // reader who has already closed it.
-  const [readerOpen, setReaderOpen] = useState<boolean | null>(null)
-  const failOpen = !facts.running && facts.failures > 0
-  const open = readerOpen ?? failOpen
+  const [open, setOpen] = useState(false)
 
   /**
-   * A PEEK INTO A RUNNING GROUP IS TEMPORARY: cleared to `null` (not `false`, so a failed
-   * group still self-opens) when the TURN ends, not when THIS group's steps finish. Arms
+   * A PEEK INTO A RUNNING GROUP IS TEMPORARY: closed again when the TURN ends, not when THIS
+   * group's steps finish. Arms
    * on `facts.running` but fires on `streaming`, not `facts.running` — the inter-tool-call
    * thinking gap reads as settled per group, and firing there snapped an open group shut
    * repeatedly, mid-build. Only a group opened WHILE running self-closes; one already
    * sealed when opened stays open by hand.
    */
   const openedWhileRunning = useRef(false)
-  if (facts.running && readerOpen === true) openedWhileRunning.current = true
+  if (facts.running && open) openedWhileRunning.current = true
   useEffect(() => {
     if (streaming || !openedWhileRunning.current) return
     openedWhileRunning.current = false
-    setReaderOpen(null)
+    setOpen(false)
   }, [streaming])
 
   // Expanding must not throw the reader somewhere else. The library's own lock is what the
@@ -249,8 +244,8 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
 
   // THE FAILURE TINT, from `ActivityAnatomy` panel 4 — its own container colours rather than the
   // status pills', because this sits quietly in a transcript and still has to be unmistakable.
-  // It follows the same predicate as the fail-open: terminal, and with something to report.
-  const problem = failOpen
+  // Terminal, and with something to report.
+  const problem = !facts.running && facts.failures > 0
 
   return (
     // `my-3` IS THE BOARD'S SPACING between a paragraph and the group that follows it. It was
@@ -271,7 +266,7 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
           onClick={() => {
             // BEFORE the state change, so the lock is in place for the height change it causes.
             lockScroll()
-            setReaderOpen(!open)
+            setOpen(!open)
           }}
           aria-expanded={open}
           data-testid="activity-group-trigger"

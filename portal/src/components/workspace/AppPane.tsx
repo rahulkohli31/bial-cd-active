@@ -28,6 +28,7 @@ import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
 import { inertWhile, usePaneLeaving } from './paneExit'
 import StarterStage from './StarterStage'
 import StartAppControl from './StartAppControl'
+import { formatElapsed } from '../ui/Waiting'
 import type { DeviceName } from './devices'
 import { WORKSPACE_RAIL_ID } from './railId'
 import {
@@ -401,13 +402,6 @@ function ElapsedSinceTheWaitBegan({ since }: { since: number | null }) {
  *  cannot come from two different clamps. */
 function secondsSpentSince(since: number | null): number {
   return Math.floor(msSpentSince(since, Date.now()) / 1_000)
-}
-
-/** `0s`, `45s`, `1m 05s`. Seconds stay two-digit past the minute so the line does not jitter. */
-function formatElapsed(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.floor(seconds / 60)
-  return `${minutes}m ${String(seconds % 60).padStart(2, '0')}s`
 }
 
 /**

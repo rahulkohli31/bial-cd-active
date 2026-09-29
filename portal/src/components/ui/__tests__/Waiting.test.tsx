@@ -173,3 +173,16 @@ describe('WaitingLine — a wait that outlives its own element', () => {
     expect(screen.getByTestId('waiting-elapsed').textContent).toBe('6s')
   })
 })
+
+describe('WaitingLine — one elapsed format everywhere', () => {
+  it.each([
+    [59, '59s'],
+    [60, '1m 00s'],
+    [338, '5m 38s'],
+  ])('★ at %i seconds reads "%s"', (seconds, reads) => {
+    // Mutation check: print raw seconds again and the last two rows go red.
+    vi.useFakeTimers()
+    render(<WaitingLine label="Working on your app" since={Date.now() - seconds * 1_000} />)
+    expect(screen.getByTestId('waiting-elapsed').textContent).toBe(reads)
+  })
+})
