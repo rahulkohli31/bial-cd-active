@@ -415,6 +415,7 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
   const elapsed = useElapsedSeconds(saving)
   const showElapsed = elapsed * 1000 >= ELAPSED_AFTER_MS
   if (dirty === null) return null
+  const refused = saving || discarding || replying || dirty === false
 
   const look = dirty
     ? 'border-primary bg-canvas-savedirty text-primary font-bold'
@@ -471,7 +472,7 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
           type="button"
           data-testid="save-project"
           // `aria-disabled`, NEVER `disabled`: a disabled control throws focus to the document body.
-          aria-disabled={saving || discarding || replying || dirty === false}
+          aria-disabled={refused}
           title={replying ? BUILD_RUNNING : undefined}
           // THE THIRD REGISTER, and a silent one: `aria-busy` is what a reader consults when asked
           // rather than something it speaks, so it costs the wait's sentence nothing. `undefined`
@@ -479,7 +480,7 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
           // that is not waiting, which is a state where the honest answer is no answer.
           aria-busy={saving || undefined}
           onClick={() => {
-            if (saving || discarding || replying || dirty === false) return
+            if (refused) return
             readActions().save?.()
           }}
           className={`${shell} transition ${saving ? 'opacity-70' : replying ? 'cursor-not-allowed opacity-50' : ''}`}

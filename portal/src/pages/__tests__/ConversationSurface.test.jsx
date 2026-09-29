@@ -577,7 +577,7 @@ describe('★ the red banner clears itself and can be dismissed', () => {
   const RUNNING = { type: 'snapshot', seq: 1, turnId: 'turn-7', turnStatus: 'running', items: [], parts: [], working: false }
 
   /** A Save pressed just before a send, refused once the build is running — the one way a Save
-   *  refusal still reaches this chat now that Save is greyed during a build. */
+   *  refusal reaches this chat, since Save is greyed during a build. */
   async function saveRefusedDuringABuild() {
     h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
     let refuse = () => {}

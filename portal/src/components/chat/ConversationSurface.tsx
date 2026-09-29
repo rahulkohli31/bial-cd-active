@@ -19,7 +19,6 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo, type FC } from 'react'
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
-import { X } from 'lucide-react'
 import Announcer, { useActivityAnnouncement } from './Announcer'
 import ChatThread from './ChatThread'
 import ChatRuntimeProvider from './runtime/ChatRuntimeProvider'
@@ -69,6 +68,7 @@ import { useDropTransientQuery } from '../../hooks/useDropTransientQuery'
 import type { PendingAttachment } from '../../utils/attachmentInput'
 import type { ChatKind } from '../../pages/ChatRoute'
 import PlanChatWorkspaceLine from '../workspace/PlanChatWorkspaceLine'
+import { DismissButton } from '../ui/DismissButton'
 import { chatKindFor } from '../../utils/chatKind'
 import { startTurn, readTurnStream, buildFromPlan, stopTurn, TurnStartError } from '../../utils/turnStreamApi'
 import { isKnownFrame } from '../../utils/turnStreamApi'
@@ -326,15 +326,16 @@ function appendText(sink: TurnSink, text: string, newBlock: boolean): void {
   sink.parts.push({ kind: 'text', text })
 }
 
-/** Record a step at its position, or replace the one already there.
+/** Record a step at its position, or replace the one already there; `true` when it is new.
  *
  * The `finished` frame carries the same tool-call id as its `started` one and REPLACES it in
  * place: appending would stack a spinner beside its own result, and the activity group's live
  * count would climb while the same step re-rendered. */
-function putStep(sink: TurnSink, toolCallId: string, step: StepItem): void {
+function putStep(sink: TurnSink, toolCallId: string, step: StepItem): boolean {
   const at = sink.parts.findIndex((part) => part.kind === 'step' && part.toolCallId === toolCallId)
   if (at === -1) sink.parts.push({ kind: 'step', toolCallId, step })
   else sink.parts[at] = { kind: 'step', toolCallId, step }
+  return at === -1
 }
 
 export default function ConversationSurface({ chatId: chatIdProp, kind, projectId = null, project = null, onProjectUpdate, projectHasSavedBuild = null, onTitleDerived }: ConversationSurfaceProps) {
@@ -1133,8 +1134,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         //
         // A step this turn has not seen means a model call has just been billed, so the counter can
         // move. A long step is re-sent under its own id every few seconds and does not count.
-        const newStep = !sink.parts.some((part) => part.kind === 'step' && part.toolCallId === frame.toolCallId)
-        putStep(sink, frame.toolCallId, frame.item)
+        const newStep = putStep(sink, frame.toolCallId, frame.item)
         if (newStep && sink.terminal === null) usageRefresh.step()
         setTurnSteps((prev) => ({ ...prev, [frame.toolCallId]: frame.item }))
         // The transcript is what draws activity now, so a step has to reach the message it
@@ -2591,17 +2591,17 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     return conversationId && turnId ? { conversationId, turnId } : null
   }, [])
 
+  const handleStopTurn = useCallback((conversationId: string, turnId: string) => {
+    setUrgent(null)
+    return stopTurn(conversationId, turnId)
+  }, [])
+
   /**
    * The thread's own cancel, which is what registers the runtime's `cancel` capability.
    *
    * It shares `stopTarget` with the composer's control rather than deriving a second one: two
    * paths to one stop is two chances to stop a different turn from the one on screen.
    */
-  const handleStopTurn = useCallback((conversationId: string, turnId: string) => {
-    setUrgent(null)
-    return stopTurn(conversationId, turnId)
-  }, [])
-
   const handleCancel = useCallback(async () => {
     const target = stopTarget()
     if (target) await stopTurn(target.conversationId, target.turnId)
@@ -2758,14 +2758,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
                 className="mx-3 mb-1 flex items-start gap-1.5 rounded-lg border border-danger/20 bg-danger/5 py-1.5 ps-2.5 pe-1 text-[11px] text-danger"
               >
                 <span className="min-w-0 flex-1">{urgentText}</span>
-                <button
-                  type="button"
-                  aria-label="Dismiss"
-                  onClick={dismissUrgent}
-                  className="-my-1 inline-flex h-6 w-6 flex-shrink-0 items-center justify-center rounded text-danger/70 transition hover:bg-danger/10 hover:text-danger"
-                >
-                  <X size={12} />
-                </button>
+                <DismissButton onDismiss={dismissUrgent} />
               </div>
             ) : null}
           </div>

@@ -196,10 +196,9 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
 
   /**
    * A PEEK INTO A RUNNING GROUP IS TEMPORARY: closed again when the TURN ends, not when THIS
-   * group's steps finish. Arms
-   * on `facts.running` but fires on `streaming`, not `facts.running` — the inter-tool-call
-   * thinking gap reads as settled per group, and firing there snapped an open group shut
-   * repeatedly, mid-build. Only a group opened WHILE running self-closes; one already
+   * group's steps finish. Arms on `facts.running` but fires on `streaming` — the
+   * inter-tool-call thinking gap reads as settled per group, and firing there snapped an open
+   * group shut repeatedly, mid-build. Only a group opened WHILE running self-closes; one already
    * sealed when opened stays open by hand.
    */
   const openedWhileRunning = useRef(false)
@@ -244,7 +243,6 @@ const ActivityGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({ grou
 
   // THE FAILURE TINT, from `ActivityAnatomy` panel 4 — its own container colours rather than the
   // status pills', because this sits quietly in a transcript and still has to be unmistakable.
-  // Terminal, and with something to report.
   const problem = !facts.running && facts.failures > 0
 
   return (

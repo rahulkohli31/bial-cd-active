@@ -1,7 +1,6 @@
 /**
- * The counter now refreshes many times per build, so two things that were harmless once per build
- * are guarded here: a failed refresh must not blank the ring, and a slow answer must not land over
- * a newer one.
+ * The counter refreshes as a build's steps land, so a failed refresh must not blank the ring and a
+ * slow answer must not land over a newer one.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'

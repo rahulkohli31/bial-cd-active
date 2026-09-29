@@ -12,13 +12,13 @@
  */
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { X } from 'lucide-react'
 import { AssistantRuntimeProvider, useExternalStoreRuntime } from '@assistant-ui/react'
 import { ToggleGroup, ToggleGroupItem } from '../ui/toggle-group'
 import { uuidv7 } from '../../utils/conversationApi'
 import { chatKindFor } from '../../utils/chatKind'
 import { useWorkspaceReport } from './workspaceChannel'
 import Composer from '../chat/Composer'
+import { DismissButton } from '../ui/DismissButton'
 import { type ComposerSubmission } from '../chat/ComposerBox'
 import { convertMessage } from '../chat/runtime/convertMessage'
 import type { ChatMessage } from '../../utils/messageTypes'
@@ -230,17 +230,12 @@ function RailComposerBody({ projectId }: RailComposerProps) {
       {urgent && (
         <div role="alert" className="mt-1.5 flex items-start gap-1.5 text-[11.5px] text-danger">
           <p className="min-w-0 flex-1">{urgent}</p>
-          <button
-            type="button"
-            aria-label="Dismiss"
-            onClick={() => {
+          <DismissButton
+            onDismiss={() => {
               setUrgent(null)
               rootRef.current?.querySelector('textarea')?.focus()
             }}
-            className="-my-1 inline-flex h-6 w-6 flex-shrink-0 items-center justify-center rounded text-danger/70 transition hover:bg-danger/10 hover:text-danger"
-          >
-            <X size={12} />
-          </button>
+          />
         </div>
       )}
     </div>
