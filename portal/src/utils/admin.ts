@@ -44,6 +44,8 @@ export interface UserLimitsOut {
   displayName: string | null
   role: 'citizen' | 'super_admin'
   suspendedAt: string | null
+  /** Whether they have ever signed in: false for someone added so a project could be shared with them. */
+  signedIn: boolean
   usageToday: number
   limits: LimitFields
   effectiveLimits: LimitFields

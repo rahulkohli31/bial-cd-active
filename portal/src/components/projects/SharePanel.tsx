@@ -19,6 +19,7 @@ import { Dialog, DialogContent, DialogTitle } from '../ui/dialog'
 import { BusyGlyph } from '../ui/Waiting'
 import { ApiError } from '../../utils/apiError'
 import {
+  colleagueKey,
   listProjectShares,
   searchColleagues,
   shareProject,
@@ -29,6 +30,7 @@ import {
 
 const MIN_QUERY_CHARS = 3
 const DEBOUNCE_MS = 300
+const NOT_SIGNED_IN_HINT = "They'll see it the first time they sign in."
 
 export interface SharePanelBodyProps {
   projectId: string
@@ -42,6 +44,15 @@ export interface SharePanelProps extends SharePanelBodyProps {
 
 function errorMessage(err: unknown, fallback: string): string {
   return err instanceof Error ? err.message : fallback
+}
+
+function PersonName({ name, signedIn }: { name: string; signedIn: boolean }): React.JSX.Element {
+  return (
+    <p className="flex items-baseline gap-1.5 min-w-0 text-sm text-tertiary">
+      <span className="min-w-0 truncate">{name}</span>
+      {!signedIn && <span className="flex-shrink-0 text-[11px] text-neutral">Not signed in yet</span>}
+    </p>
+  )
 }
 
 /**
@@ -65,9 +76,10 @@ export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.El
   // so a colleague search never puts backend prose on screen.
   const [searchNotice, setSearchNotice] = useState<string | null>(null)
 
-  const [sharingId, setSharingId] = useState<string | null>(null)
+  const [sharingKey, setSharingKey] = useState<string | null>(null)
   const [revokingId, setRevokingId] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [shareHint, setShareHint] = useState<string | null>(null)
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const requestIdRef = useRef(0)
@@ -101,6 +113,7 @@ export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.El
 
   function onQueryChange(next: string): void {
     setQuery(next)
+    setShareHint(null)
     if (debounceRef.current !== null) clearTimeout(debounceRef.current)
     const trimmed = next.trim()
     // STATE 1 OF 4: below the minimum. Said plainly rather than left silent — a box that
@@ -141,20 +154,24 @@ export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.El
   }
 
   function onShare(colleague: Colleague): void {
-    setSharingId(colleague.id)
+    const key = colleagueKey(colleague)
+    setSharingKey(key)
     setActionError(null)
-    shareProject(projectId, colleague.id)
-      .then(() => {
+    setShareHint(null)
+    shareProject(projectId, colleague)
+      .then((share) => {
         loadShares()
-        setResults((prev) => prev.filter((c) => c.id !== colleague.id))
+        setResults((prev) => prev.filter((c) => colleagueKey(c) !== key))
+        setShareHint(share.signedIn ? null : NOT_SIGNED_IN_HINT)
       })
       .catch((err: unknown) => setActionError(errorMessage(err, 'Could not share this application.')))
-      .finally(() => setSharingId(null))
+      .finally(() => setSharingKey((current) => (current === key ? null : current)))
   }
 
   function onRevoke(share: ProjectShare): void {
     setRevokingId(share.sharedWithUserId)
     setActionError(null)
+    setShareHint(null)
     unshareProject(projectId, share.sharedWithUserId)
       .then(() => setShares((prev) => prev.filter((s) => s.id !== share.id)))
       .catch((err: unknown) => setActionError(errorMessage(err, 'Could not revoke this share.')))
@@ -174,9 +191,10 @@ export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.El
         />
       </label>
 
-      {/* THE ONE REGION FOR ALL FOUR NAMED STATES (R28) — mounted unconditionally so a
-          reader hears each one land, matching the wait-region convention `ProjectsPage`
-          already establishes for this codebase. */}
+      {/* THE ONE REGION FOR ALL FOUR NAMED STATES (R28), and the hint after sharing with someone
+          who has not signed in — mounted unconditionally so a reader hears each one land,
+          matching the wait-region convention `ProjectsPage` already establishes for this
+          codebase. */}
       <div role="status" aria-live="polite" data-testid="colleague-search-status" className="mt-2 min-h-[1.125rem]">
         {searching ? (
           <p className="text-xs text-neutral flex items-center gap-1.5">
@@ -184,23 +202,27 @@ export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.El
           </p>
         ) : searchNotice ? (
           <p className="text-xs text-neutral">{searchNotice}</p>
+        ) : shareHint ? (
+          <p className="text-xs text-neutral">{shareHint}</p>
         ) : null}
       </div>
 
       {results.length > 0 && (
         <ul className="mt-1 flex flex-col gap-0.5 max-h-40 overflow-y-auto">
           {results.map((colleague) => {
-            const alreadyShared = sharedIds.has(colleague.id)
-            const busy = sharingId === colleague.id
+            const key = colleagueKey(colleague)
+            const alreadyShared = sharedIds.has(key)
+            const busy = sharingKey === key
             return (
               <li
-                key={colleague.id}
+                key={key}
                 className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg hover:bg-bial-bg"
               >
                 <div className="min-w-0">
-                  <p className="text-sm text-tertiary truncate">
-                    {colleague.displayName || colleague.emailLocalPart}
-                  </p>
+                  <PersonName
+                    name={colleague.displayName || colleague.emailLocalPart}
+                    signedIn={colleague.signedIn}
+                  />
                   <p className="text-[11px] text-neutral truncate">{colleague.emailLocalPart}</p>
                 </div>
                 <button
@@ -245,9 +267,10 @@ export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.El
                   className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg hover:bg-bial-bg"
                 >
                   <div className="min-w-0">
-                    <p className="text-sm text-tertiary truncate">
-                      {share.sharedWithDisplayName || share.sharedWithEmailLocalPart}
-                    </p>
+                    <PersonName
+                      name={share.sharedWithDisplayName || share.sharedWithEmailLocalPart}
+                      signedIn={share.signedIn}
+                    />
                     {/* "Can use", never "view only" (R6, Key Decision 3). */}
                     <p className="text-[11px] text-neutral truncate">Can use</p>
                   </div>

@@ -11,22 +11,45 @@ import { DEFAULT_PAGE_SIZE } from './projectApi'
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
-/** One colleague search hit — display name AND the email local part only, never a full
- *  address (`GET /colleagues` never returns one, by the same rule `MarketplacePage`'s
- *  "Built by X" follows: enough to tell two colleagues apart, not a directory). */
-export interface Colleague {
-  id: string
+interface ColleagueFields {
   displayName: string | null
   emailLocalPart: string
+  signedIn: boolean
 }
 
+/** One colleague search hit — display name AND the email local part only, never a full
+ *  address (`GET /colleagues` never returns one, by the same rule `MarketplacePage`'s
+ *  "Built by X" follows: enough to tell two colleagues apart, not a directory). A `user` hit
+ *  has a user here; a `directory` hit was found only in the organisation's directory and
+ *  carries its directory id instead. */
+export type Colleague =
+  | (ColleagueFields & { kind: 'user'; id: string })
+  | (ColleagueFields & { kind: 'directory'; directoryId: string })
+
+/** The one id that names a hit, whichever kind it is. */
+export function colleagueKey(colleague: Colleague): string {
+  return colleague.kind === 'user' ? colleague.id : colleague.directoryId
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value !== ''
+}
+
+/** Exactly one of `id` and `directoryId`, or the row is dropped: a hit with both could be shared
+ *  by the wrong one. */
 function toColleague(value: unknown): Colleague | null {
-  if (!isRecord(value) || typeof value.id !== 'string' || value.id === '') return null
-  return {
-    id: value.id,
+  if (!isRecord(value)) return null
+  const fields: ColleagueFields = {
     displayName: optionalString(value.displayName),
     emailLocalPart: typeof value.emailLocalPart === 'string' ? value.emailLocalPart : '',
+    // Absent reads as signed in: "Not signed in yet" shows only on the server's word.
+    signedIn: value.signedIn !== false,
   }
+  if (nonEmptyString(value.id) && value.directoryId == null) return { kind: 'user', id: value.id, ...fields }
+  if (nonEmptyString(value.directoryId) && value.id == null) {
+    return { kind: 'directory', directoryId: value.directoryId, ...fields }
+  }
+  return null
 }
 
 /**
@@ -54,6 +77,8 @@ export interface ProjectShare {
   sharedWithUserId: string
   sharedWithDisplayName: string | null
   sharedWithEmailLocalPart: string
+  /** Whether they have ever signed in, not whether they are signed in now. */
+  signedIn: boolean
   createdAt: string
 }
 
@@ -65,6 +90,7 @@ function toProjectShare(value: unknown): ProjectShare | null {
     sharedWithDisplayName: optionalString(value.sharedWithDisplayName),
     sharedWithEmailLocalPart:
       typeof value.sharedWithEmailLocalPart === 'string' ? value.sharedWithEmailLocalPart : '',
+    signedIn: value.signedIn !== false,
     createdAt: typeof value.createdAt === 'string' ? value.createdAt : '',
   }
 }
@@ -87,16 +113,19 @@ export async function listProjectShares(
     : []
 }
 
-/** Share a project with a colleague. Idempotent — sharing with the same colleague twice
- *  returns the same row rather than erroring. */
+/** Share a project with a colleague from a search. Idempotent — sharing with the same colleague
+ *  twice returns the same row rather than erroring. A directory hit is sent by its directory id
+ *  alone; the server creates their user and returns it in the row. */
 export async function shareProject(
   projectId: string,
-  sharedWithUserId: string,
+  colleague: Colleague,
   deps: AuthFetchDeps = {},
 ): Promise<ProjectShare> {
+  const body =
+    colleague.kind === 'user' ? { sharedWithUserId: colleague.id } : { directoryId: colleague.directoryId }
   const res = await authFetch(
     `/api/projects/${encodeURIComponent(projectId)}:share`,
-    { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ sharedWithUserId }) },
+    { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) },
     deps,
   )
   if (!res.ok) throw await readApiError(res, 'Failed to share this application')
