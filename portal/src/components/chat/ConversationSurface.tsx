@@ -580,9 +580,9 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       // own sentence when it has one — the 409 already names the way out.
       if (projectIdRef.current === activeProjectId) {
         setUrgent(err instanceof Error ? err.message : SAVE_DID_NOT_LAND)
-        // Same fail-toward-warning as the failed check above: a Save that threw leaves this
-        // surface unable to say what the container holds.
-        setSaveDirty(null)
+        // Save was pressable, so the state is dirty and stays so while it is read again. Only a
+        // failed re-read makes it unknown, which hides Save and Discard; nothing here says clean.
+        void refreshSaveState(activeProjectId)
       }
     } finally {
       setSaving(false)

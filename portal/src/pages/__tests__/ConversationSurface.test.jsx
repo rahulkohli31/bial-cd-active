@@ -56,6 +56,7 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
 import {
   primeTurn, renderBuilder, send, waitForGateOpen,
   planReply, turnStreaming, PLAN_CARD_ID, findStartAppControl,
+  scriptBuildTurn, T_BUILD_END,
 } from './_builderSession.jsx'
 import { ApiError } from '../../utils/apiError'
 import { discardNoticeText } from '../../utils/conversationApi'
@@ -478,16 +479,76 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
     expect(screen.queryByText(/you discarded the unsaved changes/i)).toBeNull()
   })
 
-  it('a Discard waits while this chat is replying', async () => {
-    // Mutation check: publish `replying: false` from this page and the control stays pressable.
+  it('Save and Discard both wait while this chat is building', async () => {
+    // Mutation check: publish `replying: false` from this page and both controls stay pressable.
     h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
     h.readTurnStream.mockImplementation(() => new Promise(() => {}))
     renderBuilder()
     await send('add a date filter')
 
     const control = await screen.findByTestId('discard-changes')
-    await waitFor(() => expect(control.getAttribute('title')).toBe('Wait for the reply to finish'))
+    await waitFor(() => expect(control.getAttribute('title')).toBe('Wait for the build to finish'))
     expect(control.getAttribute('aria-disabled')).toBe('true')
+    const save = screen.getByTestId('save-project')
+    expect(save.getAttribute('title')).toBe('Wait for the build to finish')
+    expect(save.getAttribute('aria-disabled')).toBe('true')
+    fireEvent.click(save)
+    expect(h.saveProject).not.toHaveBeenCalled()
+  })
+
+  it('★ Stop brings Save and Discard back, showing the work the stopped build left', async () => {
+    // Mutation check: drop `settleSaveState()` from `endGenerating` and the extra read never happens.
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
+    const turn = scriptBuildTurn({
+      hold: true,
+      opening: [{ type: 'snapshot', seq: 1, turnId: 'turn-7', turnStatus: 'running', items: [], parts: [], working: false }],
+    })
+    h.readTurnStream.mockImplementation(turn.impl)
+    renderBuilder()
+    await send('add a date filter')
+
+    await waitFor(() => expect(screen.getByTestId('save-project').getAttribute('aria-disabled')).toBe('true'))
+    expect(screen.getByTestId('discard-changes').getAttribute('aria-disabled')).toBe('true')
+    const readsBefore = h.fetchSaveState.mock.calls.length
+
+    fireEvent.click(screen.getByTestId('stop-turn'))
+    await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith('build-X', 'turn-7'))
+    await turn.frame(T_BUILD_END({ status: 'stopped', turnId: 'turn-7' }))
+    await turn.end()
+
+    await waitFor(() => expect(screen.getByTestId('save-project').getAttribute('aria-disabled')).toBe('false'))
+    expect(screen.getByTestId('save-project').textContent).toContain('Save')
+    expect(screen.getByTestId('discard-changes').getAttribute('aria-disabled')).toBe('false')
+    expect(h.fetchSaveState).toHaveBeenCalledTimes(readsBefore + 1)
+  })
+
+  it.each([
+    ['refused by the server', new ApiError('Wait for the reply to finish, then save.', 409)],
+    ['lost on the network', new TypeError('Failed to fetch')],
+  ])('★ a Save %s keeps Save and Discard, and reads the state again', async (_, failure) => {
+    // Mutation check: set the state to unknown in `handleSave`'s catch and both controls vanish.
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
+    h.saveProject.mockRejectedValue(failure)
+    renderBuilder()
+    fireEvent.click(await screen.findByTestId('save-project'))
+
+    expect((await screen.findByTestId('urgent-banner')).textContent).toContain(failure.message)
+    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalledTimes(2))
+    expect(screen.getByTestId('save-project').textContent).toContain('Save')
+    expect(screen.getByTestId('discard-changes')).toBeTruthy()
+  })
+
+  it('a failed Save whose re-read fails too leaves the state unknown, never clean', async () => {
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
+    h.saveProject.mockRejectedValue(new ApiError('Could not save your work', 503))
+    renderBuilder()
+    fireEvent.click(await screen.findByTestId('save-project'))
+
+    h.fetchSaveState.mockRejectedValue(new Error('the read failed'))
+    await screen.findByTestId('urgent-banner')
+    await waitFor(() => expect(screen.queryByTestId('save-project')).toBeNull())
+    expect(screen.queryByText('Saved')).toBeNull()
+    expect(screen.getByTestId('composer-input')).toBeTruthy()
   })
 
   it('a page that opens on a running workspace reads it once', async () => {
