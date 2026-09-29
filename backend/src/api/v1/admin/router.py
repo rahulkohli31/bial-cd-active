@@ -1723,6 +1723,7 @@ async def list_users(
             display_name=user.display_name,
             role=role_for(user, settings.superadmin_emails),
             suspended_at=user.suspended_at,
+            signed_in=user.has_signed_in,
             usage_today=used_today.get(user.id, 0),
             review_usage_today=review_today.get(user.id, 0),
             limits=_raw_limits(overrides.get(user.id)),

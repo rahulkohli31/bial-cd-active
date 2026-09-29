@@ -491,6 +491,8 @@ class UserLimitsOut(CamelModel):
     # Local suspension marker: null = active. Surfaced so the roster shows
     # who is blocked without a per-user read.
     suspended_at: datetime | None
+    # Ever signed in, not signed in now.
+    signed_in: bool
     # Today's folded BUILD token spend (all four classes, IST day) — the figure the
     # daily cap actually measures, via the same shared expression the gate reads.
     # One page-wide aggregate feeds this, never a per-row query.

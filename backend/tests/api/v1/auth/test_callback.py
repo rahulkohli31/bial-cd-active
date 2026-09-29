@@ -10,17 +10,20 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 import pytest
 from authlib.integrations.starlette_client import OAuthError
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
 from src.config import settings
 from src.db.models.refresh_token import RefreshToken
 from src.db.models.user import User
+from src.db.session import get_db
 from src.services.auth.cookies import csrf_cookie_name, refresh_cookie_name, session_cookie_name
 from src.services.auth.oidc import get_oauth
 from src.services.auth.refresh import hash_refresh_token
@@ -201,6 +204,7 @@ async def test_first_signin_provisions_user_and_sets_cookies(client, db_session)
     assert user.email == "citizen@rvaiglobal.com"
     assert user.upn == "citizen@rvaiglobal.com"
     assert user.token_version == 0
+    assert user.has_signed_in is True
 
     token_count = await db_session.scalar(
         select(func.count()).select_from(RefreshToken).where(RefreshToken.user_id == user.id)
@@ -227,6 +231,64 @@ async def test_returning_signin_updates_profile_preserves_token_version(
     await db_session.refresh(existing)
     assert existing.email == "new@rvaiglobal.com"
     assert existing.token_version == 5  # revocation state preserved
+
+
+async def test_a_first_sign_in_lands_on_the_row_created_from_the_directory(
+    client, db_session
+) -> None:
+    pre_created = await UserFactory.create(
+        db_session,
+        azure_oid="pre-created-oid",
+        email="from.directory@rvaiglobal.com",
+        display_name="From Directory",
+        token_version=2,
+        has_signed_in=False,
+    )
+    pre_created_id = pre_created.id
+
+    resp = await sign_in(
+        client, oid="pre-created-oid", email="signed.in@rvaiglobal.com", name="Signed In"
+    )
+
+    assert resp.headers["location"] == settings.FRONTEND_URL
+    rows = (
+        await db_session.scalars(select(User).where(User.azure_oid == "pre-created-oid"))
+    ).all()
+    assert len(rows) == 1
+    await db_session.refresh(rows[0])
+    assert rows[0].id == pre_created_id
+    assert rows[0].token_version == 2
+    assert rows[0].email == "signed.in@rvaiglobal.com"
+    assert rows[0].display_name == "Signed In"
+    assert rows[0].has_signed_in is True
+
+
+async def test_a_suspended_pre_created_user_is_refused_and_stays_not_signed_in(
+    app, client, db_session
+) -> None:
+    """Each request gets its own savepoint session, closed uncommitted the way `get_db` closes
+    one, so the refused sign-in's upsert is undone here as it is in production."""
+    pre_created = await UserFactory.create(
+        db_session,
+        azure_oid="suspended-pre-created-oid",
+        email="from.directory@rvaiglobal.com",
+        has_signed_in=False,
+        suspended_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+
+    async def _request_session():
+        async with AsyncSession(
+            bind=db_session.bind, expire_on_commit=False, join_transaction_mode="create_savepoint"
+        ) as session:
+            yield session
+
+    app.dependency_overrides[get_db] = _request_session
+    resp = await sign_in(client, oid="suspended-pre-created-oid", email="signed.in@rvaiglobal.com")
+
+    _assert_login_error(resp, "account_suspended")
+    await db_session.refresh(pre_created)
+    assert pre_created.has_signed_in is False
+    assert pre_created.email == "from.directory@rvaiglobal.com"
 
 
 # --- the ID token, fail-closed ----------------------------------------------------------------

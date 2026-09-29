@@ -42,12 +42,14 @@ class ShareResponse(CamelModel):
     """One row of a project's OWN share panel (R12) — who it is shared with, and when.
     Carries the SAME display-name/email-local-part pair `ColleagueResult` does: the owner
     reads this list to decide who to revoke, and needs to disambiguate the same way the
-    search that created the share did."""
+    search that created the share did. `signed_in` says whether the colleague has ever signed
+    in, not whether they are signed in now."""
 
     id: uuid.UUID
     shared_with_user_id: uuid.UUID
     shared_with_display_name: str | None
     shared_with_email_local_part: str
+    signed_in: bool
     created_at: datetime
 
 

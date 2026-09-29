@@ -50,6 +50,7 @@ async def test_envelope_shape(client, db_session) -> None:
     row = body["users"][0]
     assert {
         "suspendedAt",
+        "signedIn",
         "usageToday",
         "reviewUsageToday",
         "limits",
@@ -296,3 +297,13 @@ async def test_suspended_at_is_surfaced(client, db_session) -> None:
     by_email = {u["email"]: u for u in body["users"]}
     assert by_email["frozen@rvaiglobal.com"]["suspendedAt"] == "2026-07-09T06:00:00Z"
     assert by_email["admin@bial.com"]["suspendedAt"] is None
+
+
+async def test_the_roster_says_who_has_never_signed_in(client, db_session) -> None:
+    await UserFactory.create(db_session, email="pre.created@rvaiglobal.com", has_signed_in=False)
+    headers = await _admin(db_session)
+
+    body = await _roster(client, headers)
+    by_email = {u["email"]: u for u in body["users"]}
+    assert by_email["pre.created@rvaiglobal.com"]["signedIn"] is False
+    assert by_email["admin@bial.com"]["signedIn"] is True

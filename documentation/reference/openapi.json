@@ -4304,7 +4304,7 @@
         "type": "object"
       },
       "ShareResponse": {
-        "description": "One row of a project's OWN share panel (R12) — who it is shared with, and when.\nCarries the SAME display-name/email-local-part pair `ColleagueResult` does: the owner\nreads this list to decide who to revoke, and needs to disambiguate the same way the\nsearch that created the share did.",
+        "description": "One row of a project's OWN share panel (R12) — who it is shared with, and when.\nCarries the SAME display-name/email-local-part pair `ColleagueResult` does: the owner\nreads this list to decide who to revoke, and needs to disambiguate the same way the\nsearch that created the share did. `signed_in` says whether the colleague has ever signed\nin, not whether they are signed in now.",
         "properties": {
           "createdAt": {
             "format": "date-time",
@@ -4335,6 +4335,10 @@
             "format": "uuid",
             "title": "Sharedwithuserid",
             "type": "string"
+          },
+          "signedIn": {
+            "title": "Signedin",
+            "type": "boolean"
           }
         },
         "required": [
@@ -4342,6 +4346,7 @@
           "sharedWithUserId",
           "sharedWithDisplayName",
           "sharedWithEmailLocalPart",
+          "signedIn",
           "createdAt"
         ],
         "title": "ShareResponse",
@@ -4994,6 +4999,10 @@
             "title": "Role",
             "type": "string"
           },
+          "signedIn": {
+            "title": "Signedin",
+            "type": "boolean"
+          },
           "suspendedAt": {
             "anyOf": [
               {
@@ -5022,6 +5031,7 @@
           "displayName",
           "role",
           "suspendedAt",
+          "signedIn",
           "usageToday",
           "reviewUsageToday",
           "limits",

@@ -130,6 +130,7 @@ async def test_share_succeeds_and_returns_the_recipient(client, db_session, bind
     assert body["sharedWithUserId"] == str(colleague.id)
     assert body["sharedWithDisplayName"] == "Colleague Name"
     assert body["sharedWithEmailLocalPart"] == "colleague"
+    assert body["signedIn"] is True
 
 
 async def test_share_refuses_self_share(client, db_session, bind_store) -> None:
@@ -353,6 +354,28 @@ async def test_list_shares_is_owner_only(client, db_session, bind_store) -> None
     stranger_headers, _ = await _auth(db_session)
     stranger_view = await client.get(f"/v1/projects/{project_id}/shares", headers=stranger_headers)
     assert stranger_view.status_code == 404
+
+
+async def test_the_share_list_says_which_colleagues_have_never_signed_in(
+    client, db_session
+) -> None:
+    owner_headers, owner = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, owner.id)
+    signed_in = await UserFactory.create(db_session, email="signed.in@example.com")
+    never = await UserFactory.create(
+        db_session, email="never.signed.in@example.com", has_signed_in=False
+    )
+    await ProjectShareFactory.create(db_session, project.id, signed_in.id)
+    await ProjectShareFactory.create(db_session, project.id, never.id)
+
+    resp = await client.get(f"/v1/projects/{project.id}/shares", headers=owner_headers)
+
+    assert resp.status_code == 200
+    rows = resp.json()["shares"]
+    assert {row["sharedWithEmailLocalPart"]: row["signedIn"] for row in rows} == {
+        "signed.in": True,
+        "never.signed.in": False,
+    }
 
 
 # --- GET /{project_id} — the one relaxed read (R11) -----------------------------
