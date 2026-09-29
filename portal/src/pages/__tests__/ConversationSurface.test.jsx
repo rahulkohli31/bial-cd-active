@@ -59,7 +59,7 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
 import {
   primeTurn, renderBuilder, send, waitForGateOpen,
   planReply, turnStreaming, PLAN_CARD_ID, findStartAppControl,
-  scriptBuildTurn, T_BUILD_END,
+  scriptBuildTurn, T_BUILD_END, T_STEP,
 } from './_builderSession.jsx'
 import { ApiError } from '../../utils/apiError'
 import { discardNoticeText } from '../../utils/conversationApi'
@@ -670,5 +670,65 @@ describe('★ a Build chat\'s composer says builds take minutes', () => {
       ),
     )
     expect(screen.getAllByTestId('composer-gate-note')).toHaveLength(1)
+  })
+})
+
+describe('★ the token counter moves while a build runs', () => {
+  const refreshes = []
+  const record = () => refreshes.push(Date.now())
+  beforeEach(() => {
+    refreshes.length = 0
+    window.addEventListener('bial:usage-refresh', record)
+  })
+  afterEach(() => {
+    window.removeEventListener('bial:usage-refresh', record)
+    vi.useRealTimers()
+  })
+
+  it('★ a new step asks for a reading, the same step re-sent does not, and the end asks once more', async () => {
+    // Mutation check: count every step frame rather than new ones and the re-sent step reads again.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const turn = scriptBuildTurn({ hold: true })
+    h.readTurnStream.mockImplementation(turn.impl)
+    renderBuilder()
+    await send('add a date filter')
+    await screen.findByTestId('stop-turn')
+    expect(refreshes).toHaveLength(0)
+
+    await turn.frame(T_STEP('Installing packages', { id: 'call-1' }))
+    expect(refreshes).toHaveLength(1)
+
+    // The engine re-sends a long step under its own id; well past the window, it is still not news.
+    await act(async () => vi.advanceTimersByTime(6_000))
+    await turn.frame(T_STEP('Still installing packages…', { id: 'call-1', seq: 3 }))
+    expect(refreshes).toHaveLength(1)
+
+    await turn.frame(T_STEP('Adding the date filter', { id: 'call-2', seq: 4 }))
+    expect(refreshes).toHaveLength(2)
+
+    await turn.frame(T_BUILD_END())
+    await turn.end()
+    await waitFor(() => expect(refreshes).toHaveLength(3))
+  })
+
+  it('a turn the snapshot says has already ended starts no refreshes of its own', async () => {
+    // Mutation check: drop the terminal guard and the replayed step reads the counter again.
+    h.getBuild.mockResolvedValue({
+      id: 'build-X', kind: 'build',
+      messages: [{ id: 'u1', role: 'user', seq: 0, parts: [{ type: 'text', text: 'add a date filter' }] }],
+      activeTurn: { turnId: 't9', lastSeq: 4 },
+    })
+    h.readTurnStream.mockImplementation(async ({ onFrame }) => {
+      onFrame({ type: 'snapshot', seq: 4, turnId: 't9', turnStatus: 'completed', items: [], parts: [], working: false })
+      onFrame(T_STEP('Adding the date filter', { id: 'call-9', seq: 5 }))
+      return 'completed'
+    })
+    renderBuilder()
+
+    await waitFor(() => expect(h.readTurnStream).toHaveBeenCalledWith(expect.objectContaining({ turnId: 't9' })))
+    // The reattach's own end is the one read, and it is the only one.
+    await waitFor(() => expect(refreshes).toHaveLength(1))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(refreshes).toHaveLength(1)
   })
 })

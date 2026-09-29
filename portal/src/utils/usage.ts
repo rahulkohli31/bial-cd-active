@@ -10,12 +10,47 @@
  */
 const USAGE_EVENT = 'bial:usage-refresh'
 
-/** Tell the navbar badge to refetch (after a completed assistant turn). */
+/** Tell every token counter to refetch — after a turn ends, and as a build's steps land. */
 export function notifyUsageChanged(): void {
   try {
     window.dispatchEvent(new CustomEvent(USAGE_EVENT))
   } catch {
     // window/CustomEvent unavailable (SSR/tests) — best-effort only.
+  }
+}
+
+/** The most often a build's steps may refresh the counter. */
+export const STEP_REFRESH_WINDOW_MS = 5_000
+
+/**
+ * Refresh the counter as a build's steps land, at most once per window. A step inside the window
+ * schedules one refresh at its end, so the last step is always read. `cancel` drops that pending
+ * refresh when the build's own final refresh takes over.
+ */
+export function createStepUsageRefresh(windowMs = STEP_REFRESH_WINDOW_MS): {
+  step: () => void
+  cancel: () => void
+} {
+  let quietUntil = 0
+  let trailing: ReturnType<typeof setTimeout> | null = null
+  const refresh = () => {
+    quietUntil = Date.now() + windowMs
+    notifyUsageChanged()
+  }
+  return {
+    step() {
+      const wait = quietUntil - Date.now()
+      if (wait <= 0) refresh()
+      else
+        trailing ??= setTimeout(() => {
+          trailing = null
+          refresh()
+        }, wait)
+    },
+    cancel() {
+      if (trailing !== null) clearTimeout(trailing)
+      trailing = null
+    },
   }
 }
 

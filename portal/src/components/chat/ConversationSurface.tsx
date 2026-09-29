@@ -60,7 +60,7 @@ import {
   usePublishWorkspaceReport,
   useWorkspaceProject,
 } from '../workspace/workspaceChannel'
-import { notifyUsageChanged } from '../../utils/usage'
+import { createStepUsageRefresh, notifyUsageChanged } from '../../utils/usage'
 import { createBuildLock, openBuildLockChannel } from '../../utils/buildLock'
 import type { BuildLock } from '../../utils/buildLock'
 import { useDropTransientQuery } from '../../hooks/useDropTransientQuery'
@@ -376,6 +376,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   // The Save refusal's own words, so the build's end can clear that banner and no other: a refused
   // file or send is not resolved by the build ending.
   const saveRefusalRef = useRef<string | null>(null)
+  const [usageRefresh] = useState(createStepUsageRefresh)
   // WHICH CHAT has a turn streaming, not merely whether one does. ONE INSTANCE OF THIS
   // COMPONENT survives a chat switch under flat routing — the URL changes, this does not
   // remount — so the boolean form gated chat B's send on chat A's turn.
@@ -1006,11 +1007,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       // every ordinary reply too — and a claim nobody retracts blocks the user's next build
       // until they close the tab, which is the failure worth being generous about.
       releaseBuildClaim(activeId)
+      usageRefresh.cancel()
       notifyUsageChanged()
       settleSaveState()
       setUrgent((shown) => (shown === saveRefusalRef.current ? null : shown))
     },
-    [releaseBuildClaim, settleSaveState],
+    [releaseBuildClaim, settleSaveState, usageRefresh],
   )
 
   /**
@@ -1128,7 +1130,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // step frames. KEYED BY TOOL-CALL ID, so the `finished` frame REPLACES its own `started`
         // one in place: appending would stack a spinner beside its own result, and the activity
         // group's live count would climb while the same step re-rendered.
+        //
+        // A step this turn has not seen means a model call has just been billed, so the counter can
+        // move. A long step is re-sent under its own id every few seconds and does not count.
+        const newStep = !sink.parts.some((part) => part.kind === 'step' && part.toolCallId === frame.toolCallId)
         putStep(sink, frame.toolCallId, frame.item)
+        if (newStep && sink.terminal === null) usageRefresh.step()
         setTurnSteps((prev) => ({ ...prev, [frame.toolCallId]: frame.item }))
         // The transcript is what draws activity now, so a step has to reach the message it
         // belongs to. Without this the group renders nothing until the next text delta happens
@@ -1192,7 +1199,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         if (frame.previewUrl) setTurnPreview({ url: frame.previewUrl, state: 'ready' })
       }
     }
-  }, [])
+  }, [usageRefresh])
 
   /**
    * WHEN THE RUNNING TURN ACTUALLY BEGAN, read off the message that opened it.
