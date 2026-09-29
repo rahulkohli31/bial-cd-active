@@ -23,7 +23,7 @@ const h = vi.hoisted(() => ({
   notifyUsageChanged: vi.fn(), releaseUploadedAttachments: vi.fn(),
 }))
 
-vi.mock('../../utils/usage', () => ({ notifyUsageChanged: h.notifyUsageChanged }))
+vi.mock('../../utils/usage', async (orig) => ({ ...(await orig()), notifyUsageChanged: h.notifyUsageChanged }))
 
 vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, getBuild: h.getBuild, deriveTitle: (t) => (t || '').slice(0, 40),

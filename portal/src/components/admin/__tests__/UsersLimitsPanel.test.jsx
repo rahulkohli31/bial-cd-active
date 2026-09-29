@@ -26,6 +26,7 @@ const user = (over = {}) => ({
   displayName: 'displayName' in over ? over.displayName : 'Alice',
   role: over.role || 'citizen',
   suspendedAt: over.suspendedAt ?? null,
+  signedIn: over.signedIn ?? true,
   usageToday: over.usageToday ?? 0,
   limits: over.limits || {},
   effectiveLimits: over.effectiveLimits || { ...DEFAULTS },
@@ -78,6 +79,20 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     await screen.findByText('Alice')
     expect(within(screen.getByTestId('row-u1')).getByText('Active')).toBeTruthy()
     expect(within(screen.getByTestId('row-u2')).getByText('Suspended')).toBeTruthy()
+  })
+
+  it('says "Not signed in yet" beside someone who has never signed in, and not beside someone who has', async () => {
+    h.fetchUsers.mockResolvedValue(
+      pageOf([
+        user({ userId: 'u1', email: 'a@x.com', signedIn: true }),
+        user({ userId: 'u2', email: 'p@x.com', displayName: 'Priya', signedIn: false }),
+      ]),
+    )
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Priya')
+    expect(within(screen.getByTestId('row-u2')).getByText('Not signed in yet')).toBeTruthy()
+    expect(within(screen.getByTestId('row-u1')).getByText('Alice')).toBeTruthy()
+    expect(within(screen.getByTestId('row-u1')).queryByText('Not signed in yet')).toBeNull()
   })
 
   it('auto-loads the next keyset page in the background (no click) and keeps prior rows', async () => {

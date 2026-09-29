@@ -425,6 +425,7 @@ async def _start_session(db: AsyncSession, identity: EntraIdentity, *, trace_id:
                 "email": identity.email,
                 "upn": identity.upn,
                 "display_name": identity.display_name,
+                "has_signed_in": True,
                 "updated_at": sa.func.now(),
             },
         )

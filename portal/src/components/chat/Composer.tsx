@@ -32,6 +32,8 @@ export interface ComposerProps {
   onSubmit: (submission: ComposerSubmission) => Promise<void>
   /** True while a turn is in flight — Send waits, typing does not. */
   isRunning: boolean
+  /** Said under the box while a turn runs, in place of the generic sentence. */
+  runningNote?: string | null
   /** Any other reason Send must wait, with the sentence that explains it. */
   gate?: { blocked: boolean; reason: string } | undefined
   /** The stop control, in its permanent home on this chrome. */
@@ -56,6 +58,8 @@ export interface ComposerProps {
   footerNote?: ReactNode
   /** Urgent sentences go to the assertive slot the surface owns. */
   onUrgent: (message: string) => void
+  /** The attach control was pressed: a new attempt, so the last one's urgent sentence can go. */
+  onAttachPress?: () => void
   /**
    * The frame around the box. Defaults to the chat surface's, which sits the composer on the
    * transcript's own ground with its own gutter. It is a prop because the RAIL mounts this same
@@ -79,12 +83,14 @@ const Composer: FC<ComposerProps> = ({
   placeholder = 'Ask for another change…',
   onSubmit,
   isRunning,
+  runningNote,
   gate,
   stop,
   offer,
   contextWarning,
   footerNote,
   onUrgent,
+  onAttachPress,
   frameClassName = 'flex flex-col gap-1.5 bg-bial-surface px-3 py-2.5',
   noteClassName = 'text-neutral',
 }) => {
@@ -159,11 +165,13 @@ const Composer: FC<ComposerProps> = ({
     // `capState` sets `message` exactly when `over`, and naming both is how that is said without a
     // cast: a cap with nothing to say about itself is not a reason anyone could act on.
     if (cap.over && cap.message) return { reason: cap.message, fromOffer: false }
-    if (isRunning) return { reason: 'Replying — keep typing if you like; send unlocks when it is done.', fromOffer: false }
+    if (isRunning) {
+      return { reason: runningNote ?? 'Replying — keep typing if you like; send unlocks when it is done.', fromOffer: false }
+    }
     if (gate?.blocked) return { reason: gate.reason, fromOffer: false }
     if (offerPending) return { reason: OFFER_GATE_NOTE, fromOffer: true }
     return null
-  }, [offerPending, cap.over, cap.message, isRunning, gate])
+  }, [offerPending, cap.over, cap.message, isRunning, runningNote, gate])
   const unavailableReason = unavailable?.reason ?? null
   const offerLocked = unavailable?.fromOffer ?? false
 
@@ -207,6 +215,7 @@ const Composer: FC<ComposerProps> = ({
            with itself and the sibling arm never ran. */
         onAccepted={writeDraft}
         onUrgent={onUrgent}
+        onAttachPress={onAttachPress}
         header={
           offer ? (
             /* INSIDE the box, fixed to its top, which is what the board draws: "this teal strip

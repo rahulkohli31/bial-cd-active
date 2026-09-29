@@ -110,9 +110,9 @@ function Workspace({ project = PROJECT }: { project?: Project } = {}) {
   )
 }
 
-// THE PLAN PLACEHOLDER, because the rail's kind picker defaults to Plan. The hand-over this
+// THE BUILD PLACEHOLDER, because the rail's kind picker defaults to Build. The hand-over this
 // file is about is identical on either kind; the picker only decides which wording is showing.
-const composer = () => screen.getByPlaceholderText(/Describe what you have in mind/i)
+const composer = () => screen.getByPlaceholderText(/Describe the change you need/i)
 const send = () => screen.getByTestId('composer-send')
 const where = () => screen.getByTestId('where').textContent ?? ''
 const type = (text: string) => fireEvent.change(composer(), { target: { value: text } })
@@ -216,7 +216,7 @@ describe('a project with nothing built yet — the first message anybody sends',
     fireEvent.click(send())
 
     await waitFor(() => expect(screen.getByTestId('chat-opened')).toBeTruthy())
-    expect(where()).toMatch(/^\/chat\/[0-9a-f-]+\?projectId=pB&kind=plan$/)
+    expect(where()).toMatch(/^\/chat\/[0-9a-f-]+\?projectId=pB&kind=build$/)
     // …and nothing told them their message was lost. Paired with the assertion above, so an
     // absent alert cannot pass by the screen having failed to render at all.
     expect(screen.queryAllByRole('alert')).toHaveLength(0)

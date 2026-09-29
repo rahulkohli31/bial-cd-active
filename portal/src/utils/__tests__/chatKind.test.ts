@@ -95,6 +95,15 @@ describe('chatKindFor', () => {
     }
   })
 
+  it('★ gives a Build chat its own running line, and every other kind none', () => {
+    withCatalogue(MOCK_CATALOGUE)
+    expect(chatKindFor('build').composerRunningNote).toBe(
+      'Builds usually take several minutes and keep going if you leave. Keep typing if you like.',
+    )
+    expect(chatKindFor('plan').composerRunningNote).toBeNull()
+    expect(UNKNOWN_CHAT_KIND.composerRunningNote).toBeNull()
+  })
+
   it('falls back for the third value the field can hold today, and for one it cannot yet', () => {
     withCatalogue(MOCK_CATALOGUE)
     expect(chatKindFor('assistant')).toBe(UNKNOWN_CHAT_KIND)

@@ -69,6 +69,7 @@ export interface MergedUser {
   displayName?: string | null
   role: string
   suspendedAt: string | null
+  signedIn: boolean
   usageToday?: number
   limits?: LimitFields
   effectiveLimits?: LimitFields
@@ -124,7 +125,13 @@ export function createUserColumns({
         const u = row.original
         return (
           <>
-            <p className="font-semibold text-tertiary whitespace-nowrap">{u.displayName || u.email}</p>
+            <p className="font-semibold text-tertiary whitespace-nowrap">
+              {u.displayName || u.email}
+              {/* `fetchUsers` does not validate the row, so only an explicit false earns the label. */}
+              {u.signedIn === false && (
+                <span className="ml-1.5 text-[11px] font-normal text-neutral">Not signed in yet</span>
+              )}
+            </p>
             <p className="text-[11px] text-neutral">{u.email}</p>
           </>
         )

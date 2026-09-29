@@ -23,7 +23,14 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.project import Project
 from src.db.models.project_share import ProjectShare
 from src.db.models.user import User
+from src.schemas.shares import ColleagueResult, ShareRequest
 from src.services.audit.log import append_audit
+from src.services.directory import (
+    DirectoryMiss,
+    get_directory_person,
+    is_directory_member,
+    search_directory,
+)
 
 #: R4 — below this, the search is refused rather than run (a 1-2 character query against an
 #: anchored match is either near-useless or, for very short strings, still wide enough to
@@ -44,6 +51,63 @@ async def _owners_app_id(db: AsyncSession, project: Project) -> uuid.UUID | None
         )
     )
     return app_id
+
+
+_COLLEAGUE_NOT_FOUND = "That colleague could not be found."
+
+
+def email_local_part(email: str) -> str:
+    """The part of an address before the @: what the picker and the share list show."""
+    return email.split("@", 1)[0]
+
+
+async def resolve_colleague(db: AsyncSession, *, requester: User, request: ShareRequest) -> User:
+    """The user a share request names. A `directoryId` is not found unless the requester is a
+    directory member. One already keyed to a user here is that user; otherwise the person is read
+    back from the directory and inserted as not signed in, with an audit entry. The insert never
+    updates a row: a first sign-in that got there first keeps its own profile. Nothing is
+    committed after the directory call, so a share refused later takes the new user with it."""
+    if request.directory_id is None:
+        colleague = await db.get(User, request.shared_with_user_id)
+        if colleague is None:
+            raise AppApiError(404, _COLLEAGUE_NOT_FOUND)
+        return colleague
+    azure_oid = str(request.directory_id)
+    known = await db.scalar(sa.select(User).where(User.azure_oid == azure_oid))
+    # Ends the read so no pooled connection waits on Graph. Commit, not rollback: a rollback
+    # would expire every ORM instance this request has loaded.
+    await db.commit()
+    if not await is_directory_member(requester.azure_oid):
+        raise AppApiError(404, _COLLEAGUE_NOT_FOUND)
+    if known is not None:
+        return known
+    person = await get_directory_person(request.directory_id)
+    if person is DirectoryMiss.UNAVAILABLE:
+        raise AppApiError(503, "Couldn't look this person up right now. Try again in a moment.")
+    if person is DirectoryMiss.NOT_FOUND:
+        raise AppApiError(404, _COLLEAGUE_NOT_FOUND)
+    created_id = await db.scalar(
+        pg_insert(User)
+        .values(
+            azure_oid=azure_oid,
+            email=person.email,
+            upn=person.upn,
+            display_name=person.display_name,
+            has_signed_in=False,
+        )
+        .on_conflict_do_nothing(index_elements=[User.azure_oid])
+        .returning(User.id)
+    )
+    colleague = (await db.scalars(sa.select(User).where(User.azure_oid == azure_oid))).one()
+    if created_id is not None:
+        await append_audit(
+            db,
+            actor_id=requester.id,
+            action="user:directory_create",
+            resource_type="user",
+            resource_id=str(created_id),
+        )
+    return colleague
 
 
 async def create_share(
@@ -194,6 +258,66 @@ async def search_colleagues(
         .limit(MAX_COLLEAGUE_RESULTS)
     )
     return list(rows.all())
+
+
+def _user_hit(user: User) -> ColleagueResult:
+    return ColleagueResult(
+        id=user.id,
+        directory_id=None,
+        display_name=user.display_name,
+        email_local_part=email_local_part(user.email),
+        signed_in=user.has_signed_in,
+    )
+
+
+async def find_colleagues(
+    db: AsyncSession, *, requester: User, query: str
+) -> list[ColleagueResult]:
+    """Our own users matching `query`, then from the directory users here it matched under
+    another name, then people with no user yet, up to `MAX_COLLEAGUE_RESULTS` in all. The
+    directory is asked only when our users leave room and the requester is a directory member.
+    The requester never comes back, and a directory failure reads as no hits."""
+    found = [
+        _user_hit(user)
+        for user in await search_colleagues(db, requester_id=requester.id, query=query)
+    ]
+    slots = MAX_COLLEAGUE_RESULTS - len(found)
+    if slots == 0:
+        return found
+    # Ends the read so no pooled connection waits on Graph. Commit, not rollback: a rollback
+    # would expire every ORM instance this request has loaded.
+    await db.commit()
+    # Before the search rather than alongside it, so a non-member's query never reaches Graph.
+    if not await is_directory_member(requester.azure_oid):
+        return found
+    people = await search_directory(query)
+    if not people:
+        return found
+    users_here = {
+        user.azure_oid: user
+        for user in await db.scalars(
+            sa.select(User).where(User.azure_oid.in_([str(person.object_id) for person in people]))
+        )
+    }
+    listed = {requester.id, *(result.id for result in found)}
+    known: list[ColleagueResult] = []
+    newcomers: list[ColleagueResult] = []
+    for person in people:
+        user = users_here.get(str(person.object_id))
+        if user is None:
+            newcomers.append(
+                ColleagueResult(
+                    id=None,
+                    directory_id=person.object_id,
+                    display_name=person.display_name,
+                    email_local_part=email_local_part(person.email),
+                    signed_in=False,
+                )
+            )
+        elif user.id not in listed:
+            listed.add(user.id)
+            known.append(_user_hit(user))
+    return found + (known + newcomers)[:slots]
 
 
 @dataclass(frozen=True)

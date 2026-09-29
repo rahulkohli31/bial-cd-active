@@ -5,7 +5,7 @@
  * chat list crept back during the rewrite.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, waitFor, cleanup, within, fireEvent } from '@testing-library/react'
+import { act, screen, waitFor, cleanup, within, fireEvent } from '@testing-library/react'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 
@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
   relaunchPreview: vi.fn(),
   fetchSaveState: vi.fn(), fetchPreviewState: vi.fn(), saveProject: vi.fn(),
   discardUnsavedChanges: vi.fn(),
+  getStoredUser: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -28,6 +29,8 @@ vi.mock('../../utils/conversationApi', async (orig) => ({
   createConversation: async () => ({ id: 'conv-created' }),
   listProjectConversations: h.listProjectConversations,
 }))
+// The kind catalogue rides the signed-in profile; only the running-line seam below stands one up.
+vi.mock('../../utils/auth', async (orig) => ({ ...(await orig()), getStoredUser: (...a) => h.getStoredUser(...a) }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 vi.mock('../../utils/turnStreamApi', async (orig) => ({
   ...(await orig()),
@@ -56,7 +59,9 @@ vi.mock('../../utils/buildSessionApi', async (orig) => ({
 import {
   primeTurn, renderBuilder, send, waitForGateOpen,
   planReply, turnStreaming, PLAN_CARD_ID, findStartAppControl,
+  scriptBuildTurn, T_BUILD_END, T_STEP,
 } from './_builderSession.jsx'
+import { KEEP_PLANNING_LABEL } from '../../components/chat/OfferStrip'
 import { ApiError } from '../../utils/apiError'
 import { discardNoticeText } from '../../utils/conversationApi'
 import { DEFAULT_CONTEXT_SOFT } from '../../utils/contextLimits'
@@ -75,6 +80,7 @@ beforeEach(() => {
   // decides nothing, so nothing reaches a real `fetch`, re-primed by the two scenarios about it.
   h.fetchPreviewState.mockRejectedValue(new Error('the read is not this file\'s subject'))
   h.relaunchPreview.mockResolvedValue(undefined)
+  h.getStoredUser.mockReturnValue(null)
 })
 afterEach(cleanup)
 
@@ -478,16 +484,93 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
     expect(screen.queryByText(/you discarded the unsaved changes/i)).toBeNull()
   })
 
-  it('a Discard waits while this chat is replying', async () => {
-    // Mutation check: publish `replying: false` from this page and the control stays pressable.
+  it('Save and Discard both wait while this chat is building', async () => {
+    // Mutation check: publish `replying: false` from this page and both controls stay pressable.
     h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
     h.readTurnStream.mockImplementation(() => new Promise(() => {}))
     renderBuilder()
     await send('add a date filter')
 
     const control = await screen.findByTestId('discard-changes')
-    await waitFor(() => expect(control.getAttribute('title')).toBe('Wait for the reply to finish'))
+    await waitFor(() => expect(control.getAttribute('title')).toBe('Wait for the build to finish'))
     expect(control.getAttribute('aria-disabled')).toBe('true')
+    const save = screen.getByTestId('save-project')
+    expect(save.getAttribute('title')).toBe('Wait for the build to finish')
+    expect(save.getAttribute('aria-disabled')).toBe('true')
+    fireEvent.click(save)
+    expect(h.saveProject).not.toHaveBeenCalled()
+  })
+
+  it('★ a Plan chat\'s reply leaves Save pressable, and Discard waits for the reply', async () => {
+    // Mutation check: publish `building` from `turnRunningHere` alone and Save is greyed here.
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
+    h.readTurnStream.mockImplementation(() => new Promise(() => {}))
+    renderBuilder({ kind: 'plan' })
+    await waitForGateOpen()
+    fireEvent.change(screen.getByTestId('composer-input'), { target: { value: 'what would a filter look like?' } })
+    fireEvent.keyDown(screen.getByTestId('composer-input'), { key: 'Enter' })
+
+    const discard = await screen.findByTestId('discard-changes')
+    await waitFor(() => expect(discard.getAttribute('title')).toBe('Wait for the reply to finish'))
+    expect(discard.getAttribute('aria-disabled')).toBe('true')
+    const save = screen.getByTestId('save-project')
+    expect(save.getAttribute('aria-disabled')).toBe('false')
+    expect(save.hasAttribute('title')).toBe(false)
+  })
+
+  it('★ Stop brings Save and Discard back, showing the work the stopped build left', async () => {
+    // Mutation check: drop `settleSaveState()` from `endGenerating` and the extra read never happens.
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
+    const turn = scriptBuildTurn({
+      hold: true,
+      opening: [{ type: 'snapshot', seq: 1, turnId: 'turn-7', turnStatus: 'running', items: [], parts: [], working: false }],
+    })
+    h.readTurnStream.mockImplementation(turn.impl)
+    renderBuilder()
+    await send('add a date filter')
+
+    await waitFor(() => expect(screen.getByTestId('save-project').getAttribute('aria-disabled')).toBe('true'))
+    expect(screen.getByTestId('discard-changes').getAttribute('aria-disabled')).toBe('true')
+    const readsBefore = h.fetchSaveState.mock.calls.length
+
+    fireEvent.click(screen.getByTestId('stop-turn'))
+    await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith('build-X', 'turn-7'))
+    await turn.frame(T_BUILD_END({ status: 'stopped', turnId: 'turn-7' }))
+    await turn.end()
+
+    await waitFor(() => expect(screen.getByTestId('save-project').getAttribute('aria-disabled')).toBe('false'))
+    expect(screen.getByTestId('save-project').textContent).toContain('Save')
+    expect(screen.getByTestId('discard-changes').getAttribute('aria-disabled')).toBe('false')
+    expect(h.fetchSaveState).toHaveBeenCalledTimes(readsBefore + 1)
+  })
+
+  it.each([
+    ['refused by the server', new ApiError('Wait for the reply to finish, then save.', 409)],
+    ['lost on the network', new TypeError('Failed to fetch')],
+  ])('★ a Save %s keeps Save and Discard, and reads the state again', async (_, failure) => {
+    // Mutation check: set the state to unknown in `handleSave`'s catch and both controls vanish.
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
+    h.saveProject.mockRejectedValue(failure)
+    renderBuilder()
+    fireEvent.click(await screen.findByTestId('save-project'))
+
+    expect((await screen.findByTestId('urgent-banner')).textContent).toContain(failure.message)
+    await waitFor(() => expect(h.fetchSaveState).toHaveBeenCalledTimes(2))
+    expect(screen.getByTestId('save-project').textContent).toContain('Save')
+    expect(screen.getByTestId('discard-changes')).toBeTruthy()
+  })
+
+  it('a failed Save whose re-read fails too leaves the state unknown, never clean', async () => {
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
+    h.saveProject.mockRejectedValue(new ApiError('Could not save your work', 503))
+    renderBuilder()
+    fireEvent.click(await screen.findByTestId('save-project'))
+
+    h.fetchSaveState.mockRejectedValue(new Error('the read failed'))
+    await screen.findByTestId('urgent-banner')
+    await waitFor(() => expect(screen.queryByTestId('save-project')).toBeNull())
+    expect(screen.queryByText('Saved')).toBeNull()
+    expect(screen.getByTestId('composer-input')).toBeTruthy()
   })
 
   it('a page that opens on a running workspace reads it once', async () => {
@@ -504,5 +587,222 @@ describe('★ the Save chip on a chat follows the workspace, not only the turns'
     expect(await screen.findByTestId('save-project')).toBeTruthy()
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(h.fetchSaveState).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('★ the red banner clears itself and can be dismissed', () => {
+  const REFUSED = 'Wait for the reply to finish, then save.'
+  const RUNNING = { type: 'snapshot', seq: 1, turnId: 'turn-7', turnStatus: 'running', items: [], parts: [], working: false }
+
+  /** A Save pressed just before a send, refused once the build is running — the one way a Save
+   *  refusal reaches this chat, since Save is greyed during a build. */
+  async function saveRefusedDuringABuild() {
+    h.fetchSaveState.mockResolvedValue({ dirty: true, savedHead: 'a'.repeat(40) })
+    let refuse = () => {}
+    h.saveProject.mockImplementation(() => new Promise((_, reject) => { refuse = reject }))
+    const turn = scriptBuildTurn({ hold: true, opening: [RUNNING] })
+    h.readTurnStream.mockImplementation(turn.impl)
+    renderBuilder()
+    fireEvent.click(await screen.findByTestId('save-project'))
+    await send('add a date filter')
+    await screen.findByTestId('stop-turn')
+    await act(async () => refuse(new ApiError(REFUSED, 409)))
+    expect((await screen.findByTestId('urgent-banner')).textContent).toBe(REFUSED)
+    return turn
+  }
+
+  it('★ a Save refused while this chat builds is gone once the build ends', async () => {
+    // The reproduced bug. Mutation check: drop the clear from `endGenerating` and the refusal
+    // outlives the build.
+    const turn = await saveRefusedDuringABuild()
+
+    await turn.frame(T_BUILD_END({ turnId: 'turn-7' }))
+    await turn.end()
+
+    await waitFor(() => expect(screen.queryByTestId('urgent-banner')).toBeNull())
+    expect(screen.getByTestId('composer-input')).toBeTruthy()
+  })
+
+  it('★ any other sentence that replaced it outlives the build', async () => {
+    // Mutation check: clear the banner unconditionally in `endGenerating` and the stop failure goes.
+    const turn = await saveRefusedDuringABuild()
+    h.stopTurn.mockRejectedValue(new Error('the stop did not reach the server'))
+
+    fireEvent.click(screen.getByTestId('stop-turn'))
+    await waitFor(() => expect(screen.getByTestId('urgent-banner').textContent).toBe('Could not stop this. Try again.'))
+
+    await turn.frame(T_BUILD_END({ turnId: 'turn-7' }))
+    await turn.end()
+
+    await waitFor(() => expect(screen.queryByTestId('stop-turn')).toBeNull())
+    expect(screen.getByTestId('urgent-banner').textContent).toBe('Could not stop this. Try again.')
+  })
+
+  it('★ clears as the next message is sent', async () => {
+    // Mutation check: drop the clear from `handleSubmit` and the old sentence sits over the new turn.
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    h.saveProject.mockRejectedValue(new ApiError(REFUSED, 409))
+    h.readTurnStream.mockImplementation(() => new Promise(() => {}))
+    renderBuilder()
+    fireEvent.click(await screen.findByTestId('save-project'))
+    await screen.findByTestId('urgent-banner')
+
+    await send('add a date filter')
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
+    expect(screen.queryByTestId('urgent-banner')).toBeNull()
+  })
+
+  /** Press Save and have it refused, so the red sentence is up and the next press can clear it. */
+  async function refuseSave() {
+    h.saveProject.mockRejectedValueOnce(new ApiError(REFUSED, 409))
+    fireEvent.click(await screen.findByTestId('save-project'))
+    expect((await screen.findByTestId('urgent-banner')).textContent).toBe(REFUSED)
+  }
+
+  async function saveRefused() {
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    renderBuilder()
+    await refuseSave()
+  }
+
+  it('★ clears as the next Save starts, and that Save goes through', async () => {
+    // Mutation check: drop the clear from `handleSave` and the old refusal sits over a Save that worked.
+    await saveRefused()
+    fireEvent.click(screen.getByTestId('save-project'))
+    await waitFor(() => expect(h.saveProject).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText('Saved')).toBeTruthy()
+    expect(screen.queryByTestId('urgent-banner')).toBeNull()
+  })
+
+  it('★ clears when the attach control is pressed', async () => {
+    // Mutation check: drop `onAttachPress` from the surface's composer and the refusal stays.
+    await saveRefused()
+    fireEvent.click(screen.getByTestId('composer-attach'))
+    expect(screen.queryByTestId('urgent-banner')).toBeNull()
+    expect(screen.getByTestId('composer-input')).toBeTruthy()
+  })
+
+  it('★ clears when Keep planning is pressed', async () => {
+    // Mutation check: drop the clear from `handleKeepPlanning` and the refusal stays over the answer.
+    h.readTurnStream.mockImplementation(turnStreaming(planReply('Here is the plan.', PLAN_CARD_ID)))
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    renderBuilder()
+    await send('plan me a thing')
+    const keepPlanning = await screen.findByRole('button', { name: KEEP_PLANNING_LABEL })
+    await refuseSave()
+
+    fireEvent.click(keepPlanning)
+    await waitFor(() => expect(h.resolvePlanOptions).toHaveBeenCalledWith('build-X', PLAN_CARD_ID))
+    expect(screen.queryByTestId('urgent-banner')).toBeNull()
+  })
+
+  it.each([
+    ['the Stop control', () => fireEvent.click(screen.getByTestId('stop-turn'))],
+    ['Escape in the composer', () => fireEvent.keyDown(screen.getByTestId('composer-input'), { key: 'Escape' })],
+  ])('★ clears when the build is stopped with %s', async (_, stop) => {
+    // Mutation check: drop the clear from `handleStopTurn`, or route `handleCancel` straight to
+    // `stopTurn`, and the refusal outlives the Stop.
+    await saveRefusedDuringABuild()
+    stop()
+    await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith('build-X', 'turn-7'))
+    expect(screen.queryByTestId('urgent-banner')).toBeNull()
+  })
+
+  it('★ Dismiss closes it and puts the cursor back in the composer, inside a region that stays', async () => {
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    h.saveProject.mockRejectedValue(new ApiError(REFUSED, 409))
+    renderBuilder()
+    fireEvent.click(await screen.findByTestId('save-project'))
+    const banner = await screen.findByTestId('urgent-banner')
+    const region = banner.parentElement
+
+    fireEvent.click(within(banner).getByRole('button', { name: 'Dismiss' }))
+
+    expect(screen.queryByTestId('urgent-banner')).toBeNull()
+    expect(document.activeElement).toBe(screen.getByTestId('composer-input'))
+    expect(region?.isConnected).toBe(true)
+    expect(region?.getAttribute('aria-live')).toBe('assertive')
+  })
+})
+
+describe('★ a Build chat\'s composer says builds take minutes', () => {
+  it('shows the build line alone under the composer while the build runs', async () => {
+    // Mutation check: drop `runningNote` from the surface's composer and "Replying" comes back.
+    h.getStoredUser.mockReturnValue({
+      chat_kinds: [
+        { value: 'plan', name: 'Plan', description: 'Shape a plan first.' },
+        { value: 'build', name: 'Build', description: 'Change the live app.' },
+      ],
+    })
+    h.readTurnStream.mockImplementation(() => new Promise(() => {}))
+    renderBuilder({ kind: 'build' })
+    await send('add a date filter')
+
+    await waitFor(() =>
+      expect(screen.getByTestId('composer-gate-note').textContent).toBe(
+        'Builds usually take several minutes and keep going if you leave. Keep typing if you like.',
+      ),
+    )
+    expect(screen.getAllByTestId('composer-gate-note')).toHaveLength(1)
+  })
+})
+
+describe('★ the token counter moves while a build runs', () => {
+  const refreshes = []
+  const record = () => refreshes.push(Date.now())
+  beforeEach(() => {
+    refreshes.length = 0
+    window.addEventListener('bial:usage-refresh', record)
+  })
+  afterEach(() => {
+    window.removeEventListener('bial:usage-refresh', record)
+    vi.useRealTimers()
+  })
+
+  it('★ a new step asks for a reading, the same step re-sent does not, and the end asks once more', async () => {
+    // Mutation check: count every step frame rather than new ones and the re-sent step reads again.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const turn = scriptBuildTurn({ hold: true })
+    h.readTurnStream.mockImplementation(turn.impl)
+    renderBuilder()
+    await send('add a date filter')
+    await screen.findByTestId('stop-turn')
+    expect(refreshes).toHaveLength(0)
+
+    await turn.frame(T_STEP('Installing packages', { id: 'call-1' }))
+    expect(refreshes).toHaveLength(1)
+
+    // The engine re-sends a long step under its own id; well past the window, it is still not news.
+    await act(async () => vi.advanceTimersByTime(6_000))
+    await turn.frame(T_STEP('Still installing packages…', { id: 'call-1', seq: 3 }))
+    expect(refreshes).toHaveLength(1)
+
+    await turn.frame(T_STEP('Adding the date filter', { id: 'call-2', seq: 4 }))
+    expect(refreshes).toHaveLength(2)
+
+    await turn.frame(T_BUILD_END())
+    await turn.end()
+    await waitFor(() => expect(refreshes).toHaveLength(3))
+  })
+
+  it('a turn the snapshot says has already ended starts no refreshes of its own', async () => {
+    // Mutation check: drop the terminal guard and the replayed step reads the counter again.
+    h.getBuild.mockResolvedValue({
+      id: 'build-X', kind: 'build',
+      messages: [{ id: 'u1', role: 'user', seq: 0, parts: [{ type: 'text', text: 'add a date filter' }] }],
+      activeTurn: { turnId: 't9', lastSeq: 4 },
+    })
+    h.readTurnStream.mockImplementation(async ({ onFrame }) => {
+      onFrame({ type: 'snapshot', seq: 4, turnId: 't9', turnStatus: 'completed', items: [], parts: [], working: false })
+      onFrame(T_STEP('Adding the date filter', { id: 'call-9', seq: 5 }))
+      return 'completed'
+    })
+    renderBuilder()
+
+    await waitFor(() => expect(h.readTurnStream).toHaveBeenCalledWith(expect.objectContaining({ turnId: 't9' })))
+    // The reattach's own end is the one read, and it is the only one.
+    await waitFor(() => expect(refreshes).toHaveLength(1))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(refreshes).toHaveLength(1)
   })
 })

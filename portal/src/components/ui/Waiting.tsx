@@ -53,6 +53,14 @@ export function usePrefersReducedMotion(): boolean {
  *  noise on an interaction that already feels instant; above it, it is the whole answer. */
 export const ELAPSED_AFTER_MS = 5_000
 
+/** `0s`, `45s`, `1m 05s` — the one way a wait's elapsed time reads. Seconds stay two-digit past
+ *  the minute so the line does not jitter. */
+export function formatElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  return `${minutes}m ${String(seconds % 60).padStart(2, '0')}s`
+}
+
 /**
  * Seconds since the wait began, ticking once a second; `0` whenever `active` is false.
  *
@@ -186,7 +194,7 @@ export function WaitingLine({
           aria-hidden="true"
           className="tabular-nums text-neutral/70"
         >
-          {seconds}s
+          {formatElapsed(seconds)}
         </span>
       )}
     </span>

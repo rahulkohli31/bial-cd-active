@@ -33,3 +33,4 @@ from src.schemas.shares import SharedProjectResponse as SharedProjectResponse
 from src.schemas.shares import SharedProjectSharer as SharedProjectSharer
 from src.schemas.shares import ShareRequest as ShareRequest
 from src.schemas.shares import ShareResponse as ShareResponse
+from src.schemas.shares import UnshareRequest as UnshareRequest

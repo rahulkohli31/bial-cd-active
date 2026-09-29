@@ -59,7 +59,7 @@ import {
   usePublishWorkspaceReport,
   useWorkspaceProject,
 } from '../workspace/workspaceChannel'
-import { notifyUsageChanged } from '../../utils/usage'
+import { createStepUsageRefresh, notifyUsageChanged } from '../../utils/usage'
 import { createBuildLock, openBuildLockChannel } from '../../utils/buildLock'
 import type { BuildLock } from '../../utils/buildLock'
 import { useDropTransientQuery } from '../../hooks/useDropTransientQuery'
@@ -68,6 +68,8 @@ import { useDropTransientQuery } from '../../hooks/useDropTransientQuery'
 import type { PendingAttachment } from '../../utils/attachmentInput'
 import type { ChatKind } from '../../pages/ChatRoute'
 import PlanChatWorkspaceLine from '../workspace/PlanChatWorkspaceLine'
+import { DismissButton } from '../ui/DismissButton'
+import { chatKindFor } from '../../utils/chatKind'
 import { startTurn, readTurnStream, buildFromPlan, stopTurn, TurnStartError } from '../../utils/turnStreamApi'
 import { isKnownFrame } from '../../utils/turnStreamApi'
 import type { CompileState } from '../../utils/compileState'
@@ -324,15 +326,16 @@ function appendText(sink: TurnSink, text: string, newBlock: boolean): void {
   sink.parts.push({ kind: 'text', text })
 }
 
-/** Record a step at its position, or replace the one already there.
+/** Record a step at its position, or replace the one already there; `true` when it is new.
  *
  * The `finished` frame carries the same tool-call id as its `started` one and REPLACES it in
  * place: appending would stack a spinner beside its own result, and the activity group's live
  * count would climb while the same step re-rendered. */
-function putStep(sink: TurnSink, toolCallId: string, step: StepItem): void {
+function putStep(sink: TurnSink, toolCallId: string, step: StepItem): boolean {
   const at = sink.parts.findIndex((part) => part.kind === 'step' && part.toolCallId === toolCallId)
   if (at === -1) sink.parts.push({ kind: 'step', toolCallId, step })
   else sink.parts[at] = { kind: 'step', toolCallId, step }
+  return at === -1
 }
 
 export default function ConversationSurface({ chatId: chatIdProp, kind, projectId = null, project = null, onProjectUpdate, projectHasSavedBuild = null, onTitleDerived }: ConversationSurfaceProps) {
@@ -371,6 +374,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
    * such a map could only ever hold one entry.
    */
   const [urgent, setUrgent] = useState<string | null>(null)
+  // The Save refusal's own words, so the build's end can clear that banner and no other: a refused
+  // file or send is not resolved by the build ending.
+  const saveRefusalRef = useRef<string | null>(null)
+  const [usageRefresh] = useState(createStepUsageRefresh)
   // WHICH CHAT has a turn streaming, not merely whether one does. ONE INSTANCE OF THIS
   // COMPONENT survives a chat switch under flat routing — the URL changes, this does not
   // remount — so the boolean form gated chat B's send on chat A's turn.
@@ -555,6 +562,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   const handleSave = async () => {
     const activeProjectId = projectIdRef.current
     if (!activeProjectId || saving) return
+    setUrgent(null)
     setSaving(true)
     setSaveError(null)
     try {
@@ -579,10 +587,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       // alert beside the control is not where somebody mid-conversation is looking. The server's
       // own sentence when it has one — the 409 already names the way out.
       if (projectIdRef.current === activeProjectId) {
-        setUrgent(err instanceof Error ? err.message : SAVE_DID_NOT_LAND)
-        // Same fail-toward-warning as the failed check above: a Save that threw leaves this
-        // surface unable to say what the container holds.
-        setSaveDirty(null)
+        saveRefusalRef.current = err instanceof Error ? err.message : SAVE_DID_NOT_LAND
+        setUrgent(saveRefusalRef.current)
+        // Save was pressable, so the state is dirty and stays so while it is read again. Only a
+        // failed re-read makes it unknown, which hides Save and Discard; nothing here says clean.
+        void refreshSaveState(activeProjectId)
       }
     } finally {
       setSaving(false)
@@ -784,9 +793,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   const turnRunningHere =
     generatingChatId !== null &&
     (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
+  // A running chat not known to be a Plan chat counts as a build, so Save waits.
+  const runningKind = generatingChatId === buildId ? kind : builds.find((b) => b.id === generatingChatId)?.kind
+  const buildRunningHere = turnRunningHere && runningKind !== 'plan'
   const projectDialogs = useProjectDialogs(project, onProjectUpdate)
   usePublishSave(
-    { dirty: saveDirty, saving, error: saveError, discarding, replying: turnRunningHere, hasSavedVersion },
+    { dirty: saveDirty, saving, error: saveError, discarding, replying: turnRunningHere, building: buildRunningHere, hasSavedVersion },
     { save: handleSave, discard: handleDiscard, settings: projectDialogs.settings, share: projectDialogs.share },
   )
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
@@ -999,10 +1011,12 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       // every ordinary reply too — and a claim nobody retracts blocks the user's next build
       // until they close the tab, which is the failure worth being generous about.
       releaseBuildClaim(activeId)
+      usageRefresh.cancel()
       notifyUsageChanged()
       settleSaveState()
+      setUrgent((shown) => (shown === saveRefusalRef.current ? null : shown))
     },
-    [releaseBuildClaim, settleSaveState],
+    [releaseBuildClaim, settleSaveState, usageRefresh],
   )
 
   /**
@@ -1120,7 +1134,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // step frames. KEYED BY TOOL-CALL ID, so the `finished` frame REPLACES its own `started`
         // one in place: appending would stack a spinner beside its own result, and the activity
         // group's live count would climb while the same step re-rendered.
-        putStep(sink, frame.toolCallId, frame.item)
+        //
+        // A step this turn has not seen means a model call has just been billed, so the counter can
+        // move. A long step is re-sent under its own id every few seconds and does not count.
+        const newStep = putStep(sink, frame.toolCallId, frame.item)
+        if (newStep && sink.terminal === null) usageRefresh.step()
         setTurnSteps((prev) => ({ ...prev, [frame.toolCallId]: frame.item }))
         // The transcript is what draws activity now, so a step has to reach the message it
         // belongs to. Without this the group renders nothing until the next text delta happens
@@ -1184,7 +1202,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         if (frame.previewUrl) setTurnPreview({ url: frame.previewUrl, state: 'ready' })
       }
     }
-  }, [])
+  }, [usageRefresh])
 
   /**
    * WHEN THE RUNNING TURN ACTUALLY BEGAN, read off the message that opened it.
@@ -1628,6 +1646,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   const handleSubmit = async ({ text: rawText, attachments, conversationId }: ComposerSubmission) => {
     const text = rawText.trim()
     if (!text && attachments.length === 0) return
+    setUrgent(null)
     if (buildStarting) {
       throw new SendRefusal('Your app is being built — send unlocks when it finishes. Keep typing meanwhile.')
     }
@@ -1782,6 +1801,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     async (toolCallId: string) => {
       const activeId = buildIdRef.current
       if (!activeId) return
+      setUrgent(null)
       await resolvePlanOptions(activeId, toolCallId)
       setPlanOverrides((prev) => ({ ...prev, [toolCallId]: 'refine' }))
       setLivePlanOptions((prev) => (prev && prev.toolCallId === toolCallId ? null : prev))
@@ -2574,6 +2594,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     return conversationId && turnId ? { conversationId, turnId } : null
   }, [])
 
+  const handleStopTurn = useCallback((conversationId: string, turnId: string) => {
+    setUrgent(null)
+    return stopTurn(conversationId, turnId)
+  }, [])
+
   /**
    * The thread's own cancel, which is what registers the runtime's `cancel` capability.
    *
@@ -2582,8 +2607,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
    */
   const handleCancel = useCallback(async () => {
     const target = stopTarget()
-    if (target) await stopTurn(target.conversationId, target.turnId)
-  }, [stopTarget])
+    if (target) await handleStopTurn(target.conversationId, target.turnId)
+  }, [stopTarget, handleStopTurn])
 
   /**
    * WHY SEND IS UNAVAILABLE, when the reason is not simply "a reply is in flight".
@@ -2634,6 +2659,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   // written out twice they are two expressions that can be edited apart, and the failure mode is
   // an empty `role="alert"` box or a sentence with no box around it.
   const urgentText = urgent
+  const footerRef = useRef<HTMLDivElement>(null)
+  const dismissUrgent = () => {
+    setUrgent(null)
+    footerRef.current?.querySelector('textarea')?.focus()
+  }
 
   return (
     <div className="flex flex-1 min-h-0 overflow-hidden">
@@ -2703,6 +2733,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
             only scroller in the chat slot, which `ConversationSurface.test.jsx`'s one-scroller
             count would catch. */}
         <div
+          ref={footerRef}
           data-testid="chat-footer-column"
           className={cn('flex w-full flex-col', isPlanChat && 'mx-auto max-w-thread')}
         >
@@ -2727,9 +2758,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
             {urgentText ? (
               <div
                 data-testid="urgent-banner"
-                className="mx-3 mb-1 rounded-lg border border-danger/20 bg-danger/5 px-2.5 py-1.5 text-[11px] text-danger"
+                className="mx-3 mb-1 flex items-start gap-1.5 rounded-lg border border-danger/20 bg-danger/5 py-1.5 ps-2.5 pe-1 text-[11px] text-danger"
               >
-                {urgentText}
+                <span className="min-w-0 flex-1">{urgentText}</span>
+                <DismissButton onDismiss={dismissUrgent} />
               </div>
             ) : null}
           </div>
@@ -2749,10 +2781,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
             placeholder={kind === 'plan' ? 'Tell me what to change…' : 'Ask for another change…'}
             onSubmit={handleSubmit}
             isRunning={isRunning}
+            runningNote={chatKindFor(kind).composerRunningNote}
             gate={gate}
             contextWarning={contextWarning}
             footerNote={isPlanChat ? <PlanChatWorkspaceLine /> : undefined}
-            stop={isRunning ? { running: true, resolveTarget: stopTarget, onStopTurn: stopTurn } : undefined}
+            stop={isRunning ? { running: true, resolveTarget: stopTarget, onStopTurn: handleStopTurn } : undefined}
             offer={
               offer
                 ? {
@@ -2765,6 +2798,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
                 : undefined
             }
             onUrgent={setUrgent}
+            onAttachPress={() => setUrgent(null)}
           />
         </div>
       </div>

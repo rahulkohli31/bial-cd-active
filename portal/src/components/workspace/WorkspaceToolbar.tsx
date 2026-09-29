@@ -45,7 +45,7 @@ import {
   DropdownMenuItem,
 } from '../ui/dropdown-menu'
 import { NavMenuButton, useNavReveal } from '../layout/NavReveal'
-import { BusyGlyph, useElapsedSeconds, ELAPSED_AFTER_MS } from '../ui/Waiting'
+import { BusyGlyph, formatElapsed, useElapsedSeconds, ELAPSED_AFTER_MS } from '../ui/Waiting'
 import { usePublishState } from '../../hooks/usePublishState'
 import { chatKindFor } from '../../utils/chatKind'
 import DiscardChangesDialog from './DiscardChangesDialog'
@@ -409,12 +409,13 @@ export default function WorkspaceToolbar({
  * moving; a production save was measured at forty seconds.
  */
 function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () => WorkspaceActions }) {
-  const { dirty, saving, discarding, error, canSave } = save
+  const { dirty, saving, discarding, building, error, canSave } = save
   // Before the early return: hooks may not sit behind a conditional, and `dirty === null` is a
   // real render path here rather than an edge case.
   const elapsed = useElapsedSeconds(saving)
   const showElapsed = elapsed * 1000 >= ELAPSED_AFTER_MS
   if (dirty === null) return null
+  const refused = saving || discarding || building || dirty === false
 
   const look = dirty
     ? 'border-primary bg-canvas-savedirty text-primary font-bold'
@@ -447,7 +448,7 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
             "Saving…" is what a reader needs; the count is for the eye. */}
         {saving && showElapsed ? (
           <span aria-hidden="true" className="tabular-nums">
-            {elapsed}s
+            {formatElapsed(elapsed)}
           </span>
         ) : null}
       </span>
@@ -471,17 +472,18 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
           type="button"
           data-testid="save-project"
           // `aria-disabled`, NEVER `disabled`: a disabled control throws focus to the document body.
-          aria-disabled={saving || discarding || dirty === false}
+          aria-disabled={refused}
+          title={building ? BUILD_RUNNING : undefined}
           // THE THIRD REGISTER, and a silent one: `aria-busy` is what a reader consults when asked
           // rather than something it speaks, so it costs the wait's sentence nothing. `undefined`
           // when idle — `aria-busy={false}` would ship a permanent `aria-busy="false"` on a control
           // that is not waiting, which is a state where the honest answer is no answer.
           aria-busy={saving || undefined}
           onClick={() => {
-            if (saving || discarding || dirty === false) return
+            if (refused) return
             readActions().save?.()
           }}
-          className={`${shell} transition ${saving ? 'opacity-70' : ''}`}
+          className={`${shell} transition ${saving ? 'opacity-70' : building ? 'cursor-not-allowed opacity-50' : ''}`}
         >
           {body}
         </button>
@@ -494,10 +496,14 @@ function SaveControl({ save, readActions }: { save: SaveSlot; readActions: () =>
   )
 }
 
+/** Why Save and Discard cannot be pressed while a build runs in this project. */
+const BUILD_RUNNING = 'Wait for the build to finish'
+
 /** Why Discard cannot be pressed right now, or `null` when it can. */
-function discardRefusal({ discarding, saving, replying, dirty, hasSavedVersion }: SaveSlot): string | null {
+function discardRefusal({ discarding, saving, building, replying, dirty, hasSavedVersion }: SaveSlot): string | null {
   if (discarding) return 'Discarding your changes'
   if (saving) return 'Wait for the save to finish'
+  if (building) return BUILD_RUNNING
   if (replying) return 'Wait for the reply to finish'
   if (dirty === false) return 'No unsaved changes'
   if (!hasSavedVersion) return 'Nothing saved yet to go back to'

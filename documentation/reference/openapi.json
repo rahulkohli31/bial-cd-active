@@ -1487,8 +1487,20 @@
         "type": "object"
       },
       "ColleagueResult": {
-        "description": "One search hit (R5) — display name AND the email LOCAL PART only, never the full\naddress: enough for an owner to tell two colleagues with the same name apart, not enough\nto hand out a directory of working email addresses through a picker. NOT the admin roster\nshape, which additionally carries token limits, usage and suspension state — none of\nwhich a citizen picking a colleague to share with has any business seeing.",
+        "description": "One search hit. Exactly one of `id` and `directoryId` is set: `id` for someone with a\nuser here, `directoryId` (their Entra object id) for someone found only in the directory.\nDisplay name AND the email LOCAL PART only, never the full address: enough for an owner to\ntell two colleagues with the same name apart, not enough to hand out a directory of working\nemail addresses through a picker. `signedIn` says whether they have ever signed in here.\nNOT the admin roster shape, which additionally carries token limits, usage and suspension\nstate — none of which a citizen picking a colleague to share with has any business seeing.",
         "properties": {
+          "directoryId": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Directoryid"
+          },
           "displayName": {
             "anyOf": [
               {
@@ -1505,15 +1517,28 @@
             "type": "string"
           },
           "id": {
-            "format": "uuid",
-            "title": "Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "signedIn": {
+            "title": "Signedin",
+            "type": "boolean"
           }
         },
         "required": [
           "id",
+          "directoryId",
           "displayName",
-          "emailLocalPart"
+          "emailLocalPart",
+          "signedIn"
         ],
         "title": "ColleagueResult",
         "type": "object"
@@ -4289,22 +4314,38 @@
         "type": "string"
       },
       "ShareRequest": {
-        "description": "The body both `POST /v1/projects/{id}:share` and `:unshare` take — the colleague's user\nid, resolved from a prior `:colleagues` search result, never a typed email (a citizen\ncannot be trusted to spell a colleague's email correctly, and a share against a typo'd\naddress would silently grant nobody anything while the owner believes it worked).",
+        "description": "Who to share with: exactly one of `sharedWithUserId`, a user here, or `directoryId`, the\nEntra object id of someone found only in the directory. Both come from a prior colleague\nsearch, never a typed email: a share against a mistyped address would grant nobody anything\nwhile the owner believes it worked.",
         "properties": {
+          "directoryId": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Directoryid"
+          },
           "sharedWithUserId": {
-            "format": "uuid",
-            "title": "Sharedwithuserid",
-            "type": "string"
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sharedwithuserid"
           }
         },
-        "required": [
-          "sharedWithUserId"
-        ],
         "title": "ShareRequest",
         "type": "object"
       },
       "ShareResponse": {
-        "description": "One row of a project's OWN share panel (R12) — who it is shared with, and when.\nCarries the SAME display-name/email-local-part pair `ColleagueResult` does: the owner\nreads this list to decide who to revoke, and needs to disambiguate the same way the\nsearch that created the share did.",
+        "description": "One row of a project's OWN share panel — who it is shared with, and when.\nCarries the SAME display-name/email-local-part pair `ColleagueResult` does: the owner\nreads this list to decide who to revoke, and needs to disambiguate the same way the\nsearch that created the share did. `signed_in` says whether the colleague has ever signed\nin, not whether they are signed in now.",
         "properties": {
           "createdAt": {
             "format": "date-time",
@@ -4335,6 +4376,10 @@
             "format": "uuid",
             "title": "Sharedwithuserid",
             "type": "string"
+          },
+          "signedIn": {
+            "title": "Signedin",
+            "type": "boolean"
           }
         },
         "required": [
@@ -4342,6 +4387,7 @@
           "sharedWithUserId",
           "sharedWithDisplayName",
           "sharedWithEmailLocalPart",
+          "signedIn",
           "createdAt"
         ],
         "title": "ShareResponse",
@@ -4902,6 +4948,21 @@
         "title": "UnpublishResponse",
         "type": "object"
       },
+      "UnshareRequest": {
+        "description": "The colleague whose share `POST /v1/projects/{id}:unshare` revokes, by their user id.",
+        "properties": {
+          "sharedWithUserId": {
+            "format": "uuid",
+            "title": "Sharedwithuserid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sharedWithUserId"
+        ],
+        "title": "UnshareRequest",
+        "type": "object"
+      },
       "UploadResponse": {
         "description": "The 201 upload body: `{\"attachment\": {…}}`.",
         "properties": {
@@ -4994,6 +5055,10 @@
             "title": "Role",
             "type": "string"
           },
+          "signedIn": {
+            "title": "Signedin",
+            "type": "boolean"
+          },
           "suspendedAt": {
             "anyOf": [
               {
@@ -5022,6 +5087,7 @@
           "displayName",
           "role",
           "suspendedAt",
+          "signedIn",
           "usageToday",
           "reviewUsageToday",
           "limits",
@@ -11638,7 +11704,7 @@
     },
     "/v1/projects/colleagues": {
       "get": {
-        "description": "Find a colleague to share a project with (#198 R4/R5) — anchored match on the start of\na display-name token or the start of an email local part, never a substring (see\n`services/projects/shares.py::search_colleagues` for why: a substring match on a tenant\nsharing one email domain would match every user in it). Returns display name + email\nlocal part only, at most 10 results — NOT the admin roster shape, which additionally\ncarries token limits, usage and suspension state that no citizen picking a colleague to\nshare with has any business seeing.\n\nDECLARED BEFORE `/{project_id}` — same reason `/counts` is: FastAPI matches in\ndeclaration order, so a static path registered after the parameterised route would be\nswallowed by it and answer 422 on a UUID parse instead of running this handler.",
+        "description": "Find a colleague to share a project with (#198 R4/R5) — anchored match on the start of\na display-name token or the start of an email local part, never a substring (see\n`services/projects/shares.py::search_colleagues` for why: a substring match on a tenant\nsharing one email domain would match every user in it). Returns display name + email\nlocal part only, at most 10 results — NOT the admin roster shape, which additionally\ncarries token limits, usage and suspension state that no citizen picking a colleague to\nshare with has any business seeing. Our own users come first; when they leave room, people\nin the organisation's directory who have no user here yet fill it, carrying `directoryId`\ninstead of `id`. Only a caller who is a member of the directory is offered people from it.\nA directory that cannot be reached leaves just our own users.\n\nDECLARED BEFORE `/{project_id}` — same reason `/counts` is: FastAPI matches in\ndeclaration order, so a static path registered after the parameterised route would be\nswallowed by it and answer 422 on a UUID parse instead of running this handler.",
         "operationId": "search_project_colleagues_v1_projects_colleagues_get",
         "parameters": [
           {
@@ -13118,7 +13184,7 @@
     },
     "/v1/projects/{project_id}:share": {
       "post": {
-        "description": "Share a project the caller owns with a named colleague (#198 R1). Owner-only —\n`owned_project_or_404`, never the widened `resolve_project_access`: sharing IS a mutation\nof the project's own access list, and R6 grants a recipient \"Can use\", never the ability\nto share onward. Idempotent (R3) and refused for self-share (R2) or a project with\nnothing saved yet (R10) — both enforced inside `create_share`, not duplicated here.",
+        "description": "Share a project the caller owns with a named colleague (#198 R1). Owner-only —\n`owned_project_or_404`, never the widened `resolve_project_access`: sharing IS a mutation\nof the project's own access list, and R6 grants a recipient \"Can use\", never the ability\nto share onward. Idempotent (R3) and refused for self-share (R2) or a project with\nnothing saved yet (R10) — both enforced inside `create_share`, not duplicated here.\nA `directoryId` for someone with no user here yet creates them, not yet signed in, in the\nsame transaction as the share; a directory that cannot be reached is a 503. A `directoryId`\nfrom a caller who is not a member of the directory is not found.",
         "operationId": "share_project_v1_projects__project_id__share_post",
         "parameters": [
           {
@@ -13203,6 +13269,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many shares"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -13212,6 +13288,16 @@
               }
             },
             "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The directory could not be reached"
           }
         },
         "summary": "Share Project",
@@ -13240,7 +13326,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ShareRequest"
+                "$ref": "#/components/schemas/UnshareRequest"
               }
             }
           },

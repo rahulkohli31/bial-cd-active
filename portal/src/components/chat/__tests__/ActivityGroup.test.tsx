@@ -136,8 +136,7 @@ describe('a sealed group collapses to a count, and opens where it sits', () => {
 
   it('★ gives a problem group its own tint, and only once it is terminal', () => {
     // `ActivityAnatomy` panel 4: "nothing is hidden when something went wrong". The container, its
-    // header and its label all change; the fail-open and the tint follow the SAME predicate, so a
-    // group cannot be red and shut, or open and neutral.
+    // header and its label all change, on a group that stays closed until the reader opens it.
     mount([
       stepPart(1, 'Working on your app', 'ok'),
       stepPart(2, 'Working on your app', 'failed'),
@@ -147,11 +146,10 @@ describe('a sealed group collapses to a count, and opens where it sits', () => {
     expect(container.getAttribute('data-problem')).toBe('true')
     expect(container.className).toMatch(/border-problem-edge/)
     expect(trigger().className).toMatch(/bg-problem-ground/)
-    expect(trigger().getAttribute('aria-expanded')).toBe('true')
+    expect(trigger().getAttribute('aria-expanded')).toBe('false')
 
     cleanup()
-    // MID-TURN IT IS NEITHER TINTED NOR OPEN — expanding then would move what the reader is
-    // reading, and a failure that is still being recovered from is not yet a problem to report.
+    // MID-TURN IT IS NOT TINTED: a failure still being recovered from is not yet a problem to report.
     mount([stepPart(1, 'Working on your app', 'failed'), stepPart(2, 'Working on your app', 'pending')])
     expect(screen.getByTestId('activity-group-container').getAttribute('data-problem')).toBeNull()
     expect(trigger().getAttribute('aria-expanded')).toBe('false')
@@ -176,17 +174,22 @@ describe('a sealed group collapses to a count, and opens where it sits', () => {
   })
 })
 
-describe('a group that hit a problem opens by itself, but never mid-turn', () => {
-  it('a sealed group containing a failed step is already expanded', () => {
+describe('a group that hit a problem stays closed until the reader opens it', () => {
+  it('★ a sealed group containing a failed step is closed, and says so on its edge and label', () => {
+    // Mutation check: open a sealed group with a failure by default and this goes red.
     mount([
       stepPart(1, 'Working on your app', 'ok'),
       stepPart(2, 'Working on your app', 'failed'),
       textPart('Not green yet — continuing.'),
     ])
 
-    expect(trigger().getAttribute('aria-expanded')).toBe('true')
+    expect(trigger().getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByTestId('activity-group-rows')).toBeNull()
+    expect(trigger().textContent).toContain('· one problem')
+    expect(screen.getByTestId('activity-group-container').className).toMatch(/border-problem-edge/)
+
+    fireEvent.click(trigger())
     expect(screen.getByTestId('activity-group-rows')).toBeTruthy()
-    expect(trigger().textContent).toContain('one problem')
   })
 
   it('the negative half — the same group WHILE RUNNING stays collapsed', () => {
@@ -197,14 +200,6 @@ describe('a group that hit a problem opens by itself, but never mid-turn', () =>
 
     expect(trigger().getAttribute('aria-expanded')).toBe('false')
     expect(screen.queryByTestId('activity-group-rows')).toBeNull()
-  })
-
-  it('the reader can close a fail-opened group and it stays closed', () => {
-    mount([stepPart(1, 'Working on your app', 'failed'), textPart('Continuing.')])
-
-    expect(trigger().getAttribute('aria-expanded')).toBe('true')
-    fireEvent.click(trigger())
-    expect(trigger().getAttribute('aria-expanded')).toBe('false')
   })
 })
 
@@ -272,10 +267,9 @@ describe('a live group names what is happening NOW and grows in place', () => {
   })
 
   it('★ a glance inside a RUNNING group closes itself when the TURN ends', () => {
-    // "A glance inside is temporary, not a new resting state." Cleared
-    // to "the reader has not decided" rather than to closed, so a group that also FAILED still
-    // opens itself afterwards. The turn ending is the event — `isRunning` going false — not the
-    // group's own steps settling; see the next test for why the difference is the whole finding.
+    // "A glance inside is temporary, not a new resting state." The turn ending is the event —
+    // `isRunning` going false — not the group's own steps settling; see the next test for why the
+    // difference is the whole finding.
     const view = mount([stepPart(1, 'Reading your restaurants screen', 'pending')], {
       isRunning: true,
     })

@@ -107,6 +107,10 @@ const LABELS: Record<string, AuditLabel> = {
   'usage:reset': { title: 'Usage counter reset' },
   'user:deactivate': { title: 'User deactivated' },
   'user:reactivate': { title: 'User reactivated' },
+  'user:directory_create': {
+    title: 'User added from the directory',
+    description: 'Added so an application could be shared with them before their first sign-in.',
+  },
 }
 
 /**

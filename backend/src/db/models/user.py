@@ -49,3 +49,8 @@ class User(UUIDv7PrimaryKeyMixin, TimestampMixin, Base):
     suspended_at: Mapped[datetime.datetime | None] = mapped_column(
         sa.DateTime(timezone=True), nullable=True
     )
+    # Ever signed in, not signed in now. Server default true: only a user created from the
+    # directory starts false, and sign-in sets it true for good.
+    has_signed_in: Mapped[bool] = mapped_column(
+        sa.Boolean, server_default=sa.text("true"), nullable=False
+    )

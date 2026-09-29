@@ -14,7 +14,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { useState } from 'react'
-import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
+import { act, render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, Link, useLocation } from 'react-router-dom'
 import WorkspaceShell from '../WorkspaceShell'
 import NavReveal from '../../layout/NavReveal'
@@ -110,6 +110,7 @@ const QUIET_SAVE: Omit<SaveSlot, 'canSave' | 'canDiscard'> = {
   error: null,
   discarding: false,
   replying: false,
+  building: false,
   hasSavedVersion: false,
 }
 
@@ -524,6 +525,49 @@ describe('the Save control', () => {
     expect(screen.getByTestId('save-state').textContent).toContain('Saved')
   })
 
+  it('★ is greyed while a build runs, with the reason Discard gives, and refuses the press', () => {
+    // Mutation check: drop `building` from the Save guard and the press reaches the action.
+    const onSave = vi.fn()
+    withSave({ dirty: true, saving: false, error: null, replying: true, building: true }, onSave)
+    const save = screen.getByTestId('save-project')
+    expect(save.getAttribute('aria-disabled')).toBe('true')
+    expect(save.getAttribute('title')).toBe('Wait for the build to finish')
+    expect(save.className).toMatch(/cursor-not-allowed/)
+    expect(save.hasAttribute('disabled')).toBe(false)
+    fireEvent.click(save)
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  it('★ stays pressable while a Plan chat replies, since nothing is being built', () => {
+    // Mutation check: grey Save on `replying` instead of `building` and this press is refused.
+    const onSave = vi.fn()
+    withSave({ dirty: true, saving: false, error: null, replying: true, building: false }, onSave)
+    const save = screen.getByTestId('save-project')
+    expect(save.getAttribute('aria-disabled')).toBe('false')
+    expect(save.hasAttribute('title')).toBe(false)
+    fireEvent.click(save)
+    expect(onSave).toHaveBeenCalledTimes(1)
+  })
+
+  it('offers itself again once the build has ended', () => {
+    const onSave = vi.fn()
+    const view = withSave({ dirty: true, saving: false, error: null, replying: true, building: true }, onSave)
+    view.rerender(
+      <Workspace
+        project={{
+          heading: PROJECT_HEADING,
+          save: { dirty: true, saving: false, error: null, replying: false, building: false },
+          actions: { save: onSave, settings: null, share: null },
+        }}
+      />,
+    )
+    const save = screen.getByTestId('save-project')
+    expect(save.getAttribute('aria-disabled')).toBe('false')
+    expect(save.hasAttribute('title')).toBe(false)
+    fireEvent.click(save)
+    expect(onSave).toHaveBeenCalledTimes(1)
+  })
+
   it('renders no control with a real disabled attribute', () => {
     withSave({ dirty: false, saving: false, error: null }, () => {})
     for (const el of screen.getAllByRole('button')) expect(el.hasAttribute('disabled')).toBe(false)
@@ -563,6 +607,19 @@ describe('the Save control', () => {
     expect(screen.queryByTestId('save-spinner')).toBeNull()
     expect(cleanChip.hasAttribute('aria-busy')).toBe(false)
     expect(cleanChip.textContent).toContain('Saved')
+  })
+
+  it('a save past a minute counts in the shared format', () => {
+    vi.useFakeTimers()
+    try {
+      withSave({ dirty: true, saving: true, error: null }, () => {})
+      act(() => {
+        vi.advanceTimersByTime(65_000)
+      })
+      expect(screen.getByTestId('save-project').textContent).toContain('1m 05s')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('★ the spinner wears the class the reduced-motion block covers — the half jsdom cannot check', () => {
@@ -608,7 +665,7 @@ describe('the Save control', () => {
 })
 
 describe('the Discard control', () => {
-  const OPEN_WORK = { dirty: true, saving: false, error: null, discarding: false, replying: false, hasSavedVersion: true }
+  const OPEN_WORK = { dirty: true, saving: false, error: null, discarding: false, replying: false, building: false, hasSavedVersion: true }
   const withDiscard = (
     save: Partial<Omit<SaveSlot, 'canSave' | 'canDiscard'>>,
     handlers: Partial<WorkspaceActions> = {},
@@ -629,7 +686,8 @@ describe('the Discard control', () => {
     ['work that was never saved', { hasSavedVersion: false }, 'Nothing saved yet to go back to'],
     ['everything saved', { dirty: false }, 'No unsaved changes'],
     ['a save running', { saving: true }, 'Wait for the save to finish'],
-    ['a reply running', { replying: true }, 'Wait for the reply to finish'],
+    ['a build running', { replying: true, building: true }, 'Wait for the build to finish'],
+    ['a Plan reply running', { replying: true }, 'Wait for the reply to finish'],
     ['a discard running', { discarding: true }, 'Discarding your changes'],
   ] as const)('★ with %s it sits left of Save and says whether it can be pressed', (_, save, refusal) => {
     // Mutation check: switch to a real `disabled`, or drop the saved-version gate, and a row goes red.
@@ -652,7 +710,7 @@ describe('the Discard control', () => {
 
   it.each([
     ['a discard starting', { discarding: true }, {}, 'refused'],
-    ['a reply starting', { replying: true }, {}, 'refused'],
+    ['a build starting', { replying: true }, {}, 'refused'],
     ['the saved version going away', { hasSavedVersion: false }, {}, 'refused'],
     ['the discard action going away', {}, { discard: null }, 'hidden'],
   ] as const)('★ %s alone reaches the row', (_, save, handlers, expected) => {

@@ -38,6 +38,7 @@ import {
   presentationFor,
   SECONDARY_ACTIONS,
   versionRowData,
+  type PublishAnswer,
 } from '../utils/publishPresentation'
 import type { DeployOutcome, PublishState } from '../utils/deployApi'
 
@@ -72,7 +73,7 @@ export default function PublishStatusChip({
   const [open, setOpen] = useState(false)
   const [showModal, setShowModal] = useState(false)
   const [confirmingWithdraw, setConfirmingWithdraw] = useState(false)
-  const [answer, setAnswer] = useState<string | null>(null)
+  const [answer, setAnswer] = useState<PublishAnswer | null>(null)
   const headingId = useId()
 
   // An answer, or a press that failed, must not land behind a closed popover: the citizen
@@ -95,6 +96,9 @@ export default function PublishStatusChip({
   )
 
   const state: PublishState | null = deployment?.publishState ?? null
+  // Said only while the app is still where the answer left it: once it is live, or did not start,
+  // the press's answer is history and the state's own sentence is the news.
+  const said = answer !== null && answer.heldWhile === state ? answer.text : null
   // THE ONE RULE: `presentationFor` switches on `publishState` — no status, no
   // `unpublishedAt`, no approval lineage, no pin. `approvedRetryCommit` is the server's own
   // word for what the button publishes, and `failureCode` its own word for why an attempt
@@ -124,7 +128,7 @@ export default function PublishStatusChip({
    * region is never red and never carries an alert role.
    */
   const speak = useCallback((outcome: DeployOutcome): void => {
-    setAnswer(answerFor(outcome).text)
+    setAnswer(answerFor(outcome))
   }, [])
 
   const pressAction = useCallback(async (): Promise<void> => {
@@ -160,9 +164,9 @@ export default function PublishStatusChip({
    * `speak()` alone would leave any mount that never itself pressed something silent. The
    * answer wins while there is one (more specific). Sits OUTSIDE the popover: owed either way.
    */
-  let announcement = answer ?? ''
-  if (answer === null && loadError !== null) announcement = 'Publish status: unavailable'
-  else if (answer === null && presentation !== null) {
+  let announcement = said ?? ''
+  if (said === null && loadError !== null) announcement = 'Publish status: unavailable'
+  else if (said === null && presentation !== null) {
     announcement = `Publish status: ${presentation.label}`
   }
   // THE WAIT ITSELF SPEAKS, and it takes precedence while it is running. `busyReason`
@@ -325,12 +329,12 @@ export default function PublishStatusChip({
             </div>
           )}
 
-          {answer !== null && (
+          {said !== null && (
             <p
               data-testid="publish-answer"
               className="mt-3 border-t border-bial-border pt-2.5 text-xs leading-relaxed text-neutral"
             >
-              {answer}
+              {said}
             </p>
           )}
 

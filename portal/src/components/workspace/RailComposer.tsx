@@ -10,7 +10,7 @@
  * kind is fixed at creation, and what each kind is CALLED and what it DOES come from
  * `utils/chatKind.ts`.
  */
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { AssistantRuntimeProvider, useExternalStoreRuntime } from '@assistant-ui/react'
 import { ToggleGroup, ToggleGroupItem } from '../ui/toggle-group'
@@ -18,6 +18,7 @@ import { uuidv7 } from '../../utils/conversationApi'
 import { chatKindFor } from '../../utils/chatKind'
 import { useWorkspaceReport } from './workspaceChannel'
 import Composer from '../chat/Composer'
+import { DismissButton } from '../ui/DismissButton'
 import { type ComposerSubmission } from '../chat/ComposerBox'
 import { convertMessage } from '../chat/runtime/convertMessage'
 import type { ChatMessage } from '../../utils/messageTypes'
@@ -28,23 +29,9 @@ import {
 import type { ChatKind } from '../../pages/ChatRoute'
 
 /**
- * THE TWO KINDS, IN THE BOARD'S ORDER — Plan first, then Build, and PLAN IS SELECTED.
- *
- * The order is the board's. The default was Build, inherited from the retired composer, which
- * minted a Build chat for every send; the argument for keeping it was that changing it would
- * silently change what the control does.
- *
- * CHANGED TO PLAN, PER THE OWNER (2026-09-10), and what it costs is exactly what that argument
- * warned about: a citizen who types into a fresh project and presses send now gets a plan to read
- * and a `Build this plan` button, instead of an app being built from their first sentence. That is
- * the point. A first prompt is the one most likely to be a rough description rather than a brief,
- * and building straight from it spends a container and several minutes of the model's time on a
- * guess nobody agreed to — which is also the moment the citizen has the least idea what the
- * platform is about to do.
- *
- * IT ONLY MOVES THE DEFAULT. Build is one click away and unchanged, `?kind=build` still mints a
- * build chat, and a chat's kind is still fixed at creation. Order and default remain separate
- * decisions, and this is still the one place both are made.
+ * THE TWO KINDS, IN THE BOARD'S ORDER — Plan first, then Build — and BUILD IS SELECTED, per the
+ * owner: a send from an app builds unless the citizen picks Plan. A chat's kind is fixed at
+ * creation. Order and default are separate decisions, and this is the one place both are made.
  */
 const KINDS: readonly ChatKind[] = ['plan', 'build']
 
@@ -95,9 +82,10 @@ function RailComposerBody({ projectId }: RailComposerProps) {
   // the surface that publishes it, and the alternative is a prop chain through the rail that no
   // component in between has any business carrying.
   const report = useWorkspaceReport()
-  // PLAN, per the owner — see the `KINDS` docblock above for what that changes and what it costs.
-  const [kind, setKind] = useState<ChatKind>('plan')
+  // BUILD, per the owner — see the `KINDS` docblock above.
+  const [kind, setKind] = useState<ChatKind>('build')
   const [urgent, setUrgent] = useState<string | null>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
 
   /**
    * ASKS FOR THE WORKSPACE BEFORE IT NAVIGATES, which is why this is not a two-line navigate.
@@ -107,6 +95,7 @@ function RailComposerBody({ projectId }: RailComposerProps) {
    */
   const startChat = useCallback(
     async ({ text, attachments }: ComposerSubmission) => {
+      setUrgent(null)
       const open = () => {
         // THROUGH THE SHARED `uuidv7`, never an inline `crypto.randomUUID()`. That mints a v4, and
         // this id becomes the conversation's PRIMARY KEY, which needs to be sortable.
@@ -154,7 +143,7 @@ function RailComposerBody({ projectId }: RailComposerProps) {
   const picked = useMemo(() => chatKindFor(kind), [kind])
 
   return (
-    <div className="font-manrope">
+    <div ref={rootRef} className="font-manrope">
       {/* THE BOARD'S SEGMENTED CONTROL: a #F0F4F8 track with a white pill on the selected item.
           No hue at all — the selection is signalled by elevation, which is what keeps it legible
           and is why the icon takes its colour from the label rather than from the kind. */}
@@ -217,6 +206,7 @@ function RailComposerBody({ projectId }: RailComposerProps) {
         // there is no turn here that could be running.
         isRunning={false}
         onUrgent={setUrgent}
+        onAttachPress={() => setUrgent(null)}
         // The rail section owns its own gutter and ground already.
         frameClassName="flex flex-col gap-1.5"
       />
@@ -224,9 +214,15 @@ function RailComposerBody({ projectId }: RailComposerProps) {
       {/* Attachment refusals and send failures, said out loud. `role="alert"` because a refused
           file is a thing the citizen has to act on before their message means what they think. */}
       {urgent && (
-        <p role="alert" className="mt-1.5 text-[11.5px] text-danger">
-          {urgent}
-        </p>
+        <div role="alert" className="mt-1.5 flex items-start gap-1.5 text-[11.5px] text-danger">
+          <p className="min-w-0 flex-1">{urgent}</p>
+          <DismissButton
+            onDismiss={() => {
+              setUrgent(null)
+              rootRef.current?.querySelector('textarea')?.focus()
+            }}
+          />
+        </div>
       )}
     </div>
   )

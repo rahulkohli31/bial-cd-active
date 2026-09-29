@@ -21,8 +21,9 @@ import {
   createWorkspaceChannel,
   type WorkspaceReport,
 } from '../workspaceChannel'
-import { resolveWorkspaceState } from '../workspaceState'
+import { resolveWorkspaceState, type StartResult } from '../workspaceState'
 import { createStarter } from '../startApp'
+import { SendRefusal } from '../../chat/sendRefusal'
 import type { PreviewState } from '../../../utils/buildSessionApi'
 
 // THE START THIS RAIL ASKS FOR, held by the test rather than answered by the network. The rail
@@ -158,7 +159,7 @@ describe('the mint-and-navigate protocol, carried through the deletion', () => {
     renderComposer()
     send('a visitor log')
 
-    expect(path()).toMatch(/\?projectId=p1&kind=plan$/)
+    expect(path()).toMatch(/\?projectId=p1&kind=build$/)
     expect(routerState()).toMatchObject({ prompt: 'a visitor log', freshlyMinted: true })
   })
 
@@ -178,7 +179,7 @@ describe('the mint-and-navigate protocol, carried through the deletion', () => {
     expect(path()).toContain('projectId=p%201%26kind%3Dplan')
     // The REAL kind is the trailing one the picker wrote; the encoded literal above is part of the
     // project id and must not be mistaken for it. That is the whole point of this test.
-    expect(path()).toMatch(/&kind=plan$/)
+    expect(path()).toMatch(/&kind=build$/)
   })
 
   it('navigates nowhere on an empty or whitespace-only draft', () => {
@@ -324,26 +325,21 @@ describe('the kind picker — the control that makes the other half of the produ
     expect(path()).toMatch(/&kind=plan$/)
   })
 
-  it('★ defaults to PLAN, so a first prompt is planned rather than built from', () => {
-    // CHANGED BY DECISION, 2026-09-10. It used to default to Build, inherited from the retired
-    // composer, and the argument for keeping it was that changing it would silently change what
-    // the control does for anyone who never touches the picker. That is exactly what it now does,
-    // deliberately: a rough first sentence gets a plan to read and a `Build this plan` button
-    // instead of a container and several minutes of the model spent on a guess.
+  it('★ defaults to BUILD, so a send that never touches the picker builds', () => {
     renderComposer()
     send()
 
-    expect(path()).toMatch(/&kind=plan$/)
+    expect(path()).toMatch(/&kind=build$/)
   })
 
   it('reads its one line of explanation from the catalogue, never from this file', () => {
     // One source for what a kind IS. A second wording here would drift the first time the
     // server's changed, and nothing would notice.
     renderComposer()
-    expect(screen.getByTestId('kind-description').textContent).toBe('Shape a plan first.')
-
-    fireEvent.click(screen.getByRole('radio', { name: 'Build' }))
     expect(screen.getByTestId('kind-description').textContent).toBe('Change the live app.')
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Plan' }))
+    expect(screen.getByTestId('kind-description').textContent).toBe('Shape a plan first.')
   })
 
   it('★ cannot reach a third, empty state by re-pressing the active option', () => {
@@ -522,5 +518,75 @@ describe('★ the rail is the pane`s only narrator for the whole start, and says
       hold.settle()
       await Promise.resolve()
     })
+  })
+})
+
+describe('the rail\'s red line clears itself and can be dismissed', () => {
+  const REFUSED = 'Your workspace is busy with another application.'
+
+  /** The rail on a channel whose start answers one press at a time, in the order given. */
+  function railWithStarts(...answers: Promise<StartResult>[]) {
+    const channel = createWorkspaceChannel()
+    const start = vi.fn(() => answers.shift() ?? new Promise<StartResult>(() => {}))
+    channel.workspace.set({
+      projectId: 'p1',
+      settled: true,
+      state: resolveWorkspaceState({
+        preview: null,
+        projectHasSavedBuild: null,
+        startOutcome: null,
+        startInFlight: false,
+        waitHasGoneOnTooLong: false,
+      }),
+      onStartOutcome: vi.fn(),
+      onStartAdmitted: vi.fn(),
+      onStartPending: vi.fn(),
+      onRefresh: vi.fn(),
+      start,
+    })
+    render(
+      <MemoryRouter initialEntries={['/projects/p1']}>
+        <WorkspaceChannelProvider value={channel}>
+          <Routes>
+            <Route path="/projects/:projectId" element={<RailComposer projectId="p1" />} />
+            <Route path="*" element={<LocationProbe />} />
+          </Routes>
+        </WorkspaceChannelProvider>
+      </MemoryRouter>,
+    )
+    return start
+  }
+
+  const refusedOnce = () => Promise.resolve<StartResult>({ kind: 'failed', error: new SendRefusal(REFUSED) })
+
+  it('★ clears as the next send starts', async () => {
+    // Mutation check: drop the clear from `startChat` and the refusal outlives the second press.
+    const start = railWithStarts(refusedOnce())
+    send('a visitor log')
+    expect((await screen.findByRole('alert')).textContent).toContain(REFUSED)
+
+    send('a visitor log')
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(2))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(composer()).toBeTruthy()
+  })
+
+  it('clears when the attach control is pressed', async () => {
+    railWithStarts(refusedOnce())
+    send('a visitor log')
+    await screen.findByRole('alert')
+
+    fireEvent.click(screen.getByTestId('composer-attach'))
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('★ Dismiss closes it and puts the cursor back in the box', async () => {
+    railWithStarts(refusedOnce())
+    send('a visitor log')
+    await screen.findByRole('alert')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(document.activeElement).toBe(composer())
   })
 })

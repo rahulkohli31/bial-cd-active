@@ -85,6 +85,7 @@ class UserFactory:
         data: dict[str, Any] = {
             "azure_oid": f"oid-{uuid.uuid4()}",
             "email": "citizen@rvaiglobal.com",
+            "has_signed_in": True,
         }
         data.update(overrides)
         return User(**data)

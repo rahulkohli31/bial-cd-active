@@ -122,6 +122,20 @@ const mount = (): void => {
   render(<PublishStatusChip projectId="p1" />)
 }
 
+/** The state the hook's own refresh reads before a press answers, re-wired from inside the press. */
+const thenState = (next: PublishState): void => {
+  const current = h.usePublishState() as UsePublishState
+  const deployment = view(next)
+  h.usePublishState.mockReturnValue({ ...current, deployment, approval: deployment.approval })
+}
+
+const STARTED = {
+  outcome: 'started' as const,
+  deploymentId: 'd1',
+  appId: 'app-1',
+  status: 'running',
+}
+
 const openChip = async (): Promise<HTMLElement> => {
   fireEvent.click(screen.getByTestId('publish-chip'))
   return screen.findByTestId('publish-popover')
@@ -696,12 +710,10 @@ describe('one press, one request, and the server says which success it was', () 
   })
 
   it('★ Try again on an approved copy sends it and says so — no publish dialog', async () => {
-    const publish = vi.fn(async () => ({
-      outcome: 'started' as const,
-      deploymentId: 'd1',
-      appId: 'app-1',
-      status: 'running',
-    }))
+    const publish = vi.fn(async () => {
+      thenState('starting_up')
+      return STARTED
+    })
     wire(view('did_not_start', { approvedRetryCommit: APPROVED_SHA }), { publish })
     mount()
     await openChip()
@@ -715,12 +727,10 @@ describe('one press, one request, and the server says which success it was', () 
   })
 
   it('announces the started sentence when the deploy actually began', async () => {
-    const onConfirm = vi.fn(async () => ({
-      outcome: 'started' as const,
-      deploymentId: 'd1',
-      appId: 'app-1',
-      status: 'running',
-    }))
+    const onConfirm = vi.fn(async () => {
+      thenState('starting_up')
+      return STARTED
+    })
     wire(view('draft'), { onConfirm })
     mount()
     await openChip()
@@ -737,14 +747,17 @@ describe('one press, one request, and the server says which success it was', () 
   it('renders a routed answer in the server own words, as a success and never as an alert', async () => {
     // Mutation receipt: give `publish-answer` a `role="alert"` or the failure colour and
     // this goes red. Routing is the platform doing exactly what the button said it would.
-    const onConfirm = vi.fn(async () => ({
-      outcome: 'routed_for_review' as const,
-      appId: 'app-1',
-      submissionId: 's1',
-      commitSha: SHA,
-      submittedAt: '2026-08-19T10:00:00Z',
-      message: "Your app was sent to an administrator for review. You'll be able to publish it once approved.",
-    }))
+    const onConfirm = vi.fn(async () => {
+      thenState('in_review')
+      return {
+        outcome: 'routed_for_review' as const,
+        appId: 'app-1',
+        submissionId: 's1',
+        commitSha: SHA,
+        submittedAt: '2026-08-19T10:00:00Z',
+        message: "Your app was sent to an administrator for review. You'll be able to publish it once approved.",
+      }
+    })
     wire(view('live_newer_work', { url: 'https://x.example/' }), { onConfirm })
     mount()
     await openChip()
@@ -763,12 +776,10 @@ describe('one press, one request, and the server says which success it was', () 
   it('reads a direct publish as a success even where the button said review', async () => {
     // The one thing this surface is deliberately not trusted to predict: which of the two
     // successes a press produces. The decision is taken inside the request.
-    const onConfirm = vi.fn(async () => ({
-      outcome: 'started' as const,
-      deploymentId: 'd1',
-      appId: 'app-1',
-      status: 'running',
-    }))
+    const onConfirm = vi.fn(async () => {
+      thenState('starting_up')
+      return STARTED
+    })
     wire(view('live_drift_unknown', { url: 'https://x.example/' }), { onConfirm })
     mount()
     await openChip()
@@ -1100,5 +1111,54 @@ describe('★ the publish wait says what it is doing', () => {
     expect(settled.getAttribute('aria-busy')).toBe('false')
     // LIVENESS: the control really is the same one, back to offering its action.
     expect(settled.textContent?.trim().length).toBeGreaterThan(0)
+  })
+})
+
+describe('★ a press\'s answer retires once the app has moved on', () => {
+  /** Press Try again, and hand back a rerender that moves the app to `next` with the popover open. */
+  async function pressedThenMovesTo() {
+    const publish = vi.fn(async () => {
+      thenState('starting_up')
+      return STARTED
+    })
+    wire(view('did_not_start', { approvedRetryCommit: APPROVED_SHA }), { publish })
+    const { rerender } = render(<PublishStatusChip projectId="p1" />)
+    await openChip()
+    fireEvent.click(screen.getByTestId('publish-action'))
+    expect((await screen.findByTestId('publish-answer')).textContent).toMatch(/publishing now/i)
+    return (next: PublishState) => {
+      thenState(next)
+      rerender(<PublishStatusChip projectId="p1" />)
+    }
+  }
+
+  it('★ is gone once the app is Live, with the popover still open', async () => {
+    // Mutation check: render the answer without comparing its state and "Publishing now" stays.
+    const moveTo = await pressedThenMovesTo()
+    moveTo('live_current')
+
+    expect(screen.getByTestId('publish-chip').getAttribute('data-publish-state')).toBe('live_current')
+    expect(screen.getByTestId('publish-popover')).toBeTruthy()
+    expect(screen.queryByTestId('publish-answer')).toBeNull()
+    expect(screen.getByTestId('publish-announce').textContent).not.toMatch(/publishing now/i)
+  })
+
+  it('is gone once the app did not start, and the failure says its own sentence', async () => {
+    const moveTo = await pressedThenMovesTo()
+    moveTo('did_not_start')
+
+    expect(screen.queryByTestId('publish-answer')).toBeNull()
+    expect(screen.getByTestId('publish-popover').textContent).toContain(
+      presentationFor('did_not_start', null, null).sentence,
+    )
+  })
+
+  it('is gone after closing and reopening, as before', async () => {
+    await pressedThenMovesTo()
+    fireEvent.keyDown(screen.getByTestId('publish-popover'), { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByTestId('publish-popover')).toBeNull())
+
+    await openChip()
+    expect(screen.queryByTestId('publish-answer')).toBeNull()
   })
 })

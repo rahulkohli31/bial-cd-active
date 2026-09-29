@@ -62,10 +62,10 @@ from src.schemas import (
     ProjectSharesResponse,
     SharedProjectListResponse,
     ShareRequest,
+    UnshareRequest,
     error_responses,
 )
 from src.schemas.shares import (
-    ColleagueResult,
     SharedProjectResponse,
     SharedProjectSharer,
     ShareResponse,
@@ -92,16 +92,18 @@ from src.services.projects import (
     SharedSort,
     create_share,
     delete_project_cascade,
+    email_local_part,
+    find_colleagues,
     find_possible_duplicates,
     list_shared_with_me,
     list_shares_for_project,
     log_matches_shown,
     log_resolution,
     owned_project_or_404,
+    resolve_colleague,
     resolve_project_access,
     resweep_submission_prefixes,
     revoke_share,
-    search_colleagues,
 )
 from src.services.ratelimit import rate_limit
 from src.services.redis import build_coordination_or_503, coordination_is_gone, get_redis
@@ -650,23 +652,18 @@ async def search_project_colleagues(
     sharing one email domain would match every user in it). Returns display name + email
     local part only, at most 10 results — NOT the admin roster shape, which additionally
     carries token limits, usage and suspension state that no citizen picking a colleague to
-    share with has any business seeing.
+    share with has any business seeing. Our own users come first; when they leave room, people
+    in the organisation's directory who have no user here yet fill it, carrying `directoryId`
+    instead of `id`. Only a caller who is a member of the directory is offered people from it.
+    A directory that cannot be reached leaves just our own users.
 
     DECLARED BEFORE `/{project_id}` — same reason `/counts` is: FastAPI matches in
     declaration order, so a static path registered after the parameterised route would be
     swallowed by it and answer 422 on a UUID parse instead of running this handler.
     """
     cleaned = _clean_colleague_query(q)
-    colleagues = await search_colleagues(db, requester_id=user.id, query=cleaned)
     return ColleagueSearchResponse(
-        colleagues=[
-            ColleagueResult(
-                id=colleague.id,
-                display_name=colleague.display_name,
-                email_local_part=colleague.email.split("@", 1)[0],
-            )
-            for colleague in colleagues
-        ]
+        colleagues=await find_colleagues(db, requester=user, query=cleaned)
     )
 
 
@@ -825,17 +822,37 @@ def _share_response(share: ProjectShare, colleague: User) -> ShareResponse:
         id=share.id,
         shared_with_user_id=colleague.id,
         shared_with_display_name=colleague.display_name,
-        shared_with_email_local_part=colleague.email.split("@", 1)[0],
+        shared_with_email_local_part=email_local_part(colleague.email),
+        signed_in=colleague.has_signed_in,
         created_at=share.created_at,
     )
 
 
+SHARE_RATE_LIMIT = 30
+SHARE_RATE_WINDOW_SECONDS = 60
+
+
+async def _share_rate_key(user: CurrentUser) -> str:
+    return f"project-share:{user.id}"
+
+
+_share_limiter = rate_limit(
+    _share_rate_key,
+    limit=SHARE_RATE_LIMIT,
+    window_seconds=SHARE_RATE_WINDOW_SECONDS,
+    message="Too many shares. Please wait a moment and try again.",
+)
+
+
 @router.post(
     "/{project_id}:share",
+    dependencies=[Depends(_share_limiter)],
     responses=error_responses(
         AUTH_401,
         (400, ErrorEnvelope, "Self-share refused, or nothing saved to share yet"),
         (404, ErrorEnvelope, "Project or colleague not found"),
+        (429, ErrorEnvelope, "Too many shares"),
+        (503, ErrorEnvelope, "The directory could not be reached"),
     ),
 )
 async def share_project(
@@ -845,11 +862,12 @@ async def share_project(
     `owned_project_or_404`, never the widened `resolve_project_access`: sharing IS a mutation
     of the project's own access list, and R6 grants a recipient "Can use", never the ability
     to share onward. Idempotent (R3) and refused for self-share (R2) or a project with
-    nothing saved yet (R10) — both enforced inside `create_share`, not duplicated here."""
+    nothing saved yet (R10) — both enforced inside `create_share`, not duplicated here.
+    A `directoryId` for someone with no user here yet creates them, not yet signed in, in the
+    same transaction as the share; a directory that cannot be reached is a 503. A `directoryId`
+    from a caller who is not a member of the directory is not found."""
     project = await owned_project_or_404(db, user.id, project_id)
-    colleague = await db.get(User, body.shared_with_user_id)
-    if colleague is None:
-        raise AppApiError(404, "That colleague could not be found.")
+    colleague = await resolve_colleague(db, requester=user, request=body)
     share = await create_share(db, project=project, actor_id=user.id, colleague_id=colleague.id)
     await db.commit()
     return _share_response(share, colleague)
@@ -866,7 +884,7 @@ async def share_project(
 )
 async def unshare_project(
     project_id: uuid.UUID,
-    body: ShareRequest,
+    body: UnshareRequest,
     user: CurrentUser,
     db: DbSession,
     sandbox: OptionalSandbox,

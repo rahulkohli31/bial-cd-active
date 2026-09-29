@@ -55,6 +55,9 @@ export interface ChatKindPresentation {
    * contradicting the sentence above it promising a Plan chat changes nothing.
    */
   composerPlaceholder: string
+  /** What the line under the composer says while a turn runs in a chat of this kind, or `null`
+   *  for the composer's own sentence. LOCAL, like the placeholder. */
+  composerRunningNote: string | null
 }
 
 /**
@@ -66,7 +69,10 @@ export interface ChatKindPresentation {
  */
 const CHAT_KIND_LOOKS: Readonly<
   Partial<
-    Record<string, Pick<ChatKindPresentation, 'completion' | 'Icon' | 'pillIcon' | 'pill' | 'composerPlaceholder'>>
+    Record<
+      string,
+      Pick<ChatKindPresentation, 'completion' | 'Icon' | 'pillIcon' | 'pill' | 'composerPlaceholder' | 'composerRunningNote'>
+    >
   >
 > = {
   build: {
@@ -76,6 +82,7 @@ const CHAT_KIND_LOOKS: Readonly<
     pillIcon: null,
     pill: 'bg-accent-light text-secondary-800',
     composerPlaceholder: 'Describe the change you need…',
+    composerRunningNote: 'Builds usually take several minutes and keep going if you leave. Keep typing if you like.',
   },
   plan: {
     completion: ' chat',
@@ -84,6 +91,7 @@ const CHAT_KIND_LOOKS: Readonly<
     pill: 'bg-primary-50 text-primary-dark',
     // Names no change, because a Plan chat makes none — the line above this box says so.
     composerPlaceholder: 'Describe what you have in mind…',
+    composerRunningNote: null,
   },
 }
 
@@ -102,6 +110,7 @@ export const UNKNOWN_CHAT_KIND: ChatKindPresentation = {
   pill: 'bg-status-grey-bg text-status-grey-fg',
   // The kind is unknown, so the hint claims nothing about what sending will do.
   composerPlaceholder: 'Describe what you need…',
+  composerRunningNote: null,
 }
 
 /**
@@ -131,5 +140,6 @@ export function chatKindFor(kind: string): ChatKindPresentation {
     pillIcon: look.pillIcon,
     pill: look.pill,
     composerPlaceholder: look.composerPlaceholder,
+    composerRunningNote: look.composerRunningNote,
   }
 }

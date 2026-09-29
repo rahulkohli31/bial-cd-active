@@ -253,6 +253,8 @@ export interface SaveSlot {
   discarding: boolean
   /** A reply is running. Discard waits for it: the files are the reply's to read or change. */
   replying: boolean
+  /** The running reply is a build, which writes files, so Save waits for it too. */
+  building: boolean
   /** A saved version exists for Discard to go back to. */
   hasSavedVersion: boolean
   /**
@@ -274,6 +276,7 @@ export const NO_SAVE: SaveSlot = {
   error: null,
   discarding: false,
   replying: false,
+  building: false,
   hasSavedVersion: false,
   canSave: false,
   canDiscard: false,
@@ -328,6 +331,7 @@ const sameSave = (a: SaveSlot, b: SaveSlot) =>
   a.error === b.error &&
   a.discarding === b.discarding &&
   a.replying === b.replying &&
+  a.building === b.building &&
   a.hasSavedVersion === b.hasSavedVersion &&
   a.canSave === b.canSave &&
   a.canDiscard === b.canDiscard

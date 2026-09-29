@@ -99,6 +99,9 @@ have, so they are the ones to start first.
 - **Permission for the platform's identity to attach that managed identity** to the container apps
   it creates. Without it, container creation fails outright for projects that switch the data on
   while everything else keeps working — a failure that looks like a platform bug and is not.
+- **Permission for the platform's own identity to read users' basic profiles in the directory.**
+  Without it, sharing finds only people who have signed in before, and everything else works. The
+  identity caches its tokens, so restart the control plane after the grant.
 - **Network reachability to the database server** from the container apps environment, for both
   sandboxes and deployed applications. Each reaches its own database directly; without this their
   data layer is dead while the rest of the platform looks healthy.

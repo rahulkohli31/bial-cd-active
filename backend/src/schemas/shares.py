@@ -9,29 +9,50 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Self
+
+from pydantic import model_validator
 
 from src.schemas.base import CamelModel
 
 
 class ShareRequest(CamelModel):
-    """The body both `POST /v1/projects/{id}:share` and `:unshare` take — the colleague's user
-    id, resolved from a prior `:colleagues` search result, never a typed email (a citizen
-    cannot be trusted to spell a colleague's email correctly, and a share against a typo'd
-    address would silently grant nobody anything while the owner believes it worked)."""
+    """Who to share with: exactly one of `sharedWithUserId`, a user here, or `directoryId`, the
+    Entra object id of someone found only in the directory. Both come from a prior colleague
+    search, never a typed email: a share against a mistyped address would grant nobody anything
+    while the owner believes it worked."""
+
+    shared_with_user_id: uuid.UUID | None = None
+    directory_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_colleague(self) -> Self:
+        named = sum(value is not None for value in (self.shared_with_user_id, self.directory_id))
+        if named != 1:
+            raise ValueError("Choose exactly one colleague to share with.")
+        return self
+
+
+class UnshareRequest(CamelModel):
+    """The colleague whose share `POST /v1/projects/{id}:unshare` revokes, by their user id."""
 
     shared_with_user_id: uuid.UUID
 
 
 class ColleagueResult(CamelModel):
-    """One search hit (R5) — display name AND the email LOCAL PART only, never the full
-    address: enough for an owner to tell two colleagues with the same name apart, not enough
-    to hand out a directory of working email addresses through a picker. NOT the admin roster
-    shape, which additionally carries token limits, usage and suspension state — none of
-    which a citizen picking a colleague to share with has any business seeing."""
+    """One search hit. Exactly one of `id` and `directoryId` is set: `id` for someone with a
+    user here, `directoryId` (their Entra object id) for someone found only in the directory.
+    Display name AND the email LOCAL PART only, never the full address: enough for an owner to
+    tell two colleagues with the same name apart, not enough to hand out a directory of working
+    email addresses through a picker. `signedIn` says whether they have ever signed in here.
+    NOT the admin roster shape, which additionally carries token limits, usage and suspension
+    state — none of which a citizen picking a colleague to share with has any business seeing."""
 
-    id: uuid.UUID
+    id: uuid.UUID | None
+    directory_id: uuid.UUID | None
     display_name: str | None
     email_local_part: str
+    signed_in: bool
 
 
 class ColleagueSearchResponse(CamelModel):
@@ -39,15 +60,17 @@ class ColleagueSearchResponse(CamelModel):
 
 
 class ShareResponse(CamelModel):
-    """One row of a project's OWN share panel (R12) — who it is shared with, and when.
+    """One row of a project's OWN share panel — who it is shared with, and when.
     Carries the SAME display-name/email-local-part pair `ColleagueResult` does: the owner
     reads this list to decide who to revoke, and needs to disambiguate the same way the
-    search that created the share did."""
+    search that created the share did. `signed_in` says whether the colleague has ever signed
+    in, not whether they are signed in now."""
 
     id: uuid.UUID
     shared_with_user_id: uuid.UUID
     shared_with_display_name: str | None
     shared_with_email_local_part: str
+    signed_in: bool
     created_at: datetime
 
 
