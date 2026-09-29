@@ -793,7 +793,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   const turnRunningHere =
     generatingChatId !== null &&
     (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
-  // Anything not known to be a Plan chat counts as a build, so Save waits unless it is sure.
+  // A running chat not known to be a Plan chat counts as a build, so Save waits.
   const runningKind = generatingChatId === buildId ? kind : builds.find((b) => b.id === generatingChatId)?.kind
   const buildRunningHere = turnRunningHere && runningKind !== 'plan'
   const projectDialogs = useProjectDialogs(project, onProjectUpdate)

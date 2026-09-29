@@ -526,7 +526,7 @@ describe('the Save control', () => {
   })
 
   it('★ is greyed while a build runs, with the reason Discard gives, and refuses the press', () => {
-    // Mutation check: drop `replying` from the Save guard and the press reaches the action.
+    // Mutation check: drop `building` from the Save guard and the press reaches the action.
     const onSave = vi.fn()
     withSave({ dirty: true, saving: false, error: null, replying: true, building: true }, onSave)
     const save = screen.getByTestId('save-project')

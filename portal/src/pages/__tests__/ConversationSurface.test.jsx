@@ -652,13 +652,17 @@ describe('★ the red banner clears itself and can be dismissed', () => {
     expect(screen.queryByTestId('urgent-banner')).toBeNull()
   })
 
-  /** A Save refused with nothing running, so the red sentence is up and the next press can clear it. */
-  async function saveRefused() {
-    h.fetchSaveState.mockResolvedValue({ dirty: true })
+  /** Press Save and have it refused, so the red sentence is up and the next press can clear it. */
+  async function refuseSave() {
     h.saveProject.mockRejectedValueOnce(new ApiError(REFUSED, 409))
-    renderBuilder()
     fireEvent.click(await screen.findByTestId('save-project'))
     expect((await screen.findByTestId('urgent-banner')).textContent).toBe(REFUSED)
+  }
+
+  async function saveRefused() {
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    renderBuilder()
+    await refuseSave()
   }
 
   it('★ clears as the next Save starts, and that Save goes through', async () => {
@@ -681,13 +685,11 @@ describe('★ the red banner clears itself and can be dismissed', () => {
   it('★ clears when Keep planning is pressed', async () => {
     // Mutation check: drop the clear from `handleKeepPlanning` and the refusal stays over the answer.
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Here is the plan.', PLAN_CARD_ID)))
-    await saveRefused()
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    renderBuilder()
     await send('plan me a thing')
     const keepPlanning = await screen.findByRole('button', { name: KEEP_PLANNING_LABEL })
-    h.fetchSaveState.mockResolvedValue({ dirty: true })
-    h.saveProject.mockRejectedValueOnce(new ApiError(REFUSED, 409))
-    fireEvent.click(screen.getByTestId('save-project'))
-    await screen.findByTestId('urgent-banner')
+    await refuseSave()
 
     fireEvent.click(keepPlanning)
     await waitFor(() => expect(h.resolvePlanOptions).toHaveBeenCalledWith('build-X', PLAN_CARD_ID))
