@@ -220,7 +220,6 @@ own endpoints by convenience of being nearby.
 looks people up there, so an owner can share with a colleague who has never signed in. The call
 uses the control plane's own identity, never the one generated applications receive, and it only
 reads. If the directory cannot be reached, sharing falls back to the platform's own users.
-ADR-0032 holds the reasoning.
 
 ## Generated-app data isolation
 
