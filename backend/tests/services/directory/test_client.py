@@ -144,6 +144,7 @@ async def _fresh_directory() -> AsyncIterator[None]:
 def identity(monkeypatch: pytest.MonkeyPatch) -> _FakeIdentity:
     fake = _FakeIdentity()
     monkeypatch.setattr(directory_client, "ManagedIdentityCredential", fake)
+    monkeypatch.setenv("IDENTITY_ENDPOINT", "http://127.0.0.1:41741/msi/token")
     return fake
 
 
@@ -480,3 +481,33 @@ async def test_aclose_closes_the_credential_and_client_and_a_second_close_is_a_n
 
     await aclose_directory()
     assert identity.closes == 1
+
+
+# --- a host with no managed identity ------------------------------------------------------------
+
+
+async def test_a_host_with_no_managed_identity_skips_graph_without_a_warning(
+    monkeypatch: pytest.MonkeyPatch, identity: _FakeIdentity, graph: _FakeGraph
+) -> None:
+    monkeypatch.delenv("IDENTITY_ENDPOINT")
+    graph.answer = lambda _: httpx.Response(200, json=_page(_PRIYA))
+
+    with capture_logs() as logs:
+        found = await search_directory(_QUERY)
+        looked_up = await get_directory_person(_PRIYA_ID)
+
+    assert found == []
+    assert looked_up is DirectoryMiss.UNAVAILABLE
+    assert identity.built_with == []
+    assert graph.requests == []
+    assert _warnings(logs) == []
+
+
+async def test_the_same_search_reaches_graph_once_the_host_has_an_identity(
+    graph: _FakeGraph,
+) -> None:
+    graph.answer = lambda _: httpx.Response(200, json=_page(_PRIYA))
+
+    found = await search_directory(_QUERY)
+
+    assert [person.object_id for person in found] == [_PRIYA_ID]

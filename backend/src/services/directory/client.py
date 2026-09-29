@@ -5,13 +5,15 @@ the shared identity generated apps receive, and naming a client id would ask Gra
 Nothing here raises into a request. Any failure, including a call that outlives the time budget,
 logs one warning with the exception's class name and any HTTP status, then reads as no result:
 search returns nothing and a lookup says unavailable. Exception text is never logged, because
-httpx puts the request URL, and with it the search term, into its messages.
+httpx puts the request URL, and with it the search term, into its messages. A host with no managed
+identity, such as a developer's machine, skips Graph silently rather than waiting out the budget.
 """
 
 from __future__ import annotations
 
 import asyncio
 import enum
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -34,6 +36,8 @@ _SEARCH_TOP: Final = "25"
 # Covers the token and the request together, so a slow directory cannot hold a search open.
 _TIME_BUDGET_S: Final = 2.5
 _GUEST_MARKER: Final = "#EXT#"
+# Set by App Service on a host that has a managed identity; without it no token can be issued.
+_IDENTITY_ENDPOINT_VAR: Final = "IDENTITY_ENDPOINT"
 # Letters in any script, digits, space and `.-'_@`. A quote, backslash, colon or bracket could
 # break out of the quoted `$search` clause, so a query holding one is never sent.
 _SEARCHABLE: Final = re.compile(r"[\w .'@-]+")
@@ -54,6 +58,10 @@ class DirectoryMiss(enum.Enum):
 
     NOT_FOUND = "not_found"
     UNAVAILABLE = "unavailable"
+
+
+class _NoManagedIdentityError(Exception):
+    """This host has no managed identity, so Graph cannot be asked."""
 
 
 class _GraphUser(BaseModel):
@@ -83,6 +91,8 @@ _state = _Connection()
 async def _graph_get(url: str, params: dict[str, str], headers: dict[str, str]) -> httpx.Response:
     """One Graph GET as this process's identity; the credential and client are built on first
     use."""
+    if not os.environ.get(_IDENTITY_ENDPOINT_VAR):
+        raise _NoManagedIdentityError
     if _state.credential is None:
         _state.credential = ManagedIdentityCredential()
     if _state.http is None:
@@ -130,6 +140,8 @@ async def search_directory(query: str) -> list[DirectoryPerson]:
         response = await _graph_get(_USERS_URL, params, {"ConsistencyLevel": "eventual"})
         response.raise_for_status()
         page = _GraphUserPage.model_validate_json(response.content)
+    except _NoManagedIdentityError:
+        return []
     except Exception as exc:
         _warn(exc, response)
         return []
@@ -146,6 +158,8 @@ async def get_directory_person(object_id: uuid.UUID) -> DirectoryPerson | Direct
             return DirectoryMiss.NOT_FOUND
         response.raise_for_status()
         user = _GraphUser.model_validate_json(response.content)
+    except _NoManagedIdentityError:
+        return DirectoryMiss.UNAVAILABLE
     except Exception as exc:
         _warn(exc, response)
         return DirectoryMiss.UNAVAILABLE
