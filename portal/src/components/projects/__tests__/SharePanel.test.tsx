@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
+import { act, render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import { ApiError } from '../../../utils/apiError'
 import type { Colleague, ProjectShare } from '../../../utils/sharingApi'
 
@@ -173,5 +173,47 @@ describe('SharePanel — sharing with a colleague found only in the directory', 
     typeQuery('priy')
     expect(input.value).toBe('priy')
     await waitFor(() => expect(h.searchColleagues).toHaveBeenLastCalledWith('priy'))
+  })
+})
+
+describe('SharePanel — a slow search for text the user has since changed', () => {
+  function pendingSearch(): (found: Colleague[]) => void {
+    let resolve: (found: Colleague[]) => void = () => {}
+    h.searchColleagues.mockImplementationOnce(
+      () =>
+        new Promise<Colleague[]>((r) => {
+          resolve = r
+        }),
+    )
+    return (found) => resolve(found)
+  }
+
+  it('drops the late answer when newer text is still waiting on its own search', async () => {
+    const answerPri = pendingSearch()
+    h.searchColleagues.mockResolvedValueOnce([asha])
+    render(<SharePanelBody projectId="p1" />)
+
+    typeQuery('pri')
+    await waitFor(() => expect(h.searchColleagues).toHaveBeenCalledWith('pri'))
+    typeQuery('ash')
+    await act(async () => answerPri([priya]))
+
+    expect(screen.queryByText('Priya Sharma')).toBeNull()
+    await findRow('Asha Rao')
+    expect(screen.queryByText('Priya Sharma')).toBeNull()
+  })
+
+  it('drops the late answer once the box has been cleared', async () => {
+    const answerPri = pendingSearch()
+    render(<SharePanelBody projectId="p1" />)
+
+    typeQuery('pri')
+    await waitFor(() => expect(h.searchColleagues).toHaveBeenCalledWith('pri'))
+    typeQuery('')
+    await act(async () => answerPri([priya]))
+
+    expect(screen.getByPlaceholderText<HTMLInputElement>('Search by name or email').value).toBe('')
+    expect(screen.queryByText('Priya Sharma')).toBeNull()
+    expect(h.searchColleagues).toHaveBeenCalledTimes(1)
   })
 })

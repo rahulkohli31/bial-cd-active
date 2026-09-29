@@ -112,6 +112,8 @@ export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.El
   const sharedIds = new Set(shares.map((s) => s.sharedWithUserId))
 
   function onQueryChange(next: string): void {
+    // Every keystroke retires the search still in flight, including one for text since cleared.
+    const myId = ++requestIdRef.current
     setQuery(next)
     setShareHint(null)
     if (debounceRef.current !== null) clearTimeout(debounceRef.current)
@@ -129,10 +131,9 @@ export function SharePanelBody({ projectId }: SharePanelBodyProps): React.JSX.El
     setSearchNotice(null)
     debounceRef.current = setTimeout(() => {
       debounceRef.current = null
-      const myId = ++requestIdRef.current
       searchColleagues(trimmed)
         .then((colleagues) => {
-          if (requestIdRef.current !== myId) return // a newer keystroke's search already won
+          if (requestIdRef.current !== myId) return
           setResults(colleagues)
           // STATE 3 OF 4: no matches.
           setSearchNotice(colleagues.length === 0 ? 'No matching colleagues.' : null)
