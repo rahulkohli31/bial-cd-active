@@ -2604,8 +2604,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
    */
   const handleCancel = useCallback(async () => {
     const target = stopTarget()
-    if (target) await stopTurn(target.conversationId, target.turnId)
-  }, [stopTarget])
+    if (target) await handleStopTurn(target.conversationId, target.turnId)
+  }, [stopTarget, handleStopTurn])
 
   /**
    * WHY SEND IS UNAVAILABLE, when the reason is not simply "a reply is in flight".

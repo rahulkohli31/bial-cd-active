@@ -78,7 +78,8 @@ export interface UsageToday {
 /**
  * Fetch the authenticated caller's own daily usage. Returns
  * `{ used, limit, remaining, resetsAt }`, or null when the server declines
- * (e.g. a 401 mid-logout) — null hides the badge. Auth rides the session
+ * (e.g. a 401 mid-logout) — null is "no reading", which `useUsageToday` shows as
+ * nothing only when it has no earlier reading to keep. Auth rides the session
  * cookie (`credentials: 'include'`); the proxy rewrites /api → /v1.
  */
 export async function fetchUsageToday(fetchImpl: typeof fetch = fetch): Promise<UsageToday | null> {

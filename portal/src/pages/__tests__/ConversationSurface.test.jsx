@@ -61,6 +61,7 @@ import {
   planReply, turnStreaming, PLAN_CARD_ID, findStartAppControl,
   scriptBuildTurn, T_BUILD_END, T_STEP,
 } from './_builderSession.jsx'
+import { KEEP_PLANNING_LABEL } from '../../components/chat/OfferStrip'
 import { ApiError } from '../../utils/apiError'
 import { discardNoticeText } from '../../utils/conversationApi'
 import { DEFAULT_CONTEXT_SOFT } from '../../utils/contextLimits'
@@ -631,6 +632,60 @@ describe('★ the red banner clears itself and can be dismissed', () => {
 
     await send('add a date filter')
     await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
+    expect(screen.queryByTestId('urgent-banner')).toBeNull()
+  })
+
+  /** A Save refused with nothing running, so the red sentence is up and the next press can clear it. */
+  async function saveRefused() {
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    h.saveProject.mockRejectedValueOnce(new ApiError(REFUSED, 409))
+    renderBuilder()
+    fireEvent.click(await screen.findByTestId('save-project'))
+    expect((await screen.findByTestId('urgent-banner')).textContent).toBe(REFUSED)
+  }
+
+  it('★ clears as the next Save starts, and that Save goes through', async () => {
+    // Mutation check: drop the clear from `handleSave` and the old refusal sits over a Save that worked.
+    await saveRefused()
+    fireEvent.click(screen.getByTestId('save-project'))
+    await waitFor(() => expect(h.saveProject).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText('Saved')).toBeTruthy()
+    expect(screen.queryByTestId('urgent-banner')).toBeNull()
+  })
+
+  it('★ clears when the attach control is pressed', async () => {
+    // Mutation check: drop `onAttachPress` from the surface's composer and the refusal stays.
+    await saveRefused()
+    fireEvent.click(screen.getByTestId('composer-attach'))
+    expect(screen.queryByTestId('urgent-banner')).toBeNull()
+    expect(screen.getByTestId('composer-input')).toBeTruthy()
+  })
+
+  it('★ clears when Keep planning is pressed', async () => {
+    // Mutation check: drop the clear from `handleKeepPlanning` and the refusal stays over the answer.
+    h.readTurnStream.mockImplementation(turnStreaming(planReply('Here is the plan.', PLAN_CARD_ID)))
+    await saveRefused()
+    await send('plan me a thing')
+    const keepPlanning = await screen.findByRole('button', { name: KEEP_PLANNING_LABEL })
+    h.fetchSaveState.mockResolvedValue({ dirty: true })
+    h.saveProject.mockRejectedValueOnce(new ApiError(REFUSED, 409))
+    fireEvent.click(screen.getByTestId('save-project'))
+    await screen.findByTestId('urgent-banner')
+
+    fireEvent.click(keepPlanning)
+    await waitFor(() => expect(h.resolvePlanOptions).toHaveBeenCalledWith('build-X', PLAN_CARD_ID))
+    expect(screen.queryByTestId('urgent-banner')).toBeNull()
+  })
+
+  it.each([
+    ['the Stop control', () => fireEvent.click(screen.getByTestId('stop-turn'))],
+    ['Escape in the composer', () => fireEvent.keyDown(screen.getByTestId('composer-input'), { key: 'Escape' })],
+  ])('★ clears when the build is stopped with %s', async (_, stop) => {
+    // Mutation check: drop the clear from `handleStopTurn`, or route `handleCancel` straight to
+    // `stopTurn`, and the refusal outlives the Stop.
+    await saveRefusedDuringABuild()
+    stop()
+    await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith('build-X', 'turn-7'))
     expect(screen.queryByTestId('urgent-banner')).toBeNull()
   })
 
