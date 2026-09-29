@@ -130,6 +130,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from src.services.appdb import aclose_maintenance_engine
     from src.services.deploy.aca_publish import aclose_published_apps
     from src.services.deploy.images import aclose_image_builder
+    from src.services.directory import aclose_directory
     from src.services.lake import aclose_lake
     from src.services.redis import aclose_redis
     from src.services.sandbox import aclose_sandbox
@@ -146,8 +147,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # managed-identity credential, mgmt client and httpx registry pool — a second token cache and
     # connection pool alongside the sandbox's. `aclose_lake` holds a THIRD managed-identity
     # credential, a different identity from the other two and named by client id rather than
-    # resolved from the ambient environment, plus its own blob client. Each is a no-op when its
-    # resource was never opened.
+    # resolved from the ambient environment, plus its own blob client. `aclose_directory` holds a
+    # fourth, the system-assigned identity it reads Graph as, plus its httpx pool. Each is a no-op
+    # when its resource was never opened.
     for close in (
         aclose_redis,
         aclose_sandbox,
@@ -156,6 +158,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         aclose_published_apps,
         aclose_image_builder,
         aclose_lake,
+        aclose_directory,
     ):
         try:
             await close()

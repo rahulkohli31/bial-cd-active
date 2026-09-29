@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Final, Literal
 
+import httpx
 import sqlalchemy as sa
 from pydantic import AnyUrl, TypeAdapter, UrlConstraints, ValidationError
 from pydantic_ai.messages import ModelResponse, TextPart
@@ -208,6 +209,55 @@ class FakeStorage(ObjectStorage):
 
     async def aclose(self):
         return None
+
+
+@dataclass
+class FakeDirectory:
+    """Microsoft Graph for the whole suite, patched over the directory client's one outbound call.
+
+    Search answers with every entry in `users`, whatever the query; a lookup answers with the
+    entry whose id matches, else a 404; `unavailable` answers every call with a 503. The client's
+    own parsing and eligibility rules still run. `requests` records what the client asked for."""
+
+    users: list[dict[str, str | None]] = field(default_factory=list)
+    unavailable: bool = False
+    requests: list[httpx.Request] = field(default_factory=list)
+
+    def add_user(
+        self,
+        display_name: str | None = "Priya Raman",
+        *,
+        mail: str | None = "priya.raman@bial.example",
+        upn: str | None = None,
+        object_id: uuid.UUID | None = None,
+    ) -> uuid.UUID:
+        """Add one directory entry and return its object id. The UPN defaults to `mail`; a UPN
+        holding `#EXT#` makes a guest."""
+        object_id = object_id or uuid.uuid4()
+        self.users.append(
+            {
+                "id": str(object_id),
+                "displayName": display_name,
+                "mail": mail,
+                "userPrincipalName": upn or mail,
+            }
+        )
+        return object_id
+
+    async def __call__(
+        self, url: str, params: dict[str, str], headers: dict[str, str]
+    ) -> httpx.Response:
+        request = httpx.Request("GET", url, params=params, headers=headers)
+        self.requests.append(request)
+        if self.unavailable:
+            return httpx.Response(503, request=request)
+        if url.endswith("/users"):
+            return httpx.Response(200, json={"value": self.users}, request=request)
+        wanted = url.rsplit("/", 1)[-1]
+        for user in self.users:
+            if user["id"] == wanted:
+                return httpx.Response(200, json=user, request=request)
+        return httpx.Response(404, request=request)
 
 
 def _fake_handle(app_name: str) -> SandboxHandle:

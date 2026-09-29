@@ -184,6 +184,18 @@ def fake_storage():
     _storage_accessor._backend_singleton = None
 
 
+@pytest.fixture(autouse=True)
+def fake_directory(monkeypatch: pytest.MonkeyPatch):
+    """An empty directory for every test, which a test fills through the fake it is handed. The
+    real client would ask Azure for a managed-identity token on every colleague search."""
+    from src.services.directory import client as _directory_client
+    from tests.fakes import FakeDirectory
+
+    directory = FakeDirectory()
+    monkeypatch.setattr(_directory_client, "_graph_get", directory)
+    return directory
+
+
 async def forget_every_harness_count() -> None:
     """Empty `harness_counts` in its OWN session, because `count(...)` writes in one too.
 
