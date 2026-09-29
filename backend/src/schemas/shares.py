@@ -60,7 +60,7 @@ class ColleagueSearchResponse(CamelModel):
 
 
 class ShareResponse(CamelModel):
-    """One row of a project's OWN share panel (R12) — who it is shared with, and when.
+    """One row of a project's OWN share panel — who it is shared with, and when.
     Carries the SAME display-name/email-local-part pair `ColleagueResult` does: the owner
     reads this list to decide who to revoke, and needs to disambiguate the same way the
     search that created the share did. `signed_in` says whether the colleague has ever signed

@@ -23,7 +23,6 @@ from src.services.directory import (
     DirectoryPerson,
     aclose_directory,
     get_directory_person,
-    reset_directory_for_tests,
     search_directory,
 )
 from src.services.directory import client as directory_client
@@ -135,9 +134,9 @@ def fake_directory() -> None:
 
 @pytest.fixture(autouse=True)
 async def _fresh_directory() -> AsyncIterator[None]:
-    await reset_directory_for_tests()
+    await aclose_directory()
     yield
-    await reset_directory_for_tests()
+    await aclose_directory()
 
 
 @pytest.fixture(autouse=True)

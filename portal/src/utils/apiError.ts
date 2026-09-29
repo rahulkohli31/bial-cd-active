@@ -98,7 +98,7 @@ export function optionalCount(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : null
 }
 
-function nonEmptyString(value: unknown): value is string {
+export function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
 }
 

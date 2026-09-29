@@ -4,7 +4,7 @@
  * `projectApi.ts`'s shape: `fn(args, deps = {})`, camelCase wire, `ApiError` via
  * `readApiError`, response bodies narrowed from `unknown` — never cast, never `any`.
  */
-import { ApiError, isRecord, optionalCount, optionalString, readApiError } from './apiError'
+import { ApiError, isRecord, nonEmptyString, optionalCount, optionalString, readApiError } from './apiError'
 import { authFetch } from './api'
 import type { AuthFetchDeps } from './api'
 import { DEFAULT_PAGE_SIZE } from './projectApi'
@@ -29,10 +29,6 @@ export type Colleague =
 /** The one id that names a hit, whichever kind it is. */
 export function colleagueKey(colleague: Colleague): string {
   return colleague.kind === 'user' ? colleague.id : colleague.directoryId
-}
-
-function nonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value !== ''
 }
 
 /** Exactly one of `id` and `directoryId`, or the row is dropped: a hit with both could be shared

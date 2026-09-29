@@ -2,11 +2,8 @@
 
 The credential is `ManagedIdentityCredential()` with no client id: the backend's host also carries
 the shared identity generated apps receive, and naming a client id would ask Graph as that one.
-Nothing here raises into a request. Any failure, including a call that outlives the time budget,
-logs one warning with the exception's class name and any HTTP status, then reads as no result:
-search returns nothing and a lookup says unavailable. Exception text is never logged, because
-httpx puts the request URL, and with it the search term, into its messages. A host with no managed
-identity, such as a developer's machine, skips Graph silently rather than waiting out the budget.
+Failures are logged by exception class and HTTP status only, never by message: httpx puts the
+request URL, and with it the search term, into its messages.
 """
 
 from __future__ import annotations
@@ -89,8 +86,7 @@ _state = _Connection()
 
 
 async def _graph_get(url: str, params: dict[str, str], headers: dict[str, str]) -> httpx.Response:
-    """One Graph GET as this process's identity; the credential and client are built on first
-    use."""
+    """One Graph GET as this process's identity, inside the time budget."""
     if not os.environ.get(_IDENTITY_ENDPOINT_VAR):
         raise _NoManagedIdentityError
     if _state.credential is None:
@@ -168,8 +164,7 @@ async def get_directory_person(object_id: uuid.UUID) -> DirectoryPerson | Direct
 
 
 async def aclose_directory() -> None:
-    """Close the cached HTTP client and credential. Wired into the lifespan shutdown; a second
-    call is a no-op."""
+    """Close the cached HTTP client and credential."""
     http, credential = _state.http, _state.credential
     _state.http = None
     _state.credential = None
@@ -179,8 +174,3 @@ async def aclose_directory() -> None:
     finally:
         if credential is not None:
             await credential.close()
-
-
-async def reset_directory_for_tests() -> None:
-    """Drop the cached clients so no test inherits another's fakes."""
-    await aclose_directory()

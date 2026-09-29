@@ -92,6 +92,7 @@ from src.services.projects import (
     SharedSort,
     create_share,
     delete_project_cascade,
+    email_local_part,
     find_colleagues,
     find_possible_duplicates,
     list_shared_with_me,
@@ -820,7 +821,7 @@ def _share_response(share: ProjectShare, colleague: User) -> ShareResponse:
         id=share.id,
         shared_with_user_id=colleague.id,
         shared_with_display_name=colleague.display_name,
-        shared_with_email_local_part=colleague.email.split("@", 1)[0],
+        shared_with_email_local_part=email_local_part(colleague.email),
         signed_in=colleague.has_signed_in,
         created_at=share.created_at,
     )

@@ -48,6 +48,14 @@ async def _owners_app_id(db: AsyncSession, project: Project) -> uuid.UUID | None
     return app_id
 
 
+_COLLEAGUE_NOT_FOUND = "That colleague could not be found."
+
+
+def email_local_part(email: str) -> str:
+    """The part of an address before the @: what the picker and the share list show."""
+    return email.split("@", 1)[0]
+
+
 async def resolve_colleague(
     db: AsyncSession, *, actor_id: uuid.UUID, request: ShareRequest
 ) -> User:
@@ -59,7 +67,7 @@ async def resolve_colleague(
     if request.directory_id is None:
         colleague = await db.get(User, request.shared_with_user_id)
         if colleague is None:
-            raise AppApiError(404, "That colleague could not be found.")
+            raise AppApiError(404, _COLLEAGUE_NOT_FOUND)
         return colleague
     azure_oid = str(request.directory_id)
     known = await db.scalar(sa.select(User).where(User.azure_oid == azure_oid))
@@ -72,7 +80,7 @@ async def resolve_colleague(
     if person is DirectoryMiss.UNAVAILABLE:
         raise AppApiError(503, "Couldn't look this person up right now. Try again in a moment.")
     if person is DirectoryMiss.NOT_FOUND:
-        raise AppApiError(404, "That colleague could not be found.")
+        raise AppApiError(404, _COLLEAGUE_NOT_FOUND)
     created_id = await db.scalar(
         pg_insert(User)
         .values(
@@ -251,8 +259,7 @@ async def find_colleagues(
     db: AsyncSession, *, requester_id: uuid.UUID, query: str
 ) -> list[ColleagueResult]:
     """Our own users matching `query` first, then directory people who have no user yet, up to
-    `MAX_COLLEAGUE_RESULTS` in all. The directory is asked only when the users leave room, and
-    only after the read transaction has ended, so no pooled connection waits on Graph. Anyone
+    `MAX_COLLEAGUE_RESULTS` in all. The directory is asked only when the users leave room. Anyone
     already in `users`, the requester included, is dropped from the directory's hits before the
     cap. A directory failure reads as no hits."""
     found = [
@@ -260,7 +267,7 @@ async def find_colleagues(
             id=user.id,
             directory_id=None,
             display_name=user.display_name,
-            email_local_part=user.email.split("@", 1)[0],
+            email_local_part=email_local_part(user.email),
             signed_in=user.has_signed_in,
         )
         for user in await search_colleagues(db, requester_id=requester_id, query=query)
@@ -268,7 +275,8 @@ async def find_colleagues(
     slots = MAX_COLLEAGUE_RESULTS - len(found)
     if slots == 0:
         return found
-    # Commit, not rollback: a rollback would expire every ORM instance this request has loaded.
+    # Ends the read so no pooled connection waits on Graph. Commit, not rollback: a rollback
+    # would expire every ORM instance this request has loaded.
     await db.commit()
     people = await search_directory(query)
     if not people:
@@ -285,7 +293,7 @@ async def find_colleagues(
             id=None,
             directory_id=person.object_id,
             display_name=person.display_name,
-            email_local_part=person.email.split("@", 1)[0],
+            email_local_part=email_local_part(person.email),
             signed_in=False,
         )
         for person in people
