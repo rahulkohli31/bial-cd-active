@@ -654,7 +654,8 @@ async def search_project_colleagues(
     carries token limits, usage and suspension state that no citizen picking a colleague to
     share with has any business seeing. Our own users come first; when they leave room, people
     in the organisation's directory who have no user here yet fill it, carrying `directoryId`
-    instead of `id`. A directory that cannot be reached leaves just our own users.
+    instead of `id`. Only a caller who is a member of the directory is offered people from it.
+    A directory that cannot be reached leaves just our own users.
 
     DECLARED BEFORE `/{project_id}` — same reason `/counts` is: FastAPI matches in
     declaration order, so a static path registered after the parameterised route would be
@@ -662,7 +663,7 @@ async def search_project_colleagues(
     """
     cleaned = _clean_colleague_query(q)
     return ColleagueSearchResponse(
-        colleagues=await find_colleagues(db, requester_id=user.id, query=cleaned)
+        colleagues=await find_colleagues(db, requester=user, query=cleaned)
     )
 
 
@@ -863,9 +864,10 @@ async def share_project(
     to share onward. Idempotent (R3) and refused for self-share (R2) or a project with
     nothing saved yet (R10) — both enforced inside `create_share`, not duplicated here.
     A `directoryId` for someone with no user here yet creates them, not yet signed in, in the
-    same transaction as the share; a directory that cannot be reached is a 503."""
+    same transaction as the share; a directory that cannot be reached is a 503. A `directoryId`
+    from a caller who is not a member of the directory is not found."""
     project = await owned_project_or_404(db, user.id, project_id)
-    colleague = await resolve_colleague(db, actor_id=user.id, request=body)
+    colleague = await resolve_colleague(db, requester=user, request=body)
     share = await create_share(db, project=project, actor_id=user.id, colleague_id=colleague.id)
     await db.commit()
     return _share_response(share, colleague)

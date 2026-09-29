@@ -297,7 +297,10 @@ async def test_a_suspended_pre_created_user_is_refused_and_stays_not_signed_in(
 async def test_a_colleague_shared_with_from_the_directory_finds_the_project_on_first_sign_in(
     client, db_session, fake_storage: FakeStorage, fake_directory: FakeDirectory
 ) -> None:
-    owner = await UserFactory.create(db_session, email="owner@rvaiglobal.com")
+    owner_oid = fake_directory.add_user("Owner", mail="owner@rvaiglobal.com")
+    owner = await UserFactory.create(
+        db_session, azure_oid=str(owner_oid), email="owner@rvaiglobal.com"
+    )
     app = await AppRegistryFactory.create(db_session, user_id=owner.id)
     await fake_storage.put(snapshot_key(app.id), b"BUNDLE")
     directory_id = fake_directory.add_user(

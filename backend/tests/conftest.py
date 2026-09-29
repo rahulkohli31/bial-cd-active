@@ -193,6 +193,7 @@ def fake_directory(monkeypatch: pytest.MonkeyPatch):
 
     directory = FakeDirectory()
     monkeypatch.setattr(_directory_client, "_graph_get", directory)
+    monkeypatch.setattr(_directory_client, "_members", {})
     return directory
 
 

@@ -34,6 +34,7 @@ from src.services.build_sessions import SessionManager
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.manager import shr_name_for
 from src.services.directory import client as directory_client
+from src.services.directory import is_directory_member
 from src.services.projects.shares import revoke_share
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import accessor as storage_accessor
@@ -242,6 +243,18 @@ def request_sessions(app, db_session) -> None:
     app.dependency_overrides[get_db] = _request_session
 
 
+async def _member_auth(db_session, fake_directory: FakeDirectory):
+    """`_auth` for a caller the directory holds as a member, as a directory pick requires."""
+    headers, user = await _auth(db_session)
+    user.azure_oid = str(fake_directory.add_user("Owner Member", mail="owner.member@bial.example"))
+    await db_session.flush()
+    return headers, user
+
+
+def _paths_asked(fake_directory: FakeDirectory) -> list[str]:
+    return [request.url.path for request in fake_directory.requests]
+
+
 async def _users_keyed_to(db_session, directory_id: uuid.UUID) -> list[User]:
     rows = await db_session.scalars(select(User).where(User.azure_oid == str(directory_id)))
     return list(rows.all())
@@ -257,7 +270,7 @@ async def _audit_trail(db_session, actor_id: uuid.UUID) -> list[tuple[str, str, 
 async def test_sharing_with_a_directory_person_creates_them_not_yet_signed_in(
     client, db_session, bind_store, fake_directory: FakeDirectory
 ) -> None:
-    headers, owner = await _auth(db_session)
+    headers, owner = await _member_auth(db_session, fake_directory)
     project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
     directory_id = fake_directory.add_user(
         "Priya Raman", mail="priya.raman@bial.example", upn="p.raman@bial.example"
@@ -289,7 +302,10 @@ async def test_sharing_with_a_directory_person_creates_them_not_yet_signed_in(
     assert body["signedIn"] is False
     assert again.status_code == 200
     assert again.json()["id"] == body["id"]
-    assert len(fake_directory.requests) == 1
+    assert _paths_asked(fake_directory) == [
+        f"/v1.0/users/{owner.azure_oid}",
+        f"/v1.0/users/{directory_id}",
+    ]
     assert await _audit_trail(db_session, owner.id) == [
         ("user:directory_create", "user", str(created.id), None),
         (
@@ -304,21 +320,22 @@ async def test_sharing_with_a_directory_person_creates_them_not_yet_signed_in(
 async def test_a_sign_in_that_lands_first_keeps_its_own_row(
     client, db_session, bind_store, fake_directory: FakeDirectory, monkeypatch
 ) -> None:
-    headers, owner = await _auth(db_session)
+    headers, owner = await _member_auth(db_session, fake_directory)
     project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
     directory_id = fake_directory.add_user("Priya Raman", mail="priya.raman@bial.example")
     signed_in: list[User] = []
 
     async def _sign_in_while_graph_answers(url, params, graph_headers):
-        signed_in.append(
-            await UserFactory.create(
-                db_session,
-                azure_oid=str(directory_id),
-                email="priya@bial.example",
-                display_name="Priya (signed in)",
-                token_version=4,
+        if url.endswith(str(directory_id)):
+            signed_in.append(
+                await UserFactory.create(
+                    db_session,
+                    azure_oid=str(directory_id),
+                    email="priya@bial.example",
+                    display_name="Priya (signed in)",
+                    token_version=4,
+                )
             )
-        )
         return await fake_directory(url, params, graph_headers)
 
     monkeypatch.setattr(directory_client, "_graph_get", _sign_in_while_graph_answers)
@@ -347,10 +364,10 @@ async def test_a_sign_in_that_lands_first_keeps_its_own_row(
     ]
 
 
-async def test_a_directory_pick_already_keyed_to_a_user_asks_no_directory(
+async def test_a_directory_pick_already_keyed_to_a_user_asks_the_directory_only_about_the_owner(
     client, db_session, bind_store, fake_directory: FakeDirectory
 ) -> None:
-    headers, owner = await _auth(db_session)
+    headers, owner = await _member_auth(db_session, fake_directory)
     project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
     directory_id = uuid.uuid4()
     known = await UserFactory.create(db_session, azure_oid=str(directory_id))
@@ -363,13 +380,13 @@ async def test_a_directory_pick_already_keyed_to_a_user_asks_no_directory(
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["sharedWithUserId"] == str(known.id)
-    assert fake_directory.requests == []
+    assert _paths_asked(fake_directory) == [f"/v1.0/users/{owner.azure_oid}"]
 
 
 async def test_a_refused_directory_share_leaves_no_user_behind(
     client, db_session, fake_directory: FakeDirectory, request_sessions
 ) -> None:
-    headers, owner = await _auth(db_session)
+    headers, owner = await _member_auth(db_session, fake_directory)
     project = await ProjectFactory.create(db_session, owner.id)
     directory_id = fake_directory.add_user()
 
@@ -381,7 +398,10 @@ async def test_a_refused_directory_share_leaves_no_user_behind(
 
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "no_saved_snapshot"
-    assert len(fake_directory.requests) == 1
+    assert _paths_asked(fake_directory) == [
+        f"/v1.0/users/{owner.azure_oid}",
+        f"/v1.0/users/{directory_id}",
+    ]
     assert await _users_keyed_to(db_session, directory_id) == []
     assert await _audit_trail(db_session, owner.id) == []
 
@@ -389,9 +409,11 @@ async def test_a_refused_directory_share_leaves_no_user_behind(
 async def test_a_directory_that_cannot_be_reached_refuses_the_pick_with_a_503(
     client, db_session, bind_store, fake_directory: FakeDirectory
 ) -> None:
-    headers, owner = await _auth(db_session)
+    headers, owner = await _member_auth(db_session, fake_directory)
     project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
     directory_id = fake_directory.add_user()
+    # The owner's membership was settled by an earlier search, before the directory went down.
+    assert await is_directory_member(owner.azure_oid) is True
     fake_directory.unavailable = True
 
     resp = await client.post(
@@ -404,7 +426,10 @@ async def test_a_directory_that_cannot_be_reached_refuses_the_pick_with_a_503(
     assert resp.json()["error"]["message"] == (
         "Couldn't look this person up right now. Try again in a moment."
     )
-    assert len(fake_directory.requests) == 1
+    assert _paths_asked(fake_directory) == [
+        f"/v1.0/users/{owner.azure_oid}",
+        f"/v1.0/users/{directory_id}",
+    ]
     assert await _users_keyed_to(db_session, directory_id) == []
     shares = await client.get(f"/v1/projects/{project_id}/shares", headers=headers)
     assert shares.json()["shares"] == []
@@ -414,7 +439,7 @@ async def test_a_directory_that_cannot_be_reached_refuses_the_pick_with_a_503(
 async def test_a_directory_pick_nobody_can_be_shared_with_is_a_404(
     client, db_session, bind_store, fake_directory: FakeDirectory, who: str
 ) -> None:
-    headers, owner = await _auth(db_session)
+    headers, owner = await _member_auth(db_session, fake_directory)
     project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
     directory_id = (
         uuid.uuid4()
@@ -432,8 +457,45 @@ async def test_a_directory_pick_nobody_can_be_shared_with_is_a_404(
 
     assert resp.status_code == 404
     assert resp.json()["error"]["message"] == "That colleague could not be found."
-    assert len(fake_directory.requests) == 1
+    assert _paths_asked(fake_directory) == [
+        f"/v1.0/users/{owner.azure_oid}",
+        f"/v1.0/users/{directory_id}",
+    ]
     assert await _users_keyed_to(db_session, directory_id) == []
+
+
+@pytest.mark.parametrize("owner_is", ["guest", "absent", "unconfirmed"])
+async def test_an_owner_who_is_not_a_directory_member_cannot_pick_from_the_directory(
+    client, db_session, bind_store, fake_directory: FakeDirectory, owner_is: str
+) -> None:
+    """The directory is for BIAL's own people: a guest must not reach it through a share."""
+    headers, owner = await _auth(db_session)
+    if owner_is == "guest":
+        owner.azure_oid = str(
+            fake_directory.add_user(
+                "Guest Owner",
+                mail="owner@partner.example",
+                upn="owner_partner.example#EXT#@bial.onmicrosoft.com",
+            )
+        )
+    else:
+        owner.azure_oid = str(uuid.uuid4())
+    await db_session.flush()
+    project_id = await _mint_project_with_snapshot(client, headers, owner, db_session, bind_store)
+    directory_id = fake_directory.add_user()
+    fake_directory.unavailable = owner_is == "unconfirmed"
+
+    resp = await client.post(
+        f"/v1/projects/{project_id}:share",
+        headers=headers,
+        json={"directoryId": str(directory_id)},
+    )
+
+    assert resp.status_code == 404
+    assert resp.json()["error"]["message"] == "That colleague could not be found."
+    assert _paths_asked(fake_directory) == [f"/v1.0/users/{owner.azure_oid}"]
+    assert await _users_keyed_to(db_session, directory_id) == []
+    assert await _audit_trail(db_session, owner.id) == []
 
 
 _NOT_EXACTLY_ONE = {
@@ -476,7 +538,7 @@ async def test_a_directory_pick_on_someone_else_s_project_asks_no_directory(
     project_id = await _mint_project_with_snapshot(
         client, owner_headers, owner, db_session, bind_store
     )
-    stranger_headers, _ = await _auth(db_session)
+    stranger_headers, _ = await _member_auth(db_session, fake_directory)
     directory_id = fake_directory.add_user()
 
     resp = await client.post(
@@ -903,7 +965,7 @@ async def test_colleague_search_never_returns_the_requester(client, db_session) 
 async def test_colleague_search_fills_the_page_from_the_directory_after_our_own_users(
     client, db_session, fake_directory: FakeDirectory
 ) -> None:
-    headers, _ = await _auth(db_session)
+    headers, _ = await _member_auth(db_session, fake_directory)
     ada = await UserFactory.create(
         db_session, email="quill.ada@example.com", display_name="Quill Ada"
     )
@@ -949,7 +1011,7 @@ async def test_colleague_search_fills_the_page_from_the_directory_after_our_own_
 async def test_colleague_search_answers_with_our_own_users_when_the_directory_is_down(
     client, db_session, fake_directory: FakeDirectory
 ) -> None:
-    headers, _ = await _auth(db_session)
+    headers, user = await _member_auth(db_session, fake_directory)
     ada = await UserFactory.create(
         db_session, email="quill.ada@example.com", display_name="Quill Ada"
     )
@@ -968,7 +1030,33 @@ async def test_colleague_search_answers_with_our_own_users_when_the_directory_is
             "signedIn": True,
         }
     ]
-    assert len(fake_directory.requests) == 1
+    assert _paths_asked(fake_directory) == [f"/v1.0/users/{user.azure_oid}"]
+
+
+async def test_colleague_search_by_a_guest_answers_with_our_own_users_and_never_searches(
+    client, db_session, fake_directory: FakeDirectory
+) -> None:
+    headers, user = await _auth(db_session)
+    user.azure_oid = str(
+        fake_directory.add_user(
+            "Quill Guest",
+            mail="quill@partner.example",
+            upn="quill_partner.example#EXT#@bial.onmicrosoft.com",
+        )
+    )
+    await db_session.flush()
+    ada = await UserFactory.create(
+        db_session, email="quill.ada@example.com", display_name="Quill Ada"
+    )
+    fake_directory.add_user("Quill New", mail="quill.new@bial.example")
+
+    resp = await client.get("/v1/projects/colleagues", headers=headers, params={"q": "Quill"})
+
+    assert resp.status_code == 200
+    assert [(c["id"], c["directoryId"]) for c in resp.json()["colleagues"]] == [
+        (str(ada.id), None)
+    ]
+    assert _paths_asked(fake_directory) == [f"/v1.0/users/{user.azure_oid}"]
 
 
 async def test_colleague_search_rate_limit_enforced(client, db_session) -> None:

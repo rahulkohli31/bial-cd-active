@@ -23,6 +23,7 @@ from src.services.directory import (
     DirectoryPerson,
     aclose_directory,
     get_directory_person,
+    is_directory_member,
     search_directory,
 )
 from src.services.directory import client as directory_client
@@ -463,6 +464,68 @@ async def test_get_during_a_failure_is_unavailable_and_warns_without_the_id(
     assert [(entry["error"], entry["status"]) for entry in _warnings(logs)] == [(error, status)]
     assert str(_PRIYA_ID) not in repr(logs)
     assert "Bearer" not in repr(logs)
+
+
+# --- membership ---------------------------------------------------------------------------------
+
+
+async def test_a_member_is_looked_up_once_per_process(graph: _FakeGraph) -> None:
+    graph.answer = lambda _: httpx.Response(200, json=_PRIYA)
+
+    assert await is_directory_member(str(_PRIYA_ID)) is True
+    assert await is_directory_member(str(_PRIYA_ID).upper()) is True
+
+    assert [request.url.path for request in graph.requests] == [f"/v1.0/users/{_PRIYA_ID}"]
+
+
+@pytest.mark.parametrize(
+    "respond",
+    [
+        pytest.param(lambda: httpx.Response(404, json=_A_GRAPH_ERROR_BODY), id="absent"),
+        pytest.param(lambda: httpx.Response(200, json=_GUEST), id="guest"),
+    ],
+)
+async def test_someone_the_directory_does_not_hold_as_a_member_is_not_one_and_stays_not_one(
+    respond: Callable[[], httpx.Response], graph: _FakeGraph
+) -> None:
+    graph.answer = lambda _: respond()
+
+    guest_id = "16fd2706-8baf-433b-82eb-8c7fada847da"
+
+    assert await is_directory_member(guest_id) is False
+    assert await is_directory_member(guest_id) is False
+
+    assert [request.url.path for request in graph.requests] == [f"/v1.0/users/{guest_id}"]
+
+
+async def test_an_unreachable_directory_reads_as_not_a_member_and_is_asked_again(
+    graph: _FakeGraph,
+) -> None:
+    graph.answer = lambda _: httpx.Response(503, json=_A_GRAPH_ERROR_BODY)
+    assert await is_directory_member(str(_PRIYA_ID)) is False
+
+    graph.answer = lambda _: httpx.Response(200, json=_PRIYA)
+    assert await is_directory_member(str(_PRIYA_ID)) is True
+
+    assert len(graph.requests) == 2
+
+
+async def test_an_id_that_is_not_a_uuid_is_not_a_member_and_is_never_sent(
+    graph: _FakeGraph,
+) -> None:
+    assert await is_directory_member("oid-not-a-uuid") is False
+    assert graph.requests == []
+
+
+async def test_closing_forgets_every_membership_answer(graph: _FakeGraph) -> None:
+    graph.answer = lambda _: httpx.Response(200, json=_PRIYA)
+    assert await is_directory_member(str(_PRIYA_ID)) is True
+
+    await aclose_directory()
+    directory_client._state.http = httpx.AsyncClient(transport=httpx.MockTransport(graph._handle))
+
+    assert await is_directory_member(str(_PRIYA_ID)) is True
+    assert len(graph.requests) == 2
 
 
 # --- closing ------------------------------------------------------------------------------------

@@ -219,7 +219,10 @@ own endpoints by convenience of being nearby.
 **The control plane reads the organisation's directory, and only as its own identity.** Sharing
 looks people up there, so an owner can share with a colleague who has never signed in. The call
 uses the control plane's own identity, never the one generated applications receive, and it only
-reads. If the directory cannot be reached, sharing falls back to the platform's own users.
+reads. Only an owner the directory holds as one of the organisation's own members is offered
+people from it; a guest, or anyone whose membership cannot be confirmed, shares with the
+platform's own users alone. If the directory cannot be reached, sharing falls back to the
+platform's own users.
 
 ## Generated-app data isolation
 

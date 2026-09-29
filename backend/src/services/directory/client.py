@@ -83,6 +83,7 @@ class _Connection:
 
 
 _state = _Connection()
+_members: dict[uuid.UUID, bool] = {}
 
 
 async def _graph_get(url: str, params: dict[str, str], headers: dict[str, str]) -> httpx.Response:
@@ -163,8 +164,27 @@ async def get_directory_person(object_id: uuid.UUID) -> DirectoryPerson | Direct
     return DirectoryMiss.NOT_FOUND if person is None else person
 
 
+async def is_directory_member(object_id: str) -> bool:
+    """Whether `object_id` is an eligible member. Fails closed: a guest, an id that is not a UUID
+    and a directory that cannot be asked all read as not a member. A definite answer is kept for
+    the life of the process; an unavailable directory is asked again next time."""
+    try:
+        oid = uuid.UUID(object_id)
+    except ValueError:
+        return False
+    if (member := _members.get(oid)) is not None:
+        return member
+    person = await get_directory_person(oid)
+    if person is DirectoryMiss.UNAVAILABLE:
+        return False
+    member = isinstance(person, DirectoryPerson)
+    _members[oid] = member
+    return member
+
+
 async def aclose_directory() -> None:
-    """Close the cached HTTP client and credential."""
+    """Close the cached HTTP client and credential, and forget every membership answer."""
+    _members.clear()
     http, credential = _state.http, _state.credential
     _state.http = None
     _state.credential = None
