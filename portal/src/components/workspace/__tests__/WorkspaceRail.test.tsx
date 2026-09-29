@@ -50,7 +50,7 @@ function renderRail() {
 
 /** The composer really rendered — the liveness half every absence below is paired with. */
 function composer(): HTMLElement {
-  return screen.getByPlaceholderText(/Describe what you have in mind/i)
+  return screen.getByPlaceholderText(/Describe the change you need/i)
 }
 
 afterEach(() => cleanup())

@@ -159,7 +159,7 @@ describe('the mint-and-navigate protocol, carried through the deletion', () => {
     renderComposer()
     send('a visitor log')
 
-    expect(path()).toMatch(/\?projectId=p1&kind=plan$/)
+    expect(path()).toMatch(/\?projectId=p1&kind=build$/)
     expect(routerState()).toMatchObject({ prompt: 'a visitor log', freshlyMinted: true })
   })
 
@@ -179,7 +179,7 @@ describe('the mint-and-navigate protocol, carried through the deletion', () => {
     expect(path()).toContain('projectId=p%201%26kind%3Dplan')
     // The REAL kind is the trailing one the picker wrote; the encoded literal above is part of the
     // project id and must not be mistaken for it. That is the whole point of this test.
-    expect(path()).toMatch(/&kind=plan$/)
+    expect(path()).toMatch(/&kind=build$/)
   })
 
   it('navigates nowhere on an empty or whitespace-only draft', () => {
@@ -325,26 +325,21 @@ describe('the kind picker — the control that makes the other half of the produ
     expect(path()).toMatch(/&kind=plan$/)
   })
 
-  it('★ defaults to PLAN, so a first prompt is planned rather than built from', () => {
-    // CHANGED BY DECISION, 2026-09-10. It used to default to Build, inherited from the retired
-    // composer, and the argument for keeping it was that changing it would silently change what
-    // the control does for anyone who never touches the picker. That is exactly what it now does,
-    // deliberately: a rough first sentence gets a plan to read and a `Build this plan` button
-    // instead of a container and several minutes of the model spent on a guess.
+  it('★ defaults to BUILD, so a send that never touches the picker builds', () => {
     renderComposer()
     send()
 
-    expect(path()).toMatch(/&kind=plan$/)
+    expect(path()).toMatch(/&kind=build$/)
   })
 
   it('reads its one line of explanation from the catalogue, never from this file', () => {
     // One source for what a kind IS. A second wording here would drift the first time the
     // server's changed, and nothing would notice.
     renderComposer()
-    expect(screen.getByTestId('kind-description').textContent).toBe('Shape a plan first.')
-
-    fireEvent.click(screen.getByRole('radio', { name: 'Build' }))
     expect(screen.getByTestId('kind-description').textContent).toBe('Change the live app.')
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Plan' }))
+    expect(screen.getByTestId('kind-description').textContent).toBe('Shape a plan first.')
   })
 
   it('★ cannot reach a third, empty state by re-pressing the active option', () => {

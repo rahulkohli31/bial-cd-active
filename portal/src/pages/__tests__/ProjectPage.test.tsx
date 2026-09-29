@@ -167,7 +167,7 @@ describe('ProjectPage — the composer is unconditional', () => {
     h.getProject.mockResolvedValue(makeProject({ appId: null, appStatus: null }))
     renderProjectPage()
 
-    expect(await screen.findByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
+    expect(await screen.findByPlaceholderText(/Describe the change you need/i)).toBeTruthy()
     // Regression guard: this control must show regardless of whether the project has an app.
     expect(screen.queryByRole('button', { name: /view app/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /continue building/i })).toBeNull()
@@ -180,9 +180,9 @@ describe('ProjectPage — the composer is unconditional', () => {
     ])
     renderProjectPage()
 
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
     // NOT collapsed under an app card — the reverted app-first-fold regression.
-    expect(screen.getByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
+    expect(screen.getByPlaceholderText(/Describe the change you need/i)).toBeTruthy()
     // Inertness guards: a passive code view, a lifecycle badge and a chat reroute do not come
     // back with the running sandbox.
     expect(screen.queryByRole('button', { name: /view app/i })).toBeNull()
@@ -198,7 +198,7 @@ describe('ProjectPage — the app arrives behind one deliberate press', () => {
     h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
     renderProjectPage()
 
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
     // R-16's forbidden words — the positive half ("Your app is saved.") is pinned in
     // `AppPane.test.tsx` and `ProjectWorkspace.test.tsx`, which render the pane this file doesn't.
@@ -211,7 +211,7 @@ describe('ProjectPage — the app arrives behind one deliberate press', () => {
     h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: false }))
     renderProjectPage()
 
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
     expect(screen.queryByRole('button', { name: /launch application/i })).toBeNull()
   })
@@ -226,7 +226,7 @@ describe('ProjectPage — the app arrives behind one deliberate press', () => {
     h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
     renderProjectPage()
 
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
     await waitFor(() => expect(h.relaunchPreview).toHaveBeenCalledWith({ projectId: 'p1' }))
   })
 
@@ -237,7 +237,7 @@ describe('ProjectPage — the app arrives behind one deliberate press', () => {
     h.fetchPreviewState.mockResolvedValue(preview({ state: 'asleep', restorable: true }))
     renderProjectPage()
 
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
     // THE WHOLE POINT: reading the save state runs `git` inside the container, so asking it of a
     // stopped project would START one — a start the screen caused rather than the citizen.
@@ -248,7 +248,7 @@ describe('ProjectPage — the app arrives behind one deliberate press', () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'app-123', appStatus: 'approved' }))
     renderProjectPage()
 
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
     expect(screen.queryByRole('link', { name: /open app/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /continue building/i })).toBeNull()
   })
@@ -263,7 +263,7 @@ describe('ProjectPage — the rail carries one thing', () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1' }))
     renderProjectPage()
 
-    const composer = await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    const composer = await screen.findByPlaceholderText(/Describe the change you need/i)
     const rail = composer.closest('main') as HTMLElement
     // Liveness is the composer itself, which is what the rail is FOR.
     expect(within(rail).queryByTestId('publish-chip-stub')).toBeNull()
@@ -281,7 +281,7 @@ describe('ProjectPage — an outlet child that owns its own scroller', () => {
   it('declares its own scroller and brings no page frame of its own', async () => {
     h.getProject.mockResolvedValue(makeProject())
     const { container } = renderProjectPage()
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
 
     const main = container.querySelector('main') as HTMLElement
     expect(main).toBeTruthy()
@@ -298,7 +298,7 @@ describe('ProjectPage — an outlet child that owns its own scroller', () => {
     // "the app did not remount" assertion elsewhere would fail on the first navigation to a chat.
     h.getProject.mockResolvedValue(makeProject())
     const { container } = renderProjectPage()
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
 
     // The pane is the shell's sibling of the Outlet, not rebuilt here.
     expect(container.innerHTML).not.toMatch(/grid-cols-/)
@@ -320,13 +320,13 @@ describe('ProjectPage — nothing points back to a past chat', () => {
     h.getProject.mockResolvedValue(makeProject())
     renderProjectPage()
 
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
     expect(screen.queryByTestId('conversations')).toBeNull()
     expect(h.listProjectConversations).not.toHaveBeenCalled()
     // Paired with a liveness check: an absence assertion passes just as happily when the page
     // crashed and rendered nothing at all.
-    expect(screen.getByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
-    expect(screen.getByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
+    expect(screen.getByPlaceholderText(/Describe the change you need/i)).toBeTruthy()
+    expect(screen.getByPlaceholderText(/Describe the change you need/i)).toBeTruthy()
   })
 
   it('★ offers no way to reach or delete an existing chat, however many the project has', async () => {
@@ -337,11 +337,11 @@ describe('ProjectPage — nothing points back to a past chat', () => {
     ])
     renderProjectPage()
 
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
     expect(screen.queryByText('Scope the fields')).toBeNull()
     expect(screen.queryByText('Build the screen')).toBeNull()
     expect(screen.queryByRole('button', { name: /^delete$/i })).toBeNull()
-    expect(screen.getByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
+    expect(screen.getByPlaceholderText(/Describe the change you need/i)).toBeTruthy()
   })
 
   it('offers no copy anywhere on the screen that promises past conversations', async () => {
@@ -349,7 +349,7 @@ describe('ProjectPage — nothing points back to a past chat', () => {
     h.getProject.mockResolvedValue(makeProject())
     renderProjectPage()
 
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
     const screenText = document.body.textContent ?? ''
     expect(screenText).not.toMatch(/conversations · this project/i)
     expect(screenText).not.toMatch(/no conversations yet/i)
@@ -619,7 +619,7 @@ describe('ProjectPage — the project-open mark', () => {
     h.getProject.mockResolvedValue(makeProject({ id: 'p-strict', appId: 'a1' }))
     renderTwiceOver('p-strict')
 
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
     await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened' }]))
   })
 
@@ -631,12 +631,12 @@ describe('ProjectPage — the project-open mark', () => {
     // Mutation check: remove the once-per-project-id guard and this goes red.
     h.getProject.mockResolvedValue(makeProject({ id: 'p-return', appId: 'a1' }))
     renderProjectPage('p-return')
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
     await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened' }]))
 
     cleanup()
     renderProjectPage('p-return')
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
 
     expect(beacons()).toEqual([{ name: 'project_opened' }])
   })
@@ -647,7 +647,7 @@ describe('ProjectPage — the project-open mark', () => {
     h.getProject.mockResolvedValue(makeProject({ id: 'p-noapp', appId: null }))
     renderProjectPage('p-noapp')
 
-    await screen.findByPlaceholderText(/Describe what you have in mind/i)
+    await screen.findByPlaceholderText(/Describe the change you need/i)
     await waitFor(() => expect(beacons()).toEqual([{ name: 'project_opened' }]))
 
     const { markAppVisible } = await import('../../utils/observe')
@@ -745,7 +745,7 @@ describe('the project skeleton keeps WORDS and a busy state', () => {
     h.getProject.mockResolvedValue(makeProject({ id: 'p-wait-before' }))
     renderSwitchable('p-wait-before', 'p-wait-after')
     // The project has landed: the wait is NOT running.
-    expect(await screen.findByPlaceholderText(/Describe what you have in mind/i)).toBeTruthy()
+    expect(await screen.findByPlaceholderText(/Describe the change you need/i)).toBeTruthy()
 
     const before = screen.getByTestId('project-wait')
     expect(before.textContent).toBe('')
