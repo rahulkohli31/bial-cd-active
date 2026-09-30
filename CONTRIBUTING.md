@@ -5,7 +5,7 @@ Three trees, three toolchains:
 | Tree | What it is | Toolchain |
 |---|---|---|
 | `backend/` | FastAPI control plane | Python 3.14, `uv` |
-| `portal/` | React + Vite single-page app | Node >=20 (the image builds on 24), `npm` |
+| `portal/` | React + Vite single-page app | Node >=22.12 (the image and CI use 24, as `portal/.nvmrc` says), `npm` |
 | `sandbox/` | The build supervisor and the template every generated app starts from | Python 3.14 (via `backend/`), Node 24 in the image |
 
 `README.md` introduces the platform and maps `documentation/`. This document covers the
