@@ -1386,17 +1386,17 @@ async def delete_project(
     # project they had just previewed left the container running at roughly $2.60/day until
     # they next built something.
     #
-    # THE FORCE-DROP IS STILL THE GUARANTEE, and the reap does not demote it. The reap is
+    # THE TEARDOWN IS STILL THE GUARANTEE, and the reap does not demote it. The reap is
     # best-effort and skippable by design — an unconfigured sandbox, a busy start lock or a
     # Redis blip all leave the container standing, and outside production nothing automatic
     # takes it down (the scheduled reap's destroy half is production-only) — and a DEPLOYED or
     # published container was never in the sandbox registry to be found at all. So the
-    # project's own database is torn down with `salt_the_earth` (sever, then `DROP DATABASE
-    # ... WITH (FORCE)`) exactly as before: whatever is still holding live connections at
-    # delete time, the force-drop is what guarantees it stops reading. It runs post-commit and
-    # never raises: the rows are already gone, so a failed drop is a leak a human has to
-    # clear — the per-project-database reconciler is operator-invoked and report-only, so
-    # nothing collects it on its own — never a 500 on a delete that in fact succeeded.
+    # project's own database is torn down with `salt_the_earth` (sever, then `DROP DATABASE`)
+    # exactly as before: whatever is still holding live connections at delete time, the sever
+    # is what guarantees it stops reading. It runs post-commit and never raises: the rows are
+    # already gone, so a failed drop is a leak a human has to clear — the per-project-database
+    # reconciler is operator-invoked and report-only, so nothing collects it on its own —
+    # never a 500 on a delete that in fact succeeded.
     #
     # WHAT SURVIVED IS ON THE RECORD. Each post-commit arm reports what it could not destroy;
     # anything left standing raises `TEARDOWN_ARTEFACT_SURVIVED_EVENT` and lands, once, in a
@@ -1539,7 +1539,7 @@ async def delete_project(
     survivors: list[tuple[str, str]] = []
     if handles is not None:
         # FIRST of the post-commit sweeps, because it is the one that stops data being read:
-        # sever, then force-drop the database, then drop the role. Never raises.
+        # sever, then drop the database, then drop the role. Never raises.
         if not await salt_the_earth(db_name=handles.db_name, role_name=handles.role_name):
             survivors.append(("app_database", handles.db_name))
     # Post-commit, pre-sweep: re-walk the submission prefixes so the sweep list reflects the

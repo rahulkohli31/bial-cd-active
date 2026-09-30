@@ -3,7 +3,7 @@
 WHY THIS EXISTS
 The product requires the person deleting a project to say why, in 2–50 words. The dialog
 tells the truth that nothing is recoverable: `delete_project` calls `salt_the_earth`, which
-force-drops the project's own database and role, sweeps its blobs, and deletes its container.
+drops the project's own database and role, sweeps its blobs, and deletes its container.
 An `is_deleted` flag on `projects` would claim the opposite — a reversible delete — and would
 also cost every read a `WHERE is_deleted = false` filter forever; missing one on the list, the
 search, the dashboard tiles, or any join resurrects a deleted project, the single most common

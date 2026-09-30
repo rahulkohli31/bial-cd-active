@@ -143,6 +143,8 @@ markers = [
     # slots per table, ever). Deselected from the default lane so routine runs don't eat the
     # budget; run them explicitly before shipping a migration: `uv run pytest -m destructive_migration`.
     "destructive_migration: opt-in; alembic up/down round-trips that permanently consume pg_attribute slots on the shared test DB",
+    # Waits up to 150 s for autovacuum to reach a fresh database: `uv run pytest -m autovacuum`.
+    "autovacuum: opt-in; tears a project database down while autovacuum is working in it",
     # Not a lane — a transaction SHAPE. `db_session` joins the fixtures' transaction with a
     # SAVEPOINT for a marked test, so a route's own `db.rollback()` unwinds only its work
     # instead of the whole test. Only the tests that drive such a route wear it: a
@@ -153,4 +155,4 @@ markers = [
     "app_db: needs the real per-project database substrate; creates real databases on the cluster",
 ]
 # `--dist loadgroup` does nothing without `-n`; with it, each `xdist_group` stays on one worker.
-addopts = "-m 'not integration and not destructive_migration' --strict-markers --dist loadgroup"
+addopts = "-m 'not integration and not destructive_migration and not autovacuum' --strict-markers --dist loadgroup"

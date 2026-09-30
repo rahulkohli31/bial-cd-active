@@ -89,6 +89,10 @@ _ALREADY_GONE: Final = frozenset({_UNDEFINED_DATABASE, _UNDEFINED_OBJECT})
 async def sever(*, db_name: str, role_name: str) -> bool:
     """Lock the app out of its database and terminate its live sessions.
 
+    Only sessions this role may signal are terminated: the app's own, which is every session the
+    app can hold. Anything else inside — an autovacuum worker, another role's session — is not
+    the app, and Postgres would refuse to terminate it.
+
     Returns False (no-op) when no substrate is configured; True once the door is locked.
     Raises the underlying error if any step fails — the caller is a kill-switch and must
     not report success on a half-severed database.
@@ -153,9 +157,9 @@ async def salt_the_earth(*, db_name: str, role_name: str) -> bool:
         async with engine.connect() as conn:
             async with _best_effort("sever", db_name=db_name) as sever_step:
                 await _sever_on(conn, db_name=db_name, role_name=role_name)
-            # WITH (FORCE) terminates whatever reconnected between the sever and here — the
-            # relaunched preview and the deployed container hold no build lock, so the
-            # delete-time guard does not cover them and this is the actual guarantee.
+            # The relaunched preview and the deployed container hold no build lock, so the
+            # delete-time guard does not cover them: the sever, and the second eviction inside
+            # the drop, are the actual guarantee.
             async with _best_effort("drop_database", db_name=db_name) as drop_step:
                 await _drop_database(conn, db_name=db_name)
             # The role can only be dropped after the database it owns is gone.
@@ -192,7 +196,17 @@ async def salt_the_earth(*, db_name: str, role_name: str) -> bool:
 
 
 async def _drop_database(conn: AsyncConnection, *, db_name: str) -> None:
-    await conn.execute(sa.text(f"DROP DATABASE {quote_identifier(db_name)} WITH (FORCE)"))
+    # No FORCE: it refuses outright when an autovacuum worker is inside, which a plain DROP
+    # stops by itself, waiting up to 5 s for it before reporting the database busy.
+    drop = sa.text(f"DROP DATABASE {quote_identifier(db_name)}")
+    try:
+        await conn.execute(drop)
+    except DBAPIError as exc:
+        if _sqlstate(exc) != _OBJECT_IN_USE:
+            raise
+        # A session that connected just before the door locked can miss the first eviction.
+        await _terminate_backends(conn, db_name=db_name)
+        await conn.execute(drop)
 
 
 async def _drop_role(conn: AsyncConnection, *, role_name: str) -> None:
@@ -210,10 +224,13 @@ async def _sever_on(conn: AsyncConnection, *, db_name: str, role_name: str) -> N
 async def _terminate_backends(conn: AsyncConnection, *, db_name: str) -> int:
     # The one place a name IS a bindable value rather than an identifier: `datname` is a
     # column comparison, so it goes through a parameter like any other query.
+    # `pg_has_role`: Postgres refuses to terminate a session of a role this one has no
+    # privileges of, and a single refusal fails the whole statement.
     result = await conn.execute(
         sa.text(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            "WHERE datname = :db_name AND pid <> pg_backend_pid()"
+            "WHERE datname = :db_name AND pid <> pg_backend_pid() "
+            "AND pg_has_role(usesysid, 'USAGE')"
         ),
         {"db_name": db_name},
     )

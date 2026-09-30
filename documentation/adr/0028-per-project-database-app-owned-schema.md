@@ -136,13 +136,15 @@ login on the role, revoke its connect privilege, then terminate sessions it alre
 door locked before anyone is kicked out, so a client reconnecting mid-sequence finds it already
 locked. Re-enabling is the mirror image. This is the sole data-plane kill switch for a deployed
 app, proven against a live, reconnecting pool, not a single open connection. Irreversible teardown
-runs sever, then a forced database drop, then a role drop, after the registry row is already
-gone, post-commit and best-effort, so a failed drop becomes a logged, reclaimable orphan rather
-than a registry row pointing at destroyed data. The forced drop matters because a relaunched
-preview or the deployed container itself can reconnect between the sever and the drop, holding no
-lock any guard would see; forcing through that reconnection is the real guarantee. Both delete
-surfaces state plainly, before the action, that it destroys the project's database and files
-irreversibly.
+runs sever, then a database drop, then a role drop, after the registry row is already gone,
+post-commit and best-effort, so a failed drop becomes a logged, reclaimable orphan rather than a
+registry row pointing at destroyed data. The eviction is the real guarantee, because a relaunched
+preview or the deployed container itself holds no lock any guard would see; a session that
+slips in before the door locks is evicted again before one retry of the drop. The eviction
+touches only the app's own sessions and the drop is not forced: the maintenance role is not a
+superuser, and Postgres refuses it the autovacuum worker that visits every database, which a
+plain drop stops by itself. Both delete surfaces state plainly, before the action, that it
+destroys the project's database and files irreversibly.
 
 **Orphan reconciliation is report-only, by necessity.** PostgreSQL hands back no creation
 timestamp for a database once its registry row is gone — the provisioning comment is the only
@@ -169,7 +171,8 @@ for this phase — no deployment automation exists to create or seed it, and no 
 replayed migration would bring it up clean. Extending the old shared table was rejected outright:
 it cannot sort, aggregate, or transact correctly. Schema-per-app on one shared database was
 rejected because the wall becomes a search path and a grant inside one database rather than a
-connect privilege on a database of its own, and a forced drop has no schema-level equivalent.
+connect privilege on a database of its own, and dropping a whole database has no schema-level
+equivalent.
 
 ## Consequences
 

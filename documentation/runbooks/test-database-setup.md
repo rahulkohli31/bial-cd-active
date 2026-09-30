@@ -148,10 +148,12 @@ it as the worker starts and dropped when the worker finishes, so every worker se
 rows and a migration reaches the copies without a step of its own. A focused run — a path or a
 single test, no `-n` — stays serial and uses the test database directly.
 
-The default run already excludes two opt-in marker groups: the object-storage round-trip tests
-(which need a separate local object-storage emulator, unrelated to this runbook) and a set of
+The default run already excludes three opt-in marker groups: the object-storage round-trip tests
+(which need a separate local object-storage emulator, unrelated to this runbook), a set of
 Alembic up/down round-trips that permanently consume schema resources on a long-lived shared test
-database — leave both opted out for routine runs.
+database, and a teardown test that waits up to two and a half minutes for autovacuum to reach its
+database. Leave them opted out for routine runs; run the teardown one (`-m autovacuum`) after
+changing how a project database is torn down.
 
 **If it fails before any test runs**, naming the database and telling you to create
 `backend/.env.test`: your configuration isn't being picked up, or the configured database name
