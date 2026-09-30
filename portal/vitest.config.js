@@ -27,6 +27,10 @@ export default defineConfig({
     // is its canary: it renders a real Radix component that stubs nothing, so losing this key
     // fails one obvious test instead of a dozen obscure ones three units away.
     setupFiles: ['./src/test-setup.ts'],
+    // Bundled once instead of loaded file by file in every test file: react-day-picker pulls in
+    // all ~500 date-fns locale modules and lucide-react ~1,700 icon modules. Only listed entries
+    // are bundled — dependency discovery is off in this mode.
+    deps: { optimizer: { client: { enabled: true, include: ['react-day-picker', 'lucide-react'] } } },
     // Vitest's default is 5s, and that is a WALL-CLOCK budget the whole suite competes for.
     // The heavy BuilderPage specs finish in ~300ms each when their file runs alone, but the
     // full 80-file run executes them in parallel, so on a loaded machine (or a small CI
