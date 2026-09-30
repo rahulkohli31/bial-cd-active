@@ -5,9 +5,16 @@ on:
   push:
     branches: [main, 'release/**']
 
+# A newer push to a pull request supersedes the run still in progress for it. Pushes to main and
+# release branches always run to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  checks:
+  portal-static:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: portal
@@ -17,7 +24,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: portal/package-lock.json
 
@@ -30,21 +37,39 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      - name: Test
-        run: npm run test
+  # Vitest shards by test file, so each shard runs a third of the files on its own runner.
+  portal-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    defaults:
+      run:
+        working-directory: portal
+    steps:
+      - uses: actions/checkout@v4
 
-  # The backend previously had no CI job at all: every gate was run by hand, so a green check
-  # on a PR said nothing about the backend. These steps are what make the gates mandatory and
-  # enforced, not merely advisory.
-  #
-  # STATIC GATES ONLY, deliberately. They need no database, no Redis (tests fake it in
-  # process) and no secrets, so this job is hermetic and cannot flake. `pytest` is NOT here
-  # yet on purpose: the suite needs a `citizen_one_test` database built to the test-database
-  # runbook — including `REVOKE CONNECT` on the control-plane database, which several
-  # `appdb` tests assert against — and adding a red-by-default job would block every PR.
-  # Encoding that runbook as a service-container step is the follow-up.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: portal/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: npm run test -- --shard="$SHARD/3"
+
+  # The backend's static gates: no database, no Redis (tests fake it in process) and no secrets.
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: backend
