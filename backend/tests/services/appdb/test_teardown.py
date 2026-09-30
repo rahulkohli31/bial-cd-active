@@ -233,18 +233,18 @@ async def test_the_drop_waits_for_a_session_it_may_not_close_instead_of_refusing
             )
         )
     outsider = create_async_engine(control_plane_identity_dsn(db_name), poolclass=NullPool)
+    other = await outsider.connect()
+
+    async def leave_shortly() -> None:
+        await asyncio.sleep(1)
+        await other.close()
+
+    leaving = asyncio.create_task(leave_shortly())
     try:
-        other = await outsider.connect()
         assert await other.scalar(sa.text("SELECT 1")) == 1
-
-        async def leave_shortly() -> None:
-            await asyncio.sleep(1)
-            await other.close()
-
-        leaving = asyncio.create_task(leave_shortly())
         assert await salt_the_earth(db_name=db_name, role_name=role) is True
-        await leaving
     finally:
+        await leaving
         await outsider.dispose()
 
     assert await _catalog(maintenance, _DATABASE_EXISTS_SQL, db=db_name) is False
