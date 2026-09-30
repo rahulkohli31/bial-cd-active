@@ -36,6 +36,8 @@ from src.services.appdb.reconcile import advisory_database_sizes
 from src.services.auth.session_jwt import mint_session_jwt
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 
+pytestmark = pytest.mark.app_db
+
 _TTL = settings.auth.access_ttl_seconds
 _RECONCILE = "/v1/admin/apps/reconcile-databases"
 _LIST = "/v1/admin/apps"

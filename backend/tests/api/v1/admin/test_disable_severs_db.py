@@ -57,6 +57,8 @@ from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeStorage
 from tests.services.appdb.helpers import scalar_on
 
+pytestmark = pytest.mark.app_db
+
 _TTL = settings.auth.access_ttl_seconds
 _SHA = "1f" * 20
 _DATABASE_EXISTS = "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = :db)"

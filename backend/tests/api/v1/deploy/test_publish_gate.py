@@ -194,7 +194,8 @@ async def _gate_rows(db, app_id: uuid.UUID) -> list[AuditLog]:
                     AuditLog.resource_id == str(app_id),
                     AuditLog.action == "publish_gate",
                 )
-                .order_by(AuditLog.created_at)
+                # `created_at` is the transaction's start, so one test's rows tie on it.
+                .order_by(AuditLog.created_at, AuditLog.id)
             )
         )
         .scalars()

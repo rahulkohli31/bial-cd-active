@@ -8,6 +8,8 @@ out is the whole reason the order in `sever` is what it is.
 
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
 from typing import Any
 
@@ -15,6 +17,7 @@ import asyncpg
 import pytest
 import sqlalchemy as sa
 import structlog
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -22,15 +25,20 @@ from sqlalchemy.pool import NullPool
 from src.config import settings
 from src.services.appdb import teardown as appdb_teardown
 from src.services.appdb.engine import reset_maintenance_engine_for_tests
-from src.services.appdb.names import database_name, role_name
+from src.services.appdb.names import database_name, quote_identifier, role_name
 from src.services.appdb.provision import control_plane_dsn, ensure_project_database
 from src.services.appdb.teardown import restore_login, salt_the_earth, sever
 from tests.factories import ProjectFactory, UserFactory
-from tests.services.appdb.helpers import scalar_on
+from tests.services.appdb.helpers import control_plane_identity_dsn, execute_on, scalar_on
+
+pytestmark = pytest.mark.app_db
 
 _DATABASE_EXISTS_SQL = "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = :db)"
 _ROLE_EXISTS_SQL = "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :role)"
 _CAN_LOGIN_SQL = "SELECT rolcanlogin FROM pg_roles WHERE rolname = :role"
+_VACUUM_IN_PROGRESS_SQL = (
+    "SELECT EXISTS (SELECT 1 FROM pg_stat_progress_vacuum WHERE datname = :db)"
+)
 
 
 async def _catalog(engine: AsyncEngine, sql: str, **params: Any) -> Any:
@@ -76,6 +84,64 @@ async def test_sever_kills_a_live_session_and_refuses_the_reconnect(
     with pytest.raises(asyncpg.InvalidAuthorizationSpecificationError):
         await scalar_on(dsn, "SELECT 1")
     assert await _catalog(maintenance, _CAN_LOGIN_SQL, role=role) is False
+
+
+async def test_sever_evicts_the_app_and_leaves_a_session_it_may_not_close(
+    db_session: AsyncSession, maintenance: AsyncEngine, salted: list[uuid.UUID]
+) -> None:
+    # Postgres refuses to terminate a session of a role the maintenance role has no privileges
+    # of, and one refusal fails the whole terminate. The everyday case is an autovacuum worker,
+    # which cannot be summoned on demand; the control plane's own session stands in for it.
+    db_name, role, dsn = await _provisioned(db_session, salted)
+    outsider_role = make_url(settings.DATABASE_URL.get_secret_value()).username or ""
+    async with maintenance.connect() as conn:
+        await conn.execute(
+            sa.text(
+                f"GRANT CONNECT ON DATABASE {quote_identifier(db_name)} "
+                f"TO {quote_identifier(outsider_role)}"
+            )
+        )
+    outsider = create_async_engine(control_plane_identity_dsn(db_name), poolclass=NullPool)
+    live = create_async_engine(dsn, poolclass=NullPool)
+    try:
+        async with outsider.connect() as other:
+            assert await other.scalar(sa.text("SELECT 1")) == 1
+            async with live.connect() as app_session:
+                assert await app_session.scalar(sa.text("SELECT 1")) == 1
+
+                assert await sever(db_name=db_name, role_name=role) is True
+
+                with pytest.raises(DBAPIError):
+                    await app_session.scalar(sa.text("SELECT 1"))
+            assert await other.scalar(sa.text("SELECT 1")) == 1
+    finally:
+        await live.dispose()
+        await outsider.dispose()
+
+
+async def test_sever_fails_closed_when_it_cannot_terminate_the_apps_own_session(
+    db_session: AsyncSession, maintenance: AsyncEngine, salted: list[uuid.UUID]
+) -> None:
+    # Provisioning grants the maintenance role each app role WITH INHERIT. A role holding only
+    # ADMIN — a replacement credential, say — can lock the door but not evict: the kill-switch
+    # must refuse then, never report the app severed while its sessions stay inside.
+    db_name, role, dsn = await _provisioned(db_session, salted)
+    regrant = f"GRANT {quote_identifier(role)} TO CURRENT_USER WITH INHERIT "
+    async with maintenance.connect() as conn:
+        await conn.execute(sa.text(regrant + "FALSE"))
+    live = create_async_engine(dsn, poolclass=NullPool)
+    try:
+        async with live.connect() as app_session:
+            assert await app_session.scalar(sa.text("SELECT 1")) == 1
+
+            with pytest.raises(DBAPIError):
+                await sever(db_name=db_name, role_name=role)
+
+            assert await app_session.scalar(sa.text("SELECT 1")) == 1
+    finally:
+        async with maintenance.connect() as conn:
+            await conn.execute(sa.text(regrant + "TRUE"))
+        await live.dispose()
 
 
 async def test_restore_login_reopens_the_door(
@@ -131,8 +197,8 @@ async def test_salt_the_earth_drops_the_database_and_the_role(
 async def test_salt_the_earth_forces_out_a_live_connection(
     db_session: AsyncSession, maintenance: AsyncEngine, salted: list[uuid.UUID]
 ) -> None:
-    # `DROP DATABASE ... WITH (FORCE)` is the guarantee, not the delete-time build-session
-    # guard: a relaunched preview holds no lock and the deployed container has no interlock.
+    # The teardown's own eviction is the guarantee, not the delete-time build-session guard: a
+    # relaunched preview holds no lock and the deployed container has no interlock.
     db_name, role, dsn = await _provisioned(db_session, salted)
     live = create_async_engine(dsn, poolclass=NullPool)
     try:
@@ -144,6 +210,121 @@ async def test_salt_the_earth_forces_out_a_live_connection(
     finally:
         await live.dispose()
 
+    assert await _catalog(maintenance, _DATABASE_EXISTS_SQL, db=db_name) is False
+
+
+async def test_a_session_that_slips_in_after_the_sever_is_evicted_before_the_drop(
+    db_session: AsyncSession,
+    maintenance: AsyncEngine,
+    salted: list[uuid.UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_name, role, dsn = await _provisioned(db_session, salted)
+    real_terminate = appdb_teardown._terminate_backends
+    calls = 0
+
+    async def misses_the_first_time(conn: Any, *, db_name: str, role_name: str) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return 0
+        return await real_terminate(conn, db_name=db_name, role_name=role_name)
+
+    monkeypatch.setattr(appdb_teardown, "_terminate_backends", misses_the_first_time)
+    live = create_async_engine(dsn, poolclass=NullPool)
+    try:
+        async with live.connect() as connection:
+            assert await connection.scalar(sa.text("SELECT 1")) == 1
+            assert await salt_the_earth(db_name=db_name, role_name=role) is True
+    except DBAPIError:
+        pass  # the evicted connection may fail on the way out
+    finally:
+        await live.dispose()
+
+    assert await _catalog(maintenance, _DATABASE_EXISTS_SQL, db=db_name) is False
+
+
+async def test_the_drop_waits_for_a_session_it_may_not_close_instead_of_refusing(
+    db_session: AsyncSession, maintenance: AsyncEngine, salted: list[uuid.UUID]
+) -> None:
+    # A forced drop refuses at once when anything inside is beyond the maintenance role, and the
+    # everyday case is an autovacuum worker. A plain drop waits for it to leave, as a worker does
+    # once signalled; the control plane's own session, closed a moment later, stands in for it.
+    db_name, role, _dsn = await _provisioned(db_session, salted)
+    outsider_role = make_url(settings.DATABASE_URL.get_secret_value()).username or ""
+    async with maintenance.connect() as conn:
+        await conn.execute(
+            sa.text(
+                f"GRANT CONNECT ON DATABASE {quote_identifier(db_name)} "
+                f"TO {quote_identifier(outsider_role)}"
+            )
+        )
+    outsider = create_async_engine(control_plane_identity_dsn(db_name), poolclass=NullPool)
+    other = await outsider.connect()
+
+    async def leave_shortly() -> None:
+        await asyncio.sleep(1)
+        await other.close()
+
+    leaving = asyncio.create_task(leave_shortly())
+    try:
+        assert await other.scalar(sa.text("SELECT 1")) == 1
+        assert await salt_the_earth(db_name=db_name, role_name=role) is True
+    finally:
+        await leaving
+        await outsider.dispose()
+
+    assert await _catalog(maintenance, _DATABASE_EXISTS_SQL, db=db_name) is False
+
+
+async def test_salt_the_earth_reports_a_survivor_when_a_session_it_may_not_close_stays(
+    db_session: AsyncSession, maintenance: AsyncEngine, salted: list[uuid.UUID]
+) -> None:
+    db_name, role, _dsn = await _provisioned(db_session, salted)
+    outsider_role = make_url(settings.DATABASE_URL.get_secret_value()).username or ""
+    async with maintenance.connect() as conn:
+        await conn.execute(
+            sa.text(
+                f"GRANT CONNECT ON DATABASE {quote_identifier(db_name)} "
+                f"TO {quote_identifier(outsider_role)}"
+            )
+        )
+    outsider = create_async_engine(control_plane_identity_dsn(db_name), poolclass=NullPool)
+    try:
+        async with outsider.connect() as other:
+            assert await other.scalar(sa.text("SELECT 1")) == 1
+            with structlog.testing.capture_logs() as captured:
+                assert await salt_the_earth(db_name=db_name, role_name=role) is False
+    finally:
+        await outsider.dispose()
+
+    (failure,) = [e for e in captured if e.get("event") == "app_database_drop_database_failed"]
+    assert failure["sqlstate"] == "55006"
+    assert failure["transient"] is True
+    assert await _catalog(maintenance, _DATABASE_EXISTS_SQL, db=db_name) is True
+
+
+@pytest.mark.autovacuum
+async def test_salt_the_earth_drops_a_database_autovacuum_is_working_in(
+    db_session: AsyncSession, maintenance: AsyncEngine, salted: list[uuid.UUID]
+) -> None:
+    db_name, role, dsn = await _provisioned(db_session, salted)
+    # Throttled so hard that the worker is still inside when the teardown runs, whatever the
+    # server's own vacuum settings.
+    await execute_on(
+        dsn,
+        "CREATE TABLE dead_rows (id int) "
+        "WITH (autovacuum_vacuum_cost_delay = 100, autovacuum_vacuum_cost_limit = 1)",
+    )
+    await execute_on(dsn, "INSERT INTO dead_rows SELECT generate_series(1, 100000)")
+    await execute_on(dsn, "DELETE FROM dead_rows")
+
+    deadline = time.monotonic() + 150
+    while not await _catalog(maintenance, _VACUUM_IN_PROGRESS_SQL, db=db_name):
+        assert time.monotonic() < deadline, "autovacuum never reached the database"
+        await asyncio.sleep(0.05)
+
+    assert await salt_the_earth(db_name=db_name, role_name=role) is True
     assert await _catalog(maintenance, _DATABASE_EXISTS_SQL, db=db_name) is False
 
 

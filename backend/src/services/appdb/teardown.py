@@ -89,6 +89,11 @@ _ALREADY_GONE: Final = frozenset({_UNDEFINED_DATABASE, _UNDEFINED_OBJECT})
 async def sever(*, db_name: str, role_name: str) -> bool:
     """Lock the app out of its database and terminate its live sessions.
 
+    Every session of the app's role is terminated, plus any other session this role holds the
+    privileges of. Anything else inside — an autovacuum worker, another role's session — is not the
+    app, and Postgres would refuse to terminate it. An app session this role cannot terminate
+    raises, so the kill-switch fails closed.
+
     Returns False (no-op) when no substrate is configured; True once the door is locked.
     Raises the underlying error if any step fails — the caller is a kill-switch and must
     not report success on a half-severed database.
@@ -105,7 +110,7 @@ async def sever(*, db_name: str, role_name: str) -> bool:
         await conn.execute(sa.text(f"ALTER ROLE {quoted_role} NOLOGIN"))
         await conn.execute(sa.text(f"REVOKE CONNECT ON DATABASE {quoted_db} FROM {quoted_role}"))
         # 3, LAST: evict whoever is already inside.
-        killed = await _terminate_backends(conn, db_name=db_name)
+        killed = await _terminate_backends(conn, db_name=db_name, role_name=role_name)
     _log.info("app_database_severed", db_name=db_name, role_name=role_name, backends_killed=killed)
     return True
 
@@ -153,11 +158,11 @@ async def salt_the_earth(*, db_name: str, role_name: str) -> bool:
         async with engine.connect() as conn:
             async with _best_effort("sever", db_name=db_name) as sever_step:
                 await _sever_on(conn, db_name=db_name, role_name=role_name)
-            # WITH (FORCE) terminates whatever reconnected between the sever and here — the
-            # relaunched preview and the deployed container hold no build lock, so the
-            # delete-time guard does not cover them and this is the actual guarantee.
+            # The relaunched preview and the deployed container hold no build lock, so the
+            # delete-time guard does not cover them: the sever, and the second eviction inside
+            # the drop, are the actual guarantee.
             async with _best_effort("drop_database", db_name=db_name) as drop_step:
-                await _drop_database(conn, db_name=db_name)
+                await _drop_database(conn, db_name=db_name, role_name=role_name)
             # The role can only be dropped after the database it owns is gone.
             async with _best_effort("drop_role", db_name=db_name) as role_step:
                 await _drop_role(conn, role_name=role_name)
@@ -191,8 +196,20 @@ async def salt_the_earth(*, db_name: str, role_name: str) -> bool:
     return True
 
 
-async def _drop_database(conn: AsyncConnection, *, db_name: str) -> None:
-    await conn.execute(sa.text(f"DROP DATABASE {quote_identifier(db_name)} WITH (FORCE)"))
+async def _drop_database(conn: AsyncConnection, *, db_name: str, role_name: str) -> None:
+    # No FORCE: it refuses outright when an autovacuum worker is inside. A plain DROP stops the
+    # worker itself, and waits up to 5 s for any other session before reporting the database busy.
+    drop = sa.text(f"DROP DATABASE {quote_identifier(db_name)}")
+    try:
+        await conn.execute(drop)
+    except DBAPIError as exc:
+        if _sqlstate(exc) != _OBJECT_IN_USE:
+            raise
+        # A session that connected just before the door locked can miss the first eviction. With
+        # nothing new to evict, a second wait would end the same way.
+        if await _terminate_backends(conn, db_name=db_name, role_name=role_name) == 0:
+            raise
+        await conn.execute(drop)
 
 
 async def _drop_role(conn: AsyncConnection, *, role_name: str) -> None:
@@ -204,18 +221,22 @@ async def _sever_on(conn: AsyncConnection, *, db_name: str, role_name: str) -> N
     quoted_role = quote_identifier(role_name)
     await conn.execute(sa.text(f"ALTER ROLE {quoted_role} NOLOGIN"))
     await conn.execute(sa.text(f"REVOKE CONNECT ON DATABASE {quoted_db} FROM {quoted_role}"))
-    await _terminate_backends(conn, db_name=db_name)
+    await _terminate_backends(conn, db_name=db_name, role_name=role_name)
 
 
-async def _terminate_backends(conn: AsyncConnection, *, db_name: str) -> int:
+async def _terminate_backends(conn: AsyncConnection, *, db_name: str, role_name: str) -> int:
     # The one place a name IS a bindable value rather than an identifier: `datname` is a
     # column comparison, so it goes through a parameter like any other query.
+    # Postgres refuses to terminate a session of a role this one has no privileges of, and a
+    # single refusal fails the whole statement — so everything else is filtered out, while the
+    # app's own sessions stay in: one this role cannot terminate must fail, not be skipped.
     result = await conn.execute(
         sa.text(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            "WHERE datname = :db_name AND pid <> pg_backend_pid()"
+            "WHERE datname = :db_name AND pid <> pg_backend_pid() "
+            "AND (usename = :role_name OR pg_has_role(usesysid, 'USAGE'))"
         ),
-        {"db_name": db_name},
+        {"db_name": db_name, "role_name": role_name},
     )
     return len(result.fetchall())
 

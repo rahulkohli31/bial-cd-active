@@ -44,6 +44,8 @@ from tests.services.appdb.helpers import (
     unpersisted_record,
 )
 
+pytestmark = pytest.mark.app_db
+
 _OWNER_SQL = "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = :db"
 # `grantee = 0` is PUBLIC in an exploded ACL — the precise question is "does the
 # pseudo-role PUBLIC still hold CONNECT on this database", not "is the ACL non-empty".

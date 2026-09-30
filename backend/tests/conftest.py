@@ -3,7 +3,8 @@
 `ENV_FILE=.env.test` is set BEFORE importing `src.config` so the Settings
 singleton — and the global engine built from it in `src.db.base` — bind to the
 test database, not dev/prod. CI may override by exporting ENV_FILE / DATABASE_URL
-(real env wins). A name guard refuses to run against a non-"test" database.
+(real env wins). A name guard refuses to run against a non-"test" database. Under
+pytest-xdist every worker runs against its own copy of that database.
 """
 
 from __future__ import annotations
@@ -12,10 +13,19 @@ import os
 
 os.environ.setdefault("ENV_FILE", ".env.test")
 
+import asyncio  # noqa: E402
+import warnings  # noqa: E402
+from typing import Any  # noqa: E402
+
 import httpx  # noqa: E402
 import pytest  # noqa: E402
+import sqlalchemy as sa  # noqa: E402
+from pydantic import SecretStr  # noqa: E402
 from sqlalchemy.engine import make_url  # noqa: E402
+from sqlalchemy.exc import DBAPIError  # noqa: E402
 from sqlalchemy.ext.asyncio import (  # noqa: E402
+    AsyncConnection,
+    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -35,6 +45,17 @@ if "test" not in _db_name:
         "DATABASE_URL to a test database)."
     )
 
+# A worker's copy is made by the controller before the worker starts (`pytest_configure_node`
+# below). Rebound before any engine exists, so every reader of the setting sees the copy.
+_xdist_worker = os.environ.get("PYTEST_XDIST_WORKER")
+if _xdist_worker is not None:
+    # `render_as_string(hide_password=False)`: `str()` on a URL masks the password as `***`.
+    settings.DATABASE_URL = SecretStr(
+        make_url(settings.DATABASE_URL.get_secret_value())
+        .set(database=f"{_db_name}_{_xdist_worker}")
+        .render_as_string(hide_password=False)
+    )
+
 # Rebind the app's global engine to NullPool BEFORE any consumer imports
 # `async_session_factory` by value. pytest-asyncio runs tests on per-function
 # loops, and a pooled asyncpg connection is bound to the loop that created it —
@@ -48,6 +69,100 @@ from src.db.session import get_db  # noqa: E402
 from src.main import create_app  # noqa: E402
 
 TEST_DATABASE_URL = settings.DATABASE_URL.get_secret_value()
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node: Any) -> None:
+    """Give an xdist worker a fresh copy of the test database before the worker starts.
+
+    Runs on the controller for every worker, a crashed worker's replacement included.
+    `CREATE DATABASE … TEMPLATE` refuses while anything else is connected to the template, and
+    workers only ever connect to their copies. Copies are made on every run, so a migration
+    applied to the test database reaches them with no step of its own.
+    """
+    asyncio.run(_copy_the_test_database(node.gateway.id))
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node: Any, error: object | None) -> None:
+    """Drop a worker's copy once the worker has finished or crashed."""
+    asyncio.run(_drop_the_copy(node.gateway.id))
+
+
+def _copy_name(worker_id: str) -> str:
+    from src.services.appdb.names import quote_identifier
+
+    return quote_identifier(f"{_db_name}_{worker_id}")
+
+
+def _cluster_engine() -> AsyncEngine:
+    return create_async_engine(
+        make_url(TEST_DATABASE_URL).set(database="postgres"),
+        isolation_level="AUTOCOMMIT",
+        poolclass=NullPool,
+    )
+
+
+async def _copy_the_test_database(worker_id: str) -> None:
+    from src.services.appdb.names import quote_identifier
+
+    template = quote_identifier(_db_name)
+    copy = _copy_name(worker_id)
+    owner = quote_identifier(make_url(TEST_DATABASE_URL).username or "")
+    engine = _cluster_engine()
+    try:
+        async with engine.connect() as conn:
+            # Only a run that ended without dropping its copies leaves one, or a session on it.
+            await _drop_the_copy_on(conn, worker_id)
+            await conn.execute(sa.text(f"CREATE DATABASE {copy} TEMPLATE {template}"))
+            # Grants are not copied from a template, and the appdb tests assert this wall.
+            await conn.execute(sa.text(f"REVOKE CONNECT ON DATABASE {copy} FROM PUBLIC"))
+            await conn.execute(sa.text(f"GRANT CONNECT ON DATABASE {copy} TO {owner}"))
+    except DBAPIError as exc:
+        pytest.exit(
+            f"Could not copy {_db_name} for worker {worker_id}: {exc.orig}\n"
+            f"Close any other session on {_db_name} — another test run, psql, an IDE — and "
+            "check the test role has CREATEDB (CONTRIBUTING.md, Backend — tests).",
+            returncode=pytest.ExitCode.USAGE_ERROR,
+        )
+    finally:
+        await engine.dispose()
+
+
+async def _drop_the_copy(worker_id: str) -> None:
+    engine = _cluster_engine()
+    try:
+        async with engine.connect() as conn:
+            await _drop_the_copy_on(conn, worker_id)
+    except DBAPIError as exc:
+        # Every test has already run; the next parallel run drops this copy before copying.
+        warnings.warn(f"Could not drop {_db_name}_{worker_id}: {exc.orig}", stacklevel=1)
+    finally:
+        await engine.dispose()
+
+
+async def _drop_the_copy_on(conn: AsyncConnection, worker_id: str) -> None:
+    # Not `WITH (FORCE)`: it refuses when an autovacuum worker is inside, which a role that is not
+    # a superuser cannot terminate, while a plain DROP stops autovacuum itself.
+    await conn.execute(
+        sa.text(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = :copy AND pid <> pg_backend_pid() AND pg_has_role(usesysid, 'USAGE')"
+        ),
+        {"copy": f"{_db_name}_{worker_id}"},
+    )
+    await conn.execute(sa.text(f"DROP DATABASE IF EXISTS {_copy_name(worker_id)}"))
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    # tryfirst: xdist reads `xdist_group` in its own collection hook, which otherwise runs first.
+    for item in items:
+        if item.get_closest_marker("app_db") is not None:
+            item.add_marker(pytest.mark.xdist_group("app_db"))
+        # These write a probe revision into alembic/versions, which every worker reads.
+        elif item.get_closest_marker("destructive_migration") is not None:
+            item.add_marker(pytest.mark.xdist_group("destructive_migration"))
 
 
 @pytest.fixture(scope="session")
@@ -69,7 +184,6 @@ def _salt_every_provisioned_app_database():
     and scoped to ids this session actually claimed — never a `LIKE` sweep, which on a cluster
     dev and test share would drop a developer's live database.
     """
-    import asyncio
     import uuid as _uuid
 
     from src.services.appdb import names as _names
@@ -98,6 +212,25 @@ def _salt_every_provisioned_app_database():
         yield
     if claimed:
         asyncio.run(_salt())
+
+
+@pytest.fixture(autouse=True)
+def _app_db_substrate_only_when_marked(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+):
+    """Switch the per-project database substrate off for every test not marked `app_db`.
+
+    `.env.test` configures a real substrate, so without this an unmarked test that creates a
+    project through the API also creates a real database that the session then has to drop. The
+    memoized engine is cleared as well: `get_maintenance_engine` returns it without consulting
+    `settings.app_db`.
+    """
+    if request.node.get_closest_marker("app_db") is not None:
+        return
+    from src.services.appdb import engine as _appdb_engine
+
+    monkeypatch.setattr(_appdb_engine, "_maintenance_engine", None)
+    monkeypatch.setattr(settings, "app_db", None)
 
 
 @pytest.fixture

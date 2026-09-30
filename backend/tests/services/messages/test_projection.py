@@ -2903,9 +2903,9 @@ async def test_projecting_a_long_transcript_stays_inside_a_stated_bound(db_sessi
         kind=ChatKind.BUILD,
     )
     rows = await _rows(db_session, user, conversation)
-    started = time.perf_counter()
+    started = time.process_time()
     items = project_rows(rows)
-    elapsed = time.perf_counter() - started
+    elapsed = time.process_time() - started
 
     assert len(items) == 2
     # The SCAN is what the cap bounds, so the claim is about how much of the field was read —
@@ -2955,9 +2955,9 @@ async def test_projecting_an_ordinary_long_transcript_stays_inside_a_stated_boun
         kind=ChatKind.BUILD,
     )
     rows = await _rows(db_session, user, conversation)
-    started = time.perf_counter()
+    started = time.process_time()
     items = project_rows(rows)
-    elapsed = time.perf_counter() - started
+    elapsed = time.process_time() - started
 
     assert len(items) == 200
     assert _CREDENTIAL not in json.dumps([i.model_dump(mode="json") for i in items])

@@ -5,9 +5,16 @@ on:
   push:
     branches: [main, 'release/**']
 
+# A newer push to a pull request supersedes the run still in progress for it. Pushes to main and
+# release branches always run to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  checks:
+  portal-static:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: portal
@@ -17,7 +24,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: portal/package-lock.json
 
@@ -30,21 +37,40 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      - name: Test
-        run: npm run test
+  # Vitest shards by test file, so each shard runs a third of the files on its own runner.
+  portal-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    defaults:
+      run:
+        working-directory: portal
+    steps:
+      - uses: actions/checkout@v4
 
-  # The backend previously had no CI job at all: every gate was run by hand, so a green check
-  # on a PR said nothing about the backend. These steps are what make the gates mandatory and
-  # enforced, not merely advisory.
-  #
-  # STATIC GATES ONLY, deliberately. They need no database, no Redis (tests fake it in
-  # process) and no secrets, so this job is hermetic and cannot flake. `pytest` is NOT here
-  # yet on purpose: the suite needs a `citizen_one_test` database built to the test-database
-  # runbook — including `REVOKE CONNECT` on the control-plane database, which several
-  # `appdb` tests assert against — and adding a red-by-default job would block every PR.
-  # Encoding that runbook as a service-container step is the follow-up.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: portal/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARD_TOTAL: ${{ strategy.job-total }}
+        run: npm run test -- --shard="$SHARD/$SHARD_TOTAL"
+
+  # The backend's static gates: no database, no Redis (tests fake it in process) and no secrets.
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: backend
@@ -86,3 +112,63 @@ jobs:
           heads=$(uv run alembic heads | grep -c '(head)')
           echo "alembic heads found: $heads"
           test "$heads" -eq 1
+
+  # The backend suite, run exactly as locally: one worker per CPU, each on its own copy of the
+  # test database. The committed example env already points at this service, and its encryption
+  # key is a throwaway, so the job needs no secrets.
+  backend-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      ENV_FILE: .env.test
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5544:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-groups
+
+      # Tests that start a child interpreter hand it `.env.test` by name.
+      - name: Use the example test env
+        run: cp .env.test.example .env.test
+
+      # documentation/runbooks/test-database-setup.md, steps 1 to 3, as the service's superuser.
+      - name: Build the test database
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE bial LOGIN CREATEDB PASSWORD 'bial';
+          CREATE DATABASE citizen_one_test OWNER bial;
+          REVOKE CONNECT ON DATABASE citizen_one_test FROM PUBLIC;
+          GRANT CONNECT ON DATABASE citizen_one_test TO bial;
+          CREATE ROLE bial_appdb_maint LOGIN CREATEDB CREATEROLE NOSUPERUSER PASSWORD 'bial_appdb_maint';
+          \c citizen_one_test
+          CREATE EXTENSION IF NOT EXISTS vector;
+          SQL
+
+      - name: Migrate
+        run: uv run alembic upgrade head
+
+      - name: Test
+        run: uv run pytest -n auto -q

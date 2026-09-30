@@ -928,11 +928,11 @@ def test_an_escape_between_the_key_and_its_quote_does_not_unlock_the_tail(separa
         assert "ordinary build line 3" in rendered
 
 
-def test_the_capture_guard_stays_inside_its_wall_clock_budget() -> None:
+def test_the_capture_guard_stays_inside_its_cpu_time_budget() -> None:
     """★ MUTATION TARGET: raise `CREDENTIAL_OPEN_SCAN_MAX_CHARS` back toward its old 8,000,000 and
     this goes red — the scan stops being bounded by the ceiling, and by whatever the app printed.
 
-    Wall-clock, not concurrency: the cost is paid ON the event loop (`re` doesn't release the GIL),
+    CPU time: the cost is paid ON the event loop (`re` doesn't release the GIL),
     so a non-matching scan blocks every other request regardless of thread (measured: a 1ms ticker
     gets 0 ticks across a 304ms `to_thread` scan). The ceiling measures ~80ms and this capture is
     25x past it, so 1s never flakes — it fails loudly on a raised bound OR a superlinear
@@ -941,9 +941,9 @@ def test_the_capture_guard_stays_inside_its_wall_clock_budget() -> None:
     # input. Identifier-shaped bytes, because that is what makes this pattern work hardest. Built
     # OUTSIDE the stopwatch — 6 MB of string concatenation is not what is being measured.
     raw = ("A" * 79 + "\n") * 80_000
-    started = time.perf_counter()
+    started = time.process_time()
     rendered = _redact_command_output(raw, budget=4_000)
-    elapsed = time.perf_counter() - started
+    elapsed = time.process_time() - started
 
     assert "elided" in rendered  # LIVENESS: it really rendered the capture, it did not bail
     assert elapsed < 1.0, f"the open-credential scan took {elapsed:.2f}s"

@@ -8,7 +8,7 @@ authorizes it, and nothing after may raise — a delete that already succeeded m
 a drop failed. The build-session guard does not cover every case: a relaunched preview holds no
 lock and a deployed container has no interlock, so something can still be holding live
 connections at delete time — the sandbox reap is best-effort and cannot see a published
-container, so `DROP DATABASE ... WITH (FORCE)` after the sever is what stops that. Every database
+container, so the sever's eviction before `DROP DATABASE` is what stops that. Every database
 here is dropped by the endpoint under test or the session-scoped hook in `tests/conftest.py`."""
 
 from __future__ import annotations
@@ -47,6 +47,8 @@ from tests.factories import (
     UserFactory,
 )
 from tests.services.appdb.helpers import scalar_on
+
+pytestmark = pytest.mark.app_db
 
 _TTL = settings.auth.access_ttl_seconds
 _DATABASE_EXISTS = "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = :db)"
@@ -398,7 +400,7 @@ async def test_a_live_preview_connection_does_not_survive_the_delete(
 ) -> None:
     # Exactly the state a relaunched preview leaves behind: a READY registry entry under a
     # live stay and NO lock, so `refuse_while_build_session_live` returns without refusing.
-    # The container is still connected. The force-drop is the entire guarantee here.
+    # The container is still connected. The teardown's eviction is the entire guarantee here.
     from datetime import UTC, datetime, timedelta
 
     from src.services.build_sessions import app_name_for

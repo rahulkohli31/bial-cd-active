@@ -24,13 +24,14 @@ from src.core.redaction import (
     redact_secrets,
 )
 
-# --- the wall-clock ceiling, written FIRST --------------
+# --- the CPU-time ceiling, written FIRST ---------------
 #
 # The ReDoS this guards against was invisible to every example-based test and to all four
 # type gates. Same discipline
 # as the masker's `test_redaction_is_linear_on_an_adversarial_blob`: a 5s ceiling never
 # flakes on a linear scan (measured well under 1s) and fails loudly on any quadratic
-# regression, which lands in minutes, not seconds.
+# regression, which lands in minutes, not seconds. The ceilings here are CPU time, so a
+# loaded machine or a parallel run cannot push a linear scan over them.
 
 
 def test_detector_completes_a_pathological_64kb_line_under_the_ceiling() -> None:
@@ -47,13 +48,13 @@ def test_detector_completes_a_pathological_64kb_line_under_the_ceiling() -> None
         "x" * SCAN_INPUT_MAX_CHARS,
     )
     for payload in pathological:
-        start = time.perf_counter()
+        start = time.process_time()
         detect_credentials(payload)
-        assert time.perf_counter() - start < 5.0
+        assert time.process_time() - start < 5.0
         # The widened masker walks the same family — hold it to the same ceiling.
-        start = time.perf_counter()
+        start = time.process_time()
         redact_secrets(payload)
-        assert time.perf_counter() - start < 5.0
+        assert time.process_time() - start < 5.0
 
 
 # --- fixtures -------------------------------------------------------------------------------
@@ -358,13 +359,13 @@ def test_the_open_credential_scan_is_bounded_and_fails_closed_past_the_bound() -
     assert leaves_a_credential_value_open("x" * CREDENTIAL_OPEN_SCAN_MAX_CHARS) is False
 
 
-def test_the_open_credential_scan_stays_under_the_wall_clock_ceiling() -> None:
+def test_the_open_credential_scan_stays_under_the_cpu_time_ceiling() -> None:
     """The ReDoS discipline this module is built on, applied to the newest scan: a big
     NON-MATCHING blob under a hard time assertion is the only thing that catches a quadratic
     regression (an example-based leak test stays green through one). 5s never flakes on a linear
     scan — the ceiling is measured in hundreds of milliseconds — and fails loudly on a
     superlinear one."""
     blob = ("A" * 79 + "\n") * (CREDENTIAL_OPEN_SCAN_MAX_CHARS // 80)
-    started = time.perf_counter()
+    started = time.process_time()
     assert leaves_a_credential_value_open(blob) is False
-    assert time.perf_counter() - started < 5.0
+    assert time.process_time() - started < 5.0

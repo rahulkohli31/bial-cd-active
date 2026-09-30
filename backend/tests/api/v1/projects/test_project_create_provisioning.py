@@ -35,6 +35,8 @@ from src.services.auth.session_jwt import mint_session_jwt
 from tests.api.v1.projects.conftest import _VALID_DESCRIPTION
 from tests.factories import UserFactory
 
+pytestmark = pytest.mark.app_db
+
 _DB_EXISTS = "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = :db)"
 _TTL = settings.auth.access_ttl_seconds
 
