@@ -110,10 +110,8 @@ async def _copy_the_test_database(worker_ids: list[str]) -> None:
 
 
 @pytest.hookimpl(tryfirst=True)
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     # tryfirst: xdist reads `xdist_group` in its own collection hook, which otherwise runs first.
-    if not config.pluginmanager.hasplugin("xdist"):
-        return
     for item in items:
         if item.get_closest_marker("app_db") is not None:
             item.add_marker(pytest.mark.xdist_group("app_db"))

@@ -928,7 +928,7 @@ def test_an_escape_between_the_key_and_its_quote_does_not_unlock_the_tail(separa
         assert "ordinary build line 3" in rendered
 
 
-def test_the_capture_guard_stays_inside_its_wall_clock_budget() -> None:
+def test_the_capture_guard_stays_inside_its_cpu_time_budget() -> None:
     """★ MUTATION TARGET: raise `CREDENTIAL_OPEN_SCAN_MAX_CHARS` back toward its old 8,000,000 and
     this goes red — the scan stops being bounded by the ceiling, and by whatever the app printed.
 

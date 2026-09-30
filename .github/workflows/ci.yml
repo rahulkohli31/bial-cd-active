@@ -64,7 +64,8 @@ jobs:
       - name: Test
         env:
           SHARD: ${{ matrix.shard }}
-        run: npm run test -- --shard="$SHARD/3"
+          SHARD_TOTAL: ${{ strategy.job-total }}
+        run: npm run test -- --shard="$SHARD/$SHARD_TOTAL"
 
   # The backend's static gates: no database, no Redis (tests fake it in process) and no secrets.
   backend:

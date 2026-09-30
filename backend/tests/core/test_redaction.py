@@ -359,7 +359,7 @@ def test_the_open_credential_scan_is_bounded_and_fails_closed_past_the_bound() -
     assert leaves_a_credential_value_open("x" * CREDENTIAL_OPEN_SCAN_MAX_CHARS) is False
 
 
-def test_the_open_credential_scan_stays_under_the_wall_clock_ceiling() -> None:
+def test_the_open_credential_scan_stays_under_the_cpu_time_ceiling() -> None:
     """The ReDoS discipline this module is built on, applied to the newest scan: a big
     NON-MATCHING blob under a hard time assertion is the only thing that catches a quadratic
     regression (an example-based leak test stays green through one). 5s never flakes on a linear
