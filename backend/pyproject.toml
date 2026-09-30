@@ -152,4 +152,5 @@ markers = [
     # Unmarked tests run with the substrate switched off, although `.env.test` configures one.
     "app_db: needs the real per-project database substrate; creates real databases on the cluster",
 ]
-addopts = "-m 'not integration and not destructive_migration' --strict-markers"
+# `--dist loadgroup` does nothing without `-n`; with it, each `xdist_group` stays on one worker.
+addopts = "-m 'not integration and not destructive_migration' --strict-markers --dist loadgroup"

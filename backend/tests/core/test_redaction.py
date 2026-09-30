@@ -24,7 +24,7 @@ from src.core.redaction import (
     redact_secrets,
 )
 
-# --- the wall-clock ceiling, written FIRST --------------
+# --- the CPU-time ceiling, written FIRST ---------------
 #
 # The ReDoS this guards against was invisible to every example-based test and to all four
 # type gates. Same discipline

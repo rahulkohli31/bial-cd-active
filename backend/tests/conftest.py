@@ -14,7 +14,6 @@ import os
 os.environ.setdefault("ENV_FILE", ".env.test")
 
 import asyncio  # noqa: E402
-from collections.abc import Sequence  # noqa: E402
 from typing import Any  # noqa: E402
 
 import httpx  # noqa: E402
@@ -43,7 +42,7 @@ if "test" not in _db_name:
         "DATABASE_URL to a test database)."
     )
 
-# A worker's copy is made by the controller before the worker starts (`pytest_xdist_setupnodes`
+# A worker's copy is made by the controller before the worker starts (`pytest_configure_node`
 # below). Rebound before any engine exists, so every reader of the setting sees the copy.
 _xdist_worker = os.environ.get("PYTEST_XDIST_WORKER")
 if _xdist_worker is not None:
@@ -70,38 +69,40 @@ TEST_DATABASE_URL = settings.DATABASE_URL.get_secret_value()
 
 
 @pytest.hookimpl(optionalhook=True)
-def pytest_xdist_setupnodes(specs: Sequence[Any]) -> None:
-    """Give every xdist worker a fresh copy of the test database before any worker starts.
+def pytest_configure_node(node: Any) -> None:
+    """Give an xdist worker a fresh copy of the test database before the worker starts.
 
-    `CREATE DATABASE … TEMPLATE` refuses while anything else is connected to the template,
-    which holds only here, before the first worker connects. Copies are re-made on every run,
-    so a migration applied to the test database reaches them with no step of its own.
+    Runs on the controller for every worker, a crashed worker's replacement included.
+    `CREATE DATABASE … TEMPLATE` refuses while anything else is connected to the template, and
+    workers only ever connect to their copies. Copies are re-made on every run, so a migration
+    applied to the test database reaches them with no step of its own.
     """
-    asyncio.run(_copy_the_test_database([spec.id for spec in specs]))
+    asyncio.run(_copy_the_test_database(node.gateway.id))
 
 
-async def _copy_the_test_database(worker_ids: list[str]) -> None:
+async def _copy_the_test_database(worker_id: str) -> None:
     from src.services.appdb.names import quote_identifier
 
     base_url = make_url(TEST_DATABASE_URL)
     template = quote_identifier(_db_name)
+    copy = quote_identifier(f"{_db_name}_{worker_id}")
     owner = quote_identifier(base_url.username or "")
     engine = create_async_engine(
         base_url.set(database="postgres"), isolation_level="AUTOCOMMIT", poolclass=NullPool
     )
     try:
         async with engine.connect() as conn:
-            for worker_id in worker_ids:
-                copy = quote_identifier(f"{_db_name}_{worker_id}")
-                await conn.execute(sa.text(f"DROP DATABASE IF EXISTS {copy} WITH (FORCE)"))
-                await conn.execute(sa.text(f"CREATE DATABASE {copy} TEMPLATE {template}"))
-                # Grants are not copied from a template, and the appdb tests assert this wall.
-                await conn.execute(sa.text(f"REVOKE CONNECT ON DATABASE {copy} FROM PUBLIC"))
-                await conn.execute(sa.text(f"GRANT CONNECT ON DATABASE {copy} TO {owner}"))
+            # No FORCE: a session on the copy belongs to another run, which must not be killed.
+            await conn.execute(sa.text(f"DROP DATABASE IF EXISTS {copy}"))
+            await conn.execute(sa.text(f"CREATE DATABASE {copy} TEMPLATE {template}"))
+            # Grants are not copied from a template, and the appdb tests assert this wall.
+            await conn.execute(sa.text(f"REVOKE CONNECT ON DATABASE {copy} FROM PUBLIC"))
+            await conn.execute(sa.text(f"GRANT CONNECT ON DATABASE {copy} TO {owner}"))
     except DBAPIError as exc:
         pytest.exit(
-            f"Could not copy {_db_name} for the parallel workers: {exc.orig}\n"
-            f"Close any other session on {_db_name}, and check the test role has CREATEDB "
+            f"Could not copy {_db_name} for worker {worker_id}: {exc.orig}\n"
+            f"Close any other session on {_db_name} or its worker copies — another test run, "
+            "psql, an IDE — and check the test role has CREATEDB "
             "(CONTRIBUTING.md, Backend — tests).",
             returncode=pytest.ExitCode.USAGE_ERROR,
         )
@@ -136,7 +137,6 @@ def _salt_every_provisioned_app_database():
     and scoped to ids this session actually claimed — never a `LIKE` sweep, which on a cluster
     dev and test share would drop a developer's live database.
     """
-    import asyncio
     import uuid as _uuid
 
     from src.services.appdb import names as _names

@@ -618,8 +618,9 @@ async def test_a_malformed_output_lands_review_failed_not_an_empty_review(
 async def test_the_wall_clock_ceiling_lands_the_abandoned_bucket(
     wire, db_session, monkeypatch
 ) -> None:
-    # The ceiling is charged from the row's claim, so it has to outlast claiming and extracting
-    # on a loaded machine; a shorter one can elapse before extraction and never reach the model.
+    # The ceiling is charged from the row's `started_at`, which Postgres stamps when the test's
+    # transaction begins, so it has to outlast setup, claiming and extracting on a loaded
+    # machine; a shorter one can elapse before extraction and never reach the model.
     monkeypatch.setattr(service_module, "REVIEW_WALL_CLOCK_CEILING_S", 1.0)
     user, app = await _citizen_app(db_session)
 

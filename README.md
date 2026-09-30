@@ -37,7 +37,7 @@ system is built — `documentation/architecture.md` explains how.
 | Tree | Toolchain |
 |---|---|
 | `backend/` | Python 3.14, `uv` |
-| `portal/` | Node 20 or newer — the shipped image builds on 24 — and `npm` |
+| `portal/` | Node 22.12 or newer — the shipped image and CI build on 24 — and `npm` |
 | `sandbox/` | Python 3.14 via `backend/`, Node 24 in the image |
 
 `CONTRIBUTING.md` covers installing these and running the checks. The static checks — linting, three
