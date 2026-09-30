@@ -30,7 +30,7 @@
 #
 # INDEX digest, not a per-architecture child: the index resolves per host, so this one string
 # builds arm64 on a developer machine and amd64 in the registry.
-FROM python:3.14-alpine@sha256:05b2b8b732ecd268fee8727a369f936f022d1321b59befd13c30ede22769dcdc
+FROM python:3.14-alpine@sha256:9e9fde4d32eedce0b661d9ab91e826b62dddf28e928c230ec55f1866cac66b01
 
 # RUNTIME git — not a build convenience. The control plane SHELLS OUT to git to restore an
 # app's snapshot (`services/storage/snapshot_read.py` runs `git clone` over the bundle), and
