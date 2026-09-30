@@ -65,8 +65,21 @@ including a `REVOKE CONNECT` on the control-plane database that several per-app 
 assert against. Build it out of band before your first run.
 
 ```sh
-cd backend && uv run pytest -q      # ~8 minutes
+cd backend && uv run pytest -n auto --dist loadgroup -q   # the full run, on every core
+cd backend && uv run pytest tests/path/to/test_file.py    # a focused run stays serial
 ```
+
+The full run gives each worker its own copy of the test database, made at the start of the run.
+Nothing else may be connected to the test database at that moment (close any psql session or
+IDE database browser first), and the test role needs `CREATEDB`. CI runs the same command.
+
+`.env.test` configures a real per-project database substrate, but a test runs with it switched
+off unless it is marked `@pytest.mark.app_db`. Mark a test that needs real per-project databases;
+the marked tests all run on one worker, because some of them scan every database on the cluster.
+
+A test that fails only in the full run is almost always sharing something with another worker or
+racing a wall-clock bound. Rerun it serially first. If it passes there, find what it shares, and
+confirm the fix with a smaller `-n`.
 
 **Portal.**
 

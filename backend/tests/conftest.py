@@ -3,7 +3,8 @@
 `ENV_FILE=.env.test` is set BEFORE importing `src.config` so the Settings
 singleton — and the global engine built from it in `src.db.base` — bind to the
 test database, not dev/prod. CI may override by exporting ENV_FILE / DATABASE_URL
-(real env wins). A name guard refuses to run against a non-"test" database.
+(real env wins). A name guard refuses to run against a non-"test" database. Under
+pytest-xdist every worker runs against its own copy of that database.
 """
 
 from __future__ import annotations
@@ -12,9 +13,16 @@ import os
 
 os.environ.setdefault("ENV_FILE", ".env.test")
 
+import asyncio  # noqa: E402
+from collections.abc import Sequence  # noqa: E402
+from typing import Any  # noqa: E402
+
 import httpx  # noqa: E402
 import pytest  # noqa: E402
+import sqlalchemy as sa  # noqa: E402
+from pydantic import SecretStr  # noqa: E402
 from sqlalchemy.engine import make_url  # noqa: E402
+from sqlalchemy.exc import DBAPIError  # noqa: E402
 from sqlalchemy.ext.asyncio import (  # noqa: E402
     AsyncSession,
     async_sessionmaker,
@@ -35,6 +43,17 @@ if "test" not in _db_name:
         "DATABASE_URL to a test database)."
     )
 
+# A worker's copy is made by the controller before the worker starts (`pytest_xdist_setupnodes`
+# below). Rebound before any engine exists, so every reader of the setting sees the copy.
+_xdist_worker = os.environ.get("PYTEST_XDIST_WORKER")
+if _xdist_worker is not None:
+    # `render_as_string(hide_password=False)`: `str()` on a URL masks the password as `***`.
+    settings.DATABASE_URL = SecretStr(
+        make_url(settings.DATABASE_URL.get_secret_value())
+        .set(database=f"{_db_name}_{_xdist_worker}")
+        .render_as_string(hide_password=False)
+    )
+
 # Rebind the app's global engine to NullPool BEFORE any consumer imports
 # `async_session_factory` by value. pytest-asyncio runs tests on per-function
 # loops, and a pooled asyncpg connection is bound to the loop that created it —
@@ -48,6 +67,56 @@ from src.db.session import get_db  # noqa: E402
 from src.main import create_app  # noqa: E402
 
 TEST_DATABASE_URL = settings.DATABASE_URL.get_secret_value()
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_setupnodes(specs: Sequence[Any]) -> None:
+    """Give every xdist worker a fresh copy of the test database before any worker starts.
+
+    `CREATE DATABASE … TEMPLATE` refuses while anything else is connected to the template,
+    which holds only here, before the first worker connects. Copies are re-made on every run,
+    so a migration applied to the test database reaches them with no step of its own.
+    """
+    asyncio.run(_copy_the_test_database([spec.id for spec in specs]))
+
+
+async def _copy_the_test_database(worker_ids: list[str]) -> None:
+    from src.services.appdb.names import quote_identifier
+
+    base_url = make_url(TEST_DATABASE_URL)
+    template = quote_identifier(_db_name)
+    owner = quote_identifier(base_url.username or "")
+    engine = create_async_engine(
+        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT", poolclass=NullPool
+    )
+    try:
+        async with engine.connect() as conn:
+            for worker_id in worker_ids:
+                copy = quote_identifier(f"{_db_name}_{worker_id}")
+                await conn.execute(sa.text(f"DROP DATABASE IF EXISTS {copy} WITH (FORCE)"))
+                await conn.execute(sa.text(f"CREATE DATABASE {copy} TEMPLATE {template}"))
+                # Grants are not copied from a template, and the appdb tests assert this wall.
+                await conn.execute(sa.text(f"REVOKE CONNECT ON DATABASE {copy} FROM PUBLIC"))
+                await conn.execute(sa.text(f"GRANT CONNECT ON DATABASE {copy} TO {owner}"))
+    except DBAPIError as exc:
+        pytest.exit(
+            f"Could not copy {_db_name} for the parallel workers: {exc.orig}\n"
+            f"Close any other session on {_db_name}, and check the test role has CREATEDB "
+            "(CONTRIBUTING.md, Backend — tests).",
+            returncode=pytest.ExitCode.USAGE_ERROR,
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    # tryfirst: xdist reads `xdist_group` in its own collection hook, which otherwise runs first.
+    if not config.pluginmanager.hasplugin("xdist"):
+        return
+    for item in items:
+        if item.get_closest_marker("app_db") is not None:
+            item.add_marker(pytest.mark.xdist_group("app_db"))
 
 
 @pytest.fixture(scope="session")

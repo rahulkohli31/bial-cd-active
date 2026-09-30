@@ -33,6 +33,10 @@ from src.services.sandbox.client import (
     _RESTORE_SCRIPT,
 )
 
+# The scripts under test write to fixed `/tmp` paths, so two workers running them at once
+# overwrite each other's bundle.
+pytestmark = pytest.mark.xdist_group("workspace_scripts")
+
 _EXCLUDE_FILE = Path(__file__).resolve().parents[4] / "sandbox" / "platform-owned.gitignore"
 
 #: The image's Next config reads the path the platform serves the app under. A saved copy from an

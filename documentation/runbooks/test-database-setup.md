@@ -27,9 +27,13 @@ The application connects to one database for its own control-plane data — proj
 app registry, and so on. Create it and a login role for the application to connect as:
 
 ```sql
-CREATE ROLE <app_role> LOGIN PASSWORD '<a password>';
+CREATE ROLE <app_role> LOGIN CREATEDB PASSWORD '<a password>';
 CREATE DATABASE <your_test_db> OWNER <app_role>;
 ```
+
+`CREATEDB` is for the parallel run in step 7, which copies this database once per worker at the
+start of every run. A role created without it can be given it afterwards with
+`ALTER ROLE <app_role> CREATEDB;`.
 
 Run these as a superuser. Since PostgreSQL 16, creating a database owned by *another* role
 requires the creating role to be a member of that role — the right to create databases is not
@@ -136,8 +140,13 @@ look unrelated to whatever you were working on.
 ## 7. Run the suite
 
 ```sh
-cd backend && uv run pytest -q
+cd backend && uv run pytest -n auto --dist loadgroup -q
 ```
+
+`-n auto` runs one worker per CPU. Each worker gets its own copy of the test database, made from
+it at the start of the run, so every worker sees only its own rows and a migration reaches the
+copies without a step of its own. A focused run — a path or a single test, no `-n` — stays serial
+and uses the test database directly.
 
 The default run already excludes two opt-in marker groups: the object-storage round-trip tests
 (which need a separate local object-storage emulator, unrelated to this runbook) and a set of
@@ -148,13 +157,18 @@ database — leave both opted out for routine runs.
 `backend/.env.test`: your configuration isn't being picked up, or the configured database name
 doesn't contain `test` — see step 1.
 
+**If it stops before any test runs, saying it could not copy the test database**: something else
+is connected to that database — a psql session, an IDE's database browser — or the role lacks
+`CREATEDB` (step 1). Postgres's own message, shown with it, says which.
+
 **If it fails with a permission error connecting to the control-plane database**: step 2 was
 skipped, or undone since.
 
 **If the same handful of appdb tests fail, but which ones fail changes between runs**: see the
 debris note in step 3.
 
-A clean run from here takes roughly eight minutes.
+A clean full run takes about a minute and a half on an otherwise idle eight-core machine, and a
+serial run without `-n` about five and a half minutes.
 
 ## Where to go next
 
