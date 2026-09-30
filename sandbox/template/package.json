@@ -13,7 +13,7 @@
     "db:migrate": "node scripts/db-migrate.mjs"
   },
   "dependencies": {
-    "next": "16.3.1",
+    "next": "16.3.3",
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "@hookform/resolvers": "5.4.0",
