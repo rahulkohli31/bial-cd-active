@@ -14,6 +14,7 @@ import os
 os.environ.setdefault("ENV_FILE", ".env.test")
 
 import asyncio  # noqa: E402
+import warnings  # noqa: E402
 from typing import Any  # noqa: E402
 
 import httpx  # noqa: E402
@@ -23,6 +24,7 @@ from pydantic import SecretStr  # noqa: E402
 from sqlalchemy.engine import make_url  # noqa: E402
 from sqlalchemy.exc import DBAPIError  # noqa: E402
 from sqlalchemy.ext.asyncio import (  # noqa: E402
+    AsyncConnection,
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
@@ -111,7 +113,7 @@ async def _copy_the_test_database(worker_id: str) -> None:
     try:
         async with engine.connect() as conn:
             # Only a run that ended without dropping its copies leaves one, or a session on it.
-            await conn.execute(sa.text(f"DROP DATABASE IF EXISTS {copy} WITH (FORCE)"))
+            await _drop_the_copy_on(conn, worker_id)
             await conn.execute(sa.text(f"CREATE DATABASE {copy} TEMPLATE {template}"))
             # Grants are not copied from a template, and the appdb tests assert this wall.
             await conn.execute(sa.text(f"REVOKE CONNECT ON DATABASE {copy} FROM PUBLIC"))
@@ -131,11 +133,25 @@ async def _drop_the_copy(worker_id: str) -> None:
     engine = _cluster_engine()
     try:
         async with engine.connect() as conn:
-            await conn.execute(
-                sa.text(f"DROP DATABASE IF EXISTS {_copy_name(worker_id)} WITH (FORCE)")
-            )
+            await _drop_the_copy_on(conn, worker_id)
+    except DBAPIError as exc:
+        # Every test has already run; the next parallel run drops this copy before copying.
+        warnings.warn(f"Could not drop {_db_name}_{worker_id}: {exc.orig}", stacklevel=1)
     finally:
         await engine.dispose()
+
+
+async def _drop_the_copy_on(conn: AsyncConnection, worker_id: str) -> None:
+    # Not `WITH (FORCE)`: it refuses when an autovacuum worker is inside, which a role that is not
+    # a superuser cannot terminate, while a plain DROP stops autovacuum itself.
+    await conn.execute(
+        sa.text(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = :copy AND pid <> pg_backend_pid() AND pg_has_role(usesysid, 'USAGE')"
+        ),
+        {"copy": f"{_db_name}_{worker_id}"},
+    )
+    await conn.execute(sa.text(f"DROP DATABASE IF EXISTS {_copy_name(worker_id)}"))
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -144,6 +160,9 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
         if item.get_closest_marker("app_db") is not None:
             item.add_marker(pytest.mark.xdist_group("app_db"))
+        # These write a probe revision into alembic/versions, which every worker reads.
+        elif item.get_closest_marker("destructive_migration") is not None:
+            item.add_marker(pytest.mark.xdist_group("destructive_migration"))
 
 
 @pytest.fixture(scope="session")
