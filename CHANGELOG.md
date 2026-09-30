@@ -10,12 +10,18 @@ Deleting a project removes its database every time. A delete that happened while
 server's routine maintenance was visiting that project's database answered as if it had worked, but
 left the database and its login behind, and disabling an app could fail the same way. The backend's
 test suite also runs in about a minute and a half instead of about eight, and now runs on every pull
-request.
+request. The backend image and the sandbox image also take the security updates BIAL's scan asked
+for.
 
 ### Deploying this release
 
-- **No migration, no settings change, no sandbox rebuild.** Only the backend's code changes; the
-  portal's changes are to its tests and test tooling. Backend and portal go out in either order.
+- **No migration and no settings change, but rebuild both images.** The backend's code changes,
+  and its image and the sandbox image carry the security updates below, so each needs a fresh
+  build (dev and prod). The portal's changes are to its tests and test tooling. Backend and
+  portal go out in either order.
+- **After the rebuild, ask BIAL to scan again.** The backend images should show no critical or
+  high findings. The sandbox images lose only the few findings in the `Security` list below; the
+  rest have no fix from Debian or Caddy yet.
 - **The first deletes after the backend is out confirm it.** A project delete leaves no "teardown
   step failed" warning behind, and disabling an app no longer answers with an error at random.
 
@@ -28,6 +34,15 @@ request.
   maintenance.
 - **Disabling an app no longer fails at random** for the same reason. If the platform ever cannot
   end the app's own connections, disabling now refuses instead of reporting the app cut off.
+
+### Security
+
+- **The backend image ships the patched system libraries** (OpenSSL and the UUID library). That
+  clears the 4 critical and 18 high findings BIAL's scan reported against each of the dev and prod
+  backend images. The portal image had none.
+- **The sandbox image's npm, and the starter app's `next` and `nanoid`, move to their patched
+  releases.** Nothing about how apps are built or run changes; findings that have no fix yet, such
+  as Debian's own packages and Caddy's Go libraries, are left as they are.
 
 ### Changed
 
