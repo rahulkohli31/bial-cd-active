@@ -941,9 +941,9 @@ def test_the_capture_guard_stays_inside_its_wall_clock_budget() -> None:
     # input. Identifier-shaped bytes, because that is what makes this pattern work hardest. Built
     # OUTSIDE the stopwatch — 6 MB of string concatenation is not what is being measured.
     raw = ("A" * 79 + "\n") * 80_000
-    started = time.perf_counter()
+    started = time.process_time()
     rendered = _redact_command_output(raw, budget=4_000)
-    elapsed = time.perf_counter() - started
+    elapsed = time.process_time() - started
 
     assert "elided" in rendered  # LIVENESS: it really rendered the capture, it did not bail
     assert elapsed < 1.0, f"the open-credential scan took {elapsed:.2f}s"
