@@ -1,7 +1,8 @@
-"""Under pytest-xdist, every worker talks to its own copy of the test database.
+"""Under pytest-xdist, every worker talks to its own copy of the test database, and the `app_db`
+tests share one worker.
 
-A worker that reached the shared database instead would bring back the interference the copies
-exist to remove, and it would show up only as intermittent failures elsewhere in the suite.
+Losing either would bring back interference between workers, and it would show up only as
+intermittent failures elsewhere in the suite.
 """
 
 from __future__ import annotations
@@ -25,3 +26,9 @@ async def test_a_parallel_worker_talks_to_its_own_copy_of_the_test_database() ->
 
     assert name.endswith(f"_{_WORKER}")
     assert name in _database_denylist()
+
+
+@pytest.mark.app_db
+def test_xdist_itself_puts_an_app_db_test_in_its_group(request: pytest.FixtureRequest) -> None:
+    # xdist appends the group to a test's id only when its own collection hook saw the marker.
+    assert request.node.nodeid.endswith("@app_db")

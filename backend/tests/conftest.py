@@ -23,6 +23,7 @@ from pydantic import SecretStr  # noqa: E402
 from sqlalchemy.engine import make_url  # noqa: E402
 from sqlalchemy.exc import DBAPIError  # noqa: E402
 from sqlalchemy.ext.asyncio import (  # noqa: E402
+    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -74,26 +75,43 @@ def pytest_configure_node(node: Any) -> None:
 
     Runs on the controller for every worker, a crashed worker's replacement included.
     `CREATE DATABASE … TEMPLATE` refuses while anything else is connected to the template, and
-    workers only ever connect to their copies. Copies are re-made on every run, so a migration
+    workers only ever connect to their copies. Copies are made on every run, so a migration
     applied to the test database reaches them with no step of its own.
     """
     asyncio.run(_copy_the_test_database(node.gateway.id))
 
 
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node: Any, error: object | None) -> None:
+    """Drop a worker's copy once the worker has finished or crashed."""
+    asyncio.run(_drop_the_copy(node.gateway.id))
+
+
+def _copy_name(worker_id: str) -> str:
+    from src.services.appdb.names import quote_identifier
+
+    return quote_identifier(f"{_db_name}_{worker_id}")
+
+
+def _cluster_engine() -> AsyncEngine:
+    return create_async_engine(
+        make_url(TEST_DATABASE_URL).set(database="postgres"),
+        isolation_level="AUTOCOMMIT",
+        poolclass=NullPool,
+    )
+
+
 async def _copy_the_test_database(worker_id: str) -> None:
     from src.services.appdb.names import quote_identifier
 
-    base_url = make_url(TEST_DATABASE_URL)
     template = quote_identifier(_db_name)
-    copy = quote_identifier(f"{_db_name}_{worker_id}")
-    owner = quote_identifier(base_url.username or "")
-    engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT", poolclass=NullPool
-    )
+    copy = _copy_name(worker_id)
+    owner = quote_identifier(make_url(TEST_DATABASE_URL).username or "")
+    engine = _cluster_engine()
     try:
         async with engine.connect() as conn:
-            # No FORCE: a session on the copy belongs to another run, which must not be killed.
-            await conn.execute(sa.text(f"DROP DATABASE IF EXISTS {copy}"))
+            # Only a run that ended without dropping its copies leaves one, or a session on it.
+            await conn.execute(sa.text(f"DROP DATABASE IF EXISTS {copy} WITH (FORCE)"))
             await conn.execute(sa.text(f"CREATE DATABASE {copy} TEMPLATE {template}"))
             # Grants are not copied from a template, and the appdb tests assert this wall.
             await conn.execute(sa.text(f"REVOKE CONNECT ON DATABASE {copy} FROM PUBLIC"))
@@ -101,11 +119,21 @@ async def _copy_the_test_database(worker_id: str) -> None:
     except DBAPIError as exc:
         pytest.exit(
             f"Could not copy {_db_name} for worker {worker_id}: {exc.orig}\n"
-            f"Close any other session on {_db_name} or its worker copies — another test run, "
-            "psql, an IDE — and check the test role has CREATEDB "
-            "(CONTRIBUTING.md, Backend — tests).",
+            f"Close any other session on {_db_name} — another test run, psql, an IDE — and "
+            "check the test role has CREATEDB (CONTRIBUTING.md, Backend — tests).",
             returncode=pytest.ExitCode.USAGE_ERROR,
         )
+    finally:
+        await engine.dispose()
+
+
+async def _drop_the_copy(worker_id: str) -> None:
+    engine = _cluster_engine()
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(
+                sa.text(f"DROP DATABASE IF EXISTS {_copy_name(worker_id)} WITH (FORCE)")
+            )
     finally:
         await engine.dispose()
 

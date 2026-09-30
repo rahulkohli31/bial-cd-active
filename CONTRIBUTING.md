@@ -69,10 +69,10 @@ cd backend && uv run pytest -n auto -q                    # the full run, on eve
 cd backend && uv run pytest tests/path/to/test_file.py    # a focused run stays serial
 ```
 
-The full run gives each worker its own copy of the test database, made as the worker starts.
-Nothing else may be connected to the test database or a copy at that moment (close any psql
-session or IDE database browser first, and let another run finish), and the test role needs
-`CREATEDB`. CI runs the same command.
+The full run gives each worker its own copy of the test database, made as the worker starts and
+dropped when it finishes. Nothing else may be connected to the test database while the copies
+are made (close any psql session or IDE database browser first), one full run uses a test
+database at a time, and the test role needs `CREATEDB`. CI runs the same command.
 
 `.env.test` configures a real per-project database substrate, but a test runs with it switched
 off unless it is marked `@pytest.mark.app_db`. Mark a test that needs real per-project databases;

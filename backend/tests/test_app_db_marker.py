@@ -1,5 +1,6 @@
-"""A test gets the per-project database substrate only when it is marked `app_db`, and then on
-the one worker every marked test shares, because some of them scan every database on the cluster.
+"""A test gets the per-project database substrate only when it is marked `app_db`, and the mark
+puts it in the `app_db` group, which keeps every marked test on one worker because some of them
+scan every database on the cluster.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ def test_an_unmarked_test_runs_with_the_substrate_switched_off() -> None:
 
 
 @pytest.mark.app_db
-def test_a_marked_test_gets_the_substrate_on_the_app_db_worker(
+def test_a_marked_test_gets_the_substrate_and_the_app_db_group(
     request: pytest.FixtureRequest,
 ) -> None:
     assert settings.app_db is not None

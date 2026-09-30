@@ -144,9 +144,9 @@ cd backend && uv run pytest -n auto -q
 ```
 
 `-n auto` runs one worker per CPU. Each worker gets its own copy of the test database, made from
-it as the worker starts, so every worker sees only its own rows and a migration reaches the
-copies without a step of its own. A focused run — a path or a single test, no `-n` — stays serial
-and uses the test database directly.
+it as the worker starts and dropped when the worker finishes, so every worker sees only its own
+rows and a migration reaches the copies without a step of its own. A focused run — a path or a
+single test, no `-n` — stays serial and uses the test database directly.
 
 The default run already excludes two opt-in marker groups: the object-storage round-trip tests
 (which need a separate local object-storage emulator, unrelated to this runbook) and a set of
@@ -158,9 +158,8 @@ database — leave both opted out for routine runs.
 doesn't contain `test` — see step 1.
 
 **If it stops before any test runs, saying it could not copy the test database**: something else
-is connected to that database or one of its copies — a psql session, an IDE's database browser,
-another test run — or the role lacks `CREATEDB` (step 1). Postgres's own message, shown with it,
-says which.
+is connected to that database — a psql session, an IDE's database browser, another test run — or
+the role lacks `CREATEDB` (step 1). Postgres's own message, shown with it, says which.
 
 **If it fails with a permission error connecting to the control-plane database**: step 2 was
 skipped, or undone since.
