@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.8] - 2026-09-30
+
+Deleting a project removes its database every time. A delete that happened while the database
+server's routine maintenance was visiting that project's database answered as if it had worked, but
+left the database and its login behind, and disabling an app could fail the same way. The backend's
+test suite also runs in about a minute and a half instead of about eight, and now runs on every pull
+request.
+
+### Deploying this release
+
+- **No migration, no settings change, no sandbox rebuild.** Only the backend's code changes; the
+  portal's changes are to its tests and test tooling. Backend and portal go out in either order.
+- **The first deletes after the backend is out confirm it.** A project delete leaves no "teardown
+  step failed" warning behind, and disabling an app no longer answers with an error at random.
+
+### Fixed
+
+- **Deleting a project removes its database and login every time.** The database server's
+  maintenance visits every database, and the platform is not allowed to end that visit, so
+  deleting a project while it was under way failed and left the project's data on the server. The
+  delete now ends only the connections it is allowed to end and lets the server stop its own
+  maintenance.
+- **Disabling an app no longer fails at random** for the same reason. If the platform ever cannot
+  end the app's own connections, disabling now refuses instead of reporting the app cut off.
+
+### Changed
+
+- **The backend test suite runs on every core,** each test worker on its own copy of the test
+  database. Running it needs the test database's role to be allowed to create databases; the
+  test-database runbook covers it.
+- **Every pull request runs the backend test suite,** the portal's tests run in three parallel
+  parts, and a newer push to a pull request cancels the run it replaces.
+- **Tests that failed only on a busy machine are fixed:** timing checks that measured the machine
+  rather than the code, and rows compared in an order the database never promised.
+- **The portal needs a newer Node to run its tests;** the README lists the prerequisite.
+
 ## [1.8.7] - 2026-09-28
 
 The applications list says "Starting up" while an app is being published and updates itself when
