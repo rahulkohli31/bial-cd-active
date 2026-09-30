@@ -254,7 +254,8 @@ async def test_both_actions_are_audited(client, db_session) -> None:
             await db_session.execute(
                 select(AuditLog.action)
                 .where(AuditLog.resource_type == "user", AuditLog.resource_id == str(citizen.id))
-                .order_by(AuditLog.created_at)
+                # `created_at` is the transaction's start, so one test's rows tie on it.
+                .order_by(AuditLog.created_at, AuditLog.id)
             )
         )
         .scalars()

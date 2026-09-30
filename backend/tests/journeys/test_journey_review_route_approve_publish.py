@@ -169,7 +169,8 @@ async def test_route_approve_publish_terminates(app: FastAPI, client, db_session
             await db_session.execute(
                 sa.select(AuditLog)
                 .where(AuditLog.resource_type == "app", AuditLog.resource_id == str(app_row.id))
-                .order_by(AuditLog.created_at)
+                # `created_at` is the transaction's start, so one test's rows tie on it.
+                .order_by(AuditLog.created_at, AuditLog.id)
             )
         )
         .scalars()

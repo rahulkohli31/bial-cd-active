@@ -277,7 +277,8 @@ async def _audit_rows(db, *, app_id) -> list[AuditLog]:
             await db.execute(
                 sa.select(AuditLog)
                 .where(AuditLog.action == AUDIT_ACTION, AuditLog.resource_id == str(app_id))
-                .order_by(AuditLog.created_at)
+                # `created_at` is the transaction's start, so one test's rows tie on it.
+                .order_by(AuditLog.created_at, AuditLog.id)
             )
         )
         .scalars()
