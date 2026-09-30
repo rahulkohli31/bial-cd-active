@@ -148,5 +148,7 @@ markers = [
     # savepoint-joined session provisions its connection lazily, which turns a detached task's
     # concurrent use of that session into an error rather than a benign interleave.
     "route_rollback: the test drives a route that calls db.rollback(); join the fixture transaction by savepoint",
+    # Unmarked tests run with the substrate switched off, although `.env.test` configures one.
+    "app_db: needs the real per-project database substrate; creates real databases on the cluster",
 ]
 addopts = "-m 'not integration and not destructive_migration' --strict-markers"

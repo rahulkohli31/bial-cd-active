@@ -40,6 +40,8 @@ from src.services.storage import snapshot_key
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import FakeSandboxClient, FakeStorage, detached_work_done
 
+pytestmark = pytest.mark.app_db
+
 _BASE_ENV = ("BIAL_APP_ID", "BIAL_PORTAL_ORIGIN")
 
 

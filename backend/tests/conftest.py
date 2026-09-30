@@ -100,6 +100,25 @@ def _salt_every_provisioned_app_database():
         asyncio.run(_salt())
 
 
+@pytest.fixture(autouse=True)
+def _app_db_substrate_only_when_marked(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+):
+    """Switch the per-project database substrate off for every test not marked `app_db`.
+
+    `.env.test` configures a real substrate, so without this an unmarked test that creates a
+    project through the API also creates a real database that the session then has to drop. The
+    memoized engine is cleared as well: `get_maintenance_engine` returns it without consulting
+    `settings.app_db`.
+    """
+    if request.node.get_closest_marker("app_db") is not None:
+        return
+    from src.services.appdb import engine as _appdb_engine
+
+    monkeypatch.setattr(_appdb_engine, "_maintenance_engine", None)
+    monkeypatch.setattr(settings, "app_db", None)
+
+
 @pytest.fixture
 async def db_session(test_engine, request):
     # Each test runs inside a transaction that is rolled back afterwards, so tests

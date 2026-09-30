@@ -41,6 +41,8 @@ from src.services.appdb.reconcile import (
 )
 from tests.factories import ProjectFactory, UserFactory
 
+pytestmark = pytest.mark.app_db
+
 _DATABASE_EXISTS = "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = :db)"
 _ROLE_EXISTS = "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :role)"
 

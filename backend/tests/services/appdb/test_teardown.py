@@ -28,6 +28,8 @@ from src.services.appdb.teardown import restore_login, salt_the_earth, sever
 from tests.factories import ProjectFactory, UserFactory
 from tests.services.appdb.helpers import scalar_on
 
+pytestmark = pytest.mark.app_db
+
 _DATABASE_EXISTS_SQL = "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = :db)"
 _ROLE_EXISTS_SQL = "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :role)"
 _CAN_LOGIN_SQL = "SELECT rolcanlogin FROM pg_roles WHERE rolname = :role"
