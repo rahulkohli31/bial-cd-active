@@ -119,6 +119,31 @@ async def test_sever_evicts_the_app_and_leaves_a_session_it_may_not_close(
         await outsider.dispose()
 
 
+async def test_sever_fails_closed_when_it_cannot_terminate_the_apps_own_session(
+    db_session: AsyncSession, maintenance: AsyncEngine, salted: list[uuid.UUID]
+) -> None:
+    # Provisioning grants the maintenance role each app role WITH INHERIT. A role holding only
+    # ADMIN — a replacement credential, say — can lock the door but not evict: the kill-switch
+    # must refuse then, never report the app severed while its sessions stay inside.
+    db_name, role, dsn = await _provisioned(db_session, salted)
+    regrant = f"GRANT {quote_identifier(role)} TO CURRENT_USER WITH INHERIT "
+    async with maintenance.connect() as conn:
+        await conn.execute(sa.text(regrant + "FALSE"))
+    live = create_async_engine(dsn, poolclass=NullPool)
+    try:
+        async with live.connect() as app_session:
+            assert await app_session.scalar(sa.text("SELECT 1")) == 1
+
+            with pytest.raises(DBAPIError):
+                await sever(db_name=db_name, role_name=role)
+
+            assert await app_session.scalar(sa.text("SELECT 1")) == 1
+    finally:
+        async with maintenance.connect() as conn:
+            await conn.execute(sa.text(regrant + "TRUE"))
+        await live.dispose()
+
+
 async def test_restore_login_reopens_the_door(
     db_session: AsyncSession, maintenance: AsyncEngine, salted: list[uuid.UUID]
 ) -> None:
@@ -198,10 +223,12 @@ async def test_a_session_that_slips_in_after_the_sever_is_evicted_before_the_dro
     real_terminate = appdb_teardown._terminate_backends
     calls = 0
 
-    async def misses_the_first_time(conn: Any, *, db_name: str) -> int:
+    async def misses_the_first_time(conn: Any, *, db_name: str, role_name: str) -> int:
         nonlocal calls
         calls += 1
-        return 0 if calls == 1 else await real_terminate(conn, db_name=db_name)
+        if calls == 1:
+            return 0
+        return await real_terminate(conn, db_name=db_name, role_name=role_name)
 
     monkeypatch.setattr(appdb_teardown, "_terminate_backends", misses_the_first_time)
     live = create_async_engine(dsn, poolclass=NullPool)
@@ -248,6 +275,33 @@ async def test_the_drop_waits_for_a_session_it_may_not_close_instead_of_refusing
         await outsider.dispose()
 
     assert await _catalog(maintenance, _DATABASE_EXISTS_SQL, db=db_name) is False
+
+
+async def test_salt_the_earth_reports_a_survivor_when_a_session_it_may_not_close_stays(
+    db_session: AsyncSession, maintenance: AsyncEngine, salted: list[uuid.UUID]
+) -> None:
+    db_name, role, _dsn = await _provisioned(db_session, salted)
+    outsider_role = make_url(settings.DATABASE_URL.get_secret_value()).username or ""
+    async with maintenance.connect() as conn:
+        await conn.execute(
+            sa.text(
+                f"GRANT CONNECT ON DATABASE {quote_identifier(db_name)} "
+                f"TO {quote_identifier(outsider_role)}"
+            )
+        )
+    outsider = create_async_engine(control_plane_identity_dsn(db_name), poolclass=NullPool)
+    try:
+        async with outsider.connect() as other:
+            assert await other.scalar(sa.text("SELECT 1")) == 1
+            with structlog.testing.capture_logs() as captured:
+                assert await salt_the_earth(db_name=db_name, role_name=role) is False
+    finally:
+        await outsider.dispose()
+
+    (failure,) = [e for e in captured if e.get("event") == "app_database_drop_database_failed"]
+    assert failure["sqlstate"] == "55006"
+    assert failure["transient"] is True
+    assert await _catalog(maintenance, _DATABASE_EXISTS_SQL, db=db_name) is True
 
 
 @pytest.mark.autovacuum
