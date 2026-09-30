@@ -141,10 +141,11 @@ post-commit and best-effort, so a failed drop becomes a logged, reclaimable orph
 registry row pointing at destroyed data. The eviction is the real guarantee, because a relaunched
 preview or the deployed container itself holds no lock any guard would see; a session that
 slips in before the door locks is evicted again before one retry of the drop. The eviction
-touches only the app's own sessions and the drop is not forced: the maintenance role is not a
-superuser, and Postgres refuses it the autovacuum worker that visits every database, which a
-plain drop stops by itself. Both delete surfaces state plainly, before the action, that it
-destroys the project's database and files irreversibly.
+touches only sessions the maintenance role holds the privileges of, which include every one the
+app can hold, and the drop is not forced: the maintenance role is not a superuser, and Postgres
+refuses it the autovacuum worker that visits every database, which a plain drop stops by itself.
+Both delete surfaces state plainly, before the action, that it destroys the project's database
+and files irreversibly.
 
 **Orphan reconciliation is report-only, by necessity.** PostgreSQL hands back no creation
 timestamp for a database once its registry row is gone — the provisioning comment is the only

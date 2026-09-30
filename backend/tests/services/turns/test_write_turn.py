@@ -17,6 +17,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import time
 import uuid
 from collections.abc import Callable
 
@@ -2081,6 +2082,15 @@ def _step_labels(state: _TurnState, phase: str | None = None) -> list[str]:
     ]
 
 
+async def _until(holds: Callable[[], bool], failure: str) -> None:
+    """Yield to the event loop until `holds()`: the narrator's ticks are real timers, and a loaded
+    machine stretches how long the loop takes to reach the next one."""
+    deadline = time.monotonic() + 5
+    while not holds():
+        assert time.monotonic() < deadline, failure
+        await asyncio.sleep(0.01)
+
+
 async def test_the_acknowledgement_is_on_the_wire_before_the_model_is_asked(
     _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
 ) -> None:
@@ -2397,21 +2407,22 @@ async def test_a_long_operation_gets_a_status_line_refreshed_until_it_completes(
     compressed here rather than waited out — the property under test is "after the threshold,
     and repeatedly", not the specific number of seconds.
 
-    Mutation-check: drop the `while` and the refresh assertion goes red; drop the whole
-    narrator and the first one does."""
+    Mutation-check: drop the `while` and the refresh wait goes red; so does dropping the whole
+    narrator."""
     engine = _fresh_engine
     monkeypatch.setattr(engine_module, "LONG_OPERATION_THRESHOLD_MS", 20)
     monkeypatch.setattr(engine_module, "LONG_OPERATION_REFRESH_MS", 20)
     state = _bare_state()
 
     engine._on_event(state, _called("run_command", '{"command": ["npm", "install", "zod"]}', "c1"))
-    await asyncio.sleep(0.12)
+    await _until(
+        lambda: len(_step_labels(state, phase="started")) >= 3,
+        "the status line was said once, not REFRESHED until it completed",
+    )
 
     labels = _step_labels(state, phase="started")
-    assert labels, "no step frame at all — the seam under test never ran"
     announced, refreshes = labels[0], labels[1:]
     assert announced == "Setting up the tools your app needs"
-    assert len(refreshes) >= 2, "the status line was said once, not REFRESHED until it completed"
     # Every refresh says the SAME thing. That is what keeps an atomic live region from reading
     # the sentence out again on every tick (the portal caps announcements on top of it).
     assert set(refreshes) == {long_operation_line(announced)}
@@ -2485,13 +2496,14 @@ async def test_a_read_that_runs_long_is_narrated_now_that_reads_are_drawn(
     state = _bare_state()
 
     engine._on_event(state, _called("read_file", '{"path": "app/page.tsx"}', "r1"))
-    await asyncio.sleep(0.12)
+    await _until(
+        lambda: len(_step_labels(state, phase="started")) >= 3,
+        "the status line was said once, not REFRESHED until it completed",
+    )
 
     labels = _step_labels(state, phase="started")
-    assert labels, "no step frame at all — the seam under test never ran"
     announced, refreshes = labels[0], labels[1:]
     assert announced == "Looking at your app's main page"
-    assert len(refreshes) >= 2, "the status line was said once, not REFRESHED until it completed"
     assert set(refreshes) == {long_operation_line(announced)}
     # …and it is still the app's AREAS, never the path, however long it runs.
     assert "app/page.tsx" not in " ".join(labels)
@@ -2518,7 +2530,10 @@ async def test_a_housekeeping_command_that_runs_long_stays_silent(
         state, _called("run_command", '{"command": ["mkdir", "-p", "app/lib"]}', "h1")
     )
     engine._on_event(state, _called("read_file", '{"path": "app/page.tsx"}', "r1"))
-    await asyncio.sleep(0.12)
+    await _until(
+        lambda: any(label.startswith("Still ") for label in _step_labels(state, phase="started")),
+        "nothing was narrated at all — the threshold never fired",
+    )
 
     spoken = [
         label for label in _step_labels(state, phase="started") if label.startswith("Still ")

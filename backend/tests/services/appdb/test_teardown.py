@@ -217,14 +217,52 @@ async def test_a_session_that_slips_in_after_the_sever_is_evicted_before_the_dro
     assert await _catalog(maintenance, _DATABASE_EXISTS_SQL, db=db_name) is False
 
 
+async def test_the_drop_waits_for_a_session_it_may_not_close_instead_of_refusing(
+    db_session: AsyncSession, maintenance: AsyncEngine, salted: list[uuid.UUID]
+) -> None:
+    # A forced drop refuses at once when anything inside is beyond the maintenance role, and the
+    # everyday case is an autovacuum worker. A plain drop waits for it to leave, as a worker does
+    # once signalled; the control plane's own session, closed a moment later, stands in for it.
+    db_name, role, _dsn = await _provisioned(db_session, salted)
+    outsider_role = make_url(settings.DATABASE_URL.get_secret_value()).username or ""
+    async with maintenance.connect() as conn:
+        await conn.execute(
+            sa.text(
+                f"GRANT CONNECT ON DATABASE {quote_identifier(db_name)} "
+                f"TO {quote_identifier(outsider_role)}"
+            )
+        )
+    outsider = create_async_engine(control_plane_identity_dsn(db_name), poolclass=NullPool)
+    try:
+        other = await outsider.connect()
+        assert await other.scalar(sa.text("SELECT 1")) == 1
+
+        async def leave_shortly() -> None:
+            await asyncio.sleep(1)
+            await other.close()
+
+        leaving = asyncio.create_task(leave_shortly())
+        assert await salt_the_earth(db_name=db_name, role_name=role) is True
+        await leaving
+    finally:
+        await outsider.dispose()
+
+    assert await _catalog(maintenance, _DATABASE_EXISTS_SQL, db=db_name) is False
+
+
 @pytest.mark.autovacuum
 async def test_salt_the_earth_drops_a_database_autovacuum_is_working_in(
     db_session: AsyncSession, maintenance: AsyncEngine, salted: list[uuid.UUID]
 ) -> None:
     db_name, role, dsn = await _provisioned(db_session, salted)
-    # Enough dead rows that the worker is still vacuuming when the teardown runs.
-    await execute_on(dsn, "CREATE TABLE dead_rows (id int)")
-    await execute_on(dsn, "INSERT INTO dead_rows SELECT generate_series(1, 2000000)")
+    # Throttled so hard that the worker is still inside when the teardown runs, whatever the
+    # server's own vacuum settings.
+    await execute_on(
+        dsn,
+        "CREATE TABLE dead_rows (id int) "
+        "WITH (autovacuum_vacuum_cost_delay = 100, autovacuum_vacuum_cost_limit = 1)",
+    )
+    await execute_on(dsn, "INSERT INTO dead_rows SELECT generate_series(1, 100000)")
     await execute_on(dsn, "DELETE FROM dead_rows")
 
     deadline = time.monotonic() + 150

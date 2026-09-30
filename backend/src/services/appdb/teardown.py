@@ -89,9 +89,9 @@ _ALREADY_GONE: Final = frozenset({_UNDEFINED_DATABASE, _UNDEFINED_OBJECT})
 async def sever(*, db_name: str, role_name: str) -> bool:
     """Lock the app out of its database and terminate its live sessions.
 
-    Only sessions this role may signal are terminated: the app's own, which is every session the
-    app can hold. Anything else inside — an autovacuum worker, another role's session — is not
-    the app, and Postgres would refuse to terminate it.
+    Only sessions of roles this one holds the privileges of are terminated, which covers every
+    session the app can hold. Anything else inside — an autovacuum worker, another role's session
+    — is not the app, and Postgres would refuse to terminate it.
 
     Returns False (no-op) when no substrate is configured; True once the door is locked.
     Raises the underlying error if any step fails — the caller is a kill-switch and must
@@ -196,16 +196,18 @@ async def salt_the_earth(*, db_name: str, role_name: str) -> bool:
 
 
 async def _drop_database(conn: AsyncConnection, *, db_name: str) -> None:
-    # No FORCE: it refuses outright when an autovacuum worker is inside, which a plain DROP
-    # stops by itself, waiting up to 5 s for it before reporting the database busy.
+    # No FORCE: it refuses outright when an autovacuum worker is inside. A plain DROP stops the
+    # worker itself, and waits up to 5 s for any other session before reporting the database busy.
     drop = sa.text(f"DROP DATABASE {quote_identifier(db_name)}")
     try:
         await conn.execute(drop)
     except DBAPIError as exc:
         if _sqlstate(exc) != _OBJECT_IN_USE:
             raise
-        # A session that connected just before the door locked can miss the first eviction.
-        await _terminate_backends(conn, db_name=db_name)
+        # A session that connected just before the door locked can miss the first eviction. With
+        # nothing new to evict, a second wait would end the same way.
+        if await _terminate_backends(conn, db_name=db_name) == 0:
+            raise
         await conn.execute(drop)
 
 
