@@ -421,6 +421,27 @@ async def test_a_tree_that_cannot_be_restored_ends_the_turn_with_news_and_a_late
     assert len(workspace.restored) == 1
 
 
+_NEWER = a_sandbox_name("newer")
+
+
+async def _a_newer_container_takes_the_slot(
+    redis: aioredis.Redis, workspace: _Reclaimable, user_id: uuid.UUID
+) -> None:
+    """What a start leaves once it has registered its own container in this user's slot."""
+    workspace.by_name[_NEWER] = reaper.handle_named(_NEWER, fqdn=f"{_NEWER}.example.io")
+    await redis.hset(
+        registry_key(user_id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: _NEWER,
+            REGISTRY_FIELD_FQDN: f"{_NEWER}.example.io",
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+            REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
+        },
+    )
+    await redis.set(lock_key(user_id), "the-newer-token", ex=900)
+    await locks.renew_liveness_lease(redis, user_id)
+
+
 async def test_a_late_teardown_of_the_old_container_leaves_a_newer_one_registered(
     _fresh_engine: TurnEngine,
     db_session: AsyncSession,
@@ -433,31 +454,51 @@ async def test_a_late_teardown_of_the_old_container_leaves_a_newer_one_registere
     assert (await chat.settled()).status == "completed"
     old_name, _ = await _the_app(chat, fake_redis)
     await _the_stay_runs_out(fake_redis, chat.user.id)
-    newer = a_sandbox_name("newer")
     user_id = chat.user.id
-
-    async def _a_newer_container_registers() -> None:
-        await fake_redis.hset(
-            registry_key(user_id),
-            mapping={
-                REGISTRY_FIELD_APP_NAME: newer,
-                REGISTRY_FIELD_FQDN: f"{newer}.example.io",
-                REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
-                REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
-            },
-        )
-        await fake_redis.set(lock_key(user_id), "the-newer-token", ex=900)
-        await locks.renew_liveness_lease(fake_redis, user_id)
-
-    workspace.meanwhile = _a_newer_container_registers
+    workspace.meanwhile = lambda: _a_newer_container_takes_the_slot(fake_redis, workspace, user_id)
 
     assert (await _sweep(chat, fake_redis, workspace)).reaped == 1
 
     assert workspace.torn_down == [old_name]
     reg = await locks.read_registry(fake_redis, user_id)
-    assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == newer
+    assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == _NEWER
     assert await fake_redis.get(lock_key(user_id)) == "the-newer-token"
     assert await locks.liveness_lease_is_held(fake_redis, user_id)
+
+
+async def test_a_newer_container_registered_during_the_write_back_is_never_marked_ending(
+    _fresh_engine: TurnEngine,
+    db_session: AsyncSession,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A start can take the slot while the sweep is still writing the old tree back. The old
+    container is still torn down, by its own name, and the newer one stays attachable.
+
+    Mutation check: mark the record ending by user id alone and the newer container can no longer
+    be attached."""
+    chat, workspace = await _built_chat(_fresh_engine, db_session, session_factory)
+    await chat.send("add a page", builds_a_page())
+    assert (await chat.settled()).status == "completed"
+    old_name, _ = await _the_app(chat, fake_redis)
+    await _the_stay_runs_out(fake_redis, chat.user.id)
+    user_id = chat.user.id
+    real_put = fake_storage.put
+
+    async def _a_start_lands_mid_write_back(*args: Any, **kwargs: Any) -> object:
+        await _a_newer_container_takes_the_slot(fake_redis, workspace, user_id)
+        return await real_put(*args, **kwargs)
+
+    monkeypatch.setattr(fake_storage, "put", _a_start_lands_mid_write_back)
+
+    assert (await _sweep(chat, fake_redis, workspace)).reaped == 1
+
+    assert workspace.torn_down == [old_name]
+    reg = await locks.read_registry(fake_redis, user_id)
+    assert reg is not None and reg[REGISTRY_FIELD_STATE] == REGISTRY_STATE_READY
+    assert (await workspace.attach_existing(str(user_id))).app_name == _NEWER
 
 
 async def test_reopening_after_a_reclaim_repairs_an_older_turns_orphaned_call(

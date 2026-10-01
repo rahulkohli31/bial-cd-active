@@ -722,7 +722,9 @@ async def reap_user(
                 app_id=str(app_id),
             )
             return False
-    await mark_registry_ending(redis, user_uuid)  # step 1: guard a concurrent attach
+    # step 1: guard a concurrent attach. Refused once the slot has moved on, and the teardown
+    # below still goes ahead: it is aimed at the container this record named, by its own name.
+    await mark_registry_ending(redis, user_uuid, registered_name)
     try:
         await sandbox_client.teardown(_minimal_handle(reg))  # step 2: idempotent teardown
     except SandboxError:

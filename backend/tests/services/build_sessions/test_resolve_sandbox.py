@@ -944,7 +944,7 @@ async def test_a_registry_that_moves_on_before_the_restart_restarts_nothing(
     )
 
     async def _read_then_the_registry_moves_on(handle: SandboxHandle) -> DevStatus:
-        await mark_registry_ending(fake_redis, user.id)
+        await mark_registry_ending(fake_redis, user.id, handle.app_name)
         return _STOPPED
 
     monkeypatch.setattr(client, "dev_status", _read_then_the_registry_moves_on)

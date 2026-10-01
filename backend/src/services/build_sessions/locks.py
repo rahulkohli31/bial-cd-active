@@ -1115,12 +1115,22 @@ async def _adopt_a_pre_cutover_record(
     return inherited | {REGISTRY_FIELD_SERVING_SINCE: first_served_at}
 
 
-async def mark_registry_ending(redis: aioredis.Redis, user_uuid: uuid.UUID) -> None:
-    """Flip the registry `state` to `ending`, set FIRST in the reaper
-    ordering so a concurrent `attach_existing` sees a dying container and does not
-    reconnect. Guarded on existence so it never conjures a partial registry hash."""
-    if await redis.exists(registry_key(user_uuid)):
-        await redis.hset(registry_key(user_uuid), REGISTRY_FIELD_STATE, REGISTRY_STATE_ENDING)
+# Flip the record to `ending` only while it still names this container, in one script for the
+# same reason as the guarded delete below.
+_CAS_MARK_ENDING_LUA: Final = (
+    f"if redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}') ~= ARGV[1] then return 0 end "
+    f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_STATE}', '{REGISTRY_STATE_ENDING}') return 1"
+)
+
+
+async def mark_registry_ending(redis: aioredis.Redis, user_uuid: uuid.UUID, app_name: str) -> None:
+    """Flip the registry `state` to `ending`, set FIRST in the reaper ordering so a concurrent
+    `attach_existing` sees a dying container and does not reconnect — but only while the record
+    still names `app_name`. A newer container that has taken the slot is not dying, and refusing
+    an attach to it would strand the start that registered it. A missing record names nothing, so
+    no partial hash is ever conjured."""
+    run_script = redis.eval  # aliased to keep the call off the JS-oriented eval guard
+    await run_script(_CAS_MARK_ENDING_LUA, 1, registry_key(user_uuid), app_name)
 
 
 # Delete the record ONLY while it still names this container, and report whether the legacy key
