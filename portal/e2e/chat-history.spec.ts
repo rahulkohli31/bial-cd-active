@@ -14,10 +14,13 @@ import { fileURLToPath } from 'node:url'
  * The continuation journeys at the foot need a real model and sandbox and run only with
  * `E2E_REAL_SANDBOX=1`, the gate `real-sandbox.spec.ts` uses.
  *
- * WHAT IT TOUCHES. It finds one of the signed-in user's applications and seeds header-only chats
- * (no model turn, no tokens) under a unique title prefix. Every search, assertion and cleanup is
- * scoped to that prefix, so whatever else the account holds is neither read into a result nor
- * changed. `afterAll` deletes whatever is left of the seeded chats.
+ * WHAT IT TOUCHES. It finds one of the signed-in user's applications, preferring one that serves an
+ * app, and seeds header-only chats (no model turn, no tokens) under a unique title prefix. Every
+ * search, assertion and cleanup is scoped to that prefix, so whatever else the account holds is
+ * neither read into a result nor changed. `afterAll` deletes whatever is left of the seeded chats,
+ * and `beforeAll` first deletes any an interrupted run left behind. Opening the application starts
+ * its app container, as it would for the user: with one workspace per user, do not run this while
+ * the same login is building elsewhere.
  *
  * THE RULE EVERY TEST HERE FOLLOWS, as in `workspace-geometry.spec.ts`: an absence is paired with
  * a liveness assertion, and a measurement is preceded by proof that the thing rendered.
@@ -52,13 +55,15 @@ interface WireProject {
   isServing: boolean
 }
 
-const run = `e2e-chathist-${Date.now()}`
+const PREFIX = 'e2e-chathist-'
+const run = `${PREFIX}${Date.now()}`
 const titleOf = (n: number) => `${run} item-${String(n).padStart(2, '0')}`
 
 let api: APIRequestContext
 let csrf: Record<string, string> = {}
 let ready = false
 let projectId = ''
+let serving = false
 const seeded: Seeded[] = []
 
 async function rect(locator: Locator, what: string) {
@@ -136,9 +141,16 @@ test.describe('chat history on an application', () => {
 
     const mine = await ownedProjects(api)
     if (mine.length === 0) return
-    projectId = mine[0]!.id
+    const chosen = mine.find((p) => p.isServing) ?? mine[0]!
+    projectId = chosen.id
+    serving = chosen.isServing
     ready = true
 
+    for (const chat of await chatsOf(api, projectId)) {
+      if (!chat.title?.startsWith(PREFIX)) continue
+      const res = await api.delete(`/api/conversations/${chat._id}`, { headers: csrf })
+      expect(res.status() < 300 || res.status() === 404, `removing "${chat.title}" left by an earlier run`).toBe(true)
+    }
     for (let n = 1; n <= SEEDED; n += 1) await seedChat(titleOf(n), n % 2 === 0 ? 'build' : 'plan')
   })
 
@@ -180,7 +192,11 @@ test.describe('chat history on an application', () => {
     const pane = page.getByTestId('app-pane-region')
     await expect(pane).toBeVisible()
     const frame = page.locator('iframe[title="App Preview"]')
-    const framed = (await frame.count()) > 0
+    // An application that serves an app must frame it; the container can take a while to start.
+    // One that serves nothing has no frame to keep, and the report says that half did not run.
+    if (serving) await expect(frame.first(), 'the serving application never framed its app').toBeAttached({ timeout: 180_000 })
+    else test.info().annotations.push({ type: 'not run', description: 'the chosen application serves no app, so the framed-app half did not run' })
+    const framed = serving
 
     // An element identity that survives only if the node is never unmounted: a JS property the
     // framework knows nothing about is gone the moment React replaces the element.
