@@ -152,7 +152,7 @@ function Workspace({
   chat,
   nav = false,
 }: {
-  entry?: string
+  entry?: string | { pathname: string; state?: unknown }
   project?: SurfaceProps
   chat?: SurfaceProps
   nav?: boolean
@@ -167,6 +167,17 @@ function Workspace({
             element={
               <>
                 <Link to="/chat/c1">to chat</Link>
+                <Surface {...(project ?? { heading: PROJECT_HEADING })} />
+              </>
+            }
+          />
+          <Route
+            path="/projects/:projectId/chats"
+            element={
+              <>
+                <Link to="/chat/c1" state={{ chatList: '?kind=plan' }}>
+                  to chat from the list
+                </Link>
                 <Surface {...(project ?? { heading: PROJECT_HEADING })} />
               </>
             }
@@ -304,14 +315,87 @@ describe('what the row names on each address', () => {
     expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
   })
 
-  it('no history control is rendered anywhere', () => {
-    // Four boards draw a clock in this row and the drawer behind it is a later feature. Not
-    // built, and not stubbed either — a control that implies a drawer nobody can open is worse
-    // than its absence.
+  it('the chat list is the project screen\'s shape, and its back control returns to the application', () => {
+    render(<Workspace entry="/projects/pA/chats" />)
+
+    expect(title().textContent).toBe('Visitor Log — Airport Office')
+    expect(screen.queryByTestId('toolbar-chat-kind')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Back to the application' }))
+    expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
+  })
+})
+
+describe('the History control', () => {
+  const history = () => screen.getByRole('button', { name: 'Chat history' })
+
+  it('★ opens the chat list, is drawn pressed there, and pressed again returns to the application', () => {
     render(<Workspace />)
-    expect(screen.queryByRole('button', { name: /history/i })).toBeNull()
-    expect(screen.queryByRole('link', { name: /history/i })).toBeNull()
-    expect(row().textContent).not.toMatch(/history/i)
+    expect(history().getAttribute('aria-pressed')).toBe('false')
+
+    fireEvent.click(history())
+    expect(screen.getByTestId('where').textContent).toBe('/projects/pA/chats')
+    expect(history().getAttribute('aria-pressed')).toBe('true')
+
+    fireEvent.click(history())
+    expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
+    expect(history().getAttribute('aria-pressed')).toBe('false')
+  })
+
+  it('★ stays pressed on a chat opened from the list, and only on one opened that way', () => {
+    render(<Workspace entry="/projects/pA/chats" />)
+    fireEvent.click(screen.getByText('to chat from the list'))
+    expect(screen.getByTestId('where').textContent).toBe('/chat/c1')
+    expect(history().getAttribute('aria-pressed')).toBe('true')
+
+    fireEvent.click(history())
+    expect(screen.getByTestId('where').textContent).toBe('/projects/pA')
+
+    cleanup()
+    render(<Workspace entry="/chat/c1" />)
+    expect(history().getAttribute('aria-pressed')).toBe('false')
+    fireEvent.click(history())
+    expect(screen.getByTestId('where').textContent).toBe('/projects/pA/chats')
+  })
+
+  it('reads the pressed state from the address on a cold open of a chat with its router state', () => {
+    render(<Workspace entry={{ pathname: '/chat/c1', state: { chatList: '' } }} />)
+    expect(history().getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('★ sits immediately after Save and before the menu, so the keyboard meets them in that order', () => {
+    render(
+      <Workspace
+        project={{
+          heading: PROJECT_HEADING,
+          save: { dirty: true, hasSavedVersion: true },
+          actions: { save: () => {}, discard: async () => {}, settings: () => {} },
+        }}
+      />,
+    )
+    const save = screen.getByTestId('save-project')
+    const menu = screen.getByTestId('workspace-menu')
+    const between = (a: Element, b: Element) => Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(between(save, history())).toBe(true)
+    expect(between(history(), menu)).toBe(true)
+    // Nothing pressable between Save and History: the next control after Save is History itself.
+    const pressable = [...row().querySelectorAll('button, a[href]')]
+    expect(pressable[pressable.indexOf(save) + 1]).toBe(history())
+    expect(history().hasAttribute('tabindex')).toBe(false)
+  })
+
+  it('names itself in its tooltip and to a screen reader, as an icon alone', () => {
+    render(<Workspace />)
+    expect(history().getAttribute('title')).toBe('Chat history')
+    expect(history().textContent).toBe('')
+    expect(history().querySelector('svg')).toBeTruthy()
+  })
+
+  it('★ is offered once the application has loaded, and not over an address that never resolved', () => {
+    render(<Workspace project={{ heading: { ...PROJECT_HEADING, projectName: null } }} />)
+    // LIVENESS: the row is fully drawn around the absence.
+    expect(row().className).toMatch(/h-\[54px\]/)
+    expect(title().textContent).toBe('Your application')
+    expect(screen.queryByRole('button', { name: 'Chat history' })).toBeNull()
   })
 })
 
@@ -1120,6 +1204,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
   const save = () => screen.getByTestId('save-project')
   const discard = () => screen.getByTestId('discard-changes')
   const railToggle = () => screen.getByTestId('toolbar-collapse')
+  const historyButton = () => screen.getByTestId('toolbar-history')
 
   it('★ the row owns a horizontal scroller, so overflow is reachable instead of clipped', () => {
     // THE DEFECT IN ONE LINE. The shell's root is `overflow-hidden` for the rail and the pane, so
@@ -1151,6 +1236,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     expect(save()).toBeTruthy()
     expect(railToggle()).toBeTruthy()
     expect(menu()).toBeTruthy()
+    expect(historyButton()).toBeTruthy()
 
     expect(screen.queryByRole('button', { name: 'Tablet' })).toBeNull()
     expect(screen.queryByRole('button', { name: /rename/i })).toBeNull()
@@ -1162,7 +1248,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     // The floor is `min-h`/`min-w` rather than a bigger glyph — that class declaration is the half
     // jsdom CAN see; `hit areas grow by padding` below is its other half.
     everything()
-    for (const control of [back(), menu(), ...devices(), reload(), newTab(), railToggle()]) {
+    for (const control of [back(), menu(), historyButton(), ...devices(), reload(), newTab(), railToggle()]) {
       expect(cls(control)).toContain('narrow:min-h-[44px]')
       expect(cls(control)).toContain('narrow:min-w-[44px]')
       // A 44px box with a 15px glyph in its top-left corner is not a 44px target anyone can aim
@@ -1184,6 +1270,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     everything()
     expect(glyph(back())).toBe('16×16')
     expect(glyph(menu())).toBe('16×16')
+    expect(glyph(historyButton())).toBe('16×16')
     for (const device of devices()) expect(glyph(device)).toBe('14×14')
     expect(glyph(reload())).toBe('15×15')
     expect(glyph(newTab())).toBe('15×15')
@@ -1197,7 +1284,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     // what a 1200px viewport does — and what is left must be the pre-existing class list, with no
     // 44px floor leaking up into the desktop row.
     everything()
-    const desktop = [back(), menu(), ...devices(), reload(), newTab(), railToggle(), discard(), save()].map(
+    const desktop = [back(), menu(), historyButton(), ...devices(), reload(), newTab(), railToggle(), discard(), save()].map(
       aboveThreshold,
     )
     for (const list of desktop) expect(list).not.toMatch(/min-[hw]-\[44px\]/)
@@ -1206,7 +1293,7 @@ describe('the narrow-width contract — STRUCTURAL assertions, never measurement
     // any of them has to be deliberate: 20×20, 28×32, 28×30.
     expect(aboveThreshold(back())).toContain('p-0.5')
     for (const device of devices()) expect(aboveThreshold(device)).toMatch(/\bh-7\b.*\bw-8\b/)
-    for (const boxed of [railToggle(), menu()]) expect(aboveThreshold(boxed)).toMatch(/\bh-7\b.*\bw-\[30px\]/)
+    for (const boxed of [railToggle(), menu(), historyButton()]) expect(aboveThreshold(boxed)).toMatch(/\bh-7\b.*\bw-\[30px\]/)
   })
 
   it('★ the title carries a floor of its own, and still truncates', () => {

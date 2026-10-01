@@ -8,7 +8,7 @@
  *
  *   360px  narrowest   below this the composer and status rows start wrapping
  *   400px  project      opening width; fits the status rows without wrapping
- *   520px  a chat       opening width; a conversation needs more room than a status panel
+ *   520px  a chat       opening width, the chat list's too; a conversation needs more room
  *   640px  widest       past this the app is too narrow to judge on a desktop artboard
  *
  * Remembered per person in `localStorage`, never per project ("a width is a preference about a
@@ -16,6 +16,8 @@
  * citizen drags, every project opens there. The handle exists in exactly one width class (below
  * the stacking threshold there is no handle at all), so one key already covers "per width class".
  */
+import type { RailMode } from './workspaceChannel'
+
 export const RAIL_MIN = 360
 export const RAIL_MAX = 640
 export const RAIL_DEFAULT_DETAILS = 400
@@ -63,6 +65,6 @@ export function writeRailWidth(px: number): void {
 }
 
 /** The width a rail opens at when nothing is remembered. */
-export function openingWidth(mode: 'details' | 'conversation'): number {
-  return mode === 'conversation' ? RAIL_DEFAULT_CONVERSATION : RAIL_DEFAULT_DETAILS
+export function openingWidth(mode: RailMode): number {
+  return mode === 'details' ? RAIL_DEFAULT_DETAILS : RAIL_DEFAULT_CONVERSATION
 }

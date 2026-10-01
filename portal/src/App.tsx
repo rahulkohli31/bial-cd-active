@@ -149,7 +149,7 @@ export default function App() {
         <Route path="/assistant/:chatId" element={<Shell><AssistantPage /></Shell>} />
         {/* Cross-user by design: every signed-in BIAL user sees the same catalog. */}
         <Route path="/marketplace" element={<Shell><MarketplacePage /></Shell>} />
-        {/* THE WORKSPACE. A pathless layout route wrapping both addresses inside a project, so
+        {/* THE WORKSPACE. A pathless layout route wrapping every address inside a project, so
             the shell — and above all the running app it holds — is preserved across a move
             between them: React Router renders the same layout element at the same position
             through a sibling route change, and only the outlet content is replaced.
@@ -169,6 +169,10 @@ export default function App() {
             reached on the apps hostname at `/a/<key>/` (nginx SITE 2), never from here. */}
         <Route element={<Shell><WorkspaceShell /></Shell>}>
           <Route path="/projects/:projectId" element={<ProjectPage />} />
+          {/* THE CHAT LIST IS THE PROJECT SCREEN'S OWN ELEMENT, so the move between the two
+              re-renders the rail and nothing else: the project is not fetched again and the app
+              pane never notices. */}
+          <Route path="/projects/:projectId/chats" element={<ProjectPage />} />
           {/* One flat chat URL for both kinds: `ChatRoute` mounts the same surface whatever the
               conversation is, and the project is a breadcrumb resolved from the chat rather than
               a path segment. */}

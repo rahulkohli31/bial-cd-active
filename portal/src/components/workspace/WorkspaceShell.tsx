@@ -19,6 +19,7 @@ import RailResizeHandle from './RailResizeHandle'
 import WorkspaceToolbar from './WorkspaceToolbar'
 import { clampRailWidth, openingWidth, readRailWidth, writeRailWidth } from './railWidth'
 import { projectsListHref } from '../../utils/projectsListMemory'
+import { isChatHistoryPath } from '../../utils/chatHistoryAddress'
 import type { DeviceName } from './devices'
 import { WORKSPACE_RAIL_ID } from './railId'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
@@ -29,19 +30,19 @@ import {
   useWorkspaceChannel,
   useWorkspaceHeading,
   useWorkspacePaneVisible,
+  type RailMode,
 } from './workspaceChannel'
 
 /**
  * WHICH RAIL IS SHOWING, DERIVED FROM THE ADDRESS AND FROM NOTHING ELSE.
  *
- * A chat address means the rail IS the conversation; anything else is the project's own details.
- * There is no third mode, and no route and no `?rail=` query behind this: a query param would make
- * a rail mode a shareable link, which is a different feature, and shell state gives this for free.
+ * A chat address means the rail IS the conversation; the project's chat list address means it is
+ * that list; anything else is the project's own details. Every mode is a route, never shell state
+ * or a `?rail=` query, so Back, a reload and the History button's pressed state all read one fact.
  */
-export type RailMode = 'details' | 'conversation'
-
 function railModeFor(pathname: string): RailMode {
-  return pathname.startsWith('/chat/') ? 'conversation' : 'details'
+  if (pathname.startsWith('/chat/')) return 'conversation'
+  return isChatHistoryPath(pathname) ? 'history' : 'details'
 }
 
 /**
@@ -152,17 +153,16 @@ function ShellFrame() {
   // THE BACK CONTROL IS DERIVED FROM THE ADDRESS.
   const navigate = useNavigate()
   const back = useCallback(() => {
-    // THE CHAT'S OWN PROJECT WHENEVER THERE IS ONE TO GO TO. Keyed on the rail mode rather than on
-    // the heading's kind: the kind comes from the conversation fetch, so for the length of a cold
-    // chat open this control used to send a citizen who pressed back out to the projects list —
-    // out of the project they were working in — and the row's label said "Back to projects" while
-    // it did. The mode is derived from the pathname, so it is right from the first frame.
+    // From a chat or the chat list, the project they belong to whenever there is one to go to.
+    // Keyed on the rail mode rather than on the heading's kind: the kind comes from the
+    // conversation fetch, while the mode is derived from the pathname and is right from the first
+    // frame of a cold open.
     //
     // THE LIST ADDRESS CARRIES ITS OWN STATE BACK. Read fresh at press time, not memoised at
     // render — this control can sit for minutes before it is pressed, and the list's page,
     // search and page size can all have changed on `/projects` in the meantime.
     const to =
-      mode === 'conversation' && heading.projectId
+      mode !== 'details' && heading.projectId
         ? `/projects/${heading.projectId}`
         : projectsListHref()
     navigate(to)
