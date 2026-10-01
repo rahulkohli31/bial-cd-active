@@ -237,6 +237,14 @@ async def _settle(engine, conversation_id: uuid.UUID) -> None:
         await asyncio.wait_for(state.task, timeout=10)
 
 
+async def _until_mid_turn(state: _TurnState) -> None:
+    async def _first_block() -> None:
+        while not state.text_blocks():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_first_block(), timeout=10)
+
+
 async def _one_word(messages: list[ModelMessage], info: AgentInfo):
     yield "ok"
 
@@ -260,8 +268,7 @@ async def test_a_running_chat_is_refused_until_it_is_stopped(
     state = _fresh_engine.peek(conv.id)
     assert state is not None
     # Mid-turn, and past the user message's flush: the app and fixtures share one session.
-    while not state.text_blocks():
-        await asyncio.sleep(0.01)
+    await _until_mid_turn(state)
 
     refused = await client.delete(f"/v1/conversations/{conv.id}", headers=headers)
 
@@ -279,6 +286,40 @@ async def test_a_running_chat_is_refused_until_it_is_stopped(
     assert deleted.status_code == 200
     assert not await _exists(db_session, conv.id)
     assert await _message_count(db_session, conv.id) == 0
+
+
+@pytest.mark.usefixtures("_override_billing")
+async def test_another_users_delete_of_a_running_chat_is_404_not_409(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    """The ownership check runs before the running check, so a running chat is no existence
+    oracle: the stranger gets the same 404 as for an unknown id, the owner gets the 409."""
+    gate = asyncio.Event()
+
+    async def _stall(messages: list[ModelMessage], info: AgentInfo):
+        yield "working "
+        await gate.wait()
+        yield "never"
+
+    owner = await UserFactory.create(db_session)
+    stranger = await UserFactory.create(db_session)
+    conv = await ConversationFactory.create(db_session, owner.id, kind=ChatKind.PLAN)
+    set_chat_model(FunctionModel(stream_function=_stall))
+    assert (await _post_turn(client, _headers(owner), conv)).status_code == 202
+    state = _fresh_engine.peek(conv.id)
+    assert state is not None
+    await _until_mid_turn(state)
+
+    refused = await client.delete(f"/v1/conversations/{conv.id}", headers=_headers(stranger))
+    owners = await client.delete(f"/v1/conversations/{conv.id}", headers=_headers(owner))
+
+    assert refused.status_code == 404
+    assert refused.json() == {"error": {"message": "Conversation not found."}}
+    assert owners.status_code == 409
+    assert owners.json() == _RUNNING
+    assert await _exists(db_session, conv.id)
+    gate.set()
+    await _settle(_fresh_engine, conv.id)
 
 
 async def test_a_chat_claimed_for_a_reply_is_refused(client, db_session, _fresh_engine) -> None:

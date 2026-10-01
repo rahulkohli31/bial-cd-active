@@ -160,6 +160,18 @@ describe('useProjectChats — the read', () => {
     expect(h.list).toHaveBeenLastCalledWith('p1')
   })
 
+  it('★ a refresh that fails keeps the rows and does not report a failure', async () => {
+    h.list.mockResolvedValueOnce([header({ id: 'a' })]).mockRejectedValueOnce(new Error('offline'))
+    const { result } = renderHook(() => useProjectChats('p1'))
+    await waitFor(() => expect(result.current.chats).toHaveLength(1))
+
+    await act(async () => result.current.refresh())
+
+    expect(h.list).toHaveBeenCalledTimes(2)
+    expect(result.current.chats.map((chat) => chat.id)).toEqual(['a'])
+    expect(result.current.failed).toBe(false)
+  })
+
   it('ignores a late answer for the application it has moved away from', async () => {
     const first = deferred<(ConversationHeader | null)[]>()
     h.list.mockImplementation((projectId: string) =>

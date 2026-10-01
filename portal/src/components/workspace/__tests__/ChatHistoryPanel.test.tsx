@@ -548,6 +548,19 @@ describe('the row menu', () => {
     expect(where()).toBe('/projects/p1/chats')
   })
 
+  it('★ a rename whose re-read fails keeps the rows on screen, with no error state', async () => {
+    await renderLive()
+    h.list.mockRejectedValueOnce(new Error('offline'))
+    await startRename('c1')
+    fireEvent.change(editor(), { target: { value: 'Renamed' } })
+    fireEvent.keyDown(editor(), { key: 'Enter' })
+
+    await waitFor(() => expect(h.list).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Chat name' })).toBeNull())
+    expect(chatRows()).toHaveLength(5)
+    expect(screen.queryByText('Couldn’t load the chats')).toBeNull()
+  })
+
   it('★ every read of the list names the application', async () => {
     await renderLive()
     await startRename('c1')
@@ -849,6 +862,16 @@ describe('deleting a chat', () => {
     fireEvent.click(confirmButton())
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
     expect(chatRows()).toHaveLength(4)
+  })
+
+  it('a 409 with another code is the generic failure, not "still running"', async () => {
+    h.remove.mockRejectedValue(new ApiError('Conflict', 409, 'something_else'))
+    await renderLive()
+    await choose('c2', 'Delete…')
+    fireEvent.click(await screen.findByTestId('delete-chat-confirm'))
+
+    expect((await within(dialog()).findByRole('alert')).textContent).toBe('Could not delete the chat. Try again.')
+    expect(chatRows()).toHaveLength(5)
   })
 
   it('a chat already gone closes the dialog and reads the list again', async () => {

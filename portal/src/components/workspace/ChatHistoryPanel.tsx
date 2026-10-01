@@ -189,7 +189,7 @@ export default function ChatHistoryPanel({ projectId, chats }: ChatHistoryPanelP
       await deleteConversation(chat.id)
     } catch (caught) {
       const status = caught instanceof ApiError ? caught.status : null
-      if (status === 409) {
+      if (caught instanceof ApiError && caught.code === 'conversation_running') {
         setDeleteError(STILL_RUNNING)
         return
       }

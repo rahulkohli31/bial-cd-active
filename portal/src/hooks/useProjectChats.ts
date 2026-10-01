@@ -43,7 +43,7 @@ export interface ProjectChats {
   capped: boolean
   /** Read again from a loading state, after a failure. */
   retry: () => void
-  /** Read again with the current rows left on screen; settles once the new answer is in. */
+  /** Read again with the current rows left on screen, kept if the read fails; settles once it ends. */
   refresh: () => Promise<void>
 }
 
@@ -60,7 +60,7 @@ export function useProjectChats(projectId: string): ProjectChats {
   const [answer, setAnswer] = useState<Answer | null>(null)
   const latest = useRef(0)
 
-  const load = useCallback((id: string): Promise<void> => {
+  const load = useCallback((id: string, keepOnFailure: boolean): Promise<void> => {
     latest.current += 1
     const request = latest.current
     return listProjectConversations(id).then(
@@ -74,21 +74,26 @@ export function useProjectChats(projectId: string): ProjectChats {
         setAnswer({ projectId: id, chats, capped: headers.length >= CONVERSATION_LIST_CAP, failed: false })
       },
       () => {
-        if (latest.current === request) setAnswer({ projectId: id, chats: NO_CHATS, capped: false, failed: true })
+        if (latest.current !== request) return
+        setAnswer((previous) =>
+          keepOnFailure && previous !== null && previous.projectId === id && !previous.failed
+            ? previous
+            : { projectId: id, chats: NO_CHATS, capped: false, failed: true },
+        )
       },
     )
   }, [])
 
   useEffect(() => {
-    void load(projectId)
+    void load(projectId, false)
   }, [projectId, load])
 
   const retry = useCallback(() => {
     setAnswer(null)
-    void load(projectId)
+    void load(projectId, false)
   }, [load, projectId])
 
-  const refresh = useCallback(() => load(projectId), [load, projectId])
+  const refresh = useCallback(() => load(projectId, true), [load, projectId])
 
   // An answer about another application is no answer: a switch reads as loading, never as its rows.
   const current = answer !== null && answer.projectId === projectId ? answer : null
