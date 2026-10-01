@@ -56,18 +56,22 @@ const ADMIN = { email: 'priya@bial.aero', display_name: 'Priya Nair', isAdmin: t
 const USAGE = { used: 537_102, limit: 1_000_000, remaining: 462_898, resetsAt: '' }
 const counts = (pending: number) => ({ draft: 0, pending, approved: 0, rejected: 0, disabled: 0 })
 
-/** The five destinations, in the order `NavStates.dc.html` draws them, less Integrations — a
- *  connector is switched on in each application's own settings, so it has no destination.
- *
- *  THE ORDER TEST FILTERS THE RENDERED BUTTONS *BY* THIS LIST, so a destination missing from here
- *  is not a failure — it is dropped, and the test goes on claiming it checks the whole rail. */
-const BOARD_ORDER = [
+/** Everything that builds or runs an application, then the assistant, then Admin for an
+ *  administrator. No Integrations: a connector is switched on in each application's own settings. */
+const NAV_ORDER = [
   'My Applications',
-  'BIAL Chat',
   'Shared Applications',
   'App Marketplace',
+  'BIAL Chat',
   'Admin',
 ]
+const CITIZEN_NAV_ORDER = NAV_ORDER.slice(0, 4)
+
+/** Every entry the primary navigation draws, in order — read whole, so an extra entry fails too. */
+const navLabels = (root: HTMLElement): string[] =>
+  Array.from(root.querySelectorAll('nav[aria-label="Primary"] button')).map(
+    (button) => button.textContent?.trim() ?? '',
+  )
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -135,14 +139,42 @@ function renderAt(path: string) {
   )
 }
 
-describe('the navigation the boards draw', () => {
-  it('renders all five entries in board order for an administrator', async () => {
-    h.getStoredUser.mockReturnValue(ADMIN)
+describe('the navigation', () => {
+  it.each([
+    ['a citizen', CITIZEN, CITIZEN_NAV_ORDER],
+    ['an administrator', ADMIN, NAV_ORDER],
+  ])('draws the destinations in order for %s, on the rail at rest', async (_who, user, order) => {
+    h.getStoredUser.mockReturnValue(user)
     renderAt('/projects')
-    const labels = (await screen.findAllByRole('button'))
-      .map((b) => b.textContent ?? '')
-      .filter((text) => BOARD_ORDER.some((label) => text.startsWith(label)))
-    expect(labels.map((t) => BOARD_ORDER.find((l) => t.startsWith(l)))).toEqual(BOARD_ORDER)
+    const panel = await screen.findByTestId('nav-panel')
+    expect(panel.getAttribute('data-collapsed')).toBe('true')
+    expect(navLabels(panel)).toEqual(order)
+  })
+
+  it('draws the same order in the drawer on a narrow screen', async () => {
+    const realMatchMedia = window.matchMedia
+    window.matchMedia = (query: string) => ({ ...realMatchMedia(query), matches: query.includes('max-width') })
+    try {
+      renderAt('/projects')
+      await waitFor(() => expect(screen.queryByTestId('nav-docked')).toBeNull())
+      // The shell's own bar and the page's stand-in each carry a menu button here.
+      fireEvent.click(screen.getAllByTestId('nav-menu-button')[0])
+      expect(navLabels(await screen.findByTestId('nav-floating'))).toEqual(CITIZEN_NAV_ORDER)
+    } finally {
+      window.matchMedia = realMatchMedia
+    }
+  })
+
+  it('marks BIAL Chat current on its own address, and not on a chat about an application', async () => {
+    renderAt('/assistant')
+    await screen.findByTestId('nav-panel')
+    expect(screen.getByTestId('nav-assistant').getAttribute('aria-current')).toBe('page')
+
+    cleanup()
+    renderAt('/chat/c1')
+    await summonNav()
+    expect(screen.getByTestId('nav-projects').getAttribute('aria-current')).toBe('page')
+    expect(screen.getByTestId('nav-assistant').getAttribute('aria-current')).toBeNull()
   })
 
   it('offers no Integrations destination', async () => {

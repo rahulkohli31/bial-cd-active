@@ -87,7 +87,7 @@ const TILES: readonly {
   read: (counts: ProjectCounts | null) => number | undefined
 }[] = [
   {
-    label: 'In production',
+    label: 'Live applications',
     hint: 'apps live for BIAL staff right now',
     filter: 'inProduction',
     read: (counts) => counts?.inProduction,
@@ -551,7 +551,7 @@ export default function ProjectsPage(): React.JSX.Element {
         {/* Three numbers. Nothing else — no charts.
 
             AND THEY ANNOUNCE, because they CHANGE without saying so. A citizen who deletes a
-            project, or publishes one, watches "In production" go from 3 to 4 with no sound at
+            project, or publishes one, watches "Live applications" go from 3 to 4 with no sound at
             all — the numbers are the page's only report of what just happened to the estate.
             The region is `polite`, never `alert`: nothing here is a failure, and an assertive
             channel would interrupt whatever the person was reading to say "4".

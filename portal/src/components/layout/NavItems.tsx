@@ -35,14 +35,14 @@ export interface NavDestination {
   owns?: readonly string[]
 }
 
+// Everything that builds or runs an application comes first; the assistant comes after them.
 export const NAV_DESTINATIONS: readonly NavDestination[] = [
   { label: 'My Applications', to: '/projects', Icon: LayoutGrid, owns: ['/chat/'] },
-  // BIAL CHAT IS SECOND, AND IT OWNS NOTHING. `/chat/<id>` is a conversation about an
-  // application and belongs to the list above it; this assistant lives at its own address with
-  // nothing underneath it, so the plain path test is the whole of its active state.
-  { label: 'BIAL Chat', to: '/assistant', Icon: Bot },
   { label: 'Shared Applications', to: '/shared-applications', Icon: Users, owns: ['/shared/'] },
   { label: 'App Marketplace', to: '/marketplace', Icon: Store },
+  // Owns nothing: `/chat/<id>` is a conversation about an application and belongs to My
+  // Applications, so the plain path test is the whole of this entry's active state.
+  { label: 'BIAL Chat', to: '/assistant', Icon: Bot },
 ]
 
 export const ADMIN_DESTINATION: NavDestination = { label: 'Admin', to: '/admin', Icon: ShieldCheck }

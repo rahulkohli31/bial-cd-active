@@ -198,7 +198,7 @@ afterEach(() => {
 describe('★ the two things on this page that change silently now announce', () => {
   // The page already had two working regions — the wait sentence and the dead-bookmark notice.
   // What stayed genuinely uncovered are these two: the numbers, and the range caption. A citizen
-  // who deletes a project watches "In production" go from 3 to 4 in silence, and a search
+  // who deletes a project watches "Live applications" go from 3 to 4 in silence, and a search
   // rewrites the rows underneath with nothing said about how many there now are.
 
   it('announces the three numbers, and the region is mounted before they arrive', async () => {
@@ -219,7 +219,7 @@ describe('★ the two things on this page that change silently now announce', ()
 
     // …and the numbers land INSIDE it, so the change is what gets read.
     await waitFor(() => expect(screen.getByTestId('projects-counts').textContent).toContain('7'))
-    expect(screen.getByTestId('projects-counts').textContent).toContain('In production')
+    expect(screen.getByTestId('projects-counts').textContent).toContain('Live applications')
   })
 
   it('keeps the region when the counts fail cold, rather than swapping it out', async () => {
@@ -264,19 +264,27 @@ describe('the dashboard strip', () => {
     expect(await screen.findByText('2')).toBeTruthy()
     expect(screen.getByText('5')).toBeTruthy()
     expect(screen.getByText('1')).toBeTruthy()
-    expect(screen.getByText('In production')).toBeTruthy()
+    expect(screen.getByText('Live applications')).toBeTruthy()
     expect(screen.getByText('Total applications')).toBeTruthy()
   })
 
+  it('counts the live applications under that name, and nowhere says “In production”', async () => {
+    renderPage()
+
+    const live = await screen.findByRole('button', { name: /Live applications/ })
+    await waitFor(() => expect(live.textContent).toContain(String(COUNTS.inProduction)))
+    expect(document.body.textContent).not.toContain('In production')
+  })
+
   it('does not render a 0 while the counts are still in flight', async () => {
-    // A skeleton, not a confident zero: "0 in production" is a claim, and an unanswered
+    // A skeleton, not a confident zero: "0 live applications" is a claim, and an unanswered
     // request has not earned it.
     let resolve: (c: typeof COUNTS) => void = () => {}
     h.listProjectCounts.mockReturnValue(new Promise((r) => (resolve = r)))
 
     renderPage()
 
-    expect(screen.getByText('In production')).toBeTruthy()
+    expect(screen.getByText('Live applications')).toBeTruthy()
     expect(screen.queryByText('0')).toBeNull()
 
     resolve({ inProduction: 0, totalApplications: 0, inPipeline: 0 })
@@ -422,7 +430,7 @@ describe('a row', () => {
     renderPage()
     await screen.findByText('Starting up')
 
-    fireEvent.click(screen.getByRole('button', { name: /In production/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Live applications/ }))
     await waitFor(() => expect(h.listProjects).toHaveBeenCalledTimes(2))
     await act(async () => {
       await vi.advanceTimersByTimeAsync(PUBLISHING_POLL_MS)
@@ -456,7 +464,7 @@ describe('a row', () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(PUBLISHING_POLL_MS)
     })
-    fireEvent.click(screen.getByRole('button', { name: /In production/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Live applications/ }))
     await waitFor(() => expect(h.listProjects).toHaveBeenCalledTimes(3))
     await act(async () => {
       lateAnswer(page([publishing]))
@@ -1340,17 +1348,17 @@ describe('★ the three summary tiles filter the list beneath them', () => {
 
   const tile = (label: RegExp): HTMLElement => screen.getByRole('button', { name: label })
 
-  it('clicking “In production” narrows the list, and the tile reads as selected', async () => {
+  it('clicking “Live applications” narrows the list, and the tile reads as selected', async () => {
     answersPerFilter()
     renderPage()
     await screen.findByText('Nothing Built')
 
-    fireEvent.click(tile(/In production/))
+    fireEvent.click(tile(/Live applications/))
 
     await waitFor(() => expect(screen.queryByText('Nothing Built')).toBeNull())
     // Liveness beside the absence: the list narrowed rather than failing to render.
     expect(screen.getByText('Live One')).toBeTruthy()
-    expect(tile(/In production/).getAttribute('aria-pressed')).toBe('true')
+    expect(tile(/Live applications/).getAttribute('aria-pressed')).toBe('true')
     expect(h.listProjects).toHaveBeenLastCalledWith(
       expect.objectContaining({ filter: 'inProduction' }),
     )
@@ -1363,10 +1371,10 @@ describe('★ the three summary tiles filter the list beneath them', () => {
     renderPage('/projects?filter=inProduction')
     await screen.findByText('Live One')
 
-    fireEvent.click(tile(/In production/))
+    fireEvent.click(tile(/Live applications/))
 
     await screen.findByText('Nothing Built')
-    expect(tile(/In production/).getAttribute('aria-pressed')).toBe('false')
+    expect(tile(/Live applications/).getAttribute('aria-pressed')).toBe('false')
     expect(screen.getByTestId('location-search').textContent).toBe('')
   })
 
@@ -1380,7 +1388,7 @@ describe('★ the three summary tiles filter the list beneath them', () => {
 
     await screen.findByText('Nothing Built')
     expect(tile(/Total applications/).getAttribute('aria-pressed')).toBe('true')
-    expect(tile(/In production/).getAttribute('aria-pressed')).toBe('false')
+    expect(tile(/Live applications/).getAttribute('aria-pressed')).toBe('false')
     expect(screen.getByTestId('location-search').textContent).toBe('')
   })
 
@@ -1393,7 +1401,7 @@ describe('★ the three summary tiles filter the list beneath them', () => {
 
     await waitFor(() => expect(screen.getAllByTestId('project-card').length).toBe(1))
     expect(screen.getByText('Live One')).toBeTruthy()
-    expect(tile(/In production/).getAttribute('aria-pressed')).toBe('true')
+    expect(tile(/Live applications/).getAttribute('aria-pressed')).toBe('true')
   })
 
   it('composes with the search rather than replacing it', async () => {
@@ -1416,7 +1424,7 @@ describe('★ the three summary tiles filter the list beneath them', () => {
   it('each tile is a real button whose count still reads as a count', async () => {
     answersPerFilter()
     renderPage()
-    const production = await screen.findByRole('button', { name: /In production/ })
+    const production = await screen.findByRole('button', { name: /Live applications/ })
 
     // A NATIVE BUTTON, not a div with an onClick: Enter and Space come for free, and so does
     // the tab order. `getByRole` above already refuses anything that is not one.
@@ -1435,7 +1443,7 @@ describe('★ the three summary tiles filter the list beneath them', () => {
     renderPage()
     await screen.findByText('Nothing Built')
 
-    expect(tile(/In production/).hasAttribute('disabled')).toBe(true)
+    expect(tile(/Live applications/).hasAttribute('disabled')).toBe(true)
     // The way OUT of a filter must never go dead, whatever the numbers say.
     expect(tile(/Total applications/).hasAttribute('disabled')).toBe(false)
   })
