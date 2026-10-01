@@ -6,22 +6,18 @@
  * the app is a sliver and the preview is pointless. The stops ARE the design; a citizen who
  * wants full width already has a control for that.
  *
- *   360px  narrowest   below this the composer and status rows start wrapping
- *   400px  project      opening width; fits the status rows without wrapping
- *   520px  a chat       opening width, the chat list's too; a conversation needs more room
+ *   360px  narrowest   below this the composer starts wrapping
+ *   520px  opening      for every rail — the application, its chat list and a chat — so the app
+ *                       pane keeps its place as the rail changes between them
  *   640px  widest       past this the app is too narrow to judge on a desktop artboard
  *
  * Remembered per person in `localStorage`, never per project ("a width is a preference about a
- * screen, not a property of an app"); one stored value covers both opening widths too — once the
- * citizen drags, every project opens there. The handle exists in exactly one width class (below
+ * screen, not a property of an app"); once the citizen drags, every project opens there. The handle exists in exactly one width class (below
  * the stacking threshold there is no handle at all), so one key already covers "per width class".
  */
-import type { RailMode } from './workspaceChannel'
-
 export const RAIL_MIN = 360
 export const RAIL_MAX = 640
-export const RAIL_DEFAULT_DETAILS = 400
-export const RAIL_DEFAULT_CONVERSATION = 520
+export const RAIL_DEFAULT = 520
 
 /** How far one arrow-key press moves the boundary. Ten CSS pixels: fine enough to land on a
  *  number the citizen means, coarse enough to cross the 280px range without wearing a key out. */
@@ -34,9 +30,7 @@ export function clampRailWidth(px: number): number {
 }
 
 /**
- * The remembered width, or `null` when the citizen has never dragged one — NOT a number to
- * substitute, since the two opening widths differ and a caller that defaulted here would pick
- * one of them for both.
+ * The remembered width, or `null` when the citizen has never dragged one.
  *
  * Throw-wrapped: `localStorage` genuinely throws (Safari private mode, blocked site data), and a
  * preference nobody can save is better silently defaulted than a workspace that fails to render.
@@ -62,9 +56,4 @@ export function writeRailWidth(px: number): void {
     // Nothing to recover: the width is already applied in this session, and the only thing lost
     // is that it will not survive a reload.
   }
-}
-
-/** The width a rail opens at when nothing is remembered. */
-export function openingWidth(mode: RailMode): number {
-  return mode === 'details' ? RAIL_DEFAULT_DETAILS : RAIL_DEFAULT_CONVERSATION
 }

@@ -17,7 +17,7 @@ import { useNavReveal } from '../layout/NavReveal'
 import AppPane from './AppPane'
 import RailResizeHandle from './RailResizeHandle'
 import WorkspaceToolbar from './WorkspaceToolbar'
-import { clampRailWidth, openingWidth, readRailWidth, writeRailWidth } from './railWidth'
+import { RAIL_DEFAULT, clampRailWidth, readRailWidth, writeRailWidth } from './railWidth'
 import { projectsListHref } from '../../utils/projectsListMemory'
 import { isChatHistoryPath } from '../../utils/chatHistoryAddress'
 import type { DeviceName } from './devices'
@@ -122,13 +122,10 @@ function ShellFrame() {
   /**
    * THE BOUNDARY THE CITIZEN CAN MOVE. Read once on the first render and not watched afterwards:
    * it is a per-person setting, so subscribing to storage would be a listener with no writer.
-   *
-   * `null` FROM STORAGE IS NOT A WIDTH. It means nobody has dragged one, and the two opening
-   * widths differ — a transcript needs more room than a status panel — so substituting a number
-   * here would pick one of them for both. Once dragged, their width replaces both.
+   * Every rail mode opens at the same width, so the app pane does not move as the rail changes.
    */
   const [remembered, setRemembered] = useState<number | null>(readRailWidth)
-  const railWidth = remembered ?? openingWidth(mode)
+  const railWidth = remembered ?? RAIL_DEFAULT
   // WHICH COLUMN GROWS, and it is not a cosmetic choice. The two columns are the conversation and
   // the app, and the conversation is the SIZED one whenever the app is on screen: the builder
   // surface's chat panel sets its own 288px and the pane takes everything left over, which is
@@ -137,9 +134,6 @@ function ShellFrame() {
   //
   // When nothing wants the pane — every planning conversation — the outlet column grows
   // instead, because then it IS the whole surface.
-  //
-  // The rail supplies its own two settled widths the same way, so this stays one rule rather
-  // than becoming a per-mode table here.
   const paneVisible = useWorkspacePaneVisible()
 
   // A RAIL COLLAPSED BESIDE A PANE MUST NOT SURVIVE THE PANE GOING AWAY. The control that restores

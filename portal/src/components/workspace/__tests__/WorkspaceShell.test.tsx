@@ -184,7 +184,7 @@ describe('WorkspaceShell — which rail is showing is read from the address', ()
   const rail = () => screen.getByTestId('workspace-outlet')
 
   it.each([
-    ['/projects/p1', 'details', '400px'],
+    ['/projects/p1', 'details', '520px'],
     ['/projects/p1/chats', 'history', '520px'],
     ['/projects/p1/chats/', 'history', '520px'],
     ['/chat/c1', 'conversation', '520px'],
