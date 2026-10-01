@@ -517,6 +517,19 @@ describe('BuilderPage — the hand-off does not replay on reload', () => {
     expect(h.startTurn).not.toHaveBeenCalled()
   })
 
+  it('files handed off with no words still go out, under the attachment placeholder', async () => {
+    const sink = { current: null }
+    renderAt(
+      { ...HANDOFF_ENTRY, state: { ...HANDOFF_ENTRY.state, prompt: '', pendingAttachments: [{ name: 'roster.xlsx', dataUrl: 'data:application/octet-stream;base64,AA' }] } },
+      sink,
+    )
+
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
+    const [text, attachments] = h.buildUserParts.mock.calls[0]
+    expect(text).toBe('Please review the attached file(s).')
+    expect(attachments).toHaveLength(1)
+  })
+
   it('attachments handed off with the prompt are consumed by the FIRST turn and not re-fired', async () => {
     const sink = { current: null }
     renderAt(

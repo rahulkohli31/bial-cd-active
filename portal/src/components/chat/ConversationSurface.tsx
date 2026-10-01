@@ -958,10 +958,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
    * project's whole life.
    */
   const fireHandoffPrompt = (id: string, isAlive: () => boolean, prior: ChatMessage[]) => {
-    if (!initialPrompt) return false
+    const attachments: PendingAttachment[] = location.state?.pendingAttachments || []
+    // Files with no words are a message too: `fireRelayTurn` gives them their placeholder text.
+    if (!initialPrompt && attachments.length === 0) return false
     if (initFiredRef.current === id) return false
     initFiredRef.current = id
-    const attachments: PendingAttachment[] = location.state?.pendingAttachments || []
     // STRIP THE HANDOFF FROM HISTORY BEFORE FIRING. `initFiredRef` is a ref, so it only survives
     // within one mount — but a RELOAD is a fresh mount over the SAME history entry, and the
     // browser keeps router state across it. Left in place, every reload of a handed-off thread
