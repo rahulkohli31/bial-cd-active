@@ -20,6 +20,7 @@ import asyncio
 import base64
 
 import pytest
+import sqlalchemy as sa
 from pydantic_ai.messages import (
     BinaryContent,
     CachePoint,
@@ -36,12 +37,13 @@ from pydantic_ai.messages import (
 )
 
 from src.core.redaction import redact_secrets
-from src.db.models.conversation import ChatKind
+from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.messages import store
 from src.services.messages.store import (
     ATTACHMENT_REF_KIND,
     AttachmentRehydrationError,
+    ConversationGoneError,
     SeqContentionError,
     UnattributedBinaryError,
     append_batch,
@@ -1030,6 +1032,24 @@ async def test_seq_contention_budget_exhausted_raises_with_nothing_written(
         )
     rows = await load_rows(db_session, user_id=user.id, conversation_id=conversation.id)
     assert [row.seq for row in rows] == [0]  # the loser wrote nothing
+
+
+async def test_an_append_into_a_deleted_conversation_raises_conversation_gone(db_session, thread):
+    """Callers answer a deleted chat by this type rather than by reading constraint names, and
+    the session must survive it: the route that catches it goes on to write and answer."""
+    user, conversation = thread
+    await db_session.execute(sa.delete(Conversation).where(Conversation.id == conversation.id))
+
+    with pytest.raises(ConversationGoneError):
+        await append_batch(
+            db_session,
+            user_id=user.id,
+            conversation_id=conversation.id,
+            messages=[ModelRequest(parts=[UserPromptPart(content="too late")])],
+            entry_kind=MessageEntryKind.TURN,
+            kind=ChatKind.PLAN,
+        )
+    assert await load_rows(db_session, user_id=user.id, conversation_id=conversation.id) == []
 
 
 # --- mode-switch markers ------------------------------------------------------

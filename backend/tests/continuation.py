@@ -114,11 +114,7 @@ class Chat:
         )
 
     async def settled(self):
-        state = self.engine.peek(self.conversation.id)
-        assert state is not None and state.task is not None
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.wait_for(state.task, timeout=10)
-        return state
+        return await settled_turn(self.engine, self.conversation.id)
 
     async def stored_messages(self) -> list[Any]:
         """Every message a payload carries, in seq order: what a later turn could replay."""
@@ -155,6 +151,15 @@ async def new_chat(
     project = await ProjectFactory.create(db, user.id)
     conversation = await ConversationFactory.create(db, user.id, project_id=project.id, kind=kind)
     return Chat(engine, db, session_factory, user, conversation, workspace or Workspace())
+
+
+async def settled_turn(engine: TurnEngine, conversation_id: uuid.UUID):
+    """The conversation's newest turn once it has finished, however it finished."""
+    state = engine.peek(conversation_id)
+    assert state is not None and state.task is not None
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(state.task, timeout=10)
+    return state
 
 
 async def no_rehydration(_refs: Sequence[str]) -> dict[str, tuple[str, str]]:

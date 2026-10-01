@@ -115,36 +115,18 @@ async def test_delete_cross_user_404(client, db_session) -> None:
     )
 
 
-@pytest.mark.filterwarnings("ignore:transaction already deassociated:sqlalchemy.exc.SAWarning")
-async def test_patch_losing_race_to_delete_is_404_not_500(client, db_session, monkeypatch) -> None:
-    # (the filtered SAWarning is a test-harness artifact: the endpoint's failed commit
-    # plus the fixture's outer rollback double-clean the same connection)
-    # Builder auto-save PATCH vs a concurrent delete: the deleted row makes the flush
-    # UPDATE match zero rows (StaleDataError) — the loser must get the same non-leaking
-    # 404 a one-second-later PATCH would, never a 500.
-    import src.api.v1.conversations.router as conv_router
-
+async def test_patch_losing_race_to_delete_is_404_not_500(client, db_session) -> None:
+    # Builder auto-save PATCH vs a concurrent delete: the write is one owner-scoped UPDATE, so a
+    # delete that lands first leaves it matching zero rows. Either body shape must get the same
+    # non-leaking 404 a one-second-later PATCH would, never a 500.
     headers, user = await _auth(db_session)
     conv = await ConversationFactory.create(db_session, user.id)
+    await db_session.execute(sa.delete(Conversation).where(Conversation.id == conv.id))
 
-    real_load = conv_router._load_owned
-
-    async def _load_then_lose_race(db, user_id, conversation_id):
-        owned = await real_load(db, user_id, conversation_id)
-        # The concurrent DELETE commits between our load and our flush.
-        # synchronize_session=False: a REAL concurrent delete happens in another
-        # session, so THIS session's identity map must not learn about it — the
-        # flush then emits the zero-row UPDATE exactly as in production.
-        await db.execute(
-            sa.delete(Conversation).where(Conversation.id == owned.id),
-            execution_options={"synchronize_session": False},
-        )
-        return owned
-
-    monkeypatch.setattr(conv_router, "_load_owned", _load_then_lose_race)
-    resp = await client.patch(f"/v1/conversations/{conv.id}", json={"title": "T"}, headers=headers)
-    assert resp.status_code == 404
-    assert resp.json() == {"error": {"message": "Conversation not found."}}
+    for body in ({"title": "T"}, {"context": {"step": 1}}):
+        resp = await client.patch(f"/v1/conversations/{conv.id}", json=body, headers=headers)
+        assert resp.status_code == 404, body
+        assert resp.json() == {"error": {"message": "Conversation not found."}}, body
 
 
 async def test_delete_invalid_id_400(client, db_session) -> None:

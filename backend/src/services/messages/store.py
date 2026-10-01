@@ -141,6 +141,11 @@ class SeqContentionError(TranscriptStoreError):
     loop. Nothing was written (the failed insert rolled back); the caller may retry the turn."""
 
 
+class ConversationGoneError(TranscriptStoreError):
+    """The conversation was deleted while this append was in flight. Nothing was written: only
+    the insert's own savepoint rolled back, so the caller's transaction is still usable."""
+
+
 class UnsupportedSchemaVersionError(TranscriptStoreError):
     """A stored row was written by a NEWER payload contract than this code knows. Refusing is
     the whole point of stamping `schema_version`: a future writer may add or reshape parts,
@@ -630,6 +635,14 @@ async def _head_seq(db: AsyncSession, conversation_id: uuid.UUID) -> int:
     return _EMPTY if highest is None else int(highest)
 
 
+def _violated_constraint(exc: IntegrityError) -> str | None:
+    """The constraint the insert broke, as the server named it, never parsed from message
+    text. asyncpg carries it on the driver error that SQLAlchemy's wrapper chains as its cause."""
+    driver_error = exc.orig.__cause__ if exc.orig is not None else None
+    name = getattr(driver_error, "constraint_name", None)
+    return name if isinstance(name, str) else None
+
+
 async def append_batch(
     db: AsyncSession,
     *,
@@ -645,8 +658,9 @@ async def append_batch(
     """Durably append one batch with a server-owned gap-free seq. OWNS its commit: every
     caller sits at a durability seam where "returned" must mean "on disk". Two-writer
     discipline: pick `max+1`, insert; a concurrent writer's IntegrityError rolls back and
-    re-picks (bounded, then `SeqContentionError` with nothing written). Post-commit values
-    come back via `.returning()`, never a refresh across the commit.
+    re-picks (bounded, then `SeqContentionError` with nothing written). A conversation deleted
+    mid-append raises `ConversationGoneError`. Post-commit values come back via `.returning()`,
+    never a refresh across the commit.
 
     `meta` is for system entries — redacted here too, same egress discipline as the payload."""
     payload = dump_for_row(messages, file_attachment_ids=file_attachment_ids)
@@ -675,9 +689,14 @@ async def append_batch(
             async with db.begin_nested():
                 row = (await db.execute(statement)).one()
         except IntegrityError as exc:
-            if "uq_messages_conversation_seq" in str(exc.orig):
+            violated = _violated_constraint(exc)
+            if violated == "uq_messages_conversation_seq":
                 continue  # a concurrent writer took the slot — re-pick and retry
-            raise  # FK violation (conversation deleted mid-append) etc. — the caller's problem
+            if violated == "messages_conversation_id_fkey":
+                raise ConversationGoneError(
+                    f"conversation {conversation_id} was deleted during the append"
+                ) from exc
+            raise
         await db.commit()
         return StoredBatch(id=row.id, seq=row.seq)
     raise SeqContentionError(

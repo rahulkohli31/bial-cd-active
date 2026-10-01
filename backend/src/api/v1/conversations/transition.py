@@ -27,6 +27,7 @@ history valid regardless. One is recoverable and self-healing; the other is a pe
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from typing import Literal
 
@@ -53,7 +54,7 @@ from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.counters import count
 from src.services.connectors import connected_systems_for_project
-from src.services.messages.store import load_rows
+from src.services.messages.store import ConversationGoneError, load_rows
 from src.services.turns.copy import (
     ALREADY_BUILDING_HERE_CODE,
     WORKSPACE_UNAVAILABLE_CODE,
@@ -356,13 +357,15 @@ async def build_it(
     )
     prior = resolution_of(fresh, tool_call_id)
     if prior != "build":
-        await record_build_started(
-            db,
-            user_id=user.id,
-            conversation_id=plan_chat.id,
-            pending=card,
-            answered_already=prior is not None,
-        )
+        # A Plan chat deleted since the turn started has no call left to answer: the build stands.
+        with contextlib.suppress(ConversationGoneError):
+            await record_build_started(
+                db,
+                user_id=user.id,
+                conversation_id=plan_chat.id,
+                pending=card,
+                answered_already=prior is not None,
+            )
     await count(BUILD_HANDOFF_PRESSED)
     return BuildHandoffResponse(
         outcome="started", chat_id=str(build_chat.id), turn_id=str(turn_id)

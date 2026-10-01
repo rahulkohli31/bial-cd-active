@@ -38,6 +38,9 @@ from src.services.messages.store import (
     AttachmentRehydrationError as AttachmentRehydrationError,
 )
 from src.services.messages.store import (
+    ConversationGoneError as ConversationGoneError,
+)
+from src.services.messages.store import (
     MarkerSwapIncompleteError as MarkerSwapIncompleteError,
 )
 from src.services.messages.store import (

@@ -69,11 +69,11 @@ class Conversation(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base
     __tablename__ = "conversations"
 
     # `updated_at` (from `TimestampMixin`) reads as "last touched by a person" and is kept by
-    # TWO writers, not one: the ORM `onupdate` here covers a context PATCH, and migration
+    # TWO writers, not one: the column's `onupdate` covers a context PATCH, and migration
     # 0045's statement-level trigger on `messages` covers a new message — the trigger writes
     # behind SQLAlchemy, so a session already holding this row is stale until refreshed. A
-    # rename is not activity: the PATCH route writes a title with `updated_at` named in the SET,
-    # so the `onupdate` never fires for it.
+    # rename is not activity: the PATCH route names `updated_at` in the SET whenever it writes
+    # no context, so the `onupdate` never fires for it.
     __table_args__ = (
         sa.CheckConstraint(PARENTAGE_SHAPE, name="ck_conversations_parentage"),
         # Created by migration 0046 for the retention pass's scan by age.

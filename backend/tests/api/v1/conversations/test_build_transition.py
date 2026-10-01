@@ -44,10 +44,11 @@ from src.services.messages.projection import (
     UserTextItem,
     project_rows,
 )
-from src.services.messages.store import load_history, load_rows
+from src.services.messages.store import append_batch, load_history, load_rows
 from src.services.turns.copy import ALREADY_BUILDING_HERE_CODE
 from src.services.turns.plan_options import (
     find_pending,
+    record_build_started,
     resolution_of,
     resolve_pending_as_refine,
 )
@@ -623,6 +624,37 @@ async def test_a_failure_of_the_answer_write_still_leaves_a_complete_build_chat(
     assert history
 
 
+async def test_a_plan_chat_deleted_before_its_answer_is_written_still_answers_started(
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage, monkeypatch
+) -> None:
+    """The build has started by the time the Plan chat is answered, so a Plan chat deleted in
+    that window leaves the answer nowhere to go. The press still succeeded and must say so,
+    rather than a 500 over a build that is already running."""
+    _user, plan_chat, headers = await _plan_chat_with_offer(
+        client, db_session, set_chat_model, _fresh_engine
+    )
+    set_chat_model(_streaming_text("building"))
+    minted = uuid.uuid4()
+
+    async def _plan_chat_deleted_first(db, **kwargs):
+        deleted = await client.delete(f"/v1/conversations/{plan_chat.id}", headers=headers)
+        assert deleted.status_code == 200, deleted.text
+        await record_build_started(db, **kwargs)
+
+    monkeypatch.setattr(
+        "src.api.v1.conversations.transition.record_build_started", _plan_chat_deleted_first
+    )
+
+    resp = await client.post(_build_url(plan_chat), headers=headers, json={"chatId": str(minted)})
+    await _settle(_fresh_engine, minted)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["outcome"] == "started"
+    assert resp.json()["chatId"] == str(minted)
+    assert await _chats_with_id(db_session, plan_chat.id) == 0
+    assert await _chats_with_id(db_session, minted) == 1
+
+
 # --- the refusals -------------------------------------------------------------------------
 
 
@@ -718,6 +750,65 @@ async def test_a_minted_id_that_belongs_to_someone_else_is_one_flat_409(
     assert str(other.id) not in body
     assert str(theirs.project_id) not in body
     assert "turnId" not in body
+
+
+async def test_a_free_text_send_into_a_plan_chat_deleted_meanwhile_is_a_404(
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage, monkeypatch
+) -> None:
+    """Typing past a pending offer resolves it before the turn claims the chat, so a delete
+    between finding the offer and answering it leaves the answer nowhere to go. It must refuse
+    cleanly, not 500."""
+    import src.services.turns.plan_options as plan_options_module
+
+    _user, plan_chat, headers = await _plan_chat_with_offer(
+        client, db_session, set_chat_model, _fresh_engine
+    )
+    real_find = plan_options_module.find_pending
+
+    async def _deleted_once_found(db, **kwargs):
+        found = await real_find(db, **kwargs)
+        deleted = await client.delete(f"/v1/conversations/{plan_chat.id}", headers=headers)
+        assert deleted.status_code == 200, deleted.text
+        return found
+
+    monkeypatch.setattr(plan_options_module, "find_pending", _deleted_once_found)
+
+    resp = await client.post(
+        f"/v1/conversations/{plan_chat.id}/turns",
+        headers=headers,
+        json={"message": {"text": "make it blue", "attachmentTexts": [], "attachmentIds": []}},
+    )
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json() == {"error": {"message": "Conversation not found."}}
+    assert await _chats_with_id(db_session, plan_chat.id) == 0
+
+
+async def test_a_free_text_send_whose_offer_answer_finds_the_chat_deleted_is_a_404(
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage, monkeypatch
+) -> None:
+    """The narrower window: the offer was read, then the chat was deleted just before its
+    answer was written."""
+    _user, plan_chat, headers = await _plan_chat_with_offer(
+        client, db_session, set_chat_model, _fresh_engine
+    )
+
+    async def _deleted_before_the_answer(db, **kwargs):
+        deleted = await client.delete(f"/v1/conversations/{plan_chat.id}", headers=headers)
+        assert deleted.status_code == 200, deleted.text
+        return await append_batch(db, **kwargs)
+
+    monkeypatch.setattr("src.services.turns.plan_options.append_batch", _deleted_before_the_answer)
+
+    resp = await client.post(
+        f"/v1/conversations/{plan_chat.id}/turns",
+        headers=headers,
+        json={"message": {"text": "make it blue", "attachmentTexts": [], "attachmentIds": []}},
+    )
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json() == {"error": {"message": "Conversation not found."}}
+    assert await _chats_with_id(db_session, plan_chat.id) == 0
 
 
 async def test_a_superseded_offer_is_a_409(

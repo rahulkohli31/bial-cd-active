@@ -10,7 +10,6 @@ usual, so continuation is asserted from what each send returns, never from times
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import datetime
 import json
 import uuid
@@ -33,6 +32,7 @@ from src.services.turns.engine import (
     set_turn_engine_for_tests,
 )
 from tests.api.v1.conversations.conftest import _headers
+from tests.continuation import answering, settled_turn
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeSandboxClient, FakeStorage
 from tests.wire import assert_wire_valid
@@ -63,16 +63,6 @@ def _offering(*call_ids: str) -> FunctionModel:
     return FunctionModel(stream_function=_stream)
 
 
-def _answering(reply: str = "Happy to keep going.") -> tuple[FunctionModel, list]:
-    seen: list[list[ModelMessage]] = []
-
-    async def _stream(messages: list[ModelMessage], _info: AgentInfo):
-        seen.append(list(messages))
-        yield reply
-
-    return FunctionModel(stream_function=_stream), seen
-
-
 async def _send(client, user, conversation_id: uuid.UUID, text: str):
     return await client.post(
         f"/v1/conversations/{conversation_id}/turns",
@@ -81,18 +71,10 @@ async def _send(client, user, conversation_id: uuid.UUID, text: str):
     )
 
 
-async def _settled(conversation_id: uuid.UUID):
-    state = get_turn_engine().peek(conversation_id)
-    assert state is not None and state.task is not None
-    with contextlib.suppress(asyncio.CancelledError):
-        await asyncio.wait_for(state.task, timeout=10)
-    return state
-
-
 async def _sent_and_settled(client, user, conversation_id: uuid.UUID, text: str):
     resp = await _send(client, user, conversation_id, text)
     assert resp.status_code == 202, resp.text
-    return await _settled(conversation_id)
+    return await settled_turn(get_turn_engine(), conversation_id)
 
 
 async def _reopen(client, user, conversation_id: uuid.UUID) -> dict:
@@ -173,7 +155,7 @@ async def test_a_message_typed_two_days_later_settles_the_offer_as_refine_and_is
     client, db_session, set_chat_model
 ) -> None:
     user, conv = await _a_plan_offered_two_days_ago(client, db_session, set_chat_model, "opt-1")
-    model, seen = _answering()
+    model, seen = answering()
     set_chat_model(model)
 
     state = await _sent_and_settled(client, user, conv.id, "also track the exit time")
@@ -203,7 +185,7 @@ async def test_keep_planning_two_days_later_settles_once_and_the_chat_continues(
 
     assert first.json() == {"state": "refine", "alreadyResolved": False}
     assert second.json() == {"state": "refine", "alreadyResolved": True}
-    set_chat_model(_answering()[0])
+    set_chat_model(answering()[0])
     assert (await _sent_and_settled(client, user, conv.id, "one more thing")).status == "completed"
 
 
@@ -211,7 +193,7 @@ async def test_building_from_a_two_day_old_offer_opens_a_new_chat_and_the_plan_c
     client, db_session, set_chat_model
 ) -> None:
     user, conv = await _a_plan_offered_two_days_ago(client, db_session, set_chat_model, "opt-1")
-    set_chat_model(_answering("Built.")[0])
+    set_chat_model(answering("Built.")[0])
     build_chat_id = uuid.uuid4()
 
     pressed = await client.post(
@@ -222,7 +204,7 @@ async def test_building_from_a_two_day_old_offer_opens_a_new_chat_and_the_plan_c
 
     assert pressed.status_code == 200, pressed.text
     assert pressed.json()["outcome"] == "started"
-    await _settled(build_chat_id)
+    await settled_turn(get_turn_engine(), build_chat_id)
     assert _cards(await _reopen(client, user, conv.id)) == [("opt-1", "build")]
     state = await _sent_and_settled(client, user, conv.id, "what about weekends?")
     assert state.status == "completed"
@@ -287,12 +269,12 @@ async def test_a_stop_while_a_new_offer_is_being_written_keeps_no_offer_and_the_
         f"/v1/conversations/{conv.id}/turns/{turn_id}/stop", headers=_headers(user)
     )
     assert stop.status_code == 200
-    assert (await _settled(conv.id)).status == "stopped"
+    assert (await settled_turn(get_turn_engine(), conv.id)).status == "stopped"
 
     detail = await _reopen(client, user, conv.id)
     assert _cards(detail) == [("opt-1", "refine")]
     assert detail["activeTurn"] is None
-    set_chat_model(_answering()[0])
+    set_chat_model(answering()[0])
     assert (await _sent_and_settled(client, user, conv.id, "try again")).status == "completed"
 
 
@@ -315,7 +297,7 @@ async def test_a_reclaimed_workspace_that_was_never_saved_comes_back_fresh_and_t
     monkeypatch.setattr(storage_accessor, "_backend_singleton", fake_storage)
     workspace.by_name.clear()
     provisioned_before = len(workspace.provisioned)
-    set_chat_model(_answering()[0])
+    set_chat_model(answering()[0])
 
     state = await _sent_and_settled(client, user, conv.id, "still there?")
 
@@ -347,7 +329,7 @@ async def test_a_saved_app_that_cannot_be_read_ends_the_turn_with_news_and_a_lat
 
     monkeypatch.setattr(manager_module, "_asleep", _no_wait)
     workspace.by_name.clear()
-    set_chat_model(_answering()[0])
+    set_chat_model(answering()[0])
 
     refused = await _sent_and_settled(client, user, conv.id, "still there?")
 
@@ -365,7 +347,7 @@ async def test_rows_stored_under_an_older_payload_version_still_continue(
     await db_session.execute(
         sa.update(Message).where(Message.conversation_id == conv.id).values(schema_version=1)
     )
-    model, seen = _answering()
+    model, seen = answering()
     set_chat_model(model)
 
     state = await _sent_and_settled(client, user, conv.id, "carry on")
@@ -392,7 +374,7 @@ async def test_a_model_deployment_that_refuses_the_old_history_ends_the_turn_wit
 
     assert refused.status == "failed"
     assert refused.error_message == _TURN_FAILED_MESSAGE
-    set_chat_model(_answering()[0])
+    set_chat_model(answering()[0])
     assert (await _sent_and_settled(client, user, conv.id, "again")).status == "completed"
 
 
@@ -421,5 +403,5 @@ async def test_another_user_cannot_read_settle_build_or_send_and_the_owner_can(
     assert _cards(await _reopen(client, user, conv.id)) == [("opt-1", "pending")]
     owned = await client.post(resolve, headers=_headers(user), json={"choice": "refine"})
     assert owned.json() == {"state": "refine", "alreadyResolved": False}
-    set_chat_model(_answering()[0])
+    set_chat_model(answering()[0])
     assert (await _sent_and_settled(client, user, conv.id, "mine")).status == "completed"

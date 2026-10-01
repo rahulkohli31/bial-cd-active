@@ -23,7 +23,6 @@ import sqlalchemy as sa
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm.exc import StaleDataError
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
@@ -211,17 +210,22 @@ async def create_conversation(
     raise AppApiError(409, "This conversation id is already in use.")
 
 
+def _conversation_uuid(conversation_id: str) -> uuid.UUID:
+    """The path id as a UUID: 400 for a malformed id token, 404 for a well-formed one that is
+    not a UUID and so can key no stored conversation."""
+    if not _ID_RE.match(conversation_id):
+        raise AppApiError(400, "Invalid conversation id.")
+    try:
+        return uuid.UUID(conversation_id)
+    except ValueError:
+        raise AppApiError(404, "Conversation not found.") from None
+
+
 async def _load_owned(db: DbSession, user_id: uuid.UUID, conversation_id: str) -> Conversation:
     """Resolve a caller-owned conversation from a path id, or RAISE the matching error:
     400 for a malformed id token, 404 for a well-formed id that resolves to nothing the
     caller owns (owner-scoped — a cross-user id is indistinguishable from a missing one)."""
-    if not _ID_RE.match(conversation_id):
-        raise AppApiError(400, "Invalid conversation id.")
-    try:
-        cid = uuid.UUID(conversation_id)
-    except ValueError:
-        # A valid id token that isn't a UUID can key no stored conversation.
-        raise AppApiError(404, "Conversation not found.") from None
+    cid = _conversation_uuid(conversation_id)
     conv = await db.scalar(
         sa.select(Conversation).where(Conversation.id == cid, Conversation.user_id == user_id)
     )
@@ -318,39 +322,31 @@ async def patch_conversation(
     The title is trimmed before it is stored. Renaming does not change the chat's `updatedAt`,
     so it keeps its place in the newest-first list; a `context` write does change it. A body
     that still sends the retired `code` snapshot gets a 400 naming the retirement."""
-    if not _ID_RE.match(conversation_id):
-        raise AppApiError(400, "Invalid conversation id.")
+    cid = _conversation_uuid(conversation_id)
     body = await _json_object_body(request)
 
     if "code" in body:
         raise AppApiError(400, "code snapshots are no longer stored on conversations.")
 
-    owned = await _load_owned(db, user.id, conversation_id)
     # Absent ≠ null: only the fields present in the body are written.
-    title = _clean_title(body["title"]) if "title" in body else None
-
+    fields: dict[str, object] = {}
+    if "title" in body:
+        fields["title"] = _clean_title(body["title"])
     if "context" in body:
-        # Through the ORM, so its `onupdate` moves `updated_at`: a context write is activity.
-        if title is not None:
-            owned.title = title
-        owned.context = body["context"]
-        try:
-            await db.commit()
-        except StaleDataError:
-            # Deleted between our load and this flush: the same 404 a later PATCH would get.
-            raise AppApiError(404, "Conversation not found.") from None
-    elif title is not None:
-        # Naming `updated_at` in the SET is what stops its `onupdate` firing; assigning the
-        # attribute its own value through the ORM would not.
-        renamed = await db.scalar(
-            sa.update(Conversation)
-            .where(Conversation.id == owned.id, Conversation.user_id == user.id)
-            .values(title=title, updated_at=Conversation.updated_at)
-            .returning(Conversation.id)
-        )
-        if renamed is None:
-            raise AppApiError(404, "Conversation not found.")
-        await db.commit()
+        fields["context"] = body["context"]
+    else:
+        # A context write is activity and lets `onupdate` move `updated_at`; naming the column
+        # in the SET is what stops it firing for anything else.
+        fields["updated_at"] = Conversation.updated_at
+    written = await db.scalar(
+        sa.update(Conversation)
+        .where(Conversation.id == cid, Conversation.user_id == user.id)
+        .values(**fields)
+        .returning(Conversation.id)
+    )
+    if written is None:
+        raise AppApiError(404, "Conversation not found.")
+    await db.commit()
     return JSONResponse(content={"ok": True})
 
 

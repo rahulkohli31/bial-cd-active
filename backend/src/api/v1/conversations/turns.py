@@ -25,7 +25,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic_ai import BinaryContent
 from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.models import Model
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.deps import CurrentUser, DbSession
@@ -72,6 +71,7 @@ from src.services.connectors import connected_systems_for_project
 from src.services.messages.projection import DisplayItem, project_conversation
 from src.services.messages.store import (
     AttachmentRehydrationError,
+    ConversationGoneError,
     SeqContentionError,
     append_batch,
     load_history,
@@ -284,10 +284,8 @@ async def start_conversation_turn(
         raise AppApiError(
             409, "Another message is being recorded for this conversation. Try again."
         ) from None
-    except IntegrityError as exc:
+    except ConversationGoneError:
         # The chat was deleted after this send read it, which the claim cannot see.
-        if "messages_conversation_id_fkey" not in str(exc.orig):
-            raise
         raise AppApiError(404, "Conversation not found.") from None
 
 
@@ -568,7 +566,13 @@ async def start_turn(
     #
     # It moved BELOW the guardrail above (it used to lead this block) because it is this
     # route's first committing write, and every side-effect-free refusal has to land above it.
-    if await resolve_pending_as_refine(db, user_id=user.id, conversation_id=conversation_id):
+    try:
+        resolved = await resolve_pending_as_refine(
+            db, user_id=user.id, conversation_id=conversation_id
+        )
+    except ConversationGoneError:
+        raise AppApiError(404, "Conversation not found.") from None
+    if resolved:
         history = await _history()
 
     display_name = user.display_name or user.email

@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.app_registry import AppRegistry, AppStatus, mint_app_key
 from src.db.models.conversation import ChatKind, Conversation
+from src.db.models.deployment import Deployment, DeploymentStatus
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.project import Project
 from src.db.models.project_share import ProjectShare
@@ -126,6 +127,35 @@ class AppRegistryFactory:
         await db.flush()
         await db.refresh(app)
         return app
+
+
+class DeploymentFactory:
+    """Builds one deploy ATTEMPT for an app, owned by the app's owner. Succeeded with a URL
+    unless overridden; only a succeeded attempt carries an image digest by default.
+
+    `deployments` is append-only and ids are UUIDv7, so attempts created in order stack up in
+    that order, and liveness is a collapse over them rather than a read of the newest row."""
+
+    @staticmethod
+    def build(app: AppRegistry, **overrides: Any) -> Deployment:
+        data: dict[str, Any] = {
+            "app_id": app.id,
+            "user_id": app.user_id,
+            "status": DeploymentStatus.SUCCEEDED,
+            "url": "https://app-example.azurecontainerapps.io/",
+        }
+        data.update(overrides)
+        if data["status"] is DeploymentStatus.SUCCEEDED:
+            data.setdefault("image_digest", "sha256:" + "cd" * 32)
+        return Deployment(**data)
+
+    @classmethod
+    async def create(cls, db: AsyncSession, app: AppRegistry, **overrides: Any) -> Deployment:
+        deployment = cls.build(app, **overrides)
+        db.add(deployment)
+        await db.flush()
+        await db.refresh(deployment)
+        return deployment
 
 
 class ConversationFactory:

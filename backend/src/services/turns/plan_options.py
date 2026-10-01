@@ -215,13 +215,18 @@ async def resolve_pending_as_refine(
     pending = await find_pending(db, user_id=user_id, conversation_id=conversation_id)
     if pending is None:
         return None
-    return await resolve(
-        db,
-        user_id=user_id,
-        conversation_id=conversation_id,
-        tool_call_id=pending.tool_call_id,
-        choice="refine",
-    )
+    try:
+        return await resolve(
+            db,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            tool_call_id=pending.tool_call_id,
+            choice="refine",
+        )
+    except NoPendingOptionsError:
+        # Found and then gone: only a deleted chat loses its rows, and the send's own write
+        # reports that.
+        return None
 
 
 def resolution_of(rows: list[Message], tool_call_id: str) -> str | None:
