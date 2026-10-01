@@ -1,16 +1,29 @@
 /**
- * The Chats panel on its own: tabs, search, sort, the pinned pager and the four answers it gives
- * in place of rows. It is handed its chats directly; the read behind them is `useProjectChats`'s
- * suite, and the panel inside the real workspace is `ChatHistoryRoute.test.tsx`'s.
+ * The Chats panel on its own: tabs, search, sort, the pinned pager, the four answers it gives in
+ * place of rows, and each row's rename and delete. The list scenarios hand it its chats directly;
+ * rename and delete run it over the real `useProjectChats` against a mocked server, because what
+ * they prove is that the list is read again. The panel inside the real workspace is
+ * `ChatHistoryRoute.test.tsx`'s.
  *
  * jsdom lays nothing out, so the pinned footer is asserted as structure — last child of the panel,
  * pushed down by `mt-auto` — and the pixels belong to the browser suite.
  */
-import { describe, it, expect, vi, afterEach } from 'vitest'
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
 import ChatHistoryPanel from '../ChatHistoryPanel'
-import type { ChatRow, ProjectChats } from '../../../hooks/useProjectChats'
+import { useProjectChats, type ChatRow, type ProjectChats } from '../../../hooks/useProjectChats'
+import { ApiError } from '../../../utils/apiError'
+import type { ConversationHeader } from '../../../utils/conversationApi'
+
+const h = vi.hoisted(() => ({ list: vi.fn(), rename: vi.fn(), remove: vi.fn() }))
+
+vi.mock('../../../utils/conversationApi', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../utils/conversationApi')>()),
+  listProjectConversations: h.list,
+  renameConversation: h.rename,
+  deleteConversation: h.remove,
+}))
 
 vi.mock('../../../utils/auth', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../utils/auth')>()),
@@ -35,7 +48,7 @@ function rows(n: number): ChatRow[] {
 }
 
 function ready(chats: ChatRow[], over: Partial<ProjectChats> = {}): ProjectChats {
-  return { chats, loading: false, failed: false, capped: false, retry: vi.fn(), ...over }
+  return { chats, loading: false, failed: false, capped: false, retry: vi.fn(), refresh: vi.fn(async () => {}), ...over }
 }
 
 function Where() {
@@ -379,5 +392,422 @@ describe('opening a chat, and coming back', () => {
   it('★ coming back from a chat puts focus on that chat\'s row', () => {
     renderPanel(ready(rows(5)), '/projects/p1/chats', { returnedFrom: 'c3' })
     expect(document.activeElement?.getAttribute('href')).toBe('/chat/c3')
+  })
+})
+
+/**
+ * RENAME AND DELETE, over the real read. `server` is what the mocked API holds: the list call
+ * answers from it, a rename or a delete changes it, so a row only changes on screen if the panel
+ * reads the list again — which is the no-optimism rule these scenarios hold the panel to.
+ */
+let server: ConversationHeader[] = []
+
+function serverChats(n: number): ConversationHeader[] {
+  return Array.from({ length: n }, (_, i) => ({
+    id: `c${i + 1}`,
+    kind: i % 2 === 0 ? 'build' : 'plan',
+    projectId: 'p1',
+    title: `Chat ${i + 1}`,
+    createdAt: '2026-09-01T00:00:00Z',
+    updatedAt: new Date(Date.now() - (i + 1) * HOUR).toISOString(),
+  }))
+}
+
+function LivePanel() {
+  const chats = useProjectChats('p1')
+  return <ChatHistoryPanel projectId="p1" chats={chats} />
+}
+
+async function renderLive(entry = '/projects/p1/chats') {
+  const [pathname, search] = entry.split('?')
+  render(
+    <MemoryRouter initialEntries={[{ pathname, search: search ? `?${search}` : '' }]}>
+      <Routes>
+        <Route
+          path="/projects/:projectId/chats"
+          element={
+            <>
+              <LivePanel />
+              <Where />
+            </>
+          }
+        />
+        <Route path="*" element={<Where />} />
+      </Routes>
+    </MemoryRouter>,
+  )
+  await screen.findAllByTestId('chat-row')
+}
+
+const rowOf = (id: string) => {
+  const row = chatRows().find((candidate) => candidate.querySelector(`[data-chat-menu="${id}"]`) !== null)
+  if (!row) throw new Error(`no row for ${id}`)
+  return row
+}
+const menuOf = (id: string) => rowOf(id).querySelector<HTMLButtonElement>(`[data-chat-menu="${id}"]`) as HTMLButtonElement
+const editor = () => screen.getByRole('textbox', { name: 'Chat name' }) as HTMLInputElement
+
+/** Radix opens the menu on pointer-down, or on Enter from the keyboard. */
+async function choose(id: string, item: 'Rename' | 'Delete…', via: 'pointer' | 'keyboard' = 'pointer') {
+  if (via === 'pointer') fireEvent.pointerDown(menuOf(id))
+  else fireEvent.keyDown(menuOf(id), { key: 'Enter' })
+  fireEvent.click(await screen.findByRole('menuitem', { name: item }))
+}
+
+async function startRename(id: string) {
+  await choose(id, 'Rename')
+  await waitFor(() => expect(document.activeElement).toBe(editor()))
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((res) => {
+    resolve = res
+  })
+  return { promise, resolve }
+}
+
+beforeEach(() => {
+  server = serverChats(5)
+  h.list.mockReset()
+  h.rename.mockReset()
+  h.remove.mockReset()
+  h.list.mockImplementation(async () => server.map((chat) => ({ ...chat })))
+  h.rename.mockImplementation(async (id: string, title: string) => {
+    server = server.map((chat) => (chat.id === id ? { ...chat, title } : chat))
+  })
+  h.remove.mockImplementation(async (id: string) => {
+    server = server.filter((chat) => chat.id !== id)
+  })
+})
+
+describe('the row menu', () => {
+  it('★ ends every row, always visible, beside the row link and never inside it', async () => {
+    await renderLive()
+
+    // LIVENESS: five real rows, each with its link, before anything is said about the menu.
+    expect(chatRows()).toHaveLength(5)
+    for (const row of chatRows()) {
+      const link = within(row).getByRole('link')
+      const menu = within(row).getByRole('button', { name: /^More actions for / })
+      expect(link.contains(menu)).toBe(false)
+      expect(menu.closest('a')).toBeNull()
+      // Raised above the link's row-wide overlay, and drawn without waiting for a hover.
+      expect(menu.className).toMatch(/\brelative\b/)
+      expect(menu.className).toMatch(/\bz-10\b/)
+      expect(menu.className).not.toMatch(/\b(opacity-0|invisible|hidden)\b|group-hover/)
+      expect(menu.className).toContain('narrow:min-h-[44px]')
+      expect(menu.className).toContain('narrow:min-w-[44px]')
+    }
+    expect(menuOf('c1').getAttribute('aria-label')).toBe('More actions for Chat 1')
+  })
+
+  it('★ opens from the keyboard, offers Rename, a separator and Delete… in red, and never opens the chat', async () => {
+    await renderLive()
+
+    fireEvent.keyDown(menuOf('c2'), { key: 'Enter' })
+    const items = await screen.findAllByRole('menuitem')
+    expect(items.map((item) => item.textContent)).toEqual(['Rename', 'Delete…'])
+    expect(screen.getByRole('separator')).toBeTruthy()
+    expect(items[1].className).toMatch(/\btext-red-700\b/)
+    expect(where()).toBe('/projects/p1/chats')
+
+    cleanup()
+    await renderLive()
+    fireEvent.pointerDown(menuOf('c2'))
+    await screen.findByRole('menuitem', { name: 'Rename' })
+    fireEvent.click(menuOf('c2'))
+    expect(where()).toBe('/projects/p1/chats')
+  })
+
+  it('★ every read of the list names the application', async () => {
+    await renderLive()
+    await startRename('c1')
+    fireEvent.change(editor(), { target: { value: 'Renamed' } })
+    fireEvent.keyDown(editor(), { key: 'Enter' })
+    await waitFor(() => expect(h.list).toHaveBeenCalledTimes(2))
+    expect(h.list.mock.calls.every(([projectId]) => projectId === 'p1')).toBe(true)
+  })
+})
+
+describe('renaming a chat in its row', () => {
+  it('★ swaps the title for a focused input in a tinted row, with the hint, and the row link is gone', async () => {
+    await renderLive()
+    await startRename('c3')
+
+    expect(editor().value).toBe('Chat 3')
+    expect(screen.getByText('Enter to save · Esc to cancel')).toBeTruthy()
+    expect(rowOf('c3').className).toMatch(/\bbg-canvas-savedirty\b/)
+    // The row link does not exist while the title is being edited, so nothing in the row opens the chat.
+    expect(within(rowOf('c3')).queryByRole('link')).toBeNull()
+    expect(within(rowOf('c2')).getByRole('link')).toBeTruthy()
+    // The menu handed focus back to its trigger as it closed; the editor kept it.
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 20)))
+    expect(document.activeElement).toBe(editor())
+  })
+
+  it('★ Enter saves the trimmed name: the row shows it in the same place, with the same age, and focus is back on ⋯', async () => {
+    await renderLive()
+    const ageBefore = rowOf('c3').querySelectorAll('td')[1].textContent
+    await startRename('c3')
+
+    fireEvent.change(editor(), { target: { value: '  Should the desk sign people out?  ' } })
+    fireEvent.keyDown(editor(), { key: 'Enter' })
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Chat name' })).toBeNull())
+    expect(h.rename).toHaveBeenCalledTimes(1)
+    expect(h.rename).toHaveBeenCalledWith('c3', 'Should the desk sign people out?')
+    expect(titles()[2]).toBe('Build chatShould the desk sign people out?')
+    expect(rowOf('c3').querySelectorAll('td')[1].textContent).toBe(ageBefore)
+    await waitFor(() => expect(document.activeElement).toBe(menuOf('c3')))
+  })
+
+  it('★ no rename is optimistic: the editor stays, read-only, until the list shows the new name', async () => {
+    const held = deferred<void>()
+    h.rename.mockImplementation(async (id: string, title: string) => {
+      await held.promise
+      server = server.map((chat) => (chat.id === id ? { ...chat, title } : chat))
+    })
+    await renderLive()
+    await startRename('c2')
+
+    fireEvent.change(editor(), { target: { value: 'Renamed' } })
+    fireEvent.keyDown(editor(), { key: 'Enter' })
+    expect(editor().readOnly).toBe(true)
+    expect(screen.queryByText('Renamed')).toBeNull()
+
+    await act(async () => held.resolve())
+    await waitFor(() => expect(titles()[1]).toBe('Plan chatRenamed'))
+  })
+
+  it('★ Esc cancels: the old name stays, nothing is sent, and focus is back on ⋯', async () => {
+    await renderLive()
+    await startRename('c2')
+    fireEvent.change(editor(), { target: { value: 'Something else' } })
+    fireEvent.keyDown(editor(), { key: 'Escape' })
+
+    expect(screen.queryByRole('textbox', { name: 'Chat name' })).toBeNull()
+    expect(titles()[1]).toBe('Plan chatChat 2')
+    expect(h.rename).not.toHaveBeenCalled()
+    await waitFor(() => expect(document.activeElement).toBe(menuOf('c2')))
+  })
+
+  it('★ clicking away cancels, and nothing is ever saved on blur', async () => {
+    await renderLive()
+    await startRename('c2')
+    fireEvent.change(editor(), { target: { value: 'Typed, then abandoned' } })
+    fireEvent.blur(editor())
+
+    expect(screen.queryByRole('textbox', { name: 'Chat name' })).toBeNull()
+    expect(titles()[1]).toBe('Plan chatChat 2')
+    expect(h.rename).not.toHaveBeenCalled()
+  })
+
+  it('★ Enter and then a blur send exactly one request', async () => {
+    const held = deferred<void>()
+    h.rename.mockImplementation(async (id: string, title: string) => {
+      await held.promise
+      server = server.map((chat) => (chat.id === id ? { ...chat, title } : chat))
+    })
+    await renderLive()
+    await startRename('c1')
+    fireEvent.change(editor(), { target: { value: 'Once only' } })
+    fireEvent.keyDown(editor(), { key: 'Enter' })
+    fireEvent.blur(editor())
+    fireEvent.keyDown(editor(), { key: 'Enter' })
+
+    await act(async () => held.resolve())
+    await waitFor(() => expect(titles()[0]).toBe('Build chatOnce only'))
+    expect(h.rename).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    ['empty', '', 'Give the chat a name'],
+    ['whitespace only', '    ', 'Give the chat a name'],
+    ['over 120 characters', 'x'.repeat(121), 'Keep the name under 120 characters'],
+  ])('★ refuses an %s name before sending it, with the message in place of the hint', async (_label, typed, message) => {
+    await renderLive()
+    await startRename('c1')
+    fireEvent.change(editor(), { target: { value: typed } })
+    fireEvent.keyDown(editor(), { key: 'Enter' })
+
+    const line = screen.getByText(message)
+    expect(line.getAttribute('aria-live')).toBe('polite')
+    expect(editor().getAttribute('aria-describedby')).toBe(line.id)
+    expect(editor().getAttribute('aria-invalid')).toBe('true')
+    expect(screen.queryByText('Enter to save · Esc to cancel')).toBeNull()
+    expect(h.rename).not.toHaveBeenCalled()
+    expect(editor().value).toBe(typed)
+  })
+
+  it('accepts a name of exactly 120 characters, counted after trimming', async () => {
+    await renderLive()
+    await startRename('c1')
+    fireEvent.change(editor(), { target: { value: ` ${'x'.repeat(120)} ` } })
+    fireEvent.keyDown(editor(), { key: 'Enter' })
+    await waitFor(() => expect(h.rename).toHaveBeenCalledWith('c1', 'x'.repeat(120)))
+  })
+
+  it('★ a server failure keeps the editor open with the typed value, and says so', async () => {
+    h.rename.mockRejectedValue(new ApiError('Internal error', 500))
+    await renderLive()
+    await startRename('c1')
+    fireEvent.change(editor(), { target: { value: 'Kept as typed' } })
+    fireEvent.keyDown(editor(), { key: 'Enter' })
+
+    expect(await screen.findByText('Could not rename the chat. Try again.')).toBeTruthy()
+    expect(editor().value).toBe('Kept as typed')
+    expect(editor().readOnly).toBe(false)
+    expect(editor().getAttribute('aria-invalid')).toBe('true')
+    // The list was not read again: nothing landed, so nothing on screen changes.
+    expect(h.list).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    ['title_required', 'Give the chat a name'],
+    ['title_too_long', 'Keep the name under 120 characters'],
+  ])('reads the server refusal %s as the matching message', async (code, message) => {
+    h.rename.mockRejectedValue(new ApiError('Refused', 400, code))
+    await renderLive()
+    await startRename('c1')
+    fireEvent.change(editor(), { target: { value: 'Looks fine here' } })
+    fireEvent.keyDown(editor(), { key: 'Enter' })
+    expect(await screen.findByText(message)).toBeTruthy()
+  })
+
+  it('typing after a refusal brings the hint back', async () => {
+    await renderLive()
+    await startRename('c1')
+    fireEvent.change(editor(), { target: { value: '' } })
+    fireEvent.keyDown(editor(), { key: 'Enter' })
+    expect(screen.getByText('Give the chat a name')).toBeTruthy()
+    fireEvent.change(editor(), { target: { value: 'A' } })
+    expect(screen.getByText('Enter to save · Esc to cancel')).toBeTruthy()
+    expect(editor().getAttribute('aria-invalid')).toBe('false')
+  })
+
+  it('opens an untitled chat\'s editor empty, with its kind\'s name as the placeholder', async () => {
+    server = [{ ...serverChats(1)[0], title: '' }]
+    await renderLive()
+    await startRename('c1')
+    expect(editor().value).toBe('')
+    expect(editor().getAttribute('placeholder')).toBe('New build')
+  })
+})
+
+describe('deleting a chat', () => {
+  const dialog = () => screen.getByRole('dialog')
+  const confirmButton = () => screen.getByTestId('delete-chat-confirm') as HTMLButtonElement
+
+  it('★ asks once, naming the chat and saying the application is not affected', async () => {
+    await renderLive()
+    await choose('c2', 'Delete…')
+
+    expect(await screen.findByRole('dialog')).toBeTruthy()
+    expect(within(dialog()).getByText('Delete this chat?')).toBeTruthy()
+    expect(dialog().textContent).toContain(
+      '“Chat 2” and all of its messages will be deleted. Your application and its saved versions are not affected. This cannot be undone.',
+    )
+    expect(within(dialog()).getByRole('button', { name: 'Cancel' })).toBeTruthy()
+    expect(confirmButton().textContent?.trim()).toBe('Delete chat')
+    expect(confirmButton().className).toMatch(/\bbg-red-600\b/)
+    expect(h.remove).not.toHaveBeenCalled()
+  })
+
+  it('★ Cancel changes nothing and puts focus back on the row\'s ⋯', async () => {
+    await renderLive()
+    await choose('c2', 'Delete…')
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(h.remove).not.toHaveBeenCalled()
+    expect(chatRows()).toHaveLength(5)
+    await waitFor(() => expect(document.activeElement).toBe(menuOf('c2')))
+  })
+
+  it('★ removes the row, recounts, and moves focus to the next row\'s ⋯', async () => {
+    server = serverChats(23)
+    await renderLive()
+    expect(screen.getByTestId('chat-count').textContent).toBe('23')
+
+    await choose('c3', 'Delete…')
+    fireEvent.click(await screen.findByTestId('delete-chat-confirm'))
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(h.remove).toHaveBeenCalledWith('c3')
+    expect(screen.getByTestId('chat-count').textContent).toBe('22')
+    expect(chatRows().some((row) => row.querySelector('[data-chat-menu="c3"]') !== null)).toBe(false)
+    expect(within(footer() as HTMLElement).getByRole('status').textContent).toBe('Showing 1–8 of 22')
+    await waitFor(() => expect(document.activeElement).toBe(menuOf('c4')))
+  })
+
+  it('★ deleting the last row of the last page steps back exactly one page, and focus goes to the row before it', async () => {
+    server = serverChats(17)
+    await renderLive('/projects/p1/chats?page=3')
+    expect(chatRows()).toHaveLength(1)
+
+    await choose('c17', 'Delete…')
+    fireEvent.click(await screen.findByTestId('delete-chat-confirm'))
+
+    await waitFor(() => expect(where()).toBe('/projects/p1/chats?page=2'))
+    expect(chatRows()).toHaveLength(8)
+    expect(screen.getByRole('button', { name: '2' }).getAttribute('aria-current')).toBe('page')
+    await waitFor(() => expect(document.activeElement).toBe(menuOf('c16')))
+  })
+
+  it('deleting the only chat answers "No chats yet", with focus on the heading', async () => {
+    server = serverChats(1)
+    await renderLive()
+    await choose('c1', 'Delete…')
+    fireEvent.click(await screen.findByTestId('delete-chat-confirm'))
+
+    expect(await screen.findByText('No chats yet')).toBeTruthy()
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Chats' })))
+  })
+
+  it('★ a running chat is refused inside the open dialog, which stays open and can be pressed again', async () => {
+    h.remove.mockRejectedValue(new ApiError('Busy', 409, 'conversation_running'))
+    await renderLive()
+    await choose('c2', 'Delete…')
+    fireEvent.click(await screen.findByTestId('delete-chat-confirm'))
+
+    const alert = await within(dialog()).findByRole('alert')
+    expect(alert.textContent).toBe('This chat is still running. Stop it first, then delete it.')
+    await waitFor(() => expect(confirmButton().disabled).toBe(false))
+    expect(screen.getByRole('dialog')).toBeTruthy()
+    expect(menuOf('c2')).toBeTruthy()
+    expect(chatRows()).toHaveLength(5)
+
+    h.remove.mockReset()
+    h.remove.mockImplementation(async (id: string) => {
+      server = server.filter((chat) => chat.id !== id)
+    })
+    fireEvent.click(confirmButton())
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(chatRows()).toHaveLength(4)
+  })
+
+  it('a chat already gone closes the dialog and reads the list again', async () => {
+    h.remove.mockImplementation(async (id: string) => {
+      server = server.filter((chat) => chat.id !== id)
+      throw new ApiError('Not found', 404)
+    })
+    await renderLive()
+    await choose('c2', 'Delete…')
+    fireEvent.click(await screen.findByTestId('delete-chat-confirm'))
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(h.list).toHaveBeenCalledTimes(2)
+    expect(chatRows()).toHaveLength(4)
+  })
+
+  it('any other failure stays in the open dialog, the row kept', async () => {
+    h.remove.mockRejectedValue(new ApiError('Internal error', 500))
+    await renderLive()
+    await choose('c2', 'Delete…')
+    fireEvent.click(await screen.findByTestId('delete-chat-confirm'))
+
+    expect((await within(dialog()).findByRole('alert')).textContent).toBe('Could not delete the chat. Try again.')
+    expect(chatRows()).toHaveLength(5)
   })
 })

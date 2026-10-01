@@ -8,14 +8,16 @@
  * its compact form, so no pager here is drawn by hand.
  *
  * Its tab, search, sort and page live in the address, so Back and a chat's "All chats" link both
- * land on the view that was left.
+ * land on the view that was left. Each row's `⋯` renames the chat in place or deletes it after one
+ * confirmation; neither is optimistic — the list is read again and shows what the server holds.
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { AriaAttributes } from 'react'
 import { Link, useLocation, useSearchParams } from 'react-router-dom'
 import { flexRender, type Column } from '@tanstack/react-table'
-import { ArrowLeft, Search } from 'lucide-react'
+import { ArrowLeft, Search, Trash2 } from 'lucide-react'
 import { cn } from '../../lib/utils'
+import ConfirmDialog from '../ui/ConfirmDialog'
 import { Input } from '../ui/input'
 import { Skeleton } from '../ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../ui/table'
@@ -23,7 +25,8 @@ import { ToggleGroup, ToggleGroupItem } from '../ui/toggle-group'
 import { ListPager } from '../projects/listChrome'
 import { useChatHistoryTable, type ChatRow, type ProjectChats } from '../../hooks/useProjectChats'
 import { chatKindFor } from '../../utils/chatKind'
-import { CONVERSATION_LIST_CAP } from '../../utils/conversationApi'
+import { ApiError } from '../../utils/apiError'
+import { CONVERSATION_LIST_CAP, deleteConversation, renameConversation } from '../../utils/conversationApi'
 import {
   chatListSearch,
   chatReturnedFrom,
@@ -31,12 +34,15 @@ import {
   type ChatKindTab,
   type ChatListQuery,
 } from '../../utils/chatHistoryAddress'
-import { createChatHistoryColumns } from './chatHistoryColumns'
+import { chatName, createChatHistoryColumns, type ChatRowActions } from './chatHistoryColumns'
 
 /** Fixed, as the boards draw it: the rail has no room for a page-size select. */
 export const CHAT_PAGE_SIZE = 8
 
 const TABS: readonly ChatKindTab[] = ['all', 'plan', 'build']
+
+const STILL_RUNNING = 'This chat is still running. Stop it first, then delete it.'
+const DELETE_FAILED = 'Could not delete the chat. Try again.'
 
 const ACTION =
   'mt-3 inline-flex h-8 items-center rounded-lg border border-bial-border bg-white px-3 text-[12.5px] font-semibold text-primary-900 shadow-sm transition hover:text-primary'
@@ -102,8 +108,36 @@ export default function ChatHistoryPanel({ projectId, chats }: ChatHistoryPanelP
     [setParams],
   )
 
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState<ChatRow | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  // Where focus goes once a render has the rows it names: a row's `⋯`, or the heading for `null`.
+  const focusNext = useRef<{ menu: string | null } | null>(null)
+
+  const { refresh } = chats
+  const actions = useMemo<ChatRowActions>(
+    () => ({
+      editingId,
+      startRename: (chat) => setEditingId(chat.id),
+      saveTitle: async (chat, title) => {
+        await renameConversation(chat.id, title)
+        await refresh()
+      },
+      endRename: (chat) => {
+        focusNext.current = { menu: chat.id }
+        setEditingId(null)
+      },
+      startDelete: (chat) => {
+        setEditingId(null)
+        setDeleteError(null)
+        setDeleting(chat)
+      },
+    }),
+    [editingId, refresh],
+  )
+
   const listSearch = chatListSearch(query)
-  const columns = useMemo(() => createChatHistoryColumns(listSearch), [listSearch])
+  const columns = useMemo(() => createChatHistoryColumns(listSearch, actions), [listSearch, actions])
   const table = useChatHistoryTable({
     chats: chats.chats,
     columns,
@@ -131,6 +165,52 @@ export default function ChatHistoryPanel({ projectId, chats }: ChatHistoryPanelP
       if (lost && opener instanceof HTMLElement && opener !== document.body && opener.isConnected) opener.focus()
     }
   }, [opener])
+
+  useEffect(() => {
+    const target = focusNext.current
+    if (target === null || chats.loading) return
+    focusNext.current = null
+    // A task later, so a closing dialog has handed focus back first; focus is moved only if the
+    // control that held it has gone, never away from something the reader chose.
+    window.setTimeout(() => {
+      const active = document.activeElement
+      if (active !== null && active !== document.body && active.isConnected) return
+      const menus = rowsRef.current?.querySelectorAll<HTMLElement>('[data-chat-menu]') ?? []
+      const menu = Array.from(menus).find((button) => button.dataset.chatMenu === target.menu)
+      ;(menu ?? headingRef.current)?.focus()
+    }, 0)
+  })
+
+  const confirmDelete = async () => {
+    const chat = deleting
+    if (chat === null) return
+    setDeleteError(null)
+    try {
+      await deleteConversation(chat.id)
+    } catch (caught) {
+      const status = caught instanceof ApiError ? caught.status : null
+      if (status === 409) {
+        setDeleteError(STILL_RUNNING)
+        return
+      }
+      // A 404 is a chat already gone: the list is read again as for a delete that landed.
+      if (status !== 404) {
+        setDeleteError(DELETE_FAILED)
+        return
+      }
+    }
+    const order = table.getPrePaginationRowModel().rows.map((row) => row.id)
+    const at = order.indexOf(chat.id)
+    await refresh()
+    focusNext.current = { menu: at === -1 ? null : (order[at + 1] ?? order[at - 1] ?? null) }
+    setDeleting(null)
+  }
+
+  const closeDelete = () => {
+    if (deleting !== null) focusNext.current = { menu: deleting.id }
+    setDeleting(null)
+    setDeleteError(null)
+  }
 
   const returnedFrom = useRef(chatReturnedFrom(location.state))
   useEffect(() => {
@@ -214,7 +294,10 @@ export default function ChatHistoryPanel({ projectId, chats }: ChatHistoryPanelP
                 <TableRow
                   key={row.id}
                   data-testid="chat-row"
-                  className="relative hover:bg-bial-bg/60 focus-within:bg-bial-bg/60"
+                  className={cn(
+                    'relative',
+                    row.id === editingId ? 'bg-canvas-savedirty' : 'hover:bg-bial-bg/60 focus-within:bg-bial-bg/60',
+                  )}
                 >
                   {row.getVisibleCells().map((cell) => (
                     <TableCell key={cell.id} className={cn('px-3 py-[11px]', cell.column.columnDef.meta?.className)}>
@@ -322,6 +405,30 @@ export default function ChatHistoryPanel({ projectId, chats }: ChatHistoryPanelP
       </div>
 
       {body}
+
+      {deleting !== null && (
+        <ConfirmDialog
+          title="Delete this chat?"
+          body={
+            <>
+              “{chatName(deleting)}” and all of its messages will be deleted. Your application and its saved
+              versions are not affected. This cannot be undone.
+              {deleteError !== null && (
+                <span role="alert" className="mt-2 block font-semibold text-danger">
+                  {deleteError}
+                </span>
+              )}
+            </>
+          }
+          icon={<Trash2 size={18} aria-hidden="true" className="text-red-700" />}
+          iconClassName="bg-red-50"
+          confirmLabel="Delete chat"
+          tone="danger"
+          testId="delete-chat"
+          onClose={closeDelete}
+          onConfirm={confirmDelete}
+        />
+      )}
     </section>
   )
 }

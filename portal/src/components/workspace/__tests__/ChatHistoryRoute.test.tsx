@@ -18,6 +18,7 @@ const h = vi.hoisted(() => ({
   getProject: vi.fn(),
   list: vi.fn(),
   getConversation: vi.fn(),
+  rename: vi.fn(),
   fetchPreviewState: vi.fn(),
 }))
 
@@ -45,6 +46,7 @@ vi.mock('../../../utils/conversationApi', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../utils/conversationApi')>()),
   listProjectConversations: h.list,
   getConversation: h.getConversation,
+  renameConversation: h.rename,
 }))
 vi.mock('../../../utils/buildSessionApi', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../utils/buildSessionApi')>()),
@@ -122,13 +124,20 @@ const pane = () => screen.getByTestId('app-pane')
 const rail = () => screen.getByTestId('workspace-outlet')
 const history = () => screen.getByRole('button', { name: 'Chat history' })
 
+/** What the mocked API holds; a rename changes it, and every read answers from it. */
+let server: ConversationHeader[] = []
+
 beforeEach(() => {
   vi.clearAllMocks()
+  server = headers(23)
   h.getProject.mockResolvedValue(PROJECT)
-  h.list.mockResolvedValue(headers(23))
+  h.list.mockImplementation(async () => server.map((chat) => ({ ...chat })))
+  h.rename.mockImplementation(async (id: string, title: string) => {
+    server = server.map((chat) => (chat.id === id ? { ...chat, title } : chat))
+  })
   h.fetchPreviewState.mockResolvedValue({ state: 'alive', alive: true, previewUrl: APP_URL, restorable: true })
   h.getConversation.mockImplementation(async (id: string) => {
-    const header = headers(23).find((chat) => chat.id === id)
+    const header = server.find((chat) => chat.id === id)
     return header ? { ...header, messages: [], activeTurn: null, contextTokens: null } : null
   })
 })
@@ -258,5 +267,25 @@ describe('a chat opened from the list, and back', () => {
     await screen.findByTestId('all-chats-strip')
     expect(history().getAttribute('aria-pressed')).toBe('false')
     expect(screen.getByRole('link', { name: 'Back to all chats' }).getAttribute('href')).toBe('/projects/p1/chats')
+  })
+})
+
+describe('a chat renamed in the list', () => {
+  it('★ is called by its new name in the chat\'s own strip and the toolbar, with no reload', async () => {
+    renderAt('/projects/p1/chats')
+    await screen.findAllByTestId('chat-row')
+
+    fireEvent.pointerDown(document.querySelector('[data-chat-menu="c1"]') as HTMLElement)
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Rename' }))
+    const input = await screen.findByRole('textbox', { name: 'Chat name' })
+    fireEvent.change(input, { target: { value: 'Add an out-time column' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Chat name' })).toBeNull())
+
+    const row = screen.getAllByTestId('chat-row')[0]
+    expect(row.textContent).toContain('Add an out-time column')
+    fireEvent.click(within(row).getByRole('link'))
+    await waitFor(() => expect(screen.getByTestId('all-chats-strip-title').textContent).toBe('Add an out-time column'))
+    expect(screen.getByTestId('toolbar-title').textContent).toBe('Add an out-time column')
   })
 })

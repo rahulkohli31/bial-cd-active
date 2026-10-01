@@ -5,7 +5,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { useChatHistoryTable, useProjectChats, type ChatRow } from '../useProjectChats'
-import { createChatHistoryColumns } from '../../components/workspace/chatHistoryColumns'
+import { createChatHistoryColumns, type ChatRowActions } from '../../components/workspace/chatHistoryColumns'
 import type { ChatListQuery } from '../../utils/chatHistoryAddress'
 import type { ConversationHeader } from '../../utils/conversationApi'
 
@@ -27,6 +27,15 @@ vi.mock('../../utils/auth', async (importOriginal) => ({
 
 const HOUR = 3_600_000
 const NOW = Date.parse('2026-09-30T12:00:00Z')
+
+/** The model never presses a row's menu; these only have to exist. */
+const NO_ACTIONS: ChatRowActions = {
+  editingId: null,
+  startRename: () => {},
+  saveTitle: async () => {},
+  endRename: () => {},
+  startDelete: () => {},
+}
 
 function header(over: Partial<ConversationHeader> & { id: string }): ConversationHeader {
   return {
@@ -127,6 +136,29 @@ describe('useProjectChats — the read', () => {
     expect(h.list).toHaveBeenCalledTimes(2)
   })
 
+  it('★ refresh reads again with the rows left on screen, and settles once the new answer is in', async () => {
+    const second = deferred<(ConversationHeader | null)[]>()
+    h.list.mockResolvedValueOnce([header({ id: 'a', title: 'Old name' })]).mockReturnValueOnce(second.promise)
+    const { result } = renderHook(() => useProjectChats('p1'))
+    await waitFor(() => expect(result.current.chats).toHaveLength(1))
+
+    let settled = false
+    act(() => {
+      void result.current.refresh().then(() => {
+        settled = true
+      })
+    })
+    // Never a loading state in between: the rows the reader is looking at stay put.
+    expect(result.current.loading).toBe(false)
+    expect(result.current.chats[0].title).toBe('Old name')
+    expect(settled).toBe(false)
+
+    await act(async () => second.resolve([header({ id: 'a', title: 'New name' })]))
+    expect(settled).toBe(true)
+    expect(result.current.chats[0].title).toBe('New name')
+    expect(h.list).toHaveBeenLastCalledWith('p1')
+  })
+
   it('ignores a late answer for the application it has moved away from', async () => {
     const first = deferred<(ConversationHeader | null)[]>()
     h.list.mockImplementation((projectId: string) =>
@@ -161,7 +193,7 @@ describe('useChatHistoryTable — the model', () => {
 
   function model(chats: ChatRow[], query: Partial<ChatListQuery> = {}, capped = false) {
     const onQueryChange = vi.fn()
-    const columns = createChatHistoryColumns('')
+    const columns = createChatHistoryColumns('', NO_ACTIONS)
     const { result } = renderHook(() =>
       useChatHistoryTable({ chats, columns, query: { ...FRESH, ...query }, onQueryChange, pageSize: 8, capped }),
     )
@@ -255,7 +287,7 @@ describe('useChatHistoryTable — the model', () => {
 
   it('does not move the page itself when the rows change', async () => {
     const onQueryChange = vi.fn()
-    const columns = createChatHistoryColumns('')
+    const columns = createChatHistoryColumns('', NO_ACTIONS)
     const { rerender } = renderHook(
       ({ chats }) => {
         const table = useChatHistoryTable({ chats, columns, query: { ...FRESH, page: 2 }, onQueryChange, pageSize: 8, capped: false })

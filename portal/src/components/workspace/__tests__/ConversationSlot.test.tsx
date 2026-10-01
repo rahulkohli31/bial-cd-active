@@ -225,6 +225,12 @@ describe('ConversationSlot — the "All chats" strip', () => {
     expect(JSON.parse(screen.getByTestId('where-state').textContent ?? 'null')).toEqual({ returnedFrom: 'chat-1' })
   })
 
+  it('carries no menu: a chat is renamed and deleted from the list, not from its own header', () => {
+    renderInWorkspace()
+    expect(back()).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /more actions/i })).toBeNull()
+  })
+
   it('returns to the fresh list from a chat opened any other way', () => {
     renderInWorkspace()
     expect(back().getAttribute('href')).toBe('/projects/p1/chats')

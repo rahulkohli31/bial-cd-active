@@ -16,11 +16,13 @@ import WorkspaceRail from '../WorkspaceRail'
 import type { Project } from '../../../utils/projectApi'
 import type { ConversationHeader } from '../../../utils/conversationApi'
 
-const h = vi.hoisted(() => ({ list: vi.fn() }))
+const h = vi.hoisted(() => ({ list: vi.fn(), rename: vi.fn(), remove: vi.fn() }))
 
 vi.mock('../../../utils/conversationApi', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../utils/conversationApi')>()),
   listProjectConversations: h.list,
+  renameConversation: h.rename,
+  deleteConversation: h.remove,
 }))
 vi.mock('../../../utils/auth', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../utils/auth')>()),
@@ -169,6 +171,67 @@ describe('the last chat', () => {
     renderRail()
     expect((await screen.findByTestId('last-chat-card')).textContent).toContain('Add an out-time column')
     expect(screen.queryByText('An assistant question')).toBeNull()
+  })
+})
+
+describe('the last chat follows the list\'s renames and deletes', () => {
+  let server: ConversationHeader[] = []
+
+  beforeEach(() => {
+    server = [
+      header({ id: 'c2', title: 'Add an out-time column' }),
+      header({ id: 'c1', kind: 'plan', title: 'Out-time — what should it record?' }),
+    ]
+    h.list.mockImplementation(async () => server.map((chat) => ({ ...chat })))
+    h.rename.mockImplementation(async (id: string, title: string) => {
+      server = server.map((chat) => (chat.id === id ? { ...chat, title } : chat))
+    })
+    h.remove.mockImplementation(async (id: string) => {
+      server = server.filter((chat) => chat.id !== id)
+    })
+  })
+
+  async function openList() {
+    fireEvent.click(await screen.findByRole('link', { name: /view all/i }))
+    await screen.findAllByTestId('chat-row')
+  }
+
+  async function backToComposer() {
+    fireEvent.click(screen.getAllByRole('link', { name: 'Back to the application' })[0])
+    return screen.findByTestId('last-chat-card')
+  }
+
+  it('★ carries no menu of its own: renaming and deleting happen in the list', async () => {
+    renderRail()
+    const card = await screen.findByTestId('last-chat-card')
+    expect(card.textContent).toContain('Add an out-time column')
+    expect(screen.queryByRole('button', { name: /more actions/i })).toBeNull()
+  })
+
+  it('★ shows a chat renamed in the list by its new name, with no reload', async () => {
+    renderRail()
+    await openList()
+    fireEvent.pointerDown(document.querySelector('[data-chat-menu="c2"]') as HTMLElement)
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Rename' }))
+    const input = await screen.findByRole('textbox', { name: 'Chat name' })
+    fireEvent.change(input, { target: { value: 'Add an in-time column too' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Chat name' })).toBeNull())
+
+    expect((await backToComposer()).textContent).toContain('Add an in-time column too')
+  })
+
+  it('★ deleting the newest chat moves the card on to the next one', async () => {
+    renderRail()
+    await openList()
+    fireEvent.pointerDown(document.querySelector('[data-chat-menu="c2"]') as HTMLElement)
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete…' }))
+    fireEvent.click(await screen.findByTestId('delete-chat-confirm'))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+
+    const card = await backToComposer()
+    expect(card.textContent).toContain('Out-time — what should it record?')
+    expect(card.getAttribute('href')).toBe('/chat/c1')
   })
 })
 

@@ -41,7 +41,10 @@ export interface ProjectChats {
   failed: boolean
   /** The read came back full, so older chats may exist beyond these. */
   capped: boolean
+  /** Read again from a loading state, after a failure. */
   retry: () => void
+  /** Read again with the current rows left on screen; settles once the new answer is in. */
+  refresh: () => Promise<void>
 }
 
 interface Answer {
@@ -55,32 +58,37 @@ const NO_CHATS: ChatRow[] = []
 
 export function useProjectChats(projectId: string): ProjectChats {
   const [answer, setAnswer] = useState<Answer | null>(null)
-  const [attempt, setAttempt] = useState(0)
   const latest = useRef(0)
 
-  useEffect(() => {
+  const load = useCallback((id: string): Promise<void> => {
     latest.current += 1
     const request = latest.current
-    listProjectConversations(projectId).then(
+    return listProjectConversations(id).then(
       (headers) => {
         if (latest.current !== request) return
         const chats = headers.flatMap((header) =>
-          header !== null && header.projectId === projectId
+          header !== null && header.projectId === id
             ? [{ id: header.id, kind: header.kind, title: header.title, updatedAt: header.updatedAt }]
             : [],
         )
-        setAnswer({ projectId, chats, capped: headers.length >= CONVERSATION_LIST_CAP, failed: false })
+        setAnswer({ projectId: id, chats, capped: headers.length >= CONVERSATION_LIST_CAP, failed: false })
       },
       () => {
-        if (latest.current === request) setAnswer({ projectId, chats: NO_CHATS, capped: false, failed: true })
+        if (latest.current === request) setAnswer({ projectId: id, chats: NO_CHATS, capped: false, failed: true })
       },
     )
-  }, [projectId, attempt])
+  }, [])
+
+  useEffect(() => {
+    void load(projectId)
+  }, [projectId, load])
 
   const retry = useCallback(() => {
     setAnswer(null)
-    setAttempt((n) => n + 1)
-  }, [])
+    void load(projectId)
+  }, [load, projectId])
+
+  const refresh = useCallback(() => load(projectId), [load, projectId])
 
   // An answer about another application is no answer: a switch reads as loading, never as its rows.
   const current = answer !== null && answer.projectId === projectId ? answer : null
@@ -90,6 +98,7 @@ export function useProjectChats(projectId: string): ProjectChats {
     failed: current?.failed ?? false,
     capped: current?.capped ?? false,
     retry,
+    refresh,
   }
 }
 
