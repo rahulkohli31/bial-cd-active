@@ -71,8 +71,10 @@ test.describe('the workspace toolbar at the declared 360px minimum', () => {
     // NEGATIVE CONTROL. Without this, a workspace that rendered an empty toolbar passes every
     // measurement below by having nothing to measure.
     const occupants = toolbar.locator('button, a, [role="button"]')
-    const found = await occupants.count()
-    expect(found, 'the toolbar rendered no pressable controls at all — the measurements below would be vacuous').toBeGreaterThanOrEqual(5)
+    // The application's own controls arrive after the project loads, so wait for them rather than count the first frame.
+    await expect
+      .poll(() => occupants.count(), { message: 'the toolbar rendered no pressable controls at all — the measurements below would be vacuous', timeout: 20_000 })
+      .toBeGreaterThanOrEqual(5)
 
     // 44x44 is the floor, not the target: the controls are padded up to it, so `>=` is the
     // honest comparison. A control absent at this width is skipped rather than failed — the rail
@@ -117,6 +119,41 @@ test.describe('the workspace toolbar at the declared 360px minimum', () => {
       const svg = page.getByLabel(new RegExp(`^${label}`)).first().locator('svg').first()
       if ((await svg.count()) === 0) continue
       await expect(svg, `${name}'s glyph changed size — the target should have grown by padding`).toHaveAttribute('width', expected)
+    }
+  })
+
+  test('the History button is a 44x44 target that overlaps neither Save nor the framed app', async ({ page }) => {
+    await openFirstProject(page)
+
+    const toolbar = page.getByTestId('workspace-toolbar')
+    await toolbar.waitFor({ state: 'visible', timeout: 30_000 })
+
+    // NEGATIVE CONTROL: the button and the control it must not overlap both rendered. A toolbar
+    // that lost either would pass every comparison below by having nothing to compare.
+    const history = page.getByTestId('toolbar-history')
+    const save = page.getByTestId('save-project')
+    await expect(history, 'the History button is not in the toolbar').toBeAttached()
+    await expect(save, 'Save is not in the toolbar — the overlap check below would be vacuous').toBeAttached()
+
+    const historyBox = await rect(history, 'the History button')
+    const saveBox = await rect(save, 'Save')
+    expect(historyBox.width, `History is ${historyBox.width}px wide`).toBeGreaterThanOrEqual(44)
+    expect(historyBox.height, `History is ${historyBox.height}px tall`).toBeGreaterThanOrEqual(44)
+
+    expect(historyBox.x, 'History is not after Save').toBeGreaterThanOrEqual(saveBox.x + saveBox.width - 1)
+    expect(overlaps(historyBox, saveBox), 'the History button overlaps Save').toBe(false)
+
+    // The pane is measured through its own testid, so a stopped app, whose pane has no frame,
+    // still has a rectangle to be clear of.
+    const pane = page.getByTestId('app-pane-region')
+    if ((await pane.count()) > 0 && (await pane.isVisible())) {
+      const paneBox = await rect(pane, 'the app pane')
+      expect(overlaps(historyBox, paneBox), 'the History button overlaps the app pane').toBe(false)
+    }
+    const frame = page.locator('iframe[title="App Preview"]')
+    if ((await frame.count()) > 0) {
+      const frameBox = await rect(frame.first(), 'the app frame')
+      expect(overlaps(historyBox, frameBox), 'the History button overlaps the framed app').toBe(false)
     }
   })
 
