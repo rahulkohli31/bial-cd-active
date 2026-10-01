@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic_ai import BinaryContent
 from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.models import Model
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.deps import CurrentUser, DbSession
@@ -283,6 +284,11 @@ async def start_conversation_turn(
         raise AppApiError(
             409, "Another message is being recorded for this conversation. Try again."
         ) from None
+    except IntegrityError as exc:
+        # The chat was deleted after this send read it, which the claim cannot see.
+        if "messages_conversation_id_fkey" not in str(exc.orig):
+            raise
+        raise AppApiError(404, "Conversation not found.") from None
 
 
 def _project_needing_a_workspace(conversation: Conversation) -> uuid.UUID | None:

@@ -1,6 +1,6 @@
 """`conversations.updated_at` reads as "last touched by a person": migration 0045's
-statement-level trigger advances it on a message insert, alongside the existing ORM
-`onupdate` for a title/context PATCH. The default lane proves the trigger's effect against the
+statement-level trigger advances it on a message insert, alongside the ORM `onupdate` for a
+context PATCH (a rename names `updated_at` in its SET, so it moves nothing). The default lane proves the trigger's effect against the
 real migrated schema inside the per-test transaction; the destructive lane
 (`uv run pytest -m destructive_migration`) walks the chain to prove the backfill, which only a
 downgrade/upgrade round trip can show.
@@ -79,12 +79,12 @@ async def test_a_batch_of_several_messages_advances_it_once(db_session) -> None:
     assert conversation.updated_at > _LONG_AGO
 
 
-async def test_editing_a_conversations_title_still_advances_it(db_session) -> None:
-    """Both writers land on the same column: a header edit is a person touching the chat too."""
+async def test_editing_a_conversations_context_still_advances_it(db_session) -> None:
+    """Both writers land on the same column: a context edit is a person touching the chat too."""
     user = await UserFactory.create(db_session)
     conversation = await ConversationFactory.create(db_session, user.id, updated_at=_LONG_AGO)
 
-    conversation.title = "renamed"
+    conversation.context = {"draft": "edited"}
     await db_session.flush()
 
     await db_session.refresh(conversation)
