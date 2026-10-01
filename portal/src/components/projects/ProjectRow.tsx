@@ -61,7 +61,8 @@ export default function ProjectRow({
       trailing={
         <AppRowMenu
           appName={project.name}
-          onOpen={onOpen}
+          projectId={project.id}
+          isServing={project.isServing}
           onSettings={onSettings}
           where="row"
         />

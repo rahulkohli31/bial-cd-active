@@ -39,7 +39,8 @@ export default function ProjectCard({
       trailing={
         <AppRowMenu
           appName={name}
-          onOpen={onOpen}
+          projectId={project.id}
+          isServing={project.isServing}
           onSettings={onSettings}
           where="tile"
         />
