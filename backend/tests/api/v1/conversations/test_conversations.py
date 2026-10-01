@@ -421,6 +421,48 @@ async def test_a_project_scoped_list_leaves_out_the_same_users_generic_chat(
     assert str(generic.id) in {c["_id"] for c in unscoped.json()["conversations"]}
 
 
+async def test_a_project_scoped_list_shows_nothing_for_a_project_the_caller_does_not_own(
+    client, db_session
+) -> None:
+    headers, user = await _auth(db_session)
+    other = await UserFactory.create(db_session)
+    theirs = await ProjectFactory.create(db_session, other.id)
+    mine = await ProjectFactory.create(db_session, user.id)
+    await ConversationFactory.create(db_session, other.id, project_id=theirs.id)
+    own = await ConversationFactory.create(db_session, user.id, project_id=mine.id)
+
+    foreign = await client.get(f"/v1/conversations?projectId={theirs.id}", headers=headers)
+    owned = await client.get(f"/v1/conversations?projectId={mine.id}", headers=headers)
+
+    assert foreign.status_code == 200
+    assert foreign.json() == {"conversations": []}
+    assert [c["_id"] for c in owned.json()["conversations"]] == [str(own.id)]
+
+
+async def test_the_list_returns_the_newest_200_and_leaves_the_oldest_out(
+    client, db_session
+) -> None:
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    start = datetime.datetime(2026, 7, 1, tzinfo=_UTC)
+    made = [
+        await ConversationFactory.create(
+            db_session,
+            user.id,
+            project_id=project.id,
+            updated_at=start + datetime.timedelta(minutes=minute),
+        )
+        for minute in range(201)
+    ]
+
+    resp = await client.get(f"/v1/conversations?projectId={project.id}", headers=headers)
+
+    ids = [c["_id"] for c in resp.json()["conversations"]]
+    assert len(ids) == 200
+    assert ids == [str(c.id) for c in reversed(made[1:])]
+    assert str(made[0].id) not in ids
+
+
 async def test_requires_auth(client) -> None:
     assert (await client.get("/v1/conversations")).status_code == 401
 

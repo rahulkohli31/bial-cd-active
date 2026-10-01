@@ -20,10 +20,25 @@ import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-li
 import { MemoryRouter } from 'react-router-dom'
 
 import MarketplacePage from '../MarketplacePage'
+import ProjectsPage from '../ProjectsPage'
+import SharedApplicationsPage from '../SharedApplicationsPage'
 import { storeView } from '../../utils/listView'
 import type { MarketplacePage as Page } from '../../utils/marketplaceApi'
 
-const h = vi.hoisted(() => ({ listMarketplace: vi.fn() }))
+const h = vi.hoisted(() => ({
+  listMarketplace: vi.fn(),
+  listProjects: vi.fn(),
+  listProjectCounts: vi.fn(),
+  listSharedWithMe: vi.fn(),
+}))
+vi.mock('../../utils/projectApi', () => ({
+  listProjects: h.listProjects,
+  listProjectCounts: h.listProjectCounts,
+}))
+vi.mock('../../utils/sharingApi', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  listSharedWithMe: h.listSharedWithMe,
+}))
 vi.mock('../../utils/marketplaceApi', async (importOriginal) => {
   // Only the network call is faked. `PAGE_SIZES`/`DEFAULT_PAGE_SIZE` are real constants the
   // component renders from, so stubbing the whole module would silently empty the
@@ -642,5 +657,49 @@ describe('MarketplacePage list and grid views', () => {
     expect(screen.getByText('Report baggage belt faults.').getAttribute('title')).toBe(
       'Report baggage belt faults.',
     )
+  })
+})
+
+describe.each([
+  ['list', 'grid'],
+  ['grid', 'list'],
+] as const)('choosing %s on the Marketplace', (chosen, before) => {
+  it('opens My Applications and Shared Applications in the same view', async () => {
+    storeView(before)
+    h.listMarketplace.mockResolvedValue(page())
+    h.listProjects.mockResolvedValue({ items: [], page: 1, pageSize: 8, total: 0, totalPages: 0 })
+    h.listProjectCounts.mockResolvedValue({ inProduction: 0, totalApplications: 0, inPipeline: 0 })
+    h.listSharedWithMe.mockResolvedValue({
+      items: [],
+      sharers: [],
+      page: 1,
+      pageSize: 8,
+      total: 0,
+      totalPages: 0,
+    })
+    const label = (view: string) => `${view === 'list' ? 'List' : 'Grid'} view`
+    const pressed = (view: string) => screen.getByLabelText(label(view)).getAttribute('data-state')
+
+    const marketplace = renderPage()
+    await screen.findByText('Baggage Belt Faults', {}, { timeout: 5000 })
+    expect(pressed(before)).toBe('on')
+    fireEvent.click(screen.getByLabelText(label(chosen)))
+    expect(pressed(chosen)).toBe('on')
+    marketplace.unmount()
+
+    for (const [path, Page] of [
+      ['/projects', ProjectsPage],
+      ['/shared-applications', SharedApplicationsPage],
+    ] as const) {
+      const opened = render(
+        <MemoryRouter initialEntries={[path]}>
+          <Page />
+        </MemoryRouter>,
+      )
+      await waitFor(() => expect(screen.getByLabelText(label(chosen))).toBeTruthy())
+      expect(pressed(chosen)).toBe('on')
+      expect(pressed(before)).toBe('off')
+      opened.unmount()
+    }
   })
 })
