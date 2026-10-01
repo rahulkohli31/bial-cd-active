@@ -421,17 +421,6 @@ async def test_a_tree_that_cannot_be_restored_ends_the_turn_with_news_and_a_late
     assert len(workspace.restored) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "`reap_user` clears the per-user registry record, the liveness lease and the lock by "
-        "user id alone after its teardown returns. A start that registered a newer container "
-        "while that delete was in flight loses all three, and the newer container keeps running "
-        "with nothing naming it. The by-name guard (`delete_registry_if_it_still_names`) covers "
-        "the client's own teardown and the shutdown routine but not this path, which the "
-        "late-teardown learning lists as a deliberate exception. Left for the lead to decide."
-    ),
-)
 async def test_a_late_teardown_of_the_old_container_leaves_a_newer_one_registered(
     _fresh_engine: TurnEngine,
     db_session: AsyncSession,

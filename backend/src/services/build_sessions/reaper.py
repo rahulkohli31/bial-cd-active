@@ -48,7 +48,7 @@ from src.services.build_sessions.locks import (
     DeadlineWriter,
     an_instant_on_the_hash,
     clear_serving,
-    delete_registry,
+    delete_registry_if_it_still_names,
     elapsed_ms,
     grant_stay_of_execution,
     heartbeat_is_alive,
@@ -631,6 +631,30 @@ async def _hand_the_debt_over(
         return False
 
 
+async def _let_go_unless_taken(redis: aioredis.Redis, user_uuid: uuid.UUID, app_name: str) -> None:
+    """Clear this user's record, liveness lease and lock, unless the slot has changed hands since
+    the record was read as naming `app_name`.
+
+    All three are keyed by user, and a start can claim them while a teardown here is still in
+    flight. The record goes only while it still names `app_name`. The lease and the lock name no
+    container, so they go only when nothing else can own them: a record naming another container,
+    or a start in flight, keeps all three. A record that is merely gone is no such sign — the
+    client's own teardown clears it when this process started the container."""
+    cleared = await delete_registry_if_it_still_names(redis, user_uuid, app_name)
+    if not cleared and (
+        await redis.exists(registry_key(user_uuid))
+        or await read_starting_marker(redis, user_uuid) is not None
+    ):
+        _log.warning(
+            "the slot changed hands during the reap; leaving its record, lease and lock alone",
+            user_id=str(user_uuid),
+            app_name=app_name,
+        )
+        return
+    await release_liveness_lease(redis, user_uuid)
+    await reap_lock(redis, user_uuid)
+
+
 async def reap_user(
     redis: aioredis.Redis,
     user_uuid: uuid.UUID,
@@ -672,9 +696,7 @@ async def reap_user(
             user_id=str(user_uuid),
             app_name=registered_name,
         )
-        await delete_registry(redis, user_uuid)
-        await release_liveness_lease(redis, user_uuid)
-        await reap_lock(redis, user_uuid)
+        await _let_go_unless_taken(redis, user_uuid, registered_name)
         return False
     # THE WRITE-BACK NEVER RUNS FOR A SHARED VIEW (#198), whatever `app_id` the caller resolved.
     # `sweep_all`'s own `_owning_app_id` currently maps a `shr-` registry record to the OWNER's
@@ -715,9 +737,7 @@ async def reap_user(
             user_id=str(user_uuid),
         )
         if await _hand_the_debt_over(reg, user_uuid=user_uuid, app_id=app_id):
-            await delete_registry(redis, user_uuid)
-            await release_liveness_lease(redis, user_uuid)
-            await reap_lock(redis, user_uuid)
+            await _let_go_unless_taken(redis, user_uuid, registered_name)
         # Nothing took the debt — no app owns this container, or its record cannot say WHICH
         # container it is — so the state stays exactly where it was and a later sweep retries
         # through it. Sparing, never forgetting.
@@ -728,13 +748,7 @@ async def reap_user(
     # before the mark-ending flip and the delete below is about to remove it for good. The
     # container's whole life is over, so whether it ever served anybody is now a settled fact.
     _sound_the_alarm_if_the_proof_is_absent(reg, user_uuid=user_uuid)
-    await delete_registry(redis, user_uuid)  # registry cleared
-    # ...and the liveness lease goes WITH the record it belonged to. The failure arm above
-    # releases it too, but only once an owed row has taken the deletion over; where nothing can,
-    # it is kept, because dropping it would strip the protection off a container that is still
-    # standing and may still be building.
-    await release_liveness_lease(redis, user_uuid)
-    await reap_lock(redis, user_uuid)  # step 3: release the (possibly drifted) lock — LAST
+    await _let_go_unless_taken(redis, user_uuid, registered_name)  # step 3: record, lease, lock
     return True
 
 

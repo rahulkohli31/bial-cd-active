@@ -8,7 +8,7 @@ import ast
 import contextlib
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -202,6 +202,25 @@ async def test_a_record_naming_something_that_is_not_a_sandbox_deletes_nothing(
     assert client.torn_down == [], "a name we cannot vouch for must never reach ARM"
     assert await locks.read_registry(fake_redis, USER) is None, "the bogus record is cleared"
     assert any("not a sandbox name" in str(entry.get("event", "")) for entry in logs)
+
+
+async def test_a_record_with_no_name_field_at_all_is_still_cleared(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """A write that checks the hash exists and then sets one field can leave a nameless hash
+    behind once the record is gone. The arm above is what collects it, and it clears by name.
+
+    Mutation check: compare a missing name as anything but empty in the guarded delete, and the
+    record and the lock are kept, refused again on every pass."""
+    await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_STATE, REGISTRY_STATE_ENDING)
+    await fake_redis.set(lock_key(USER), "some-crashed-token", ex=LOCK_TTL)
+    client = FakeSandboxClient()
+
+    assert await reaper.reap_user(fake_redis, USER, client) is False
+
+    assert client.torn_down == []
+    assert await locks.read_registry(fake_redis, USER) is None
+    assert await locks.lock_is_held(fake_redis, USER) is False
 
 
 async def test_reap_user_tears_down_a_shared_sandbox_in_the_slot(
@@ -1202,6 +1221,118 @@ async def test_a_shared_view_whose_stamp_names_another_app_is_refused(
         assert await reaper.reap_user(fake_redis, recipient, client) is False
 
     assert (await db_session.scalar(sa.select(sa.func.count()).select_from(PendingTeardown))) == 0
+
+
+# --- the slot changes hands while its container is being reaped ----------------------------------
+#
+# The record, the lease and the lock are all keyed by user, and a start can claim them while the
+# ARM delete here is still in flight. `test_reclaim_and_continue.py` drives the same race through
+# a real turn and the real sweep; these pin each arm of the decision.
+
+NEWER = a_sandbox_name("newer")
+
+
+class _MeanwhileDuringTeardown(FakeSandboxClient):
+    """A teardown during which `meanwhile` acts on the user's slot first."""
+
+    def __init__(self, meanwhile: Callable[[], Awaitable[object]]) -> None:
+        super().__init__()
+        self._meanwhile = meanwhile
+
+    async def teardown(self, handle: SandboxHandle) -> None:
+        await self._meanwhile()
+        await super().teardown(handle)
+
+
+async def _a_newer_container_registers(redis: aioredis.Redis, user: uuid.UUID) -> None:
+    await redis.hset(
+        registry_key(user),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: NEWER,
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+            REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
+        },
+    )
+    await redis.set(lock_key(user), "the-newer-token", ex=LOCK_TTL)
+    await _hold_a_lease(redis, user)
+
+
+@pytest.mark.parametrize("the_clients_teardown_clears_it", [False, True])
+async def test_a_reap_nobody_raced_clears_the_record_the_lease_and_the_lock(
+    fake_redis: aioredis.Redis, the_clients_teardown_clears_it: bool
+) -> None:
+    """The real client clears the record itself, by name, when this process started the
+    container, so a reap often finds it already gone. Gone is not taken.
+
+    Mutation check: release the lease and the lock only when the reaper's own delete cleared the
+    record, and the second case goes red."""
+    await _seed(fake_redis, USER, with_heartbeat=False)
+    await _hold_a_lease(fake_redis, USER)
+
+    async def _what_the_real_client_does() -> None:
+        if the_clients_teardown_clears_it:
+            await locks.delete_registry_if_it_still_names(fake_redis, USER, SBX)
+
+    client = _MeanwhileDuringTeardown(_what_the_real_client_does)
+
+    assert await reaper.reap_user(fake_redis, USER, client) is True
+
+    assert client.torn_down == [SBX]
+    assert await locks.read_registry(fake_redis, USER) is None
+    assert await fake_redis.exists(lease_key(USER)) == 0
+    assert await locks.lock_is_held(fake_redis, USER) is False
+
+
+async def test_a_start_still_provisioning_when_the_teardown_returns_keeps_its_lock(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """A start that cleared this record in its own reconcile holds the lock and its starting
+    marker while it provisions, with nothing registered yet.
+
+    Mutation check: stop reading the starting marker and the start's lock is released under it."""
+    await _seed(fake_redis, USER, with_heartbeat=False)
+
+    async def _a_start_takes_the_slot() -> None:
+        await fake_redis.delete(registry_key(USER))
+        await fake_redis.set(lock_key(USER), "the-starting-token", ex=LOCK_TTL)
+        await locks.write_starting_marker(fake_redis, USER, uuid.uuid4())
+
+    client = _MeanwhileDuringTeardown(_a_start_takes_the_slot)
+
+    assert await reaper.reap_user(fake_redis, USER, client) is True
+
+    assert client.torn_down == [SBX]
+    assert await fake_redis.get(lock_key(USER)) == "the-starting-token"
+
+
+async def test_a_failed_teardown_owes_the_old_container_and_leaves_the_newer_one_its_slot(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutation check: clear by user id alone in the debt arm and the newer record, its lease and
+    its lock all go."""
+    user = await UserFactory.create(db_session)
+    app = await AppRegistryFactory.create(db_session, user_id=user.id)
+    await _seed(fake_redis, user.id, app_name=app_name_for(app.id), with_heartbeat=False)
+    await _preserve(fake_storage, app.id)
+    client = _MeanwhileDuringTeardown(lambda: _a_newer_container_registers(fake_redis, user.id))
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert await reaper.reap_user(fake_redis, user.id, client, app_id=app.id) is False
+
+    reg = await locks.read_registry(fake_redis, user.id)
+    assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == NEWER
+    assert await fake_redis.get(lock_key(user.id)) == "the-newer-token"
+    assert await locks.liveness_lease_is_held(fake_redis, user.id)
+    owed = (
+        await db_session.scalars(
+            sa.select(PendingTeardown.app_name).where(PendingTeardown.user_id == user.id)
+        )
+    ).all()
+    assert owed == [app_name_for(app.id)]
 
 
 @contextlib.asynccontextmanager
