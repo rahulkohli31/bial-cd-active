@@ -18,7 +18,7 @@ import {
   DropdownMenuTrigger,
 } from '../ui/dropdown-menu'
 import { ApiError } from '../../utils/apiError'
-import { chatKindFor, type ChatKindPresentation } from '../../utils/chatKind'
+import { chatKindFor } from '../../utils/chatKind'
 import { openedFromChatList } from '../../utils/chatHistoryAddress'
 import { relativeTime } from '../../utils/relativeTime'
 import type { ChatRow } from '../../hooks/useProjectChats'
@@ -44,13 +44,11 @@ export interface ChatRowActions {
   startDelete: (chat: ChatRow) => void
 }
 
-/** What a chat with no title yet is called, here and in the toolbar alike. */
-export function untitledChatName(kind: ChatKindPresentation): string {
-  return `New ${kind.word.toLowerCase()}`
-}
+/** What a chat with no title yet is called, whatever its kind, here and in the toolbar alike. */
+export const UNTITLED_CHAT_NAME = 'New chat'
 
-export function chatName(chat: Pick<ChatRow, 'kind' | 'title'>): string {
-  return chat.title || untitledChatName(chatKindFor(chat.kind))
+export function chatName(chat: Pick<ChatRow, 'title'>): string {
+  return chat.title || UNTITLED_CHAT_NAME
 }
 
 /** The kind as a square tile, for rows. Its name is spoken; the glyph is not. */
@@ -174,7 +172,7 @@ function ChatTitleEditor({ chat, actions }: { chat: ChatRow; actions: ChatRowAct
         aria-label="Chat name"
         aria-invalid={error !== null}
         aria-describedby={hintId}
-        placeholder={untitledChatName(chatKindFor(chat.kind))}
+        placeholder={UNTITLED_CHAT_NAME}
         onChange={(event) => {
           setValue(event.target.value)
           setError(null)

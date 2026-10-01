@@ -51,7 +51,7 @@ import { usePublishState } from '../../hooks/usePublishState'
 import { chatKindFor } from '../../utils/chatKind'
 import { chatHistoryPath, chatListOpenedFrom } from '../../utils/chatHistoryAddress'
 import DiscardChangesDialog from './DiscardChangesDialog'
-import { untitledChatName } from './chatHistoryColumns'
+import { UNTITLED_CHAT_NAME } from './chatHistoryColumns'
 import { useRailSlot, useWorkspaceActions, useWorkspaceAddress, useWorkspaceHeading, useWorkspacePaneVisible, useWorkspaceSave } from './workspaceChannel'
 import type { SaveSlot, WorkspaceActions } from './workspaceChannel'
 import { DEVICES, type DeviceName } from './devices'
@@ -245,15 +245,11 @@ export default function WorkspaceToolbar({
                where the squeeze does. */
             className="min-w-0 truncate text-[15px] font-extrabold tracking-[-0.25px] text-primary-900 narrow:min-w-[9rem]"
           >
-            {/* A CHAT WITH NO TITLE YET IS THE ORDINARY CASE, not an error: the row is created by
-                the first send and its title is derived from that message. Naming the kind is more
-                use than an empty slot or a spinner.
-
-                WITH NO KIND EITHER, the slot stays empty for that one fetch. "New chat" would be a
-                claim — this chat is brand new — about a chat that is far more often an existing
-                one still loading, and the row holds its 54px height regardless, so nothing shifts
-                by waiting the moment out. */}
-            {heading.chatTitle || (kind ? untitledChatName(kind) : '')}
+            {/* A chat with no title yet is the ordinary case: its first message with words names
+                it. Until the chat has resolved (no kind yet) the slot stays empty, because "New
+                chat" would be a claim about what is far more often an existing chat still loading;
+                the row holds its height, so nothing shifts. */}
+            {heading.chatTitle || (kind ? UNTITLED_CHAT_NAME : '')}
           </h1>
         </>
       ) : (

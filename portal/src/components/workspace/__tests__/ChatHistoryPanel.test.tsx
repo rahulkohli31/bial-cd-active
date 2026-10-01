@@ -127,9 +127,9 @@ describe('the list as drawn', () => {
     expect(within(chatRows()[1]).getByText('Plan chat')).toBeTruthy()
   })
 
-  it('names an untitled chat by its kind', () => {
+  it('calls an untitled chat New chat whatever its kind', () => {
     renderPanel(ready([{ id: 'u', kind: 'plan', title: '', updatedAt: new Date().toISOString() }]))
-    expect(titles()).toEqual(['Plan chatNew plan'])
+    expect(titles()).toEqual(['Plan chatNew chat'])
   })
 
   it('★ keeps a long title to one line, whole in its tooltip, without pushing Updated aside', () => {
@@ -763,12 +763,12 @@ describe('renaming a chat in its row', () => {
     expect(editor().getAttribute('aria-invalid')).toBe('false')
   })
 
-  it('opens an untitled chat\'s editor empty, with its kind\'s name as the placeholder', async () => {
+  it('opens an untitled chat\'s editor empty, with New chat as the placeholder', async () => {
     server = [{ ...serverChats(1)[0], title: '' }]
     await renderLive()
     await startRename('c1')
     expect(editor().value).toBe('')
-    expect(editor().getAttribute('placeholder')).toBe('New build')
+    expect(editor().getAttribute('placeholder')).toBe('New chat')
   })
 })
 

@@ -16,10 +16,9 @@ import { useLocation } from 'react-router-dom'
 import ConversationSurface from '../chat/ConversationSurface'
 import type { ChatKind } from '../../pages/ChatRoute'
 import type { Project } from '../../utils/projectApi'
-import { chatKindFor } from '../../utils/chatKind'
 import { chatHistoryPath, chatListOpenedFrom, returningFromChat } from '../../utils/chatHistoryAddress'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
-import { KindChip, RoundBackLink, untitledChatName } from './chatHistoryColumns'
+import { KindChip, RoundBackLink, UNTITLED_CHAT_NAME } from './chatHistoryColumns'
 import { useWorkspaceHeading, useWorkspacePaneVisible } from './workspaceChannel'
 
 /** What `ChatRoute` resolved: which conversation, of which kind, in which project. */
@@ -58,7 +57,7 @@ function AllChatsStrip({ chatId, kind, projectId }: { chatId: string; kind: Chat
   const listSearch = chatListOpenedFrom(useLocation().state)
   const titleRef = useRef<HTMLHeadingElement>(null)
   const openedFromList = listSearch !== null
-  const name = heading.chatTitle || untitledChatName(chatKindFor(kind))
+  const name = heading.chatTitle || UNTITLED_CHAT_NAME
 
   useEffect(() => {
     if (openedFromList) titleRef.current?.focus()

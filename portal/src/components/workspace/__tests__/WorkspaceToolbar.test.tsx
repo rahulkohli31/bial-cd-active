@@ -246,12 +246,11 @@ describe('what the row names on each address', () => {
     expect(plan.querySelector('svg')).toBeTruthy()
   })
 
-  it('a freshly created chat, whose title is not yet known, names its kind rather than nothing', () => {
-    // Ordinary, not an error: the title is derived from the first message. A blank <h1> or a
-    // spinner would both be worse than the kind.
+  it('a freshly created chat, whose title is not yet known, is called New chat rather than nothing', () => {
+    // Ordinary, not an error: the title is derived from the first message.
     render(<Workspace entry="/chat/c1" chat={{ heading: { ...CHAT_HEADING, chatTitle: null } }} />)
 
-    expect(title().textContent).toBe('New build')
+    expect(title().textContent).toBe('New chat')
     expect(screen.getByTestId('toolbar-chat-kind')).toBeTruthy()
   })
 

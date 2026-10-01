@@ -140,7 +140,7 @@ export interface ConversationSurfaceProps {
   /**
    * THE TITLE THIS SURFACE DERIVES, HANDED BACK UP. Derived from the first message, the
    * moment the row is created — the toolbar heading otherwise learns it from a GET that
-   * already 404'd, so the row would say "New build chat" until reload instead of the real
+   * already 404'd, so the row would say "New chat" until reload instead of the real
    * title the instant it's sent. A CALLBACK RATHER THAN A SECOND PUBLISHER: this surface
    * informs, the route decides, so the heading keeps one author.
    */
@@ -1400,7 +1400,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     // draws comes from the same place it always did — the text being sent — and the server names
     // the row from the first accepted message that has words, by the same rule. Derived on every
     // send because a first message of attachments alone has none; the route keeps the first name.
-    const derivedTitle = projectId ? deriveTitle(partsToText(parts)) : null
+    const derivedTitle = deriveTitle(partsToText(parts))
     // OPTIMISTIC, AND DELIBERATELY SO. A refused send leaves the row untitled, so this can name a
     // chat the citizen is being told about a refusal for in the same breath. That is the right
     // trade for a heading: it appears the moment the message is sent rather than a reply later.

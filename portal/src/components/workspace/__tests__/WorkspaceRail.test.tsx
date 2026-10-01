@@ -134,10 +134,10 @@ describe('the last chat', () => {
     expect(composer()).toBeTruthy()
   })
 
-  it('names an untitled last chat by its kind, and keeps a long title to one line', async () => {
+  it('calls an untitled last chat New chat, and keeps a long title to one line', async () => {
     h.list.mockResolvedValue([header({ id: 'c1', title: '' })])
     renderRail()
-    expect((await screen.findByTestId('last-chat-card')).textContent).toContain('New build')
+    expect((await screen.findByTestId('last-chat-card')).textContent).toContain('New chat')
 
     cleanup()
     const long = 'A very long chat title that goes on well past the width of any rail this card will sit in'

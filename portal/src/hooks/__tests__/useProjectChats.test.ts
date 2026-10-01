@@ -253,13 +253,13 @@ describe('useChatHistoryTable — the model', () => {
     expect(table().getPageCount()).toBe(0)
   })
 
-  it('names an untitled chat by its kind, and finds it by that name', () => {
+  it('calls an untitled chat New chat whatever its kind, and finds it by that name', () => {
     const chats: ChatRow[] = [
       { id: 'untitled', kind: 'plan', title: '', updatedAt: '2026-09-30T10:00:00Z' },
       { id: 'named', kind: 'build', title: 'Add an out-time column', updatedAt: '2026-09-30T09:00:00Z' },
     ]
-    const { table } = model(chats, { q: 'new plan' })
-    expect(table().getRowModel().rows.map((row) => row.getValue('chat'))).toEqual(['New plan'])
+    const { table } = model(chats, { q: 'new chat' })
+    expect(table().getRowModel().rows.map((row) => row.getValue('chat'))).toEqual(['New chat'])
   })
 
   it('makes exactly one page of exactly eight chats, and none of none', () => {

@@ -236,9 +236,9 @@ describe('ConversationSlot — the "All chats" strip', () => {
     expect(back().getAttribute('href')).toBe('/projects/p1/chats')
   })
 
-  it('names a chat with no title yet by its kind', () => {
+  it('calls a chat with no title yet New chat', () => {
     renderInWorkspace({ chatTitle: null })
-    expect(screen.getByTestId('all-chats-strip-title').textContent).toBe('New plan')
+    expect(screen.getByTestId('all-chats-strip-title').textContent).toBe('New chat')
   })
 
   it('keeps a long title to one line, whole in its tooltip, and the chip whole beside it', () => {
