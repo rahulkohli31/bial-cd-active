@@ -104,32 +104,19 @@ _SEQ_RETRIES: Final = 2
 _EMPTY: Final = -1
 
 # The synthesized result stitched under a dangling tool call at load (see
-# `repair_dangling_tool_calls`). Plain factual prose — the model reads this as history.
+# `repair_dangling_tool_calls`). The model reads it as history, and it is sent to the model.
 #
-# KNOWN ISSUE, DELIBERATELY ACCEPTED — READ THIS BEFORE SHIPPING CHAT HISTORY.
-# A stop lands wherever the turn happens to be, which is routinely AFTER a tool call has been
-# issued and BEFORE its result is recorded. This line is what makes that replayable at all: it
-# keeps the history wire-valid, so a stopped turn never wedges the conversation.
+# It must not claim the call did nothing. A cut lands wherever the run stands, routinely after a
+# tool RAN and before its result was recorded, and a reopened chat is replayed by a run that was
+# not there: told "not executed", the model writes the file again or reasons from a state that
+# never existed. So the note says the call may have taken effect and asks for a check first.
 #
-# What it does NOT do is tell the truth when the tool actually RAN. "Treat it as not executed"
-# is a guess, and on the wrong side of it the model is told a file was never written when it
-# was — so it writes it again, or reasons forward from a state that never existed.
-#
-# THE DECISION: accept it while a transcript is only ever replayed by the run that produced it.
-# The window is one turn wide, the citizen is watching, and a wrong guess is visible immediately.
-# WHEN REOPENING PAST CONVERSATIONS / CHAT HISTORY GOES LIVE THAT STOPS HOLDING: an old
-# transcript gets replayed by a run that was not there, nobody is left who saw what happened, and
-# this sentence becomes the ONLY account of it.
-#
-# WHICH STOP LANDED HERE IS THE WHOLE QUESTION, and only one of the two can. A Build turn stopped
-# on the platform's behalf — a project switch, a lapsed lease, the age ceiling — waits for the
-# next tool-result boundary, so the in-flight call finishes, its result is recorded, and nothing
-# dangles for this line to guess about. What still reaches it is a stop that CUT the run: the
-# citizen's own Stop button (`BuildSessionManager._stop_the_held_session`), and a cooperative stop
-# whose boundary did not arrive inside its bound.
+# Only a stop that CUT the run reaches this: the citizen's own Stop
+# (`BuildSessionManager._stop_the_held_session`), or a cooperative stop whose boundary did not
+# arrive inside its bound. A stop at a tool-result boundary records the real result.
 _INTERRUPTED_RESULT: Final = (
-    "This tool call was interrupted before a result was recorded (the run was cut short). "
-    "Treat it as not executed."
+    "This tool call was interrupted before its result was recorded (the run was cut short). "
+    "It may have taken effect: check the current state before repeating it."
 )
 
 
