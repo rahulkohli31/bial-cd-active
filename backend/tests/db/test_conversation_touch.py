@@ -1,7 +1,8 @@
 """`conversations.updated_at` reads as "last touched by a person": migration 0045's
 statement-level trigger advances it on a message insert, alongside the ORM `onupdate` for a
-context PATCH (a rename names `updated_at` in its SET, so it moves nothing). The default lane proves the trigger's effect against the
-real migrated schema inside the per-test transaction; the destructive lane
+context PATCH (a rename names `updated_at` in its SET, so it moves nothing). The default lane
+proves the trigger's effect against the real migrated schema inside the per-test transaction; the
+destructive lane
 (`uv run pytest -m destructive_migration`) walks the chain to prove the backfill, which only a
 downgrade/upgrade round trip can show.
 """
