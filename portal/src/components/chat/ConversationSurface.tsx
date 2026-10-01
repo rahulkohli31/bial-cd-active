@@ -138,13 +138,12 @@ export interface ConversationSurfaceProps {
   /** Told when the settings dialog changes the project, so the route that owns it redraws. */
   onProjectUpdate: (project: Project) => void
   /**
-   * THE TITLE THIS SURFACE DERIVES, HANDED BACK UP. Derived from the first message, the
-   * moment the row is created — the toolbar heading otherwise learns it from a GET that
-   * already 404'd, so the row would say "New chat" until reload instead of the real
-   * title the instant it's sent. A CALLBACK RATHER THAN A SECOND PUBLISHER: this surface
-   * informs, the route decides, so the heading keeps one author.
+   * THE TITLE THIS SURFACE DERIVES, HANDED BACK UP with the chat it belongs to, once the server
+   * has accepted a message — the toolbar heading otherwise learns it only from a GET read before
+   * the chat had a name, and would say "New chat" until reload. A CALLBACK RATHER THAN A SECOND
+   * PUBLISHER: this surface informs, the route decides, so the heading keeps one author.
    */
-  onTitleDerived?: (title: string) => void
+  onTitleDerived?: (chatId: string, title: string) => void
   /**
    * Which kind of conversation this is. Read for ONE thing: whether the app pane is seen.
    *
@@ -1392,19 +1391,6 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     seqRef.current += 1
     const userMsg: ChatMessage = { id: `local_${Date.now()}`, role: 'user', parts, seq: userSeq, createdAt: new Date().toISOString() }
     setMessages([...priorMessages, userMsg])
-
-    // THE TITLE IS STILL DERIVED HERE, AND IT IS THE ONLY THING LEFT OF THE PARENTAGE BLOCK.
-    //
-    // The conversation row was created above, before the upload, with NO title: `deriveTitle`
-    // reads the draft, and the draft is not known a round trip earlier. So the heading the board
-    // draws comes from the same place it always did — the text being sent — and the server names
-    // the row from the first accepted message that has words, by the same rule. Derived on every
-    // send because a first message of attachments alone has none; the route keeps the first name.
-    const derivedTitle = deriveTitle(partsToText(parts))
-    // OPTIMISTIC, AND DELIBERATELY SO. A refused send leaves the row untitled, so this can name a
-    // chat the citizen is being told about a refusal for in the same breath. That is the right
-    // trade for a heading: it appears the moment the message is sent rather than a reply later.
-    if (derivedTitle) onTitleDerived?.(derivedTitle)
     dropTransientQuery(activeId)
     refreshBuilds()
 
@@ -1436,6 +1422,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         attachmentIds: wire.attachmentIds ?? [],
       })
       posted = true
+      // Only now: a refused send names nothing, and the server named an untitled chat from this
+      // message, by the same rule, in the commit that accepted it.
+      const derivedTitle = deriveTitle(partsToText(parts))
+      if (derivedTitle) onTitleDerived?.(activeId, derivedTitle)
       // THE METER, FROM THE ADMISSION THAT JUST PASSED. This is the number the server measured
       // to decide whether to accept this very turn — one token higher and the call above would
       // have thrown the 413 instead. So the line under the composer and the wall behind it are

@@ -160,10 +160,9 @@ export default function ChatRoute() {
     // its state, aborted on unmount. Only a cold open shows the spinner.
     setResolution((prev) => (prev.status === 'ready' ? prev : { status: 'loading' }))
 
-    // THE TITLE IS ALREADY STORED AND ALREADY RETURNED — it was simply never read back.
-    // It is set when the row is created, derived from the chat's first message, so a
-    // freshly minted chat legitimately has none until that message lands. `null` is that case and
-    // the row names the kind instead; it is never an error and never a spinner.
+    // THE TITLE IS ALREADY STORED AND ALREADY RETURNED. The server sets it when the chat's first
+    // message with words is accepted, so a freshly minted chat legitimately has none yet. `null`
+    // is that case and the heading reads "New chat"; it is never an error and never a spinner.
     const ready = (kind: ChatKind, projectId: string | null, title: string | null = null): void => {
       // The chat-open count that feeds the project-to-chat drop-off ratio tracked for
       // observability (`1 − project_opened_chat / project_opened`), marked at THE one seam
@@ -382,8 +381,10 @@ export default function ChatRoute() {
     <ConversationSlot
       // THE ROW'S TITLE, LEARNED FROM THE SURFACE THAT DERIVES IT. `resolution` is this route's
       // own state, so the heading published above still has exactly one author.
-      onTitleDerived={(title) =>
-        setResolution((held) => (held.status === 'ready' && !held.title ? { ...held, title } : held))
+      onTitleDerived={(derivedFor, title) =>
+        setResolution((held) =>
+          held.status === 'ready' && held.chatId === derivedFor && !held.title ? { ...held, title } : held,
+        )
       }
       onProjectUpdate={setProject}
       conversation={{

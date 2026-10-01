@@ -36,7 +36,7 @@ interface Props {
   /** Passed through to the surface — see `ConversationSurfaceProps.onProjectUpdate`. */
   onProjectUpdate: (project: Project) => void
   /** Passed through to the surface — see `ConversationSurfaceProps.onTitleDerived`. */
-  onTitleDerived?: (title: string) => void
+  onTitleDerived?: (chatId: string, title: string) => void
   /**
    * Hide the conversation without discarding it. Nothing sets it yet — the builder surface's own
    * chat-panel collapse hides a panel, not the whole conversation. It exists here so that the

@@ -55,7 +55,7 @@ vi.mock('../../components/workspace/ConversationSlot', () => ({
     // The surface derives a title from the first message of a chat whose row had none, and hands
     // it BACK to this route — see `onTitleDerived` in `ChatRoute`. Accepted here so the merge is
     // reachable from a test at all; a stub that omits it drops the call silently.
-    onTitleDerived?: (title: string) => void
+    onTitleDerived?: (chatId: string, title: string) => void
   }) {
     const navigate = useNavigate()
     const { chatId, kind, projectId, project } = conversation
@@ -64,7 +64,10 @@ vi.mock('../../components/workspace/ConversationSlot', () => ({
         {`${kind}|${chatId}|${projectId}|${project?.name ?? null}`}
         <button onClick={() => navigate(`/chat/${chatId}`, { replace: true })}>drop query</button>
         <button onClick={() => navigate('/chat/c2')}>go to c2</button>
-        <button onClick={() => onTitleDerived?.('Add an out-time column')}>derive a title</button>
+        <button onClick={() => onTitleDerived?.(chatId, 'Add an out-time column')}>derive a title</button>
+        <button onClick={() => onTitleDerived?.('a-chat-left-behind', 'Words from the chat left behind')}>
+          derive a title for another chat
+        </button>
         {project && <button onClick={() => onProjectUpdate({ ...project, name: 'Visitor Log' })}>rename the project</button>}
       </div>
     )
@@ -493,7 +496,7 @@ describe('ChatRoute — what it publishes for the toolbar row', () => {
 
   it('★ takes the title back from the surface when the chat had none', async () => {
     // A freshly minted chat legitimately has no title until the surface derives one; without
-    // the merge the row goes on naming the kind for the whole life of the chat.
+    // the merge the heading reads "New chat" for the whole life of the chat.
     h.getConversation.mockResolvedValue(conversation({ title: '' }))
     renderRoute('/chat/c1')
     await waitFor(() => expect(heading()).toBe('p1|VIP Movement|plan|null'))
@@ -516,6 +519,19 @@ describe('ChatRoute — what it publishes for the toolbar row', () => {
     // heading before a merge that was going to happen anyway.
     await waitFor(() => expect(screen.getByTestId('conversation-slot')).toBeTruthy())
     expect(heading()).toBe('p1|VIP Movement|plan|What the row already says')
+  })
+
+  it('★ ignores a title derived for a chat that is no longer the one open', async () => {
+    // A send in the chat just left can settle after the switch; its words must not name this one.
+    h.getConversation.mockResolvedValue(conversation({ title: '' }))
+    renderRoute('/chat/c1')
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|plan|null'))
+
+    fireEvent.click(screen.getByText('derive a title for another chat'))
+    fireEvent.click(screen.getByText('derive a title'))
+
+    // The second click proves the merge is live, so the first one's absence is a refusal.
+    await waitFor(() => expect(heading()).toBe('p1|VIP Movement|plan|Add an out-time column'))
   })
 })
 

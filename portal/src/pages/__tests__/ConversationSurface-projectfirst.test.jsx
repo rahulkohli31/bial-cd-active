@@ -237,6 +237,41 @@ describe('BuilderPage — a refine turn', () => {
   })
 })
 
+describe('BuilderPage — only an accepted message names the heading', () => {
+  const renderWith = (onTitleDerived) =>
+    render(
+      <MemoryRouter initialEntries={['/chat/build-X']}>
+        <Routes>
+          {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" onTitleDerived={onTitleDerived} />} />)}
+        </Routes>
+      </MemoryRouter>,
+    )
+
+  it('names this chat once the server holds the message', async () => {
+    h.getBuild.mockResolvedValue(null)
+    const onTitleDerived = vi.fn()
+    renderWith(onTitleDerived)
+    await screen.findByPlaceholderText(/ask for another change/i)
+
+    await send('Log every visitor at gate 4')
+
+    await waitFor(() => expect(onTitleDerived).toHaveBeenCalledWith('build-X', 'Log every visitor at gate 4'))
+  })
+
+  it('names nothing when the server refuses the message', async () => {
+    h.getBuild.mockResolvedValue(null)
+    h.startTurn.mockRejectedValue(new TurnStartError(429, 'You have used all of today’s tokens.'))
+    const onTitleDerived = vi.fn()
+    renderWith(onTitleDerived)
+    await screen.findByPlaceholderText(/ask for another change/i)
+
+    await send('Log every visitor at gate 4')
+
+    expect(await screen.findByText('You have used all of today’s tokens.')).toBeTruthy()
+    expect(onTitleDerived).not.toHaveBeenCalled()
+  })
+})
+
 describe('BuilderPage — the preview is fed NO app credentials', () => {
   it('never hands LivePreview a config / appKey / accessToken / previewCode', async () => {
     renderHandoff()
