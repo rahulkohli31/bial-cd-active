@@ -12,10 +12,9 @@
  * confirmation; neither is optimistic — the list is read again and shows what the server holds.
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
-import type { AriaAttributes } from 'react'
 import { Link, useLocation, useSearchParams } from 'react-router-dom'
-import { flexRender, type Column } from '@tanstack/react-table'
-import { ArrowLeft, Search, Trash2 } from 'lucide-react'
+import { flexRender } from '@tanstack/react-table'
+import { Search, Trash2 } from 'lucide-react'
 import { cn } from '../../lib/utils'
 import ConfirmDialog from '../ui/ConfirmDialog'
 import { Input } from '../ui/input'
@@ -24,6 +23,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '.
 import { ToggleGroup, ToggleGroupItem } from '../ui/toggle-group'
 import { ListPager } from '../projects/listChrome'
 import { useChatHistoryTable, type ChatRow, type ProjectChats } from '../../hooks/useProjectChats'
+import { ariaSortOf } from '../../utils/ariaSort'
 import { chatKindFor } from '../../utils/chatKind'
 import { ApiError } from '../../utils/apiError'
 import { CONVERSATION_LIST_CAP, deleteConversation, renameConversation } from '../../utils/conversationApi'
@@ -34,7 +34,7 @@ import {
   type ChatKindTab,
   type ChatListQuery,
 } from '../../utils/chatHistoryAddress'
-import { chatName, createChatHistoryColumns, type ChatRowActions } from './chatHistoryColumns'
+import { chatName, createChatHistoryColumns, RoundBackLink, type ChatRowActions } from './chatHistoryColumns'
 
 /** Fixed, as the boards draw it: the rail has no room for a page-size select. */
 export const CHAT_PAGE_SIZE = 8
@@ -46,11 +46,6 @@ const DELETE_FAILED = 'Could not delete the chat. Try again.'
 
 const ACTION =
   'mt-3 inline-flex h-8 items-center rounded-lg border border-bial-border bg-white px-3 text-[12.5px] font-semibold text-primary-900 shadow-sm transition hover:text-primary'
-
-function ariaSortOf(column: Column<ChatRow, unknown>): AriaAttributes['aria-sort'] {
-  if (column.id !== 'updated') return undefined
-  return column.getIsSorted() === 'asc' ? 'ascending' : 'descending'
-}
 
 /** The panel's answer in place of rows: a heading, one sentence and one way forward. */
 function ListMessage({ heading, sentence, action }: { heading: string; sentence: string; action: ReactNode }) {
@@ -322,7 +317,6 @@ export default function ChatHistoryPanel({ projectId, chats }: ChatHistoryPanelP
           <ListPager
             compact
             page={page}
-            activePage={page}
             totalPages={pageCount}
             onGo={(next) => table.setPageIndex(next - 1)}
             label="Chats pagination"
@@ -341,16 +335,7 @@ export default function ChatHistoryPanel({ projectId, chats }: ChatHistoryPanelP
       className="flex flex-1 flex-col bg-white px-[18px] pb-3.5 pt-4"
     >
       <div className="mb-3.5 flex flex-wrap items-center gap-2.5">
-        <Link
-          to={backToApplication}
-          aria-label="Back to the application"
-          title="Back to the application"
-          className="inline-flex flex-shrink-0 items-center justify-center rounded-full narrow:min-h-[44px] narrow:min-w-[44px]"
-        >
-          <span className="inline-flex h-[30px] w-[30px] items-center justify-center rounded-full border border-bial-border bg-white text-gray-600 shadow-[0_2px_8px_rgba(16,24,40,.08)] transition hover:text-primary">
-            <ArrowLeft size={15} aria-hidden="true" />
-          </span>
-        </Link>
+        <RoundBackLink to={backToApplication} label="Back to the application" />
         <h2
           id={headingId}
           ref={headingRef}

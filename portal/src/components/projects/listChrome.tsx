@@ -106,8 +106,8 @@ interface ListPagerProps {
    *  stay live while a page is in flight. */
   page: number
   /** What the rows on screen ANSWER to. A page that failed must not mark its own number active
-   *  over the rows that succeeded. */
-  activePage: number
+   *  over the rows that succeeded. Defaults to `page`. */
+  activePage?: number
   totalPages: number
   onGo: (page: number) => void
   /** Names the landmark, so a screen reader on a page with two pagers can tell them apart. */
@@ -132,7 +132,7 @@ interface ListPagerProps {
  */
 export function ListPager({
   page,
-  activePage,
+  activePage = page,
   totalPages,
   onGo,
   label,

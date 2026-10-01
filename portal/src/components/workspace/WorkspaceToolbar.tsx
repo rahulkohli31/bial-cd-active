@@ -106,6 +106,7 @@ export default function WorkspaceToolbar({
    *  destination the press does not go to. */
   const backToProject = mode !== null && mode !== 'details' && heading.projectId !== null
 
+  const historyProjectId = heading.projectId
   const navigate = useNavigate()
   const routerState: unknown = useLocation().state
   const historyPressed = mode === 'history' || (isChat && chatListOpenedFrom(routerState) !== null)
@@ -347,7 +348,7 @@ export default function WorkspaceToolbar({
 
         {/* Offered on every screen of a loaded application, chats or none: with none it opens the
             list's "No chats yet". */}
-        {heading.projectId !== null && heading.projectName !== null && (
+        {historyProjectId !== null && heading.projectName !== null && (
           <button
             type="button"
             data-testid="toolbar-history"
@@ -355,8 +356,7 @@ export default function WorkspaceToolbar({
             aria-label="Chat history"
             title="Chat history"
             onClick={() => {
-              if (heading.projectId === null) return
-              navigate(historyPressed ? `/projects/${heading.projectId}` : chatHistoryPath(heading.projectId))
+              navigate(historyPressed ? `/projects/${historyProjectId}` : chatHistoryPath(historyProjectId))
             }}
             className="inline-flex h-7 w-[30px] flex-shrink-0 items-center justify-center rounded-lg text-neutral transition hover:bg-bial-bg hover:text-primary aria-pressed:bg-primary/10 aria-pressed:text-primary aria-pressed:ring-1 aria-pressed:ring-inset aria-pressed:ring-primary/30 narrow:min-h-[44px] narrow:min-w-[44px]"
           >

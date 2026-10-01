@@ -7,8 +7,8 @@
  */
 import { useEffect, useId, useRef, useState } from 'react'
 import type { Column, ColumnDef } from '@tanstack/react-table'
-import { Link } from 'react-router-dom'
-import { ChevronDown, ChevronUp, MoreHorizontal, Pencil, Trash2 } from 'lucide-react'
+import { Link, type To } from 'react-router-dom'
+import { ArrowLeft, ChevronDown, ChevronUp, MoreHorizontal, Pencil, Trash2 } from 'lucide-react'
 import { Input } from '../ui/input'
 import {
   DropdownMenu,
@@ -77,6 +77,23 @@ export function KindChip({ kind }: { kind: string }) {
       {look.word}
       {look.completion && <span className="sr-only">{look.completion}</span>}
     </span>
+  )
+}
+
+/** The round arrow that leads back to a list; the 44px target is the phone-width one. */
+export function RoundBackLink({ to, state, label }: { to: To; state?: unknown; label: string }) {
+  return (
+    <Link
+      to={to}
+      state={state}
+      aria-label={label}
+      title={label}
+      className="inline-flex flex-shrink-0 items-center justify-center rounded-full narrow:min-h-[44px] narrow:min-w-[44px]"
+    >
+      <span className="inline-flex h-[30px] w-[30px] items-center justify-center rounded-full border border-bial-border bg-white text-gray-600 shadow-[0_2px_8px_rgba(16,24,40,.08)] transition hover:text-primary">
+        <ArrowLeft size={15} aria-hidden="true" />
+      </span>
+    </Link>
   )
 }
 
@@ -300,14 +317,12 @@ export function createChatHistoryColumns(listSearch: string, actions: ChatRowAct
       accessorKey: 'kind',
       filterFn: 'equals',
       enableSorting: false,
-      enableGlobalFilter: false,
     },
     {
       id: 'updated',
       accessorFn: (row) => Date.parse(row.updatedAt) || 0,
       header: ({ column }) => <UpdatedHeader column={column} />,
       sortingFn: 'basic',
-      enableGlobalFilter: false,
       cell: ({ row }) => relativeTime(row.original.updatedAt),
       meta: { className: 'w-[96px] whitespace-nowrap text-xs tabular-nums text-neutral' },
     },
@@ -315,7 +330,6 @@ export function createChatHistoryColumns(listSearch: string, actions: ChatRowAct
       id: 'actions',
       header: () => <span className="sr-only">Actions</span>,
       enableSorting: false,
-      enableGlobalFilter: false,
       cell: ({ row }) => <ChatRowMenu chat={row.original} actions={actions} />,
       meta: { className: 'w-[46px] px-2 text-right narrow:w-[60px]' },
     },

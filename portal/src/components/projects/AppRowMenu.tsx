@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import { MoreHorizontal, ExternalLink, Copy, Settings } from 'lucide-react'
 import {
   DropdownMenu,
@@ -8,7 +8,7 @@ import {
   DropdownMenuSeparator,
 } from '../ui/dropdown-menu'
 import { getDeployment } from '../../utils/deployApi'
-import { ClipboardRefused, copyToClipboard } from '../../utils/clipboard'
+import { useCopyOutcome } from '../../hooks/useCopyOutcome'
 
 /**
  * The `⋯` menu an application carries in the list and on its tile — ONE component, so the two
@@ -38,8 +38,6 @@ export interface AppRowMenuProps {
   /** Distinguishes the row's menu from the tile's in the DOM — one testid each. */
   where: 'row' | 'tile'
 }
-
-type CopyOutcome = 'idle' | 'copied' | 'refused'
 
 const ITEM = 'gap-2 rounded-sm px-2 py-1.5 text-sm text-primary-900 focus:bg-surface-muted'
 
@@ -73,21 +71,15 @@ export default function AppRowMenu({
 }: AppRowMenuProps) {
   const [open, setOpen] = useState(false)
   const [address, setAddress] = useState<string | null>(null)
-  const [copy, setCopy] = useState<CopyOutcome>('idle')
+  const { outcome, copy, reset } = useCopyOutcome()
   // Bumped on every open and close, so an answer from an earlier open is dropped.
   const openToken = useRef(0)
-
-  useEffect(() => {
-    if (copy !== 'copied') return undefined
-    const timer = window.setTimeout(() => setCopy('idle'), 2500)
-    return () => window.clearTimeout(timer)
-  }, [copy])
 
   const onOpenChange = (next: boolean): void => {
     setOpen(next)
     const token = ++openToken.current
     setAddress(null)
-    setCopy('idle')
+    reset()
     if (!next || !isServing) return
     void getDeployment(projectId)
       .then((view) => usableAddress(view.liveUrl))
@@ -98,18 +90,7 @@ export default function AppRowMenu({
       })
   }
 
-  const copyAddress = (url: string): void => {
-    const token = openToken.current
-    void copyToClipboard(url).then(
-      () => {
-        if (openToken.current === token) setCopy('copied')
-      },
-      (error: unknown) => {
-        if (!(error instanceof ClipboardRefused)) throw error
-        if (openToken.current === token) setCopy('refused')
-      },
-    )
-  }
+  const note = !isServing ? 'Not live yet' : address === null ? 'Address unavailable' : undefined
 
   return (
     <DropdownMenu open={open} onOpenChange={onOpenChange}>
@@ -127,42 +108,36 @@ export default function AppRowMenu({
         align="end"
         className="min-w-[220px] max-w-[280px] rounded-md border-bial-border bg-white p-1 shadow-lg"
       >
-        {!isServing ? (
+        {note !== undefined ? (
           <DropdownMenuItem disabled className={ITEM}>
             <ExternalLink size={15} />
-            <ItemText label="Open Application" note="Not live yet" />
+            <ItemText label="Open Application" note={note} />
           </DropdownMenuItem>
-        ) : address === null ? (
-          <>
-            <DropdownMenuItem disabled className={ITEM}>
-              <ExternalLink size={15} />
-              <ItemText label="Open Application" note="Address unavailable" />
-            </DropdownMenuItem>
-            <DropdownMenuItem disabled className={ITEM}>
-              <Copy size={15} />
-              <ItemText label="Copy Production URL" note="Address unavailable" />
-            </DropdownMenuItem>
-          </>
         ) : (
-          <>
-            <DropdownMenuItem asChild className={ITEM}>
-              <a href={address} target="_blank" rel="noopener noreferrer">
-                <ExternalLink size={15} />
-                Open Application
-              </a>
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              className={ITEM}
-              // Kept open so the outcome below is read where the press happened.
-              onSelect={(event) => {
-                event.preventDefault()
-                copyAddress(address)
-              }}
-            >
-              <Copy size={15} />
-              Copy Production URL
-            </DropdownMenuItem>
-          </>
+          <DropdownMenuItem asChild className={ITEM}>
+            <a href={address ?? undefined} target="_blank" rel="noopener noreferrer">
+              <ExternalLink size={15} />
+              Open Application
+            </a>
+          </DropdownMenuItem>
+        )}
+        {isServing && (
+          <DropdownMenuItem
+            disabled={address === null}
+            className={ITEM}
+            // Kept open so the outcome below is read where the press happened.
+            onSelect={(event) => {
+              event.preventDefault()
+              if (address !== null) void copy(address)
+            }}
+          >
+            <Copy size={15} />
+            {address === null ? (
+              <ItemText label="Copy Production URL" note="Address unavailable" />
+            ) : (
+              'Copy Production URL'
+            )}
+          </DropdownMenuItem>
         )}
         <DropdownMenuSeparator className="bg-bial-border" />
         <DropdownMenuItem onSelect={onSettings} className={ITEM}>
@@ -175,8 +150,8 @@ export default function AppRowMenu({
             data-testid={`app-menu-${where}-copy-outcome`}
             className="px-2 text-[11px] leading-relaxed"
           >
-            {copy === 'copied' && <p className="py-1 text-primary-900">Production URL copied</p>}
-            {copy === 'refused' && address !== null && (
+            {outcome === 'copied' && <p className="py-1 text-primary-900">Production URL copied</p>}
+            {outcome === 'refused' && address !== null && (
               <p className="py-1 text-danger">
                 Could not copy the address
                 <span className="block break-all font-mono text-neutral">{address}</span>

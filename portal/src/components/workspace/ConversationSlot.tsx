@@ -12,15 +12,14 @@
  * draft and the app pane survive it.
  */
 import { useEffect, useRef } from 'react'
-import { Link, useLocation } from 'react-router-dom'
-import { ArrowLeft } from 'lucide-react'
+import { useLocation } from 'react-router-dom'
 import ConversationSurface from '../chat/ConversationSurface'
 import type { ChatKind } from '../../pages/ChatRoute'
 import type { Project } from '../../utils/projectApi'
 import { chatKindFor } from '../../utils/chatKind'
 import { chatHistoryPath, chatListOpenedFrom, returningFromChat } from '../../utils/chatHistoryAddress'
 import { HIDDEN_BUT_MOUNTED } from './hiddenSubtree'
-import { KindChip, untitledChatName } from './chatHistoryColumns'
+import { KindChip, RoundBackLink, untitledChatName } from './chatHistoryColumns'
 import { useWorkspaceHeading, useWorkspacePaneVisible } from './workspaceChannel'
 
 /** What `ChatRoute` resolved: which conversation, of which kind, in which project. */
@@ -70,17 +69,11 @@ function AllChatsStrip({ chatId, kind, projectId }: { chatId: string; kind: Chat
       {/* Without the app beside it the chat fills the window, and the strip keeps to the
           transcript's measure. */}
       <div className={`flex items-center gap-2.5 ${paneVisible ? '' : 'mx-auto w-full max-w-thread'}`}>
-        <Link
+        <RoundBackLink
           to={chatHistoryPath(projectId) + (listSearch ?? '')}
           state={returningFromChat(chatId)}
-          aria-label="Back to all chats"
-          title="Back to all chats"
-          className="inline-flex flex-shrink-0 items-center justify-center rounded-full narrow:min-h-[44px] narrow:min-w-[44px]"
-        >
-          <span className="inline-flex h-[30px] w-[30px] items-center justify-center rounded-full border border-bial-border bg-white text-gray-600 shadow-[0_2px_8px_rgba(16,24,40,.08)] transition hover:text-primary">
-            <ArrowLeft size={15} aria-hidden="true" />
-          </span>
-        </Link>
+          label="Back to all chats"
+        />
         <div className="min-w-0">
           <p className="text-[11px] font-semibold text-neutral">All chats</p>
           <h2

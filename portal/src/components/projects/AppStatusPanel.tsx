@@ -17,12 +17,12 @@
  * metadata HEAD, no container in the path) — it must render even when the workspace is
  * stopped, which is exactly where `save-state` (container-attached) has nothing to say.
  */
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Check, Copy, ExternalLink } from 'lucide-react'
 import PublishDialog from '../PublishDialog'
 import { usePublishState } from '../../hooks/usePublishState'
 import { shortSha } from '../../utils/shortSha'
-import { ClipboardRefused, copyToClipboard } from '../../utils/clipboard'
+import { useCopyOutcome } from '../../hooks/useCopyOutcome'
 import {
   ACTION_LABEL,
   answerFor,
@@ -90,15 +90,7 @@ function StatusLabel() {
  * no builder attribution. The link opens the citizen's app as it is.
  */
 function LiveAddress({ url }: { url: string }) {
-  const [outcome, setOutcome] = useState<'idle' | 'copied' | 'refused'>('idle')
-
-  // The confirmation is temporary on purpose: a control stuck reading "copied" is
-  // describing the last press for ever, and the next press has nothing to say.
-  useEffect(() => {
-    if (outcome !== 'copied') return
-    const timer = window.setTimeout(() => setOutcome('idle'), 2500)
-    return () => window.clearTimeout(timer)
-  }, [outcome])
+  const { outcome, copy } = useCopyOutcome()
 
   return (
     <>
@@ -115,18 +107,7 @@ function LiveAddress({ url }: { url: string }) {
         type="button"
         data-testid="status-copy-link"
         aria-label={outcome === 'copied' ? 'Link copied' : 'Copy the link to this app'}
-        onClick={() => {
-          void copyToClipboard(url).then(
-            () => setOutcome('copied'),
-            (error: unknown) => {
-              // `copyToClipboard` folds every cause it knows — no clipboard on this
-              // origin, a denied permission, a failed write — into one typed error, so
-              // this handles that one case rather than swallowing whatever arrives.
-              if (!(error instanceof ClipboardRefused)) throw error
-              setOutcome('refused')
-            },
-          )
-        }}
+        onClick={() => void copy(url)}
         className="ml-1.5 inline-block align-[-1px] text-primary transition hover:text-primary-600"
       >
         {outcome === 'copied' ? (
