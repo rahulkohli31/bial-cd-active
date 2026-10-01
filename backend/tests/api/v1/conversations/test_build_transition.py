@@ -276,6 +276,36 @@ async def test_the_new_chat_opens_with_the_plan_and_nothing_else(
     assert rows[0].visibility is MessageVisibility.VISIBLE
 
 
+async def test_the_new_build_chat_is_named_from_the_plan_it_opens_with(
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
+) -> None:
+    """The plan is the build chat's first message, so it names the chat the way a typed first
+    message would, in the commit that makes the chat exist."""
+    _user, plan_chat, headers = await _plan_chat_with_offer(
+        client, db_session, set_chat_model, _fresh_engine
+    )
+    set_chat_model(_streaming_text("building it now"))
+    minted = uuid.uuid4()
+
+    resp = await client.post(_build_url(plan_chat), headers=headers, json={"chatId": str(minted)})
+    assert resp.status_code == 200, resp.text
+    await _settle(_fresh_engine, minted)
+
+    titles = dict(
+        (
+            await db_session.execute(
+                sa.select(Conversation.id, Conversation.title).where(
+                    Conversation.id.in_([plan_chat.id, minted])
+                )
+            )
+        ).all()
+    )
+    # Mutation-checked: start the handoff's turn with `title_text=""` and the build chat is left
+    # unnamed.
+    assert titles[minted] == "Here is what your visitor log will do. Y…"
+    assert titles[plan_chat.id] == "plan the visitors app"
+
+
 async def test_the_handoff_resolves_the_projects_connected_data_for_the_build_it_starts(
     client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage, monkeypatch
 ) -> None:

@@ -506,6 +506,25 @@ describe('deriveTitle', () => {
     expect(deriveTitle('  hello  ')).toBe('hello')
     expect(deriveTitle('y'.repeat(60))).toBe('y'.repeat(40) + '…')
   })
+
+  // The server's `derive_title` tests carry the same table (`NAMES` in
+  // `backend/tests/api/v1/conversations/test_chat_naming.py`): the heading and the saved name agree.
+  it.each([
+    ['  hello  ', 'hello'],
+    ['line one\nline two', 'line one line two'],
+    ['tab\there\r\n\r\nthen a line a para', 'tab here then a line a para'],
+    ['a\x00b\x07c\x7fd\x85e', 'a b c d e'],
+    [' 　wide spaces ', 'wide spaces'],
+    ['y'.repeat(40), 'y'.repeat(40)],
+    ['y'.repeat(41), 'y'.repeat(40) + '…'],
+    ['😀'.repeat(45), '😀'.repeat(40) + '…'],
+    ['a'.repeat(39) + '😀😀', 'a'.repeat(39) + '😀…'],
+    ['﻿kept mark ', '﻿kept mark'],
+    ['', ''],
+    [' \n\t  ', ''],
+  ])('names %j as %j', (text, expected) => {
+    expect(deriveTitle(text)).toBe(expected)
+  })
 })
 
 // One `messages` row can project SEVERAL items, and every one of them inherits that row's

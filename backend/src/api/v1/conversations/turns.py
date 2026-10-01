@@ -14,6 +14,7 @@ plumbing shared with plan→build lives in `_shared.py` — one source, no copie
 from __future__ import annotations
 
 import asyncio
+import unicodedata
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from typing import Literal
@@ -192,6 +193,29 @@ async def _app_is_switched_off(
     return switched_off
 
 
+# Whitespace, control characters (newline and tab among them) and the two Unicode line and
+# paragraph separators: every run of them becomes one space in a chat's name.
+_SPACE_IN_A_NAME = frozenset({"Zs", "Cc", "Zl", "Zp"})
+_NAME_CODE_POINTS = 40
+
+
+def derive_title(text: str) -> str | None:
+    """A chat's name from the citizen's own words, or None when there are none.
+
+    Runs of whitespace and control characters collapse to one space, the ends are trimmed, and
+    anything past 40 code points is cut and marked with "…". The portal's `deriveTitle` applies
+    the same rule to draw the heading, so the two change together."""
+    spaced = "".join(
+        " " if unicodedata.category(char) in _SPACE_IN_A_NAME else char for char in text
+    )
+    name = " ".join(word for word in spaced.split(" ") if word)
+    if not name:
+        return None
+    if len(name) <= _NAME_CODE_POINTS:
+        return name
+    return f"{name[:_NAME_CODE_POINTS]}…"
+
+
 async def start_conversation_turn(
     *,
     db: AsyncSession,
@@ -210,8 +234,12 @@ async def start_conversation_turn(
     expects_mutation: bool = False,
     attachments: AttachmentDelivery | None = None,
     file_attachment_ids: Sequence[str],
+    title_text: str,
 ) -> uuid.UUID:
     """Persist the user turn and start the run — ONE expression, two readers.
+
+    `title_text` is the citizen's own words, without attachment markup: it names a chat that has
+    no name yet, in the same commit as the message.
 
     `POST /turns` and `Build it` differ only in prompt origin, visibility, and whether a file
     change is OWED; the rest (pre-run write, engine claim, conflict mappings) is identical, so
@@ -246,8 +274,22 @@ async def start_conversation_turn(
     # is the same reason `_externalize_binaries` runs on the serialized tree. `load_history` drops
     # them again, so the model never meets one.
     file_refs = list(dict.fromkeys(file_attachment_ids))
+    title = derive_title(title_text)
 
     async def persist_user_turn() -> None:
+        if title is not None:
+            # Uncommitted until `append_batch` commits the message, so a send refused at the
+            # append leaves the chat unnamed. `IS NULL` keeps a name the citizen already gave it,
+            # and naming `updated_at` keeps the ORM's `onupdate` out: the message moves it.
+            await db.execute(
+                sa.update(Conversation)
+                .where(
+                    Conversation.id == conversation.id,
+                    Conversation.user_id == user.id,
+                    Conversation.title.is_(None),
+                )
+                .values(title=title, updated_at=Conversation.updated_at)
+            )
         await append_batch(
             db,
             user_id=user.id,
@@ -625,6 +667,7 @@ async def start_turn(
             for file in (delivery.files if delivery is not None else ())
             if file.attachment_id in sent_ids
         ],
+        title_text=body.message.text,
     )
     # `None` rather than `0` for a conversation nobody has measured — see the field's own note.
     # A brand-new chat is UNMEASURED, not empty, and the meter stays silent on the difference.

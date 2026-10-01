@@ -324,6 +324,7 @@ async def build_it(
         # a file to have been attached to. The parameter carries no default so that a route which
         # ever does carry files has to say so instead of inheriting an empty one.
         file_attachment_ids=(),
+        title_text=plan,
     )
 
     # --- ONLY NOW: the one write in the Plan chat -------------------------------------------
