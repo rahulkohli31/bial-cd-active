@@ -25,9 +25,9 @@ export function sharerName(displayName: string | null): string {
   return displayName ?? NAMELESS_COLLEAGUE
 }
 
-/** Up to two initials for the mark beside a sharer's name. Two colleagues can share both — this
- *  is decoration, never what tells them apart; the filter does that, and it matches on the id. */
-function initials(name: string): string {
+/** Up to two initials for the mark beside a person's name. Two colleagues can share both — this
+ *  is decoration, never what tells them apart. */
+export function initials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean)
   return parts.slice(0, 2).map((part) => part.charAt(0).toUpperCase()).join('') || '?'
 }

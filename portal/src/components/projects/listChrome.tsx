@@ -25,9 +25,10 @@ import {
 
 interface ViewControlsProps {
   view: View
-  density: Density
   onView: (next: View) => void
-  onDensity: (next: Density) => void
+  /** Omitted by a page whose grid has fixed columns; the density control is then not drawn. */
+  density?: Density
+  onDensity?: (next: Density) => void
 }
 
 /**
@@ -40,7 +41,7 @@ interface ViewControlsProps {
 export function ViewControls({ view, density, onView, onDensity }: ViewControlsProps): React.JSX.Element {
   return (
     <>
-      {view === 'grid' && (
+      {view === 'grid' && density !== undefined && onDensity !== undefined && (
         <ToggleGroup
           type="single"
           value={density}
