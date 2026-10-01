@@ -1397,9 +1397,10 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     //
     // The conversation row was created above, before the upload, with NO title: `deriveTitle`
     // reads the draft, and the draft is not known a round trip earlier. So the heading the board
-    // draws comes from the same place it always did — the text being sent — and the row is named
-    // by the first message the server actually accepts.
-    const derivedTitle = userSeq === 0 && projectId ? deriveTitle(partsToText(parts)) : null
+    // draws comes from the same place it always did — the text being sent — and the server names
+    // the row from the first accepted message that has words, by the same rule. Derived on every
+    // send because a first message of attachments alone has none; the route keeps the first name.
+    const derivedTitle = projectId ? deriveTitle(partsToText(parts)) : null
     // OPTIMISTIC, AND DELIBERATELY SO. A refused send leaves the row untitled, so this can name a
     // chat the citizen is being told about a refusal for in the same breath. That is the right
     // trade for a heading: it appears the moment the message is sent rather than a reply later.
