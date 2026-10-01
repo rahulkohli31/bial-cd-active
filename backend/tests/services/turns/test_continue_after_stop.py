@@ -2,8 +2,7 @@
 
 Each scenario stops a real turn through the engine, asserts the rows that were actually
 written, then sends again the way the send route does: history through `load_history`, the
-one loader, and the user's message persisted under the claim. The next turn must complete on a
-history the provider would accept.
+one loader, and the user's message persisted under the claim. The next turn must complete.
 
 pydantic-ai repairs a dangling call by itself before every request, so what the scripted model
 receives cannot prove the store's repair. The wire check is applied to what `load_history` hands

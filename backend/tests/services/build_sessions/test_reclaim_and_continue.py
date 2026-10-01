@@ -7,9 +7,8 @@ Two claims, each proved by driving a real turn through the engine and the real s
 * once a container has gone, the next message restores the workspace and continues, whatever
   gap the stored tool results have, and never throws.
 
-The sweep does not wait for tool results to be stored; it only destroys what nothing claims.
-Ordering is therefore asserted at the moment of teardown, by a container that records what was
-already durable when it was told to go, never by timing.
+The sweep does not wait for tool results to be stored, so ordering is asserted at the moment of
+teardown, by a container that records what was already durable when it was told to go.
 """
 
 from __future__ import annotations

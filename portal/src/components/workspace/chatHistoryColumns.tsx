@@ -28,6 +28,7 @@ export const CHAT_TITLE_MAX = 120
 
 const NAME_REQUIRED = 'Give the chat a name'
 const NAME_TOO_LONG = `Keep the name under ${CHAT_TITLE_MAX} characters`
+const NAME_INVALID = 'The name cannot contain line breaks or control characters'
 const RENAME_FAILED = 'Could not rename the chat. Try again.'
 
 /** What a row's menu and its rename editor call back into. */
@@ -38,6 +39,8 @@ export interface ChatRowActions {
   /** Settles once the list shows the new title; throws the server's refusal. */
   saveTitle: (chat: ChatRow, title: string) => Promise<void>
   endRename: (chat: ChatRow) => void
+  /** Reads the list again, as for a chat found to be gone. */
+  refresh: () => Promise<void>
   startDelete: (chat: ChatRow) => void
 }
 
@@ -106,6 +109,7 @@ function titleProblem(title: string): string | null {
 function renameFailure(error: unknown): string {
   if (error instanceof ApiError && error.code === 'title_required') return NAME_REQUIRED
   if (error instanceof ApiError && error.code === 'title_too_long') return NAME_TOO_LONG
+  if (error instanceof ApiError && error.code === 'title_invalid') return NAME_INVALID
   return RENAME_FAILED
 }
 
@@ -150,6 +154,11 @@ function ChatTitleEditor({ chat, actions }: { chat: ChatRow; actions: ChatRowAct
       await actions.saveTitle(chat, title)
       finish()
     } catch (caught) {
+      if (caught instanceof ApiError && caught.status === 404) {
+        await actions.refresh()
+        finish()
+        return
+      }
       setError(renameFailure(caught))
       savingRef.current = false
       setSaving(false)

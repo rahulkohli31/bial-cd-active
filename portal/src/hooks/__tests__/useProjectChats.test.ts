@@ -34,6 +34,7 @@ const NO_ACTIONS: ChatRowActions = {
   startRename: () => {},
   saveTitle: async () => {},
   endRename: () => {},
+  refresh: async () => {},
   startDelete: () => {},
 }
 

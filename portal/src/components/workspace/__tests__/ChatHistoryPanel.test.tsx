@@ -208,6 +208,34 @@ describe('the pager', () => {
     expect(chatRows()).toHaveLength(7)
   })
 
+  it('keeps the page in the address while the list failed, and shows its rows once Retry succeeds', async () => {
+    h.list.mockRejectedValueOnce(new ApiError('Internal error', 500))
+    render(
+      <MemoryRouter initialEntries={['/projects/p1/chats?page=3']}>
+        <Routes>
+          <Route
+            path="/projects/:projectId/chats"
+            element={
+              <>
+                <LivePanel />
+                <Where />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    )
+    await screen.findByText('Couldn’t load the chats')
+    expect(where()).toBe('/projects/p1/chats?page=3')
+
+    server = serverChats(23)
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await screen.findAllByTestId('chat-row')
+    expect(where()).toBe('/projects/p1/chats?page=3')
+    expect(titles()[0]).toContain('Chat 17')
+    expect(chatRows()).toHaveLength(7)
+  })
+
   it.each([
     ['one chat', 1],
     ['a full page', 8],
@@ -666,6 +694,7 @@ describe('renaming a chat in its row', () => {
   it.each([
     ['title_required', 'Give the chat a name'],
     ['title_too_long', 'Keep the name under 120 characters'],
+    ['title_invalid', 'The name cannot contain line breaks or control characters'],
   ])('reads the server refusal %s as the matching message', async (code, message) => {
     h.rename.mockRejectedValue(new ApiError('Refused', 400, code))
     await renderLive()
@@ -673,6 +702,41 @@ describe('renaming a chat in its row', () => {
     fireEvent.change(editor(), { target: { value: 'Looks fine here' } })
     fireEvent.keyDown(editor(), { key: 'Enter' })
     expect(await screen.findByText(message)).toBeTruthy()
+  })
+
+  it('a chat gone before the rename lands closes the editor and reads the list again', async () => {
+    h.rename.mockImplementation(async (id: string) => {
+      server = server.filter((chat) => chat.id !== id)
+      throw new ApiError('Not found', 404)
+    })
+    await renderLive()
+    await startRename('c2')
+    fireEvent.change(editor(), { target: { value: 'Too late' } })
+    fireEvent.keyDown(editor(), { key: 'Enter' })
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Chat name' })).toBeNull())
+    expect(h.list).toHaveBeenCalledTimes(2)
+    expect(chatRows()).toHaveLength(4)
+    expect(screen.queryByText('Could not rename the chat. Try again.')).toBeNull()
+  })
+
+  it('a rename that settles after another row\'s editor opened leaves that editor open', async () => {
+    const held = deferred<void>()
+    h.rename.mockImplementation(async (id: string, title: string) => {
+      await held.promise
+      server = server.map((chat) => (chat.id === id ? { ...chat, title } : chat))
+    })
+    await renderLive()
+    await startRename('c1')
+    fireEvent.change(editor(), { target: { value: 'First' } })
+    fireEvent.keyDown(editor(), { key: 'Enter' })
+    await startRename('c2')
+    fireEvent.change(editor(), { target: { value: 'Second, still typing' } })
+
+    await act(async () => held.resolve())
+    await waitFor(() => expect(rowOf('c1').textContent).toContain('First'))
+    expect(editor().value).toBe('Second, still typing')
+    expect(rowOf('c2').className).toMatch(/\bbg-canvas-savedirty\b/)
   })
 
   it('typing after a refusal brings the hint back', async () => {

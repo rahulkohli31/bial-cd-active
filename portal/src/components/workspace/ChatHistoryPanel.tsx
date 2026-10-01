@@ -110,6 +110,9 @@ export default function ChatHistoryPanel({ projectId, chats }: ChatHistoryPanelP
   const focusNext = useRef<{ menu: string | null } | null>(null)
 
   const { refresh } = chats
+  // The editor that is open now, which a save that settles late has to be compared against.
+  const editingRef = useRef(editingId)
+  editingRef.current = editingId
   const actions = useMemo<ChatRowActions>(
     () => ({
       editingId,
@@ -118,7 +121,9 @@ export default function ChatHistoryPanel({ projectId, chats }: ChatHistoryPanelP
         await renameConversation(chat.id, title)
         await refresh()
       },
+      refresh,
       endRename: (chat) => {
+        if (editingRef.current !== chat.id) return
         focusNext.current = { menu: chat.id }
         setEditingId(null)
       },
@@ -148,8 +153,8 @@ export default function ChatHistoryPanel({ projectId, chats }: ChatHistoryPanelP
   const page = Math.min(query.page, pageCount)
 
   useEffect(() => {
-    if (!chats.loading && query.page > pageCount) commit({ page: pageCount }, 'replace')
-  }, [chats.loading, query.page, pageCount, commit])
+    if (!chats.loading && !chats.failed && query.page > pageCount) commit({ page: pageCount }, 'replace')
+  }, [chats.loading, chats.failed, query.page, pageCount, commit])
 
   // Read during the first render, while whatever opened the list still holds focus.
   const [opener] = useState(() => document.activeElement)
