@@ -112,6 +112,7 @@ const deployment = (publishState: PublishState = 'draft', over: Partial<Deployme
   startedAt: null,
   finishedAt: null,
   unpublishedAt: null,
+  liveUrl: null,
   approval: null,
   publishState,
   approvedRetryCommit: null,

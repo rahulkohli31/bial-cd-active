@@ -117,6 +117,12 @@ export interface DeploymentView {
    */
   unpublishedAt: string | null
   /**
+   * Where the app is serving now: null exactly when the projects list says it is not
+   * serving. Unlike `url` it does not follow the latest attempt, so a running or failed
+   * republish leaves it in place.
+   */
+  liveUrl: string | null
+  /**
    * The APP's approval lifecycle, not the deployment's. Null has exactly one
    * meaning — this project has no app row yet — never "we couldn't read it".
    */
@@ -358,6 +364,7 @@ function toDeploymentView(body: unknown): DeploymentView {
     startedAt: optionalString(body.startedAt),
     finishedAt: optionalString(body.finishedAt),
     unpublishedAt: optionalString(body.unpublishedAt),
+    liveUrl: optionalString(body.liveUrl),
     approval: toApprovalState(body.approval),
     publishState: toPublishState(body.publishState),
     approvedRetryCommit: optionalString(body.approvedRetryCommit),

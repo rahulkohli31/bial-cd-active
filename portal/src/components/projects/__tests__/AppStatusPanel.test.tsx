@@ -70,6 +70,7 @@ const view = (publishState: PublishState, over: Partial<DeploymentView> = {}): D
   startedAt: null,
   finishedAt: null,
   unpublishedAt: null,
+  liveUrl: null,
   approval: null,
   publishState,
   approvedRetryCommit: null,
