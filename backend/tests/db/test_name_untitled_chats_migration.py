@@ -200,3 +200,22 @@ async def test_untitled_chats_are_named_and_nothing_else_moves(db_session, monke
         generic.id: "Summarise the belt fault log",
     }
     assert {updated_at for _, updated_at in after.values()} == {_LONG_AGO}
+
+
+async def test_a_chat_named_after_the_walk_read_it_keeps_that_name(db_session) -> None:
+    """The write re-checks `title IS NULL`: a send or a rename that lands between the walk's read
+    and its write wins over the derived name."""
+    user = await UserFactory.create(db_session)
+    chat = await _chat(
+        db_session, user, (_prompt("derived from the prompt"), {}), title="Renamed meanwhile"
+    )
+    connection = await db_session.connection()
+
+    await connection.execute(
+        _REVISION._NAME, [{"id": chat.id, "title": "derived from the prompt"}]
+    )
+
+    title = await db_session.scalar(
+        sa.select(Conversation.title).where(Conversation.id == chat.id)
+    )
+    assert title == "Renamed meanwhile"
