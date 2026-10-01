@@ -113,6 +113,7 @@ function deployment(publishState: PublishState, over: Partial<DeploymentView> = 
     startedAt: null,
     finishedAt: null,
     unpublishedAt: null,
+    liveUrl: null,
     approval: null,
     publishState,
     approvedRetryCommit: null,

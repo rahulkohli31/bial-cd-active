@@ -9,9 +9,10 @@ POINTER at the last build session touching the app — never reassigned (SPA-rou
 creation) — tool gating derives from this column alone, never the client. `project_id` is present
 for exactly the two kinds that build an application; a `generic` chat is the citizen's, not a
 project's, and a CHECK constraint holds that biconditional at the database.
-`title`/`context` are SPA-owned mutable fields; legacy `code` JSONB was dropped in migration 0024
-(truth: the build snapshots — `app_registry.current_code` followed it in migration 0039, once
-its one remaining reader was deleted). Ownership is `user_id` — every read scoped by it.
+`title` is set from the first message and renamed by the SPA; `context` is SPA-owned. Legacy
+`code` JSONB was dropped in migration 0024 (truth: the build snapshots —
+`app_registry.current_code` followed it in migration 0039, once its one remaining reader was
+deleted). Ownership is `user_id` — every read scoped by it.
 """
 
 from __future__ import annotations
@@ -69,9 +70,11 @@ class Conversation(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base
     __tablename__ = "conversations"
 
     # `updated_at` (from `TimestampMixin`) reads as "last touched by a person" and is kept by
-    # TWO writers, not one: the ORM `onupdate` here covers a title/context PATCH, and migration
+    # TWO writers, not one: the column's `onupdate` covers a context PATCH, and migration
     # 0045's statement-level trigger on `messages` covers a new message — the trigger writes
-    # behind SQLAlchemy, so a session already holding this row is stale until refreshed.
+    # behind SQLAlchemy, so a session already holding this row is stale until refreshed. A
+    # rename is not activity: the PATCH route names `updated_at` in the SET whenever it writes
+    # no context, so the `onupdate` never fires for it.
     __table_args__ = (
         sa.CheckConstraint(PARENTAGE_SHAPE, name="ck_conversations_parentage"),
         # Created by migration 0046 for the retention pass's scan by age.
@@ -93,8 +96,8 @@ class Conversation(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base
     # no server default — a chat whose kind the creator did not choose is a programming error,
     # not a chat that quietly becomes one of them (fail-first).
     kind: Mapped[ChatKind] = mapped_column(chat_kind_enum, nullable=False)
-    # Derived client-side from the first message; mutable via PATCH. TEXT (short in
-    # practice — the SPA caps it ~40 chars — but unbounded here).
+    # Named by the send route from the first accepted message's text, renamed through PATCH.
+    # TEXT, unbounded here; both writers keep it short.
     title: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     # An opaque SPA-owned bag: stored verbatim, never inspected by the server, and settable
     # through `POST /conversations` and the header PATCH.

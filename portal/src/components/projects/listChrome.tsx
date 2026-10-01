@@ -25,9 +25,10 @@ import {
 
 interface ViewControlsProps {
   view: View
-  density: Density
   onView: (next: View) => void
-  onDensity: (next: Density) => void
+  /** Omitted by a page whose grid has fixed columns; the density control is then not drawn. */
+  density?: Density
+  onDensity?: (next: Density) => void
 }
 
 /**
@@ -40,7 +41,7 @@ interface ViewControlsProps {
 export function ViewControls({ view, density, onView, onDensity }: ViewControlsProps): React.JSX.Element {
   return (
     <>
-      {view === 'grid' && (
+      {view === 'grid' && density !== undefined && onDensity !== undefined && (
         <ToggleGroup
           type="single"
           value={density}
@@ -105,12 +106,15 @@ interface ListPagerProps {
    *  stay live while a page is in flight. */
   page: number
   /** What the rows on screen ANSWER to. A page that failed must not mark its own number active
-   *  over the rows that succeeded. */
-  activePage: number
+   *  over the rows that succeeded. Defaults to `page`. */
+  activePage?: number
   totalPages: number
   onGo: (page: number) => void
   /** Names the landmark, so a screen reader on a page with two pagers can tell them apart. */
   label: string
+  /** The narrow-column form: no jumps to the ends, three numbers where they fit, and "a of b"
+   *  in their place below the `sm` width. */
+  compact?: boolean
 }
 
 /**
@@ -126,63 +130,82 @@ interface ListPagerProps {
  * The edges are `aria-disabled` and pointer-inert rather than `disabled`, which is this portal's
  * rule throughout — a disabled control throws focus to the document body.
  */
-export function ListPager({ page, activePage, totalPages, onGo, label }: ListPagerProps): React.JSX.Element {
+export function ListPager({
+  page,
+  activePage = page,
+  totalPages,
+  onGo,
+  label,
+  compact = false,
+}: ListPagerProps): React.JSX.Element {
   const pageWindow = useMemo(() => {
-    const span = Math.min(5, Math.max(totalPages, 1))
+    const span = Math.min(compact ? 3 : 5, Math.max(totalPages, 1))
     // Centre on the current page, then clamp so the window never runs past either end.
     const first = Math.min(Math.max(page - Math.floor(span / 2), 1), Math.max(totalPages - span + 1, 1))
     return Array.from({ length: span }, (_, i) => first + i)
-  }, [page, totalPages])
+  }, [page, totalPages, compact])
 
   const atFirst = page <= 1
   const atLast = page >= totalPages
   const inert = 'pointer-events-none opacity-40'
+  // The compact steps draw only their chevron; the word stays for a screen reader.
+  const step = compact ? 'px-2 [&>span]:sr-only' : ''
+  const edge = (at: boolean) => `${step} ${at ? inert : ''}`.trim() || undefined
 
   return (
     <Pagination className="mx-0 w-auto" aria-label={label}>
-      <PaginationContent className="flex-wrap justify-end">
+      <PaginationContent className={compact ? 'justify-end' : 'flex-wrap justify-end'}>
         {/* Jump-to-first/last: at six pages the difference is four clicks or one. */}
-        <PaginationItem>
-          <PaginationLink
-            aria-label="First page"
-            aria-disabled={atFirst}
-            onClick={() => !atFirst && onGo(1)}
-            className={atFirst ? inert : undefined}
-          >
-            <ChevronsLeft size={15} />
-          </PaginationLink>
-        </PaginationItem>
+        {!compact && (
+          <PaginationItem>
+            <PaginationLink
+              aria-label="First page"
+              aria-disabled={atFirst}
+              onClick={() => !atFirst && onGo(1)}
+              className={atFirst ? inert : undefined}
+            >
+              <ChevronsLeft size={15} />
+            </PaginationLink>
+          </PaginationItem>
+        )}
         <PaginationItem>
           <PaginationPrevious
             aria-disabled={atFirst}
             onClick={() => !atFirst && onGo(page - 1)}
-            className={atFirst ? inert : undefined}
+            className={edge(atFirst)}
           />
         </PaginationItem>
         {pageWindow.map((n) => (
-          <PaginationItem key={n}>
+          <PaginationItem key={n} className={compact ? 'hidden sm:list-item' : undefined}>
             <PaginationLink isActive={n === activePage} onClick={() => onGo(n)}>
               {n}
             </PaginationLink>
           </PaginationItem>
         ))}
+        {compact && (
+          <PaginationItem className="whitespace-nowrap px-1 text-xs tabular-nums text-neutral sm:hidden">
+            {activePage} of {Math.max(totalPages, 1)}
+          </PaginationItem>
+        )}
         <PaginationItem>
           <PaginationNext
             aria-disabled={atLast}
             onClick={() => !atLast && onGo(page + 1)}
-            className={atLast ? inert : undefined}
+            className={edge(atLast)}
           />
         </PaginationItem>
-        <PaginationItem>
-          <PaginationLink
-            aria-label="Last page"
-            aria-disabled={atLast}
-            onClick={() => !atLast && onGo(totalPages)}
-            className={atLast ? inert : undefined}
-          >
-            <ChevronsRight size={15} />
-          </PaginationLink>
-        </PaginationItem>
+        {!compact && (
+          <PaginationItem>
+            <PaginationLink
+              aria-label="Last page"
+              aria-disabled={atLast}
+              onClick={() => !atLast && onGo(totalPages)}
+              className={atLast ? inert : undefined}
+            >
+              <ChevronsRight size={15} />
+            </PaginationLink>
+          </PaginationItem>
+        )}
       </PaginationContent>
     </Pagination>
   )

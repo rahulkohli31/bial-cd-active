@@ -2,10 +2,10 @@
 
 WHY THIS EXISTS: "live" is a deployment fact, not a lifecycle one — `AppStatus.APPROVED` means
 an admin said yes, not that anything is serving. Per the client: "we have live = deployed /
-published — if the application is published and has url we will show that status." THREE
-SURFACES read this and must never drift — the marketplace catalog, the projects list's status
-column, and the dashboard's "In production" count — or the dashboard says three are live while
-the list beneath it shows two.
+published — if the application is published and has url we will show that status." Every
+surface reads this and must never drift — the marketplace catalog, the projects list's status
+column, the dashboard's "Live applications" count and the deployment read's live address — or
+the dashboard says three are live while the list beneath it shows two.
 
 `deployments` is APPEND-ONLY (one row per ATTEMPT), so liveness is a COLLAPSE of two: the
 newest SUCCEEDED attempt with a URL (`last_success`), and the newest attempt bearing a takedown
@@ -91,7 +91,7 @@ def live_app_ids(*, owner_user_id: uuid.UUID | None = None) -> sa.Select[Any]:
         # touching `unpublished_at` at all. A purely deployment-side predicate therefore
         # calls a kill-switched app live: it still has a newest-succeeded row with a URL and
         # no takedown stamp. The row would render the green Live badge (serving is checked
-        # first, so `Switched off` is unreachable), and "In production" would count an app
+        # first, so `Switched off` is unreachable), and "Live applications" would count an app
         # an administrator had already killed.
         #
         # So liveness reads BOTH sides of the same question. These are the predicates the

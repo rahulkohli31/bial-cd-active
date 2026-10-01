@@ -84,6 +84,7 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # the publish classification classes and their one policy row, seeded with the launch set,
     # and the review's class-definition fingerprint column. 0050_user_has_signed_in adds the
     # marker that tells a user created from the directory apart from one who has signed in.
+    # 0051_name_untitled_chats is data only: it names every untitled chat after its first message.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0050_user_has_signed_in"]
+    assert heads == ["0051_name_untitled_chats"]

@@ -178,20 +178,21 @@ const _paneViewIsASubsetOfLivePreviewProps: UnacceptedPaneProps extends never ? 
 void _paneViewIsASubsetOfLivePreviewProps
 
 /**
+ * WHICH RAIL IS SHOWING, and it is DERIVED FROM THE ADDRESS rather than chosen by anybody:
+ * `details` on a project address, `history` on its chat list, `conversation` on a chat. Each is a
+ * route of its own, never a `?rail=` query, so Back and a reload land on the same rail.
+ */
+export type RailMode = 'details' | 'history' | 'conversation'
+
+/**
  * The rail's slot — WHICH RAIL IS SHOWING, and how the shell is laying it out.
  *
- * `WorkspaceShell` derives the mode from the address and publishes it here; `WorkspaceRail` reads
- * it. Nothing writes it from below.
+ * `WorkspaceShell` derives the mode from the address and publishes it here; the toolbar reads it.
+ * Nothing writes it from below.
  */
 export interface RailSlot {
-  /**
-   * WHICH RAIL IS SHOWING, and it is DERIVED FROM THE ADDRESS rather than chosen by anybody:
-   * `details` on a project address, `conversation` on a chat one.
-   *
-   * There is no route for it and no `?rail=` query param, deliberately — a query param would make
-   * a rail mode a shareable link, which is a different feature.
-   */
-  mode: string | null
+  /** `null` until the shell has published one. */
+  mode: RailMode | null
   /**
    * Below the stacking threshold the two columns stack instead of sitting side by side.
    *

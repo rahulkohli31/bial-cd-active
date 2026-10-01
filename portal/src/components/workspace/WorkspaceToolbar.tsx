@@ -17,15 +17,16 @@
  * Discard read their values from the `save` cell and their actions from `actions` at press time, so
  * a handler whose identity changes every render costs nothing and no stale closure is reachable.
  *
- * NOT HERE: the history-drawer control. Four boards draw its icon, but the drawer is a later
- * feature by the owner's decision — an affordance for a drawer nobody can open is worse than
- * no affordance, so it is neither built nor left as a disabled stub.
+ * History opens the application's chat list and is drawn pressed while that list, or a chat
+ * opened from it, is showing; both facts are read from the address.
  */
 import { useMemo, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import {
   ChevronLeft,
   ChevronRight,
   ExternalLink,
+  History,
   MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
@@ -48,7 +49,9 @@ import { NavMenuButton, useNavReveal } from '../layout/NavReveal'
 import { BusyGlyph, formatElapsed, useElapsedSeconds, ELAPSED_AFTER_MS } from '../ui/Waiting'
 import { usePublishState } from '../../hooks/usePublishState'
 import { chatKindFor } from '../../utils/chatKind'
+import { chatHistoryPath, chatListOpenedFrom } from '../../utils/chatHistoryAddress'
 import DiscardChangesDialog from './DiscardChangesDialog'
+import { UNTITLED_CHAT_NAME } from './chatHistoryColumns'
 import { useRailSlot, useWorkspaceActions, useWorkspaceAddress, useWorkspaceHeading, useWorkspacePaneVisible, useWorkspaceSave } from './workspaceChannel'
 import type { SaveSlot, WorkspaceActions } from './workspaceChannel'
 import { DEVICES, type DeviceName } from './devices'
@@ -86,7 +89,8 @@ export default function WorkspaceToolbar({
   // then re-shaped under the reader once the fetch landed and threw anyone who pressed back
   // right out of the project they were in. `rail.mode` is derived from the pathname alone, so
   // it is right on the first frame; the kind still decides only what the pill says.
-  const isChat = useRailSlot().mode === 'conversation'
+  const mode = useRailSlot().mode
+  const isChat = mode === 'conversation'
   const kind = useMemo(() => (heading.chatKind ? chatKindFor(heading.chatKind) : null), [heading.chatKind])
   // Capitalised so JSX reads it as a component rather than as an intrinsic element. `null` is a
   // kind whose pill is the word alone — see `pillIcon`.
@@ -100,7 +104,12 @@ export default function WorkspaceToolbar({
 
   /** The same predicate `WorkspaceShell`'s back handler uses, so the label cannot promise a
    *  destination the press does not go to. */
-  const backToProject = isChat && heading.projectId !== null
+  const backToProject = mode !== null && mode !== 'details' && heading.projectId !== null
+
+  const historyProjectId = heading.projectId
+  const navigate = useNavigate()
+  const routerState: unknown = useLocation().state
+  const historyPressed = mode === 'history' || (isChat && chatListOpenedFrom(routerState) !== null)
 
   // Only when there is something to point at. The device widths and the new-tab link both describe
   // a framed app, and drawing them over an empty pane offers controls that cannot do anything.
@@ -236,15 +245,11 @@ export default function WorkspaceToolbar({
                where the squeeze does. */
             className="min-w-0 truncate text-[15px] font-extrabold tracking-[-0.25px] text-primary-900 narrow:min-w-[9rem]"
           >
-            {/* A CHAT WITH NO TITLE YET IS THE ORDINARY CASE, not an error: the row is created by
-                the first send and its title is derived from that message. Naming the kind is more
-                use than an empty slot or a spinner.
-
-                WITH NO KIND EITHER, the slot stays empty for that one fetch. "New chat" would be a
-                claim — this chat is brand new — about a chat that is far more often an existing
-                one still loading, and the row holds its 54px height regardless, so nothing shifts
-                by waiting the moment out. */}
-            {heading.chatTitle || (kind ? `New ${kind.word.toLowerCase()}` : '')}
+            {/* A chat with no title yet is the ordinary case: its first message with words names
+                it. Until the chat has resolved (no kind yet) the slot stays empty, because "New
+                chat" would be a claim about what is far more often an existing chat still loading;
+                the row holds its height, so nothing shifts. */}
+            {heading.chatTitle || (kind ? UNTITLED_CHAT_NAME : '')}
           </h1>
         </>
       ) : (
@@ -336,6 +341,24 @@ export default function WorkspaceToolbar({
 
         <DiscardControl save={save} readActions={readActions} projectId={heading.projectId} />
         <SaveControl save={save} readActions={readActions} />
+
+        {/* Offered on every screen of a loaded application, chats or none: with none it opens the
+            list's "No chats yet". */}
+        {historyProjectId !== null && heading.projectName !== null && (
+          <button
+            type="button"
+            data-testid="toolbar-history"
+            aria-pressed={historyPressed}
+            aria-label="Chat history"
+            title="Chat history"
+            onClick={() => {
+              navigate(historyPressed ? `/projects/${historyProjectId}` : chatHistoryPath(historyProjectId))
+            }}
+            className="inline-flex h-7 w-[30px] flex-shrink-0 items-center justify-center rounded-lg text-neutral transition hover:bg-bial-bg hover:text-primary aria-pressed:bg-primary/10 aria-pressed:text-primary aria-pressed:ring-1 aria-pressed:ring-inset aria-pressed:ring-primary/30 narrow:min-h-[44px] narrow:min-w-[44px]"
+          >
+            <History size={16} aria-hidden="true" />
+          </button>
+        )}
 
         {/* THE TOKEN COUNTER FOLLOWS THE CITIZEN INTO THE WORKSPACE, which is the one screen
             where tokens are actually spent. It lives in the navigation panel, and the panel is

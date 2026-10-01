@@ -42,7 +42,21 @@ function overlaps(a: { x: number; y: number; width: number; height: number }, b:
   return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y
 }
 
-async function openFirstProject(page: Page) {
+/**
+ * Opens one of the user's applications that serves an app, so the toolbar carries the app's own
+ * controls (Save among them); a never-built application has none to measure. Without such an
+ * application, the first one in the list.
+ */
+async function openServingProject(page: Page) {
+  const res = await page.request.get('/api/projects?limit=50')
+  const items = res.ok()
+    ? (((await res.json()) as { items?: Array<{ id: string; access: string; isServing: boolean }> }).items ?? [])
+    : []
+  const serving = items.find((p) => p.access !== 'shared' && p.isServing)
+  if (serving) {
+    await page.goto(`/projects/${serving.id}`)
+    return serving.id
+  }
   await page.goto('/projects')
   // BOTH VIEWS, because the landing screen remembers which one you last chose (`projectsListMemory`)
   // and a run inherits whatever that was. `project-card` and `project-row` are the two roots, and
@@ -63,7 +77,7 @@ test.describe('the workspace toolbar at the declared 360px minimum', () => {
   test.use({ viewport: NARROW })
 
   test('every pressable control presents at least 44x44, and the glyphs did not grow to do it', async ({ page }) => {
-    await openFirstProject(page)
+    await openServingProject(page)
 
     const toolbar = page.getByTestId('workspace-toolbar')
     await toolbar.waitFor({ state: 'visible', timeout: 30_000 })
@@ -71,8 +85,10 @@ test.describe('the workspace toolbar at the declared 360px minimum', () => {
     // NEGATIVE CONTROL. Without this, a workspace that rendered an empty toolbar passes every
     // measurement below by having nothing to measure.
     const occupants = toolbar.locator('button, a, [role="button"]')
-    const found = await occupants.count()
-    expect(found, 'the toolbar rendered no pressable controls at all — the measurements below would be vacuous').toBeGreaterThanOrEqual(5)
+    // The application's own controls arrive after the project loads, so wait for them rather than count the first frame.
+    await expect
+      .poll(() => occupants.count(), { message: 'the toolbar rendered no pressable controls at all — the measurements below would be vacuous', timeout: 20_000 })
+      .toBeGreaterThanOrEqual(5)
 
     // 44x44 is the floor, not the target: the controls are padded up to it, so `>=` is the
     // honest comparison. A control absent at this width is skipped rather than failed — the rail
@@ -120,8 +136,43 @@ test.describe('the workspace toolbar at the declared 360px minimum', () => {
     }
   })
 
+  test('the History button is a 44x44 target that overlaps neither Save nor the framed app', async ({ page }) => {
+    await openServingProject(page)
+
+    const toolbar = page.getByTestId('workspace-toolbar')
+    await toolbar.waitFor({ state: 'visible', timeout: 30_000 })
+
+    // NEGATIVE CONTROL: the button and the control it must not overlap both rendered. A toolbar
+    // that lost either would pass every comparison below by having nothing to compare.
+    const history = page.getByTestId('toolbar-history')
+    const save = page.getByTestId('save-project')
+    await expect(history, 'the History button is not in the toolbar').toBeAttached()
+    await expect(save, 'Save is not in the toolbar — the overlap check below would be vacuous').toBeAttached()
+
+    const historyBox = await rect(history, 'the History button')
+    const saveBox = await rect(save, 'Save')
+    expect(historyBox.width, `History is ${historyBox.width}px wide`).toBeGreaterThanOrEqual(44)
+    expect(historyBox.height, `History is ${historyBox.height}px tall`).toBeGreaterThanOrEqual(44)
+
+    expect(historyBox.x, 'History is not after Save').toBeGreaterThanOrEqual(saveBox.x + saveBox.width - 1)
+    expect(overlaps(historyBox, saveBox), 'the History button overlaps Save').toBe(false)
+
+    // The pane is measured through its own testid, so a stopped app, whose pane has no frame,
+    // still has a rectangle to be clear of.
+    const pane = page.getByTestId('app-pane-region')
+    if ((await pane.count()) > 0 && (await pane.isVisible())) {
+      const paneBox = await rect(pane, 'the app pane')
+      expect(overlaps(historyBox, paneBox), 'the History button overlaps the app pane').toBe(false)
+    }
+    const frame = page.locator('iframe[title="App Preview"]')
+    if ((await frame.count()) > 0) {
+      const frameBox = await rect(frame.first(), 'the app frame')
+      expect(overlaps(historyBox, frameBox), 'the History button overlaps the framed app').toBe(false)
+    }
+  })
+
   test('the row scrolls, so nothing is stranded off-screen with no way to reach it', async ({ page }) => {
-    await openFirstProject(page)
+    await openServingProject(page)
 
     const toolbar = page.getByTestId('workspace-toolbar')
     await toolbar.waitFor({ state: 'visible', timeout: 30_000 })
@@ -157,7 +208,7 @@ test.describe('the workspace toolbar above the stacking threshold', () => {
   test.use({ viewport: WIDE })
 
   test('the desktop row is untouched by the narrow-width work', async ({ page }) => {
-    await openFirstProject(page)
+    await openServingProject(page)
 
     const toolbar = page.getByTestId('workspace-toolbar')
     await toolbar.waitFor({ state: 'visible', timeout: 30_000 })
@@ -199,7 +250,7 @@ test.describe('the platform draws no chrome over the citizen’s own app', () =>
    * establishes the frame is revealed and uncovered FIRST, and skips honestly if it is not.
    */
   test('no platform-owned element overlaps a control inside the framed app', async ({ page }) => {
-    await openFirstProject(page)
+    await openServingProject(page)
 
     const frame = page.locator('iframe[title="App Preview"]')
     if ((await frame.count()) === 0) {
@@ -287,7 +338,7 @@ test.describe('a reviewer’s note never pushes the review action out of view', 
    * nothing about which one moved.
    */
   test('a 1,000-character rejection note leaves the review action clickable', async ({ page }) => {
-    await openFirstProject(page)
+    await openServingProject(page)
 
     const note = page.getByTestId('status-row-rejection-note')
     const action = page.getByTestId('status-action')

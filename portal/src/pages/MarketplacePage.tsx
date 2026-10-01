@@ -13,6 +13,8 @@ import { ExternalLink, Search, Store } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type React from 'react'
 
+import MarketplaceListRows from '../components/projects/MarketplaceListRows'
+import { ViewControls } from '../components/projects/listChrome'
 import {
   Pagination,
   PaginationContent,
@@ -29,6 +31,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '../components/ui/select'
+import { useListView } from '../hooks/useListView'
 import {
   DEFAULT_PAGE_SIZE,
   PAGE_SIZES,
@@ -107,6 +110,7 @@ function EntryCard({ entry }: { entry: MarketplaceEntry }): React.JSX.Element {
 }
 
 export default function MarketplacePage(): React.JSX.Element {
+  const { view, setView } = useListView()
   const [query, setQuery] = useState('')
   // The COMMITTED filter text — what actually produced the rows on screen. Distinct from
   // `query`, which runs ahead by the debounce window. Never read inside the dispatcher's
@@ -235,6 +239,7 @@ export default function MarketplacePage(): React.JSX.Element {
   // <body>, and the layout shifted. They stay mounted and are marked `aria-busy` instead.
   const showSizer = total > PAGE_SIZES[0]
   const showPages = totalPages > 1
+  const sizerLabel = view === 'list' ? 'Rows per page' : 'Cards per page'
 
   return (
     // The gradient ground is the platform's, not this page's — which is why it is painted here
@@ -303,6 +308,10 @@ export default function MarketplacePage(): React.JSX.Element {
               </SelectContent>
             </Select>
           </div>
+
+          <div className="flex">
+            <ViewControls view={view} onView={setView} />
+          </div>
         </div>
 
         {/* Said plainly while searching: the sort control stays usable, but relevance wins,
@@ -333,16 +342,27 @@ export default function MarketplacePage(): React.JSX.Element {
           </div>
         )}
 
-        {items.length > 0 && (
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {items.map((entry, i) => (
-              // Index-qualified: the server now guarantees one row per app, but a future
-              // server-side duplicate should degrade to a visible duplicate card rather than
-              // a React reconciliation hazard.
-              <EntryCard key={`${entry.url}-${i}`} entry={entry} />
-            ))}
-          </div>
+        {/* Not gated on `loading`: it counts the rows still on screen, and hiding it mid-fetch
+            would jump them. No rows means the empty state carries the count instead. */}
+        {total > 0 && items.length > 0 && (
+          <p className="text-xs text-neutral/70 -mt-2">
+            {total} published {total === 1 ? 'app' : 'apps'}
+          </p>
         )}
+
+        {items.length > 0 &&
+          (view === 'list' ? (
+            <MarketplaceListRows entries={items} />
+          ) : (
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {items.map((entry, i) => (
+                // Index-qualified: the server now guarantees one row per app, but a future
+                // server-side duplicate should degrade to a visible duplicate card rather than
+                // a React reconciliation hazard.
+                <EntryCard key={`${entry.url}-${i}`} entry={entry} />
+              ))}
+            </div>
+          ))}
 
         {/* `!error` matters: on a failed first load `loading` is false and `items` is empty,
             so without it this renders "Nothing has been published yet" directly beneath the
@@ -374,11 +394,16 @@ export default function MarketplacePage(): React.JSX.Element {
 
         {loading && <p className="text-sm text-neutral py-4 text-center">Loading…</p>}
 
+        {/* `mt-auto` pins the pager to the foot of the page whatever the row count or page size,
+            so it must stay the column's last child. */}
         {(showSizer || showPages) && (
-          <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-2">
+          <div
+            data-testid="marketplace-pager"
+            className="mt-auto flex flex-col sm:flex-row items-center justify-between gap-4 pt-2"
+          >
             {showSizer && (
               <div className="flex items-center gap-2 text-xs text-neutral whitespace-nowrap">
-                Rows per page
+                {sizerLabel}
                 <Select
                   value={String(pageSize)}
                   onValueChange={(value: string) => {
@@ -389,7 +414,7 @@ export default function MarketplacePage(): React.JSX.Element {
                 >
                   <SelectTrigger
                     data-testid="marketplace-page-size"
-                    aria-label="Rows per page"
+                    aria-label={sizerLabel}
                     className="w-[72px] py-1.5"
                   >
                     <SelectValue />
@@ -446,15 +471,6 @@ export default function MarketplacePage(): React.JSX.Element {
               </Pagination>
             )}
           </div>
-        )}
-
-        {/* `items.length > 0`: without it this count renders directly beneath the empty
-            state, so the page said "Nothing has been published yet" above "5 published
-            apps". The disagreement branch above now carries the count in that case. */}
-        {total > 0 && !loading && items.length > 0 && (
-          <p className="text-xs text-neutral/70 text-center">
-            {total} published {total === 1 ? 'app' : 'apps'}
-          </p>
         )}
       </main>
     </div>

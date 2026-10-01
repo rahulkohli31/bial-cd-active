@@ -16,13 +16,29 @@
  * Use `pickSelect`.
  */
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 
 import MarketplacePage from '../MarketplacePage'
+import ProjectsPage from '../ProjectsPage'
+import SharedApplicationsPage from '../SharedApplicationsPage'
+import { storeView } from '../../utils/listView'
 import type { MarketplacePage as Page } from '../../utils/marketplaceApi'
 
-const h = vi.hoisted(() => ({ listMarketplace: vi.fn() }))
+const h = vi.hoisted(() => ({
+  listMarketplace: vi.fn(),
+  listProjects: vi.fn(),
+  listProjectCounts: vi.fn(),
+  listSharedWithMe: vi.fn(),
+}))
+vi.mock('../../utils/projectApi', () => ({
+  listProjects: h.listProjects,
+  listProjectCounts: h.listProjectCounts,
+}))
+vi.mock('../../utils/sharingApi', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  listSharedWithMe: h.listSharedWithMe,
+}))
 vi.mock('../../utils/marketplaceApi', async (importOriginal) => {
   // Only the network call is faked. `PAGE_SIZES`/`DEFAULT_PAGE_SIZE` are real constants the
   // component renders from, so stubbing the whole module would silently empty the
@@ -58,6 +74,13 @@ const renderPage = () =>
 /** The args of the most recent request — what the page actually asked the server for. */
 const lastCall = () => h.listMarketplace.mock.calls.at(-1)?.[0]
 
+/** `mt-auto` pins the pager to the page foot only while it is the column's last child. */
+function expectPagerPinned() {
+  const pager = screen.getByTestId('marketplace-pager')
+  expect(pager.parentElement?.lastElementChild).toBe(pager)
+  expect(pager.classList.contains('mt-auto')).toBe(true)
+}
+
 /** Opens a <Select> trigger and picks the option with this text. */
 async function pickSelect(triggerTestId: string, optionText: string) {
   fireEvent.click(screen.getByTestId(triggerTestId))
@@ -66,6 +89,7 @@ async function pickSelect(triggerTestId: string, optionText: string) {
 
 afterEach(cleanup)
 beforeEach(() => {
+  localStorage.clear()
   h.listMarketplace.mockReset()
   // jsdom doesn't implement these; Radix's <Select> calls them on open/scroll. `src/test-setup.ts`
   // now defines all four globally, so these four lines are redundant rather than load-bearing —
@@ -77,13 +101,15 @@ beforeEach(() => {
   Element.prototype.setPointerCapture = vi.fn()
 })
 
-describe('MarketplacePage', () => {
+describe.each(['list', 'grid'] as const)('MarketplacePage in the %s view', (view) => {
+  beforeEach(() => storeView(view))
+
   it('shows an app built by someone else, naming the builder', async () => {
     h.listMarketplace.mockResolvedValue(page())
     renderPage()
 
     expect(await screen.findByText('Baggage Belt Faults', {}, { timeout: 5000 })).toBeTruthy()
-    expect(screen.getByText(/Built by Priya Builder/)).toBeTruthy()
+    expect(within(screen.getByTestId('marketplace-entry')).getByText(/Priya Builder/)).toBeTruthy()
     expect(screen.getByTestId('marketplace-open').getAttribute('href')).toBe(
       'https://pub-abc.example/',
     )
@@ -494,5 +520,186 @@ describe('MarketplacePage', () => {
 
     await waitFor(() => expect(screen.queryByText('STALE PAGE TWO')).toBeNull())
     expect(screen.getByText('FRESH PAGE THREE')).toBeTruthy()
+  })
+
+  it('keeps an entry with no description and no builder whole', async () => {
+    h.listMarketplace.mockResolvedValue(
+      page({ items: [entry({ description: null, builderDisplayName: null })] }),
+    )
+    renderPage()
+
+    const row = await screen.findByTestId('marketplace-entry', {}, { timeout: 5000 })
+    expect(within(row).getByText('Baggage Belt Faults')).toBeTruthy()
+    expect(within(row).getByText(/no description yet/i)).toBeTruthy()
+    expect(within(row).getByTestId('marketplace-open')).toBeTruthy()
+  })
+
+  it('opens the app at its address in a new tab, with the external-link mark', async () => {
+    h.listMarketplace.mockResolvedValue(page())
+    renderPage()
+
+    const link = await screen.findByTestId('marketplace-open', {}, { timeout: 5000 })
+    expect(link.getAttribute('href')).toBe('https://pub-abc.example/')
+    expect(link.getAttribute('target')).toBe('_blank')
+    expect(link.getAttribute('rel')).toBe('noopener noreferrer')
+    expect(link.textContent).toBe('Open app')
+    expect(link.querySelector('svg')).not.toBeNull()
+  })
+
+  it('keeps the pager last in the column with one row and with a full page', async () => {
+    const full = Array.from({ length: 10 }, (_, i) =>
+      entry({ name: `App ${i}`, url: `https://pub-${i}.example/` }),
+    )
+    h.listMarketplace.mockResolvedValue(page({ items: full, pageSize: 10, total: 21, totalPages: 3 }))
+    renderPage()
+    await screen.findByText('App 9', {}, { timeout: 5000 })
+    expectPagerPinned()
+
+    h.listMarketplace.mockResolvedValue(
+      page({ items: [entry()], page: 3, pageSize: 10, total: 21, totalPages: 3 }),
+    )
+    fireEvent.click(screen.getByTestId('marketplace-page-3'))
+    await screen.findByText('Baggage Belt Faults', {}, { timeout: 5000 })
+    expect(screen.getAllByTestId('marketplace-entry')).toHaveLength(1)
+    expectPagerPinned()
+  })
+
+  it('keeps the pager last while a page loads and after it fails', async () => {
+    h.listMarketplace.mockResolvedValue(page({ pageSize: 10, total: 25, totalPages: 3 }))
+    renderPage()
+    await screen.findByTestId('marketplace-page-2', {}, { timeout: 5000 })
+
+    let fail: (reason: Error) => void = () => {}
+    h.listMarketplace.mockReturnValueOnce(
+      new Promise<Page>((_, reject) => {
+        fail = reject
+      }),
+    )
+    fireEvent.click(screen.getByTestId('marketplace-page-2'))
+    await screen.findByText('Loading…')
+    expectPagerPinned()
+
+    fail(new Error('Network is down'))
+    await screen.findByRole('alert', {}, { timeout: 5000 })
+    expectPagerPinned()
+  })
+})
+
+describe('MarketplacePage list and grid views', () => {
+  it('switches between a table and cards, and remembers the choice', async () => {
+    h.listMarketplace.mockResolvedValue(page())
+    const first = renderPage()
+
+    const table = await screen.findByRole('table', {}, { timeout: 5000 })
+    expect(within(table).getAllByRole('columnheader').map((th) => th.textContent)).toEqual([
+      'Application',
+      'Built by',
+      'Open',
+    ])
+
+    fireEvent.click(screen.getByLabelText('Grid view'))
+    await waitFor(() => expect(screen.queryByRole('table')).toBeNull())
+    expect(screen.getByTestId('marketplace-entry')).toBeTruthy()
+
+    first.unmount()
+    renderPage()
+    await screen.findByText('Baggage Belt Faults', {}, { timeout: 5000 })
+    expect(screen.queryByRole('table')).toBeNull()
+
+    fireEvent.click(screen.getByLabelText('List view'))
+    expect(await screen.findByRole('table')).toBeTruthy()
+  })
+
+  it('names the page-size control after the view', async () => {
+    h.listMarketplace.mockResolvedValue(page({ pageSize: 10, total: 30, totalPages: 3 }))
+    renderPage()
+
+    const sizer = await screen.findByTestId('marketplace-page-size', {}, { timeout: 5000 })
+    expect(sizer.getAttribute('aria-label')).toBe('Rows per page')
+    expect(screen.getByText('Rows per page')).toBeTruthy()
+
+    fireEvent.click(screen.getByLabelText('Grid view'))
+    await waitFor(() =>
+      expect(screen.getByTestId('marketplace-page-size').getAttribute('aria-label')).toBe(
+        'Cards per page',
+      ),
+    )
+    expect(screen.getByText('Cards per page')).toBeTruthy()
+  })
+
+  it('draws no card-size control in the grid', async () => {
+    storeView('grid')
+    h.listMarketplace.mockResolvedValue(page())
+    renderPage()
+
+    await screen.findByText('Baggage Belt Faults', {}, { timeout: 5000 })
+    expect(screen.getByLabelText('Grid view').getAttribute('data-state')).toBe('on')
+    expect(screen.queryByLabelText('M cards')).toBeNull()
+  })
+
+  it('keeps all three cells of a row whose entry has no description or builder', async () => {
+    h.listMarketplace.mockResolvedValue(
+      page({ items: [entry({ description: null, builderDisplayName: null })] }),
+    )
+    renderPage()
+
+    const row = await screen.findByTestId('marketplace-entry', {}, { timeout: 5000 })
+    expect(row.tagName).toBe('TR')
+    expect(within(row).getAllByRole('cell')).toHaveLength(3)
+  })
+
+  it('puts the full name and description in a title, where a row clips them', async () => {
+    h.listMarketplace.mockResolvedValue(page())
+    renderPage()
+
+    const name = await screen.findByText('Baggage Belt Faults', {}, { timeout: 5000 })
+    expect(name.getAttribute('title')).toBe('Baggage Belt Faults')
+    expect(screen.getByText('Report baggage belt faults.').getAttribute('title')).toBe(
+      'Report baggage belt faults.',
+    )
+  })
+})
+
+describe.each([
+  ['list', 'grid'],
+  ['grid', 'list'],
+] as const)('choosing %s on the Marketplace', (chosen, before) => {
+  it('opens My Applications and Shared Applications in the same view', async () => {
+    storeView(before)
+    h.listMarketplace.mockResolvedValue(page())
+    h.listProjects.mockResolvedValue({ items: [], page: 1, pageSize: 8, total: 0, totalPages: 0 })
+    h.listProjectCounts.mockResolvedValue({ inProduction: 0, totalApplications: 0, inPipeline: 0 })
+    h.listSharedWithMe.mockResolvedValue({
+      items: [],
+      sharers: [],
+      page: 1,
+      pageSize: 8,
+      total: 0,
+      totalPages: 0,
+    })
+    const label = (view: string) => `${view === 'list' ? 'List' : 'Grid'} view`
+    const pressed = (view: string) => screen.getByLabelText(label(view)).getAttribute('data-state')
+
+    const marketplace = renderPage()
+    await screen.findByText('Baggage Belt Faults', {}, { timeout: 5000 })
+    expect(pressed(before)).toBe('on')
+    fireEvent.click(screen.getByLabelText(label(chosen)))
+    expect(pressed(chosen)).toBe('on')
+    marketplace.unmount()
+
+    for (const [path, Page] of [
+      ['/projects', ProjectsPage],
+      ['/shared-applications', SharedApplicationsPage],
+    ] as const) {
+      const opened = render(
+        <MemoryRouter initialEntries={[path]}>
+          <Page />
+        </MemoryRouter>,
+      )
+      await waitFor(() => expect(screen.getByLabelText(label(chosen))).toBeTruthy())
+      expect(pressed(chosen)).toBe('on')
+      expect(pressed(before)).toBe('off')
+      opened.unmount()
+    }
   })
 })

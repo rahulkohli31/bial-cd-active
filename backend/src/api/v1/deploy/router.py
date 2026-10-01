@@ -80,6 +80,7 @@ from src.services.deploy.gate import (
     declaration_document,
     review_at_head,
 )
+from src.services.deploy.liveness import last_success_deployment, live_app_ids
 from src.services.deploy.names import published_app_name
 from src.services.deploy.service import (
     FAIL_NO_SNAPSHOT,
@@ -199,6 +200,20 @@ async def _owned_app_row(
             )
         )
     ).scalar_one_or_none()
+
+
+async def _live_url(db: AsyncSession, *, app_id: uuid.UUID, user_id: uuid.UUID) -> str | None:
+    """The address the caller's app is serving at now, or `None` when it is not live.
+
+    Membership is `live_app_ids` and the row is `last_success_deployment`, the pair the
+    marketplace reads, so this is non-null exactly when the projects list says `isServing`."""
+    serving = last_success_deployment()
+    return await db.scalar(
+        sa.select(serving.url).where(
+            serving.app_id == app_id,
+            serving.app_id.in_(live_app_ids(owner_user_id=user_id)),
+        )
+    )
 
 
 @router.post(
@@ -846,6 +861,7 @@ async def latest_deployment(
         # have been saved, so the rail draws no saved row rather than one that cannot
         # tell.
         return DeploymentResponse(
+            live_url=None,
             publish_state=PublishState.NOTHING_BUILT,
             approved_retry_commit=None,
             saved_head=None,
@@ -881,6 +897,7 @@ async def latest_deployment(
     if row is None:
         return DeploymentResponse(
             app_id=str(app_row.id),
+            live_url=None,
             approval=approval,
             publish_state=publish_state,
             approved_retry_commit=retry_commit,
@@ -890,6 +907,7 @@ async def latest_deployment(
         )
     return DeploymentResponse.of(
         row,
+        live_url=await _live_url(db, app_id=app_row.id, user_id=user.id),
         approval=approval,
         publish_state=publish_state,
         approved_retry_commit=retry_commit,

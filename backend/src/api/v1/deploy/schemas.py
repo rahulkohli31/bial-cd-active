@@ -541,6 +541,10 @@ class DeploymentResponse(CamelModel):
     # because that is still how the attempt ended. A client rendering a live-app link MUST
     # test this as well, or it shows a citizen a URL that 404s with nothing to explain why.
     unpublished_at: datetime | None = None
+    # Where the app is serving now, by the same rule as the projects list's `isServing`: null
+    # exactly when that is false. Unlike `url` it does not follow the latest attempt, so a
+    # republish that is running or has failed leaves the live address in place.
+    live_url: str | None
     # The app's approval lifecycle. NULL has ONE defined meaning: this project has
     # no app row yet, so there is no lifecycle to report — never "we didn't look".
     approval: ApprovalState | None = None
@@ -590,6 +594,7 @@ class DeploymentResponse(CamelModel):
         cls,
         row: Deployment,
         *,
+        live_url: str | None,
         approval: ApprovalState | None = None,
         publish_state: PublishState,
         approved_retry_commit: str | None,
@@ -617,6 +622,7 @@ class DeploymentResponse(CamelModel):
             started_at=row.created_at,
             finished_at=row.finished_at,
             unpublished_at=row.unpublished_at,
+            live_url=live_url,
             approval=approval,
             publish_state=publish_state,
             approved_retry_commit=approved_retry_commit,

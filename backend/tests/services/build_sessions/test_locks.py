@@ -156,7 +156,7 @@ async def test_the_one_guard_never_swallows_cancellation(
         ("get", lambda r: locks.reap_lock(r, USER)),
         ("exists", lambda r: locks.lock_is_held(r, USER)),
         ("hgetall", lambda r: locks.read_registry(r, USER)),
-        ("exists", lambda r: locks.mark_registry_ending(r, USER)),
+        ("eval", lambda r: locks.mark_registry_ending(r, USER, SBX)),
         ("delete", lambda r: locks.delete_registry(r, USER)),
         # Both serving-proof writes are answer-bearing in the same way `renew_lock` is: their
         # `False` means "the store said no", and a swallowed error would hand the caller a
@@ -201,14 +201,17 @@ async def test_every_primitive_but_acquire_still_surfaces_redis_errors(
 
 async def test_registry_state_helpers(fake_redis: aioredis.Redis) -> None:
     # mark_ending on an absent registry never conjures a partial hash.
-    await locks.mark_registry_ending(fake_redis, USER)
+    await locks.mark_registry_ending(fake_redis, USER, "sbx-x")
     assert await locks.read_registry(fake_redis, USER) is None
 
     await fake_redis.hset(
         registry_key(USER),
         mapping={REGISTRY_FIELD_APP_NAME: "sbx-x", REGISTRY_FIELD_STATE: "ready"},
     )
-    await locks.mark_registry_ending(fake_redis, USER)
+    # ...nor marks a record that names another container.
+    await locks.mark_registry_ending(fake_redis, USER, "sbx-outgoing")
+    assert await fake_redis.hget(registry_key(USER), REGISTRY_FIELD_STATE) == "ready"
+    await locks.mark_registry_ending(fake_redis, USER, "sbx-x")
     reg = await locks.read_registry(fake_redis, USER)
     assert reg is not None
     assert reg[REGISTRY_FIELD_STATE] == REGISTRY_STATE_ENDING
@@ -548,7 +551,7 @@ async def test_the_first_sighting_is_recorded_once_and_every_later_one_is_silent
         await locks.record_the_first_serve(
             fake_redis, USER, app_name=SBX, observer="turn_watcher", cold=False
         )
-        await locks.mark_registry_ending(fake_redis, USER)
+        await locks.mark_registry_ending(fake_redis, USER, SBX)
         await locks.record_the_first_serve(
             fake_redis, USER, app_name=SBX, observer="reconciler", cold=None
         )

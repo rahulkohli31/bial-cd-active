@@ -4,6 +4,61 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.9] - 2026-10-01
+
+An application's chats are one press away. The workspace shows the last chat under the message box,
+and a History button opens every chat of that application, to search, sort, rename or delete. Every
+chat is named from the start of its first message, and chats from before this release are named
+too. The Marketplace can list its applications as rows, the application menu opens a live
+application and copies its address, and BIAL Chat moves below the application pages in the
+navigation.
+
+### Deploying this release
+
+- **One migration, data only.** It names every unnamed chat after the start of its first message.
+  No table changes and no chat's last-updated time moves, so no list reorders, and the older
+  backend runs unchanged on the migrated database.
+- **Backend and worker first, then the portal.** The new portal reads a live application's address
+  from the backend; in front of an older backend, Open Application and Copy Production URL say
+  "Address unavailable". The worker runs the clean-up sweep this release fixes, so it takes the new
+  backend image too.
+- **No settings change and no sandbox change.**
+
+### Added
+
+- **Chat history for each application.** The last chat sits under the message box with its kind,
+  name and age, and View all opens the list. The History button in the workspace toolbar opens the
+  same list in the rail: Plan and Build tabs, search, newest or oldest first, and pages of eight.
+  Opening a chat keeps the app on screen, and the strip above the chat leads back to the list as it
+  was left.
+- **Rename and delete a chat** from the list. A rename keeps the chat's place. A delete asks first
+  and removes only the chat and its messages; the application and its saved versions are untouched.
+  A chat whose reply is still running cannot be deleted until it is stopped.
+- **The Marketplace has a list view** beside the grid, remembered between visits, with its pager at
+  the foot of the page.
+- **The application menu opens a live application** in a new tab and copies its production address.
+
+### Changed
+
+- **Chats are named from their first message.** The first message with words names the chat, up to
+  its first 40 characters, the same for every kind of chat, and the name is saved, so the list, the
+  heading and every device agree. A chat with no name yet reads "New chat".
+- **BIAL Chat comes after the application pages** in the navigation, and the dashboard tile reads
+  "Live applications".
+- **The rail is one width everywhere,** so the app beside it stays put when moving between the
+  details, the chat list and a chat.
+- **Tests prove a stopped chat carries on:** after a reload, days later, and after its workspace was
+  reclaimed, and the browser suite covers the chat list, the Marketplace list and the application
+  menu.
+
+### Fixed
+
+- **The clean-up sweep no longer ends a workspace that was just reopened.** When a workspace came
+  back on a new container while the sweep was closing the old one, the sweep could clear the new
+  one's record. It now lets go only of the container it set out to close.
+- **A message sent to a chat deleted meanwhile answers "not found"** instead of failing with a
+  server error.
+
 ## [1.8.8] - 2026-09-30
 
 Deleting a project removes its database every time. A delete that happened while the database

@@ -16,6 +16,10 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent } from '@testing-library/react'
+
+const h = vi.hoisted(() => ({ getDeployment: vi.fn() }))
+vi.mock('../../../utils/deployApi', () => ({ getDeployment: h.getDeployment }))
+
 import ProjectRow from '../ProjectRow'
 import type { Project } from '../../../utils/projectApi'
 
@@ -203,7 +207,7 @@ describe('ProjectRow — no nested interactive elements, still', () => {
     trigger.focus()
     expect(document.activeElement).toBe(trigger)
     fireEvent.keyDown(trigger, { key: 'Enter' })
-    expect(await screen.findByRole('menuitem', { name: 'Open' })).toBeTruthy()
+    expect(await screen.findByRole('menuitem', { name: 'Settings…' })).toBeTruthy()
     expect(onOpen).not.toHaveBeenCalled()
   })
 
@@ -213,20 +217,19 @@ describe('ProjectRow — no nested interactive elements, still', () => {
  * A LIST ROW IS WHERE AN APPLICATION IS FOUND, NOT WHERE IT IS OPERATED. Restart, Take down and
  * Delete live in Settings, each on the tab that owns the thing it changes.
  */
-describe('ProjectRow — the menu is two entries, and stays two', () => {
-  it('★ offers exactly Open and Settings…, even on an application that IS serving', async () => {
-    // SERVING IS THE CASE THAT MATTERS. `isServing` is the one fact about an application that
-    // could make this menu differ at all, so a guard written against a dormant one proves
-    // nothing about the rule it is meant to hold shut.
-    //
-    // The exact list IS the liveness half: a menu that failed to render has no two entries to
-    // enumerate, so the absences underneath cannot be a crash reading as a pass.
+describe('ProjectRow — the menu offers the live application, and nothing operational', () => {
+  it('★ offers the live application, its address and Settings…, and no operational entry', async () => {
+    // SERVING IS THE CASE THAT MATTERS: it is the state in which the menu offers the most, so a
+    // guard written against a dormant application proves nothing about the rule it holds shut.
+    // The exact list is the liveness half, so the absences underneath cannot be a crash.
+    h.getDeployment.mockResolvedValue({ liveUrl: 'https://app-visitor-log.example.io/' })
     render(<ProjectRow project={project({ isServing: true })} onOpen={vi.fn()} onSettings={vi.fn()} />)
     fireEvent.pointerDown(screen.getByTestId('app-menu-row'))
 
-    await screen.findByRole('menuitem', { name: 'Open' })
+    await screen.findByRole('menuitem', { name: 'Open Application' })
     expect(screen.getAllByRole('menuitem').map((item) => item.textContent)).toEqual([
-      'Open',
+      'Open Application',
+      'Copy Production URL',
       'Settings…',
     ])
     expect(screen.queryByTestId('menu-restart')).toBeNull()

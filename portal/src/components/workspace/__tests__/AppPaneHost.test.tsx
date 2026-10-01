@@ -339,10 +339,8 @@ describe('AppPaneHost — which column grows, and which one is sized', () => {
     expectRailIsSized(outlet().className)
   })
 
-  it('gives the conversation the WIDER of the two OPENING widths', () => {
-    // The two opening widths are 400px and 520px, and which is which is not arbitrary: a
-    // conversation holds a transcript and a composer, the project's details do not. It only holds pre-drag — after
-    // that, the citizen's own width replaces it everywhere ("drag it once, every project opens there").
+  it('opens the conversation at the one opening width every rail shares', () => {
+    // Pre-drag only: after a drag the citizen's own width replaces it everywhere.
     render(<Workspace chatSurface={<ChatSurface />} />)
     expect(outlet().style.getPropertyValue('--rail-w')).toBe('520px')
   })

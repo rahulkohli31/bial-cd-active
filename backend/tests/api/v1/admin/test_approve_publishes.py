@@ -711,8 +711,9 @@ async def test_a_newer_version_failing_before_it_names_a_commit_is_not_the_copy_
     assert status["publishState"] == "did_not_start"
     assert status["approvedRetryCommit"] is None
     # Two extra reads: the count of failed copies, and the last publish, which decided it —
-    # this row could not say for itself.
-    assert len(statements) == 5, statements
+    # this row could not say for itself. The other four are the read's own, the live address
+    # among them.
+    assert len(statements) == 6, statements
 
 
 async def test_a_first_attempt_failing_before_it_names_a_commit_retries_the_copy(
@@ -761,4 +762,4 @@ async def test_a_row_that_names_its_commit_costs_the_poll_no_last_publish_read(
 
     assert status["approvedRetryCommit"] == wire.submitted[1]
     # One extra read, the count of failed copies; the row names its commit, so no last publish.
-    assert len(statements) == 4, statements
+    assert len(statements) == 5, statements

@@ -518,7 +518,7 @@ async def test_the_status_read_issues_no_new_query_and_exactly_one_metadata_head
     wire, client, db_session, test_engine
 ) -> None:
     """The cost argument, pinned on the statement stream rather than trusted from a
-    docstring: the ONLY I/O this unit may add beyond the three SELECTs already issued is
+    docstring: the ONLY I/O this unit may add beyond the four SELECTs already issued is
     exactly one `storage.head()` — never a second SELECT, and never a `storage.get()` of
     the snapshot bytes (`build_sessions/manager.py::_saved_head` is the named anti-pattern
     this counts against). Asserted in BOTH directions."""
@@ -546,9 +546,9 @@ async def test_the_status_read_issues_no_new_query_and_exactly_one_metadata_head
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["publishState"] == "live_current"
-    # The three: the project-ownership `get`, the `AppRegistry` select, and
-    # `deployment_for_app`'s select. A fourth is what this unit refuses.
-    assert len(statements) == 3, f"expected exactly today's three SELECTs, got {statements}"
+    # The four: the project-ownership `get`, the `AppRegistry` select, `deployment_for_app`'s
+    # select, and the live address. A fifth is what this unit refuses.
+    assert len(statements) == 4, f"expected exactly today's four SELECTs, got {statements}"
     assert store.head_calls == 1
     assert store.get_calls == 0, "the snapshot bytes must never be downloaded for this read"
 

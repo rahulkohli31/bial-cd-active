@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime
 import re
+import unicodedata
 import uuid
 from typing import Annotated, Any
 
@@ -22,7 +23,6 @@ import sqlalchemy as sa
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm.exc import StaleDataError
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
@@ -35,6 +35,7 @@ from src.api.v1.conversations.schemas import (
 )
 from src.core.errors import AppApiError
 from src.db.models.conversation import ChatKind, Conversation
+from src.db.models.project import MAX_PROJECT_NAME
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.conversations import gather_and_delete_conversation
 from src.services.messages.projection import measured_context_tokens, project_conversation
@@ -42,6 +43,11 @@ from src.services.messages.store import load_rows
 from src.services.projects import owned_project_or_404
 from src.services.storage import ObjectStorage, sweep_blobs
 from src.services.turns.engine import get_turn_engine
+from src.services.turns.guard import (
+    ConversationBusyError,
+    claim_conversation,
+    release_conversation,
+)
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -55,6 +61,9 @@ _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _KINDS = {k.value for k in ChatKind}
 # Newest-first list cap (Express limit).
 _LIST_LIMIT = 200
+# Control characters (newline and tab among them) and the two Unicode line/paragraph separators.
+_NOT_IN_A_NAME = frozenset({"Cc", "Zl", "Zp"})
+_STILL_RUNNING = "This chat is still running. Stop it first, then delete it."
 # A conversation-owned storage handle for the delete sweep (swappable in tests).
 StorageDep = Annotated[ObjectStorage, Depends(storage_dependency)]
 
@@ -201,17 +210,22 @@ async def create_conversation(
     raise AppApiError(409, "This conversation id is already in use.")
 
 
+def _conversation_uuid(conversation_id: str) -> uuid.UUID:
+    """The path id as a UUID: 400 for a malformed id token, 404 for a well-formed one that is
+    not a UUID and so can key no stored conversation."""
+    if not _ID_RE.match(conversation_id):
+        raise AppApiError(400, "Invalid conversation id.")
+    try:
+        return uuid.UUID(conversation_id)
+    except ValueError:
+        raise AppApiError(404, "Conversation not found.") from None
+
+
 async def _load_owned(db: DbSession, user_id: uuid.UUID, conversation_id: str) -> Conversation:
     """Resolve a caller-owned conversation from a path id, or RAISE the matching error:
     400 for a malformed id token, 404 for a well-formed id that resolves to nothing the
     caller owns (owner-scoped — a cross-user id is indistinguishable from a missing one)."""
-    if not _ID_RE.match(conversation_id):
-        raise AppApiError(400, "Invalid conversation id.")
-    try:
-        cid = uuid.UUID(conversation_id)
-    except ValueError:
-        # A valid id token that isn't a UUID can key no stored conversation.
-        raise AppApiError(404, "Conversation not found.") from None
+    cid = _conversation_uuid(conversation_id)
     conv = await db.scalar(
         sa.select(Conversation).where(Conversation.id == cid, Conversation.user_id == user_id)
     )
@@ -265,11 +279,37 @@ async def get_conversation(conversation_id: str, user: CurrentUser, db: DbSessio
     )
 
 
+def _clean_title(value: object) -> str:
+    """The chat's name, trimmed, or a 400 a person can act on."""
+    if not isinstance(value, str):
+        raise AppApiError(400, "title must be a string", code="title_invalid")
+    title = value.strip()
+    if not title:
+        raise AppApiError(400, "Give the chat a name.", code="title_required")
+    if len(title) > MAX_PROJECT_NAME:
+        raise AppApiError(
+            400, f"Keep the name under {MAX_PROJECT_NAME} characters.", code="title_too_long"
+        )
+    if any(unicodedata.category(char) in _NOT_IN_A_NAME for char in title):
+        raise AppApiError(
+            400,
+            "The name cannot contain line breaks or control characters.",
+            code="title_invalid",
+        )
+    return title
+
+
 @router.patch(
     "/{conversation_id}",
     response_model=OkResponse,
     responses=error_responses(
-        (400, ErrorEnvelope, "Invalid conversation id or title"),
+        (
+            400,
+            ErrorEnvelope,
+            "Invalid conversation id or body; a title that is empty (`title_required`), longer "
+            "than the name limit (`title_too_long`), or not a single line of text "
+            "(`title_invalid`)",
+        ),
         (404, ErrorEnvelope, "Conversation not found"),
         AUTH_401,
     ),
@@ -277,35 +317,36 @@ async def get_conversation(conversation_id: str, user: CurrentUser, db: DbSessio
 async def patch_conversation(
     conversation_id: str, request: Request, user: CurrentUser, db: DbSession
 ) -> JSONResponse:
-    """Update the mutable header fields the SPA owns: `title` and `context`. The legacy `code`
-    snapshot is gone with its column (0024) — code truth lives in the build snapshots
-    (`app_registry.current_code` followed it in migration 0039); a body that still sends
-    `code` gets a 400 naming the retirement, not a silent ignore."""
-    if not _ID_RE.match(conversation_id):
-        raise AppApiError(400, "Invalid conversation id.")
+    """Update the mutable header fields the SPA owns: `title` and `context`.
+
+    The title is trimmed before it is stored. Renaming does not change the chat's `updatedAt`,
+    so it keeps its place in the newest-first list; a `context` write does change it. A body
+    that still sends the retired `code` snapshot gets a 400 naming the retirement."""
+    cid = _conversation_uuid(conversation_id)
     body = await _json_object_body(request)
 
     if "code" in body:
         raise AppApiError(400, "code snapshots are no longer stored on conversations.")
 
-    owned = await _load_owned(db, user.id, conversation_id)
-
-    # Apply only the fields present in the body (absent ≠ null — `key in body` distinguishes).
+    # Absent ≠ null: only the fields present in the body are written.
+    fields: dict[str, object] = {}
     if "title" in body:
-        # title is a text column — a non-string would 500 on commit; 400 instead.
-        # (context is JSONB and legitimately accepts objects, so it is not narrowed.)
-        if not isinstance(body["title"], str):
-            raise AppApiError(400, "title must be a string")
-        owned.title = body["title"]
+        fields["title"] = _clean_title(body["title"])
     if "context" in body:
-        owned.context = body["context"]
-    try:
-        await db.commit()
-    except StaleDataError:
-        # The conversation (or its whole project) was deleted between our load and this
-        # flush — the loser of that race gets the same non-leaking 404 a PATCH one
-        # second later would, not a 500 (builder auto-save vs delete is routine).
-        raise AppApiError(404, "Conversation not found.") from None
+        fields["context"] = body["context"]
+    else:
+        # A context write is activity and lets `onupdate` move `updated_at`; naming the column
+        # in the SET is what stops it firing for anything else.
+        fields["updated_at"] = Conversation.updated_at
+    written = await db.scalar(
+        sa.update(Conversation)
+        .where(Conversation.id == cid, Conversation.user_id == user.id)
+        .values(**fields)
+        .returning(Conversation.id)
+    )
+    if written is None:
+        raise AppApiError(404, "Conversation not found.")
+    await db.commit()
     return JSONResponse(content={"ok": True})
 
 
@@ -318,18 +359,31 @@ async def patch_conversation(
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid conversation id"),
         (404, ErrorEnvelope, "Conversation not found"),
+        (409, ErrorEnvelope, "The chat is still running (`conversation_running`)"),
         AUTH_401,
     ),
 )
 async def delete_conversation(
     conversation_id: str, user: CurrentUser, db: DbSession, storage: StorageDep
 ) -> JSONResponse:
+    """Delete the chat, its messages and the attachments it sent. A chat that is still
+    running is refused until it is stopped."""
     owned = await _load_owned(db, user.id, conversation_id)
 
-    # Delete the rows (attachments + conversation + cascaded messages) INSIDE the txn,
-    # commit, and only THEN best-effort sweep the object-store blobs — so a rolled-back
-    # delete never destroys a blob a restored row still points at (rollback safety).
-    blob_keys = await gather_and_delete_conversation(db, owned, user_id=user.id)
-    await db.commit()
+    # Held for the whole delete, so a send meanwhile gets the ordinary busy answer instead of
+    # writing into a chat that is going. In-process, like the claim itself: single replica only.
+    try:
+        claim_conversation(owned.id)
+    except ConversationBusyError:
+        raise AppApiError(409, _STILL_RUNNING, code="conversation_running") from None
+    try:
+        if get_turn_engine().active_turn_info(owned.id) is not None:
+            raise AppApiError(409, _STILL_RUNNING, code="conversation_running")
+        # Rows go inside the transaction and blobs only after the commit, so a rolled-back
+        # delete never destroys a blob a restored row still points at.
+        blob_keys = await gather_and_delete_conversation(db, owned, user_id=user.id)
+        await db.commit()
+    finally:
+        release_conversation(owned.id)
     await sweep_blobs(storage, blob_keys)
     return JSONResponse(content={"ok": True})

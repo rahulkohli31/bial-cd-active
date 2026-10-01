@@ -112,6 +112,7 @@ const deployment = (publishState: PublishState = 'draft', over: Partial<Deployme
   startedAt: null,
   finishedAt: null,
   unpublishedAt: null,
+  liveUrl: null,
   approval: null,
   publishState,
   approvedRetryCommit: null,
@@ -693,11 +694,11 @@ describe('the stacked crossing is a class, not a remount', () => {
     expect(grid().className).toMatch(/wide:flex-row/)
   })
 
-  it('gives the project rail the narrower of the two OPENING widths', async () => {
+  it('opens the project rail at the width a chat opens at, so the pane keeps its place', async () => {
     render(<Workspace />)
     await waitFor(() => expect(railComposer()).toBeTruthy())
 
-    expect(rail().style.getPropertyValue('--rail-w')).toBe('400px')
+    expect(rail().style.getPropertyValue('--rail-w')).toBe('520px')
     expect(rail().getAttribute('data-rail-mode')).toBe('details')
   })
 })

@@ -1991,8 +1991,8 @@ class SessionManager:
 
         WHERE THE DANGLING TOOL CALL COMES FROM, known and accepted. The stop cuts the run
         wherever it stands, which is routinely between a tool call and its result. The replay is
-        kept valid by `_INTERRUPTED_RESULT` in `messages/store.py` — read the decision recorded
-        beside it before shipping chat history.
+        kept valid by `_INTERRUPTED_RESULT` in `messages/store.py`, which tells the model the call
+        may have taken effect.
 
         A CUT RATHER THAN A BOUNDARY, AND THAT IS A CHOICE. A Build turn can be asked to end at
         its next tool-result boundary instead, which leaves nothing for the replay to guess at —

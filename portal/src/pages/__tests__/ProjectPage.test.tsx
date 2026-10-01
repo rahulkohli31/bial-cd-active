@@ -57,6 +57,7 @@ vi.mock('../../utils/projectApi', async (importOriginal) => ({
 }))
 vi.mock('../../utils/conversationApi.js', () => ({
   listProjectConversations: h.listProjectConversations,
+  CONVERSATION_LIST_CAP: 200,
 }))
 // Stubbed to a MARKER, not null, so tests can assert WHERE it is mounted — a null stub would let
 // the chip silently vanish from either header branch.
@@ -307,53 +308,48 @@ describe('ProjectPage — an outlet child that owns its own scroller', () => {
 })
 
 /**
- * No recents list — not hidden, not an empty state: the list, its read, the prop chain and the
- * delete handler are all absent. This is pinned by an absence assertion paired with a liveness
- * check, plus a search over every piece of copy that would have offered it.
- *
- * Deliberate: the only route back to an existing chat, and the only way to delete one, are the
- * owner's decision, not collateral — chats, plans and uploaded files all stay in the database.
- * `chatKindFor`'s own fallback is pinned separately in `utils/__tests__/chatKind.test.ts`.
+ * The rail points back to past chats through one card — the newest chat, with View all above it —
+ * fed by one read of this application's chats. The list itself is the chat list address's;
+ * `ChatHistoryPanel.test.tsx` and `ChatHistoryRoute.test.tsx` own it.
  */
-describe('ProjectPage — nothing points back to a past chat', () => {
-  it('★ renders no conversations section, and asks the server for no list', async () => {
+describe('ProjectPage — the rail points back to the last chat', () => {
+  it('★ reads this application\'s chats once, by its id', async () => {
     h.getProject.mockResolvedValue(makeProject())
     renderProjectPage()
 
     await screen.findByPlaceholderText(/Describe the change you need/i)
-    expect(screen.queryByTestId('conversations')).toBeNull()
-    expect(h.listProjectConversations).not.toHaveBeenCalled()
-    // Paired with a liveness check: an absence assertion passes just as happily when the page
-    // crashed and rendered nothing at all.
-    expect(screen.getByPlaceholderText(/Describe the change you need/i)).toBeTruthy()
-    expect(screen.getByPlaceholderText(/Describe the change you need/i)).toBeTruthy()
+    await waitFor(() => expect(h.listProjectConversations).toHaveBeenCalledTimes(1))
+    expect(h.listProjectConversations).toHaveBeenCalledWith('p1')
   })
 
-  it('★ offers no way to reach or delete an existing chat, however many the project has', async () => {
+  it('★ shows the newest chat under the composer, and no more of the list than that', async () => {
     h.getProject.mockResolvedValue(makeProject())
     h.listProjectConversations.mockResolvedValue([
-      { id: 'c1', kind: 'plan', projectId: 'p1', title: 'Scope the fields', updatedAt: '2026-07-10T00:00:00Z' },
       { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
+      { id: 'c1', kind: 'plan', projectId: 'p1', title: 'Scope the fields', updatedAt: '2026-07-10T00:00:00Z' },
     ])
     renderProjectPage()
 
-    await screen.findByPlaceholderText(/Describe the change you need/i)
+    const card = await screen.findByTestId('last-chat-card')
+    expect(card.textContent).toContain('Build the screen')
+    expect(card.getAttribute('href')).toBe('/chat/c2')
+    expect(screen.getByRole('link', { name: /view all/i }).getAttribute('href')).toBe('/projects/p1/chats')
     expect(screen.queryByText('Scope the fields')).toBeNull()
-    expect(screen.queryByText('Build the screen')).toBeNull()
     expect(screen.queryByRole('button', { name: /^delete$/i })).toBeNull()
     expect(screen.getByPlaceholderText(/Describe the change you need/i)).toBeTruthy()
   })
 
-  it('offers no copy anywhere on the screen that promises past conversations', async () => {
-    // A removed control isn't fully gone while its advertising copy remains.
+  it('names past chats only through that card, never with a list heading of its own', async () => {
     h.getProject.mockResolvedValue(makeProject())
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'c2', kind: 'build', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
+    ])
     renderProjectPage()
 
-    await screen.findByPlaceholderText(/Describe the change you need/i)
+    await screen.findByTestId('last-chat-card')
     const screenText = document.body.textContent ?? ''
     expect(screenText).not.toMatch(/conversations · this project/i)
     expect(screenText).not.toMatch(/no conversations yet/i)
-    expect(screenText).not.toMatch(/past (chats|conversations)/i)
     expect(screenText).not.toMatch(/recent (chats|conversations|builds)/i)
   })
 })

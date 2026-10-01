@@ -12,7 +12,7 @@
  * `appStatus`: `approved` only means an admin said yes, and one-click deploy never
  * writes `status` at all, so an ordinary live app still reads `draft`. `isServing` is
  * therefore checked FIRST — computed server-side by `services/deploy/liveness.py`,
- * the same predicate the marketplace and dashboard's "In production" count use.
+ * the same predicate the marketplace and dashboard's "Live applications" count use.
  *
  * A PUBLISH IN FLIGHT IS A THIRD FACT, and it outranks both: `isPublishing` is true exactly
  * when the chip reads `starting_up`, which the chip says over a live app as well as a new one.

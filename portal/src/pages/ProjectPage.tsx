@@ -1,5 +1,6 @@
 /**
- * `/projects/:projectId` — the project screen IS the app now.
+ * `/projects/:projectId` — the project screen IS the app now. `/projects/:projectId/chats` renders
+ * this same element, with the rail showing the chat list instead of the composer.
  *
  * WHY THIS EXISTS: it shows the RUNNING SANDBOX beside the rail, behind one control the person
  * presses deliberately — nothing starts a container because a screen was opened (the pane reads
@@ -20,7 +21,7 @@
  * the admin registry, not here. A new chat opens at a flat `/chat/{uuid}` carrying its project in
  * a transient `?projectId=&kind=` query — the row doesn't exist until its first message.
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft } from 'lucide-react'
 import ProjectWorkspace from '../components/workspace/ProjectWorkspace'
@@ -132,11 +133,16 @@ export default function ProjectPage() {
     [navigate],
   )
 
+  // Read when used, so the load below runs once per project: `navigate` changes identity with
+  // the pathname, and this element also serves the chat list address.
+  const exits = useRef({ goToProjects, bounceGone, bounceToShared })
+  exits.current = { goToProjects, bounceGone, bounceToShared }
+
   // Load the project. A 404 means it was deleted elsewhere — bounce to the index rather than
   // strand the user on a dead page.
   useEffect(() => {
     if (!projectId) {
-      goToProjects()
+      exits.current.goToProjects()
       return
     }
     let active = true
@@ -151,7 +157,7 @@ export default function ProjectPage() {
         // signal that tells the two apart. `replace` because this bounce is involuntary: the
         // address they opened is real, it just belongs to the other view of it.
         if (loaded.access === 'shared') {
-          bounceToShared(projectId)
+          exits.current.bounceToShared(projectId)
           return
         }
         setProject(loaded)
@@ -166,7 +172,7 @@ export default function ProjectPage() {
       } catch (err) {
         if (!active) return
         if (err instanceof ApiError && err.status === 404) {
-          bounceGone()
+          exits.current.bounceGone()
           return
         }
         setLoadError(loadErrorFor(err))
@@ -177,15 +183,7 @@ export default function ProjectPage() {
     return () => {
       active = false
     }
-  }, [projectId, goToProjects, bounceGone, bounceToShared])
-
-  /* THE CHATS READ, ITS ERROR AND THE DELETE HANDLER ARE DELIBERATELY ABSENT. They existed for
-     one renderer, the rail's "Conversations · this project" list, which the client asked not to
-     have — nothing points back to a chat, running or finished. Removing the list removed the only
-     route back to an existing chat AND the only way to delete one; both are the owner's decision,
-     taken knowingly. Chats, their plans and their uploaded files stay in the database. Said here
-     as well as in the rail because this is where the reads would be, and an absent fetch explains
-     itself to nobody. */
+  }, [projectId])
 
   /* THE THREE BRANCHES ARE ONE RETURN, AND THE POLITE REGION IS ABOVE ALL OF THEM.
      They used to be three early returns, and that shape is exactly what cannot carry a live

@@ -164,8 +164,6 @@ describe('the keyboard reaches every width the pointer does', () => {
 
 describe('what the handle remembers, and what it does not', () => {
   it('★ the chosen width survives a route change from the project screen to a chat', () => {
-    // It could not while the width was a per-mode literal: moving to a chat replaced 400 with 520
-    // and the citizen's choice was gone. Their width replaces both opening widths now.
     render(<Workspace />)
     drag(600)
     fireEvent.click(screen.getByText('to chat'))
@@ -173,9 +171,8 @@ describe('what the handle remembers, and what it does not', () => {
   })
 
   it('★ a press on the divider that never moved remembers nothing', () => {
-    // THE DEFECT THIS IS WRITTEN AGAINST. A remembered width replaces BOTH opening widths, so
-    // committing on every `pointerup` meant one stray click on the 9px divider inside a chat
-    // pinned every project screen at the chat's 520px — a preference the citizen never expressed.
+    // A remembered width replaces the opening width everywhere, so one stray click on the 9px
+    // divider must not record a preference the citizen never expressed.
     render(<Workspace />)
     fireEvent.pointerDown(handle(), { pointerId: 1, clientX: 400 })
     fireEvent.pointerUp(handle(), { pointerId: 1, clientX: 400 })
@@ -208,7 +205,7 @@ describe('what the handle remembers, and what it does not', () => {
 
   it('opens at the board\'s own width when nothing is remembered', () => {
     render(<Workspace />)
-    expect(widthOf()).toBe('400px')
+    expect(widthOf()).toBe('520px')
   })
 
   it('opens at the remembered one once there is one, for every project', () => {
@@ -218,11 +215,10 @@ describe('what the handle remembers, and what it does not', () => {
   })
 
   it('ignores a stored value it cannot read, rather than clamping a guess out of it', () => {
-    // `null` means "we do not know", and the two opening widths differ — inventing 360 from a
-    // corrupt entry would silently narrow every workspace this person opens.
+    // Inventing 360 from a corrupt entry would silently narrow every workspace this person opens.
     window.localStorage.setItem('bial:rail-width', 'not-a-number')
     render(<Workspace />)
-    expect(widthOf()).toBe('400px')
+    expect(widthOf()).toBe('520px')
   })
 })
 

@@ -19,13 +19,12 @@ from sqlalchemy.dialects import postgresql
 
 from src.api.v1.projects.router import _IN_FLIGHT_ROW, _publishing_now
 from src.db.models.app_registry import AppStatus
-from src.db.models.deployment import Deployment, DeploymentStatus
+from src.db.models.deployment import DeploymentStatus
 from tests.api.v1.projects.test_projects_crud import _auth
-from tests.factories import AppRegistryFactory, ProjectFactory
+from tests.factories import AppRegistryFactory, DeploymentFactory, ProjectFactory
 
 _PROJECTS = "/v1/projects"
 _COUNTS = "/v1/projects/counts"
-_URL = "https://app-example.azurecontainerapps.io/"
 
 
 async def _project_with_app(db, user_id, *, name: str, status: AppStatus = AppStatus.DRAFT):
@@ -34,31 +33,6 @@ async def _project_with_app(db, user_id, *, name: str, status: AppStatus = AppSt
         db, user_id=user_id, project_id=project.id, status=status
     )
     return project, app
-
-
-async def _deploy(
-    db,
-    app,
-    user_id,
-    *,
-    status: DeploymentStatus = DeploymentStatus.SUCCEEDED,
-    url: str | None = _URL,
-    unpublished_at: dt.datetime | None = None,
-) -> Deployment:
-    """One deploy ATTEMPT. `deployments` is append-only, so several of these stack up per
-    app and liveness is a collapse over them, never a flat read of the newest row."""
-    row = Deployment(
-        app_id=app.id,
-        user_id=user_id,
-        status=status,
-        image_digest="sha256:" + "cd" * 32,
-        url=url,
-        unpublished_at=unpublished_at,
-    )
-    db.add(row)
-    await db.flush()
-    await db.refresh(row)
-    return row
 
 
 async def _rows(client, headers, field: str = "isServing") -> dict[str, bool]:
@@ -73,7 +47,7 @@ async def _rows(client, headers, field: str = "isServing") -> dict[str, bool]:
 async def test_a_deployed_app_with_a_url_is_live(client, db_session) -> None:
     headers, user = await _auth(db_session)
     _, app = await _project_with_app(db_session, user.id, name="Visitor Log")
-    await _deploy(db_session, app, user.id)
+    await DeploymentFactory.create(db_session, app)
 
     assert (await _rows(client, headers))["Visitor Log"] is True
 
@@ -95,7 +69,7 @@ async def test_a_draft_app_that_deployed_is_live_anyway(client, db_session) -> N
     is still `draft`. Keying off the lifecycle would miss exactly the common case."""
     headers, user = await _auth(db_session)
     _, app = await _project_with_app(db_session, user.id, name="Self Published")
-    await _deploy(db_session, app, user.id)
+    await DeploymentFactory.create(db_session, app)
 
     assert (await _rows(client, headers))["Self Published"] is True
 
@@ -105,7 +79,7 @@ async def test_a_succeeded_deploy_with_no_url_is_not_live(client, db_session) ->
     something a citizen can open."""
     headers, user = await _auth(db_session)
     _, app = await _project_with_app(db_session, user.id, name="No Address")
-    await _deploy(db_session, app, user.id, url=None)
+    await DeploymentFactory.create(db_session, app, url=None)
 
     assert (await _rows(client, headers))["No Address"] is False
 
@@ -113,7 +87,7 @@ async def test_a_succeeded_deploy_with_no_url_is_not_live(client, db_session) ->
 async def test_a_failed_deploy_is_not_live(client, db_session) -> None:
     headers, user = await _auth(db_session)
     _, app = await _project_with_app(db_session, user.id, name="Failed Build")
-    await _deploy(db_session, app, user.id, status=DeploymentStatus.FAILED, url=None)
+    await DeploymentFactory.create(db_session, app, status=DeploymentStatus.FAILED, url=None)
 
     assert (await _rows(client, headers))["Failed Build"] is False
 
@@ -133,7 +107,7 @@ async def test_a_project_with_no_app_at_all_is_not_live(client, db_session) -> N
 async def test_an_unpublished_app_stops_being_live(client, db_session) -> None:
     headers, user = await _auth(db_session)
     _, app = await _project_with_app(db_session, user.id, name="Taken Down")
-    await _deploy(db_session, app, user.id, unpublished_at=dt.datetime.now(dt.UTC))
+    await DeploymentFactory.create(db_session, app, unpublished_at=dt.datetime.now(dt.UTC))
 
     assert (await _rows(client, headers))["Taken Down"] is False
 
@@ -147,8 +121,8 @@ async def test_a_redeploy_after_an_unpublish_is_live_again(client, db_session) -
     """
     headers, user = await _auth(db_session)
     _, app = await _project_with_app(db_session, user.id, name="Republished")
-    await _deploy(db_session, app, user.id, unpublished_at=dt.datetime.now(dt.UTC))
-    await _deploy(db_session, app, user.id)  # newer, succeeded, addressable
+    await DeploymentFactory.create(db_session, app, unpublished_at=dt.datetime.now(dt.UTC))
+    await DeploymentFactory.create(db_session, app)  # newer, succeeded, addressable
 
     assert (await _rows(client, headers))["Republished"] is True
 
@@ -157,9 +131,9 @@ async def test_a_second_takedown_after_a_republish_is_not_live(client, db_sessio
     """The other direction, and the one a naive "newest row wins" read gets wrong."""
     headers, user = await _auth(db_session)
     _, app = await _project_with_app(db_session, user.id, name="Down Again")
-    await _deploy(db_session, app, user.id, unpublished_at=dt.datetime.now(dt.UTC))
-    await _deploy(db_session, app, user.id)
-    await _deploy(db_session, app, user.id, unpublished_at=dt.datetime.now(dt.UTC))
+    await DeploymentFactory.create(db_session, app, unpublished_at=dt.datetime.now(dt.UTC))
+    await DeploymentFactory.create(db_session, app)
+    await DeploymentFactory.create(db_session, app, unpublished_at=dt.datetime.now(dt.UTC))
 
     assert (await _rows(client, headers))["Down Again"] is False
 
@@ -171,9 +145,9 @@ async def test_counts_are_owner_scoped(client, db_session) -> None:
     headers, user = await _auth(db_session)
     other_headers, other = await _auth(db_session)
     _, mine = await _project_with_app(db_session, user.id, name="Mine")
-    await _deploy(db_session, mine, user.id)
+    await DeploymentFactory.create(db_session, mine)
     _, theirs = await _project_with_app(db_session, other.id, name="Theirs")
-    await _deploy(db_session, theirs, other.id)
+    await DeploymentFactory.create(db_session, theirs)
 
     resp = await client.get(_COUNTS, headers=headers)
 
@@ -193,17 +167,17 @@ async def test_in_production_agrees_with_the_rows_beneath_it(client, db_session)
     headers, user = await _auth(db_session)
 
     _, live_one = await _project_with_app(db_session, user.id, name="Live One")
-    await _deploy(db_session, live_one, user.id)
+    await DeploymentFactory.create(db_session, live_one)
 
     _, republished = await _project_with_app(db_session, user.id, name="Republished")
-    await _deploy(db_session, republished, user.id, unpublished_at=dt.datetime.now(dt.UTC))
-    await _deploy(db_session, republished, user.id)
+    await DeploymentFactory.create(db_session, republished, unpublished_at=dt.datetime.now(dt.UTC))
+    await DeploymentFactory.create(db_session, republished)
 
     _, approved = await _project_with_app(
         db_session, user.id, name="Approved Only", status=AppStatus.APPROVED
     )
     _, taken_down = await _project_with_app(db_session, user.id, name="Taken Down")
-    await _deploy(db_session, taken_down, user.id, unpublished_at=dt.datetime.now(dt.UTC))
+    await DeploymentFactory.create(db_session, taken_down, unpublished_at=dt.datetime.now(dt.UTC))
     await ProjectFactory.create(db_session, user.id, name="Nothing Built")
 
     counts = (await client.get(_COUNTS, headers=headers)).json()
@@ -249,7 +223,7 @@ async def test_a_disabled_app_is_not_live_even_with_a_standing_deployment(
     """
     headers, user = await _auth(db_session)
     _, app = await _project_with_app(db_session, user.id, name="Killed", status=AppStatus.DISABLED)
-    await _deploy(db_session, app, user.id)  # succeeded, has a URL, never unpublished
+    await DeploymentFactory.create(db_session, app)  # succeeded, has a URL, never unpublished
 
     assert (await _rows(client, headers))["Killed"] is False
     assert (await client.get(_COUNTS, headers=headers)).json()["inProduction"] == 0
@@ -262,7 +236,7 @@ async def test_a_rejected_app_is_not_live_either(client, db_session) -> None:
     _, app = await _project_with_app(
         db_session, user.id, name="Refused", status=AppStatus.REJECTED
     )
-    await _deploy(db_session, app, user.id)
+    await DeploymentFactory.create(db_session, app)
 
     assert (await _rows(client, headers))["Refused"] is False
 
@@ -280,7 +254,7 @@ async def test_the_single_project_endpoint_reports_serving_too(client, db_sessio
     those responses."""
     headers, user = await _auth(db_session)
     project, app = await _project_with_app(db_session, user.id, name="Visitor Log")
-    await _deploy(db_session, app, user.id)
+    await DeploymentFactory.create(db_session, app)
     await db_session.commit()
 
     resp = await client.get(f"{_PROJECTS}/{project.id}", headers=headers)
@@ -295,7 +269,7 @@ async def test_a_patch_answers_serving_from_the_deployment_not_the_default(
     """A rename must not flip a live app to not-serving in the response it returns."""
     headers, user = await _auth(db_session)
     project, app = await _project_with_app(db_session, user.id, name="Visitor Log")
-    await _deploy(db_session, app, user.id)
+    await DeploymentFactory.create(db_session, app)
     await db_session.commit()
 
     resp = await client.patch(
@@ -337,15 +311,15 @@ async def _mixed_estate(db, user_id) -> None:
     two that no tile but the total claims: a draft taken back down, and a project with nothing
     built in it."""
     _, live_one = await _project_with_app(db, user_id, name="Live One")
-    await _deploy(db, live_one, user_id)
+    await DeploymentFactory.create(db, live_one)
     _, republished = await _project_with_app(db, user_id, name="Republished")
-    await _deploy(db, republished, user_id, unpublished_at=dt.datetime.now(dt.UTC))
-    await _deploy(db, republished, user_id)
+    await DeploymentFactory.create(db, republished, unpublished_at=dt.datetime.now(dt.UTC))
+    await DeploymentFactory.create(db, republished)
     await _project_with_app(db, user_id, name="Approved Only", status=AppStatus.APPROVED)
     await _project_with_app(db, user_id, name="Waiting", status=AppStatus.PENDING)
     await _project_with_app(db, user_id, name="Changes Asked", status=AppStatus.REJECTED)
     _, taken_down = await _project_with_app(db, user_id, name="Taken Down")
-    await _deploy(db, taken_down, user_id, unpublished_at=dt.datetime.now(dt.UTC))
+    await DeploymentFactory.create(db, taken_down, unpublished_at=dt.datetime.now(dt.UTC))
     await ProjectFactory.create(db, user_id, name="Nothing Built")
 
 
@@ -428,9 +402,9 @@ async def test_a_filter_never_reaches_another_citizens_applications(client, db_s
     headers, user = await _auth(db_session)
     other_headers, other = await _auth(db_session)
     _, mine = await _project_with_app(db_session, user.id, name="Mine")
-    await _deploy(db_session, mine, user.id)
+    await DeploymentFactory.create(db_session, mine)
     _, theirs = await _project_with_app(db_session, other.id, name="Theirs")
-    await _deploy(db_session, theirs, other.id)
+    await DeploymentFactory.create(db_session, theirs)
 
     assert await _names(client, headers) == {"Mine"}
     assert await _names(client, headers, filter="inProduction") == {"Mine"}
@@ -459,7 +433,7 @@ async def test_a_first_publish_in_flight_is_publishing_and_not_live(client, db_s
     reads `draft` while the project page says Starting up."""
     headers, user = await _auth(db_session)
     _, app = await _project_with_app(db_session, user.id, name="Flight Dashboard")
-    await _deploy(db_session, app, user.id, status=DeploymentStatus.RUNNING, url=None)
+    await DeploymentFactory.create(db_session, app, status=DeploymentStatus.RUNNING, url=None)
 
     assert (await _rows(client, headers, "isPublishing"))["Flight Dashboard"] is True
     assert (await _rows(client, headers))["Flight Dashboard"] is False
@@ -468,8 +442,8 @@ async def test_a_first_publish_in_flight_is_publishing_and_not_live(client, db_s
 async def test_a_new_version_publishing_over_a_live_app_is_publishing(client, db_session) -> None:
     headers, user = await _auth(db_session)
     _, app = await _project_with_app(db_session, user.id, name="Visitor Log")
-    await _deploy(db_session, app, user.id)
-    await _deploy(db_session, app, user.id, status=DeploymentStatus.RUNNING, url=None)
+    await DeploymentFactory.create(db_session, app)
+    await DeploymentFactory.create(db_session, app, status=DeploymentStatus.RUNNING, url=None)
 
     assert (await _rows(client, headers, "isPublishing"))["Visitor Log"] is True
     assert (await _rows(client, headers))["Visitor Log"] is True
@@ -478,9 +452,9 @@ async def test_a_new_version_publishing_over_a_live_app_is_publishing(client, db
 async def test_a_finished_publish_is_not_publishing(client, db_session) -> None:
     headers, user = await _auth(db_session)
     _, live = await _project_with_app(db_session, user.id, name="Went Live")
-    await _deploy(db_session, live, user.id)
+    await DeploymentFactory.create(db_session, live)
     _, failed = await _project_with_app(db_session, user.id, name="Did Not Start")
-    await _deploy(db_session, failed, user.id, status=DeploymentStatus.FAILED, url=None)
+    await DeploymentFactory.create(db_session, failed, status=DeploymentStatus.FAILED, url=None)
     await ProjectFactory.create(db_session, user.id, name="Nothing Built")
 
     assert await _rows(client, headers, "isPublishing") == {
@@ -499,11 +473,11 @@ async def test_a_running_row_under_review_or_switched_off_is_not_publishing(
     _, pending = await _project_with_app(
         db_session, user.id, name="Waiting", status=AppStatus.PENDING
     )
-    await _deploy(db_session, pending, user.id, status=DeploymentStatus.RUNNING, url=None)
+    await DeploymentFactory.create(db_session, pending, status=DeploymentStatus.RUNNING, url=None)
     _, disabled = await _project_with_app(
         db_session, user.id, name="Switched Off", status=AppStatus.DISABLED
     )
-    await _deploy(db_session, disabled, user.id, status=DeploymentStatus.RUNNING, url=None)
+    await DeploymentFactory.create(db_session, disabled, status=DeploymentStatus.RUNNING, url=None)
 
     assert await _rows(client, headers, "isPublishing") == {
         "Waiting": False,
@@ -514,7 +488,7 @@ async def test_a_running_row_under_review_or_switched_off_is_not_publishing(
 async def test_the_single_project_endpoints_report_publishing_too(client, db_session) -> None:
     headers, user = await _auth(db_session)
     project, app = await _project_with_app(db_session, user.id, name="Visitor Log")
-    await _deploy(db_session, app, user.id, status=DeploymentStatus.RUNNING, url=None)
+    await DeploymentFactory.create(db_session, app, status=DeploymentStatus.RUNNING, url=None)
     empty = await ProjectFactory.create(db_session, user.id, name="Nothing Built")
     await db_session.commit()
 
@@ -537,12 +511,12 @@ async def test_a_first_publish_counts_as_in_the_pipeline(client, db_session) -> 
     headers, user = await _auth(db_session)
     other_headers, other = await _auth(db_session)
     _, first = await _project_with_app(db_session, user.id, name="First Publish")
-    await _deploy(db_session, first, user.id, status=DeploymentStatus.RUNNING, url=None)
+    await DeploymentFactory.create(db_session, first, status=DeploymentStatus.RUNNING, url=None)
     _, update = await _project_with_app(db_session, user.id, name="Update")
-    await _deploy(db_session, update, user.id)
-    await _deploy(db_session, update, user.id, status=DeploymentStatus.RUNNING, url=None)
+    await DeploymentFactory.create(db_session, update)
+    await DeploymentFactory.create(db_session, update, status=DeploymentStatus.RUNNING, url=None)
     _, theirs = await _project_with_app(db_session, other.id, name="Theirs")
-    await _deploy(db_session, theirs, other.id, status=DeploymentStatus.RUNNING, url=None)
+    await DeploymentFactory.create(db_session, theirs, status=DeploymentStatus.RUNNING, url=None)
 
     counts = (await client.get(_COUNTS, headers=headers)).json()
 
@@ -563,7 +537,7 @@ async def test_the_pipeline_tile_agrees_with_the_row_flag_for_every_status(
         _, app = await _project_with_app(
             db_session, user.id, name=app_status.value, status=app_status
         )
-        await _deploy(db_session, app, user.id, status=DeploymentStatus.RUNNING, url=None)
+        await DeploymentFactory.create(db_session, app, status=DeploymentStatus.RUNNING, url=None)
     reviewed = {AppStatus.PENDING.value, AppStatus.REJECTED.value, AppStatus.APPROVED.value}
 
     publishing = await _rows(client, headers, "isPublishing")

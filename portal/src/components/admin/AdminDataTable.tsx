@@ -1,5 +1,5 @@
 import { useEffect, useId, useState } from 'react'
-import type { AriaAttributes, ReactNode } from 'react'
+import type { ReactNode } from 'react'
 import {
   flexRender,
   getCoreRowModel,
@@ -10,7 +10,6 @@ import {
   useReactTable,
 } from '@tanstack/react-table'
 import type {
-  Column,
   ColumnDef,
   ColumnFiltersState,
   Header,
@@ -21,6 +20,7 @@ import type {
   Table as TanStackTable,
 } from '@tanstack/react-table'
 import { cn } from '../../lib/utils'
+import { ariaSortOf } from '../../utils/ariaSort'
 import { Alert, AlertDescription } from '../ui/alert'
 import { Input } from '../ui/input'
 import { Label } from '../ui/label'
@@ -104,14 +104,6 @@ function HeaderLabel<TRow>({ header }: { header: Header<TRow, unknown> }) {
   if (header.isPlaceholder) return null
   if (column.getCanSort() && typeof label === 'string') return <SortHeader label={label} column={column} />
   return flexRender(label, header.getContext())
-}
-
-function ariaSortOf<TRow>(column: Column<TRow, unknown>): AriaAttributes['aria-sort'] {
-  if (!column.getCanSort()) return undefined
-  const sorted = column.getIsSorted()
-  if (sorted === 'asc') return 'ascending'
-  if (sorted === 'desc') return 'descending'
-  return 'none'
 }
 
 /**

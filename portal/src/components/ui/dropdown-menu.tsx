@@ -37,7 +37,7 @@ import { cn } from "@/lib/utils"
  *    `[&>svg]:shrink-0` stays: it protects the label from squashing the icon, and overrides
  *    nothing a caller set.
  *
- * 5. THE ALIAS SET IS TRIMMED TO THE FIVE NAMES THE ONE CONSUMER MOUNTS. Group, Separator,
+ * 5. THE ALIAS SET IS TRIMMED TO THE NAMES ITS CALLERS MOUNT. Group,
  *    Shortcut, CheckboxItem, RadioGroup/RadioItem, ItemIndicator, Sub* and the `inset` prop
  *    were all vendored by the registry and reach nothing; they are named here because the next
  *    `npx shadcn@latest add` listing `dropdown-menu` restores them as an unexplained diff.
@@ -93,10 +93,23 @@ const DropdownMenuItem = React.forwardRef<
 ))
 DropdownMenuItem.displayName = DropdownMenuPrimitive.Item.displayName
 
+const DropdownMenuSeparator = React.forwardRef<
+  React.ElementRef<typeof DropdownMenuPrimitive.Separator>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Separator>
+>(({ className, ...props }, ref) => (
+  <DropdownMenuPrimitive.Separator
+    ref={ref}
+    className={cn("-mx-1 my-1 h-px bg-muted", className)}
+    {...props}
+  />
+))
+DropdownMenuSeparator.displayName = DropdownMenuPrimitive.Separator.displayName
+
 export {
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuLabel,
   DropdownMenuItem,
+  DropdownMenuSeparator,
 }

@@ -498,19 +498,28 @@ export async function getConversation(id: string, deps: AuthFetchDeps = {}): Pro
   }
 }
 
-/* THE ROW-CREATE AND HEADER-PATCH WRAPPERS ARE GONE.
- *
- * A CHAT'S ROW IS NO LONGER CREATED BY A ROUND TRIP OF ITS OWN. `POST /conversations` used to
- * commit the row before the first turn went out, checking only project ownership — so a first
- * message the workspace then refused left a real, empty chat behind. The row's parentage now
- * rides the turn itself (`startTurn`'s `create` block, `turnStreamApi.ts`): written inside the
- * turn's own transaction, after every side-effect-free refusal, so a refusal rolls it back.
- * `PATCH /conversations/{id}` lost its client the same way — the header is written by the turn.
- *
- * NOTHING RENDERS A LIST OF CHATS, the other half: no recents rail, no chat list inside a chat.
- * So there is no row to summarise, date, or delete — the SERVER routes are untouched, these are
- * clients with no caller, not capabilities the backend lost. Cleanup, if ever needed, is a
- * scheduled job rather than a control. */
+/**
+ * Rename a chat from the chat list. The server trims the title, refuses an empty, over-long or
+ * multi-line one with a 400 whose `code` names which, and leaves the chat's Updated time alone so a
+ * rename never moves it in the list.
+ */
+export async function renameConversation(id: string, title: string, deps: AuthFetchDeps = {}): Promise<void> {
+  const res = await authFetch(
+    `/api/conversations/${encodeURIComponent(id)}`,
+    { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }) },
+    deps,
+  )
+  if (!res.ok) throw await readApiError(res, 'Could not rename the chat. Try again.')
+}
+
+/**
+ * Delete a chat and its messages. A chat whose turn is still running is refused with a 409
+ * (`conversation_running`); the application and its saved versions are never touched.
+ */
+export async function deleteConversation(id: string, deps: AuthFetchDeps = {}): Promise<void> {
+  const res = await authFetch(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }, deps)
+  if (!res.ok) throw await readApiError(res, 'Could not delete the chat. Try again.')
+}
 
 // Client-minted ids + timestamps (Decision 3): ids are no longer guessable `chat_<timestamp>`.
 //
@@ -540,10 +549,24 @@ export function uuidv7(): string {
 // The store's mint IS the shared mint — one implementation, nothing to drift.
 const newId = uuidv7
 
-/** Derive a conversation title from its first message text (≤40 chars + ellipsis). */
+// Whitespace, control characters (newline and tab among them) and the two Unicode line and
+// paragraph separators: every run of them becomes one space in a chat's name.
+const SPACE_IN_A_NAME = /[\p{Zs}\p{Cc}\p{Zl}\p{Zp}]+/gu
+const NAME_CODE_POINTS = 40
+
+/**
+ * A chat's name from its first message: runs of whitespace and control characters collapse to one
+ * space, the ends are trimmed, and anything past 40 code points is cut and marked with "…".
+ *
+ * THE SERVER NAMES THE ROW BY THE SAME RULE (`derive_title` in
+ * `backend/src/api/v1/conversations/turns.py`), so the heading drawn from this is the name the
+ * chat is saved under. Only spaces are trimmed, because `trim()` also strips a byte-order mark the
+ * server keeps; and the count is code points, as the server counts, never UTF-16 units.
+ */
 export function deriveTitle(text: string): string {
-  const t = (text || '').trim()
-  return t.slice(0, 40) + (t.length > 40 ? '…' : '')
+  const name = (text || '').replace(SPACE_IN_A_NAME, ' ').replace(/^ | $/g, '')
+  const points = Array.from(name)
+  return points.length > NAME_CODE_POINTS ? `${points.slice(0, NAME_CODE_POINTS).join('')}…` : name
 }
 
 /**
@@ -556,9 +579,9 @@ export function deriveTitle(text: string): string {
  * the row has to exist a round trip earlier than the send — and two orderings cannot both be true.
  * The trade is recorded rather than hidden: a refused first send leaves an empty chat.
  *
- * NO TITLE IS PASSED, deliberately. `deriveTitle` runs on the draft at SEND time, which is one
- * round trip later than this call, and stamping refused text into a row nobody can delete would
- * be worse than leaving it unnamed. The first message that actually lands titles the chat.
+ * NO TITLE IS PASSED, deliberately. The words are not known until SEND time, one round trip later
+ * than this call, and stamping refused text onto a chat would name it after a message that was
+ * never sent. The server names the chat when it accepts the first message with words in it.
  *
  * IDEMPOTENT PER OWNER: re-posting the same id with the same parentage answers 200 with the
  * existing header, which is what makes a retry after a refused first send work — the leftover chat

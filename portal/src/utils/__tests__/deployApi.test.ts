@@ -87,6 +87,24 @@ describe('getDeployment parses the takedown axis', () => {
   })
 })
 
+describe('getDeployment carries the live address', () => {
+  it('reads liveUrl apart from the latest attempt’s url, and a missing key as null', async () => {
+    const republishing = await getDeployment(
+      'p1',
+      deps(
+        vi.fn(async () =>
+          ok({ ...BODY, status: 'running', url: null, liveUrl: 'https://pub-abc.example/' }),
+        ),
+      ),
+    )
+    const unknown = await getDeployment('p1', deps(vi.fn(async () => ok(BODY))))
+
+    expect(republishing.url).toBeNull()
+    expect(republishing.liveUrl).toBe('https://pub-abc.example/')
+    expect(unknown.liveUrl).toBeNull()
+  })
+})
+
 describe('getDeployment parses the APPROVAL state riding on the same response', () => {
   const APPROVAL = {
     status: 'pending',

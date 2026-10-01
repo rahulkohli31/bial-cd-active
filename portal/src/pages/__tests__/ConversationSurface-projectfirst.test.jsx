@@ -237,6 +237,41 @@ describe('BuilderPage — a refine turn', () => {
   })
 })
 
+describe('BuilderPage — only an accepted message names the heading', () => {
+  const renderWith = (onTitleDerived) =>
+    render(
+      <MemoryRouter initialEntries={['/chat/build-X']}>
+        <Routes>
+          {inWorkspace(<Route path="/chat/:chatId" element={<ConversationSurface kind="build" projectId="p1" onTitleDerived={onTitleDerived} />} />)}
+        </Routes>
+      </MemoryRouter>,
+    )
+
+  it('names this chat once the server holds the message', async () => {
+    h.getBuild.mockResolvedValue(null)
+    const onTitleDerived = vi.fn()
+    renderWith(onTitleDerived)
+    await screen.findByPlaceholderText(/ask for another change/i)
+
+    await send('Log every visitor at gate 4')
+
+    await waitFor(() => expect(onTitleDerived).toHaveBeenCalledWith('build-X', 'Log every visitor at gate 4'))
+  })
+
+  it('names nothing when the server refuses the message', async () => {
+    h.getBuild.mockResolvedValue(null)
+    h.startTurn.mockRejectedValue(new TurnStartError(429, 'You have used all of today’s tokens.'))
+    const onTitleDerived = vi.fn()
+    renderWith(onTitleDerived)
+    await screen.findByPlaceholderText(/ask for another change/i)
+
+    await send('Log every visitor at gate 4')
+
+    expect(await screen.findByText('You have used all of today’s tokens.')).toBeTruthy()
+    expect(onTitleDerived).not.toHaveBeenCalled()
+  })
+})
+
 describe('BuilderPage — the preview is fed NO app credentials', () => {
   it('never hands LivePreview a config / appKey / accessToken / previewCode', async () => {
     renderHandoff()
@@ -480,6 +515,19 @@ describe('BuilderPage — the hand-off does not replay on reload', () => {
     await act(async () => { await Promise.resolve() })
 
     expect(h.startTurn).not.toHaveBeenCalled()
+  })
+
+  it('files handed off with no words still go out, under the attachment placeholder', async () => {
+    const sink = { current: null }
+    renderAt(
+      { ...HANDOFF_ENTRY, state: { ...HANDOFF_ENTRY.state, prompt: '', pendingAttachments: [{ name: 'roster.xlsx', dataUrl: 'data:application/octet-stream;base64,AA' }] } },
+      sink,
+    )
+
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
+    const [text, attachments] = h.buildUserParts.mock.calls[0]
+    expect(text).toBe('Please review the attached file(s).')
+    expect(attachments).toHaveLength(1)
   })
 
   it('attachments handed off with the prompt are consumed by the FIRST turn and not re-fired', async () => {

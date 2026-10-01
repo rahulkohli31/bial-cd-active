@@ -7,12 +7,15 @@ import {
   messagesFromProjection,
   createConversation as mod_createConversation,
   createConversationStore,
+  renameConversation,
+  deleteConversation,
   deriveTitle,
   discardNoticeText,
 } from '../conversationApi'
 import { toStepItem } from '../turnStreamApi'
 import { OUTCOME_COPY, outcomeSummary } from '../messageTypes'
 import { formatStamp } from '../publishPresentation'
+import { ApiError } from '../apiError'
 
 // authFetch deps injection — no real token/network.
 const deps = (fetchImpl) => ({ fetchImpl, getToken: () => 'tok', refresh: vi.fn() })
@@ -356,43 +359,24 @@ describe('messagesFromProjection — workspace_discarded', () => {
   })
 })
 
-describe('the patch / delete round trips are gone, and create came back on purpose', () => {
+describe('create, rename and delete', () => {
   /**
-   * A GUARD, NARROWED — not deleted, and not widened by accident.
-   *
-   * It used to cover three absences. `createConversation` IS BACK, and that was a decision
-   * someone made on purpose, which is exactly what this block existed to force: an upload now
-   * names the conversation it belongs to, so the row has to exist before the first file is sent,
-   * a round trip earlier than the turn that used to create it. The guarantee that went with the
-   * old ordering — a refused first message leaving no chat behind — is knowingly traded, and the
-   * empty row it leaves is a tracked follow-up rather than a surprise.
-   *
-   * THE OTHER TWO STAY ABSENT, and for reasons nothing in this change touches. `patchConversation`
-   * had no caller once a chat's title came from its first message. `deleteConversation` had
-   * exactly one, the project rail's past-conversations list, and a later product decision deleted
-   * the list: nothing points back to a chat, so nothing offers to delete one. The SERVER routes
-   * are all untouched.
+   * Each is a module function, called where the chat is already in hand — the send path creates,
+   * the chat list renames and deletes. The store stays a READ store, so holding one never offers a
+   * way to change a chat.
    */
-  it('★ the module offers create and a read half — and still no patch or delete', async () => {
+  it('★ the module offers create, rename and delete, and the store still only reads', async () => {
     const mod = await import('../conversationApi')
     expect(typeof mod.createConversation).toBe('function')
-    expect('patchConversation' in mod).toBe(false)
-    expect('deleteConversation' in mod).toBe(false)
-    // THE STORE IS A READ STORE STILL. `createConversation` is called by the send path directly,
-    // where the conversation id and its project are already in hand; putting it back on the store
-    // would offer it to every holder of one, which is a wider surface than the change needs.
+    expect(typeof mod.renameConversation).toBe('function')
+    expect(typeof mod.deleteConversation).toBe('function')
     const store = mod.createConversationStore('plan')
-    expect('createConversation' in store).toBe(false)
-    expect('deleteConversation' in store).toBe(false)
-    // Paired with a liveness assertion: the READ half is still there, so the absences above are
-    // real absences and not an empty module or an empty store object.
-    expect(typeof mod.listProjectConversations).toBe('function')
-    expect(typeof store.getConversation).toBe('function')
+    expect(Object.keys(store).sort()).toEqual(['getConversation', 'loadHistory', 'newConversation'])
   })
 
   it('★ creates with NO title — the draft is not known a round trip early', async () => {
-    // Stamping the refused text into a row nobody can delete would be worse than leaving it
-    // unnamed, so the first message that actually lands titles the chat.
+    // A title stamped from refused text would name the chat after a message that was never sent,
+    // so the first message that actually lands titles the chat.
     const fetchImpl = vi.fn(async () => ok({ conversation: { _id: 'c1', kind: 'build', projectId: 'p1' } }))
 
     const header = await mod_createConversation(
@@ -416,6 +400,59 @@ describe('the patch / delete round trips are gone, and create came back on purpo
     await expect(
       mod_createConversation({ id: 'c1', projectId: 'p1', kind: 'build' }, deps(fetchImpl)),
     ).rejects.toThrow('Project not found.')
+  })
+
+  it('★ renames with a PATCH carrying the title and nothing else, to the url-encoded id', async () => {
+    const fetchImpl = vi.fn(async () => ok({ ok: true }))
+    await expect(renameConversation('a/b', 'New name', deps(fetchImpl))).resolves.toBeUndefined()
+
+    const [url, init] = fetchImpl.mock.calls[0]
+    expect(url).toBe('/api/conversations/a%2Fb')
+    expect(init.method).toBe('PATCH')
+    expect(init.headers['Content-Type']).toBe('application/json')
+    expect(JSON.parse(init.body)).toEqual({ title: 'New name' })
+  })
+
+  it.each([
+    [400, 'title_required'],
+    [400, 'title_too_long'],
+    [400, 'title_invalid'],
+    [404, null],
+  ])('★ a refused rename throws an ApiError carrying %s and its code (%s)', async (status, code) => {
+    const fetchImpl = vi.fn(async () => ({
+      ok: false,
+      status,
+      json: async () => ({ error: { message: 'Refused.', ...(code ? { code } : {}) } }),
+    }))
+    const refusal = await renameConversation('c1', 'x', deps(fetchImpl)).catch((error) => error)
+    expect(refusal).toBeInstanceOf(ApiError)
+    expect(refusal.status).toBe(status)
+    expect(refusal.code).toBe(code)
+  })
+
+  it('★ deletes with a DELETE and no body, to the url-encoded id', async () => {
+    const fetchImpl = vi.fn(async () => ok({ ok: true }))
+    await expect(deleteConversation('a/b', deps(fetchImpl))).resolves.toBeUndefined()
+
+    const [url, init] = fetchImpl.mock.calls[0]
+    expect(url).toBe('/api/conversations/a%2Fb')
+    expect(init.method).toBe('DELETE')
+    expect(init.body).toBeUndefined()
+  })
+
+  it.each([
+    [409, 'conversation_running'],
+    [404, null],
+  ])('★ a refused delete throws an ApiError carrying %s and its code (%s)', async (status, code) => {
+    const fetchImpl = vi.fn(async () => ({
+      ok: false,
+      status,
+      json: async () => ({ error: { message: 'Refused.', ...(code ? { code } : {}) } }),
+    }))
+    const refusal = await deleteConversation('c1', deps(fetchImpl)).catch((error) => error)
+    expect(refusal).toBeInstanceOf(ApiError)
+    expect(refusal.status).toBe(status)
+    expect(refusal.code).toBe(code)
   })
 })
 
@@ -468,6 +505,25 @@ describe('deriveTitle', () => {
   it('truncates at 40 with ellipsis and trims', () => {
     expect(deriveTitle('  hello  ')).toBe('hello')
     expect(deriveTitle('y'.repeat(60))).toBe('y'.repeat(40) + '…')
+  })
+
+  // The server's `derive_title` tests carry the same table (`NAMES` in
+  // `backend/tests/api/v1/conversations/test_chat_naming.py`): the heading and the saved name agree.
+  it.each([
+    ['  hello  ', 'hello'],
+    ['line one\nline two', 'line one line two'],
+    ['tab\there\r\n\r\nthen a line a para', 'tab here then a line a para'],
+    ['a\x00b\x07c\x7fd\x85e', 'a b c d e'],
+    [' 　wide spaces ', 'wide spaces'],
+    ['y'.repeat(40), 'y'.repeat(40)],
+    ['y'.repeat(41), 'y'.repeat(40) + '…'],
+    ['😀'.repeat(45), '😀'.repeat(40) + '…'],
+    ['a'.repeat(39) + '😀😀', 'a'.repeat(39) + '😀…'],
+    ['﻿kept mark ', '﻿kept mark'],
+    ['', ''],
+    [' \n\t  ', ''],
+  ])('names %j as %j', (text, expected) => {
+    expect(deriveTitle(text)).toBe(expected)
   })
 })
 

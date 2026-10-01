@@ -2188,6 +2188,17 @@
             ],
             "title": "Headsha"
           },
+          "liveUrl": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Liveurl"
+          },
           "publishState": {
             "$ref": "#/components/schemas/PublishState"
           },
@@ -2276,6 +2287,7 @@
           }
         },
         "required": [
+          "liveUrl",
           "publishState",
           "approvedRetryCommit",
           "savedHead",
@@ -10242,6 +10254,7 @@
     },
     "/v1/conversations/{conversation_id}": {
       "delete": {
+        "description": "Delete the chat, its messages and the attachments it sent. A chat that is still\nrunning is refused until it is stopped.",
         "operationId": "delete_conversation_v1_conversations__conversation_id__delete",
         "parameters": [
           {
@@ -10304,6 +10317,16 @@
               }
             },
             "description": "Conversation not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The chat is still running (`conversation_running`)"
           },
           "422": {
             "content": {
@@ -10423,7 +10446,7 @@
         ]
       },
       "patch": {
-        "description": "Update the mutable header fields the SPA owns: `title` and `context`. The legacy `code`\nsnapshot is gone with its column (0024) — code truth lives in the build snapshots\n(`app_registry.current_code` followed it in migration 0039); a body that still sends\n`code` gets a 400 naming the retirement, not a silent ignore.",
+        "description": "Update the mutable header fields the SPA owns: `title` and `context`.\n\nThe title is trimmed before it is stored. Renaming does not change the chat's `updatedAt`,\nso it keeps its place in the newest-first list; a `context` write does change it. A body\nthat still sends the retired `code` snapshot gets a 400 naming the retirement.",
         "operationId": "patch_conversation_v1_conversations__conversation_id__patch",
         "parameters": [
           {
@@ -10455,7 +10478,7 @@
                 }
               }
             },
-            "description": "Invalid conversation id or title"
+            "description": "Invalid conversation id or body; a title that is empty (`title_required`), longer than the name limit (`title_too_long`), or not a single line of text (`title_invalid`)"
           },
           "401": {
             "content": {

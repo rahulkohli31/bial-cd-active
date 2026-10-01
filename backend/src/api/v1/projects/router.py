@@ -1100,8 +1100,9 @@ async def _reap_the_project_sandbox_or_shrug(
     — registry identity check, then `reap_user` — and its docstring states the invariant: there
     is exactly one teardown sequence in this codebase and no route may drift from the reaper's.
     So the reap is `reap_user`'s ordered one (`mark_registry_ending` → `teardown` →
-    `delete_registry` → `release_liveness_lease` → `reap_lock`), and this function contributes
-    only the identity check in front of it. Releasing the lock and the lease is not garnish:
+    `delete_registry_if_it_still_names` → `release_liveness_lease` → `reap_lock`), and this
+    function contributes only the identity check in front of it. Releasing the lock and the
+    lease is not garnish:
     `LOCK_TTL_SECONDS = 900`, so a teardown that cleared only the registry would leave the
     citizen unable to start ANY sandbox for fifteen minutes after deleting a project.
 

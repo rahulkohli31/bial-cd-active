@@ -68,6 +68,9 @@ const IN_SHELL_SURFACES = [
   'components/workspace/WorkspaceToolbar.tsx',
   'components/workspace/WorkspaceRail.tsx',
   'components/workspace/RailComposer.tsx',
+  'components/workspace/LastChatCard.tsx',
+  'components/workspace/ChatHistoryPanel.tsx',
+  'components/workspace/chatHistoryColumns.tsx',
   'components/workspace/RailResizeHandle.tsx',
   'components/workspace/PlanChatWorkspaceLine.tsx',
   'components/workspace/StartAppControl.tsx',
@@ -160,6 +163,37 @@ describe('WorkspaceShell — the grid is the shell\'s own', () => {
     expect(grid()).toBe(before)
     expect(grid().className).toMatch(/flex-col/)
     expect(grid().className).not.toMatch(/flex-row/)
+  })
+})
+
+describe('WorkspaceShell — which rail is showing is read from the address', () => {
+  function At({ entry }: { entry: string }) {
+    return (
+      <MemoryRouter initialEntries={[entry]}>
+        <Routes>
+          <Route element={<WorkspaceShell />}>
+            <Route path="/projects/:projectId" element={<div data-testid="surface" />} />
+            <Route path="/projects/:projectId/chats" element={<div data-testid="surface" />} />
+            <Route path="/chat/:chatId" element={<div data-testid="surface" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>
+    )
+  }
+
+  const rail = () => screen.getByTestId('workspace-outlet')
+
+  it.each([
+    ['/projects/p1', 'details', '520px'],
+    ['/projects/p1/chats', 'history', '520px'],
+    ['/projects/p1/chats/', 'history', '520px'],
+    ['/chat/c1', 'conversation', '520px'],
+  ])('%s is the %s rail, opening at %s', (entry, mode, width) => {
+    window.localStorage.removeItem('bial:rail-width')
+    render(<At entry={entry} />)
+    expect(screen.getByTestId('surface')).toBeTruthy()
+    expect(rail().getAttribute('data-rail-mode')).toBe(mode)
+    expect(rail().style.getPropertyValue('--rail-w')).toBe(width)
   })
 })
 
