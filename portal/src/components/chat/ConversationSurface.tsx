@@ -2175,7 +2175,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     let latestProbe = 0
     let timer: ReturnType<typeof setInterval> | null = null
     // THE CADENCE THE ANSWERS HAVE DECIDED, and the delay the running timer was actually armed
-    // with. `starting` is asked about every three seconds instead of every forty-five,
+    // with. `starting` is asked about every second instead of every forty-five,
     // because it is the one reading whose successor arrives with no gesture from anybody —
     // `nextProbeCadence` owns that decision, the bound on it, and the reasoning behind both
     // numbers, and the project surface's poll reads the same function so the two cannot drift.
@@ -2248,7 +2248,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // composer and toolbar — for a reading nobody's screen can tell apart from the one already
         // up. `useWorkspaceState` has guarded this since it was written; the guard was never ported
         // here, and the accelerated cadence turned that from one wasted render every 45 seconds
-        // into one every 3, through exactly the window a citizen is watching their app come up.
+        // into one every second, through exactly the window a citizen is watching their app come up.
         setPolledPreview((prev) =>
           prev && prev.projectId === projectId && samePreviewState(prev.state, state)
             ? prev

@@ -74,15 +74,11 @@ export function isTerminalReading(preview: Pick<PreviewState, 'state' | 'restora
  * numbers exist to prevent: an app serving at t=2.7s, a pane still saying "Getting your app
  * ready." at t=45.5s, and nothing animating in between to suggest it was not simply hung.
  *
- * WHY 3 SECONDS. Chosen from the platform's own timings, because no start could be measured in
- * the session that wrote this (the Azure subscription was read-only) — and that is worth saying
- * plainly rather than dressing a guess as a measurement. Two anchors:
- *
- *  - The one start measured directly had the flip at 2.7s. At 3s that start is caught on the
- *    first or second accelerated read; at 45s it was caught 42.8s late.
- *  - The read is cheap by contract — one cache read, at most two rows and two object-store HEADs,
- *    no container call — so 20 of them a minute — only while somebody is watching a start — is a
- *    real cost and a small one.
+ * WHY 1 SECOND. A start's readiness should reach the page within about a second of the platform
+ * knowing it, and every second of delay here is a second somebody sits in front of a finished app.
+ * The read is cheap by contract — one cache read, at most two rows and two object-store HEADs, no
+ * container call — so 60 of them a minute, only while somebody is watching a start, is a real
+ * cost and a small one.
  *
  * WHAT WOULD HAVE SETTLED IT BETTER: the distribution of `starting`→`alive` on real starts, warm
  * attach and cold create+pull separately, with the interval set near the tenth percentile and the
@@ -105,7 +101,7 @@ export function isTerminalReading(preview: Pick<PreviewState, 'state' | 'restora
  * that never advancing a single step. {@link spendProbeCadence} is the other half, and both polls
  * call it from their `catch`.
  */
-export const STARTING_PROBE_MS = 3_000
+export const STARTING_PROBE_MS = 1_000
 
 /**
  * 300 SECONDS OF ACCELERATED ASKING — the server's own outer bound on a start in flight.
@@ -122,12 +118,12 @@ export const STARTING_PROBE_MS = 3_000
  * that setup twice. Past it the server itself stops claiming a start is in flight, so neither does
  * this timer.
  *
- * WHAT IT COSTS, STATED RATHER THAN BURIED: 100 cheap reads, and only while somebody is watching a
+ * WHAT IT COSTS, STATED RATHER THAN BURIED: 300 cheap reads, and only while somebody is watching a
  * start. It is also the ceiling a dark endpoint buys (see {@link spendProbeCadence}) — five
- * minutes of 3-second polling against a broken server. That is the price of one ceiling covering
+ * minutes of 1-second polling against a broken server. That is the price of one ceiling covering
  * the whole wait.
  */
-export const STARTING_PROBE_LIMIT = 100
+export const STARTING_PROBE_LIMIT = 300_000 / STARTING_PROBE_MS
 
 /**
  * HOW OFTEN A HIDDEN SURFACE ASKS — and why it is not the same 45 seconds a visible one uses.
@@ -248,7 +244,7 @@ export function mayHaveStopped(
  * IT SPENDS, AND IT DECIDES NOTHING. THAT ASYMMETRY IS THE WHOLE RULE.
  *
  * SPENDS, because {@link STARTING_PROBE_LIMIT} is meant as a ceiling on how long anybody may be
- * polled at three seconds, and a budget only successful reads draw from is no ceiling at all: an
+ * polled at the accelerated cadence, and a budget only successful reads draw from is no ceiling at all: an
  * endpoint erroring from the first tick pinned both polls at 3s forever, which is the bug this
  * exists to close.
  *

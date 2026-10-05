@@ -419,6 +419,12 @@ describe('nextProbeCadence — what opens a window, what closes it, what spends 
     },
   )
 
+  it('asks every second through a five-minute window, then back at the background cadence', () => {
+    expect(nextProbeCadence('starting', BACKGROUND_CADENCE).delayMs).toBe(1_000)
+    expect(STARTING_PROBE_MS * STARTING_PROBE_LIMIT).toBe(300_000)
+    expect(nextProbeCadence('alive', { delayMs: 1_000, fastReads: 3 }).delayMs).toBe(45_000)
+  })
+
   it('stops accelerating at the bound and never counts past it', () => {
     const exhausted = nextProbeCadence('starting', {
       delayMs: STARTING_PROBE_MS,

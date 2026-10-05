@@ -32,7 +32,7 @@
  *
  * A throwing read spends from the window too (`spendProbeCadence`): the bound ceilings elapsed
  * fast-polling rather than tallying answers returned, so an endpoint erroring mid-start still buys an
- * unbounded 3-second poll for the tab's life. An accelerated tick asks the preview state only —
+ * unbounded accelerated poll for the tab's life. An accelerated tick asks the preview state only —
  * `fetchSaveState` still waits for `alive`, since a seconds-old container is still booting — so the save
  * state lands within one accelerated interval of when it would have arrived unaccelerated.
  *
@@ -231,7 +231,7 @@ export function useWorkspaceState({
     }
 
     // `accelerated` is false for the mount read and for both visibility handlers. Those are a
-    // fresh surface and a deliberate human act — neither is the 3-second timer, and neither
+    // fresh surface and a deliberate human act — neither is the accelerated timer, and neither
     // should be denied the container read a background tick makes.
     const read = async (accelerated = false) => {
       if (!live) return
@@ -289,12 +289,12 @@ export function useWorkspaceState({
           // read is `null`, which is the tri-state's "no claim", and every consumer already
           // treats that as "could not tell" rather than as "clean".
           //
-          // AND ON A BACKGROUND TICK. An accelerated read is the 3-second timer that watches a
+          // AND ON A BACKGROUND TICK. An accelerated read is the timer that watches a
           // start land, so the container it would ask has been alive for seconds and is still
           // restoring and booting — two `git` executions are the last thing it needs, and the
           // answer is the one the next background tick gives for free. The acceleration must cost
           // cheap reads and nothing else. SKIPPED, NOT RETURNED FROM: this read still owes
-          // the timer below its cadence decision, and an early exit here would leave the 3-second
+          // the timer below its cadence decision, and an early exit here would leave the accelerated
           // interval running over an app that is already up.
           if (!accelerated && !hidden) {
             const state = await fetchSaveState(projectId).catch(() => null)
