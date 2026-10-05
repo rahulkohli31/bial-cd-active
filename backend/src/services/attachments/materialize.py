@@ -33,6 +33,7 @@ import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -240,7 +241,7 @@ async def _ids_already_sent(
     The payload marker is written by `append_batch` as part of the turn's own commit, so a row
     appears here exactly when a message carrying it became durable.
     """
-    payloads = (
+    payloads: Sequence[list[Any]] = (
         (
             await db.execute(
                 sa.select(Message.payload).where(

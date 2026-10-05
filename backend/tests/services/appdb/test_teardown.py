@@ -29,7 +29,12 @@ from src.services.appdb.names import database_name, quote_identifier, role_name
 from src.services.appdb.provision import control_plane_dsn, ensure_project_database
 from src.services.appdb.teardown import restore_login, salt_the_earth, sever
 from tests.factories import ProjectFactory, UserFactory
-from tests.services.appdb.helpers import control_plane_identity_dsn, execute_on, scalar_on
+from tests.services.appdb.helpers import (
+    control_plane_identity_dsn,
+    execute_on,
+    refused_by_postgres,
+    scalar_on,
+)
 
 pytestmark = pytest.mark.app_db
 
@@ -81,7 +86,7 @@ async def test_sever_kills_a_live_session_and_refuses_the_reconnect(
 
     # ...and the reconnect a pool would immediately attempt finds the door locked. Order
     # matters: had the terminate run FIRST, this reconnect would have succeeded.
-    with pytest.raises(asyncpg.InvalidAuthorizationSpecificationError):
+    with refused_by_postgres(asyncpg.InvalidAuthorizationSpecificationError):
         await scalar_on(dsn, "SELECT 1")
     assert await _catalog(maintenance, _CAN_LOGIN_SQL, role=role) is False
 

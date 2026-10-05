@@ -62,18 +62,16 @@ RUN curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v2.11.4/c
 
 # Supervisor deps (Debian trixie marks the base env externally-managed → allow the install).
 #
-# PINNED, not ranged. These are captured from what the previous image actually resolved to on
-# build day, so the Python 3.11 -> 3.13 move is the ONLY supervisor-side variable in this
-# rebuild — measured identical on both bases before pinning, so it is a capture rather than an
-# upgrade. The old `fastapi>=0.111` was wider than it looked: starlette crossed a major under it.
+# PINNED, not ranged, so a rebuild never moves the supervisor's packages on its own: a range
+# is wider than it looks, and starlette has crossed a major under a `fastapi>=` floor before.
 #
 # `websockets` is listed EXPLICITLY even though `uvicorn[standard]` already pulls it: the
 # supervisor's HMR compile-state consumer imports it directly, and a dependency a file imports
-# should not be an accident of another package's extra. The version is a CAPTURE of what
-# `uvicorn[standard]==0.52.2` resolves to on this base, not an upgrade — pinning it here only
-# stops it moving on its own between builds.
+# should not be an accident of another package's extra. The version is what
+# `uvicorn[standard]==0.54.0` resolves to on this base; pinning it here only stops it moving on
+# its own between builds.
 RUN pip3 install --no-cache-dir --break-system-packages \
-        "fastapi==0.141.1" "uvicorn[standard]==0.52.2" "websockets==17.0.1"
+        "fastapi==0.142.2" "uvicorn[standard]==0.54.0" "websockets==17.2"
 
 # The attachment reader's libraries. Pinned like their neighbours above, and captured from
 # what this base actually resolved to rather than picked from a changelog.

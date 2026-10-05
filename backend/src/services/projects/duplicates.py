@@ -141,7 +141,9 @@ async def find_possible_duplicates(
         return DuplicateCheckResult(matches=[])
 
 
-def _candidate_query(description: str, query_embedding: list[float] | None) -> sa.Select[Any]:
+def _candidate_query(
+    description: str, query_embedding: list[float] | None
+) -> sa.Select[*tuple[Any, ...]]:
     """Build the candidate query: up to `_CANDIDATE_WINDOW` rows per arm, FULL OUTER joined,
     carrying each arm's own rank AND native score (never a fused RRF score — R34 forbids a
     flat fused-score cutoff), joined onto the display columns `MarketplaceEntry` needs.

@@ -22,7 +22,7 @@ pytestmark = pytest.mark.skipif(_WORKER is None, reason="runs only under pytest-
 
 async def test_a_parallel_worker_talks_to_its_own_copy_of_the_test_database() -> None:
     async with db_base.async_session_factory() as db:
-        name = (await db.execute(sa.text("SELECT current_database()"))).scalar_one()
+        name: str = (await db.execute(sa.text("SELECT current_database()"))).scalar_one()
 
     assert name.endswith(f"_{_WORKER}")
     assert name in _database_denylist()

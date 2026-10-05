@@ -40,6 +40,7 @@ from tests.services.appdb.helpers import (
     control_plane_database_name,
     control_plane_identity_dsn,
     execute_on,
+    refused_by_postgres,
     scalar_on,
     unpersisted_record,
 )
@@ -349,7 +350,7 @@ async def test_a_crash_before_the_wall_leaves_a_non_terminal_marker_and_self_hea
     # ...and the wall is now genuinely up: an identity that is not the app role (nor a
     # member of it) is refused at connect time, not at query time.
     assert await _catalog(maintenance, _PUBLIC_CONNECT_SQL, db=db_name) is False
-    with pytest.raises(asyncpg.InsufficientPrivilegeError) as refused:
+    with refused_by_postgres(asyncpg.InsufficientPrivilegeError) as refused:
         await scalar_on(control_plane_identity_dsn(db_name), "SELECT 1")
     assert "permission denied for database" in str(refused.value)
 
@@ -378,7 +379,7 @@ async def test_role_a_cannot_connect_to_project_b_database(
     # CONNECT time, which is why this is structural rather than a predicate anyone can
     # forget to write.
     crossing = control_plane_dsn(record_a).replace(record_a.db_name, record_b.db_name)
-    with pytest.raises(asyncpg.InsufficientPrivilegeError) as refused:
+    with refused_by_postgres(asyncpg.InsufficientPrivilegeError) as refused:
         await scalar_on(crossing, "SELECT 1")
     assert "permission denied for database" in str(refused.value)
 
@@ -400,7 +401,7 @@ async def test_an_app_role_cannot_reach_the_control_plane_database(
     control_plane = control_plane_database_name()
     assert "test" in control_plane, "refusing to probe a non-test database"
 
-    with pytest.raises(asyncpg.InsufficientPrivilegeError) as refused:
+    with refused_by_postgres(asyncpg.InsufficientPrivilegeError) as refused:
         await scalar_on(app_role_pointed_at(record, control_plane), "SELECT 1")
     assert "permission denied for database" in str(refused.value)
 

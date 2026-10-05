@@ -389,13 +389,13 @@ class SharedWithMePage:
 SharedSort = Literal["recentlyShared", "name"]
 
 
-def _narrow(
-    query: sa.Select[Any],
+def _narrow[*Ts](
+    query: sa.Select[*Ts],
     user_id: uuid.UUID,
     *,
     search: str | None,
     shared_by: uuid.UUID | None,
-) -> sa.Select[Any]:
+) -> sa.Select[*Ts]:
     """The shared list's FROM and WHERE, written ONCE and shared by the page, the total and the
     facet — a total counted over a different predicate than the page is what renders page numbers
     a person can click and find empty.

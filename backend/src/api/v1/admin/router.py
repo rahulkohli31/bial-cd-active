@@ -31,6 +31,7 @@ import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, status
 from pydantic.alias_generators import to_camel
+from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -403,7 +404,7 @@ async def _publish_facts(
     newest = await db.scalars(
         sa.select(Deployment)
         .where(Deployment.app_id.in_(app_ids))
-        .distinct(Deployment.app_id)
+        .ext(distinct_on(Deployment.app_id))
         .order_by(Deployment.app_id, Deployment.id.desc())
     )
     newest_by_app = {row.app_id: row for row in newest}

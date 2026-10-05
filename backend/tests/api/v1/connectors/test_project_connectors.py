@@ -455,6 +455,33 @@ async def test_a_citizen_with_no_history_switches_it_on_and_the_next_start_carri
     assert await build_connector_env(db_session, user_id=user.id, project_id=project.id) == {}
 
 
+async def test_a_switch_off_reaches_a_session_that_already_holds_the_row(
+    client, db_session, monkeypatch
+) -> None:
+    """The switch is an upsert, which a session's cached copy of the row does not see on its own.
+    A start reading through a session that loaded the row before the switch-off must not carry
+    the connector's coordinates."""
+    monkeypatch.setattr(
+        settings,
+        "connector_lake",
+        LakeConfig(
+            url="https://alakeaccount.blob.core.windows.net/acontainer/reports/",
+            identity_client_id="52b74947-0621-46e2-a523-a6b466f47c33",
+            identity_resource_id="/subscriptions/s/resourcegroups/r/providers/x/an-identity",
+        ),
+    )
+    user, project = await _owned(db_session)
+    assert (await _put(client, user, project.id, {"enabled": True})).status_code == 200
+    held = await db_session.scalar(
+        sa.select(ProjectConnector).where(ProjectConnector.project_id == project.id)
+    )
+    assert held is not None and held.enabled is True
+
+    assert (await _put(client, user, project.id, {"enabled": False})).status_code == 200
+
+    assert await build_connector_env(db_session, user_id=user.id, project_id=project.id) == {}
+
+
 async def test_a_write_without_the_csrf_header_is_refused(client, db_session) -> None:
     """The shape a cross-site form post arrives in: the cookie rides along, the header does not."""
     user, project = await _owned(db_session)

@@ -60,13 +60,13 @@ def _snapshot() -> dict[str, Any]:
         try:
             async with engine.connect() as conn:
                 projects_table = await conn.scalar(text("SELECT to_regclass('projects')"))
-                app_registry_columns = set(
+                app_registry_columns: set[str] = set(
                     (await conn.execute(text(_COLUMNS_SQL), {"table": "app_registry"})).scalars()
                 )
-                users_columns = set(
+                users_columns: set[str] = set(
                     (await conn.execute(text(_COLUMNS_SQL), {"table": "users"})).scalars()
                 )
-                app_registry_constraints = set(
+                app_registry_constraints: set[str] = set(
                     (await conn.execute(text(_CONSTRAINTS_SQL))).scalars()
                 )
         finally:

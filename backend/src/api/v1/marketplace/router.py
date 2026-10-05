@@ -90,7 +90,7 @@ def clean_sort(value: str | None) -> Sort:
     raise AppApiError(422, "sort must be one of: newest, name.")
 
 
-def _live_catalog() -> tuple[sa.Select[Any], type[Deployment]]:
+def _live_catalog() -> tuple[sa.Select[*tuple[Any, ...]], type[Deployment]]:
     """The catalog's membership predicate, expressed EXACTLY ONCE — the BROWSE path only
     (no `q`). Search (#191 slice 3) no longer filters this query; it is answered by
     `_hybrid_catalog` below instead of a `WHERE ... @@ ...` bolted onto this one, because a
@@ -150,7 +150,7 @@ _ARM_POOL_CAP = 200
 
 def _hybrid_catalog(
     search: str, query_embedding: list[float] | None
-) -> tuple[sa.Select[Any], type[Deployment]]:
+) -> tuple[sa.Select[*tuple[Any, ...]], type[Deployment]]:
     """The fused (keyword + semantic) ranking for one search query (#191 slice 3, R27),
     joined onto the same last-success deployment/project/user projection `_live_catalog`
     uses for browsing — everything downstream of `(query, deployment)` is identical
@@ -250,9 +250,9 @@ def _hybrid_catalog(
     return query, deployment
 
 
-def _entry(row: sa.Row[Any]) -> MarketplaceEntry:
-    # `row._tuple()`, not attribute access — but be precise about what that buys: on an
-    # `Any`-parameterised `Row`, `_tuple()` is itself typed `Any`, so NEITHER the arity nor
+def _entry(row: sa.Row[*tuple[Any, ...]]) -> MarketplaceEntry:
+    # `row._tuple()`, not attribute access — but be precise about what that buys: on a `Row`
+    # of `Any` columns, `_tuple()` is typed `tuple[Any, ...]`, so NEITHER the arity nor
     # the order below is checked statically; swapping two same-typed columns in
     # `with_only_columns` passes mypy clean.
     #

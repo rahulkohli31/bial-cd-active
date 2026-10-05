@@ -188,6 +188,9 @@ def create_app() -> FastAPI:
         docs_url=None if settings.is_production else "/docs",
         redoc_url=None if settings.is_production else "/redoc",
         openapi_url=None if settings.is_production else "/openapi.json",
+        # A host-injected `OTEL_EXPORTER_OTLP_*` would otherwise start exporting request
+        # telemetry by itself.
+        telemetry={"auto_configure": False},
     )
 
     register_exception_handlers(app)
