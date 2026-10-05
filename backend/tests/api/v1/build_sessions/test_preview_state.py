@@ -32,7 +32,7 @@ from src.services.build_sessions.locks import (
     write_start_failure,
     write_starting_marker,
 )
-from src.services.build_sessions.manager import SessionManager, app_name_for
+from src.services.build_sessions.manager import SessionManager
 from src.services.redis import (
     BUILD_COORDINATION_UNAVAILABLE_MSG,
     REGISTRY_STATE_ENDING,
@@ -54,6 +54,7 @@ from src.services.redis.keys import (
     starting_key,
 )
 from src.services.sandbox import DevStatus, SandboxError, SandboxHandle, SandboxNotReadyError
+from src.services.sandbox.base import app_name_for
 from src.services.storage import StorageError, StorageNotFoundError, snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory

@@ -350,6 +350,38 @@ async def test_a_database_that_will_not_record_does_not_fail_the_start(
     assert [entry["step"] for entry in unrecorded] == ["open"]
 
 
+async def test_a_database_that_will_not_record_the_close_does_not_raise(
+    db_session: AsyncSession, books: SessionFactory
+) -> None:
+    """The close runs on the start's way out, a failed start's included, so a refused write must
+    not replace what the start itself raised.
+
+    Mutation check: narrow the close's `except` to `IntegrityError` and the close raises."""
+    user = await UserFactory.create(db_session, email="st-closedown@rvaiglobal.com")
+    app = await AppRegistryFactory.create(db_session, user_id=user.id)
+
+    @contextlib.asynccontextmanager
+    async def _the_database_is_down() -> AsyncIterator[AsyncSession]:
+        raise OperationalError("UPDATE sandbox_starts", {}, ConnectionRefusedError())
+        yield db_session  # pragma: no cover - unreachable; makes this a generator
+
+    up_then_down = iter((books, lambda: _the_database_is_down()))
+    record = StartRecord()
+    record.admitted(SandboxStartKind.REOPEN, user_id=user.id, books=lambda: next(up_then_down)())
+    await record.open(app_id=app.id, env={"BIAL_APP_ID": str(app.id)})
+    assert record.on_the_books == record.id, "guard the premise: the row was written"
+
+    with structlog.testing.capture_logs() as logs:
+        await record.close(SandboxStartOutcome.FAILED)
+
+    unrecorded = [entry for entry in logs if entry["event"] == SANDBOX_START_NOT_RECORDED_EVENT]
+    assert [(entry["step"], entry["start_id"]) for entry in unrecorded] == [
+        ("close", str(record.id))
+    ]
+    [row] = await _rows(db_session, user.id)
+    assert row.outcome is None
+
+
 async def test_a_relaunch_that_takes_the_slot_from_another_project_is_a_switch(
     db_session: AsyncSession,
     fake_redis: aioredis.Redis,

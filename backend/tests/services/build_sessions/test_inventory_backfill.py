@@ -14,8 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.project_share import ProjectShare
 from src.services.build_sessions.appdata import resolve_app_for_project
-from src.services.build_sessions.inventory import _app_names_to_owners, backfill_sandbox_tags
-from src.services.build_sessions.manager import app_name_for, shr_name_for
+from src.services.build_sessions.inventory import (
+    OwnedApp,
+    _app_names_to_owners,
+    backfill_sandbox_tags,
+    owning_app_ids,
+)
 from src.services.sandbox.base import (
     KIND_BUILD_SANDBOX,
     KIND_SHARED_SANDBOX,
@@ -23,7 +27,9 @@ from src.services.sandbox.base import (
     TAG_USER_ID,
     FleetMember,
     a_fresh_sandbox_name,
+    app_name_for,
     pool_member_tags,
+    shr_name_for,
 )
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import a_fleet_member, a_ready_pool_row
@@ -75,6 +81,22 @@ async def test_a_names_to_owners_includes_both_the_build_and_the_shared_name(
     assert known[shared_name].app_id == app_id
     assert known[shared_name].user_id == recipient_id  # the RECIPIENT, never the owner
     assert known[shared_name].kind == KIND_SHARED_SANDBOX
+
+
+async def test_the_sweeps_map_names_the_apps_owner_for_a_build_and_a_view_alike(
+    db_session: AsyncSession,
+) -> None:
+    """A sweep writes a tree back only to an app the slot's own user owns. Were a view's name to
+    carry its recipient as owner, a recipient's slot naming the owner's app would pass that check
+    and its tree would land on the owner's saved copy.
+
+    Mutation check: carry a view's recipient as its app's owner and this goes red."""
+    app_id, owner_id, recipient_id = await _owner_and_recipient_with_a_share(db_session)
+
+    owned = await owning_app_ids(db_session)
+
+    assert owned[app_name_for(app_id)] == OwnedApp(app_id, owner_id)
+    assert owned[shr_name_for(app_id, recipient_id)] == OwnedApp(app_id, owner_id)
 
 
 async def test_backfill_stamps_an_untagged_shared_view_as_shared_not_build(

@@ -24,7 +24,7 @@ import structlog
 from pydantic import SecretStr
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from structlog.testing import capture_logs
 
 import src.db.base as db_base
@@ -43,7 +43,7 @@ from src.services.redis.keys import (
 )
 from src.services.sandbox import client as client_module
 from src.services.sandbox import pool
-from src.services.sandbox.aca import AcaControlPlane, AcaError
+from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError
 from src.services.sandbox.base import (
     KIND_BUILD_SANDBOX,
     KIND_SHARED_SANDBOX,
@@ -99,6 +99,10 @@ class PoolAca(AcaControlPlane):
         self.filled_under: list[tuple[Stopwatch, dict[str, Any]]] = []
         # Set, a restamp waits on it: how a test holds one in flight.
         self.restamps_wait_for: asyncio.Event | None = None
+        # How many more reads of a container's environment Azure throttles, by name, and every
+        # read asked for.
+        self.env_reads_throttled: dict[str, int] = {}
+        self.env_reads: list[str] = []
 
     def made_for_the_pool(self, name: str, *, token: str | None) -> None:
         self.envs[name] = {"BIAL_POOL_MEMBER": "1"}
@@ -151,6 +155,10 @@ class PoolAca(AcaControlPlane):
         self.envs.pop(name, None)
 
     async def get_app_env_value(self, *, name: str, key: str) -> str | None:
+        self.env_reads.append(name)
+        if self.env_reads_throttled.get(name, 0):
+            self.env_reads_throttled[name] -= 1
+            raise AcaTransientError("ACA get was throttled or 5xx'd")
         return self.envs.get(name, {}).get(key)
 
     async def get_app_fqdn(self, *, name: str) -> str | None:
@@ -512,6 +520,10 @@ def _bearer_unreadable(world: SimpleNamespace, name: str) -> None:
     world.aca.envs[name].pop("SUPERVISOR_TOKEN")
 
 
+def _container_absent(world: SimpleNamespace, name: str) -> None:
+    world.aca.envs.pop(name)
+
+
 def _health_refused(world: SimpleNamespace, name: str) -> None:
     world.supervisors.health_status[f"{name}.pool.example"] = 503
 
@@ -530,6 +542,7 @@ def _configure_hangs(world: SimpleNamespace, name: str) -> None:
 
 _FAILURES = [
     pytest.param(_bearer_unreadable, "claim_failed", id="bearer-unreadable"),
+    pytest.param(_container_absent, "claim_failed", id="container-absent"),
     pytest.param(_health_refused, "unhealthy", id="health-refused"),
     pytest.param(_health_hangs, "unhealthy", id="health-hangs"),
     pytest.param(_configure_refused, "claim_failed", id="configure-500"),
@@ -677,6 +690,134 @@ async def test_a_claim_whose_registry_write_fails_fails_the_start_and_lets_it_go
     assert world.aca.deleted == [member]
     assert world.aca.created == []
     assert await _ledger() == {}
+
+
+async def _no_wait(seconds: float) -> None:
+    return None
+
+
+async def test_a_bearer_read_azure_throttles_once_is_asked_again_and_the_claim_stands(
+    world, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A throttle says nothing about the container, so the read is asked again before the claim
+    gives the container up.
+
+    Mutation check: read the bearer once and the start creates its own."""
+    member = await _ready(world)
+    world.aca.env_reads_throttled[member] = 1
+    monkeypatch.setattr(client_module, "_asleep", _no_wait)
+
+    handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4())
+    await _settled(world.client)
+
+    assert (handle.app_name, stopwatch.claimed) == (member, True)
+    assert world.aca.env_reads[:2] == [member, member]
+    assert world.aca.created == []
+    assert world.aca.deleted == []
+
+
+async def test_a_container_whose_bearer_azure_keeps_throttling_goes_back_and_the_next_is_taken(
+    world, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Nothing was learnt of the container, and deleting it would drain the pool exactly while
+    Azure is struggling. It goes back ready, and the start takes the next one.
+
+    Mutation check: let it go like a container whose bearer is missing and it is deleted."""
+    throttled = await _ready(world, since=datetime.now(UTC) - timedelta(hours=1))
+    sound = await _ready(world)
+    world.aca.env_reads_throttled[throttled] = 2
+    monkeypatch.setattr(client_module, "_asleep", _no_wait)
+
+    handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4())
+    await _settled(world.client)
+
+    assert (handle.app_name, stopwatch.claimed) == (sound, True)
+    assert world.aca.deleted == []
+    [replacement] = world.aca.filled
+    assert await _ledger() == {
+        throttled: SandboxPoolState.READY,
+        replacement: SandboxPoolState.READY,
+    }
+
+
+async def test_a_start_does_not_claim_again_the_container_it_puts_back(
+    world, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its next claim would take the same container while Azure still throttles the read.
+
+    Mutation check: put the container back as soon as its read fails and it is read four times."""
+    throttled = await _ready(world)
+    world.aca.env_reads_throttled[throttled] = 4
+    monkeypatch.setattr(client_module, "_asleep", _no_wait)
+
+    handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4())
+    await _settled(world.client)
+
+    assert (stopwatch.claimed, stopwatch.miss_reason) == (False, "claim_failed")
+    assert world.aca.created == [handle.app_name]
+    assert world.aca.env_reads == [throttled, throttled]
+    assert world.aca.deleted == []
+    assert await _ledger() == {throttled: SandboxPoolState.READY}
+
+
+# --- a ledger that does not answer -----------------------------------------------------------
+
+
+def _ledger_down(*_: object, **__: object) -> Any:
+    raise OperationalError("SELECT sandbox_pool", {}, ConnectionRefusedError())
+
+
+@pytest.mark.parametrize(
+    ("statement", "ready_count"),
+    [pytest.param("ready_count", None, id="count"), pytest.param("claim", 1, id="claim")],
+)
+async def test_a_ledger_that_does_not_answer_the_claim_leaves_the_start_to_create(
+    world, monkeypatch: pytest.MonkeyPatch, statement: str, ready_count: int | None
+) -> None:
+    """The pool only ever saves a start time: a ledger that does not answer costs the claim, not
+    the start, and touches no ready container.
+
+    Mutation check: let the ledger's error out of the claim and the start fails."""
+    member = await _ready(world)
+    monkeypatch.setattr(pool, statement, _ledger_down)
+
+    with capture_logs() as logged:
+        handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4())
+
+    assert (stopwatch.claimed, stopwatch.miss_reason, stopwatch.ready_count) == (
+        False,
+        "claim_failed",
+        ready_count,
+    )
+    assert world.aca.created == [handle.app_name]
+    assert [e["event"] for e in logged if e["event"] == "sandbox_pool_ledger_unreachable"] == [
+        "sandbox_pool_ledger_unreachable"
+    ]
+    assert await _ledger() == {member: SandboxPoolState.READY}
+
+
+async def test_a_claim_whose_row_cannot_be_forgotten_keeps_the_container_it_recorded(
+    world, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the registry records the container it is the person's, whatever the ledger says; the
+    row left claimed is cleared by a pass, which spares a container the registry names.
+
+    Mutation check: fail the start when the row cannot be forgotten and the claim is lost."""
+    member = await _ready(world)
+    user = uuid.uuid4()
+    monkeypatch.setattr(pool, "forget", _ledger_down)
+
+    with capture_logs() as logged:
+        handle, stopwatch = await _start(world.client, user, uuid.uuid4())
+
+    assert (handle.app_name, stopwatch.claimed) == (member, True)
+    assert await _recorded_name(world.redis, user) == member
+    assert [
+        e["app_name"] for e in logged if e["event"] == "sandbox_pool_row_outlived_its_claim"
+    ] == [member]
+    monkeypatch.undo()
+    await _settled(world.client)
+    assert (await _ledger())[member] is SandboxPoolState.CLAIMED
 
 
 # --- the ledger statements -------------------------------------------------------------------
@@ -837,9 +978,41 @@ async def test_a_refused_create_whose_clean_up_is_refused_too_is_left_retiring(w
     assert await _ledger() == {attempted: SandboxPoolState.RETIRING}
 
 
-async def test_a_fill_whose_row_a_pass_let_go_deletes_what_it_made(world) -> None:
-    """A pass that judged the create overdue has given up its row, so nothing would hold the
-    container the create goes on to make."""
+async def test_a_refused_create_whose_row_and_clean_up_are_both_gone_is_held_retiring(
+    world,
+) -> None:
+    """A pass let the row go while the create ran, so the retire finds nothing: a new retiring
+    row names whatever may stand under that name.
+
+    Mutation check: write no row when the retire finds none and the name is held nowhere."""
+    world.aca.refuses_to_create = True
+    world.aca.refuses_every_delete = True
+    let_go: list[str] = []
+
+    async def a_pass_lets_the_row_go() -> None:
+        if let_go:
+            return
+        [name] = await _ledger()
+        let_go.append(name)
+        async with db_base.async_session_factory() as db:
+            await db.execute(sa.delete(SandboxPoolMember).where(SandboxPoolMember.name == name))
+            await db.commit()
+
+    world.aca.on_each_call = a_pass_lets_the_row_go
+
+    assert await world.client.fill_one(5) == "refused"
+
+    assert await _ledger() == {let_go[0]: SandboxPoolState.RETIRING}
+
+
+async def _a_fill_whose_row_a_pass_let_go(
+    world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, *, answers: bool
+) -> tuple[asyncio.Task[client_module.FillOutcome], str]:
+    """A fill held mid-create while a pass judges it overdue: its row retired, and forgotten once
+    Azure confirms a name nothing has been made under yet gone."""
+    if not answers:
+        world.supervisors.silent_for = 1_000
+        monkeypatch.setattr(client_module, "FIRST_ANSWER_CEILING", timedelta(0))
     world.aca.fills_wait_for = asyncio.Event()
     filling = asyncio.create_task(world.client.fill_one(5))
     await asyncio.wait_for(world.aca.fill_began.wait(), timeout=5)
@@ -850,12 +1023,75 @@ async def test_a_fill_whose_row_a_pass_let_go_deletes_what_it_made(world) -> Non
         )
     assert member_id is not None
     assert await pool.retire(member_id, was=SandboxPoolState.FILLING) is True
+    await pool.forget(member_id)
+    return filling, name
+
+
+@pytest.mark.parametrize("answers", [True, False], ids=["answered", "never-answered"])
+async def test_a_fill_whose_row_a_pass_let_go_deletes_what_it_made(
+    world, monkeypatch: pytest.MonkeyPatch, answers: bool
+) -> None:
+    """A pass that judged the create overdue has given up its row, so nothing would hold the
+    container the create goes on to make, whether or not it ever answers.
+
+    Mutation check: delete a silent container only while its own retire lands and it stands."""
+    filling, name = await _a_fill_whose_row_a_pass_let_go(world, monkeypatch, answers=answers)
+
+    world.aca.fills_wait_for.set()
+
+    assert await filling == "refused"
+    assert world.aca.deleted == [name]
+    assert await _ledger() == {}
+
+
+@pytest.mark.parametrize("answers", [True, False], ids=["answered", "never-answered"])
+async def test_a_fill_with_no_row_whose_delete_is_refused_is_held_retiring(
+    world, monkeypatch: pytest.MonkeyPatch, answers: bool
+) -> None:
+    """★ Nothing else names the container, so a retiring row is written for it and a later pass
+    retries the delete, rather than the container billing with no row and no record.
+
+    Mutation check: write no row when the delete is refused and the container is named nowhere."""
+    filling, name = await _a_fill_whose_row_a_pass_let_go(world, monkeypatch, answers=answers)
+    world.aca.refuses_every_delete = True
 
     world.aca.fills_wait_for.set()
 
     assert await filling == "refused"
     assert world.aca.deleted == [name]
     assert await _ledger() == {name: SandboxPoolState.RETIRING}
+
+
+async def test_a_fill_queued_past_its_deadline_whose_row_a_pass_let_go_makes_nothing(
+    world,
+) -> None:
+    """★ The deadline is the create's, not the queue's: a refill that waited behind the bound
+    while the worker's pass let its row go must not then make a container no row holds.
+
+    Mutation check: create without restarting the row's clock and a container is made."""
+    for _ in range(client_module._POOL_WORK_AT_ONCE):
+        await world.client._pool_work.acquire()
+    filling = asyncio.create_task(world.client.fill_one(5))
+
+    async def queued() -> bool:
+        return len(await _ledger()) == 1
+
+    await _until(queued)
+    worker = AcaSandboxClient(
+        _config(pool_day_size=0, pool_night_size=0),
+        transport=httpx.MockTransport(world.supervisors),
+        aca=world.aca,
+    )
+    late = datetime.now(UTC) + pool_pass.ROW_DEADLINE + timedelta(minutes=1)
+    after = await pool_pass.keep_the_pool(worker, at=late)
+    await worker.aclose()
+    assert after.overdue, "guard the premise: the pass let the queued fill's row go"
+    for _ in range(client_module._POOL_WORK_AT_ONCE):
+        world.client._pool_work.release()
+
+    assert await filling == "refused"
+    assert world.aca.create_attempts == []
+    assert await _ledger() == {}
 
 
 async def test_one_claim_makes_one_replacement_that_a_pass_meanwhile_counts(world) -> None:
@@ -1087,7 +1323,8 @@ async def test_a_retire_takes_only_a_row_still_in_the_state_it_was_judged_in(wor
 
 def test_a_row_is_overdue_only_after_the_longest_create_could_have_run() -> None:
     """Every create attempt waits at most five minutes for Azure, and a create is tried four
-    times; a pool member then has five minutes to answer. A row younger than that may still have
-    its create, or its first answer, in flight."""
+    times; a pool member then has five minutes to answer. The deadline covers the create and the
+    first answer from the moment the fill holds the pool's bound, when its row's clock restarts,
+    so a row younger than that may still have either in flight."""
     assert pool_pass.ROW_DEADLINE > timedelta(minutes=25)
     assert pool_pass.ROW_DEADLINE < timedelta(minutes=30)

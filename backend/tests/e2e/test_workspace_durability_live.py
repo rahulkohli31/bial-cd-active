@@ -20,8 +20,9 @@ import pytest
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.services.build_sessions.manager import SessionManager, app_name_for
+from src.services.build_sessions.manager import SessionManager
 from src.services.build_sessions.reaper import is_a_sandbox_name
+from src.services.sandbox.base import app_name_for
 from src.services.storage import snapshot_key
 from src.services.storage.bundle import parse_bundle_head_sha
 from tests.factories import ProjectFactory, UserFactory

@@ -29,7 +29,7 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import NamedTuple, Protocol, runtime_checkable
 
 import redis.asyncio as aioredis
 import sqlalchemy as sa
@@ -195,17 +195,26 @@ class _KnownContainer:
     the RECIPIENT for a shared view (`shared_sandbox_tags`' own rule, restated here rather than
     left implicit in a bare tuple, which is exactly what let this dict go a whole feature
     without a `shr-` entry: nothing about `tuple[UUID, UUID]` said which fleet a name belonged
-    to, so nobody who used it needed to answer that question)."""
+    to, so nobody who used it needed to answer that question). `owner_id` is the app's owner on
+    either kind."""
 
     app_id: uuid.UUID
     user_id: uuid.UUID
     kind: str
+    owner_id: uuid.UUID
 
 
-async def owning_app_ids(db: AsyncSession) -> dict[str, uuid.UUID]:
-    """Container name -> the app that owns it. A sweep writes a container's tree back to the app
-    its record names only while that app is in this map, and finds the app by name for a record
-    written before records named their app.
+class OwnedApp(NamedTuple):
+    """The app a container name was derived from, and the user who owns that app."""
+
+    app_id: uuid.UUID
+    owner_id: uuid.UUID
+
+
+async def owning_app_ids(db: AsyncSession) -> dict[str, OwnedApp]:
+    """Container name -> the app that owns it, and that app's owner. A sweep writes a container's
+    tree back to the app its record names only while that app is in this map and owned by the
+    slot's user, and finds the app by name for a record written before records named their app.
 
     A DATABASE THAT WILL NOT ANSWER FAILS THE CALLER rather than returning an empty map. Empty
     resolves every container to `None`, which a sweep cannot tell apart from "this caller has no
@@ -215,7 +224,7 @@ async def owning_app_ids(db: AsyncSession) -> dict[str, uuid.UUID]:
     EVERY DOOR ONTO A SWEEP MUST CALL THIS. The scheduled pass and the operator's by-hand
     reconciliation both destroy containers, and a door that skips it destroys their work."""
     owners = await _app_names_to_owners(db)
-    return {name: known.app_id for name, known in owners.items()}
+    return {name: OwnedApp(known.app_id, known.owner_id) for name, known in owners.items()}
 
 
 async def _app_names_to_owners(db: AsyncSession) -> dict[str, _KnownContainer]:
@@ -240,20 +249,20 @@ async def _app_names_to_owners(db: AsyncSession) -> dict[str, _KnownContainer]:
     rows = (await db.execute(sa.select(AppRegistry.id, AppRegistry.user_id))).all()
     known: dict[str, _KnownContainer] = {
         app_name_for(app_id): _KnownContainer(
-            app_id=app_id, user_id=user_id, kind=KIND_BUILD_SANDBOX
+            app_id=app_id, user_id=user_id, kind=KIND_BUILD_SANDBOX, owner_id=user_id
         )
         for app_id, user_id in rows
     }
     share_rows = (
         await db.execute(
-            sa.select(AppRegistry.id, ProjectShare.shared_with_user_id).join(
+            sa.select(AppRegistry.id, ProjectShare.shared_with_user_id, AppRegistry.user_id).join(
                 ProjectShare, ProjectShare.project_id == AppRegistry.project_id
             )
         )
     ).all()
-    for app_id, recipient_id in share_rows:
+    for app_id, recipient_id, owner_id in share_rows:
         known[shr_name_for(app_id, recipient_id)] = _KnownContainer(
-            app_id=app_id, user_id=recipient_id, kind=KIND_SHARED_SANDBOX
+            app_id=app_id, user_id=recipient_id, kind=KIND_SHARED_SANDBOX, owner_id=owner_id
         )
     return known
 

@@ -66,7 +66,6 @@ from src.services.build_sessions.manager import (
     NoSnapshotToRelaunchError,
     SessionManager,
     SnapshotUnavailableError,
-    app_name_for,
 )
 from src.services.build_sessions.reaper import sweep_all
 from src.services.build_sessions.sandbox_starts import StartRecord
@@ -89,6 +88,7 @@ from src.services.redis.keys import (
     start_failure_key,
 )
 from src.services.sandbox import SandboxError, SandboxHandle
+from src.services.sandbox.base import app_name_for
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import (
     StorageAuthError,
@@ -633,7 +633,7 @@ async def test_clean_end_then_start_restores_from_snapshot_not_fresh(
     # blank template.
     #
     # It must ALSO not destroy the pardoned container on the way. The allocator used to pass no
-    # `spare_app`, so `_the_live_sandbox_is_already_the_one_we_want` answered False
+    # `spare`, so `_the_live_sandbox_is_already_the_one_we_want` answered False
     # unconditionally and reconcile-on-start reaped every incumbent — including, as here, one
     # already serving this very app. That is the same destroy-and-rebuild bug removed from
     # the two turn paths and never removed from this one. Here only the claim line's `reclaimed`

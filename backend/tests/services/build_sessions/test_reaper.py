@@ -27,8 +27,9 @@ from src.api.v1.build_sessions.schemas import (
 from src.config import settings
 from src.db.models.app_registry import AppRegistry
 from src.db.models.pending_teardown import PendingTeardown
-from src.services.build_sessions import app_name_for, locks, pass_history, reaper, shr_name_for
+from src.services.build_sessions import locks, pass_history, reaper
 from src.services.build_sessions.alarms import SERVING_PROOF_ABSENT_AT_TEARDOWN
+from src.services.build_sessions.inventory import OwnedApp
 from src.services.build_sessions.pass_history import CopyAttempt
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
@@ -59,6 +60,8 @@ from src.services.sandbox.base import (
     TAG_KIND,
     DevStatus,
     ServedCount,
+    app_name_for,
+    shr_name_for,
 )
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
@@ -96,7 +99,7 @@ def attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
 
 
 #: A name the platform could actually have MINTED — `sbx-` + 28 lowercase hex, the exact shape
-#: `manager.app_name_for` produces, not the old "sbx-x" that no code path can emit.
+#: `app_name_for` produces, not the old "sbx-x" that no code path can emit.
 
 
 SBX = a_sandbox_name("x")
@@ -393,7 +396,9 @@ async def test_the_scheduled_sweep_resolves_the_owning_app_id_and_the_operator_o
 
     monkeypatch.setattr(reaper, "reap_user", _spy_reap)
 
-    await reaper.sweep_all(fake_redis, FakeSandboxClient(), app_ids_by_name={SBX: app_id})
+    await reaper.sweep_all(
+        fake_redis, FakeSandboxClient(), app_ids_by_name={SBX: OwnedApp(app_id, USER)}
+    )
     await reaper.sweep_all(fake_redis, FakeSandboxClient())
 
     assert gated_with == [app_id, None]
@@ -2230,7 +2235,7 @@ async def test_a_container_named_unrelated_to_its_app_is_reaped_with_its_tree_wr
     client = AttachesWhatTheRecordNames()
 
     result = await reaper.sweep_all(
-        fake_redis, client, app_ids_by_name={app_name_for(app_id): app_id}
+        fake_redis, client, app_ids_by_name={app_name_for(app_id): OwnedApp(app_id, USER)}
     )
 
     assert result.reaped == 1
@@ -2250,12 +2255,37 @@ async def test_a_recorded_app_whose_row_has_gone_is_reaped_with_nothing_written(
     name = await _registered_unrelated(fake_redis, USER, app_id=app_id)
     client = AttachesWhatTheRecordNames()
 
-    result = await reaper.sweep_all(fake_redis, client, app_ids_by_name={SBX: uuid.uuid4()})
+    result = await reaper.sweep_all(
+        fake_redis, client, app_ids_by_name={SBX: OwnedApp(uuid.uuid4(), USER)}
+    )
 
     assert result.reaped == 1
     assert client.torn_down == [name]
     assert client.bundled_from == []
     assert await _saved_head(fake_storage, app_id) is None
+
+
+async def test_a_record_naming_another_users_app_is_reaped_with_nothing_written_there(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ A record in one person's slot that names a colleague's app, with no shared-view stamp,
+    would have this person's tree bundled into the colleague's saved copy. Whatever wrote the
+    record, a tree goes back only to an app the slot's own user owns.
+
+    Mutation check: hold the recorded app to the map without its owner and the copy is replaced."""
+    owner, colleague, owners_app = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _preserve(fake_storage, owners_app, head="b" * 40)
+    name = await _registered_unrelated(fake_redis, colleague, app_id=owners_app)
+    client = AttachesWhatTheRecordNames()
+
+    result = await reaper.sweep_all(
+        fake_redis, client, app_ids_by_name={app_name_for(owners_app): OwnedApp(owners_app, owner)}
+    )
+
+    assert result.reaped == 1
+    assert client.torn_down == [name]
+    assert client.bundled_from == []
+    assert await _saved_head(fake_storage, owners_app) == "b" * 40
 
 
 async def test_reaping_a_shared_view_named_like_a_build_sandbox_writes_nothing_back(
@@ -2298,7 +2328,7 @@ async def test_of_a_build_container_and_a_view_under_one_app_only_the_build_is_w
     client = AttachesWhatTheRecordNames()
 
     result = await reaper.sweep_all(
-        fake_redis, client, app_ids_by_name={app_name_for(app_id): app_id}
+        fake_redis, client, app_ids_by_name={app_name_for(app_id): OwnedApp(app_id, owner)}
     )
 
     assert result.reaped == 2

@@ -229,6 +229,9 @@ _POOL_WORK_AT_ONCE: Final = 2
 # How many claimed containers a start lets go before it creates its own.
 _CLAIMS_PER_START: Final = 2
 
+# How many times a claim asks Azure for a container's bearer through transient errors.
+_BEARER_READS: Final = 2
+
 #: How long a container made for the pool may take to answer once Azure reports it made: its
 #: supervisor has been measured answering a minute and a half after the create returned.
 FIRST_ANSWER_CEILING: Final = timedelta(minutes=5)
@@ -387,11 +390,13 @@ class SandboxNotConfiguredError(SandboxError):
 
 class _ClaimFellThroughError(Exception):
     """A step of a claim before its registry write failed; `reason` is the miss the start records
-    if no other claim works."""
+    if no other claim works. `keep` says the step learnt nothing of the container, which goes back
+    to the pool rather than being let go."""
 
-    def __init__(self, reason: Miss) -> None:
+    def __init__(self, reason: Miss, *, keep: bool = False) -> None:
         super().__init__(reason)
         self.reason: Miss = reason
+        self.keep = keep
 
 
 class _SlotTakenError(SandboxError):
@@ -1081,9 +1086,9 @@ class AcaSandboxClient(SandboxClient):
 
     async def _read_supervisor_token(self, app_name: str) -> str | None:
         """Read a container's supervisor bearer straight off its own ACA env, or `None` when it
-        cannot be read. The ONE place that ARM call happens — `_recover_token` (registry-keyed
-        reattach) and `attach_by_name` (no registry at all) both go through this rather than
-        each reading `get_app_env_value` for itself.
+        cannot be read. `_recover_token` (registry-keyed reattach) and `attach_by_name` (no
+        registry at all) both go through this; only a claim reads it for itself, because it must
+        tell a transient error from a container that is gone.
 
         `AcaError`/`AcaTransientError` collapse to `None` here: this method says only whether the
         token was read, never why not — the caller holds the context (a registry record, or
@@ -1203,9 +1208,10 @@ class AcaSandboxClient(SandboxClient):
     ) -> SandboxHandle | None:
         """Make a ready container from the pool this start's own, or answer `None` for the start
         to create one; the start's stopwatch records which, and why not. A claimed container that
-        fails a step before its registry write is let go and another tried, twice at most. Only
-        the registry write fails the start, as it would fail a create: a slot another start took
-        meanwhile, or a registry that did not answer."""
+        fails a step before its registry write is let go, or put back when the step learnt
+        nothing of it, and another tried, twice at most. Only the registry write fails the start,
+        as it would fail a create: a slot another start took meanwhile, or a registry that did
+        not answer."""
         # Deferred: the ledger reaches `src.db`, which reaches `src.config`.
         from src.db.base import DB_UNREACHABLE
         from src.services.sandbox import pool
@@ -1221,52 +1227,62 @@ class AcaSandboxClient(SandboxClient):
             stopwatch.missed("claim_failed", ready_count=None)
             return None
         miss: Miss = "no_ready"
-        for _ in range(_CLAIMS_PER_START):
-            try:
-                member = await pool.claim(self._config.image_ref)
-            except DB_UNREACHABLE:
-                _log.warning("sandbox_pool_ledger_unreachable", exc_info=True)
-                miss = "claim_failed"
-                break
-            if member is None:
-                break
-            try:
-                handle = await self._make_it_theirs(
-                    member,
-                    user_uuid,
-                    app_env,
-                    app_id=app_id,
-                    shared_project_id=shared_project_id,
-                    shared_owner_id=shared_owner_id,
-                )
-            except _ClaimFellThroughError as exc:
-                self._detach(self._let_it_go(member))
-                _log.warning(
-                    "sandbox_pool_claim_fell_through",
-                    app_name=member.name,
-                    reason=exc.reason,
-                    exc_info=True,
-                )
-                miss = exc.reason
-                continue
-            except BaseException:
-                self._detach(self._let_it_go(member))
-                raise
-            try:
-                await pool.forget(member.id)
-            except DB_UNREACHABLE:
-                # The container is this start's either way: the registry now records it.
-                _log.error(
-                    "sandbox_pool_row_outlived_its_claim", app_name=member.name, exc_info=True
-                )
-            stopwatch.took_a_ready_one(ready_count=ready)
-            stopwatch.split("created")
-            _log.info("sandbox_pool_member_claimed", app_name=member.name, ready_count=ready)
-            # Side by side: the replacement's row is what tells a pass meanwhile that the pool
-            # is being made whole, and the restamp spends seconds on ARM.
-            self._detach(self._refill())
-            self._detach(self._restamp(member.name, _identity_tags(kind, user_uuid, app_id)))
-            return handle
+        # Put back once this start is done claiming, so its own next claim cannot take one again.
+        kept: list[ClaimedMember] = []
+        try:
+            for _ in range(_CLAIMS_PER_START):
+                try:
+                    member = await pool.claim(self._config.image_ref)
+                except DB_UNREACHABLE:
+                    _log.warning("sandbox_pool_ledger_unreachable", exc_info=True)
+                    miss = "claim_failed"
+                    break
+                if member is None:
+                    break
+                try:
+                    handle = await self._make_it_theirs(
+                        member,
+                        user_uuid,
+                        app_env,
+                        app_id=app_id,
+                        shared_project_id=shared_project_id,
+                        shared_owner_id=shared_owner_id,
+                    )
+                except _ClaimFellThroughError as exc:
+                    if exc.keep:
+                        kept.append(member)
+                    else:
+                        self._detach(self._let_it_go(member))
+                    _log.warning(
+                        "sandbox_pool_claim_fell_through",
+                        app_name=member.name,
+                        reason=exc.reason,
+                        kept=exc.keep,
+                        exc_info=True,
+                    )
+                    miss = exc.reason
+                    continue
+                except BaseException:
+                    self._detach(self._let_it_go(member))
+                    raise
+                try:
+                    await pool.forget(member.id)
+                except DB_UNREACHABLE:
+                    # The container is this start's either way: the registry now records it.
+                    _log.error(
+                        "sandbox_pool_row_outlived_its_claim", app_name=member.name, exc_info=True
+                    )
+                stopwatch.took_a_ready_one(ready_count=ready)
+                stopwatch.split("created")
+                _log.info("sandbox_pool_member_claimed", app_name=member.name, ready_count=ready)
+                # Side by side: the replacement's row is what tells a pass meanwhile that the
+                # pool is being made whole, and the restamp spends seconds on ARM.
+                self._detach(self._refill())
+                self._detach(self._restamp(member.name, _identity_tags(kind, user_uuid, app_id)))
+                return handle
+        finally:
+            for member in kept:
+                self._detach(self._put_it_back(member))
         stopwatch.missed(miss, ready_count=ready)
         return None
 
@@ -1286,9 +1302,7 @@ class AcaSandboxClient(SandboxClient):
         container is the caller's to let go."""
         stopwatch = running_stopwatch()
         with stopwatch.lap("bearer_read"):
-            token = await self._read_supervisor_token(member.name)
-        if token is None:
-            raise _ClaimFellThroughError("claim_failed")
+            token = await self._read_a_claimed_bearer(member.name)
         handle = SandboxHandle(
             fqdn=member.fqdn,
             token=token,
@@ -1325,6 +1339,37 @@ class AcaSandboxClient(SandboxClient):
             self._app_owners.pop(member.name, None)
             raise
         return handle
+
+    async def _read_a_claimed_bearer(self, name: str) -> str:
+        """A claimed container's supervisor bearer, off its Azure environment. A transient ARM
+        error is asked again once, and a second keeps the container: nothing was learnt of it. A
+        container Azure does not have, or one with no bearer, falls through to be let go."""
+        transient: AcaTransientError | None = None
+        for attempt in range(_BEARER_READS):
+            if attempt:
+                await _asleep(_ACA_RETRY_START_SECONDS)
+            try:
+                token = await self._aca.get_app_env_value(name=name, key=_SUPERVISOR_TOKEN_ENV)
+            except AcaTransientError as exc:
+                transient = exc
+                continue
+            except AcaError as exc:
+                raise _ClaimFellThroughError("claim_failed") from exc
+            if token is None:
+                raise _ClaimFellThroughError("claim_failed")
+            return token
+        raise _ClaimFellThroughError("claim_failed", keep=True) from transient
+
+    async def _put_it_back(self, member: ClaimedMember) -> None:
+        """Return a claimed container to the pool, behind the start. A row left claimed is
+        cleared by a pass past its deadline."""
+        from src.db.base import DB_UNREACHABLE
+        from src.services.sandbox import pool
+
+        try:
+            await pool.put_back(member.id)
+        except DB_UNREACHABLE:
+            _log.warning("sandbox_pool_row_not_put_back", app_name=member.name, exc_info=True)
 
     async def _let_it_go(self, member: ClaimedMember) -> None:
         """Delete a container whose claim failed, behind the start. Its row is marked retiring
@@ -1367,10 +1412,11 @@ class AcaSandboxClient(SandboxClient):
     async def fill_one(self, target: int) -> FillOutcome:
         """Make one ready container for the pool unless the filling and ready rows of the
         configured image already number `target`. Its row is written before it waits for the
-        pool's bound, so every count of the pool sees it queued, and is marked ready at the
-        address Azure answers with once its supervisor answers too. A create Azure refuses, a
-        container that never answers, or a fill cut short leaves no row, or a retiring one while
-        the container may still stand. A ledger failure raises."""
+        pool's bound, so every count of the pool sees it queued; its deadline restarts once the
+        bound is held, and a fill whose row a pass let go meanwhile makes nothing. The row is
+        marked ready at the address Azure answers with once its supervisor answers too. A create
+        Azure refuses, a container that never answers, or a fill cut short leaves no row, or a
+        retiring one while the container may still stand. A ledger failure raises."""
         from src.db.models.sandbox_pool import SandboxPoolState
         from src.services.sandbox import pool
 
@@ -1386,6 +1432,9 @@ class AcaSandboxClient(SandboxClient):
         }
         try:
             async with self._pool_work:
+                if not await pool.restart_the_clock(member_id):
+                    _log.warning("sandbox_pool_fill_outlived_its_row", app_name=name)
+                    return "refused"
                 # No data identity: nothing project-specific reaches a container before its claim.
                 fqdn = await self._create_with_retry(
                     name, env, pool_member_tags(), None, arm="pool_fill"
@@ -1397,7 +1446,8 @@ class AcaSandboxClient(SandboxClient):
         except _CreateFailedError as exc:
             _log.warning("sandbox_pool_fill_refused", app_name=name, exc_info=True)
             if exc.left_standing:
-                await pool.retire(member_id, was=SandboxPoolState.FILLING)
+                if not await pool.retire(member_id, was=SandboxPoolState.FILLING):
+                    await pool.hold_for_deletion(name, self._config.image_ref)
             else:
                 await pool.forget(member_id)
             return "refused"
@@ -1405,19 +1455,27 @@ class AcaSandboxClient(SandboxClient):
             # Azure may finish a create its caller gave up on, so a pass deletes what it made.
             await asyncio.shield(self._give_up_the_fill(member_id, name))
             raise
-        if not answered:
-            _log.warning("sandbox_pool_member_never_answered", app_name=name)
-            if await pool.retire(member_id, was=SandboxPoolState.FILLING) and (
-                await self.delete_pool_container(name)
-            ):
-                await pool.forget(member_id)
-            return "refused"
         if not marked_ready:
-            # A pass let the row go as overdue, so nothing holds this container now.
-            await self._safe_teardown(name)
+            if not answered:
+                _log.warning("sandbox_pool_member_never_answered", app_name=name)
+            # Never claimable, or a pass let its row go as overdue: nothing will take it.
+            await self._let_the_fill_go(member_id, name)
             return "refused"
         _log.info("sandbox_pool_member_filled", app_name=name, image_ref=self._config.image_ref)
         return "filled"
+
+    async def _let_the_fill_go(self, member_id: uuid.UUID, name: str) -> None:
+        """Delete a container made for the pool that will never be ready, then its row once Azure
+        confirms it gone. A delete Azure refuses leaves a retiring row naming the container, for a
+        later pass to retry. A ledger failure raises."""
+        from src.db.models.sandbox_pool import SandboxPoolState
+        from src.services.sandbox import pool
+
+        await pool.retire(member_id, was=SandboxPoolState.FILLING)
+        if await self.delete_pool_container(name):
+            await pool.forget(member_id)
+        else:
+            await pool.hold_for_deletion(name, self._config.image_ref)
 
     async def _first_answer(self, handle: SandboxHandle) -> bool:
         """Whether a container just made answers `/health` within `FIRST_ANSWER_CEILING`. Azure

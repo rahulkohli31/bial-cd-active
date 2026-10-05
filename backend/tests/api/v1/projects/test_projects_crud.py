@@ -1027,13 +1027,13 @@ def _lock(user_id):
 async def _live_session_for(fake_redis, user_id, app_id) -> None:
     """The state a real live build leaves behind: the lock held, plus a registry hash naming
     the app being built."""
-    from src.services.build_sessions import app_name_for
     from src.services.redis.keys import (
         REGISTRY_FIELD_APP_NAME,
         REGISTRY_FIELD_FQDN,
         REGISTRY_FIELD_STATE,
         registry_key,
     )
+    from src.services.sandbox.base import app_name_for
 
     await fake_redis.set(_lock(user_id), "holder-token")
     await fake_redis.hset(
@@ -1279,7 +1279,6 @@ async def test_a_relaunched_preview_is_torn_down_with_the_project_it_was_serving
     from datetime import UTC, datetime, timedelta
 
     from src.api.v1.build_sessions.deps import sandbox_or_none_dependency
-    from src.services.build_sessions import app_name_for
     from src.services.redis.keys import (
         REGISTRY_FIELD_APP_NAME,
         REGISTRY_FIELD_FQDN,
@@ -1287,6 +1286,7 @@ async def test_a_relaunched_preview_is_torn_down_with_the_project_it_was_serving
         REGISTRY_FIELD_STATE,
         registry_key,
     )
+    from src.services.sandbox.base import app_name_for
     from tests.fakes import FakeSandboxClient
 
     headers, user, project, app_row = await _project_with_app(db_session)

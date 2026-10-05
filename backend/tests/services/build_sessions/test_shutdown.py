@@ -31,7 +31,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.pending_teardown import PendingTeardown
-from src.services.build_sessions import app_name_for, shr_name_for
 from src.services.build_sessions import shutdown as shutdown_module
 from src.services.build_sessions.alarms import REAP_FOUND_NO_REPOSITORY_EVENT
 from src.services.build_sessions.integrity import PORCELAIN_FAILED_MARK
@@ -65,7 +64,9 @@ from src.services.sandbox.base import (
     TAG_KIND,
     TAG_POOL,
     ExecResult,
+    app_name_for,
     control_plane_segment,
+    shr_name_for,
 )
 from src.services.storage import StorageError, snapshot_key
 from tests.factories import (
@@ -1253,9 +1254,7 @@ async def test_the_background_spawn_returns_before_the_teardown_finishes(
     assert await _rows_for(scene) == []
 
 
-# =============================================================================
-# A row written before rows said whether the tree goes back
-# =============================================================================
+# --- a row written before rows said whether the tree goes back ---
 
 
 async def _owed_by_an_older_process(

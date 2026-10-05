@@ -158,8 +158,6 @@ from src.services.sandbox import (
     SandboxNotReadyError,
 )
 from src.services.sandbox.base import a_fresh_sandbox_name
-from src.services.sandbox.base import app_name_for as app_name_for
-from src.services.sandbox.base import shr_name_for as shr_name_for
 from src.services.sandbox.stopwatch import timed_by
 from src.services.storage import (
     BundleValidationError,
@@ -926,6 +924,15 @@ async def _the_live_sandbox_is_already_the_one_we_want(
     if reg is None:
         return False
     return _registry_serves_and_is_ready(reg, spare, user_id)
+
+
+async def _forget_what_a_restarted_container_served(
+    redis: aioredis.Redis, user_id: uuid.UUID, handle: SandboxHandle
+) -> None:
+    """Retract the serving proof of a container Azure restarted, while the record still names it.
+    Its record stands until its rebirth hands it over, and a poll meanwhile would frame it."""
+    with suppress(RedisError):
+        await clear_serving(redis, user_id, app_name=handle.app_name)
 
 
 def _registry_serves_and_is_ready(
@@ -2731,6 +2738,7 @@ class SessionManager:
                 if not attached.configured:
                     # Azure restarted it, and its files went with its settings: it is born again
                     # from the saved copy, like a container that is gone.
+                    await _forget_what_a_restarted_container_served(redis, user_id, attached)
                     raise NoLiveSandboxError(app_id)
             except SandboxUnreachableError:
                 # UNKNOWN, AND THEREFORE NOT RESTORABLE — caught ahead of its parent. The
@@ -3183,6 +3191,7 @@ class SessionManager:
             raise NoLiveSandboxError(recipient_id) from exc
         if not handle.configured:
             # Its files went with its settings: restored like a view that is gone.
+            await _forget_what_a_restarted_container_served(get_redis(), recipient_id, handle)
             raise NoLiveSandboxError(recipient_id)
         return handle
 
@@ -3381,9 +3390,12 @@ class SessionManager:
         if await read_registry(redis, user_id) is not None:
             with suppress(SandboxGoneError):
                 handle = await sandbox_client.attach_existing(str(user_id))
-        if handle is None or not handle.configured:
+        if handle is not None and not handle.configured:
             # An unconfigured container is one Azure restarted, its files gone with its settings.
             # No repository is left for the integrity gate to set aside, so it is reborn here.
+            await _forget_what_a_restarted_container_served(redis, user_id, handle)
+            handle = None
+        if handle is None:
             return _ResolvedSandbox(
                 await self._restore_or_provision(
                     sandbox_client, user_id, app_id, env, record=record

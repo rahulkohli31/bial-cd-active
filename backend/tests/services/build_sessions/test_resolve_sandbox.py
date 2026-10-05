@@ -17,7 +17,7 @@ import asyncio
 import contextlib
 import uuid
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 import redis.asyncio as aioredis
@@ -57,7 +57,11 @@ from src.services.build_sessions.manager import (
 from src.services.build_sessions.pass_history import CopyAttempt
 from src.services.build_sessions.shutdown import ShutdownReason
 from src.services.redis import REGISTRY_STATE_READY
-from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_STATE
+from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_SERVING_SINCE,
+    REGISTRY_FIELD_STATE,
+)
 from src.services.sandbox import SandboxError
 from src.services.sandbox.base import DevStatus, ExecResult, SandboxHandle
 from src.services.sandbox.config import SandboxConfig
@@ -182,6 +186,25 @@ async def _attached(
     return client, session.app_id
 
 
+def _the_proof_at_each_rebirth(
+    manager: SessionManager,
+    monkeypatch: pytest.MonkeyPatch,
+    redis: aioredis.Redis,
+    user_id: uuid.UUID,
+) -> list[str | None]:
+    """The serving proof the record carries as each birth clears the slot."""
+    seen: list[str | None] = []
+    clear_the_way = manager._clear_the_way_for_a_birth
+
+    async def looked_at(*args: Any) -> None:
+        reg = await read_registry(redis, user_id)
+        seen.append(None if reg is None else reg.get(REGISTRY_FIELD_SERVING_SINCE))
+        await clear_the_way(*args)
+
+    monkeypatch.setattr(manager, "_clear_the_way_for_a_birth", looked_at)
+    return seen
+
+
 async def _seed_saved(store: FakeStorage, app_id: uuid.UUID, sha: str = RECORDED) -> None:
     await store.put(snapshot_key(app_id), a_git_bundle(sha), metadata={"head_sha": sha})
 
@@ -262,9 +285,10 @@ async def test_a_turn_reaching_a_restarted_container_restores_its_saved_copy_int
     """★ A claimed pool container that Azure restarted comes back with no settings and none of
     its files, so it holds no repository the integrity gate could set aside. The turn treats it
     as gone: the saved copy goes into a new container, and the restarted one is owed its delete
-    with nothing written back.
+    with nothing written back. Its serving proof goes first, or a poll framed it meanwhile.
 
-    Mutation check: attach to it whatever it reports and the turn runs in the restarted one."""
+    Mutation check: attach to it whatever it reports and the turn runs in the restarted one.
+    Mutation check: give it up without retracting its proof and it still vouches at the rebirth."""
     user, project_id = await _mk(db_session, "u2-restarted@rvaiglobal.com")
     manager = a_manager_whose_ledger_is(db_session)
     client, app_id = await _attached(db_session, manager, user, project_id)
@@ -273,15 +297,17 @@ async def test_a_turn_reaching_a_restarted_container_restores_its_saved_copy_int
     client.unconfigured.add(restarted)
     await _seed_saved(fake_storage, app_id)
     monkeypatch.setattr(manager_module, "shut_it_down_in_the_background", lambda *_, **__: None)
+    await mark_serving(fake_redis, user.id, app_name=restarted, when=datetime.now(UTC))
+    proof_at_the_rebirth = _the_proof_at_each_rebirth(manager, monkeypatch, fake_redis, user.id)
 
     session = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
 
+    assert proof_at_the_rebirth == [""]
     assert session.attached is False
     assert client.restored == [session.handle.app_name]
     assert session.handle.app_name != restarted
-    assert client.configured_with == []
     owed = await db_session.execute(
         sa.select(PendingTeardown.app_name, PendingTeardown.write_back).where(
             PendingTeardown.user_id == user.id

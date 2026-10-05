@@ -9,6 +9,7 @@ the tests here are as much about what is NOT written as about what is.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -17,12 +18,18 @@ from httpx import AsyncClient
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.v1.build_sessions import router as build_sessions_router
 from src.api.v1.build_sessions.schemas import (
     HIDDEN_SURFACE_PRESENT_STAY_SECONDS,
     SURFACE_PRESENT_STAY_SECONDS,
 )
 from src.services.build_sessions.appdata import resolve_app_for_project
-from src.services.build_sessions.manager import app_name_for
+from src.services.build_sessions.locks import (
+    Occupant,
+    SharedViewStamp,
+    record_holds,
+    shared_view_stamp,
+)
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_ID,
@@ -38,6 +45,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_TOKEN_REF,
     legacy_registry_key,
 )
+from src.services.sandbox.base import app_name_for
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import a_name_unrelated_to_its_app
@@ -404,3 +412,49 @@ async def test_the_body_may_be_omitted_and_reads_as_a_visible_surface(
     stay, _ = await _stay(fake_redis, user.id)
     assert stay is not None
     assert stay - before <= timedelta(seconds=SURFACE_PRESENT_STAY_SECONDS + 5)
+
+
+class _AskedFor(Mapping[str, str]):
+    """A registry record that remembers every field it was asked for."""
+
+    def __init__(self, fields: dict[str, str]) -> None:
+        self._fields = fields
+        self.asked: set[str] = set()
+
+    def __getitem__(self, field: str) -> str:
+        self.asked.add(field)
+        return self._fields[field]
+
+    def __iter__(self) -> Iterator[str]:
+        self.asked.update(self._fields)
+        return iter(self._fields)
+
+    def __len__(self) -> int:
+        return len(self._fields)
+
+
+def test_a_renewal_fetches_every_field_its_ownership_check_reads() -> None:
+    """The renewal fetches named fields rather than the whole record, so a field the check comes to
+    read that the list lacks would read as absent and refuse every renewal of that container.
+
+    Mutation check: drop the owner's field from the renewal's list and this goes red."""
+    app_id, user_id = uuid.uuid4(), uuid.uuid4()
+    view = SharedViewStamp(owner_id=uuid.uuid4(), project_id=uuid.uuid4())
+    recorded = _AskedFor(
+        {
+            REGISTRY_FIELD_APP_ID: str(app_id),
+            REGISTRY_FIELD_APP_NAME: a_name_unrelated_to_its_app(),
+            REGISTRY_FIELD_SHARED_PROJECT_ID: str(view.project_id),
+            REGISTRY_FIELD_SHARED_OWNER_ID: str(view.owner_id),
+        }
+    )
+    named_for_its_app = _AskedFor({REGISTRY_FIELD_APP_NAME: app_name_for(app_id)})
+
+    for reg in (recorded, named_for_its_app):
+        for occupant in (Occupant(app_id), Occupant(app_id, view)):
+            record_holds(reg, occupant, user_id)
+        shared_view_stamp(reg)
+
+    assert recorded.asked | named_for_its_app.asked == set(
+        build_sessions_router._WHAT_A_RENEWAL_READS
+    )

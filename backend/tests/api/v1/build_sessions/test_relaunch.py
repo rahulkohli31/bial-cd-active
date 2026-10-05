@@ -10,6 +10,7 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -687,8 +688,8 @@ async def test_a_restarted_pool_container_is_given_up_and_its_project_restored_a
 ) -> None:
     """★ Azure restarting a claimed pool container brings it back with no project settings and
     none of its files, so starting the app in it would show the bare template. The start treats
-    it as gone: the saved copy goes into a new container, the restarted one is never configured
-    or started, and it is owed its delete with nothing written back.
+    it as gone: the saved copy goes into a new container, the restarted one is never started,
+    and it is owed its delete with nothing written back.
 
     Mutation check: attach to it whatever it reports and no second restore happens."""
     sandbox = wire.sbx
@@ -703,10 +704,58 @@ async def test_a_restarted_pool_container_is_given_up_and_its_project_restored_a
 
     assert sandbox.restored[0] == restarted
     [reborn] = sandbox.restored[1:]
-    assert sandbox.configured_with == []
     assert sandbox.started == [restarted, reborn]
     assert [(owed.app_name, owed.write_back) for owed in handed_over] == [(restarted, False)]
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_APP_NAME) == reborn
+
+
+async def test_a_restarted_container_is_not_reported_alive_while_its_rebirth_waits(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ The restore runs behind the press, and until it hands the restarted container over, the
+    record still names it. A poll in that window framed it as alive, and the browser framed a
+    502, so its serving proof goes the moment the start decides on a rebirth.
+
+    Mutation check: decide on the rebirth without retracting the proof and the poll reads alive."""
+    sandbox = wire.sbx
+    user, project = await _user_project(db_session, "rl-restarted-poll@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
+    [restarted] = sandbox.restored
+    sandbox.attach_handle = sandbox.by_name[restarted]
+    sandbox.unconfigured.add(restarted)
+    url = f"/v1/build-sessions/projects/{project.id}/preview-state"
+    before = (await client.get(url, headers=auth_headers(user))).json()
+    assert before["state"] == "alive", "guard the premise: the restarted container had served"
+
+    at_the_rebirth, go_on = asyncio.Event(), asyncio.Event()
+    clear_the_way = wire.manager._clear_the_way_for_a_birth
+
+    async def held_at_the_rebirth(*args: Any) -> None:
+        at_the_rebirth.set()
+        await go_on.wait()
+        await clear_the_way(*args)
+
+    monkeypatch.setattr(wire.manager, "_clear_the_way_for_a_birth", held_at_the_rebirth)
+    pressed = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+    assert pressed.status_code == 202
+    await asyncio.wait_for(at_the_rebirth.wait(), timeout=5)
+
+    meanwhile = (await client.get(url, headers=auth_headers(user))).json()
+    go_on.set()
+    await detached_work_done(wire.manager)
+
+    assert meanwhile["state"] == "starting"
+    assert meanwhile.get("previewUrl") is None
 
 
 async def test_no_registry_at_all_still_takes_the_restore_arm(

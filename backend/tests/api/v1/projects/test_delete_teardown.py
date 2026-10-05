@@ -403,7 +403,6 @@ async def test_a_live_preview_connection_does_not_survive_the_delete(
     # The container is still connected. The teardown's eviction is the entire guarantee here.
     from datetime import UTC, datetime, timedelta
 
-    from src.services.build_sessions import app_name_for
     from src.services.redis.keys import (
         REGISTRY_FIELD_APP_NAME,
         REGISTRY_FIELD_FQDN,
@@ -412,6 +411,7 @@ async def test_a_live_preview_connection_does_not_survive_the_delete(
         lock_key,
         registry_key,
     )
+    from src.services.sandbox.base import app_name_for
 
     headers, user, project, app_row, record = await _project_with_database(db_session)
     await fake_redis.hset(
@@ -458,7 +458,6 @@ async def test_a_live_build_still_refuses_the_delete_and_leaves_the_database_alo
     # A held lock refuses before anything is gathered, so the database must be
     # exactly as reachable afterwards as it was before. A refusal that had already severed
     # would be a silent outage on a delete the user was told did not happen.
-    from src.services.build_sessions import app_name_for
     from src.services.redis.keys import (
         REGISTRY_FIELD_APP_NAME,
         REGISTRY_FIELD_FQDN,
@@ -466,6 +465,7 @@ async def test_a_live_build_still_refuses_the_delete_and_leaves_the_database_alo
         lock_key,
         registry_key,
     )
+    from src.services.sandbox.base import app_name_for
 
     headers, user, project, app_row, record = await _project_with_database(db_session)
     await fake_redis.set(lock_key(user.id), "holder-token")
@@ -663,13 +663,13 @@ async def _registry_names(
 ) -> None:
     """Put the registry into the state a live container leaves behind: this user's one hash,
     naming this app's container."""
-    from src.services.build_sessions import app_name_for
     from src.services.redis.keys import (
         REGISTRY_FIELD_APP_NAME,
         REGISTRY_FIELD_FQDN,
         REGISTRY_FIELD_STATE,
         registry_key,
     )
+    from src.services.sandbox.base import app_name_for
 
     await fake_redis.hset(
         registry_key(user_id),
@@ -688,7 +688,7 @@ def _registry(user_id: uuid.UUID) -> str:
 
 
 def _named(app_id: uuid.UUID) -> str:
-    from src.services.build_sessions import app_name_for
+    from src.services.sandbox.base import app_name_for
 
     return app_name_for(app_id)
 
@@ -736,9 +736,9 @@ async def test_a_sandbox_serving_a_different_project_is_left_alone(
     # route's own build-session guard proceeds here exactly as it should, because nothing is
     # building.
     #
-    # Mutation check: delete the `reg is None or reg.get(...) != app_name_for(app_id)` arm in
-    # `_reap_the_project_sandbox_or_shrug` and this goes red on BOTH assertions — B's container
-    # torn down and B's registry entry cleared.
+    # Mutation check: delete the `record_holds` identity check in `_whose_container_is_registered`
+    # and this goes red on BOTH assertions — B's container torn down and B's registry entry
+    # cleared.
     from tests.fakes import FakeSandboxClient
 
     headers, user, project_a, app_a = await _project_with_app(db_session)

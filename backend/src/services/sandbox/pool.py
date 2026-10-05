@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 from src.db import base as db_base
 from src.db.models.sandbox_pool import (
@@ -134,6 +135,12 @@ async def hold_a_create(name: str, image_ref: str) -> uuid.UUID:
     return member_id
 
 
+async def restart_the_clock(member_id: uuid.UUID) -> bool:
+    """Restart a filling row's deadline as its create begins, and answer whether the row is still
+    filling: a fill queued past its deadline finds its row let go by a pass."""
+    return await _move(member_id, SandboxPoolState.FILLING, SandboxPoolState.FILLING)
+
+
 async def mark_ready(member_id: uuid.UUID, fqdn: str) -> bool:
     """Mark a filling row ready at the address its create answered with. False when the row is no
     longer filling: a pass judged the create overdue and let it go."""
@@ -144,6 +151,29 @@ async def retire(member_id: uuid.UUID, *, was: SandboxPoolState) -> bool:
     """Mark a row retiring as its container is let go, only while it is still `was`, and answer
     whether it was. A pass deletes the container of a retiring row whose delete did not finish."""
     return await _move(member_id, was, SandboxPoolState.RETIRING)
+
+
+async def put_back(member_id: uuid.UUID) -> bool:
+    """Mark a claimed row ready again, only while it is still claimed: its claim learnt nothing of
+    the container, which may serve the next start."""
+    return await _move(member_id, SandboxPoolState.CLAIMED, SandboxPoolState.READY)
+
+
+async def hold_for_deletion(name: str, image_ref: str) -> None:
+    """Hold a container whose delete Azure refused on a retiring row, for a pass to retry: a new
+    row when a pass has already let the container's own row go, else the row that names it."""
+    async with db_base.async_session_factory() as db:
+        await db.execute(
+            postgresql.insert(SandboxPoolMember)
+            .values(
+                name=name,
+                image_ref=image_ref,
+                state=SandboxPoolState.RETIRING,
+                state_changed_at=sa.func.now(),
+            )
+            .on_conflict_do_nothing(constraint="uq_sandbox_pool_name")
+        )
+        await db.commit()
 
 
 async def forget(member_id: uuid.UUID) -> None:

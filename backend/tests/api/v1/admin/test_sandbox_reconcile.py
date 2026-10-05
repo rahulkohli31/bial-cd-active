@@ -22,11 +22,10 @@ from src.api.v1.build_sessions.deps import sandbox_or_none_dependency
 from src.config import settings
 from src.db.models.audit import AuditLog
 from src.services.auth.session_jwt import mint_session_jwt
-from src.services.build_sessions.manager import app_name_for
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_STATE
 from src.services.sandbox import SandboxError
-from src.services.sandbox.base import FleetMember
+from src.services.sandbox.base import FleetMember, app_name_for
 from tests.factories import UserFactory
 from tests.fakes import a_fleet_member
 

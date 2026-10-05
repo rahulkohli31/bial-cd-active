@@ -13,6 +13,8 @@ restore from, and how it tags the container it mints.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 import redis.asyncio as aioredis
@@ -24,7 +26,12 @@ from src.db.models.project import Project
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.appdata import resolve_app_for_project
-from src.services.build_sessions.locks import SharedViewStamp, lock_is_held, read_registry
+from src.services.build_sessions.locks import (
+    SharedViewStamp,
+    lock_is_held,
+    mark_serving,
+    read_registry,
+)
 from src.services.build_sessions.manager import (
     NoSnapshotToRelaunchError,
     SandboxReclaimBlockedError,
@@ -37,6 +44,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
+    REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_SHARED_OWNER_ID,
     REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_SHARED_SERVED_COUNT,
@@ -288,13 +296,15 @@ async def test_a_restarted_view_is_given_up_and_the_owners_copy_restored_again(
     fake_redis: aioredis.Redis,
     fake_storage: FakeStorage,
     handed_over: list[tuple[str, bool]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """★ Azure restarting a claimed container brings it back with no settings and none of its
     files. A launch treats it as gone: the owner's saved copy goes into a new container, the
-    restarted one is never configured or started, and it is owed its delete with nothing written
-    back.
+    restarted one is never started, and it is owed its delete with nothing written back. Its
+    serving proof goes first, or a poll would frame it meanwhile.
 
-    Mutation check: attach to it whatever it reports and no second restore happens."""
+    Mutation check: attach to it whatever it reports and no second restore happens.
+    Mutation check: give it up without retracting its proof and it still vouches at the rebirth."""
     owner, project, app_id = await _owner_with_saved_app(
         db_session, fake_storage, email="owner-restarted@example.com"
     )
@@ -305,13 +315,23 @@ async def test_a_restarted_view_is_given_up_and_the_owners_copy_restored_again(
     [restarted] = client.restored
     client.attach_handle = client.by_name[restarted]
     client.unconfigured.add(restarted)
+    await mark_serving(fake_redis, recipient.id, app_name=restarted, when=datetime.now(UTC))
+    proof_at_the_rebirth: list[str | None] = []
+    clear_the_way = manager._clear_the_way_for_a_birth
+
+    async def looked_at(*args: Any) -> None:
+        reg = await read_registry(fake_redis, recipient.id)
+        proof_at_the_rebirth.append(None if reg is None else reg.get(REGISTRY_FIELD_SERVING_SINCE))
+        await clear_the_way(*args)
+
+    monkeypatch.setattr(manager, "_clear_the_way_for_a_birth", looked_at)
 
     preview = await manager.launch_shared_preview(db_session, recipient, project, client)
 
+    assert proof_at_the_rebirth == [""]
     assert preview.app_id == app_id
     assert client.restored[0] == restarted
     [reborn] = client.restored[1:]
-    assert client.configured_with == []
     assert client.started == [restarted, reborn]
     assert handed_over == [(restarted, False)]
 

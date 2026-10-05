@@ -114,7 +114,7 @@ def a_git_bundle(sha: str = "a" * 40) -> bytes:
 
 
 def a_sandbox_name(marker: str = "x") -> str:
-    """A container name the platform could actually have MINTED: `manager.app_name_for` emits
+    """A container name the platform could actually have MINTED: `app_name_for` emits
     `sbx-` + exactly 28 lowercase hex characters. Fixtures used to say `"sbx-x"` — a shape no
     code path produces — which let a missing name guard on the ARM delete path go unnoticed
     (`reap_user` handed the registry's value straight to a delete, `""` included). Hex-encoded
@@ -129,7 +129,7 @@ def a_name_unrelated_to_its_app() -> str:
 
 
 def a_shared_sandbox_name(marker: str = "x") -> str:
-    """The `shr-` sibling of `a_sandbox_name` (#198) — a shape `manager.shr_name_for` could
+    """The `shr-` sibling of `a_sandbox_name` (#198) — a shape `shr_name_for` could
     actually have minted, for the same reason: a fixture no code path produces would let a
     missing shape guard on the ARM delete path go unnoticed."""
     return "shr-" + (marker.encode().hex() + "0" * 28)[:28]
@@ -417,10 +417,9 @@ class FakeSandboxClient(SandboxClient):
         # that is meant to compare as a real total.
         self.served_count_truncated: bool = False
         # Containers that report no settings, as a claimed pool container Azure restarted does:
-        # they refuse `dev_start` until configured, as the supervisor does. Every delivery is
-        # recorded with the container it went to, and so is every start a container accepted.
+        # they refuse `dev_start` as the supervisor does. Every start a container accepted is
+        # recorded with the container it went to.
         self.unconfigured: set[str] = set()
-        self.configured_with: list[tuple[str, dict[str, str]]] = []
         self.started: list[str] = []
 
     async def _refuse_to_orphan(self, user_id: str) -> None:
@@ -554,12 +553,6 @@ class FakeSandboxClient(SandboxClient):
             raise SandboxError("dev/start failed with status 412")
         self.started.append(handle.app_name)
         return 4321
-
-    async def configure(self, handle: SandboxHandle, env: Mapping[str, str]) -> None:
-        if handle.app_name not in self.unconfigured:
-            raise SandboxError("configure failed with status 409")
-        self.configured_with.append((handle.app_name, dict(env)))
-        self.unconfigured.discard(handle.app_name)
 
     async def dev_status(self, handle: SandboxHandle) -> DevStatus:
         """A dev server that is up and answering. `root_status` rides from the attribute rather

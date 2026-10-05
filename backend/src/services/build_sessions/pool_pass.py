@@ -37,9 +37,10 @@ from src.services.sandbox.client import (
 
 _log = structlog.get_logger()
 
-#: Longer than a pool create and its container's first answer, or a start's own create and the
-#: registry write after it, can still be running. A filling or claimed row older than this was
-#: left by a process that died.
+#: Longer than a pool create and its container's first answer, timed from when the fill holds the
+#: pool's bound, or a start's own create and the registry write after it, can still be running. A
+#: filling or claimed row older than this was left by a process that died, or is a fill still
+#: queued for the bound, which makes nothing once its row is gone.
 ROW_DEADLINE: Final = CREATE_CEILING + FIRST_ANSWER_CEILING + timedelta(minutes=1)
 
 #: The advisory lock every pass takes, in the worker and at the backend's startup alike.

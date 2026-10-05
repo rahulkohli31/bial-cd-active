@@ -444,7 +444,7 @@ async def test_a_second_message_attaches_instead_of_rebuilding_the_container(
     and without a guard, the same reconcile-then-allocate rule that ran once per build would
     tear down and rebuild a HEALTHY container on every single message.
 
-    Mutation-check: drop the `spare_app` guard in `_holding_user_lock` and this goes red —
+    Mutation-check: drop the `spare` guard in `_holding_user_lock` and this goes red —
     `torn_down` gains the first container and `restored` gains a second entry."""
     user, project_id = await _mk(db_session, "w10@rvaiglobal.com")
     manager = SessionManager()

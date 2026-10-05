@@ -672,7 +672,8 @@ class SandboxClient(abc.ABC):
         """Provision a BRAND-NEW container for `user_id`, returning a handle with `ready=False`.
         `app_env` is the app's injected environment, every name in it chosen to survive the
         supervisor's child-env scrub allowlist. The caller MUST already hold the one-per-user
-        lock. Transient provisioning errors are retried with capped exponential backoff.
+        lock. Transient provisioning errors are retried with capped exponential backoff. The
+        handle's `app_name` is the container's own, which a claimed pool container keeps.
 
         Refused while the user's registry still names a container: writing this one's record
         over it would leave the old container with nothing that names it. The caller hands that
@@ -712,29 +713,14 @@ class SandboxClient(abc.ABC):
         shared_project_id: uuid.UUID | None = None,
         shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
-        """Provision a FRESH container and restore a git-bundle onto its local disk (git ops
-        over `/_sup/exec`), then RE-INJECT the app-data credential from `app_env`. Returns a
-        handle (`ready=False` until `wait_ready` / `dev_start`).
-
-        `source_key` names WHICH bundle to restore, defaulting to the app's saved snapshot.
-        It exists so a recovery can pull the crash-recovery copy instead — the only reason that
-        copy is written at all. Optional with a default rather than required, because every
-        existing caller means "the saved one" and should keep reading that way.
-
-        `kind` (#198) selects the ARM identity the fresh container is stamped with —
-        `sandbox_tags` (the default, `user_id` as OWNER) or `shared_sandbox_tags` (`user_id` as
-        RECIPIENT). ADDED, not widened from a callback: every existing caller means the default
-        and this keeps meaning it without touching a single call site.
-
-        `shared_project_id`/`shared_owner_id` (#198) are the registry-hash counterpart of
-        `kind="shared_sandbox"`: written to `REGISTRY_FIELD_SHARED_PROJECT_ID`/
-        `REGISTRY_FIELD_SHARED_OWNER_ID` so a LATER occupancy check (`_occupying_project`'s
-        sibling in `manager.py`) can recognize "this slot holds a colleague's shared view", which
-        the container's name cannot say. `None` on the `build_sandbox` arm, always; supplying one
-        without the other is a caller error, never a partial stamp.
-
-        Refused, like `provision_new`, while the registry still names a container: the caller
-        hands that one over first."""
+        """Provision a fresh container and restore a git bundle onto its disk, then re-inject the
+        app-data credential from `app_env`; the handle is `ready=False` until `wait_ready`. Its
+        `app_name` is the container's own, which a claimed pool container keeps. `source_key`
+        names the bundle: the app's saved snapshot by default, the crash-recovery copy for a
+        recovery. `kind` selects the ARM identity, with `user_id` the owner of a build sandbox
+        and the recipient of a shared view, whose `shared_project_id` and `shared_owner_id` are
+        stamped on the registry record together, as a container's name cannot say it is a view.
+        Refused, like `provision_new`, while the registry still names a container."""
         ...
 
     @abc.abstractmethod
@@ -841,14 +827,6 @@ class SandboxClient(abc.ABC):
         supervisor image — and must not be read as "definitely no new traffic", which would let
         the sweep reap a container it simply failed to probe."""
         return None
-
-    async def configure(self, handle: SandboxHandle, env: Mapping[str, str]) -> None:
-        """Give a pool container its project's settings over `POST /_sup/configure`: the
-        per-project names in `env`, nothing else, accepted once per supervisor process.
-
-        DELIBERATELY NOT abstract, same reason as `someone_has_to_go_first`. The default refuses:
-        a client that cannot deliver settings must never report that it did."""
-        raise SandboxError("this sandbox client cannot configure a workspace")
 
     async def reset_to_bundle(self, handle: SandboxHandle, bundle: bytes) -> None:
         """Put a git bundle's tree into a live container in place of its own — the Discard button.

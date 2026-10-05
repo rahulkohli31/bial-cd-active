@@ -29,7 +29,7 @@ import uuid
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Final, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 import redis.asyncio as aioredis
 import structlog
@@ -91,6 +91,10 @@ from src.services.sandbox.base import (
     SandboxIdentity,
     identity_from_tags,
 )
+
+if TYPE_CHECKING:
+    # Only for the annotation: the inventory reaches `src.db.base`, which this module must not.
+    from src.services.build_sessions.inventory import OwnedApp
 
 _log = structlog.get_logger()
 
@@ -907,7 +911,7 @@ async def reconcile_user(
     sandbox_client: SandboxClient,
     *,
     certified_dead: bool = False,
-    app_ids_by_name: Mapping[str, uuid.UUID] | None = None,
+    app_ids_by_name: Mapping[str, OwnedApp] | None = None,
 ) -> bool:
     """Reconcile the user's OWN stale state; True if it reaped.
 
@@ -985,11 +989,12 @@ async def _a_claim_still_stands(
 
 def _owning_app_id(
     reg: dict[str, str],
-    app_ids_by_name: Mapping[str, uuid.UUID] | None,
+    app_ids_by_name: Mapping[str, OwnedApp] | None,
     user_uuid: uuid.UUID,
 ) -> uuid.UUID | None:
     """The app id behind this registry record — the slot this container's tree is written back to.
-    The record's own app id, held to the map so an app whose row is gone resolves to nothing.
+    The record's own app id, held to the map so an app whose row is gone, or that another user
+    owns, resolves to nothing.
 
     BOTH UNRESOLVED CASES END IN A DESTROYED CONTAINER WITH NOTHING WRITTEN, so neither may be
     silent. They are not the same failure. No map at all is a CALLER that did not supply one:
@@ -1004,16 +1009,19 @@ def _owning_app_id(
         )
         return None
     recorded = reg.get(REGISTRY_FIELD_APP_ID)
+    app_id: uuid.UUID | None
     if recorded is None:
         # A record the previous release wrote carries no app id; its name was derived from one.
-        app_id = app_ids_by_name.get(reg.get(REGISTRY_FIELD_APP_NAME, ""))
+        derived = app_ids_by_name.get(reg.get(REGISTRY_FIELD_APP_NAME, ""))
+        app_id = None if derived is None else derived.app_id
     else:
         app_id = uuid.UUID(recorded)
-        if app_id not in app_ids_by_name.values():
+        # Only the slot's own user's app: anyone else's would get this tree over their saved copy.
+        if (app_id, user_uuid) not in app_ids_by_name.values():
             app_id = None
     if app_id is None:
         _log.info(
-            "reaping a registered container with no app row; nothing to preserve",
+            "reaping a registered container with no app row of this user's; nothing to preserve",
             user_id=str(user_uuid),
             app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
         )
@@ -1034,7 +1042,7 @@ async def sweep_all(
     sandbox_client: SandboxClient,
     *,
     live_users: set[uuid.UUID] | None = None,
-    app_ids_by_name: Mapping[str, uuid.UUID] | None = None,
+    app_ids_by_name: Mapping[str, OwnedApp] | None = None,
 ) -> SweepResult:
     """SCAN-iterate the registry namespace (never `KEYS`) and reconcile each user; returns what
     it reaped AND what it could not. Idempotent + concurrency-safe, safe to call on a timer.

@@ -42,7 +42,6 @@ from src.services.build_sessions.locks import (
     renew_liveness_lease,
     write_starting_marker,
 )
-from src.services.build_sessions.manager import app_name_for
 from src.services.lake.config import LakeConfig
 from src.services.lake.env import connector_env_names
 from src.services.redis.keys import (
@@ -52,6 +51,7 @@ from src.services.redis.keys import (
     REGISTRY_STATE_READY,
     registry_key,
 )
+from src.services.sandbox.base import app_name_for
 from src.services.usage import ist_today
 from tests.api.v1.connectors.conftest import KEY, UNKNOWN_KEY, auth_headers
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory

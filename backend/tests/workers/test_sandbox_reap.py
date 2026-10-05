@@ -12,6 +12,7 @@ import pytest
 import redis.asyncio as aioredis
 
 from src.services.build_sessions.destroy import may_destroy_on_this_control_plane
+from src.services.build_sessions.inventory import OwnedApp
 
 
 def test_only_production_may_destroy() -> None:
@@ -93,7 +94,7 @@ async def test_off_production_the_registry_pass_stays_off_and_the_owed_pass_runs
         owed_passes.append(args)
         return OwedSweepResult(settled=0, still_owed=0, failed=0)
 
-    async def _owning() -> dict[str, uuid.UUID]:
+    async def _owning() -> dict[str, OwnedApp]:
         return {}
 
     # Redis, the control plane and the owner map are all AVAILABLE on purpose: the sweep must
@@ -136,8 +137,10 @@ async def test_the_scheduled_sweep_hands_the_owning_app_ids_to_the_gate(
         seen["map"] = app_ids_by_name
         return SweepResult(reaped=0, failed=0)
 
-    async def _owning() -> dict[str, uuid.UUID]:
-        return {"sbx-x": app_id}
+    owned = {"sbx-x": OwnedApp(app_id, uuid.uuid4())}
+
+    async def _owning() -> dict[str, OwnedApp]:
+        return owned
 
     monkeypatch.setattr("src.services.build_sessions.reaper.sweep_all", _spy_sweep)
     monkeypatch.setattr(sandbox_reap, "_owning_app_ids", _owning)
@@ -146,4 +149,4 @@ async def test_the_scheduled_sweep_hands_the_owning_app_ids_to_the_gate(
 
     await sandbox_reap.reap_abandoned_sandboxes()
 
-    assert seen["map"] == {"sbx-x": app_id}
+    assert seen["map"] == owned

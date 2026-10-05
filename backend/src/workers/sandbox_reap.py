@@ -2,30 +2,28 @@
 then `sweep_owed_teardowns` over the deletions this platform still owes.
 
 TWO INPUTS, BECAUSE THE REGISTRY CANNOT SEE THE SECOND POPULATION. A container whose deletion is
-owed has had its registry record cleared — that is what hands the citizen their workspace back
-after a failure of ours — so the scan reaches everything except exactly the containers that
-already went wrong once. The owed row is the only thing that still names one.
+owed has had its registry record cleared, which hands the citizen their workspace back, so the
+scan misses exactly the containers that already went wrong once. The owed row still names one.
 
-TWO GUARDS BIND THIS PATH AND NEITHER IS OPTIONAL, because this is where almost all of the
-deleting happens: `_owning_app_ids` names the slot each container's tree is written back to, and
-without it a sweep destroys unsaved work; `may_destroy_on_this_control_plane` keeps the unattended
-registry pass off every non-production control plane. The owed pass runs on every control plane:
-it only carries out deletions a start or a switch on this one already decided, each guarded by
-name and instance, and off production nothing else would ever retry one.
-
-THE PER-PASS CEILING IS THE ONE GUARD THIS PATH DELIBERATELY DOES NOT TAKE. A bounded sweep that
-never finishes its list would leave the same users unreconciled on every tick.
+TWO GUARDS BIND THE REGISTRY PASS AND NEITHER IS OPTIONAL: `_owning_app_ids` names the slot each
+container's tree is written back to, without which a sweep destroys unsaved work, and
+`may_destroy_on_this_control_plane` keeps it off every non-production control plane. The owed pass
+runs everywhere: it carries out only deletions a start or a switch here already decided, each
+guarded by name and instance. No per-pass ceiling: a bounded sweep that never finishes its list
+would leave the same users unreconciled on every tick.
 """
 
 from __future__ import annotations
 
-import uuid
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import structlog
 
 from src.broker import broker
 from src.config import settings
+
+if TYPE_CHECKING:
+    from src.services.build_sessions.inventory import OwnedApp
 
 _log = structlog.get_logger()
 
@@ -122,7 +120,7 @@ async def reap_abandoned_sandboxes() -> None:
         )
 
 
-async def _owning_app_ids() -> dict[str, uuid.UUID]:
+async def _owning_app_ids() -> dict[str, OwnedApp]:
     """`owning_app_ids` on a session of this pass's own, since a scheduled task has no request
     to borrow one from. A raise here fails the pass; the next tick, five minutes out, retries."""
     from src.db.base import async_session_factory

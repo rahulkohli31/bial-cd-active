@@ -608,6 +608,30 @@ async def test_a_start_time_without_the_csrf_header_writes_nothing(
     assert await _browser_ms(db_session, start_id) is None
 
 
+async def test_a_start_time_past_the_limit_the_two_routes_share_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """One bucket for both routes, so a caller cannot spend the counter's limit and then go on
+    writing start times.
+
+    Mutation check: drop the limiter from `/start-visible` and the start gains a time."""
+    owner = await UserFactory.create(db_session, email="start-limit@rvaiglobal.com")
+    start_id = await _a_start(db_session, owner)
+    headers = _headers(owner)
+    for _ in range(OBSERVATION_RATE_LIMIT):
+        spent = await client.post(
+            "/v1/observations", json={"name": HarnessCounter.PROJECT_OPENED.value}, headers=headers
+        )
+        assert spent.status_code == 201
+
+    resp = await client.post(
+        _START_VISIBLE, json={"startId": str(start_id), "durationMs": 1_000}, headers=headers
+    )
+
+    assert resp.status_code == 429
+    assert await _browser_ms(db_session, start_id) is None
+
+
 def test_start_visible_openapi_documents_its_refusals() -> None:
     from src.main import create_app
 

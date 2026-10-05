@@ -34,7 +34,7 @@ from src.services.redis import registry_key
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
 from src.services.sandbox import pool, reset_sandbox_for_tests, set_sandbox_for_tests
 from src.services.sandbox.base import a_fresh_sandbox_name
-from src.services.sandbox.client import AcaSandboxClient
+from src.services.sandbox.client import AcaSandboxClient, SandboxNotConfiguredError
 from src.services.sandbox.config import SandboxConfig
 from src.workers.sandbox_pool import (
     SANDBOX_POOL_CRON,
@@ -42,6 +42,7 @@ from src.workers.sandbox_pool import (
     keep_the_pool_at_its_size,
 )
 from tests.factories import UserFactory
+from tests.fakes import FakeSandboxClient
 from tests.services.sandbox.test_pool import IMAGE, OLD_IMAGE, PoolAca, Supervisors
 
 pytestmark = pytest.mark.usefixtures("empty_sandbox_pool")
@@ -513,6 +514,22 @@ async def test_a_worker_with_no_sandbox_says_so_and_does_nothing() -> None:
 
     [line] = [entry for entry in logged if entry["event"].startswith("sandbox_pool_pass")]
     assert (line["event"], line["reason"]) == ("sandbox_pool_pass_disabled", "unconfigured")
+
+
+async def test_a_pass_with_a_sandbox_client_that_cannot_hold_a_pool_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pass creates and deletes through the Azure client's own bound, which no other client
+    has, so one configured with any other refuses rather than running without it.
+
+    Mutation check: drop the client's type check and the pass fails some other way."""
+    monkeypatch.setattr(settings, "sandbox", _config(day=1, night=1))
+    set_sandbox_for_tests(FakeSandboxClient())
+    try:
+        with pytest.raises(SandboxNotConfiguredError):
+            await pool_pass.run_pool_pass()
+    finally:
+        reset_sandbox_for_tests()
 
 
 def test_the_pass_is_scheduled_every_minute_under_a_pinned_id() -> None:

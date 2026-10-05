@@ -13,11 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.pending_teardown import PendingTeardown
 from src.services.build_sessions.inventory import FleetLister, take_sandbox_inventory
-from src.services.build_sessions.manager import app_name_for
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_STATE
 from src.services.sandbox import SandboxError, pool
-from src.services.sandbox.base import FleetMember, a_fresh_sandbox_name
+from src.services.sandbox.base import FleetMember, a_fresh_sandbox_name, app_name_for
 from tests.factories import UserFactory
 from tests.fakes import a_fleet_member, a_ready_pool_row
 
