@@ -249,15 +249,13 @@ async def test_reap_user_tears_down_a_shared_sandbox_in_the_slot(
 async def test_reap_user_skips_the_write_back_for_a_shared_view_even_with_an_app_id(
     fake_redis: aioredis.Redis,
 ) -> None:
-    """The bug a live Azure run found: `sweep_all`'s own `_owning_app_id` resolves a `shr-`
-    record to the OWNER's app id (`_app_names_to_owners` keys the name off the recipient but
-    carries the shared app's id as the value), so the scheduled sweep always calls `reap_user`
-    with `app_id is not None` for a shared view. Acting on that id would write this RECIPIENT's
-    tree over the OWNER's saved copy (R22: read-never-write for a recipient), and a write-back
-    that could not land then REFUSES the reap outright, sparing the container forever. No storage
-    is bound in this test at all: if the write-back ran, touching it would fail loudly rather than
-    silently pass, which is exactly the point — a shared view must never reach it regardless of
-    which app_id a caller resolved for it."""
+    """A shared view's record carries the OWNER's app id, so a caller can resolve one for it and
+    pass it here. Acting on that id would write this RECIPIENT's tree over the OWNER's saved copy,
+    which a recipient may read and never write, and a write-back that could not land then REFUSES
+    the reap outright, sparing the container forever. No storage is bound in this test at all: if
+    the write-back ran, touching it would fail loudly rather than silently pass, which is exactly
+    the point — a shared view must never reach it regardless of which app_id a caller resolved
+    for it."""
     shared_name = a_shared_sandbox_name("colleague")
     await _seed(fake_redis, USER, app_name=shared_name)
     client = FakeSandboxClient()
@@ -1150,7 +1148,7 @@ async def test_a_shared_view_whose_delete_fails_is_owed_against_its_owners_app(
     the_owners_app_is_named: bool,
 ) -> None:
     """★ A FAILED DELETE NEVER FORGETS A SHARED VIEW. Giving the view up, a revoke and the
-    reconcile before a start reap it with no app id; the sweep names its owner's. Either way the
+    reconcile before a start reap it with no app id; a caller may name its owner's. Either way the
     app is the OWNER's, never the slot holder's, so the ledger reads the owner and project the
     launch stamped on the record and owes the delete against them. Without the row, the next
     container registered in this slot overwrites the only record naming the view, and it runs and
@@ -2311,11 +2309,11 @@ async def test_reaping_a_shared_view_named_like_a_build_sandbox_writes_nothing_b
 async def test_of_a_build_container_and_a_view_under_one_app_only_the_build_is_written_back(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """★ The owner's slot and a colleague's slot both record the same app. The sweep resolves
-    that app for both; only the owner's container holds work to save.
+    """★ The owner's slot and a colleague's slot both record the same app, and only the owner's
+    container holds work to save. The view's reap says nothing of a missing app row, the line an
+    operator reads as work destroyed unsaved.
 
-    Mutation check: skip the shared-view test in `reap_user` and both trees are bundled into the
-    owner's saved copy, the colleague's last."""
+    Mutation check: resolve the view's app as a build sandbox's is and its reap reports one."""
     app_id = uuid.uuid4()
     owner, colleague = uuid.uuid4(), uuid.uuid4()
     builds = await _registered_unrelated(fake_redis, owner, app_id=app_id)
@@ -2327,13 +2325,18 @@ async def test_of_a_build_container_and_a_view_under_one_app_only_the_build_is_w
     )
     client = AttachesWhatTheRecordNames()
 
-    result = await reaper.sweep_all(
-        fake_redis, client, app_ids_by_name={app_name_for(app_id): OwnedApp(app_id, owner)}
-    )
+    with structlog.testing.capture_logs() as logs:
+        result = await reaper.sweep_all(
+            fake_redis, client, app_ids_by_name={app_name_for(app_id): OwnedApp(app_id, owner)}
+        )
 
     assert result.reaped == 2
     assert sorted(client.torn_down) == sorted([builds, views])
     assert client.bundled_from == [builds]
+    nothing_to_preserve = (
+        "reaping a registered container with no app row of this user's; nothing to preserve"
+    )
+    assert [e for e in logs if e["event"] == nothing_to_preserve] == []
 
 
 async def test_a_shared_view_named_like_a_build_sandbox_is_renewed_by_its_traffic(

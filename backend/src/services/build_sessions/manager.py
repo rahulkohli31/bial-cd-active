@@ -35,6 +35,7 @@ from contextlib import (
     contextmanager,
     suppress,
 )
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -926,13 +927,21 @@ async def _the_live_sandbox_is_already_the_one_we_want(
     return _registry_serves_and_is_ready(reg, spare, user_id)
 
 
+# The container this start found restarted after it had served, read by its hand-over: the proof
+# the start retracted is not the absence the hand-over's alarm counts.
+_restarted_after_serving: ContextVar[str | None] = ContextVar(
+    "restarted_after_serving", default=None
+)
+
+
 async def _forget_what_a_restarted_container_served(
     redis: aioredis.Redis, user_id: uuid.UUID, handle: SandboxHandle
 ) -> None:
     """Retract the serving proof of a container Azure restarted, while the record still names it.
     Its record stands until its rebirth hands it over, and a poll meanwhile would frame it."""
     with suppress(RedisError):
-        await clear_serving(redis, user_id, app_name=handle.app_name)
+        if await clear_serving(redis, user_id, app_name=handle.app_name):
+            _restarted_after_serving.set(handle.app_name)
 
 
 def _registry_serves_and_is_ready(
@@ -1548,9 +1557,10 @@ class SessionManager:
             )
             if owed is None:
                 return False
-            sound_the_alarm_if_the_proof_is_absent(
-                reg, user_uuid=user_id, reason=ShutdownReason.REPLACED.value
-            )
+            if name != _restarted_after_serving.get():
+                sound_the_alarm_if_the_proof_is_absent(
+                    reg, user_uuid=user_id, reason=ShutdownReason.REPLACED.value
+                )
         await delete_registry_if_it_still_names(redis, user_id, name)
         if owed is not None:
             shut_it_down_in_the_background(

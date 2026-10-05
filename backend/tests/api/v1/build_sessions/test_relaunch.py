@@ -19,6 +19,7 @@ from httpx import AsyncClient
 from pydantic import SecretStr
 from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 import src.services.build_sessions.manager as manager_mod
 from src.api.v1.build_sessions.deps import (
@@ -32,6 +33,7 @@ from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
 from src.db.models.harness_counter import HarnessCount, HarnessCounter
 from src.db.models.sandbox_start import SandboxStart
+from src.services.build_sessions.alarms import SERVING_PROOF_ABSENT_AT_TEARDOWN
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
 from src.services.build_sessions.manager import SessionManager
@@ -44,6 +46,7 @@ from src.services.redis import (
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
+    REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_STAY_WRITER,
 )
@@ -756,6 +759,44 @@ async def test_a_restarted_container_is_not_reported_alive_while_its_rebirth_wai
 
     assert meanwhile["state"] == "starting"
     assert meanwhile.get("previewUrl") is None
+
+
+@pytest.mark.parametrize("had_served", [True, False], ids=["served", "never-served"])
+async def test_a_restarted_container_raises_the_absent_proof_alarm_only_if_it_never_served(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    handed_over: list[OwedTeardown],
+    had_served: bool,
+) -> None:
+    """The start retracts a restarted container's proof before handing it over, and the alarm
+    counts containers that reached teardown never having served.
+
+    Mutation check: sound the alarm at every hand-over and the one that served is counted.
+    Mutation check: note every restarted container as served and the silent one is not."""
+    sandbox = wire.sbx
+    user, project = await _user_project(db_session, f"rl-restarted-{had_served}@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
+    [restarted] = sandbox.restored
+    sandbox.attach_handle = sandbox.by_name[restarted]
+    sandbox.unconfigured.add(restarted)
+    assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE), (
+        "guard the premise: the first start watched its app serve"
+    )
+    if not had_served:
+        await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE, "")
+
+    with capture_logs() as logged:
+        assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
+
+    assert [(owed.app_name, owed.write_back) for owed in handed_over] == [(restarted, False)]
+    fired = [e for e in logged if e["event"] == SERVING_PROOF_ABSENT_AT_TEARDOWN]
+    assert [(e["app_name"], e["reason"]) for e in fired] == (
+        [] if had_served else [(restarted, "replaced")]
+    )
 
 
 async def test_no_registry_at_all_still_takes_the_restore_arm(

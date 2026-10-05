@@ -697,12 +697,12 @@ async def reap_user(
         await _let_go_unless_taken(redis, user_uuid, registered_name)
         return False
     # THE WRITE-BACK NEVER RUNS FOR A SHARED VIEW, whatever `app_id` the caller resolved, and the
-    # record's stamp is what says it is one — never its name. `sweep_all`'s own `_owning_app_id`
-    # maps a shared view to the OWNER's app id — passing that here would write this RECIPIENT's
-    # tree over the OWNER's saved copy, and a recipient's access to that storage is
-    # read-never-write. A shared view holds nothing worth preserving in the first place: the
-    # recipient never edits its tree directly, and what they own of it is a restore of the
-    # owner's own snapshot, already durable at its source.
+    # record's stamp is what says it is one — never its name. A view's record carries the OWNER's
+    # app id, and a caller passing that here would write this RECIPIENT's tree over the OWNER's
+    # saved copy, and a recipient's access to that storage is read-never-write. A shared view
+    # holds nothing worth preserving in the first place: the recipient never edits its tree
+    # directly, and what they own of it is a restore of the owner's own snapshot, already durable
+    # at its source.
     if app_id is not None and not is_a_shared_view(reg):
         if not record_holds(reg, Occupant(app_id), user_uuid):
             # THE APP TO SAVE INTO MUST BE THE ONE THIS RECORD NAMES. The caller resolved it from
@@ -1007,6 +1007,9 @@ def _owning_app_id(
             user_id=str(user_uuid),
             app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
         )
+        return None
+    if is_a_shared_view(reg):
+        # Never written back, so there is nothing to lose and nothing to report.
         return None
     recorded = reg.get(REGISTRY_FIELD_APP_ID)
     app_id: uuid.UUID | None

@@ -243,9 +243,8 @@ async def _app_names_to_owners(db: AsyncSession) -> dict[str, _KnownContainer]:
     because the question is "does ANY user (or ANY share) own this"; between them they read two
     identifier columns plus one junction row, no user data, superadmin-only.
 
-    A project shared with several colleagues produces one `shr-` entry per recipient, all keyed
-    off the SAME app id — a fan-out `_owning_app_ids` (this function's only consumer) already
-    tolerates, since it only ever reads the app id back out, never the name."""
+    A project shared with several colleagues produces one `shr-` entry per recipient, each with the
+    same app id and the app's OWNER, never the recipient, as `owner_id`."""
     rows = (await db.execute(sa.select(AppRegistry.id, AppRegistry.user_id))).all()
     known: dict[str, _KnownContainer] = {
         app_name_for(app_id): _KnownContainer(

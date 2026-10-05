@@ -99,9 +99,10 @@ class PoolAca(AcaControlPlane):
         self.filled_under: list[tuple[Stopwatch, dict[str, Any]]] = []
         # Set, a restamp waits on it: how a test holds one in flight.
         self.restamps_wait_for: asyncio.Event | None = None
-        # How many more reads of a container's environment Azure throttles, by name, and every
-        # read asked for.
+        # How many more reads of a container's environment Azure throttles, by name, the
+        # containers whose reads it refuses outright, and every read asked for.
         self.env_reads_throttled: dict[str, int] = {}
+        self.env_reads_refused: set[str] = set()
         self.env_reads: list[str] = []
 
     def made_for_the_pool(self, name: str, *, token: str | None) -> None:
@@ -159,6 +160,8 @@ class PoolAca(AcaControlPlane):
         if self.env_reads_throttled.get(name, 0):
             self.env_reads_throttled[name] -= 1
             raise AcaTransientError("ACA get was throttled or 5xx'd")
+        if name in self.env_reads_refused:
+            raise AcaError("ACA refused the read")
         return self.envs.get(name, {}).get(key)
 
     async def get_app_fqdn(self, *, name: str) -> str | None:
@@ -524,6 +527,10 @@ def _container_absent(world: SimpleNamespace, name: str) -> None:
     world.aca.envs.pop(name)
 
 
+def _bearer_read_refused(world: SimpleNamespace, name: str) -> None:
+    world.aca.env_reads_refused.add(name)
+
+
 def _health_refused(world: SimpleNamespace, name: str) -> None:
     world.supervisors.health_status[f"{name}.pool.example"] = 503
 
@@ -543,6 +550,7 @@ def _configure_hangs(world: SimpleNamespace, name: str) -> None:
 _FAILURES = [
     pytest.param(_bearer_unreadable, "claim_failed", id="bearer-unreadable"),
     pytest.param(_container_absent, "claim_failed", id="container-absent"),
+    pytest.param(_bearer_read_refused, "claim_failed", id="bearer-read-refused"),
     pytest.param(_health_refused, "unhealthy", id="health-refused"),
     pytest.param(_health_hangs, "unhealthy", id="health-hangs"),
     pytest.param(_configure_refused, "claim_failed", id="configure-500"),
@@ -1062,6 +1070,23 @@ async def test_a_fill_with_no_row_whose_delete_is_refused_is_held_retiring(
     assert await _ledger() == {name: SandboxPoolState.RETIRING}
 
 
+async def test_a_silent_fill_whose_delete_is_refused_is_held_retiring_on_its_own_row(
+    world, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its own row still names the container, so holding it for the next pass writes nothing.
+
+    Mutation check: hold it with a plain insert and the fill raises on the name its row holds."""
+    world.supervisors.silent_for = 1_000
+    monkeypatch.setattr(client_module, "FIRST_ANSWER_CEILING", timedelta(0))
+    world.aca.refuses_every_delete = True
+
+    assert await world.client.fill_one(5) == "refused"
+
+    [name] = world.aca.filled
+    assert world.aca.deleted == [name]
+    assert await _ledger() == {name: SandboxPoolState.RETIRING}
+
+
 async def test_a_fill_queued_past_its_deadline_whose_row_a_pass_let_go_makes_nothing(
     world,
 ) -> None:
@@ -1306,6 +1331,40 @@ async def test_a_fill_cut_short_is_retired_for_the_next_pass_to_delete(world) ->
     assert after.deleted == 1
     assert world.aca.deleted == [name]
     assert await _ledger() == {}
+
+
+async def test_a_fill_whose_clock_restarts_has_a_whole_deadline_before_a_pass_lets_it_go(
+    world,
+) -> None:
+    """A fill can wait for the pool's bound for most of its deadline, and a pass must not let its
+    row go while the create it then begins is running.
+
+    Mutation check: answer whether the row is filling without moving its time and it is overdue."""
+    name = a_fresh_sandbox_name()
+    async with db_base.async_session_factory() as db:
+        row = SandboxPoolMember(
+            name=name,
+            image_ref=IMAGE,
+            state=SandboxPoolState.FILLING,
+            state_changed_at=datetime.now(UTC) - pool_pass.ROW_DEADLINE + timedelta(minutes=1),
+        )
+        db.add(row)
+        await db.commit()
+    world.client._config = _config(pool_day_size=0, pool_night_size=0)
+
+    assert await pool.restart_the_clock(row.id) is True
+
+    async with db_base.async_session_factory() as db:
+        restarted = await db.scalar(
+            sa.select(SandboxPoolMember.state_changed_at).where(SandboxPoolMember.id == row.id)
+        )
+    assert restarted is not None
+    assert abs(datetime.now(UTC) - restarted) < timedelta(seconds=5)
+    after = await pool_pass.keep_the_pool(
+        world.client, at=datetime.now(UTC) + timedelta(minutes=2)
+    )
+    assert after.overdue is False
+    assert await _ledger() == {name: SandboxPoolState.FILLING}
 
 
 async def test_a_retire_takes_only_a_row_still_in_the_state_it_was_judged_in(world) -> None:
