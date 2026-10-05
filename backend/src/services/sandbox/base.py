@@ -296,6 +296,18 @@ def shared_sandbox_tags(*, recipient_id: uuid.UUID, app_id: uuid.UUID) -> dict[s
     )
 
 
+def pool_member_tags() -> dict[str, str]:
+    """The ARM identity of a container made for the pool, until its claim restamps it: its kind,
+    its control plane and the pool tag, and nothing naming an owner, an app or a birth."""
+    return checked_tags(
+        {
+            TAG_KIND: KIND_BUILD_SANDBOX,
+            TAG_CONTROL_PLANE: control_plane_segment(),
+            TAG_POOL: "1",
+        }
+    )
+
+
 def published_app_tags(*, app_id: uuid.UUID) -> dict[str, str]:
     """Identity for a PUBLISHED app — deliberately shorter than `sandbox_tags`. Two omissions:
     no `TAG_CREATED_AT` (every publish is a full `PUT`, so a timestamp here would be rewritten

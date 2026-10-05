@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.project_share import ProjectShare
@@ -21,9 +22,11 @@ from src.services.sandbox.base import (
     TAG_KIND,
     TAG_USER_ID,
     FleetMember,
+    a_fresh_sandbox_name,
+    pool_member_tags,
 )
 from tests.factories import ProjectFactory, UserFactory
-from tests.fakes import a_fleet_member
+from tests.fakes import a_fleet_member, a_ready_pool_row
 
 
 class _Tagger:
@@ -31,11 +34,11 @@ class _Tagger:
     half `test_inventory.py`'s own `_Fleet` (read-only) does not need."""
 
     def __init__(self, names: list[str]) -> None:
-        self.names = names
+        self.fleet = [a_fleet_member(n) for n in names]
         self.stamped: dict[str, dict[str, str]] = {}
 
     async def list_sandbox_fleet(self) -> list[FleetMember]:
-        return [a_fleet_member(n) for n in self.names]
+        return self.fleet
 
     async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
         self.stamped[name] = tags
@@ -110,3 +113,23 @@ async def test_backfill_leaves_an_unmatched_name_ownerless_and_build_kind(
     stamped = tagger.stamped["sbx-" + "0" * 28]
     assert stamped[TAG_KIND] == KIND_BUILD_SANDBOX
     assert TAG_USER_ID not in stamped
+
+
+@pytest.mark.usefixtures("empty_sandbox_pool")
+async def test_backfill_does_not_count_a_ready_pool_container_as_unowned(
+    db_session: AsyncSession,
+) -> None:
+    """A pool container carries a kind and no owner until its claim, which is exactly the shape
+    the unowned count escalates; one the ledger holds is the pool's, not an orphan's."""
+    member, stranger = a_fresh_sandbox_name(), a_fresh_sandbox_name()
+    await a_ready_pool_row(member, fqdn=f"{member}.example", image_ref="acr/img:v1")
+    tagger = _Tagger([])
+    tagger.fleet = [
+        a_fleet_member(member, tags=pool_member_tags()),
+        a_fleet_member(stranger, tags={TAG_KIND: KIND_BUILD_SANDBOX}),
+    ]
+
+    report = await backfill_sandbox_tags(db_session, tagger)
+
+    assert (report.scanned, report.already_tagged, report.unowned) == (2, 2, 1)
+    assert tagger.stamped == {}

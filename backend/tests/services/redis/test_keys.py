@@ -25,6 +25,7 @@ from src.services.redis.keys import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
     birth_marker_key,
+    birth_marker_scan_pattern,
     heartbeat_key,
     key_prefix,
     lake_file_key,
@@ -191,6 +192,10 @@ def test_the_scan_patterns_are_literals_and_never_wildcard_the_environment() -> 
     for pattern in patterns:
         head = pattern.removesuffix("registry:*")
         assert "*" not in head, f"{pattern} wildcards a segment above the user id"
+
+
+def test_the_birth_marker_scan_pattern_is_this_environments_literal() -> None:
+    assert birth_marker_scan_pattern() == f"bial:{_ENV}:sandbox:birth:*"
 
 
 # --- the type IS the boundary --------------------------------------------------------------

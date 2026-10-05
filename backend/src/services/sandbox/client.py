@@ -75,7 +75,9 @@ from src.services.sandbox.base import (
     SandboxNotReadyError,
     ServedCount,
     ServedPage,
+    a_fresh_sandbox_name,
     base_path_for,
+    pool_member_tags,
     sandbox_tags,
     shared_sandbox_tags,
 )
@@ -192,11 +194,11 @@ _SUPERVISOR_TOKEN_BYTES: Final = 32
 _SUPERVISOR_TOKEN_ENV: Final = "SUPERVISOR_TOKEN"
 _TOKEN_REF_BYTES: Final = 16
 
-# WHICH OF THE TWO BIRTHS a container had, carried only so the create notice can say. A
+# WHICH BIRTH a container had, carried only so the create notice can say. A
 # `Literal` rather than a bare `str` because the value is a log FIELD an operator filters on,
-# and a second spelling of either arm is invisible until the day someone greps for the one that
+# and a second spelling of any arm is invisible until the day someone greps for the one that
 # stopped matching — the same reasoning that pins the event names themselves.
-_BirthArm = Literal["provision_new", "restore_from_snapshot"]
+_BirthArm = Literal["provision_new", "restore_from_snapshot", "pool_fill"]
 
 # Capped exponential backoff for transient ACA provisioning errors.
 _ACA_MAX_ATTEMPTS: Final = 4
@@ -1176,7 +1178,7 @@ class AcaSandboxClient(SandboxClient):
         arm: _BirthArm,
     ) -> str:
         """Create the ACA container, retrying the transient failures. `arm` is carried for the
-        success notice below and nothing else — the two births are otherwise identical here.
+        success notice below and nothing else — the births are otherwise identical here.
 
         THE ARM LAYER USED TO BE SILENT ON SUCCESS, so the most expensive step of a build left
         no trace of how long it took or how many attempts it cost; the terminal failure below
@@ -1380,9 +1382,7 @@ class AcaSandboxClient(SandboxClient):
             await pool.retire(member.id)
         except (SQLAlchemyError, OSError):  # fmt: skip  # ruff py314 strips parens
             _log.warning("sandbox_pool_row_not_retired", app_name=member.name, exc_info=True)
-        async with pool.pool_work_bound():
-            deleted = await self._safe_teardown(member.name)
-        if not deleted:
+        if not await self.delete_pool_container(member.name):
             return
         try:
             await pool.forget(member.id)
@@ -1390,9 +1390,10 @@ class AcaSandboxClient(SandboxClient):
             _log.warning("sandbox_pool_row_outlived_its_container", app_name=member.name)
 
     async def _after_the_claim(self, name: str, tags: dict[str, str]) -> None:
-        """What a claim leaves running behind its start, through the pool's bound: the restamp
-        that gives the container its kind, owner, app and birth. A lost restamp is not repaired,
-        because the sweep reads the registry."""
+        """What a claim leaves running behind its start, each through the pool's bound: the
+        restamp that gives the container its kind, owner, app and birth, then the one fill that
+        replaces it. A lost restamp is not repaired, because the sweep reads the registry; a lost
+        fill is made up by the worker's next pass."""
         from src.services.sandbox.pool import pool_work_bound
 
         try:
@@ -1400,6 +1401,57 @@ class AcaSandboxClient(SandboxClient):
                 await self.stamp_tags(name=name, tags=tags)
         except SandboxError:
             _log.warning("sandbox_pool_claim_restamp_failed", app_name=name, exc_info=True)
+        try:
+            await self.fill_one()
+        except (SQLAlchemyError, OSError):  # fmt: skip  # ruff py314 strips parens
+            _log.warning("sandbox_pool_refill_failed", exc_info=True)
+
+    async def fill_one(self) -> bool:
+        """Make one ready container for the pool, through the pool's bound, and answer whether the
+        pool gained it. Its row is written before its create, so every count of the pool sees the
+        create in flight, and is marked ready at the address Azure answers with. A create Azure
+        refuses leaves no row, or a retiring one while the container may still stand. A ledger
+        failure raises."""
+        from src.db.models.sandbox_pool import SandboxPoolState
+        from src.services.build_sessions.appdata import portal_origin
+        from src.services.sandbox import pool
+
+        async with pool.pool_work_bound():
+            name = a_fresh_sandbox_name()
+            member_id = await pool.add_filling(name, self._config.image_ref)
+            env = {
+                _SUPERVISOR_TOKEN_ENV: secrets.token_urlsafe(_SUPERVISOR_TOKEN_BYTES),
+                "BIAL_BASE_PATH": base_path_for(name),
+                "BIAL_APPS_HOSTNAME": _apps_hostname(),
+                "BIAL_PORTAL_ORIGIN": portal_origin(),
+                "BIAL_POOL_MEMBER": "1",
+            }
+            try:
+                # No data identity: nothing project-specific reaches a container before its claim.
+                fqdn = await self._create_with_retry(
+                    name, env, pool_member_tags(), None, arm="pool_fill"
+                )
+            except SandboxError as exc:
+                _log.warning("sandbox_pool_fill_refused", app_name=name, exc_info=True)
+                if isinstance(exc, _CreateFailedError) and exc.left_standing:
+                    await pool.retire(member_id, was=SandboxPoolState.FILLING)
+                else:
+                    await pool.forget(member_id)
+                return False
+            if not await pool.mark_ready(member_id, fqdn):
+                # A pass let the row go as overdue, so nothing holds this container now.
+                await self._safe_teardown(name)
+                return False
+        _log.info("sandbox_pool_member_filled", app_name=name, image_ref=self._config.image_ref)
+        return True
+
+    async def delete_pool_container(self, name: str) -> bool:
+        """Delete a container the pool's ledger holds, through the pool's bound; True once Azure
+        confirms it gone."""
+        from src.services.sandbox.pool import pool_work_bound
+
+        async with pool_work_bound():
+            return await self._safe_teardown(name)
 
     def _detach(self, work: Coroutine[Any, Any, None]) -> None:
         # A context of its own: the start's would hand this work its stopwatch and log bindings,

@@ -648,7 +648,7 @@ async def test_a_container_from_the_pool_is_the_persons_one_workspace(
 ) -> None:
     """Once claimed, a pool container is a workspace like any other: the next press attaches to
     it, and switching to another project writes it back and hands it to the shutdown routine,
-    never back to the pool.
+    never back to the pool. The switch's start takes the replacement the first claim made.
 
     Mutation check: claim nothing in `_provision_container` and the first start records a create
     under a name of its own instead of the pool container."""
@@ -666,8 +666,10 @@ async def test_a_container_from_the_pool_is_the_persons_one_workspace(
 
     assert (await _relaunch(client, user, project_a, aca_wire.manager)).status_code == 202
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_APP_NAME) == member
+    await asyncio.gather(*aca_wire.sandbox._detached)
     assert (await _relaunch(client, user, project_a, aca_wire.manager)).status_code == 202
-    assert aca_wire.aca.create_calls == []
+    [replacement] = aca_wire.aca.create_calls
+    assert aca_wire.aca.created[replacement]["BIAL_POOL_MEMBER"] == "1"
     assert [host for host, _ in aca_wire.sup.configured] == [fqdn]
 
     assert (await _relaunch(client, user, project_b, aca_wire.manager)).status_code == 202
@@ -676,8 +678,7 @@ async def test_a_container_from_the_pool_is_the_persons_one_workspace(
         (member, PendingTeardownKind.BUILD, True)
     ]
     assert aca_wire.aca.delete_calls == []
-    [created] = aca_wire.aca.create_calls
-    assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_APP_NAME) == created
+    assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_APP_NAME) == replacement
     await asyncio.gather(*aca_wire.sandbox._detached)
 
 

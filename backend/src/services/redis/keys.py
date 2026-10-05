@@ -271,6 +271,12 @@ def registry_scan_patterns() -> tuple[str, ...]:
     return (f"{key_prefix()}{FAMILY_REGISTRY}:*", f"{LEGACY_KEY_PREFIX}{FAMILY_REGISTRY}:*")
 
 
+def birth_marker_scan_pattern() -> str:
+    """The pattern a fleet scan reads every birth marker under. One literal: no marker was ever
+    written under the legacy prefix."""
+    return f"{key_prefix()}{FAMILY_BIRTH}:*"
+
+
 # --- Registry hash fields (frozen — SESSION-API writes/reads these, never a
 # hand-typed field string) --------------------------------------------------
 

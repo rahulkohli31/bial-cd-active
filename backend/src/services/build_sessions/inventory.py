@@ -37,10 +37,12 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.app_registry import AppRegistry
+from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.project_share import ProjectShare
-from src.services.build_sessions.locks import read_registry
+from src.db.models.sandbox_pool import SandboxPoolMember
+from src.services.build_sessions.locks import read_birth_marker, read_registry
 from src.services.redis import registry_scan_patterns
-from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
+from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, birth_marker_scan_pattern
 from src.services.sandbox.base import (
     KIND_BUILD_SANDBOX,
     KIND_SHARED_SANDBOX,
@@ -91,8 +93,10 @@ class SandboxInventory:
     """What ARM has, what the registry claims, and the gap between them.
 
     `unregistered` is THE LEAK: containers Azure is billing for that nothing tracks, so no sweep
-    will ever reach them. `registered_missing` is the opposite and far less urgent — a registry
-    entry whose container is already gone, which the next `reconcile_user` clears on its own."""
+    will ever reach them; a container the pool's ledger, an owed teardown or a birth marker holds
+    is tracked, and left out. `registered_missing` is the opposite and far less urgent — a
+    registry entry whose container is already gone, which the next `reconcile_user` clears on its
+    own."""
 
     live: tuple[str, ...]
     registered: tuple[str, ...]
@@ -100,7 +104,7 @@ class SandboxInventory:
     registered_missing: tuple[str, ...]
 
 
-async def _registered_app_names(redis: aioredis.Redis) -> set[str]:
+async def registered_app_names(redis: aioredis.Redis) -> set[str]:
     """Every app name the sandbox registry currently claims is live.
 
     Scans through `registry_scan_patterns()` and reads through `read_registry`, which is how the
@@ -126,7 +130,7 @@ async def _registered_app_names(redis: aioredis.Redis) -> set[str]:
 
 
 async def take_sandbox_inventory(
-    redis: aioredis.Redis, control_plane: FleetLister
+    db: AsyncSession, redis: aioredis.Redis, control_plane: FleetLister
 ) -> SandboxInventory:
     """Diff the sandbox containers ARM knows about against the ones the registry claims.
 
@@ -134,13 +138,39 @@ async def take_sandbox_inventory(
     worst possible output — it is the exact answer that gets a billing container forgotten for
     another twelve days."""
     live = {member.name for member in await control_plane.list_sandbox_fleet()}
-    registered = await _registered_app_names(redis)
+    registered = await registered_app_names(redis)
+    tracked = registered | await _held_without_a_registry(db) | await _being_born(redis)
     return SandboxInventory(
         live=tuple(sorted(live)),
         registered=tuple(sorted(registered)),
-        unregistered=tuple(sorted(live - registered)),
+        unregistered=tuple(sorted(live - tracked)),
         registered_missing=tuple(sorted(registered - live)),
     )
+
+
+async def _held_without_a_registry(db: AsyncSession) -> set[str]:
+    """Containers the platform still holds that no registry names: the pool's, until a claim,
+    and the owed, whose record is cleared before the container goes and which may be mid
+    write-back. An operator told either is an orphan would delete it by hand. Fleet-wide on
+    purpose: two name columns, no user data, superadmin-only."""
+    pool = await db.scalars(sa.select(SandboxPoolMember.name))
+    owed = await db.scalars(sa.select(PendingTeardown.app_name))
+    return {*pool, *owed}
+
+
+async def _being_born(redis: aioredis.Redis) -> set[str]:
+    """Containers a start is creating that no registry records yet, by their birth markers.
+    Read through `read_birth_marker`, as the next birth reads one."""
+    names: set[str] = set()
+    async for raw_key in redis.scan_iter(match=birth_marker_scan_pattern()):
+        try:
+            user_uuid = uuid.UUID(str(raw_key).rsplit(":", 1)[-1])
+        except ValueError:
+            continue  # a key we did not write; not ours to interpret
+        app_name = (await read_birth_marker(redis, user_uuid) or {}).get(REGISTRY_FIELD_APP_NAME)
+        if app_name:
+            names.add(app_name)
+    return names
 
 
 # --- the tag backfill ----------------------------------------------------------------
@@ -281,6 +311,7 @@ async def backfill_sandbox_tags(db: AsyncSession, control_plane: FleetTagger) ->
     reporting "nothing left to stamp" is the exact false green the destroy flag is gated on."""
     live = {member.name: member.tags for member in await control_plane.list_sandbox_fleet()}
     owners = await _app_names_to_owners(db)
+    held = await _held_without_a_registry(db)
     # END THE READ TRANSACTION BEFORE THE ARM LOOP. `owners` is already materialised as plain
     # UUIDs, so nothing below needs the session — and what follows is an unbounded serial walk of
     # PATCHes, each pollable to `_LRO_CEILING_SECONDS`. Holding the request's connection
@@ -301,8 +332,9 @@ async def backfill_sandbox_tags(db: AsyncSession, control_plane: FleetTagger) ->
             already_tagged += 1
             # A container stamped by an EARLIER pass and still carrying no owner. Counting it
             # only when this pass did the stamping is what made the escalate-forever population
-            # vanish on every re-run.
-            if not live[name].get(TAG_USER_ID):
+            # vanish on every re-run. A ready pool container, which carries no owner until its
+            # claim, and an owed one are accounted for without one.
+            if not live[name].get(TAG_USER_ID) and name not in held:
                 unowned += 1
             continue
         owner = owners.get(name)

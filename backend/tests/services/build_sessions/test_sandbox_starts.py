@@ -219,7 +219,9 @@ async def test_a_relaunch_that_takes_a_ready_container_records_the_claim(
 
     [row] = await _rows(db_session, user.id)
     assert (row.claimed, row.miss_reason, row.ready_count) == (True, None, 1)
-    assert aca.control_plane.create_calls == []
+    await asyncio.gather(*aca.client._detached)
+    [the_replacement] = aca.control_plane.create_calls
+    assert aca.control_plane.created[the_replacement]["BIAL_POOL_MEMBER"] == "1"
     assert row.create_ms is not None
     assert {"bearer_read", "configure", "registry_write"} <= set(row.sub_steps)
     assert row.outcome is SandboxStartOutcome.SERVED

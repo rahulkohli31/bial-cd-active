@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 import pytest
 import redis.asyncio as aioredis
 from pydantic import SecretStr
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.services.build_sessions import locks, reaper
@@ -165,7 +166,7 @@ async def test_a_fleet_registered_under_the_old_prefix_is_still_swept(
 
 
 async def test_a_fleet_registered_under_the_old_prefix_is_still_inventoried(
-    fake_redis: aioredis.Redis,
+    db_session: AsyncSession, fake_redis: aioredis.Redis
 ) -> None:
     """The report-only Azure inventory is the platform's ONLY view of containers nothing tracks.
     If the cutover made pre-cutover records unreadable, every one of them would be reported as
@@ -174,7 +175,7 @@ async def test_a_fleet_registered_under_the_old_prefix_is_still_inventoried(
     await _seed_legacy(fake_redis, user, _LEGACY_APP)
 
     inv = await take_sandbox_inventory(
-        fake_redis, _Fleet([_LEGACY_APP, a_sandbox_name("genuinely-orphaned")])
+        db_session, fake_redis, _Fleet([_LEGACY_APP, a_sandbox_name("genuinely-orphaned")])
     )
 
     assert inv.registered == (_LEGACY_APP,)
@@ -459,7 +460,7 @@ async def test_reconcile_on_start_reaps_a_legacy_record(fake_redis: aioredis.Red
 
 
 async def test_a_sweep_ignores_another_environments_keys_entirely(
-    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    db_session: AsyncSession, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """From the sweep's end: pointed at a Redis holding production's records, a
     development process must find NOTHING — not "records it does not understand", nothing at all.
@@ -475,7 +476,7 @@ async def test_a_sweep_ignores_another_environments_keys_entirely(
     client = FakeSandboxClient()
     result = await reaper.sweep_all(fake_redis, client)
     inv = await take_sandbox_inventory(
-        fake_redis, _Fleet([a_sandbox_name("production-container")])
+        db_session, fake_redis, _Fleet([a_sandbox_name("production-container")])
     )
 
     assert result == reaper.SweepResult(reaped=0, failed=0)

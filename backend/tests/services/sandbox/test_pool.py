@@ -1,4 +1,5 @@
-"""The claim inside the create seam, against ledger rows on the real test database.
+"""The claim inside the create seam and the fill that replaces what it takes, against ledger rows
+on the real test database.
 
 The ledger commits in sessions of its own, so exclusivity is what Postgres does, not what a double
 says it does, and every test starts and ends with the table empty. Azure is a control plane keyed
@@ -66,16 +67,31 @@ pytestmark = pytest.mark.usefixtures("empty_sandbox_pool")
 
 class PoolAca(AcaControlPlane):
     """Every container Azure knows, by name: its environment, its tags, and what was done to it.
+    A create made for the pool, which carries the pool flag, is kept apart from a start's own.
     `__init__` is overridden so no credential or management client is built."""
 
     def __init__(self) -> None:
         self.envs: dict[str, dict[str, str]] = {}
         self.tags: dict[str, dict[str, str]] = {}
+        self.identities: dict[str, str | None] = {}
+        self.create_attempts: list[str] = []
         self.created: list[str] = []
+        self.filled: list[str] = []
         self.deleted: list[str] = []
+        self.refuses_to_create = False
         self.refuses_to_delete: set[str] = set()
-        # The stopwatch and log bindings each restamp ran under.
+        self.refuses_every_delete = False
+        # Set, a create for the pool waits on it: how a test holds a fill in flight.
+        self.fills_wait_for: asyncio.Event | None = None
+        self.fill_began = asyncio.Event()
+        self.fill_takes = 0.0
+        self.filling_now = 0
+        self.most_filling_at_once = 0
+        # Run as each create or delete reaches Azure: what a test samples meanwhile.
+        self.on_each_call: Callable[[], Awaitable[object]] | None = None
+        # The stopwatch and log bindings each restamp, and each fill, ran under.
         self.restamped_under: list[tuple[Stopwatch, dict[str, Any]]] = []
+        self.filled_under: list[tuple[Stopwatch, dict[str, Any]]] = []
 
     def made_for_the_pool(self, name: str, *, token: str | None) -> None:
         self.envs[name] = {"BIAL_POOL_MEMBER": "1"}
@@ -95,14 +111,35 @@ class PoolAca(AcaControlPlane):
         tags: dict[str, str],
         identity_resource_id: str | None = None,
     ) -> str:
-        self.created.append(name)
+        if self.on_each_call is not None:
+            await self.on_each_call()
+        self.create_attempts.append(name)
+        if self.refuses_to_create:
+            raise AcaError("the create was refused")
         self.envs[name] = dict(env)
         self.tags[name] = dict(tags)
+        self.identities[name] = identity_resource_id
+        if env.get("BIAL_POOL_MEMBER") != "1":
+            self.created.append(name)
+            return f"{name}.aca.example"
+        self.filled.append(name)
+        self.filled_under.append((running_stopwatch(), structlog.contextvars.get_contextvars()))
+        self.filling_now += 1
+        self.most_filling_at_once = max(self.most_filling_at_once, self.filling_now)
+        self.fill_began.set()
+        try:
+            await asyncio.sleep(self.fill_takes)
+            if self.fills_wait_for is not None:
+                await asyncio.wait_for(self.fills_wait_for.wait(), timeout=5)
+        finally:
+            self.filling_now -= 1
         return f"{name}.aca.example"
 
     async def delete_app(self, *, name: str) -> None:
+        if self.on_each_call is not None:
+            await self.on_each_call()
         self.deleted.append(name)
-        if name in self.refuses_to_delete:
+        if self.refuses_every_delete or name in self.refuses_to_delete:
             raise AcaError("the delete was refused")
         self.envs.pop(name, None)
 
@@ -265,7 +302,7 @@ async def test_a_start_takes_a_ready_container_as_its_own_workspace(world) -> No
     assert record[REGISTRY_FIELD_APP_ID] == str(app_id)
     assert record[REGISTRY_FIELD_FQDN] == f"{member}.pool.example"
     assert world.aca.created == []
-    assert await _ledger() == {}
+    assert member not in await _ledger()
     assert (stopwatch.claimed, stopwatch.miss_reason, stopwatch.ready_count) == (True, None, 1)
     assert {"bearer_read", "configure", "registry_write"} <= set(stopwatch.laps)
     # A claimed start's create stage is the claim.
@@ -339,9 +376,12 @@ async def test_two_starts_at_once_never_receive_the_same_ready_container(
 
 
 async def test_six_starts_against_five_ready_containers_claim_five_and_create_one(world) -> None:
+    """The replacements each claim starts are held filling, so the sixth start finds none ready."""
     members = {await _ready(world) for _ in range(5)}
+    world.aca.fills_wait_for = asyncio.Event()
 
     started = [await _start(world.client, uuid.uuid4(), uuid.uuid4()) for _ in range(6)]
+    world.aca.fills_wait_for.set()
 
     assert {handle.app_name for handle, _ in started[:5]} == members
     assert [(w.claimed, w.ready_count) for _, w in started[:5]] == [
@@ -422,8 +462,9 @@ async def test_a_build_claim_is_restamped_with_its_owner_and_birth(world) -> Non
 
 
 async def test_work_a_claim_leaves_behind_runs_outside_the_start(world) -> None:
-    """The restamp outlives the start, whose record is closed by then: it must see neither the
-    start's stopwatch nor its log bindings, or it would time itself into a closed record."""
+    """The restamp and the replacement outlive the start, whose record is closed by then: they
+    must see neither the start's stopwatch nor its log bindings, or they would time themselves
+    into a closed record."""
     await _ready(world)
     stopwatch = Stopwatch()
 
@@ -434,10 +475,12 @@ async def test_work_a_claim_leaves_behind_runs_outside_the_start(world) -> None:
     laps_at_the_return = dict(stopwatch.laps)
     await _settled(world.client)
 
-    [(timed_by_then, bound_then)] = world.aca.restamped_under
-    assert timed_by_then is not stopwatch
-    assert timed_by_then is running_stopwatch()
-    assert "build_id" not in bound_then
+    [(restamp_timed_by, restamp_bound)] = world.aca.restamped_under
+    [(fill_timed_by, fill_bound)] = world.aca.filled_under
+    assert restamp_timed_by is fill_timed_by is running_stopwatch()
+    assert restamp_timed_by is not stopwatch
+    assert "build_id" not in restamp_bound
+    assert "build_id" not in fill_bound
     assert stopwatch.laps == laps_at_the_return
 
 
@@ -523,7 +566,8 @@ async def test_a_failed_claim_moves_on_to_the_next_ready_container(
     assert (stopwatch.claimed, stopwatch.miss_reason) == (True, None)
     assert world.aca.created == []
     assert world.aca.deleted == [broken]
-    assert await _ledger() == {}
+    [replacement] = world.aca.filled
+    assert await _ledger() == {replacement: SandboxPoolState.READY}
 
 
 async def test_a_failed_claim_whose_delete_is_refused_is_left_retiring(world) -> None:
@@ -716,3 +760,182 @@ async def test_pool_work_runs_two_at_a_time_on_whichever_loop_asks(_round: int) 
     await asyncio.gather(*(a_piece_of_pool_work() for _ in range(6)))
 
     assert most == 2
+
+
+# --- making ready containers -----------------------------------------------------------------
+
+
+async def test_a_fill_makes_a_container_that_holds_nothing_of_any_project(world) -> None:
+    """Made from its own name with the platform's settings and nothing else: no project's
+    settings, no data identity, and no owner, app or birth on its tags until a claim."""
+    assert await world.client.fill_one() is True
+
+    [name] = world.aca.filled
+    env = world.aca.envs[name]
+    assert set(env) == {
+        "SUPERVISOR_TOKEN",
+        "BIAL_BASE_PATH",
+        "BIAL_APPS_HOSTNAME",
+        "BIAL_PORTAL_ORIGIN",
+        "BIAL_POOL_MEMBER",
+    }
+    assert env["BIAL_BASE_PATH"] == f"/a/{name}"
+    assert env["BIAL_APPS_HOSTNAME"] == "citizenapps.bialairport.com"
+    assert env["BIAL_PORTAL_ORIGIN"] == "http://localhost:5173"
+    assert env["BIAL_POOL_MEMBER"] == "1"
+    assert len(env["SUPERVISOR_TOKEN"]) >= 43
+    assert world.aca.tags[name] == {
+        TAG_KIND: KIND_BUILD_SANDBOX,
+        TAG_CONTROL_PLANE: control_plane_segment(),
+        TAG_POOL: "1",
+    }
+    assert world.aca.identities[name] is None
+    async with db_base.async_session_factory() as db:
+        row = await db.scalar(sa.select(SandboxPoolMember).where(SandboxPoolMember.name == name))
+    assert row is not None
+    assert (row.state, row.fqdn, row.image_ref) == (
+        SandboxPoolState.READY,
+        f"{name}.aca.example",
+        IMAGE,
+    )
+
+
+async def test_each_fill_gets_a_bearer_of_its_own(world) -> None:
+    await world.client.fill_one()
+    await world.client.fill_one()
+
+    first, second = world.aca.filled
+    assert world.aca.envs[first]["SUPERVISOR_TOKEN"] != world.aca.envs[second]["SUPERVISOR_TOKEN"]
+
+
+async def test_a_fill_is_on_the_ledger_before_azure_is_asked(world) -> None:
+    """So the refill and the worker's pass each count the other's create in flight."""
+    world.aca.fills_wait_for = asyncio.Event()
+    filling = asyncio.create_task(world.client.fill_one())
+    await asyncio.wait_for(world.aca.fill_began.wait(), timeout=5)
+
+    [name] = world.aca.filled
+    assert await _ledger() == {name: SandboxPoolState.FILLING}
+
+    world.aca.fills_wait_for.set()
+    assert await filling is True
+    assert await _ledger() == {name: SandboxPoolState.READY}
+
+
+async def test_a_create_azure_refuses_leaves_no_row_and_nothing_standing(world) -> None:
+    world.aca.refuses_to_create = True
+
+    assert await world.client.fill_one() is False
+
+    [attempted] = world.aca.create_attempts
+    assert world.aca.deleted == [attempted]
+    assert await _ledger() == {}
+
+
+async def test_a_refused_create_whose_clean_up_is_refused_too_is_left_retiring(world) -> None:
+    """Something may stand under that name, so its row stays for a pass to retry the delete."""
+    world.aca.refuses_to_create = True
+    world.aca.refuses_every_delete = True
+
+    assert await world.client.fill_one() is False
+
+    [attempted] = world.aca.create_attempts
+    assert await _ledger() == {attempted: SandboxPoolState.RETIRING}
+
+
+async def test_a_fill_whose_row_a_pass_let_go_deletes_what_it_made(world) -> None:
+    """A pass that judged the create overdue has given up its row, so nothing would hold the
+    container the create goes on to make."""
+    world.aca.fills_wait_for = asyncio.Event()
+    filling = asyncio.create_task(world.client.fill_one())
+    await asyncio.wait_for(world.aca.fill_began.wait(), timeout=5)
+    [name] = world.aca.filled
+    async with db_base.async_session_factory() as db:
+        member_id = await db.scalar(
+            sa.select(SandboxPoolMember.id).where(SandboxPoolMember.name == name)
+        )
+    assert member_id is not None
+    assert await pool.retire(member_id, was=SandboxPoolState.FILLING) is True
+
+    world.aca.fills_wait_for.set()
+
+    assert await filling is False
+    assert world.aca.deleted == [name]
+    assert await _ledger() == {name: SandboxPoolState.RETIRING}
+
+
+async def test_one_claim_makes_one_replacement_that_a_pass_meanwhile_counts(world) -> None:
+    """The replacement is on the ledger while Azure makes it, so the worker's pass in that
+    minute finds the pool at its size and makes nothing of its own."""
+    world.client._config = _config(pool_day_size=1, pool_night_size=1)
+    member = await _ready(world)
+    world.aca.fills_wait_for = asyncio.Event()
+
+    handle, _ = await _start(world.client, uuid.uuid4(), uuid.uuid4())
+    await asyncio.wait_for(world.aca.fill_began.wait(), timeout=5)
+    meanwhile = await pool.keep_the_pool(world.client, world.client._config, at=datetime.now(UTC))
+    world.aca.fills_wait_for.set()
+    await _settled(world.client)
+
+    assert handle.app_name == member
+    assert meanwhile.filled == 0
+    [replacement] = world.aca.filled
+    assert await _ledger() == {replacement: SandboxPoolState.READY}
+
+
+async def test_a_burst_of_claims_makes_its_replacements_two_at_a_time(world) -> None:
+    for _ in range(6):
+        await _ready(world)
+    world.aca.fill_takes = 0.05
+
+    started = await asyncio.gather(
+        *(_start(world.client, uuid.uuid4(), uuid.uuid4()) for _ in range(6))
+    )
+    await _settled(world.client)
+
+    assert all(stopwatch.claimed for _, stopwatch in started)
+    assert len(world.aca.filled) == 6
+    assert world.aca.most_filling_at_once == 2
+
+
+async def test_a_lost_replacement_does_not_fail_the_start_that_claimed(
+    world, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ledger going away after a claim costs the pool one replacement, which the worker's
+    next pass makes up, and nothing else."""
+    member = await _ready(world)
+
+    async def unreachable(name: str, image_ref: str) -> uuid.UUID:
+        raise OSError("the database went away")
+
+    monkeypatch.setattr(pool, "add_filling", unreachable)
+
+    with capture_logs() as logged:
+        handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4())
+        await _settled(world.client)
+
+    assert (handle.app_name, stopwatch.claimed) == (member, True)
+    assert world.aca.filled == []
+    assert [e["event"] for e in logged if e["event"] == "sandbox_pool_refill_failed"] == [
+        "sandbox_pool_refill_failed"
+    ]
+
+
+async def test_a_retire_takes_only_a_row_still_in_the_state_it_was_judged_in(world) -> None:
+    """Every retire is a compare-and-set, which is what keeps one from deleting a container a
+    start claimed after the pass looked."""
+    member = await _ready(world)
+    claimed = await pool.claim(IMAGE)
+    assert claimed is not None and claimed.name == member
+
+    assert await pool.retire(claimed.id, was=SandboxPoolState.READY) is False
+    assert await _ledger() == {member: SandboxPoolState.CLAIMED}
+    assert await pool.retire(claimed.id) is True
+    assert await _ledger() == {member: SandboxPoolState.RETIRING}
+
+
+def test_a_row_is_overdue_only_after_the_longest_create_could_have_run() -> None:
+    """Every create attempt waits at most five minutes for Azure, and a create is tried four
+    times: twenty minutes, and a row younger than that may still have its create in flight."""
+    assert pool.ROW_DEADLINE > timedelta(minutes=20)
+    assert pool.ROW_DEADLINE < timedelta(minutes=25)

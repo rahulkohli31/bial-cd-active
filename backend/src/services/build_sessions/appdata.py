@@ -130,6 +130,12 @@ def _origin(url: str) -> str:
     return url.rstrip("/")
 
 
+def portal_origin() -> str:
+    """`BIAL_PORTAL_ORIGIN`: the one origin allowed to frame a sandbox, from `FRONTEND_URL`, which
+    both processes that make sandboxes hold."""
+    return _origin(settings.FRONTEND_URL)
+
+
 def build_app_env(app_id: uuid.UUID) -> dict[str, str]:
     """The two always-present `BIAL_*` env vars injected into the sandbox at provision and
     re-injected on restore (the app identity + the `BIAL_PORTAL_ORIGIN`). Requires a
@@ -140,5 +146,5 @@ def build_app_env(app_id: uuid.UUID) -> dict[str, str]:
         raise SandboxNotConfiguredError("sandbox is not configured: cannot build app env")
     return {
         "BIAL_APP_ID": str(app_id),
-        "BIAL_PORTAL_ORIGIN": _origin(settings.FRONTEND_URL),
+        "BIAL_PORTAL_ORIGIN": portal_origin(),
     }

@@ -1233,7 +1233,7 @@ async def reconcile_sandboxes(
         raise AppApiError(503, _SANDBOX_UNAVAILABLE)
     with build_coordination_or_503():
         try:
-            inventory = await take_sandbox_inventory(get_redis(), sandbox)
+            inventory = await take_sandbox_inventory(db, get_redis(), sandbox)
         except SandboxError as exc:
             # Never a partial inventory: a half-enumerated fleet is indistinguishable from a
             # clean one, and "clean" is the answer that gets an orphan forgotten.

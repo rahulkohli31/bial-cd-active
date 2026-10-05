@@ -80,6 +80,15 @@ def test_no_sandbox_value_in_the_worker_sample_looks_real() -> None:
     )
 
 
+def test_the_worker_samples_portal_address_is_a_placeholder() -> None:
+    """The worker needs the portal's address for the sandboxes it makes for the pool, and the value
+    nearest to hand is the real one. This repository is public and names no deployment."""
+    lines = (_BACKEND_ROOT / _WORKER_SAMPLE).read_text(encoding="utf-8").splitlines()
+    portal = [line for line in lines if line.lstrip("# ").startswith("FRONTEND_URL=")]
+
+    assert portal == ["FRONTEND_URL=https://REPLACE-ME.example.com"]
+
+
 def test_the_worker_sample_is_not_excluded_by_gitignore() -> None:
     """A TEMPLATE NOBODY CAN COMMIT IS THE ABSENCE IT WAS WRITTEN TO FIX. `backend/.gitignore` is
     `.env.*` — which matches this filename — rescued only by the `!.env*.example` negation on the
