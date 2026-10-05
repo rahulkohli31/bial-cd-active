@@ -13,7 +13,7 @@
 import { authFetch } from './api'
 import { asCompileState } from './compileState'
 import type { CompileState } from './compileState'
-import { readApiError } from './apiError'
+import { optionalString, readApiError } from './apiError'
 
 // ---------------------------------------------------------------------------------------
 // Frame types (mirror backend `conversations/schemas.py`; camelCase on the wire)
@@ -475,7 +475,7 @@ function toTurnFrame(parsed: unknown): TurnFrame | null {
         state,
         message: typeof parsed.message === 'string' ? parsed.message : null,
         notice: typeof parsed.notice === 'string' ? parsed.notice : null,
-        startId: typeof parsed.startId === 'string' ? parsed.startId : null,
+        startId: optionalString(parsed.startId),
       }
     }
     case 'preview': {

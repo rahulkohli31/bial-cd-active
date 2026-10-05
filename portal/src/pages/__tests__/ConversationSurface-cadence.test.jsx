@@ -181,7 +181,7 @@ async function watchingAStart() {
   // The turn has to be genuinely OVER, not merely closed: both container reads below are gated on
   // `liveTurnIdRef.current === null`, so a helper that left the turn live would prove their absence
   // by the wrong mechanism entirely. Well under one accelerated interval, so no tick rides on it.
-  await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+  await act(async () => { await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS / 2) })
   return turn
 }
 
@@ -217,7 +217,8 @@ describe('the chat surface asks faster while a workspace is starting', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1) })
 
     // LIVENESS FIRST, so the two absences below are about a probe that ran rather than one that
-    // never fired: three seconds bought a read, which at the background cadence it would not have.
+    // never fired: one accelerated interval bought a read, which at the background cadence it would
+    // not have.
     expect(h.fetchPreviewState.mock.calls.length).toBe(before + 1)
     expect(framedUrl()).toBe(PREVIEW_URL)
 
@@ -239,7 +240,7 @@ describe('the chat surface asks faster while a workspace is starting', () => {
     const settled = h.fetchPreviewState.mock.calls.length
 
     // Ten accelerated intervals over a running app add nothing — the whole product does not go on
-    // a three-second poll because one workspace once started.
+    // the accelerated poll because one workspace once started.
     await act(async () => { await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS * 10) })
     expect(h.fetchPreviewState.mock.calls.length).toBe(settled)
 
@@ -251,10 +252,10 @@ describe('the chat surface asks faster while a workspace is starting', () => {
   it('★ a start that goes dark is bounded too — a failed probe SPENDS from the window', async () => {
     // THE OTHER HALF OF THE BOUND. `fetchPreviewState` throws on any non-2xx and on a dropped
     // connection, and for as long as only the success path could advance `fastReads`, a workspace
-    // that reached `starting` and then began erroring was probed every three seconds for the life
-    // of the tab — twenty requests a minute, from the chat route as well as the project one, with
-    // the 40-read ceiling that exists to stop a hung start never moving. `spendProbeCadence` in
-    // the `catch` is the fix; this counts the reads it is supposed to stop.
+    // that reached `starting` and then began erroring was probed at the accelerated cadence for the
+    // life of the tab, from the chat route as well as the project one, with the read ceiling that
+    // exists to stop a hung start never moving. `spendProbeCadence` in the `catch` is the fix; this
+    // counts the reads it is supposed to stop.
     await watchingAStart()
     const before = h.fetchPreviewState.mock.calls.length
     h.fetchPreviewState.mockRejectedValue(new Error('500 from preview-state'))
@@ -273,7 +274,7 @@ describe('the chat surface asks faster while a workspace is starting', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS * 10) })
     expect(h.fetchPreviewState.mock.calls.length).toBe(spent)
 
-    // NOTHING WAS RECLASSIFIED ON THE WAY. Forty failures say nothing about a container, so the
+    // NOTHING WAS RECLASSIFIED ON THE WAY. These failures say nothing about a container, so the
     // pane still says a start is happening — no "we could not check", no "gone".
     //
     // READ OFF THE STATE HANDLE, NOT THE SENTENCE. This window is longer than the pane's own
@@ -288,6 +289,28 @@ describe('the chat surface asks faster while a workspace is starting', () => {
     // ABSENCE PAIRED WITH LIVENESS: quiet because it is slow, not because it died.
     await act(async () => { await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS) })
     expect(h.fetchPreviewState.mock.calls.length).toBeGreaterThan(spent)
+  })
+
+  it('★ never starts a probe on a tick while the last one is still waiting', async () => {
+    // At the accelerated cadence a probe slower than one interval would put another request in the
+    // air behind it every second. Mutation check: drop the tick's skip and the second count goes red.
+    await watchingAStart()
+    let answer = () => undefined
+    h.fetchPreviewState.mockImplementationOnce(() => new Promise((resolve) => { answer = resolve }))
+    const before = h.fetchPreviewState.mock.calls.length
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1) })
+    expect(h.fetchPreviewState.mock.calls.length).toBe(before + 1)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS * 5) })
+    expect(h.fetchPreviewState.mock.calls.length).toBe(before + 1)
+
+    // LIVENESS: once the slow answer lands, the ticks ask again.
+    await act(async () => {
+      answer(preview('starting'))
+      await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
+    })
+    expect(h.fetchPreviewState.mock.calls.length).toBeGreaterThan(before + 1)
   })
 
   it('changes cadence WITHOUT re-running the effect, so the pane never blinks', async () => {
@@ -317,12 +340,11 @@ describe('the chat surface asks faster while a workspace is starting', () => {
  * THE OTHER HALF OF THE ACCELERATION'S BILL — the one nobody sends a request for.
  *
  * `fetchPreviewState` PARSES A FRESH OBJECT EVERY TICK, so a poll that records its answer
- * unconditionally hands this surface a new `polledPreview` identity three seconds apart forever,
+ * unconditionally hands this surface a new `polledPreview` identity one accelerated interval apart,
  * and React re-renders the whole thing — transcript, composer, toolbar — for a reading nobody's
- * screen can tell apart from the one already up. `useWorkspaceState` has compared the FIELDS
- * before recording since it was written; the chat surface's copy of the same poll never did, and
- * accelerating the cadence turned that from one wasted render every forty-five seconds into one
- * every three, straight through the window a citizen sits watching their app come up.
+ * screen can tell apart from the one already up — on every accelerated tick, straight through the
+ * window a citizen sits watching their app come up. `useWorkspaceState` compares the FIELDS before
+ * recording, and this surface's copy of the same poll has to as well.
  *
  * THE MUTANT THIS EXISTS FOR: collapse the recorder back to
  * `setPolledPreview((prev) => (state.state === 'unknown' && prev ? prev : { projectId, state }))`

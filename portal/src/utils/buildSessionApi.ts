@@ -11,7 +11,7 @@
  * reusing `auth.ts` `getCsrfToken()`); the GETs are safe methods and carry NO token. This is
  * net-new: no prior business route in the portal enforces CSRF.
  */
-import { ApiError, extractApiCode, extractApiMessage, isRecord, readApiError } from './apiError'
+import { ApiError, extractApiCode, extractApiMessage, isRecord, optionalString, readApiError } from './apiError'
 import { authFetch } from './api'
 import { asCompileState } from './compileState'
 import type { CompileState } from './compileState'
@@ -124,7 +124,7 @@ export async function relaunchPreview(
   deps: AuthFetchDeps = {},
 ): Promise<string | null> {
   const body = await postJson(`${BASE}/relaunch`, { projectId: args.projectId }, 'Failed to relaunch the preview', deps)
-  return isRecord(body) && typeof body.startId === 'string' ? body.startId : null
+  return isRecord(body) ? optionalString(body.startId) : null
 }
 
 // ─── lock operations — THERE ARE NONE LEFT ─────────────────────────────────
@@ -213,7 +213,7 @@ function toSharedPreviewResponse(value: unknown): SharedPreviewResponse {
     previewUrl: typeof value.previewUrl === 'string' ? value.previewUrl : '',
     ready: value.ready === true,
     snapshotTakenAt: typeof value.snapshotTakenAt === 'string' ? value.snapshotTakenAt : null,
-    startId: typeof value.startId === 'string' ? value.startId : null,
+    startId: optionalString(value.startId),
   }
 }
 

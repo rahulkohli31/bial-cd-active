@@ -20,7 +20,6 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, RefreshCw } from 'lucide-react'
 import { BusyGlyph } from '../components/ui/Waiting'
 import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
-import { MOUNTED_TYPE, framedPathOf, isFrameReportFor, originOf } from '../components/LivePreview'
 import { getProject } from '../utils/projectApi'
 import type { Project } from '../utils/projectApi'
 import {
@@ -35,6 +34,7 @@ import type { SharedPreviewResponse } from '../utils/buildSessionTypes'
 import { ApiError } from '../utils/apiError'
 import { relativeTimeVerbose } from '../utils/relativeTime'
 import { markStartAbandoned, markStartClicked, markStartVisible } from '../utils/observe'
+import { MOUNTED_TYPE, isTrustedFrameReport } from '../utils/frameReport'
 import { PROJECT_GONE_NOTICE } from './ProjectsPage'
 
 export default function SharedProjectPage(): React.JSX.Element {
@@ -177,12 +177,10 @@ export default function SharedProjectPage(): React.JSX.Element {
   const framedUrl = preview !== null && preview.ready ? preview.previewUrl : null
   useEffect(() => {
     if (!projectId || framedUrl === null) return
-    const origin = originOf(framedUrl)
-    const path = framedPathOf(framedUrl)
     const onMessage = (e: MessageEvent) => {
-      const frameWindow = frameRef.current?.contentWindow
-      if (origin === null || e.origin !== origin || !frameWindow || e.source !== frameWindow) return
-      if (isFrameReportFor(e.data, MOUNTED_TYPE, path)) markStartVisible(projectId)
+      if (isTrustedFrameReport(e, framedUrl, frameRef.current?.contentWindow, MOUNTED_TYPE)) {
+        markStartVisible(projectId)
+      }
     }
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)

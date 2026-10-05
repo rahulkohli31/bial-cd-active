@@ -80,11 +80,6 @@ export function isTerminalReading(preview: Pick<PreviewState, 'state' | 'restora
  * container call — so 60 of them a minute, only while somebody is watching a start, is a real
  * cost and a small one.
  *
- * WHAT WOULD HAVE SETTLED IT BETTER: the distribution of `starting`→`alive` on real starts, warm
- * attach and cold create+pull separately, with the interval set near the tenth percentile and the
- * window near the ninety-fifth. Anyone holding that data should change these two numbers and say
- * so here.
- *
  * WHY IT STOPS, AND WHEN — see {@link STARTING_PROBE_LIMIT}.
  *
  * FALLING BACK IS NOT A VERDICT. The reading is left exactly as it was — still `starting`, still
@@ -94,12 +89,12 @@ export function isTerminalReading(preview: Pick<PreviewState, 'state' | 'restora
  *
  * AND IT STOPS ON A CLOCK, NOT ON A TALLY OF ANSWERS WE LIKED. The bound is only a ceiling if
  * EVERY read spends from it — including the ones that came back with nothing.
- * `fetchPreviewState` throws on any non-2xx and on a dropped connection, and for as long as
- * only `nextProbeCadence` could advance the count, a workspace that reached `starting` and then hit
- * a 500, an expired session or a dead network was asked every three seconds FOR THE LIFE OF THE
- * TAB — twenty requests a minute, on both surfaces, with the bound that exists to prevent exactly
- * that never advancing a single step. {@link spendProbeCadence} is the other half, and both polls
- * call it from their `catch`.
+ * `fetchPreviewState` throws on any non-2xx and on a dropped connection, so if only
+ * `nextProbeCadence` could advance the count, a workspace that reached `starting` and then hit a
+ * 500, an expired session or a dead network would be asked at the accelerated cadence FOR THE LIFE
+ * OF THE TAB, on both surfaces, with the bound that exists to prevent exactly that never advancing
+ * a single step. {@link spendProbeCadence} is the other half, and both polls call it from their
+ * `catch`.
  */
 export const STARTING_PROBE_MS = 1_000
 
@@ -137,36 +132,41 @@ export const STARTING_PROBE_LIMIT = 300_000 / STARTING_PROBE_MS
 export const HIDDEN_PROBE_MS = 120_000
 
 /**
- * Does THIS tick renew the container's lease, and on which budget?
+ * Which budget does a renewal ask for?
  *
  * SHARED BY BOTH POLLS, deliberately, exactly like {@link nextProbeCadence}. There are two
  * surfaces that can frame a project — the project workspace and the chat route — and a surface
  * that frames an app WITHOUT renewing is a silent container-killer: the citizen is looking right
  * at their app while the platform counts it as abandoned. Putting this decision on one screen's
  * hook is precisely how the chat route would be missed, so it lives here where neither can drift
- * from the other and neither can forget it.
- *
- * EVERY TICK RENEWS, INCLUDING THROUGHOUT A START, and that is the half this used to get wrong.
- * Accelerated ticks were exempt on the grounds that a starting container is held by the marker and
- * the lock rather than by a stay — but the marker is written ONCE, with a five-minute TTL, and the
- * accelerated window is five minutes too. A citizen watching a start therefore sent zero renewals
- * across exactly the window where the two things holding their container both lapse, and the sweep
- * runs every five minutes.
- *
- * RENEWING THERE IS STRUCTURALLY SAFE, which is what the old reasoning missed. `renew_presence_stay`
- * is a compare-and-set on the registry's own `app_name`: with no record, or a record naming another
- * container, it writes nothing and answers `nothing_running` / `not_this_container`. And the deadline
- * it writes is a monotonic `max`, so a five-minute visible renewal cannot truncate the long stay a
- * start already granted itself. The absolute age ceiling bounds all of it regardless.
- *
- * EVERY TICK RENEWS, so this answers WHICH BUDGET and never whether. It is still one exported
- * function rather than a ternary at each call site: the two surfaces framing a project must not be
- * able to disagree about this, and a surface that quietly stopped renewing is a silent
- * container-killer — the citizen is looking right at their app while the platform counts it
- * abandoned.
+ * from the other and neither can forget it. {@link renewsOnThisTick} is the other half: whether.
  */
 export function presenceToRenew(documentHidden: boolean): SurfacePresence {
   return documentHidden ? 'hidden' : 'visible'
+}
+
+/**
+ * Does THIS tick renew the container's lease? `lastRenewedAt` is the caller's clock reading at its
+ * last renewal, `null` before the first.
+ *
+ * EVERY UNACCELERATED TICK RENEWS, AND A WATCHED START RENEWS THROUGHOUT. A starting container is
+ * held by the marker and the lock, but the marker is written ONCE with a five-minute TTL and the
+ * accelerated window is five minutes too, so a start that renewed nothing would let both lapse
+ * across exactly the window the five-minute sweep runs in.
+ *
+ * NOT ON EVERY ACCELERATED TICK, though. A renewal moves a deadline minutes away by the time since
+ * the last one, so at the accelerated cadence nearly every one would be a write that changes
+ * nothing. An accelerated tick renews once the last renewal is {@link PREVIEW_PROBE_MS} old: as
+ * often as the background cadence renews. Timed, not counted, because a throttled tab fires its
+ * ticks late and a count would starve the lease.
+ *
+ * RENEWING THERE IS STRUCTURALLY SAFE. `renew_presence_stay` is a compare-and-set on the registry's
+ * own `app_name`: with no record, or a record naming another container, it writes nothing. And the
+ * deadline it writes is a monotonic `max`, so a five-minute visible renewal cannot truncate the
+ * long stay a start already granted itself. The absolute age ceiling bounds all of it regardless.
+ */
+export function renewsOnThisTick(accelerated: boolean, now: number, lastRenewedAt: number | null): boolean {
+  return !accelerated || lastRenewedAt === null || now - lastRenewedAt >= PREVIEW_PROBE_MS
 }
 
 /**
@@ -197,7 +197,7 @@ export const BACKGROUND_CADENCE: ProbeCadence = { delayMs: PREVIEW_PROBE_MS, fas
  * the read, on the `keepAsking`/`stopAsking` seam both effects already own.
  *
  * STRICTLY `starting`, and it reverts on anything else. A window that stayed open on `alive` would
- * put the whole product on a 3-second poll, which is the change nobody asked for. A read that
+ * put the whole product on the accelerated poll, which is the change nobody asked for. A read that
  * never answered is {@link spendProbeCadence}'s, not this function's.
  */
 export function nextProbeCadence(answer: PreviewLifeState, held: ProbeCadence): ProbeCadence {
@@ -244,9 +244,8 @@ export function mayHaveStopped(
  * IT SPENDS, AND IT DECIDES NOTHING. THAT ASYMMETRY IS THE WHOLE RULE.
  *
  * SPENDS, because {@link STARTING_PROBE_LIMIT} is meant as a ceiling on how long anybody may be
- * polled at the accelerated cadence, and a budget only successful reads draw from is no ceiling at all: an
- * endpoint erroring from the first tick pinned both polls at 3s forever, which is the bug this
- * exists to close.
+ * polled at the accelerated cadence, and a budget only successful reads draw from is no ceiling at
+ * all: an endpoint erroring from the first tick would pin both polls there forever.
  *
  * DECIDES NOTHING, because a failed read is not evidence about the workspace. It cannot tell you
  * whether the container is still coming up, and ending the window on it — or worse, letting it

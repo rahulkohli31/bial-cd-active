@@ -24,9 +24,11 @@ import { describe, it, expect } from 'vitest'
 import {
   BACKGROUND_CADENCE,
   LAUNCH_LABEL,
+  PREVIEW_PROBE_MS,
   STARTING_PROBE_LIMIT,
   isTerminalReading,
   mayHaveStopped,
+  renewsOnThisTick,
   resolveWorkspaceState,
   sameWorkspaceState,
   WORKSPACE_STATE_FIELDS,
@@ -635,5 +637,24 @@ describe('mayHaveStopped — when a stuck wait is worth a container call', () =>
 
   it('never asks about a settled answer, stalled or not', () => {
     expect(mayHaveStopped('asleep', true, windowSpent)).toBe(false)
+  })
+})
+
+describe('renewsOnThisTick — how often a tick holds the container open', () => {
+  const T = 1_000_000
+
+  it('renews on every unaccelerated tick, however recent the last renewal', () => {
+    expect(renewsOnThisTick(false, T, T)).toBe(true)
+  })
+
+  it('renews on the first accelerated tick when nothing has renewed yet', () => {
+    expect(renewsOnThisTick(true, T, null)).toBe(true)
+  })
+
+  it('★ renews on an accelerated tick only once the last renewal is a background interval old', () => {
+    // At the accelerated cadence nearly every renewal would move a minutes-away deadline by a second.
+    expect(renewsOnThisTick(true, T + 1_000, T)).toBe(false)
+    expect(renewsOnThisTick(true, T + PREVIEW_PROBE_MS - 1, T)).toBe(false)
+    expect(renewsOnThisTick(true, T + PREVIEW_PROBE_MS, T)).toBe(true)
   })
 })

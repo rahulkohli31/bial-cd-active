@@ -202,7 +202,7 @@ describe('the cadence — the timer two features depend on', () => {
  *
  * WHAT THESE SCENARIOS PIN, beyond "it is faster now": the acceleration is bounded at both ends.
  * It is gated STRICTLY on `starting` and reverts on anything else (or the whole product ends up on
- * a three-second poll), and it gives up after a fixed number of reads (or a start that hangs polls
+ * the accelerated poll), and it gives up after a fixed number of reads (or a start that hangs polls
  * for the life of the tab). And it never reclassifies the wait it gives up on — the pane still
  * says a start is happening, because that is still what is true. Reading an elapsed budget as a
  * statement about the container is the mistake that once marked a live sandbox dead and rolled a
@@ -216,8 +216,8 @@ describe('the accelerated cadence while a start is in flight', () => {
     const { result } = mount()
     await waitFor(() => expect(result.current.state.name).toBe('starting'))
 
-    // Three seconds, not forty-five. At the old cadence nothing has fired by here at all, so the
-    // pane is still telling somebody their running app is being prepared.
+    // One accelerated interval, not one background cadence. At the background cadence nothing has
+    // fired by here at all, so the pane is still telling somebody their running app is being prepared.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
     })
@@ -238,8 +238,8 @@ describe('the accelerated cadence while a start is in flight', () => {
     const settled = api.fetchPreviewState.mock.calls.length
 
     // TEN accelerated intervals over a running workspace buy nothing. The mutation this pins is a
-    // window that stays open on `alive`, which puts every idle project screen in the product on a
-    // three-second poll — the request volume this fix is explicitly not allowed to change.
+    // window that stays open on `alive`, which puts every idle project screen in the product on the
+    // accelerated poll — the request volume this fix is explicitly not allowed to change.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS * 10)
     })
@@ -439,10 +439,10 @@ describe('nextProbeCadence — what opens a window, what closes it, what spends 
  * ★ THE HALF OF THE BOUND THAT WAS NEVER SPENT — a read that came back with NOTHING.
  *
  * `nextProbeCadence` is only reachable from the success path, and `fetchPreviewState` throws on any
- * non-2xx and on a dropped connection. So the 120-second bound was a ceiling on SUCCESSFUL reads:
- * a workspace that reached `starting` and then met a 500, an expired session or a dead network was
- * asked every three seconds FOR THE LIFE OF THE TAB, on both surfaces, with the counter that exists
- * to stop a hung start never moving a step.
+ * non-2xx and on a dropped connection. So without a spend in the `catch` the bound is a ceiling on
+ * SUCCESSFUL reads: a workspace that reached `starting` and then met a 500, an expired session or a
+ * dead network is asked at the accelerated cadence FOR THE LIFE OF THE TAB, on both surfaces, with
+ * the counter that exists to stop a hung start never moving a step.
  *
  * THE RULE THESE PIN, and the asymmetry is the whole of it: a failed read SPENDS from the window
  * and DECIDES nothing. It cannot say whether the container is still coming up, so ending the window
@@ -522,8 +522,8 @@ describe('what an unreadable answer may and may not do', () => {
     // THE FINDING, AT THE HOOK. The mount read opens the accelerated window and every read after it
     // is a 500 — the shape of an expired session, a restarted API, or a gateway that fell over. The
     // bound existed for exactly this, and could not reach it: `nextProbeCadence` was the only thing
-    // that could advance `fastReads`, and it lives on the success path, so this tab asked every
-    // three seconds forever — twenty requests a minute, for as long as it stayed open.
+    // that could advance `fastReads`, and it lives on the success path, so this tab asked at the
+    // accelerated cadence for as long as it stayed open.
     const MINE = 'proj-goes-dark'
     let reads = 0
     api.fetchPreviewState.mockImplementation(async (id: string) => {
@@ -573,7 +573,7 @@ describe('what an unreadable answer may and may not do', () => {
   it('★ failures alone never buy an accelerated window nothing earned', async () => {
     // Erroring from the very first read: nothing has ever said `starting`, so there is no window to
     // spend and no reason to go fast. The mutation this pins is a `catch` that OPENS one — which
-    // would put every project screen behind a flaky endpoint on a three-second poll.
+    // would put every project screen behind a flaky endpoint on the accelerated poll.
     const MINE = 'proj-never-answered'
     let reads = 0
     api.fetchPreviewState.mockImplementation(async (id: string) => {
@@ -921,31 +921,72 @@ describe('presence renewal — what holds the container open', () => {
     expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'hidden')
   })
 
-  it('★ renews throughout a watched start — the window where nothing else holds the container', async () => {
-    // THE GAP THIS CLOSES. Accelerated ticks used to renew nothing, on the grounds that a starting
-    // container is held by the marker and the lock rather than by a stay. But the marker is written
-    // ONCE with a five-minute TTL and the accelerated window is five minutes, so a citizen watching
-    // a start sent zero renewals across exactly the window in which both of those lapse — and the
-    // sweep runs every five minutes.
+  it('★ renews throughout a watched start, once a background interval, the first read at once', async () => {
+    // BOTH ENDS OF THE BOUND. The marker holding a starting container is written ONCE with a
+    // five-minute TTL, the length of the accelerated window, so a watched start that renewed nothing
+    // would let it lapse across exactly the window the sweep runs in. Renewing on every accelerated
+    // tick is the other failure: each one moves a minutes-away deadline by a second.
     //
-    // Renewing here is a no-op when there is no record to renew: the server's write is a
-    // compare-and-set on the registry's own `app_name`, and its deadline is a monotonic max, so it
-    // can neither conjure a lease nor truncate the longer one a start already granted itself.
+    // Mutation checks: renew on every tick and the second count goes red; renew on no accelerated
+    // tick and the third does; renew only from the timer and the first does.
     api.fetchPreviewState.mockResolvedValue(reading({ state: 'starting' }))
     mount()
     await settle()
-    api.renewPresence.mockClear()
+    expect(api.renewPresence).toHaveBeenCalledTimes(1)
 
-    // Three accelerated ticks, three renewals — not one at the start and silence after it.
-    for (let tick = 0; tick < 3; tick += 1) {
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
-      })
-    }
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS - 2 * STARTING_PROBE_MS)
+    })
+    // LIVENESS: the accelerated timer really was ticking through the quiet stretch.
+    expect(api.fetchPreviewState.mock.calls.length).toBeGreaterThan(40)
+    expect(api.renewPresence).toHaveBeenCalledTimes(1)
 
-    expect(api.fetchPreviewState).toHaveBeenCalled()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3 * STARTING_PROBE_MS)
+    })
+    expect(api.renewPresence).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS)
+    })
     expect(api.renewPresence).toHaveBeenCalledTimes(3)
-    expect(api.renewPresence).toHaveBeenCalledWith('proj-1', 'visible')
+    expect(api.renewPresence).toHaveBeenLastCalledWith('proj-1', 'visible')
+  })
+
+  it('★ a tick never starts a read while the last one is still waiting', async () => {
+    // At the accelerated cadence a read slower than one interval would put another request in the
+    // air behind it every second. A focus is not a tick: tabbing back still asks for a fresh answer.
+    //
+    // Mutation checks: drop the tick's skip and the count after the five ticks goes red; skip every
+    // read, not only a tick's, and the count after the focus does.
+    let answer: (value: PreviewState) => void = () => undefined
+    api.fetchPreviewState
+      .mockResolvedValueOnce(reading({ state: 'starting' }))
+      .mockImplementationOnce(() => new Promise<PreviewState>((resolve) => { answer = resolve }))
+      .mockResolvedValue(reading({ state: 'starting' }))
+    mount()
+    await settle()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
+    })
+    expect(api.fetchPreviewState).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5 * STARTING_PROBE_MS)
+    })
+    expect(api.fetchPreviewState).toHaveBeenCalledTimes(2)
+
+    act(() => {
+      window.dispatchEvent(new Event('focus'))
+    })
+    expect(api.fetchPreviewState).toHaveBeenCalledTimes(3)
+
+    // LIVENESS: once the slow answer lands, the ticks ask again.
+    await act(async () => {
+      answer(reading({ state: 'starting' }))
+      await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
+    })
+    expect(api.fetchPreviewState.mock.calls.length).toBeGreaterThan(3)
   })
 
   it('renders nothing and assumes nothing when a renewal cannot be made', async () => {

@@ -44,6 +44,7 @@ import {
   mayHaveStopped,
   nextProbeCadence,
   presenceToRenew,
+  renewsOnThisTick,
   resolveWorkspaceState,
   spendProbeCadence,
 } from '../workspace/workspaceState'
@@ -2182,9 +2183,14 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     // the gesture where the user is asking to be brought up to date, it would answer with the
     // reading they already had.
     let latestProbe = 0
+    // A tick that finds a probe still waiting skips its own: at the accelerated cadence a slow answer
+    // would otherwise stack a request behind it every second. A count, because the gesture probes
+    // above overlap on purpose.
+    let probesInFlight = 0
+    let lastRenewedAt: number | null = null
     let timer: ReturnType<typeof setInterval> | null = null
     // THE CADENCE THE ANSWERS HAVE DECIDED, and the delay the running timer was actually armed
-    // with. `starting` is asked about every second instead of every forty-five,
+    // with. `starting` is asked about at the accelerated cadence rather than the background one,
     // because it is the one reading whose successor arrives with no gesture from anybody —
     // `nextProbeCadence` owns that decision, the bound on it, and the reasoning behind both
     // numbers, and the project surface's poll reads the same function so the two cannot drift.
@@ -2222,20 +2228,20 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       // reading it at fire time would call itself a background probe on a decision it had not
       // made yet.
       const accelerated = armed === STARTING_PROBE_MS
-      timer = setInterval(() => void probe(accelerated), armed)
+      timer = setInterval(() => void probe(accelerated, true), armed)
     }
     // `accelerated` is false for the mount probe and for both visibility handlers — a fresh
-    // surface and a deliberate human act are not the three-second timer, and neither should be
+    // surface and a deliberate human act are not the accelerated timer, and neither should be
     // denied the container reads a background tick makes.
-    const probe = async (accelerated = false) => {
+    const probe = async (accelerated = false, fromTimer = false) => {
       if (!live) return
       // A HIDDEN TAB STILL READS AND STILL RENEWS, and admits nothing else.
       //
       // This surface frames the app too, so it holds the container open exactly as the project
       // screen does — a chat route that went silent the moment somebody switched tabs would have
       // its citizen's app collected while they were reading something else for two minutes. The
-      // renewal decision is shared with the project surface (`presenceToRenew`) so the two
-      // surfaces cannot drift, and so neither can forget it.
+      // renewal decisions are shared with the project surface (`renewsOnThisTick`,
+      // `presenceToRenew`) so the two surfaces cannot drift, and so neither can forget them.
       //
       // WHAT STAYS VISIBLE-ONLY: `fetchCompileState` and `checkWorkspace` below. Each spends a
       // container call, and the second can restart the app's dev server; a hidden tab has nobody
@@ -2243,11 +2249,19 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       const hidden = document.visibilityState !== 'visible'
       // NOT AWAITED. The renewal holds the container open; this surface reports it and never
       // waits on it, so a slow renewal cannot delay the read the screen is rendering.
-      void renewPresence(projectId, presenceToRenew(hidden))
+      const now = Date.now()
+      if (renewsOnThisTick(accelerated, now, lastRenewedAt)) {
+        lastRenewedAt = now
+        void renewPresence(projectId, presenceToRenew(hidden))
+      }
+      if (fromTimer && probesInFlight > 0) return
       const generation = ++latestProbe
       const probeSettled = pressEnd.readBegins()
       try {
-        const state = await fetchPreviewState(projectId)
+        probesInFlight += 1
+        const state = await fetchPreviewState(projectId).finally(() => {
+          probesInFlight -= 1
+        })
         // Superseded: a probe started after this one, so its answer is newer whatever order the
         // two responses arrived in. Bail before touching state OR the timer — an overtaken probe
         // calling `stopAsking()` would end the poll on a verdict that has already been replaced.
@@ -2255,9 +2269,8 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // AN UNCHANGED ANSWER KEEPS ITS OLD OBJECT. `fetchPreviewState` parses a fresh object
         // every tick, so replacing unconditionally re-renders this whole surface — message list,
         // composer and toolbar — for a reading nobody's screen can tell apart from the one already
-        // up. `useWorkspaceState` has guarded this since it was written; the guard was never ported
-        // here, and the accelerated cadence turned that from one wasted render every 45 seconds
-        // into one every second, through exactly the window a citizen is watching their app come up.
+        // up, on every accelerated tick through exactly the window a citizen is watching their app
+        // come up. `useWorkspaceState` holds its reading the same way.
         setPolledPreview((prev) =>
           prev && prev.projectId === projectId && samePreviewState(prev.state, state)
             ? prev
@@ -2290,7 +2303,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // the call is an attach against a dead workspace; without the second it races the
         // stream and can move the pane backwards to an older reading.
         //
-        // AND NOT ON AN ACCELERATED TICK. The three-second cadence exists to catch a
+        // AND NOT ON AN ACCELERATED TICK. The accelerated cadence exists to catch a
         // `starting` workspace the moment it serves, and the tick that catches it is looking at a
         // container that came up seconds ago — still unpacking a snapshot, still booting a dev
         // server. A compile state read there is a container exec spent on a question whose answer
@@ -2352,12 +2365,11 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         // could not read — would pull a working preview off screen.
         //
         // IT DOES STILL SPEND FROM THE ACCELERATED WINDOW, though. `fetchPreviewState` throws on
-        // any non-2xx and on a dropped connection, so while only the success path could advance
-        // the count, a workspace that reached `starting` and then started erroring was probed
-        // every three seconds for the life of the tab — twenty requests a minute, with the bound
-        // that exists to stop a hung start never moving. `spendProbeCadence` draws from the window
-        // without deciding anything about the workspace; see its own note for why that asymmetry
-        // is the point.
+        // any non-2xx and on a dropped connection, so if only the success path could advance the
+        // count, a workspace that reached `starting` and then started erroring would be probed at
+        // the accelerated cadence for the life of the tab, with the bound that exists to stop a
+        // hung start never moving. `spendProbeCadence` draws from the window without deciding
+        // anything about the workspace; see its own note for why that asymmetry is the point.
         //
         // It ends an admitted press all the same, or a dead endpoint would hold the press forever.
         if (live && generation === latestProbe) probeSettled()
