@@ -28,8 +28,6 @@ from src.services.build_sessions.manager import (
     NoSnapshotToRelaunchError,
     SandboxReclaimBlockedError,
     SessionManager,
-    app_name_for,
-    shr_name_for,
 )
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import (
@@ -105,9 +103,8 @@ async def test_launch_cold_restores_and_returns_the_owners_app_id(
 
     preview = await manager.launch_shared_preview(db_session, recipient, project, client)
 
-    shared_name = shr_name_for(app_id, recipient.id)
     assert preview.app_id == app_id  # the OWNER's app id, never the recipient's
-    assert client.restored == [shared_name]
+    assert len(client.restored) == 1
     assert client.provisioned == []  # never a blank template
     assert preview.ready is True
     assert await lock_is_held(fake_redis, recipient.id) is False  # lock released, slot free
@@ -138,7 +135,7 @@ async def test_launch_keeps_a_restored_container_whose_dev_server_never_readies(
 
     assert preview.ready is False, "an app that never served must not be reported as ready"
     assert preview.preview_url, "…but the URL still ships — the pane owns the labelled wait"
-    assert client.restored == [shr_name_for(app_id, recipient.id)]  # it WAS created...
+    assert len(client.restored) == 1  # it WAS created...
     assert client.torn_down == []  # ...and it survives the owner's app being slow
     assert await lock_is_held(fake_redis, recipient.id) is False
 
@@ -183,7 +180,7 @@ async def test_launch_stamps_the_registry_with_the_shared_projects_identity(
 ) -> None:
     """The registry-hash half of requirement 24 (#198 slice 5): Launch must stamp WHICH
     project this slot is a shared view of, and WHOSE, so a later occupancy check can
-    recognize it without reverse-parsing `shr_name_for`'s hash. See
+    recognize it, which the container's name cannot say. See
     `test_a_live_shared_view_earns_the_hand_over_dialog_instead_of_silent_reclaim` for the
     behavior this stamp exists to enable."""
     owner, project, app_id = await _owner_with_saved_app(
@@ -237,7 +234,7 @@ async def test_launch_attaches_to_an_already_live_shared_view(
     first = await manager.launch_shared_preview(db_session, recipient, project, client)
 
     # Re-attach: point the fake at itself as an already-live container under the same name.
-    shared_name = shr_name_for(app_id, recipient.id)
+    shared_name = client.restored[0]
     client.attach_handle = SandboxHandle(
         fqdn=f"{shared_name}.example",
         token="tok",  # noqa: S106 - a fake, never a real bearer
@@ -266,8 +263,8 @@ async def test_refresh_always_restores_even_when_already_live(
 
     await manager.launch_shared_preview(db_session, recipient, project, client, force_refresh=True)
 
-    shared_name = shr_name_for(app_id, recipient.id)
-    assert client.restored == [shared_name, shared_name]  # restored TWICE, not attached once
+    # Restored TWICE, each into a container of its own, not attached once.
+    assert len(set(client.restored)) == 2
 
 
 async def test_launch_with_no_saved_snapshot_is_a_dead_end_404(
@@ -328,7 +325,7 @@ async def test_revoke_tears_down_a_live_shared_view(
     manager = SessionManager()
     client = FakeSandboxClient()
     await manager.launch_shared_preview(db_session, recipient, project, client)
-    shared_name = shr_name_for(app_id, recipient.id)
+    shared_name = client.restored[0]
 
     revoked = await manager.revoke_shared_preview(
         recipient.id, app_id, _the_view(owner, project), sandbox_client=client
@@ -371,7 +368,8 @@ async def test_a_first_message_puts_a_live_shared_view_away_and_starts(
         db_session, recipient.id, description="Recipient's own, different project"
     )
     manager = SessionManager()
-    await manager.launch_shared_preview(db_session, recipient, project, FakeSandboxClient())
+    viewer = FakeSandboxClient()
+    await manager.launch_shared_preview(db_session, recipient, project, viewer)
 
     build_client = FakeSandboxClient()
     session = await manager.ensure_sandbox(
@@ -379,7 +377,7 @@ async def test_a_first_message_puts_a_live_shared_view_away_and_starts(
     )
 
     assert session.project_id == recipient_project.id
-    assert shr_name_for(app_id, recipient.id) in build_client.torn_down
+    assert viewer.restored[0] in build_client.torn_down
     assert build_client.provisioned, "the recipient's own workspace was started"
     assert await fake_storage.get(snapshot_key(app_id)) == b"BUNDLE"
 
@@ -400,15 +398,16 @@ async def test_opening_their_own_app_puts_a_live_shared_view_away_and_starts(
     await db_session.commit()
     await fake_storage.put(snapshot_key(own_app_id), b"OWN-BUNDLE")
     manager = SessionManager()
-    await manager.launch_shared_preview(db_session, recipient, project, FakeSandboxClient())
+    viewer = FakeSandboxClient()
+    await manager.launch_shared_preview(db_session, recipient, project, viewer)
 
     client = FakeSandboxClient()
     started = await manager.relaunch_preview(db_session, recipient, recipient_project.id, client)
     await detached_work_done(manager)
 
     assert started.app_id == own_app_id
-    assert shr_name_for(app_id, recipient.id) in client.torn_down
-    assert client.restored == [app_name_for(own_app_id)]
+    assert viewer.restored[0] in client.torn_down
+    assert len(client.restored) == 1
     assert await fake_storage.get(snapshot_key(app_id)) == b"BUNDLE"
 
 

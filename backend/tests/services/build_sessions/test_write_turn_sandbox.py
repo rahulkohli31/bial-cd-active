@@ -43,7 +43,6 @@ from src.services.build_sessions.manager import (
     NoLiveSandboxError,
     SessionManager,
     StopOutcome,
-    app_name_for,
 )
 from src.services.build_sessions.reaper import reap_user, sweep_all
 from src.services.redis import heartbeat_key
@@ -158,7 +157,7 @@ async def test_ensure_sandbox_allocates_a_build_worth_of_state_without_the_build
     )
 
     # Everything a build would hold, because the reaper cannot tell the two apart.
-    assert client.provisioned == [app_name_for(session.app_id)]  # fresh project -> provision
+    assert client.provisioned == [session.handle.app_name]  # fresh project -> provision
     assert manager.active_session_for(user.id) is session
     assert await lock_is_held(fake_redis, user.id) is True
     assert await heartbeat_is_alive(fake_redis, user.id) is True
@@ -464,7 +463,7 @@ async def test_a_second_message_attaches_instead_of_rebuilding_the_container(
     assert second.app_id == first.app_id
     assert client.torn_down == []  # the healthy container was NOT destroyed
     assert client.restored == []  # and nothing was rebuilt from the snapshot
-    assert client.provisioned == [app_name_for(first.app_id)]  # only the very first message
+    assert client.provisioned == [first.handle.app_name]  # only the very first message
 
 
 async def test_a_different_project_never_steals_the_container(
@@ -497,7 +496,7 @@ async def test_a_different_project_never_steals_the_container(
 
     assert second.app_id != first.app_id  # B got its own container, never A's
     assert client.torn_down == []  # and the start destroyed nothing to get it
-    assert app_name_for(first.app_id) not in client.restored
+    assert first.handle.app_name not in client.restored
     assert len(handed_over) == 1  # A left by the one door that saves it first
 
 
@@ -560,13 +559,13 @@ async def test_giving_up_a_project_explicitly_still_destroys_it_on_the_spot(
     )
 
     assert released is True
-    assert client.torn_down == [app_name_for(first.app_id)]  # released on the user's say-so
+    assert client.torn_down == [first.handle.app_name]  # released on the user's say-so
     client.attach_handle = None
     second = await manager.ensure_sandbox(
         db_session, user, project_b, sandbox_client=client, may_write=True
     )
     assert second.app_id != first.app_id
-    assert app_name_for(second.app_id) in client.provisioned
+    assert second.handle.app_name in client.provisioned
 
 
 async def test_the_next_write_turn_restores_the_tree_the_last_one_saved(
@@ -593,8 +592,9 @@ async def test_the_next_write_turn_restores_the_tree_the_last_one_saved(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
     assert second.app_id == first.app_id  # same project -> same app
-    assert client.restored == [app_name_for(second.app_id)]  # RESTORED
-    assert client.provisioned == [app_name_for(first.app_id)]  # only the very first attach
+    assert second.handle.app_name != first.handle.app_name  # a new container, a new name
+    assert client.restored == [second.handle.app_name]  # RESTORED
+    assert client.provisioned == [first.handle.app_name]  # only the very first attach
     # ...from the one durable slot. This pins the SOURCE only — `FakeSandboxClient` hands back
     # the same constant bundle whichever key is read, so it says nothing about the bytes; the
     # e2e twin proves the tree itself.
@@ -716,7 +716,7 @@ async def test_a_committed_but_unsaved_workspace_is_written_back_not_abandoned(
     owed = await db_session.scalar(
         sa.select(PendingTeardown.app_name).where(PendingTeardown.user_id == user.id)
     )
-    assert owed == app_name_for(first.app_id)
+    assert owed == first.handle.app_name
 
 
 # --- an incumbent nobody can question ----------------------
@@ -1174,7 +1174,7 @@ async def _a_container_that_is_already_up(
     await manager.finish_turn_sandbox(first)
     assert first.handle is not None
     client.attach_handle = first.handle  # as in production: the live container is attachable
-    assert client.provisioned == [app_name_for(first.app_id)]
+    assert client.provisioned == [first.handle.app_name]
     assert client.torn_down == []
     return client, first.handle
 
@@ -1340,7 +1340,7 @@ async def test_a_reaped_container_comes_back_with_the_work_not_the_last_save(
     session2 = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=resumed, may_write=True
     )
-    assert resumed.restored == [app_name_for(session2.app_id)]
+    assert resumed.restored == [session2.handle.app_name]
     assert resumed.restored_from == [None], "the one durable slot, which now holds tree B"
 
 

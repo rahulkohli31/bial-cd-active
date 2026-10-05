@@ -2448,10 +2448,10 @@ async def test_a_debt_is_owed_against_the_app_its_record_names_whatever_its_name
 
     async with _the_test_session(db_session, monkeypatch):
         owed = await owe_a_teardown_the_reap_could_not_perform(
-            user_id=user.id, app_id=app.id, reg=reg
+            user_id=user.id, app_id=app.id, reg=reg, write_back=True
         )
 
-    assert owed is True
+    assert owed is not None
     assert [
         (row.app_name, row.app_id, row.project_id, row.kind)
         for row in await _owed_rows(db_session, user.id)
@@ -2476,8 +2476,8 @@ async def test_a_debt_whose_record_names_another_app_is_refused(
 
     async with _the_test_session(db_session, monkeypatch):
         owed = await owe_a_teardown_the_reap_could_not_perform(
-            user_id=user.id, app_id=app.id, reg=reg
+            user_id=user.id, app_id=app.id, reg=reg, write_back=True
         )
 
-    assert owed is False
+    assert owed is None
     assert await _owed_rows(db_session, user.id) == []

@@ -3,8 +3,9 @@
 Two entry points, plus `src/workers/sandbox_reap.py`, the scheduled caller of
 `sweep_all`:
 
-* `reconcile_user` reaps the caller's OWN stale lock/registry/heartbeat at the top of
-  every `start` — closes the "crashed tab -> can never start again" lockout.
+* `reconcile_user` reaps the caller's OWN stale lock/registry/heartbeat at the top of a
+  start that cannot hand its slot's holder to the background — closes the "crashed tab -> can
+  never start again" lockout.
 * `sweep_all` reconciles EVERY registered user, idempotent + concurrency-safe; runs on
   a schedule, or by hand at `POST /v1/build-sessions/internal/reap`.
 
@@ -92,9 +93,9 @@ from src.services.sandbox.base import (
 
 _log = structlog.get_logger()
 
-#: `app_name_for` mints `sbx-` + `app_id.hex[:28]`. Both halves are pinned here because the guard
-#: below is a fail-closed check on a name we are about to DELETE, and a guard that accepts more
-#: than the minter produces is a guard with a gap in it.
+#: Every sandbox name is a prefix plus 28 lowercase hex characters. Both halves are pinned here
+#: because the guard below is a fail-closed check on a name we are about to DELETE, and a guard
+#: that accepts more than the minters produce is a guard with a gap in it.
 _NAME_SLUG_LENGTH = 28
 _HEX_LOWER = frozenset("0123456789abcdef")
 
@@ -171,7 +172,8 @@ def _minimal_handle(reg: dict[str, str]) -> SandboxHandle:
 
 
 def is_a_sandbox_name(app_name: str) -> bool:
-    """Could this string be a container THIS platform minted? (`manager.app_name_for`.)
+    """Could this string be a container THIS platform minted? (`a_fresh_sandbox_name`, and
+    `manager.app_name_for` for a container still running under a name derived from its app.)
 
     THE LAST CHECK BEFORE AN ARM DELETE. The reap path rebuilds its teardown target from a
     registry record that can be corrupted or missing — `reg.get(APP_NAME, "")` turns a missing
@@ -190,9 +192,9 @@ def is_a_shared_sandbox_name(app_name: str) -> bool:
     reason: a name this platform will hand to an ARM delete has to be provably one it minted
     (`manager.shr_name_for`), not assumed from a prefix alone.
 
-    Wired into `reap_user`'s own gate alongside its `sbx-` sibling: the one per-user slot the
-    registry describes can hold EITHER lineage — a builder's own sandbox or a colleague's
-    shared-runtime view restored into it — and `reap_user` tears down whichever is there."""
+    Only a shared view still running under the name `shr_name_for` gave it has this shape; a new
+    view is `sbx-`. Wired into `reap_user`'s gate and the owed-teardown routine's beside its
+    `sbx-` sibling, so such a view is still torn down."""
     if not app_name.startswith(SHARED_SANDBOX_NAME_PREFIX):
         return False
     slug = app_name[len(SHARED_SANDBOX_NAME_PREFIX) :]
@@ -615,8 +617,8 @@ async def _hand_the_debt_over(
     from src.services.build_sessions.shutdown import owe_a_teardown_the_reap_could_not_perform
 
     try:
-        return await owe_a_teardown_the_reap_could_not_perform(
-            user_id=user_uuid, app_id=app_id, reg=reg
+        owed = await owe_a_teardown_the_reap_could_not_perform(
+            user_id=user_uuid, app_id=app_id, reg=reg, write_back=True
         )
     except Exception:
         _log.exception(
@@ -625,6 +627,7 @@ async def _hand_the_debt_over(
             app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
         )
         return False
+    return owed is not None
 
 
 async def _let_go_unless_taken(redis: aioredis.Redis, user_uuid: uuid.UUID, app_name: str) -> None:

@@ -1,8 +1,9 @@
 """The one shutdown routine: claim the debt, stop the agent, write the work back, destroy the
 container — by NAME and by INSTANCE.
 
-WHAT ACTUALLY ARRIVES HERE IS THE PROJECT SWITCH, and one retry of a debt a switch left behind.
-A lapsed presence lease and the absolute age ceiling are decided in `reaper.reconcile_user` and
+WHAT ACTUALLY ARRIVES HERE IS A CONTAINER A START LEFT BEHIND — the outgoing project of a switch,
+or whatever held the slot a start replaced — and the retry of a debt either left. A lapsed
+presence lease and the absolute age ceiling are decided in `reaper.reconcile_user` and
 fall through to `reap_user`, which carries its own ordering, its own write-back and its own
 release — a second implementation of the same act. Only this one stops the outgoing turn at a
 boundary or re-checks the registry before each Redis write. Anything changed about how a
@@ -140,6 +141,9 @@ class ShutdownReason(enum.StrEnum):
     PROJECT_SWITCHED = "project_switched"
     #: A debt carried forward: the sweep is retrying a deletion an earlier run could not perform.
     PRESENCE_LAPSED = "presence_lapsed"
+    #: A start took the slot from the container in it — a dead session's, a shared view, a
+    #: workspace being put back — and goes on without that container's tree.
+    REPLACED = "replaced"
 
 
 class ShutdownOutcome(enum.StrEnum):
@@ -164,14 +168,15 @@ class OwedTeardown:
 
     The routine runs on its own session in its own task, so it is handed values rather than an
     ORM row bound to somebody else's transaction. `instance_ref` is the registry `created_at` of
-    the container this row was written for — the discriminator the name cannot provide, because
-    `app_name_for` is stable across teardown and recreate."""
+    the container this row was written for, which tells it apart from a later container under the
+    same name: a name minted from its app id is reused by every container of that app."""
 
     id: uuid.UUID
     user_id: uuid.UUID
     app_id: uuid.UUID
     app_name: str
     kind: PendingTeardownKind
+    write_back: bool
     project_id: uuid.UUID
     instance_ref: datetime
     conversation_id: uuid.UUID | None
@@ -194,6 +199,7 @@ def _owed_from(row: PendingTeardown) -> OwedTeardown:
         app_id=row.app_id,
         app_name=row.app_name,
         kind=kind,
+        write_back=row.write_back,
         project_id=row.project_id,
         instance_ref=row.instance_ref,
         conversation_id=row.conversation_id,
@@ -251,6 +257,7 @@ async def claim_the_teardown_we_owe(
     app_id: uuid.UUID,
     app_name: str,
     kind: PendingTeardownKind,
+    write_back: bool,
     project_id: uuid.UUID,
     instance_ref: datetime,
     conversation_id: uuid.UUID | None,
@@ -274,6 +281,7 @@ async def claim_the_teardown_we_owe(
             app_id=app_id,
             app_name=app_name,
             kind=kind,
+            write_back=write_back,
             project_id=project_id,
             instance_ref=instance_ref,
             conversation_id=conversation_id,
@@ -298,15 +306,21 @@ async def owe_a_teardown_the_reap_could_not_perform(
     user_id: uuid.UUID,
     app_id: uuid.UUID | None,
     reg: Mapping[str, str],
-) -> bool:
-    """Hand a failed reap's deletion to the owed-row ledger. True when the ledger took it.
+    write_back: bool,
+    session_factory: SessionFactory | None = None,
+) -> OwedTeardown | None:
+    """Put the deletion of the container this record names on the owed-row ledger. The row, or
+    `None` when the ledger could not take it.
 
     The reaper's failure arm holds the citizen's lock and registry so a later sweep can retry,
-    which spends that citizen's one workspace on the platform's own failure. The row carries the
+    which spends that citizen's one workspace on the platform's own failure, and a start that
+    replaces whatever holds the slot would otherwise wait on its delete. The row carries the
     retry instead — but only when it can be made to describe ONE container: with no app id there
-    is nothing to write back for, and with no instance stamp the ARM delete could not tell this
-    container from whatever is created under the same name next. Either gap leaves the old
-    behaviour in place, which spares rather than forgets.
+    is no app to owe it against, and with no instance stamp the ARM delete could not tell this
+    container from whatever is created under the same name next. Either gap leaves the caller's
+    own behaviour in place.
+
+    `write_back` says whether the routine writes a build sandbox's tree back before deleting it.
 
     A SHARED VIEW IS OWED AGAINST ITS OWNER'S APP, never the slot holder's: the record's stamp is
     the owner and project its launch stamped, and a caller's `app_id` is not consulted. The
@@ -315,17 +329,17 @@ async def owe_a_teardown_the_reap_could_not_perform(
     # whatever is created under the same name next.
     instance_ref = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
     if instance_ref is None:
-        return False
-    factory = _the_default_factory()
+        return None
+    factory = session_factory if session_factory is not None else _the_default_factory()
     if is_a_shared_view(reg):
         shared_view = shared_view_stamp(reg)
         if shared_view is None:
-            return False
+            return None
         return await _owe_a_shared_view(
             factory, user_id=user_id, reg=reg, instance_ref=instance_ref, shared_view=shared_view
         )
     if app_id is None:
-        return False
+        return None
     # THE RECORD AND THE APP ID ARRIVE FROM DIFFERENT READS, so the row is only sound if they
     # describe the same container. The caller resolves `app_id` from one registry read and the
     # reap re-reads the registry for itself; a slot swap between the two hands this function one
@@ -340,7 +354,7 @@ async def owe_a_teardown_the_reap_could_not_perform(
             app_id=str(app_id),
             app_name=app_name,
         )
-        return False
+        return None
     async with factory() as db:
         project_id = await db.scalar(
             sa.select(AppRegistry.project_id).where(
@@ -350,18 +364,18 @@ async def owe_a_teardown_the_reap_could_not_perform(
         if project_id is None:
             # No app row: nothing owns this container's work, so there is no write-back to
             # promise and no project for an activity marker to sit beside.
-            return False
-        await claim_the_teardown_we_owe(
+            return None
+        return await claim_the_teardown_we_owe(
             db,
             user_id=user_id,
             app_id=app_id,
             app_name=app_name,
             kind=PendingTeardownKind.BUILD,
+            write_back=write_back,
             project_id=project_id,
             instance_ref=instance_ref,
             conversation_id=None,
         )
-    return True
 
 
 async def _owe_a_shared_view(
@@ -371,7 +385,7 @@ async def _owe_a_shared_view(
     reg: Mapping[str, str],
     instance_ref: datetime,
     shared_view: SharedViewStamp,
-) -> bool:
+) -> OwedTeardown | None:
     """The shared-view arm of `owe_a_teardown_the_reap_could_not_perform`. The app is found from
     the stamp, and the record is held to it exactly as the build-sandbox arm holds its own: a
     stamp and a record that describe different containers owe nothing."""
@@ -381,7 +395,7 @@ async def _owe_a_shared_view(
     async with factory() as db:
         app_id = await existing_app_id(db, shared_view.owner_id, shared_view.project_id)
         if app_id is None:
-            return False
+            return None
         if not record_holds(reg, Occupant(app_id, shared_view), user_id):
             _log.error(
                 "refusing the debt: the shared view's stamp and its record describe different "
@@ -390,18 +404,18 @@ async def _owe_a_shared_view(
                 app_id=str(app_id),
                 app_name=app_name,
             )
-            return False
-        await claim_the_teardown_we_owe(
+            return None
+        return await claim_the_teardown_we_owe(
             db,
             user_id=user_id,
             app_id=app_id,
             app_name=app_name,
             kind=PendingTeardownKind.SHARED,
+            write_back=False,
             project_id=shared_view.project_id,
             instance_ref=instance_ref,
             conversation_id=None,
         )
-    return True
 
 
 # --- the detached run -----------------------------------------------------------------------
@@ -494,10 +508,12 @@ async def run_the_shutdown(
     if owed.conversation_id is not None:
         await _stop_the_outgoing_turn(owed, factory, reason)
 
-    if owed.kind is PendingTeardownKind.SHARED:
+    if owed.kind is PendingTeardownKind.SHARED or not owed.write_back:
         # A shared view holds nothing of the recipient's to write back: what they see is a
         # restore of somebody else's snapshot, already durable at its source, and that storage
-        # is read-never-write for them.
+        # is read-never-write for them. A container a start replaced holds a dead session's tree,
+        # a failed attempt's, or one already set aside, and writing it back would put it over the
+        # saved copy.
         return await _destroy(owed, redis, sandbox_client, factory, handle, reason)
 
     try:
@@ -651,11 +667,10 @@ async def _mark_ending_if_still_ours(redis: aioredis.Redis, owed: OwedTeardown) 
 async def _a_different_instance_answers(redis: aioredis.Redis, owed: OwedTeardown) -> bool:
     """Has the citizen reopened this project, so the name now belongs to a NEW container?
 
-    THE NAME CANNOT ANSWER THIS. `app_name_for` is stable across teardown and recreate, so a row
-    claimed for the outgoing container would otherwise delete the one a citizen reopened during
-    the stop wait. The registry's `created_at` is re-stamped at every registration, which is
-    exactly the property a discriminator needs, and `instance_ref` is the stamp this row was
-    written for.
+    A name minted from its app id is reused by every container of that app, so a row claimed for
+    the outgoing container could otherwise delete the one a citizen reopened during the stop
+    wait. The registry's `created_at` is re-stamped at every registration, which is exactly the
+    property a discriminator needs, and `instance_ref` is the stamp this row was written for.
 
     A registry naming something ELSE is not a mismatch: that is the ordinary switch, where the
     outgoing container is still standing at its own name and nothing else claims it. An

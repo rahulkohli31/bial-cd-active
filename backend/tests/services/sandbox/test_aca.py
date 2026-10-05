@@ -283,20 +283,13 @@ async def test_a_fresh_registry_never_inherits_a_previous_occupants_preview_stay
     fake_redis: aioredis.Redis,
 ) -> None:
     # `_write_registry` is an `hset(mapping=…)` MERGE, so a field it does not name SURVIVES
-    # a re-registration. `preview_stay_until` surviving is a leak with teeth:
-    #
-    #   relaunch grants a 30-min stay -> the user starts a build -> reconcile's reap hits a
-    #   transient ACA error, whose arm deliberately KEEPS the registry -> a preview holds no
-    #   lock, so the build's acquire still succeeds -> the build re-registers over the
-    #   surviving hash and INHERITS the lease -> if that build's process later dies, the
-    #   sweep spares its ORPHANED container for the rest of the half hour.
-    #
-    # That inverts the protection into exactly the leak it exists to prevent, so a freshly
-    # written registry is authoritative about the lease: it carries NO stay, always.
+    # into the new record. A surviving `preview_stay_until` would have the sweep spare the new
+    # container for the rest of somebody else's stay if its own process died, so a freshly
+    # written registry is authoritative about the lease: it carries NO stay, always. The hash
+    # left here names no container; one that did would refuse the provision outright.
     await fake_redis.hset(
         registry_key(USER),
         mapping={
-            REGISTRY_FIELD_APP_NAME: "sbx-preview-that-was-never-reaped",
             REGISTRY_FIELD_PREVIEW_STAY_UNTIL: (
                 datetime.now(UTC) + timedelta(minutes=25)
             ).isoformat(),

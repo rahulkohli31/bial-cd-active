@@ -222,6 +222,7 @@ async def _owe(
     app_id: uuid.UUID | None = None,
     app_name: str | None = None,
     kind: PendingTeardownKind = PendingTeardownKind.BUILD,
+    write_back: bool = True,
 ) -> OwedTeardown:
     owning = app_id or scene.app_id
     async with scene.factory() as db:
@@ -231,6 +232,7 @@ async def _owe(
             app_id=owning,
             app_name=app_name or app_name_for(owning),
             kind=kind,
+            write_back=write_back,
             project_id=scene.project_id,
             instance_ref=instance_ref,
             conversation_id=conversation_id,
@@ -448,6 +450,86 @@ async def test_a_built_container_writes_its_tree_back_before_it_is_destroyed(
     meta = await fake_storage.head(snapshot_key(scene.app_id))
     assert meta is not None and (meta.metadata or {})["head_sha"] == BUNDLED
     assert client.torn_down == [scene.app_name]
+
+
+async def test_a_container_a_start_replaced_is_destroyed_without_its_tree_written_back(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage, scene: _Scene
+) -> None:
+    """★ The start that took the slot from this container restores the saved copy itself, and the
+    tree left here is a dead session's or one already set aside. Written back, it would land over
+    that saved copy. Not a byte is read out of it.
+
+    Mutation check: write back every build sandbox whatever its row says, and the saved head moves
+    to the dead tree's."""
+    born = _born_at(30)
+    name = a_name_unrelated_to_its_app()
+    await _seed_registry(fake_redis, scene.user_id, app_name=name, created_at=born)
+    await _saved_copy(fake_storage, scene.app_id)
+    client = _answers_by_name(_Sandbox(), name)
+    asked: list[list[str]] = []
+    answer = client.exec_handler
+    assert answer is not None
+
+    def _recording(cmd: list[str]) -> ExecResult:
+        asked.append(cmd)
+        return answer(cmd)
+
+    client.exec_handler = _recording
+    owed = await _owe(scene, instance_ref=born, app_name=name, write_back=False)
+
+    outcome = await run_the_shutdown(
+        owed,
+        redis=fake_redis,
+        sandbox_client=client,
+        reason=ShutdownReason.REPLACED,
+        session_factory=scene.factory,
+    )
+
+    assert outcome is ShutdownOutcome.DESTROYED
+    assert client.torn_down == [name]
+    assert asked == [], "the container was read"
+    assert list(fake_storage.objects) == [snapshot_key(scene.app_id)]
+    meta = await fake_storage.head(snapshot_key(scene.app_id))
+    assert meta is not None and (meta.metadata or {})["head_sha"] == SAVED
+
+
+async def test_a_replaced_container_whose_delete_fails_stays_owed_and_the_sweep_retries_it(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage, scene: _Scene
+) -> None:
+    """A delete the background could not perform is still a debt, and the sweep's retry is the
+    same delete — still without the tree.
+
+    Mutation check: read every row back as one that writes back, and the retry moves the saved
+    head to the dead tree's."""
+    born = _born_at(40)
+    name = a_name_unrelated_to_its_app()
+    await _seed_registry(fake_redis, scene.user_id, app_name=name, created_at=born)
+    await _saved_copy(fake_storage, scene.app_id)
+    client = _answers_by_name(_Sandbox(), name)
+    client.teardown_error = SandboxNotReadyError("ARM said no")
+    owed = await _owe(scene, instance_ref=born, app_name=name, write_back=False)
+
+    first = await run_the_shutdown(
+        owed,
+        redis=fake_redis,
+        sandbox_client=client,
+        reason=ShutdownReason.REPLACED,
+        session_factory=scene.factory,
+    )
+    [row] = await _rows_for(scene)
+
+    assert first is ShutdownOutcome.STILL_OWED
+    assert (row.app_name, row.write_back) == (name, False)
+
+    client.teardown_error = None
+    await _lapse_the_claim(scene, row.id)
+    result = await sweep_owed_teardowns(fake_redis, client, session_factory=scene.factory)
+
+    assert (result.settled, result.still_owed, result.failed) == (1, 0, 0)
+    assert client.torn_down == [name]
+    assert await _rows_for(scene) == []
+    meta = await fake_storage.head(snapshot_key(scene.app_id))
+    assert meta is not None and (meta.metadata or {})["head_sha"] == SAVED
 
 
 # =============================================================================
@@ -898,6 +980,8 @@ async def test_a_shared_view_owed_a_delete_is_destroyed_with_no_write_back(
             app_id=scene.app_id,
             app_name=name,
             kind=PendingTeardownKind.SHARED,
+            # A row the column's default speaks for: the kind alone has to keep the view's tree.
+            write_back=True,
             project_id=scene.project_id,
             instance_ref=born,
             conversation_id=None,
@@ -1117,6 +1201,7 @@ async def _owed_by_an_older_process(
             app_id=scene.app_id,
             app_name=app_name,
             kind=PendingTeardownKind.BUILD,
+            write_back=True,
             project_id=scene.project_id,
             instance_ref=instance_ref,
             conversation_id=None,
@@ -1198,6 +1283,8 @@ async def test_a_shared_view_owed_under_a_build_sandboxs_name_is_never_written_b
             app_id=scene.app_id,
             app_name=name,
             kind=PendingTeardownKind.SHARED,
+            # A row the column's default speaks for: the kind alone has to keep the view's tree.
+            write_back=True,
             project_id=scene.project_id,
             instance_ref=born,
             conversation_id=None,

@@ -1216,13 +1216,13 @@ async def _a_saved_project(db: AsyncSession, store, email: str):
     return user, project, app_id
 
 
-def _the_live_container(app_id: uuid.UUID) -> SandboxHandle:
+def _the_live_container(app_name: str) -> SandboxHandle:
     """What `attach_existing` hands back for a container that is already up — the handle that
     makes the next relaunch take the ATTACH arm instead of restoring."""
     return SandboxHandle(
         fqdn="live.example",
         token="tok",  # noqa: S106 - a fake, never a real bearer
-        app_name=app_name_for(app_id),
+        app_name=app_name,
         preview_url="https://live.example",
         ready=True,
     )
@@ -1246,7 +1246,7 @@ async def test_a_page_less_attach_is_non_destructive_and_the_triple_holds(
     # handle is set BEFORE either baseline is read: set it after, and "before" and "after"
     # would differ in what the fake can answer rather than in the reading under test.
     assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
-    wire.sbx.attach_handle = _the_live_container(app_id)
+    wire.sbx.attach_handle = _the_live_container(wire.sbx.restored[-1])
 
     save_state_url = f"/v1/build-sessions/projects/{project.id}/save-state"
     before_save_state = (await client.get(save_state_url, headers=auth_headers(user))).json()
@@ -1314,7 +1314,7 @@ async def test_an_attach_that_cannot_confirm_anything_refuses_rather_than_restor
     # A cold relaunch first, so a real container is up and registered for this app: without it
     # the attach below would be the certain-absent case rather than the unknown one.
     assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
-    wire.sbx.attach_handle = _the_live_container(app_id)
+    wire.sbx.attach_handle = _the_live_container(wire.sbx.restored[-1])
 
     save_state_url = f"/v1/build-sessions/projects/{project.id}/save-state"
     before_save_state = (await client.get(save_state_url, headers=auth_headers(user))).json()
@@ -1415,7 +1415,7 @@ async def test_a_cold_relaunch_whose_root_shows_no_page_keeps_the_container_it_j
     assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
     assert wire.sbx.torn_down == [], "the restored container was destroyed for answering 404"
-    assert wire.sbx.restored == [app_name_for(app_id)], "guard the premise: this was the cold arm"
+    assert len(wire.sbx.restored) == 1, "guard the premise: this was the cold arm"
     # NOTHING WATCHED IT PAINT, so nothing may claim it did.
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE) == ""
     settled = await _probe(client, user, project)
@@ -1489,7 +1489,7 @@ async def test_an_attached_container_whose_root_shows_no_page_loses_its_proof_no
         "guard the premise: there has to be a standing proof for the retraction to take back"
     )
     assert (await _probe(client, user, project))["state"] == "alive"
-    wire.sbx.attach_handle = _the_live_container(app_id)
+    wire.sbx.attach_handle = _the_live_container(wire.sbx.restored[-1])
     torn_down_before = list(wire.sbx.torn_down)
     # The agent deleted the page, or the route it is mid-edit stopped compiling. The container is
     # the same one that was serving a moment ago — nothing about it is gone.
@@ -1560,7 +1560,7 @@ async def test_a_supervisor_blip_never_retracts_a_proof_the_container_already_ea
     assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
     standing = await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_SERVING_SINCE)
     assert standing, "guard the premise: the container earned a proof on the way up"
-    wire.sbx.attach_handle = _the_live_container(app_id)
+    wire.sbx.attach_handle = _the_live_container(wire.sbx.restored[-1])
 
     async def the_supervisor_did_not_answer(handle: SandboxHandle) -> DevStatus:
         raise SandboxError("the supervisor did not answer")

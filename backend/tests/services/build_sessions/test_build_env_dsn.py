@@ -34,7 +34,7 @@ from src.services.appdb.engine import reset_maintenance_engine_for_tests
 from src.services.appdb.names import database_name, role_name
 from src.services.appdb.teardown import salt_the_earth
 from src.services.build_sessions.appdb_env import provision_app_database
-from src.services.build_sessions.manager import SessionManager, app_name_for
+from src.services.build_sessions.manager import SessionManager
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from tests.factories import ProjectFactory, UserFactory
@@ -165,7 +165,7 @@ async def test_the_fresh_provision_arm_injects_the_dsn_alongside_the_base_env(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
 
-    assert client.provisioned == [app_name_for(session.app_id)]
+    assert client.provisioned == [session.handle.app_name]
     assert client.provision_env is not None
     _assert_is_a_sandbox_dsn(client.provision_env["BIAL_DATABASE_URL"], project_id)
     # Merged, not replaced — the always-present identity vars are still there.
@@ -217,7 +217,7 @@ async def test_the_restore_arm_reinjects_the_dsn(
         db_session, user, project_id, sandbox_client=second_client, may_write=True
     )
 
-    assert second_client.restored == [app_name_for(second.app_id)]  # restored, not re-provisioned
+    assert second_client.restored == [second.handle.app_name]  # restored, not re-provisioned
     assert second_client.restore_env is not None
     _assert_is_a_sandbox_dsn(second_client.restore_env["BIAL_DATABASE_URL"], project_id)
 
@@ -244,7 +244,7 @@ async def test_relaunch_preview_reinjects_the_dsn(
     await manager.relaunch_preview(db_session, user, project_id, client)
     await detached_work_done(manager)
 
-    assert client.restored == [app_name_for(built.app_id)]
+    assert len(client.restored) == 1
     assert client.restore_env is not None
     _assert_is_a_sandbox_dsn(client.restore_env["BIAL_DATABASE_URL"], project_id)
     assert all(name in client.restore_env for name in _BASE_ENV)

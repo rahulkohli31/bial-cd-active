@@ -173,41 +173,49 @@ async def test_a_confirmed_teardown_does_drop_the_ownership_record(wired: Any) -
     )
 
 
-# ------------------------------------------------------------------ the success path
+# ------------------------------------------------------------------ the record it would replace
 
 
-async def test_a_failed_defensive_teardown_does_not_orphan_the_old_container(
+async def test_a_restore_refuses_to_provision_over_a_container_the_registry_still_names(
     wired: Any,
 ) -> None:
-    """The SECOND ghost factory, on the success path rather than the failure path: recovery must
-    not manufacture the thing it is recovering from."""
-    client, aca, calls = wired(delete_fails=True, restore_fails=False, existing_app=_OLD_APP)
+    """★ The record is the only thing naming the container it describes. Writing the new
+    container's record over it would leave that one running with nothing that finds it, so the
+    caller has to hand it over first, and the client refuses when nobody has.
+
+    Mutation check: drop the guard in `_provision_container` and the new container is created and
+    recorded over the old one's record."""
+    client, aca, calls = wired(delete_fails=False, restore_fails=False, existing_app=_OLD_APP)
 
     with pytest.raises(SandboxError):
         await client.restore_from_snapshot(
             str(_USER), _NEW_APP, app_env=_env(), source_key="snap/key"
         )
 
-    assert _OLD_APP in aca.deleted, "the old container's teardown was never attempted"
-    assert calls["write_registry"] == [], (
-        "the registry was overwritten with the new app name while the OLD container's delete "
-        "had failed — the old container is now unrecorded and bills forever"
-    )
-    assert _NEW_APP not in aca.created, (
-        "a replacement container was provisioned even though the old one could not be torn "
-        "down, so the deployment now holds two containers and a record for one"
-    )
+    assert aca.created == []
+    assert aca.deleted == [], "the client deletes nothing a caller has not handed over"
+    assert calls["write_registry"] == []
 
 
-async def test_a_confirmed_defensive_teardown_proceeds_normally(wired: Any) -> None:
+async def test_a_fresh_provision_refuses_the_same_way(wired: Any) -> None:
     client, aca, calls = wired(delete_fails=False, restore_fails=False, existing_app=_OLD_APP)
+
+    with pytest.raises(SandboxError):
+        await client.provision_new(str(_USER), _NEW_APP, app_env=_env())
+
+    assert aca.created == []
+    assert calls["write_registry"] == []
+
+
+async def test_an_empty_slot_is_provisioned_into(wired: Any) -> None:
+    client, aca, calls = wired(delete_fails=False, restore_fails=False, existing_app=None)
 
     handle = await client.restore_from_snapshot(
         str(_USER), _NEW_APP, app_env=_env(), source_key="snap/key"
     )
 
-    assert _OLD_APP in aca.deleted
-    assert _NEW_APP in aca.created
+    assert aca.deleted == []
+    assert aca.created == [_NEW_APP]
     assert calls["write_registry"] == [_NEW_APP]
     assert handle.app_name == _NEW_APP
 
@@ -215,9 +223,8 @@ async def test_a_confirmed_defensive_teardown_proceeds_normally(wired: Any) -> N
 async def test_a_restore_failing_before_teardown_leaves_everything_intact(
     wired: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Fetch-and-validate happens BEFORE anything is destroyed, so a missing bundle must leave
-    the original container running and attachable. This pins the ordering the file already got
-    right, so a later refactor cannot quietly undo it."""
+    """The bundle is fetched BEFORE anything is created or recorded, so a missing one leaves the
+    slot exactly as it was."""
     client, aca, calls = wired(delete_fails=False, restore_fails=False, existing_app=_OLD_APP)
 
     class _MissingStorage:

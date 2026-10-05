@@ -94,6 +94,7 @@ from src.services.build_sessions.locks import (
     clear_starting_marker,
     date_the_wait_from_the_start,
     delete_registry,
+    delete_registry_if_it_still_names,
     grant_stay_of_execution,
     is_a_shared_view,
     liveness_lease_is_held,
@@ -102,6 +103,7 @@ from src.services.build_sessions.locks import (
     reap_lock,
     record_holds,
     record_the_first_serve,
+    release_liveness_lease,
     release_lock_as_holder,
     settle_stay_once_provisioning_ends,
     stamp_is_proven,
@@ -109,12 +111,19 @@ from src.services.build_sessions.locks import (
     write_start_failure,
     write_starting_marker,
 )
-from src.services.build_sessions.reaper import reap_user, reconcile_user
+from src.services.build_sessions.reaper import (
+    handle_named,
+    is_a_sandbox_name,
+    is_a_shared_sandbox_name,
+    reap_user,
+    reconcile_user,
+)
 from src.services.build_sessions.sandbox_starts import StartRecord
 from src.services.build_sessions.shutdown import (
     ShutdownReason,
     claim_the_teardown_we_owe,
     cut_the_turn_where_it_stands,
+    owe_a_teardown_the_reap_could_not_perform,
     shut_it_down_in_the_background,
 )
 from src.services.build_sessions.snapshot import (
@@ -131,6 +140,7 @@ from src.services.messages.store import SeqContentionError, append_batch
 from src.services.orchestrator.constants import READINESS_POLL_S
 from src.services.redis import RedisNotConfiguredError, get_redis
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -150,6 +160,7 @@ from src.services.sandbox import (
     SandboxHandle,
     SandboxNotReadyError,
 )
+from src.services.sandbox.base import a_fresh_sandbox_name
 from src.services.sandbox.stopwatch import timed_by
 from src.services.storage import (
     BundleValidationError,
@@ -973,22 +984,20 @@ def _one_relaunch_in_the_log(**fields: str) -> Iterator[None]:
 
 
 def app_name_for(app_id: uuid.UUID) -> str:
-    """An ACA-compliant container name (2–32 chars, lowercase alphanumeric/hyphen,
-    letter-first, ends alphanumeric), stable per app: `sbx-` + 28 hex chars of the
-    app_id (`str(app_id)` is an invalid ACA name — dots/length; the hex slug is safe)."""
+    """`sbx-` + 28 hex chars of the app_id, stable per app. No container is created under it —
+    `a_fresh_sandbox_name` names every one — so it only recognises one still running under it:
+    for a registry record carrying no app id, and in the inventory's forward match."""
     return f"{SANDBOX_NAME_PREFIX}{app_id.hex[:28]}"
 
 
 def shr_name_for(app_id: uuid.UUID, recipient_id: uuid.UUID) -> str:
-    """An ACA-compliant container name for a SHARED-RUNTIME sandbox (#198), stable per
-    (app, recipient) PAIR: `shr-` + 28 hex chars of a SHA-256 digest of both ids.
+    """`shr-` + 28 hex chars of a SHA-256 digest of the app and recipient ids, stable per pair.
+    Like `app_name_for`, no container is created under it; it only recognises a view still
+    running under it.
 
-    A hash, not a slice, unlike `app_name_for` — the same app shared with two colleagues must
-    mint two different containers, one per recipient's own restricted view, and 28 hex
-    characters is not room enough to losslessly encode two 128-bit UUIDs. FORWARD-MATCH-ONLY
-    like its two siblings (`app_name_for`, `deploy.names.published_app_name`): nothing may
-    ever reverse-parse an app id or a recipient id back out of this name; both are carried
-    losslessly instead on the container's own ARM tags (`shared_sandbox_tags`)."""
+    FORWARD-MATCH-ONLY: nothing may ever reverse-parse an app id or a recipient id back out of
+    this name; both are carried losslessly on the container's own ARM tags
+    (`shared_sandbox_tags`)."""
     digest = hashlib.sha256(f"{app_id}:{recipient_id}".encode()).hexdigest()
     return f"{SHARED_SANDBOX_NAME_PREFIX}{digest[:28]}"
 
@@ -1324,25 +1333,24 @@ class SessionManager:
         was swallowed into the same `None` and every affected user was told a build session
         was already active when none existed.
 
-        `reconcile_user` above runs BEFORE the acquire and calls the deliberately-unguarded
+        The reclaim above runs BEFORE the acquire and calls the deliberately-unguarded
         primitives (see the REDIS-ERROR POLICY in `locks.py`), so a hard outage usually
         raises there first — a raw `RedisError`, which the same router seam maps to the same
         503. Both shapes land on one status; neither is a 409 and neither is a 500.
 
-        The reconcile passes `certified_dead=True`: every caller of this context manager
-        holds the per-user `_start_lock_for`, and the deploy contract is single-replica — so a
-        lock/heartbeat still present in Redis here is a dead session's residue, not
-        liveness, and reconcile reaps THROUGH it instead of letting the acquire below 409
-        on a ghost. The sweep's `reconcile_user` keeps the shield (it holds neither fact).
+        The reclaim treats whatever still claims the slot as dead: every caller of this context
+        manager holds the per-user `_start_lock_for`, and the deploy contract is single-replica —
+        so a lock/heartbeat still present in Redis here is a dead session's residue, not
+        liveness, and the reclaim takes the slot through it instead of letting the acquire below
+        409 on a ghost (`_reclaim_the_slot`). The sweep's `reconcile_user` keeps the shield (it
+        holds neither fact).
 
-        `incumbent_is_leaving` IS WHAT KEEPS THAT REAP OFF A LIVE CONTAINER, and it is required
-        rather than defaulted because only the caller knows. It says the container currently in
-        the registry has been handed to the shutdown routine, which is stopping its turn and
-        writing its tree back right now. A reap-through here would both BLOCK this start on an
-        ARM delete measured in tens of seconds and delete that container out from under its own
-        write-back — two parties destroying one container, one of them without saving it. So the
-        branch below releases the lock and touches nothing else, exactly as it does for a
-        container this start is about to reuse.
+        `incumbent_is_leaving` IS WHAT KEEPS THAT RECLAIM OFF A LIVE CONTAINER, and it is
+        required rather than defaulted because only the caller knows. It says the container
+        currently in the registry has been handed to the shutdown routine, which is stopping its
+        turn and writing its tree back right now. A reclaim here would aim a second delete at it
+        while that write-back runs. So the branch below releases the lock and touches nothing
+        else, exactly as it does for a container this start is about to reuse.
 
         Failure-safe by construction:
         - Compensation runs on ANY body failure INCLUDING CancelledError — a dropped request
@@ -1367,9 +1375,9 @@ class SessionManager:
         # THE CLOCK STARTS AT THE DOOR, not at `acquire_lock` below — the placement is the whole
         # honesty of the number. `acquire_lock` never waits (it answers None on contention and
         # this raises a 409), so timing that call alone would report ~0 forever and say nothing.
-        # What a citizen actually waits through here is the RECONCILE: tearing a stale container
-        # down is an ARM delete measured in tens of seconds. `reclaimed` on the same line says
-        # whether that is where the time went.
+        # What a citizen actually waits through here is the RECLAIM: a ledger write when the
+        # holder goes to the background, an ARM delete measured in tens of seconds when it cannot.
+        # `reclaimed` on the same line says whether there was a holder to take the slot from.
         claim_started_at = time.monotonic()
         reclaimed = False
         if incumbent_is_leaving or await _the_live_sandbox_is_already_the_one_we_want(
@@ -1397,7 +1405,7 @@ class SessionManager:
                 await delete_registry(redis, user_id)
             await reap_lock(redis, user_id)
         else:
-            reclaimed = await reconcile_user(redis, user_id, sandbox_client, certified_dead=True)
+            reclaimed = await self._reclaim_the_slot(redis, user_id, sandbox_client)
         token = await acquire_lock(redis, user_id)
         if token is None:
             raise BuildSessionConflictError()
@@ -1482,6 +1490,64 @@ class SessionManager:
             with suppress(BaseException):
                 await asyncio.shield(comp)
             raise
+
+    async def _reclaim_the_slot(
+        self, redis: aioredis.Redis, user_id: uuid.UUID, sandbox_client: SandboxClient
+    ) -> bool:
+        """Take the one-per-user slot from whatever a dead session left in it. True when there was
+        a container to take it from.
+
+        The container is handed to the shutdown routine and deleted in the background, so the
+        start waits on a ledger write rather than on its ARM delete. One the ledger cannot take is
+        reaped inline by `reconcile_user`, certified dead."""
+        # First, as a certified reconcile does: left standing, the lease would let the sweep go on
+        # sparing a container being taken down, and then whatever this user registers next.
+        await release_liveness_lease(redis, user_id)
+        reg = await read_registry(redis, user_id)
+        if reg is not None and await self._owe_the_holder(redis, user_id, sandbox_client, reg):
+            await reap_lock(redis, user_id)
+            return True
+        return await reconcile_user(redis, user_id, sandbox_client, certified_dead=True)
+
+    async def _owe_the_holder(
+        self,
+        redis: aioredis.Redis,
+        user_id: uuid.UUID,
+        sandbox_client: SandboxClient,
+        reg: Mapping[str, str],
+    ) -> bool:
+        """Hand the container this record names to the shutdown routine and clear the record, so a
+        new container can take the slot. False, touching nothing, when the ledger cannot take it:
+        a name this platform did not mint, a record with no birthday, or one whose app it cannot
+        name.
+
+        NEVER WITH A WRITE-BACK. What a start replaces holds a dead session's tree, a failed
+        attempt's, or one already set aside, and writing it over the saved copy is the loss to
+        avoid; a shared view is never written back at all. A container already owed is left to
+        the run that owes it, as the door leaves it."""
+        name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+        if not (is_a_sandbox_name(name) or is_a_shared_sandbox_name(name)):
+            return False
+        async with self._session_factory() as db:
+            already_owed = await _is_already_on_its_way_out(db, user_id, name)
+        owed = None
+        if not already_owed:
+            recorded_app = reg.get(REGISTRY_FIELD_APP_ID)
+            owed = await owe_a_teardown_the_reap_could_not_perform(
+                user_id=user_id,
+                app_id=uuid.UUID(recorded_app) if recorded_app is not None else None,
+                reg=reg,
+                write_back=False,
+                session_factory=self._session_factory,
+            )
+            if owed is None:
+                return False
+        await delete_registry_if_it_still_names(redis, user_id, name)
+        if owed is not None:
+            shut_it_down_in_the_background(
+                owed, redis=redis, sandbox_client=sandbox_client, reason=ShutdownReason.REPLACED
+            )
+        return True
 
     async def _slot_conflict_for(
         self,
@@ -1922,10 +1988,10 @@ class SessionManager:
             return False
         instance_ref = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
         if instance_ref is None:
-            # NO BIRTHDAY, NO DISCRIMINATOR. `app_name_for` is stable across teardown and
-            # recreate, so a row written without the stamp could delete a container this citizen
-            # reopens during the wait. Refuse the hand-over rather than aim a delete by name
-            # alone; the reconcile below keeps the behaviour it always had.
+            # NO BIRTHDAY, NO DISCRIMINATOR. A name minted from its app id is reused by every
+            # container of that app, so a row written without the stamp could delete a container
+            # this citizen reopens during the wait. Refuse the hand-over rather than aim a delete
+            # by name alone; the reclaim below reaps it inline instead.
             _log.warning(
                 "the outgoing container carries no registry birthday; not handing it over",
                 user_id=str(user.id),
@@ -1939,6 +2005,7 @@ class SessionManager:
             app_id=occupying.app_id,
             app_name=outgoing,
             kind=PendingTeardownKind.BUILD,
+            write_back=True,
             project_id=occupying.project_id,
             instance_ref=instance_ref,
             conversation_id=leaving.at_its_boundary,
@@ -2792,7 +2859,7 @@ class SessionManager:
                 if env is not None:
                     with timed_by(scope.record):
                         scope.handle = await self._restore_or_bust(
-                            sandbox_client, user_id, app_name_for(app_id), app_id, env
+                            sandbox_client, user_id, app_id, env
                         )
                     # A birth, so the connector copy fires, detached and unawaited: nothing on
                     # the platform reads what it writes, so no start may wait on it or be lost
@@ -2904,7 +2971,7 @@ class SessionManager:
         handed to the shutdown routine exactly as any other door hands it over (written back,
         then destroyed in the background), `_holding_user_lock` is the identical skeleton
         `relaunch_preview` runs under, and a build the recipient starts on their own project
-        afterward reaps straight through an unattended shared view exactly as it would through a
+        afterward takes the slot from an unattended shared view exactly as it would from a
         relaunched preview — no separate teardown path to keep in step with this one.
 
         DELIBERATELY NARROWER THAN `relaunch_preview` in two ways, both scope decisions rather
@@ -2959,16 +3026,16 @@ class SessionManager:
             )
             # OPENING A COLLEAGUE'S PROJECT IS OPENING A DIFFERENT PROJECT, so the recipient's
             # own container leaves the way it leaves at every other door — written back over its
-            # saved copy and destroyed in the background — rather than being reclaimed inline by
-            # the reconcile below, which saves nothing. Asked about THE VIEW, never the `None` a
+            # saved copy and destroyed in the background — rather than being taken by the reclaim
+            # below, which saves nothing. Asked about THE VIEW, never the `None` a
             # Refresh hands the lock: a live shared view being refreshed is the one we already
             # want, and handing it over would tear down the very thing being refreshed.
             incumbent_is_leaving = await self._show_the_outgoing_project_the_door(
                 db, recipient, spare=the_view, sandbox_client=sandbox_client
             )
-            # `spare=None` on Refresh is what makes the reconcile reclaim a live view
-            # unconditionally, so the restore arm always runs even though what it would restore
-            # is the view already there.
+            # `spare=None` on Refresh is what makes the reclaim take a live view unconditionally,
+            # so the restore arm always runs even though what it would restore is the view
+            # already there.
             async with self._holding_user_lock(
                 redis,
                 recipient.id,
@@ -3005,7 +3072,6 @@ class SessionManager:
                             scope.handle = await self._restore_or_bust(
                                 sandbox_client,
                                 recipient.id,
-                                shr_name_for(owner_app_id, recipient.id),
                                 owner_app_id,
                                 env,
                                 source_key=snapshot_key(owner_app_id),
@@ -3313,12 +3379,11 @@ class SessionManager:
         `record` is the start the two birth arms are timed into; without one they are timed
         into a record nothing admitted, which is never written."""
         redis = get_redis()
-        app_name = app_name_for(app_id)
         born_into = record if record is not None else StartRecord()
         if await read_registry(redis, user_id) is None:
             return _ResolvedSandbox(
                 await self._restore_or_provision(
-                    sandbox_client, user_id, app_name, app_id, env, record=born_into
+                    sandbox_client, user_id, app_id, env, record=born_into
                 ),
                 attached=False,
             )
@@ -3327,7 +3392,7 @@ class SessionManager:
         except SandboxGoneError:
             return _ResolvedSandbox(
                 await self._restore_or_provision(
-                    sandbox_client, user_id, app_name, app_id, env, record=born_into
+                    sandbox_client, user_id, app_id, env, record=born_into
                 ),
                 attached=False,
             )
@@ -3336,14 +3401,13 @@ class SessionManager:
         # one hands back a container that has been running unattended, and until this unit
         # nothing ever asked whether it still held the app.
         return await self._still_theirs_or_put_it_back(
-            sandbox_client, user_id, app_name, app_id, env, handle, announce=announce
+            sandbox_client, user_id, app_id, env, handle, announce=announce
         )
 
     async def _still_theirs_or_put_it_back(
         self,
         sandbox_client: SandboxClient,
         user_id: uuid.UUID,
-        app_name: str,
         app_id: uuid.UUID,
         env: dict[str, str],
         handle: SandboxHandle,
@@ -3401,7 +3465,6 @@ class SessionManager:
             restored = await self._restore_or_bust(
                 sandbox_client,
                 user_id,
-                app_name,
                 app_id,
                 env,
                 source_key=None,
@@ -3459,11 +3522,30 @@ class SessionManager:
             return _Quarantine.FAILED
         return _Quarantine.WRITTEN
 
+    async def _clear_the_way_for_a_birth(
+        self, redis: aioredis.Redis, user_id: uuid.UUID, sandbox_client: SandboxClient
+    ) -> None:
+        """Empty the slot a new container is about to be recorded in: the client refuses to write
+        over a record naming another container, which would leave that one with nothing that
+        finds it.
+
+        What is still there — a container its attach found gone, a workspace being put back, a
+        failed attempt's leftover — is handed over (`_owe_the_holder`). One the ledger cannot take
+        is deleted inline, and a refused delete fails this attempt rather than orphaning it."""
+        reg = await read_registry(redis, user_id)
+        if reg is None or await self._owe_the_holder(redis, user_id, sandbox_client, reg):
+            return
+        name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+        if is_a_sandbox_name(name) or is_a_shared_sandbox_name(name):
+            await sandbox_client.teardown(handle_named(name))
+        # A name this platform did not mint is somebody else's container, if anything: only its
+        # record goes.
+        await delete_registry_if_it_still_names(redis, user_id, name)
+
     async def _restore_or_provision(
         self,
         sandbox_client: SandboxClient,
         user_id: uuid.UUID,
-        app_name: str,
         app_id: uuid.UUID,
         env: dict[str, str],
         *,
@@ -3488,7 +3570,7 @@ class SessionManager:
             if await self._snapshot_exists_or_bust(app_id):
                 try:
                     return await self._restore_or_bust(
-                        sandbox_client, user_id, app_name, app_id, env, source_key=None
+                        sandbox_client, user_id, app_id, env, source_key=None
                     )
                 except StorageNotFoundError:
                     # The ONLY error that may reach provision_new: the store positively answered
@@ -3497,13 +3579,15 @@ class SessionManager:
                         "snapshot disappeared between head-check and restore; provisioning fresh",
                         app_id=str(app_id),
                     )
-            return await sandbox_client.provision_new(str(user_id), app_name, app_env=env)
+            await self._clear_the_way_for_a_birth(get_redis(), user_id, sandbox_client)
+            return await sandbox_client.provision_new(
+                str(user_id), a_fresh_sandbox_name(), app_env=env
+            )
 
     async def _restore_or_bust(
         self,
         sandbox_client: SandboxClient,
         user_id: uuid.UUID,
-        app_name: str,
         app_id: uuid.UUID,
         env: dict[str, str],
         *,
@@ -3531,9 +3615,12 @@ class SessionManager:
         while True:
             attempt += 1
             try:
+                await self._clear_the_way_for_a_birth(get_redis(), user_id, sandbox_client)
                 return await sandbox_client.restore_from_snapshot(
                     str(user_id),
-                    app_name,
+                    # Per attempt, never hoisted: a late delete of a failed attempt's container
+                    # must not be able to reach this one.
+                    a_fresh_sandbox_name(),
                     app_env=env,
                     source_key=source_key,
                     kind=kind,

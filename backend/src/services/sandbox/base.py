@@ -16,6 +16,7 @@ from __future__ import annotations
 import abc
 import datetime as dt
 import enum
+import secrets
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -47,23 +48,29 @@ class SandboxGoneError(SandboxError):
 
 
 SANDBOX_NAME_PREFIX = "sbx-"
-"""The prefix every sandbox container app carries (`app_name_for`).
+"""The prefix every sandbox container app carries, build sandbox and shared view alike
+(`a_fresh_sandbox_name`).
 
-Defined here rather than inline at the mint site because two sides need to agree on it and
-they cannot import each other: `manager.app_name_for` WRITES it, and `AcaControlPlane.
-list_sandbox_app_names` READS it back to tell our containers from the deployed apps and
-unrelated workloads sharing the resource group. A drift between those two would make the
+`AcaControlPlane.list_sandbox_fleet` reads it back to tell our containers from the deployed apps
+and unrelated workloads sharing the resource group. A drift between the two would make the
 orphan reconciler quietly report nothing."""
 
 SHARED_SANDBOX_NAME_PREFIX = "shr-"
-"""The prefix every SHARED-RUNTIME container carries (`manager.shr_name_for`, #198) — a
-colleague's read-only, app-frame-only view of a project shared with them, restored from the
-builder's own saved snapshot. A THIRD lineage beside `sbx-` (the builder's own build sandbox)
-and `pub-` (a published app), never a variant of either: it is neither the builder's live
-workspace nor a citizen's shipped app, and every place that already tells those two apart by
-name (the portal edge's routing regex, the reaper, the fleet reclaimer) has to learn this
-third shape too, or a shared container becomes invisible to exactly the guards that keep the
-other two lineages from leaking money or access."""
+"""The prefix `manager.shr_name_for` gives a colleague's shared view. Nothing creates a container
+under it — a new view takes `a_fresh_sandbox_name` — so it is only read, for views still running
+under it: by the portal edge's routing, the reaper's name guard, and the fallbacks for a registry
+record without an app id and an owed row without a kind."""
+
+
+def a_fresh_sandbox_name() -> str:
+    """`sbx-` plus 28 secure-random hex characters: a name for one container, never reused.
+
+    Every container this platform creates takes a new one, each further attempt a start makes
+    included, so a late delete aimed at an old container can never reach the one that replaced
+    it. A shared view takes the same shape; the registry's stamp, never the name, says which a
+    container is. 32 characters, ACA's ceiling, and the shape the portal edge, the supervisor and
+    the fleet listing accept."""
+    return f"{SANDBOX_NAME_PREFIX}{secrets.token_hex(14)}"
 
 
 def base_path_for(app_name: str) -> str:
@@ -92,8 +99,8 @@ def base_path_for(app_name: str) -> str:
 # fleet sweep can no longer judge.
 
 TAG_KIND: Final = "bial-kind"
-"""What the resource IS. Today only the name prefix (`sbx-`/`pub-`/`shr-`) says this, which is a
-convention, rather than a record."""
+"""What the resource IS. A build sandbox and a shared view carry the same name shape, so the name
+cannot say."""
 
 TAG_USER_ID: Final = "bial-user-id"
 """The owning user's UUID, in plaintext. A container must be judgeable without the coordination
@@ -102,9 +109,8 @@ identifier, not a secret, and the resource group is internal-only. This is a del
 accepted trade-off — it does surface in cost exports."""
 
 TAG_APP_ID: Final = "bial-app-id"
-"""The app UUID this container serves. Note the name is NOT a substitute: `app_name_for` keeps only
-28 of the app_id's 32 hex characters, so a sandbox name is lossy and this tag is the only lossless
-back-reference the resource carries."""
+"""The app UUID this container serves. A container's name says nothing about its app, so this tag
+is the only back-reference the resource carries."""
 
 TAG_CONTROL_PLANE: Final = "bial-control-plane"
 """Which control plane created it — the environment segment. A dev control
@@ -625,7 +631,11 @@ class SandboxClient(abc.ABC):
 
         Returns a handle with `ready=False`. The caller MUST already hold the Redis
         one-per-user lock. Transient provisioning errors retried with capped
-        exponential backoff."""
+        exponential backoff.
+
+        Refused while the user's registry still names a container: writing this one's record
+        over it would leave the old container with nothing that names it. The caller hands that
+        one over first."""
         ...
 
     @abc.abstractmethod
@@ -673,17 +683,17 @@ class SandboxClient(abc.ABC):
         `kind` (#198) selects the ARM identity the fresh container is stamped with —
         `sandbox_tags` (the default, `user_id` as OWNER) or `shared_sandbox_tags` (`user_id` as
         RECIPIENT). ADDED, not widened from a callback: every existing caller means the default
-        and this keeps meaning it without touching a single call site. `is_a_shared_sandbox_name`
-        already matched this shape before any caller could produce it — a widening kept in step
-        with the guard it feeds, never announced ahead of one.
+        and this keeps meaning it without touching a single call site.
 
         `shared_project_id`/`shared_owner_id` (#198) are the registry-hash counterpart of
         `kind="shared_sandbox"`: written to `REGISTRY_FIELD_SHARED_PROJECT_ID`/
         `REGISTRY_FIELD_SHARED_OWNER_ID` so a LATER occupancy check (`_occupying_project`'s
-        sibling in `manager.py`) can recognize "this slot holds a colleague's shared view"
-        without reverse-parsing `shr_name_for`'s hash — which, like every other name this
-        platform derives, is forward-match-only. `None` on the `build_sandbox` arm, always;
-        supplying one without the other is a caller error, never a partial stamp."""
+        sibling in `manager.py`) can recognize "this slot holds a colleague's shared view", which
+        the container's name cannot say. `None` on the `build_sandbox` arm, always; supplying one
+        without the other is a caller error, never a partial stamp.
+
+        Refused, like `provision_new`, while the registry still names a container: the caller
+        hands that one over first."""
         ...
 
     @abc.abstractmethod

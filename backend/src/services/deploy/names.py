@@ -6,7 +6,7 @@ sandbox registry and tears down whatever `app_name` it finds there; deploy never
 `bial:sandbox:*` key, so a published app is invisible by construction.
 
 The `pub-` prefix is a SECOND, independent belt: an ARM-side listing partitions the resource
-group unambiguously. Same 28-hex slug length as `app_name_for` so the two stay derivable — do
+group unambiguously. The 28-hex slug fills ACA's 32-character limit, as a sandbox name does — do
 not "improve" the truncation; uniqueness belongs on `app_id`, never the name."""
 
 from __future__ import annotations

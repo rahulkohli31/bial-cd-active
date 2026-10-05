@@ -430,8 +430,7 @@ class AcaControlPlane:
 
         THE ONLY AZURE-SIDE VIEW OF THE FLEET (Redis only sees what it has a record of),
         filtered to `SANDBOX_NAME_PREFIX` so it never touches published apps or other workloads.
-        DELIBERATELY EXCLUDES `SHARED_SANDBOX_NAME_PREFIX` (#198) too, as of this writing — a
-        `shr-` container needs its own read before it can safely join this listing.
+        A shared view is `sbx-` too and is listed; one still running under a `shr-` name is not.
 
         A TRUNCATED FLEET MUST NEVER READ AS CLEAN: transient ARM failures raise
         `AcaTransientError` rather than a short list — a half-enumerated "no orphans" is

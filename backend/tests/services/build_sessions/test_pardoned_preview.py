@@ -13,7 +13,6 @@ HOW THE SESSIONS GET HERE. A session is allocated by `ensure_sandbox` and ended 
 
 from __future__ import annotations
 
-import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -28,7 +27,7 @@ from src.services.build_sessions.locks import (
     read_registry,
     stay_of_execution_is_current,
 )
-from src.services.build_sessions.manager import SessionManager, app_name_for
+from src.services.build_sessions.manager import SessionManager
 from src.services.build_sessions.reaper import sweep_all
 from src.services.redis import heartbeat_key, registry_key
 from src.services.redis.keys import REGISTRY_FIELD_PREVIEW_STAY_UNTIL
@@ -59,7 +58,7 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
 
 async def _completed_build(
     db: AsyncSession, email: str, client: FakeSandboxClient
-) -> tuple[User, SessionManager, uuid.UUID]:
+) -> tuple[User, SessionManager, str]:
     """Take one session all the way to the end of a write turn, and hand back the pardoned
     state. The assertion is the fixture's own liveness check: a session that never reached its
     terminal would make every lease assertion below vacuous."""
@@ -71,7 +70,7 @@ async def _completed_build(
     )
     await manager.finish_turn_sandbox(session)
     assert session.turn_finish is not None and session.turn_finish.is_set()
-    return user, manager, session.app_id
+    return user, manager, session.handle.app_name
 
 
 async def test_sweep_spares_a_pardoned_preview_inside_its_lease(
@@ -80,13 +79,13 @@ async def test_sweep_spares_a_pardoned_preview_inside_its_lease(
     # The heartbeat is deleted FIRST so the lease alone spares the container — otherwise its
     # ≤90 s residue would mask a broken stay.
     client = FakeSandboxClient()
-    user, manager, app_id = await _completed_build(db_session, "pardon1@rvaiglobal.com", client)
+    user, manager, name = await _completed_build(db_session, "pardon1@rvaiglobal.com", client)
     await fake_redis.delete(heartbeat_key(user.id))
 
     reaped = (await sweep_all(fake_redis, client, live_users=manager.live_user_ids())).reaped
 
     assert reaped == 0  # spared: the lease is current
-    assert app_name_for(app_id) not in client.torn_down
+    assert name not in client.torn_down
     assert await read_registry(fake_redis, user.id) is not None
     assert await stay_of_execution_is_current(fake_redis, user.id) is True
 
@@ -98,7 +97,7 @@ async def test_sweep_reaps_a_pardoned_preview_once_its_lease_lapses(
     # and the next sweep executes the pardon — teardown, registry gone. This is the server half
     # of the portal's "placeholder + Relaunch" journey.
     client = FakeSandboxClient()
-    user, manager, app_id = await _completed_build(db_session, "pardon2@rvaiglobal.com", client)
+    user, manager, name = await _completed_build(db_session, "pardon2@rvaiglobal.com", client)
     await fake_redis.delete(heartbeat_key(user.id))
     lapsed = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
     await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_PREVIEW_STAY_UNTIL, lapsed)
@@ -106,7 +105,7 @@ async def test_sweep_reaps_a_pardoned_preview_once_its_lease_lapses(
     reaped = (await sweep_all(fake_redis, client, live_users=manager.live_user_ids())).reaped
 
     assert reaped == 1
-    assert app_name_for(app_id) in client.torn_down
+    assert name in client.torn_down
     assert await read_registry(fake_redis, user.id) is None
     assert await lock_is_held(fake_redis, user.id) is False
 
@@ -126,7 +125,7 @@ async def test_pardon_survives_a_stay_grant_failure(
 
     monkeypatch.setattr("src.services.build_sessions.manager.grant_stay_of_execution", boom_grant)
     client = FakeSandboxClient()
-    user, manager, app_id = await _completed_build(db_session, "pardon4@rvaiglobal.com", client)
+    user, manager, name = await _completed_build(db_session, "pardon4@rvaiglobal.com", client)
 
     # The turn's ending completed: lock released, session popped.
     assert await lock_is_held(fake_redis, user.id) is False
@@ -137,4 +136,4 @@ async def test_pardon_survives_a_stay_grant_failure(
     assert await read_registry(fake_redis, user.id) is not None
     await fake_redis.delete(heartbeat_key(user.id))
     assert (await sweep_all(fake_redis, client, live_users=manager.live_user_ids())).reaped == 1
-    assert app_name_for(app_id) in client.torn_down
+    assert name in client.torn_down

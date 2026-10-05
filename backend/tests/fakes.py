@@ -73,6 +73,7 @@ from src.services.sandbox.base import (
     FileResult,
     FleetMember,
     SandboxClient,
+    SandboxError,
     SandboxGoneError,
     SandboxHandle,
     SandboxNotReadyError,
@@ -415,9 +416,16 @@ class FakeSandboxClient(SandboxClient):
         # that is meant to compare as a real total.
         self.served_count_truncated: bool = False
 
+    async def _refuse_to_orphan(self, user_id: str) -> None:
+        """The real client's refusal to record a container over a record naming another: a
+        caller that forgot to hand the old one over fails here as it would in production."""
+        if await get_redis().hget(registry_key(uuid.UUID(user_id)), REGISTRY_FIELD_APP_NAME):
+            raise SandboxError("the registry still names a container nobody has taken over")
+
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
+        await self._refuse_to_orphan(user_id)
         self.provisioned.append(app_name)
         self.provision_env = dict(app_env)
         handle = _fake_handle(app_name)
@@ -471,6 +479,7 @@ class FakeSandboxClient(SandboxClient):
         shared_project_id: uuid.UUID | None = None,
         shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
+        await self._refuse_to_orphan(user_id)
         self.restored.append(app_name)
         # Which bundle a restore PULLED is the whole question for the recovery flow, so record
         # it — `restored` only says a restore happened, never from what.

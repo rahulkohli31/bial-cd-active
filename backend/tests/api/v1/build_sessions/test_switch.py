@@ -16,6 +16,7 @@ of them is a switch that still refuses the citizen who switches by typing.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from datetime import datetime
@@ -38,16 +39,18 @@ from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.manager import (
     SessionManager,
-    app_name_for,
-    shr_name_for,
 )
 from src.services.build_sessions.shutdown import (
     OwedTeardown,
     ShutdownReason,
     claim_the_teardown_we_owe,
 )
-from src.services.redis import registry_key
-from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_CREATED_AT
+from src.services.redis import REGISTRY_STATE_ENDING, registry_key
+from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_CREATED_AT,
+    REGISTRY_FIELD_STATE,
+)
 from src.services.sandbox.aca import AcaTransientError
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
@@ -156,15 +159,25 @@ async def _serving(
     user: User,
     project_id: uuid.UUID,
     client: FakeSandboxClient,
-) -> uuid.UUID:
+) -> tuple[uuid.UUID, str]:
     """One project up and serving with no turn running — the ordinary state a citizen leaves
-    behind when they open something else."""
+    behind when they open something else. Its app, and the name of its container."""
     session = await manager.ensure_sandbox(
         db, user, project_id, sandbox_client=client, may_write=True
     )
     await manager.finish_turn_sandbox(session)
     client.attach_handle = session.handle
-    return session.app_id
+    return session.app_id, session.handle.app_name
+
+
+def _a_manager_whose_ledger_is(db: AsyncSession) -> SessionManager:
+    """A manager whose own sessions are the test's, so a debt it owes is one the test can read."""
+
+    @contextlib.asynccontextmanager
+    async def _session() -> AsyncIterator[AsyncSession]:
+        yield db
+
+    return SessionManager(session_factory=lambda: _session())
 
 
 async def _owed_rows(db: AsyncSession, user_id: uuid.UUID) -> list[PendingTeardown]:
@@ -192,16 +205,16 @@ async def test_opening_another_project_starts_it_and_owes_the_first_one_a_teardo
     user, project_a, project_b = await _citizen_with_two_projects(db_session, "sw1@example.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "a" * 40)
-    app_a = await _serving(manager, db_session, user, project_a, client)
+    _, name_a = await _serving(manager, db_session, user, project_a, client)
 
     started = await manager.ensure_sandbox(
         db_session, user, project_b, sandbox_client=client, may_write=True
     )
 
     assert started.project_id == project_b
-    assert app_name_for(started.app_id) in client.provisioned
+    assert started.handle.app_name in client.provisioned
     owed = await _owed_rows(db_session, user.id)
-    assert [row.app_name for row in owed] == [app_name_for(app_a)]
+    assert [row.app_name for row in owed] == [name_a]
     assert owed[0].project_id == project_a
     assert spawns.reasons == [ShutdownReason.PROJECT_SWITCHED]
     # NOT THE START'S JOB. The outgoing container is destroyed by the routine, after its tree is
@@ -260,14 +273,14 @@ async def test_a_first_message_on_another_project_switches_inside_the_same_reque
     user, project_a, project_b = await _citizen_with_two_projects(db_session, "sw3@example.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "b" * 40)
-    app_a = await _serving(manager, db_session, user, project_a, client)
+    app_a, name_a = await _serving(manager, db_session, user, project_a, client)
 
     started = await manager.ensure_sandbox(
         db_session, user, project_b, sandbox_client=client, may_write=True
     )
 
     assert started.app_id != app_a
-    assert [row.app_name for row in await _owed_rows(db_session, user.id)] == [app_name_for(app_a)]
+    assert [row.app_name for row in await _owed_rows(db_session, user.id)] == [name_a]
 
 
 async def test_the_outgoing_container_is_handed_over_whatever_its_record_calls_it(
@@ -284,7 +297,7 @@ async def test_the_outgoing_container_is_handed_over_whatever_its_record_calls_i
     user, project_a, project_b = await _citizen_with_two_projects(db_session, "sw13@example.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "2" * 40)
-    app_a = await _serving(manager, db_session, user, project_a, client)
+    app_a, _ = await _serving(manager, db_session, user, project_a, client)
     name = a_name_unrelated_to_its_app()
     await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_APP_NAME, name)
 
@@ -441,7 +454,7 @@ async def test_reopening_the_project_that_holds_the_slot_owes_nothing(
     user, project_a, _ = await _citizen_with_two_projects(db_session, "sw7@example.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "e" * 40)
-    app_a = await _serving(manager, db_session, user, project_a, client)
+    app_a, name_a = await _serving(manager, db_session, user, project_a, client)
 
     again = await manager.ensure_sandbox(
         db_session, user, project_a, sandbox_client=client, may_write=True
@@ -451,7 +464,7 @@ async def test_reopening_the_project_that_holds_the_slot_owes_nothing(
     assert spawns.owed == []
     assert await _owed_rows(db_session, user.id) == []
     assert client.torn_down == []
-    assert client.provisioned == [app_name_for(app_a)]  # attached, never rebuilt
+    assert client.provisioned == [name_a]  # attached, never rebuilt
 
 
 async def test_two_starts_in_one_interaction_owe_one_teardown_not_two(
@@ -470,7 +483,7 @@ async def test_two_starts_in_one_interaction_owe_one_teardown_not_two(
     user, project_a, _ = await _citizen_with_two_projects(db_session, "sw8@example.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "f" * 40)
-    app_a = await _serving(manager, db_session, user, project_a, client)
+    _, name_a = await _serving(manager, db_session, user, project_a, client)
 
     # `spare=None` is what a never-built incoming project resolves to — no app row yet.
     pressed = await manager._show_the_outgoing_project_the_door(  # noqa: SLF001 - the seam itself
@@ -483,7 +496,7 @@ async def test_two_starts_in_one_interaction_owe_one_teardown_not_two(
     assert pressed is True
     assert typed is True, "the second door must still read the container as leaving"
     rows = await _owed_rows(db_session, user.id)
-    assert [row.app_name for row in rows] == [app_name_for(app_a)]
+    assert [row.app_name for row in rows] == [name_a]
     assert len(spawns.owed) == 1, "the second call found the debt already claimed"
 
 
@@ -507,14 +520,15 @@ async def test_a_start_beside_a_shutdown_already_running_deletes_nothing(
     user, project_a, project_b = await _citizen_with_two_projects(db_session, "sw9@example.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "0" * 40)
-    app_a = await _serving(manager, db_session, user, project_a, client)
+    app_a, name_a = await _serving(manager, db_session, user, project_a, client)
     reg = await fake_redis.hgetall(registry_key(user.id))
     await claim_the_teardown_we_owe(
         db_session,
         user_id=user.id,
         app_id=app_a,
-        app_name=app_name_for(app_a),
+        app_name=name_a,
         kind=PendingTeardownKind.BUILD,
+        write_back=True,
         project_id=project_a,
         instance_ref=datetime.fromisoformat(_text(reg[REGISTRY_FIELD_CREATED_AT])),
         conversation_id=None,
@@ -529,7 +543,52 @@ async def test_a_start_beside_a_shutdown_already_running_deletes_nothing(
     assert len(await _owed_rows(db_session, user.id)) == 1
     # A is still reachable BY NAME, which is the only handle the write-back has left: the
     # per-user registry has moved on to B.
-    assert app_name_for(app_a) in client.by_name
+    assert name_a in client.by_name
+
+
+async def test_a_start_beside_a_shutdown_already_deleting_leaves_its_debt_to_it(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    spawns: _Spawns,
+) -> None:
+    """A's shutdown has written A back and marked it ending, so B's start finds A no longer ready
+    and takes the slot from it. A is already owed: the start claims nothing and spawns nothing,
+    and the debt stays the one that writes A back, not a second one that would not.
+
+    Mutation check: owe the holder without asking whether it is already owed and a second routine
+    is spawned on the first one's row."""
+    user, project_a, project_b = await _citizen_with_two_projects(db_session, "sw14@example.com")
+    manager = _a_manager_whose_ledger_is(db_session)
+    client = _with_head(FakeSandboxClient(), "3" * 40)
+    app_a, name_a = await _serving(manager, db_session, user, project_a, client)
+    reg = await fake_redis.hgetall(registry_key(user.id))
+    await claim_the_teardown_we_owe(
+        db_session,
+        user_id=user.id,
+        app_id=app_a,
+        app_name=name_a,
+        kind=PendingTeardownKind.BUILD,
+        write_back=True,
+        project_id=project_a,
+        instance_ref=datetime.fromisoformat(_text(reg[REGISTRY_FIELD_CREATED_AT])),
+        conversation_id=None,
+    )
+    await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_STATE, REGISTRY_STATE_ENDING)
+
+    started = await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=client, may_write=True
+    )
+
+    assert started.project_id == project_b
+    assert spawns.owed == [], "a debt already claimed was claimed again"
+    assert [(row.app_name, row.write_back) for row in await _owed_rows(db_session, user.id)] == [
+        (name_a, True)
+    ]
+    assert client.torn_down == []
+    assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_APP_NAME) == (
+        started.handle.app_name
+    )
 
 
 async def test_the_start_returns_before_the_teardown_finishes(
@@ -579,8 +638,10 @@ async def test_a_colleagues_shared_view_is_put_away_without_a_write_back(
     spawns: _Spawns,
 ) -> None:
     """★ A shared view is somebody else's restore of somebody else's saved bundle, so it holds no
-    tree of the recipient's. Opening their own project reclaims it inline — no owed row, because
-    there is nothing to write back, and never over the owner's saved copy."""
+    tree of the recipient's. Opening their own project owes its delete as a shared view, never
+    with a write-back over the owner's saved copy, and starts without waiting for it.
+
+    Mutation check: owe the view as the slot holder's build sandbox and the row's kind says so."""
     owner = await UserFactory.create(db_session, email="sw11-owner@example.com")
     shared_project = await ProjectFactory.create(db_session, owner.id)
     owner_app = await resolve_app_for_project(db_session, owner.id, shared_project.id)
@@ -589,17 +650,21 @@ async def test_a_colleagues_shared_view_is_put_away_without_a_write_back(
     await fake_storage.put(snapshot_key(owner_app), b"BUNDLE")
     recipient = await UserFactory.create(db_session, email="sw11-recipient@example.com")
     own_project = await ProjectFactory.create(db_session, recipient.id)
-    manager = SessionManager()
+    manager = _a_manager_whose_ledger_is(db_session)
     client = FakeSandboxClient()
     await manager.launch_shared_preview(db_session, recipient, shared_project, client)
+    [view] = client.restored
 
     session = await manager.ensure_sandbox(
         db_session, recipient, own_project.id, sandbox_client=client, may_write=True
     )
 
     assert session.project_id == own_project.id
-    assert shr_name_for(owner_app, recipient.id) in client.torn_down
-    assert spawns.owed == [], "nothing of the recipient's to write back"
+    assert client.torn_down == [], "the start waited on the view's delete"
+    assert [(o.app_name, o.app_id, o.kind, o.write_back) for o in spawns.owed] == [
+        (view, owner_app, PendingTeardownKind.SHARED, False)
+    ]
+    assert spawns.reasons == [ShutdownReason.REPLACED]
     assert await fake_storage.get(snapshot_key(owner_app)) == b"BUNDLE"
 
 
@@ -632,13 +697,9 @@ async def test_a_refused_create_is_retried_under_the_same_name(
     real_aca: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Coming back to a project whose container was just destroyed asks Azure for the name it
-    has always had, and a refusal on the way in is survived by ASKING AGAIN — never by inventing
-    a second name.
-
-    ONE MECHANISM, DELIBERATELY. A suffix would work around a name-lock and leave two containers
-    a citizen's registry cannot tell apart, and every later reach — the by-name teardown most of
-    all — is keyed on the name being derivable from the app id.
+    """A refusal on the way in is survived by ASKING AGAIN under the name the create was asked
+    for, never by inventing a second one mid-create: a create that may have half-happened can
+    only be retried, or cleaned up, under the name it was made with.
 
     WHAT THIS DOES NOT PROVE is which refusals reach the ladder. `is_transient` admits 429 and
     5xx; a 409 carrying a being-deleted `error_code` is classified terminal today and would reach
@@ -647,7 +708,6 @@ async def test_a_refused_create_is_retried_under_the_same_name(
     app_id = await resolve_app_for_project(db_session, user.id, project)
     await db_session.commit()
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")
-    name = app_name_for(app_id)
     refusals = {"left": 1}
     real_create = real_aca.aca.create_app
 
@@ -669,7 +729,8 @@ async def test_a_refused_create_is_retried_under_the_same_name(
     await detached_work_done(real_aca.manager)
 
     assert resp.status_code == 202, resp.text
-    assert real_aca.aca.create_calls == [name, name], "asked twice, under one name"
+    first, second = real_aca.aca.create_calls
+    assert first == second, "asked twice, under one name"
 
 
 def _text(raw: bytes | str) -> str:

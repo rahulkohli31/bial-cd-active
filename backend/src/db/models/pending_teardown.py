@@ -9,16 +9,17 @@ for a detached routine to stop the turn, write the code back, and destroy the co
 `app_name` is UNIQUE: at most one owed deletion may exist per container name at a time — the
 constraint IS the concurrency claim's `ON CONFLICT` inference target.
 
-`kind` says whether the container is a build sandbox, written back before it goes, or a shared
-view, which never is. NULL only on a row a process older than the column wrote; `shutdown.py`
-reads that one case from the name.
+`kind` says whether the container is a build sandbox or a shared view, which is never written
+back. NULL only on a row a process older than the column wrote; `shutdown.py` reads that one
+case from the name. `write_back` says whether a build sandbox's tree is written back before it
+goes: false for a container a start replaced, whose tree is a dead session's or already set aside.
 
-`instance_ref` is the discriminator the name cannot provide, and it is the per-user registry's
-OWN `created_at` (re-stamped at every registration), not the ARM resource id. An ARM container
-app's resource id is derived from nothing but its name, subscription and resource group, so it
-reads identically for the container this row names and for whatever gets created under the same
-name afterward — it cannot discriminate. The registry stamp actually changes across teardown and
-recreate, which is what a discriminator needs to do.
+`instance_ref` tells this container from a later one under the same name — a name minted from its
+app id is reused by every container of that app — and it is the per-user registry's OWN
+`created_at` (re-stamped at every registration), not the ARM resource id. An ARM container app's
+resource id is derived from nothing but its name, subscription and resource group, so it reads
+identically for the container this row names and for whatever gets created under the same name
+afterward — it cannot discriminate.
 
 No state enum: the row is deleted on success, so its existence IS the state. `claimed_until` is
 both the concurrency claim and the retry schedule — a sweep claims with a conditional UPDATE on
@@ -40,8 +41,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from src.db.base import Base
 from src.db.mixins import OwnedByUserMixin, TimestampMixin, UUIDv7PrimaryKeyMixin
 
-# `app_name_for` / `shr_name_for` (`sandbox/base.py`) both emit exactly a 4-char prefix plus
-# 28 hex characters — ACA's own 32-character cap on a container name.
+# Every sandbox name is a 4-char prefix plus 28 hex characters — ACA's own 32-character cap.
 MAX_APP_NAME = 32
 
 
@@ -69,6 +69,8 @@ class PendingTeardown(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, B
     kind: Mapped[PendingTeardownKind | None] = mapped_column(
         pending_teardown_kind_enum, nullable=True
     )
+    # Defaulted true so a row a process older than the column writes keeps its write-back.
+    write_back: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.true())
     # No ForeignKey — see the module docstring.
     project_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, nullable=False, index=True)
     instance_ref: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)

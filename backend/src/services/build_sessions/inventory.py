@@ -203,11 +203,13 @@ async def owning_app_ids(db: AsyncSession) -> dict[str, uuid.UUID]:
 
 
 async def _app_names_to_owners(db: AsyncSession) -> dict[str, _KnownContainer]:
-    """Map every name this platform could have PRODUCED back to who it belongs to — both fleets
-    this one Redis-per-user slot can ever hold (#198): a build sandbox (`sbx-`, keyed by its
-    owner) and a colleague's shared view (`shr-`, keyed by the RECIPIENT — same rule
-    `shared_sandbox_tags` follows, since a `shr-` container's per-slot occupancy and revocable
-    access are the recipient's, not the project owner's).
+    """Map every name derived from an app back to who it belongs to — both fleets this one
+    Redis-per-user slot can ever hold (#198): a build sandbox (`sbx-`, keyed by its owner) and a
+    colleague's shared view (`shr-`, keyed by the RECIPIENT — same rule `shared_sandbox_tags`
+    follows, since a shared view's per-slot occupancy and revocable access are the recipient's,
+    not the project owner's). Only a container still running under a derived name matches: a
+    container named by `a_fresh_sandbox_name` says nothing about its app, and is judged by its
+    registry record and its ARM tags instead.
 
     FORWARD-MATCHED, never reverse-parsed, on both arms: `app_name_for`/`shr_name_for` each keep
     only 28 of 32 hex characters, so deriving every known name and comparing is exact, while

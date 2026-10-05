@@ -33,7 +33,6 @@ from src.db.models.user import User
 from src.db.session import get_db
 from src.services.build_sessions import SessionManager
 from src.services.build_sessions.appdata import resolve_app_for_project
-from src.services.build_sessions.manager import shr_name_for
 from src.services.directory import client as directory_client
 from src.services.directory import is_directory_member
 from src.services.projects.shares import revoke_share
@@ -669,8 +668,7 @@ async def test_unshare_tears_down_the_colleagues_live_container(
     project = await db_session.get(Project, uuid.UUID(project_id))
     launched = await manager.launch_shared_preview(db_session, colleague, project, sbx)
     assert launched.app_id == app_id
-    shared_name = shr_name_for(app_id, colleague.id)
-    assert shared_name in sbx.restored
+    [shared_name] = sbx.restored
 
     resp = await client.post(
         f"/v1/projects/{project_id}:unshare",

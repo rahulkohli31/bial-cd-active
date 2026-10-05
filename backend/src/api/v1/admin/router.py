@@ -1285,11 +1285,12 @@ async def backfill_sandbox_tags_endpoint(
     # a container is judgeable with Redis down — that self-stamped `created_at` is what the
     # fleet sweep's own age ceiling reads. Every container created BEFORE that carries nothing.
     #
-    # OWNERSHIP IS RECOVERED, NEVER GUESSED. `app_name_for` keeps 28 of an app_id's 32 hex
-    # characters, so a sandbox name is NOT invertible; names are matched FORWARD against the app
-    # table. A container matching no row is stamped `kind` + `backfilled_at` and nothing else — no
-    # owner, no app — and stays for an operator to find in the `unowned` count. Inventing a
-    # plausible owner for it is the one move this would need to be careful never to make.
+    # OWNERSHIP IS RECOVERED, NEVER GUESSED. A sandbox name is NOT invertible — `app_name_for`
+    # keeps 28 of an app_id's 32 hex characters, and a fresh name carries none — so names are
+    # matched FORWARD against the app table. A container matching no row is stamped `kind` +
+    # `backfilled_at` and nothing else — no owner, no app — and stays for an operator to find in
+    # the `unowned` count. Inventing a plausible owner for it is the one move this would need to
+    # be careful never to make.
     #
     # A sibling of the three reconcilers above in every operational respect: superadmin-gated,
     # operator-invoked, idempotent (an already-tagged container is skipped, so the age clock is

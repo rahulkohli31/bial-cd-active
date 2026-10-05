@@ -87,6 +87,7 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # 0051_name_untitled_chats is data only: it names every untitled chat after its first message.
     # 0052_sandbox_starts adds the table that keeps one row of stage timings per sandbox start.
     # 0053_pending_teardown_kind says whether an owed teardown is a build sandbox or a shared view.
+    # 0054_teardown_write_back says whether an owed build sandbox's tree is written back first.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0053_pending_teardown_kind"]
+    assert heads == ["0054_teardown_write_back"]

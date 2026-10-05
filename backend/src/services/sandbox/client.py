@@ -869,10 +869,11 @@ class AcaSandboxClient(SandboxClient):
 
         A MISSING RECORD IS ACTED ON DESTRUCTIVELY: `attach_existing` turns `None` into
         `SandboxGoneError` (restores the last save over the container), and
-        `restore_from_snapshot` provisions over the existing one — so this fallback belongs
-        in the point read, not only the scan. `build_sessions.locks.read_registry` mirrors it
-        and must behave identically; kept separate (`services/sandbox/` may not import
-        `services/build_sessions/`), guarded against drift by `test_key_migration.py`."""
+        `_provision_container` writes a new record over the slot it finds empty — so this
+        fallback belongs in the point read, not only the scan.
+        `build_sessions.locks.read_registry` mirrors it and must behave identically; kept
+        separate (`services/sandbox/` may not import `services/build_sessions/`), guarded against
+        drift by `test_key_migration.py`."""
         raw = await get_redis().hgetall(registry_key(user_uuid))
         if raw:
             return {str(k): str(v) for k, v in raw.items()}
@@ -1109,17 +1110,24 @@ class AcaSandboxClient(SandboxClient):
         RECIPIENT, not the app's owner, on the `shared_sandbox` arm. `shared_project_id`/
         `shared_owner_id` are the registry-hash half of that same distinction — see
         `_write_registry`'s own docstring — and are only ever non-`None` on that arm."""
+        existing = await self._read_registry(user_uuid)
+        if existing is not None and existing.get(REGISTRY_FIELD_APP_NAME):
+            # The new record would replace the only one naming that container, leaving it running
+            # with nothing that can find it. Whoever holds it must be handed over first.
+            raise SandboxError(
+                "cannot provision: the registry still names a container nobody has taken over, "
+                "and writing over its record would orphan it"
+            )
         token = secrets.token_urlsafe(_SUPERVISOR_TOKEN_BYTES)
         # The supervisor bearer lives ONLY in the container env (the supervisor keeps it out of
         # the scrubbed child env) and in-process; Redis stores a token_ref, never the token.
         #
         # WHERE THIS APP IS SERVED FROM, derived here rather than passed in. This is the one seam
-        # BOTH births pass through — `provision_new` and `restore_from_snapshot` — so a restored
-        # sandbox comes back at the same path for free, and a relaunch cannot strand the preview
-        # at an address the router will never produce. It is deliberately NOT in
-        # `build_app_env`: the publish path calls that same builder, and a base path added there
-        # would ship an `sbx-` value into published containers whose images were built with a
-        # `pub-` one. `app_name` is in scope here and is exactly the key the router matches on.
+        # BOTH births pass through — `provision_new` and `restore_from_snapshot` — so a preview
+        # is always served under its own container's name, the key the router matches on. It is
+        # deliberately NOT in `build_app_env`: the publish path calls that same builder, and a
+        # base path added there would ship an `sbx-` value into published containers whose
+        # images were built with a `pub-` one.
         env = {
             **app_env,
             _SUPERVISOR_TOKEN_ENV: token,
@@ -1409,43 +1417,15 @@ class AcaSandboxClient(SandboxClient):
         # app_id).
         app_id = uuid.UUID(app_env["BIAL_APP_ID"])
         key = source_key or snapshot_key(app_id)
-        # FETCH AND VALIDATE BEFORE DESTROYING ANYTHING. The pull used to live inside
-        # `_restore_snapshot_into`, i.e. two steps AFTER the teardown below — so a missing,
-        # unreachable or unreadable bundle tore the live container down and only then
-        # discovered it had nothing to put back. The container's tree is the only copy of
-        # everything since the user last saved, so that ordering turned "the restore failed"
-        # into "the work is gone".
-        #
-        # Recovery must never require destroying the thing being recovered. Failures here
-        # (`StorageNotFoundError`, `StorageError`, `BundleValidationError`) now propagate with
-        # the original container still running and still attachable.
+        # FETCHED BEFORE ANYTHING IS CREATED, so a missing, unreachable or unreadable bundle
+        # (`StorageNotFoundError`, `StorageError`, `BundleValidationError`) fails the restore
+        # with no container to clean up.
         #
         # NOT validated here, deliberately. `parse_bundle_head_sha` reads only the header, so
         # it cannot detect the truncation that actually matters, and gating the restore on it
         # would refuse bundles the container can in fact fetch — trading a narrow, already-
-        # covered failure for a broad new one. The fetch's own `StorageNotFoundError` /
-        # `StorageError` are the signals worth acting on, and they now arrive before anything
-        # is destroyed, which is the whole point of the reorder.
+        # covered failure for a broad new one.
         bundle = await get_storage().get(key)
-        # Defensively tear down any live original BEFORE overwriting the registry, so a
-        # still-running container is never orphaned by the restore's fresh create.
-        existing = await self._read_registry(user_uuid)
-        if existing is not None:
-            old_app_name = existing.get(REGISTRY_FIELD_APP_NAME)
-            if old_app_name and not await self._safe_teardown(old_app_name):
-                # ABORT rather than provision over it. `_provision_container` overwrites
-                # the user-keyed registry hash with the NEW app name, so continuing here would
-                # leave the OLD container running with nothing pointing at it — an anonymous,
-                # forever-billing ghost, manufactured by the recovery path itself.
-                #
-                # Failing is the safe direction: the builder sees a restore that did not happen
-                # and can retry, and the old container is still recorded, still attachable, and
-                # still reachable by the sweep. Deleting work to make a retry succeed is the
-                # trade this whole unit refuses.
-                raise SandboxError(
-                    "cannot restore: the existing container could not be torn down, and "
-                    "provisioning over it would orphan it"
-                )
         handle = await self._provision_container(
             user_uuid,
             app_name,
