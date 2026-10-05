@@ -31,8 +31,8 @@ actually succeeded — the platform has to do on its own.
 |---|---|---|
 | **Control plane** | The HTTP API. Authentication, projects and conversations, quota, the approval workflow, and the orchestration of everything below. | App Service for Containers |
 | **Portal** | The single-page application people actually use, served by a small web edge that also forwards API calls to the control plane. | App Service for Containers |
-| **Background worker** | The scheduled passes nobody triggers: reconciling deployments, sweeping and reclaiming idle sandboxes, deleting old sandbox start timings, removing conversations nobody has come back to. Same image as the control plane, started with a different command and no inbound traffic. | Container Apps |
-| **Build sandbox** | One disposable container per project, holding a live workspace and running the generated application so its author can see it. | Container Apps |
+| **Background worker** | The scheduled passes nobody triggers: reconciling deployments, sweeping and reclaiming idle sandboxes, keeping the pool of ready sandboxes at its size, deleting old sandbox start timings, removing conversations nobody has come back to. Same image as the control plane, started with a different command and no inbound traffic. | Container Apps |
+| **Build sandbox** | One disposable container per project, holding a live workspace and running the generated application so its author can see it. Made when someone starts work, or taken from a pool of ready ones made ahead. | Container Apps |
 | **Deployed application** | An approved application, built from a durable snapshot and published for its audience. | Container Apps |
 
 The worker shares the control plane's image deliberately — the task definitions have to be
@@ -45,9 +45,9 @@ no JavaScript runtime either, because the interface is compiled to static files 
 Keeping the two apart means the interface can be rebuilt and redeployed without touching the API,
 and that the API's container carries no toolchain it does not use at runtime.
 
-The build sandbox is not deployed by an operator. The control plane creates one when someone
-starts work and deletes it when they are done; an operator only ever builds and publishes the
-image it is created from.
+The build sandbox is not deployed by an operator. The control plane creates one — or takes a ready
+one made ahead of time — when someone starts work and deletes it when they are done; an operator
+only ever builds and publishes the image it is created from.
 
 ```mermaid
 flowchart TD
@@ -119,6 +119,79 @@ container is destroyed, *then* the slot is released — always in that order. Re
 first would let the next build start before the previous workspace was safely stored, and it would
 restore from a snapshot that was either stale or absent. The slot is what makes storing and
 destroying look atomic to the person waiting.
+
+## Ready containers
+
+Creating a container is the slowest step of a start, and it is the cloud provider's, not the
+platform's. So the platform makes some containers ahead of time and hands one to whoever starts
+next. The shape of that follows from what a sandbox is.
+
+**A ready container knows nothing about any project.** Generated code is untrusted, so a container
+made before anyone has asked for it holds nothing that could be turned against anyone: no
+project's identity, no storage key, no database address, no data identity. Those arrive after a
+start claims the container, over the authenticated channel the control plane already uses to drive
+every sandbox, once, into the supervisor's own environment — where the allowlist and the redaction
+that already guard every sandbox cover them with no second code path. Until they have arrived the
+container refuses to start the application.
+
+**A ready container is used once.** Code has run in it. When its project leaves it is saved and
+deleted like any other sandbox and never returned to the pool, because reuse could carry one
+project's files and processes into the next.
+
+**Every start goes through the one place that creates a container.** A claim there covers every
+kind of start, and when nothing ready can be claimed that same place creates a container the old
+way. The pool can make a start faster; it cannot make one fail.
+
+**A container's name is not its app's name.** A container made ahead has no app to be named
+after, so every lookup reads a record of which app a container serves instead of working the name
+out, and names are random and never reused. A delete by name can then only remove what it was meant
+for, which is also what lets the previous occupant of a slot be deleted in the background instead
+of making the next start wait for it.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Control plane
+    participant L as Pool ledger
+    participant C as Ready container
+    participant R as Registry
+    participant F as Refill
+
+    S->>L: claim one ready container
+    L-->>S: the container, now marked claimed
+    S->>C: health check, bounded to seconds
+    S->>C: deliver the project's settings, once
+    S->>R: record the container and its app
+    S->>L: forget the container
+    S-->>F: start one replacement
+    S->>C: restore the project, start the application
+    Note over S,C: A step that fails before the record deletes the container<br/>and may try another ready one.<br/>Otherwise the start creates one the old way.
+```
+
+**Two records, with different jobs.** The registry, held in the coordination store, says which
+container each person holds and which application it belongs to: it is what the platform knows
+about a live container. The ledger, held in the platform database, lists pool containers from the
+moment they begin to be made until their claim completes, and a container a start creates for
+itself until the registry records it, since a create outlives a cancelled start and nothing else
+would name it. Its job is to make the hand-over exclusive: a claim is a single compare-and-set on
+one row, so two people starting at once are never given the same container, even through a deploy,
+when two instances of the control plane briefly run side by side. When the claim has written the
+registry the ledger forgets the container, and from then on the registry describes it like any
+other. The ledger lives in the database because it is the thing that must be neither lost nor spent
+twice, and the coordination store, which can lose what it holds, is the wrong place for that.
+
+**The count is held at two speeds.** The process that took a container starts its replacement at
+once, because nobody should wait for a periodic pass. The worker's periodic pass restores the
+count after everything else — a crash, a refused create, the end of the working day, a new sandbox
+image — and replaces ready containers on an old image with new ones before it removes the old.
+It acts only on containers the ledger holds. A container the ledger does not hold may be somebody's
+workspace waiting to be saved, and destroying on a guess is what the rules below forbid.
+
+**Pool work leaves room for people.** Pool creates share each process's limited capacity to talk
+to the cloud provider with starts someone is waiting on, so pool work is bounded per process, and a
+refused create stops that pass rather than pressing on. The size follows working hours, because a
+ready container costs money while it waits. Sizes and hours are settings, owned by
+`backend/src/services/sandbox/config.py`; the bound is fixed in the code.
 
 ## Publishing
 
@@ -310,12 +383,19 @@ nothing is claimed by mistake.
 **Nothing is destroyed until a durable copy exists.** The snapshot precedes the delete, always.
 This is the same ordering the build flow follows, for the same reason. The one exception is a
 workspace whose repository is already gone: no snapshot can be taken of it, now or later, so it is
-reclaimed and counted rather than kept billing forever.
+reclaimed and counted rather than kept billing forever. A copy is only ever written to an app the
+sandbox's own holder owns; a record naming anyone else's app is destroyed with nothing written.
+
+**A ready container the pool holds is neither a sandbox in use nor an orphan.** The sweep reaches
+only containers a registry names, so it never reaches one. Only the pool removes them: its periodic
+pass, or a claim that found one unfit.
 
 **A container the coordination store has no record of is found separately, by hand.** The cloud
 provider knows about every container the store has forgotten; an operator asks it directly and
-deletes what it names. This is a reported inventory, not an automatic pass — it is not something
-the platform is asked to get right unattended.
+deletes what it names. The inventory leaves out what the platform still holds without a registry
+record — a ready container, one whose deletion is owed, one a start is still creating — so what it
+names is unclaimed by anything. This is a reported inventory, not an automatic pass — it is not
+something the platform is asked to get right unattended.
 
 ## Where to go next
 

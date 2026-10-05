@@ -80,9 +80,10 @@ matters more than the syntax:
   be added.
 
 - **`citizen-dev-aca-role.json`** — lets the control plane create, read and delete the container
-  apps that run generated applications, and join them to a managed environment. It is confined to
-  container apps: it cannot reach a database, a cache or a storage account sharing the same
-  resource group.
+  apps that run generated applications, and join them to a managed environment. The background
+  worker needs the same actions: it deletes abandoned sandboxes and creates the ready ones the pool
+  holds. It is confined to container apps: it cannot reach a database, a cache or a storage account
+  sharing the same resource group.
 
 `AssignableScopes` in both files carries the documented placeholder form rather than a real scope.
 **The scope is chosen at assignment time**, and choosing it is a real decision — it is what decides
