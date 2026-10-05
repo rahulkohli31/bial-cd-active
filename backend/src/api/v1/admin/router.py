@@ -67,6 +67,9 @@ from src.api.v1.admin.schemas import (
     RejectRequest,
     RoleReconcileCounts,
     SandboxReconcileResponse,
+    SandboxStartKindSummary,
+    SandboxStartMedians,
+    SandboxStartsResponse,
     SandboxTagBackfillResponse,
     StorageReconcileResponse,
     SuspensionResponse,
@@ -102,6 +105,7 @@ from src.db.models.feedback import Feedback
 from src.db.models.harness_counter import HarnessCount
 from src.db.models.project import Project
 from src.db.models.project_database import ProjectDatabase
+from src.db.models.sandbox_start import SandboxStart, SandboxStartOutcome
 from src.db.models.token_usage import TokenUsage, TokenUsageKind
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
@@ -2066,6 +2070,103 @@ async def harness_counters(
                 name=name, total=int(total or 0), occurrences=occurrences, last_seen_at=last_seen
             )
             for name, total, occurrences, last_seen in rows
+        ],
+        since=since,
+    )
+
+
+def _median(column: sa.ColumnExpressionArgument[Any]) -> sa.ColumnElement[Any]:
+    return sa.func.percentile_cont(0.5).within_group(column)
+
+
+def _whole_ms(value: float | None) -> int | None:
+    return None if value is None else round(value)
+
+
+@users_router.get("/sandbox-starts", responses=error_responses(*_ADMIN_AUTH))
+async def sandbox_starts(
+    admin: CurrentSuperadmin, db: DbSession, days: int = 7
+) -> SandboxStartsResponse:
+    """How long sandbox starts take, per kind of start: how many there were, how they ended, how
+    many took a ready container and why the rest did not, and the median of each stage.
+
+    Totals and medians only: a start row names who started which app and when, so no route
+    returns one. `days` bounds the window, which cannot reach past the rows' own retention."""
+    # `CurrentSuperadmin` for the reason `harness_counters` gives, and no `user_id` predicate:
+    # an aggregate across every citizen is what this route is.
+    since = datetime.now(UTC) - timedelta(days=max(1, min(days, 90)))
+    in_window = SandboxStart.started_at >= since
+    door_to_first_page_ms = sa.case(
+        (
+            SandboxStart.outcome == SandboxStartOutcome.SERVED,
+            sa.extract("epoch", SandboxStart.ended_at - SandboxStart.started_at) * 1000,
+        )
+    )
+    rows = (
+        await db.execute(
+            sa.select(
+                SandboxStart.kind,
+                sa.func.count(),
+                sa.func.count().filter(SandboxStart.outcome == SandboxStartOutcome.SERVED),
+                sa.func.count().filter(SandboxStart.outcome == SandboxStartOutcome.FAILED),
+                sa.func.count().filter(SandboxStart.claimed),
+                _median(SandboxStart.admission_ms),
+                _median(SandboxStart.settings_ms),
+                _median(SandboxStart.create_ms),
+                _median(SandboxStart.dev_start_ms),
+                _median(SandboxStart.first_page_ms),
+                _median(SandboxStart.browser_visible_ms),
+                _median(door_to_first_page_ms),
+            )
+            .where(in_window)
+            .group_by(SandboxStart.kind)
+            .order_by(SandboxStart.kind)
+        )
+    ).all()
+    misses = (
+        await db.execute(
+            sa.select(SandboxStart.kind, SandboxStart.miss_reason, sa.func.count())
+            .where(in_window, SandboxStart.miss_reason.is_not(None))
+            .group_by(SandboxStart.kind, SandboxStart.miss_reason)
+        )
+    ).all()
+    return SandboxStartsResponse(
+        kinds=[
+            SandboxStartKindSummary(
+                kind=kind,
+                starts=starts,
+                served=served,
+                failed=failed,
+                claimed=claimed,
+                misses={
+                    reason: count
+                    for miss_kind, reason, count in misses
+                    if miss_kind == kind and reason is not None
+                },
+                medians=SandboxStartMedians(
+                    admission_ms=_whole_ms(admission),
+                    settings_ms=_whole_ms(settings_stage),
+                    create_ms=_whole_ms(create),
+                    dev_start_ms=_whole_ms(dev_start),
+                    first_page_ms=_whole_ms(first_page),
+                    browser_visible_ms=_whole_ms(browser_visible),
+                    total_ms=_whole_ms(total),
+                ),
+            )
+            for (
+                kind,
+                starts,
+                served,
+                failed,
+                claimed,
+                admission,
+                settings_stage,
+                create,
+                dev_start,
+                first_page,
+                browser_visible,
+                total,
+            ) in rows
         ],
         since=since,
     )

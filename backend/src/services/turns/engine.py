@@ -97,6 +97,7 @@ from src.core.integrity_types import BaselineIdentity
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.harness_counter import HarnessCounter
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
+from src.db.models.sandbox_start import SandboxStartOutcome
 from src.db.models.user import User
 from src.services.agent.agent import ChatDeps, chat_agent, static_instruction_parts
 from src.services.agent.attachment_tools import AttachmentReader
@@ -2272,7 +2273,8 @@ class TurnEngine:
         # is to catch an app that is showing it AFTER someone asked for something else.
         state.had_prior_building_turns = await has_ever_been_built(session.app_id)
         state.workspace_state = "ready"
-        self._emit(state, lambda seq: WorkspaceFrame(seq=seq, state="ready"))
+        start_id = session.start.on_the_books
+        self._emit(state, lambda seq: WorkspaceFrame(seq=seq, state="ready", start_id=start_id))
         # BOOT THE DEV SERVER THE MOMENT WE HOLD THE CONTAINER, not after the whole model run
         # plus a `tsc`. Next's first route compile is 5-7s, so starting it here puts that
         # compile alongside the agent's first request instead of after it. It matters most on a
@@ -2285,7 +2287,9 @@ class TurnEngine:
         # framing; blocking the turn's start on readiness would trade one latency problem for
         # another one the user can see.
         try:
-            await sandbox_client.dev_start(session.handle)
+            with session.start.lap("dev_start"):
+                await sandbox_client.dev_start(session.handle)
+            session.start.split("dev_started")
             # THE DEV SERVER IS COMING UP — AND THAT IS ALL THIS SAYS. The gap between this
             # line and `app_first_served` is the interesting one: a build that reaches here and
             # stops has a dev server that started and never compiled a route, which today is
@@ -3264,6 +3268,7 @@ class TurnEngine:
         sandbox = state.sandbox
         if sandbox is None:
             return
+        start = state.write_session.start if state.write_session is not None else None
         reconnecting = False
         # THE CRASH EDGE'S OTHER LATCH, kept apart from `reconnecting` on purpose. That flag is
         # gated on `state.preview_framed` — correct for the SSE frame, which must not announce a
@@ -3351,6 +3356,8 @@ class TurnEngine:
                 # `root_status` as today's behaviour on purpose, so the pre-`root_status` fleet
                 # keeps its preview instead of being locked out of it by a field it never sends.
                 if status.shows_a_page:
+                    if start is not None:
+                        start.split("first_page")
                     first_serve = state.claim_preview_frame()
                     if first_serve or reconnecting:
                         # First serve, or recovered after a crash — either way the client needs
@@ -3386,6 +3393,9 @@ class TurnEngine:
                         await count(
                             HarnessCounter.APP_START_REACHED_RUNNING, app_id=sandbox.app_id
                         )
+                    # Behind the frame, for the counter's reason. Only the first close writes.
+                    if start is not None:
+                        await start.close(SandboxStartOutcome.SERVED)
                     reconnecting = False
             else:
                 # Counted on the PAIR (nothing answering AND no child alive), not on the framed/

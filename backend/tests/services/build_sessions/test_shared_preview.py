@@ -387,7 +387,7 @@ async def test_opening_their_own_app_puts_a_live_shared_view_away_and_starts(
     started = await manager.relaunch_preview(db_session, recipient, recipient_project.id, client)
     await detached_work_done(manager)
 
-    assert started == own_app_id
+    assert started.app_id == own_app_id
     assert shr_name_for(app_id, recipient.id) in client.torn_down
     assert client.restored == [app_name_for(own_app_id)]
     assert await fake_storage.get(snapshot_key(app_id)) == b"BUNDLE"

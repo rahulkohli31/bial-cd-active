@@ -281,7 +281,7 @@ async def relaunch_preview(
     # outage of the coordination store is a 503 here, never a claim that a build is running.
     with build_coordination_or_503():
         try:
-            app_id = await manager.relaunch_preview(db, user, body.project_id, sandbox)
+            admitted = await manager.relaunch_preview(db, user, body.project_id, sandbox)
         except BuildSessionConflictError:
             # This project's own work is running — relaunch never pre-empts it (409). A
             # DIFFERENT project of theirs never reaches here: that is a switch, and it starts.
@@ -307,7 +307,7 @@ async def relaunch_preview(
             raise AppApiError(
                 status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG
             ) from exc
-        return RelaunchPreviewResponse(app_id=app_id)
+        return RelaunchPreviewResponse(app_id=admitted.app_id, start_id=admitted.start_id)
     raise _coordination_is_gone()
 
 
@@ -780,6 +780,7 @@ async def _shared_preview_or_refuse(
             preview_url=preview.preview_url,
             ready=preview.ready,
             snapshot_taken_at=preview.snapshot_taken_at,
+            start_id=preview.start_id,
         )
     raise _coordination_is_gone()
 

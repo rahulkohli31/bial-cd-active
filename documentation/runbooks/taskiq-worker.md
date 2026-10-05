@@ -2,8 +2,9 @@
 
 The Taskiq worker is the platform's background process. It runs the recurring reconciliation and
 cleanup passes the control plane does not run inline — settling stalled deployments, sweeping and
-reclaiming abandoned sandboxes, and removing conversations nobody has come back to. Reach for this
-document to start the worker, confirm it is actually alive, or size and troubleshoot it.
+reclaiming abandoned sandboxes, deleting sandbox start timings past their retention, and removing
+conversations nobody has come back to. Reach for this document to start the worker, confirm it is
+actually alive, or size and troubleshoot it.
 
 ## 1. It will not boot from the control plane's own environment file — check this first
 
@@ -60,10 +61,11 @@ Only the conversation-retention pass (section 4) records a durable outcome row i
 database on every tick — success, decline, or failure alike. That row's staleness is the one
 queryable signal that the whole worker process has stopped, but it is a WEAK one: retention runs
 once a day and declines most of its own ticks by design, so its record can be up to a day stale
-before an absence is even meaningful. The other scheduled passes — deployment reconciliation and
-the routine sandbox sweep — only log their outcome; confirm those are still running from their own
-log lines, since neither leaves a queryable record behind. There is today no single signal that
-proves the worker process as a whole, rather than one of its passes, is alive.
+before an absence is even meaningful. The other scheduled passes — deployment reconciliation, the
+routine sandbox sweep and the purge of old sandbox start timings — only log their outcome; confirm
+those are still running from their own log lines, since none leaves a queryable record behind.
+There is today no single signal that proves the worker process as a whole, rather than one of its
+passes, is alive.
 
 ## 4. The conversation-retention pass ships switched off
 

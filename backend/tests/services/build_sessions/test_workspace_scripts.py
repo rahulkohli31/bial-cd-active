@@ -30,6 +30,7 @@ from src.services.sandbox.client import (
     _BUNDLE_B64_NAME,
     _DISCARD_SCRIPT,
     _INIT_REPO_SCRIPT,
+    _REINSTALLED_MARKER,
     _RESTORE_SCRIPT,
 )
 
@@ -167,18 +168,20 @@ class _Sandbox:
         self.git("bundle", "create", str(path), "HEAD")
         return path.read_bytes()
 
-    def restore(self, bundle: bytes) -> None:
-        self._over_a_pushed_bundle(bundle, _RESTORE_SCRIPT)
+    def restore(self, bundle: bytes) -> subprocess.CompletedProcess[str]:
+        return self._over_a_pushed_bundle(bundle, _RESTORE_SCRIPT)
 
     def discard(self, bundle: bytes) -> None:
         self._over_a_pushed_bundle(bundle, _DISCARD_SCRIPT)
 
-    def _over_a_pushed_bundle(self, bundle: bytes, script: str) -> None:
+    def _over_a_pushed_bundle(
+        self, bundle: bytes, script: str
+    ) -> subprocess.CompletedProcess[str]:
         """What `SandboxClient._run_over_a_pushed_bundle` does: push the base64, run the script."""
         (self.ws / _BUNDLE_B64_NAME).write_text(
             base64.b64encode(bundle).decode("ascii"), encoding="ascii"
         )
-        self.ok(script)
+        return self.ok(script)
 
 
 @pytest.fixture
@@ -413,6 +416,23 @@ def test_a_saved_tree_restores_with_its_history(sandbox: _Sandbox) -> None:
     assert fresh.head() == sandbox.head()
     assert fresh.commits() == 2
     assert not (fresh.ws / _BUNDLE_B64_NAME).exists()
+
+
+@pytest.mark.parametrize(
+    ("saved_lockfile", "reinstalled"), [("moved\n", True), ("baked\n", False)]
+)
+def test_a_restore_says_so_when_it_reinstalls_and_only_then(
+    sandbox: _Sandbox, saved_lockfile: str, reinstalled: bool
+) -> None:
+    """The control plane reads this one line to record whether a start paid for a reinstall."""
+    sandbox.write({**_STARTER, "package-lock.json": saved_lockfile})
+    sandbox.ok(_INIT_REPO_SCRIPT)
+    fresh = sandbox.fresh_container()
+    fresh.write({**_STARTER, "package-lock.json": "baked\n"})
+
+    restored = fresh.restore(sandbox.bundle())
+
+    assert (_REINSTALLED_MARKER in restored.stdout.splitlines()) is reinstalled
 
 
 def test_a_restore_overlays_the_baked_tree(sandbox: _Sandbox) -> None:

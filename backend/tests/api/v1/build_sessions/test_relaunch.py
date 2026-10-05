@@ -30,6 +30,7 @@ from src.api.v1.build_sessions.schemas import (
 from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
 from src.db.models.harness_counter import HarnessCount, HarnessCounter
+from src.db.models.sandbox_start import SandboxStart
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
 from src.services.build_sessions.manager import SessionManager, app_name_for
@@ -90,8 +91,9 @@ async def test_relaunch_is_accepted_and_the_poll_reports_the_app(
 ) -> None:
     """The start answers 202 with the app it admitted: whether the app is up, and where, is the
     preview-state poll's to say, and saying it twice is how two readers came to disagree about
-    one container. The one other field is a constant `status`, which a tab loaded before this
-    server needs to read the body at all.
+    one container. The other two fields are a constant `status`, which a tab loaded before this
+    server needs to read the body at all, and the start it began, which the browser times
+    itself against.
 
     Mutation-check: drop `status` from `RelaunchPreviewResponse` and this goes red."""
     user, project = await _user_project(db_session, "rl1@rvaiglobal.com")
@@ -100,7 +102,14 @@ async def test_relaunch_is_accepted_and_the_poll_reports_the_app(
     resp = await _relaunch(client, user, project, wire.manager)
 
     assert resp.status_code == 202
-    assert resp.json() == {"appId": str(app_id), "status": "provisioning"}
+    start_id = await db_session.scalar(
+        sa.select(SandboxStart.id).where(SandboxStart.user_id == user.id)
+    )
+    assert resp.json() == {
+        "appId": str(app_id),
+        "status": "provisioning",
+        "startId": str(start_id),
+    }
     polled = await client.get(
         f"/v1/build-sessions/projects/{project.id}/preview-state", headers=auth_headers(user)
     )
@@ -511,6 +520,21 @@ async def test_a_relaunch_onto_a_live_healthy_container_touches_no_aca_lifecycle
     assert warm.status_code == 202
     assert aca_wire.aca.delete_calls == []
     assert aca_wire.aca.create_calls == [app_name_for(app_id)]
+
+
+async def test_a_relaunch_that_attaches_answers_with_no_start(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
+) -> None:
+    # Mutation check: answer with the start's id whether or not its row was written and the
+    # second `startId` goes red.
+    user, project = await _user_project(db_session, "rl-attach-start@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+
+    cold = await _relaunch(client, user, project, aca_wire.manager)
+    warm = await _relaunch(client, user, project, aca_wire.manager)
+
+    assert cold.json()["startId"] is not None
+    assert warm.json()["startId"] is None
 
 
 async def test_the_warm_relaunch_attaches_to_the_pre_existing_container(

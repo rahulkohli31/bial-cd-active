@@ -1364,7 +1364,8 @@ async def test_a_user_who_never_saved_can_still_get_their_work_back(
     await reap_user(fake_redis, user.id, client, app_id=session.app_id)
     client.attach_handle = None
 
-    assert await manager.relaunch_preview(db_session, user, project_id, client) == session.app_id
+    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
+    assert relaunched.app_id == session.app_id
     await detached_work_done(manager)
     assert client.restored_from[-1] is None
 

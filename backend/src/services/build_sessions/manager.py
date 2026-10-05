@@ -36,7 +36,7 @@ from contextlib import (
     contextmanager,
     suppress,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import Final, Literal
@@ -59,6 +59,7 @@ from src.db.models.harness_counter import HarnessCounter
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.project import Project
+from src.db.models.sandbox_start import SandboxStartKind, SandboxStartOutcome
 from src.db.models.user import User
 from src.services.build_sessions.alarms import (
     APP_FIRST_SERVE_NOT_OBSERVED_EVENT,
@@ -105,6 +106,7 @@ from src.services.build_sessions.locks import (
     write_starting_marker,
 )
 from src.services.build_sessions.reaper import is_a_shared_sandbox_name, reap_user, reconcile_user
+from src.services.build_sessions.sandbox_starts import StartRecord
 from src.services.build_sessions.shutdown import (
     ShutdownReason,
     claim_the_teardown_we_owe,
@@ -144,6 +146,7 @@ from src.services.sandbox import (
     SandboxHandle,
     SandboxNotReadyError,
 )
+from src.services.sandbox.stopwatch import timed_by
 from src.services.storage import (
     BundleValidationError,
     StorageError,
@@ -297,6 +300,21 @@ _UNKNOWN_REPORT_SILENCE_SECONDS: float = 60.0
 # rule has ever heard of. `shared_launch` (#198) is the recipient's own door: a colleague's
 # read-only view of a project shared with them, occupying the SAME per-user slot a build would.
 _ClaimArm = Literal["relaunch", "ensure_sandbox", "shared_launch"]
+
+
+def _kind_of_start(
+    arm: _ClaimArm, *, incumbent_is_leaving: bool, spare_app: str | None
+) -> SandboxStartKind:
+    """A colleague's view is a shared view; any other start that hands another project's
+    workspace over is a switch; else a relaunch is a reopen, and a turn's start is a new project
+    when the project has no app yet and a chat when it has one."""
+    if arm == "shared_launch":
+        return SandboxStartKind.SHARED_VIEW
+    if incumbent_is_leaving:
+        return SandboxStartKind.SWITCH
+    if arm == "relaunch":
+        return SandboxStartKind.REOPEN
+    return SandboxStartKind.NEW_PROJECT if spare_app is None else SandboxStartKind.CHAT
 
 
 # The end sequence's own DB session factory (it outlives the starting request). Typed as what this
@@ -977,7 +995,17 @@ class _StartInFlight:
     the admission a second press for the same project joins instead of starting its own."""
 
     project_id: uuid.UUID
-    admitted: asyncio.Future[uuid.UUID]
+    admitted: asyncio.Future[AdmittedRelaunch]
+    record: StartRecord
+
+
+@dataclass(frozen=True)
+class AdmittedRelaunch:
+    """What `relaunch_preview` hands the router: the app, and the id of the start it began, or
+    `None` when it attached to a container already running."""
+
+    app_id: uuid.UUID
+    start_id: uuid.UUID | None
 
 
 @dataclass(frozen=True)
@@ -996,6 +1024,8 @@ class SharedPreview:
     preview_url: str
     ready: bool
     snapshot_taken_at: datetime | None
+    #: The start this launch began, or `None` when it attached to a view already running.
+    start_id: uuid.UUID | None
 
 
 class SharedProjectHasNoAppError(Exception):
@@ -1040,9 +1070,13 @@ class _LockScope:
     release them). `spared` is a separate escape, answering not "who owns this now" but "would
     destroying it be a rollback at all" — set when the container was ATTACHED (already running
     before this start) or BROUGHT UP (its dev server started, so tearing a working preview down
-    over a Redis heartbeat blip is not a fair trade even though this start created it)."""
+    over a Redis heartbeat blip is not a fair trade even though this start created it).
+
+    `record` is the start being timed: the compensation closes it failed unless the container
+    was spared or adopted."""
 
     token: str
+    record: StartRecord
     handle: SandboxHandle | None = None
     adopted: bool = False
     spared: bool = False
@@ -1110,6 +1144,8 @@ class BuildSession:
     # of the slot — which is what lets a message sent the instant a turn ends wait for the
     # release instead of bouncing off the sender's own finished turn.
     turn_finish: asyncio.Event | None = None
+    #: The start this session's container came from. Never written when the session attached.
+    start: StartRecord = field(default_factory=StartRecord)
 
 
 def _what_will_release_the_slot(session: BuildSession | None) -> asyncio.Event | None:
@@ -1238,6 +1274,9 @@ class SessionManager:
             await release_lock_as_holder(redis, user_id, scope.token)
         except Exception:
             _log.exception("lock release failed in compensation", user_id=str(user_id))
+        # After the lock, because nothing waits on a timing row.
+        if not scope.spared:
+            await scope.record.close(SandboxStartOutcome.FAILED)
 
     @asynccontextmanager
     async def _holding_user_lock(
@@ -1249,6 +1288,7 @@ class SessionManager:
         *,
         arm: _ClaimArm,
         incumbent_is_leaving: bool,
+        record: StartRecord,
         spare_app: str | None = None,
     ) -> AsyncIterator[_LockScope]:
         """Reconcile stale state → acquire the one-per-user Redis lock → run the body
@@ -1316,6 +1356,9 @@ class SessionManager:
           whichever the body did. A failed body clears it from the compensation arm instead
           (see `_compensate_lock_and_container`), so every exit — success, adoption or
           failure — leaves no marker behind before its TTL would have.
+
+        `record` is the start being timed. Its admission ends, and its kind is decided, the
+        moment the lock is held.
         """
         # THE CLOCK STARTS AT THE DOOR, not at `acquire_lock` below — the placement is the whole
         # honesty of the number. `acquire_lock` never waits (it answers None on contention and
@@ -1355,7 +1398,12 @@ class SessionManager:
         if token is None:
             raise BuildSessionConflictError()
         lock_wait_ms = int((time.monotonic() - claim_started_at) * 1000)
-        scope = _LockScope(token=token)
+        record.admitted(
+            _kind_of_start(arm, incumbent_is_leaving=incumbent_is_leaving, spare_app=spare_app),
+            user_id=user_id,
+            books=self._session_factory,
+        )
+        scope = _LockScope(token=token, record=record)
         try:
             # From here until the scope exits, a poll of `project_preview_state` for
             # `project_id` answers `starting` rather than the stale `asleep` it would otherwise
@@ -2507,9 +2555,10 @@ class SessionManager:
         user: User,
         project_id: uuid.UUID,
         sandbox_client: SandboxClient,
-    ) -> uuid.UUID:
-        """Admit a start of this project's saved app and return its app id. The start runs on
-        detached, and `project_preview_state` reports it: `starting`, then `alive`.
+    ) -> AdmittedRelaunch:
+        """Admit a start of this project's saved app and return its app id, with the start's
+        own when a container is being started. The start runs on detached, and
+        `project_preview_state` reports it: `starting`, then `alive`.
 
         Every refusal is decided before this returns — the one-slot conflict, a colleague's
         shared view in the slot, nothing saved, an unreadable snapshot, a container that may be
@@ -2520,7 +2569,9 @@ class SessionManager:
         if joining is not None and joining.project_id == project_id:
             return await asyncio.shield(joining.admitted)
         start = _StartInFlight(
-            project_id=project_id, admitted=asyncio.get_running_loop().create_future()
+            project_id=project_id,
+            admitted=asyncio.get_running_loop().create_future(),
+            record=StartRecord(),
         )
         self._starting[user.id] = start
         try:
@@ -2541,8 +2592,9 @@ class SessionManager:
             # answer below, and a joiner awaiting the future still re-raises it.
             start.admitted.exception()
             raise
-        start.admitted.set_result(app_id)
-        return app_id
+        admitted = AdmittedRelaunch(app_id=app_id, start_id=start.record.on_the_books)
+        start.admitted.set_result(admitted)
+        return admitted
 
     def _forget_the_start(self, user_id: uuid.UUID, start: _StartInFlight) -> None:
         # Only our own record: a switch to another project may already have replaced it.
@@ -2586,6 +2638,7 @@ class SessionManager:
                     project_id,
                     arm="relaunch",
                     incumbent_is_leaving=incumbent_is_leaving,
+                    record=start.record,
                     spare_app=spare_app,
                 )
             )
@@ -2618,6 +2671,7 @@ class SessionManager:
                     **await provision_app_database(db, project_id),
                     **await build_connector_env(db, user_id=user_id, project_id=project_id),
                 }
+                await start.record.open(app_id=app_id, env=env)
             # Both locks now belong to the detached half, which releases them when the container
             # is up — or compensates, if bringing it up fails.
             bringing_it_up = held.pop_all()
@@ -2699,7 +2753,10 @@ class SessionManager:
             # then a first compile on one vCPU, and past this watch only the sweep stamps it.
             budget_s=(2 if env is not None else 1) * _COLD_READY_BUDGET_SECONDS,
         ):
+            # Keeps the stages it reached; past this watch only the sweep can see the app serve.
+            await scope.record.close(None)
             return
+        scope.record.split("first_page")
         await count(HarnessCounter.APP_START_REACHED_RUNNING, app_id=app_id)
         if cold_started_at is not None:
             await count(
@@ -2707,6 +2764,7 @@ class SessionManager:
                 value=int((time.monotonic() - cold_started_at) * 1000),
                 app_id=app_id,
             )
+        await scope.record.close(SandboxStartOutcome.SERVED)
 
     async def _up_under_the_locks(
         self,
@@ -2728,9 +2786,10 @@ class SessionManager:
         async with held:
             try:
                 if env is not None:
-                    scope.handle = await self._restore_or_bust(
-                        sandbox_client, user_id, app_name, app_id, env, source_key=None
-                    )
+                    with timed_by(scope.record):
+                        scope.handle = await self._restore_or_bust(
+                            sandbox_client, user_id, app_name, app_id, env, source_key=None
+                        )
                     # A birth, so the connector copy fires, detached and unawaited: nothing on
                     # the platform reads what it writes, so no start may wait on it or be lost
                     # to it.
@@ -2743,7 +2802,9 @@ class SessionManager:
                 assert scope.handle is not None
                 handle = scope.handle
                 try:
-                    await sandbox_client.dev_start(handle)
+                    with scope.record.lap("dev_start"):
+                        await sandbox_client.dev_start(handle)
+                    scope.record.split("dev_started")
                 except SandboxError:
                     if not attached:
                         raise  # a fresh container with no dev server has nothing to preview
@@ -2854,7 +2915,12 @@ class SessionManager:
             build_id=str(uuid.uuid7()), user_id=str(recipient.id), project_id=str(project.id)
         ):
             return await self._launch_shared_preview_under_one_build_id(
-                db, recipient, project, sandbox_client, force_refresh=force_refresh
+                db,
+                recipient,
+                project,
+                sandbox_client,
+                force_refresh=force_refresh,
+                record=StartRecord(),
             )
 
     async def _launch_shared_preview_under_one_build_id(
@@ -2865,6 +2931,7 @@ class SessionManager:
         sandbox_client: SandboxClient,
         *,
         force_refresh: bool,
+        record: StartRecord,
     ) -> SharedPreview:
         """The whole of `launch_shared_preview` — go there for what it does and why; this half
         is the same code, one indent level out, so the correlation binding has a block to own."""
@@ -2904,6 +2971,7 @@ class SessionManager:
                 project.id,
                 arm="shared_launch",
                 incumbent_is_leaving=incumbent_is_leaving,
+                record=record,
                 spare_app=spare_app,
             ) as scope:
                 # THE SNAPSHOT GATE — the OWNER's saved bundle (requirement 21).
@@ -2926,18 +2994,20 @@ class SessionManager:
                         **await provision_app_storage(owner_app_id),
                         **await provision_app_database(db, project.id),
                     }
+                    await record.open(app_id=owner_app_id, env=env)
                     try:
-                        scope.handle = await self._restore_or_bust(
-                            sandbox_client,
-                            recipient.id,
-                            shared_name,
-                            owner_app_id,
-                            env,
-                            source_key=snapshot_key(owner_app_id),
-                            kind="shared_sandbox",
-                            shared_project_id=project.id,
-                            shared_owner_id=project.user_id,
-                        )
+                        with timed_by(record):
+                            scope.handle = await self._restore_or_bust(
+                                sandbox_client,
+                                recipient.id,
+                                shared_name,
+                                owner_app_id,
+                                env,
+                                source_key=snapshot_key(owner_app_id),
+                                kind="shared_sandbox",
+                                shared_project_id=project.id,
+                                shared_owner_id=project.user_id,
+                            )
                     except StorageNotFoundError as exc:
                         # The bundle vanished between the head-check above and the pull — the
                         # same 404 bucket `relaunch_preview` maps this into.
@@ -2957,7 +3027,9 @@ class SessionManager:
                 assert scope.handle is not None
                 handle = scope.handle
                 try:
-                    await sandbox_client.dev_start(handle)
+                    with record.lap("dev_start"):
+                        await sandbox_client.dev_start(handle)
+                    record.split("dev_started")
                 except SandboxError:
                     if not attached:
                         raise  # a fresh container with no dev server has nothing to preview
@@ -3002,6 +3074,7 @@ class SessionManager:
                     # Pays the app's first route compile so the recipient's own browser does
                     # not: this view is framed the moment the response lands.
                     await sandbox_client.someone_has_to_go_first(handle)
+                    record.split("first_page")
                 preview_url = handle.preview_url
                 # …and the FINAL re-grant, re-basing the reprieve on the instant the preview
                 # actually became viewable rather than the instant either arm merely attempted
@@ -3010,11 +3083,16 @@ class SessionManager:
                 await grant_stay_of_execution(
                     redis, recipient.id, writer=DeadlineWriter.BUILDER_ACTED
                 )
+            # Served once the view is handed back ready: a view that is not ready has shown no
+            # page yet, so its row stays open.
+            if ready:
+                await record.close(SandboxStartOutcome.SERVED)
             return SharedPreview(
                 app_id=owner_app_id,
                 preview_url=preview_url,
                 ready=ready,
                 snapshot_taken_at=snapshot_taken_at,
+                start_id=record.on_the_books,
             )
 
     async def _attach_for_shared_view(
@@ -3084,6 +3162,7 @@ class SessionManager:
         because the reaper, the registry sweep and `active_session_for` must see this exactly
         as they see a build's session.
         """
+        record = StartRecord()
         async with self._start_lock_for(user.id):
             redis = get_redis()
             user_id = user.id
@@ -3108,6 +3187,7 @@ class SessionManager:
                 project_id,
                 arm="ensure_sandbox",
                 incumbent_is_leaving=incumbent_is_leaving,
+                record=record,
                 spare_app=spare_app,
             ) as scope:
                 app_id = await resolve_app_for_project(db, user_id, project_id)
@@ -3131,7 +3211,7 @@ class SessionManager:
                 # or a Stop pressed in the wrong millisecond deleted the app the user was
                 # looking at, with every unsaved change in it.
                 resolved = await self._resolve_sandbox(
-                    sandbox_client, user_id, app_id, env, announce=announce
+                    sandbox_client, user_id, app_id, env, announce=announce, record=record
                 )
                 # BIRTH ONLY. `_resolve_sandbox` reports its arm, and the attach arm is the
                 # steady state here — every Write message after the first reuses the running
@@ -3159,6 +3239,7 @@ class SessionManager:
             news=resolved.news,
             restored=resolved.restored,
             attached=resolved.attached,
+            start=record,
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id
@@ -3214,6 +3295,7 @@ class SessionManager:
         env: dict[str, str],
         *,
         announce: RecoveryAnnouncer | None = None,
+        record: StartRecord | None = None,
     ) -> _ResolvedSandbox:
         """The one-per-user rehydrate resolution, in three arms: a live registry ATTACHES to
         the running container; no registry (a clean end always leaves none) or a registry
@@ -3222,19 +3304,26 @@ class SessionManager:
         would discard the user's work onto a blank template. A CONTAINER GETS ITS ENVIRONMENT
         EXACTLY ONCE, AT BIRTH: the birth arms build the whole `BIAL_*` set while attach
         passes none, so rotating a credential is a REBIRTH, never an attach. REPORTS ITS ARM
-        (`_ResolvedSandbox.attached`) so `_LockScope.take` can spare it from compensation."""
+        (`_ResolvedSandbox.attached`) so `_LockScope.take` can spare it from compensation.
+        `record` is the start the two birth arms are timed into; without one they are timed
+        into a record nothing admitted, which is never written."""
         redis = get_redis()
         app_name = app_name_for(app_id)
+        born_into = record if record is not None else StartRecord()
         if await read_registry(redis, user_id) is None:
             return _ResolvedSandbox(
-                await self._restore_or_provision(sandbox_client, user_id, app_name, app_id, env),
+                await self._restore_or_provision(
+                    sandbox_client, user_id, app_name, app_id, env, record=born_into
+                ),
                 attached=False,
             )
         try:
             handle = await sandbox_client.attach_existing(str(user_id))
         except SandboxGoneError:
             return _ResolvedSandbox(
-                await self._restore_or_provision(sandbox_client, user_id, app_name, app_id, env),
+                await self._restore_or_provision(
+                    sandbox_client, user_id, app_name, app_id, env, record=born_into
+                ),
                 attached=False,
             )
         # THE ONE ARM WHERE THE TREE IS OLDER THAN THIS REQUEST. The other two have just
@@ -3372,6 +3461,8 @@ class SessionManager:
         app_name: str,
         app_id: uuid.UUID,
         env: dict[str, str],
+        *,
+        record: StartRecord,
     ) -> SandboxHandle:
         """Restore the snapshot when one exists; provision a fresh template ONLY when the
         bundle is CONFIRMED absent. Fresh-provision has exactly ONE reachable arm:
@@ -3387,19 +3478,21 @@ class SessionManager:
         # container is simply reused on the next start. Disabled storage (dev/test) yields {} — a
         # no-op merge.
         env = {**env, **await provision_app_storage(app_id)}
-        if await self._snapshot_exists_or_bust(app_id):
-            try:
-                return await self._restore_or_bust(
-                    sandbox_client, user_id, app_name, app_id, env, source_key=None
-                )
-            except StorageNotFoundError:
-                # The ONLY error that may reach provision_new: the store positively answered
-                # "no bundle" on the pull, so there is no work to overwrite.
-                _log.warning(
-                    "snapshot disappeared between head-check and restore; provisioning fresh",
-                    app_id=str(app_id),
-                )
-        return await sandbox_client.provision_new(str(user_id), app_name, app_env=env)
+        await record.open(app_id=app_id, env=env)
+        with timed_by(record):
+            if await self._snapshot_exists_or_bust(app_id):
+                try:
+                    return await self._restore_or_bust(
+                        sandbox_client, user_id, app_name, app_id, env, source_key=None
+                    )
+                except StorageNotFoundError:
+                    # The ONLY error that may reach provision_new: the store positively answered
+                    # "no bundle" on the pull, so there is no work to overwrite.
+                    _log.warning(
+                        "snapshot disappeared between head-check and restore; provisioning fresh",
+                        app_id=str(app_id),
+                    )
+            return await sandbox_client.provision_new(str(user_id), app_name, app_env=env)
 
     async def _restore_or_bust(
         self,
@@ -3562,6 +3655,9 @@ class SessionManager:
             self._maybe_prune_start_lock(session.user_id)
             # AFTER the pop, so whoever this wakes finds the slot already free.
             finishing.set()
+            # Last, because nothing waits on a timing row. The turn that began this start is
+            # over, so what its row holds now is final.
+            await session.start.close(None)
 
 
 # --- accessor singleton (mirrors get_redis / get_sandbox) --------------------

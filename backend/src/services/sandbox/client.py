@@ -76,6 +76,7 @@ from src.services.sandbox.base import (
     shared_sandbox_tags,
 )
 from src.services.sandbox.config import SandboxConfig
+from src.services.sandbox.stopwatch import running_stopwatch
 from src.services.storage import get_storage, snapshot_key
 
 _log = structlog.get_logger()
@@ -218,10 +219,13 @@ _FINGERPRINT_THE_INSTALLED_LOCKFILE: Final = (
 _FINGERPRINT_THE_WANTED_LOCKFILE: Final = (
     "snap_lock=$(sha256sum package-lock.json 2>/dev/null || echo snap-lock-missing); "
 )
+# The one line of a restore's output the control plane reads back: the start it belongs to records
+# whether it paid for a reinstall.
+_REINSTALLED_MARKER: Final = "bial-restore: reinstalling dependencies"
 _RECONCILE_A_MOVED_LOCKFILE: Final = (
     'if [ "$baked_lock" = "$snap_lock" ]; then '
     "echo 'lockfile unchanged - skipping npm reconcile'; "
-    "else npm install --no-audit --no-fund --loglevel=error; fi; "
+    f"else echo '{_REINSTALLED_MARKER}'; npm install --no-audit --no-fund --loglevel=error; fi; "
 )
 _REMOVE_THE_PUSHED_BUNDLE: Final = f"rm -f /tmp/bial-app.bundle {_BUNDLE_B64_NAME}"
 
@@ -1141,17 +1145,20 @@ class AcaSandboxClient(SandboxClient):
 
         identity_resource_id = identity_resource_id_for_env(app_env)
         fqdn = await self._create_with_retry(app_name, env, tags, identity_resource_id, arm=arm)
+        stopwatch = running_stopwatch()
+        stopwatch.split("created")
         token_ref = self._register_token(token)
         self._app_owners[app_name] = user_uuid
         try:
-            await self._write_registry(
-                user_uuid,
-                app_name=app_name,
-                fqdn=fqdn,
-                token_ref=token_ref,
-                shared_project_id=shared_project_id,
-                shared_owner_id=shared_owner_id,
-            )
+            with stopwatch.lap("registry_write"):
+                await self._write_registry(
+                    user_uuid,
+                    app_name=app_name,
+                    fqdn=fqdn,
+                    token_ref=token_ref,
+                    shared_project_id=shared_project_id,
+                    shared_owner_id=shared_owner_id,
+                )
         except Exception:
             await self._safe_teardown(app_name)
             self._evict_token(token)
@@ -1348,7 +1355,12 @@ class AcaSandboxClient(SandboxClient):
     async def _restore_snapshot_into(self, handle: SandboxHandle, bundle: bytes) -> None:
         """Push an ALREADY-FETCHED bundle into the container. The fetch itself belongs to the
         caller, above the teardown — see `restore_from_snapshot`."""
-        await self._run_over_a_pushed_bundle(handle, bundle, _RESTORE_SCRIPT, "snapshot restore")
+        result = await self._run_over_a_pushed_bundle(
+            handle, bundle, _RESTORE_SCRIPT, "snapshot restore"
+        )
+        running_stopwatch().saw_the_restore_reinstall(
+            _REINSTALLED_MARKER in result.stdout.splitlines()
+        )
 
     async def reset_to_bundle(self, handle: SandboxHandle, bundle: bytes) -> None:
         await self._run_over_a_pushed_bundle(
@@ -1357,16 +1369,20 @@ class AcaSandboxClient(SandboxClient):
 
     async def _run_over_a_pushed_bundle(
         self, handle: SandboxHandle, bundle: bytes, script: str, what: str
-    ) -> None:
+    ) -> ExecResult:
         """Write the bundle into the workspace, then run one of the two bundle scripts over it."""
         encoded = base64.b64encode(bundle).decode("ascii")
-        await self.files(handle, FileCreate(path=_BUNDLE_B64_NAME, file_text=encoded))
+        stopwatch = running_stopwatch()
+        with stopwatch.lap("files"):
+            await self.files(handle, FileCreate(path=_BUNDLE_B64_NAME, file_text=encoded))
         run_command = self.exec  # aliased to keep the call off the JS-oriented exec guard
-        result = await run_command(
-            handle, ["sh", "-c", script], timeout_s=_RESTORE_TIMEOUT_SECONDS
-        )
+        with stopwatch.lap("restore_exec"):
+            result = await run_command(
+                handle, ["sh", "-c", script], timeout_s=_RESTORE_TIMEOUT_SECONDS
+            )
         if result.exit != 0:
             raise SandboxError(f"{what} failed (exit {result.exit})")
+        return result
 
     async def restore_from_snapshot(
         self,

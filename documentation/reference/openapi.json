@@ -3888,6 +3888,18 @@
             "title": "Appid",
             "type": "string"
           },
+          "startId": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startid"
+          },
           "status": {
             "const": "provisioning",
             "default": "provisioning",
@@ -3896,7 +3908,8 @@
           }
         },
         "required": [
-          "appId"
+          "appId",
+          "startId"
         ],
         "title": "RelaunchPreviewResponse",
         "type": "object"
@@ -4145,6 +4158,192 @@
         "title": "SandboxReconcileResponse",
         "type": "object"
       },
+      "SandboxStartKind": {
+        "enum": [
+          "reopen",
+          "new_project",
+          "chat",
+          "switch",
+          "shared_view"
+        ],
+        "title": "SandboxStartKind",
+        "type": "string"
+      },
+      "SandboxStartKindSummary": {
+        "description": "The starts of one kind: how many, how they ended, how many took a ready container, why\nthe rest did not, and how long each stage took. A start neither served nor failed is still\nunder way, or one whose first page no watcher saw.",
+        "properties": {
+          "claimed": {
+            "title": "Claimed",
+            "type": "integer"
+          },
+          "failed": {
+            "title": "Failed",
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SandboxStartKind"
+          },
+          "medians": {
+            "$ref": "#/components/schemas/SandboxStartMedians"
+          },
+          "misses": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "propertyNames": {
+              "$ref": "#/components/schemas/SandboxStartMiss"
+            },
+            "title": "Misses",
+            "type": "object"
+          },
+          "served": {
+            "title": "Served",
+            "type": "integer"
+          },
+          "starts": {
+            "title": "Starts",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "starts",
+          "served",
+          "failed",
+          "claimed",
+          "misses",
+          "medians"
+        ],
+        "title": "SandboxStartKindSummary",
+        "type": "object"
+      },
+      "SandboxStartMedians": {
+        "description": "Median milliseconds of each stage over the starts that reached it, and of the whole start,\ndoor to first page, over the starts that served. `None` where no start had it.",
+        "properties": {
+          "admissionMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Admissionms"
+          },
+          "browserVisibleMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browservisiblems"
+          },
+          "createMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Createms"
+          },
+          "devStartMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Devstartms"
+          },
+          "firstPageMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Firstpagems"
+          },
+          "settingsMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Settingsms"
+          },
+          "totalMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totalms"
+          }
+        },
+        "required": [
+          "admissionMs",
+          "settingsMs",
+          "createMs",
+          "devStartMs",
+          "firstPageMs",
+          "browserVisibleMs",
+          "totalMs"
+        ],
+        "title": "SandboxStartMedians",
+        "type": "object"
+      },
+      "SandboxStartMiss": {
+        "description": "Why a start created a container rather than claiming a ready one.",
+        "enum": [
+          "no_ready",
+          "unhealthy",
+          "claim_failed",
+          "size_zero"
+        ],
+        "title": "SandboxStartMiss",
+        "type": "string"
+      },
+      "SandboxStartsResponse": {
+        "description": "`GET /v1/admin/sandbox-starts` → 200 — sandbox start times, per kind of start.\n\nTotals and medians only. Each start row names who started which app and when, so no route\nreturns one.",
+        "properties": {
+          "kinds": {
+            "items": {
+              "$ref": "#/components/schemas/SandboxStartKindSummary"
+            },
+            "title": "Kinds",
+            "type": "array"
+          },
+          "since": {
+            "format": "date-time",
+            "title": "Since",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kinds",
+          "since"
+        ],
+        "title": "SandboxStartsResponse",
+        "type": "object"
+      },
       "SandboxTagBackfillResponse": {
         "description": "What one identity backfill pass did to the pre-existing fleet.\n\nTHE BUCKETS SUM: `scanned == alreadyTagged + stamped + skippedNoRow + failed`. `skippedNoRow`\ncontainers WERE stamped (`kind` + `backfilled_at`) but match no app row — a sandbox name keeps\nonly 28 of 32 hex chars, so it is not invertible — and stay unowned rather than guessed at.\n`unowned` is that same population, RECOUNTED EVERY PASS, deliberately outside the sum: a\ncontainer `alreadyTagged` on pass 2 makes `skippedNoRow` read zero and `scanned` look clean —\nthe trap `unowned` alone still catches. Counts only; failures travel to the logs by name.",
         "properties": {
@@ -4378,13 +4577,26 @@
               }
             ],
             "title": "Snapshottakenat"
+          },
+          "startId": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startid"
           }
         },
         "required": [
           "appId",
           "previewUrl",
           "ready",
-          "snapshotTakenAt"
+          "snapshotTakenAt",
+          "startId"
         ],
         "title": "SharedPreviewResponse",
         "type": "object"
@@ -7299,6 +7511,80 @@
           }
         },
         "summary": "Harness Counters",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/admin/sandbox-starts": {
+      "get": {
+        "description": "How long sandbox starts take, per kind of start: how many there were, how they ended, how\nmany took a ready container and why the rest did not, and the median of each stage.\n\nTotals and medians only: a start row names who started which app and when, so no route\nreturns one. `days` bounds the window, which cannot reach past the rows' own retention.",
+        "operationId": "sandbox_starts_v1_admin_sandbox_starts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 7,
+              "title": "Days",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxStartsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Super-admin privileges required"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Sandbox Starts",
         "tags": [
           "admin"
         ]

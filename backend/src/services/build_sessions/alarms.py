@@ -293,3 +293,12 @@ incident. Read it beside `build_workspace_claimed`'s `reclaimed` field for the s
 refusal with no reclaim anywhere near it means an observer outlived its container without
 anything evicting it, and that is a bounded-wait bug in whichever `observer` the neighbouring
 `app_first_serve_not_observed` line names."""
+
+
+SANDBOX_START_NOT_RECORDED_EVENT: Final = "sandbox_start_not_recorded"
+"""A sandbox start's row could not be written or closed. WARNING.
+
+The start itself carries on: the row is timing, and timing never fails a start. What is lost is
+that start's place in the aggregate, so a run of these reads as a hole in the numbers.
+
+Fields: `step` (`open` | `close`), `start_id`."""

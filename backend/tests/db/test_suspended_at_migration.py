@@ -85,6 +85,7 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # and the review's class-definition fingerprint column. 0050_user_has_signed_in adds the
     # marker that tells a user created from the directory apart from one who has signed in.
     # 0051_name_untitled_chats is data only: it names every untitled chat after its first message.
+    # 0052_sandbox_starts adds the table that keeps one row of stage timings per sandbox start.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0051_name_untitled_chats"]
+    assert heads == ["0052_sandbox_starts"]

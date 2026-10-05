@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import uuid
 
+import sqlalchemy as sa
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.db.models.sandbox_start import SandboxStart, SandboxStartKind, SandboxStartOutcome
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.manager import shr_name_for
 from src.services.projects.shares import create_share
@@ -89,6 +91,31 @@ async def test_launch_happy_path_returns_200_ready_preview(
     assert shared_name in wire.sbx.restored
     # Never occupies the build slot, exactly like relaunch_preview.
     assert wire.manager._active_by_user == {}
+
+
+async def test_a_launch_writes_a_shared_view_start_and_answers_with_its_id(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """The colleague is who started it, the owner's app is what started, and the browser times
+    the view against the id this answers with."""
+    owner, project, app_id, recipient = await _shared_project(
+        db_session, fake_storage, owner_email="owner-st@example.com", recipient_email="r-st@x.com"
+    )
+
+    resp = await client.post(
+        f"/v1/build-sessions/projects/{project.id}/shared-launch",
+        headers=auth_headers(recipient),
+    )
+
+    assert resp.status_code == 200, resp.text
+    [row] = (await db_session.scalars(sa.select(SandboxStart))).all()
+    assert (row.kind, row.user_id, row.app_id) == (
+        SandboxStartKind.SHARED_VIEW,
+        recipient.id,
+        app_id,
+    )
+    assert row.outcome is SandboxStartOutcome.SERVED
+    assert resp.json()["startId"] == str(row.id)
 
 
 async def test_launch_with_nothing_saved_is_404(

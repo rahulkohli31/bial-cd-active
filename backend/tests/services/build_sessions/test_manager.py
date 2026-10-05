@@ -1125,7 +1125,7 @@ async def _relaunched(
     client: FakeSandboxClient,
 ) -> uuid.UUID:
     """One press, with everything it detached waited out."""
-    app_id = await manager.relaunch_preview(db, user, project_id, client)
+    app_id = (await manager.relaunch_preview(db, user, project_id, client)).app_id
     await detached_work_done(manager)
     return app_id
 
@@ -1173,7 +1173,7 @@ async def test_relaunch_answers_before_the_container_is_up(
         manager.relaunch_preview(db_session, user, project_id, client), timeout=5
     )
 
-    assert answered == app_id
+    assert answered.app_id == app_id
     await asyncio.wait_for(client.restoring.wait(), timeout=5)
     assert await read_starting_marker(fake_redis, user.id) == project_id  # the poll says starting
     assert await lock_is_held(fake_redis, user.id) is True  # the start still holds the slot
@@ -1201,7 +1201,7 @@ async def test_a_second_press_while_the_first_is_still_coming_up_joins_it(
         manager.relaunch_preview(db_session, user, project_id, client), timeout=5
     )
 
-    assert again == app_id
+    assert again.app_id == app_id
     client.gate.set()
     await detached_work_done(manager)
     assert client.restored == [app_name_for(app_id)]  # one start, not two
@@ -1425,7 +1425,7 @@ async def test_a_press_during_a_failed_starts_teardown_starts_afresh_instead_of_
         await asyncio.sleep(0)
     client.gate.set()
 
-    assert await asyncio.wait_for(again, timeout=5) == app_id
+    assert (await asyncio.wait_for(again, timeout=5)).app_id == app_id
     await detached_work_done(manager)
     name = app_name_for(app_id)
     assert client.restored == [name, name], "the second press joined the lost start"
@@ -1500,7 +1500,7 @@ async def test_a_relaunch_while_a_turn_is_still_letting_go_waits_like_a_message_
 
     gate.set()
     await finishing
-    assert await relaunching == app_id  # and then the start is admitted
+    assert (await relaunching).app_id == app_id  # and then the start is admitted
     await detached_work_done(manager)
 
 
