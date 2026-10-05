@@ -30,7 +30,7 @@
 #
 # INDEX digest, not a per-architecture child: the index resolves per host, so this one string
 # builds arm64 on a developer machine and amd64 in the registry.
-FROM python:3.14-alpine@sha256:9e9fde4d32eedce0b661d9ab91e826b62dddf28e928c230ec55f1866cac66b01
+FROM python:3.14-alpine@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72
 
 # RUNTIME git — not a build convenience. The control plane SHELLS OUT to git to restore an
 # app's snapshot (`services/storage/snapshot_read.py` runs `git clone` over the bundle), and
@@ -75,7 +75,9 @@ COPY pyproject.toml uv.lock ./
 #
 # Never pipe this RUN through tail/tee — a pipe returns the LAST command's status and would
 # swallow exactly the failure the flag exists to raise.
-RUN uv sync --locked --no-build --no-group dev --group api --group worker
+#
+# `--no-cache` keeps uv's download cache, a second copy of every package, out of the image.
+RUN uv sync --locked --no-build --no-cache --no-group dev --group api --group worker
 
 # Copy only the application package — narrows the image and avoids baking host
 # artifacts/secrets in (secrets are injected at runtime, never baked).

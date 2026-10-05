@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.10] - 2026-10-05
+
+The backend image takes the security updates BIAL's scan of 5 October asked for. Its critical
+findings are gone, and so are all but one of its high ones. The portal image is unchanged: Alpine
+has not yet released fixes for what the scan found in it.
+
+### Deploying this release
+
+- **Rebuild the backend image for dev and prod, then redeploy the backend and the worker.** The
+  worker runs the same image and moves only when it is pointed at the new build's digest; a new
+  tag alone leaves it on the old image. The portal needs no rebuild.
+- **No migration, no settings change and no sandbox change.**
+- **After the rebuild, ask BIAL to scan again.** Each backend image should go from 30 rows to about
+  6, none of them critical. What is left has no released fix yet: zlib and busybox (in the portal
+  images too), and two Python findings in code the backend does not reach. One Python finding this
+  release does fix may still be listed, because its public record has not caught up.
+
+### Security
+
+- **The JWT library and Azure's sign-in library move to their patched releases.** The JWT library
+  reaches the backend only through Azure's sign-in library, and the update clears its 10 findings,
+  the critical one included. How people sign in and how sessions work is unchanged.
+- **The backend image no longer carries uv's download cache.** It held a second copy of every
+  installed package, so the scan reported each package's findings twice.
+- **The backend's base image moves to the latest Python 3.14 and OpenSSL patch releases,** which
+  fixes four of its six Python findings.
+
 ## [1.8.9] - 2026-10-01
 
 An application's chats are one press away. The workspace shows the last chat under the message box,
