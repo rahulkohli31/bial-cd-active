@@ -100,6 +100,11 @@ the `BIAL_*` ones for a reader inside the app.
 (`backend/src/services/sandbox/client.py`), never in `build_app_env` — a base path added there
 would ship an `sbx-` value into a `pub-` published container.
 
+A pool member is created with `BIAL_POOL_MEMBER=1`, which no child sees, and without the six
+per-project names: `BIAL_APP_ID`, the two Blob values, the database URL and the two `BIAL_DICE_*`.
+`POST /_sup/configure` with `{"env": {...}}` delivers those six once; until it does,
+`/_sup/health` reports `"configured": false` and `/_sup/dev/start` answers 412.
+
 **The last four are conditional, and the condition is a security boundary.** The two `BIAL_DICE_*`
 values, the managed identity itself, and therefore Azure's `IDENTITY_*` pair are attached only
 when a lake is configured **and** the connector is switched on for this project **and** its

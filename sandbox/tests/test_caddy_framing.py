@@ -75,10 +75,10 @@ def test_sup_block_is_fenced_frame_ancestors_none(framed: Sandbox) -> None:
 
 
 def test_sup_health_is_open_and_ok(framed: Sandbox) -> None:
-    # GET /health is unauthenticated and returns {"ok": true} through the Caddy ingress.
+    # GET /health is unauthenticated and answers through the Caddy ingress.
     resp = framed.health()
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
+    assert resp.json() == {"ok": True, "configured": True}
 
 
 # --- the image builds + the entrypoint brings up caddy + uvicorn; no-token fails fast ------
@@ -86,7 +86,7 @@ def test_entrypoint_starts_caddy_and_supervisor(framed: Sandbox) -> None:
     # The `framed` fixture only yields after `wait_health` succeeded → both processes are up:
     # Caddy answered `/` (with the CSP header) and the supervisor answered `/_sup/health`.
     assert framed.raw_head("/").headers.get("content-security-policy")
-    assert framed.health().json() == {"ok": True}
+    assert framed.health().json() == {"ok": True, "configured": True}
 
 
 def test_missing_supervisor_token_fails_fast(sandbox_image: str) -> None:

@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import unquote, urlsplit
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
 # --- config (fail-fast: required settings have no defaults) --------------------------------
@@ -84,8 +84,9 @@ _ENV_ALLOW_NAMES = frozenset({"PATH", "HOME", "USER", "LOGNAME", "LANG", "TZ", "
 _ENV_ALLOW_PREFIXES = ("LC_", "NODE_", "NEXT_", "CHOKIDAR_", "WATCHPACK_", "npm_")
 
 
-# The SINGLE source of truth for the injected-env contract: (name, description, secret?). The two
-# views below (child-env allowlist, redaction set) are DERIVED from this table so they can't drift.
+# The SINGLE source of truth for the injected-env contract. The three views below (child-env
+# allowlist, redaction set, the names `/configure` accepts) are DERIVED from this table so they
+# can't drift.
 # `description` stays even though `/env/manifest` — its one reader — is gone (dead code:
 # nothing ever called it): the table remains the documented contract surface. Listed EXPLICITLY
 # (not via a suffix rule) because several end in `_URL`, which a denylist would wrongly drop; the
@@ -105,19 +106,33 @@ class InjectedEnvVar(NamedTuple):
     name: str
     description: str
     secret: bool  # True => the VALUE is a bearer credential, redacted from observable output.
+    # True => one project's own setting: a pool member receives it through `/configure` after its
+    # claim. Every other row is set when the container is created, and `/configure` refuses it.
+    per_project: bool = False
 
 
 _INJECTED_ENV: tuple[InjectedEnvVar, ...] = (
-    InjectedEnvVar("BIAL_APP_ID", "the app's id", False),
+    InjectedEnvVar("BIAL_APP_ID", "the app's id", False, per_project=True),
     InjectedEnvVar(
         "BIAL_PORTAL_ORIGIN", "the portal origin (preview framing / error relay)", False
     ),
-    InjectedEnvVar("BIAL_BLOB_CONTAINER_URL", "the app's per-app Blob container URL", False),
-    InjectedEnvVar("BIAL_BLOB_SAS", "the container-scoped SAS (secret — never printed)", True),
+    InjectedEnvVar(
+        "BIAL_BLOB_CONTAINER_URL",
+        "the app's per-app Blob container URL",
+        False,
+        per_project=True,
+    ),
+    InjectedEnvVar(
+        "BIAL_BLOB_SAS",
+        "the container-scoped SAS (secret — never printed)",
+        True,
+        per_project=True,
+    ),
     InjectedEnvVar(
         "BIAL_DATABASE_URL",
         "the app's own PostgreSQL connection string (secret, server-only — never printed)",
         True,
+        per_project=True,
     ),
     InjectedEnvVar(
         "BIAL_BASE_PATH",
@@ -145,11 +160,13 @@ _INJECTED_ENV: tuple[InjectedEnvVar, ...] = (
         "BIAL_DICE_URL",
         "the flight-data lake: account, container and folder in one URL (a label, not a secret)",
         False,
+        per_project=True,
     ),
     InjectedEnvVar(
         "BIAL_DICE_CLIENT_ID",
         "the managed identity's CLIENT id — what ManagedIdentityCredential must be given",
         False,
+        per_project=True,
     ),
     # --- Azure's own, injected the moment an identity is attached to this container app ---------
     InjectedEnvVar(
@@ -169,6 +186,8 @@ _INJECTED_ENV: tuple[InjectedEnvVar, ...] = (
 _INJECTED_KEYS = tuple(v.name for v in _INJECTED_ENV)
 # The names whose VALUES are secret bearer credentials — redacted from observable output.
 _SECRET_ENV_NAMES = tuple(v.name for v in _INJECTED_ENV if v.secret)
+# The only names `/configure` may write.
+_PER_PROJECT_ENV_NAMES = frozenset(v.name for v in _INJECTED_ENV if v.per_project)
 # A shorter value can't be a real SAS/credential; redacting it would blank ordinary text.
 _MIN_SECRET_LEN = 8
 
@@ -314,6 +333,51 @@ def _resolve(path: str) -> Path:
 def _auth(authorization: str = Header(default="")) -> None:
     if authorization != f"Bearer {TOKEN}":
         raise HTTPException(401, "bad or missing bearer token")
+
+
+# --- pool membership: a container whose project settings arrive after it is claimed ---------
+class _Configure:
+    """Whether this process has accepted its one `/configure`. Process state on purpose: a pool
+    member that Azure restarts boots from its creation env again, reports itself unconfigured,
+    and takes its settings anew."""
+
+    lock = threading.Lock()
+    accepted: bool = False
+
+
+def _configured() -> bool:
+    """False only for a pool member (`BIAL_POOL_MEMBER=1`) that has not accepted its settings.
+    Any other container was given them at creation. The flag is not in `_INJECTED_ENV`, so no
+    child ever sees it."""
+    return os.environ.get("BIAL_POOL_MEMBER") != "1" or _Configure.accepted
+
+
+_CONFIGURE_REFUSED = (
+    'configure takes {"env": {...}} naming only per-project settings, each a non-empty string'
+)
+
+
+def _configure_env(raw: bytes) -> dict[str, str] | None:
+    """The settings a `/configure` body delivers, or None when any part of it is unacceptable:
+    not exactly `{"env": {...}}`, an empty map, a name outside `_PER_PROJECT_ENV_NAMES`, or a
+    value that is not a non-empty string an environment can hold."""
+    try:
+        payload = json.loads(raw)
+    except (ValueError, RecursionError):  # a deeply nested body raises RecursionError
+        return None
+    if not isinstance(payload, dict) or payload.keys() != {"env"}:
+        return None
+    submitted = payload["env"]
+    if not isinstance(submitted, dict) or not submitted:
+        return None
+    env: dict[str, str] = {}
+    for name, value in submitted.items():
+        if name not in _PER_PROJECT_ENV_NAMES:
+            return None
+        if not isinstance(value, str) or not value or "\x00" in value:
+            return None
+        env[name] = value
+    return env
 
 
 # --- dev-server state ----------------------------------------------------------------------
@@ -1261,6 +1325,26 @@ class DevStartBody(BaseModel):
 # --- endpoints -----------------------------------------------------------------------------
 @app.get("/health")
 def health() -> dict[str, bool]:
+    return {"ok": True, "configured": _configured()}
+
+
+@app.post("/configure", dependencies=[Depends(_auth)])
+async def configure(request: Request) -> dict[str, bool]:
+    """Hand a claimed pool member its project's settings: once per process, all or nothing.
+
+    The body is read raw because FastAPI's own validation 422 echoes the submitted input, and this
+    input carries the database URL and the SAS. Every refusal is a fixed string; nothing
+    submitted, name or value, is ever echoed or logged."""
+    env = _configure_env(await request.body())
+    if env is None:
+        raise HTTPException(422, _CONFIGURE_REFUSED)
+    with _Configure.lock:
+        if _configured():
+            raise HTTPException(409, "already configured")
+        # The env is written before the flag flips, so a `/dev/start` that reads configured also
+        # sees every delivered value.
+        os.environ.update(env)
+        _Configure.accepted = True
     return {"ok": True}
 
 
@@ -1379,6 +1463,9 @@ def files(body: FilesBody) -> dict[str, Any]:
 
 @app.post("/dev/start", dependencies=[Depends(_auth)])
 def dev_start(body: DevStartBody) -> dict[str, Any]:
+    if not _configured():
+        # 412, not 409: the control plane reads a 409 from here as "already running".
+        raise HTTPException(412, "not configured yet")
     with _Dev.lock:
         if _Dev.proc and _Dev.proc.poll() is None:
             raise HTTPException(409, "dev server already running")
