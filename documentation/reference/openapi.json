@@ -12119,6 +12119,115 @@
         ]
       }
     },
+    "/v1/observations/start-visible": {
+      "post": {
+        "description": "Attach the browser's click-to-visible time to one of the caller's own sandbox starts.\n\nThe first report wins. A start that is someone else's, that does not exist, or that already\nhas its time is refused alike and nothing changes, so the refusal says nothing about whether\na start exists.",
+        "operationId": "record_start_visible_v1_observations_start_visible_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "How long the caller waited, in milliseconds, from the click that began one of their own\nsandbox starts to its app showing in their browser. `startId` is the id the server handed back\nfor that start; the duration is a whole number above zero and within the route's ceiling.",
+                "properties": {
+                  "durationMs": {
+                    "title": "Durationms",
+                    "type": "integer"
+                  },
+                  "startId": {
+                    "format": "uuid",
+                    "title": "Startid",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "startId",
+                  "durationMs"
+                ],
+                "title": "StartVisibleRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A start id that is not a UUID, or a duration outside its bound"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "CSRF check failed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No start of the caller's is waiting for a time under this id"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many observations"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DetailBody"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Record Start Visible",
+        "tags": [
+          "observations"
+        ]
+      }
+    },
     "/v1/projects": {
       "get": {
         "description": "One NUMBERED page of the caller's projects, newest-first, optionally filtered by a\ncase-insensitive name/description substring and by one summary tile.\n\n`filter` is the tile a citizen clicked, and it selects exactly the set that tile counted —\n`_tile_predicate` is the single definition both read. Absent means everything, which is what\nthe \"Total applications\" tile is.\n\n`total` is read separately from the page, so a create landing between the two reads can\nmake the count and the rows disagree for one render; say something true when they do\nrather than asserting either number. A page past the end is an empty `items` with the\nreal `total`, not a 404.",

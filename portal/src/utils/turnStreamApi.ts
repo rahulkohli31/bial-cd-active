@@ -180,6 +180,9 @@ export interface WorkspaceFrame {
    *  it and belongs in the banner slot rather than in the build bubble. Sharing one field made
    *  every ordinary turn post "Getting your workspace ready…" above the composer. */
   notice?: string | null
+  /** On `ready`: the start this turn began, which the browser's clock reports against; `null` when
+   *  the turn attached to a workspace already running. */
+  startId?: string | null
 }
 
 /** The live preview. A NEW url remounts the iframe; `reconnecting` says the dev process died
@@ -472,6 +475,7 @@ function toTurnFrame(parsed: unknown): TurnFrame | null {
         state,
         message: typeof parsed.message === 'string' ? parsed.message : null,
         notice: typeof parsed.notice === 'string' ? parsed.notice : null,
+        startId: typeof parsed.startId === 'string' ? parsed.startId : null,
       }
     }
     case 'preview': {

@@ -76,3 +76,16 @@ describe('the browser sends only names the beacon route accepts', () => {
     }
   })
 })
+
+describe('the browser reports a start`s wait where, and as, the route reads it', () => {
+  it('★ posts to the route the router declares, under the keys it reads', () => {
+    // The body's own keys are pinned by `observe.test.ts`; this pins the other side of the wire,
+    // where a rename would refuse every report in silence.
+    const observeTs = readFileSync(path.resolve(process.cwd(), 'src', 'utils', 'observe.ts'), 'utf8')
+    expect(observeTs).toContain(`'/api/observations/start-visible'`)
+    expect(ROUTER_PY).toMatch(/APIRouter\(prefix="\/observations"/)
+    expect(ROUTER_PY).toMatch(/@router\.post\(\s*"\/start-visible"/)
+    expect(ROUTER_PY).toContain('body.get("startId")')
+    expect(ROUTER_PY).toContain('body.get("durationMs")')
+  })
+})

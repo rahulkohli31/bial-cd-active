@@ -31,7 +31,7 @@ import TurnBanner from './TurnBanner'
 import { createConversation, discardNoticeText, listProjectConversations } from '../../utils/conversationApi'
 import type { ConversationHeader } from '../../utils/conversationApi'
 import type { Project } from '../../utils/projectApi'
-import { markAppVisible } from '../../utils/observe'
+import { markAppVisible, markStartClicked, markStartVisible } from '../../utils/observe'
 import { isConversationGone } from '../../utils/chatErrors'
 
 import { resolvePreviewAddress } from '../../utils/previewAddress'
@@ -1039,8 +1039,14 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
    * mid-turn RE-ATTACH on reload. A frame must not be interpreted two different ways depending
    * on which consumer happened to open the socket; `sink` carries the mutable accumulators
    * (the turn's ordered `parts`, the reasoning flag, the terminal status) back out to the caller.
+   * `began` hears the start a sent turn began; a re-attach has no click to time and passes none.
    */
-  const turnFrameHandler = useCallback((activeId: string, assistantId: string, sink: TurnSink) => {
+  const turnFrameHandler = useCallback((
+    activeId: string,
+    assistantId: string,
+    sink: TurnSink,
+    began?: (startId: string | null) => void,
+  ) => {
     // A NEW OBJECT FOR THE CHANGED MESSAGE, IDENTITY PRESERVED FOR EVERY OTHER — the runtime
     // caches the conversion on object identity, so an in-place mutation is invisible and the
     // transcript simply never re-renders (convertMessage trap 4). `.map` gives exactly that.
@@ -1147,6 +1153,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         paint()
       } else if (frame.type === 'workspace') {
         setTurnWorkspace({ state: frame.state, message: frame.message ?? null })
+        if (frame.state === 'ready') began?.(frame.startId ?? null)
         // `notice`, never `message`. The ordinary lifecycle pair carries a `message`
         // ("Getting your workspace ready…") on EVERY turn, and routing that here would post the
         // phase narration above the composer every time anyone sent anything. A notice is a
@@ -1320,6 +1327,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   ) => {
     const text = rawText.trim() || (attachments.length ? 'Please review the attached file(s).' : '')
     if (!text) return
+    const began = projectId ? markStartClicked(projectId) : undefined
 
     const stillHere = () => isAlive() && buildIdRef.current === activeId
     // READ BEFORE THE AWAITS BELOW, not after: `seqRef` is what tells a first message from a
@@ -1447,7 +1455,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
       streamAbortRef.current?.abort()
       const controller = new AbortController()
       streamAbortRef.current = controller
-      const onFrame = turnFrameHandler(activeId, assistantId, sink)
+      const onFrame = turnFrameHandler(activeId, assistantId, sink, began)
       outcome = await readTurnStream({ conversationId: activeId, signal: controller.signal, onFrame })
       if (outcome === 'truncated' && !sink.terminal && !controller.signal.aborted) {
         // A dropped socket before the terminal: one resubscribe consolidates the turn so far
@@ -2031,6 +2039,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
   // or a deep link straight into a chat, which never opened the project page that starts it.
   const handlePreviewRevealed = useCallback(() => {
     markAppVisible(projectId ?? null)
+    markStartVisible(projectId ?? null)
   }, [projectId])
   /* `completedLive` IS GONE FROM THIS SURFACE. It answered two questions with one boolean —
      "the container is up" and "a build finished successfully" — so the pane could not keep an

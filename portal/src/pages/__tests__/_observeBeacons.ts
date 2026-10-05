@@ -24,3 +24,11 @@ export function beaconsFrom(mocked: Mock<typeof authFetch>): unknown[] {
     .filter(([url]) => url === '/api/observations')
     .map(([, opts]) => JSON.parse(String(opts?.body)))
 }
+
+/** The start waits posted through a mocked `authFetch`, in order — `beaconsFrom`'s twin for the
+ *  start-visible route. */
+export function startWaitsFrom(mocked: Mock<typeof authFetch>): unknown[] {
+  return mocked.mock.calls
+    .filter(([url]) => url === '/api/observations/start-visible')
+    .map(([, opts]) => JSON.parse(String(opts?.body)))
+}

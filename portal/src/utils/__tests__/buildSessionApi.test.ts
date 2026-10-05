@@ -62,13 +62,19 @@ describe('buildSessionApi — control operations', () => {
     expect(active.message).toBe('You already have a build running.')
   })
 
-  it('relaunchPreview: a 202 resolves with nothing to read — the poll reports the start', async () => {
+  it('relaunchPreview: a 202 resolves with the start it began, and with no address — the poll reports the start', async () => {
     // The answer means ADMITTED, not up: whether the app is serving, and where, is the
     // preview-state poll's to say. A client that read an address off this answer would be a
-    // second reader of one fact, and the two disagreed about the same container before.
-    const fetchImpl = jsonFetch(202, { appId: 'a1' })
+    // second reader of one fact, and the two disagreed about the same container before. The start
+    // id is the one read: the browser's clock reports against it.
+    const began = jsonFetch(202, { appId: 'a1', status: 'provisioning', startId: 's-1' })
+    await expect(relaunchPreview({ projectId: 'p1' }, { fetchImpl: began })).resolves.toBe('s-1')
 
-    await expect(relaunchPreview({ projectId: 'p1' }, { fetchImpl })).resolves.toBeUndefined()
+    const attached = jsonFetch(202, { appId: 'a1', status: 'provisioning', startId: null })
+    await expect(relaunchPreview({ projectId: 'p1' }, { fetchImpl: attached })).resolves.toBeNull()
+
+    const fetchImpl = jsonFetch(202, { appId: 'a1' })
+    await expect(relaunchPreview({ projectId: 'p1' }, { fetchImpl })).resolves.toBeNull()
 
     expect(headerOf(fetchImpl, 'X-CSRF-Token')).toBe(CSRF)
     expect(JSON.parse(optsOf(fetchImpl).body as string)).toEqual({ projectId: 'p1' })
@@ -88,6 +94,18 @@ describe('buildSessionApi — control operations', () => {
     expect(err).toBeInstanceOf(ApiError)
     expect((err as ApiError).status).toBe(404)
     expect((err as ApiError).code).toBe('no_saved_build')
+  })
+})
+
+describe('buildSessionApi — the shared view names the start it began', () => {
+  it('reads the start id off a launch and a refresh, and its absence as no start', async () => {
+    const view = { appId: 'a1', previewUrl: 'https://apps.example/a/shr-1/', ready: true, snapshotTakenAt: null }
+    const launched = await launchSharedPreview('p1', { fetchImpl: jsonFetch(200, { ...view, startId: 's-1' }) })
+    expect(launched.startId).toBe('s-1')
+    const refreshed = await refreshSharedPreview('p1', { fetchImpl: jsonFetch(200, { ...view, startId: 's-2' }) })
+    expect(refreshed.startId).toBe('s-2')
+    const attached = await launchSharedPreview('p1', { fetchImpl: jsonFetch(200, { ...view, startId: null }) })
+    expect(attached.startId).toBeNull()
   })
 })
 

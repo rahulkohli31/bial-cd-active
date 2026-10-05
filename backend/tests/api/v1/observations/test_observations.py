@@ -1,8 +1,9 @@
-"""POST /v1/observations — the browser's one narrow write path.
+"""POST /v1/observations and /v1/observations/start-visible — the browser's narrow write paths.
 
 WHAT THESE PIN, and it is a short list on purpose: the only counter names this route can ever
-produce are the three it allows, and a malformed or hostile call writes NOTHING and returns a
-refusal rather than a silent success.
+produce are the three it allows, a start's time lands only on the caller's own start and only
+once, and a malformed or hostile call writes NOTHING and returns a refusal rather than a silent
+success.
 
 The rows escape the test transaction: `count(...)` owns its own session and COMMITS, exactly so a
 count survives a rolled-back transaction (`tests/services/build_sessions/test_counters.py` pins
@@ -12,18 +13,23 @@ cannot reach these rows.
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime
+
 import pytest
 import sqlalchemy as sa
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.observations.router import MAX_OBSERVED_MS, OBSERVATION_RATE_LIMIT
 from src.config import settings
 from src.db.base import async_session_factory
 from src.db.models.harness_counter import HarnessCount, HarnessCounter
+from src.db.models.sandbox_start import SandboxProjectType, SandboxStart, SandboxStartKind
 from src.db.models.user import User
 from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.session_jwt import mint_session_jwt
-from tests.factories import UserFactory
+from tests.factories import AppRegistryFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
 
@@ -386,3 +392,226 @@ def test_observations_openapi_documents_its_refusals() -> None:
     assert "201" in op["responses"]
     props = op["requestBody"]["content"]["application/json"]["schema"]["properties"]
     assert "name" in props and "value" in props
+
+
+# --- a start's click-to-visible time ---------------------------------------------------------
+
+_START_VISIBLE = "/v1/observations/start-visible"
+
+
+async def _a_start(db: AsyncSession, owner: User) -> uuid.UUID:
+    """One of `owner`'s starts, its browser time not yet reported."""
+    app = await AppRegistryFactory.create(db, user_id=owner.id)
+    start = SandboxStart(
+        user_id=owner.id,
+        app_id=app.id,
+        kind=SandboxStartKind.REOPEN,
+        project_type=SandboxProjectType.PLAIN,
+        started_at=datetime.now(UTC),
+    )
+    db.add(start)
+    await db.flush()
+    return start.id
+
+
+async def _browser_ms(db: AsyncSession, start_id: uuid.UUID) -> int | None:
+    return await db.scalar(
+        sa.select(SandboxStart.browser_visible_ms).where(SandboxStart.id == start_id)
+    )
+
+
+async def test_a_start_gains_the_time_the_browser_measured(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    owner = await UserFactory.create(db_session, email="start-ok@rvaiglobal.com")
+    start_id = await _a_start(db_session, owner)
+
+    resp = await client.post(
+        _START_VISIBLE,
+        json={"startId": str(start_id), "durationMs": 41_250},
+        headers=_headers(owner),
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    assert await _browser_ms(db_session, start_id) == 41_250
+
+
+async def test_a_second_report_for_a_start_changes_nothing(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A reload, a second tab or a replayed request must not move a time already on the row.
+
+    Mutation check: drop the `browser_visible_ms IS NULL` predicate and this goes red."""
+    owner = await UserFactory.create(db_session, email="start-twice@rvaiglobal.com")
+    start_id = await _a_start(db_session, owner)
+    first = await client.post(
+        _START_VISIBLE,
+        json={"startId": str(start_id), "durationMs": 41_250},
+        headers=_headers(owner),
+    )
+    assert first.status_code == 200
+
+    again = await client.post(
+        _START_VISIBLE,
+        json={"startId": str(start_id), "durationMs": 9_000},
+        headers=_headers(owner),
+    )
+
+    assert again.status_code == 404
+    assert again.json()["error"]["code"] == "unknown_start"
+    assert await _browser_ms(db_session, start_id) == 41_250
+
+
+async def test_another_persons_start_is_refused_and_left_untouched(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The caller's id in the update is the only thing between a signed-in person and every
+    other person's start rows.
+
+    Mutation check: drop the `user_id` predicate and this goes red."""
+    owner = await UserFactory.create(db_session, email="start-owner@rvaiglobal.com")
+    stranger = await UserFactory.create(db_session, email="start-stranger@rvaiglobal.com")
+    start_id = await _a_start(db_session, owner)
+
+    resp = await client.post(
+        _START_VISIBLE,
+        json={"startId": str(start_id), "durationMs": 1_000},
+        headers=_headers(stranger),
+    )
+
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "unknown_start"
+    assert await _browser_ms(db_session, start_id) is None
+    # The refusal spent nothing: the owner's own report still lands.
+    mine = await client.post(
+        _START_VISIBLE,
+        json={"startId": str(start_id), "durationMs": 52_000},
+        headers=_headers(owner),
+    )
+    assert mine.status_code == 200
+    assert await _browser_ms(db_session, start_id) == 52_000
+
+
+async def test_an_unknown_start_is_refused_exactly_as_another_persons_is(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # Identical refusals, or the route would say which start ids exist.
+    owner = await UserFactory.create(db_session, email="start-known@rvaiglobal.com")
+    stranger = await UserFactory.create(db_session, email="start-prober@rvaiglobal.com")
+    someone_elses = await _a_start(db_session, owner)
+
+    theirs = await client.post(
+        _START_VISIBLE,
+        json={"startId": str(someone_elses), "durationMs": 1_000},
+        headers=_headers(stranger),
+    )
+    nobodys = await client.post(
+        _START_VISIBLE,
+        json={"startId": str(uuid.uuid7()), "durationMs": 1_000},
+        headers=_headers(stranger),
+    )
+
+    assert theirs.status_code == nobodys.status_code == 404
+    assert theirs.json() == nobodys.json()
+
+
+async def test_the_ceiling_is_five_minutes_and_belongs_to_the_honest_side(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    owner = await UserFactory.create(db_session, email="start-edge@rvaiglobal.com")
+    start_id = await _a_start(db_session, owner)
+
+    resp = await client.post(
+        _START_VISIBLE,
+        json={"startId": str(start_id), "durationMs": 300_000},
+        headers=_headers(owner),
+    )
+
+    assert resp.status_code == 200
+    assert await _browser_ms(db_session, start_id) == 300_000
+
+
+@pytest.mark.parametrize(
+    ("duration", "code"),
+    [
+        (300_001, "value_out_of_range"),
+        (0, "value_out_of_range"),
+        (-1, "value_out_of_range"),
+        (None, "invalid_value"),
+        ("1200", "invalid_value"),
+        (12.5, "invalid_value"),
+        (True, "invalid_value"),
+        ([1], "invalid_value"),
+    ],
+    ids=["above-ceiling", "zero", "negative", "missing", "string", "float", "bool", "list"],
+)
+async def test_a_duration_that_is_not_a_whole_number_within_its_bound_is_refused(
+    client: AsyncClient, db_session: AsyncSession, duration: object, code: str
+) -> None:
+    owner = await UserFactory.create(db_session, email="start-bad@rvaiglobal.com")
+    start_id = await _a_start(db_session, owner)
+    body: dict[str, object] = {"startId": str(start_id)}
+    if duration is not None:
+        body["durationMs"] = duration
+
+    resp = await client.post(_START_VISIBLE, json=body, headers=_headers(owner))
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == code
+    assert await _browser_ms(db_session, start_id) is None
+
+
+@pytest.mark.parametrize(
+    "start_id", [None, "not-a-start", 42], ids=["missing", "not-a-uuid", "number"]
+)
+async def test_a_start_id_that_is_not_a_uuid_is_refused(
+    client: AsyncClient, db_session: AsyncSession, start_id: object
+) -> None:
+    owner = await UserFactory.create(db_session, email="start-noid@rvaiglobal.com")
+    body: dict[str, object] = {"durationMs": 1_000}
+    if start_id is not None:
+        body["startId"] = start_id
+
+    resp = await client.post(_START_VISIBLE, json=body, headers=_headers(owner))
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_body"
+
+
+async def test_an_unauthenticated_start_time_writes_nothing(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    owner = await UserFactory.create(db_session, email="start-anon@rvaiglobal.com")
+    start_id = await _a_start(db_session, owner)
+
+    resp = await client.post(_START_VISIBLE, json={"startId": str(start_id), "durationMs": 1_000})
+
+    assert resp.status_code == 401
+    assert await _browser_ms(db_session, start_id) is None
+
+
+async def test_a_start_time_without_the_csrf_header_writes_nothing(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    owner = await UserFactory.create(db_session, email="start-csrf@rvaiglobal.com")
+    start_id = await _a_start(db_session, owner)
+
+    resp = await client.post(
+        _START_VISIBLE,
+        json={"startId": str(start_id), "durationMs": 1_000},
+        headers=_headers(owner, with_csrf=False),
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "csrf_failed"
+    assert await _browser_ms(db_session, start_id) is None
+
+
+def test_start_visible_openapi_documents_its_refusals() -> None:
+    from src.main import create_app
+
+    op = create_app().openapi()["paths"][_START_VISIBLE]["post"]
+    assert {"200", "400", "401", "403", "404", "429"} <= set(op["responses"])
+    props = op["requestBody"]["content"]["application/json"]["schema"]["properties"]
+    assert "startId" in props and "durationMs" in props
