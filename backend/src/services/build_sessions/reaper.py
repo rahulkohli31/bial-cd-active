@@ -81,6 +81,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_SHARED_SERVED_COUNT,
     REGISTRY_FIELD_STATE,
+    user_id_from_key,
 )
 from src.services.sandbox import DevStatus, SandboxClient, SandboxError, SandboxHandle
 from src.services.sandbox.base import (
@@ -140,13 +141,6 @@ async def _scan_the_registry_namespace(redis: aioredis.Redis) -> AsyncIterator[s
             yield str(raw_key)
 
 
-def _user_from_registry_key(key: str) -> uuid.UUID | None:
-    try:
-        return uuid.UUID(key.rsplit(":", 1)[-1])
-    except ValueError:
-        return None
-
-
 def handle_named(app_name: str, *, fqdn: str = "") -> SandboxHandle:
     """The minimal teardown handle — ACA delete is keyed by `app_name` alone; `fqdn` is carried
     when known, left empty otherwise, and read by nothing on the teardown path.
@@ -173,7 +167,7 @@ def _minimal_handle(reg: dict[str, str]) -> SandboxHandle:
 
 def is_a_sandbox_name(app_name: str) -> bool:
     """Could this string be a container THIS platform minted? (`a_fresh_sandbox_name`, and
-    `manager.app_name_for` for a container still running under a name derived from its app.)
+    `app_name_for` for a container still running under a name derived from its app.)
 
     THE LAST CHECK BEFORE AN ARM DELETE. The reap path rebuilds its teardown target from a
     registry record that can be corrupted or missing — `reg.get(APP_NAME, "")` turns a missing
@@ -188,17 +182,20 @@ def is_a_sandbox_name(app_name: str) -> bool:
 
 
 def is_a_shared_sandbox_name(app_name: str) -> bool:
-    """The `shr-` sibling of `is_a_sandbox_name` (#198) — same fail-closed shape check, same
-    reason: a name this platform will hand to an ARM delete has to be provably one it minted
-    (`manager.shr_name_for`), not assumed from a prefix alone.
-
-    Only a shared view still running under the name `shr_name_for` gave it has this shape; a new
-    view is `sbx-`. Wired into `reap_user`'s gate and the owed-teardown routine's beside its
-    `sbx-` sibling, so such a view is still torn down."""
+    """The `shr-` sibling of `is_a_sandbox_name` — same fail-closed shape check, same reason: a
+    name this platform will hand to an ARM delete has to be provably one it minted
+    (`shr_name_for`), not assumed from a prefix alone. Only a shared view still running under the
+    name `shr_name_for` gave it has this shape; a new view is `sbx-`."""
     if not app_name.startswith(SHARED_SANDBOX_NAME_PREFIX):
         return False
     slug = app_name[len(SHARED_SANDBOX_NAME_PREFIX) :]
     return len(slug) == _NAME_SLUG_LENGTH and all(c in _HEX_LOWER for c in slug)
+
+
+def is_a_platform_sandbox_name(app_name: str) -> bool:
+    """A name this platform may hand to an ARM delete: a build sandbox's or a shared view's. The
+    gate every path that deletes a container by a recorded name passes."""
+    return is_a_sandbox_name(app_name) or is_a_shared_sandbox_name(app_name)
 
 
 async def _reach_the_container(
@@ -683,7 +680,7 @@ async def reap_user(
     # to tear down. Recognizing only `sbx-` here was the orphaning bug the shared runtime would
     # otherwise reproduce on every Revoke: the record would be deleted (below) while a `shr-`
     # container it could not vouch for kept running and billing, forever anonymous.
-    if not (is_a_sandbox_name(registered_name) or is_a_shared_sandbox_name(registered_name)):
+    if not is_a_platform_sandbox_name(registered_name):
         # FAIL CLOSED ON A NAME WE CANNOT VOUCH FOR. Everything below hands this string to an ARM
         # delete, and the record it came from is the least trustworthy input here. Refusing but
         # KEEPING the record would re-refuse every five minutes forever, so the record goes and
@@ -1055,7 +1052,7 @@ async def sweep_all(
     # honest anyway.
     seen: set[uuid.UUID] = set()
     async for raw_key in _scan_the_registry_namespace(redis):
-        user_uuid = _user_from_registry_key(str(raw_key))
+        user_uuid = user_id_from_key(str(raw_key))
         if user_uuid is None or user_uuid in live or user_uuid in seen:
             continue
         seen.add(user_uuid)

@@ -24,8 +24,6 @@ from src.services.redis.keys import (
     REGISTRY_FIELDS,
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
-    birth_marker_key,
-    birth_marker_scan_pattern,
     heartbeat_key,
     key_prefix,
     lake_file_key,
@@ -37,6 +35,7 @@ from src.services.redis.keys import (
     ns,
     registry_key,
     registry_scan_patterns,
+    user_id_from_key,
 )
 
 # Two DISTINCT fixed UUIDs so format + disjointness assertions are deterministic.
@@ -64,10 +63,6 @@ def test_registry_key_format_is_byte_stable() -> None:
 
 def test_lease_key_format_is_byte_stable() -> None:
     assert lease_key(_U1) == f"bial:{_ENV}:sandbox:lease:{_U1}"
-
-
-def test_birth_marker_key_format_is_byte_stable() -> None:
-    assert birth_marker_key(_U1) == f"bial:{_ENV}:sandbox:birth:{_U1}"
 
 
 def test_key_prefix_is_the_environment_scoped_root() -> None:
@@ -194,8 +189,20 @@ def test_the_scan_patterns_are_literals_and_never_wildcard_the_environment() -> 
         assert "*" not in head, f"{pattern} wildcards a segment above the user id"
 
 
-def test_the_birth_marker_scan_pattern_is_this_environments_literal() -> None:
-    assert birth_marker_scan_pattern() == f"bial:{_ENV}:sandbox:birth:*"
+@pytest.mark.parametrize(
+    "key",
+    [
+        f"bial:{_ENV}:sandbox:registry:{_U1}",
+        f"bial:sandbox:registry:{_U1}",
+    ],
+)
+def test_a_scanned_key_gives_back_the_user_it_was_built_for(key: str) -> None:
+    assert user_id_from_key(key) == _U1
+
+
+@pytest.mark.parametrize("key", ["bial:sandbox:registry:not-a-uuid", "bial:sandbox:registry:"])
+def test_a_key_this_platform_did_not_write_names_nobody(key: str) -> None:
+    assert user_id_from_key(key) is None
 
 
 # --- the type IS the boundary --------------------------------------------------------------

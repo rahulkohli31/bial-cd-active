@@ -30,7 +30,6 @@ from src.api.v1.build_sessions.schemas import (
 from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
 from src.db.models.harness_counter import HarnessCount, HarnessCounter
-from src.db.models.pending_teardown import PendingTeardownKind
 from src.db.models.sandbox_start import SandboxStart
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
@@ -630,9 +629,7 @@ async def test_a_registry_marked_ending_is_never_attached_to(
     held, replacement = aca_wire.aca.create_calls
     assert replacement != held
     assert aca_wire.aca.delete_calls == [], "the start waited on an ARM delete"
-    assert [(owed.app_name, owed.kind, owed.write_back) for owed in handed_over] == [
-        (held, PendingTeardownKind.BUILD, False)
-    ]
+    assert [(owed.app_name, owed.write_back) for owed in handed_over] == [(held, False)]
     reg = await fake_redis.hgetall(registry_key(user.id))
     assert reg[REGISTRY_FIELD_APP_NAME] == replacement
 
@@ -674,39 +671,42 @@ async def test_a_container_from_the_pool_is_the_persons_one_workspace(
 
     assert (await _relaunch(client, user, project_b, aca_wire.manager)).status_code == 202
 
-    assert [(owed.app_name, owed.kind, owed.write_back) for owed in handed_over] == [
-        (member, PendingTeardownKind.BUILD, True)
-    ]
+    assert [(owed.app_name, owed.write_back) for owed in handed_over] == [(member, True)]
     assert aca_wire.aca.delete_calls == []
     assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_APP_NAME) == replacement
     await asyncio.gather(*aca_wire.sandbox._detached)
 
 
-async def test_a_restarted_pool_container_is_given_its_settings_again_and_starts(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+async def test_a_restarted_pool_container_is_given_up_and_its_project_restored_again(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    handed_over: list[OwedTeardown],
 ) -> None:
-    """Azure restarting a claimed pool container brings it back from its creation environment,
-    which held no project settings, and it refuses to start the app. The attach hands them back,
-    built as the start that would have created it builds them, and the app starts.
+    """★ Azure restarting a claimed pool container brings it back with no project settings and
+    none of its files, so starting the app in it would show the bare template. The start treats
+    it as gone: the saved copy goes into a new container, the restarted one is never configured
+    or started, and it is owed its delete with nothing written back.
 
-    Mutation check: drop the hand-back from the relaunch's attach arm and the second start is
-    refused."""
+    Mutation check: attach to it whatever it reports and no second restore happens."""
     sandbox = wire.sbx
-    user, project = await _user_project(db_session, "rl-reconfig@rvaiglobal.com")
-    app_id = await _seed_snapshot(db_session, user, project, fake_storage)
+    user, project = await _user_project(db_session, "rl-restarted@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
     assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
-    [name] = sandbox.restored
-    sandbox.attach_handle = sandbox.by_name[name]
-    sandbox.unconfigured.add(name)
+    [restarted] = sandbox.restored
+    sandbox.attach_handle = sandbox.by_name[restarted]
+    sandbox.unconfigured.add(restarted)
 
     assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
 
-    [(configured, env)] = sandbox.configured_with
-    assert configured == name
-    assert env["BIAL_APP_ID"] == str(app_id)
-    assert sandbox.restore_env is not None
-    assert set(env) == set(sandbox.restore_env)
-    assert sandbox.started == [name, name]
+    assert sandbox.restored[0] == restarted
+    [reborn] = sandbox.restored[1:]
+    assert sandbox.configured_with == []
+    assert sandbox.started == [restarted, reborn]
+    assert [(owed.app_name, owed.write_back) for owed in handed_over] == [(restarted, False)]
+    assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_APP_NAME) == reborn
 
 
 async def test_no_registry_at_all_still_takes_the_restore_arm(

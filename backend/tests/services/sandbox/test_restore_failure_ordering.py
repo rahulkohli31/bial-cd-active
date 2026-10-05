@@ -17,21 +17,27 @@ from typing import Any
 
 import pytest
 import redis.asyncio as aioredis
+import sqlalchemy as sa
 from pydantic import SecretStr
 from redis.exceptions import RedisError
+from structlog.testing import capture_logs
 
-from src.services.build_sessions.locks import note_a_birth, read_birth_marker
-from src.services.redis.keys import REGISTRY_FIELD_APP_ID, REGISTRY_FIELD_APP_NAME
+import src.db.base as db_base
+from src.db.models.sandbox_pool import SandboxPoolMember, SandboxPoolState
 from src.services.sandbox import client as client_module
+from src.services.sandbox import pool
 from src.services.sandbox.aca import AcaError
 from src.services.sandbox.base import SandboxError
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
+from tests.fakes import a_sandbox_name
 
 _USER = uuid.uuid4()
 _APP_ID = uuid.uuid4()
-_NEW_APP = "sbx-new"
-_OLD_APP = "sbx-old"
+_NEW_APP = a_sandbox_name("new")
+_OLD_APP = a_sandbox_name("old")
+
+pytestmark = pytest.mark.usefixtures("empty_sandbox_pool")
 
 
 def _config() -> SandboxConfig:
@@ -86,8 +92,8 @@ class _Storage:
 
 @pytest.fixture
 def wired(monkeypatch: pytest.MonkeyPatch, fake_redis: aioredis.Redis) -> Any:
-    """A client whose registry and object store are recorded rather than real. The birth marker
-    is written to the fake Redis."""
+    """A client whose registry and object store are recorded rather than real. The pool's ledger
+    is the test database's."""
 
     def _make(
         *,
@@ -142,6 +148,12 @@ def wired(monkeypatch: pytest.MonkeyPatch, fake_redis: aioredis.Redis) -> Any:
 
 def _env() -> dict[str, str]:
     return {"BIAL_APP_ID": str(_APP_ID)}
+
+
+async def _ledger() -> dict[str, SandboxPoolState]:
+    async with db_base.async_session_factory() as db:
+        rows = await db.execute(sa.select(SandboxPoolMember.name, SandboxPoolMember.state))
+    return {name: state for name, state in rows}
 
 
 # ------------------------------------------------------------------ the failure path
@@ -224,36 +236,71 @@ async def test_a_fresh_provision_refuses_the_same_way(wired: Any) -> None:
     assert calls["write_registry"] == []
 
 
-async def test_an_empty_slot_is_provisioned_into(wired: Any, fake_redis: aioredis.Redis) -> None:
-    """Mutation check: keep the birth marker once the record is written and it outlives a birth
-    that needs nothing found."""
+async def test_an_empty_slot_is_provisioned_into(
+    wired: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The create is on the pool's ledger until its record is written, and off it after.
+
+    Mutation check: keep the row once the record is written and it outlives a create that needs
+    nothing found."""
     client, aca, calls = wired(delete_fails=False, restore_fails=False, existing_app=None)
+    on_the_ledger_as_azure_was_asked: list[dict[str, SandboxPoolState]] = []
+    create_app = aca.create_app
+
+    async def create_app_seeing_the_ledger(**kwargs: Any) -> str:
+        on_the_ledger_as_azure_was_asked.append(await _ledger())
+        return await create_app(**kwargs)
+
+    monkeypatch.setattr(aca, "create_app", create_app_seeing_the_ledger)
 
     handle = await client.restore_from_snapshot(
         str(_USER), _NEW_APP, app_env=_env(), source_key="snap/key"
     )
 
+    assert on_the_ledger_as_azure_was_asked == [{_NEW_APP: SandboxPoolState.CLAIMED}]
     assert aca.deleted == []
     assert aca.created == [_NEW_APP]
     assert calls["write_registry"] == [_NEW_APP]
     assert handle.app_name == _NEW_APP
-    assert await read_birth_marker(fake_redis, _USER) is None
+    assert await _ledger() == {}
 
 
-# ------------------------------------------------------------------ the birth marker
+async def test_a_ledger_that_does_not_answer_costs_the_create_nothing(
+    wired: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, aca, calls = wired(delete_fails=False, restore_fails=False, existing_app=None)
+
+    async def unreachable(name: str, image_ref: str) -> uuid.UUID:
+        raise OSError("the database went away")
+
+    monkeypatch.setattr(pool, "hold_a_create", unreachable)
+
+    with capture_logs() as logged:
+        handle = await client.restore_from_snapshot(
+            str(_USER), _NEW_APP, app_env=_env(), source_key="snap/key"
+        )
+
+    assert handle.app_name == _NEW_APP
+    assert (aca.created, calls["write_registry"]) == ([_NEW_APP], [_NEW_APP])
+    assert [
+        e["app_name"] for e in logged if e["event"] == "sandbox_create_not_held_on_the_ledger"
+    ] == [_NEW_APP]
+
+
+# ------------------------------------------------------------------ a create left standing
 
 
 @pytest.mark.parametrize("failing_step", ["create", "registry-write"])
 @pytest.mark.parametrize("self_clean_refused", [True, False], ids=["refused", "confirmed"])
-async def test_a_failed_birth_keeps_its_marker_only_while_its_container_may_stand(
-    wired: Any, fake_redis: aioredis.Redis, failing_step: str, self_clean_refused: bool
+async def test_a_failed_create_keeps_its_ledger_row_only_while_its_container_may_stand(
+    wired: Any, failing_step: str, self_clean_refused: bool
 ) -> None:
     """★ A container whose self-clean was refused carries a name nothing will create again, so
-    its birth marker is the only thing left that can find it. One confirmed gone takes its
-    marker with it.
+    its ledger row is the only thing left that can find it. One confirmed gone takes its row
+    with it.
 
-    Mutation check: drop the marker whatever the self-clean said and the refused cases go red;
-    keep it after a confirmed one and the confirmed cases do."""
+    Mutation check: drop the row whatever the self-clean said and the refused cases go red; keep
+    it after a confirmed one and the confirmed cases do."""
     client, aca, _ = wired(
         delete_fails=self_clean_refused,
         restore_fails=False,
@@ -268,40 +315,7 @@ async def test_a_failed_birth_keeps_its_marker_only_while_its_container_may_stan
         )
 
     assert aca.deleted == [_NEW_APP], "the self-clean was never attempted"
-    marker = await read_birth_marker(fake_redis, _USER)
-    named = (
-        None
-        if marker is None
-        else (marker[REGISTRY_FIELD_APP_NAME], marker[REGISTRY_FIELD_APP_ID])
-    )
-    assert named == ((_NEW_APP, str(_APP_ID)) if self_clean_refused else None)
-
-
-async def test_a_birth_refuses_to_create_while_an_earlier_births_marker_stands(
-    wired: Any, fake_redis: aioredis.Redis
-) -> None:
-    """★ An earlier birth's marker is the only thing naming its container, and writing over it
-    would forget that container. The start hands it over first, and the client refuses when
-    nobody has.
-
-    Mutation check: write the marker whether or not one stands and the new container is created
-    over it."""
-    client, aca, _ = wired(delete_fails=False, restore_fails=False, existing_app=None)
-    assert await note_a_birth(
-        fake_redis,
-        _USER,
-        app_name=_OLD_APP,
-        app_id=_APP_ID,
-        shared_project_id=None,
-        shared_owner_id=None,
-    )
-
-    with pytest.raises(SandboxError):
-        await client.provision_new(str(_USER), _NEW_APP, app_env=_env())
-
-    assert aca.created == []
-    marker = await read_birth_marker(fake_redis, _USER)
-    assert marker is not None and marker[REGISTRY_FIELD_APP_NAME] == _OLD_APP
+    assert await _ledger() == ({_NEW_APP: SandboxPoolState.CLAIMED} if self_clean_refused else {})
 
 
 async def test_a_restore_failing_before_teardown_leaves_everything_intact(

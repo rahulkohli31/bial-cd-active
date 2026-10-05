@@ -20,7 +20,6 @@ from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
-from src.db.models.pending_teardown import PendingTeardownKind
 from src.db.models.project import Project
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
@@ -80,13 +79,13 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def handed_over(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, PendingTeardownKind, bool]]:
+def handed_over(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, bool]]:
     """Every container a start hands to the shutdown routine, recorded rather than run: what the
     routine does with a shared view is `test_shutdown.py`'s subject."""
-    recorded: list[tuple[str, PendingTeardownKind, bool]] = []
+    recorded: list[tuple[str, bool]] = []
 
     def _record(owed: OwedTeardown, *, reason: ShutdownReason, **_aimed_at: object) -> None:
-        recorded.append((owed.app_name, owed.kind, owed.write_back))
+        recorded.append((owed.app_name, owed.write_back))
 
     monkeypatch.setattr(manager_module, "shut_it_down_in_the_background", _record)
     return recorded
@@ -284,6 +283,39 @@ async def test_refresh_always_restores_even_when_already_live(
     assert len(set(client.restored)) == 2
 
 
+async def test_a_restarted_view_is_given_up_and_the_owners_copy_restored_again(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    handed_over: list[tuple[str, bool]],
+) -> None:
+    """★ Azure restarting a claimed container brings it back with no settings and none of its
+    files. A launch treats it as gone: the owner's saved copy goes into a new container, the
+    restarted one is never configured or started, and it is owed its delete with nothing written
+    back.
+
+    Mutation check: attach to it whatever it reports and no second restore happens."""
+    owner, project, app_id = await _owner_with_saved_app(
+        db_session, fake_storage, email="owner-restarted@example.com"
+    )
+    recipient = await UserFactory.create(db_session, email="recipient-restarted@example.com")
+    manager = a_manager_whose_ledger_is(db_session)
+    client = FakeSandboxClient()
+    await manager.launch_shared_preview(db_session, recipient, project, client)
+    [restarted] = client.restored
+    client.attach_handle = client.by_name[restarted]
+    client.unconfigured.add(restarted)
+
+    preview = await manager.launch_shared_preview(db_session, recipient, project, client)
+
+    assert preview.app_id == app_id
+    assert client.restored[0] == restarted
+    [reborn] = client.restored[1:]
+    assert client.configured_with == []
+    assert client.started == [restarted, reborn]
+    assert handed_over == [(restarted, False)]
+
+
 async def test_launch_with_no_saved_snapshot_is_a_dead_end_404(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
@@ -375,7 +407,7 @@ async def test_a_first_message_puts_a_live_shared_view_away_and_starts(
     db_session: AsyncSession,
     fake_redis: aioredis.Redis,
     fake_storage: FakeStorage,
-    handed_over: list[tuple[str, PendingTeardownKind, bool]],
+    handed_over: list[tuple[str, bool]],
 ) -> None:
     """★ A colleague's shared view in the recipient's slot never blocks their own project: it
     holds no work of its own, so it is handed over as a shared view, deleted with nothing written
@@ -397,7 +429,7 @@ async def test_a_first_message_puts_a_live_shared_view_away_and_starts(
     )
 
     assert session.project_id == recipient_project.id
-    assert handed_over == [(viewer.restored[0], PendingTeardownKind.SHARED, False)]
+    assert handed_over == [(viewer.restored[0], False)]
     assert build_client.torn_down == []
     assert build_client.provisioned, "the recipient's own workspace was started"
     assert await fake_storage.get(snapshot_key(app_id)) == b"BUNDLE"
@@ -407,7 +439,7 @@ async def test_opening_their_own_app_puts_a_live_shared_view_away_and_starts(
     db_session: AsyncSession,
     fake_redis: aioredis.Redis,
     fake_storage: FakeStorage,
-    handed_over: list[tuple[str, PendingTeardownKind, bool]],
+    handed_over: list[tuple[str, bool]],
 ) -> None:
     """★ The same for the start control: relaunching a saved app of the recipient's own
     replaces the shared view in their slot instead of refusing."""
@@ -430,7 +462,7 @@ async def test_opening_their_own_app_puts_a_live_shared_view_away_and_starts(
     await detached_work_done(manager)
 
     assert started.app_id == own_app_id
-    assert handed_over == [(viewer.restored[0], PendingTeardownKind.SHARED, False)]
+    assert handed_over == [(viewer.restored[0], False)]
     assert client.torn_down == []
     assert len(client.restored) == 1
     assert await fake_storage.get(snapshot_key(app_id)) == b"BUNDLE"

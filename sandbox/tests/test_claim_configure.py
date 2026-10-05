@@ -73,9 +73,7 @@ async def test_a_claimed_pool_container_takes_its_settings_once_and_redacts_them
 
     store = fakeredis.aioredis.FakeRedis(decode_responses=True)
     monkeypatch.setattr(redis_client, "_redis_singleton", store)
-    member = ClaimedMember(
-        id=uuid.uuid4(), name=name, fqdn=f"127.0.0.1:{sbx.port}", image_ref="local"
-    )
+    member = ClaimedMember(id=uuid.uuid4(), name=name, fqdn=f"127.0.0.1:{sbx.port}")
     client = OverHttp(
         SandboxConfig(
             subscription_id="local",
@@ -102,7 +100,7 @@ async def test_a_claimed_pool_container_takes_its_settings_once_and_redacts_them
             member, user, env, app_id=app_id, shared_project_id=None, shared_owner_id=None
         )
 
-        assert await client.health(handle) is True
+        assert sbx.health().json() == {"ok": True, "configured": True}
         assert await store.hget(registry_key(user), REGISTRY_FIELD_APP_NAME) == name
         with pytest.raises(SandboxError, match="409"):
             await client.configure(handle, {**env, "BIAL_APP_ID": "someone-elses-app"})

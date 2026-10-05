@@ -16,6 +16,7 @@ from __future__ import annotations
 import abc
 import datetime as dt
 import enum
+import hashlib
 import secrets
 import uuid
 from collections.abc import Mapping
@@ -56,10 +57,33 @@ and unrelated workloads sharing the resource group. A drift between the two woul
 orphan reconciler quietly report nothing."""
 
 SHARED_SANDBOX_NAME_PREFIX = "shr-"
-"""The prefix `manager.shr_name_for` gives a colleague's shared view. Nothing creates a container
-under it — a new view takes `a_fresh_sandbox_name` — so it is only read, for views still running
-under it: by the portal edge's routing, the reaper's name guard, and the fallbacks for a registry
-record without an app id and an owed row without a kind."""
+"""The prefix `shr_name_for` gives a colleague's shared view. Nothing creates a container under it
+— a new view takes `a_fresh_sandbox_name` — so it is only read, for views still running under it:
+by the portal edge's routing, the reaper's name guard, the fallback for a registry record without
+an app id, and the owed-teardown routine, which never writes such a view back."""
+
+#: Which kind of container a birth makes: a person's own build sandbox, or a colleague's view of a
+#: shared app, held in the viewer's slot.
+SandboxKind = Literal["build_sandbox", "shared_sandbox"]
+
+
+def app_name_for(app_id: uuid.UUID) -> str:
+    """`sbx-` + 28 hex chars of the app_id, stable per app. No container is created under it —
+    `a_fresh_sandbox_name` names every one — so it only recognises one still running under it:
+    for a registry record carrying no app id, and in the inventory's forward match."""
+    return f"{SANDBOX_NAME_PREFIX}{app_id.hex[:28]}"
+
+
+def shr_name_for(app_id: uuid.UUID, recipient_id: uuid.UUID) -> str:
+    """`shr-` + 28 hex chars of a SHA-256 digest of the app and recipient ids, stable per pair.
+    Like `app_name_for`, no container is created under it; it only recognises a view still
+    running under it.
+
+    FORWARD-MATCH-ONLY: nothing may ever reverse-parse an app id or a recipient id back out of
+    this name; both are carried losslessly on the container's own ARM tags
+    (`shared_sandbox_tags`)."""
+    digest = hashlib.sha256(f"{app_id}:{recipient_id}".encode()).hexdigest()
+    return f"{SHARED_SANDBOX_NAME_PREFIX}{digest[:28]}"
 
 
 def a_fresh_sandbox_name() -> str:
@@ -126,10 +150,10 @@ permanently overdue, i.e. instantly destroy-eligible while being seconds old. Th
 author your own."""
 
 TAG_POOL: Final = "bial-pool"
-"""Present on a container made ahead of time for the pool of ready sandboxes; only its presence is
-read. Until its claim such a container carries this, its kind and its control plane and nothing
-else: owner, app and `TAG_CREATED_AT` are stamped after the claim, and the merge that stamps them
-leaves this one in place."""
+"""Present on a container made ahead of time for the pool of ready sandboxes: a marker for an
+operator reading Azure, which no code reads. Until its claim such a container carries this, its
+kind and its control plane and nothing else: owner, app and `TAG_CREATED_AT` are stamped after the
+claim, and the merge that stamps them leaves this one in place."""
 
 TAG_BACKFILLED_AT: Final = "bial-backfilled-at"
 """Present ONLY on a container whose identity was reconstructed after the fact. It marks the
@@ -328,11 +352,8 @@ def published_app_tags(*, app_id: uuid.UUID) -> dict[str, str]:
 
 @dataclass(frozen=True)
 class SandboxHandle:
-    """The frozen 5-field handle returned by every provision/attach/restore call and
-    passed back into every operation.
-
-    `app_root_url` below is a DERIVED property, not a sixth field — the handle's shape is
-    unchanged and every `dataclasses.replace` call site keeps working."""
+    """The frozen handle returned by every provision/attach/restore call and passed back into
+    every operation. `app_root_url` below is a derived property, not a field."""
 
     fqdn: str
     """The container's ACA ingress FQDN, host only, NO scheme (e.g. `app-xyz.westeurope.
@@ -361,6 +382,11 @@ class SandboxHandle:
     A stdout-marker-plus-child-alive check would get this wrong in both directions: the marker
     fires once `next dev` is LISTENING, before the first route has compiled, and a dev server
     the agent started itself would be invisible to a child-state check forever."""
+    configured: bool = True
+    """Whether the supervisor said, on the attach that made this handle, that it holds its
+    project's settings. False only for a pool container not configured since it booted, which
+    Azure restarting a claimed one also produces; it refuses to start the app until `configure`.
+    A supervisor that does not say was given its settings when it was created."""
 
     @property
     def app_root_url(self) -> str:
@@ -643,13 +669,10 @@ class SandboxClient(abc.ABC):
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
-        """Provision a BRAND-NEW container for `user_id`. `app_env` is the app's injected
-        environment, every name in it chosen to survive the supervisor's child-env scrub
-        allowlist; what belongs in it is `manager._resolve_sandbox`'s to decide.
-
-        Returns a handle with `ready=False`. The caller MUST already hold the Redis
-        one-per-user lock. Transient provisioning errors retried with capped
-        exponential backoff.
+        """Provision a BRAND-NEW container for `user_id`, returning a handle with `ready=False`.
+        `app_env` is the app's injected environment, every name in it chosen to survive the
+        supervisor's child-env scrub allowlist. The caller MUST already hold the one-per-user
+        lock. Transient provisioning errors are retried with capped exponential backoff.
 
         Refused while the user's registry still names a container: writing this one's record
         over it would leave the old container with nothing that names it. The caller hands that
@@ -685,7 +708,7 @@ class SandboxClient(abc.ABC):
         *,
         app_env: dict[str, str],
         source_key: str | None = None,
-        kind: Literal["build_sandbox", "shared_sandbox"] = "build_sandbox",
+        kind: SandboxKind = "build_sandbox",
         shared_project_id: uuid.UUID | None = None,
         shared_owner_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
@@ -818,15 +841,6 @@ class SandboxClient(abc.ABC):
         supervisor image — and must not be read as "definitely no new traffic", which would let
         the sweep reap a container it simply failed to probe."""
         return None
-
-    async def health(self, handle: SandboxHandle) -> bool:
-        """Whether the container holds its project's settings, per `GET /_sup/health`. False only
-        for a pool container that has not been configured since it booted, which Azure restarting
-        a claimed one also produces; it refuses to start the app until `configure`.
-
-        DELIBERATELY NOT abstract, same reason as `someone_has_to_go_first`. The default answers
-        True: a client fronting no pool container has nothing waiting for its settings."""
-        return True
 
     async def configure(self, handle: SandboxHandle, env: Mapping[str, str]) -> None:
         """Give a pool container its project's settings over `POST /_sup/configure`: the

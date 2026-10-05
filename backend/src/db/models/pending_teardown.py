@@ -9,10 +9,10 @@ for a detached routine to stop the turn, write the code back, and destroy the co
 `app_name` is UNIQUE: at most one owed deletion may exist per container name at a time — the
 constraint IS the concurrency claim's `ON CONFLICT` inference target.
 
-`kind` says whether the container is a build sandbox or a shared view, which is never written
-back. NULL only on a row a process older than the column wrote; `shutdown.py` reads that one
-case from the name. `write_back` says whether a build sandbox's tree is written back before it
-goes: false for a container a start replaced, whose tree is a dead session's or already set aside.
+`write_back` says whether the container's tree is written back before it goes: false for a
+shared view, and for a container a start replaced, whose tree is a dead session's or already set
+aside. A shared view's row that a process older than the column writes carries the default;
+`shutdown.py` reads that one case from the name.
 
 `instance_ref` tells this container from a later one under the same name — a name minted from its
 app id is reused by every container of that app — and it is the per-user registry's OWN
@@ -31,7 +31,6 @@ forgive a container the platform still owes."""
 
 from __future__ import annotations
 
-import enum
 import uuid
 from datetime import datetime
 
@@ -45,19 +44,6 @@ from src.db.mixins import OwnedByUserMixin, TimestampMixin, UUIDv7PrimaryKeyMixi
 MAX_APP_NAME = 32
 
 
-class PendingTeardownKind(enum.StrEnum):
-    BUILD = "build"
-    SHARED = "shared"
-
-
-pending_teardown_kind_enum = sa.Enum(
-    PendingTeardownKind,
-    name="pending_teardown_kind",
-    values_callable=lambda members: [member.value for member in members],
-    create_type=False,
-)
-
-
 class PendingTeardown(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base):
     __tablename__ = "pending_teardowns"
 
@@ -66,9 +52,6 @@ class PendingTeardown(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, B
     # No ForeignKey — see the module docstring.
     app_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, nullable=False, index=True)
     app_name: Mapped[str] = mapped_column(sa.String(MAX_APP_NAME), nullable=False)
-    kind: Mapped[PendingTeardownKind | None] = mapped_column(
-        pending_teardown_kind_enum, nullable=True
-    )
     # Defaulted true so a row a process older than the column writes keeps its write-back.
     write_back: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.true())
     # No ForeignKey — see the module docstring.

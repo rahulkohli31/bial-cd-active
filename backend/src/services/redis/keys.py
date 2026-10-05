@@ -13,7 +13,6 @@ keyed by user except the cooperative stop, which is keyed by conversation:
     lease:{user_id}      string — liveness lease (epoch seconds, TTL mandatory)
     starting:{user_id}   string — start-in-flight marker (project id, TTL mandatory)
     start_failure:{user_id} string — the last failed start (JSON, TTL mandatory)
-    birth:{user_id}      hash   — the container a birth is creating, until it is recorded
     stop:{conversation_id} string — cooperative stop ask (TTL mandatory)
 
 ANOTHER DOMAIN, `bial:{environment}:lake:`, holds the connector data-plane copy — parquet
@@ -71,7 +70,6 @@ FAMILY_REGISTRY: Final = "registry"
 FAMILY_LEASE: Final = "lease"
 FAMILY_STARTING: Final = "starting"
 FAMILY_START_FAILURE: Final = "start_failure"
-FAMILY_BIRTH: Final = "birth"
 FAMILY_COOPERATIVE_STOP: Final = "stop"
 
 # The two lake families. `file` holds one copied parquet file's BYTES; `index` is the single
@@ -141,17 +139,6 @@ def registry_key(user_id: uuid.UUID) -> str:
 
     THE ONLY WRITE TARGET for the registry. The legacy key below is read-only."""
     return ns(FAMILY_REGISTRY, user_id)
-
-
-def birth_marker_key(user_id: uuid.UUID) -> str:
-    """`bial:{env}:sandbox:birth:{user_id}` — the container a birth is creating, written before
-    the create and deleted once the registry records it or its self-clean is confirmed.
-
-    A create outlives a cancelled start, and its container carries a name nothing will ever create
-    again, so until the registry names it this is the only record that it may exist. NO TTL: the
-    next birth hands what it names to the shutdown routine. Its fields are the registry's own
-    (`app_name`, `app_id`, `created_at`, and a shared view's stamp)."""
-    return ns(FAMILY_BIRTH, user_id)
 
 
 def lease_key(user_id: uuid.UUID) -> str:
@@ -271,10 +258,13 @@ def registry_scan_patterns() -> tuple[str, ...]:
     return (f"{key_prefix()}{FAMILY_REGISTRY}:*", f"{LEGACY_KEY_PREFIX}{FAMILY_REGISTRY}:*")
 
 
-def birth_marker_scan_pattern() -> str:
-    """The pattern a fleet scan reads every birth marker under. One literal: no marker was ever
-    written under the legacy prefix."""
-    return f"{key_prefix()}{FAMILY_BIRTH}:*"
+def user_id_from_key(key: str) -> uuid.UUID | None:
+    """The user a scanned per-user key belongs to, or `None` for a key this platform did not
+    write: its last segment is the user id under every prefix."""
+    try:
+        return uuid.UUID(key.rsplit(":", 1)[-1])
+    except ValueError:
+        return None
 
 
 # --- Registry hash fields (frozen — SESSION-API writes/reads these, never a

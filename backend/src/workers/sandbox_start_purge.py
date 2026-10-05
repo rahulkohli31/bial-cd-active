@@ -19,7 +19,6 @@ _log = structlog.get_logger()
 SANDBOX_START_PURGE_TASK_NAME: Final = "sandbox_start_purge"
 SANDBOX_START_PURGE_SCHEDULE_ID: Final = "sandbox-start-purge-hourly"
 SANDBOX_START_PURGE_CRON: Final = "41 * * * *"
-SANDBOX_START_RETENTION: Final = dt.timedelta(days=90)
 
 
 @broker.task(
@@ -31,7 +30,7 @@ async def purge_old_sandbox_starts() -> None:
     import sqlalchemy as sa
 
     from src.db.base import async_session_factory
-    from src.db.models.sandbox_start import SandboxStart
+    from src.db.models.sandbox_start import SANDBOX_START_RETENTION, SandboxStart
 
     cutoff = dt.datetime.now(dt.UTC) - SANDBOX_START_RETENTION
     async with async_session_factory() as db:

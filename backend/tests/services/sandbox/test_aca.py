@@ -330,6 +330,42 @@ async def test_attach_existing_reconnects_without_a_new_create(fake_redis: aiore
     await client.aclose()
 
 
+@pytest.mark.parametrize(
+    ("answer", "configured"),
+    [
+        (httpx.Response(200, json={"ok": True, "configured": False}), False),
+        (httpx.Response(200, json={"ok": True, "configured": True}), True),
+        # A supervisor built before pool containers was given its settings at creation.
+        (httpx.Response(200, json={"ok": True}), True),
+        (httpx.Response(200, json=["ok"]), True),
+        (httpx.Response(200, content=b"not json"), True),
+    ],
+)
+async def test_an_attach_carries_what_its_own_probe_heard_about_the_containers_settings(
+    fake_redis: aioredis.Redis, answer: httpx.Response, configured: bool
+) -> None:
+    """The attach already asks the supervisor's health to know it answers, so whether the
+    container holds its project's settings rides on the handle and nothing asks a second time."""
+    asked = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal asked
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
+        if request.url.path.endswith("/dev/status"):
+            return httpx.Response(200, json={"running": True, "ready": True, "port": 3000})
+        asked += 1
+        return answer
+
+    client = _client(FakeAca(), handler)
+    await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+
+    handle = await client.attach_existing(str(USER))
+
+    assert (handle.configured, asked) == (configured, 1)
+    await client.aclose()
+
+
 async def test_attach_existing_dev_status_blip_falls_back_to_not_ready(
     fake_redis: aioredis.Redis,
 ) -> None:

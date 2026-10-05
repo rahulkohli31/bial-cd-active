@@ -23,12 +23,15 @@ import sqlalchemy as sa
 import structlog
 from pydantic import SecretStr
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import RedisError
 from sqlalchemy.exc import IntegrityError
 from structlog.testing import capture_logs
 
 import src.db.base as db_base
+from src.core.alarms import SANDBOX_POOL_BELOW_SIZE_EVENT
 from src.core.connectors import CONNECTORS
 from src.db.models.sandbox_pool import SandboxPoolMember, SandboxPoolState
+from src.services.build_sessions import pool_pass
 from src.services.lake.env import connector_env_names
 from src.services.redis import registry_key
 from src.services.redis.keys import (
@@ -38,6 +41,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_SHARED_OWNER_ID,
     REGISTRY_FIELD_SHARED_PROJECT_ID,
 )
+from src.services.sandbox import client as client_module
 from src.services.sandbox import pool
 from src.services.sandbox.aca import AcaControlPlane, AcaError
 from src.services.sandbox.base import (
@@ -46,6 +50,7 @@ from src.services.sandbox.base import (
     TAG_CONTROL_PLANE,
     TAG_KIND,
     TAG_POOL,
+    SandboxError,
     SandboxHandle,
     a_fresh_sandbox_name,
     control_plane_segment,
@@ -92,6 +97,8 @@ class PoolAca(AcaControlPlane):
         # The stopwatch and log bindings each restamp, and each fill, ran under.
         self.restamped_under: list[tuple[Stopwatch, dict[str, Any]]] = []
         self.filled_under: list[tuple[Stopwatch, dict[str, Any]]] = []
+        # Set, a restamp waits on it: how a test holds one in flight.
+        self.restamps_wait_for: asyncio.Event | None = None
 
     def made_for_the_pool(self, name: str, *, token: str | None) -> None:
         self.envs[name] = {"BIAL_POOL_MEMBER": "1"}
@@ -151,6 +158,8 @@ class PoolAca(AcaControlPlane):
 
     async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
         self.restamped_under.append((running_stopwatch(), structlog.contextvars.get_contextvars()))
+        if self.restamps_wait_for is not None:
+            await asyncio.wait_for(self.restamps_wait_for.wait(), timeout=5)
         self.tags.setdefault(name, {}).update(tags)
 
     async def aclose(self) -> None:
@@ -159,9 +168,12 @@ class PoolAca(AcaControlPlane):
 
 class Supervisors:
     """Each container's supervisor, told apart by the host a request goes to. Like the real one,
-    each takes one delivery of settings and refuses the next."""
+    each takes one delivery of settings and refuses the next. Each stays silent for its first
+    `silent_for` health checks, as a container Azure has only just made does."""
 
     def __init__(self) -> None:
+        self.silent_for = 0
+        self.health_checks: dict[str, int] = {}
         self.health_status: dict[str, int] = {}
         self.configure_status: dict[str, int] = {}
         self.hangs_on: set[tuple[str, str]] = set()
@@ -178,6 +190,9 @@ class Supervisors:
             raise httpx.ReadTimeout("no answer", request=request)
         configured = any(seen == host for seen, _, _ in self.configured)
         if path == "/health":
+            self.health_checks[host] = self.health_checks.get(host, 0) + 1
+            if self.health_checks[host] <= self.silent_for:
+                raise httpx.ReadTimeout("not serving yet", request=request)
             if self.health_waits_for is not None:
                 await asyncio.wait_for(self.health_waits_for.wait(), timeout=5)
             return httpx.Response(
@@ -279,6 +294,12 @@ async def _start(
 
 async def _recorded_name(redis: aioredis.Redis, user_id: uuid.UUID) -> str:
     return str(await redis.hget(registry_key(user_id), REGISTRY_FIELD_APP_NAME))
+
+
+async def _until(condition: Callable[[], Awaitable[bool]]) -> None:
+    async with asyncio.timeout(5):
+        while not await condition():
+            await asyncio.sleep(0.01)
 
 
 # --- the claim, end to end -------------------------------------------------------------------
@@ -507,24 +528,12 @@ def _configure_hangs(world: SimpleNamespace, name: str) -> None:
     world.supervisors.hangs_on.add((f"{name}.pool.example", "/configure"))
 
 
-def _registry_write_fails(world: SimpleNamespace, name: str) -> None:
-    real = world.client._write_registry_into_an_empty_slot
-
-    async def refusing(user_uuid: uuid.UUID, *, app_name: str, **fields: Any) -> None:
-        if app_name == name:
-            raise RedisConnectionError("the coordination store went away")
-        await real(user_uuid, app_name=app_name, **fields)
-
-    world.client._write_registry_into_an_empty_slot = refusing
-
-
 _FAILURES = [
     pytest.param(_bearer_unreadable, "claim_failed", id="bearer-unreadable"),
     pytest.param(_health_refused, "unhealthy", id="health-refused"),
     pytest.param(_health_hangs, "unhealthy", id="health-hangs"),
     pytest.param(_configure_refused, "claim_failed", id="configure-500"),
     pytest.param(_configure_hangs, "claim_failed", id="configure-hangs"),
-    pytest.param(_registry_write_fails, "claim_failed", id="registry-write-fails"),
 ]
 
 
@@ -570,6 +579,32 @@ async def test_a_failed_claim_moves_on_to_the_next_ready_container(
     assert await _ledger() == {replacement: SandboxPoolState.READY}
 
 
+async def test_a_start_lets_two_failed_claims_go_and_then_creates_its_own(world) -> None:
+    """A run of broken ready containers costs a start two claims, not the whole pool: the third
+    stays ready for a later start, and this one records the last reason it was given.
+
+    Mutation check: let the claim loop run until the ledger is empty and the third is spent."""
+    an_hour_ago = datetime.now(UTC) - timedelta(hours=1)
+    first = await _ready(world, since=an_hour_ago)
+    second = await _ready(world, since=an_hour_ago + timedelta(minutes=1))
+    third = await _ready(world, since=an_hour_ago + timedelta(minutes=2))
+    _configure_refused(world, first)
+    _health_refused(world, second)
+    _health_refused(world, third)
+
+    handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4())
+    await _settled(world.client)
+
+    assert (stopwatch.claimed, stopwatch.miss_reason, stopwatch.ready_count) == (
+        False,
+        "unhealthy",
+        3,
+    )
+    assert world.aca.created == [handle.app_name]
+    assert world.aca.deleted == [first, second]
+    assert (await _ledger())[third] is SandboxPoolState.READY
+
+
 async def test_a_failed_claim_whose_delete_is_refused_is_left_retiring(world) -> None:
     member = await _ready(world)
     _health_refused(world, member)
@@ -594,12 +629,15 @@ async def test_a_refused_configure_logs_none_of_what_it_carried(world) -> None:
         assert all(secret not in repr(entry) for entry in logged)
 
 
-async def test_a_claim_whose_slot_was_taken_meanwhile_writes_nothing_and_stops_claiming(
+async def test_a_claim_whose_slot_was_taken_meanwhile_fails_the_start_and_spends_no_more(
     world,
 ) -> None:
     """The provision's guard is a read, and a claim spends seconds before its registry write:
     another start may take the person's slot meanwhile. The claim's write then lands nothing,
-    its container is let go, and no further ready container is spent on a slot that is taken."""
+    its container is let go, and the start fails as a create would on a taken slot, spending no
+    further ready container and creating none.
+
+    Mutation check: fall through to another claim on a taken slot and the spare is spent."""
     member = await _ready(world, since=datetime.now(UTC) - timedelta(hours=1))
     spare = await _ready(world)
     user = uuid.uuid4()
@@ -609,59 +647,36 @@ async def test_a_claim_whose_slot_was_taken_meanwhile_writes_nothing_and_stops_c
         await world.redis.hset(registry_key(user), mapping={REGISTRY_FIELD_APP_NAME: elsewhere})
 
     world.supervisors.meanwhile = another_start_takes_the_slot
-    names_seen: list[str] = []
-    real_write = world.client._write_registry
 
-    async def the_creates_write(user_uuid: uuid.UUID, *, app_name: str, **fields: Any) -> None:
-        named = await world.redis.hget(registry_key(user_uuid), REGISTRY_FIELD_APP_NAME)
-        names_seen.append(str(named))
-        await real_write(user_uuid, app_name=app_name, **fields)
-
-    world.client._write_registry = the_creates_write
-
-    handle, stopwatch = await _start(world.client, user, uuid.uuid4())
+    with pytest.raises(SandboxError):
+        await _start(world.client, user, uuid.uuid4())
     await _settled(world.client)
 
-    assert (stopwatch.claimed, stopwatch.miss_reason) == (False, "claim_failed")
-    assert names_seen == [elsewhere], "the claim wrote over the record another start made"
+    assert await _recorded_name(world.redis, user) == elsewhere
     assert world.aca.deleted == [member]
-    assert world.aca.created == [handle.app_name]
+    assert world.aca.created == []
     assert await _ledger() == {spare: SandboxPoolState.READY}
 
 
-@pytest.mark.parametrize("shared", [False, True], ids=["build", "shared-view"])
-async def test_a_claim_writes_the_record_a_create_writes(world, shared: bool) -> None:
-    """Two writers of one record: a field one sets and the other does not is a container read
-    differently depending on how it was born. Both start from a slot holding a previous
-    occupant's leftovers, which each must disown."""
-    stamp = (uuid.uuid4(), uuid.uuid4()) if shared else (None, None)
-    leftovers = {
-        "preview_stay_until": "2026-10-05T10:00:00+00:00",
-        "shared_served_count": "7",
-        "shared_project_id": str(uuid.uuid4()),
-        "shared_owner_id": str(uuid.uuid4()),
-    }
-    created, claimed = uuid.uuid4(), uuid.uuid4()
-    fields = {
-        "app_name": "sbx-" + "a" * 28,
-        "app_id": uuid.uuid4(),
-        "fqdn": "sbx.example",
-        "token_ref": "ref",
-        "shared_project_id": stamp[0],
-        "shared_owner_id": stamp[1],
-    }
-    for user in (created, claimed):
-        await world.redis.hset(registry_key(user), mapping=leftovers)
+async def test_a_claim_whose_registry_write_fails_fails_the_start_and_lets_it_go(
+    world, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registry that does not answer would fail a create's write the same way, so the start
+    fails rather than spending another ready container or creating one."""
+    member = await _ready(world)
 
-    await world.client._write_registry(created, **fields)
-    await world.client._write_registry_into_an_empty_slot(claimed, **fields)
+    async def refusing(user_uuid: uuid.UUID, **fields: Any) -> None:
+        raise RedisConnectionError("the coordination store went away")
 
-    by_create = await world.redis.hgetall(registry_key(created))
-    by_claim = await world.redis.hgetall(registry_key(claimed))
-    for record in (by_create, by_claim):
-        assert record.pop("created_at") == record.pop("waiting_since")
-    assert by_claim == by_create
-    assert ("shared_project_id" in by_claim) is shared
+    monkeypatch.setattr(world.client, "_write_registry", refusing)
+
+    with pytest.raises(RedisError):
+        await _start(world.client, uuid.uuid4(), uuid.uuid4())
+    await _settled(world.client)
+
+    assert world.aca.deleted == [member]
+    assert world.aca.created == []
+    assert await _ledger() == {}
 
 
 # --- the ledger statements -------------------------------------------------------------------
@@ -678,8 +693,7 @@ async def test_a_claim_prefers_the_current_image_and_falls_back_to_an_older_one(
     second = await pool.claim(IMAGE)
 
     assert first is not None and second is not None
-    assert (first.name, first.image_ref) == (current, IMAGE)
-    assert (second.name, second.image_ref) == (old, OLD_IMAGE)
+    assert (first.name, second.name) == (current, old)
     assert await pool.claim(IMAGE) is None
 
 
@@ -733,33 +747,13 @@ async def test_retiring_touches_only_a_claimed_row(world) -> None:
         )
     assert second_id is not None
 
-    await pool.retire(claimed.id)
-    await pool.retire(second_id)
+    await pool.retire(claimed.id, was=SandboxPoolState.CLAIMED)
+    await pool.retire(second_id, was=SandboxPoolState.CLAIMED)
 
     assert await _ledger() == {
         first: SandboxPoolState.RETIRING,
         second: SandboxPoolState.READY,
     }
-
-
-@pytest.mark.parametrize("_round", [1, 2])
-async def test_pool_work_runs_two_at_a_time_on_whichever_loop_asks(_round: int) -> None:
-    """Each test runs on an event loop of its own, and a semaphore belongs to the loop it first
-    waited on, so a second round on a fresh loop is what proves the bound is made per loop."""
-    running = 0
-    most = 0
-
-    async def a_piece_of_pool_work() -> None:
-        nonlocal running, most
-        async with pool.pool_work_bound():
-            running += 1
-            most = max(most, running)
-            await asyncio.sleep(0.01)
-            running -= 1
-
-    await asyncio.gather(*(a_piece_of_pool_work() for _ in range(6)))
-
-    assert most == 2
 
 
 # --- making ready containers -----------------------------------------------------------------
@@ -768,7 +762,7 @@ async def test_pool_work_runs_two_at_a_time_on_whichever_loop_asks(_round: int) 
 async def test_a_fill_makes_a_container_that_holds_nothing_of_any_project(world) -> None:
     """Made from its own name with the platform's settings and nothing else: no project's
     settings, no data identity, and no owner, app or birth on its tags until a claim."""
-    assert await world.client.fill_one() is True
+    assert await world.client.fill_one(5) == "filled"
 
     [name] = world.aca.filled
     env = world.aca.envs[name]
@@ -801,8 +795,8 @@ async def test_a_fill_makes_a_container_that_holds_nothing_of_any_project(world)
 
 
 async def test_each_fill_gets_a_bearer_of_its_own(world) -> None:
-    await world.client.fill_one()
-    await world.client.fill_one()
+    await world.client.fill_one(5)
+    await world.client.fill_one(5)
 
     first, second = world.aca.filled
     assert world.aca.envs[first]["SUPERVISOR_TOKEN"] != world.aca.envs[second]["SUPERVISOR_TOKEN"]
@@ -811,21 +805,21 @@ async def test_each_fill_gets_a_bearer_of_its_own(world) -> None:
 async def test_a_fill_is_on_the_ledger_before_azure_is_asked(world) -> None:
     """So the refill and the worker's pass each count the other's create in flight."""
     world.aca.fills_wait_for = asyncio.Event()
-    filling = asyncio.create_task(world.client.fill_one())
+    filling = asyncio.create_task(world.client.fill_one(5))
     await asyncio.wait_for(world.aca.fill_began.wait(), timeout=5)
 
     [name] = world.aca.filled
     assert await _ledger() == {name: SandboxPoolState.FILLING}
 
     world.aca.fills_wait_for.set()
-    assert await filling is True
+    assert await filling == "filled"
     assert await _ledger() == {name: SandboxPoolState.READY}
 
 
 async def test_a_create_azure_refuses_leaves_no_row_and_nothing_standing(world) -> None:
     world.aca.refuses_to_create = True
 
-    assert await world.client.fill_one() is False
+    assert await world.client.fill_one(5) == "refused"
 
     [attempted] = world.aca.create_attempts
     assert world.aca.deleted == [attempted]
@@ -837,7 +831,7 @@ async def test_a_refused_create_whose_clean_up_is_refused_too_is_left_retiring(w
     world.aca.refuses_to_create = True
     world.aca.refuses_every_delete = True
 
-    assert await world.client.fill_one() is False
+    assert await world.client.fill_one(5) == "refused"
 
     [attempted] = world.aca.create_attempts
     assert await _ledger() == {attempted: SandboxPoolState.RETIRING}
@@ -847,7 +841,7 @@ async def test_a_fill_whose_row_a_pass_let_go_deletes_what_it_made(world) -> Non
     """A pass that judged the create overdue has given up its row, so nothing would hold the
     container the create goes on to make."""
     world.aca.fills_wait_for = asyncio.Event()
-    filling = asyncio.create_task(world.client.fill_one())
+    filling = asyncio.create_task(world.client.fill_one(5))
     await asyncio.wait_for(world.aca.fill_began.wait(), timeout=5)
     [name] = world.aca.filled
     async with db_base.async_session_factory() as db:
@@ -859,7 +853,7 @@ async def test_a_fill_whose_row_a_pass_let_go_deletes_what_it_made(world) -> Non
 
     world.aca.fills_wait_for.set()
 
-    assert await filling is False
+    assert await filling == "refused"
     assert world.aca.deleted == [name]
     assert await _ledger() == {name: SandboxPoolState.RETIRING}
 
@@ -873,7 +867,7 @@ async def test_one_claim_makes_one_replacement_that_a_pass_meanwhile_counts(worl
 
     handle, _ = await _start(world.client, uuid.uuid4(), uuid.uuid4())
     await asyncio.wait_for(world.aca.fill_began.wait(), timeout=5)
-    meanwhile = await pool.keep_the_pool(world.client, world.client._config, at=datetime.now(UTC))
+    meanwhile = await pool_pass.keep_the_pool(world.client, at=datetime.now(UTC))
     world.aca.fills_wait_for.set()
     await _settled(world.client)
 
@@ -884,6 +878,7 @@ async def test_one_claim_makes_one_replacement_that_a_pass_meanwhile_counts(worl
 
 
 async def test_a_burst_of_claims_makes_its_replacements_two_at_a_time(world) -> None:
+    """Six claims at a size of five: five replacements, never more than two made at once."""
     for _ in range(6):
         await _ready(world)
     world.aca.fill_takes = 0.05
@@ -894,7 +889,7 @@ async def test_a_burst_of_claims_makes_its_replacements_two_at_a_time(world) -> 
     await _settled(world.client)
 
     assert all(stopwatch.claimed for _, stopwatch in started)
-    assert len(world.aca.filled) == 6
+    assert len(world.aca.filled) == 5
     assert world.aca.most_filling_at_once == 2
 
 
@@ -905,7 +900,7 @@ async def test_a_lost_replacement_does_not_fail_the_start_that_claimed(
     next pass makes up, and nothing else."""
     member = await _ready(world)
 
-    async def unreachable(name: str, image_ref: str) -> uuid.UUID:
+    async def unreachable(name: str, image_ref: str, *, up_to: int) -> uuid.UUID:
         raise OSError("the database went away")
 
     monkeypatch.setattr(pool, "add_filling", unreachable)
@@ -921,6 +916,162 @@ async def test_a_lost_replacement_does_not_fail_the_start_that_claimed(
     ]
 
 
+async def test_a_fill_is_ready_only_once_its_supervisor_answers(
+    world, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ Azure reports a create done up to a minute and a half before the supervisor inside it
+    serves. A claim in that gap would find a sound container silent and let it go, so the fill
+    holds its row filling until the container answers.
+
+    Mutation check: mark the row ready as the create returns and it is ready while silent."""
+    world.supervisors.silent_for = 3
+    while_it_was_silent: list[dict[str, SandboxPoolState]] = []
+
+    async def asked_again(seconds: float) -> None:
+        while_it_was_silent.append(await _ledger())
+
+    monkeypatch.setattr(client_module, "_asleep", asked_again)
+
+    assert await world.client.fill_one(5) == "filled"
+
+    [name] = world.aca.filled
+    assert world.supervisors.health_checks[f"{name}.aca.example"] == 4
+    assert while_it_was_silent == [{name: SandboxPoolState.FILLING}] * 3
+    assert await _ledger() == {name: SandboxPoolState.READY}
+
+
+async def test_a_container_that_never_answers_is_let_go_and_the_pass_counts_it_refused(
+    world, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Never claimable, so it is deleted like a create Azure refused, and the pass stops filling
+    and raises the alarm as it would for one.
+
+    Mutation check: mark a silent container ready and the pass counts it filled."""
+    world.supervisors.silent_for = 1_000
+    monkeypatch.setattr(client_module, "FIRST_ANSWER_CEILING", timedelta(0))
+    world.client._config = _config(pool_day_size=1, pool_night_size=1)
+
+    with capture_logs() as logged:
+        outcome = await pool_pass.keep_the_pool(world.client, at=datetime.now(UTC))
+
+    assert (outcome.filled, outcome.refused) == (0, True)
+    [name] = world.aca.filled
+    assert world.aca.deleted == [name]
+    assert await _ledger() == {}
+    assert [e["event"] for e in logged if e["event"] == SANDBOX_POOL_BELOW_SIZE_EVENT] == [
+        SANDBOX_POOL_BELOW_SIZE_EVENT
+    ]
+
+
+async def test_a_claims_replacement_is_on_the_ledger_while_its_restamp_is_in_flight(
+    world,
+) -> None:
+    """★ The restamp spends seconds on ARM, and a replacement queued behind it would be invisible
+    to a pass in those seconds, which would make one of its own.
+
+    Mutation check: refill only once the restamp is done and no row appears while it hangs."""
+    member = await _ready(world)
+    world.aca.restamps_wait_for = asyncio.Event()
+
+    await _start(world.client, uuid.uuid4(), uuid.uuid4())
+
+    async def a_replacement_is_on_the_ledger() -> bool:
+        return set(await _ledger()) - {member} != set()
+
+    await _until(a_replacement_is_on_the_ledger)
+    world.aca.restamps_wait_for.set()
+    await _settled(world.client)
+
+
+async def test_a_fill_waiting_for_the_bound_is_already_on_the_ledger(world) -> None:
+    """So a pass, or another refill, counts a create still queued behind the two in flight.
+
+    Mutation check: write the row once the bound is held and the queued fill is not counted."""
+    world.aca.fills_wait_for = asyncio.Event()
+    fills = [asyncio.create_task(world.client.fill_one(5)) for _ in range(3)]
+
+    async def two_in_flight_and_three_rows() -> bool:
+        return world.aca.filling_now == 2 and len(await _ledger()) == 3
+
+    await _until(two_in_flight_and_three_rows)
+    assert set((await _ledger()).values()) == {SandboxPoolState.FILLING}
+    world.aca.fills_wait_for.set()
+
+    assert await asyncio.gather(*fills) == ["filled", "filled", "filled"]
+
+
+async def test_a_rush_of_claims_and_a_pass_among_their_refills_make_the_pool_whole_once(
+    world,
+) -> None:
+    """★ Five starts take all five ready containers at once, and their refills queue behind the
+    bound while the worker's pass runs. Each fill is written only while the pool is short, so
+    between them the refills and the pass make five, and nothing is made only to be retired.
+
+    Mutation check: write a fill's row whatever the pool holds and eight are made."""
+    for _ in range(5):
+        await _ready(world)
+    world.aca.fills_wait_for = asyncio.Event()
+
+    started = await asyncio.gather(
+        *(_start(world.client, uuid.uuid4(), uuid.uuid4()) for _ in range(5))
+    )
+
+    async def two_refills_in_flight() -> bool:
+        return world.aca.filling_now == 2
+
+    await _until(two_refills_in_flight)
+    meanwhile = asyncio.create_task(pool_pass.keep_the_pool(world.client, at=datetime.now(UTC)))
+    await asyncio.sleep(0.05)
+    world.aca.fills_wait_for.set()
+    await meanwhile
+    await _settled(world.client)
+
+    assert all(stopwatch.claimed for _, stopwatch in started)
+    assert len(world.aca.filled) == 5
+    assert world.aca.deleted == []
+    assert list((await _ledger()).values()) == [SandboxPoolState.READY] * 5
+
+
+async def test_a_claim_after_the_size_drops_makes_no_replacement(world) -> None:
+    """At the evening's smaller size the containers still ready are enough, so the claim's refill
+    makes nothing for the next pass to retire.
+
+    Mutation check: refill whatever the pool holds and one container is made."""
+    for _ in range(3):
+        await _ready(world)
+    world.client._config = _config(pool_day_size=1, pool_night_size=1)
+
+    _, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4())
+    await _settled(world.client)
+
+    assert stopwatch.claimed is True
+    assert world.aca.filled == []
+    assert list((await _ledger()).values()) == [SandboxPoolState.READY] * 2
+
+
+async def test_a_fill_cut_short_is_retired_for_the_next_pass_to_delete(world) -> None:
+    """★ A backend or worker stopping mid-create cancels the fill, and Azure may finish the
+    container anyway. Its row goes retiring at once, so the next pass deletes the container
+    instead of the row being counted, and holding back every fill, until its deadline.
+
+    Mutation check: retire nothing on a cancellation and the row stays filling."""
+    world.aca.fills_wait_for = asyncio.Event()
+    filling = asyncio.create_task(world.client.fill_one(5))
+    await asyncio.wait_for(world.aca.fill_began.wait(), timeout=5)
+    [name] = world.aca.filled
+
+    filling.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await filling
+
+    assert await _ledger() == {name: SandboxPoolState.RETIRING}
+    world.client._config = _config(pool_day_size=0, pool_night_size=0)
+    after = await pool_pass.keep_the_pool(world.client, at=datetime.now(UTC))
+    assert after.deleted == 1
+    assert world.aca.deleted == [name]
+    assert await _ledger() == {}
+
+
 async def test_a_retire_takes_only_a_row_still_in_the_state_it_was_judged_in(world) -> None:
     """Every retire is a compare-and-set, which is what keeps one from deleting a container a
     start claimed after the pass looked."""
@@ -930,12 +1081,13 @@ async def test_a_retire_takes_only_a_row_still_in_the_state_it_was_judged_in(wor
 
     assert await pool.retire(claimed.id, was=SandboxPoolState.READY) is False
     assert await _ledger() == {member: SandboxPoolState.CLAIMED}
-    assert await pool.retire(claimed.id) is True
+    assert await pool.retire(claimed.id, was=SandboxPoolState.CLAIMED) is True
     assert await _ledger() == {member: SandboxPoolState.RETIRING}
 
 
 def test_a_row_is_overdue_only_after_the_longest_create_could_have_run() -> None:
     """Every create attempt waits at most five minutes for Azure, and a create is tried four
-    times: twenty minutes, and a row younger than that may still have its create in flight."""
-    assert pool.ROW_DEADLINE > timedelta(minutes=20)
-    assert pool.ROW_DEADLINE < timedelta(minutes=25)
+    times; a pool member then has five minutes to answer. A row younger than that may still have
+    its create, or its first answer, in flight."""
+    assert pool_pass.ROW_DEADLINE > timedelta(minutes=25)
+    assert pool_pass.ROW_DEADLINE < timedelta(minutes=30)

@@ -87,27 +87,9 @@ class Stopwatch:
         return _ms(ended - began)
 
 
-class _NobodyIsTiming(Stopwatch):
-    """What the context holds outside a timed start: every reading is dropped."""
-
-    def split(self, name: Split) -> None:
-        return None
-
-    @contextmanager
-    def lap(self, name: Lap) -> Iterator[None]:
-        yield
-
-    def saw_the_restore_reinstall(self, reinstalled: bool) -> None:
-        return None
-
-    def took_a_ready_one(self, *, ready_count: int) -> None:
-        return None
-
-    def missed(self, reason: Miss, *, ready_count: int | None) -> None:
-        return None
-
-
-_NOBODY_IS_TIMING = _NobodyIsTiming()
+# What the context holds outside a timed start: stopped, so every reading is dropped.
+_NOBODY_IS_TIMING = Stopwatch()
+_NOBODY_IS_TIMING.stop()
 _running: ContextVar[Stopwatch] = ContextVar("sandbox_start_stopwatch", default=_NOBODY_IS_TIMING)
 
 

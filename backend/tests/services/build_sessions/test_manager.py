@@ -34,7 +34,7 @@ from src.api.v1.build_sessions.schemas import (
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus
-from src.db.models.pending_teardown import PendingTeardown, PendingTeardownKind
+from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions import shutdown as shutdown_module
@@ -69,6 +69,7 @@ from src.services.build_sessions.manager import (
     app_name_for,
 )
 from src.services.build_sessions.reaper import sweep_all
+from src.services.build_sessions.sandbox_starts import StartRecord
 from src.services.build_sessions.shutdown import OwedTeardown, ShutdownReason
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
@@ -222,7 +223,9 @@ async def test_resolve_sandbox_attaches_when_registry_is_live(
         },
     )
     env = build_app_env(app_id)
-    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
+    ).handle
     assert client.provisioned == [] and client.restored == []  # attached, no re-provision
     assert handle.app_name == app_name_for(app_id)
 
@@ -247,7 +250,9 @@ async def test_resolve_sandbox_restores_when_gone_but_snapshot_exists(
         },
     )
     env = build_app_env(app_id)
-    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
+    ).handle
     assert client.restored == [handle.app_name]  # attach gone + snapshot -> restore
     assert client.provisioned == []
 
@@ -478,9 +483,7 @@ async def test_a_dead_sessions_container_goes_behind_the_start_without_its_tree(
         .scalars()
         .all()
     )
-    assert [(row.app_name, row.kind, row.write_back) for row in owed] == [
-        (held, PendingTeardownKind.BUILD, False)
-    ]
+    assert [(row.app_name, row.write_back) for row in owed] == [(held, False)]
 
     client.gate.set()
     await asyncio.gather(*behind)
@@ -542,6 +545,26 @@ async def test_a_dead_sessions_lock_and_lease_go_with_the_container_it_hands_ove
     assert await fake_redis.get(lock_key(user.id)) == second.lock_token
     assert await liveness_lease_is_held(fake_redis, user.id) is False
     await _end_the_turn(manager, second)
+
+
+async def test_a_lock_left_with_no_record_beside_it_does_not_refuse_the_start(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """A process that died between taking the lock and recording a container leaves the lock
+    alone in the slot, and the start takes the slot through it.
+
+    Mutation check: return from the empty slot's reclaim without reaping the lock and the start
+    is refused."""
+    user, project_id = await _mk(db_session, "m-lone-lock@rvaiglobal.com")
+    await fake_redis.set(lock_key(user.id), "a-dead-sessions-token", ex=900)
+    manager = SessionManager()
+
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=FakeSandboxClient(), may_write=True
+    )
+
+    assert await fake_redis.get(lock_key(user.id)) == session.lock_token
+    await _end_the_turn(manager, session)
 
 
 async def test_a_holder_handed_over_without_ever_serving_raises_the_absent_proof_alarm(
@@ -675,7 +698,9 @@ async def test_restore_falls_back_to_fresh_when_snapshot_vanishes_mid_restore(
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # head-check sees it...
 
     env = build_app_env(app_id)
-    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
+    ).handle
     assert client.provisioned == [handle.app_name]  # ...the pull 404s -> fresh
 
 
@@ -747,7 +772,9 @@ async def test_head_check_retries_a_transient_blip_then_restores(
         client = FakeSandboxClient()
         app_id, env = await _seed_app_with_bundle(db_session, user, project_id, store)
 
-        handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
+        handle = (
+            await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
+        ).handle
 
         assert store.head_calls == _HEAD_ATTEMPTS  # blipped, blipped, answered
         assert len(no_sleep) == _HEAD_ATTEMPTS - 1  # backed off between attempts
@@ -825,7 +852,9 @@ async def test_restore_retries_a_transient_sandbox_error_then_succeeds(
     client = FlakyRestore()
     app_id, env = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
 
-    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
+    ).handle
 
     assert client.attempts == 2
     assert client.restored == [handle.app_name]
@@ -1140,7 +1169,9 @@ async def test_a_retry_after_a_container_was_left_behind_starts_another_under_a_
     client = LeavesItsFirstContainerBehind()
     app_id, env = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
 
-    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
+    ).handle
 
     left_behind, replacement = client.restored
     assert left_behind != replacement
@@ -1181,7 +1212,7 @@ async def test_a_holder_the_ledger_cannot_take_keeps_its_record_when_its_delete_
     client.teardown_error = SandboxError("ARM refused the delete")
 
     with pytest.raises(SnapshotUnavailableError):
-        await manager._resolve_sandbox(client, user.id, app_id, env)
+        await manager._resolve_sandbox(client, user.id, app_id, env, record=StartRecord())
 
     reg = await read_registry(fake_redis, user.id)
     assert reg is not None and reg[REGISTRY_FIELD_APP_NAME] == holder
@@ -1287,7 +1318,9 @@ async def test_restore_injects_both_blob_vars(
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # no registry + snapshot -> restore
 
     handle = (
-        await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
+        await manager._resolve_sandbox(
+            client, user.id, app_id, build_app_env(app_id), record=StartRecord()
+        )
     ).handle
     assert client.restored == [handle.app_name]
     assert calls == [app_id]
@@ -1330,7 +1363,9 @@ async def test_attach_does_no_storage_work_and_forwards_no_env(
     )
 
     handle = (
-        await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
+        await manager._resolve_sandbox(
+            client, user.id, app_id, build_app_env(app_id), record=StartRecord()
+        )
     ).handle
     assert client.provisioned == [] and client.restored == []  # attached
     assert handle.app_name == app_name_for(app_id)
@@ -2602,6 +2637,33 @@ async def test_a_project_that_never_switched_it_on_is_born_with_nothing_extra(
     assert client.provision_env is not None
     assert url_name not in client.provision_env
     assert client_id_name not in client.provision_env
+
+
+async def test_a_colleagues_view_of_a_switched_on_project_is_born_with_nothing_extra(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    _lake_configured: None,
+) -> None:
+    """The connector is its owner's: a colleague's view of the project gets none of it.
+
+    Mutation check: build the view's settings with the owner's connector and the colleague's
+    container is born with the owner's coordinates."""
+    from src.db.models.project import Project
+
+    owner, project_id = await _switched_on_connector_project(db_session, "cx4@rvaiglobal.com")
+    await _seed_app_with_bundle(db_session, owner, project_id, fake_storage)
+    colleague = await UserFactory.create(db_session, email="cx4-colleague@rvaiglobal.com")
+    project = await db_session.get(Project, project_id)
+    assert project is not None
+    client = FakeSandboxClient()
+
+    await SessionManager().launch_shared_preview(db_session, colleague, project, client)
+
+    url_name, client_id_name = _connector_names()
+    assert client.restore_env is not None, "the view was never restored"
+    assert url_name not in client.restore_env
+    assert client_id_name not in client.restore_env
 
 
 # --- the copy fires on a BIRTH, and only on a birth ----------------------------------------------

@@ -63,7 +63,7 @@ def test_abstractmethod_set_equals_the_pinned_contract() -> None:
     assert set(SandboxClient.__abstractmethods__) == _C2_METHODS
 
 
-def test_handle_has_the_five_expected_fields_with_correct_types() -> None:
+def test_handle_has_the_expected_fields_and_holds_its_settings_unless_told() -> None:
     handle = SandboxHandle(
         fqdn="app-xyz.westeurope.azurecontainerapps.io",
         token="tok",
@@ -77,8 +77,10 @@ def test_handle_has_the_five_expected_fields_with_correct_types() -> None:
         "app_name",
         "preview_url",
         "ready",
+        "configured",
     }
     assert handle.ready is False
+    assert handle.configured is True
 
 
 def test_handle_is_frozen() -> None:

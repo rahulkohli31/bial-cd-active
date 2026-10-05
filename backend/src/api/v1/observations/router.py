@@ -21,10 +21,8 @@ The defence is the per-user limit in the moment, not a per-user filter afterward
 observability inside a single-tenant enterprise deployment; it must not become a way to
 profile a citizen.
 
-ONE WRITE USES THE IDENTITY. `POST /observations/start-visible` attaches the browser's
-click-to-visible time to a `sandbox_starts` row the caller's own start wrote. It never creates a
-row and never reads one back: the caller's id is in the update's predicate, which is what keeps
-the write on their own start.
+ONE WRITE USES THE IDENTITY: `POST /observations/start-visible` times one of the caller's own
+sandbox starts, and creates and reads back nothing.
 
 NO READ. The counters are read behind the superadmin gate at `GET /v1/admin/harness-counters`,
 the start times at `GET /v1/admin/sandbox-starts`."""

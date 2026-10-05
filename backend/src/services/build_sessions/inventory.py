@@ -40,9 +40,9 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.project_share import ProjectShare
 from src.db.models.sandbox_pool import SandboxPoolMember
-from src.services.build_sessions.locks import read_birth_marker, read_registry
+from src.services.build_sessions.locks import read_registry
 from src.services.redis import registry_scan_patterns
-from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, birth_marker_scan_pattern
+from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, user_id_from_key
 from src.services.sandbox.base import (
     KIND_BUILD_SANDBOX,
     KIND_SHARED_SANDBOX,
@@ -54,7 +54,9 @@ from src.services.sandbox.base import (
     TAG_USER_ID,
     FleetMember,
     SandboxError,
+    app_name_for,
     control_plane_segment,
+    shr_name_for,
 )
 
 _log = structlog.get_logger()
@@ -93,8 +95,8 @@ class SandboxInventory:
     """What ARM has, what the registry claims, and the gap between them.
 
     `unregistered` is THE LEAK: containers Azure is billing for that nothing tracks, so no sweep
-    will ever reach them; a container the pool's ledger, an owed teardown or a birth marker holds
-    is tracked, and left out. `registered_missing` is the opposite and far less urgent — a
+    will ever reach them; a container the pool's ledger or an owed teardown holds is tracked, and
+    left out. `registered_missing` is the opposite and far less urgent — a
     registry entry whose container is already gone, which the next `reconcile_user` clears on its
     own."""
 
@@ -115,11 +117,9 @@ async def registered_app_names(redis: aioredis.Redis) -> set[str]:
     seen: set[uuid.UUID] = set()
     for pattern in registry_scan_patterns():
         async for raw_key in redis.scan_iter(match=pattern):
-            try:
-                user_uuid = uuid.UUID(str(raw_key).rsplit(":", 1)[-1])
-            except ValueError:
-                continue  # a key we did not write; not ours to interpret
-            if user_uuid in seen:  # the same user under both prefixes — one read is enough
+            user_uuid = user_id_from_key(str(raw_key))
+            # A key we did not write, or the same user under both prefixes: one read is enough.
+            if user_uuid is None or user_uuid in seen:
                 continue
             seen.add(user_uuid)
             reg = await read_registry(redis, user_uuid)
@@ -139,7 +139,7 @@ async def take_sandbox_inventory(
     another twelve days."""
     live = {member.name for member in await control_plane.list_sandbox_fleet()}
     registered = await registered_app_names(redis)
-    tracked = registered | await _held_without_a_registry(db) | await _being_born(redis)
+    tracked = registered | await _held_without_a_registry(db)
     return SandboxInventory(
         live=tuple(sorted(live)),
         registered=tuple(sorted(registered)),
@@ -150,27 +150,13 @@ async def take_sandbox_inventory(
 
 async def _held_without_a_registry(db: AsyncSession) -> set[str]:
     """Containers the platform still holds that no registry names: the pool's, until a claim,
-    and the owed, whose record is cleared before the container goes and which may be mid
-    write-back. An operator told either is an orphan would delete it by hand. Fleet-wide on
-    purpose: two name columns, no user data, superadmin-only."""
+    and a start's own until its record is written, both on the pool's ledger; and the owed,
+    whose record is cleared before the container goes and which may be mid write-back. An
+    operator told any is an orphan would delete it by hand. Fleet-wide on purpose: two name
+    columns, no user data, superadmin-only."""
     pool = await db.scalars(sa.select(SandboxPoolMember.name))
     owed = await db.scalars(sa.select(PendingTeardown.app_name))
     return {*pool, *owed}
-
-
-async def _being_born(redis: aioredis.Redis) -> set[str]:
-    """Containers a start is creating that no registry records yet, by their birth markers.
-    Read through `read_birth_marker`, as the next birth reads one."""
-    names: set[str] = set()
-    async for raw_key in redis.scan_iter(match=birth_marker_scan_pattern()):
-        try:
-            user_uuid = uuid.UUID(str(raw_key).rsplit(":", 1)[-1])
-        except ValueError:
-            continue  # a key we did not write; not ours to interpret
-        app_name = (await read_birth_marker(redis, user_uuid) or {}).get(REGISTRY_FIELD_APP_NAME)
-        if app_name:
-            names.add(app_name)
-    return names
 
 
 # --- the tag backfill ----------------------------------------------------------------
@@ -234,7 +220,7 @@ async def owning_app_ids(db: AsyncSession) -> dict[str, uuid.UUID]:
 
 async def _app_names_to_owners(db: AsyncSession) -> dict[str, _KnownContainer]:
     """Map every name derived from an app back to who it belongs to — both fleets this one
-    Redis-per-user slot can ever hold (#198): a build sandbox (`sbx-`, keyed by its owner) and a
+    Redis-per-user slot can ever hold: a build sandbox (`sbx-`, keyed by its owner) and a
     colleague's shared view (`shr-`, keyed by the RECIPIENT — same rule `shared_sandbox_tags`
     follows, since a shared view's per-slot occupancy and revocable access are the recipient's,
     not the project owner's). Only a container still running under a derived name matches: a
@@ -246,14 +232,11 @@ async def _app_names_to_owners(db: AsyncSession) -> dict[str, _KnownContainer]:
     parsing an owner out of either is a guess that could write a future reap's tree back into the
     wrong app's slot. FLEET-WIDE ON PURPOSE — neither query here is scoped by `user_id`,
     because the question is "does ANY user (or ANY share) own this"; between them they read two
-    identifier columns plus one junction row, no user data, superadmin-only. `app_name_for`/
-    `shr_name_for` are imported in-function to keep `manager`'s heavy imports out of the worker.
+    identifier columns plus one junction row, no user data, superadmin-only.
 
     A project shared with several colleagues produces one `shr-` entry per recipient, all keyed
     off the SAME app id — a fan-out `_owning_app_ids` (this function's only consumer) already
     tolerates, since it only ever reads the app id back out, never the name."""
-    from src.services.build_sessions.manager import app_name_for, shr_name_for
-
     rows = (await db.execute(sa.select(AppRegistry.id, AppRegistry.user_id))).all()
     known: dict[str, _KnownContainer] = {
         app_name_for(app_id): _KnownContainer(

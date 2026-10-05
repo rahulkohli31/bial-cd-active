@@ -49,7 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.app_registry import AppRegistry
 from src.db.models.message import Message, MessageEntryKind
-from src.db.models.pending_teardown import PendingTeardown, PendingTeardownKind
+from src.db.models.pending_teardown import PendingTeardown
 from src.services.build_sessions.alarms import REAP_FOUND_NO_REPOSITORY_EVENT
 from src.services.build_sessions.drain import is_drained, the_ceiling_hours
 from src.services.build_sessions.locks import (
@@ -65,11 +65,7 @@ from src.services.build_sessions.locks import (
     release_liveness_lease,
     shared_view_stamp,
 )
-from src.services.build_sessions.reaper import (
-    handle_named,
-    is_a_sandbox_name,
-    is_a_shared_sandbox_name,
-)
+from src.services.build_sessions.reaper import handle_named, is_a_platform_sandbox_name
 from src.services.build_sessions.snapshot import WorkspaceHasNoRepositoryError, write_the_tree_back
 from src.services.messages.projection import TURN_TERMINAL_KIND
 from src.services.redis import REGISTRY_STATE_ENDING, registry_key
@@ -175,7 +171,6 @@ class OwedTeardown:
     user_id: uuid.UUID
     app_id: uuid.UUID
     app_name: str
-    kind: PendingTeardownKind
     write_back: bool
     project_id: uuid.UUID
     instance_ref: datetime
@@ -185,21 +180,13 @@ class OwedTeardown:
 
 
 def _owed_from(row: PendingTeardown) -> OwedTeardown:
-    kind = row.kind
-    if kind is None:
-        # A row a process older than the `kind` column wrote, when the name still said which.
-        kind = (
-            PendingTeardownKind.SHARED
-            if row.app_name.startswith(SHARED_SANDBOX_NAME_PREFIX)
-            else PendingTeardownKind.BUILD
-        )
     return OwedTeardown(
         id=row.id,
         user_id=row.user_id,
         app_id=row.app_id,
         app_name=row.app_name,
-        kind=kind,
-        write_back=row.write_back,
+        # A shared view's row that a process older than the column wrote carries its default.
+        write_back=row.write_back and not row.app_name.startswith(SHARED_SANDBOX_NAME_PREFIX),
         project_id=row.project_id,
         instance_ref=row.instance_ref,
         conversation_id=row.conversation_id,
@@ -256,7 +243,6 @@ async def claim_the_teardown_we_owe(
     user_id: uuid.UUID,
     app_id: uuid.UUID,
     app_name: str,
-    kind: PendingTeardownKind,
     write_back: bool,
     project_id: uuid.UUID,
     instance_ref: datetime,
@@ -280,7 +266,6 @@ async def claim_the_teardown_we_owe(
             user_id=user_id,
             app_id=app_id,
             app_name=app_name,
-            kind=kind,
             write_back=write_back,
             project_id=project_id,
             instance_ref=instance_ref,
@@ -309,36 +294,27 @@ async def owe_a_teardown_the_reap_could_not_perform(
     write_back: bool,
     session_factory: SessionFactory | None = None,
 ) -> OwedTeardown | None:
-    """Put the deletion of the container this record names on the owed-row ledger. The row, or
-    `None` when the ledger could not take it.
+    """Put the deletion of the container this record names on the owed-row ledger, so the retry
+    rides on the row rather than on the citizen's held lock and registry. The row, or `None` when
+    it cannot describe ONE container: no app to owe it against, or no instance stamp to tell it
+    from whatever is created under the same name next. The caller's own behaviour then stands.
 
-    The reaper's failure arm holds the citizen's lock and registry so a later sweep can retry,
-    which spends that citizen's one workspace on the platform's own failure, and a start that
-    replaces whatever holds the slot would otherwise wait on its delete. The row carries the
-    retry instead — but only when it can be made to describe ONE container: with no app id there
-    is no app to owe it against, and with no instance stamp the ARM delete could not tell this
-    container from whatever is created under the same name next. Either gap leaves the caller's
-    own behaviour in place.
-
-    `write_back` says whether the routine writes a build sandbox's tree back before deleting it.
-
-    A SHARED VIEW IS OWED AGAINST ITS OWNER'S APP, never the slot holder's: the record's stamp is
-    the owner and project its launch stamped, and a caller's `app_id` is not consulted. The
-    routine deletes a shared view with no write-back."""
+    `write_back` says whether a build sandbox's tree goes back first. A SHARED VIEW IS OWED AGAINST
+    ITS OWNER'S APP, found from the record's stamp and never from the caller's `app_id`, and is
+    never written back."""
     # The record's OWN birthday: re-stamped at every registration, so it tells this container from
     # whatever is created under the same name next.
     instance_ref = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
     if instance_ref is None:
         return None
     factory = session_factory if session_factory is not None else _the_default_factory()
-    if is_a_shared_view(reg):
-        shared_view = shared_view_stamp(reg)
-        if shared_view is None:
-            return None
+    shared_view = shared_view_stamp(reg)
+    if shared_view is not None:
         return await _owe_a_shared_view(
             factory, user_id=user_id, reg=reg, instance_ref=instance_ref, shared_view=shared_view
         )
-    if app_id is None:
+    # A shared view the previous release registered carries no stamp to owe it against.
+    if app_id is None or is_a_shared_view(reg):
         return None
     # THE RECORD AND THE APP ID ARRIVE FROM DIFFERENT READS, so the row is only sound if they
     # describe the same container. The caller resolves `app_id` from one registry read and the
@@ -370,7 +346,6 @@ async def owe_a_teardown_the_reap_could_not_perform(
             user_id=user_id,
             app_id=app_id,
             app_name=app_name,
-            kind=PendingTeardownKind.BUILD,
             write_back=write_back,
             project_id=project_id,
             instance_ref=instance_ref,
@@ -410,7 +385,6 @@ async def _owe_a_shared_view(
             user_id=user_id,
             app_id=app_id,
             app_name=app_name,
-            kind=PendingTeardownKind.SHARED,
             write_back=False,
             project_id=shared_view.project_id,
             instance_ref=instance_ref,
@@ -474,7 +448,7 @@ async def run_the_shutdown(
     a switch is the incoming project's container. A row that writes nothing back never reaches
     the container at all: it is deleted by name, so an unreachable one is not spared."""
     factory = session_factory if session_factory is not None else _the_default_factory()
-    if not (is_a_sandbox_name(owed.app_name) or is_a_shared_sandbox_name(owed.app_name)):
+    if not is_a_platform_sandbox_name(owed.app_name):
         # FAIL CLOSED ON A NAME WE CANNOT VOUCH FOR — everything below hands this string to an
         # ARM delete. A row that cannot name one of this platform's own containers describes a
         # deletion nobody should perform, and keeping it would only re-refuse forever.
@@ -485,13 +459,12 @@ async def run_the_shutdown(
         await _settle_the_debt(owed, factory)
         return ShutdownOutcome.NOT_THIS_INSTANCE
 
-    if owed.kind is PendingTeardownKind.SHARED or not owed.write_back:
+    if not owed.write_back:
         # A shared view holds nothing of the recipient's to write back: what they see is a
         # restore of somebody else's snapshot, already durable at its source, and that storage
         # is read-never-write for them. A container a start replaced holds a dead session's tree,
         # a failed attempt's, or one already set aside, and writing it back would put it over the
-        # saved copy. The kind is tested as well as the flag because a shared view's row written
-        # by an older process carries the flag's default.
+        # saved copy.
         if owed.conversation_id is not None:
             await _stop_the_outgoing_turn(owed, factory, reason)
         return await _destroy(owed, redis, sandbox_client, factory, None, reason)

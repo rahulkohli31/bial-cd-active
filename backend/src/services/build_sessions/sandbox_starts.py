@@ -10,15 +10,13 @@ start it times.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
-from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import sqlalchemy as sa
 import structlog
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.db.base import DB_UNREACHABLE
 from src.db.models.sandbox_start import (
     SandboxProjectType,
     SandboxStart,
@@ -30,9 +28,10 @@ from src.services.build_sessions.alarms import SANDBOX_START_NOT_RECORDED_EVENT
 from src.services.lake.env import identity_resource_id_for_env
 from src.services.sandbox.stopwatch import Stopwatch
 
-_log = structlog.get_logger()
+if TYPE_CHECKING:
+    from src.services.build_sessions.shutdown import SessionFactory
 
-SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+_log = structlog.get_logger()
 
 
 class StartRecord(Stopwatch):
@@ -46,7 +45,6 @@ class StartRecord(Stopwatch):
         self._user_id: uuid.UUID | None = None
         self._books: SessionFactory | None = None
         self._written = False
-        self._closed = False
 
     @property
     def on_the_books(self) -> uuid.UUID | None:
@@ -87,7 +85,7 @@ class StartRecord(Stopwatch):
                     )
                 )
                 await db.commit()
-        except (SQLAlchemyError, OSError):  # fmt: skip  # ruff py314 strips parens
+        except DB_UNREACHABLE:
             _log.warning(
                 SANDBOX_START_NOT_RECORDED_EVENT, step="open", start_id=str(self.id), exc_info=True
             )
@@ -100,9 +98,8 @@ class StartRecord(Stopwatch):
         can be seconds before the close that records it. `None` closes a start that neither
         failed nor was seen to serve: the stages it reached are kept and it has no end."""
         books = self._books
-        if not self._written or self._closed or books is None:
+        if not self._written or self._stopped or books is None:
             return
-        self._closed = True
         self.stop()
         to_first_page = self.elapsed_ms(None, "first_page")
         if outcome is None and to_first_page is not None:
@@ -138,7 +135,7 @@ class StartRecord(Stopwatch):
                     )
                 )
                 await db.commit()
-        except (SQLAlchemyError, OSError):  # fmt: skip  # ruff py314 strips parens
+        except DB_UNREACHABLE:
             _log.warning(
                 SANDBOX_START_NOT_RECORDED_EVENT,
                 step="close",

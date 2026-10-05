@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 import redis.asyncio as aioredis
 from pydantic import SecretStr
 
@@ -37,6 +38,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_WAITING_SINCE,
 )
+from src.services.sandbox.base import SandboxError
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
 from tests.fakes import a_sandbox_name
@@ -69,18 +71,43 @@ def _a_client() -> AcaSandboxClient:
 
 
 async def _the_previous_occupant(redis: aioredis.Redis, user: uuid.UUID) -> None:
-    """A hash left behind by the container that held this user's one slot before — carrying both
-    inheritable facts: a standing serving proof and a standing stay of execution."""
+    """What the container that held this user's one slot before left behind once its name was
+    cleared — carrying both inheritable facts: a standing serving proof and a standing stay of
+    execution."""
     await redis.hset(
         registry_key(user),
         mapping={
-            REGISTRY_FIELD_APP_NAME: _PREDECESSOR,
             REGISTRY_FIELD_APP_ID: str(_PREDECESSORS_APP),
             REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
             REGISTRY_FIELD_SERVING_SINCE: "2026-09-10T09:41:04+00:00",
             REGISTRY_FIELD_PREVIEW_STAY_UNTIL: "2026-09-10T10:41:04+00:00",
         },
     )
+
+
+async def test_a_record_that_still_names_a_container_is_never_written_over(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ The record is the only thing naming the container it describes, so a write landing on it
+    would leave that container running with nothing that finds it. A start reaching an occupied
+    slot fails, and the record stays exactly as it was.
+
+    Mutation check: drop the name guard from the script and the successor's write lands."""
+    user = uuid.uuid4()
+    await _the_previous_occupant(fake_redis, user)
+    await fake_redis.hset(registry_key(user), REGISTRY_FIELD_APP_NAME, _PREDECESSOR)
+    before = await fake_redis.hgetall(registry_key(user))
+
+    with pytest.raises(SandboxError):
+        await _a_client()._write_registry(
+            user,
+            app_name=_SUCCESSOR,
+            app_id=_SUCCESSORS_APP,
+            fqdn=f"{_SUCCESSOR}.example",
+            token_ref="ref-fresh",
+        )
+
+    assert await fake_redis.hgetall(registry_key(user)) == before
 
 
 async def test_a_new_container_says_it_has_never_served(fake_redis: aioredis.Redis) -> None:

@@ -1,13 +1,11 @@
-"""The `sandbox_pool` table — the ledger of containers made ahead of time for the pool.
+"""The `sandbox_pool` table — the ledger of containers made ahead of time for the pool, and of a
+start's own create until the registry records it.
 
-A row is written before its container is created and deleted once a claim has written the
-person's registry record, from which point the registry describes the container like any other.
-A claim is a compare-and-set on one `ready` row, so two starts never receive the same container.
-
-No `user_id`: a pool container belongs to nobody until it is claimed, and the claim deletes its
-row. `image_ref` is the image the container was made from, which is how an image change is seen.
-`name` holds only the shape `a_fresh_sandbox_name` mints: every path that deletes a container
-refuses any other, so a pool container under another name could never be cleaned up.
+A row is written before its container is created and deleted once the person's registry record
+names the container. A claim is a compare-and-set on one `ready` row, so two starts never receive
+the same container; a start's own create is `claimed` from the outset. No `user_id`: a row's
+container belongs to nobody until the registry, scoped by user, records it. `name` holds only the
+shape `a_fresh_sandbox_name` mints, since every path that deletes a container refuses any other.
 """
 
 from __future__ import annotations
@@ -49,6 +47,7 @@ class SandboxPoolMember(UUIDv7PrimaryKeyMixin, Base):
     name: Mapped[str] = mapped_column(sa.String(MAX_APP_NAME), nullable=False)
     # The container's own address; unknown until its create has answered.
     fqdn: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    # The image the container was made from, which is how an image change is seen.
     image_ref: Mapped[str] = mapped_column(sa.Text, nullable=False)
     state: Mapped[SandboxPoolState] = mapped_column(sandbox_pool_state_enum, nullable=False)
     state_changed_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)

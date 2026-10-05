@@ -31,9 +31,12 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_SERVING_SINCE,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_STAY_WRITER,
     REGISTRY_FIELD_TOKEN_REF,
+    legacy_registry_key,
 )
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
@@ -126,6 +129,22 @@ async def test_a_container_named_unrelated_to_its_app_has_its_stay_renewed(
     stay, writer = await _stay(fake_redis, user.id)
     assert stay is not None
     assert writer == "surface_present"
+
+
+async def test_a_record_left_under_the_old_key_has_its_stay_renewed(
+    client: AsyncClient, db_session: AsyncSession, fake_redis
+) -> None:
+    """Mutation check: read only the current key and the screen framing this container stops
+    holding it open."""
+    user, project, app_id = await _user_project_app(db_session, "old-key@bial.test")
+    await _register(fake_redis, user.id, app_name_for(app_id))
+    await fake_redis.rename(registry_key(user.id), legacy_registry_key(user.id))
+
+    body = await _renew(client, user, project)
+
+    assert body["outcome"] == "renewed"
+    stay, _ = await _stay(fake_redis, user.id)
+    assert stay is not None
 
 
 async def test_a_hidden_surface_asks_for_the_longer_budget(
@@ -245,6 +264,31 @@ async def test_a_renewal_aimed_at_another_project_writes_nothing(
     assert stay is None, "the other project's container was given a reprieve it did not earn"
 
 
+async def test_a_view_of_the_app_is_not_its_build_sandbox(
+    client: AsyncClient, db_session: AsyncSession, fake_redis
+) -> None:
+    """A record naming this app but stamped as a shared view is not the container this project's
+    screen frames.
+
+    Mutation check: leave the stamp out of what the renewal reads and the view is held open."""
+    user, project, app_id = await _user_project_app(db_session, "a-view@bial.test")
+    await _register(fake_redis, user.id, a_name_unrelated_to_its_app())
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_ID: str(app_id),
+            REGISTRY_FIELD_SHARED_OWNER_ID: str(uuid.uuid4()),
+            REGISTRY_FIELD_SHARED_PROJECT_ID: str(project.id),
+        },
+    )
+
+    body = await _renew(client, user, project)
+
+    assert body["outcome"] == "not_this_container"
+    stay, _ = await _stay(fake_redis, user.id)
+    assert stay is None
+
+
 async def test_no_registry_hash_is_conjured_for_a_project_with_nothing_running(
     client: AsyncClient, db_session: AsyncSession, fake_redis
 ) -> None:
@@ -322,8 +366,8 @@ async def test_an_unreadable_coordination_store_answers_503(
     re-arms on the difference, and reading an outage as "your container is gone" is exactly the
     mistake `preview-state` was reshaped to stop making.
 
-    PATCHED ON `eval`, WHICH IS THE ONE CALL THIS ROUTE MAKES. Refusing a method the route never
-    invokes would leave this green whatever the route did with an outage."""
+    PATCHED ON `eval`, THE ROUTE'S WRITE. Refusing a method the route never invokes would leave
+    this green whatever the route did with an outage."""
     user, project, app_id = await _user_project_app(db_session, "outage@bial.test")
     await _register(fake_redis, user.id, app_name_for(app_id))
 

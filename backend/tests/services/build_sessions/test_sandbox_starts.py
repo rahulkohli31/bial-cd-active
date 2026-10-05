@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import cast
+from typing import cast, get_args
 
 import httpx
 import pytest
@@ -58,6 +58,7 @@ from src.services.sandbox import SandboxHandle
 from src.services.sandbox.base import a_fresh_sandbox_name
 from src.services.sandbox.client import _REINSTALLED_MARKER, _RESTORE_SCRIPT, AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
+from src.services.sandbox.stopwatch import Miss
 from src.services.storage import snapshot_key
 from src.services.turns.engine import TurnEngine, _TurnState, set_turn_engine_for_tests
 from src.services.turns.guard import _mid_reply
@@ -646,6 +647,12 @@ def _a_turn_holding(user_id: uuid.UUID, app: AppRegistry, record: StartRecord) -
 
 
 # --- what a row says about its start -----------------------------------------------------------
+
+
+def test_every_reason_a_start_gives_for_creating_is_one_its_row_can_hold() -> None:
+    """The stopwatch carries a reason as a `Literal` and the row as a native enum, so a reason
+    only one side knows fails the close that would record it."""
+    assert set(get_args(Miss)) == {miss.value for miss in SandboxStartMiss}
 
 
 @pytest.mark.parametrize(

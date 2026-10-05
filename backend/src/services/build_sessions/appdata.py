@@ -14,7 +14,6 @@ value into published containers built with a `pub-` one. The database half: `app
 from __future__ import annotations
 
 import uuid
-from urllib.parse import urlsplit
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -26,6 +25,7 @@ from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus, mint_app_key
 from src.services.projects import owned_project_or_404
 from src.services.sandbox import SandboxNotConfiguredError
+from src.services.sandbox.client import portal_origin
 
 # THE SWITCHED-OFF REFUSAL, in one place because two surfaces say it: the gate
 # below, and the pre-read in `api/v1/conversations/turns.py` that lets a citizen read this
@@ -119,21 +119,6 @@ async def resolve_app_for_project(
     if app_status is AppStatus.DISABLED:
         raise AppApiError(409, APP_SWITCHED_OFF, code=APP_SWITCHED_OFF_CODE)
     return app_id
-
-
-def _origin(url: str) -> str:
-    """The bare origin (`scheme://host[:port]`, no path / trailing slash) of a URL —
-    `FRONTEND_URL` is a plain `str`, not guaranteed path-free."""
-    parts = urlsplit(url)
-    if parts.scheme and parts.netloc:
-        return f"{parts.scheme}://{parts.netloc}"
-    return url.rstrip("/")
-
-
-def portal_origin() -> str:
-    """`BIAL_PORTAL_ORIGIN`: the one origin allowed to frame a sandbox, from `FRONTEND_URL`, which
-    both processes that make sandboxes hold."""
-    return _origin(settings.FRONTEND_URL)
 
 
 def build_app_env(app_id: uuid.UUID) -> dict[str, str]:

@@ -1,6 +1,6 @@
 """The Azure-side sandbox inventory — the fleet view the Redis sweep cannot
 produce. A fake lister, the real registry namespace, and what holds a container no registry
-names: the pool's ledger, the owed teardowns and the birth markers."""
+names: the pool's ledger and the owed teardowns."""
 
 from __future__ import annotations
 
@@ -11,13 +11,12 @@ import pytest
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models.pending_teardown import PendingTeardown, PendingTeardownKind
+from src.db.models.pending_teardown import PendingTeardown
 from src.services.build_sessions.inventory import FleetLister, take_sandbox_inventory
-from src.services.build_sessions.locks import note_a_birth
 from src.services.build_sessions.manager import app_name_for
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_STATE
-from src.services.sandbox import SandboxError
+from src.services.sandbox import SandboxError, pool
 from src.services.sandbox.base import FleetMember, a_fresh_sandbox_name
 from tests.factories import UserFactory
 from tests.fakes import a_fleet_member, a_ready_pool_row
@@ -130,7 +129,6 @@ async def test_a_container_whose_teardown_is_owed_is_not_reported_as_unregistere
             user_id=user.id,
             app_id=uuid.uuid4(),
             app_name=owed,
-            kind=PendingTeardownKind.BUILD,
             write_back=True,
             project_id=uuid.uuid4(),
             instance_ref=datetime.now(UTC),
@@ -144,20 +142,14 @@ async def test_a_container_whose_teardown_is_owed_is_not_reported_as_unregistere
     assert inv.unregistered == (orphan,)
 
 
+@pytest.mark.usefixtures("empty_sandbox_pool")
 async def test_a_container_a_start_is_still_creating_is_not_reported_as_unregistered(
     db_session: AsyncSession, fake_redis: aioredis.Redis
 ) -> None:
-    """Until the registry records it, its birth marker is the only thing naming it, and a create
-    in flight is exactly what an operator deleting orphans by hand must not reach."""
+    """Until the registry records it, the ledger row its start wrote is the only thing naming it,
+    and a create in flight is exactly what an operator deleting orphans by hand must not reach."""
     being_born, orphan = a_fresh_sandbox_name(), a_fresh_sandbox_name()
-    assert await note_a_birth(
-        fake_redis,
-        uuid.uuid4(),
-        app_name=being_born,
-        app_id=uuid.uuid4(),
-        shared_project_id=None,
-        shared_owner_id=None,
-    )
+    await pool.hold_a_create(being_born, "acr/img:v1")
 
     inv = await take_sandbox_inventory(db_session, fake_redis, _Fleet([being_born, orphan]))
 

@@ -1,4 +1,4 @@
-"""Revision 0054: an owed teardown says whether its build sandbox's tree is written back first.
+"""Revision 0054: an owed teardown says whether its container's tree is written back first.
 
 DEFAULT LANE: the revision's real `downgrade()` and `upgrade()` run inside the per-test transaction
 against seeded rows and are rolled back with it, so the round trip is proved with rows present
@@ -23,6 +23,7 @@ _BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
 _MIGRATION_PATH = _BACKEND_ROOT / "alembic" / "versions" / "2026_10_05_0054_teardown_write_back.py"
 _BEFORE = "sbx-" + "1" * 28
 _DURING_THE_ROLLBACK = "sbx-6d0f3a9e21c84b7f95e0a1c2d3b4"
+_A_SHARED_VIEW = "shr-" + "3" * 28
 
 
 def _migration() -> ModuleType:
@@ -71,7 +72,7 @@ def test_the_revision_id_fits_the_version_column() -> None:
     """Against a literal, never the string that produced it — that passes at any length."""
     assert _REVISION.revision == "0054_teardown_write_back"
     assert len("0054_teardown_write_back") <= 32
-    assert _REVISION.down_revision == "0053_pending_teardown_kind"
+    assert _REVISION.down_revision == "0052_sandbox_starts"
 
 
 async def test_a_row_that_does_not_name_the_column_keeps_its_write_back(db_session) -> None:
@@ -113,3 +114,22 @@ async def test_a_row_that_does_not_name_the_column_keeps_its_write_back(db_sessi
         )
     )
     assert nullable == "NO"
+
+
+async def test_the_upgrade_marks_a_shared_views_row_as_never_written_back(db_session) -> None:
+    """A `shr-` row from before the revision owes a shared view, which is never written back; a
+    build sandbox's row beside it keeps its write-back.
+
+    Mutation check: drop the upgrade's UPDATE and the view's row is left claiming a write-back."""
+    user = await UserFactory.create(db_session)
+    await _owe(db_session, user.id, _BEFORE)
+    await _owe(db_session, user.id, _A_SHARED_VIEW)
+
+    await _run(db_session, "downgrade")
+    await _run(db_session, "upgrade")
+
+    rows = await db_session.execute(
+        sa.text("SELECT app_name, write_back FROM pending_teardowns WHERE user_id = :user_id"),
+        {"user_id": user.id},
+    )
+    assert dict(rows.all()) == {_BEFORE: True, _A_SHARED_VIEW: False}

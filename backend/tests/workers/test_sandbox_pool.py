@@ -25,9 +25,11 @@ from taskiq.cli.scheduler.run import is_cron_task_now
 import src.db.base as db_base
 from src.config import settings
 from src.core.alarms import SANDBOX_POOL_BELOW_SIZE_EVENT
-from src.db.models.pending_teardown import PendingTeardown, PendingTeardownKind
+from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.sandbox_pool import SandboxPoolMember, SandboxPoolState
 from src.db.models.user import User
+from src.services.build_sessions import pool_pass
+from src.services.build_sessions.pool_pass import ROW_DEADLINE, PoolPass, keep_the_pool
 from src.services.redis import registry_key
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
 from src.services.sandbox import pool, reset_sandbox_for_tests, set_sandbox_for_tests
@@ -110,7 +112,6 @@ async def owe() -> AsyncIterator[Callable[[str], Awaitable[None]]]:
                     user_id=user.id,
                     app_id=uuid.uuid4(),
                     app_name=app_name,
-                    kind=PendingTeardownKind.BUILD,
                     write_back=True,
                     project_id=uuid.uuid4(),
                     instance_ref=datetime.now(UTC),
@@ -148,6 +149,12 @@ async def _row(
         )
         await db.commit()
     return name
+
+
+async def _a_pass(keeper: SimpleNamespace, config: SandboxConfig, *, at: datetime) -> PoolPass:
+    """One pass at `at`, under `config` as the client's own."""
+    keeper.client._config = config
+    return await keep_the_pool(keeper.client, at=at)
 
 
 async def _ledger() -> dict[str, tuple[SandboxPoolState, str]]:
@@ -190,7 +197,7 @@ async def test_at_nine_on_a_monday_morning_the_pool_fills_to_the_day_size(keeper
     since = MONDAY_MORNING - timedelta(hours=1)
     ready = {await _row(keeper, READY, since=since) for _ in range(2)}
 
-    outcome = await pool.keep_the_pool(keeper.client, config, at=MONDAY_MORNING)
+    outcome = await _a_pass(keeper, config, at=MONDAY_MORNING)
 
     assert (outcome.target, outcome.filled, outcome.retired) == (5, 3, 0)
     assert len(keeper.aca.filled) == 3
@@ -203,9 +210,7 @@ async def test_a_minute_before_nine_the_night_size_still_holds(keeper) -> None:
     older = await _row(keeper, READY, since=since)
     newer = await _row(keeper, READY, since=since + timedelta(minutes=5))
 
-    outcome = await pool.keep_the_pool(
-        keeper.client, config, at=MONDAY_MORNING - timedelta(minutes=1)
-    )
+    outcome = await _a_pass(keeper, config, at=MONDAY_MORNING - timedelta(minutes=1))
 
     assert (outcome.target, outcome.filled, outcome.retired) == (1, 0, 1)
     assert keeper.aca.deleted == [older]
@@ -223,7 +228,7 @@ async def test_at_seven_in_the_evening_the_pool_shrinks_and_no_claimed_container
     ready = [await _row(keeper, READY, since=since + timedelta(minutes=i)) for i in range(5)]
     claimed = {await _row(keeper, CLAIMED, since=evening) for _ in range(3)}
 
-    outcome = await pool.keep_the_pool(keeper.client, config, at=evening)
+    outcome = await _a_pass(keeper, config, at=evening)
 
     assert (outcome.target, outcome.retired, outcome.deleted, outcome.filled) == (1, 4, 4, 0)
     assert keeper.aca.deleted == ready[:4]
@@ -240,7 +245,7 @@ async def test_at_seven_in_the_evening_the_pool_shrinks_and_no_claimed_container
 async def test_the_night_size_holds_before_the_day_starts_and_at_the_weekend(
     keeper, at: datetime
 ) -> None:
-    outcome = await pool.keep_the_pool(keeper.client, _config(day=5, night=1), at=at)
+    outcome = await _a_pass(keeper, _config(day=5, night=1), at=at)
 
     assert (outcome.target, outcome.filled) == (1, 1)
 
@@ -264,11 +269,11 @@ async def test_an_image_change_is_swapped_in_new_before_old_without_dipping_belo
 
     keeper.aca.on_each_call = the_ready_count
 
-    first = await pool.keep_the_pool(keeper.client, config, at=datetime.now(UTC))
+    first = await _a_pass(keeper, config, at=datetime.now(UTC))
     await _its_create_finished(elsewhere[0])
-    second = await pool.keep_the_pool(keeper.client, config, at=datetime.now(UTC))
+    second = await _a_pass(keeper, config, at=datetime.now(UTC))
     await _its_create_finished(elsewhere[1])
-    third = await pool.keep_the_pool(keeper.client, config, at=datetime.now(UTC))
+    third = await _a_pass(keeper, config, at=datetime.now(UTC))
 
     assert [(p.filled, p.retired) for p in (first, second, third)] == [(3, 0), (0, 4), (0, 1)]
     assert len(ready_counts) == 8
@@ -287,10 +292,10 @@ async def test_a_create_left_filling_past_its_deadline_is_deleted_and_nothing_is
 ) -> None:
     config = _config(day=5, night=5)
     at = datetime.now(UTC)
-    stuck = await _row(keeper, FILLING, since=at - pool.ROW_DEADLINE - timedelta(minutes=1))
+    stuck = await _row(keeper, FILLING, since=at - ROW_DEADLINE - timedelta(minutes=1))
 
     with capture_logs() as logged:
-        outcome = await pool.keep_the_pool(keeper.client, config, at=at)
+        outcome = await _a_pass(keeper, config, at=at)
 
     assert (outcome.overdue, outcome.deleted, outcome.filled) == (True, 1, 0)
     assert keeper.aca.deleted == [stuck]
@@ -307,13 +312,33 @@ async def test_a_claim_inside_its_deadline_survives_and_one_past_it_nothing_name
     no project work was ever put in its container."""
     at = datetime.now(UTC)
     in_flight = await _row(keeper, CLAIMED, since=at - timedelta(minutes=1))
-    abandoned = await _row(keeper, CLAIMED, since=at - pool.ROW_DEADLINE - timedelta(minutes=1))
+    abandoned = await _row(keeper, CLAIMED, since=at - ROW_DEADLINE - timedelta(minutes=1))
 
-    outcome = await pool.keep_the_pool(keeper.client, _config(day=0, night=0), at=at)
+    outcome = await _a_pass(keeper, _config(day=0, night=0), at=at)
 
     assert outcome.deleted == 1
     assert keeper.aca.deleted == [abandoned]
     assert await _states() == {in_flight: CLAIMED}
+
+
+async def test_a_starts_create_left_claimed_past_its_deadline_holds_back_no_fill(
+    keeper, fake_redis: aioredis.Redis
+) -> None:
+    """A start's own create is held claimed until its record is written. One left past its
+    deadline is cleared like any claim nothing names, and the pool fills as usual: a stuck start
+    is no sign that Azure is refusing the pool's creates.
+
+    Mutation check: count a claimed row past its deadline toward stopping the fills and none is
+    made, and the alarm fires."""
+    at = datetime.now(UTC)
+    stuck = await _row(keeper, CLAIMED, since=at - ROW_DEADLINE - timedelta(minutes=1))
+
+    with capture_logs() as logged:
+        outcome = await _a_pass(keeper, _config(day=2, night=2), at=at)
+
+    assert (outcome.deleted, outcome.filled, outcome.overdue) == (1, 2, False)
+    assert keeper.aca.deleted == [stuck]
+    assert _events(logged, SANDBOX_POOL_BELOW_SIZE_EVENT) == []
 
 
 @pytest.mark.parametrize("held_by", ["registry", "owed_teardown"])
@@ -323,13 +348,13 @@ async def test_a_claim_past_its_deadline_that_somebody_still_holds_keeps_its_con
     """A claim whose registry write landed and whose row could not be deleted: the container is
     somebody's workspace, or has their work being saved out of it. Only the row goes."""
     at = datetime.now(UTC)
-    stuck = await _row(keeper, CLAIMED, since=at - pool.ROW_DEADLINE - timedelta(minutes=1))
+    stuck = await _row(keeper, CLAIMED, since=at - ROW_DEADLINE - timedelta(minutes=1))
     if held_by == "registry":
         await fake_redis.hset(registry_key(uuid.uuid4()), mapping={REGISTRY_FIELD_APP_NAME: stuck})
     else:
         await owe(stuck)
 
-    outcome = await pool.keep_the_pool(keeper.client, _config(day=0, night=0), at=at)
+    outcome = await _a_pass(keeper, _config(day=0, night=0), at=at)
 
     assert outcome.deleted == 0
     assert keeper.aca.deleted == []
@@ -343,12 +368,12 @@ async def test_a_delete_azure_refuses_is_left_retiring_and_retried_by_the_next_p
     member = await _row(keeper, READY)
     keeper.aca.refuses_to_delete.add(member)
 
-    first = await pool.keep_the_pool(keeper.client, config, at=datetime.now(UTC))
+    first = await _a_pass(keeper, config, at=datetime.now(UTC))
     assert (first.retired, first.deleted) == (1, 0)
     assert await _states() == {member: RETIRING}
 
     keeper.aca.refuses_to_delete.clear()
-    second = await pool.keep_the_pool(keeper.client, config, at=datetime.now(UTC))
+    second = await _a_pass(keeper, config, at=datetime.now(UTC))
 
     assert second.deleted == 1
     assert keeper.aca.deleted == [member, member]
@@ -362,7 +387,7 @@ async def test_a_claim_landing_between_the_passes_look_and_its_retire_keeps_its_
     about to retire; the retire's compare-and-set is what stops it."""
     since = datetime.now(UTC) - timedelta(hours=1)
     rows = [await _row(keeper, READY, since=since + timedelta(minutes=i)) for i in range(6)]
-    real_reading = pool._the_ledger
+    real_reading = pool.the_ledger
 
     async def a_start_claims_right_after_the_reading() -> list[SandboxPoolMember]:
         reading = await real_reading()
@@ -370,11 +395,9 @@ async def test_a_claim_landing_between_the_passes_look_and_its_retire_keeps_its_
         assert claimed is not None and claimed.name == rows[0]
         return reading
 
-    monkeypatch.setattr(pool, "_the_ledger", a_start_claims_right_after_the_reading)
+    monkeypatch.setattr(pool, "the_ledger", a_start_claims_right_after_the_reading)
 
-    outcome = await pool.keep_the_pool(
-        keeper.client, _config(day=5, night=5), at=datetime.now(UTC)
-    )
+    outcome = await _a_pass(keeper, _config(day=5, night=5), at=datetime.now(UTC))
 
     assert outcome.retired == 0
     assert keeper.aca.deleted == []
@@ -394,9 +417,7 @@ async def test_while_azure_refuses_creates_each_pass_asks_once_and_raises_the_al
     for minute in range(3):
         asked_before = len(keeper.aca.create_attempts)
         with capture_logs() as logged:
-            outcome = await pool.keep_the_pool(
-                keeper.client, config, at=start + timedelta(minutes=minute)
-            )
+            outcome = await _a_pass(keeper, config, at=start + timedelta(minutes=minute))
         assert len(keeper.aca.create_attempts) - asked_before == 1
         assert (outcome.filled, outcome.refused) == (0, True)
         [alarm] = _events(logged, SANDBOX_POOL_BELOW_SIZE_EVENT)
@@ -404,9 +425,7 @@ async def test_while_azure_refuses_creates_each_pass_asks_once_and_raises_the_al
 
     keeper.aca.refuses_to_create = False
     with capture_logs() as logged:
-        recovered = await pool.keep_the_pool(
-            keeper.client, config, at=start + timedelta(minutes=3)
-        )
+        recovered = await _a_pass(keeper, config, at=start + timedelta(minutes=3))
 
     assert (recovered.filled, recovered.ready) == (5, 5)
     assert _events(logged, SANDBOX_POOL_BELOW_SIZE_EVENT) == []
@@ -414,10 +433,10 @@ async def test_while_azure_refuses_creates_each_pass_asks_once_and_raises_the_al
 
 async def test_the_alarm_never_fires_while_the_size_is_zero(keeper) -> None:
     at = datetime.now(UTC)
-    await _row(keeper, FILLING, since=at - pool.ROW_DEADLINE - timedelta(minutes=1))
+    await _row(keeper, FILLING, since=at - ROW_DEADLINE - timedelta(minutes=1))
 
     with capture_logs() as logged:
-        outcome = await pool.keep_the_pool(keeper.client, _config(day=0, night=0), at=at)
+        outcome = await _a_pass(keeper, _config(day=0, night=0), at=at)
 
     assert (outcome.overdue, outcome.deleted) == (True, 1)
     assert _events(logged, SANDBOX_POOL_BELOW_SIZE_EVENT) == []
@@ -439,8 +458,8 @@ async def test_two_passes_at_once_run_one_between_them(keeper, configured) -> No
         await asyncio.wait_for(asyncio.gather(*passes), timeout=5)
 
     assert len(keeper.aca.filled) == 2
-    assert len(_events(logged, pool.POOL_PASS_LOCKED_OUT_EVENT)) == 1
-    assert len(_events(logged, pool.POOL_PASS_EVENT)) == 1
+    assert len(_events(logged, pool_pass.POOL_PASS_LOCKED_OUT_EVENT)) == 1
+    assert len(_events(logged, pool_pass.POOL_PASS_EVENT)) == 1
 
 
 async def test_a_backend_starting_on_a_new_image_swaps_the_pool_without_waiting_for_it(
@@ -467,7 +486,7 @@ async def test_a_backend_starting_on_a_new_image_swaps_the_pool_without_waiting_
             await _until(swapped)
 
     assert len(keeper.aca.filled) == 5
-    assert len(_events(logged, pool.POOL_PASS_LOCKED_OUT_EVENT)) == 1
+    assert len(_events(logged, pool_pass.POOL_PASS_LOCKED_OUT_EVENT)) == 1
     assert {name for name, (state, _) in (await _ledger()).items() if state is READY} >= old
 
 
@@ -482,7 +501,7 @@ async def test_each_tick_logs_one_line_even_at_a_size_of_zero(keeper, configured
         await keep_the_pool_at_its_size()
 
     [line] = [entry for entry in logged if entry["event"].startswith("sandbox_pool_pass")]
-    assert line["event"] == pool.POOL_PASS_EVENT
+    assert line["event"] == pool_pass.POOL_PASS_EVENT
     assert (line["target"], line["ready"], line["filled"]) == (0, 0, 0)
 
 

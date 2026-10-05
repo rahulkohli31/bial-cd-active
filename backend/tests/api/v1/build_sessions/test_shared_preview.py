@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import src.db.base as db_base
 from src.api.v1.build_sessions.deps import sandbox_dependency, sandbox_or_none_dependency
 from src.config import settings
-from src.db.models.pending_teardown import PendingTeardown, PendingTeardownKind
+from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.sandbox_start import SandboxStart, SandboxStartKind, SandboxStartOutcome
 from src.services.build_sessions import shutdown as shutdown_module
 from src.services.build_sessions.appdata import resolve_app_for_project
@@ -176,37 +176,6 @@ async def test_refresh_restores_again_even_when_already_live(
     assert len(set(wire.sbx.restored)) == 2
 
 
-async def test_a_restarted_shared_view_is_given_the_owners_settings_again_and_starts(
-    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
-) -> None:
-    """A colleague's view taken from the pool comes back without its settings when Azure
-    restarts it, and refuses to start the app. Launching it again hands them back, built as the
-    view's own birth builds them, from the owner's app.
-
-    Mutation check: drop the hand-back from the shared launch's attach arm and the second launch
-    starts nothing."""
-    sandbox = wire.sbx
-    owner, project, app_id, recipient = await _shared_project(
-        db_session, fake_storage, owner_email="owner-rc@example.com", recipient_email="r-rc@x.com"
-    )
-    launch = f"/v1/build-sessions/projects/{project.id}/shared-launch"
-    assert (await client.post(launch, headers=auth_headers(recipient))).status_code == 200
-    [name] = sandbox.restored
-    sandbox.attach_handle = sandbox.by_name[name]
-    sandbox.unconfigured.add(name)
-
-    relaunched = await client.post(launch, headers=auth_headers(recipient))
-
-    assert relaunched.status_code == 200, relaunched.text
-    assert sandbox.restored == [name]
-    [(configured, env)] = sandbox.configured_with
-    assert configured == name
-    assert env["BIAL_APP_ID"] == str(app_id)
-    assert sandbox.restore_env is not None
-    assert set(env) == set(sandbox.restore_env)
-    assert sandbox.started == [name, name]
-
-
 async def test_launch_without_csrf_is_403(
     client: AsyncClient, db_session: AsyncSession, fake_storage, wire
 ) -> None:
@@ -306,9 +275,9 @@ async def test_a_refresh_answers_before_the_old_view_is_deleted_and_owes_it_unre
     assert new != old
     assert await fake_redis.hget(registry_key(recipient.id), REGISTRY_FIELD_APP_NAME) == new
     assert [
-        (row.app_name, row.app_id, row.kind, row.write_back)
+        (row.app_name, row.app_id, row.write_back)
         for row in await _owed_by(db_session, recipient.id)
-    ] == [(old, app_id, PendingTeardownKind.SHARED, False)]
+    ] == [(old, app_id, False)]
 
     slow_arm.aca.gate.set()
     await asyncio.gather(*(set(shutdown_module._IN_FLIGHT) - slow_arm.in_flight_before))

@@ -951,3 +951,11 @@ def test_a_record_carrying_an_app_id_is_never_classified_by_its_name() -> None:
     """Mutation check: classify by the `shr-` prefix whatever the record carries and this goes
     red."""
     assert locks.is_a_shared_view(_a_record(app_id=_APP, name="shr-" + "0" * 28)) is False
+
+
+def test_a_record_the_previous_release_wrote_is_read_by_its_name_before_its_stamp() -> None:
+    """Mutation check: parse the stamp first and this record raises instead."""
+    reg = _a_record(app_id=None, name="shr-" + "0" * 28)
+    reg |= {"shared_owner_id": "garbled", "shared_project_id": "garbled"}
+
+    assert locks.is_a_shared_view(reg) is True

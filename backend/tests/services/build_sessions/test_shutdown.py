@@ -30,7 +30,7 @@ import structlog.testing
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.message import MessageEntryKind, MessageVisibility
-from src.db.models.pending_teardown import PendingTeardown, PendingTeardownKind
+from src.db.models.pending_teardown import PendingTeardown
 from src.services.build_sessions import app_name_for, shr_name_for
 from src.services.build_sessions import shutdown as shutdown_module
 from src.services.build_sessions.alarms import REAP_FOUND_NO_REPOSITORY_EVENT
@@ -229,7 +229,6 @@ async def _owe(
     conversation_id: uuid.UUID | None = None,
     app_id: uuid.UUID | None = None,
     app_name: str | None = None,
-    kind: PendingTeardownKind = PendingTeardownKind.BUILD,
     write_back: bool = True,
 ) -> OwedTeardown:
     owning = app_id or scene.app_id
@@ -239,7 +238,6 @@ async def _owe(
             user_id=scene.user_id,
             app_id=owning,
             app_name=app_name or app_name_for(owning),
-            kind=kind,
             write_back=write_back,
             project_id=scene.project_id,
             instance_ref=instance_ref,
@@ -541,25 +539,22 @@ async def test_a_replaced_container_whose_delete_fails_stays_owed_and_the_sweep_
 
 
 @pytest.mark.parametrize(
-    ("kind", "write_back"),
-    [(PendingTeardownKind.BUILD, False), (PendingTeardownKind.SHARED, True)],
+    ("name", "write_back"),
+    [("sbx-" + "7" * 28, False), ("shr-" + "7" * 28, True)],
     ids=["replaced", "an-older-processes-shared-view"],
 )
 async def test_a_container_nothing_is_read_from_goes_on_the_first_pass_even_unreachable(
-    fake_redis: aioredis.Redis, scene: _Scene, kind: PendingTeardownKind, write_back: bool
+    fake_redis: aioredis.Redis, scene: _Scene, name: str, write_back: bool
 ) -> None:
     """★ Sparing an unreachable container protects a tree that may be the only copy. A row that
     writes nothing back protects nothing, so its container is deleted by name on the first pass
     rather than billing through the strikes. A shared view's row written by an older process
-    carries the flag's default, so its kind alone has to send it there.
+    carries the flag's default, so its `shr-` name alone has to send it there.
 
     Mutation check: reach the container before reading the row and both are spared; read the flag
     alone and the shared view is."""
-    name = a_name_unrelated_to_its_app()
     client = _wont_answer(name)
-    owed = await _owe(
-        scene, instance_ref=_born_at(10), app_name=name, kind=kind, write_back=write_back
-    )
+    owed = await _owe(scene, instance_ref=_born_at(10), app_name=name, write_back=write_back)
 
     with structlog.testing.capture_logs() as logs:
         outcome = await run_the_shutdown(
@@ -1054,9 +1049,7 @@ async def test_a_shared_view_owed_a_delete_is_destroyed_with_no_write_back(
             user_id=recipient.id,
             app_id=scene.app_id,
             app_name=name,
-            kind=PendingTeardownKind.SHARED,
-            # A row the column's default speaks for: the kind alone has to keep the view's tree.
-            write_back=True,
+            write_back=False,
             project_id=scene.project_id,
             instance_ref=born,
             conversation_id=None,
@@ -1261,21 +1254,21 @@ async def test_the_background_spawn_returns_before_the_teardown_finishes(
 
 
 # =============================================================================
-# A row written before rows said which kind of container they owe
+# A row written before rows said whether the tree goes back
 # =============================================================================
 
 
 async def _owed_by_an_older_process(
     scene: _Scene, *, user_id: uuid.UUID, app_name: str, instance_ref: datetime
 ) -> None:
-    """A lapsed row as a process older than the `kind` column leaves it: the kind is NULL."""
+    """A lapsed row as a process older than the `write_back` column leaves it: the column holds
+    its default."""
     async with scene.factory() as db:
         owed = await claim_the_teardown_we_owe(
             db,
             user_id=user_id,
             app_id=scene.app_id,
             app_name=app_name,
-            kind=PendingTeardownKind.BUILD,
             write_back=True,
             project_id=scene.project_id,
             instance_ref=instance_ref,
@@ -1284,7 +1277,7 @@ async def _owed_by_an_older_process(
         await db.execute(
             sa.update(PendingTeardown)
             .where(PendingTeardown.id == owed.id)
-            .values(kind=None, claimed_until=datetime.now(UTC) - timedelta(minutes=1))
+            .values(claimed_until=datetime.now(UTC) - timedelta(minutes=1))
         )
         await db.commit()
 
@@ -1295,10 +1288,11 @@ async def test_an_older_rows_shared_view_is_destroyed_without_a_write_back(
     db_session: AsyncSession,
     scene: _Scene,
 ) -> None:
-    """★ No kind on the row, and a `shr-` name: the view of the owner's app it always was.
+    """★ The column's default on the row, and a `shr-` name: the view of the owner's app it always
+    was.
 
-    Mutation check: read a NULL kind as a build sandbox whatever its name, and the colleague's
-    tree is written over the owner's saved copy."""
+    Mutation check: read the row's flag alone, whatever its name, and the colleague's tree is
+    written over the owner's saved copy."""
     recipient = await UserFactory.create(db_session)
     name = shr_name_for(scene.app_id, recipient.id)
     born = _born_at(10)
@@ -1318,8 +1312,8 @@ async def test_an_older_rows_shared_view_is_destroyed_without_a_write_back(
 async def test_an_older_rows_build_sandbox_is_written_back_as_it_always_was(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage, scene: _Scene
 ) -> None:
-    """Mutation check: read a NULL kind as a shared view whatever its name, and the citizen's
-    unsaved work goes with the container."""
+    """Mutation check: read the column's default as no write-back and the citizen's unsaved work
+    goes with the container."""
     born = _born_at(10)
     await _seed_registry(fake_redis, scene.user_id, app_name=scene.app_name, created_at=born)
     await _saved_copy(fake_storage, scene.app_id)
@@ -1342,7 +1336,7 @@ async def test_a_shared_view_owed_under_a_build_sandboxs_name_is_never_written_b
     db_session: AsyncSession,
     scene: _Scene,
 ) -> None:
-    """The row's kind decides, not the name: a view may carry the build sandbox's name shape.
+    """The row's flag decides, not the name: a view may carry the build sandbox's name shape.
 
     Mutation check: decide by the name's prefix and the owner's saved copy is overwritten."""
     recipient = await UserFactory.create(db_session)
@@ -1357,9 +1351,7 @@ async def test_a_shared_view_owed_under_a_build_sandboxs_name_is_never_written_b
             user_id=recipient.id,
             app_id=scene.app_id,
             app_name=name,
-            kind=PendingTeardownKind.SHARED,
-            # A row the column's default speaks for: the kind alone has to keep the view's tree.
-            write_back=True,
+            write_back=False,
             project_id=scene.project_id,
             instance_ref=born,
             conversation_id=None,

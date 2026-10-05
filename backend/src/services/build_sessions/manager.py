@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import asyncio
 import enum
-import hashlib
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
@@ -57,7 +56,7 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation
 from src.db.models.harness_counter import HarnessCounter
 from src.db.models.message import Message, MessageEntryKind
-from src.db.models.pending_teardown import PendingTeardown, PendingTeardownKind
+from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.project import Project
 from src.db.models.sandbox_start import SandboxStartKind, SandboxStartOutcome
 from src.db.models.user import User
@@ -95,11 +94,9 @@ from src.services.build_sessions.locks import (
     date_the_wait_from_the_start,
     delete_registry,
     delete_registry_if_it_still_names,
-    forget_the_birth_if_it_still_names,
     grant_stay_of_execution,
     is_a_shared_view,
     liveness_lease_is_held,
-    read_birth_marker,
     read_registry,
     read_registry_and_starting_marker,
     reap_lock,
@@ -115,8 +112,7 @@ from src.services.build_sessions.locks import (
 )
 from src.services.build_sessions.reaper import (
     handle_named,
-    is_a_sandbox_name,
-    is_a_shared_sandbox_name,
+    is_a_platform_sandbox_name,
     reap_user,
     reconcile_user,
     sound_the_alarm_if_the_proof_is_absent,
@@ -153,8 +149,6 @@ from src.services.redis.keys import (
     REGISTRY_STATE_READY,
 )
 from src.services.sandbox import (
-    SANDBOX_NAME_PREFIX,
-    SHARED_SANDBOX_NAME_PREFIX,
     CompileState,
     DevStatus,
     SandboxClient,
@@ -164,6 +158,8 @@ from src.services.sandbox import (
     SandboxNotReadyError,
 )
 from src.services.sandbox.base import a_fresh_sandbox_name
+from src.services.sandbox.base import app_name_for as app_name_for
+from src.services.sandbox.base import shr_name_for as shr_name_for
 from src.services.sandbox.stopwatch import timed_by
 from src.services.storage import (
     BundleValidationError,
@@ -341,10 +337,6 @@ def _kind_of_start(
 # context-manager factory (the real `async_sessionmaker` satisfies this by construction).
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
-# Clears the record a holder was found through, while it still names that container: the
-# registry's, or a birth marker's.
-_Forget = Callable[[aioredis.Redis, uuid.UUID, str], Awaitable[bool]]
-
 
 class BuildSessionConflictError(Exception):
     """The user already holds a live build session (the one-per-user lock is held)."""
@@ -407,6 +399,25 @@ def reset_idle_checks_for_tests() -> None:
     _idle_checks.clear()
 
 
+async def _birth_settings(
+    db: AsyncSession,
+    *,
+    app_id: uuid.UUID,
+    project_id: uuid.UUID,
+    connector_user_id: uuid.UUID | None,
+) -> dict[str, str]:
+    """The project settings a container of `app_id` is born with. `connector_user_id` is whose
+    connector grant it carries; a shared view carries none."""
+    env = {
+        **build_app_env(app_id),
+        **await provision_app_storage(app_id),
+        **await provision_app_database(db, project_id),
+    }
+    if connector_user_id is not None:
+        env |= await build_connector_env(db, user_id=connector_user_id, project_id=project_id)
+    return env
+
+
 async def _stopped_reading(
     sandbox_client: SandboxClient, handle: SandboxHandle
 ) -> DevStatus | None:
@@ -422,26 +433,6 @@ async def _stopped_reading(
     except SandboxError:
         return None
     return None if status.running or status.ready else status
-
-
-async def _hand_back_its_settings(
-    sandbox_client: SandboxClient,
-    handle: SandboxHandle,
-    its_settings: Callable[[], Awaitable[dict[str, str]]],
-) -> None:
-    """Configure an attached container that reports it has no settings: a claimed pool container
-    Azure restarted boots from its creation environment, which held none, and refuses to start the
-    app. `its_settings` builds them as the start that would have created it does. A health reading
-    that could not be taken leaves the container as it was; a refused configure raises."""
-    try:
-        configured = await sandbox_client.health(handle)
-    except SandboxError:
-        _log.warning("attached_container_health_unread", app_name=handle.app_name, exc_info=True)
-        return
-    if configured:
-        return
-    await sandbox_client.configure(handle, await its_settings())
-    _log.warning("attached_container_given_its_settings_again", app_name=handle.app_name)
 
 
 class _Quarantine(enum.StrEnum):
@@ -1010,25 +1001,6 @@ def _one_relaunch_in_the_log(**fields: str) -> Iterator[None]:
         structlog.contextvars.reset_contextvars(**tokens)
 
 
-def app_name_for(app_id: uuid.UUID) -> str:
-    """`sbx-` + 28 hex chars of the app_id, stable per app. No container is created under it —
-    `a_fresh_sandbox_name` names every one — so it only recognises one still running under it:
-    for a registry record carrying no app id, and in the inventory's forward match."""
-    return f"{SANDBOX_NAME_PREFIX}{app_id.hex[:28]}"
-
-
-def shr_name_for(app_id: uuid.UUID, recipient_id: uuid.UUID) -> str:
-    """`shr-` + 28 hex chars of a SHA-256 digest of the app and recipient ids, stable per pair.
-    Like `app_name_for`, no container is created under it; it only recognises a view still
-    running under it.
-
-    FORWARD-MATCH-ONLY: nothing may ever reverse-parse an app id or a recipient id back out of
-    this name; both are carried losslessly on the container's own ARM tags
-    (`shared_sandbox_tags`)."""
-    digest = hashlib.sha256(f"{app_id}:{recipient_id}".encode()).hexdigest()
-    return f"{SHARED_SANDBOX_NAME_PREFIX}{digest[:28]}"
-
-
 @dataclass(frozen=True)
 class _StartInFlight:
     """A start of one project that has been asked for and not yet brought up: the project, and
@@ -1104,16 +1076,13 @@ class _ResolvedSandbox:
 
 @dataclass
 class _LockScope:
-    """The mutable state a `_holding_user_lock` body shares with its compensation: the held
-    token, any container the body created (torn down if the body fails), and whether the body
-    ADOPTED the lock+container (a start's session takes ownership, so a clean exit must not
-    release them). `spared` is a separate escape, answering not "who owns this now" but "would
-    destroying it be a rollback at all" — set when the container was ATTACHED (already running
-    before this start) or BROUGHT UP (its dev server started, so tearing a working preview down
-    over a Redis heartbeat blip is not a fair trade even though this start created it).
-
-    `record` is the start being timed: the compensation closes it failed unless the container
-    was spared or adopted."""
+    """The mutable state a `_holding_user_lock` body shares with its compensation: the held token,
+    any container the body created (torn down if the body fails), and whether the body ADOPTED the
+    lock+container (a start's session then owns them, so a clean exit must not release them).
+    `spared` answers not "who owns this now" but "would destroying it be a rollback at all": set
+    when the container was ATTACHED (running before this start) or BROUGHT UP (its dev server
+    started, so tearing a working preview down over a Redis blip is not a fair trade). `record` is
+    the start being timed: the compensation closes it failed unless it was spared or adopted."""
 
     token: str
     record: StartRecord
@@ -1531,7 +1500,10 @@ class SessionManager:
         # sparing a container being taken down, and then whatever this user registers next.
         await release_liveness_lease(redis, user_id)
         reg = await read_registry(redis, user_id)
-        if reg is not None and await self._owe_the_holder(redis, user_id, sandbox_client, reg):
+        if reg is None:
+            await reap_lock(redis, user_id)
+            return False
+        if await self._owe_the_holder(redis, user_id, sandbox_client, reg):
             await reap_lock(redis, user_id)
             return True
         return await reconcile_user(redis, user_id, sandbox_client, certified_dead=True)
@@ -1542,11 +1514,9 @@ class SessionManager:
         user_id: uuid.UUID,
         sandbox_client: SandboxClient,
         reg: Mapping[str, str],
-        *,
-        forget: _Forget = delete_registry_if_it_still_names,
     ) -> bool:
-        """Hand the container this record names to the shutdown routine and `forget` the record,
-        so a new container can take the slot. False, touching nothing, when the ledger cannot take
+        """Hand the container this record names to the shutdown routine and clear the record, so
+        a new container can take the slot. False, touching nothing, when the ledger cannot take
         it: a name this platform did not mint, a record with no birthday, or one whose app it
         cannot name.
 
@@ -1555,7 +1525,7 @@ class SessionManager:
         avoid; a shared view is never written back at all. A container already owed is left to
         the run that owes it, as the door leaves it."""
         name = reg.get(REGISTRY_FIELD_APP_NAME, "")
-        if not (is_a_sandbox_name(name) or is_a_shared_sandbox_name(name)):
+        if not is_a_platform_sandbox_name(name):
             return False
         async with self._session_factory() as db:
             already_owed = await _is_already_on_its_way_out(db, user_id, name)
@@ -1574,7 +1544,7 @@ class SessionManager:
             sound_the_alarm_if_the_proof_is_absent(
                 reg, user_uuid=user_id, reason=ShutdownReason.REPLACED.value
             )
-        await forget(redis, user_id, name)
+        await delete_registry_if_it_still_names(redis, user_id, name)
         if owed is not None:
             shut_it_down_in_the_background(
                 owed, redis=redis, sandbox_client=sandbox_client, reason=ShutdownReason.REPLACED
@@ -1839,16 +1809,7 @@ class SessionManager:
                 verdict=verdict.state.value,
             )
         if verdict.state is WorkspaceState.INTACT:
-
-            async def its_settings() -> dict[str, str]:
-                return {
-                    **build_app_env(app_id),
-                    **await provision_app_storage(app_id),
-                    **await provision_app_database(db, project_id),
-                    **await build_connector_env(db, user_id=user.id, project_id=project_id),
-                }
-
-            await self._restart_if_stopped(user.id, app_id, handle, sandbox_client, its_settings)
+            await self._restart_if_stopped(user.id, app_id, handle, sandbox_client)
         return verdict.state
 
     async def _restart_if_stopped(
@@ -1857,13 +1818,13 @@ class SessionManager:
         app_id: uuid.UUID,
         handle: SandboxHandle,
         sandbox_client: SandboxClient,
-        its_settings: Callable[[], Awaitable[dict[str, str]]],
     ) -> None:
         """Start an INTACT app's dev server again in the container it stopped in, so the wait
         over it ends on the app. The container, its unsaved tree and the commit an approval pins
         all stay; nothing is written back. `_IDLE_CHECK_WINDOW` bounds a server that keeps dying
-        to one restart a minute, and only while a tab is asking. A container that reports no
-        settings is given `its_settings` first, or it refuses the start.
+        to one restart a minute, and only while a tab is asking. A container Azure restarted
+        never gets here: its files went with its settings, and a tree with no repository is
+        never INTACT.
 
         NEVER UNDER ANYTHING USING THE CONTAINER. Refused — not waited for — while this user's
         start lock is held: a start, a restore or a Discard brings its own dev server, and the
@@ -1896,13 +1857,6 @@ class SessionManager:
             # of framing the dead one.
             with suppress(RedisError):
                 await clear_serving(redis, user_id, app_name=handle.app_name)
-            try:
-                await _hand_back_its_settings(sandbox_client, handle, its_settings)
-            except SandboxError:
-                # The start below is refused in turn, and reported as not restarted.
-                _log.warning(
-                    "idle_restart_settings_refused", app_name=handle.app_name, exc_info=True
-                )
             restarted = await self._boot_the_tree_we_put_back(
                 sandbox_client, handle, user_id, arm="idle"
             )
@@ -2054,7 +2008,6 @@ class SessionManager:
             user_id=user.id,
             app_id=occupying.app_id,
             app_name=outgoing,
-            kind=PendingTeardownKind.BUILD,
             write_back=True,
             project_id=occupying.project_id,
             instance_ref=instance_ref,
@@ -2771,23 +2724,14 @@ class SessionManager:
             if not await self._snapshot_exists_or_bust(app_id):
                 raise NoSnapshotToRelaunchError(app_id)
             await db.commit()
-
-            # Written twice on purpose, here and in `ensure_sandbox`: `_restore_or_provision`
-            # falls back to a blank template, which a relaunch must never do, so a var added to
-            # one site alone is a half-fix.
-            async def the_settings_a_birth_gets() -> dict[str, str]:
-                return {
-                    **build_app_env(app_id),
-                    **await provision_app_storage(app_id),
-                    **await provision_app_database(db, project_id),
-                    **await build_connector_env(db, user_id=user_id, project_id=project_id),
-                }
-
             env: dict[str, str] | None = None
             cold_started_at: float | None = None
             try:
-                scope.handle = await self._attach_for_read(user_id, app_id, sandbox_client)
-                scope.spare()
+                attached = await self._attach_for_read(user_id, app_id, sandbox_client)
+                if not attached.configured:
+                    # Azure restarted it, and its files went with its settings: it is born again
+                    # from the saved copy, like a container that is gone.
+                    raise NoLiveSandboxError(app_id)
             except SandboxUnreachableError:
                 # UNKNOWN, AND THEREFORE NOT RESTORABLE — caught ahead of its parent. The
                 # container is supposed to be there and may hold work; restoring would tear it
@@ -2796,12 +2740,14 @@ class SessionManager:
             except NoLiveSandboxError:
                 # The cold-start clock starts here, the instant the platform decides to restore.
                 cold_started_at = time.monotonic()
-                env = await the_settings_a_birth_gets()
+                # `ensure_sandbox` builds its own without the storage grant its birth arm mints.
+                env = await _birth_settings(
+                    db, app_id=app_id, project_id=project_id, connector_user_id=user_id
+                )
                 await start.record.open(app_id=app_id, env=env)
             else:
-                await _hand_back_its_settings(
-                    sandbox_client, scope.handle, the_settings_a_birth_gets
-                )
+                scope.handle = attached
+                scope.spare()
             # Both locks now belong to the detached half, which releases them when the container
             # is up — or compensates, if bringing it up fails.
             bringing_it_up = held.pop_all()
@@ -3044,12 +2990,7 @@ class SessionManager:
             build_id=str(uuid.uuid7()), user_id=str(recipient.id), project_id=str(project.id)
         ):
             return await self._launch_shared_preview_under_one_build_id(
-                db,
-                recipient,
-                project,
-                sandbox_client,
-                force_refresh=force_refresh,
-                record=StartRecord(),
+                db, recipient, project, sandbox_client, force_refresh=force_refresh
             )
 
     async def _launch_shared_preview_under_one_build_id(
@@ -3060,10 +3001,10 @@ class SessionManager:
         sandbox_client: SandboxClient,
         *,
         force_refresh: bool,
-        record: StartRecord,
     ) -> SharedPreview:
         """The whole of `launch_shared_preview` — go there for what it does and why; this half
         is the same code, one indent level out, so the correlation binding has a block to own."""
+        record = StartRecord()
         async with self._start_lock_for(recipient.id):
             redis = get_redis()
             if recipient.id in self._active_by_user:
@@ -3108,14 +3049,6 @@ class SessionManager:
                 if not await self._snapshot_exists_or_bust(owner_app_id):
                     raise NoSnapshotToRelaunchError(owner_app_id)
                 snapshot_taken_at = await _snapshot_written_at(owner_app_id)
-
-                async def the_settings_a_birth_gets() -> dict[str, str]:
-                    return {
-                        **build_app_env(owner_app_id),
-                        **await provision_app_storage(owner_app_id),
-                        **await provision_app_database(db, project.id),
-                    }
-
                 attached = False
                 if not force_refresh:
                     try:
@@ -3126,12 +3059,10 @@ class SessionManager:
                         scope.spare()
                     except NoLiveSandboxError:
                         pass
-                    else:
-                        await _hand_back_its_settings(
-                            sandbox_client, scope.handle, the_settings_a_birth_gets
-                        )
                 if not attached:
-                    env = await the_settings_a_birth_gets()
+                    env = await _birth_settings(
+                        db, app_id=owner_app_id, project_id=project.id, connector_user_id=None
+                    )
                     await record.open(app_id=owner_app_id, env=env)
                     try:
                         with timed_by(record):
@@ -3235,21 +3166,25 @@ class SessionManager:
     async def _attach_for_shared_view(
         self, recipient_id: uuid.UUID, the_view: Occupant, sandbox_client: SandboxClient
     ) -> SandboxHandle:
-        """A handle on an already-live shared view, or `NoLiveSandboxError`. Registry-only —
-        unlike `_attach_for_read`, there is no in-process session to check first, because
-        `launch_shared_preview` never adopts one: a shared view has no chat turn and mints no
-        `BuildSession`."""
+        """A handle on an already-live shared view, or `NoLiveSandboxError`, also for one Azure
+        restarted. Registry-only — unlike `_attach_for_read`, there is no in-process session to
+        check first, because `launch_shared_preview` never adopts one: a shared view has no chat
+        turn and mints no `BuildSession`."""
         if not await _the_live_sandbox_is_already_the_one_we_want(
             get_redis(), recipient_id, the_view
         ):
             raise NoLiveSandboxError(recipient_id)
         try:
-            return await sandbox_client.attach_existing(str(recipient_id))
+            handle = await sandbox_client.attach_existing(str(recipient_id))
         except SandboxGoneError as exc:
             # CERTAIN absence — the client raises this only when it has confirmed the container
             # is gone (ARM says the revision does not exist, the registry is empty, or the
             # reaper already marked it ending). The restore arm above is the honest next step.
             raise NoLiveSandboxError(recipient_id) from exc
+        if not handle.configured:
+            # Its files went with its settings: restored like a view that is gone.
+            raise NoLiveSandboxError(recipient_id)
+        return handle
 
     # --- the Write turn's sandbox --------------------------------------------
 
@@ -3432,42 +3367,29 @@ class SessionManager:
         env: dict[str, str],
         *,
         announce: RecoveryAnnouncer | None = None,
-        record: StartRecord | None = None,
+        record: StartRecord,
     ) -> _ResolvedSandbox:
-        """The one-per-user rehydrate resolution, in three arms: a live registry ATTACHES to
-        the running container; no registry (a clean end always leaves none) or a registry
-        whose container is gone RESTORES the snapshot when one exists; PROVISIONS a fresh
-        template only when there is none — without this arm, a graceful stop→start loop
-        would discard the user's work onto a blank template. A CONTAINER GETS ITS ENVIRONMENT
-        ONCE, AT BIRTH: the birth arms build the whole `BIAL_*` set while attach passes none
-        unless the container holds none, so rotating a credential is a REBIRTH, never an
-        attach. REPORTS ITS ARM
-        (`_ResolvedSandbox.attached`) so `_LockScope.take` can spare it from compensation.
-        `record` is the start the two birth arms are timed into; without one they are timed
-        into a record nothing admitted, which is never written."""
+        """The one-per-user rehydrate resolution, in three arms: a live registry ATTACHES to the
+        running container; no registry, or one whose container is gone or unconfigured, RESTORES
+        the snapshot when one exists and PROVISIONS a fresh template only when there is none —
+        else a graceful stop→start loop would discard the user's work onto a blank template. A
+        CONTAINER GETS ITS ENVIRONMENT ONCE, AT BIRTH, so rotating a credential is a REBIRTH, never
+        an attach. Reports its arm so `_LockScope.take` can spare an attached container from
+        compensation; `record` times the two birth arms."""
         redis = get_redis()
-        born_into = record if record is not None else StartRecord()
-        if await read_registry(redis, user_id) is None:
+        handle: SandboxHandle | None = None
+        if await read_registry(redis, user_id) is not None:
+            with suppress(SandboxGoneError):
+                handle = await sandbox_client.attach_existing(str(user_id))
+        if handle is None or not handle.configured:
+            # An unconfigured container is one Azure restarted, its files gone with its settings.
+            # No repository is left for the integrity gate to set aside, so it is reborn here.
             return _ResolvedSandbox(
                 await self._restore_or_provision(
-                    sandbox_client, user_id, app_id, env, record=born_into
+                    sandbox_client, user_id, app_id, env, record=record
                 ),
                 attached=False,
             )
-        try:
-            handle = await sandbox_client.attach_existing(str(user_id))
-        except SandboxGoneError:
-            return _ResolvedSandbox(
-                await self._restore_or_provision(
-                    sandbox_client, user_id, app_id, env, record=born_into
-                ),
-                attached=False,
-            )
-
-        async def the_settings_a_birth_gets() -> dict[str, str]:
-            return {**env, **await provision_app_storage(app_id)}
-
-        await _hand_back_its_settings(sandbox_client, handle, the_settings_a_birth_gets)
         # THE ONE ARM WHERE THE TREE IS OLDER THAN THIS REQUEST. The other two have just
         # built the workspace from a bundle or a template, so there is nothing to have lost. This
         # one hands back a container that has been running unattended, and until this unit
@@ -3601,40 +3523,17 @@ class SessionManager:
         finds it.
 
         What is still there — a container its attach found gone, a workspace being put back, a
-        failed attempt's leftover — is handed over (`_owe_the_holder`), and so is a container an
-        earlier birth created and never saw recorded, which only its birth marker names. One the
-        ledger cannot take is deleted inline, and a refused delete fails this attempt rather than
-        orphaning it."""
+        failed attempt's leftover — is handed over (`_owe_the_holder`). One the ledger cannot take
+        is deleted inline, and a refused delete fails this attempt rather than orphaning it."""
         reg = await read_registry(redis, user_id)
-        if reg is not None:
-            await self._let_go_of(
-                redis, user_id, sandbox_client, reg, delete_registry_if_it_still_names
-            )
-        # After the record: a marker naming the container it named finds it already owed.
-        unrecorded = await read_birth_marker(redis, user_id)
-        if unrecorded is not None:
-            await self._let_go_of(
-                redis, user_id, sandbox_client, unrecorded, forget_the_birth_if_it_still_names
-            )
-
-    async def _let_go_of(
-        self,
-        redis: aioredis.Redis,
-        user_id: uuid.UUID,
-        sandbox_client: SandboxClient,
-        record: Mapping[str, str],
-        forget: _Forget,
-    ) -> None:
-        """Hand over the container `record` names, or delete it inline when the ledger cannot
-        take it, then `forget` the record."""
-        if await self._owe_the_holder(redis, user_id, sandbox_client, record, forget=forget):
+        if reg is None or await self._owe_the_holder(redis, user_id, sandbox_client, reg):
             return
-        name = record.get(REGISTRY_FIELD_APP_NAME, "")
-        if is_a_sandbox_name(name) or is_a_shared_sandbox_name(name):
+        name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+        if is_a_platform_sandbox_name(name):
             await sandbox_client.teardown(handle_named(name))
         # A name this platform did not mint is somebody else's container, if anything: only its
         # record goes.
-        await forget(redis, user_id, name)
+        await delete_registry_if_it_still_names(redis, user_id, name)
 
     async def _restore_or_provision(
         self,
@@ -3653,8 +3552,7 @@ class SessionManager:
         `SnapshotUnavailableError` and aborts the start instead, because the next write of the
         saved copy would silently put that fresh template over the user's work."""
         # Ensure the app's Blob container + mint a fresh session SAS ONLY on this birth
-        # (provision/restore) arm — never on attach, which reuses the live container's SAS
-        # unless the container has lost its settings.
+        # (provision/restore) arm — never on attach, which reuses the live container's SAS.
         # A configured-store failure propagates: it fails the start before any sandbox handle
         # exists (start's compensation releases the lock; nothing to tear down), and the idempotent
         # container is simply reused on the next start. Disabled storage (dev/test) yields {} — a

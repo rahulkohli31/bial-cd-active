@@ -20,7 +20,7 @@ import enum
 import secrets
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Final, Literal
 
@@ -464,7 +464,10 @@ class FakeSandboxClient(SandboxClient):
             raise SandboxGoneError("sandbox is ending")
         if self.attach_handle is None:
             raise SandboxGoneError("no live sandbox for user")
-        return self.attach_handle
+        # The real client reads this off the supervisor's answer to the attach's own probe.
+        return replace(
+            self.attach_handle, configured=self.attach_handle.app_name not in self.unconfigured
+        )
 
     async def attach_by_name(self, *, app_name: str) -> SandboxHandle:
         """Mirrors the real client's absent-vs-unreachable split, keyed on `by_name` /
@@ -551,9 +554,6 @@ class FakeSandboxClient(SandboxClient):
             raise SandboxError("dev/start failed with status 412")
         self.started.append(handle.app_name)
         return 4321
-
-    async def health(self, handle: SandboxHandle) -> bool:
-        return handle.app_name not in self.unconfigured
 
     async def configure(self, handle: SandboxHandle, env: Mapping[str, str]) -> None:
         if handle.app_name not in self.unconfigured:

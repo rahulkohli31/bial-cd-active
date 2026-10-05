@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.v1.build_sessions.deps import sandbox_dependency, sandbox_or_none_dependency
 from src.config import settings
 from src.db.models.conversation import ChatKind
-from src.db.models.pending_teardown import PendingTeardown, PendingTeardownKind
+from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.appdata import resolve_app_for_project
@@ -283,7 +283,7 @@ async def test_the_outgoing_container_is_handed_over_whatever_its_record_calls_i
     spawns: _Spawns,
 ) -> None:
     """★ The record names the outgoing app; the owed row names the container by the name the
-    record gave it, as a build sandbox owed against that app's project.
+    record gave it, owed against that app's project with its tree written back.
 
     Mutation check: attribute the outgoing container by the name derived from each app and it is
     reclaimed inline instead — destroyed without its tree written back."""
@@ -302,7 +302,7 @@ async def test_the_outgoing_container_is_handed_over_whatever_its_record_calls_i
     assert [(row.app_name, row.app_id, row.project_id) for row in rows] == [
         (name, app_a, project_a)
     ]
-    assert rows[0].kind is PendingTeardownKind.BUILD
+    assert rows[0].write_back is True
     assert len(spawns.owed) == 1
     assert client.torn_down == []
 
@@ -520,7 +520,6 @@ async def test_a_start_beside_a_shutdown_already_running_deletes_nothing(
         user_id=user.id,
         app_id=app_a,
         app_name=name_a,
-        kind=PendingTeardownKind.BUILD,
         write_back=True,
         project_id=project_a,
         instance_ref=datetime.fromisoformat(_text(reg[REGISTRY_FIELD_CREATED_AT])),
@@ -561,7 +560,6 @@ async def test_a_start_beside_a_shutdown_already_deleting_leaves_its_debt_to_it(
         user_id=user.id,
         app_id=app_a,
         app_name=name_a,
-        kind=PendingTeardownKind.BUILD,
         write_back=True,
         project_id=project_a,
         instance_ref=datetime.fromisoformat(_text(reg[REGISTRY_FIELD_CREATED_AT])),
@@ -654,8 +652,8 @@ async def test_a_colleagues_shared_view_is_put_away_without_a_write_back(
 
     assert session.project_id == own_project.id
     assert client.torn_down == [], "the start waited on the view's delete"
-    assert [(o.app_name, o.app_id, o.kind, o.write_back) for o in spawns.owed] == [
-        (view, owner_app, PendingTeardownKind.SHARED, False)
+    assert [(o.app_name, o.app_id, o.write_back) for o in spawns.owed] == [
+        (view, owner_app, False)
     ]
     assert spawns.reasons == [ShutdownReason.REPLACED]
     assert await fake_storage.get(snapshot_key(owner_app)) == b"BUNDLE"

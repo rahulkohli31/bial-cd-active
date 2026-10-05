@@ -91,8 +91,14 @@ from src.services.redis import (
     build_coordination_or_503,
     coordination_is_gone,
     get_redis,
+    registry_key,
 )
-from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
+from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
+)
 from src.services.sandbox import SandboxError
 from src.services.sandbox.base import CompileState
 from src.services.storage import StorageError
@@ -114,6 +120,14 @@ _START_FAILURE_SENTENCES: Final[Mapping[StartFailure, str]] = {
     StartFailure.SANDBOX_UNAVAILABLE: _SANDBOX_UNAVAILABLE_MSG,
     StartFailure.COORDINATION_UNAVAILABLE: BUILD_COORDINATION_UNAVAILABLE_MSG,
 }
+
+# Every field `record_holds` compares, and the name a renewal is aimed at.
+_WHAT_A_RENEWAL_READS: Final = (
+    REGISTRY_FIELD_APP_ID,
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+)
 
 
 class ReapResponse(CamelModel):
@@ -1010,7 +1024,13 @@ async def renew_presence(
         return RenewPresenceResponse(outcome=RenewalOutcome.NOTHING_RUNNING)
     with build_coordination_or_503():
         redis = get_redis()
-        reg = await read_registry(redis, user.id)
+        read = await redis.hmget(registry_key(user.id), _WHAT_A_RENEWAL_READS)
+        # Nothing read takes the whole read, which adopts a record left under the old key.
+        reg = {
+            field: str(value)
+            for field, value in zip(_WHAT_A_RENEWAL_READS, read, strict=True)
+            if value is not None
+        } or await read_registry(redis, user.id)
         if reg is None:
             return RenewPresenceResponse(outcome=RenewalOutcome.NOTHING_RUNNING)
         if not record_holds(reg, Occupant(app_id), user.id):

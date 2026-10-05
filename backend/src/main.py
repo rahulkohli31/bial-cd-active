@@ -14,9 +14,8 @@ the worker already schedules. The two boot-path items, `_reconcile_interrupted_d
 """
 
 import asyncio
-import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Final
 
 import structlog
@@ -29,7 +28,6 @@ from src.core.log_config import configure_logging
 from src.schemas import DetailBody, error_responses
 from src.services.cors.middleware import ScopedCORSMiddleware
 from src.services.redis import get_redis
-from src.services.sandbox.config import SandboxConfig
 
 configure_logging(production=settings.is_production)
 
@@ -105,18 +103,15 @@ async def _reconcile_interrupted_deploys() -> None:
         _log.warning("deploy_startup_reconcile_failed", exc_info=True)
 
 
-async def _swap_the_pool_onto_this_image(config: SandboxConfig) -> None:
+async def _swap_the_pool_onto_this_image() -> None:
     """One pass over the pool of ready sandboxes, so a changed sandbox image is swapped in from
     this backend's startup rather than from the worker's next minute. It takes the lock the
     worker's pass takes, so a worker pass in the same minute stands down. A failure is logged:
     the backend serves without it, and the worker's next pass does the same work."""
-    from src.services.sandbox import get_sandbox
-    from src.services.sandbox.pool import PoolKeeper, keep_the_pool_under_the_lock
+    from src.services.build_sessions.pool_pass import run_pool_pass
 
     try:
-        sandbox = get_sandbox()
-        if isinstance(sandbox, PoolKeeper):
-            await keep_the_pool_under_the_lock(sandbox, config)
+        await run_pool_pass()
     except Exception:
         _log.warning("sandbox_pool_startup_pass_failed", exc_info=True)
 
@@ -144,14 +139,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await _reconcile_interrupted_deploys()
     # Not awaited: each fill takes about twenty seconds, and no request waits on the pool.
     pool_pass = (
-        None
-        if settings.sandbox is None
-        else asyncio.create_task(_swap_the_pool_onto_this_image(settings.sandbox))
+        None if settings.sandbox is None else asyncio.create_task(_swap_the_pool_onto_this_image())
     )
     yield
     if pool_pass is not None:
         pool_pass.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        with suppress(asyncio.CancelledError):
             await pool_pass
     # Shutdown: close every client so no aiohttp session / connection pool leaks. Each is
     # a no-op when its resource was never opened.

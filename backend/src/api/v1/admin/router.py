@@ -105,7 +105,11 @@ from src.db.models.feedback import Feedback
 from src.db.models.harness_counter import HarnessCount
 from src.db.models.project import Project
 from src.db.models.project_database import ProjectDatabase
-from src.db.models.sandbox_start import SandboxStart, SandboxStartOutcome
+from src.db.models.sandbox_start import (
+    SANDBOX_START_RETENTION,
+    SandboxStart,
+    SandboxStartOutcome,
+)
 from src.db.models.token_usage import TokenUsage, TokenUsageKind
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
@@ -2051,7 +2055,7 @@ async def harness_counters(
     # MOUNTED ON THE `/admin` ROUTER, not `/admin/apps`, and the distinction is real rather than
     # cosmetic: everything under `/admin/apps` is about one app's governance, and these counters
     # are about the DEPLOYMENT. They would answer the same numbers whether any app existed or not.
-    since = datetime.now(UTC) - timedelta(days=max(1, min(days, 90)))
+    since = _window_start(days, ceiling_days=90)
     rows = (
         await db.execute(
             sa.select(
@@ -2076,6 +2080,11 @@ async def harness_counters(
     )
 
 
+def _window_start(days: int, *, ceiling_days: int) -> datetime:
+    """The start of a window of `days`, held between one day and `ceiling_days`."""
+    return datetime.now(UTC) - timedelta(days=max(1, min(days, ceiling_days)))
+
+
 def _median(column: sa.ColumnExpressionArgument[Any]) -> sa.ColumnElement[Any]:
     return sa.func.percentile_cont(0.5).within_group(column)
 
@@ -2095,7 +2104,7 @@ async def sandbox_starts(
     returns one. `days` bounds the window, which cannot reach past the rows' own retention."""
     # `CurrentSuperadmin` for the reason `harness_counters` gives, and no `user_id` predicate:
     # an aggregate across every citizen is what this route is.
-    since = datetime.now(UTC) - timedelta(days=max(1, min(days, 90)))
+    since = _window_start(days, ceiling_days=SANDBOX_START_RETENTION.days)
     in_window = SandboxStart.started_at >= since
     door_to_first_page_ms = sa.case(
         (
@@ -2104,26 +2113,34 @@ async def sandbox_starts(
         )
     )
     rows = (
-        await db.execute(
-            sa.select(
-                SandboxStart.kind,
-                sa.func.count(),
-                sa.func.count().filter(SandboxStart.outcome == SandboxStartOutcome.SERVED),
-                sa.func.count().filter(SandboxStart.outcome == SandboxStartOutcome.FAILED),
-                sa.func.count().filter(SandboxStart.claimed),
-                _median(SandboxStart.admission_ms),
-                _median(SandboxStart.settings_ms),
-                _median(SandboxStart.create_ms),
-                _median(SandboxStart.dev_start_ms),
-                _median(SandboxStart.first_page_ms),
-                _median(SandboxStart.browser_visible_ms),
-                _median(door_to_first_page_ms),
+        (
+            await db.execute(
+                sa.select(
+                    SandboxStart.kind,
+                    sa.func.count().label("starts"),
+                    sa.func.count()
+                    .filter(SandboxStart.outcome == SandboxStartOutcome.SERVED)
+                    .label("served"),
+                    sa.func.count()
+                    .filter(SandboxStart.outcome == SandboxStartOutcome.FAILED)
+                    .label("failed"),
+                    sa.func.count().filter(SandboxStart.claimed).label("claimed"),
+                    _median(SandboxStart.admission_ms).label("admission_ms"),
+                    _median(SandboxStart.settings_ms).label("settings_ms"),
+                    _median(SandboxStart.create_ms).label("create_ms"),
+                    _median(SandboxStart.dev_start_ms).label("dev_start_ms"),
+                    _median(SandboxStart.first_page_ms).label("first_page_ms"),
+                    _median(SandboxStart.browser_visible_ms).label("browser_visible_ms"),
+                    _median(door_to_first_page_ms).label("total_ms"),
+                )
+                .where(in_window)
+                .group_by(SandboxStart.kind)
+                .order_by(SandboxStart.kind)
             )
-            .where(in_window)
-            .group_by(SandboxStart.kind)
-            .order_by(SandboxStart.kind)
         )
-    ).all()
+        .mappings()
+        .all()
+    )
     misses = (
         await db.execute(
             sa.select(SandboxStart.kind, SandboxStart.miss_reason, sa.func.count())
@@ -2134,40 +2151,21 @@ async def sandbox_starts(
     return SandboxStartsResponse(
         kinds=[
             SandboxStartKindSummary(
-                kind=kind,
-                starts=starts,
-                served=served,
-                failed=failed,
-                claimed=claimed,
+                kind=row["kind"],
+                starts=row["starts"],
+                served=row["served"],
+                failed=row["failed"],
+                claimed=row["claimed"],
                 misses={
                     reason: count
                     for miss_kind, reason, count in misses
-                    if miss_kind == kind and reason is not None
+                    if miss_kind == row["kind"] and reason is not None
                 },
                 medians=SandboxStartMedians(
-                    admission_ms=_whole_ms(admission),
-                    settings_ms=_whole_ms(settings_stage),
-                    create_ms=_whole_ms(create),
-                    dev_start_ms=_whole_ms(dev_start),
-                    first_page_ms=_whole_ms(first_page),
-                    browser_visible_ms=_whole_ms(browser_visible),
-                    total_ms=_whole_ms(total),
+                    **{stage: _whole_ms(row[stage]) for stage in SandboxStartMedians.model_fields}
                 ),
             )
-            for (
-                kind,
-                starts,
-                served,
-                failed,
-                claimed,
-                admission,
-                settings_stage,
-                create,
-                dev_start,
-                first_page,
-                browser_visible,
-                total,
-            ) in rows
+            for row in rows
         ],
         since=since,
     )

@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Final
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
@@ -22,6 +23,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
 from src.db.mixins import OwnedByUserMixin, UUIDv7PrimaryKeyMixin
+
+SANDBOX_START_RETENTION: Final = timedelta(days=90)
 
 
 class SandboxStartKind(enum.StrEnum):

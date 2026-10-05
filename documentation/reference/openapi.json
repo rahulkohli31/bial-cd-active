@@ -4322,7 +4322,7 @@
         "type": "string"
       },
       "SandboxStartsResponse": {
-        "description": "`GET /v1/admin/sandbox-starts` → 200 — sandbox start times, per kind of start.\n\nTotals and medians only. Each start row names who started which app and when, so no route\nreturns one.",
+        "description": "`GET /v1/admin/sandbox-starts` → 200 — sandbox start times, per kind of start.",
         "properties": {
           "kinds": {
             "items": {

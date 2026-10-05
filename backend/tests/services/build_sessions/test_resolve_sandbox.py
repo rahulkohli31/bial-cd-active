@@ -253,44 +253,41 @@ async def test_a_brand_new_project_attaches_with_nothing_to_say(
     assert session.restored is False
 
 
-async def test_an_attached_container_without_its_settings_is_given_them_before_the_turn(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+async def test_a_turn_reaching_a_restarted_container_restores_its_saved_copy_into_a_new_one(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A claimed pool container that Azure restarted reports no settings and refuses to start
-    the app. The turn attaching to it hands them back first, built as its birth was given them.
+    """★ A claimed pool container that Azure restarted comes back with no settings and none of
+    its files, so it holds no repository the integrity gate could set aside. The turn treats it
+    as gone: the saved copy goes into a new container, and the restarted one is owed its delete
+    with nothing written back.
 
-    Mutation check: drop the hand-back from `_resolve_sandbox` and nothing is delivered."""
-    user, project_id = await _mk(db_session, "u2-reconfig@rvaiglobal.com")
-    manager = SessionManager()
+    Mutation check: attach to it whatever it reports and the turn runs in the restarted one."""
+    user, project_id = await _mk(db_session, "u2-restarted@rvaiglobal.com")
+    manager = a_manager_whose_ledger_is(db_session)
     client, app_id = await _attached(db_session, manager, user, project_id)
     assert client.attach_handle is not None
-    name = client.attach_handle.app_name
-    client.unconfigured.add(name)
+    restarted = client.attach_handle.app_name
+    client.unconfigured.add(restarted)
+    await _seed_saved(fake_storage, app_id)
+    monkeypatch.setattr(manager_module, "shut_it_down_in_the_background", lambda *_, **__: None)
 
     session = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=client, may_write=True
     )
 
-    assert session.attached is True
-    [(configured, env)] = client.configured_with
-    assert configured == name
-    assert env["BIAL_APP_ID"] == str(app_id)
-    assert client.provision_env is not None
-    assert set(env) == set(client.provision_env)
-
-
-async def test_an_attached_container_holding_its_settings_is_not_configured_again(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
-) -> None:
-    user, project_id = await _mk(db_session, "u2-configured@rvaiglobal.com")
-    manager = SessionManager()
-    client, _ = await _attached(db_session, manager, user, project_id)
-
-    await manager.ensure_sandbox(
-        db_session, user, project_id, sandbox_client=client, may_write=True
-    )
-
+    assert session.attached is False
+    assert client.restored == [session.handle.app_name]
+    assert session.handle.app_name != restarted
     assert client.configured_with == []
+    owed = await db_session.execute(
+        sa.select(PendingTeardown.app_name, PendingTeardown.write_back).where(
+            PendingTeardown.user_id == user.id
+        )
+    )
+    assert [tuple(row) for row in owed.all()] == [(restarted, False)]
 
 
 # =============================================================================
@@ -888,93 +885,6 @@ async def test_an_app_that_is_serving_is_left_alone(
 
     assert client.dev_started == []
     assert client.torn_down == []
-
-
-async def test_a_stopped_app_whose_container_lost_its_settings_gets_them_before_its_restart(
-    db_session: AsyncSession,
-    fake_redis: aioredis.Redis,
-    fake_storage: FakeStorage,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """★ A claimed pool container that Azure restarted boots without its settings and refuses the
-    start, so a tab left open would wait on an app that never comes back until the citizen sends
-    a message. The restart hands them back first, built as the turn's attach builds them.
-
-    Mutation check: drop the hand-back from the idle restart and the start is refused."""
-    monkeypatch.setattr(manager_module, "READINESS_POLL_S", 0)
-    manager, client, user, project_id = await _a_stopped_app(
-        db_session, fake_redis, fake_storage, "u4-stopped-unconfigured@rvaiglobal.com"
-    )
-    name = _sandbox_name(client)
-    client.unconfigured.add(name)
-
-    await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
-    await _settle(manager)
-
-    [(configured, env)] = client.configured_with
-    assert configured == name
-    assert client.provision_env is not None
-    assert env["BIAL_APP_ID"] == client.provision_env["BIAL_APP_ID"]
-    assert set(env) == set(client.provision_env)
-    assert client.started == [name]
-
-
-async def test_a_stopped_app_that_holds_its_settings_is_not_configured_again(
-    db_session: AsyncSession,
-    fake_redis: aioredis.Redis,
-    fake_storage: FakeStorage,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Mutation check: configure whatever the container reports and a delivery is recorded."""
-    monkeypatch.setattr(manager_module, "READINESS_POLL_S", 0)
-    manager, client, user, project_id = await _a_stopped_app(
-        db_session, fake_redis, fake_storage, "u4-stopped-configured@rvaiglobal.com"
-    )
-    delivered: list[str] = []
-
-    async def _deliver(handle: SandboxHandle, env: object) -> None:
-        delivered.append(handle.app_name)
-
-    monkeypatch.setattr(client, "configure", _deliver)
-
-    await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
-    await _settle(manager)
-
-    assert delivered == []
-    assert client.started == [_sandbox_name(client)]
-
-
-async def test_a_refused_settings_delivery_is_reported_as_a_restart_that_did_not_happen(
-    db_session: AsyncSession,
-    fake_redis: aioredis.Redis,
-    fake_storage: FakeStorage,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An idle tab's check answers about the files whatever the container says to its settings;
-    a raise here would turn that answer into a server error.
-
-    Mutation check: let the refused delivery raise and the check does not answer."""
-    monkeypatch.setattr(manager_module, "READINESS_POLL_S", 0)
-    manager, client, user, project_id = await _a_stopped_app(
-        db_session, fake_redis, fake_storage, "u4-stopped-refused@rvaiglobal.com"
-    )
-    client.unconfigured.add(_sandbox_name(client))
-
-    async def _refuse(handle: SandboxHandle, env: object) -> None:
-        raise SandboxError("configure failed with status 409")
-
-    monkeypatch.setattr(client, "configure", _refuse)
-
-    with capture_logs() as logs:
-        state = await manager.project_workspace_check(
-            db_session, user, project_id, sandbox_client=client
-        )
-    await _settle(manager)
-
-    assert state is WorkspaceState.INTACT
-    assert client.started == []
-    stopped = [e for e in logs if e["event"] == APP_STOPPED_WHILE_IDLE_EVENT]
-    assert [e["restarted"] for e in stopped] == [False]
 
 
 async def test_a_supervisor_that_cannot_answer_restarts_nothing(

@@ -846,42 +846,25 @@ async def test_the_serving_probe_sends_no_bearer_to_the_app() -> None:
 # --- a pool container's settings -------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("body", "configured"),
-    [
-        ({"ok": True, "configured": False}, False),
-        ({"ok": True, "configured": True}, True),
-        # A supervisor built before pool containers was given its settings at creation.
-        ({"ok": True}, True),
-    ],
-)
-async def test_health_says_whether_the_supervisor_holds_its_settings(
-    body: dict[str, object], configured: bool
-) -> None:
+async def test_a_claims_health_check_is_bounded_far_under_the_create_it_saves() -> None:
     seen: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["path"] = request.url.path
         seen["timeout"] = request.extensions["timeout"]
-        return httpx.Response(200, json=body)
+        return httpx.Response(200, json={"ok": True, "configured": False})
 
-    assert await _client(handler).health(_handle()) is configured
+    await _client(handler)._check_health(_handle())
+
     assert seen["path"] == "/_sup/health"
-    # Bounded far under the time of the create a claim would save.
     assert seen["timeout"] == {"connect": 2.0, "read": 2.0, "write": 2.0, "pool": 2.0}
 
 
-@pytest.mark.parametrize(
-    "answer",
-    [
-        httpx.Response(503, json={"detail": "starting"}),
-        httpx.Response(200, json=["ok"]),
-        httpx.Response(200, content=b"not json"),
-    ],
-)
-async def test_a_health_answer_that_is_not_a_readable_200_raises(answer: httpx.Response) -> None:
+async def test_a_claims_health_check_refuses_anything_but_a_200() -> None:
+    answer = httpx.Response(503, json={"detail": "starting"})
+
     with pytest.raises(SandboxError):
-        await _client(lambda _request: answer).health(_handle())
+        await _client(lambda _request: answer)._check_health(_handle())
 
 
 async def test_configure_sends_only_the_per_project_names_under_the_bearer() -> None:

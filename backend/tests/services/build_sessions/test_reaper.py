@@ -26,7 +26,7 @@ from src.api.v1.build_sessions.schemas import (
 )
 from src.config import settings
 from src.db.models.app_registry import AppRegistry
-from src.db.models.pending_teardown import PendingTeardown, PendingTeardownKind
+from src.db.models.pending_teardown import PendingTeardown
 from src.services.build_sessions import app_name_for, locks, pass_history, reaper, shr_name_for
 from src.services.build_sessions.alarms import SERVING_PROOF_ABSENT_AT_TEARDOWN
 from src.services.build_sessions.pass_history import CopyAttempt
@@ -2376,7 +2376,7 @@ async def test_a_failed_reap_of_a_view_named_like_a_build_sandbox_is_owed_and_ne
         )
     ).scalar_one()
     assert (row.app_name, row.app_id, row.project_id) == (name, app.id, app.project_id)
-    assert row.kind is PendingTeardownKind.SHARED
+    assert row.write_back is False
 
     client.teardown_error = None
     client.by_name[name] = SandboxHandle(
@@ -2453,9 +2453,9 @@ async def test_a_debt_is_owed_against_the_app_its_record_names_whatever_its_name
 
     assert owed is not None
     assert [
-        (row.app_name, row.app_id, row.project_id, row.kind)
+        (row.app_name, row.app_id, row.project_id, row.write_back)
         for row in await _owed_rows(db_session, user.id)
-    ] == [(name, app.id, app.project_id, PendingTeardownKind.BUILD)]
+    ] == [(name, app.id, app.project_id, True)]
 
 
 async def test_a_debt_whose_record_names_another_app_is_refused(

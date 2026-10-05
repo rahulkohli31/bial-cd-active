@@ -602,10 +602,7 @@ class SandboxStartKindSummary(CamelModel):
 
 
 class SandboxStartsResponse(CamelModel):
-    """`GET /v1/admin/sandbox-starts` → 200 — sandbox start times, per kind of start.
-
-    Totals and medians only. Each start row names who started which app and when, so no route
-    returns one."""
+    """`GET /v1/admin/sandbox-starts` → 200 — sandbox start times, per kind of start."""
 
     kinds: list[SandboxStartKindSummary]
     since: datetime
