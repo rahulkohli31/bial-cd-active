@@ -44,6 +44,7 @@ import {
   mayHaveStopped,
   nextProbeCadence,
   presenceToRenew,
+  readIsStillWorthWaitingFor,
   renewsOnThisTick,
   resolveWorkspaceState,
   spendProbeCadence,
@@ -2183,10 +2184,7 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
     // the gesture where the user is asking to be brought up to date, it would answer with the
     // reading they already had.
     let latestProbe = 0
-    // A tick that finds a probe still waiting skips its own: at the accelerated cadence a slow answer
-    // would otherwise stack a request behind it every second. A count, because the gesture probes
-    // above overlap on purpose.
-    let probesInFlight = 0
+    let newestProbeBeganAt: number | null = null
     let lastRenewedAt: number | null = null
     let timer: ReturnType<typeof setInterval> | null = null
     // THE CADENCE THE ANSWERS HAVE DECIDED, and the delay the running timer was actually armed
@@ -2254,13 +2252,13 @@ export default function ConversationSurface({ chatId: chatIdProp, kind, projectI
         lastRenewedAt = now
         void renewPresence(projectId, presenceToRenew(hidden))
       }
-      if (fromTimer && probesInFlight > 0) return
+      if (fromTimer && readIsStillWorthWaitingFor(newestProbeBeganAt, now)) return
       const generation = ++latestProbe
+      newestProbeBeganAt = now
       const probeSettled = pressEnd.readBegins()
       try {
-        probesInFlight += 1
         const state = await fetchPreviewState(projectId).finally(() => {
-          probesInFlight -= 1
+          if (generation === latestProbe) newestProbeBeganAt = null
         })
         // Superseded: a probe started after this one, so its answer is newer whatever order the
         // two responses arrived in. Bail before touching state OR the timer — an overtaken probe

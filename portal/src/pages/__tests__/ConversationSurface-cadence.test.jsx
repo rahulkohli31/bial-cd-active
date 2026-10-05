@@ -38,7 +38,7 @@ import {
   waitForGateOpen,
   T_STEP, T_WORKSPACE, T_PREVIEW, T_BUILD_END, T_DELTA, PREVIEW_URL, inWorkspace,
 } from './_builderSession.jsx'
-import { PREVIEW_PROBE_MS, STARTING_PROBE_LIMIT, STARTING_PROBE_MS } from '../../components/workspace/workspaceState'
+import { PREVIEW_PROBE_MS, READ_PATIENCE_MS, STARTING_PROBE_LIMIT, STARTING_PROBE_MS } from '../../components/workspace/workspaceState'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), getBuild: vi.fn(),
@@ -291,12 +291,20 @@ describe('the chat surface asks faster while a workspace is starting', () => {
     expect(h.fetchPreviewState.mock.calls.length).toBeGreaterThan(spent)
   })
 
-  it('★ never starts a probe on a tick while the last one is still waiting', async () => {
+  it('★ never starts a probe on a tick while the newest one is still waiting', async () => {
     // At the accelerated cadence a probe slower than one interval would put another request in the
-    // air behind it every second. Mutation check: drop the tick's skip and the second count goes red.
+    // air behind it every second. A focus still probes, and once its answer lands the slow probe
+    // behind it holds nothing, since its answer would lose.
+    //
+    // Mutation checks: drop the tick's skip and the second count goes red; skip every probe, not only
+    // a tick's, and the third does; count every outstanding probe and the fourth does; let any
+    // probe's settling clear the wait, not only the newest's, and the last does.
     await watchingAStart()
-    let answer = () => undefined
-    h.fetchPreviewState.mockImplementationOnce(() => new Promise((resolve) => { answer = resolve }))
+    let answerSlow = () => undefined
+    h.fetchPreviewState
+      .mockImplementationOnce(() => new Promise((resolve) => { answerSlow = resolve }))
+      .mockResolvedValueOnce(preview('starting'))
+      .mockImplementationOnce(() => new Promise(() => undefined))
     const before = h.fetchPreviewState.mock.calls.length
 
     await act(async () => { await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1) })
@@ -305,12 +313,41 @@ describe('the chat surface asks faster while a workspace is starting', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS * 5) })
     expect(h.fetchPreviewState.mock.calls.length).toBe(before + 1)
 
-    // LIVENESS: once the slow answer lands, the ticks ask again.
+    await act(async () => { window.dispatchEvent(new Event('focus')) })
+    expect(h.fetchPreviewState.mock.calls.length).toBe(before + 2)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS) })
+    expect(h.fetchPreviewState.mock.calls.length).toBe(before + 3)
+
     await act(async () => {
-      answer(preview('starting'))
-      await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
+      answerSlow(preview('starting'))
+      await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS)
     })
-    expect(h.fetchPreviewState.mock.calls.length).toBeGreaterThan(before + 1)
+    expect(h.fetchPreviewState.mock.calls.length).toBe(before + 3)
+  })
+
+  it('★ a probe that hangs past the patience bound stops holding the ticks, and its retry is waited on', async () => {
+    // The probe has no timeout of its own, so a tick that waited on it unconditionally would freeze
+    // this pane for as long as the browser took to fail it. Past the bound the tick probes again —
+    // once, not once a tick: the retry is now the newest probe, and it gets the same patience.
+    //
+    // Mutation checks: wait on a probe however old it is and the third count goes red; measure from
+    // the oldest outstanding probe instead of the newest and the fourth does.
+    await watchingAStart()
+    h.fetchPreviewState.mockImplementation(() => new Promise(() => undefined))
+    const before = h.fetchPreviewState.mock.calls.length
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1) })
+    expect(h.fetchPreviewState.mock.calls.length).toBe(before + 1)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(READ_PATIENCE_MS - 2 * STARTING_PROBE_MS) })
+    expect(h.fetchPreviewState.mock.calls.length).toBe(before + 1)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2 * STARTING_PROBE_MS) })
+    expect(h.fetchPreviewState.mock.calls.length).toBe(before + 2)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(READ_PATIENCE_MS - 2 * STARTING_PROBE_MS) })
+    expect(h.fetchPreviewState.mock.calls.length).toBe(before + 2)
   })
 
   it('changes cadence WITHOUT re-running the effect, so the pane never blinks', async () => {

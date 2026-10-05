@@ -118,8 +118,9 @@ export async function startApp(sinks: StartSinks): Promise<StartResult> {
  * WHEN AN ADMITTED PRESS ENDS: on the first read BEGUN after the admission, once it settles.
  *
  * Only a read begun after the admission can end it — one already in flight carries the reading
- * from before the press. Answered or failed, that read ends it, so a press lasts no longer than
- * one read: a read that hangs is overtaken by the poll's next tick, which begins another.
+ * from before the press. Answered or failed, that read ends it. One that hangs holds the press
+ * until a newer read settles: a gesture's, or the first poll tick's once the hung read has waited
+ * `READ_PATIENCE_MS`.
  */
 export interface PressEnd {
   /** The server admitted the press. */

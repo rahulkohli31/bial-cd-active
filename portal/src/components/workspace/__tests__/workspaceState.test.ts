@@ -25,9 +25,11 @@ import {
   BACKGROUND_CADENCE,
   LAUNCH_LABEL,
   PREVIEW_PROBE_MS,
+  READ_PATIENCE_MS,
   STARTING_PROBE_LIMIT,
   isTerminalReading,
   mayHaveStopped,
+  readIsStillWorthWaitingFor,
   renewsOnThisTick,
   resolveWorkspaceState,
   sameWorkspaceState,
@@ -656,5 +658,20 @@ describe('renewsOnThisTick — how often a tick holds the container open', () =>
     expect(renewsOnThisTick(true, T + 1_000, T)).toBe(false)
     expect(renewsOnThisTick(true, T + PREVIEW_PROBE_MS - 1, T)).toBe(false)
     expect(renewsOnThisTick(true, T + PREVIEW_PROBE_MS, T)).toBe(true)
+  })
+})
+
+describe('readIsStillWorthWaitingFor — when a tick asks again over a read still in the air', () => {
+  const T = 1_000_000
+
+  it('never waits when no read is outstanding', () => {
+    expect(readIsStillWorthWaitingFor(null, T)).toBe(false)
+  })
+
+  it('★ waits on a read younger than the patience bound, and not a moment longer', () => {
+    // The read has no timeout of its own: waiting on it past this would freeze the poll on one stalled request.
+    expect(readIsStillWorthWaitingFor(T, T)).toBe(true)
+    expect(readIsStillWorthWaitingFor(T, T + READ_PATIENCE_MS - 1)).toBe(true)
+    expect(readIsStillWorthWaitingFor(T, T + READ_PATIENCE_MS)).toBe(false)
   })
 })

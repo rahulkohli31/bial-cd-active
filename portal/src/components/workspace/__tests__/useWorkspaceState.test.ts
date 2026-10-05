@@ -33,6 +33,7 @@ const {
   BACKGROUND_CADENCE,
   HIDDEN_PROBE_MS,
   PREVIEW_PROBE_MS,
+  READ_PATIENCE_MS,
   STARTING_PROBE_LIMIT,
   STARTING_PROBE_MS,
   nextProbeCadence,
@@ -953,16 +954,21 @@ describe('presence renewal — what holds the container open', () => {
     expect(api.renewPresence).toHaveBeenLastCalledWith('proj-1', 'visible')
   })
 
-  it('★ a tick never starts a read while the last one is still waiting', async () => {
+  it('★ a tick never starts a read while the newest one is still waiting', async () => {
     // At the accelerated cadence a read slower than one interval would put another request in the
-    // air behind it every second. A focus is not a tick: tabbing back still asks for a fresh answer.
+    // air behind it every second. A focus is not a tick: tabbing back still asks for a fresh answer,
+    // and once that answer lands the slow read behind it holds nothing, since its answer would lose.
     //
     // Mutation checks: drop the tick's skip and the count after the five ticks goes red; skip every
-    // read, not only a tick's, and the count after the focus does.
-    let answer: (value: PreviewState) => void = () => undefined
+    // read, not only a tick's, and the count after the focus does; count every outstanding read
+    // and the count after the focus's answer does; let any read's settling clear the wait, not
+    // only the newest's, and the last count does.
+    let answerSlow: (value: PreviewState) => void = () => undefined
     api.fetchPreviewState
       .mockResolvedValueOnce(reading({ state: 'starting' }))
-      .mockImplementationOnce(() => new Promise<PreviewState>((resolve) => { answer = resolve }))
+      .mockImplementationOnce(() => new Promise<PreviewState>((resolve) => { answerSlow = resolve }))
+      .mockResolvedValueOnce(reading({ state: 'starting' }))
+      .mockImplementationOnce(() => new Promise<PreviewState>(() => undefined))
       .mockResolvedValue(reading({ state: 'starting' }))
     mount()
     await settle()
@@ -981,12 +987,49 @@ describe('presence renewal — what holds the container open', () => {
     })
     expect(api.fetchPreviewState).toHaveBeenCalledTimes(3)
 
-    // LIVENESS: once the slow answer lands, the ticks ask again.
     await act(async () => {
-      answer(reading({ state: 'starting' }))
+      await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS)
+    })
+    expect(api.fetchPreviewState).toHaveBeenCalledTimes(4)
+
+    await act(async () => {
+      answerSlow(reading({ state: 'starting' }))
+      await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS)
+    })
+    expect(api.fetchPreviewState).toHaveBeenCalledTimes(4)
+  })
+
+  it('★ a read that hangs past the patience bound stops holding the ticks, and its retry is waited on', async () => {
+    // The read has no timeout of its own, so a tick that waited on it unconditionally would freeze the
+    // poll for as long as the browser took to fail it. Past the bound the tick asks again — once, not
+    // once a tick: the retry is now the newest read, and it gets the same patience.
+    //
+    // Mutation checks: wait on a read however old it is and the third count goes red; measure from
+    // the oldest outstanding read instead of the newest and the fourth does.
+    api.fetchPreviewState
+      .mockResolvedValueOnce(reading({ state: 'starting' }))
+      .mockImplementation(() => new Promise<PreviewState>(() => undefined))
+    mount()
+    await settle()
+    await act(async () => {
       await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
     })
-    expect(api.fetchPreviewState.mock.calls.length).toBeGreaterThan(3)
+    expect(api.fetchPreviewState).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(READ_PATIENCE_MS - 2 * STARTING_PROBE_MS)
+    })
+    expect(api.fetchPreviewState).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2 * STARTING_PROBE_MS)
+    })
+    expect(api.fetchPreviewState).toHaveBeenCalledTimes(3)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(READ_PATIENCE_MS - 2 * STARTING_PROBE_MS)
+    })
+    expect(api.fetchPreviewState).toHaveBeenCalledTimes(3)
   })
 
   it('renders nothing and assumes nothing when a renewal cannot be made', async () => {

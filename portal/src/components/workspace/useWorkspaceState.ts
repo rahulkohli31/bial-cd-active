@@ -55,6 +55,7 @@ import {
   mayHaveStopped,
   nextProbeCadence,
   presenceToRenew,
+  readIsStillWorthWaitingFor,
   renewsOnThisTick,
   resolveWorkspaceState,
   spendProbeCadence,
@@ -199,10 +200,7 @@ export function useWorkspaceState({
     // exactly the gesture where somebody is asking to be brought up to date it would answer with
     // the reading they already had.
     let latest = 0
-    // A tick that finds a read still waiting skips its own: at the accelerated cadence a slow answer
-    // would otherwise stack a request behind it every second. A count, because the gesture reads
-    // above overlap on purpose.
-    let readsInFlight = 0
+    let newestReadBeganAt: number | null = null
     let lastRenewedAt: number | null = null
     let timer: ReturnType<typeof setInterval> | null = null
     // WHAT THE ANSWERS SO FAR HAVE DECIDED ABOUT THE CADENCE, and what the running timer was
@@ -263,13 +261,13 @@ export function useWorkspaceState({
         lastRenewedAt = now
         void renewPresence(projectId, presenceToRenew(hidden))
       }
-      if (fromTimer && readsInFlight > 0) return
+      if (fromTimer && readIsStillWorthWaitingFor(newestReadBeganAt, now)) return
       const generation = ++latest
+      newestReadBeganAt = now
       const readSettled = pressEnd.readBegins()
       try {
-        readsInFlight += 1
         const next = await fetchPreviewState(projectId).finally(() => {
-          readsInFlight -= 1
+          if (generation === latest) newestReadBeganAt = null
         })
         // Superseded: a later read started, so its answer is newer whatever order the responses
         // arrived in. Bail before touching state OR the timer — an overtaken read calling

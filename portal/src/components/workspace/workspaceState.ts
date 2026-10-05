@@ -170,6 +170,27 @@ export function renewsOnThisTick(accelerated: boolean, now: number, lastRenewedA
 }
 
 /**
+ * HOW LONG A TICK WAITS ON A READ STILL IN THE AIR before it asks again.
+ *
+ * The read has no timeout of its own, so a tick that always waited on one would freeze the poll for
+ * as long as a browser or a proxy took to fail a stalled request — minutes. The read is cheap by
+ * contract, so one unanswered for ten seconds is lost rather than slow.
+ */
+export const READ_PATIENCE_MS = 10_000
+
+/**
+ * Does a timer tick skip its own read? `newestReadBeganAt` is when the poll's newest read began,
+ * `null` once it has settled.
+ *
+ * SKIPS WHILE IT IS YOUNG, or at the accelerated cadence a slow answer would put another request
+ * behind it every second. Only the newest read counts: an older one's answer loses to it whatever
+ * order they land in. SHARED BY BOTH POLLS, like {@link renewsOnThisTick}.
+ */
+export function readIsStillWorthWaitingFor(newestReadBeganAt: number | null, now: number): boolean {
+  return newestReadBeganAt !== null && now - newestReadBeganAt < READ_PATIENCE_MS
+}
+
+/**
  * The poll's cadence, and how much of the accelerated window it has spent.
  *
  * A pair rather than a bare number because the two are decided together and drift apart the moment
