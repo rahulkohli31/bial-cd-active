@@ -86,6 +86,7 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # marker that tells a user created from the directory apart from one who has signed in.
     # 0051_name_untitled_chats is data only: it names every untitled chat after its first message.
     # 0052_sandbox_starts adds the table that keeps one row of stage timings per sandbox start.
+    # 0053_pending_teardown_kind says whether an owed teardown is a build sandbox or a shared view.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0052_sandbox_starts"]
+    assert heads == ["0053_pending_teardown_kind"]

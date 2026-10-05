@@ -233,6 +233,8 @@ def test_registry_fields_are_the_frozen_set() -> None:
             "token_ref",
             "created_at",
             "state",
+            # The app the container runs; every lookup compares it rather than a name.
+            "app_id",
             # THE ONLY FIELD ON THIS HASH THAT MEANS THE APP ANSWERED A REQUEST. `state` is a
             # reaper-lifecycle label — its two values say whether the container is being torn
             # down — and the platform reporting `state=ready` as "your app is running" is the

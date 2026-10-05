@@ -25,6 +25,7 @@ from src.services.build_sessions import locks, reaper
 from src.services.build_sessions.inventory import take_sandbox_inventory
 from src.services.redis.keys import (
     REGISTRY_FIELD_ADOPTED_FROM_LEGACY,
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -243,6 +244,24 @@ async def test_a_field_added_after_the_cutover_migrates_too(fake_redis: aioredis
 
     assert reg is not None
     assert reg[REGISTRY_FIELD_PREVIEW_STAY_UNTIL] == "2026-07-22T04:41:00+00:00"
+
+
+async def test_both_adoptions_carry_a_recorded_app_through(fake_redis: aioredis.Redis) -> None:
+    """A legacy record that names its app keeps naming it: every lookup reads the app from the
+    record, so an adoption that dropped it would hand the container to the derived-name fallback
+    and, once that goes, to nobody."""
+    user_a, user_b = uuid.uuid4(), uuid.uuid4()
+    app = "0198f2c0-0000-7000-8000-00000000b001"
+    for user in (user_a, user_b):
+        await _seed_legacy(fake_redis, user, _LEGACY_APP)
+        await fake_redis.hset(legacy_registry_key(user), REGISTRY_FIELD_APP_ID, app)
+
+    from_locks = await locks.read_registry(fake_redis, user_a)
+    from_client = await _client_with_no_arm()._read_registry(user_b)
+
+    assert from_locks is not None and from_client is not None
+    assert from_locks[REGISTRY_FIELD_APP_ID] == from_client[REGISTRY_FIELD_APP_ID] == app
+    assert await fake_redis.hget(registry_key(user_b), REGISTRY_FIELD_APP_ID) == app
 
 
 async def test_a_current_record_wins_over_a_stale_legacy_one(fake_redis: aioredis.Redis) -> None:

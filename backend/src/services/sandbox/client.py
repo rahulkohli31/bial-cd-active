@@ -35,6 +35,7 @@ from src.services.redis import (
     registry_key,
 )
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -765,6 +766,7 @@ class AcaSandboxClient(SandboxClient):
         user_uuid: uuid.UUID,
         *,
         app_name: str,
+        app_id: uuid.UUID,
         fqdn: str,
         token_ref: str,
         shared_project_id: uuid.UUID | None = None,
@@ -790,13 +792,22 @@ class AcaSandboxClient(SandboxClient):
         user's own build sandbox or a colleague's shared view, and a stamp left behind by
         one must never be inherited by the other. `shared_project_id is None` means "this is
         an ordinary build sandbox" and both fields are `hdel`-ed; passing one without the
-        other is a caller error (`launch_shared_preview` always supplies both together)."""
+        other is a caller error (`launch_shared_preview` always supplies both together).
+
+        ONE TRANSACTION. The stamp is the only thing that says build sandbox or shared view, so
+        a reader landing between separate writes would find this container under the previous
+        occupant's kind — and a shared view read as a build sandbox is written back over its
+        owner's saved copy."""
         key = registry_key(user_uuid)
         born = datetime.now(UTC).isoformat()
-        await get_redis().hset(
+        pipe = get_redis().pipeline(transaction=True)
+        pipe.hset(
             key,
             mapping={
                 REGISTRY_FIELD_APP_NAME: app_name,
+                # In the mapping, never written conditionally: the previous occupant's app must
+                # be overwritten, or every lookup would find this container under its app.
+                REGISTRY_FIELD_APP_ID: str(app_id),
                 REGISTRY_FIELD_FQDN: fqdn,
                 REGISTRY_FIELD_TOKEN_REF: token_ref,
                 REGISTRY_FIELD_CREATED_AT: born,
@@ -820,9 +831,9 @@ class AcaSandboxClient(SandboxClient):
         )
         # A SEPARATE `hset`, not folded into the mapping above, purely so each stays a plain
         # dict literal passed straight to its call — the shape every other field on this hash
-        # already relies on for its typing. `hset(mapping=...)` is still one MERGE either way.
+        # already relies on for its typing. The transaction lands both together.
         if shared_project_id is not None:
-            await get_redis().hset(
+            pipe.hset(
                 key,
                 mapping={
                     REGISTRY_FIELD_SHARED_PROJECT_ID: str(shared_project_id),
@@ -837,13 +848,10 @@ class AcaSandboxClient(SandboxClient):
         # total, `count <= last_seen` reads as "no new traffic" immediately, and the sweep's
         # `APP_SERVED_TRAFFIC` renewal (`reaper.py::_renew_shared_view_from_traffic`) never
         # fires for it at all.
-        await get_redis().hdel(
-            key, REGISTRY_FIELD_PREVIEW_STAY_UNTIL, REGISTRY_FIELD_SHARED_SERVED_COUNT
-        )
+        pipe.hdel(key, REGISTRY_FIELD_PREVIEW_STAY_UNTIL, REGISTRY_FIELD_SHARED_SERVED_COUNT)
         if shared_project_id is None:
-            await get_redis().hdel(
-                key, REGISTRY_FIELD_SHARED_PROJECT_ID, REGISTRY_FIELD_SHARED_OWNER_ID
-            )
+            pipe.hdel(key, REGISTRY_FIELD_SHARED_PROJECT_ID, REGISTRY_FIELD_SHARED_OWNER_ID)
+        await pipe.execute()
         # Deferred import — see the cycle note at the top of this module.
         from src.services.build_sessions.alarms import SANDBOX_REGISTRY_MARKED_PENDING_EVENT
 
@@ -1154,6 +1162,7 @@ class AcaSandboxClient(SandboxClient):
                 await self._write_registry(
                     user_uuid,
                     app_name=app_name,
+                    app_id=app_id,
                     fqdn=fqdn,
                     token_ref=token_ref,
                     shared_project_id=shared_project_id,

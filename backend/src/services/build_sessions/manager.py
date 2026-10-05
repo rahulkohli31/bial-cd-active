@@ -28,7 +28,7 @@ import enum
 import hashlib
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import (
     AbstractAsyncContextManager,
     AsyncExitStack,
@@ -57,7 +57,7 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation
 from src.db.models.harness_counter import HarnessCounter
 from src.db.models.message import Message, MessageEntryKind
-from src.db.models.pending_teardown import PendingTeardown
+from src.db.models.pending_teardown import PendingTeardown, PendingTeardownKind
 from src.db.models.project import Project
 from src.db.models.sandbox_start import SandboxStartKind, SandboxStartOutcome
 from src.db.models.user import User
@@ -84,6 +84,8 @@ from src.services.build_sessions.integrity import (
 from src.services.build_sessions.locks import (
     DeadlineWriter,
     FailedStart,
+    Occupant,
+    SharedViewStamp,
     StartFailure,
     acquire_lock,
     an_instant_on_the_hash,
@@ -93,10 +95,12 @@ from src.services.build_sessions.locks import (
     date_the_wait_from_the_start,
     delete_registry,
     grant_stay_of_execution,
+    is_a_shared_view,
     liveness_lease_is_held,
     read_registry,
     read_registry_and_starting_marker,
     reap_lock,
+    record_holds,
     record_the_first_serve,
     release_lock_as_holder,
     settle_stay_once_provisioning_ends,
@@ -105,7 +109,7 @@ from src.services.build_sessions.locks import (
     write_start_failure,
     write_starting_marker,
 )
-from src.services.build_sessions.reaper import is_a_shared_sandbox_name, reap_user, reconcile_user
+from src.services.build_sessions.reaper import reap_user, reconcile_user
 from src.services.build_sessions.sandbox_starts import StartRecord
 from src.services.build_sessions.shutdown import (
     ShutdownReason,
@@ -303,7 +307,7 @@ _ClaimArm = Literal["relaunch", "ensure_sandbox", "shared_launch"]
 
 
 def _kind_of_start(
-    arm: _ClaimArm, *, incumbent_is_leaving: bool, spare_app: str | None
+    arm: _ClaimArm, *, incumbent_is_leaving: bool, spare: Occupant | None
 ) -> SandboxStartKind:
     """A colleague's view is a shared view; any other start that hands another project's
     workspace over is a switch; else a relaunch is a reopen, and a turn's start is a new project
@@ -314,7 +318,7 @@ def _kind_of_start(
         return SandboxStartKind.SWITCH
     if arm == "relaunch":
         return SandboxStartKind.REOPEN
-    return SandboxStartKind.NEW_PROJECT if spare_app is None else SandboxStartKind.CHAT
+    return SandboxStartKind.NEW_PROJECT if spare is None else SandboxStartKind.CHAT
 
 
 # The end sequence's own DB session factory (it outlives the starting request). Typed as what this
@@ -667,15 +671,13 @@ class _OccupyingProject:
 
 
 async def _occupying_project(
-    db: AsyncSession, user_id: uuid.UUID, app_name: str
+    db: AsyncSession, user_id: uuid.UUID, reg: Mapping[str, str]
 ) -> _OccupyingProject | None:
-    """Resolve a live container's registry name back to the project whose work is inside it.
-    `app_name_for` keeps 28 of the app_id's 32 hex chars, so it is NOT invertible: every
-    consumer compares FORWARD instead, reading the user's few app rows (one per project,
-    indexed by `user_id`) and re-deriving the name for each. A lossy inverse would be a silent
-    mis-attribution — naming the wrong project is worse than naming none. `None` means the
-    container cannot be attributed to any app this user owns (a genuine ghost, which the
-    reconcile below is for) — callers must fall through, never refuse on it."""
+    """Resolve the build sandbox a live registry record describes to the project whose work is
+    inside it, by asking `record_holds` of each of the user's few app rows (one per project,
+    indexed by `user_id`). `None` means the container cannot be attributed to any app this user
+    owns — a colleague's shared view, or a genuine ghost, which the reconcile below is for —
+    and callers must fall through, never refuse on it."""
     rows = (
         await db.execute(
             sa.select(AppRegistry.id, AppRegistry.project_id, Project.name)
@@ -684,7 +686,7 @@ async def _occupying_project(
         )
     ).all()
     for app_id, project_id, project_name in rows:
-        if app_name_for(app_id) == app_name:
+        if record_holds(reg, Occupant(app_id), user_id):
             return _OccupyingProject(
                 app_id=app_id, project_id=project_id, project_name=project_name
             )
@@ -861,20 +863,20 @@ async def _note_the_discard(
     return notes
 
 
-async def _sandbox_name_for_existing_app(
+async def _occupant_of_existing_app(
     db: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
-) -> str | None:
-    """The container name this project's sandbox would carry — WITHOUT minting an app row.
+) -> Occupant | None:
+    """The build sandbox this project's start would look for — WITHOUT minting an app row.
 
     `resolve_app_for_project` upserts, and a read that mints is a read that leaves a DRAFT row
     behind every time a turn is refused. None means the project has never been built, so there
     is nothing live that could belong to it."""
     app_id = await existing_app_id(db, user_id, project_id)
-    return app_name_for(app_id) if app_id is not None else None
+    return Occupant(app_id) if app_id is not None else None
 
 
 async def _the_live_sandbox_is_already_the_one_we_want(
-    redis: aioredis.Redis, user_id: uuid.UUID, spare_app: str | None
+    redis: aioredis.Redis, user_id: uuid.UUID, spare: Occupant | None
 ) -> bool:
     """Is the container already up the very one this caller is about to ask for? The point is
     to NOT destroy a healthy container: the reconcile below exists to clear a GHOST left by a
@@ -882,9 +884,9 @@ async def _the_live_sandbox_is_already_the_one_we_want(
     orphan it forever), but write is a chat mode now — every message allocates — and running
     that rule on every message tore a perfectly good, already-running container down and
     rebuilt it from the snapshot each time. So: ask first via one hash read (same app, READY
-    → attach); anything else falls through to the reconcile unchanged. `spare_app=None` means
+    → attach); anything else falls through to the reconcile unchanged. `spare=None` means
     no claim to make, and fails toward that old, safe behaviour (`False`)."""
-    if spare_app is None:
+    if spare is None:
         return False
     try:
         reg = await read_registry(redis, user_id)
@@ -894,11 +896,13 @@ async def _the_live_sandbox_is_already_the_one_we_want(
         return False
     if reg is None:
         return False
-    return _registry_serves_and_is_ready(reg, spare_app)
+    return _registry_serves_and_is_ready(reg, spare, user_id)
 
 
-def _registry_serves_and_is_ready(reg: dict[str, str], app_name: str) -> bool:
-    """Does this registry hash say a READY container is serving `app_name`? Factored out so
+def _registry_serves_and_is_ready(
+    reg: Mapping[str, str], occupant: Occupant, user_id: uuid.UUID
+) -> bool:
+    """Does this registry hash say a READY container is serving `occupant`? Factored out so
     two callers cannot drift: the start path's "spare or reclaim?" and
     `project_preview_state`'s "is my preview live?" share this comparison while differing on
     the error arm (the poll must not swallow a Redis failure into `False`) — two hand-written
@@ -906,7 +910,7 @@ def _registry_serves_and_is_ready(reg: dict[str, str], app_name: str) -> bool:
     registry marked `ending` is a container the reaper has already committed to destroying,
     and attaching to it would race the teardown while also skipping the cleanup."""
     return (
-        reg.get(REGISTRY_FIELD_APP_NAME) == app_name
+        record_holds(reg, occupant, user_id)
         and reg.get(REGISTRY_FIELD_STATE) == REGISTRY_STATE_READY
     )
 
@@ -1289,7 +1293,7 @@ class SessionManager:
         arm: _ClaimArm,
         incumbent_is_leaving: bool,
         record: StartRecord,
-        spare_app: str | None = None,
+        spare: Occupant | None = None,
     ) -> AsyncIterator[_LockScope]:
         """Reconcile stale state → acquire the one-per-user Redis lock → run the body
         compensated. The ONE skeleton behind `relaunch_preview` and `ensure_sandbox` (their
@@ -1369,7 +1373,7 @@ class SessionManager:
         claim_started_at = time.monotonic()
         reclaimed = False
         if incumbent_is_leaving or await _the_live_sandbox_is_already_the_one_we_want(
-            redis, user_id, spare_app
+            redis, user_id, spare
         ):
             # SPARE THE CONTAINER, NOT THE LOCK. Reconcile does two jobs, and only one of them
             # is the destructive one this branch exists to skip: it also `reap_lock`s, and that
@@ -1399,7 +1403,7 @@ class SessionManager:
             raise BuildSessionConflictError()
         lock_wait_ms = int((time.monotonic() - claim_started_at) * 1000)
         record.admitted(
-            _kind_of_start(arm, incumbent_is_leaving=incumbent_is_leaving, spare_app=spare_app),
+            _kind_of_start(arm, incumbent_is_leaving=incumbent_is_leaving, spare=spare),
             user_id=user_id,
             books=self._session_factory,
         )
@@ -1770,7 +1774,7 @@ class SessionManager:
                 user_id in self._active_by_user
                 or await liveness_lease_is_held(redis, user_id)
                 or not await _the_live_sandbox_is_already_the_one_we_want(
-                    redis, user_id, app_name_for(app_id)
+                    redis, user_id, Occupant(app_id)
                 )
             ):
                 return
@@ -1879,7 +1883,7 @@ class SessionManager:
         db: AsyncSession,
         user: User,
         *,
-        spare_app: str | None,
+        spare: Occupant | None,
         sandbox_client: SandboxClient,
     ) -> bool:
         """Hand the container holding this citizen's slot to the shutdown routine, and answer
@@ -1899,7 +1903,7 @@ class SessionManager:
         down, so it earns the same branch and must not be claimed a second time.
         """
         redis = get_redis()
-        if await _the_live_sandbox_is_already_the_one_we_want(redis, user.id, spare_app):
+        if await _the_live_sandbox_is_already_the_one_we_want(redis, user.id, spare):
             # OPENING THE PROJECT THAT ALREADY HOLDS THE SLOT IS NOT A SWITCH — nothing is being
             # left behind, so nothing is torn down and no debt is published.
             return False
@@ -1907,13 +1911,13 @@ class SessionManager:
         if reg is None or reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_READY:
             return False
         outgoing = reg.get(REGISTRY_FIELD_APP_NAME)
-        if outgoing is None or outgoing == spare_app:
+        if outgoing is None or (spare is not None and record_holds(reg, spare, user.id)):
             return False
         if await _is_already_on_its_way_out(db, user.id, outgoing):
             return True
-        occupying = await _occupying_project(db, user.id, outgoing)
+        occupying = await _occupying_project(db, user.id, reg)
         if occupying is None:
-            # A name matching no app this citizen owns: a colleague's shared view, or a ghost.
+            # A record matching no app this citizen owns: a colleague's shared view, or a ghost.
             # Neither holds work of theirs to write back, so the reconcile below reclaims it.
             return False
         instance_ref = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
@@ -1934,6 +1938,7 @@ class SessionManager:
             user_id=user.id,
             app_id=occupying.app_id,
             app_name=outgoing,
+            kind=PendingTeardownKind.BUILD,
             project_id=occupying.project_id,
             instance_ref=instance_ref,
             conversation_id=leaving.at_its_boundary,
@@ -2231,12 +2236,16 @@ class SessionManager:
             # nothing, and so is the operator.
             self._say_the_preview_read_failed(user.id, project_id)
             raise
-        mine = app_name_for(app_id) if app_id is not None else None
+        mine = Occupant(app_id) if app_id is not None else None
         # WHEN THIS PROJECT'S WAIT BEGAN, and only this project's: the marker is per USER, so a
         # start in flight for a DIFFERENT project of theirs names an instant that is not this
         # pane's to count from.
         waiting_since = start_began_at if starting == project_id else None
-        if mine is not None and reg is not None and _registry_serves_and_is_ready(reg, mine):
+        if (
+            mine is not None
+            and reg is not None
+            and _registry_serves_and_is_ready(reg, mine, user.id)
+        ):
             if not stamp_is_proven(reg):
                 # THE CONTAINER EXISTS AND HAS NEVER ANSWERED A REQUEST. This is the whole
                 # citizen-visible fix: until this arm, `state=ready` — an ACA container was
@@ -2276,11 +2285,11 @@ class SessionManager:
             # this as "the poll did not say", exactly as it reads an unreachable store.
             return PreviewState(
                 state=PreviewLifeState.ALIVE,
-                # The PUBLIC address, composed from the app name rather than the registry
+                # The PUBLIC address, composed from the recorded name rather than the registry
                 # FQDN. This site builds no `SandboxHandle`, so it is invisible to anything
                 # that follows the handle's field — and it is what the cockpit frames, so
                 # getting it wrong shows a blank preview over a perfectly healthy container.
-                preview_url=settings.app_url(mine) if fqdn else None,
+                preview_url=settings.app_url(reg[REGISTRY_FIELD_APP_NAME]) if fqdn else None,
                 serving_since=an_instant_on_the_hash(reg, REGISTRY_FIELD_SERVING_SINCE),
             )
         if starting == project_id:
@@ -2311,14 +2320,11 @@ class SessionManager:
         into the same False, sending the caller straight back into a reclaim refusal it was
         told had been cleared — strict re-raises instead, and the router answers 503.
 
-        ACCEPTS EITHER LINEAGE IN THE SLOT (#198, R16's acceptance example: "when the reaper
-        sweeps it OR the release path runs, the container is actually deleted"). The registry
-        this reads is keyed by `user.id` alone — there is exactly one entry per user — so
-        whatever name it holds is unambiguously THIS caller's, whether that is `project_id`'s
-        own `sbx-` container or a colleague's `shr-` view they have open. Before this, a `shr-`
-        occupant failed the `app_name_for(app_id)` comparison and the function returned False
-        without reaping anything: a recipient whose slot held a shared view had no route back
-        to their own build sandbox, and Azure/Redis both still showed the container live."""
+        ACCEPTS EITHER OCCUPANT OF THE SLOT. The registry this reads is keyed by `user.id`
+        alone — there is exactly one entry per user — so whatever it holds is unambiguously THIS
+        caller's: `project_id`'s own build sandbox, or a colleague's shared view they have open,
+        which its stamp names. Releasing the view is a recipient's only route back to their own
+        build sandbox, and the reap never writes a view back."""
         async with self._start_lock_for(user.id):
             app_id = await existing_app_id(db, user.id, project_id)
             if app_id is None:
@@ -2333,8 +2339,7 @@ class SessionManager:
             reg = await read_registry(redis, user.id)
             if reg is None or reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_READY:
                 return False
-            occupied_by = reg.get(REGISTRY_FIELD_APP_NAME, "")
-            if occupied_by != app_name_for(app_id) and not is_a_shared_sandbox_name(occupied_by):
+            if not record_holds(reg, Occupant(app_id), user.id) and not is_a_shared_view(reg):
                 return False
             # THE APP ID GOES WITH IT. Without it the reaper has no slot to write this
             # container's tree back to, and this is the one control a citizen presses that
@@ -2345,6 +2350,7 @@ class SessionManager:
         self,
         recipient_id: uuid.UUID,
         owner_app_id: uuid.UUID,
+        view: SharedViewStamp,
         *,
         sandbox_client: SandboxClient,
     ) -> bool:
@@ -2355,7 +2361,7 @@ class SessionManager:
         recipient, so there is no `_active_by_user` conflict to raise here — nobody is
         competing for their own slot. And it must NOT refuse merely because the recipient is
         mid-build on a project of their OWN: that build's container simply is not the shared
-        name being asked about, so the identity check below already answers False for it,
+        view being asked about, so the identity check below already answers False for it,
         which is the correct "nothing of this share's to revoke" outcome, not an error.
 
         Holds the recipient's OWN start lock — the same one `launch_shared_preview` and any
@@ -2364,10 +2370,9 @@ class SessionManager:
         `release_project_sandbox`: the router is about to act on the outcome, and a failed
         teardown must reach it as a 503 rather than a silent False."""
         redis = get_redis()
-        shared_name = shr_name_for(owner_app_id, recipient_id)
         async with self._start_lock_for(recipient_id):
             if not await _the_live_sandbox_is_already_the_one_we_want(
-                redis, recipient_id, shared_name
+                redis, recipient_id, Occupant(owner_app_id, view)
             ):
                 return False
             return await reap_user(redis, recipient_id, sandbox_client, strict=True)
@@ -2425,7 +2430,7 @@ class SessionManager:
         if live is not None and live.app_id == app_id and live.handle is not None:
             return live.handle
         if not await _the_live_sandbox_is_already_the_one_we_want(
-            get_redis(), user_id, app_name_for(app_id)
+            get_redis(), user_id, Occupant(app_id)
         ):
             raise NoLiveSandboxError(app_id)
         try:
@@ -2626,9 +2631,9 @@ class SessionManager:
             # Read-only, and outside the lock's scope because it has to be: `app_id` is not
             # bound until inside it, and `resolve_app_for_project` mints a DRAFT row, so it
             # cannot name the container a request that may still be refused would spare.
-            spare_app = await _sandbox_name_for_existing_app(db, user_id, project_id)
+            spare = await _occupant_of_existing_app(db, user_id, project_id)
             incumbent_is_leaving = await self._show_the_outgoing_project_the_door(
-                db, user, spare_app=spare_app, sandbox_client=sandbox_client
+                db, user, spare=spare, sandbox_client=sandbox_client
             )
             scope = await held.enter_async_context(
                 self._holding_user_lock(
@@ -2639,7 +2644,7 @@ class SessionManager:
                     arm="relaunch",
                     incumbent_is_leaving=incumbent_is_leaving,
                     record=start.record,
-                    spare_app=spare_app,
+                    spare=spare,
                 )
             )
             app_id = await resolve_app_for_project(db, user_id, project_id)
@@ -2746,7 +2751,7 @@ class SessionManager:
             handle,
             redis,
             user_id,
-            app_name=app_name_for(app_id),
+            app_name=handle.app_name,
             cold=env is not None,
             observer="relaunch",
             # A restored app's first page can come well after one budget, an `npm` reconcile
@@ -2781,14 +2786,13 @@ class SessionManager:
     ) -> SandboxHandle:
         """Restore when `env` is given, then start the dev server, hand the container its stay,
         and let both locks go. Returns the handle the watch reads."""
-        app_name = app_name_for(app_id)
         attached = env is None
         async with held:
             try:
                 if env is not None:
                     with timed_by(scope.record):
                         scope.handle = await self._restore_or_bust(
-                            sandbox_client, user_id, app_name, app_id, env, source_key=None
+                            sandbox_client, user_id, app_name_for(app_id), app_id, env
                         )
                     # A birth, so the connector copy fires, detached and unawaited: nothing on
                     # the platform reads what it writes, so no start may wait on it or be lost
@@ -2817,7 +2821,7 @@ class SessionManager:
                         exc_info=True,
                     )
                 await self._retract_a_proof_it_cannot_back(
-                    sandbox_client, handle, redis, user_id, app_name=app_name
+                    sandbox_client, handle, redis, user_id, app_name=handle.app_name
                 )
                 # Up, with its dev server started: destroying it over a later Redis blip is no
                 # longer a rollback.
@@ -2828,7 +2832,7 @@ class SessionManager:
                     )
                 # Settled rather than re-granted: provisioning is over, and the screen framing
                 # the app renews its own stay from here.
-                await settle_stay_once_provisioning_ends(redis, user_id, app_name=app_name)
+                await settle_stay_once_provisioning_ends(redis, user_id, app_name=handle.app_name)
             except BaseException as exc:
                 # Before compensation, which can spend tens of seconds tearing the container
                 # down: a press arriving meanwhile starts afresh instead of joining a lost start.
@@ -2950,20 +2954,21 @@ class SessionManager:
             owner_app_id = await existing_app_id(db, project.user_id, project.id)
             if owner_app_id is None:
                 raise SharedProjectHasNoAppError(project.id)
-            shared_name = shr_name_for(owner_app_id, recipient.id)
+            the_view = Occupant(
+                owner_app_id, SharedViewStamp(owner_id=project.user_id, project_id=project.id)
+            )
             # OPENING A COLLEAGUE'S PROJECT IS OPENING A DIFFERENT PROJECT, so the recipient's
             # own container leaves the way it leaves at every other door — written back over its
             # saved copy and destroyed in the background — rather than being reclaimed inline by
-            # the reconcile below, which saves nothing. Asked with the IDENTITY name, never the
-            # `None` a Refresh hands the lock: a live shared view being refreshed is the one we
-            # already want, and handing it over would tear down the very thing being refreshed.
+            # the reconcile below, which saves nothing. Asked about THE VIEW, never the `None` a
+            # Refresh hands the lock: a live shared view being refreshed is the one we already
+            # want, and handing it over would tear down the very thing being refreshed.
             incumbent_is_leaving = await self._show_the_outgoing_project_the_door(
-                db, recipient, spare_app=shared_name, sandbox_client=sandbox_client
+                db, recipient, spare=the_view, sandbox_client=sandbox_client
             )
-            # `spare_app=None` on Refresh is what makes the reconcile reclaim a live view
-            # unconditionally, so the restore arm always runs even though the name it would
-            # produce is identical to what is already there.
-            spare_app = None if force_refresh else shared_name
+            # `spare=None` on Refresh is what makes the reconcile reclaim a live view
+            # unconditionally, so the restore arm always runs even though what it would restore
+            # is the view already there.
             async with self._holding_user_lock(
                 redis,
                 recipient.id,
@@ -2972,7 +2977,7 @@ class SessionManager:
                 arm="shared_launch",
                 incumbent_is_leaving=incumbent_is_leaving,
                 record=record,
-                spare_app=spare_app,
+                spare=None if force_refresh else the_view,
             ) as scope:
                 # THE SNAPSHOT GATE — the OWNER's saved bundle (requirement 21).
                 if not await self._snapshot_exists_or_bust(owner_app_id):
@@ -2982,7 +2987,7 @@ class SessionManager:
                 if not force_refresh:
                     try:
                         scope.handle = await self._attach_for_shared_view(
-                            recipient.id, shared_name, sandbox_client
+                            recipient.id, the_view, sandbox_client
                         )
                         attached = True
                         scope.spare()
@@ -3000,7 +3005,7 @@ class SessionManager:
                             scope.handle = await self._restore_or_bust(
                                 sandbox_client,
                                 recipient.id,
-                                shared_name,
+                                shr_name_for(owner_app_id, recipient.id),
                                 owner_app_id,
                                 env,
                                 source_key=snapshot_key(owner_app_id),
@@ -3096,14 +3101,14 @@ class SessionManager:
             )
 
     async def _attach_for_shared_view(
-        self, recipient_id: uuid.UUID, shared_name: str, sandbox_client: SandboxClient
+        self, recipient_id: uuid.UUID, the_view: Occupant, sandbox_client: SandboxClient
     ) -> SandboxHandle:
         """A handle on an already-live shared view, or `NoLiveSandboxError`. Registry-only —
         unlike `_attach_for_read`, there is no in-process session to check first, because
         `launch_shared_preview` never adopts one: a shared view has no chat turn and mints no
         `BuildSession`."""
         if not await _the_live_sandbox_is_already_the_one_we_want(
-            get_redis(), recipient_id, shared_name
+            get_redis(), recipient_id, the_view
         ):
             raise NoLiveSandboxError(recipient_id)
         try:
@@ -3171,14 +3176,14 @@ class SessionManager:
             # _project` below MINTS, and minting out here would leave an app row behind for a
             # turn that then gets refused. No app row yet means nothing live can be ours, which
             # is the correct answer for a project's very first turn.
-            spare_app = await _sandbox_name_for_existing_app(db, user_id, project_id)
+            spare = await _occupant_of_existing_app(db, user_id, project_id)
             # ABOVE THE LOCK, because the lock's reconcile is what would otherwise destroy the
             # incumbent, and an `ending` registry can no longer be attached to or questioned.
             # A FIRST MESSAGE IS A DOOR: this is the only way a never-built project starts, so a
             # citizen who switches by typing has to be handed through here exactly as one who
             # pressed start is handed through the relaunch door.
             incumbent_is_leaving = await self._show_the_outgoing_project_the_door(
-                db, user, spare_app=spare_app, sandbox_client=sandbox_client
+                db, user, spare=spare, sandbox_client=sandbox_client
             )
             async with self._holding_user_lock(
                 redis,
@@ -3188,7 +3193,7 @@ class SessionManager:
                 arm="ensure_sandbox",
                 incumbent_is_leaving=incumbent_is_leaving,
                 record=record,
-                spare_app=spare_app,
+                spare=spare,
             ) as scope:
                 app_id = await resolve_app_for_project(db, user_id, project_id)
                 await db.commit()

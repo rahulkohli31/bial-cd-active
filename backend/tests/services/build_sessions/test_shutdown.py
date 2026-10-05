@@ -30,7 +30,7 @@ import structlog.testing
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.message import MessageEntryKind, MessageVisibility
-from src.db.models.pending_teardown import PendingTeardown
+from src.db.models.pending_teardown import PendingTeardown, PendingTeardownKind
 from src.services.build_sessions import app_name_for, shr_name_for
 from src.services.build_sessions import shutdown as shutdown_module
 from src.services.build_sessions.alarms import REAP_FOUND_NO_REPOSITORY_EVENT
@@ -67,7 +67,13 @@ from tests.factories import (
     ProjectFactory,
     UserFactory,
 )
-from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle, a_sandbox_name
+from tests.fakes import (
+    FakeSandboxClient,
+    FakeStorage,
+    a_git_bundle,
+    a_name_unrelated_to_its_app,
+    a_sandbox_name,
+)
 
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
@@ -215,6 +221,7 @@ async def _owe(
     conversation_id: uuid.UUID | None = None,
     app_id: uuid.UUID | None = None,
     app_name: str | None = None,
+    kind: PendingTeardownKind = PendingTeardownKind.BUILD,
 ) -> OwedTeardown:
     owning = app_id or scene.app_id
     async with scene.factory() as db:
@@ -223,6 +230,7 @@ async def _owe(
             user_id=scene.user_id,
             app_id=owning,
             app_name=app_name or app_name_for(owning),
+            kind=kind,
             project_id=scene.project_id,
             instance_ref=instance_ref,
             conversation_id=conversation_id,
@@ -889,6 +897,7 @@ async def test_a_shared_view_owed_a_delete_is_destroyed_with_no_write_back(
             user_id=recipient.id,
             app_id=scene.app_id,
             app_name=name,
+            kind=PendingTeardownKind.SHARED,
             project_id=scene.project_id,
             instance_ref=born,
             conversation_id=None,
@@ -1090,3 +1099,119 @@ async def test_the_background_spawn_returns_before_the_teardown_finishes(
     await task
     assert client.torn_down == [scene.app_name]
     assert await _rows_for(scene) == []
+
+
+# =============================================================================
+# A row written before rows said which kind of container they owe
+# =============================================================================
+
+
+async def _owed_by_an_older_process(
+    scene: _Scene, *, user_id: uuid.UUID, app_name: str, instance_ref: datetime
+) -> None:
+    """A lapsed row as a process older than the `kind` column leaves it: the kind is NULL."""
+    async with scene.factory() as db:
+        owed = await claim_the_teardown_we_owe(
+            db,
+            user_id=user_id,
+            app_id=scene.app_id,
+            app_name=app_name,
+            kind=PendingTeardownKind.BUILD,
+            project_id=scene.project_id,
+            instance_ref=instance_ref,
+            conversation_id=None,
+        )
+        await db.execute(
+            sa.update(PendingTeardown)
+            .where(PendingTeardown.id == owed.id)
+            .values(kind=None, claimed_until=datetime.now(UTC) - timedelta(minutes=1))
+        )
+        await db.commit()
+
+
+async def test_an_older_rows_shared_view_is_destroyed_without_a_write_back(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+    scene: _Scene,
+) -> None:
+    """★ No kind on the row, and a `shr-` name: the view of the owner's app it always was.
+
+    Mutation check: read a NULL kind as a build sandbox whatever its name, and the colleague's
+    tree is written over the owner's saved copy."""
+    recipient = await UserFactory.create(db_session)
+    name = shr_name_for(scene.app_id, recipient.id)
+    born = _born_at(10)
+    await _seed_registry(fake_redis, recipient.id, app_name=name, created_at=born)
+    await _saved_copy(fake_storage, scene.app_id)
+    client = _answers_by_name(_Sandbox(), name, born=born)
+    await _owed_by_an_older_process(scene, user_id=recipient.id, app_name=name, instance_ref=born)
+
+    result = await sweep_owed_teardowns(fake_redis, client, session_factory=scene.factory)
+
+    assert result.settled == 1
+    assert client.torn_down == [name]
+    meta = await fake_storage.head(snapshot_key(scene.app_id))
+    assert meta is not None and (meta.metadata or {})["head_sha"] == SAVED
+
+
+async def test_an_older_rows_build_sandbox_is_written_back_as_it_always_was(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage, scene: _Scene
+) -> None:
+    """Mutation check: read a NULL kind as a shared view whatever its name, and the citizen's
+    unsaved work goes with the container."""
+    born = _born_at(10)
+    await _seed_registry(fake_redis, scene.user_id, app_name=scene.app_name, created_at=born)
+    await _saved_copy(fake_storage, scene.app_id)
+    client = _answers_by_name(_Sandbox(), scene.app_name, born=born)
+    await _owed_by_an_older_process(
+        scene, user_id=scene.user_id, app_name=scene.app_name, instance_ref=born
+    )
+
+    result = await sweep_owed_teardowns(fake_redis, client, session_factory=scene.factory)
+
+    assert result.settled == 1
+    assert client.torn_down == [scene.app_name]
+    meta = await fake_storage.head(snapshot_key(scene.app_id))
+    assert meta is not None and (meta.metadata or {})["head_sha"] == BUNDLED
+
+
+async def test_a_shared_view_owed_under_a_build_sandboxs_name_is_never_written_back(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+    scene: _Scene,
+) -> None:
+    """The row's kind decides, not the name: a view may carry the build sandbox's name shape.
+
+    Mutation check: decide by the name's prefix and the owner's saved copy is overwritten."""
+    recipient = await UserFactory.create(db_session)
+    name = a_name_unrelated_to_its_app()
+    born = _born_at(10)
+    await _seed_registry(fake_redis, recipient.id, app_name=name, created_at=born)
+    await _saved_copy(fake_storage, scene.app_id)
+    client = _answers_by_name(_Sandbox(), name, born=born)
+    async with scene.factory() as db:
+        owed = await claim_the_teardown_we_owe(
+            db,
+            user_id=recipient.id,
+            app_id=scene.app_id,
+            app_name=name,
+            kind=PendingTeardownKind.SHARED,
+            project_id=scene.project_id,
+            instance_ref=born,
+            conversation_id=None,
+        )
+
+    outcome = await run_the_shutdown(
+        owed,
+        redis=fake_redis,
+        sandbox_client=client,
+        reason=ShutdownReason.PRESENCE_LAPSED,
+        session_factory=scene.factory,
+    )
+
+    assert outcome is ShutdownOutcome.DESTROYED
+    assert client.torn_down == [name]
+    meta = await fake_storage.head(snapshot_key(scene.app_id))
+    assert meta is not None and (meta.metadata or {})["head_sha"] == SAVED

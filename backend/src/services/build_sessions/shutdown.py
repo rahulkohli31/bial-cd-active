@@ -34,7 +34,7 @@ import asyncio
 import enum
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -48,17 +48,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.app_registry import AppRegistry
 from src.db.models.message import Message, MessageEntryKind
-from src.db.models.pending_teardown import PendingTeardown
+from src.db.models.pending_teardown import PendingTeardown, PendingTeardownKind
 from src.services.build_sessions.alarms import REAP_FOUND_NO_REPOSITORY_EVENT
 from src.services.build_sessions.drain import is_drained, the_ceiling_hours
 from src.services.build_sessions.locks import (
+    Occupant,
     SharedViewStamp,
     an_instant_on_the_hash,
     delete_registry_if_it_still_names,
+    is_a_shared_view,
     read_registry,
     read_starting_marker,
     reap_lock,
+    record_holds,
     release_liveness_lease,
+    shared_view_stamp,
 )
 from src.services.build_sessions.reaper import (
     handle_named,
@@ -74,7 +78,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
 )
 from src.services.sandbox import SandboxClient, SandboxError, SandboxGoneError, SandboxHandle
-from src.services.sandbox.base import identity_from_tags
+from src.services.sandbox.base import SHARED_SANDBOX_NAME_PREFIX, identity_from_tags
 from src.services.storage import StorageError
 
 _log = structlog.get_logger()
@@ -167,6 +171,7 @@ class OwedTeardown:
     user_id: uuid.UUID
     app_id: uuid.UUID
     app_name: str
+    kind: PendingTeardownKind
     project_id: uuid.UUID
     instance_ref: datetime
     conversation_id: uuid.UUID | None
@@ -175,11 +180,20 @@ class OwedTeardown:
 
 
 def _owed_from(row: PendingTeardown) -> OwedTeardown:
+    kind = row.kind
+    if kind is None:
+        # A row a process older than the `kind` column wrote, when the name still said which.
+        kind = (
+            PendingTeardownKind.SHARED
+            if row.app_name.startswith(SHARED_SANDBOX_NAME_PREFIX)
+            else PendingTeardownKind.BUILD
+        )
     return OwedTeardown(
         id=row.id,
         user_id=row.user_id,
         app_id=row.app_id,
         app_name=row.app_name,
+        kind=kind,
         project_id=row.project_id,
         instance_ref=row.instance_ref,
         conversation_id=row.conversation_id,
@@ -236,6 +250,7 @@ async def claim_the_teardown_we_owe(
     user_id: uuid.UUID,
     app_id: uuid.UUID,
     app_name: str,
+    kind: PendingTeardownKind,
     project_id: uuid.UUID,
     instance_ref: datetime,
     conversation_id: uuid.UUID | None,
@@ -258,6 +273,7 @@ async def claim_the_teardown_we_owe(
             user_id=user_id,
             app_id=app_id,
             app_name=app_name,
+            kind=kind,
             project_id=project_id,
             instance_ref=instance_ref,
             conversation_id=conversation_id,
@@ -281,9 +297,7 @@ async def owe_a_teardown_the_reap_could_not_perform(
     *,
     user_id: uuid.UUID,
     app_id: uuid.UUID | None,
-    app_name: str,
-    instance_ref: datetime | None,
-    shared_view: SharedViewStamp | None = None,
+    reg: Mapping[str, str],
 ) -> bool:
     """Hand a failed reap's deletion to the owed-row ledger. True when the ledger took it.
 
@@ -294,34 +308,34 @@ async def owe_a_teardown_the_reap_could_not_perform(
     container from whatever is created under the same name next. Either gap leaves the old
     behaviour in place, which spares rather than forgets.
 
-    A SHARED VIEW IS OWED AGAINST ITS OWNER'S APP, never the slot holder's: `shared_view` is the
-    owner and project its launch stamped on the record, and a caller's `app_id` is not consulted.
-    The routine deletes a shared view with no write-back."""
+    A SHARED VIEW IS OWED AGAINST ITS OWNER'S APP, never the slot holder's: the record's stamp is
+    the owner and project its launch stamped, and a caller's `app_id` is not consulted. The
+    routine deletes a shared view with no write-back."""
+    # The record's OWN birthday: re-stamped at every registration, so it tells this container from
+    # whatever is created under the same name next.
+    instance_ref = an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT)
     if instance_ref is None:
         return False
     factory = _the_default_factory()
-    if is_a_shared_sandbox_name(app_name):
+    if is_a_shared_view(reg):
+        shared_view = shared_view_stamp(reg)
+        if shared_view is None:
+            return False
         return await _owe_a_shared_view(
-            factory,
-            user_id=user_id,
-            app_name=app_name,
-            instance_ref=instance_ref,
-            shared_view=shared_view,
+            factory, user_id=user_id, reg=reg, instance_ref=instance_ref, shared_view=shared_view
         )
     if app_id is None:
         return False
-    # THE NAME AND THE APP ID ARRIVE FROM DIFFERENT READS, so the row is only sound if they
+    # THE RECORD AND THE APP ID ARRIVE FROM DIFFERENT READS, so the row is only sound if they
     # describe the same container. The caller resolves `app_id` from one registry read and the
     # reap re-reads the registry for itself; a slot swap between the two hands this function one
-    # container's name and another's id, and the ownership query below would still pass. The row
-    # is what stands between a name and an ARM delete: a mismatched pair bundles the wrong tree
-    # against the wrong saved head and marks the wrong project as closing. Local import — the
-    # manager imports this module.
-    from src.services.build_sessions.manager import app_name_for
-
-    if app_name != app_name_for(app_id):
+    # container's record and another's id, and the ownership query below would still pass. The
+    # row is what stands between a name and an ARM delete: a mismatched pair bundles the wrong
+    # tree against the wrong saved head and marks the wrong project as closing.
+    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+    if not record_holds(reg, Occupant(app_id), user_id):
         _log.error(
-            "refusing the debt: the name and the app id describe different containers",
+            "refusing the debt: the record and the app id describe different containers",
             user_id=str(user_id),
             app_id=str(app_id),
             app_name=app_name,
@@ -342,6 +356,7 @@ async def owe_a_teardown_the_reap_could_not_perform(
             user_id=user_id,
             app_id=app_id,
             app_name=app_name,
+            kind=PendingTeardownKind.BUILD,
             project_id=project_id,
             instance_ref=instance_ref,
             conversation_id=None,
@@ -353,24 +368,23 @@ async def _owe_a_shared_view(
     factory: SessionFactory,
     *,
     user_id: uuid.UUID,
-    app_name: str,
+    reg: Mapping[str, str],
     instance_ref: datetime,
-    shared_view: SharedViewStamp | None,
+    shared_view: SharedViewStamp,
 ) -> bool:
     """The shared-view arm of `owe_a_teardown_the_reap_could_not_perform`. The app is found from
-    the stamp, and the name is held to it exactly as the build-sandbox arm holds its own: a stamp
-    and a name that describe different containers owe nothing."""
-    if shared_view is None:
-        return False
-    from src.services.build_sessions.manager import existing_app_id, shr_name_for
+    the stamp, and the record is held to it exactly as the build-sandbox arm holds its own: a
+    stamp and a record that describe different containers owe nothing."""
+    from src.services.build_sessions.manager import existing_app_id
 
+    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
     async with factory() as db:
         app_id = await existing_app_id(db, shared_view.owner_id, shared_view.project_id)
         if app_id is None:
             return False
-        if app_name != shr_name_for(app_id, user_id):
+        if not record_holds(reg, Occupant(app_id, shared_view), user_id):
             _log.error(
-                "refusing the debt: the shared view's stamp and its name describe different "
+                "refusing the debt: the shared view's stamp and its record describe different "
                 "containers",
                 user_id=str(user_id),
                 app_id=str(app_id),
@@ -382,6 +396,7 @@ async def _owe_a_shared_view(
             user_id=user_id,
             app_id=app_id,
             app_name=app_name,
+            kind=PendingTeardownKind.SHARED,
             project_id=shared_view.project_id,
             instance_ref=instance_ref,
             conversation_id=None,
@@ -479,7 +494,7 @@ async def run_the_shutdown(
     if owed.conversation_id is not None:
         await _stop_the_outgoing_turn(owed, factory, reason)
 
-    if is_a_shared_sandbox_name(owed.app_name):
+    if owed.kind is PendingTeardownKind.SHARED:
         # A shared view holds nothing of the recipient's to write back: what they see is a
         # restore of somebody else's snapshot, already durable at its source, and that storage
         # is read-never-write for them.

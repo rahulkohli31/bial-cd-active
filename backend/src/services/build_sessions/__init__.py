@@ -20,6 +20,8 @@ from src.services.build_sessions.appdb_env import (
 )
 from src.services.build_sessions.appstorage import provision_app_storage as provision_app_storage
 from src.services.build_sessions.locks import LockUnavailableError as LockUnavailableError
+from src.services.build_sessions.locks import Occupant as Occupant
+from src.services.build_sessions.locks import SharedViewStamp as SharedViewStamp
 from src.services.build_sessions.locks import acquire_lock as acquire_lock
 from src.services.build_sessions.locks import delete_registry as delete_registry
 from src.services.build_sessions.locks import heartbeat_is_alive as heartbeat_is_alive
@@ -27,6 +29,7 @@ from src.services.build_sessions.locks import lock_is_held as lock_is_held
 from src.services.build_sessions.locks import mark_registry_ending as mark_registry_ending
 from src.services.build_sessions.locks import read_registry as read_registry
 from src.services.build_sessions.locks import reap_lock as reap_lock
+from src.services.build_sessions.locks import record_holds as record_holds
 from src.services.build_sessions.locks import release_lock_as_holder as release_lock_as_holder
 from src.services.build_sessions.locks import renew_lock as renew_lock
 from src.services.build_sessions.locks import write_heartbeat as write_heartbeat

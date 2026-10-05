@@ -22,6 +22,7 @@ from pydantic import SecretStr
 from src.services.build_sessions.locks import stay_of_execution_is_current
 from src.services.redis import REGISTRY_STATE_ENDING, REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_STATE,
@@ -268,6 +269,8 @@ async def test_provision_new_writes_registry_and_injects_env(fake_redis: aioredi
 
     reg = await fake_redis.hgetall(registry_key(USER))
     assert reg[REGISTRY_FIELD_STATE] == REGISTRY_STATE_READY
+    # The app the env names, which is what every later lookup finds this container by.
+    assert reg[REGISTRY_FIELD_APP_ID] == str(APP_ID)
     token_ref = reg[REGISTRY_FIELD_TOKEN_REF]
     assert isinstance(token_ref, str)  # decode_responses=True — Redis hands back str
     assert token_ref and token_ref != handle.token  # a REFERENCE, never the raw token

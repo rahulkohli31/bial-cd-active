@@ -75,11 +75,12 @@ from src.services.appdb.teardown import salt_the_earth, teardown_handles
 from src.services.audit.log import append_audit
 from src.services.audit.teardown import record_what_survived
 from src.services.build_sessions import (
+    Occupant,
     SessionManager,
-    app_name_for,
+    SharedViewStamp,
     read_registry,
     reap_user,
-    shr_name_for,
+    record_holds,
 )
 from src.services.build_sessions.manager import snapshot_presence
 from src.services.deploy.liveness import live_app_ids
@@ -915,7 +916,10 @@ async def unshare_project(
             with build_coordination_or_503():
                 try:
                     await manager.revoke_shared_preview(
-                        body.shared_with_user_id, app_id, sandbox_client=sandbox
+                        body.shared_with_user_id,
+                        app_id,
+                        SharedViewStamp(owner_id=project.user_id, project_id=project.id),
+                        sandbox_client=sandbox,
                     )
                 except SandboxError as exc:
                     raise AppApiError(
@@ -1045,8 +1049,11 @@ class _WhoseContainer(enum.Enum):
     UNREADABLE = "unreadable"
 
 
-async def _whose_container_is_registered(user_id: uuid.UUID, app_id: uuid.UUID) -> _WhoseContainer:
-    """Read the per-user sandbox registry and say whose container it names.
+async def _whose_container_is_registered(
+    user_id: uuid.UUID, app_id: uuid.UUID
+) -> tuple[_WhoseContainer, str | None]:
+    """Read the per-user sandbox registry and say whose container it names, with the container's
+    recorded name when it is this app's.
 
     THE REGISTRY KEY IS PER-USER, which is the whole reason this question exists: without it,
     "the reap did not happen" and "this project had a container to reap" are the same sentence,
@@ -1061,14 +1068,20 @@ async def _whose_container_is_registered(user_id: uuid.UUID, app_id: uuid.UUID) 
             user_id=str(user_id),
             exc_info=True,
         )
-        return _WhoseContainer.UNREADABLE
+        return _WhoseContainer.UNREADABLE, None
     if reg is None:
-        return _WhoseContainer.NOTHING_REGISTERED
-    return (
-        _WhoseContainer.OURS
-        if reg.get(REGISTRY_FIELD_APP_NAME) == app_name_for(app_id)
-        else _WhoseContainer.SOMEONE_ELSES
-    )
+        return _WhoseContainer.NOTHING_REGISTERED, None
+    if record_holds(reg, Occupant(app_id), user_id):
+        return _WhoseContainer.OURS, reg.get(REGISTRY_FIELD_APP_NAME, "")
+    return _WhoseContainer.SOMEONE_ELSES, None
+
+
+def _the_survivor(name: str | None, *tags: uuid.UUID) -> str:
+    """What an operator finds a surviving container by: the name its record gave, or — when no
+    record could be read naming it — the ARM tag values that pick it out of the fleet: its app,
+    and for a shared view the colleague holding it, since every view of an app shares the app's
+    tag with the owner's own container."""
+    return name if name is not None else "/".join(str(tag) for tag in tags)
 
 
 async def _reap_the_project_sandbox_or_shrug(
@@ -1106,7 +1119,7 @@ async def _reap_the_project_sandbox_or_shrug(
     `LOCK_TTL_SECONDS = 900`, so a teardown that cleared only the registry would leave the
     citizen unable to start ANY sandbox for fifteen minutes after deleting a project.
 
-    THE IDENTITY CHECK IS NAME-EQUALITY, and deliberately NOT `_registry_serves_and_is_ready`.
+    THE IDENTITY CHECK IS `record_holds` ALONE, deliberately NOT `_registry_serves_and_is_ready`.
     That helper also demands `state == "ready"`, and an entry left at `ending` by an earlier
     failed teardown — which names THIS project's own container — would be skipped and go on
     billing. The check is needed at all because the registry key is per-USER: an unconditional
@@ -1165,7 +1178,7 @@ async def _reap_the_project_sandbox_or_shrug(
             # "nothing of ours" — it is precisely what a provision in flight looks like, and a
             # provision is the commonest holder of the lock we just failed to take. Naming
             # another project's container is the only reading that actually rules ours out.
-            whose = await _whose_container_is_registered(user_id, app_id)
+            whose, name = await _whose_container_is_registered(user_id, app_id)
             if whose is _WhoseContainer.SOMEONE_ELSES:
                 logger.info(
                     "project_delete_sandbox_reap_skipped_not_ours",
@@ -1182,20 +1195,20 @@ async def _reap_the_project_sandbox_or_shrug(
             logger.warning(
                 TEARDOWN_ARTEFACT_SURVIVED_EVENT,
                 artefact="sandbox_container",
-                artefact_id=app_name_for(app_id),
+                artefact_id=_the_survivor(name, app_id),
                 reason="another start held the per-user lock for the whole wait",
                 app_id=str(app_id),
                 user_id=str(user_id),
                 waited_seconds=_SANDBOX_REAP_LOCK_WAIT_SECONDS,
             )
-            return app_name_for(app_id)
+            return _the_survivor(name, app_id)
         try:
             redis = get_redis()
             # IN HERE, EMPTY REALLY DOES MEAN NOTHING SURVIVED, and that asymmetry with the
             # two lock-free arms is the point rather than an oversight: holding the per-user
             # start lock excludes the concurrent provision that makes an empty registry
             # ambiguous out there.
-            registered = await _whose_container_is_registered(user_id, app_id)
+            registered, name = await _whose_container_is_registered(user_id, app_id)
             if registered is _WhoseContainer.UNREADABLE:
                 # THE QUESTION COULD NOT BE ASKED, which is not an answer. The reap's own first
                 # act is to read this same registry, so there is nothing to gain by pressing
@@ -1211,12 +1224,12 @@ async def _reap_the_project_sandbox_or_shrug(
                 logger.warning(
                     TEARDOWN_ARTEFACT_SURVIVED_EVENT,
                     artefact="sandbox_container",
-                    artefact_id=app_name_for(app_id),
+                    artefact_id=_the_survivor(name, app_id),
                     reason="the sandbox registry could not be read, so nothing could be checked",
                     app_id=str(app_id),
                     user_id=str(user_id),
                 )
-                return app_name_for(app_id)
+                return _the_survivor(name, app_id)
             if registered is not _WhoseContainer.OURS:
                 # NOT A LEAK, so not an alarm: either nothing is registered — and under this
                 # lock that really does mean nothing is coming up either — or what is
@@ -1242,12 +1255,12 @@ async def _reap_the_project_sandbox_or_shrug(
                 logger.warning(
                     TEARDOWN_ARTEFACT_SURVIVED_EVENT,
                     artefact="sandbox_container",
-                    artefact_id=app_name_for(app_id),
+                    artefact_id=_the_survivor(name, app_id),
                     reason="the teardown did not remove the registered container",
                     app_id=str(app_id),
                     user_id=str(user_id),
                 )
-                return app_name_for(app_id)
+                return _the_survivor(name, app_id)
         finally:
             lock.release()
     except Exception:  # noqa: BLE001 — post-commit: an alarm and a record, never a 500
@@ -1257,7 +1270,8 @@ async def _reap_the_project_sandbox_or_shrug(
         # read now and names someone else's, nothing of this project's survived and the record
         # must not say otherwise. Unreadable or ours -> report, which is where an actual failed
         # teardown lands.
-        if await _whose_container_is_registered(user_id, app_id) is _WhoseContainer.SOMEONE_ELSES:
+        whose, name = await _whose_container_is_registered(user_id, app_id)
+        if whose is _WhoseContainer.SOMEONE_ELSES:
             logger.info(
                 "project_delete_sandbox_reap_skipped_not_ours",
                 app_id=str(app_id),
@@ -1268,13 +1282,13 @@ async def _reap_the_project_sandbox_or_shrug(
         logger.warning(
             TEARDOWN_ARTEFACT_SURVIVED_EVENT,
             artefact="sandbox_container",
-            artefact_id=app_name_for(app_id),
+            artefact_id=_the_survivor(name, app_id),
             reason="the reap raised",
             app_id=str(app_id),
             user_id=str(user_id),
             exc_info=True,
         )
-        return app_name_for(app_id)
+        return _the_survivor(name, app_id)
     return None
 
 
@@ -1283,6 +1297,7 @@ async def _reap_a_shared_views_container_or_shrug(
     *,
     recipient_id: uuid.UUID,
     owner_app_id: uuid.UUID,
+    view: SharedViewStamp,
 ) -> str | None:
     """Take down ONE recipient's live view of a just-deleted project's shared app, best-effort.
     NEVER RAISES — `delete_project`'s own sibling to `_reap_the_project_sandbox_or_shrug`
@@ -1305,14 +1320,15 @@ async def _reap_a_shared_views_container_or_shrug(
     view is left running."""
     if sandbox is None:
         return None
-    shared_name = shr_name_for(owner_app_id, recipient_id)
+    shared_name: str | None = None
     try:
         redis = get_redis()
         reg = await read_registry(redis, recipient_id)
-        if reg is None or reg.get(REGISTRY_FIELD_APP_NAME) != shared_name:
+        if reg is None or not record_holds(reg, Occupant(owner_app_id, view), recipient_id):
             # Nothing registered, or the recipient's slot holds something else of THEIRS
             # (their own build, or a different colleague's shared project) — not ours to touch.
             return None
+        shared_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
         if await reap_user(redis, recipient_id, sandbox, strict=False):
             return None
         logger.warning(
@@ -1328,13 +1344,13 @@ async def _reap_a_shared_views_container_or_shrug(
         logger.warning(
             TEARDOWN_ARTEFACT_SURVIVED_EVENT,
             artefact="shared_sandbox_container",
-            artefact_id=shared_name,
+            artefact_id=_the_survivor(shared_name, owner_app_id, recipient_id),
             reason="the reap raised",
             recipient_id=str(recipient_id),
             owner_app_id=str(owner_app_id),
             exc_info=True,
         )
-        return shared_name
+        return _the_survivor(shared_name, owner_app_id, recipient_id)
 
 
 @router.delete(
@@ -1602,7 +1618,10 @@ async def delete_project(
     if app_id is not None:
         for recipient_id in shared_recipient_ids:
             recipient_standing = await _reap_a_shared_views_container_or_shrug(
-                sandbox, recipient_id=recipient_id, owner_app_id=app_id
+                sandbox,
+                recipient_id=recipient_id,
+                owner_app_id=app_id,
+                view=SharedViewStamp(owner_id=user.id, project_id=project_id),
             )
             if recipient_standing is not None:
                 survivors.append(("shared_sandbox_container", recipient_standing))

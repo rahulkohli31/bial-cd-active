@@ -160,8 +160,8 @@ async def _the_live_session_is_this_project(
     THE THREE SIGNALS CARRY TWO KINDS OF IDENTITY. The starting marker holds a PROJECT id
     outright and is written under the lock, so while one stands it IS the live session's
     identity — and it is the only one that can answer during a cold start, before a registry
-    entry exists. The lock and the lease carry none: theirs comes from the registry hash's app
-    name, which `the_live_session_is_this_app` compares and fails closed on.
+    entry exists. The lock and the lease carry none: theirs comes from the registry record's app,
+    which `the_live_session_is_this_app` compares and fails closed on.
 
     A PROJECT NOTHING WAS EVER BUILT IN HAS NO APP ROW, and so no container of its own — a
     registry naming an app is naming somebody else's work. A registry naming NOTHING is

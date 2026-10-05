@@ -381,6 +381,7 @@ _EXPECTED_COLUMNS = frozenset(
         "user_id",
         "app_id",
         "app_name",
+        "kind",
         "project_id",
         "instance_ref",
         "conversation_id",

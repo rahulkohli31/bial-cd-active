@@ -701,7 +701,7 @@ async def _verify_once(
     # looks at the same app: a false green, reintroduced by the fix for a different one.
     # "A report counts against exactly one verdict" is a statement about `verify`'s ANSWER, never
     # about each attempt at it.
-    client_reports = [*carried_reports, *drain_client_errors(handle.app_name)]
+    client_reports = [*carried_reports, *drain_client_errors(app_id)]
     # Only a CRASH gates the verdict — see `NON_FATAL_CLIENT_SOURCES`. Both lists are kept: the
     # fatal ones decide, the full set is what the agent gets to read when they decide red.
     fatal_reports = [r for r in client_reports if r.source not in NON_FATAL_CLIENT_SOURCES]

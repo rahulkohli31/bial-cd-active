@@ -41,10 +41,13 @@ from src.services.redis import (
     registry_scan_patterns,
 )
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_SERVING_SINCE,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
     REGISTRY_FIELD_WAITING_SINCE,
@@ -54,7 +57,7 @@ from src.services.sandbox import DevStatus, SandboxError, SandboxHandle, Sandbox
 from src.services.storage import StorageError, StorageNotFoundError, snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
-from tests.fakes import FakeSandboxClient, detached_work_done
+from tests.fakes import FakeSandboxClient, a_name_unrelated_to_its_app, detached_work_done
 
 
 async def _user_project(db: AsyncSession, email: str):
@@ -243,6 +246,56 @@ async def test_a_live_container_for_this_project_is_alive_with_a_framable_url(
     # ALIVE NOW MEANS SERVED. This container carries a real stamp, so the answer comes off the
     # proven arm rather than the pre-cutover grandfather — see the serving-proof section below.
     assert body["servingSince"] is not None
+
+
+async def test_a_container_named_unrelated_to_its_app_is_alive_at_the_address_its_name_gives(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """★ The record names the app; the name is whatever the container was given, and the
+    address the pane frames follows the container, not the app.
+
+    Mutation check: compare the derived name and this project reads asleep over a serving app;
+    build the address from the derived name and the pane frames a container that is not there."""
+    user, project = await _user_project(db_session, "ps-unrelated@rvaiglobal.com")
+    app_id = await _built(db_session, user, project)
+    name = a_name_unrelated_to_its_app()
+    await _register_container(
+        fake_redis, user.id, name, state=REGISTRY_STATE_READY, serving_since=SERVED
+    )
+    await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_APP_ID, str(app_id))
+
+    body = await _probe(client, user, project)
+
+    assert body["state"] == "alive"
+    assert body["previewUrl"] == f"https://citizenapps.bialairport.com/a/{name}"
+
+
+async def test_a_colleagues_view_recorded_under_this_projects_app_is_not_its_preview(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """A view in this user's slot of an app with the same id is a colleague's restore, never
+    this project's own running build."""
+    user, project = await _user_project(db_session, "ps-view@rvaiglobal.com")
+    app_id = await _built(db_session, user, project)
+    await _register_container(
+        fake_redis,
+        user.id,
+        a_name_unrelated_to_its_app(),
+        state=REGISTRY_STATE_READY,
+        serving_since=SERVED,
+    )
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_ID: str(app_id),
+            REGISTRY_FIELD_SHARED_OWNER_ID: str(uuid.uuid4()),
+            REGISTRY_FIELD_SHARED_PROJECT_ID: str(uuid.uuid4()),
+        },
+    )
+
+    body = await _probe(client, user, project)
+
+    assert (body["state"], body["previewUrl"]) == ("asleep", None)
 
 
 async def test_whoever_holds_the_workspace_this_project_reads_asleep_and_restorable(

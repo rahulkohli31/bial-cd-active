@@ -141,7 +141,6 @@ from src.services.build_sessions.manager import (
     SnapshotUnavailableError,
     StopOutcome,
     WorkspaceUnreadableError,
-    app_name_for,
 )
 from src.services.messages.projection import (
     APP_CHANGE_NOTICE_KIND,
@@ -1398,15 +1397,16 @@ class TurnEngine:
         # with no edit to any of them.
         #
         # `build_id` IS the turn id for a turn (a relaunch mints its own), spelled as its own
-        # key so one grep spans both doors into a container. `app_id`/`app_name` are what the
-        # CALLER believes; `_attach_sandbox` re-binds both off the session it actually got,
-        # because a Plan chat can carry no app id at all and the container is the authority.
+        # key so one grep spans both doors into a container. `app_id` is what the CALLER
+        # believes and `app_name` is not known yet; `_attach_sandbox` re-binds both off the
+        # session it actually got, because a Plan chat can carry no app id at all and the
+        # container is the authority.
         log_context = structlog.contextvars.bind_contextvars(
             build_id=str(state.turn_id),
             user_id=str(state.user_id),
             project_id=str(project_id) if project_id is not None else None,
             app_id=str(app_id) if app_id is not None else None,
-            app_name=app_name_for(app_id) if app_id is not None else None,
+            app_name=None,
             conversation_id=str(state.conversation_id),
             turn_id=str(state.turn_id),
         )
@@ -2258,7 +2258,7 @@ class TurnEngine:
         # just fixed. The gap between turns is not even a quiet one: the pane reloads its frame
         # at every terminal, so it actively manufactures reports about the OLD tree. Discarded
         # once, here, where "the agent has not started yet" is still true.
-        discarded = discard_client_errors(session.handle.app_name)
+        discarded = discard_client_errors(session.app_id)
         if discarded:
             _log.info(
                 "client_error_reports_fenced",

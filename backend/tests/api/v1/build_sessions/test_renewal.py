@@ -25,6 +25,7 @@ from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.manager import app_name_for
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -36,6 +37,7 @@ from src.services.redis.keys import (
 )
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
+from tests.fakes import a_name_unrelated_to_its_app
 
 
 async def _user_project_app(db_session: AsyncSession, email: str):
@@ -105,6 +107,25 @@ async def test_a_present_surface_pushes_the_stay_forward(
     assert writer == "surface_present"
     assert timedelta(seconds=SURFACE_PRESENT_STAY_SECONDS - 5) <= stay - before
     assert stay - before <= timedelta(seconds=SURFACE_PRESENT_STAY_SECONDS + 5)
+
+
+async def test_a_container_named_unrelated_to_its_app_has_its_stay_renewed(
+    client: AsyncClient, db_session: AsyncSession, fake_redis
+) -> None:
+    """The record names the app; the name is whatever the container was given.
+
+    Mutation check: compare, or hand the script, the name derived from the app and the screen
+    framing this container stops holding it open."""
+    user, project, app_id = await _user_project_app(db_session, "unrelated@bial.test")
+    await _register(fake_redis, user.id, a_name_unrelated_to_its_app())
+    await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_APP_ID, str(app_id))
+
+    body = await _renew(client, user, project)
+
+    assert body["outcome"] == "renewed"
+    stay, writer = await _stay(fake_redis, user.id)
+    assert stay is not None
+    assert writer == "surface_present"
 
 
 async def test_a_hidden_surface_asks_for_the_longer_budget(

@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.v1.build_sessions.deps import sandbox_dependency, sandbox_or_none_dependency
 from src.config import settings
 from src.db.models.conversation import ChatKind
-from src.db.models.pending_teardown import PendingTeardown
+from src.db.models.pending_teardown import PendingTeardown, PendingTeardownKind
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.appdata import resolve_app_for_project
@@ -47,7 +47,7 @@ from src.services.build_sessions.shutdown import (
     claim_the_teardown_we_owe,
 )
 from src.services.redis import registry_key
-from src.services.redis.keys import REGISTRY_FIELD_CREATED_AT
+from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_CREATED_AT
 from src.services.sandbox.aca import AcaTransientError
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
@@ -57,7 +57,12 @@ from src.services.turns.guard import _mid_reply
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.api.v1.build_sessions.test_relaunch import RecordingAca, SupervisorScript
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import FakeSandboxClient, FakeStorage, detached_work_done
+from tests.fakes import (
+    FakeSandboxClient,
+    FakeStorage,
+    a_name_unrelated_to_its_app,
+    detached_work_done,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -265,6 +270,37 @@ async def test_a_first_message_on_another_project_switches_inside_the_same_reque
     assert [row.app_name for row in await _owed_rows(db_session, user.id)] == [app_name_for(app_a)]
 
 
+async def test_the_outgoing_container_is_handed_over_whatever_its_record_calls_it(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    spawns: _Spawns,
+) -> None:
+    """★ The record names the outgoing app; the owed row names the container by the name the
+    record gave it, as a build sandbox owed against that app's project.
+
+    Mutation check: attribute the outgoing container by the name derived from each app and it is
+    reclaimed inline instead — destroyed without its tree written back."""
+    user, project_a, project_b = await _citizen_with_two_projects(db_session, "sw13@example.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "2" * 40)
+    app_a = await _serving(manager, db_session, user, project_a, client)
+    name = a_name_unrelated_to_its_app()
+    await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_APP_NAME, name)
+
+    await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=client, may_write=True
+    )
+
+    rows = await _owed_rows(db_session, user.id)
+    assert [(row.app_name, row.app_id, row.project_id) for row in rows] == [
+        (name, app_a, project_a)
+    ]
+    assert rows[0].kind is PendingTeardownKind.BUILD
+    assert len(spawns.owed) == 1
+    assert client.torn_down == []
+
+
 # --- a turn in flight ------------------------------------------------------------------
 
 
@@ -436,12 +472,12 @@ async def test_two_starts_in_one_interaction_owe_one_teardown_not_two(
     client = _with_head(FakeSandboxClient(), "f" * 40)
     app_a = await _serving(manager, db_session, user, project_a, client)
 
-    # `spare_app=None` is what a never-built incoming project resolves to — no app row yet.
+    # `spare=None` is what a never-built incoming project resolves to — no app row yet.
     pressed = await manager._show_the_outgoing_project_the_door(  # noqa: SLF001 - the seam itself
-        db_session, user, spare_app=None, sandbox_client=client
+        db_session, user, spare=None, sandbox_client=client
     )
     typed = await manager._show_the_outgoing_project_the_door(  # noqa: SLF001 - the seam itself
-        db_session, user, spare_app=None, sandbox_client=client
+        db_session, user, spare=None, sandbox_client=client
     )
 
     assert pressed is True
@@ -478,6 +514,7 @@ async def test_a_start_beside_a_shutdown_already_running_deletes_nothing(
         user_id=user.id,
         app_id=app_a,
         app_name=app_name_for(app_a),
+        kind=PendingTeardownKind.BUILD,
         project_id=project_a,
         instance_ref=datetime.fromisoformat(_text(reg[REGISTRY_FIELD_CREATED_AT])),
         conversation_id=None,

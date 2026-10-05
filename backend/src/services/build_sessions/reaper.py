@@ -46,21 +46,23 @@ from src.services.build_sessions.drain import (
 )
 from src.services.build_sessions.locks import (
     DeadlineWriter,
+    Occupant,
     an_instant_on_the_hash,
     clear_serving,
     delete_registry_if_it_still_names,
     elapsed_ms,
     grant_stay_of_execution,
     heartbeat_is_alive,
+    is_a_shared_view,
     liveness_lease_is_held,
     lock_is_held,
     mark_registry_ending,
     read_registry,
     read_starting_marker,
     reap_lock,
+    record_holds,
     record_the_first_serve,
     release_liveness_lease,
-    shared_view_stamp,
     stamp_is_proven,
     stay_of_execution_is_current,
 )
@@ -71,6 +73,7 @@ from src.services.build_sessions.snapshot import (
 )
 from src.services.redis import REGISTRY_STATE_READY, registry_key, registry_scan_patterns
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -613,14 +616,7 @@ async def _hand_the_debt_over(
 
     try:
         return await owe_a_teardown_the_reap_could_not_perform(
-            user_id=user_uuid,
-            app_id=app_id,
-            app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
-            # The record's OWN birthday, which is what the owed row's instance check compares
-            # against: it is re-stamped at every registration, so it can tell this container from
-            # whatever is created under the same name next. No stamp, no discriminator, no row.
-            instance_ref=an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT),
-            shared_view=shared_view_stamp(reg),
+            user_id=user_uuid, app_id=app_id, reg=reg
         )
     except Exception:
         _log.exception(
@@ -698,15 +694,26 @@ async def reap_user(
         )
         await _let_go_unless_taken(redis, user_uuid, registered_name)
         return False
-    # THE WRITE-BACK NEVER RUNS FOR A SHARED VIEW (#198), whatever `app_id` the caller resolved.
-    # `sweep_all`'s own `_owning_app_id` currently maps a `shr-` registry record to the OWNER's
-    # app id (`_app_names_to_owners` keys every `shr-` name off the recipient, but the value it
-    # carries is still the shared app's id) — passing that here would write this RECIPIENT's tree
-    # over the OWNER's saved copy, and a recipient's access to that storage is read-never-write.
-    # A shared view holds nothing worth preserving in the first place: the recipient never edits
-    # its tree directly, and what they own of it is a restore of the owner's own snapshot,
-    # already durable at its source.
-    if app_id is not None and not is_a_shared_sandbox_name(registered_name):
+    # THE WRITE-BACK NEVER RUNS FOR A SHARED VIEW, whatever `app_id` the caller resolved, and the
+    # record's stamp is what says it is one — never its name. `sweep_all`'s own `_owning_app_id`
+    # maps a shared view to the OWNER's app id — passing that here would write this RECIPIENT's
+    # tree over the OWNER's saved copy, and a recipient's access to that storage is
+    # read-never-write. A shared view holds nothing worth preserving in the first place: the
+    # recipient never edits its tree directly, and what they own of it is a restore of the
+    # owner's own snapshot, already durable at its source.
+    if app_id is not None and not is_a_shared_view(reg):
+        if not record_holds(reg, Occupant(app_id), user_uuid):
+            # THE APP TO SAVE INTO MUST BE THE ONE THIS RECORD NAMES. The caller resolved it from
+            # an earlier read, and saving across a slot swap since then would put one app's tree
+            # in another's saved copy. Spared; the next pass resolves the app again.
+            _log.warning(
+                "reap refused: the record names a different app from the one asked to keep its "
+                "work",
+                user_id=str(user_uuid),
+                app_id=str(app_id),
+                app_name=registered_name,
+            )
+            return False
         if not await _take_the_copy_we_promised(
             sandbox_client,
             app_id=app_id,
@@ -772,9 +779,9 @@ async def _renew_shared_view_from_traffic(
     OBSERVATION, NOT AN INPUT, same posture as `_observe_the_serving_proof` and for the same
     reason: it runs ahead of the claims the sweep reads, so a failure here must never affect the
     reap decision reading them. Recorded and swallowed; `CancelledError` still propagates."""
-    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
-    if not is_a_shared_sandbox_name(app_name):
+    if not is_a_shared_view(reg):
         return
+    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
     try:
         handle = await sandbox_client.attach_existing(str(user_uuid))
         served = await sandbox_client.served_count(handle)
@@ -811,7 +818,7 @@ async def _renew_shared_view_from_traffic(
 
 
 def _shared_view_past_its_ceiling(
-    identity: SandboxIdentity | None, app_name: str, now: datetime
+    identity: SandboxIdentity | None, reg: Mapping[str, str], now: datetime
 ) -> bool:
     """#198's absolute session ceiling (requirement 20) — independent of the renewable traffic
     stay above, so a wedged or spoofed supervisor report can never buy a shared view
@@ -823,7 +830,7 @@ def _shared_view_past_its_ceiling(
     Measured from the CONTAINER's birthday (`_container_age_source`), because a failed teardown
     followed by a fresh registration would otherwise reset the record's `created_at` and let a
     shared view earn a new ceiling each time."""
-    if not is_a_shared_sandbox_name(app_name):
+    if not is_a_shared_view(reg):
         return False
     if identity is None or identity.created_at is None:
         return False  # cannot prove an age, so this subtracts nothing
@@ -970,7 +977,7 @@ async def _a_claim_still_stands(
         return False
     if identity is None and app_name:
         identity = await _container_age_source(sandbox_client, reg, app_name)
-    return not _shared_view_past_its_ceiling(identity, app_name, now) and not _past_the_ceiling(
+    return not _shared_view_past_its_ceiling(identity, reg, now) and not _past_the_ceiling(
         identity, now=now, outranks_a_turn=False
     )
 
@@ -981,13 +988,13 @@ def _owning_app_id(
     user_uuid: uuid.UUID,
 ) -> uuid.UUID | None:
     """The app id behind this registry record — the slot this container's tree is written back to.
+    The record's own app id, held to the map so an app whose row is gone resolves to nothing.
 
     BOTH UNRESOLVED CASES END IN A DESTROYED CONTAINER WITH NOTHING WRITTEN, so neither may be
     silent. They are not the same failure. No map at all is a CALLER that did not supply one:
     every door onto this sweep is meant to, so it reads as a defect and is logged as one. An
-    unmatched name is a registry record naming a container whose app row is gone — an app that no
-    longer exists has nowhere for its tree to go, and sparing it forever is the leak this sweep
-    exists to close."""
+    unmatched record names a container whose app row is gone — an app that no longer exists has
+    nowhere for its tree to go, and sparing it forever is the leak this sweep exists to close."""
     if app_ids_by_name is None:
         _log.warning(
             "sweeping with no app map; these containers are destroyed without a write-back",
@@ -995,7 +1002,14 @@ def _owning_app_id(
             app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
         )
         return None
-    app_id = app_ids_by_name.get(reg.get(REGISTRY_FIELD_APP_NAME, ""))
+    recorded = reg.get(REGISTRY_FIELD_APP_ID)
+    if recorded is None:
+        # A record the previous release wrote carries no app id; its name was derived from one.
+        app_id = app_ids_by_name.get(reg.get(REGISTRY_FIELD_APP_NAME, ""))
+    else:
+        app_id = uuid.UUID(recorded)
+        if app_id not in app_ids_by_name.values():
+            app_id = None
     if app_id is None:
         _log.info(
             "reaping a registered container with no app row; nothing to preserve",

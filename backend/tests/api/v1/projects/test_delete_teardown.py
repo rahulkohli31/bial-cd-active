@@ -951,9 +951,11 @@ async def test_a_lock_held_over_an_empty_registry_still_reports(
         lock.release()
 
     assert resp.status_code == 200
-    assert _survived(captured, artefact="sandbox_container") == [_named(app_row.id)]
+    # No record names the container yet, so the app id is what finds it: every sandbox carries it
+    # as an ARM tag, and a name derived from the app could name a container that never existed.
+    assert _survived(captured, artefact="sandbox_container") == [str(app_row.id)]
     assert await _teardown_record(db_session, project.id) == [
-        {"artefact": "sandbox_container", "id": _named(app_row.id)}
+        {"artefact": "sandbox_container", "id": str(app_row.id)}
     ]
 
 
@@ -1519,3 +1521,140 @@ async def test_a_record_that_cannot_be_written_still_leaves_the_delete_successfu
     assert resp.status_code == 200
     assert await db_session.get(Project, project.id) is None
     assert any(e.get("event") == "project_teardown_record_failed" for e in captured)
+
+
+async def _registered_unrelated(fake_redis: Any, user_id: uuid.UUID, app_id: uuid.UUID) -> str:
+    """This app's container as this release records it: its app, and a name unrelated to it."""
+    from src.services.redis.keys import (
+        REGISTRY_FIELD_APP_ID,
+        REGISTRY_FIELD_APP_NAME,
+        REGISTRY_FIELD_FQDN,
+        REGISTRY_FIELD_STATE,
+    )
+    from tests.fakes import a_name_unrelated_to_its_app
+
+    name = a_name_unrelated_to_its_app()
+    await fake_redis.hset(
+        _registry(user_id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: name,
+            REGISTRY_FIELD_APP_ID: str(app_id),
+            REGISTRY_FIELD_FQDN: f"{name}.example.net",
+            REGISTRY_FIELD_STATE: "ready",
+        },
+    )
+    return name
+
+
+async def test_the_projects_container_is_torn_down_whatever_its_record_calls_it(
+    app: Any, client: AsyncClient, db_session: AsyncSession, fake_redis: Any
+) -> None:
+    """Mutation check: recognise the project's container by the name derived from its app and
+    this one is read as somebody else's and left billing."""
+    from tests.fakes import FakeSandboxClient
+
+    headers, user, project, app_row = await _project_with_app(db_session)
+    sandbox = FakeSandboxClient()
+    _wire_sandbox(app, sandbox)
+    _wire_manager(app)
+    name = await _registered_unrelated(fake_redis, user.id, app_row.id)
+
+    resp = await _delete(client, project.id, headers)
+
+    assert resp.status_code == 200
+    assert sandbox.torn_down == [name]
+    assert await fake_redis.exists(_registry(user.id)) == 0
+
+
+async def test_a_container_that_survives_is_recorded_under_the_name_its_record_gave(
+    app: Any, client: AsyncClient, db_session: AsyncSession, fake_redis: Any
+) -> None:
+    """An operator goes looking for the name on the record. A name derived from the app would
+    send them after a container that never existed.
+
+    Mutation check: report the derived name and both the alarm and the row name the wrong
+    container."""
+    from src.services.sandbox import SandboxError
+    from tests.fakes import FakeSandboxClient
+
+    headers, user, project, app_row = await _project_with_app(db_session)
+    sandbox = FakeSandboxClient()
+    sandbox.teardown_error = SandboxError("ARM said no")
+    _wire_sandbox(app, sandbox)
+    _wire_manager(app)
+    name = await _registered_unrelated(fake_redis, user.id, app_row.id)
+
+    with structlog.testing.capture_logs() as captured:
+        resp = await _delete(client, project.id, headers)
+
+    assert resp.status_code == 200
+    assert _survived(captured, artefact="sandbox_container") == [name]
+    assert await _teardown_record(db_session, project.id) == [
+        {"artefact": "sandbox_container", "id": name}
+    ]
+
+
+async def test_an_unreadable_registry_records_the_app_and_says_nothing_could_be_checked(
+    app: Any, client: AsyncClient, db_session: AsyncSession, fake_redis: Any, monkeypatch: Any
+) -> None:
+    """No record could be read, so no name is known: the app id is what an operator filters the
+    fleet by, and the reason must not claim a teardown was attempted.
+
+    Mutation check: report a name derived from the app and the record names a container that may
+    never have existed."""
+    from redis.exceptions import RedisError
+
+    from tests.fakes import FakeSandboxClient
+
+    headers, user, project, app_row = await _project_with_app(db_session)
+    sandbox = FakeSandboxClient()
+    _wire_sandbox(app, sandbox)
+    _wire_manager(app)
+
+    async def _unreadable(*args: Any, **kwargs: Any) -> Any:
+        raise RedisError("the registry will not answer")
+
+    monkeypatch.setattr(_the_router_module(), "read_registry", _unreadable)
+
+    with structlog.testing.capture_logs() as captured:
+        resp = await _delete(client, project.id, headers)
+
+    assert resp.status_code == 200
+    assert _survived(captured, artefact="sandbox_container") == [str(app_row.id)]
+    assert [
+        entry["reason"]
+        for entry in captured
+        if entry.get("event") == TEARDOWN_ARTEFACT_SURVIVED_EVENT
+    ] == ["the sandbox registry could not be read, so nothing could be checked"]
+    assert await _teardown_record(db_session, project.id) == [
+        {"artefact": "sandbox_container", "id": str(app_row.id)}
+    ]
+    assert sandbox.torn_down == []
+
+
+async def test_a_reap_that_raises_records_the_container_under_the_name_its_record_gave(
+    app: Any, client: AsyncClient, db_session: AsyncSession, fake_redis: Any, monkeypatch: Any
+) -> None:
+    """Mutation check: report the name derived from the app on the broad arm and the record
+    sends an operator after a container that is not there."""
+    from tests.fakes import FakeSandboxClient
+
+    headers, user, project, app_row = await _project_with_app(db_session)
+    sandbox = FakeSandboxClient()
+    _wire_sandbox(app, sandbox)
+    _wire_manager(app)
+    name = await _registered_unrelated(fake_redis, user.id, app_row.id)
+
+    async def _explodes(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("redis went away mid-reap")
+
+    monkeypatch.setattr(_the_router_module(), "reap_user", _explodes)
+
+    with structlog.testing.capture_logs() as captured:
+        resp = await _delete(client, project.id, headers)
+
+    assert resp.status_code == 200
+    assert _survived(captured, artefact="sandbox_container") == [name]
+    assert await _teardown_record(db_session, project.id) == [
+        {"artefact": "sandbox_container", "id": name}
+    ]

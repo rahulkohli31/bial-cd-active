@@ -952,7 +952,7 @@ async def test_the_re_check_does_not_carry_a_browser_crash_out_of_the_verdict() 
     fake.push_dev_logs("⨯ unhandledRejection Error: printed before the agent's edit")
     fake.changed_since_watermark = True  # so the re-check fires
     park_client_error(
-        fake.handle().app_name,
+        _APP_ID,
         source="window.onerror",
         title="Cannot read properties of undefined (reading 'map')",
         stack="at RecordsTable (app/records/page.tsx:41:19)",

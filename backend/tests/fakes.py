@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import enum
+import secrets
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ from src.core.connectors import CONNECTORS, ConnectedSystem, ResolvedWindow
 from src.db.models.conversation import ChatKind, Conversation
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.project_connector import ConnectorWindowKind
+from src.services.build_sessions.locks import read_registry
 from src.services.build_sessions.manager import SessionManager
 from src.services.build_sessions.outcome import (
     FORCE_ENDED,
@@ -48,9 +50,11 @@ from src.services.redis import (
     registry_key,
 )
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
+    REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_SHARED_OWNER_ID,
     REGISTRY_FIELD_SHARED_PROJECT_ID,
@@ -114,6 +118,12 @@ def a_sandbox_name(marker: str = "x") -> str:
     (`reap_user` handed the registry's value straight to a delete, `""` included). Hex-encoded
     and padded so names stay distinct and a failure message still names its fixture."""
     return "sbx-" + (marker.encode().hex() + "0" * 28)[:28]
+
+
+def a_name_unrelated_to_its_app() -> str:
+    """A container name that says nothing about the app it runs: the sandbox shape, random hex.
+    A lookup that still derives a name from the app cannot find a container called this."""
+    return "sbx-" + secrets.token_hex(14)
 
 
 def a_shared_sandbox_name(marker: str = "x") -> str:
@@ -275,6 +285,7 @@ async def _hydrate_registry(
     user_id: str,
     handle: SandboxHandle,
     *,
+    app_env: dict[str, str],
     shared_project_id: uuid.UUID | None = None,
     shared_owner_id: uuid.UUID | None = None,
 ) -> None:
@@ -292,13 +303,18 @@ async def _hydrate_registry(
     Green, and blind to the whole change.
 
     `shared_project_id`/`shared_owner_id` (#198) mirror the real client's `_write_registry`:
-    stamped only when given, `None` on the ordinary `provision_new` arm."""
+    stamped only when given, `None` on the ordinary `provision_new` arm. The app id is read off
+    `app_env` as the real client reads it, so an env without one fails here as it would there."""
     key = registry_key(uuid.UUID(user_id))
     born = datetime.now(UTC).isoformat()
-    await get_redis().hset(
+    # One transaction, as the real writer: the stamp is the only classifier, so no reader may
+    # see this container under the previous occupant's kind.
+    pipe = get_redis().pipeline(transaction=True)
+    pipe.hset(
         key,
         mapping={
             REGISTRY_FIELD_APP_NAME: handle.app_name,
+            REGISTRY_FIELD_APP_ID: app_env["BIAL_APP_ID"],
             REGISTRY_FIELD_FQDN: handle.fqdn,
             # A reference, never the raw token — mirrors the real client's contract.
             REGISTRY_FIELD_TOKEN_REF: f"ref-{handle.app_name}",
@@ -311,21 +327,19 @@ async def _hydrate_registry(
         },
     )
     if shared_project_id is not None:
-        await get_redis().hset(
+        pipe.hset(
             key,
             mapping={
                 REGISTRY_FIELD_SHARED_PROJECT_ID: str(shared_project_id),
                 REGISTRY_FIELD_SHARED_OWNER_ID: str(shared_owner_id),
             },
         )
-    # `shared_served_count` disowned UNCONDITIONALLY — mirrors the real client's own fix: a
-    # high-water mark left behind by a PRIOR occupant of this slot (build sandbox or a
-    # replaced shared view) must never be compared against a fresh container's first reading.
-    await get_redis().hdel(key, REGISTRY_FIELD_SHARED_SERVED_COUNT)
+    # A stay and a served-count high-water mark left by a PRIOR occupant of this slot are
+    # disowned on every fresh container, exactly as the real client disowns them.
+    pipe.hdel(key, REGISTRY_FIELD_PREVIEW_STAY_UNTIL, REGISTRY_FIELD_SHARED_SERVED_COUNT)
     if shared_project_id is None:
-        await get_redis().hdel(
-            key, REGISTRY_FIELD_SHARED_PROJECT_ID, REGISTRY_FIELD_SHARED_OWNER_ID
-        )
+        pipe.hdel(key, REGISTRY_FIELD_SHARED_PROJECT_ID, REGISTRY_FIELD_SHARED_OWNER_ID)
+    await pipe.execute()
 
 
 class FakeSandboxClient(SandboxClient):
@@ -407,7 +421,7 @@ class FakeSandboxClient(SandboxClient):
         self.provisioned.append(app_name)
         self.provision_env = dict(app_env)
         handle = _fake_handle(app_name)
-        await _hydrate_registry(user_id, handle)
+        await _hydrate_registry(user_id, handle, app_env=app_env)
         self.by_name[app_name] = handle
         return handle
 
@@ -470,7 +484,11 @@ class FakeSandboxClient(SandboxClient):
         self.restore_env = dict(app_env)
         handle = _fake_handle(app_name)
         await _hydrate_registry(
-            user_id, handle, shared_project_id=shared_project_id, shared_owner_id=shared_owner_id
+            user_id,
+            handle,
+            app_env=app_env,
+            shared_project_id=shared_project_id,
+            shared_owner_id=shared_owner_id,
         )
         self.by_name[app_name] = handle
         return handle
@@ -571,6 +589,47 @@ class FakeSandboxClient(SandboxClient):
         self.torn_down.append(handle.app_name)
         self.by_name.pop(handle.app_name, None)
         self.unreachable_by_name.discard(handle.app_name)
+
+
+class AttachesWhatTheRecordNames(FakeSandboxClient):
+    """Attaches whichever container the user's record names, as the real client does, answers
+    the whole write-back ladder, and says which containers it bundled a tree out of — so a test
+    that asserts nothing was written back is asserting it of a write-back that COULD have run."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bundled_from: list[str] = []
+        bundle = base64.b64encode(a_git_bundle("c" * 40)).decode()
+
+        def handler(cmd: list[str]) -> ExecResult:
+            if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
+                return ExecResult(stdout=f"{'a' * 40}@@ M page.tsx@@4@@", stderr="", exit=0)
+            if cmd[0] == "base64":
+                return ExecResult(stdout=bundle, stderr="", exit=0)
+            return ExecResult(stdout="", stderr="", exit=0)
+
+        self.exec_handler = handler
+
+    async def attach_existing(self, user_id: str) -> SandboxHandle:
+        reg = await read_registry(get_redis(), uuid.UUID(user_id))
+        if reg is None or reg.get(REGISTRY_FIELD_STATE) == REGISTRY_STATE_ENDING:
+            raise SandboxGoneError("nothing to attach")
+        name = reg[REGISTRY_FIELD_APP_NAME]
+        return SandboxHandle(
+            fqdn=f"{name}.example", token="tok", app_name=name, preview_url="", ready=True
+        )
+
+    async def exec(
+        self,
+        handle: SandboxHandle,
+        cmd: list[str],
+        *,
+        cwd: str | None = None,
+        timeout_s: int = 900,
+    ) -> ExecResult:
+        if cmd[0] == "base64":
+            self.bundled_from.append(handle.app_name)
+        return await super().exec(handle, cmd, cwd=cwd, timeout_s=timeout_s)
 
 
 class DevServerDownUntilStarted(FakeSandboxClient):

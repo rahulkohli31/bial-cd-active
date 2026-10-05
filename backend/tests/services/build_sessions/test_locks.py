@@ -853,3 +853,101 @@ async def test_write_starting_marker_surfaces_redis_errors_bare(
     monkeypatch.setattr(fake_redis, "set", _boom)
     with pytest.raises(RedisError):
         await locks.write_starting_marker(fake_redis, USER, PROJECT)
+
+
+# --- which container a record describes ------------------------------------------------------
+
+_APP = uuid.UUID("0198f2c0-0000-7000-8000-00000000c001")
+_OTHER_APP = uuid.UUID("0198f2c0-0000-7000-8000-00000000c002")
+_OWNER = uuid.UUID("0198f2c0-0000-7000-8000-00000000c003")
+_PROJECT = uuid.UUID("0198f2c0-0000-7000-8000-00000000c004")
+_VIEW = locks.SharedViewStamp(owner_id=_OWNER, project_id=_PROJECT)
+#: A name that says nothing about the app: the shape a container may carry from now on.
+_UNRELATED = "sbx-5be7f0c2a9d14e3b86f1027c3d4e"
+
+
+def _a_record(
+    *, app_id: uuid.UUID | None, name: str = _UNRELATED, view: bool = False
+) -> dict[str, str]:
+    reg = {REGISTRY_FIELD_APP_NAME: name}
+    if app_id is not None:
+        reg["app_id"] = str(app_id)
+    if view:
+        reg["shared_owner_id"] = str(_OWNER)
+        reg["shared_project_id"] = str(_PROJECT)
+    return reg
+
+
+def test_a_record_naming_its_container_anything_is_found_by_its_recorded_app() -> None:
+    reg = _a_record(app_id=_APP)
+
+    assert locks.record_holds(reg, locks.Occupant(_APP), USER) is True
+    assert locks.record_holds(reg, locks.Occupant(_OTHER_APP), USER) is False
+
+
+def test_a_record_without_an_app_id_is_still_matched_by_the_name_derived_from_its_app() -> None:
+    """A record the release before this one wrote: no app id, and a name derived from the app.
+
+    Mutation check: drop the fallback and treat a missing app id as no match, and the first
+    assertion goes red."""
+    derived = "sbx-" + _APP.hex[:28]
+
+    assert locks.record_holds(_a_record(app_id=None, name=derived), locks.Occupant(_APP), USER)
+    assert not locks.record_holds(
+        _a_record(app_id=None, name=_UNRELATED), locks.Occupant(_APP), USER
+    )
+
+
+def test_an_old_shared_views_record_is_matched_by_the_name_derived_from_app_and_holder() -> None:
+    import hashlib
+
+    derived = "shr-" + hashlib.sha256(f"{_APP}:{USER}".encode()).hexdigest()[:28]
+    reg = _a_record(app_id=None, name=derived, view=True)
+
+    assert locks.record_holds(reg, locks.Occupant(_APP, _VIEW), USER) is True
+    assert locks.record_holds(reg, locks.Occupant(_APP, _VIEW), OTHER) is False
+
+
+def test_a_colleagues_view_of_an_app_is_never_that_apps_build_sandbox() -> None:
+    """★ The owner's build container and a viewer's shared one carry the same app id. Read as
+    the build sandbox, the view would be written back over the owner's saved copy.
+
+    Mutation check: compare the app id alone and the first assertion goes red."""
+    view = _a_record(app_id=_APP, view=True)
+    build = _a_record(app_id=_APP)
+
+    assert locks.record_holds(view, locks.Occupant(_APP), USER) is False
+    assert locks.record_holds(view, locks.Occupant(_APP, _VIEW), USER) is True
+    assert locks.record_holds(build, locks.Occupant(_APP, _VIEW), USER) is False
+
+
+def test_a_view_of_another_project_is_not_this_view() -> None:
+    elsewhere = locks.SharedViewStamp(owner_id=_OWNER, project_id=uuid.uuid4())
+
+    assert not locks.record_holds(
+        _a_record(app_id=_APP, view=True), locks.Occupant(_APP, elsewhere), USER
+    )
+
+
+@pytest.mark.parametrize(
+    ("reg", "shared"),
+    [
+        (_a_record(app_id=_APP, view=True), True),
+        (_a_record(app_id=_APP), False),
+        # A shared view whose name is the build sandbox's shape: the stamp decides, not the name.
+        (_a_record(app_id=_APP, name=_UNRELATED, view=True), True),
+        # A record the previous release wrote, whose name still said so.
+        (_a_record(app_id=None, name="shr-" + "0" * 28), True),
+        (_a_record(app_id=None, name="sbx-" + "0" * 28), False),
+    ],
+)
+def test_the_stamp_says_whether_a_record_is_a_shared_view(
+    reg: dict[str, str], shared: bool
+) -> None:
+    assert locks.is_a_shared_view(reg) is shared
+
+
+def test_a_record_carrying_an_app_id_is_never_classified_by_its_name() -> None:
+    """Mutation check: classify by the `shr-` prefix whatever the record carries and this goes
+    red."""
+    assert locks.is_a_shared_view(_a_record(app_id=_APP, name="shr-" + "0" * 28)) is False

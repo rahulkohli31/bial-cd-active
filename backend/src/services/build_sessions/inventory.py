@@ -187,8 +187,9 @@ class _KnownContainer:
 
 
 async def owning_app_ids(db: AsyncSession) -> dict[str, uuid.UUID]:
-    """Container name -> the app that owns it, which is what tells a sweep where to write a
-    container's tree back before it destroys it.
+    """Container name -> the app that owns it. A sweep writes a container's tree back to the app
+    its record names only while that app is in this map, and finds the app by name for a record
+    written before records named their app.
 
     A DATABASE THAT WILL NOT ANSWER FAILS THE CALLER rather than returning an empty map. Empty
     resolves every container to `None`, which a sweep cannot tell apart from "this caller has no

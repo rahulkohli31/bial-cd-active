@@ -46,6 +46,7 @@ from src.services.build_sessions.manager import app_name_for
 from src.services.lake.config import LakeConfig
 from src.services.lake.env import connector_env_names
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_STATE,
     REGISTRY_STATE_READY,
@@ -54,6 +55,7 @@ from src.services.redis.keys import (
 from src.services.usage import ist_today
 from tests.api.v1.connectors.conftest import KEY, UNKNOWN_KEY, auth_headers
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
+from tests.fakes import a_name_unrelated_to_its_app
 
 _CONNECTOR = CONNECTORS[KEY]
 
@@ -730,6 +732,35 @@ async def test_the_project_the_build_is_running_in_is_still_refused(
         project=building.name, name=_CONNECTOR.display_name
     )
     assert await _stored_rows(db_session, building.id) == []
+
+
+async def test_the_live_project_is_refused_whatever_its_container_is_called(
+    client, db_session, fake_redis
+) -> None:
+    """★ The live session is recognised by the app its record names, never by a name derived
+    from that app — and still only for that project.
+
+    Mutation check: compare the name derived from the app and the live project reads as
+    somebody else's, so a change lands on a container mid-build."""
+    user, building = await _owned(db_session)
+    elsewhere = await ProjectFactory.create(db_session, user.id)
+    building_app = await _app_of(db_session, user, building)
+    await _app_of(db_session, user, elsewhere)
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: a_name_unrelated_to_its_app(),
+            REGISTRY_FIELD_APP_ID: str(building_app.id),
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+        },
+    )
+    await acquire_lock(fake_redis, user.id)
+
+    refused = await _put(client, user, building.id, {"enabled": True})
+    allowed = await _put(client, user, elsewhere.id, {"enabled": True})
+
+    assert refused.status_code == 409, refused.text
+    assert allowed.status_code == 200, allowed.text
 
 
 async def test_the_refusal_names_the_project_whose_session_is_in_the_way(

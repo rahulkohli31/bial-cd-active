@@ -27,7 +27,6 @@ from src.api.v1.build_sessions.schemas import (
 )
 from src.api.v1.conversations.schemas import DiagnosticFrame
 from src.db.models.app_registry import AppRegistry
-from src.services.build_sessions import app_name_for
 from src.services.orchestrator import client_errors
 from src.services.orchestrator.errors import CLIENT_ERROR_TITLE
 from src.services.orchestrator.prompt import build_repair_prompt
@@ -36,6 +35,7 @@ from src.services.sandbox import ExecResult
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.api.v1.build_sessions.test_csrf import _MUTATING_POSTS
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
+from tests.fakes import a_name_unrelated_to_its_app
 from tests.services.orchestrator.fake_sandbox import FakeSandbox
 
 _ROUTE = "/v1/build-sessions/projects/{project_id}/client-error"
@@ -115,12 +115,42 @@ async def test_owner_report_is_parked_for_the_next_verify(
 
     assert resp.status_code == 202
     assert resp.json() == {"recorded": True}
-    # Keyed by the SANDBOX name, because that is the only identity the verify holds
-    # (`SandboxHandle.app_name`). A report parked under any other key is a report nothing reads.
-    parked = client_errors.drain_client_errors(app_name_for(app.id))
+    # Keyed by the APP, which is what the verify drains by: the container serving it may carry
+    # any name. A report parked under any other key is a report nothing reads.
+    parked = client_errors.drain_client_errors(app.id)
     assert [(r.source, r.title, r.stack) for r in parked] == [
         (_A_CRASH["source"], _A_CRASH["title"], _A_CRASH["stack"])
     ]
+
+
+async def test_a_reported_crash_reaches_the_verify_of_its_app_whatever_the_container_is_called(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The route knows the project, never the container, and the container may carry any name:
+    the report has to be waiting under the app the verify is asked about.
+
+    Mutation check: drain by the handle's name in `verify` and the crash is never collected."""
+    user, app = await _owner_with_app(db_session, "u13-anyname@rvaiglobal.com")
+    await client.post(
+        _ROUTE.format(project_id=app.project_id), json=_A_CRASH, headers=auth_headers(user)
+    )
+    fake = FakeSandbox(app_name=a_name_unrelated_to_its_app())
+    fake.dev_ready = True
+
+    outcome, _ = await verify(
+        fake,
+        fake.handle(),
+        log_cursor=0,
+        max_polls=3,
+        poll_s=0.0,
+        app_id=app.id,
+        had_prior_building_turns=False,
+        indeterminate_retries=0,
+        indeterminate_backoff_s=0.0,
+    )
+
+    assert outcome.green is False
+    assert outcome.error is not None and outcome.error.source == ErrorSource.CLIENT
 
 
 async def test_report_without_a_stack_is_accepted(
@@ -137,7 +167,7 @@ async def test_report_without_a_stack_is_accepted(
     )
 
     assert resp.status_code == 202
-    assert client_errors.drain_client_errors(app_name_for(app.id))[0].stack == ""
+    assert client_errors.drain_client_errors(app.id)[0].stack == ""
 
 
 async def test_report_for_another_users_project_is_404_not_403(
@@ -160,7 +190,7 @@ async def test_report_for_another_users_project_is_404_not_403(
     assert resp.json()["error"]["message"] == "Project not found."
     # ABSENCE + LIVENESS: nothing was parked against the victim's app, and the route is
     # demonstrably working — the same call from the owner below does park one.
-    assert client_errors.drain_client_errors(app_name_for(victims_app.id)) == []
+    assert client_errors.drain_client_errors(victims_app.id) == []
     owner = await UserFactory.create(db_session, email="u13-owner-proof@rvaiglobal.com")
     mine = await AppRegistryFactory.create(db_session, user_id=owner.id)
     ok = await client.post(
@@ -227,7 +257,7 @@ async def test_report_without_csrf_is_403(client: AsyncClient, db_session: Async
 
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "csrf_failed"
-    assert client_errors.drain_client_errors(app_name_for(app.id)) == []
+    assert client_errors.drain_client_errors(app.id) == []
 
 
 def test_the_route_is_in_the_hand_maintained_csrf_table() -> None:
@@ -256,7 +286,7 @@ async def test_report_volume_is_bounded(client: AsyncClient, db_session: AsyncSe
 
     assert answers[:cap] == [True] * cap
     assert answers[cap:] == [False] * 25
-    parked = client_errors.drain_client_errors(app_name_for(app.id))
+    parked = client_errors.drain_client_errors(app.id)
     assert len(parked) == cap
     # The FIRST reports survive, not the newest: a loop repeating one fault must not be able to
     # push the original occurrence out of its own report.
@@ -277,7 +307,7 @@ async def test_an_oversized_stack_is_refused_at_the_boundary(
     )
 
     assert resp.status_code == 422
-    assert client_errors.drain_client_errors(app_name_for(app.id)) == []
+    assert client_errors.drain_client_errors(app.id) == []
 
 
 async def test_a_late_report_does_not_resurrect_a_finished_turn(
@@ -307,7 +337,7 @@ async def test_a_late_report_does_not_resurrect_a_finished_turn(
     assert wire.manager.active_session_for(user.id) is None
     # LIVENESS: the report really was received and is waiting — this test is not green because
     # the POST 404'd.
-    assert len(client_errors.drain_client_errors(app_name_for(app.id))) == 1
+    assert len(client_errors.drain_client_errors(app.id)) == 1
 
 
 # The health verdict
@@ -323,7 +353,7 @@ async def test_a_reported_crash_makes_a_server_clean_verify_not_green() -> None:
     baseline, _ = await _verify(fake)
     assert baseline.green is True  # the state the report has to be able to overturn
 
-    client_errors.park_client_error(fake.handle().app_name, **_A_CRASH)
+    client_errors.park_client_error(_APP_ID, **_A_CRASH)
     outcome, _ = await _verify(fake)
 
     assert outcome.green is False
@@ -337,7 +367,7 @@ async def test_a_report_counts_against_exactly_one_verdict() -> None:
     the build and burn the whole self-heal budget re-reporting itself while the agent fixed it."""
     fake = FakeSandbox()
     fake.dev_ready = True
-    client_errors.park_client_error(fake.handle().app_name, **_A_CRASH)
+    client_errors.park_client_error(_APP_ID, **_A_CRASH)
 
     first, _ = await _verify(fake)
     second, _ = await _verify(fake)
@@ -355,13 +385,13 @@ async def test_a_compile_error_outranks_the_report_but_the_verdict_still_falls()
     fake = FakeSandbox()
     fake.dev_ready = True
     fake.queue_commands(ExecResult(stdout="app/x.tsx(1,1): error TS2322: bad", stderr="", exit=2))
-    client_errors.park_client_error(fake.handle().app_name, **_A_CRASH)
+    client_errors.park_client_error(_APP_ID, **_A_CRASH)
 
     outcome, _ = await _verify(fake)
 
     assert outcome.green is False
     assert outcome.error is not None and outcome.error.source == ErrorSource.TSC
-    assert client_errors.drain_client_errors(fake.handle().app_name) == []
+    assert client_errors.drain_client_errors(_APP_ID) == []
 
 
 # The agent channel, and its inertness everywhere else
@@ -370,7 +400,7 @@ async def test_a_compile_error_outranks_the_report_but_the_verdict_still_falls()
 async def _client_error_from_a_report(**report: str) -> BuildError:
     fake = FakeSandbox()
     fake.dev_ready = True
-    client_errors.park_client_error(fake.handle().app_name, **report)
+    client_errors.park_client_error(_APP_ID, **report)
     outcome, _ = await _verify(fake)
     assert outcome.error is not None
     return outcome.error
@@ -538,14 +568,14 @@ def test_a_stale_report_expires_unread() -> None:
     ticking = {"now": 1_000.0}
     store = client_errors.ClientErrorStore(clock=lambda: ticking["now"])
 
-    assert store.record("sbx-stale", **_A_CRASH) is True
+    assert store.record(_APP_ID, **_A_CRASH) is True
     ticking["now"] += client_errors.REPORT_TTL_S + 1
-    assert store.drain("sbx-stale") == []
+    assert store.drain(_APP_ID) == []
 
     # LIVENESS: the same call inside the window IS collected, so the emptiness above is expiry
     # and not a store that never accepted anything.
-    assert store.record("sbx-stale", **_A_CRASH) is True
-    assert len(store.drain("sbx-stale")) == 1
+    assert store.record(_APP_ID, **_A_CRASH) is True
+    assert len(store.drain(_APP_ID)) == 1
 
 
 def test_the_number_of_tracked_apps_is_capped() -> None:
@@ -553,15 +583,16 @@ def test_the_number_of_tracked_apps_is_capped() -> None:
     never drained — nobody ever built it again — has nothing else that would remove it, so without
     a ceiling a long-lived control plane accumulates one list per app it ever previewed."""
     store = client_errors.ClientErrorStore()
-    for index in range(client_errors.MAX_APPS + 5):
-        store.record(f"sbx-{index}", **_A_CRASH)
+    apps = [uuid.uuid7() for _ in range(client_errors.MAX_APPS + 5)]
+    for app_id in apps:
+        store.record(app_id, **_A_CRASH)
 
     # ABSENCE: the five oldest were evicted to make room.
-    assert store.drain("sbx-0") == []
+    assert store.drain(apps[0]) == []
     # LIVENESS: the newest are all still there, so this is eviction and not a store that dropped
     # every write once it filled.
-    assert len(store.drain(f"sbx-{client_errors.MAX_APPS + 4}")) == 1
-    assert len(store.drain(f"sbx-{client_errors.MAX_APPS}")) == 1
+    assert len(store.drain(apps[client_errors.MAX_APPS + 4])) == 1
+    assert len(store.drain(apps[client_errors.MAX_APPS])) == 1
 
 
 # Which reports gate the verdict, and which turn they belong to
@@ -580,7 +611,7 @@ async def test_a_console_warning_does_not_fail_the_build() -> None:
     fake.dev_ready = True
     for source in ("console.error", "console.warn"):
         client_errors.park_client_error(
-            fake.handle().app_name, source=source, title="Each child needs a key prop", stack=""
+            _APP_ID, source=source, title="Each child needs a key prop", stack=""
         )
 
     outcome, _ = await _verify(fake)
@@ -596,10 +627,10 @@ async def test_a_real_crash_still_fails_the_build_and_carries_the_warnings_as_co
     fake = FakeSandbox()
     fake.dev_ready = True
     client_errors.park_client_error(
-        fake.handle().app_name, source="console.warn", title="deprecated lifecycle", stack=""
+        _APP_ID, source="console.warn", title="deprecated lifecycle", stack=""
     )
     client_errors.park_client_error(
-        fake.handle().app_name,
+        _APP_ID,
         source="window.onerror",
         title="Cannot read properties of undefined",
         stack="at RecordsTable",
@@ -622,18 +653,16 @@ def test_a_turn_fences_off_reports_that_predate_it() -> None:
 
     The gap between turns is not even quiet: the preview pane reloads its frame at every turn
     terminal, so it actively manufactures reports about the old tree."""
-    fake = FakeSandbox()
-    app_name = fake.handle().app_name
-    client_errors.park_client_error(app_name, source="window.onerror", title="old crash", stack="")
+    client_errors.park_client_error(_APP_ID, source="window.onerror", title="old crash", stack="")
 
-    discarded = client_errors.discard_client_errors(app_name)
+    discarded = client_errors.discard_client_errors(_APP_ID)
 
     assert discarded == 1
-    assert client_errors.drain_client_errors(app_name) == []
+    assert client_errors.drain_client_errors(_APP_ID) == []
     # LIVENESS: the store still works after the fence — a report parked AFTER it survives, which
     # is the whole point of fencing rather than disabling.
-    client_errors.park_client_error(app_name, source="window.onerror", title="new", stack="")
-    assert [r.title for r in client_errors.drain_client_errors(app_name)] == ["new"]
+    client_errors.park_client_error(_APP_ID, source="window.onerror", title="new", stack="")
+    assert [r.title for r in client_errors.drain_client_errors(_APP_ID)] == ["new"]
 
 
 async def test_an_unrecognised_reporter_source_is_treated_as_a_crash() -> None:
@@ -648,7 +677,7 @@ async def test_an_unrecognised_reporter_source_is_treated_as_a_crash() -> None:
     fake = FakeSandbox()
     fake.dev_ready = True
     client_errors.park_client_error(
-        fake.handle().app_name, source="window.onunhandledsomething", title="boom", stack=""
+        _APP_ID, source="window.onunhandledsomething", title="boom", stack=""
     )
 
     outcome, _ = await _verify(fake)
