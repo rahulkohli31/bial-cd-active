@@ -417,6 +417,26 @@ async def _stopped_reading(
     return None if status.running or status.ready else status
 
 
+async def _hand_back_its_settings(
+    sandbox_client: SandboxClient,
+    handle: SandboxHandle,
+    its_settings: Callable[[], Awaitable[dict[str, str]]],
+) -> None:
+    """Configure an attached container that reports it has no settings: a claimed pool container
+    Azure restarted boots from its creation environment, which held none, and refuses to start the
+    app. `its_settings` builds them as the start that would have created it does. A health reading
+    that could not be taken leaves the container as it was; a refused configure raises."""
+    try:
+        configured = await sandbox_client.health(handle)
+    except SandboxError:
+        _log.warning("attached_container_health_unread", app_name=handle.app_name, exc_info=True)
+        return
+    if configured:
+        return
+    await sandbox_client.configure(handle, await its_settings())
+    _log.warning("attached_container_given_its_settings_again", app_name=handle.app_name)
+
+
 class _Quarantine(enum.StrEnum):
     """What happened to the tree the integrity gate was about to restore over."""
 
@@ -2721,6 +2741,18 @@ class SessionManager:
             if not await self._snapshot_exists_or_bust(app_id):
                 raise NoSnapshotToRelaunchError(app_id)
             await db.commit()
+
+            # Written twice on purpose, here and in `ensure_sandbox`: `_restore_or_provision`
+            # falls back to a blank template, which a relaunch must never do, so a var added to
+            # one site alone is a half-fix.
+            async def the_settings_a_birth_gets() -> dict[str, str]:
+                return {
+                    **build_app_env(app_id),
+                    **await provision_app_storage(app_id),
+                    **await provision_app_database(db, project_id),
+                    **await build_connector_env(db, user_id=user_id, project_id=project_id),
+                }
+
             env: dict[str, str] | None = None
             cold_started_at: float | None = None
             try:
@@ -2734,16 +2766,12 @@ class SessionManager:
             except NoLiveSandboxError:
                 # The cold-start clock starts here, the instant the platform decides to restore.
                 cold_started_at = time.monotonic()
-                # Built on this arm only: a container gets its env once, at birth. Written twice
-                # on purpose — `_restore_or_provision` falls back to a blank template, which a
-                # relaunch must never do — so a var added to one site alone is a half-fix.
-                env = {
-                    **build_app_env(app_id),
-                    **await provision_app_storage(app_id),
-                    **await provision_app_database(db, project_id),
-                    **await build_connector_env(db, user_id=user_id, project_id=project_id),
-                }
+                env = await the_settings_a_birth_gets()
                 await start.record.open(app_id=app_id, env=env)
+            else:
+                await _hand_back_its_settings(
+                    sandbox_client, scope.handle, the_settings_a_birth_gets
+                )
             # Both locks now belong to the detached half, which releases them when the container
             # is up — or compensates, if bringing it up fails.
             bringing_it_up = held.pop_all()
@@ -3050,6 +3078,14 @@ class SessionManager:
                 if not await self._snapshot_exists_or_bust(owner_app_id):
                     raise NoSnapshotToRelaunchError(owner_app_id)
                 snapshot_taken_at = await _snapshot_written_at(owner_app_id)
+
+                async def the_settings_a_birth_gets() -> dict[str, str]:
+                    return {
+                        **build_app_env(owner_app_id),
+                        **await provision_app_storage(owner_app_id),
+                        **await provision_app_database(db, project.id),
+                    }
+
                 attached = False
                 if not force_refresh:
                     try:
@@ -3060,12 +3096,12 @@ class SessionManager:
                         scope.spare()
                     except NoLiveSandboxError:
                         pass
+                    else:
+                        await _hand_back_its_settings(
+                            sandbox_client, scope.handle, the_settings_a_birth_gets
+                        )
                 if not attached:
-                    env = {
-                        **build_app_env(owner_app_id),
-                        **await provision_app_storage(owner_app_id),
-                        **await provision_app_database(db, project.id),
-                    }
+                    env = await the_settings_a_birth_gets()
                     await record.open(app_id=owner_app_id, env=env)
                     try:
                         with timed_by(record):
@@ -3373,8 +3409,9 @@ class SessionManager:
         whose container is gone RESTORES the snapshot when one exists; PROVISIONS a fresh
         template only when there is none — without this arm, a graceful stop→start loop
         would discard the user's work onto a blank template. A CONTAINER GETS ITS ENVIRONMENT
-        EXACTLY ONCE, AT BIRTH: the birth arms build the whole `BIAL_*` set while attach
-        passes none, so rotating a credential is a REBIRTH, never an attach. REPORTS ITS ARM
+        ONCE, AT BIRTH: the birth arms build the whole `BIAL_*` set while attach passes none
+        unless the container holds none, so rotating a credential is a REBIRTH, never an
+        attach. REPORTS ITS ARM
         (`_ResolvedSandbox.attached`) so `_LockScope.take` can spare it from compensation.
         `record` is the start the two birth arms are timed into; without one they are timed
         into a record nothing admitted, which is never written."""
@@ -3396,6 +3433,11 @@ class SessionManager:
                 ),
                 attached=False,
             )
+
+        async def the_settings_a_birth_gets() -> dict[str, str]:
+            return {**env, **await provision_app_storage(app_id)}
+
+        await _hand_back_its_settings(sandbox_client, handle, the_settings_a_birth_gets)
         # THE ONE ARM WHERE THE TREE IS OLDER THAN THIS REQUEST. The other two have just
         # built the workspace from a bundle or a template, so there is nothing to have lost. This
         # one hands back a container that has been running unattended, and until this unit
@@ -3559,7 +3601,8 @@ class SessionManager:
         `SnapshotUnavailableError` and aborts the start instead, because the next write of the
         saved copy would silently put that fresh template over the user's work."""
         # Ensure the app's Blob container + mint a fresh session SAS ONLY on this birth
-        # (provision/restore) arm — never on attach, which reuses the live container's SAS.
+        # (provision/restore) arm — never on attach, which reuses the live container's SAS
+        # unless the container has lost its settings.
         # A configured-store failure propagates: it fails the start before any sandbox handle
         # exists (start's compensation releases the lock; nothing to tear down), and the idempotent
         # container is simply reused on the next start. Disabled storage (dev/test) yields {} — a

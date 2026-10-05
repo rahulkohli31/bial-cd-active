@@ -52,6 +52,7 @@ from src.services.sandbox.base import (
     SandboxError,
     SandboxGoneError,
     SandboxHandle,
+    a_fresh_sandbox_name,
 )
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
@@ -63,7 +64,7 @@ from tests.api.v1.build_sessions.conftest import (
 )
 from tests.conftest import forget_every_harness_count
 from tests.factories import ProjectFactory, UserFactory
-from tests.fakes import a_git_bundle, detached_work_done
+from tests.fakes import a_git_bundle, a_ready_pool_row, detached_work_done
 
 
 async def _user_project(db: AsyncSession, email: str):
@@ -362,6 +363,7 @@ class RecordingAca(AcaControlPlane):
         # Which connector identity, if any, each container was born with. `None` is the answer
         # for every container on a deployment with no lake — which is every test but the gate's.
         self.identities: dict[str, str | None] = {}
+        self.stamped: dict[str, dict[str, str]] = {}
 
     async def create_app(
         self,
@@ -390,6 +392,15 @@ class RecordingAca(AcaControlPlane):
         # quietly re-create the very data-loss path this lane exists to test.
         return self.created.get(name, {}).get(key)
 
+    async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
+        self.stamped.setdefault(name, {}).update(tags)
+
+    def made_for_the_pool(self, name: str) -> str:
+        """A container a pool fill made, as Azure knows it. Returns its address."""
+        self.created[name] = {"SUPERVISOR_TOKEN": "pool-bearer", "BIAL_POOL_MEMBER": "1"}
+        self.fqdns[name] = f"{name}.pool.westeurope.azurecontainerapps.io"
+        return self.fqdns[name]
+
     async def aclose(self) -> None:
         return None
 
@@ -414,11 +425,16 @@ class SupervisorScript:
         # page-less reading sets it to 404 and says so.
         self.root_status: int | None = None
         self.paths: list[str] = []
+        # Every delivery of a pool container's settings: the host it went to, and the names.
+        self.configured: list[tuple[str, dict[str, str]]] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path.removeprefix("/_sup")
         self.paths.append(path)
         if path == "/health":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/configure":
+            self.configured.append((request.url.host, json.loads(request.content)["env"]))
             return httpx.Response(200, json={"ok": True})
         if path == "/files":
             return httpx.Response(200, json={"ok": True})
@@ -619,6 +635,77 @@ async def test_a_registry_marked_ending_is_never_attached_to(
     ]
     reg = await fake_redis.hgetall(registry_key(user.id))
     assert reg[REGISTRY_FIELD_APP_NAME] == replacement
+
+
+async def test_a_container_from_the_pool_is_the_persons_one_workspace(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    aca_wire,
+    handed_over: list[OwedTeardown],
+    empty_sandbox_pool: None,
+) -> None:
+    """Once claimed, a pool container is a workspace like any other: the next press attaches to
+    it, and switching to another project writes it back and hands it to the shutdown routine,
+    never back to the pool.
+
+    Mutation check: claim nothing in `_provision_container` and the first start records a create
+    under a name of its own instead of the pool container."""
+    aca_wire.sandbox._config = aca_wire.sandbox._config.model_copy(
+        update={"pool_day_size": 1, "pool_night_size": 1}
+    )
+    member = a_fresh_sandbox_name()
+    fqdn = aca_wire.aca.made_for_the_pool(member)
+    await a_ready_pool_row(member, fqdn=fqdn, image_ref="acr/img:latest")
+    user, project_a = await _user_project(db_session, "rl-pool@rvaiglobal.com")
+    project_b = await ProjectFactory.create(db_session, user.id)
+    app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
+    await _seed_snapshot(db_session, user, project_b, fake_storage)
+    await _seed_worked_on(fake_storage, app_a)
+
+    assert (await _relaunch(client, user, project_a, aca_wire.manager)).status_code == 202
+    assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_APP_NAME) == member
+    assert (await _relaunch(client, user, project_a, aca_wire.manager)).status_code == 202
+    assert aca_wire.aca.create_calls == []
+    assert [host for host, _ in aca_wire.sup.configured] == [fqdn]
+
+    assert (await _relaunch(client, user, project_b, aca_wire.manager)).status_code == 202
+
+    assert [(owed.app_name, owed.kind, owed.write_back) for owed in handed_over] == [
+        (member, PendingTeardownKind.BUILD, True)
+    ]
+    assert aca_wire.aca.delete_calls == []
+    [created] = aca_wire.aca.create_calls
+    assert await fake_redis.hget(registry_key(user.id), REGISTRY_FIELD_APP_NAME) == created
+    await asyncio.gather(*aca_wire.sandbox._detached)
+
+
+async def test_a_restarted_pool_container_is_given_its_settings_again_and_starts(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """Azure restarting a claimed pool container brings it back from its creation environment,
+    which held no project settings, and it refuses to start the app. The attach hands them back,
+    built as the start that would have created it builds them, and the app starts.
+
+    Mutation check: drop the hand-back from the relaunch's attach arm and the second start is
+    refused."""
+    sandbox = wire.sbx
+    user, project = await _user_project(db_session, "rl-reconfig@rvaiglobal.com")
+    app_id = await _seed_snapshot(db_session, user, project, fake_storage)
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
+    [name] = sandbox.restored
+    sandbox.attach_handle = sandbox.by_name[name]
+    sandbox.unconfigured.add(name)
+
+    assert (await _relaunch(client, user, project, wire.manager)).status_code == 202
+
+    [(configured, env)] = sandbox.configured_with
+    assert configured == name
+    assert env["BIAL_APP_ID"] == str(app_id)
+    assert sandbox.restore_env is not None
+    assert set(env) == set(sandbox.restore_env)
+    assert sandbox.started == [name, name]
 
 
 async def test_no_registry_at_all_still_takes_the_restore_arm(

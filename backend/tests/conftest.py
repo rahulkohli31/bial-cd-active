@@ -357,6 +357,27 @@ async def empty_harness_counts():
     await forget_every_harness_count()
 
 
+async def forget_every_pool_member() -> None:
+    """Empty `sandbox_pool`, which the ledger writes in committed sessions of its own, so no
+    per-test rollback reaches it."""
+    from sqlalchemy import delete
+
+    from src.db.base import async_session_factory
+    from src.db.models.sandbox_pool import SandboxPoolMember
+
+    async with async_session_factory() as db:
+        await db.execute(delete(SandboxPoolMember))
+        await db.commit()
+
+
+@pytest.fixture
+async def empty_sandbox_pool():
+    """An empty pool ledger, before and after. See `forget_every_pool_member`."""
+    await forget_every_pool_member()
+    yield
+    await forget_every_pool_member()
+
+
 async def forget_every_worker_pass() -> None:
     """Empty `worker_passes`, for the same reason `harness_counts` is emptied: a pass record is a
     historical fact written in its own committed session, so no per-test rollback reaches it.

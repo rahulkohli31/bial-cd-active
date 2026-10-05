@@ -244,6 +244,46 @@ async def test_a_brand_new_project_attaches_with_nothing_to_say(
     assert session.restored is False
 
 
+async def test_an_attached_container_without_its_settings_is_given_them_before_the_turn(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """A claimed pool container that Azure restarted reports no settings and refuses to start
+    the app. The turn attaching to it hands them back first, built as its birth was given them.
+
+    Mutation check: drop the hand-back from `_resolve_sandbox` and nothing is delivered."""
+    user, project_id = await _mk(db_session, "u2-reconfig@rvaiglobal.com")
+    manager = SessionManager()
+    client, app_id = await _attached(db_session, manager, user, project_id)
+    assert client.attach_handle is not None
+    name = client.attach_handle.app_name
+    client.unconfigured.add(name)
+
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+
+    assert session.attached is True
+    [(configured, env)] = client.configured_with
+    assert configured == name
+    assert env["BIAL_APP_ID"] == str(app_id)
+    assert client.provision_env is not None
+    assert set(env) == set(client.provision_env)
+
+
+async def test_an_attached_container_holding_its_settings_is_not_configured_again(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    user, project_id = await _mk(db_session, "u2-configured@rvaiglobal.com")
+    manager = SessionManager()
+    client, _ = await _attached(db_session, manager, user, project_id)
+
+    await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+
+    assert client.configured_with == []
+
+
 # =============================================================================
 # Confirmed loss
 # =============================================================================

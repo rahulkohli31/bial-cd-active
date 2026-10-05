@@ -1,0 +1,718 @@
+"""The claim inside the create seam, against ledger rows on the real test database.
+
+The ledger commits in sessions of its own, so exclusivity is what Postgres does, not what a double
+says it does, and every test starts and ends with the table empty. Azure is a control plane keyed
+by container name, and each container's supervisor is scripted per host.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any
+
+import httpx
+import pytest
+import redis.asyncio as aioredis
+import sqlalchemy as sa
+import structlog
+from pydantic import SecretStr
+from redis.exceptions import ConnectionError as RedisConnectionError
+from sqlalchemy.exc import IntegrityError
+from structlog.testing import capture_logs
+
+import src.db.base as db_base
+from src.core.connectors import CONNECTORS
+from src.db.models.sandbox_pool import SandboxPoolMember, SandboxPoolState
+from src.services.lake.env import connector_env_names
+from src.services.redis import registry_key
+from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_FQDN,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
+)
+from src.services.sandbox import pool
+from src.services.sandbox.aca import AcaControlPlane, AcaError
+from src.services.sandbox.base import (
+    KIND_BUILD_SANDBOX,
+    KIND_SHARED_SANDBOX,
+    TAG_CONTROL_PLANE,
+    TAG_KIND,
+    TAG_POOL,
+    SandboxHandle,
+    a_fresh_sandbox_name,
+    control_plane_segment,
+    identity_from_tags,
+)
+from src.services.sandbox.client import AcaSandboxClient
+from src.services.sandbox.config import SandboxConfig
+from src.services.sandbox.stopwatch import Stopwatch, running_stopwatch, timed_by
+from src.services.storage import snapshot_key
+from tests.fakes import FakeStorage, a_git_bundle, a_ready_pool_row
+
+IMAGE = "acr.azurecr.io/citizen-dev-sandbox:v2"
+OLD_IMAGE = "acr.azurecr.io/citizen-dev-sandbox:v1"
+DSN = "postgresql://bialrole_pool:POOLROLEPASSWORD@db.example:5432/bialapp_pool"
+SAS = "sv=2021-08-06&sr=c&sp=rwdl&sig=POOLSASSIGNATURE"
+
+pytestmark = pytest.mark.usefixtures("empty_sandbox_pool")
+
+
+class PoolAca(AcaControlPlane):
+    """Every container Azure knows, by name: its environment, its tags, and what was done to it.
+    `__init__` is overridden so no credential or management client is built."""
+
+    def __init__(self) -> None:
+        self.envs: dict[str, dict[str, str]] = {}
+        self.tags: dict[str, dict[str, str]] = {}
+        self.created: list[str] = []
+        self.deleted: list[str] = []
+        self.refuses_to_delete: set[str] = set()
+        # The stopwatch and log bindings each restamp ran under.
+        self.restamped_under: list[tuple[Stopwatch, dict[str, Any]]] = []
+
+    def made_for_the_pool(self, name: str, *, token: str | None) -> None:
+        self.envs[name] = {"BIAL_POOL_MEMBER": "1"}
+        if token is not None:
+            self.envs[name]["SUPERVISOR_TOKEN"] = token
+        self.tags[name] = {
+            TAG_KIND: KIND_BUILD_SANDBOX,
+            TAG_CONTROL_PLANE: control_plane_segment(),
+            TAG_POOL: "1",
+        }
+
+    async def create_app(
+        self,
+        *,
+        name: str,
+        env: dict[str, str],
+        tags: dict[str, str],
+        identity_resource_id: str | None = None,
+    ) -> str:
+        self.created.append(name)
+        self.envs[name] = dict(env)
+        self.tags[name] = dict(tags)
+        return f"{name}.aca.example"
+
+    async def delete_app(self, *, name: str) -> None:
+        self.deleted.append(name)
+        if name in self.refuses_to_delete:
+            raise AcaError("the delete was refused")
+        self.envs.pop(name, None)
+
+    async def get_app_env_value(self, *, name: str, key: str) -> str | None:
+        return self.envs.get(name, {}).get(key)
+
+    async def get_app_fqdn(self, *, name: str) -> str | None:
+        return f"{name}.aca.example" if name in self.envs else None
+
+    async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
+        self.restamped_under.append((running_stopwatch(), structlog.contextvars.get_contextvars()))
+        self.tags.setdefault(name, {}).update(tags)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class Supervisors:
+    """Each container's supervisor, told apart by the host a request goes to. Like the real one,
+    each takes one delivery of settings and refuses the next."""
+
+    def __init__(self) -> None:
+        self.health_status: dict[str, int] = {}
+        self.configure_status: dict[str, int] = {}
+        self.hangs_on: set[tuple[str, str]] = set()
+        self.configured: list[tuple[str, str, dict[str, str]]] = []
+        # Set, health checks wait on it: how a test holds a claim open.
+        self.health_waits_for: asyncio.Event | None = None
+        # Run as a delivery of settings lands: what another start does meanwhile.
+        self.meanwhile: Callable[[], Awaitable[object]] | None = None
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        path = request.url.path.removeprefix("/_sup")
+        if (host, path) in self.hangs_on:
+            raise httpx.ReadTimeout("no answer", request=request)
+        configured = any(seen == host for seen, _, _ in self.configured)
+        if path == "/health":
+            if self.health_waits_for is not None:
+                await asyncio.wait_for(self.health_waits_for.wait(), timeout=5)
+            return httpx.Response(
+                self.health_status.get(host, 200), json={"ok": True, "configured": configured}
+            )
+        if path == "/configure":
+            if configured:
+                return httpx.Response(409, json={"detail": "already configured"})
+            status = self.configure_status.get(host, 200)
+            if status == 200:
+                if self.meanwhile is not None:
+                    await self.meanwhile()
+                env = json.loads(request.content)["env"]
+                self.configured.append((host, request.headers["authorization"], env))
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(status, json={"detail": "refused"})
+        if path == "/exec":
+            return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
+        if path == "/files":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"detail": path})
+
+
+def _config(**overrides: Any) -> SandboxConfig:
+    return SandboxConfig.model_validate(
+        {
+            "subscription_id": "s",
+            "resource_group": "r",
+            "region": "centralindia",
+            "managed_environment_name": "aca-env",
+            "acr_server": "acr.azurecr.io",
+            "acr_username": "acr-user",
+            "acr_password": SecretStr("acr-pass"),
+            "image_ref": IMAGE,
+            "pool_day_size": 5,
+            "pool_night_size": 5,
+            **overrides,
+        }
+    )
+
+
+def _app_env(app_id: uuid.UUID) -> dict[str, str]:
+    return {
+        "BIAL_APP_ID": str(app_id),
+        "BIAL_PORTAL_ORIGIN": "https://portal.example",
+        "BIAL_BLOB_CONTAINER_URL": "https://blob.example/app",
+        "BIAL_BLOB_SAS": SAS,
+        "BIAL_DATABASE_URL": DSN,
+    }
+
+
+@pytest.fixture
+async def world(fake_redis: aioredis.Redis) -> AsyncIterator[SimpleNamespace]:
+    aca = PoolAca()
+    supervisors = Supervisors()
+    client = AcaSandboxClient(_config(), transport=httpx.MockTransport(supervisors), aca=aca)
+    yield SimpleNamespace(aca=aca, supervisors=supervisors, client=client, redis=fake_redis)
+    await _settled(client)
+    await client.aclose()
+
+
+async def _settled(client: AcaSandboxClient) -> None:
+    """Wait out the work a claim left running behind its start."""
+    while client._detached:
+        await asyncio.gather(*list(client._detached))
+
+
+async def _ready(
+    world: SimpleNamespace,
+    *,
+    image_ref: str = IMAGE,
+    since: datetime | None = None,
+    token: str | None = "pool-bearer",
+) -> str:
+    """A container made for the pool and its ready row. Returns its name, whose host is
+    `<name>.pool.example`."""
+    name = a_fresh_sandbox_name()
+    world.aca.made_for_the_pool(name, token=token)
+    await a_ready_pool_row(name, fqdn=f"{name}.pool.example", image_ref=image_ref, since=since)
+    return name
+
+
+async def _ledger() -> dict[str, SandboxPoolState]:
+    async with db_base.async_session_factory() as db:
+        rows = await db.execute(sa.select(SandboxPoolMember.name, SandboxPoolMember.state))
+    return {name: state for name, state in rows}
+
+
+async def _start(
+    client: AcaSandboxClient, user_id: uuid.UUID, app_id: uuid.UUID
+) -> tuple[SandboxHandle, Stopwatch]:
+    stopwatch = Stopwatch()
+    with timed_by(stopwatch):
+        handle = await client.provision_new(
+            str(user_id), a_fresh_sandbox_name(), app_env=_app_env(app_id)
+        )
+    return handle, stopwatch
+
+
+async def _recorded_name(redis: aioredis.Redis, user_id: uuid.UUID) -> str:
+    return str(await redis.hget(registry_key(user_id), REGISTRY_FIELD_APP_NAME))
+
+
+# --- the claim, end to end -------------------------------------------------------------------
+
+
+async def test_a_start_takes_a_ready_container_as_its_own_workspace(world) -> None:
+    """The person's workspace is the pool container: the registry records it under its own name
+    and address, the handle reaches it with its own bearer, and its row is gone, because the
+    registry describes it from here."""
+    member = await _ready(world)
+    user, app_id = uuid.uuid4(), uuid.uuid4()
+
+    handle, stopwatch = await _start(world.client, user, app_id)
+
+    assert handle.app_name == member
+    assert handle.fqdn == f"{member}.pool.example"
+    assert handle.token == "pool-bearer"
+    assert handle.preview_url.endswith(f"/a/{member}")
+    record = await world.redis.hgetall(registry_key(user))
+    assert record[REGISTRY_FIELD_APP_NAME] == member
+    assert record[REGISTRY_FIELD_APP_ID] == str(app_id)
+    assert record[REGISTRY_FIELD_FQDN] == f"{member}.pool.example"
+    assert world.aca.created == []
+    assert await _ledger() == {}
+    assert (stopwatch.claimed, stopwatch.miss_reason, stopwatch.ready_count) == (True, None, 1)
+    assert {"bearer_read", "configure", "registry_write"} <= set(stopwatch.laps)
+    # A claimed start's create stage is the claim.
+    assert stopwatch.elapsed_ms(None, "created") is not None
+
+
+async def test_a_claimed_container_is_given_exactly_the_projects_own_settings(world) -> None:
+    """Over the supervisor's authenticated call, with the bearer read back from the container's
+    own Azure environment. The portal origin was set when the container was made, and any name
+    the supervisor does not take would refuse the whole delivery."""
+    member = await _ready(world)
+    url_name, client_id_name = connector_env_names(next(iter(CONNECTORS)))
+    env = {
+        **_app_env(uuid.uuid4()),
+        url_name: "https://lake.example/data/",
+        client_id_name: "lake-client-id",
+        "SOMETHING_ELSE": "not for the container",
+    }
+
+    await world.client.provision_new(str(uuid.uuid4()), a_fresh_sandbox_name(), app_env=env)
+
+    [(host, auth, delivered)] = world.supervisors.configured
+    assert (host, auth) == (f"{member}.pool.example", "Bearer pool-bearer")
+    assert delivered == {
+        "BIAL_APP_ID": env["BIAL_APP_ID"],
+        "BIAL_BLOB_CONTAINER_URL": "https://blob.example/app",
+        "BIAL_BLOB_SAS": SAS,
+        "BIAL_DATABASE_URL": DSN,
+        url_name: "https://lake.example/data/",
+        client_id_name: "lake-client-id",
+    }
+
+
+async def test_two_starts_at_once_never_receive_the_same_ready_container(
+    world, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One ready container, two people pressing at once: one takes it, the other creates as
+    today and records that nothing was ready. The second asks the ledger while the first is
+    still taking over its container, which is where a claim spends its seconds; two statements
+    landing together are the row-lock test's."""
+    member = await _ready(world)
+    first, second = uuid.uuid4(), uuid.uuid4()
+    first_claimed, both_asked = asyncio.Event(), asyncio.Event()
+    world.supervisors.health_waits_for = both_asked
+    asked = 0
+    real_claim = pool.claim
+
+    async def counted_claim(image_ref: str) -> pool.ClaimedMember | None:
+        nonlocal asked
+        claimed = await real_claim(image_ref)
+        asked += 1
+        (first_claimed if asked == 1 else both_asked).set()
+        return claimed
+
+    monkeypatch.setattr(pool, "claim", counted_claim)
+
+    pressed_first = asyncio.create_task(_start(world.client, first, uuid.uuid4()))
+    await asyncio.wait_for(first_claimed.wait(), timeout=5)
+    (one, one_watch), (two, two_watch) = await asyncio.gather(
+        pressed_first, _start(world.client, second, uuid.uuid4())
+    )
+    await _settled(world.client)
+
+    assert (one.app_name, one_watch.claimed) == (member, True)
+    assert (two_watch.claimed, two_watch.miss_reason) == (False, "no_ready")
+    assert world.aca.created == [two.app_name]
+    assert world.aca.deleted == []
+    assert len(world.supervisors.configured) == 1
+    assert await _recorded_name(world.redis, first) == member
+    assert await _recorded_name(world.redis, second) == two.app_name
+
+
+async def test_six_starts_against_five_ready_containers_claim_five_and_create_one(world) -> None:
+    members = {await _ready(world) for _ in range(5)}
+
+    started = [await _start(world.client, uuid.uuid4(), uuid.uuid4()) for _ in range(6)]
+
+    assert {handle.app_name for handle, _ in started[:5]} == members
+    assert [(w.claimed, w.ready_count) for _, w in started[:5]] == [
+        (True, 5),
+        (True, 4),
+        (True, 3),
+        (True, 2),
+        (True, 1),
+    ]
+    last_handle, last = started[5]
+    assert (last.claimed, last.miss_reason, last.ready_count) == (False, "no_ready", 0)
+    assert world.aca.created == [last_handle.app_name]
+
+
+async def test_a_size_of_zero_creates_without_asking_the_ledger(world) -> None:
+    """No day counts as daytime here, so the night size of zero applies at any instant. A ready
+    row left over is not claimed: a size of zero is how the pool is switched off."""
+    world.client._config = _config(pool_night_size=0, pool_day_days=frozenset())
+    member = await _ready(world)
+
+    handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4())
+
+    assert (stopwatch.claimed, stopwatch.miss_reason, stopwatch.ready_count) == (
+        False,
+        "size_zero",
+        0,
+    )
+    assert world.aca.created == [handle.app_name]
+    assert await _ledger() == {member: SandboxPoolState.READY}
+
+
+async def test_a_shared_view_claims_and_is_restamped_with_the_viewer_as_owner(
+    world, fake_storage: FakeStorage
+) -> None:
+    """The registry carries the shared-view stamp from the claim, and the restamp behind it gives
+    the container the shared kind, the colleague as owner and the owner's app, beside the pool
+    tag it was made with."""
+    member = await _ready(world)
+    viewer, owner, project_id, app_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await fake_storage.put(snapshot_key(app_id), a_git_bundle())
+
+    handle = await world.client.restore_from_snapshot(
+        str(viewer),
+        a_fresh_sandbox_name(),
+        app_env=_app_env(app_id),
+        kind="shared_sandbox",
+        shared_project_id=project_id,
+        shared_owner_id=owner,
+    )
+    await _settled(world.client)
+
+    assert handle.app_name == member
+    record = await world.redis.hgetall(registry_key(viewer))
+    assert record[REGISTRY_FIELD_SHARED_PROJECT_ID] == str(project_id)
+    assert record[REGISTRY_FIELD_SHARED_OWNER_ID] == str(owner)
+    assert record[REGISTRY_FIELD_APP_ID] == str(app_id)
+    identity = identity_from_tags(world.aca.tags[member])
+    assert (identity.kind, identity.user_id, identity.app_id) == (
+        KIND_SHARED_SANDBOX,
+        viewer,
+        app_id,
+    )
+    assert identity.created_at is not None
+    assert world.aca.tags[member][TAG_POOL] == "1"
+
+
+async def test_a_build_claim_is_restamped_with_its_owner_and_birth(world) -> None:
+    member = await _ready(world)
+    user, app_id = uuid.uuid4(), uuid.uuid4()
+    before = datetime.now(UTC)
+
+    await _start(world.client, user, app_id)
+    await _settled(world.client)
+
+    identity = identity_from_tags(world.aca.tags[member])
+    assert (identity.kind, identity.user_id, identity.app_id) == (KIND_BUILD_SANDBOX, user, app_id)
+    assert identity.created_at is not None and identity.created_at >= before
+
+
+async def test_work_a_claim_leaves_behind_runs_outside_the_start(world) -> None:
+    """The restamp outlives the start, whose record is closed by then: it must see neither the
+    start's stopwatch nor its log bindings, or it would time itself into a closed record."""
+    await _ready(world)
+    stopwatch = Stopwatch()
+
+    with structlog.contextvars.bound_contextvars(build_id="the-start"), timed_by(stopwatch):
+        await world.client.provision_new(
+            str(uuid.uuid4()), a_fresh_sandbox_name(), app_env=_app_env(uuid.uuid4())
+        )
+    laps_at_the_return = dict(stopwatch.laps)
+    await _settled(world.client)
+
+    [(timed_by_then, bound_then)] = world.aca.restamped_under
+    assert timed_by_then is not stopwatch
+    assert timed_by_then is running_stopwatch()
+    assert "build_id" not in bound_then
+    assert stopwatch.laps == laps_at_the_return
+
+
+# --- a claim that fails ----------------------------------------------------------------------
+
+
+def _bearer_unreadable(world: SimpleNamespace, name: str) -> None:
+    world.aca.envs[name].pop("SUPERVISOR_TOKEN")
+
+
+def _health_refused(world: SimpleNamespace, name: str) -> None:
+    world.supervisors.health_status[f"{name}.pool.example"] = 503
+
+
+def _health_hangs(world: SimpleNamespace, name: str) -> None:
+    world.supervisors.hangs_on.add((f"{name}.pool.example", "/health"))
+
+
+def _configure_refused(world: SimpleNamespace, name: str) -> None:
+    world.supervisors.configure_status[f"{name}.pool.example"] = 500
+
+
+def _configure_hangs(world: SimpleNamespace, name: str) -> None:
+    world.supervisors.hangs_on.add((f"{name}.pool.example", "/configure"))
+
+
+def _registry_write_fails(world: SimpleNamespace, name: str) -> None:
+    real = world.client._write_registry_into_an_empty_slot
+
+    async def refusing(user_uuid: uuid.UUID, *, app_name: str, **fields: Any) -> None:
+        if app_name == name:
+            raise RedisConnectionError("the coordination store went away")
+        await real(user_uuid, app_name=app_name, **fields)
+
+    world.client._write_registry_into_an_empty_slot = refusing
+
+
+_FAILURES = [
+    pytest.param(_bearer_unreadable, "claim_failed", id="bearer-unreadable"),
+    pytest.param(_health_refused, "unhealthy", id="health-refused"),
+    pytest.param(_health_hangs, "unhealthy", id="health-hangs"),
+    pytest.param(_configure_refused, "claim_failed", id="configure-500"),
+    pytest.param(_configure_hangs, "claim_failed", id="configure-hangs"),
+    pytest.param(_registry_write_fails, "claim_failed", id="registry-write-fails"),
+]
+
+
+@pytest.mark.parametrize(("break_it", "reason"), _FAILURES)
+async def test_a_failed_claim_is_deleted_and_the_start_creates_recording_why(
+    world, break_it, reason: str
+) -> None:
+    member = await _ready(world)
+    break_it(world, member)
+    user = uuid.uuid4()
+
+    handle, stopwatch = await _start(world.client, user, uuid.uuid4())
+    await _settled(world.client)
+
+    assert (stopwatch.claimed, stopwatch.miss_reason, stopwatch.ready_count) == (
+        False,
+        reason,
+        1,
+    )
+    assert world.aca.created == [handle.app_name]
+    assert await _recorded_name(world.redis, user) == handle.app_name
+    assert world.aca.deleted == [member]
+    assert await _ledger() == {}
+
+
+@pytest.mark.parametrize(("break_it", "reason"), _FAILURES)
+async def test_a_failed_claim_moves_on_to_the_next_ready_container(
+    world, break_it, reason: str
+) -> None:
+    an_hour_ago = datetime.now(UTC) - timedelta(hours=1)
+    broken = await _ready(world, since=an_hour_ago)
+    sound = await _ready(world)
+    break_it(world, broken)
+
+    handle, stopwatch = await _start(world.client, uuid.uuid4(), uuid.uuid4())
+    await _settled(world.client)
+
+    assert handle.app_name == sound
+    assert (stopwatch.claimed, stopwatch.miss_reason) == (True, None)
+    assert world.aca.created == []
+    assert world.aca.deleted == [broken]
+    assert await _ledger() == {}
+
+
+async def test_a_failed_claim_whose_delete_is_refused_is_left_retiring(world) -> None:
+    member = await _ready(world)
+    _health_refused(world, member)
+    world.aca.refuses_to_delete.add(member)
+
+    await _start(world.client, uuid.uuid4(), uuid.uuid4())
+    await _settled(world.client)
+
+    assert await _ledger() == {member: SandboxPoolState.RETIRING}
+
+
+async def test_a_refused_configure_logs_none_of_what_it_carried(world) -> None:
+    member = await _ready(world)
+    _configure_refused(world, member)
+
+    with capture_logs() as logged:
+        await _start(world.client, uuid.uuid4(), uuid.uuid4())
+        await _settled(world.client)
+
+    assert logged, "the failed claim must be on the record"
+    for secret in ("POOLROLEPASSWORD", "POOLSASSIGNATURE", "pool-bearer"):
+        assert all(secret not in repr(entry) for entry in logged)
+
+
+async def test_a_claim_whose_slot_was_taken_meanwhile_writes_nothing_and_stops_claiming(
+    world,
+) -> None:
+    """The provision's guard is a read, and a claim spends seconds before its registry write:
+    another start may take the person's slot meanwhile. The claim's write then lands nothing,
+    its container is let go, and no further ready container is spent on a slot that is taken."""
+    member = await _ready(world, since=datetime.now(UTC) - timedelta(hours=1))
+    spare = await _ready(world)
+    user = uuid.uuid4()
+    elsewhere = a_fresh_sandbox_name()
+
+    async def another_start_takes_the_slot() -> None:
+        await world.redis.hset(registry_key(user), mapping={REGISTRY_FIELD_APP_NAME: elsewhere})
+
+    world.supervisors.meanwhile = another_start_takes_the_slot
+    names_seen: list[str] = []
+    real_write = world.client._write_registry
+
+    async def the_creates_write(user_uuid: uuid.UUID, *, app_name: str, **fields: Any) -> None:
+        named = await world.redis.hget(registry_key(user_uuid), REGISTRY_FIELD_APP_NAME)
+        names_seen.append(str(named))
+        await real_write(user_uuid, app_name=app_name, **fields)
+
+    world.client._write_registry = the_creates_write
+
+    handle, stopwatch = await _start(world.client, user, uuid.uuid4())
+    await _settled(world.client)
+
+    assert (stopwatch.claimed, stopwatch.miss_reason) == (False, "claim_failed")
+    assert names_seen == [elsewhere], "the claim wrote over the record another start made"
+    assert world.aca.deleted == [member]
+    assert world.aca.created == [handle.app_name]
+    assert await _ledger() == {spare: SandboxPoolState.READY}
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["build", "shared-view"])
+async def test_a_claim_writes_the_record_a_create_writes(world, shared: bool) -> None:
+    """Two writers of one record: a field one sets and the other does not is a container read
+    differently depending on how it was born. Both start from a slot holding a previous
+    occupant's leftovers, which each must disown."""
+    stamp = (uuid.uuid4(), uuid.uuid4()) if shared else (None, None)
+    leftovers = {
+        "preview_stay_until": "2026-10-05T10:00:00+00:00",
+        "shared_served_count": "7",
+        "shared_project_id": str(uuid.uuid4()),
+        "shared_owner_id": str(uuid.uuid4()),
+    }
+    created, claimed = uuid.uuid4(), uuid.uuid4()
+    fields = {
+        "app_name": "sbx-" + "a" * 28,
+        "app_id": uuid.uuid4(),
+        "fqdn": "sbx.example",
+        "token_ref": "ref",
+        "shared_project_id": stamp[0],
+        "shared_owner_id": stamp[1],
+    }
+    for user in (created, claimed):
+        await world.redis.hset(registry_key(user), mapping=leftovers)
+
+    await world.client._write_registry(created, **fields)
+    await world.client._write_registry_into_an_empty_slot(claimed, **fields)
+
+    by_create = await world.redis.hgetall(registry_key(created))
+    by_claim = await world.redis.hgetall(registry_key(claimed))
+    for record in (by_create, by_claim):
+        assert record.pop("created_at") == record.pop("waiting_since")
+    assert by_claim == by_create
+    assert ("shared_project_id" in by_claim) is shared
+
+
+# --- the ledger statements -------------------------------------------------------------------
+
+
+async def test_a_claim_prefers_the_current_image_and_falls_back_to_an_older_one(world) -> None:
+    """An older-image container can still serve a start until its replacement is ready, so it is
+    claimed only when no current one is ready, however long it has waited."""
+    an_hour_ago = datetime.now(UTC) - timedelta(hours=1)
+    old = await _ready(world, image_ref=OLD_IMAGE, since=an_hour_ago)
+    current = await _ready(world)
+
+    first = await pool.claim(IMAGE)
+    second = await pool.claim(IMAGE)
+
+    assert first is not None and second is not None
+    assert (first.name, first.image_ref) == (current, IMAGE)
+    assert (second.name, second.image_ref) == (old, OLD_IMAGE)
+    assert await pool.claim(IMAGE) is None
+
+
+async def test_a_claim_skips_a_row_another_claim_holds_rather_than_waiting_for_it(world) -> None:
+    """The row lock another claim holds until it commits is skipped, not waited on: a start is
+    never queued behind someone else's claim, and never handed the row it holds."""
+    held = await _ready(world, since=datetime.now(UTC) - timedelta(hours=1))
+    free = await _ready(world)
+    async with db_base.async_session_factory() as other_claim:
+        await other_claim.execute(
+            sa.select(SandboxPoolMember.id).where(SandboxPoolMember.name == held).with_for_update()
+        )
+
+        mine = await asyncio.wait_for(pool.claim(IMAGE), timeout=5)
+        nothing_left = await asyncio.wait_for(pool.claim(IMAGE), timeout=5)
+
+        await other_claim.rollback()
+    assert mine is not None and mine.name == free
+    assert nothing_left is None
+    assert await _ledger() == {held: SandboxPoolState.READY, free: SandboxPoolState.CLAIMED}
+
+
+@pytest.mark.parametrize(
+    "name", ["pub-" + "a" * 28, "sbx-" + "A" * 28, "sbx-" + "a" * 27, "shr-" + "a" * 28]
+)
+async def test_the_ledger_holds_only_names_this_platform_mints(name: str) -> None:
+    """Every path that deletes a container refuses a name of any other shape, so a pool
+    container under one could never be cleaned up."""
+    with pytest.raises(IntegrityError):
+        await a_ready_pool_row(name, fqdn="x.example", image_ref=IMAGE)
+
+
+async def test_the_ready_count_counts_only_ready_rows(world) -> None:
+    await _ready(world)
+    await _ready(world)
+    claimed = await pool.claim(IMAGE)
+    assert claimed is not None
+
+    assert await pool.ready_count() == 1
+
+
+async def test_retiring_touches_only_a_claimed_row(world) -> None:
+    """A retire is how a failed claim's row leaves the pool, so it must never take a ready one."""
+    first = await _ready(world, since=datetime.now(UTC) - timedelta(hours=1))
+    second = await _ready(world)
+    claimed = await pool.claim(IMAGE)
+    assert claimed is not None and claimed.name == first
+    async with db_base.async_session_factory() as db:
+        second_id = await db.scalar(
+            sa.select(SandboxPoolMember.id).where(SandboxPoolMember.name == second)
+        )
+    assert second_id is not None
+
+    await pool.retire(claimed.id)
+    await pool.retire(second_id)
+
+    assert await _ledger() == {
+        first: SandboxPoolState.RETIRING,
+        second: SandboxPoolState.READY,
+    }
+
+
+@pytest.mark.parametrize("_round", [1, 2])
+async def test_pool_work_runs_two_at_a_time_on_whichever_loop_asks(_round: int) -> None:
+    """Each test runs on an event loop of its own, and a semaphore belongs to the loop it first
+    waited on, so a second round on a fresh loop is what proves the bound is made per loop."""
+    running = 0
+    most = 0
+
+    async def a_piece_of_pool_work() -> None:
+        nonlocal running, most
+        async with pool.pool_work_bound():
+            running += 1
+            most = max(most, running)
+            await asyncio.sleep(0.01)
+            running -= 1
+
+    await asyncio.gather(*(a_piece_of_pool_work() for _ in range(6)))
+
+    assert most == 2

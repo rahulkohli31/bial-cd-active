@@ -415,6 +415,12 @@ class FakeSandboxClient(SandboxClient):
         # (`ServedCount`'s own docstring). `False` by default: most tests script a small count
         # that is meant to compare as a real total.
         self.served_count_truncated: bool = False
+        # Containers that report no settings, as a claimed pool container Azure restarted does:
+        # they refuse `dev_start` until configured, as the supervisor does. Every delivery is
+        # recorded with the container it went to, and so is every start a container accepted.
+        self.unconfigured: set[str] = set()
+        self.configured_with: list[tuple[str, dict[str, str]]] = []
+        self.started: list[str] = []
 
     async def _refuse_to_orphan(self, user_id: str) -> None:
         """The real client's refusal to record a container over a record naming another: a
@@ -540,7 +546,19 @@ class FakeSandboxClient(SandboxClient):
     async def dev_start(
         self, handle: SandboxHandle, *, cmd: list[str] | None = None, cwd: str | None = None
     ) -> int:
+        if handle.app_name in self.unconfigured:
+            raise SandboxError("dev/start failed with status 412")
+        self.started.append(handle.app_name)
         return 4321
+
+    async def health(self, handle: SandboxHandle) -> bool:
+        return handle.app_name not in self.unconfigured
+
+    async def configure(self, handle: SandboxHandle, env: Mapping[str, str]) -> None:
+        if handle.app_name not in self.unconfigured:
+            raise SandboxError("configure failed with status 409")
+        self.configured_with.append((handle.app_name, dict(env)))
+        self.unconfigured.discard(handle.app_name)
 
     async def dev_status(self, handle: SandboxHandle) -> DevStatus:
         """A dev server that is up and answering. `root_status` rides from the attribute rather
@@ -685,6 +703,27 @@ class DevServerDownUntilStarted(FakeSandboxClient):
     async def dev_status(self, handle: SandboxHandle) -> DevStatus:
         up = handle.app_name in self._serving
         return DevStatus(running=up, ready=up, port=3000, root_status=200 if up else None)
+
+
+async def a_ready_pool_row(
+    name: str, *, fqdn: str, image_ref: str, since: datetime | None = None
+) -> None:
+    """A ready row in the pool's ledger, committed the way the ledger commits its own; a test
+    that writes one takes `empty_sandbox_pool`."""
+    from src.db.base import async_session_factory
+    from src.db.models.sandbox_pool import SandboxPoolMember, SandboxPoolState
+
+    async with async_session_factory() as db:
+        db.add(
+            SandboxPoolMember(
+                name=name,
+                fqdn=fqdn,
+                image_ref=image_ref,
+                state=SandboxPoolState.READY,
+                state_changed_at=since or datetime.now(UTC),
+            )
+        )
+        await db.commit()
 
 
 async def detached_work_done(manager: SessionManager) -> None:

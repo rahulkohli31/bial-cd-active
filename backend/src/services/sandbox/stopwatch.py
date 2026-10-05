@@ -20,8 +20,11 @@ Split = Literal["admitted", "settings", "created", "dev_started", "first_page"]
 
 #: The steps timed inside a stage. `files` and `restore_exec` are the bundle push and the restore
 #: script; together with `registry_write` and `dev_start` they fill the gap between a container
-#: being created and its dev server starting.
-Lap = Literal["files", "restore_exec", "registry_write", "dev_start"]
+#: being created and its dev server starting. `bearer_read` and `configure` are steps of a claim.
+Lap = Literal["files", "restore_exec", "registry_write", "dev_start", "bearer_read", "configure"]
+
+#: Why a start created a container rather than claiming a ready one.
+Miss = Literal["no_ready", "unhealthy", "claim_failed", "size_zero"]
 
 
 def _ms(seconds: float) -> int:
@@ -40,6 +43,11 @@ class Stopwatch:
         self.laps: dict[str, int] = {}
         #: Whether the restore reinstalled packages; `None` when no restore ran.
         self.reinstalled: bool | None = None
+        #: Whether the container came from the pool, why not when it did not, and how many were
+        #: ready when the start asked. A retried birth is described by its last attempt.
+        self.claimed = False
+        self.miss_reason: Miss | None = None
+        self.ready_count: int | None = None
         self._stopped = False
 
     def split(self, name: Split) -> None:
@@ -58,6 +66,14 @@ class Stopwatch:
     def saw_the_restore_reinstall(self, reinstalled: bool) -> None:
         if not self._stopped:
             self.reinstalled = reinstalled
+
+    def took_a_ready_one(self, *, ready_count: int) -> None:
+        if not self._stopped:
+            self.claimed, self.miss_reason, self.ready_count = True, None, ready_count
+
+    def missed(self, reason: Miss, *, ready_count: int | None) -> None:
+        if not self._stopped:
+            self.claimed, self.miss_reason, self.ready_count = False, reason, ready_count
 
     def stop(self) -> None:
         self._stopped = True
@@ -82,6 +98,12 @@ class _NobodyIsTiming(Stopwatch):
         yield
 
     def saw_the_restore_reinstall(self, reinstalled: bool) -> None:
+        return None
+
+    def took_a_ready_one(self, *, ready_count: int) -> None:
+        return None
+
+    def missed(self, reason: Miss, *, ready_count: int | None) -> None:
         return None
 
 

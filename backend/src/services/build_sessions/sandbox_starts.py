@@ -23,6 +23,7 @@ from src.db.models.sandbox_start import (
     SandboxProjectType,
     SandboxStart,
     SandboxStartKind,
+    SandboxStartMiss,
     SandboxStartOutcome,
 )
 from src.services.build_sessions.alarms import SANDBOX_START_NOT_RECORDED_EVENT
@@ -127,6 +128,13 @@ class StartRecord(Stopwatch):
                         first_page_ms=self.elapsed_ms("dev_started", "first_page"),
                         sub_steps=dict(self.laps),
                         reinstalled=self.reinstalled,
+                        claimed=self.claimed,
+                        miss_reason=(
+                            None
+                            if self.miss_reason is None
+                            else SandboxStartMiss(self.miss_reason)
+                        ),
+                        ready_count=self.ready_count,
                     )
                 )
                 await db.commit()

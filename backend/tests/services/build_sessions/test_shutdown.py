@@ -58,7 +58,15 @@ from src.services.redis.keys import (
     cooperative_stop_key,
 )
 from src.services.sandbox import SandboxHandle, SandboxNotReadyError
-from src.services.sandbox.base import KIND_BUILD_SANDBOX, TAG_CREATED_AT, TAG_KIND, ExecResult
+from src.services.sandbox.base import (
+    KIND_BUILD_SANDBOX,
+    TAG_CONTROL_PLANE,
+    TAG_CREATED_AT,
+    TAG_KIND,
+    TAG_POOL,
+    ExecResult,
+    control_plane_segment,
+)
 from src.services.storage import StorageError, snapshot_key
 from tests.factories import (
     AppRegistryFactory,
@@ -941,6 +949,37 @@ async def test_the_ceiling_outranks_the_strike_budget(
     client = _wont_answer(scene.app_name)
     client.tags_by_name[scene.app_name] = {TAG_CREATED_AT: born.isoformat()}
     owed = await _owe(scene, instance_ref=born)
+
+    outcome = await run_the_shutdown(
+        owed,
+        redis=fake_redis,
+        sandbox_client=client,
+        reason=ShutdownReason.PRESENCE_LAPSED,
+        session_factory=scene.factory,
+    )
+
+    assert outcome is ShutdownOutcome.DESTROYED
+    assert owed.attempts < shutdown_module._STRIKES_BEFORE_IT_GOES
+    assert client.torn_down == [scene.app_name]
+
+
+async def test_a_pool_container_whose_restamp_was_lost_is_aged_from_its_registration(
+    fake_redis: aioredis.Redis, scene: _Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A container taken from the pool carries no birthday tag until the restamp behind its claim
+    lands, and that restamp is not repaired when lost. The registration the row recorded stands
+    in, so the ceiling still reaches it.
+
+    Mutation check: drop the fallback to the row's registration and this container is spared."""
+    monkeypatch.setattr(shutdown_module, "the_ceiling_hours", lambda: 2)
+    registered = _born_at(60 * 5)
+    client = _wont_answer(scene.app_name)
+    client.tags_by_name[scene.app_name] = {
+        TAG_KIND: KIND_BUILD_SANDBOX,
+        TAG_CONTROL_PLANE: control_plane_segment(),
+        TAG_POOL: "1",
+    }
+    owed = await _owe(scene, instance_ref=registered)
 
     outcome = await run_the_shutdown(
         owed,

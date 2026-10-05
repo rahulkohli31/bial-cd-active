@@ -37,7 +37,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Final
 
@@ -747,20 +747,26 @@ async def _let_go_of_the_slot(redis: aioredis.Redis, owed: OwedTeardown) -> None
 # --- the unread arm -------------------------------------------------------------------------
 
 
-async def _past_the_age_ceiling(sandbox_client: SandboxClient, app_name: str) -> bool:
+async def _past_the_age_ceiling(sandbox_client: SandboxClient, owed: OwedTeardown) -> bool:
     """Has this container outlived the absolute ceiling, measured on its OWN birthday?
 
-    The ARM tag, never the registry: this arm is reached when the registry may well name somebody
-    else, and a record re-stamped at every registration would hand a container whose delete
-    failed a whole fresh ceiling. No age means no ceiling — the attempt count is the other bound,
-    and it needs nothing from ARM."""
+    The ARM tag, never the live registry: this arm is reached when the registry may well name
+    somebody else, and a record re-stamped at every registration would hand a container whose
+    delete failed a whole fresh ceiling. A tag with no birthday, which a container taken from the
+    pool carries until its restamp lands, falls back to the registration this row recorded; that
+    is never earlier than the birth, so it can only spare. A tag read that fails means no age,
+    and no age means no ceiling — the attempt count is the other bound, and it needs nothing from
+    ARM."""
     after_hours = the_ceiling_hours()
     try:
-        tags = await sandbox_client.get_app_tags(name=app_name)
+        tags = await sandbox_client.get_app_tags(name=owed.app_name)
     except SandboxError:
         return False
+    identity = identity_from_tags(tags)
+    if identity.created_at is None:
+        identity = replace(identity, created_at=owed.instance_ref)
     return is_drained(
-        identity_from_tags(tags),
+        identity,
         now=datetime.now(UTC),
         after_hours=after_hours,
         turn_in_flight=False,
@@ -783,7 +789,7 @@ async def _spare_or_go_in_unread(
     against precisely the population it exists to bound. Past the ceiling, or past the strikes,
     it goes, and what could not be read is recorded."""
     if owed.attempts < _STRIKES_BEFORE_IT_GOES and not await _past_the_age_ceiling(
-        sandbox_client, owed.app_name
+        sandbox_client, owed
     ):
         _log.warning(
             "sparing an unreadable container for another attempt", why=why, **_about(owed, reason)

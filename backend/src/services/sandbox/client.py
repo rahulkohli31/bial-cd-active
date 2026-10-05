@@ -15,16 +15,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import secrets
 import time
 import uuid
+from collections.abc import Coroutine, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 import httpx
 import structlog
 from redis.exceptions import RedisError
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.core.redaction import scrub_untrusted
 from src.services.redis import (
@@ -77,8 +80,11 @@ from src.services.sandbox.base import (
     shared_sandbox_tags,
 )
 from src.services.sandbox.config import SandboxConfig
-from src.services.sandbox.stopwatch import running_stopwatch
+from src.services.sandbox.stopwatch import Miss, running_stopwatch
 from src.services.storage import get_storage, snapshot_key
+
+if TYPE_CHECKING:
+    from src.services.sandbox.pool import ClaimedMember
 
 _log = structlog.get_logger()
 
@@ -144,6 +150,39 @@ _ALREADY_RUNNING_PID: Final = 0
 # seconds is a wedged supervisor — and waiting 30s for that would stall the watcher that also
 # owns crash detection. Timing out is not a failure here: it is `UNKNOWN`, which holds.
 _COMPILE_TIMEOUT_SECONDS: Final = 5.0
+
+# A claim's health check has to stay far under the time of the create it would save, and
+# `configure` only writes an environment.
+_HEALTH_TIMEOUT_SECONDS: Final = 2.0
+_CONFIGURE_TIMEOUT_SECONDS: Final = 5.0
+
+# The supervisor's per-project rows, the only names its `/configure` accepts: anything else in a
+# start's environment was set when the pool container was made, or never belongs in one. The
+# connector's two are generated from its key; see `services/lake/env.py`.
+_PER_PROJECT_ENV_NAMES: Final = frozenset(
+    {"BIAL_APP_ID", "BIAL_BLOB_CONTAINER_URL", "BIAL_BLOB_SAS", "BIAL_DATABASE_URL"}
+)
+
+# The record `_write_registry` writes, as one script that writes nothing while the record names a
+# container. ARGV: app name, app id, fqdn, token_ref, birth, then the shared view's project and
+# owner, both empty for a build sandbox.
+_WRITE_INTO_AN_EMPTY_SLOT_LUA: Final = (
+    f"local named = redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}') "
+    "if named and named ~= '' then return 0 end "
+    f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}', ARGV[1], "
+    f"'{REGISTRY_FIELD_APP_ID}', ARGV[2], '{REGISTRY_FIELD_FQDN}', ARGV[3], "
+    f"'{REGISTRY_FIELD_TOKEN_REF}', ARGV[4], '{REGISTRY_FIELD_CREATED_AT}', ARGV[5], "
+    f"'{REGISTRY_FIELD_STATE}', '{REGISTRY_STATE_READY}', "
+    f"'{REGISTRY_FIELD_WAITING_SINCE}', ARGV[5], '{REGISTRY_FIELD_SERVING_SINCE}', '') "
+    f"redis.call('HDEL', KEYS[1], '{REGISTRY_FIELD_PREVIEW_STAY_UNTIL}', "
+    f"'{REGISTRY_FIELD_SHARED_SERVED_COUNT}') "
+    "if ARGV[6] ~= '' then "
+    f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_SHARED_PROJECT_ID}', ARGV[6], "
+    f"'{REGISTRY_FIELD_SHARED_OWNER_ID}', ARGV[7]) "
+    f"else redis.call('HDEL', KEYS[1], '{REGISTRY_FIELD_SHARED_PROJECT_ID}', "
+    f"'{REGISTRY_FIELD_SHARED_OWNER_ID}') end "
+    "return 1"
+)
 
 # Supervisor bearer token + registry token_ref sizing (secrets, never a UUID).
 _SUPERVISOR_TOKEN_BYTES: Final = 32
@@ -312,10 +351,42 @@ class SandboxNotConfiguredError(SandboxError):
     bare `SandboxError`."""
 
 
+class _ClaimFellThroughError(Exception):
+    """A step of a claim failed; `reason` is the miss the start records if no other claim works.
+    `try_another` is False when another ready container would fail the same way."""
+
+    def __init__(self, reason: Miss, *, try_another: bool = True) -> None:
+        super().__init__(reason)
+        self.reason: Miss = reason
+        self.try_another = try_another
+
+
+class _SlotTakenError(SandboxError):
+    """A conditional registry write found the person's record naming a container already."""
+
+
 async def _asleep(seconds: float) -> None:
     """Poll/backoff sleep behind one indirection so tests can record the schedule
     without real waits."""
     await asyncio.sleep(seconds)
+
+
+def _per_project_env_names() -> frozenset[str]:
+    """Every name a claimed pool container is configured with. Lazy for the reason the lake
+    import in `_provision_container` gives."""
+    from src.core.connectors import CONNECTORS
+    from src.services.lake.env import connector_env_names
+
+    return _PER_PROJECT_ENV_NAMES.union(*(connector_env_names(key) for key in CONNECTORS))
+
+
+def _identity_tags(
+    kind: Literal["build_sandbox", "shared_sandbox"], user_uuid: uuid.UUID, app_id: uuid.UUID
+) -> dict[str, str]:
+    """The ARM identity of a container born now. On the shared arm `user_uuid` is the recipient."""
+    if kind == "shared_sandbox":
+        return shared_sandbox_tags(recipient_id=user_uuid, app_id=app_id)
+    return sandbox_tags(user_id=user_uuid, app_id=app_id)
 
 
 def _public_app_url(app_name: str) -> str:
@@ -372,6 +443,8 @@ class AcaSandboxClient(SandboxClient):
         # user-keyed registry hash for a session this process created. Empty after a
         # restart — the reaper, which holds the user_id, clears the registry itself.
         self._app_owners: dict[str, uuid.UUID] = {}
+        # Pool work a claim leaves running behind the start, held so it is not collected.
+        self._detached: set[asyncio.Task[None]] = set()
 
     @property
     def _aca(self) -> AcaControlPlane:
@@ -576,6 +649,29 @@ class AcaSandboxClient(SandboxClient):
         # Map the supervisor's wire field `next` -> `DevLogs.next_cursor` (renamed only to avoid
         # shadowing the builtin); pass it back as `since` for only-new lines.
         return DevLogs(lines=[str(line) for line in data["lines"]], next_cursor=int(data["next"]))
+
+    async def health(self, handle: SandboxHandle) -> bool:
+        """Whether the supervisor holds its project's settings, bounded at two seconds; any
+        answer but a readable 200 raises `SandboxError`. A supervisor built before pool
+        containers existed does not say, and was given its settings when it was created."""
+        resp = await self._get(handle, "health", timeout=_HEALTH_TIMEOUT_SECONDS)
+        if resp.status_code != 200:
+            raise SandboxError(f"health failed with status {resp.status_code}")
+        try:
+            data: Any = resp.json()
+            return bool(data.get("configured", True))
+        except (AttributeError, ValueError) as exc:  # fmt: skip  # ruff py314 strips parens
+            raise SandboxError("health returned a malformed body") from exc
+
+    async def configure(self, handle: SandboxHandle, env: Mapping[str, str]) -> None:
+        """Give a pool container its project's settings: the per-project names in `env` and no
+        other, which the supervisor takes once. Any refusal raises `SandboxError`. The body holds
+        the database URL and the SAS, so nothing here logs or carries a value."""
+        names = _per_project_env_names()
+        body = {"env": {name: value for name, value in env.items() if name in names}}
+        resp = await self._post(handle, "configure", body, timeout=_CONFIGURE_TIMEOUT_SECONDS)
+        if resp.status_code != 200:
+            raise SandboxError(f"configure failed with status {resp.status_code}")
 
     async def wait_ready(
         self, handle: SandboxHandle, *, timeout_s: float = 120.0
@@ -864,6 +960,40 @@ class AcaSandboxClient(SandboxClient):
         # is on the record.
         _log.info(SANDBOX_REGISTRY_MARKED_PENDING_EVENT, app_name=app_name, serving_since="")
 
+    async def _write_registry_into_an_empty_slot(
+        self,
+        user_uuid: uuid.UUID,
+        *,
+        app_name: str,
+        app_id: uuid.UUID,
+        fqdn: str,
+        token_ref: str,
+        shared_project_id: uuid.UUID | None,
+        shared_owner_id: uuid.UUID | None,
+    ) -> None:
+        """`_write_registry`'s record, written only while the record names no container, in one
+        script; `_SlotTakenError` otherwise. A claim spends seconds between the provision's guard
+        and this write, and another start may have taken the slot meanwhile."""
+        born = datetime.now(UTC).isoformat()
+        written = await get_redis().eval(
+            _WRITE_INTO_AN_EMPTY_SLOT_LUA,
+            1,
+            registry_key(user_uuid),
+            app_name,
+            str(app_id),
+            fqdn,
+            token_ref,
+            born,
+            "" if shared_project_id is None else str(shared_project_id),
+            "" if shared_owner_id is None else str(shared_owner_id),
+        )
+        if not written:
+            raise _SlotTakenError("the registry already names a container")
+        # Deferred import — see the cycle note at the top of this module.
+        from src.services.build_sessions.alarms import SANDBOX_REGISTRY_MARKED_PENDING_EVENT
+
+        _log.info(SANDBOX_REGISTRY_MARKED_PENDING_EVENT, app_name=app_name, serving_since="")
+
     async def _read_registry(self, user_uuid: uuid.UUID) -> dict[str, str] | None:
         """Read the sandbox record, falling back to the legacy key and migrating what it finds.
 
@@ -1086,6 +1216,187 @@ class AcaSandboxClient(SandboxClient):
         await self._safe_teardown(app_name)
         raise SandboxError("ACA container provisioning failed") from last
 
+    # --- the pool of ready sandboxes ------------------------------------------
+
+    async def _claim_a_ready_one(
+        self,
+        user_uuid: uuid.UUID,
+        app_env: dict[str, str],
+        *,
+        app_id: uuid.UUID,
+        kind: Literal["build_sandbox", "shared_sandbox"],
+        shared_project_id: uuid.UUID | None,
+        shared_owner_id: uuid.UUID | None,
+    ) -> SandboxHandle | None:
+        """Make a ready container from the pool this start's own, or answer `None` for the start
+        to create one; the start's stopwatch records which, and why not. A claimed container that
+        fails any step is let go and the next one tried. Nothing here fails a start: the worst the
+        pool can do is leave it to create its own container, as it would with no pool at all."""
+        # Deferred: the ledger reaches `src.db`, which reaches `src.config`.
+        from src.services.sandbox import pool
+
+        stopwatch = running_stopwatch()
+        if self._config.pool_size_at(datetime.now(UTC)) == 0:
+            stopwatch.missed("size_zero", ready_count=0)
+            return None
+        try:
+            ready = await pool.ready_count()
+        except (SQLAlchemyError, OSError):  # fmt: skip  # ruff py314 strips parens
+            _log.warning("sandbox_pool_ledger_unreachable", exc_info=True)
+            stopwatch.missed("claim_failed", ready_count=None)
+            return None
+        miss: Miss = "no_ready"
+        while True:
+            try:
+                member = await pool.claim(self._config.image_ref)
+            except (SQLAlchemyError, OSError):  # fmt: skip  # ruff py314 strips parens
+                _log.warning("sandbox_pool_ledger_unreachable", exc_info=True)
+                miss = "claim_failed"
+                break
+            if member is None:
+                break
+            try:
+                handle = await self._make_it_theirs(
+                    member,
+                    user_uuid,
+                    app_env,
+                    app_id=app_id,
+                    shared_project_id=shared_project_id,
+                    shared_owner_id=shared_owner_id,
+                )
+            except BaseException as exc:
+                self._detach(self._let_it_go(member))
+                if not isinstance(exc, _ClaimFellThroughError):
+                    raise
+                _log.warning(
+                    "sandbox_pool_claim_fell_through",
+                    app_name=member.name,
+                    reason=exc.reason,
+                    tried_another=exc.try_another,
+                    exc_info=True,
+                )
+                miss = exc.reason
+                if exc.try_another:
+                    continue
+                break
+            try:
+                await pool.forget(member.id)
+            except (SQLAlchemyError, OSError):  # fmt: skip  # ruff py314 strips parens
+                # The container is this start's either way: the registry now records it.
+                _log.error(
+                    "sandbox_pool_row_outlived_its_claim", app_name=member.name, exc_info=True
+                )
+            stopwatch.took_a_ready_one(ready_count=ready)
+            stopwatch.split("created")
+            _log.info("sandbox_pool_member_claimed", app_name=member.name, ready_count=ready)
+            self._detach(
+                self._after_the_claim(member.name, _identity_tags(kind, user_uuid, app_id))
+            )
+            return handle
+        stopwatch.missed(miss, ready_count=ready)
+        return None
+
+    async def _make_it_theirs(
+        self,
+        member: ClaimedMember,
+        user_uuid: uuid.UUID,
+        app_env: dict[str, str],
+        *,
+        app_id: uuid.UUID,
+        shared_project_id: uuid.UUID | None,
+        shared_owner_id: uuid.UUID | None,
+    ) -> SandboxHandle:
+        """Take over a container just claimed: read its bearer, check it answers, hand it its
+        project's settings, then write the registry record that makes it this person's
+        workspace. A failed step raises `_ClaimFellThroughError` naming the miss; the container is
+        the caller's to let go."""
+        fqdn = member.fqdn
+        if fqdn is None:
+            raise _ClaimFellThroughError("claim_failed")
+        stopwatch = running_stopwatch()
+        with stopwatch.lap("bearer_read"):
+            token = await self._read_supervisor_token(member.name)
+        if token is None:
+            raise _ClaimFellThroughError("claim_failed")
+        handle = SandboxHandle(
+            fqdn=fqdn,
+            token=token,
+            app_name=member.name,
+            # Its base path, apps hostname and portal origin were set when it was made, from
+            # this same name.
+            preview_url=_public_app_url(member.name),
+            ready=False,
+        )
+        try:
+            await self.health(handle)
+        except SandboxError as exc:
+            raise _ClaimFellThroughError("unhealthy") from exc
+        try:
+            with stopwatch.lap("configure"):
+                await self.configure(handle, app_env)
+        except SandboxError as exc:
+            raise _ClaimFellThroughError("claim_failed") from exc
+        token_ref = self._register_token(token)
+        self._app_owners[member.name] = user_uuid
+        try:
+            with stopwatch.lap("registry_write"):
+                await self._write_registry_into_an_empty_slot(
+                    user_uuid,
+                    app_name=member.name,
+                    app_id=app_id,
+                    fqdn=fqdn,
+                    token_ref=token_ref,
+                    shared_project_id=shared_project_id,
+                    shared_owner_id=shared_owner_id,
+                )
+        except BaseException as exc:
+            self._evict_token(token)
+            self._app_owners.pop(member.name, None)
+            if isinstance(exc, _SlotTakenError):
+                raise _ClaimFellThroughError("claim_failed", try_another=False) from exc
+            if isinstance(exc, RedisError):
+                raise _ClaimFellThroughError("claim_failed") from exc
+            raise
+        return handle
+
+    async def _let_it_go(self, member: ClaimedMember) -> None:
+        """Delete a container whose claim failed, behind the start. Its row is marked retiring
+        first and goes once Azure confirms the delete; a delete Azure refuses leaves it retiring
+        for a later pass to retry."""
+        from src.services.sandbox import pool
+
+        try:
+            await pool.retire(member.id)
+        except (SQLAlchemyError, OSError):  # fmt: skip  # ruff py314 strips parens
+            _log.warning("sandbox_pool_row_not_retired", app_name=member.name, exc_info=True)
+        async with pool.pool_work_bound():
+            deleted = await self._safe_teardown(member.name)
+        if not deleted:
+            return
+        try:
+            await pool.forget(member.id)
+        except (SQLAlchemyError, OSError):  # fmt: skip  # ruff py314 strips parens
+            _log.warning("sandbox_pool_row_outlived_its_container", app_name=member.name)
+
+    async def _after_the_claim(self, name: str, tags: dict[str, str]) -> None:
+        """What a claim leaves running behind its start, through the pool's bound: the restamp
+        that gives the container its kind, owner, app and birth. A lost restamp is not repaired,
+        because the sweep reads the registry."""
+        from src.services.sandbox.pool import pool_work_bound
+
+        try:
+            async with pool_work_bound():
+                await self.stamp_tags(name=name, tags=tags)
+        except SandboxError:
+            _log.warning("sandbox_pool_claim_restamp_failed", app_name=name, exc_info=True)
+
+    def _detach(self, work: Coroutine[Any, Any, None]) -> None:
+        # A context of its own: the start's would hand this work its stopwatch and log bindings,
+        # and the work outlives the start whose record they belong to.
+        task = asyncio.create_task(work, context=contextvars.Context())
+        self._detached.add(task)
+        task.add_done_callback(self._detached.discard)
+
     async def _provision_container(
         self,
         user_uuid: uuid.UUID,
@@ -1109,7 +1420,10 @@ class AcaSandboxClient(SandboxClient):
         `SandboxClient.restore_from_snapshot`'s own docstring for why `user_uuid` means the
         RECIPIENT, not the app's owner, on the `shared_sandbox` arm. `shared_project_id`/
         `shared_owner_id` are the registry-hash half of that same distinction — see
-        `_write_registry`'s own docstring — and are only ever non-`None` on that arm."""
+        `_write_registry`'s own docstring — and are only ever non-`None` on that arm.
+
+        A ready container from the pool is taken in place of the create when one can be claimed,
+        under its own name rather than `app_name`."""
         existing = await self._read_registry(user_uuid)
         if existing is not None and existing.get(REGISTRY_FIELD_APP_NAME):
             # The new record would replace the only one naming that container, leaving it running
@@ -1118,6 +1432,21 @@ class AcaSandboxClient(SandboxClient):
                 "cannot provision: the registry still names a container nobody has taken over, "
                 "and writing over its record would orphan it"
             )
+        # The app_id comes from `app_env` for the same reason `restore_from_snapshot` reads it
+        # there: the frozen client signature carries no app_id. A `KeyError` here means the env
+        # builder upstream is broken, which is worth failing loudly on rather than provisioning an
+        # anonymous container to paper over.
+        app_id = uuid.UUID(app_env["BIAL_APP_ID"])
+        claimed = await self._claim_a_ready_one(
+            user_uuid,
+            app_env,
+            app_id=app_id,
+            kind=kind,
+            shared_project_id=shared_project_id,
+            shared_owner_id=shared_owner_id,
+        )
+        if claimed is not None:
+            return claimed
         token = secrets.token_urlsafe(_SUPERVISOR_TOKEN_BYTES)
         # The supervisor bearer lives ONLY in the container env (the supervisor keeps it out of
         # the scrubbed child env) and in-process; Redis stores a token_ref, never the token.
@@ -1134,17 +1463,8 @@ class AcaSandboxClient(SandboxClient):
             "BIAL_BASE_PATH": base_path_for(app_name),
             "BIAL_APPS_HOSTNAME": _apps_hostname(),
         }
-        # Identity resolved BEFORE the create, so a container never exists untagged. The app_id
-        # comes from `app_env` for the same reason `restore_from_snapshot` reads it there: the
-        # frozen client signature carries no app_id. A `KeyError` here means the env builder
-        # upstream is broken, which is worth failing loudly on rather than provisioning an
-        # anonymous container to paper over.
-        app_id = uuid.UUID(app_env["BIAL_APP_ID"])
-        tags = (
-            shared_sandbox_tags(recipient_id=user_uuid, app_id=app_id)
-            if kind == "shared_sandbox"
-            else sandbox_tags(user_id=user_uuid, app_id=app_id)
-        )
+        # Identity resolved BEFORE the create, so a container never exists untagged.
+        tags = _identity_tags(kind, user_uuid, app_id)
         # WHETHER THIS CONTAINER MAY READ A CONNECTOR'S DATA, read back out of the environment
         # the caller built rather than decided again here. The access question — a lake
         # configured, the connector switched on for this project — was answered once by

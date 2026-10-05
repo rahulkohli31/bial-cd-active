@@ -28,6 +28,7 @@ from src.db.models.project_connector import ProjectConnector as ProjectConnector
 from src.db.models.project_database import ProjectDatabase as ProjectDatabase
 from src.db.models.project_share import ProjectShare as ProjectShare
 from src.db.models.refresh_token import RefreshToken as RefreshToken
+from src.db.models.sandbox_pool import SandboxPoolMember as SandboxPoolMember
 from src.db.models.sandbox_start import SandboxStart as SandboxStart
 from src.db.models.token_usage import TokenUsage as TokenUsage
 from src.db.models.user import User as User

@@ -38,6 +38,7 @@ from src.db.models.sandbox_start import (
     SandboxProjectType,
     SandboxStart,
     SandboxStartKind,
+    SandboxStartMiss,
     SandboxStartOutcome,
 )
 from src.db.models.user import User
@@ -54,6 +55,7 @@ from src.services.lake.env import connector_env_names
 from src.services.orchestrator.deps import SandboxSession
 from src.services.redis.keys import REGISTRY_FIELD_SERVING_SINCE
 from src.services.sandbox import SandboxHandle
+from src.services.sandbox.base import a_fresh_sandbox_name
 from src.services.sandbox.client import _REINSTALLED_MARKER, _RESTORE_SCRIPT, AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
@@ -61,7 +63,7 @@ from src.services.turns.engine import TurnEngine, _TurnState, set_turn_engine_fo
 from src.services.turns.guard import _mid_reply
 from tests.api.v1.build_sessions.test_relaunch import RecordingAca, SupervisorScript
 from tests.factories import AppRegistryFactory, ConversationFactory, ProjectFactory, UserFactory
-from tests.fakes import FakeSandboxClient, FakeStorage, detached_work_done
+from tests.fakes import FakeSandboxClient, FakeStorage, a_ready_pool_row, detached_work_done
 
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
@@ -172,7 +174,8 @@ async def test_a_restoring_relaunch_writes_one_reopen_row_with_every_stage_fille
     assert row.id == admitted.start_id
     assert (row.kind, row.app_id, row.claimed) == (SandboxStartKind.REOPEN, app_id, False)
     assert row.project_type is SandboxProjectType.PLAIN
-    assert row.miss_reason is None
+    # The pool's sizes default to zero, so the start created its container and says why.
+    assert (row.miss_reason, row.ready_count) == (SandboxStartMiss.SIZE_ZERO, 0)
     assert row.outcome is SandboxStartOutcome.SERVED
     assert row.ended_at is not None and row.ended_at >= row.started_at
     stages = {
@@ -190,6 +193,36 @@ async def test_a_restoring_relaunch_writes_one_reopen_row_with_every_stage_fille
     assert row.browser_visible_ms is None
     assert set(row.sub_steps) == {"files", "restore_exec", "registry_write", "dev_start"}
     assert row.reinstalled is False
+
+
+async def test_a_relaunch_that_takes_a_ready_container_records_the_claim(
+    db_session: AsyncSession,
+    fake_storage: FakeStorage,
+    manager: SessionManager,
+    aca,
+    empty_sandbox_pool: None,
+) -> None:
+    """What tells a start the pool served from one it did not: it claimed, nothing was missed,
+    how many were ready, and a create stage that is the claim itself.
+
+    Mutation check: drop the claim's facts from `StartRecord.close` and every field here reads as
+    the column default."""
+    aca.client._config = _config().model_copy(update={"pool_day_size": 1, "pool_night_size": 1})
+    member = a_fresh_sandbox_name()
+    fqdn = aca.control_plane.made_for_the_pool(member)
+    await a_ready_pool_row(member, fqdn=fqdn, image_ref="acr/img:latest")
+    user, project_id = await _mk(db_session, "st-claim@rvaiglobal.com")
+    await _saved(db_session, user, project_id, fake_storage)
+
+    await manager.relaunch_preview(db_session, user, project_id, aca.client)
+    await detached_work_done(manager)
+
+    [row] = await _rows(db_session, user.id)
+    assert (row.claimed, row.miss_reason, row.ready_count) == (True, None, 1)
+    assert aca.control_plane.create_calls == []
+    assert row.create_ms is not None
+    assert {"bearer_read", "configure", "registry_write"} <= set(row.sub_steps)
+    assert row.outcome is SandboxStartOutcome.SERVED
 
 
 async def test_a_relaunch_whose_watch_runs_out_keeps_the_stages_it_reached(
