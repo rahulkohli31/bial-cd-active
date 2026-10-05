@@ -13,6 +13,7 @@ keyed by user except the cooperative stop, which is keyed by conversation:
     lease:{user_id}      string — liveness lease (epoch seconds, TTL mandatory)
     starting:{user_id}   string — start-in-flight marker (project id, TTL mandatory)
     start_failure:{user_id} string — the last failed start (JSON, TTL mandatory)
+    birth:{user_id}      hash   — the container a birth is creating, until it is recorded
     stop:{conversation_id} string — cooperative stop ask (TTL mandatory)
 
 ANOTHER DOMAIN, `bial:{environment}:lake:`, holds the connector data-plane copy — parquet
@@ -29,8 +30,8 @@ There is deliberately NO `:channel` family — single-replica means build progre
 WHY THIS EXISTS. Production shares one Redis instance with other BIAL apps, and a scheduled job
 reads this namespace as a spare-list and deletes Azure containers on the strength of it — a
 process pointed at the wrong instance must not act on another deployment's fleet. The registry
-hash is the ONE family with no TTL and the sole input to the fleet sweep and Azure inventory, so
-a moved or forgotten key permanently strands every container live at that instant. A fleet scan
+hash carries no TTL and is the sole input to the fleet sweep and Azure inventory, so a moved or
+forgotten key permanently strands every container live at that instant. A fleet scan
 issues current AND legacy as two literals, never one `bial:*:` glob, which would reach into
 another environment's fleet; a legacy match is dual-read too (`locks.read_registry`), and the
 legacy prefix stays read-only."""
@@ -70,6 +71,7 @@ FAMILY_REGISTRY: Final = "registry"
 FAMILY_LEASE: Final = "lease"
 FAMILY_STARTING: Final = "starting"
 FAMILY_START_FAILURE: Final = "start_failure"
+FAMILY_BIRTH: Final = "birth"
 FAMILY_COOPERATIVE_STOP: Final = "stop"
 
 # The two lake families. `file` holds one copied parquet file's BYTES; `index` is the single
@@ -139,6 +141,17 @@ def registry_key(user_id: uuid.UUID) -> str:
 
     THE ONLY WRITE TARGET for the registry. The legacy key below is read-only."""
     return ns(FAMILY_REGISTRY, user_id)
+
+
+def birth_marker_key(user_id: uuid.UUID) -> str:
+    """`bial:{env}:sandbox:birth:{user_id}` — the container a birth is creating, written before
+    the create and deleted once the registry records it or its self-clean is confirmed.
+
+    A create outlives a cancelled start, and its container carries a name nothing will ever create
+    again, so until the registry names it this is the only record that it may exist. NO TTL: the
+    next birth hands what it names to the shutdown routine. Its fields are the registry's own
+    (`app_name`, `app_id`, `created_at`, and a shared view's stamp)."""
+    return ns(FAMILY_BIRTH, user_id)
 
 
 def lease_key(user_id: uuid.UUID) -> str:

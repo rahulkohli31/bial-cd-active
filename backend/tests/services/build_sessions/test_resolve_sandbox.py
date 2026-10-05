@@ -21,12 +21,14 @@ from typing import Literal
 
 import pytest
 import redis.asyncio as aioredis
+import sqlalchemy as sa
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
 from src.api.v1.build_sessions.schemas import PreviewLifeState
 from src.config import settings
+from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions import pass_history
@@ -53,6 +55,7 @@ from src.services.build_sessions.manager import (
     reset_idle_checks_for_tests,
 )
 from src.services.build_sessions.pass_history import CopyAttempt
+from src.services.build_sessions.shutdown import ShutdownReason
 from src.services.redis import REGISTRY_STATE_READY
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_STATE
 from src.services.sandbox import SandboxError
@@ -60,7 +63,13 @@ from src.services.sandbox.base import DevStatus, ExecResult, SandboxHandle
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import quarantine_prefix, snapshot_key
 from tests.factories import ProjectFactory, UserFactory
-from tests.fakes import DevServerDownUntilStarted, FakeSandboxClient, FakeStorage, a_git_bundle
+from tests.fakes import (
+    DevServerDownUntilStarted,
+    FakeSandboxClient,
+    FakeStorage,
+    a_git_bundle,
+    a_manager_whose_ledger_is,
+)
 
 RECORDED = "a" * 40
 
@@ -463,10 +472,22 @@ async def test_a_restore_that_fails_still_tells_the_citizen(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The alternative is a preview that quietly shows a template beside a chat that says
-    nothing."""
+    nothing. The container it found reverted was handed over before the pull, so it is going
+    whatever the pull did: no record names it, and its debt carries no write-back.
+
+    Mutation check: owe the holder with a write-back and its tree goes over the saved copy;
+    skip the hand-over and the record still names it."""
     user, project_id = await _mk(db_session, "u2h@rvaiglobal.com")
-    manager = SessionManager()
+    manager = a_manager_whose_ledger_is(db_session)
     client, app_id = await _attached(db_session, manager, user, project_id)
+    assert client.attach_handle is not None
+    held = client.attach_handle.app_name
+    spawned: list[ShutdownReason] = []
+
+    def _record(owed: object, *, reason: ShutdownReason, **_aimed_at: object) -> None:
+        spawned.append(reason)
+
+    monkeypatch.setattr(manager_module, "shut_it_down_in_the_background", _record)
     await _seed_saved(fake_storage, app_id)
     client.exec_handler = _answers(None, commits=0, ancestry="")
 
@@ -492,6 +513,14 @@ async def test_a_restore_that_fails_still_tells_the_citizen(
     assert heard.news == [RecoveryNews.RESTORING, RecoveryNews.UNRECOVERABLE]
     assert session.restored is False
     assert session.news is RecoveryNews.UNRECOVERABLE
+    assert await read_registry(fake_redis, user.id) is None
+    owed = await db_session.execute(
+        sa.select(PendingTeardown.app_name, PendingTeardown.write_back).where(
+            PendingTeardown.user_id == user.id
+        )
+    )
+    assert [tuple(row) for row in owed.all()] == [(held, False)]
+    assert spawned == [ShutdownReason.REPLACED]
 
 
 async def test_confirmed_loss_with_nothing_to_restore_says_so_and_restores_nothing(
@@ -859,6 +888,93 @@ async def test_an_app_that_is_serving_is_left_alone(
 
     assert client.dev_started == []
     assert client.torn_down == []
+
+
+async def test_a_stopped_app_whose_container_lost_its_settings_gets_them_before_its_restart(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ A claimed pool container that Azure restarted boots without its settings and refuses the
+    start, so a tab left open would wait on an app that never comes back until the citizen sends
+    a message. The restart hands them back first, built as the turn's attach builds them.
+
+    Mutation check: drop the hand-back from the idle restart and the start is refused."""
+    monkeypatch.setattr(manager_module, "READINESS_POLL_S", 0)
+    manager, client, user, project_id = await _a_stopped_app(
+        db_session, fake_redis, fake_storage, "u4-stopped-unconfigured@rvaiglobal.com"
+    )
+    name = _sandbox_name(client)
+    client.unconfigured.add(name)
+
+    await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
+    await _settle(manager)
+
+    [(configured, env)] = client.configured_with
+    assert configured == name
+    assert client.provision_env is not None
+    assert env["BIAL_APP_ID"] == client.provision_env["BIAL_APP_ID"]
+    assert set(env) == set(client.provision_env)
+    assert client.started == [name]
+
+
+async def test_a_stopped_app_that_holds_its_settings_is_not_configured_again(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutation check: configure whatever the container reports and a delivery is recorded."""
+    monkeypatch.setattr(manager_module, "READINESS_POLL_S", 0)
+    manager, client, user, project_id = await _a_stopped_app(
+        db_session, fake_redis, fake_storage, "u4-stopped-configured@rvaiglobal.com"
+    )
+    delivered: list[str] = []
+
+    async def _deliver(handle: SandboxHandle, env: object) -> None:
+        delivered.append(handle.app_name)
+
+    monkeypatch.setattr(client, "configure", _deliver)
+
+    await manager.project_workspace_check(db_session, user, project_id, sandbox_client=client)
+    await _settle(manager)
+
+    assert delivered == []
+    assert client.started == [_sandbox_name(client)]
+
+
+async def test_a_refused_settings_delivery_is_reported_as_a_restart_that_did_not_happen(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle tab's check answers about the files whatever the container says to its settings;
+    a raise here would turn that answer into a server error.
+
+    Mutation check: let the refused delivery raise and the check does not answer."""
+    monkeypatch.setattr(manager_module, "READINESS_POLL_S", 0)
+    manager, client, user, project_id = await _a_stopped_app(
+        db_session, fake_redis, fake_storage, "u4-stopped-refused@rvaiglobal.com"
+    )
+    client.unconfigured.add(_sandbox_name(client))
+
+    async def _refuse(handle: SandboxHandle, env: object) -> None:
+        raise SandboxError("configure failed with status 409")
+
+    monkeypatch.setattr(client, "configure", _refuse)
+
+    with capture_logs() as logs:
+        state = await manager.project_workspace_check(
+            db_session, user, project_id, sandbox_client=client
+        )
+    await _settle(manager)
+
+    assert state is WorkspaceState.INTACT
+    assert client.started == []
+    stopped = [e for e in logs if e["event"] == APP_STOPPED_WHILE_IDLE_EVENT]
+    assert [e["restarted"] for e in stopped] == [False]
 
 
 async def test_a_supervisor_that_cannot_answer_restarts_nothing(

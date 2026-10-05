@@ -81,6 +81,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_STAY_WRITER,
     REGISTRY_FIELD_WAITING_SINCE,
+    birth_marker_key,
     start_failure_key,
     starting_key,
 )
@@ -1226,3 +1227,73 @@ async def delete_registry(redis: aioredis.Redis, user_uuid: uuid.UUID) -> None:
     await redis.delete(registry_key(user_uuid))
     if adopted:
         await redis.delete(legacy_registry_key(user_uuid))
+
+
+# --- the birth marker -----------------------------------------------------------------------
+
+# Written only while no marker stands, in one script: one left by an earlier birth is the only
+# thing naming its container, and overwriting it would forget that container. ARGV: app name, app
+# id, birth, then a shared view's project and owner, both empty for a build sandbox.
+_NOTE_A_BIRTH_LUA: Final = (
+    "if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end "
+    f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}', ARGV[1], "
+    f"'{REGISTRY_FIELD_APP_ID}', ARGV[2], '{REGISTRY_FIELD_CREATED_AT}', ARGV[3]) "
+    "if ARGV[4] ~= '' then "
+    f"redis.call('HSET', KEYS[1], '{REGISTRY_FIELD_SHARED_PROJECT_ID}', ARGV[4], "
+    f"'{REGISTRY_FIELD_SHARED_OWNER_ID}', ARGV[5]) end "
+    "return 1"
+)
+
+# Delete the marker only while it still names this container. A missing name compares as empty,
+# as the registry's guarded delete takes it, so a marker with no name can still be cleared.
+_CAS_FORGET_A_BIRTH_LUA: Final = (
+    f"if (redis.call('HGET', KEYS[1], '{REGISTRY_FIELD_APP_NAME}') or '') ~= ARGV[1] "
+    "then return 0 end "
+    "return redis.call('DEL', KEYS[1])"
+)
+
+
+async def note_a_birth(
+    redis: aioredis.Redis,
+    user_uuid: uuid.UUID,
+    *,
+    app_name: str,
+    app_id: uuid.UUID,
+    shared_project_id: uuid.UUID | None,
+    shared_owner_id: uuid.UUID | None,
+) -> bool:
+    """Name the container a birth is about to create, in the registry's own fields, so the next
+    birth can hand it over as it hands over a record. False, writing nothing, while an earlier
+    birth's marker still stands.
+
+    No `serving_since`, deliberately: its absence keeps the absent-proof alarm quiet for a
+    container that never reached its record and so never had the chance to serve."""
+    run_script = redis.eval  # aliased to keep the call off the JS-oriented eval guard
+    written = await run_script(
+        _NOTE_A_BIRTH_LUA,
+        1,
+        birth_marker_key(user_uuid),
+        app_name,
+        str(app_id),
+        datetime.now(UTC).isoformat(),
+        "" if shared_project_id is None else str(shared_project_id),
+        "" if shared_owner_id is None else str(shared_owner_id),
+    )
+    return bool(written)
+
+
+async def read_birth_marker(redis: aioredis.Redis, user_uuid: uuid.UUID) -> dict[str, str] | None:
+    """The container an earlier birth was creating and never saw recorded, or `None`."""
+    raw = await redis.hgetall(birth_marker_key(user_uuid))
+    return {str(k): str(v) for k, v in raw.items()} if raw else None
+
+
+async def forget_the_birth_if_it_still_names(
+    redis: aioredis.Redis, user_uuid: uuid.UUID, app_name: str
+) -> bool:
+    """Delete this user's birth marker, but only while it still names `app_name`. True when it
+    did."""
+    run_script = redis.eval  # aliased to keep the call off the JS-oriented eval guard
+    return bool(
+        await run_script(_CAS_FORGET_A_BIRTH_LUA, 1, birth_marker_key(user_uuid), app_name)
+    )

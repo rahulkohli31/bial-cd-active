@@ -540,6 +540,42 @@ async def test_a_replaced_container_whose_delete_fails_stays_owed_and_the_sweep_
     assert meta is not None and (meta.metadata or {})["head_sha"] == SAVED
 
 
+@pytest.mark.parametrize(
+    ("kind", "write_back"),
+    [(PendingTeardownKind.BUILD, False), (PendingTeardownKind.SHARED, True)],
+    ids=["replaced", "an-older-processes-shared-view"],
+)
+async def test_a_container_nothing_is_read_from_goes_on_the_first_pass_even_unreachable(
+    fake_redis: aioredis.Redis, scene: _Scene, kind: PendingTeardownKind, write_back: bool
+) -> None:
+    """★ Sparing an unreachable container protects a tree that may be the only copy. A row that
+    writes nothing back protects nothing, so its container is deleted by name on the first pass
+    rather than billing through the strikes. A shared view's row written by an older process
+    carries the flag's default, so its kind alone has to send it there.
+
+    Mutation check: reach the container before reading the row and both are spared; read the flag
+    alone and the shared view is."""
+    name = a_name_unrelated_to_its_app()
+    client = _wont_answer(name)
+    owed = await _owe(
+        scene, instance_ref=_born_at(10), app_name=name, kind=kind, write_back=write_back
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        outcome = await run_the_shutdown(
+            owed,
+            redis=fake_redis,
+            sandbox_client=client,
+            reason=ShutdownReason.REPLACED,
+            session_factory=scene.factory,
+        )
+
+    assert outcome is ShutdownOutcome.DESTROYED
+    assert client.torn_down == [name]
+    assert await _rows_for(scene) == []
+    assert SANDBOX_DESTROYED_UNREAD_EVENT not in [line["event"] for line in logs]
+
+
 # =============================================================================
 # What the routine must never touch
 # =============================================================================

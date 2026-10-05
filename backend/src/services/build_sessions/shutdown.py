@@ -471,7 +471,8 @@ async def run_the_shutdown(
 
     THE HANDLE IS BUILT ONCE, at the top, from the name alone — the write-back and the teardown
     share it. Rebuilding it lower down would reach whatever the registry names by then, which on
-    a switch is the incoming project's container."""
+    a switch is the incoming project's container. A row that writes nothing back never reaches
+    the container at all: it is deleted by name, so an unreachable one is not spared."""
     factory = session_factory if session_factory is not None else _the_default_factory()
     if not (is_a_sandbox_name(owed.app_name) or is_a_shared_sandbox_name(owed.app_name)):
         # FAIL CLOSED ON A NAME WE CANNOT VOUCH FOR — everything below hands this string to an
@@ -483,6 +484,17 @@ async def run_the_shutdown(
         )
         await _settle_the_debt(owed, factory)
         return ShutdownOutcome.NOT_THIS_INSTANCE
+
+    if owed.kind is PendingTeardownKind.SHARED or not owed.write_back:
+        # A shared view holds nothing of the recipient's to write back: what they see is a
+        # restore of somebody else's snapshot, already durable at its source, and that storage
+        # is read-never-write for them. A container a start replaced holds a dead session's tree,
+        # a failed attempt's, or one already set aside, and writing it back would put it over the
+        # saved copy. The kind is tested as well as the flag because a shared view's row written
+        # by an older process carries the flag's default.
+        if owed.conversation_id is not None:
+            await _stop_the_outgoing_turn(owed, factory, reason)
+        return await _destroy(owed, redis, sandbox_client, factory, None, reason)
 
     try:
         handle = await sandbox_client.attach_by_name(app_name=owed.app_name)
@@ -507,14 +519,6 @@ async def run_the_shutdown(
 
     if owed.conversation_id is not None:
         await _stop_the_outgoing_turn(owed, factory, reason)
-
-    if owed.kind is PendingTeardownKind.SHARED or not owed.write_back:
-        # A shared view holds nothing of the recipient's to write back: what they see is a
-        # restore of somebody else's snapshot, already durable at its source, and that storage
-        # is read-never-write for them. A container a start replaced holds a dead session's tree,
-        # a failed attempt's, or one already set aside, and writing it back would put it over the
-        # saved copy.
-        return await _destroy(owed, redis, sandbox_client, factory, handle, reason)
 
     try:
         await write_the_tree_back(sandbox_client, handle, owed.app_id)
@@ -693,8 +697,8 @@ async def _destroy(
 ) -> ShutdownOutcome:
     """Mark ending → ARM DELETE → delete registry → release lease → reap lock.
 
-    `handle` is `None` only on the unread arm, where the container never answered; the teardown
-    is keyed by name either way."""
+    `handle` is `None` where the container was never reached: a row that writes nothing back, or
+    the unread arm. The teardown is keyed by name either way."""
     if await _a_different_instance_answers(redis, owed):
         # The start path owns whatever answers to this name now. Issuing the delete would take a
         # container the citizen is looking at, so the row is dropped rather than retried — a

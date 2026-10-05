@@ -16,7 +16,6 @@ of them is a switch that still refuses the citizen who switches by typing.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from datetime import datetime
@@ -63,6 +62,7 @@ from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import (
     FakeSandboxClient,
     FakeStorage,
+    a_manager_whose_ledger_is,
     a_name_unrelated_to_its_app,
     detached_work_done,
 )
@@ -170,16 +170,6 @@ async def _serving(
     return session.app_id, session.handle.app_name
 
 
-def _a_manager_whose_ledger_is(db: AsyncSession) -> SessionManager:
-    """A manager whose own sessions are the test's, so a debt it owes is one the test can read."""
-
-    @contextlib.asynccontextmanager
-    async def _session() -> AsyncIterator[AsyncSession]:
-        yield db
-
-    return SessionManager(session_factory=lambda: _session())
-
-
 async def _owed_rows(db: AsyncSession, user_id: uuid.UUID) -> list[PendingTeardown]:
     return list(
         (await db.execute(sa.select(PendingTeardown).where(PendingTeardown.user_id == user_id)))
@@ -216,6 +206,9 @@ async def test_opening_another_project_starts_it_and_owes_the_first_one_a_teardo
     owed = await _owed_rows(db_session, user.id)
     assert [row.app_name for row in owed] == [name_a]
     assert owed[0].project_id == project_a
+    # The outgoing project's tree is its citizen's work: the routine saves it before the delete.
+    assert owed[0].write_back is True
+    assert [o.write_back for o in spawns.owed] == [True]
     assert spawns.reasons == [ShutdownReason.PROJECT_SWITCHED]
     # NOT THE START'S JOB. The outgoing container is destroyed by the routine, after its tree is
     # written back — a delete issued here would be the second party aimed at one container.
@@ -559,7 +552,7 @@ async def test_a_start_beside_a_shutdown_already_deleting_leaves_its_debt_to_it(
     Mutation check: owe the holder without asking whether it is already owed and a second routine
     is spawned on the first one's row."""
     user, project_a, project_b = await _citizen_with_two_projects(db_session, "sw14@example.com")
-    manager = _a_manager_whose_ledger_is(db_session)
+    manager = a_manager_whose_ledger_is(db_session)
     client = _with_head(FakeSandboxClient(), "3" * 40)
     app_a, name_a = await _serving(manager, db_session, user, project_a, client)
     reg = await fake_redis.hgetall(registry_key(user.id))
@@ -650,7 +643,7 @@ async def test_a_colleagues_shared_view_is_put_away_without_a_write_back(
     await fake_storage.put(snapshot_key(owner_app), b"BUNDLE")
     recipient = await UserFactory.create(db_session, email="sw11-recipient@example.com")
     own_project = await ProjectFactory.create(db_session, recipient.id)
-    manager = _a_manager_whose_ledger_is(db_session)
+    manager = a_manager_whose_ledger_is(db_session)
     client = FakeSandboxClient()
     await manager.launch_shared_preview(db_session, recipient, shared_project, client)
     [view] = client.restored

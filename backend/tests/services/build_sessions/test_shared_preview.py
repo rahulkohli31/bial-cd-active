@@ -20,8 +20,10 @@ from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
+from src.db.models.pending_teardown import PendingTeardownKind
 from src.db.models.project import Project
 from src.db.models.user import User
+from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import SharedViewStamp, lock_is_held, read_registry
 from src.services.build_sessions.manager import (
@@ -29,6 +31,7 @@ from src.services.build_sessions.manager import (
     SandboxReclaimBlockedError,
     SessionManager,
 )
+from src.services.build_sessions.shutdown import OwedTeardown, ShutdownReason
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_ID,
@@ -48,6 +51,7 @@ from tests.fakes import (
     AttachesWhatTheRecordNames,
     FakeSandboxClient,
     FakeStorage,
+    a_manager_whose_ledger_is,
     a_name_unrelated_to_its_app,
     detached_work_done,
 )
@@ -73,6 +77,19 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
             image_ref="acr/img:latest",
         ),
     )
+
+
+@pytest.fixture
+def handed_over(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, PendingTeardownKind, bool]]:
+    """Every container a start hands to the shutdown routine, recorded rather than run: what the
+    routine does with a shared view is `test_shutdown.py`'s subject."""
+    recorded: list[tuple[str, PendingTeardownKind, bool]] = []
+
+    def _record(owed: OwedTeardown, *, reason: ShutdownReason, **_aimed_at: object) -> None:
+        recorded.append((owed.app_name, owed.kind, owed.write_back))
+
+    monkeypatch.setattr(manager_module, "shut_it_down_in_the_background", _record)
+    return recorded
 
 
 async def _owner_with_saved_app(
@@ -355,11 +372,14 @@ async def test_revoke_is_a_noop_when_nothing_is_there(
 
 
 async def test_a_first_message_puts_a_live_shared_view_away_and_starts(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    handed_over: list[tuple[str, PendingTeardownKind, bool]],
 ) -> None:
     """★ A colleague's shared view in the recipient's slot never blocks their own project: it
-    holds no work of its own, so it is torn down and the recipient's workspace starts. Nothing
-    is written back, so the OWNER's saved copy is untouched."""
+    holds no work of its own, so it is handed over as a shared view, deleted with nothing written
+    back, and the recipient's workspace starts. The OWNER's saved copy is untouched."""
     owner, project, app_id = await _owner_with_saved_app(
         db_session, fake_storage, email="owner11@example.com"
     )
@@ -367,7 +387,7 @@ async def test_a_first_message_puts_a_live_shared_view_away_and_starts(
     recipient_project = await ProjectFactory.create(
         db_session, recipient.id, description="Recipient's own, different project"
     )
-    manager = SessionManager()
+    manager = a_manager_whose_ledger_is(db_session)
     viewer = FakeSandboxClient()
     await manager.launch_shared_preview(db_session, recipient, project, viewer)
 
@@ -377,13 +397,17 @@ async def test_a_first_message_puts_a_live_shared_view_away_and_starts(
     )
 
     assert session.project_id == recipient_project.id
-    assert viewer.restored[0] in build_client.torn_down
+    assert handed_over == [(viewer.restored[0], PendingTeardownKind.SHARED, False)]
+    assert build_client.torn_down == []
     assert build_client.provisioned, "the recipient's own workspace was started"
     assert await fake_storage.get(snapshot_key(app_id)) == b"BUNDLE"
 
 
 async def test_opening_their_own_app_puts_a_live_shared_view_away_and_starts(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    handed_over: list[tuple[str, PendingTeardownKind, bool]],
 ) -> None:
     """★ The same for the start control: relaunching a saved app of the recipient's own
     replaces the shared view in their slot instead of refusing."""
@@ -397,7 +421,7 @@ async def test_opening_their_own_app_puts_a_live_shared_view_away_and_starts(
     own_app_id = await resolve_app_for_project(db_session, recipient.id, recipient_project.id)
     await db_session.commit()
     await fake_storage.put(snapshot_key(own_app_id), b"OWN-BUNDLE")
-    manager = SessionManager()
+    manager = a_manager_whose_ledger_is(db_session)
     viewer = FakeSandboxClient()
     await manager.launch_shared_preview(db_session, recipient, project, viewer)
 
@@ -406,7 +430,8 @@ async def test_opening_their_own_app_puts_a_live_shared_view_away_and_starts(
     await detached_work_done(manager)
 
     assert started.app_id == own_app_id
-    assert viewer.restored[0] in client.torn_down
+    assert handed_over == [(viewer.restored[0], PendingTeardownKind.SHARED, False)]
+    assert client.torn_down == []
     assert len(client.restored) == 1
     assert await fake_storage.get(snapshot_key(app_id)) == b"BUNDLE"
 

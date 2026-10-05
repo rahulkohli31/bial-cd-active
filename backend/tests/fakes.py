@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import enum
 import secrets
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Final, Literal
@@ -731,6 +732,19 @@ async def detached_work_done(manager: SessionManager) -> None:
     page, a compensation — including whatever those spawn while being waited on."""
     while manager._tasks:
         await asyncio.gather(*list(manager._tasks), return_exceptions=True)
+
+
+def a_manager_whose_ledger_is(db: AsyncSession) -> SessionManager:
+    """A manager whose own sessions are the test's, so a debt it owes is one the test can read.
+
+    A default manager's sessions cannot see the test's uncommitted rows, so its ledger declines
+    every hand-over and the inline delete runs in its place: a test of a hand-over binds this."""
+
+    @contextlib.asynccontextmanager
+    async def _session() -> AsyncIterator[AsyncSession]:
+        yield db
+
+    return SessionManager(session_factory=lambda: _session())
 
 
 # ── Writers re-hosted from `src/`, where nothing calls them any more ──────────

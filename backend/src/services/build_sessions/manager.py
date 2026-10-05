@@ -95,9 +95,11 @@ from src.services.build_sessions.locks import (
     date_the_wait_from_the_start,
     delete_registry,
     delete_registry_if_it_still_names,
+    forget_the_birth_if_it_still_names,
     grant_stay_of_execution,
     is_a_shared_view,
     liveness_lease_is_held,
+    read_birth_marker,
     read_registry,
     read_registry_and_starting_marker,
     reap_lock,
@@ -117,6 +119,7 @@ from src.services.build_sessions.reaper import (
     is_a_shared_sandbox_name,
     reap_user,
     reconcile_user,
+    sound_the_alarm_if_the_proof_is_absent,
 )
 from src.services.build_sessions.sandbox_starts import StartRecord
 from src.services.build_sessions.shutdown import (
@@ -337,6 +340,10 @@ def _kind_of_start(
 # `async_sessionmaker`, so a test can bind it to the rolled-back session with a plain
 # context-manager factory (the real `async_sessionmaker` satisfies this by construction).
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+
+# Clears the record a holder was found through, while it still names that container: the
+# registry's, or a birth marker's.
+_Forget = Callable[[aioredis.Redis, uuid.UUID, str], Awaitable[bool]]
 
 
 class BuildSessionConflictError(Exception):
@@ -1535,11 +1542,13 @@ class SessionManager:
         user_id: uuid.UUID,
         sandbox_client: SandboxClient,
         reg: Mapping[str, str],
+        *,
+        forget: _Forget = delete_registry_if_it_still_names,
     ) -> bool:
-        """Hand the container this record names to the shutdown routine and clear the record, so a
-        new container can take the slot. False, touching nothing, when the ledger cannot take it:
-        a name this platform did not mint, a record with no birthday, or one whose app it cannot
-        name.
+        """Hand the container this record names to the shutdown routine and `forget` the record,
+        so a new container can take the slot. False, touching nothing, when the ledger cannot take
+        it: a name this platform did not mint, a record with no birthday, or one whose app it
+        cannot name.
 
         NEVER WITH A WRITE-BACK. What a start replaces holds a dead session's tree, a failed
         attempt's, or one already set aside, and writing it over the saved copy is the loss to
@@ -1562,7 +1571,10 @@ class SessionManager:
             )
             if owed is None:
                 return False
-        await delete_registry_if_it_still_names(redis, user_id, name)
+            sound_the_alarm_if_the_proof_is_absent(
+                reg, user_uuid=user_id, reason=ShutdownReason.REPLACED.value
+            )
+        await forget(redis, user_id, name)
         if owed is not None:
             shut_it_down_in_the_background(
                 owed, redis=redis, sandbox_client=sandbox_client, reason=ShutdownReason.REPLACED
@@ -1827,7 +1839,16 @@ class SessionManager:
                 verdict=verdict.state.value,
             )
         if verdict.state is WorkspaceState.INTACT:
-            await self._restart_if_stopped(user.id, app_id, handle, sandbox_client)
+
+            async def its_settings() -> dict[str, str]:
+                return {
+                    **build_app_env(app_id),
+                    **await provision_app_storage(app_id),
+                    **await provision_app_database(db, project_id),
+                    **await build_connector_env(db, user_id=user.id, project_id=project_id),
+                }
+
+            await self._restart_if_stopped(user.id, app_id, handle, sandbox_client, its_settings)
         return verdict.state
 
     async def _restart_if_stopped(
@@ -1836,11 +1857,13 @@ class SessionManager:
         app_id: uuid.UUID,
         handle: SandboxHandle,
         sandbox_client: SandboxClient,
+        its_settings: Callable[[], Awaitable[dict[str, str]]],
     ) -> None:
         """Start an INTACT app's dev server again in the container it stopped in, so the wait
         over it ends on the app. The container, its unsaved tree and the commit an approval pins
         all stay; nothing is written back. `_IDLE_CHECK_WINDOW` bounds a server that keeps dying
-        to one restart a minute, and only while a tab is asking.
+        to one restart a minute, and only while a tab is asking. A container that reports no
+        settings is given `its_settings` first, or it refuses the start.
 
         NEVER UNDER ANYTHING USING THE CONTAINER. Refused — not waited for — while this user's
         start lock is held: a start, a restore or a Discard brings its own dev server, and the
@@ -1873,6 +1896,13 @@ class SessionManager:
             # of framing the dead one.
             with suppress(RedisError):
                 await clear_serving(redis, user_id, app_name=handle.app_name)
+            try:
+                await _hand_back_its_settings(sandbox_client, handle, its_settings)
+            except SandboxError:
+                # The start below is refused in turn, and reported as not restarted.
+                _log.warning(
+                    "idle_restart_settings_refused", app_name=handle.app_name, exc_info=True
+                )
             restarted = await self._boot_the_tree_we_put_back(
                 sandbox_client, handle, user_id, arm="idle"
             )
@@ -3512,10 +3542,9 @@ class SessionManager:
                 source_key=None,
             )
         except StorageError, SandboxError, SnapshotUnavailableError:
-            # `restore_from_snapshot` fetches BEFORE it destroys anything and self-cleans on the
-            # way out, so a failure here leaves the container either untouched or gone —
-            # never half-restored. Either way the citizen has to be told, because the alternative
-            # is a preview that quietly shows a template.
+            # The holder was handed over before the pull, its tree already set aside or provably
+            # bare; reported as attached so compensation aims no second delete at it. The citizen
+            # has to be told, because the alternative is a preview that quietly shows a template.
             _log.exception("workspace restore failed after quarantine", app_id=str(app_id))
             await _say(announce, RecoveryNews.UNRECOVERABLE)
             return _ResolvedSandbox(handle, attached=True, news=RecoveryNews.UNRECOVERABLE)
@@ -3572,17 +3601,40 @@ class SessionManager:
         finds it.
 
         What is still there — a container its attach found gone, a workspace being put back, a
-        failed attempt's leftover — is handed over (`_owe_the_holder`). One the ledger cannot take
-        is deleted inline, and a refused delete fails this attempt rather than orphaning it."""
+        failed attempt's leftover — is handed over (`_owe_the_holder`), and so is a container an
+        earlier birth created and never saw recorded, which only its birth marker names. One the
+        ledger cannot take is deleted inline, and a refused delete fails this attempt rather than
+        orphaning it."""
         reg = await read_registry(redis, user_id)
-        if reg is None or await self._owe_the_holder(redis, user_id, sandbox_client, reg):
+        if reg is not None:
+            await self._let_go_of(
+                redis, user_id, sandbox_client, reg, delete_registry_if_it_still_names
+            )
+        # After the record: a marker naming the container it named finds it already owed.
+        unrecorded = await read_birth_marker(redis, user_id)
+        if unrecorded is not None:
+            await self._let_go_of(
+                redis, user_id, sandbox_client, unrecorded, forget_the_birth_if_it_still_names
+            )
+
+    async def _let_go_of(
+        self,
+        redis: aioredis.Redis,
+        user_id: uuid.UUID,
+        sandbox_client: SandboxClient,
+        record: Mapping[str, str],
+        forget: _Forget,
+    ) -> None:
+        """Hand over the container `record` names, or delete it inline when the ledger cannot
+        take it, then `forget` the record."""
+        if await self._owe_the_holder(redis, user_id, sandbox_client, record, forget=forget):
             return
-        name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+        name = record.get(REGISTRY_FIELD_APP_NAME, "")
         if is_a_sandbox_name(name) or is_a_shared_sandbox_name(name):
             await sandbox_client.teardown(handle_named(name))
         # A name this platform did not mint is somebody else's container, if anything: only its
         # record goes.
-        await delete_registry_if_it_still_names(redis, user_id, name)
+        await forget(redis, user_id, name)
 
     async def _restore_or_provision(
         self,

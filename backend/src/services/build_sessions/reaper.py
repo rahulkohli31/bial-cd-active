@@ -240,11 +240,11 @@ async def _reach_the_container(
 #
 # WHAT IT MAY NEVER DO IS DECIDE ANYTHING. A container that has not yet served is not therefore
 # reapable, and this section is structured so that it CANNOT become evidence in that judgement:
-# both entry points (`_observe_the_serving_proof` and `_sound_the_alarm_if_the_proof_is_absent`)
+# both entry points (`_observe_the_serving_proof` and `sound_the_alarm_if_the_proof_is_absent`)
 # return `None`, so there is no value for the reap decision to read; each is called only once
-# that decision is already taken — the sparing verdict, or a teardown that has succeeded; and
-# nothing here marks a registry `ending`, tears anything down, or touches a lock, a lease or a
-# heartbeat.
+# that decision is already taken — the sparing verdict, a teardown that has succeeded, or a
+# holder a start has handed over; and nothing here marks a registry `ending`, tears anything
+# down, or touches a lock, a lease or a heartbeat.
 
 
 @dataclass(frozen=True)
@@ -451,7 +451,9 @@ async def _make_the_stamp_agree(
         )
 
 
-def _sound_the_alarm_if_the_proof_is_absent(reg: dict[str, str], *, user_uuid: uuid.UUID) -> None:
+def sound_the_alarm_if_the_proof_is_absent(
+    reg: Mapping[str, str], *, user_uuid: uuid.UUID, reason: str
+) -> None:
     """A container is about to stop existing with no proof it ever served a page — say so, once.
 
     THE EMPTY SENTINEL PROVES NOTHING ON ITS OWN. A container that never served leaves it behind,
@@ -478,11 +480,7 @@ def _sound_the_alarm_if_the_proof_is_absent(reg: dict[str, str], *, user_uuid: u
         user_id=str(user_uuid),
         app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
         lifetime_ms=elapsed_ms(created, datetime.now(UTC)),
-        # `reap_idle` for every teardown on this path, and it is accurate rather than convenient:
-        # `reap_user` is reached only once the lock, the heartbeat, the liveness lease, the
-        # start-in-flight marker and any stay of execution have all lapsed or been certified
-        # dead. The other reasons in the vocabulary belong to teardowns the reaper does not do.
-        reason="reap_idle",
+        reason=reason,
     )
 
 
@@ -759,7 +757,10 @@ async def reap_user(
     # THE RECORD IS STILL IN HAND, and this is the last moment it will be: `reg` was read
     # before the mark-ending flip and the delete below is about to remove it for good. The
     # container's whole life is over, so whether it ever served anybody is now a settled fact.
-    _sound_the_alarm_if_the_proof_is_absent(reg, user_uuid=user_uuid)
+    # `reap_idle`, accurate rather than convenient: `reap_user` is reached only once the lock, the
+    # heartbeat, the liveness lease, the start-in-flight marker and any stay of execution have all
+    # lapsed or been certified dead.
+    sound_the_alarm_if_the_proof_is_absent(reg, user_uuid=user_uuid, reason="reap_idle")
     await _let_go_unless_taken(redis, user_uuid, registered_name)  # step 3: record, lease, lock
     return True
 

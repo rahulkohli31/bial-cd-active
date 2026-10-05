@@ -713,10 +713,14 @@ async def test_a_committed_but_unsaved_workspace_is_written_back_not_abandoned(
     )
 
     assert client.torn_down == []
-    owed = await db_session.scalar(
-        sa.select(PendingTeardown.app_name).where(PendingTeardown.user_id == user.id)
-    )
-    assert owed == first.handle.app_name
+    owed = (
+        await db_session.execute(
+            sa.select(PendingTeardown.app_name, PendingTeardown.write_back).where(
+                PendingTeardown.user_id == user.id
+            )
+        )
+    ).all()
+    assert [tuple(row) for row in owed] == [(first.handle.app_name, True)]
 
 
 # --- an incumbent nobody can question ----------------------

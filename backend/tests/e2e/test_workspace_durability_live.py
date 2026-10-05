@@ -21,6 +21,7 @@ import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.services.build_sessions.manager import SessionManager, app_name_for
+from src.services.build_sessions.reaper import is_a_sandbox_name
 from src.services.storage import snapshot_key
 from src.services.storage.bundle import parse_bundle_head_sha
 from tests.factories import ProjectFactory, UserFactory
@@ -63,7 +64,8 @@ async def test_a_first_turn_provisions_a_real_container(
     )
 
     assert session.handle is not None
-    assert session.handle.app_name == app_name_for(session.app_id)
+    name = session.handle.app_name
+    assert is_a_sandbox_name(name) and name != app_name_for(session.app_id)
     # The real supervisor answers on the real container.
     health = await _run(sandbox, session.handle, "echo alive")
     assert health.stdout.strip() == "alive"

@@ -48,13 +48,11 @@ export default function SharedProjectPage(): React.JSX.Element {
   const [launching, setLaunching] = useState(false)
   const [launchError, setLaunchError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
-  // FORCES THE IFRAME TO ACTUALLY RELOAD. `preview.previewUrl` is a hash of (app, recipient)
-  // — `shr_name_for` — so it is byte-identical across a teardown-and-restore: a successful
-  // Refresh writes the SAME `src` to the SAME node, React sees no prop change, and the
-  // browser never reloads. The recipient keeps looking at a document whose container
-  // underneath it has already been destroyed and rebuilt. Bumped on every successful
-  // launch/refresh and folded into the iframe's `key`, which — unlike `src` — React always
-  // treats a change to as "this is a new element", forcing a real remount.
+  // FORCES THE IFRAME TO ACTUALLY RELOAD. A Launch that finds the view already running answers
+  // with the `previewUrl` the frame already holds, so React writes the SAME `src` to the SAME
+  // node and the browser never reloads. Bumped on every successful launch/refresh and folded
+  // into the iframe's `key`, which — unlike `src` — React always treats a change to as "this is
+  // a new element", forcing a real remount.
   const [frameNonce, setFrameNonce] = useState(0)
   const frameRef = useRef<HTMLIFrameElement | null>(null)
 

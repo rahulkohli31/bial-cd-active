@@ -24,6 +24,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELDS,
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
+    birth_marker_key,
     heartbeat_key,
     key_prefix,
     lake_file_key,
@@ -62,6 +63,10 @@ def test_registry_key_format_is_byte_stable() -> None:
 
 def test_lease_key_format_is_byte_stable() -> None:
     assert lease_key(_U1) == f"bial:{_ENV}:sandbox:lease:{_U1}"
+
+
+def test_birth_marker_key_format_is_byte_stable() -> None:
+    assert birth_marker_key(_U1) == f"bial:{_ENV}:sandbox:birth:{_U1}"
 
 
 def test_key_prefix_is_the_environment_scoped_root() -> None:

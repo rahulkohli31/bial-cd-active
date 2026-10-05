@@ -9,7 +9,9 @@ already went wrong once. The owed row is the only thing that still names one.
 TWO GUARDS BIND THIS PATH AND NEITHER IS OPTIONAL, because this is where almost all of the
 deleting happens: `_owning_app_ids` names the slot each container's tree is written back to, and
 without it a sweep destroys unsaved work; `may_destroy_on_this_control_plane` keeps the unattended
-timer off every non-production control plane.
+registry pass off every non-production control plane. The owed pass runs on every control plane:
+it only carries out deletions a start or a switch on this one already decided, each guarded by
+name and instance, and off production nothing else would ever retry one.
 
 THE PER-PASS CEILING IS THE ONE GUARD THIS PATH DELIBERATELY DOES NOT TAKE. A bounded sweep that
 never finishes its list would leave the same users unreconciled on every tick.
@@ -33,21 +35,23 @@ SANDBOX_REAP_CRON: Final = "*/5 * * * *"
 
 
 def _off_duty_because() -> str | None:
-    """Why this sweep must not run, or `None` when it may."""
+    """Why neither pass may run, or `None` when the owed pass may."""
     if settings.redis is None:
         # The sweep enumerates from the registry, so with no coordination store it would report
         # a zero it has not earned rather than an answer.
         return "unconfigured"
     if settings.sandbox is None or not settings.sandbox.sweep_enabled:
         return "flag_off"
-    # This gates the SCHEDULED sweep only: `POST /v1/build-sessions/internal/reap` still runs
-    # `sweep_all` on any control plane, and reconcile-on-start still collects a developer's own
-    # stale sandbox at their next build, so an off-production deployment is not left unreaped.
+    return None
+
+
+def _the_registry_pass_may_run() -> bool:
+    """The SCHEDULED registry pass is production's alone: `POST /v1/build-sessions/internal/reap`
+    still runs `sweep_all` on any control plane, and a start still hands the holder of its own
+    slot to the shutdown routine."""
     from src.services.build_sessions.destroy import may_destroy_on_this_control_plane
 
-    if not may_destroy_on_this_control_plane(str(settings.ENVIRONMENT)):
-        return "off_production"
-    return None
+    return may_destroy_on_this_control_plane(str(settings.ENVIRONMENT))
 
 
 @broker.task(
@@ -65,20 +69,22 @@ async def reap_abandoned_sandboxes() -> None:
         _log.info("sandbox_reap_pass_disabled", reason=off_duty)
         return
 
-    from src.services.build_sessions.reaper import sweep_all
+    from src.services.build_sessions.reaper import SweepResult, sweep_all
     from src.services.build_sessions.shutdown import sweep_owed_teardowns
     from src.services.redis import get_redis
     from src.services.sandbox import SandboxNotConfiguredError, get_sandbox
 
     try:
-        # `live_users` is an in-process set and means nothing in a second process; what spares a
-        # build in flight here is the wall-clock liveness lease instead.
-        result = await sweep_all(
-            get_redis(),
-            get_sandbox(),
-            live_users=set(),
-            app_ids_by_name=await _owning_app_ids(),
-        )
+        result: SweepResult | None = None
+        if _the_registry_pass_may_run():
+            # `live_users` is an in-process set and means nothing in a second process; what
+            # spares a build in flight here is the wall-clock liveness lease instead.
+            result = await sweep_all(
+                get_redis(),
+                get_sandbox(),
+                live_users=set(),
+                app_ids_by_name=await _owning_app_ids(),
+            )
         # THE REGISTRY IS NO LONGER THE ONLY INPUT. A container the platform owes a deletion for
         # has had its registry record cleared — that is what gives the citizen their workspace
         # back — so the scan above cannot see it at all. The owed row is the only thing that
@@ -88,6 +94,16 @@ async def reap_abandoned_sandboxes() -> None:
         _log.info("sandbox_reap_pass_disabled", reason="unconfigured")
         return
 
+    if result is None:
+        # `disabled` speaks for the registry pass alone; the owed pass above ran.
+        _log.info(
+            "sandbox_reap_pass_disabled",
+            reason="off_production",
+            owed_settled=owed.settled,
+            owed_still_outstanding=owed.still_owed,
+            owed_failed=owed.failed,
+        )
+        return
     if result.failed or owed.failed:
         _log.warning(
             "sandbox_reap_pass_partial",

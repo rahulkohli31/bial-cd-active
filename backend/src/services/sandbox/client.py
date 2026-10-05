@@ -365,6 +365,15 @@ class _SlotTakenError(SandboxError):
     """A conditional registry write found the person's record naming a container already."""
 
 
+class _CreateFailedError(SandboxError):
+    """A create that failed for good. `left_standing` is True when its self-clean was refused, so
+    the container may still exist."""
+
+    def __init__(self, message: str, *, left_standing: bool) -> None:
+        super().__init__(message)
+        self.left_standing = left_standing
+
+
 async def _asleep(seconds: float) -> None:
     """Poll/backoff sleep behind one indirection so tests can record the schedule
     without real waits."""
@@ -1213,8 +1222,10 @@ class AcaSandboxClient(SandboxClient):
                 return fqdn
         # Terminal after the container may partially exist: self-clean any half-created
         # revision (idempotent) so nothing invisible-to-the-reaper leaks, then raise.
-        await self._safe_teardown(app_name)
-        raise SandboxError("ACA container provisioning failed") from last
+        cleaned = await self._safe_teardown(app_name)
+        raise _CreateFailedError(
+            "ACA container provisioning failed", left_standing=not cleaned
+        ) from last
 
     # --- the pool of ready sandboxes ------------------------------------------
 
@@ -1480,7 +1491,21 @@ class AcaSandboxClient(SandboxClient):
         from src.services.lake.env import identity_resource_id_for_env
 
         identity_resource_id = identity_resource_id_for_env(app_env)
-        fqdn = await self._create_with_retry(app_name, env, tags, identity_resource_id, arm=arm)
+        await self._note_the_birth(
+            user_uuid,
+            app_name=app_name,
+            app_id=app_id,
+            shared_project_id=shared_project_id,
+            shared_owner_id=shared_owner_id,
+        )
+        try:
+            fqdn = await self._create_with_retry(
+                app_name, env, tags, identity_resource_id, arm=arm
+            )
+        except _CreateFailedError as exc:
+            if not exc.left_standing:
+                await self._forget_the_birth(user_uuid, app_name)
+            raise
         stopwatch = running_stopwatch()
         stopwatch.split("created")
         token_ref = self._register_token(token)
@@ -1497,10 +1522,12 @@ class AcaSandboxClient(SandboxClient):
                     shared_owner_id=shared_owner_id,
                 )
         except Exception:
-            await self._safe_teardown(app_name)
+            if await self._safe_teardown(app_name):
+                await self._forget_the_birth(user_uuid, app_name)
             self._evict_token(token)
             self._app_owners.pop(app_name, None)
             raise
+        await self._forget_the_birth(user_uuid, app_name)
         return SandboxHandle(
             fqdn=fqdn,
             token=token,
@@ -1515,6 +1542,45 @@ class AcaSandboxClient(SandboxClient):
             preview_url=_public_app_url(app_name),
             ready=False,
         )
+
+    async def _note_the_birth(
+        self,
+        user_uuid: uuid.UUID,
+        *,
+        app_name: str,
+        app_id: uuid.UUID,
+        shared_project_id: uuid.UUID | None,
+        shared_owner_id: uuid.UUID | None,
+    ) -> None:
+        """Name the container in a birth marker before creating it. A create outlives a cancelled
+        start and nothing creates its name again, so until the registry records it the marker is
+        the only thing that can find it. Refuses while an earlier birth's marker stands, which the
+        start hands over first."""
+        # Deferred import — see the cycle note at the top of this module.
+        from src.services.build_sessions.locks import note_a_birth
+
+        if not await note_a_birth(
+            get_redis(),
+            user_uuid,
+            app_name=app_name,
+            app_id=app_id,
+            shared_project_id=shared_project_id,
+            shared_owner_id=shared_owner_id,
+        ):
+            raise SandboxError(
+                "cannot create: an earlier birth's container is still unaccounted for, and "
+                "writing over its marker would orphan it"
+            )
+
+    async def _forget_the_birth(self, user_uuid: uuid.UUID, app_name: str) -> None:
+        """Drop this birth's marker once its container is recorded or confirmed gone. One left
+        behind is harmless: the next birth reads it against the registry."""
+        from src.services.build_sessions.locks import forget_the_birth_if_it_still_names
+
+        try:
+            await forget_the_birth_if_it_still_names(get_redis(), user_uuid, app_name)
+        except RedisError:
+            _log.warning("sandbox_birth_marker_left_behind", app_name=app_name, exc_info=True)
 
     async def _undo_a_container_whose_next_step_died(
         self, user_uuid: uuid.UUID, handle: SandboxHandle, *, event: str, during: str
@@ -1691,7 +1757,7 @@ class AcaSandboxClient(SandboxClient):
 
     async def _restore_snapshot_into(self, handle: SandboxHandle, bundle: bytes) -> None:
         """Push an ALREADY-FETCHED bundle into the container. The fetch itself belongs to the
-        caller, above the teardown — see `restore_from_snapshot`."""
+        caller, before the container is created — see `restore_from_snapshot`."""
         result = await self._run_over_a_pushed_bundle(
             handle, bundle, _RESTORE_SCRIPT, "snapshot restore"
         )
