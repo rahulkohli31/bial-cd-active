@@ -1,5 +1,5 @@
-"""The pass that holds the pool of ready sandboxes at its size, run every minute by the worker and
-once at the backend's startup, one at a time under an advisory lock.
+"""The pass that holds the pool of ready sandboxes at its size, run every minute by the worker, one
+at a time under an advisory lock.
 
 It acts only on containers the pool's ledger holds, never on one a registry names: a claimed row
 left past its deadline loses its container only when no registry record and no owed teardown names
@@ -43,7 +43,7 @@ _log = structlog.get_logger()
 #: queued for the bound, which makes nothing once its row is gone.
 ROW_DEADLINE: Final = CREATE_CEILING + FIRST_ANSWER_CEILING + timedelta(minutes=1)
 
-#: The advisory lock every pass takes, in the worker and at the backend's startup alike.
+#: The advisory lock every pass takes.
 POOL_LOCK_KEY: Final = 0x50_4F_4F_4C_01  # "POOL" + 01
 
 POOL_PASS_EVENT: Final = "sandbox_pool_pass_completed"
@@ -78,8 +78,8 @@ async def run_pool_pass() -> None:
 
 
 async def keep_the_pool_under_the_lock(client: AcaSandboxClient) -> None:
-    """One pass now, unless another process holds the pool's lock — the second scheduler of a
-    deploy, or a backend's startup pass — in which case this one says so and stands down."""
+    """One pass now, unless another pass holds the pool's lock — the second scheduler of a deploy,
+    or the last tick's pass still filling — in which case this one says so and stands down."""
     async with single_flight_lock(POOL_LOCK_KEY) as took_the_lock:
         if not took_the_lock:
             _log.info(POOL_PASS_LOCKED_OUT_EVENT)

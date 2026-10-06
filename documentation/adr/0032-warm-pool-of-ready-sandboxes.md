@@ -105,9 +105,12 @@ is not repaired: the sweep judges from the registry.
 **Refill is in the backend, the count is held by the worker, and each process bounds its own pool
 work.** A claim starts one replacement as a detached task in the backend, beside the restamp
 above, so refill never waits for a periodic pass. A worker task every minute, under the database
-lock that stops two schedulers acting at once, brings the count to its target. It deletes the
-container of a filling or claimed row left past its deadline (longer than a create and a new
-container's first answer can take, timed from when the fill gets its turn) — though a claimed row whose container a registry record or an
+lock that stops two schedulers acting at once, brings the count to its target. That pass is the
+only periodic one: a backend runs none, even when it starts, so after a backend start the pool
+changes only through claims and their refills until the worker's next tick, at most a minute
+later. The pass deletes the container of a filling or claimed row left past its deadline (longer
+than a create and a new container's first answer can take, timed from when the fill gets its
+turn) — though a claimed row whose container a registry record or an
 owed deletion names has become somebody's workspace, and loses only its row — and retries retiring
 rows. It retires ready containers above the target, older images first. Then, unless a filling row
 was past its deadline, it fills one container at a time and stops at the first that is not made.
@@ -133,11 +136,10 @@ in one country, so the zone is a constant in the code and not a setting.
 was made from. When the configured image changes, the worker fills replacements from the new image
 first and retires an old-image ready container only when a new-image one is ready to take its
 place; until then an old one can still be claimed, so the count never dips during the swap. The
-backend also runs one pass at its own startup, under the same lock, so the swap begins with the
-new configuration rather than at the worker's next minute; it runs detached, because each fill
-takes about twenty seconds. Only unclaimed containers are swapped. The platform learns that an
-image was deployed only from the image reference changing, so each sandbox deploy sets it to the
-new immutable tag in both the backend and the worker; a moving tag would hide the deploy.
+swap begins at the worker's first pass under the new image reference. Only unclaimed containers
+are swapped. The platform learns that an image was deployed only from the image reference
+changing, so each sandbox deploy sets it to the new immutable tag in both the backend and the
+worker; a moving tag would hide the deploy.
 
 **The pool ships switched off.** Every size is zero when this lands. A connector project's app
 reads tenant data through an identity that Azure attaches when the container is created, and a

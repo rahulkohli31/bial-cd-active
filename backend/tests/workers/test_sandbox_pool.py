@@ -87,7 +87,7 @@ async def keeper() -> AsyncIterator[SimpleNamespace]:
 @pytest.fixture
 def configured(keeper: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> Any:
     """Make `keeper` this process's sandbox client, under the given sizes, as the worker task
-    and the backend's startup find it."""
+    finds it."""
 
     def configure(config: SandboxConfig) -> None:
         keeper.client._config = config
@@ -178,12 +178,6 @@ async def _its_create_finished(name: str) -> None:
         )
     assert member_id is not None
     assert await pool.mark_ready(member_id, f"{name}.pool.example")
-
-
-async def _until(condition: Callable[[], Awaitable[bool]]) -> None:
-    async with asyncio.timeout(5):
-        while not await condition():
-            await asyncio.sleep(0.01)
 
 
 def _events(logged: Sequence[Mapping[str, Any]], event: str) -> list[Mapping[str, Any]]:
@@ -461,34 +455,6 @@ async def test_two_passes_at_once_run_one_between_them(keeper, configured) -> No
     assert len(keeper.aca.filled) == 2
     assert len(_events(logged, pool_pass.POOL_PASS_LOCKED_OUT_EVENT)) == 1
     assert len(_events(logged, pool_pass.POOL_PASS_EVENT)) == 1
-
-
-async def test_a_backend_starting_on_a_new_image_swaps_the_pool_without_waiting_for_it(
-    keeper, configured
-) -> None:
-    """Startup goes on while the first replacement is still being made, and the worker's pass in
-    that same minute stands down rather than starting a second swap."""
-    from src.main import create_app, lifespan
-
-    configured(_config(day=5, night=5))
-    old = {await _row(keeper, READY, image_ref=OLD_IMAGE) for _ in range(5)}
-    keeper.aca.fills_wait_for = asyncio.Event()
-
-    async def swapped() -> bool:
-        return list((await _ledger()).values()).count((READY, IMAGE)) == 5
-
-    with capture_logs() as logged:
-        async with lifespan(create_app()):
-            await asyncio.wait_for(keeper.aca.fill_began.wait(), timeout=5)
-            assert keeper.aca.filling_now == 1, "startup waited for the swap"
-            await asyncio.wait_for(keep_the_pool_at_its_size(), timeout=5)
-            assert len(keeper.aca.filled) == 1
-            keeper.aca.fills_wait_for.set()
-            await _until(swapped)
-
-    assert len(keeper.aca.filled) == 5
-    assert len(_events(logged, pool_pass.POOL_PASS_LOCKED_OUT_EVENT)) == 1
-    assert {name for name, (state, _) in (await _ledger()).items() if state is READY} >= old
 
 
 # --- the worker task -------------------------------------------------------------------------

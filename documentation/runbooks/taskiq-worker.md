@@ -125,19 +125,20 @@ containers the pool's own ledger holds:
   supervisor answers, which can be a minute and more after Azure reports it made.
 
 It takes a database advisory lock, as the retention pass does, so the two schedulers that briefly
-coexist across a deploy never both run it; the backend runs one pass at its own startup under the
-same lock. Its creates and deletes are bounded to two at a time in this process so the worker's
-own capacity to talk to Azure is left for everything else. It never acts on a
-container a registry names, which is every sandbox a person is using, and it runs in every
-environment, not only production, because it deletes only what the ledger says is its own.
+coexist across a deploy never both run it. It is the only periodic pass over the pool: the backend
+runs none, not even when it starts, so after a backend start nothing but claims and their refills
+changes the pool until this pass's next tick, at most a minute later. Its creates and deletes are
+bounded to two at a time in this process so the worker's own capacity to talk to Azure is left for
+everything else. It never acts on a container a registry names, which is every sandbox a person is
+using, and it runs in every environment, not only production, because it deletes only what the
+ledger says is its own.
 
 **It ships at zero.** Every size defaults to zero, so a fresh deployment's pass finds a target of
 zero, has nothing to fill, retire or swap, and does nothing visible. Raising a size is a change to
 the settings of both the worker and the backend, taking effect when each process restarts, and
-the two must agree. The backend claims only while its own size for the hour is above zero, refills
-after each claim while the pool is below that size, and runs one pass at its own sizes when it
-starts; the worker fills and retires to
-its sizes every minute. A worker above zero beside a backend at zero fills containers nobody
+the two must agree. The backend claims only while its own size for the hour is above zero, and
+refills after each claim while the pool is below that size; the worker fills and retires to its
+sizes every minute. A worker above zero beside a backend at zero fills containers nobody
 claims, and a worker below the backend retires what the backend adds.
 
 **What it needs.** The worker's own identity must be allowed to create containers, which writes

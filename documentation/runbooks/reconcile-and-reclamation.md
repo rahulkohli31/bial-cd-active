@@ -43,12 +43,12 @@ applies.
 ## Blast radius
 
 Only the reap lever above and the scheduled sweep ever delete a container that somebody was using;
-everything else here only reports. The pool's own pass — every minute in the worker, and once at
-each backend start — also deletes containers, but only ones its own ledger holds, never one a
-registry record or an owed deletion names. The reporting design is deliberate, not an unfinished
-feature: a container provisioned seconds ago can still look like an orphan for a moment — its
-record moving from the pool's ledger to the registry while the report reads them, or a start whose
-ledger write failed — and that ambiguity is not something to hand an irreversible delete.
+everything else here only reports. The pool's own pass, every minute in the worker, also deletes
+containers, but only ones its own ledger holds, never one a registry record or an owed deletion
+names. The reporting design is deliberate, not an unfinished feature: a container provisioned
+seconds ago can still look like an orphan for a moment — its record moving from the pool's ledger to
+the registry while the report reads them, or a start whose ledger write failed — and that ambiguity
+is not something to hand an irreversible delete.
 
 The scheduled sweep runs two passes: first the same registry sweep the reap lever runs, then a
 retry of any container deletion the platform still owes — a container a switch or a start let go
@@ -92,10 +92,10 @@ touched. Do it when the alarm below cannot be fixed, when spend must stop at onc
 forced rollback.
 
 1. Set every pool size, day and night, to zero — in the worker first, then in the backend — and
-   restart each so the change takes effect. The worker goes first because the backend runs one pass
-   at its own sizes whenever it starts: a backend drained first would empty the pool only for a
-   worker still holding a size to fill it again. A backend that still holds a size meanwhile can
-   claim what is still ready, and the worker retires the replacement each such claim makes.
+   restart each so the change takes effect. The worker goes first because only its pass retires
+   ready sandboxes; the backend runs no pass of its own. A backend that still holds a size
+   meanwhile can claim what is still ready, and the worker retires the replacement each such claim
+   makes.
 2. Wait for the worker to retire what is ready. One pass retires everything above the size, one
    sandbox after another, each delete waiting for Azure to confirm it, so a large pool takes a few
    minutes. A delete Azure refuses leaves its row retiring, and the next pass tries it again.

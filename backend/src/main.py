@@ -9,13 +9,13 @@ save), and, on shutdown, closes the Redis pool + the sandbox client + the object
 client(s) so no aiohttp session / connection pool leaks.
 
 Nothing recurring runs here: a sweep here would run in every API replica beside the copy
-the worker already schedules. The two boot-path items, `_reconcile_interrupted_deploys` and
-`_swap_the_pool_onto_this_image`, are one-shots, not loops.
+the worker already schedules; the one boot-path item, `_reconcile_interrupted_deploys`,
+is a one-shot, not a loop.
 """
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from typing import Final
 
 import structlog
@@ -103,19 +103,6 @@ async def _reconcile_interrupted_deploys() -> None:
         _log.warning("deploy_startup_reconcile_failed", exc_info=True)
 
 
-async def _swap_the_pool_onto_this_image() -> None:
-    """One pass over the pool of ready sandboxes, so a changed sandbox image is swapped in from
-    this backend's startup rather than from the worker's next minute. It takes the lock the
-    worker's pass takes, so a worker pass in the same minute stands down. A failure is logged:
-    the backend serves without it, and the worker's next pass does the same work."""
-    from src.services.build_sessions.pool_pass import run_pool_pass
-
-    try:
-        await run_pool_pass()
-    except Exception:
-        _log.warning("sandbox_pool_startup_pass_failed", exc_info=True)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Startup: open AND probe the app-global Redis coordination pool when configured
@@ -137,15 +124,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # is the expected case during a rollout — not an edge case. Startup alone is not enough
     # (a crash-loop can run this before ARM has settled), so the scheduled pass repeats it.
     await _reconcile_interrupted_deploys()
-    # Not awaited: each fill takes about twenty seconds, and no request waits on the pool.
-    pool_pass = (
-        None if settings.sandbox is None else asyncio.create_task(_swap_the_pool_onto_this_image())
-    )
     yield
-    if pool_pass is not None:
-        pool_pass.cancel()
-        with suppress(asyncio.CancelledError):
-            await pool_pass
     # Shutdown: close every client so no aiohttp session / connection pool leaks. Each is
     # a no-op when its resource was never opened.
     from src.services.appdb import aclose_maintenance_engine

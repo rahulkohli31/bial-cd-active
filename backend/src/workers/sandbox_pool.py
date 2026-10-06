@@ -2,8 +2,8 @@
 
 Unlike the sweep it runs in every environment: it deletes only containers the pool's own ledger
 holds, never one a registry names. Each tick logs one line, at a size of zero too, so a silent
-minute means the pass is not running. It shares an advisory lock with the backend's startup pass,
-so the two schedulers of a deploy, or a backend starting in the same minute, run one pass.
+minute means the pass is not running. Each pass takes an advisory lock, so the two schedulers of
+a deploy run one pass between them.
 """
 
 from __future__ import annotations

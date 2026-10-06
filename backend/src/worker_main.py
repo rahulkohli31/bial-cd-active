@@ -8,8 +8,7 @@ rides along.
 WHAT IS ON A TIMER: the pool of ready sandboxes every minute, deploy reconciliation and the
 sandbox sweep every five minutes, the purge of old sandbox start rows hourly, and conversation
 retention daily. Everything else that sweeps is OPERATOR-INVOKED, run only when a superadmin calls
-it; `main.py`'s boot one-shots are neither — one settles a deploy before cron can run, the other
-starts one pool pass so a changed sandbox image is swapped in from startup.
+it; `main.py`'s boot one-shot is neither — it settles a deploy before cron can run.
 
 WHY THIS EXISTS instead of `taskiq worker` / `taskiq scheduler`: both were tried and both are
 broken — a `WORKER_STARTUP` handler that starts the scheduler recurses without bound
