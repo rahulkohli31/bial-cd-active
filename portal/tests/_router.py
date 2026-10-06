@@ -45,6 +45,8 @@ OTHER_SBX_KEY = "sbx-" + "99887766554433221100aabbccdd"
 # Correctly shaped and deliberately NOT given a DNS alias: this is what an expired sandbox or a
 # mistyped-but-plausible key looks like to the router.
 GHOST_KEY = "sbx-" + "deadbeefdeadbeefdeadbeefdead"
+# The stub answers for the portal's backend hop under this name too.
+BACKEND_ALIAS = f"backend.{APPS_DOMAIN}"
 
 
 def docker_available() -> bool:
@@ -117,6 +119,9 @@ class Router:
             # getheaders() collapses repeats; keep every Set-Cookie for the "exactly one" test.
             cookies = resp.headers.get_all("Set-Cookie") or []
             got["__set_cookie_count"] = str(len(cookies))
+            # And every other header's count, for the "each security header exactly once" tests.
+            for name in {k.lower() for k, _ in resp.getheaders()}:
+                got[f"__count:{name}"] = str(len(resp.headers.get_all(name) or []))
             return resp.status, got, payload
         finally:
             conn.close()

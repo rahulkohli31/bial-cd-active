@@ -15,6 +15,7 @@ import pytest
 from _router import (
     APPS_DOMAIN,
     APPS_HOSTNAME,
+    BACKEND_ALIAS,
     OTHER_SBX_KEY,
     PORTAL_ORIGIN,
     PUB_KEY,
@@ -60,6 +61,7 @@ def stub_apps(images: None, docker_network: str) -> Iterator[None]:
     args = ["docker", "run", "-d", "--name", name, "--network", docker_network]
     for key in (SBX_KEY, PUB_KEY, OTHER_SBX_KEY, SHR_KEY):
         args += ["--network-alias", f"{key}.{APPS_DOMAIN}"]
+    args += ["--network-alias", BACKEND_ALIAS]
     args += [STUB_IMAGE]
     proc = _run(args, timeout=120)
     if proc.returncode != 0:
@@ -97,6 +99,18 @@ def _wait_for_tls(network: str, host: str, timeout: float = 45.0) -> None:
 
 @pytest.fixture(scope="session")
 def router(stub_apps: None, docker_network: str) -> Iterator[Router]:
+    # No backend answers here, deliberately: the body-ceiling test reads the unreachable upstream.
+    yield from _start_router(docker_network, "http://backend-not-used:8000")
+
+
+@pytest.fixture(scope="session")
+def router_with_backend(stub_apps: None, docker_network: str) -> Iterator[Router]:
+    """The same router with its backend hop answered by the stub, which sends the four security
+    headers the real backend sets, so the edge's single ownership of them can be observed."""
+    yield from _start_router(docker_network, f"https://{BACKEND_ALIAS}")
+
+
+def _start_router(docker_network: str, backend_url: str) -> Iterator[Router]:
     port = _free_port()
     name = f"router-{uuid.uuid4().hex[:8]}"
     proc = _run(
@@ -115,7 +129,7 @@ def router(stub_apps: None, docker_network: str) -> Iterator[Router]:
             "-e",
             "DNS_RESOLVER=127.0.0.11",
             "-e",
-            "BACKEND_URL=http://backend-not-used:8000",
+            f"BACKEND_URL={backend_url}",
             "-e",
             f"APPS_DOMAIN={APPS_DOMAIN}",
             "-e",

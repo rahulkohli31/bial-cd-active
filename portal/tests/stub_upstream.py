@@ -126,8 +126,18 @@ def _handle(conn: ssl.SSLSocket) -> None:
             f"|REF={headers.get('referer', '')}|CK={headers.get('cookie', '')}"
             f"|XFH={headers.get('x-forwarded-host', '')}\n"
         ).encode()
+        # As the backend (the portal rewrites `/api` to `/v1`), the four security headers the real
+        # one sets; as an app, the two headers that fingerprint its server.
+        extra = (
+            "X-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\n"
+            "Referrer-Policy: no-referrer\r\n"
+            "Strict-Transport-Security: max-age=63072000; includeSubDomains\r\n"
+            if target.startswith("/v1/")
+            else "Via: 1.1 Caddy\r\nX-Powered-By: Next.js\r\n"
+        )
         conn.sendall(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+            + extra.encode()
             + f"Content-Length: {len(body)}\r\n\r\n".encode()
             + body
         )

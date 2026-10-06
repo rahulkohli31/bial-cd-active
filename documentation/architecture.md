@@ -216,6 +216,14 @@ The control plane is also unreachable on the generated application's own origin.
 path that serves applications forwards to the API, so an application cannot call the platform's
 own endpoints by convenience of being nearby.
 
+**The edge sends a page's security headers once, and a preview's development surface not at
+all.** The portal edge owns the browser-facing security headers: what the control plane sets
+behind it is replaced rather than repeated. The interface's own document carries a full content
+policy; everything else keeps the framing rules alone, because the sign-in page brings a stricter
+policy of its own and a browser enforces both together. A preview runs a development server, so
+the applications edge refuses the framework's source maps and its development endpoints before
+they reach one.
+
 **A generated application cannot spend the person's request budget.** Every signed-in person has a
 ceiling on how many API requests they can make in a minute. Requests the browser marks as coming
 from an application's page count apart from the portal's own, so an application someone merely
