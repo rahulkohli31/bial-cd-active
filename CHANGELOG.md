@@ -24,13 +24,6 @@ How the build agent works and debugs an application is unchanged.
   keeps the image it was published with, and restarting it reuses that image.
 - **If the pool of ready sandboxes is live, its sandboxes keep the previous Next.js** until they are
   replaced.
-- **Rotate any credential the removed admin endpoints handed out,** including the development
-  application's database password the assessment revealed. There is no in-app path for this; it is
-  an operator step.
-- **Ask BIAL infrastructure for a rate rule at the gateway on everything under `/api/v1/auth/`
-  and on `/api/health`.** The application's own ceiling leaves them out, so a person can always
-  sign in, sign out and be told who they are, and it cannot key a request without a session: every
-  BIAL user reaches it from one address.
 - **After deploying, check one portal page and one API response:** each security header should
   appear once. A gateway that adds its own copies would bring the duplicates back.
 
