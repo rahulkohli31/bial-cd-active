@@ -105,9 +105,8 @@ async def api_ceiling(request: Request) -> None:
     """Refuse a signed-in user's request over the per-minute ceiling with a 429.
 
     Verifies the session's signature without a database read. A request with no valid session
-    is not counted: the routes that serve one are sign-in and health, and there is no safe key
-    for them here — every BIAL user shares one egress address and the forwarded one is the
-    client's to choose."""
+    is not counted: there is no safe key for it — every BIAL user shares one egress address and
+    the forwarded one is the client's to choose."""
     claims = _session_claims(request)
     if claims is None:
         return

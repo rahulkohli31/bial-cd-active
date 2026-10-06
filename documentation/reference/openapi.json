@@ -8440,16 +8440,6 @@
             },
             "description": "Account suspended"
           },
-          "429": {
-            "content": {
-              "text/html": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Too many requests from this user"
-          },
           "500": {
             "content": {
               "text/html": {
@@ -8509,16 +8499,6 @@
             },
             "description": "Validation Error"
           },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Too many requests from this user"
-          },
           "500": {
             "content": {
               "application/json": {
@@ -8557,16 +8537,6 @@
               }
             },
             "description": "Account suspended"
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -8608,16 +8578,6 @@
               }
             },
             "description": "CSRF check failed"
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -8670,16 +8630,6 @@
             },
             "description": "Account suspended"
           },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Too many requests from this user"
-          },
           "500": {
             "content": {
               "application/json": {
@@ -8730,16 +8680,6 @@
               }
             },
             "description": "CSRF check failed"
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -11633,16 +11573,6 @@
               }
             },
             "description": "Account suspended"
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Too many requests from this user"
           },
           "500": {
             "content": {

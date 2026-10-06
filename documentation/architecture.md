@@ -225,9 +225,10 @@ the applications edge refuses the framework's source maps and its development en
 they reach one.
 
 **A generated application cannot spend the person's request budget.** Every signed-in person has a
-ceiling on how many API requests they can make in a minute. Requests the browser marks as coming
-from an application's page count apart from the portal's own, so an application someone merely
-opens cannot lock them out of the portal.
+ceiling on how many API requests they can make over a short window. Requests the browser marks as
+coming from an application's page count apart from the portal's own, so an application someone
+merely opens cannot lock them out of the portal; signing in and out, and the portal asking who is
+signed in, are never refused by it.
 
 **The control plane reads the organisation's directory, and only as its own identity.** Sharing
 looks people up there, so an owner can share with a colleague who has never signed in. The call

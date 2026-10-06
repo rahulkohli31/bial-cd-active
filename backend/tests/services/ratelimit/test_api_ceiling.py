@@ -1,4 +1,4 @@
-"""One ceiling across the whole API, per signed-in user.
+"""One ceiling across the API, per signed-in user.
 
 The production ceiling is far above any test's request count, so each test swaps in a tiny
 limiter with an injectable clock. The decision under test is WHO is counted and in WHICH
@@ -20,6 +20,7 @@ from src.services.ratelimit import InProcessRateLimiter
 from tests.factories import UserFactory
 
 _LIMIT = 3
+_PROBE = "/v1/projects/counts"
 
 
 class _Clock:
@@ -54,10 +55,10 @@ async def test_the_portal_bucket_refuses_the_request_over_the_ceiling(
 ) -> None:
     me = await _session(db_session)
     for _ in range(_LIMIT):
-        allowed = await client.get("/v1/auth/me", headers=_from("same-origin", me))
+        allowed = await client.get(_PROBE, headers=_from("same-origin", me))
         assert allowed.status_code == 200
 
-    refused = await client.get("/v1/auth/me", headers=_from("same-origin", me))
+    refused = await client.get(_PROBE, headers=_from("same-origin", me))
 
     assert refused.status_code == 429
     assert refused.json()["error"]["message"]
@@ -68,11 +69,11 @@ async def test_a_generated_apps_traffic_cannot_spend_the_portals_budget(
 ) -> None:
     me = await _session(db_session)
     for _ in range(_LIMIT):
-        await client.get("/v1/auth/me", headers=_from("same-site", me))
-    assert (await client.get("/v1/auth/me", headers=_from("same-site", me))).status_code == 429
-    assert (await client.get("/v1/auth/me", headers=_from("cross-site", me))).status_code == 429
+        await client.get(_PROBE, headers=_from("same-site", me))
+    assert (await client.get(_PROBE, headers=_from("same-site", me))).status_code == 429
+    assert (await client.get(_PROBE, headers=_from("cross-site", me))).status_code == 429
 
-    assert (await client.get("/v1/auth/me", headers=_from("same-origin", me))).status_code == 200
+    assert (await client.get(_PROBE, headers=_from("same-origin", me))).status_code == 200
 
 
 async def test_a_request_without_fetch_metadata_counts_as_the_portal(
@@ -80,9 +81,9 @@ async def test_a_request_without_fetch_metadata_counts_as_the_portal(
 ) -> None:
     me = await _session(db_session)
     for _ in range(_LIMIT):
-        await client.get("/v1/auth/me", headers=_from(None, me))
+        await client.get(_PROBE, headers=_from(None, me))
 
-    assert (await client.get("/v1/auth/me", headers=_from("same-origin", me))).status_code == 429
+    assert (await client.get(_PROBE, headers=_from("same-origin", me))).status_code == 429
 
 
 async def test_one_users_ceiling_is_not_anothers(
@@ -90,9 +91,9 @@ async def test_one_users_ceiling_is_not_anothers(
 ) -> None:
     me, colleague = await _session(db_session), await _session(db_session)
     for _ in range(_LIMIT + 1):
-        await client.get("/v1/auth/me", headers=me)
+        await client.get(_PROBE, headers=me)
 
-    assert (await client.get("/v1/auth/me", headers=colleague)).status_code == 200
+    assert (await client.get(_PROBE, headers=colleague)).status_code == 200
 
 
 async def test_the_window_rolls_over(
@@ -100,11 +101,11 @@ async def test_the_window_rolls_over(
 ) -> None:
     me = await _session(db_session)
     for _ in range(_LIMIT + 1):
-        await client.get("/v1/auth/me", headers=me)
+        await client.get(_PROBE, headers=me)
 
     clock.now += 60
 
-    assert (await client.get("/v1/auth/me", headers=me)).status_code == 200
+    assert (await client.get(_PROBE, headers=me)).status_code == 200
 
 
 @pytest.mark.parametrize(
@@ -120,7 +121,7 @@ async def test_the_window_rolls_over(
 async def test_a_request_without_a_valid_session_is_never_counted(
     client: AsyncClient, clock: _Clock, cookie: dict[str, str]
 ) -> None:
-    statuses = {(await client.get("/v1/auth/me", headers=cookie)).status_code for _ in range(5)}
+    statuses = {(await client.get(_PROBE, headers=cookie)).status_code for _ in range(5)}
 
     assert statuses == {401}
 
@@ -132,6 +133,20 @@ async def test_the_ceiling_runs_before_the_route_does(
     admin route, not that route's own 403."""
     me = await _session(db_session)
     for _ in range(_LIMIT):
-        await client.get("/v1/auth/me", headers=me)
+        await client.get(_PROBE, headers=me)
 
     assert (await client.get("/v1/admin/apps", headers=me)).status_code == 429
+
+
+@pytest.mark.parametrize("path", ["/v1/auth/me", "/v1/health"])
+async def test_the_sessions_own_routes_stay_outside_the_ceiling(
+    client: AsyncClient, db_session: AsyncSession, clock: _Clock, path: str
+) -> None:
+    """A refused who-am-I reads as signed out in the portal, so a person over the ceiling must
+    still be told who they are."""
+    me = await _session(db_session)
+    for _ in range(_LIMIT):
+        await client.get(_PROBE, headers=me)
+    assert (await client.get(_PROBE, headers=me)).status_code == 429
+
+    assert (await client.get(path, headers=me)).status_code == 200

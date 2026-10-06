@@ -43,37 +43,40 @@ from src.schemas import AUTH_403_SUSPENDED, DetailBody, ErrorEnvelope, error_res
 # Cross-cutting error codes are documented ONCE here as v1-router-level defaults:
 # the unhandled-exception 500 (`{"detail": "Internal server error"}`,
 # `unhandled_exception_handler`) so every v1 route clears SonarQube S8415 without a
-# per-route declaration, the suspension 403 `current_user` raises on every
-# authenticated route (deps.py), and the 429 of `api_ceiling`, the one dependency every v1
-# route runs. FastAPI merges `{**router.responses, **route.responses}`, so a route with its
-# own declaration — admin's superadmin 403 — overrides these defaults. The handlers
-# themselves (`core/errors.py`) are registered app-wide from `main.py`, not here.
+# per-route declaration, and the suspension 403 `current_user` raises on every
+# authenticated route (deps.py). FastAPI merges `{**router.responses,
+# **route.responses}`, so a route with its own declaration — admin's superadmin 403 —
+# overrides these defaults. This is DOCUMENTATION only: the handlers themselves
+# (`core/errors.py`) are registered app-wide from `main.py`, not here.
 v1_router = APIRouter(
     prefix="/v1",
-    dependencies=[Depends(api_ceiling)],
-    responses=error_responses(
-        AUTH_403_SUSPENDED,
-        (429, ErrorEnvelope, "Too many requests from this user"),
-        (500, DetailBody, "Internal server error"),
-    ),
+    responses=error_responses(AUTH_403_SUSPENDED, (500, DetailBody, "Internal server error")),
 )
+# Outside the request ceiling: a person over it must still be able to sign in, sign out and be
+# told who they are, and the portal reads a refused who-am-I as signed out.
 v1_router.include_router(health_router)
 v1_router.include_router(auth_router)
-v1_router.include_router(usage_router)
-v1_router.include_router(feedback_router)
-v1_router.include_router(observations_router)
-v1_router.include_router(projects_router)
-v1_router.include_router(marketplace_router)
-v1_router.include_router(deploy_router)
-v1_router.include_router(classification_router)
-v1_router.include_router(conversations_router)
-v1_router.include_router(turns_router)
-v1_router.include_router(transition_router)
-v1_router.include_router(attachments_router)
-v1_router.include_router(connectors_router)
-v1_router.include_router(apps_router)
-v1_router.include_router(build_sessions_router)
-v1_router.include_router(admin_router)
-v1_router.include_router(admin_users_router)
-v1_router.include_router(admin_classification_router)
-v1_router.include_router(deploy_admin_router)
+
+_ceilinged = APIRouter(
+    dependencies=[Depends(api_ceiling)],
+    responses=error_responses((429, ErrorEnvelope, "Too many requests from this user")),
+)
+_ceilinged.include_router(usage_router)
+_ceilinged.include_router(feedback_router)
+_ceilinged.include_router(observations_router)
+_ceilinged.include_router(projects_router)
+_ceilinged.include_router(marketplace_router)
+_ceilinged.include_router(deploy_router)
+_ceilinged.include_router(classification_router)
+_ceilinged.include_router(conversations_router)
+_ceilinged.include_router(turns_router)
+_ceilinged.include_router(transition_router)
+_ceilinged.include_router(attachments_router)
+_ceilinged.include_router(connectors_router)
+_ceilinged.include_router(apps_router)
+_ceilinged.include_router(build_sessions_router)
+_ceilinged.include_router(admin_router)
+_ceilinged.include_router(admin_users_router)
+_ceilinged.include_router(admin_classification_router)
+_ceilinged.include_router(deploy_admin_router)
+v1_router.include_router(_ceilinged)
