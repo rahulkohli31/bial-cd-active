@@ -272,3 +272,19 @@ test.describe('duplicate check before create (#191 slice 4)', () => {
     await expect(page).toHaveURL(/\/projects\/[0-9a-f-]{36}/)
   })
 })
+
+// The search box's value is read back from the URL. jsdom cannot show this: act() flushes every
+// update before an assertion, so only a real browser sees a deferred URL update revert the input.
+test('the search box keeps every key and the caret on a mid-string edit', async ({ page }) => {
+  await page.goto('/projects')
+  const search = page.getByLabel('Search applications')
+  await search.click()
+  await page.keyboard.type('abcdefgh')
+  await expect(search).toHaveValue('abcdefgh')
+
+  await search.evaluate((el: HTMLInputElement) => el.setSelectionRange(3, 3))
+  await page.keyboard.type('XY')
+
+  await expect(search).toHaveValue('abcXYdefgh')
+  await expect(page).toHaveURL(/[?&]q=abcXYdefgh/)
+})

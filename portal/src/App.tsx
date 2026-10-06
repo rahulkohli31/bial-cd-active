@@ -116,7 +116,9 @@ function Shell({ children }: { children: ReactNode }) {
 
 export default function App() {
   return (
-    <BrowserRouter basename={import.meta.env.BASE_URL}>
+    // Synchronous URL updates: three search boxes take their value from the URL, and a
+    // controlled input cannot be driven from a transition without losing the caret and keys.
+    <BrowserRouter basename={import.meta.env.BASE_URL} useTransitions={false}>
       <Routes>
         <Route path="/" element={<Navigate to="/login" replace />} />
         <Route path="/login" element={<LoginPage />} />

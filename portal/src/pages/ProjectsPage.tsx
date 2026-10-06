@@ -365,7 +365,9 @@ export default function ProjectsPage(): React.JSX.Element {
     if (!loading && totalPages > 0 && page > totalPages) commit({ page: totalPages }, 'replace')
   }, [loading, page, totalPages, commit])
 
-  const openProject = (id: string): void => navigate(`/projects/${id}`)
+  const openProject = (id: string): void => {
+    void navigate(`/projects/${id}`)
+  }
 
   const handleCreated = (project: Project): void => {
     setShowCreate(false)

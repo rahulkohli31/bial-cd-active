@@ -36,8 +36,9 @@ export default defineConfig({
     // default and costs nothing: the SPA is same-origin with vite at :5173, so nothing here
     // actually preflights.
     cors: false,
-    // Dev parity for the portal's document CSP (prod sets this via nginx envsubst); only
-    // framing is constrained, so HMR, the module graph, and the API proxy are untouched.
+    // The framing half of the portal's CSP (prod sets it via nginx envsubst). Dev stops there:
+    // prod's document policy also sets `script-src 'self'`, which would refuse the React
+    // plugin's inline preamble, so a CSP block of the page shows only against the container.
     //
     // THE FOURTH COPY OF THE FRAMING POLICY — and the one nginx does NOT emit. No envsubst
     // variable means it silently drifts if the apps hostname ever moves: a stale value fails

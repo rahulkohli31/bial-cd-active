@@ -113,10 +113,11 @@ from a cryptographically secure token generator, is stored encrypted at rest und
 no-default fleet-wide key, and is injected into the sandbox as a single server-side-only
 environment variable — never baked into the built image, never published to the browser.
 Redaction covers the connection string whole and its embedded password separately, since a log
-line printing only the password would sail past a redactor watching for the whole string. There is
-deliberately no reset lever on the credential-reveal endpoint: one role serves both the sandbox
-and the deployed app, so resetting it would sever a live deployment mid-flight; leak response is a
-manual, documented procedure instead.
+line printing only the password would sail past a redactor watching for the whole string. No
+person is ever handed the credential: publishing injects it into the deployed app the same way.
+There is deliberately no in-app reset: one role serves both the sandbox and the deployed app, so
+resetting it would sever a live deployment mid-flight; leak response is a manual, documented
+procedure instead.
 
 **No connection pooler in the app path, and a stated connection budget.** App connections go
 directly to the server's standard port. A pooler pools by `(user, database)`, so a server-side
@@ -161,8 +162,8 @@ size is surfaced beside this as an explicitly advisory number nothing reads as a
 **Audit.** Every gated action is audited by role and database name, counts and timestamps — never
 the credential. Provisioning is not audited, deliberately: it runs on paths with no human actor to
 attribute it to, and a row whose actor is a guess is worse than a structured log line. The
-one-time credential reveal the deployment runbook uses returns the connection string in its
-response body only — never logged, never audited, never listed.
+connection string itself is never logged, never audited, never listed and never returned by any
+endpoint.
 
 ## Rejected alternatives
 
@@ -217,5 +218,5 @@ ADR-0004 (control-plane user scoping — the other isolation boundary, unchanged
 audit vocabulary this follows), ADR-0006 (the token generator and UUIDv7 keys this uses), ADR-0008
 (native enums, now an app's own concern inside its own schema), ADR-0013 (the control plane's own
 database access, which this runs beside rather than through), ADR-0014 (the sandbox this
-credential is injected into), ADR-0015 (deployment — the runbook consuming the credential reveal),
+credential is injected into), ADR-0015 (deployment — the publish path that injects the credential),
 ADR-0018 (the build-agent model that made a platform-owned migration runner impossible).

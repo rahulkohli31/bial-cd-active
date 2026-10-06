@@ -209,9 +209,7 @@ def test_the_framed_404_offers_no_link_out_of_the_frame(router: Router, dest: st
 
     Asserted as the ABSENCE OF A LINK plus the PRESENCE OF A BODY: the absence alone would pass on
     an empty response, which is the false-green this repo has shipped before."""
-    status, headers, body = router.request(
-        f"/a/{GHOST_KEY}/", headers={"Sec-Fetch-Dest": dest}
-    )
+    status, headers, body = router.request(f"/a/{GHOST_KEY}/", headers={"Sec-Fetch-Dest": dest})
     assert status == 404
     assert headers["content-type"].startswith("text/html")
     # Liveness: there IS a page, and it speaks to the citizen who built the app.
@@ -691,3 +689,108 @@ def test_a_dead_apps_404_does_not_plant_a_routing_cookie(router: Router) -> None
     assert status == 404
     assert headers["__set_cookie_count"] == "0"
     assert "set-cookie" not in headers
+
+
+# --------------------------------------------------------------------------------------
+# what the edge discloses, and what it never serves
+# --------------------------------------------------------------------------------------
+
+_EDGE_VALUES = {
+    "x-frame-options": "SAMEORIGIN",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "strict-origin-when-cross-origin",
+    "strict-transport-security": "max-age=63072000; includeSubDomains",
+}
+
+
+@pytest.mark.parametrize("target", ["/api/projects", "/api/v1/auth/callback"])
+def test_a_proxied_response_carries_each_security_header_once_with_the_edges_value(
+    router_with_backend: Router, target: str
+) -> None:
+    """The stub backend sends its own copy of all four. One must reach the browser."""
+    status, headers, body = router_with_backend.request(target, host="portal.bial.test")
+    assert status == 200
+    assert "REQ=" in body
+    for name, value in _EDGE_VALUES.items():
+        assert headers[f"__count:{name}"] == "1", name
+        assert headers[name] == value
+
+
+@pytest.mark.parametrize(
+    ("target", "document"),
+    [("/", True), ("/index.html", True), ("/projects/123", True), ("/assets/app.js", False)],
+)
+def test_every_portal_page_carries_hsts_and_only_the_document_the_full_policy(
+    router: Router, target: str, document: bool
+) -> None:
+    """Every SPA route reaches `= /index.html` by internal redirect, so it gets the document's
+    policy; an asset keeps the framing one."""
+    status, headers, _ = router.request(target, host="portal.bial.test")
+    assert status == 200
+    assert headers["strict-transport-security"] == _EDGE_VALUES["strict-transport-security"]
+    assert ("default-src 'self'" in headers["content-security-policy"]) is document
+
+
+def test_the_sign_in_callback_keeps_the_framing_policy(router_with_backend: Router) -> None:
+    """The callback brings its own nonce policy, and a script-src from the edge would block it."""
+    _, headers, _ = router_with_backend.request("/api/v1/auth/callback", host="portal.bial.test")
+    assert "script-src" not in headers["content-security-policy"]
+
+
+@pytest.mark.parametrize("host", ["portal.bial.test", APPS_HOSTNAME])
+def test_neither_site_names_its_version(router: Router, host: str) -> None:
+    _, headers, _ = router.request("/", host=host)
+    assert headers["server"] == "nginx"
+
+
+def test_an_app_response_does_not_name_the_software_behind_it(router: Router) -> None:
+    status, headers, body = router.request(f"/a/{SBX_KEY}/")
+    assert status == 200
+    assert "REQ=" in body
+    assert "via" not in headers
+    assert "x-powered-by" not in headers
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        f"/a/{SBX_KEY}/_next/static/chunks/main.js.map",
+        f"/a/{PUB_KEY}/_next/static/chunks/main.js.map",
+        f"/a/{SBX_KEY}/__nextjs_source-map?filename=x",
+        f"/a/{SHR_KEY}/__nextjs_restart_dev",
+        f"/a/{SBX_KEY}/_next/mcp",
+        f"/a/{PUB_KEY}/_next/development/request-insights",
+    ],
+)
+def test_next_source_and_dev_endpoints_never_reach_an_app(router: Router, target: str) -> None:
+    status, _, body = router.request(target)
+    assert status == 404
+    assert "REQ=" not in body
+
+
+@pytest.mark.parametrize("target", ["/__nextjs_original-stack-frames", "/_next/mcp"])
+def test_a_root_relative_dev_endpoint_never_reaches_an_app_either(
+    router: Router, target: str
+) -> None:
+    """Next's dev client asks for some of these with no key in the path; the keyless arm would
+    otherwise resolve the app from the Referer and forward it."""
+    referer = {"Referer": f"https://{APPS_HOSTNAME}/a/{SBX_KEY}/"}
+    status, _, body = router.request(
+        target,
+        method="POST",
+        headers={**referer, "Content-Type": "application/json"},
+        body=b"{}",
+    )
+    assert status == 404
+    assert "REQ=" not in body
+
+    status, _, body = router.request("/api/items", headers=referer)
+    assert status == 200
+    assert _target(body) == f"/a/{SBX_KEY}/api/items"
+
+
+@pytest.mark.parametrize("route", ["data/route.map", "data/__nextjs_notes", "docs/_next/x.map"])
+def test_an_apps_own_routes_below_its_root_still_reach_it(router: Router, route: str) -> None:
+    status, _, body = router.request(f"/a/{PUB_KEY}/{route}")
+    assert status == 200
+    assert _target(body) == f"/a/{PUB_KEY}/{route}"

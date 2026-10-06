@@ -6,7 +6,7 @@
  * runtime lives at the SURFACE, not here, so the composer can share it via `useAui()`.
  *
  * `MessageContent` is RE-HOSTED, not replaced: it holds four guarantees —
- * `disallowedElements` (this repo's only `img-src` protection), the CSV-injection
+ * `disallowedElements` (no model-written `<img>` ever renders), the CSV-injection
  * control, `remark-breaks`, and the `mode="static"` guard — that
  * `@assistant-ui/react-markdown` lacks; its 21-case parity checklist must pass first.
  */

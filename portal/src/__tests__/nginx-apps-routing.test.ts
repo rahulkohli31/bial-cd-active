@@ -116,6 +116,13 @@ function directiveValue(body: string, name: string): string | null {
 const SERVERS = blocksOf(CODE, /^server[ \t]*\{/m)
 const PORTAL = SERVERS[0]!
 const APPS = SERVERS[1]!
+const PORTAL_LOCATIONS = blocksOf(PORTAL.body, LOCATION)
+const APPS_LOCATIONS = blocksOf(APPS.body, LOCATION)
+
+/** Every header a block hides from its upstream, sorted. */
+function hiddenHeaders(body: string): string[] {
+  return [...body.matchAll(/proxy_hide_header[ \t]+([^;\s]+)[ \t]*;/g)].map((m) => m[1]!).sort()
+}
 
 // A key of the exact shape the router accepts, and the near-misses that must not be accepted.
 const HEX28 = '0123456789abcdef0123456789ab'
@@ -238,40 +245,138 @@ describe('nginx.conf — each site declares its own request-body ceiling', () =>
   })
 })
 
-describe('nginx.conf — the framing policy names the apps host without revoking the old one', () => {
+describe('nginx.conf — the portal serves two policies: framing everywhere, full on the document', () => {
   const CSP = /add_header[ \t]+Content-Security-Policy[ \t]+"([^"]*)"[ \t]+always[ \t]*;/g
-  const declared = [...CODE.matchAll(CSP)].map((m) => m[1]!)
+  const policyOf = (body: string) => [...body.matchAll(CSP)].map((m) => m[1]!)
+  const documentLocation = PORTAL_LOCATIONS.find((l) => l.header === '= /index.html')!
+  const framing = [
+    ...policyOf(serverLevel(PORTAL)),
+    ...PORTAL_LOCATIONS.filter((l) => l !== documentLocation).flatMap((l) => policyOf(l.body)),
+  ]
+  const documentPolicy = policyOf(documentLocation.body)
 
-  it('declares the SAME policy everywhere it declares one', () => {
+  it('declares the SAME framing policy everywhere except the document', () => {
     // A location-level add_header REPLACES every inherited one, so a declaration that drifts does
     // not warn — that route just serves a weaker policy. Compared as a set, holding at any count.
-    expect(declared.length).toBeGreaterThanOrEqual(3)
-    expect(new Set(declared).size).toBe(1)
+    expect(framing.length).toBeGreaterThanOrEqual(2)
+    expect(new Set(framing).size).toBe(1)
   })
 
-  it('permits the apps hostname and NOT the retired Container Apps wildcard', () => {
-    // The wildcard was kept only while the portal handed the browser a `*.${APPS_DOMAIN}` preview
-    // URL; that address has moved, so re-adding it would permit an origin that never resolves from
-    // a BIAL desk. `${APPS_DOMAIN}` still composes the router's upstream, just not this header.
-    const policy = declared[0]!
+  it('keeps the framing policy to framing, because the sign-in page brings its own', () => {
+    // The callback page carries the backend's nonce policy and browsers enforce every CSP on a
+    // response, so a script-src here would block that nonce script and every sign-in with it.
+    const policy = framing[0]!
     expect(policy).toContain('https://${APPS_HOSTNAME}')
     expect(policy).not.toContain('${APPS_DOMAIN}')
     expect(policy).toMatch(/frame-src 'self'/)
-    // The portal itself stays un-frameable; this policy constrains framing and nothing else, so a
-    // default-src/script-src creeping in here is a change of kind, not of degree.
     expect(policy).toMatch(/frame-ancestors 'self'/)
     expect(policy).not.toMatch(/default-src|script-src|connect-src/)
   })
 
-  it('declares it once per header-overriding portal location, plus once at server level', () => {
-    // NOT `toBe(3)`, deliberately: a new declaration that drifts in value fails the byte-identity
-    // test above, while a new header-overriding location that FORGOT its policy fails only this
-    // count. Also fails if the apps site starts adding security headers, which it must not.
-    const overriding = blocksOf(PORTAL.body, LOCATION).filter((l) => /add_header/.test(l.body))
+  it('serves the full policy on the document, once, framing the same origins', () => {
+    expect(documentPolicy).toHaveLength(1)
+    const policy = documentPolicy[0]!
+    for (const directive of [
+      "default-src 'self'",
+      "script-src 'self';",
+      "object-src 'none'",
+      "base-uri 'self'",
+      "frame-ancestors 'self'",
+    ]) {
+      expect(policy).toContain(directive)
+    }
+    expect(policy).toContain(framing[0]!.split(';')[0]!.trim())
+    expect(policy).not.toMatch(/unsafe-eval/)
+    expect(policy).not.toMatch(/script-src[^;]*unsafe-inline/)
+  })
+
+  it('declares a policy in every header-overriding portal location, plus once at server level', () => {
+    // A new header-overriding location that FORGOT its policy fails only this check. Also fails
+    // if the apps site starts adding security headers, which it must not.
+    const overriding = PORTAL_LOCATIONS.filter((l) => /add_header/.test(l.body))
     expect(overriding.length).toBeGreaterThan(0)
     for (const loc of overriding) expect(loc.body).toMatch(/Content-Security-Policy/)
-    expect(serverLevel(PORTAL)).toMatch(/Content-Security-Policy/)
-    expect(declared).toHaveLength(overriding.length + 1)
+    expect(policyOf(serverLevel(PORTAL))).toHaveLength(1)
+    expect(policyOf(APPS.body)).toHaveLength(0)
+  })
+})
+
+describe('nginx.conf — one copy of each security header, and no version', () => {
+  const HSTS = 'add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;'
+
+  it('never names the nginx version, on either site', () => {
+    // http context, outside both servers, so neither site can forget it.
+    const outsideServers = SERVERS.reduce((rest, block) => rest.replace(block.body, ''), CODE)
+    expect(directiveValue(outsideServers, 'server_tokens')).toBe('off')
+  })
+
+  it('hides the backend copies of the four headers on every proxied response', () => {
+    // Declared at server level and inherited; a location that declared its own proxy_hide_header
+    // would silently drop all four, so none may.
+    expect(hiddenHeaders(serverLevel(PORTAL))).toEqual([
+      'Referrer-Policy',
+      'Strict-Transport-Security',
+      'X-Content-Type-Options',
+      'X-Frame-Options',
+    ])
+    for (const loc of PORTAL_LOCATIONS) expect(loc.body).not.toMatch(/proxy_hide_header/)
+  })
+
+  it('sends HSTS from the server level and every header-overriding location', () => {
+    expect(serverLevel(PORTAL)).toContain(HSTS)
+    for (const loc of PORTAL_LOCATIONS.filter((l) => /add_header/.test(l.body))) {
+      expect(loc.body).toContain(HSTS)
+    }
+  })
+
+  it('keeps the referrer policy that sign-in depends on', () => {
+    // `no-referrer` makes the callback's form post arrive with `Origin: null`, which the backend
+    // refuses as a cross-origin write.
+    const policies = [...CODE.matchAll(/add_header[ \t]+Referrer-Policy[ \t]+"([^"]*)"/g)].map(
+      (m) => m[1],
+    )
+    expect(new Set(policies)).toEqual(new Set(['strict-origin-when-cross-origin']))
+  })
+})
+
+describe('nginx.conf — the apps site serves no Next source and no Next dev endpoint', () => {
+  const blockIndex = APPS_LOCATIONS.findIndex((l) => l.header.includes('__nextjs_'))
+
+  it('answers 404 before either proxy arm can match', () => {
+    // Regex locations are tried in file order and the first match wins; the keyless prefix arm
+    // loses to any regex. So the block must precede the keyed arm, and must also match keyless
+    // paths, because Next's dev client asks for some of these root-relative.
+    const keyedIndex = APPS_LOCATIONS.findIndex((l) => /\$app_key \$1/.test(l.body))
+    expect(blockIndex).toBeGreaterThanOrEqual(0)
+    expect(blockIndex).toBeLessThan(keyedIndex)
+    const block = APPS_LOCATIONS[blockIndex]!
+    expect(block.body).toMatch(/return[ \t]+404[ \t]*;/)
+    expect(block.body).not.toMatch(/proxy_pass/)
+  })
+
+  it('matches the dev surface at the app root only, so an app keeps its own routes', () => {
+    const pattern = new RegExp(APPS_LOCATIONS[blockIndex]!.header.replace(/^~\s*"|"$/g, ''))
+    expect(pattern.test(`/a/sbx-${HEX28}/_next/static/chunks/main.js.map`)).toBe(true)
+    expect(pattern.test('/_next/static/chunks/main.js.map')).toBe(true)
+    expect(pattern.test(`/a/sbx-${HEX28}/__nextjs_source-map`)).toBe(true)
+    expect(pattern.test('/__nextjs_original-stack-frames')).toBe(true)
+    expect(pattern.test('/__nextjs_restart_dev')).toBe(true)
+    expect(pattern.test(`/a/sbx-${HEX28}/_next/mcp`)).toBe(true)
+    expect(pattern.test('/_next/mcp')).toBe(true)
+    expect(pattern.test(`/a/pub-${HEX28}/_next/development/request-insights`)).toBe(true)
+    expect(pattern.test(`/a/pub-${HEX28}/data/route.map`)).toBe(false)
+    expect(pattern.test(`/a/sbx-${HEX28}/_next/static/chunks/main.js`)).toBe(false)
+    expect(pattern.test(`/a/sbx-${HEX28}/_next/hmr`)).toBe(false)
+    expect(pattern.test(`/a/sbx-${HEX28}/mcp`)).toBe(false)
+    // Both branches are anchored: an unanchored one would match these deeper paths, and its
+    // `.*` would restart at every `/_next/` of a crafted URI.
+    expect(pattern.test(`/a/pub-${HEX28}/docs/_next/x.map`)).toBe(false)
+    expect(pattern.test(`/a/pub-${HEX28}/data/__nextjs_x`)).toBe(false)
+    expect(pattern.test(`/a/sbx-${HEX28}` + '/_next/'.repeat(1100) + 'x')).toBe(false)
+  })
+
+  it('hides the two headers that name the software behind an app', () => {
+    expect(hiddenHeaders(serverLevel(APPS))).toEqual(['Via', 'X-Powered-By'])
   })
 })
 

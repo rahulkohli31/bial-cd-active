@@ -191,7 +191,9 @@ export default function SharedApplicationsPage(): React.JSX.Element {
   const firstOnPage = (appliedPage - 1) * appliedPageSize + 1
   const lastOnPage = firstOnPage + items.length - 1
 
-  const openShared = (id: string): void => navigate(`/shared/${id}`)
+  const openShared = (id: string): void => {
+    void navigate(`/shared/${id}`)
+  }
 
   return (
     <div className="min-h-full font-manrope flex flex-col bg-bial-bg">

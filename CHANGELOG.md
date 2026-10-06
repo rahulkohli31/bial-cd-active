@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.11] - 2026-10-06
+
+The fixes from the interim security assessment of the portal and its API. One finding, that a
+preview opens for anyone who has its link, is how previews are designed to work and is answered in
+the assessment response rather than changed here. Everything else the assessment raised is fixed.
+How the build agent works and debugs an application is unchanged.
+
+### Deploying this release
+
+- **Rebuild the backend, portal and sandbox images for dev and prod, and deploy all three.** None
+  depends on another going first. The worker runs the backend image and moves only when it is
+  pointed at the new build's digest.
+- **No migration and no settings change.**
+- **Projects saved before this release open more slowly the first time,** by about 16 to 25
+  seconds, because restoring one reinstalls its own Next.js. That reinstall needs the npm registry,
+  so while the registry is unreachable those projects cannot open.
+- **Republish any live application that should move to the patched Next.js.** A live application
+  keeps the image it was published with, and restarting it reuses that image.
+- **If the pool of ready sandboxes is live, its sandboxes keep the previous Next.js** until they are
+  replaced.
+- **After deploying, check one portal page and one API response:** each security header should
+  appear once. A gateway that adds its own copies would bring the duplicates back.
+
+### Security
+
+- **The admin endpoints that showed an application's database password and minted a long-lived
+  deploy credential are removed.** Publishing injects both credentials itself, so no person is
+  handed either.
+- **Every signed-in person has a per-minute ceiling on API requests.** Requests the browser marks
+  as coming from an application's page count separately, so an application someone opens cannot
+  use up the portal's share. Signing in, signing out and the portal asking who is signed in are
+  never refused.
+- **New projects start on the patched Next.js release, and publishing a project built on an older
+  Next.js 16 builds it on the patched one.** The preview of an existing project keeps its own
+  Next.js until the project is published.
+- **The portal moves to the patched React Router release.** Navigation and the search boxes behave
+  as before.
+- **The portal's edge no longer names its version, and sends each security header once,** with
+  strict transport security on every page. The portal page itself now carries a full content
+  security policy.
+- **The applications edge no longer serves Next.js source maps or its development endpoints,**
+  including the development server's agent interface, and hides the headers that name the software
+  behind an application.
+
 ## [1.8.10] - 2026-10-05
 
 The backend image takes the security updates BIAL's scan of 5 October asked for. Its critical

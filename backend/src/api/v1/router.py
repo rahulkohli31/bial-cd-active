@@ -15,8 +15,9 @@ precisely the probe the 404 refuses to answer. Reaching across owners is an expl
 audited admin action, and the one read that drops the predicate on purpose — the published-app
 catalog — argues for itself in its own module header."""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
+from src.api.deps import api_ceiling
 from src.api.v1.admin.classification import router as admin_classification_router
 from src.api.v1.admin.router import router as admin_router
 from src.api.v1.admin.router import users_router as admin_users_router
@@ -37,7 +38,7 @@ from src.api.v1.marketplace.router import router as marketplace_router
 from src.api.v1.observations.router import router as observations_router
 from src.api.v1.projects.router import router as projects_router
 from src.api.v1.usage.router import router as usage_router
-from src.schemas import AUTH_403_SUSPENDED, DetailBody, error_responses
+from src.schemas import AUTH_403_SUSPENDED, DetailBody, ErrorEnvelope, error_responses
 
 # Cross-cutting error codes are documented ONCE here as v1-router-level defaults:
 # the unhandled-exception 500 (`{"detail": "Internal server error"}`,
@@ -51,23 +52,31 @@ v1_router = APIRouter(
     prefix="/v1",
     responses=error_responses(AUTH_403_SUSPENDED, (500, DetailBody, "Internal server error")),
 )
+# Outside the request ceiling: a person over it must still be able to sign in, sign out and be
+# told who they are, and the portal reads a refused who-am-I as signed out.
 v1_router.include_router(health_router)
 v1_router.include_router(auth_router)
-v1_router.include_router(usage_router)
-v1_router.include_router(feedback_router)
-v1_router.include_router(observations_router)
-v1_router.include_router(projects_router)
-v1_router.include_router(marketplace_router)
-v1_router.include_router(deploy_router)
-v1_router.include_router(classification_router)
-v1_router.include_router(conversations_router)
-v1_router.include_router(turns_router)
-v1_router.include_router(transition_router)
-v1_router.include_router(attachments_router)
-v1_router.include_router(connectors_router)
-v1_router.include_router(apps_router)
-v1_router.include_router(build_sessions_router)
-v1_router.include_router(admin_router)
-v1_router.include_router(admin_users_router)
-v1_router.include_router(admin_classification_router)
-v1_router.include_router(deploy_admin_router)
+
+_ceilinged = APIRouter(
+    dependencies=[Depends(api_ceiling)],
+    responses=error_responses((429, ErrorEnvelope, "Too many requests from this user")),
+)
+_ceilinged.include_router(usage_router)
+_ceilinged.include_router(feedback_router)
+_ceilinged.include_router(observations_router)
+_ceilinged.include_router(projects_router)
+_ceilinged.include_router(marketplace_router)
+_ceilinged.include_router(deploy_router)
+_ceilinged.include_router(classification_router)
+_ceilinged.include_router(conversations_router)
+_ceilinged.include_router(turns_router)
+_ceilinged.include_router(transition_router)
+_ceilinged.include_router(attachments_router)
+_ceilinged.include_router(connectors_router)
+_ceilinged.include_router(apps_router)
+_ceilinged.include_router(build_sessions_router)
+_ceilinged.include_router(admin_router)
+_ceilinged.include_router(admin_users_router)
+_ceilinged.include_router(admin_classification_router)
+_ceilinged.include_router(deploy_admin_router)
+v1_router.include_router(_ceilinged)

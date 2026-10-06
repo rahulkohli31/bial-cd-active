@@ -1,15 +1,14 @@
 /**
  * AN ATTACHMENT, OPENED OVER THE CONVERSATION.
  *
- * WHY THIS EXISTS: nothing here is framed, and that is diagnosed, not stylistic. A same-origin
- * `/api/attachments/{id}` frame was tried and called "diagnosed against the live configuration"
- * — it wasn't diagnosed far enough. The control plane's middleware sets `X-Frame-Options: DENY`
- * on every response, attachment downloads included (`backend/src/main.py`), and DENY forbids
- * framing by any origin, same-origin included; nginx does not strip it. A staged file's `data:`
- * URL is refused too, by `frame-src 'self'` in `nginx.conf`. A refused frame renders BLANK with
- * no `error` event to explain it — the very defect the frame was meant to fix. So there is no
- * frame: this dialog renders only what it can honestly build from bytes it already holds — an
- * `<img>` (no directive restricts one), decoded text, or a plain "can't preview" sentence. A SENT
+ * WHY THIS EXISTS: nothing here is framed, and that is diagnosed, not stylistic. Whether a
+ * same-origin `/api/attachments/{id}` frame loads depends on which framing header reaches the
+ * browser: the control plane sends `X-Frame-Options: DENY` (`backend/src/main.py`) and the
+ * portal edge replaces it with its own (`nginx.conf`). A staged file's `data:` URL is refused
+ * outright, by the page's `frame-src`. A refused frame renders BLANK with no `error` event to
+ * explain it — the very defect a frame would be meant to fix. So there is no frame: this dialog
+ * renders only what it can honestly build from bytes it already holds — an `<img>` (`img-src`
+ * admits every URL this builds), decoded text, or a plain "can't preview" sentence. A SENT
  * document is `AttachmentChips`' job (fetch + new tab), never this component's; that's also why
  * there's no stored-address branch — every caller already holds the URL to show.
  *
@@ -97,7 +96,7 @@ const AttachmentPreview: FC<AttachmentPreviewProps> = ({ target, onClose }) => {
             expired — reload the page and try again.
           </p>
         ) : isImage ? (
-          // NO DIRECTIVE RESTRICTS AN IMAGE. `data:`, `blob:` and same-origin all render, which is
+          // `img-src` ADMITS ALL THREE. `data:`, `blob:` and same-origin all render, which is
           // why this branch never had the framing defect the others did. `onError` is load-bearing
           // HERE and only here: an `<img>` fires `error` on a 404 or an expired session.
           <img
