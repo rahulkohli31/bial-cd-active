@@ -21,23 +21,17 @@ from pathlib import Path
 
 import pytest
 
+from src.services.deploy.config import DeployConfig
 from src.services.deploy.context import NEXT_FLOOR, build_context
+from src.services.orchestrator.errors import DRIFT_RECOVERED_NOTICE
 
 pytestmark = pytest.mark.integration
 
 _REPO = Path(__file__).resolve().parents[4]
-_DOCKERFILE = _REPO / "backend" / "src" / "services" / "deploy" / "assets" / "Dockerfile"
+_NODE_IMAGE = DeployConfig.model_fields["node_base_image"].default
 # The notice as the step PRINTED it (`#<step> <seconds> <text>`). BuildKit also echoes each
 # RUN command, which contains the same words, so a bare substring match proves nothing.
-_FALLBACK_RAN = re.compile(
-    r"^#\d+ [\d.]+ lockfile drifted from package.json; falling back to npm install$", re.MULTILINE
-)
-
-
-def _node_image() -> str:
-    match = re.search(r"^ARG NODE_IMAGE=(\S+)$", _DOCKERFILE.read_text(), re.MULTILINE)
-    assert match is not None
-    return match.group(1)
+_FALLBACK_RAN = re.compile(rf"^#\d+ [\d.]+ {re.escape(DRIFT_RECOVERED_NOTICE)}", re.MULTILINE)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -56,13 +50,12 @@ def _unpack_to(packed: bytes, dest: Path) -> Path:
     return dest
 
 
-def _build(context: Path, tag: str, *, target: str | None = None) -> str:
+def _build(context: Path, tag: str, *, target: str) -> str:
     # `--no-cache`: a cached step replays no output, and the fallback is read from output.
     command = ["docker", "build", "--no-cache", "--progress=plain", "-t", tag]
     command += ["--build-arg", "BIAL_BASE_PATH=/a/pub-0000000000000000000000000000"]
     command += ["--build-arg", "BIAL_APPS_HOSTNAME=apps.example.test"]
-    if target is not None:
-        command += ["--target", target]
+    command += ["--target", target]
     proc = subprocess.run([*command, str(context)], capture_output=True, text=True, timeout=1800)
     assert proc.returncode == 0, proc.stderr[-4000:]
     return proc.stderr
@@ -87,7 +80,7 @@ def test_an_old_project_publishes_on_the_floor_through_the_drift_fallback(tmp_pa
         '"dependencies":{"next":"16.3.3","react":"19.2.7","react-dom":"19.2.7"}}'
     )
     locked = subprocess.run(
-        ["docker", "run", "--rm", "-v", f"{app}:/app", "-w", "/app", _node_image(),
+        ["docker", "run", "--rm", "-v", f"{app}:/app", "-w", "/app", _NODE_IMAGE,
          "npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"],
         capture_output=True, text=True, timeout=600,
     )  # fmt: skip

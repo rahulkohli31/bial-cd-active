@@ -260,19 +260,10 @@ def test_a_changed_file_changes_the_bytes(hostile_tree: Path) -> None:
 
 
 # --- the Next floor ---------------------------------------------------------------
-#
-# A project keeps the Next its own lockfile pins, so the publish raises an old one in the
-# BUILD COPY only. The decision is read from the lockfile because that is what `npm ci`
-# installs; the spec in `package.json` can be a range the lock resolved low.
 
 
 def _app(
-    tmp_path: Path,
-    *,
-    spec: str | None,
-    locked: str | None,
-    section: str = "dependencies",
-    lock: bool = True,
+    tmp_path: Path, *, spec: str | None, locked: str | None = None, section: str = "dependencies"
 ) -> Path:
     root = tmp_path / "app"
     root.mkdir()
@@ -283,10 +274,8 @@ def _app(
     if section != "dependencies":
         package["dependencies"] = {"pg": "8.22.0"}
     (root / "package.json").write_text(json.dumps(package, indent=2))
-    if lock:
-        packages: dict[str, object] = {"": {"name": "app"}}
-        if locked is not None:
-            packages["node_modules/next"] = {"version": locked}
+    if locked is not None:
+        packages = {"": {"name": "app"}, "node_modules/next": {"version": locked}}
         (root / "package-lock.json").write_text(
             json.dumps({"lockfileVersion": 3, "packages": packages})
         )
@@ -297,6 +286,10 @@ def _package(root: Path) -> dict[str, dict[str, str]]:
     return json.loads(_unpack(build_context(root))["package.json"])
 
 
+def _assert_untouched(root: Path) -> None:
+    assert _unpack(build_context(root))["package.json"] == (root / "package.json").read_bytes()
+
+
 @pytest.mark.parametrize("spec", ["16.3.1", "^16.3.1", "16.x", ">=16.0.0"])
 def test_a_project_locked_below_the_floor_publishes_on_the_floor(tmp_path: Path, spec) -> None:
     package = _package(_app(tmp_path, spec=spec, locked="16.3.1"))
@@ -304,40 +297,30 @@ def test_a_project_locked_below_the_floor_publishes_on_the_floor(tmp_path: Path,
     assert package["dependencies"] == {"react": "19.2.7", "next": NEXT_FLOOR}
 
 
-@pytest.mark.parametrize("locked", ["16.3.8", "16.4.0", "15.5.0"])
+@pytest.mark.parametrize(
+    ("spec", "locked"),
+    [("^16.3.8", "16.3.8"), ("^16.4.0", "16.4.0"), ("^15.5.0", "15.5.0"), ("16.3.1", "16.3.8")],
+    ids=["at-floor", "above", "other-major", "lock-decides-not-spec"],
+)
 def test_a_lock_at_or_above_the_floor_or_on_another_major_is_left_alone(
-    tmp_path: Path, locked
+    tmp_path: Path, spec, locked
 ) -> None:
-    root = _app(tmp_path, spec=f"^{locked}", locked=locked)
-
-    assert _unpack(build_context(root))["package.json"] == (root / "package.json").read_bytes()
-
-
-def test_the_lock_decides_not_the_spec(tmp_path: Path) -> None:
-    """An exact spec below the floor that the lock already resolved higher is not the
-    version `npm ci` installs."""
-    root = _app(tmp_path, spec="16.3.1", locked="16.3.8")
-
-    assert _unpack(build_context(root))["package.json"] == (root / "package.json").read_bytes()
+    _assert_untouched(_app(tmp_path, spec=spec, locked=locked))
 
 
 def test_without_a_lock_an_exact_spec_decides(tmp_path: Path) -> None:
-    package = _package(_app(tmp_path, spec="16.3.3", locked=None, lock=False))
+    package = _package(_app(tmp_path, spec="16.3.3"))
 
     assert package["dependencies"]["next"] == NEXT_FLOOR
 
 
 @pytest.mark.parametrize("spec", ["^16.3.3", "latest"])
 def test_without_a_lock_a_range_or_tag_is_left_alone(tmp_path: Path, spec) -> None:
-    root = _app(tmp_path, spec=spec, locked=None, lock=False)
-
-    assert _unpack(build_context(root))["package.json"] == (root / "package.json").read_bytes()
+    _assert_untouched(_app(tmp_path, spec=spec))
 
 
 def test_an_app_without_next_is_left_alone(tmp_path: Path) -> None:
-    root = _app(tmp_path, spec=None, locked=None)
-
-    assert _unpack(build_context(root))["package.json"] == (root / "package.json").read_bytes()
+    _assert_untouched(_app(tmp_path, spec=None))
 
 
 def test_next_under_dev_dependencies_is_raised_where_it_is_declared(tmp_path: Path) -> None:

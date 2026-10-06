@@ -149,7 +149,8 @@ def _collect(root: Path) -> dict[str, bytes]:
 
 
 def _apply_platform_overlay(files: dict[str, bytes]) -> None:
-    """Rename the app's Next config aside, then write every platform-owned file.
+    """Rename the app's Next config aside, write every platform-owned file, then raise an old
+    Next to the floor.
 
     Mutates in place. Runs AFTER `_collect`, so a platform target always wins over whatever
     the tree happened to contain at that path — while the agent's Dockerfile, which is what
@@ -183,14 +184,17 @@ def _raise_next_to_floor(files: dict[str, bytes]) -> None:
     holds. A manifest that will not parse is left for the build to report."""
     try:
         package = json.loads(files.get("package.json", b"{}"))
-        sections = [
-            deps
-            for deps in (package.get("dependencies"), package.get("devDependencies"))
-            if isinstance(deps, dict) and "next" in deps
-        ]
-        if not sections:
+        declared = next(
+            (
+                deps
+                for deps in (package.get("dependencies"), package.get("devDependencies"))
+                if isinstance(deps, dict) and "next" in deps
+            ),
+            None,
+        )
+        if declared is None:
             return
-        installed = _locked_next(files, str(sections[0]["next"]))
+        installed = _locked_next(files, str(declared["next"]))
     except ValueError, AttributeError:
         return
     match = _EXACT_VERSION.fullmatch(installed)
@@ -199,7 +203,7 @@ def _raise_next_to_floor(files: dict[str, bytes]) -> None:
     parts = tuple(int(part) for part in match.groups())
     if parts[0] != _NEXT_FLOOR_PARTS[0] or parts >= _NEXT_FLOOR_PARTS:
         return
-    sections[0]["next"] = NEXT_FLOOR
+    declared["next"] = NEXT_FLOOR
     files["package.json"] = (json.dumps(package, indent=2) + "\n").encode()
     _log.info("deploy_next_floor_raised", from_version=installed, to_version=NEXT_FLOOR)
 

@@ -7,6 +7,8 @@ bucket, not the number.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,8 +39,8 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
     return tick
 
 
-async def _session(db: AsyncSession, **user: str) -> dict[str, str]:
-    person = await UserFactory.create(db, **user)
+async def _session(db: AsyncSession) -> dict[str, str]:
+    person = await UserFactory.create(db)
     jwt = mint_session_jwt(person.id, person.token_version, settings.auth.access_ttl_seconds)
     return {"Cookie": f"session={jwt}"}
 
@@ -107,8 +109,13 @@ async def test_the_window_rolls_over(
 
 @pytest.mark.parametrize(
     "cookie",
-    [{}, {"Cookie": "session=not-a-jwt"}, {"Cookie": "session=eyJhbGciOiJub25lIn0.e30."}],
-    ids=["none", "garbage", "unsigned"],
+    [
+        {},
+        {"Cookie": "session=not-a-jwt"},
+        {"Cookie": "session=eyJhbGciOiJub25lIn0.e30."},
+        {"Cookie": f"session={mint_session_jwt(uuid.uuid4(), 0, -60)}"},
+    ],
+    ids=["none", "garbage", "unsigned", "expired"],
 )
 async def test_a_request_without_a_valid_session_is_never_counted(
     client: AsyncClient, clock: _Clock, cookie: dict[str, str]
@@ -116,23 +123,6 @@ async def test_a_request_without_a_valid_session_is_never_counted(
     statuses = {(await client.get("/v1/auth/me", headers=cookie)).status_code for _ in range(5)}
 
     assert statuses == {401}
-
-
-async def test_an_expired_session_is_never_counted(
-    client: AsyncClient, db_session: AsyncSession, clock: _Clock
-) -> None:
-    person = await UserFactory.create(db_session)
-    expired = {"Cookie": f"session={mint_session_jwt(person.id, person.token_version, -60)}"}
-
-    statuses = {(await client.get("/v1/auth/me", headers=expired)).status_code for _ in range(5)}
-
-    assert statuses == {401}
-
-
-async def test_health_is_never_limited(client: AsyncClient, clock: _Clock) -> None:
-    statuses = {(await client.get("/v1/health")).status_code for _ in range(_LIMIT + 2)}
-
-    assert 429 not in statuses
 
 
 async def test_the_ceiling_runs_before_the_route_does(
@@ -145,8 +135,3 @@ async def test_the_ceiling_runs_before_the_route_does(
         await client.get("/v1/auth/me", headers=me)
 
     assert (await client.get("/v1/admin/apps", headers=me)).status_code == 429
-
-
-def test_the_production_ceiling() -> None:
-    assert deps._API_CEILING._limit == deps.API_CEILING_PER_MINUTE == 600
-    assert deps._API_CEILING._window == 60

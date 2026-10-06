@@ -116,6 +116,13 @@ function directiveValue(body: string, name: string): string | null {
 const SERVERS = blocksOf(CODE, /^server[ \t]*\{/m)
 const PORTAL = SERVERS[0]!
 const APPS = SERVERS[1]!
+const PORTAL_LOCATIONS = blocksOf(PORTAL.body, LOCATION)
+const APPS_LOCATIONS = blocksOf(APPS.body, LOCATION)
+
+/** Every header a block hides from its upstream, sorted. */
+function hiddenHeaders(body: string): string[] {
+  return [...body.matchAll(/proxy_hide_header[ \t]+([^;\s]+)[ \t]*;/g)].map((m) => m[1]!).sort()
+}
 
 // A key of the exact shape the router accepts, and the near-misses that must not be accepted.
 const HEX28 = '0123456789abcdef0123456789ab'
@@ -241,11 +248,10 @@ describe('nginx.conf — each site declares its own request-body ceiling', () =>
 describe('nginx.conf — the portal serves two policies: framing everywhere, full on the document', () => {
   const CSP = /add_header[ \t]+Content-Security-Policy[ \t]+"([^"]*)"[ \t]+always[ \t]*;/g
   const policyOf = (body: string) => [...body.matchAll(CSP)].map((m) => m[1]!)
-  const portalLocations = blocksOf(PORTAL.body, LOCATION)
-  const documentLocation = portalLocations.find((l) => l.header === '= /index.html')!
+  const documentLocation = PORTAL_LOCATIONS.find((l) => l.header === '= /index.html')!
   const framing = [
     ...policyOf(serverLevel(PORTAL)),
-    ...portalLocations.filter((l) => l !== documentLocation).flatMap((l) => policyOf(l.body)),
+    ...PORTAL_LOCATIONS.filter((l) => l !== documentLocation).flatMap((l) => policyOf(l.body)),
   ]
   const documentPolicy = policyOf(documentLocation.body)
 
@@ -287,7 +293,7 @@ describe('nginx.conf — the portal serves two policies: framing everywhere, ful
   it('declares a policy in every header-overriding portal location, plus once at server level', () => {
     // A new header-overriding location that FORGOT its policy fails only this check. Also fails
     // if the apps site starts adding security headers, which it must not.
-    const overriding = portalLocations.filter((l) => /add_header/.test(l.body))
+    const overriding = PORTAL_LOCATIONS.filter((l) => /add_header/.test(l.body))
     expect(overriding.length).toBeGreaterThan(0)
     for (const loc of overriding) expect(loc.body).toMatch(/Content-Security-Policy/)
     expect(policyOf(serverLevel(PORTAL))).toHaveLength(1)
@@ -296,7 +302,6 @@ describe('nginx.conf — the portal serves two policies: framing everywhere, ful
 })
 
 describe('nginx.conf — one copy of each security header, and no version', () => {
-  const portalLocations = blocksOf(PORTAL.body, LOCATION)
   const HSTS = 'add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;'
 
   it('never names the nginx version, on either site', () => {
@@ -308,19 +313,18 @@ describe('nginx.conf — one copy of each security header, and no version', () =
   it('hides the backend copies of the four headers on every proxied response', () => {
     // Declared at server level and inherited; a location that declared its own proxy_hide_header
     // would silently drop all four, so none may.
-    const hidden = [...serverLevel(PORTAL).matchAll(/proxy_hide_header[ \t]+([^;\s]+)[ \t]*;/g)]
-    expect(hidden.map((m) => m[1]).sort()).toEqual([
+    expect(hiddenHeaders(serverLevel(PORTAL))).toEqual([
       'Referrer-Policy',
       'Strict-Transport-Security',
       'X-Content-Type-Options',
       'X-Frame-Options',
     ])
-    for (const loc of portalLocations) expect(loc.body).not.toMatch(/proxy_hide_header/)
+    for (const loc of PORTAL_LOCATIONS) expect(loc.body).not.toMatch(/proxy_hide_header/)
   })
 
   it('sends HSTS from the server level and every header-overriding location', () => {
     expect(serverLevel(PORTAL)).toContain(HSTS)
-    for (const loc of portalLocations.filter((l) => /add_header/.test(l.body))) {
+    for (const loc of PORTAL_LOCATIONS.filter((l) => /add_header/.test(l.body))) {
       expect(loc.body).toContain(HSTS)
     }
   })
@@ -336,24 +340,22 @@ describe('nginx.conf — one copy of each security header, and no version', () =
 })
 
 describe('nginx.conf — the apps site serves no Next source and no Next dev endpoint', () => {
-  const appsLocations = blocksOf(APPS.body, LOCATION)
-  const blockIndex = appsLocations.findIndex((l) => l.header.includes('__nextjs_'))
+  const blockIndex = APPS_LOCATIONS.findIndex((l) => l.header.includes('__nextjs_'))
 
   it('answers 404 before either proxy arm can match', () => {
     // Regex locations are tried in file order and the first match wins; the keyless prefix arm
-    // loses to any regex. So the block must precede the keyed arm, and it must not be anchored to
-    // `/a/<key>/`, because Next's dev client asks for some of these root-relative.
-    const keyedIndex = appsLocations.findIndex((l) => /\$app_key \$1/.test(l.body))
+    // loses to any regex. So the block must precede the keyed arm, and must also match keyless
+    // paths, because Next's dev client asks for some of these root-relative.
+    const keyedIndex = APPS_LOCATIONS.findIndex((l) => /\$app_key \$1/.test(l.body))
     expect(blockIndex).toBeGreaterThanOrEqual(0)
     expect(blockIndex).toBeLessThan(keyedIndex)
-    const block = appsLocations[blockIndex]!
+    const block = APPS_LOCATIONS[blockIndex]!
     expect(block.body).toMatch(/return[ \t]+404[ \t]*;/)
     expect(block.body).not.toMatch(/proxy_pass/)
-    expect(block.header).not.toMatch(/"\^/)
   })
 
   it('matches maps only under /_next/, so an app keeps its own .map routes', () => {
-    const pattern = new RegExp(appsLocations[blockIndex]!.header.replace(/^~\s*"|"$/g, ''))
+    const pattern = new RegExp(APPS_LOCATIONS[blockIndex]!.header.replace(/^~\s*"|"$/g, ''))
     expect(pattern.test(`/a/sbx-${HEX28}/_next/static/chunks/main.js.map`)).toBe(true)
     expect(pattern.test('/_next/static/chunks/main.js.map')).toBe(true)
     expect(pattern.test(`/a/sbx-${HEX28}/__nextjs_source-map`)).toBe(true)
@@ -362,11 +364,15 @@ describe('nginx.conf — the apps site serves no Next source and no Next dev end
     expect(pattern.test(`/a/pub-${HEX28}/data/route.map`)).toBe(false)
     expect(pattern.test(`/a/sbx-${HEX28}/_next/static/chunks/main.js`)).toBe(false)
     expect(pattern.test(`/a/sbx-${HEX28}/_next/hmr`)).toBe(false)
+    // Linear on a hostile URI: the map branch is anchored, so `.*` never restarts.
+    const hostile = `/a/sbx-${HEX28}` + '/_next/'.repeat(1100) + 'x'
+    const started = performance.now()
+    expect(pattern.test(hostile)).toBe(false)
+    expect(performance.now() - started).toBeLessThan(5)
   })
 
   it('hides the two headers that name the software behind an app', () => {
-    const hidden = [...serverLevel(APPS).matchAll(/proxy_hide_header[ \t]+([^;\s]+)[ \t]*;/g)]
-    expect(hidden.map((m) => m[1]).sort()).toEqual(['Via', 'X-Powered-By'])
+    expect(hiddenHeaders(serverLevel(APPS))).toEqual(['Via', 'X-Powered-By'])
   })
 })
 

@@ -716,24 +716,19 @@ def test_a_proxied_response_carries_each_security_header_once_with_the_edges_val
         assert headers[name] == value
 
 
-@pytest.mark.parametrize("target", ["/", "/index.html", "/projects/123", "/assets/app.js"])
-def test_every_portal_page_and_asset_carries_hsts(router: Router, target: str) -> None:
-    status, headers, _ = router.request(target, host="portal.bial.test")
-    assert status == 200
-    assert headers["strict-transport-security"] == _EDGE_VALUES["strict-transport-security"]
-
-
 @pytest.mark.parametrize(
-    ("target", "full"),
+    ("target", "document"),
     [("/", True), ("/index.html", True), ("/projects/123", True), ("/assets/app.js", False)],
 )
-def test_only_the_document_carries_the_full_policy(
-    router: Router, target: str, full: bool
+def test_every_portal_page_carries_hsts_and_only_the_document_the_full_policy(
+    router: Router, target: str, document: bool
 ) -> None:
     """Every SPA route reaches `= /index.html` by internal redirect, so it gets the document's
     policy; an asset keeps the framing one."""
-    _, headers, _ = router.request(target, host="portal.bial.test")
-    assert ("default-src 'self'" in headers["content-security-policy"]) is full
+    status, headers, _ = router.request(target, host="portal.bial.test")
+    assert status == 200
+    assert headers["strict-transport-security"] == _EDGE_VALUES["strict-transport-security"]
+    assert ("default-src 'self'" in headers["content-security-policy"]) is document
 
 
 def test_the_sign_in_callback_keeps_the_framing_policy(router_with_backend: Router) -> None:
