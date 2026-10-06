@@ -138,15 +138,33 @@ async def test_the_ceiling_runs_before_the_route_does(
     assert (await client.get("/v1/admin/apps", headers=me)).status_code == 429
 
 
-@pytest.mark.parametrize("path", ["/v1/auth/me", "/v1/health"])
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/v1/auth/me"),
+        ("GET", "/v1/health"),
+        ("POST", "/v1/auth/logout"),
+        ("POST", "/v1/auth/refresh"),
+    ],
+)
 async def test_the_sessions_own_routes_stay_outside_the_ceiling(
-    client: AsyncClient, db_session: AsyncSession, clock: _Clock, path: str
+    client: AsyncClient, db_session: AsyncSession, clock: _Clock, method: str, path: str
 ) -> None:
-    """A refused who-am-I reads as signed out in the portal, so a person over the ceiling must
-    still be told who they are."""
+    """A refused who-am-I reads as signed out in the portal, and a refused sign-out leaves the
+    session alive, so a person over the ceiling must still reach both."""
     me = await _session(db_session)
     for _ in range(_LIMIT):
         await client.get(_PROBE, headers=me)
     assert (await client.get(_PROBE, headers=me)).status_code == 429
 
-    assert (await client.get(path, headers=me)).status_code == 200
+    assert (await client.request(method, path, headers=me)).status_code != 429
+
+
+def test_only_the_sessions_own_routes_are_mounted_outside_the_ceiling(app) -> None:
+    """The ceiling and its documented 429 come from one router, so a router mounted beside it
+    instead of inside it shows here as an operation without the 429."""
+    outside = ("/v1/auth/", "/v1/health")
+    for path, operations in app.openapi()["paths"].items():
+        for method, operation in operations.items():
+            ceilinged = "429" in operation["responses"]
+            assert ceilinged != path.startswith(outside), f"{method.upper()} {path}"
