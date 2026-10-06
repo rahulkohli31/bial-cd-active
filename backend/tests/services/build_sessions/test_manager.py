@@ -593,6 +593,36 @@ async def test_a_holder_handed_over_without_ever_serving_raises_the_absent_proof
     await _end_the_turn(manager, second)
 
 
+async def test_a_restarted_containers_quiet_hand_over_does_not_silence_another_holders_alarm(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    spawned: list[tuple[OwedTeardown, ShutdownReason]],
+) -> None:
+    """The alarm stays quiet for the one restarted container that had served. A holder the same
+    start replaces that never served is still counted.
+
+    Mutation check: test only that some container was remembered, not which one, and this alarm
+    goes silent."""
+    manager = a_manager_whose_ledger_is(db_session)
+    user, project_id, client, held = await _a_holder_left_ending(
+        db_session, fake_redis, manager, "m-dead-other@rvaiglobal.com"
+    )
+    remembered = manager_module._restarted_after_serving.set("sbx-a-restarted-one-that-served")
+
+    try:
+        with structlog.testing.capture_logs() as logs:
+            second = await manager.ensure_sandbox(
+                db_session, user, project_id, sandbox_client=client, may_write=True
+            )
+    finally:
+        manager_module._restarted_after_serving.reset(remembered)
+
+    fired = [e for e in logs if e["event"] == SERVING_PROOF_ABSENT_AT_TEARDOWN]
+    assert [(e["app_name"], e["reason"]) for e in fired] == [(held, "replaced")]
+    await _end_the_turn(manager, second)
+
+
 async def test_concurrent_same_user_starts_never_double_allocate(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
