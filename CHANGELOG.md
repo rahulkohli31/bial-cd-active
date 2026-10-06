@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.9.0] - 2026-10-06
 
 Workspaces can now be made ahead of time, so a start no longer has to wait for Azure to create
 one. The pool ships switched off: every size is 0, and no start changes speed until a later release
