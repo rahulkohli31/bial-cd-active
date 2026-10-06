@@ -4,6 +4,190 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Workspaces can now be made ahead of time, so a start no longer has to wait for Azure to create
+one. The pool ships switched off: every size is 0, and no start changes speed until a later release
+raises them. What changes now is the time around a start. The page notices a finished start within
+a second instead of three. A shared-view Refresh no longer waits about half a minute for the old
+workspace to be deleted. Every start is timed from the click to the app showing and recorded once,
+with the time of each stage, so what the pool buys and where the next seconds are can be read from
+the platform's own numbers. Workspaces are now found by what the platform recorded about them, and
+every new workspace gets a random name; nothing a person sees depends on the old names, but the
+deploy order below does.
+
+### Deploying this release
+
+- **Deploy order protects citizens' work, so follow it exactly.** In a local mixed-version run of
+  this release against the previous one, the new code handled everything the old release left
+  behind correctly: old workspace records, old shared views and old owed deletions were found,
+  saved to the right app (shared views never) and deleted. The reverse is unsafe. Once the new
+  backend starts a workspace (random `sbx-` name), an old worker deletes it without saving as soon
+  as it goes idle. An old worker retrying a deletion the new code owed writes a colleague's shared
+  view over the owner's saved copy, or writes a discarded container's tree over its app's saved
+  copy. An old backend opening any project deletes the citizen's current workspace without saving
+  it, and one that writes a record over a new one makes the new sweep later save one app's tree
+  into another app's saved copy. So: run the migrations (the old release runs safely on the new
+  schema), stop the old backend, deploy the worker and wait until only the new worker revision
+  runs, then start the new backend. Do this outside working hours, with the scheduled sweep on and
+  no manual reap. Do not roll back once the new backend has run; if a rollback is unavoidable,
+  first set the pool to size zero and wait for the new worker to empty it, then save and end every
+  live workspace through the new code, and wait until no deletion is owed.
+- **Three migrations, all additive:** the start-timing table; a write-back flag on owed teardowns,
+  which existing rows take as on, except a shared view's, which take it as off; and the pool's
+  ledger. The older backend keeps running on the migrated database until
+  the deploy order above stops it.
+- **Ship the sandbox image first.** It carries the supervisor's new call for handing a ready
+  workspace its project's settings, and newer packages. A new backend on the old image works until
+  a pool size is raised, and then every claim fails at that call and the start creates a workspace
+  as before. The portal can ship at any point: the browser's time attaches to a start only when the
+  portal and the backend are both new.
+- **Set `SANDBOX__IMAGE_REF` to the new immutable sandbox tag in both the backend and the worker,**
+  now and on every sandbox deploy after it, in the same step. The pool recognises a new image only
+  by that setting changing, so a setting left on `:latest` hides the deploy and ready workspaces
+  keep the old image.
+- **Grant the worker's identity the container-apps write action, which creates a container with
+  its tags, and the environment-join action on the sandbox resource group,** before the deploy.
+  The container apps role definition in `documentation/reference/` holds both. Without them every
+  create the worker makes for the pool is refused once a size is raised; starts are unaffected.
+- **Set the worker's `FRONTEND_URL` to the portal's public address,** the same value the backend
+  holds, and an `https` address in production. The new worker does not start without it.
+- **Keep every pool size at 0 in every environment until the connector pool (#297) ships.** A connector
+  project that claimed a plain ready workspace would start without the data identity.
+- **The backend runs no pool pass when it starts.** After a backend start the pool changes only through
+  claims and their refills until the worker's next tick, at most a minute later.
+- **Leave every pool size at 0.** `SANDBOX__POOL_DAY_SIZE` and `SANDBOX__POOL_NIGHT_SIZE` default
+  to 0 and need no setting; the day's hours and days take their defaults. The sizes are raised only
+  after a later release lets a data-connector project's start claim a ready workspace, and after
+  the environment's capacity has been checked for twice the pool.
+- **Rebuild the backend image, which the worker shares, and the sandbox image and the portal.**
+- **After the first start under the new code, the release is roll-forward only.** If a rollback is
+  ever forced, set every pool size to 0, save and end every live workspace through the new code
+  with the superadmin reap, wait until no deletion is owed (`pending_teardowns` is empty), and only
+  then start the old code; the steps are in `documentation/runbooks/reconcile-and-reclamation.md`.
+- **Check after the deploy.** In the superadmin report of sandbox starts, open a saved project,
+  send a new project's first message, send a chat message after the workspace has gone, switch
+  projects and open a shared app: each kind shows up once, with its stage times. In the worker's
+  log, the pool pass ticks every minute and finds a target of zero.
+
+### Added
+
+- **One record for every start that brings up a workspace:** a reopen, a new project's first
+  message, a chat with nothing running, a switch and a shared view. It holds the kind of start, the
+  project type, whether it took a ready workspace and, if it did not, why, and the time of each
+  stage: admission, settings, creating the workspace, starting the app server and the first page.
+  It also holds the steps inside those stages and whether the restore had to reinstall packages.
+  Attaching to a workspace that is already running writes none. Recording never fails or slows a
+  start.
+- **A superadmin report of sandbox starts,** with counts and medians for each kind. No route
+  returns a row, because a row names who started which app and when. Rows go with their user or
+  app, and an hourly pass in the worker deletes them after 90 days.
+- **The browser times every start from the click to the app showing.** The clock stops on the
+  framed app's own signal that it has mounted, never on the frame loading, and the browser reports
+  the time against the start the server named. The server attaches it only to the caller's own
+  start. A start nobody saw, or abandoned for another project, reports nothing.
+- **The pool of ready workspaces, switched off.** A ready workspace is made ahead of time, holds
+  nothing that belongs to a project, and is used once. Every kind of start claims one at the place
+  it would otherwise create a workspace; the claim is exclusive, even while two backends overlap in
+  a deploy, and checks the workspace is healthy first. A start tries at most two ready workspaces;
+  one that cannot claim either creates a workspace as before, its record saying why. A workspace
+  counts as ready only once its supervisor answers. A claim starts a replacement at once, a worker
+  pass every minute holds the count at the size set for the time of day in India time, and each
+  size is capped at 20. When the sandbox image changes, new workspaces are made before old ones are
+  retired, so the count does not dip.
+- **A call that hands a ready workspace its project's settings after the claim.** The supervisor
+  accepts it once, only for the project's own names, over the workspace's own credential. It never
+  echoes or logs what it was sent, and the values are hidden from output exactly as before. Until
+  the settings arrive, a ready workspace reports itself unconfigured and refuses to start the app.
+  A claimed workspace that Azure restarts comes back unconfigured and without its files, so a
+  reopen, a chat message or a shared view treats it as gone and restores the saved copy into a new
+  workspace.
+- **A below-size alarm.** The worker logs it when a pass ends below the configured size after Azure
+  refused a create or a new workspace never answered, or after finding a pool workspace left
+  unfinished past its deadline. Each of those stops the filling for that pass. It never fires at a
+  size of 0.
+- **Settings:** `SANDBOX__POOL_DAY_SIZE`, `SANDBOX__POOL_NIGHT_SIZE`, `SANDBOX__POOL_DAY_START`,
+  `SANDBOX__POOL_DAY_END` and `SANDBOX__POOL_DAY_DAYS`, read by both the backend and the worker,
+  and the worker's required `FRONTEND_URL`.
+
+### Changed
+
+- **The page notices a finished start within a second.** During a start it reads the preview state
+  every second instead of every three, over the same five-minute window. A tick is skipped while
+  the previous read is still waiting, and the workspace's presence is renewed at most every 45
+  seconds meanwhile.
+- **Every new workspace has a random name,** a shared view included, and a name is never reused.
+  A workspace's preview address now follows the workspace, so a new start leads to a new address.
+  No screen offers one to keep.
+- **Workspaces are found and told apart by what the platform recorded,** not by a name worked out
+  from the app. The registry records the app, a shared view is recognised by its recorded stamp, and
+  an owed teardown records whether its workspace is written back. A record written before this
+  release, and a shared view's owed teardown that the old release writes during the deploy, are
+  still read by their names until a later release removes that fallback.
+- **A shared-view Refresh and a stale workspace in the slot are deleted in the background,** as
+  switching projects already was, so the start no longer waits about half a minute for the delete.
+- **A workspace a start creates is held on the pool's ledger from before Azure is asked for it
+  until its record is written,** so one whose start died mid-create is deleted by the worker's
+  minute pass once no create could still be running, unless a record or an owed deletion has come
+  to name it by then.
+- **The orphan report, and the tag backfill's count of unowned workspaces, leave out every
+  workspace the pool's ledger holds — a ready one, or one a start is still creating — and the
+  workspaces whose deletion is still owed.**
+- **Off production, the scheduled sweep now retries owed deletions too.** Only its pass over the
+  registered workspaces stays production-only, and the line it logs off production carries the
+  owed counts.
+- **Packages move to their latest releases:** the backend's Azure container and storage libraries,
+  FastAPI and its Starlette, uvicorn, Taskiq and its Redis broker, SQLAlchemy and Alembic, and the
+  supervisor's FastAPI and uvicorn. The only code changes were what SQLAlchemy 2.1 asks for.
+- **FastAPI's own telemetry export is switched off.** The new version starts exporting request
+  telemetry by itself when the host's environment names a telemetry endpoint.
+
+### Fixed
+
+- **The sweep saves a workspace only into the app its record names.** If the record changed to a
+  different app after the sweep chose its target, because the person's workspace was swapped in
+  between, the workspace is spared and the next pass tries again, instead of one app's files
+  landing in another's saved copy.
+- **A shared view that outlives a project delete is recorded by its app and its colleague,** so
+  the owed-teardown record says whose view is left.
+- **A start no longer writes its workspace record over one another start wrote while it was
+  creating.** It fails as a refused create does and deletes its own workspace, instead of leaving
+  the other start's workspace with nothing that names it.
+- **A restarted ready workspace is no longer shown as running while its restore waits.** Its old
+  serving proof is withdrawn first, so the page waits for the restored app instead of framing the
+  dead one.
+- **A ready workspace whose credentials Azure would not read for a moment goes back to the pool**
+  instead of being deleted; the start takes the next one or creates its own.
+- **A pool fill the worker gave up on while it waited makes nothing,** and a container that never
+  answered is deleted even when its ledger row is already gone; a delete Azure refuses leaves a row
+  the next pass retries.
+- **A preview read that hangs no longer freezes the start's one-second poll.** A tick waits for an
+  in-flight read for at most ten seconds.
+
+### Security
+
+- **A claimed ready workspace never has its project's database address or storage key in Azure's
+  own record of it.** They are delivered over the supervisor's channel after the claim. A workspace
+  created on demand still carries them there, as before.
+- **The settings call accepts nothing the supervisor does not already allow into a generated app,
+  once per process,** and refuses with fixed text that echoes no submitted value.
+- **The sweep writes a workspace back only into an app its own holder owns.** A record that names
+  another person's app is deleted with nothing written, whatever wrote the record.
+
+### Known limits
+
+- **A fill stopped in the middle keeps the pool one short for about half an hour.** A worker that
+  dies while creating a container leaves a filling row, which counts toward the size until its
+  deadline. Until then nothing is logged and a container Azure already finished sits unclaimed;
+  the first pass after the deadline deletes it and logs the below-size alarm, and the next pass
+  fills the replacement. Starts are unaffected apart from one fewer fast open.
+- **A workspace Azure restarts loses its files, whichever way it was made.** A claimed ready
+  workspace is now recognised and restored from the saved copy. A workspace created on demand
+  still carries its settings, so it looks sound: a reopen, or a shared view opened without
+  Refresh, attaches to it and serves the image's bare starter, and a chat message reports that the
+  workspace cannot be recovered, until a follow-up release handles it. The saved copy is never
+  overwritten in either case.
+
 ## [1.8.11] - 2026-10-06
 
 The fixes from the interim security assessment of the portal and its API. One finding, that a
