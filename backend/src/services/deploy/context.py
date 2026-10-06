@@ -149,8 +149,7 @@ def _collect(root: Path) -> dict[str, bytes]:
 
 
 def _apply_platform_overlay(files: dict[str, bytes]) -> None:
-    """Rename the app's Next config aside, write every platform-owned file, then raise an old
-    Next to the floor.
+    """Rename the app's Next config aside, then write every platform-owned file.
 
     Mutates in place. Runs AFTER `_collect`, so a platform target always wins over whatever
     the tree happened to contain at that path — while the agent's Dockerfile, which is what
@@ -165,45 +164,50 @@ def _apply_platform_overlay(files: dict[str, bytes]) -> None:
     files[_WRAPPER_TARGET] = _asset_bytes("next.config.ts")
     for asset, target in _ASSET_TARGETS.items():
         files[target] = _asset_bytes(asset)
-    _raise_next_to_floor(files)
 
 
-def _locked_next(files: dict[str, bytes], declared: str) -> str:
-    """The Next version `npm ci` will install: the lockfile's, or the spec itself when there
-    is no lockfile to resolve it."""
-    if "package-lock.json" not in files:
-        return declared
-    lock = json.loads(files["package-lock.json"])
-    return str(lock.get("packages", {}).get("node_modules/next", {}).get("version", declared))
+def _json_object(raw: bytes) -> dict[str, object] | None:
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _installed_next(files: dict[str, bytes], spec: str) -> str:
+    """The Next version the build installs. `npm install` honours an exact spec whatever the
+    lockfile says; otherwise it is the lockfile's, or the spec when nothing resolves it."""
+    if _EXACT_VERSION.fullmatch(spec) or "package-lock.json" not in files:
+        return spec
+    lock = _json_object(files["package-lock.json"])
+    packages = lock.get("packages") if lock is not None else None
+    entry = packages.get("node_modules/next") if isinstance(packages, dict) else None
+    version = entry.get("version") if isinstance(entry, dict) else None
+    return version if isinstance(version, str) else spec
 
 
 def _raise_next_to_floor(files: dict[str, bytes]) -> None:
     """Raise an old 16.x Next to `NEXT_FLOOR` in the build copy of `package.json`.
 
     The Dockerfile's drift fallback then resolves Next alone while every other locked version
-    holds. A manifest that will not parse is left for the build to report."""
-    try:
-        package = json.loads(files.get("package.json", b"{}"))
-        declared = next(
-            (
-                deps
-                for deps in (package.get("dependencies"), package.get("devDependencies"))
-                if isinstance(deps, dict) and "next" in deps
-            ),
-            None,
-        )
-        if declared is None:
-            return
-        installed = _locked_next(files, str(declared["next"]))
-    except ValueError, AttributeError:
+    holds. A manifest that is not a JSON object is left for the build to report."""
+    package = _json_object(files.get("package.json", b"{}"))
+    if package is None:
+        _log.warning("deploy_next_floor_skipped", reason="package.json is not a JSON object")
         return
+    for section in (package.get("dependencies"), package.get("devDependencies")):
+        if isinstance(section, dict) and isinstance(spec := section.get("next"), str):
+            break
+    else:
+        return
+    installed = _installed_next(files, spec)
     match = _EXACT_VERSION.fullmatch(installed)
     if match is None:
         return
     parts = tuple(int(part) for part in match.groups())
     if parts[0] != _NEXT_FLOOR_PARTS[0] or parts >= _NEXT_FLOOR_PARTS:
         return
-    declared["next"] = NEXT_FLOOR
+    section["next"] = NEXT_FLOOR
     files["package.json"] = (json.dumps(package, indent=2) + "\n").encode()
     _log.info("deploy_next_floor_raised", from_version=installed, to_version=NEXT_FLOOR)
 
@@ -237,6 +241,7 @@ def build_context(root: Path) -> bytes:
     through `build_context_async` from request paths."""
     files = _collect(root)
     _apply_platform_overlay(files)
+    _raise_next_to_floor(files)
     packed = _pack(files)
     if len(packed) > MAX_CONTEXT_BYTES:
         raise ContextTooLargeError(

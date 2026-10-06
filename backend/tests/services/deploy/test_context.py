@@ -299,8 +299,8 @@ def test_a_project_locked_below_the_floor_publishes_on_the_floor(tmp_path: Path,
 
 @pytest.mark.parametrize(
     ("spec", "locked"),
-    [("^16.3.8", "16.3.8"), ("^16.4.0", "16.4.0"), ("^15.5.0", "15.5.0"), ("16.3.1", "16.3.8")],
-    ids=["at-floor", "above", "other-major", "lock-decides-not-spec"],
+    [("^16.3.8", "16.3.8"), ("^16.4.0", "16.4.0"), ("^15.5.0", "15.5.0"), ("^16.3.1", "16.3.8")],
+    ids=["at-floor", "above", "other-major", "a-range-follows-the-lock"],
 )
 def test_a_lock_at_or_above_the_floor_or_on_another_major_is_left_alone(
     tmp_path: Path, spec, locked
@@ -308,8 +308,9 @@ def test_a_lock_at_or_above_the_floor_or_on_another_major_is_left_alone(
     _assert_untouched(_app(tmp_path, spec=spec, locked=locked))
 
 
-def test_without_a_lock_an_exact_spec_decides(tmp_path: Path) -> None:
-    package = _package(_app(tmp_path, spec="16.3.3"))
+@pytest.mark.parametrize("locked", [None, "16.3.8"], ids=["no-lock", "newer-lock"])
+def test_an_exact_spec_decides_whatever_the_lock_says(tmp_path: Path, locked) -> None:
+    package = _package(_app(tmp_path, spec="16.3.3", locked=locked))
 
     assert package["dependencies"]["next"] == NEXT_FLOOR
 
@@ -330,15 +331,45 @@ def test_next_under_dev_dependencies_is_raised_where_it_is_declared(tmp_path: Pa
     assert package["dependencies"] == {"pg": "8.22.0"}
 
 
-@pytest.mark.parametrize("broken", ["package.json", "package-lock.json"])
-def test_an_unreadable_manifest_passes_through_for_the_build_to_report(
-    tmp_path: Path, broken
+@pytest.mark.parametrize("content", ["{not json", "[]", "null"])
+def test_a_manifest_that_is_not_an_object_passes_through_for_the_build_to_report(
+    tmp_path: Path, content
 ) -> None:
     root = _app(tmp_path, spec="16.3.1", locked="16.3.1")
-    (root / broken).write_text("{not json")
-    files = _unpack(build_context(root))
+    (root / "package.json").write_text(content)
+    with capture_logs() as logs:
+        files = _unpack(build_context(root))
 
     assert files["package.json"] == (root / "package.json").read_bytes()
+    assert [entry["event"] for entry in logs if "next_floor" in entry["event"]] == [
+        "deploy_next_floor_skipped"
+    ]
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["{not json", "[]", '{"packages": []}', '{"packages": {"node_modules/next": "16.3.1"}}'],
+)
+def test_a_lock_that_resolves_nothing_leaves_a_range_alone(tmp_path: Path, content) -> None:
+    root = _app(tmp_path, spec="^16.3.1", locked="16.3.1")
+    (root / "package-lock.json").write_text(content)
+
+    _assert_untouched(root)
+
+
+def test_new_projects_start_at_or_above_the_floor() -> None:
+    """A floor raised without re-locking the template would send every new project's publish
+    through the npm install fallback."""
+    template = Path(__file__).resolve().parents[4] / "sandbox" / "template"
+    declared = json.loads((template / "package.json").read_text())["dependencies"]["next"]
+    lock = json.loads((template / "package-lock.json").read_text())["packages"]
+
+    assert {lock[""]["dependencies"]["next"], lock["node_modules/next"]["version"]} == {declared}
+    assert _parts(declared) >= _parts(NEXT_FLOOR)
+
+
+def _parts(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
 
 
 def test_a_raise_is_logged_with_both_versions(tmp_path: Path) -> None:
