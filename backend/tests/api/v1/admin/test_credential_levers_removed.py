@@ -21,19 +21,22 @@ _TTL = settings.auth.access_ttl_seconds
 
 
 @pytest.mark.parametrize("lever", ["database-credential", "deploy-credential"])
-@pytest.mark.parametrize("email", ["admin@bial.com", "nobody@rvaiglobal.com"])
+@pytest.mark.parametrize(
+    ("email", "sibling_status"), [("admin@bial.com", 200), ("nobody@rvaiglobal.com", 403)]
+)
 async def test_the_lever_does_not_exist(
-    client: AsyncClient, db_session: AsyncSession, lever: str, email: str
+    client: AsyncClient, db_session: AsyncSession, lever: str, email: str, sibling_status: int
 ) -> None:
     owner = await UserFactory.create(db_session)
     app = await AppRegistryFactory.create(db_session, user_id=owner.id)
     caller = await UserFactory.create(db_session, email=email)
-    cookie = mint_session_jwt(caller.id, caller.token_version, _TTL)
+    headers = {"Cookie": f"session={mint_session_jwt(caller.id, caller.token_version, _TTL)}"}
 
-    resp = await client.post(
-        f"/v1/admin/apps/{app.id}/{lever}", headers={"Cookie": f"session={cookie}"}
-    )
+    resp = await client.post(f"/v1/admin/apps/{app.id}/{lever}", headers=headers)
 
     assert resp.status_code == 404
     audited = await db_session.scalar(sa.select(sa.func.count()).select_from(AuditLog))
     assert audited == 0
+    # The same caller reaches a sibling route on the same app, so the 404 is the lever's alone.
+    sibling = await client.get(f"/v1/admin/apps/{app.id}/history", headers=headers)
+    assert sibling.status_code == sibling_status
