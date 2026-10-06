@@ -6,7 +6,7 @@ from the session cookie and returns the live `User`. This is AUTHENTICATION only
 (who you are) — no role/permission check (RBAC is a later phase).
 """
 
-from typing import Annotated
+from typing import Annotated, Final
 
 import structlog
 from fastapi import Depends, HTTPException, Request, status
@@ -17,6 +17,8 @@ from src.db.session import get_db
 from src.services.auth.cookies import session_cookie_name
 from src.services.auth.errors import AuthError
 from src.services.auth.session_jwt import decode_session_jwt
+from src.services.ratelimit import InProcessRateLimiter
+from src.services.ratelimit.limiter import RateLimitExceededError
 from src.services.storage import (
     AppContainerStore,
     ObjectStorage,
@@ -78,6 +80,38 @@ async def current_user(request: Request, db: DbSession) -> User:
 
 
 CurrentUser = Annotated[User, Depends(current_user)]
+
+
+API_CEILING_PER_MINUTE: Final = 600
+"""Requests one signed-in user may make in a minute, per source. The portal's busiest
+legitimate rate is about eighty: the start probe running on two surfaces at once."""
+
+_API_CEILING = InProcessRateLimiter(limit=API_CEILING_PER_MINUTE, window_seconds=60)
+
+# `Sec-Fetch-Site` is set by the browser and page script cannot forge it. A generated app's
+# host shares the portal's registrable domain, so its requests carry the viewer's cookie as
+# `same-site`; counting them apart keeps an app someone merely opened from spending the budget
+# the portal needs to keep them signed in.
+_APP_ORIGINATED: Final = frozenset({"same-site", "cross-site"})
+
+
+async def api_ceiling(request: Request) -> None:
+    """Refuse a signed-in user's request over the per-minute ceiling with a 429.
+
+    Verifies the session's signature without a database read. A request with no valid session
+    is not counted: the routes that serve one are sign-in and health, and there is no safe key
+    for them here — every BIAL user shares one egress address and the forwarded one is the
+    client's to choose."""
+    token = request.cookies.get(session_cookie_name())
+    if not token:
+        return
+    try:
+        claims = decode_session_jwt(token)
+    except AuthError:
+        return
+    source = "app" if request.headers.get("sec-fetch-site") in _APP_ORIGINATED else "portal"
+    if not _API_CEILING.hit(f"{claims.user_id}:{source}"):
+        raise RateLimitExceededError("Too many requests. Please wait a minute and try again.")
 
 
 def storage_dependency() -> ObjectStorage:

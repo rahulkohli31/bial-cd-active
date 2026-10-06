@@ -15,8 +15,9 @@ precisely the probe the 404 refuses to answer. Reaching across owners is an expl
 audited admin action, and the one read that drops the predicate on purpose — the published-app
 catalog — argues for itself in its own module header."""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
+from src.api.deps import api_ceiling
 from src.api.v1.admin.classification import router as admin_classification_router
 from src.api.v1.admin.router import router as admin_router
 from src.api.v1.admin.router import users_router as admin_users_router
@@ -37,19 +38,24 @@ from src.api.v1.marketplace.router import router as marketplace_router
 from src.api.v1.observations.router import router as observations_router
 from src.api.v1.projects.router import router as projects_router
 from src.api.v1.usage.router import router as usage_router
-from src.schemas import AUTH_403_SUSPENDED, DetailBody, error_responses
+from src.schemas import AUTH_403_SUSPENDED, DetailBody, ErrorEnvelope, error_responses
 
 # Cross-cutting error codes are documented ONCE here as v1-router-level defaults:
 # the unhandled-exception 500 (`{"detail": "Internal server error"}`,
 # `unhandled_exception_handler`) so every v1 route clears SonarQube S8415 without a
-# per-route declaration, and the suspension 403 `current_user` raises on every
-# authenticated route (deps.py). FastAPI merges `{**router.responses,
-# **route.responses}`, so a route with its own declaration — admin's superadmin 403 —
-# overrides these defaults. This is DOCUMENTATION only: the handlers themselves
-# (`core/errors.py`) are registered app-wide from `main.py`, not here.
+# per-route declaration, the suspension 403 `current_user` raises on every
+# authenticated route (deps.py), and the 429 of `api_ceiling`, the one dependency every v1
+# route runs. FastAPI merges `{**router.responses, **route.responses}`, so a route with its
+# own declaration — admin's superadmin 403 — overrides these defaults. The handlers
+# themselves (`core/errors.py`) are registered app-wide from `main.py`, not here.
 v1_router = APIRouter(
     prefix="/v1",
-    responses=error_responses(AUTH_403_SUSPENDED, (500, DetailBody, "Internal server error")),
+    dependencies=[Depends(api_ceiling)],
+    responses=error_responses(
+        AUTH_403_SUSPENDED,
+        (429, ErrorEnvelope, "Too many requests from this user"),
+        (500, DetailBody, "Internal server error"),
+    ),
 )
 v1_router.include_router(health_router)
 v1_router.include_router(auth_router)

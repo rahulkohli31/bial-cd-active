@@ -216,6 +216,11 @@ The control plane is also unreachable on the generated application's own origin.
 path that serves applications forwards to the API, so an application cannot call the platform's
 own endpoints by convenience of being nearby.
 
+**A generated application cannot spend the person's request budget.** Every signed-in person has a
+ceiling on how many API requests they can make in a minute. Requests the browser marks as coming
+from an application's page count apart from the portal's own, so an application someone merely
+opens cannot lock them out of the portal.
+
 **The control plane reads the organisation's directory, and only as its own identity.** Sharing
 looks people up there, so an owner can share with a colleague who has never signed in. The call
 uses the control plane's own identity, never the one generated applications receive, and it only

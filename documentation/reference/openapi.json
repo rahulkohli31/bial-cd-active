@@ -5369,6 +5369,16 @@
             },
             "description": "Super-admin privileges required"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -5420,6 +5430,16 @@
               }
             },
             "description": "Super-admin privileges required"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -5483,6 +5503,16 @@
             },
             "description": "Super-admin privileges required"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -5534,6 +5564,16 @@
               }
             },
             "description": "Super-admin privileges required"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -5597,6 +5637,16 @@
             },
             "description": "Super-admin privileges required"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -5659,6 +5709,16 @@
             },
             "description": "Super-admin privileges required"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -5720,6 +5780,16 @@
               }
             },
             "description": "Super-admin privileges required"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -5825,6 +5895,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -5915,6 +5995,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -6020,6 +6110,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -6123,6 +6223,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -6228,6 +6338,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -6332,6 +6452,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -6425,6 +6555,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -6529,6 +6669,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -6623,6 +6773,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -6684,6 +6844,16 @@
               }
             },
             "description": "Super-admin privileges required"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -6766,6 +6936,16 @@
               }
             },
             "description": "A scored class with no weight (`weight_required`), or a body that fails validation"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -6870,6 +7050,16 @@
             },
             "description": "A scored class with no weight (`weight_required`), or a body that fails validation"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -6942,6 +7132,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -6992,6 +7192,16 @@
               }
             },
             "description": "Super-admin privileges required"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -7066,6 +7276,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -7173,6 +7393,16 @@
             },
             "description": "Invalid pagination cursor or over-long q"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -7254,6 +7484,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -7348,6 +7588,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -7452,6 +7702,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -7546,6 +7806,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -7630,6 +7900,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -7713,6 +7993,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -7807,6 +8097,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -8089,6 +8389,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -8129,6 +8439,16 @@
               }
             },
             "description": "Account suspended"
+          },
+          "429": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -8189,6 +8509,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -8227,6 +8557,16 @@
               }
             },
             "description": "Account suspended"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -8268,6 +8608,16 @@
               }
             },
             "description": "CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -8320,6 +8670,16 @@
             },
             "description": "Account suspended"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -8370,6 +8730,16 @@
               }
             },
             "description": "CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -8422,6 +8792,16 @@
               }
             },
             "description": "CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -8527,6 +8907,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -8610,6 +9000,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -8715,6 +9115,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -8808,6 +9218,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -8913,6 +9333,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -9016,6 +9446,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -9121,6 +9561,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -9215,6 +9665,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -9308,6 +9768,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -9413,6 +9883,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -9506,6 +9986,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -9601,6 +10091,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -9684,6 +10184,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -9776,6 +10286,16 @@
               }
             },
             "description": "Invalid request body"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -9893,6 +10413,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -9982,6 +10512,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -10086,6 +10626,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -10177,6 +10727,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -10267,6 +10827,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -10377,6 +10947,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -10643,6 +11223,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -10890,6 +11480,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -11034,6 +11634,16 @@
             },
             "description": "Account suspended"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -11161,6 +11771,16 @@
               }
             },
             "description": "Invalid page, limit, sort, or over-long q"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -11386,6 +12006,16 @@
             },
             "description": "Invalid page/pageSize/filter or over-long q"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -11455,6 +12085,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -11590,6 +12230,16 @@
               }
             },
             "description": "Account suspended"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -11727,6 +12377,16 @@
             },
             "description": "Invalid page, limit, sort, sharedBy, or over-long q"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -11831,6 +12491,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -11922,6 +12592,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -12025,6 +12705,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -12108,6 +12798,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -12315,6 +13015,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -12427,6 +13137,16 @@
               }
             },
             "description": "The window is not one this connector offers"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -12550,6 +13270,16 @@
             },
             "description": "A send that goes to an administrator with no note (`note_required`, with `error.detail.reason` one of `hard_block`, `over_threshold`, `review_unfinished`, `rejection_standing`), or an answer for a class that is not active (`unknown_class`); an incomplete body is FastAPI's own validation 422 with the `{\"detail\": [...]}` shape instead"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -12643,6 +13373,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -12738,6 +13478,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -12832,6 +13582,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -12925,6 +13685,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
@@ -13154,6 +13924,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -13236,6 +14016,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -13308,6 +14098,16 @@
             },
             "description": "Validation Error"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -13358,6 +14158,16 @@
               }
             },
             "description": "Account suspended"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests from this user"
           },
           "500": {
             "content": {
