@@ -1,5 +1,5 @@
-"""The admin database levers: `disable` severs, `enable` restores, the reveal
-endpoint hands over the DSN, and `hard_delete` salts the earth after committing.
+"""The admin database levers: `disable` severs, `enable` restores, and `hard_delete` salts
+the earth after committing.
 
 WHY THIS EXISTS
 Real cluster, real connections, no fakes on the database side. That is not thoroughness
@@ -72,11 +72,6 @@ def _cookie(jwt: str) -> dict[str, str]:
 async def _admin(db: AsyncSession) -> dict[str, str]:
     # The .env.test allowlist contains admin@bial.com → super-admin.
     user = await UserFactory.create(db, email="admin@bial.com")
-    return _cookie(mint_session_jwt(user.id, user.token_version, _TTL))
-
-
-async def _citizen(db: AsyncSession) -> dict[str, str]:
-    user = await UserFactory.create(db, email="nobody@rvaiglobal.com")
     return _cookie(mint_session_jwt(user.id, user.token_version, _TTL))
 
 
@@ -393,122 +388,6 @@ async def test_a_refused_enable_leaves_the_database_severed(
     assert await _audit_rows(db_session, "db:restore") == []
     with pytest.raises(asyncpg.InvalidAuthorizationSpecificationError):
         await scalar_on(dsn, "SELECT 1")
-
-
-# --- the reveal: POST /v1/admin/apps/{app_id}/database-credential ------------------------
-
-
-async def test_reveal_hands_a_superadmin_a_working_dsn(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    row, record = await _with_database(db_session, **_approved())
-
-    resp = await client.post(
-        f"/v1/admin/apps/{row.id}/database-credential", headers=await _admin(db_session)
-    )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["dbName"] == record.db_name
-    assert body["roleName"] == record.role_name
-    # The `BIAL_DATABASE_URL` form a deployed app is given: node-postgres cannot parse
-    # SQLAlchemy's `postgresql+asyncpg://` driver selector.
-    assert body["dsn"].startswith("postgresql://")
-    assert "+asyncpg" not in body["dsn"]
-    # It is not merely well-formed — it connects.
-    assert await scalar_on(control_plane_dsn(record), "SELECT 1") == 1
-
-
-async def test_the_reveal_audit_row_carries_no_secret(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    row, record = await _with_database(db_session, **_approved())
-    password = decrypt_password(record.password_encrypted)
-
-    resp = await client.post(
-        f"/v1/admin/apps/{row.id}/database-credential", headers=await _admin(db_session)
-    )
-
-    revealed = await _audit_rows(db_session, "db:reveal")
-    assert len(revealed) == 1
-    detail = revealed[0].detail
-    assert detail is not None
-    assert detail["roleName"] == record.role_name
-    assert detail["host"] == resp.json()["host"] and detail["host"]
-    # WHO and WHERE, never WITH WHAT — the DSN differs from this row by exactly the password.
-    serialized = json.dumps(detail)
-    assert password not in serialized
-    assert resp.json()["dsn"] not in serialized
-
-
-async def test_reveal_is_superadmin_only(client: AsyncClient, db_session: AsyncSession) -> None:
-    row, _record = await _with_database(db_session, **_approved())
-
-    resp = await client.post(
-        f"/v1/admin/apps/{row.id}/database-credential", headers=await _citizen(db_session)
-    )
-
-    assert resp.status_code == 403
-    assert await _audit_rows(db_session, "db:reveal") == []
-
-
-async def test_reveal_for_a_project_without_a_database_is_a_409(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    # A state, not a bug: no row means never provisioned. A 500 here would send an operator
-    # hunting a platform fault that does not exist.
-    row = await _app_row(db_session, **_approved())
-
-    resp = await client.post(
-        f"/v1/admin/apps/{row.id}/database-credential", headers=await _admin(db_session)
-    )
-
-    assert resp.status_code == 409
-
-
-async def test_reveal_when_the_substrate_is_unconfigured_is_409_and_writes_no_audit(
-    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A db_ready row exists, but `APP_DB__*` is later unconfigured. The reveal path never
-    # calls `get_maintenance_engine` — it goes `sandbox_dsn` -> `_app_db_settings()`, which
-    # raises `AppDatabaseUnconfiguredError` when `settings.app_db` is None — so the engine
-    # singleton is deliberately NOT reset here. The handler maps that to a 409 (a state, not
-    # a bug) and must NOT audit a reveal that handed over no credential.
-    row, _record = await _with_database(db_session, **_approved())
-    headers = await _admin(db_session)
-    app_id = row.id
-
-    monkeypatch.setattr(settings, "app_db", None)
-    try:
-        resp = await client.post(f"/v1/admin/apps/{app_id}/database-credential", headers=headers)
-        assert resp.status_code == 409
-        assert (
-            resp.json()["error"]["message"]
-            == "Per-project databases are not configured on this deployment."
-        )
-        assert await _audit_rows(db_session, "db:reveal") == []
-    finally:
-        # The cached engine (built from real config during provision) is untouched by the
-        # app_db swap; reset it anyway so no test after this reuses a stale singleton.
-        await reset_maintenance_engine_for_tests()
-
-
-async def test_reveal_refuses_a_database_that_never_finished_provisioning(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    # `db_ready = false` means the external sequence died partway, so the cross-app wall may
-    # never have gone up. Handing that DSN to an operator would publish a database that is
-    # not yet isolated.
-    row, record = await _with_database(db_session, **_approved())
-    await db_session.execute(
-        sa.update(ProjectDatabase).where(ProjectDatabase.id == record.id).values(db_ready=False)
-    )
-
-    resp = await client.post(
-        f"/v1/admin/apps/{row.id}/database-credential", headers=await _admin(db_session)
-    )
-
-    assert resp.status_code == 409
 
 
 # --- hard delete: the admin danger-op ----------------------------------------------------

@@ -32,7 +32,6 @@ import structlog
 from fastapi import APIRouter, status
 from pydantic.alias_generators import to_camel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.api.deps import ContainerStore, DbSession, OptionalStorage, Storage
@@ -52,10 +51,8 @@ from src.api.v1.admin.schemas import (
     BulkLimitsRequest,
     BulkLimitsResponse,
     BundleUrlResponse,
-    DatabaseCredentialResponse,
     DatabaseReconcileCounts,
     DatabaseReconcileResponse,
-    DeployCredentialResponse,
     DeployReconcileResponse,
     FeedbackItem,
     FeedbackResponse,
@@ -109,8 +106,6 @@ from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
 from src.schemas import ADMIN_AUTH, AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.appdb.engine import get_maintenance_engine
-from src.services.appdb.errors import AppDatabaseUnconfiguredError
-from src.services.appdb.provision import sandbox_dsn
 from src.services.appdb.reconcile import (
     AppDatabaseReconcileReport,
     advisory_database_sizes,
@@ -144,7 +139,6 @@ from src.services.sandbox import SandboxError
 from src.services.storage import (
     ObjectStorage,
     StorageError,
-    StorageSignError,
     submission_key,
 )
 from src.services.storage.reconcile import (
@@ -282,9 +276,8 @@ _RESTORE_TARGET = sa.func.coalesce(
 def _db_detail(app_id: uuid.UUID, handles: TeardownHandles) -> dict[str, Any]:
     """Audit `detail` for a database lever: NAMES only.
 
-    Never the DSN, never the password, never the host's credentials —
-    the same discipline `deploy-credential:mint` applies when it audits nothing but an
-    expiry. A name is an identifier an operator can act on; the DSN is a credential.
+    Never the DSN, never the password, never the host's credentials. A name is an identifier
+    an operator can act on; the DSN is a credential.
     """
     return {"appId": str(app_id), "dbName": handles.db_name, "roleName": handles.role_name}
 
@@ -736,10 +729,9 @@ async def disable(
     PENDING stays out: an app waiting for review is REJECTED, not switched off, and the copy
     below says so rather than leaving the administrator to guess which lever they wanted.
 
-    NOT severed here, deliberately: the app's deploy Blob SAS (see
-    `mint_deploy_credential`). A re-mint revokes it, because each mint replaces the container's
-    one stored access policy under a fresh id; deleting that policy by hand means looking the id
-    up first. Either is an operator step — do not read this response as "the files are locked"."""
+    NOT severed here, deliberately: the app's long-lived deploy Blob SAS. Revoking it means
+    deleting the container's stored access policy, an operator step — do not read this response
+    as "the files are locked"."""
     # The sever, not merely the status, because the shared-table plane and its per-request
     # app-key 403 are gone: a deployed container holds a real credential and answers to nobody
     # but PostgreSQL.
@@ -971,136 +963,6 @@ async def bundle_download_url(
         commit_sha=commit_sha,
         expires_in_seconds=int(_BUNDLE_URL_TTL.total_seconds()),
     )
-
-
-@router.post(
-    "/{app_id}/deploy-credential",
-    responses=error_responses(
-        (404, ErrorEnvelope, "App not found"),
-        (409, ErrorEnvelope, "Storage cannot mint a long-lived credential in this configuration"),
-        (503, ErrorEnvelope, "Storage temporarily unavailable"),
-        *_ADMIN_AUTH,
-    ),
-)
-async def mint_deploy_credential(
-    app_id: uuid.UUID,
-    admin: CurrentSuperadmin,
-    db: DbSession,
-    container_store: ContainerStore,
-) -> DeployCredentialResponse:
-    """Mint the deployed app's long-lived, container-scoped Blob credential — the
-    `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS` pair.
-
-    Deliberately independent: the credential reaches the app's own container DIRECTLY, so a
-    deployed app never proxies file traffic through the control-plane. That independence cuts
-    both ways — `disable` kill-switches the DATA plane but does NOT revoke this SAS."""
-    # Like `bundle-url`, the minted token is a bearer credential: audited as an EVENT (who,
-    # which app, when it dies) with the SAS value itself never logged and never in the audit
-    # `detail`. Not part of any list projection — a mint is always an explicit, recorded act.
-    await _get_app_or_404(db, app_id)
-    if container_store is None:
-        # Fail closed and say what to fix: object storage is simply not configured here, so
-        # there is no container and nothing to sign with.
-        raise AppApiError(409, "Object storage is not configured on this deployment.")
-    try:
-        credential = await container_store.mint_deploy_container_sas(app_id)
-    except StorageSignError as exc:
-        # Actionable, and admin-only — but still no internal error text: the copy names the
-        # configuration to change, never what the SDK raised.
-        raise AppApiError(
-            409,
-            "This deployment's storage uses managed identity, which cannot issue a credential "
-            "beyond 7 days. Configure a storage account key to mint a deploy credential.",
-        ) from exc
-    except StorageError as exc:
-        raise AppApiError(503, "Storage is temporarily unavailable. Please try again.") from exc
-    await append_audit(
-        db,
-        actor_id=admin.id,
-        action="deploy-credential:mint",
-        resource_type="app",
-        resource_id=str(app_id),
-        # Expiry ONLY — never the SAS, never the container URL's query string.
-        detail={"expiresAt": credential.expires_at.isoformat()},
-    )
-    await db.commit()
-    return DeployCredentialResponse(
-        container_url=container_store.container_url(app_id),
-        sas=credential.sas,
-        expires_at=credential.expires_at,
-    )
-
-
-@router.post(
-    "/{app_id}/database-credential",
-    responses=error_responses(
-        (404, ErrorEnvelope, "App not found"),
-        (409, ErrorEnvelope, "This project has no database to reveal"),
-        *_ADMIN_AUTH,
-    ),
-)
-async def reveal_database_credential(
-    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
-) -> DatabaseCredentialResponse:
-    """Reveal the project database's connection string — the deployed app's
-    `BIAL_DATABASE_URL`, byte-for-byte the value the sandbox is injected with.
-
-    There is no rotation lever here on purpose: one role serves both the sandbox and the
-    deployed container, so a reset would cut a live deployment off. Leak response is a
-    deliberate, separate operator story."""
-    # The database is keyed by PROJECT while this router is keyed by app, so `app.project_id`
-    # is the resolution. The audit row is project-scoped and carries `appId` so it still shows
-    # up in the app's trail.
-    #
-    # Modelled on `mint_deploy_credential`, including the parts that are security decisions
-    # rather than style: the secret is returned in the RESPONSE BODY ONLY, it is never part of
-    # any list projection (a listing would mass-reveal one credential per row), and the audit
-    # `detail` records the role name and the host — WHO can connect and WHERE — but never the
-    # DSN and never the password. A reveal is an event, and the event is what gets recorded.
-    app = await _get_app_or_404(db, app_id)
-    record = (
-        await db.execute(
-            sa.select(ProjectDatabase).where(
-                ProjectDatabase.project_id == app.project_id,
-                ProjectDatabase.db_ready.is_(True),
-            )
-        )
-    ).scalar_one_or_none()
-    if record is None:
-        # Absent OR not-terminal: a claim row whose external sequence never finished means
-        # the cross-app wall may be down, so its DSN is not a thing to hand an operator.
-        # Fail-closed and non-500 — "no database" is a state, not a bug.
-        raise AppApiError(409, "This project has no database yet.")
-    try:
-        # Resolved lazily, INSIDE the body: an eager `Depends` would raise ahead of the 404
-        # and 409 above and turn both into 500s (commit 6be7a9c's whole lesson).
-        dsn = sandbox_dsn(record)
-    except AppDatabaseUnconfiguredError as exc:
-        raise AppApiError(
-            409, "Per-project databases are not configured on this deployment."
-        ) from exc
-    # Plain scalars before the commit — after it, every one of these is lazy I/O.
-    db_name, role, host = record.db_name, record.role_name, _dsn_host(dsn)
-    await append_audit(
-        db,
-        actor_id=admin.id,
-        action="db:reveal",
-        resource_type="project",
-        resource_id=str(app.project_id),
-        # Role + host + database NAME. The DSN differs from these by exactly one field —
-        # the password — and that field is the entire reason this row is not the DSN.
-        detail={"appId": str(app_id), "roleName": role, "dbName": db_name, "host": host},
-    )
-    await db.commit()
-    return DatabaseCredentialResponse(dsn=dsn, db_name=db_name, role_name=role, host=host)
-
-
-def _dsn_host(dsn: str) -> str:
-    """`host:port` out of a DSN, parsed rather than sliced so no credential can ride along
-    into an audit row (`make_url` keeps the password in a separate field)."""
-    url = make_url(dsn)
-    host = url.host or ""
-    return f"{host}:{url.port}" if url.port else host
 
 
 @router.delete(

@@ -228,35 +228,6 @@ class BundleUrlResponse(CamelModel):
     expires_in_seconds: int
 
 
-class DeployCredentialResponse(CamelModel):
-    """The long-lived per-app Blob credential a deployed container runs with, as
-    `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS`. `sas` is a 365-day bearer
-    credential: the admin pastes it straight into an ACA secret and it is NEVER logged, NEVER
-    written to the audit trail (the audit row carries the expiry, not the token), and never part
-    of any list projection. `expiresAt` comes from the app's stored access policy — deleting that
-    policy revokes this credential."""
-
-    container_url: str
-    sas: str
-    expires_at: datetime
-
-
-class DatabaseCredentialResponse(CamelModel):
-    """The project database's connection string, a deployed app's `BIAL_DATABASE_URL`.
-    `dsn` embeds the app role's password, so it is the same
-    kind of object as `DeployCredentialResponse.sas`: returned in this body and nowhere else
-    — never logged, never in the audit `detail` (which records `roleName` + `host` instead),
-    never in a list projection.
-
-    `dbName` / `roleName` / `host` are the non-secret half, repeated so an operator can
-    identify and later reconcile the database without re-reading the credential."""
-
-    dsn: str
-    db_name: str
-    role_name: str
-    host: str
-
-
 # The rejection note's floor. A rejection is the only thing the citizen gets
 # back, and an EMPTY note rendered as nothing at all — a bare red badge and no idea what
 # to change. The floor is a product decision in disguise (it decides how much an
