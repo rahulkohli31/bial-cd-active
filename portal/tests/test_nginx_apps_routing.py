@@ -758,6 +758,8 @@ def test_an_app_response_does_not_name_the_software_behind_it(router: Router) ->
         f"/a/{PUB_KEY}/_next/static/chunks/main.js.map",
         f"/a/{SBX_KEY}/__nextjs_source-map?filename=x",
         f"/a/{SHR_KEY}/__nextjs_restart_dev",
+        f"/a/{SBX_KEY}/_next/mcp",
+        f"/a/{PUB_KEY}/_next/development/request-insights",
     ],
 )
 def test_next_source_and_dev_endpoints_never_reach_an_app(router: Router, target: str) -> None:
@@ -766,12 +768,15 @@ def test_next_source_and_dev_endpoints_never_reach_an_app(router: Router, target
     assert "REQ=" not in body
 
 
-def test_a_root_relative_dev_endpoint_never_reaches_an_app_either(router: Router) -> None:
+@pytest.mark.parametrize("target", ["/__nextjs_original-stack-frames", "/_next/mcp"])
+def test_a_root_relative_dev_endpoint_never_reaches_an_app_either(
+    router: Router, target: str
+) -> None:
     """Next's dev client asks for some of these with no key in the path; the keyless arm would
     otherwise resolve the app from the Referer and forward it."""
     referer = {"Referer": f"https://{APPS_HOSTNAME}/a/{SBX_KEY}/"}
     status, _, body = router.request(
-        "/__nextjs_original-stack-frames",
+        target,
         method="POST",
         headers={**referer, "Content-Type": "application/json"},
         body=b"{}",
@@ -784,7 +789,8 @@ def test_a_root_relative_dev_endpoint_never_reaches_an_app_either(router: Router
     assert _target(body) == f"/a/{SBX_KEY}/api/items"
 
 
-def test_an_apps_own_map_route_still_reaches_it(router: Router) -> None:
-    status, _, body = router.request(f"/a/{PUB_KEY}/data/route.map")
+@pytest.mark.parametrize("route", ["data/route.map", "data/__nextjs_notes", "docs/_next/x.map"])
+def test_an_apps_own_routes_below_its_root_still_reach_it(router: Router, route: str) -> None:
+    status, _, body = router.request(f"/a/{PUB_KEY}/{route}")
     assert status == 200
-    assert _target(body) == f"/a/{PUB_KEY}/data/route.map"
+    assert _target(body) == f"/a/{PUB_KEY}/{route}"

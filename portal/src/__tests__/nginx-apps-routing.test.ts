@@ -354,21 +354,25 @@ describe('nginx.conf — the apps site serves no Next source and no Next dev end
     expect(block.body).not.toMatch(/proxy_pass/)
   })
 
-  it('matches maps only under /_next/, so an app keeps its own .map routes', () => {
+  it('matches the dev surface at the app root only, so an app keeps its own routes', () => {
     const pattern = new RegExp(APPS_LOCATIONS[blockIndex]!.header.replace(/^~\s*"|"$/g, ''))
     expect(pattern.test(`/a/sbx-${HEX28}/_next/static/chunks/main.js.map`)).toBe(true)
     expect(pattern.test('/_next/static/chunks/main.js.map')).toBe(true)
     expect(pattern.test(`/a/sbx-${HEX28}/__nextjs_source-map`)).toBe(true)
     expect(pattern.test('/__nextjs_original-stack-frames')).toBe(true)
     expect(pattern.test('/__nextjs_restart_dev')).toBe(true)
+    expect(pattern.test(`/a/sbx-${HEX28}/_next/mcp`)).toBe(true)
+    expect(pattern.test('/_next/mcp')).toBe(true)
+    expect(pattern.test(`/a/pub-${HEX28}/_next/development/request-insights`)).toBe(true)
     expect(pattern.test(`/a/pub-${HEX28}/data/route.map`)).toBe(false)
     expect(pattern.test(`/a/sbx-${HEX28}/_next/static/chunks/main.js`)).toBe(false)
     expect(pattern.test(`/a/sbx-${HEX28}/_next/hmr`)).toBe(false)
-    // Linear on a hostile URI: the map branch is anchored, so `.*` never restarts.
-    const hostile = `/a/sbx-${HEX28}` + '/_next/'.repeat(1100) + 'x'
-    const started = performance.now()
-    expect(pattern.test(hostile)).toBe(false)
-    expect(performance.now() - started).toBeLessThan(5)
+    expect(pattern.test(`/a/sbx-${HEX28}/mcp`)).toBe(false)
+    // Both branches are anchored: an unanchored one would match these deeper paths, and its
+    // `.*` would restart at every `/_next/` of a crafted URI.
+    expect(pattern.test(`/a/pub-${HEX28}/docs/_next/x.map`)).toBe(false)
+    expect(pattern.test(`/a/pub-${HEX28}/data/__nextjs_x`)).toBe(false)
+    expect(pattern.test(`/a/sbx-${HEX28}` + '/_next/'.repeat(1100) + 'x')).toBe(false)
   })
 
   it('hides the two headers that name the software behind an app', () => {
