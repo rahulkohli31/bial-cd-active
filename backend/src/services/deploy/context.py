@@ -24,6 +24,8 @@ from __future__ import annotations
 import asyncio
 import gzip
 import io
+import json
+import re
 import tarfile
 from importlib import resources
 from pathlib import Path
@@ -100,6 +102,16 @@ _EMPTY_APP_CONFIG: Final = (
 )
 
 
+# --- the Next floor ----------------------------------------------------------------
+
+# The oldest Next a publish may build on. A project keeps whatever Next its own lockfile
+# pins, so an app saved before a security release would otherwise publish without it.
+# Only a 16.x is raised: a jump across majors can break a build that preview never tried.
+NEXT_FLOOR: Final = "16.3.8"
+_NEXT_FLOOR_PARTS: Final = tuple(int(part) for part in NEXT_FLOOR.split("."))
+_EXACT_VERSION: Final = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
 class ContextTooLargeError(Exception):
     """The packed context exceeded `MAX_CONTEXT_BYTES` — dependencies or build output
     reached the snapshot. A platform problem, surfaced rather than uploaded."""
@@ -152,6 +164,44 @@ def _apply_platform_overlay(files: dict[str, bytes]) -> None:
     files[_WRAPPER_TARGET] = _asset_bytes("next.config.ts")
     for asset, target in _ASSET_TARGETS.items():
         files[target] = _asset_bytes(asset)
+    _raise_next_to_floor(files)
+
+
+def _locked_next(files: dict[str, bytes], declared: str) -> str:
+    """The Next version `npm ci` will install: the lockfile's, or the spec itself when there
+    is no lockfile to resolve it."""
+    if "package-lock.json" not in files:
+        return declared
+    lock = json.loads(files["package-lock.json"])
+    return str(lock.get("packages", {}).get("node_modules/next", {}).get("version", declared))
+
+
+def _raise_next_to_floor(files: dict[str, bytes]) -> None:
+    """Raise an old 16.x Next to `NEXT_FLOOR` in the build copy of `package.json`.
+
+    The Dockerfile's drift fallback then resolves Next alone while every other locked version
+    holds. A manifest that will not parse is left for the build to report."""
+    try:
+        package = json.loads(files.get("package.json", b"{}"))
+        sections = [
+            deps
+            for deps in (package.get("dependencies"), package.get("devDependencies"))
+            if isinstance(deps, dict) and "next" in deps
+        ]
+        if not sections:
+            return
+        installed = _locked_next(files, str(sections[0]["next"]))
+    except ValueError, AttributeError:
+        return
+    match = _EXACT_VERSION.fullmatch(installed)
+    if match is None:
+        return
+    parts = tuple(int(part) for part in match.groups())
+    if parts[0] != _NEXT_FLOOR_PARTS[0] or parts >= _NEXT_FLOOR_PARTS:
+        return
+    sections[0]["next"] = NEXT_FLOOR
+    files["package.json"] = (json.dumps(package, indent=2) + "\n").encode()
+    _log.info("deploy_next_floor_raised", from_version=installed, to_version=NEXT_FLOOR)
 
 
 def _pack(files: dict[str, bytes]) -> bytes:

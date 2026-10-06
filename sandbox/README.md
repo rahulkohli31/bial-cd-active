@@ -64,7 +64,7 @@ Resolved to the newest stable at authoring and pinned into `package.json` + a re
 | Layer            | Pinned version            |
 |------------------|---------------------------|
 | Node (image)     | **24 LTS** (`node:24-trixie-slim`) — Debian 13; bookworm left security support 2026-07-12 |
-| Next.js          | **16.3.3** (App Router)   |
+| Next.js          | **16.3.8** (App Router)   |
 | React / react-dom| **19.2.7**                |
 | TypeScript       | **5.9.3**  (the `5.x` line is frozen — TS 7.x is out but the contract pins the 5.x line) |
 | Tailwind CSS     | **4.3.2** (+ `@tailwindcss/postcss` 4.3.2, `tw-animate-css` 1.4.0) |
