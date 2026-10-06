@@ -168,7 +168,8 @@ export default function ChatHistoryPanel({ projectId, chats }: ChatHistoryPanelP
 
   useEffect(() => {
     const target = focusNext.current
-    if (target === null || chats.loading) return
+    // Not while the page is being corrected: the row it names is on the page being stepped to.
+    if (target === null || chats.loading || query.page > pageCount) return
     focusNext.current = null
     // A task later, so a closing dialog has handed focus back first; focus is moved only if the
     // control that held it has gone, never away from something the reader chose.
