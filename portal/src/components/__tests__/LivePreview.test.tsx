@@ -1025,7 +1025,11 @@ describe('★ the deletions, pinned structurally — because a rendered assertio
     // one thing this file is genuinely load-bearing for.
     const source = (await import('../LivePreview?raw')).default as string
 
-    expect(source).toMatch(/e\.source/)          // the inbound-message gate, on origin AND source
+    // The inbound-message gate, on origin AND source, and the shared module that holds both halves.
+    expect(source).toMatch(/!isFromFrame\(e, previewOriginRef\.current, frameWindow\)/)
+    const gate = (await import('../../utils/frameReport?raw')).default as string
+    expect(gate).toMatch(/e\.origin !== origin/)
+    expect(gate).toMatch(/!!frameWindow && e\.source === frameWindow/)
     expect(source).toMatch(/sandbox=/)           // the sandbox token list
     expect(source).toMatch(/const frameKey =/)   // the frame's identity
     // The device WIDTHS are still read here; the TABLE moved out with the control that picks them,
@@ -1081,9 +1085,10 @@ describe('★ the deletions, pinned structurally — because a rendered assertio
     // `sandbox/template/instrumentation-client.ts`. A constant renamed here compiles and a value
     // changed here goes silent — the pane simply never hears the beacon again — so the VALUES are
     // what is pinned, not the identifiers.
-    expect(source).toMatch(/const MOUNTED_TYPE = 'bial:app-mounted'/)
-    expect(source).toMatch(/const PAINTING_TYPE = 'bial:app-painting'/)
-    expect(source).toMatch(/const PING_TYPE = 'bial:ping'/)
+    const wire = (await import('../../utils/frameReport?raw')).default as string
+    expect(wire).toMatch(/const MOUNTED_TYPE = 'bial:app-mounted'/)
+    expect(wire).toMatch(/const PAINTING_TYPE = 'bial:app-painting'/)
+    expect(wire).toMatch(/const PING_TYPE = 'bial:ping'/)
     // ★ AND THE TIMER THAT IS GONE STAYS GONE, WHICH IS A BEHAVIOUR AND NOT A TIDY-UP.
     // `PING_REPLY_MS` was a clock of its own — a window in which a ping had to be answered — and an
     // unanswered ping now simply costs the next expiry of the SAME wait. Bringing it back would

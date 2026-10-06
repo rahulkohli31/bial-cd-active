@@ -222,6 +222,22 @@ describe('the compile frame — an absent signal is never good news', () => {
   })
 })
 
+describe('the workspace frame carries the start the turn began', () => {
+  const parseOne = (json: string) => parseSseText(`data: ${json}\n\n`).frames
+
+  it('reads the start id off a ready frame, and anything else as no start', () => {
+    expect(parseOne('{"type":"workspace","seq":1,"state":"ready","startId":"s-1"}')).toEqual([
+      { type: 'workspace', seq: 1, state: 'ready', message: null, notice: null, startId: 's-1' },
+    ])
+    expect(parseOne('{"type":"workspace","seq":1,"state":"ready","startId":null}')).toMatchObject([
+      { startId: null },
+    ])
+    expect(parseOne('{"type":"workspace","seq":1,"state":"ready","startId":7}')).toMatchObject([
+      { startId: null },
+    ])
+  })
+})
+
 describe('readTurnStream', () => {
   it('delivers frames split across chunks and resolves completed on [DONE]', async () => {
     const whole = `id: 3\ndata: ${SNAPSHOT}\n\nid: 4\ndata: ${DELTA}\n\nid: 5\ndata: ${ENDED}\n\ndata: [DONE]\n\n`

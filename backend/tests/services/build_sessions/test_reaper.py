@@ -27,8 +27,9 @@ from src.api.v1.build_sessions.schemas import (
 from src.config import settings
 from src.db.models.app_registry import AppRegistry
 from src.db.models.pending_teardown import PendingTeardown
-from src.services.build_sessions import app_name_for, locks, pass_history, reaper, shr_name_for
+from src.services.build_sessions import locks, pass_history, reaper
 from src.services.build_sessions.alarms import SERVING_PROOF_ABSENT_AT_TEARDOWN
+from src.services.build_sessions.inventory import OwnedApp
 from src.services.build_sessions.pass_history import CopyAttempt
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
@@ -39,6 +40,7 @@ from src.services.redis import (
     registry_key,
 )
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -58,14 +60,18 @@ from src.services.sandbox.base import (
     TAG_KIND,
     DevStatus,
     ServedCount,
+    app_name_for,
+    shr_name_for,
 )
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from tests.factories import AppRegistryFactory, UserFactory
 from tests.fakes import (
+    AttachesWhatTheRecordNames,
     FakeSandboxClient,
     FakeStorage,
     a_git_bundle,
+    a_name_unrelated_to_its_app,
     a_sandbox_name,
     a_shared_sandbox_name,
 )
@@ -93,7 +99,7 @@ def attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
 
 
 #: A name the platform could actually have MINTED — `sbx-` + 28 lowercase hex, the exact shape
-#: `manager.app_name_for` produces, not the old "sbx-x" that no code path can emit.
+#: `app_name_for` produces, not the old "sbx-x" that no code path can emit.
 
 
 SBX = a_sandbox_name("x")
@@ -243,15 +249,13 @@ async def test_reap_user_tears_down_a_shared_sandbox_in_the_slot(
 async def test_reap_user_skips_the_write_back_for_a_shared_view_even_with_an_app_id(
     fake_redis: aioredis.Redis,
 ) -> None:
-    """The bug a live Azure run found: `sweep_all`'s own `_owning_app_id` resolves a `shr-`
-    record to the OWNER's app id (`_app_names_to_owners` keys the name off the recipient but
-    carries the shared app's id as the value), so the scheduled sweep always calls `reap_user`
-    with `app_id is not None` for a shared view. Acting on that id would write this RECIPIENT's
-    tree over the OWNER's saved copy (R22: read-never-write for a recipient), and a write-back
-    that could not land then REFUSES the reap outright, sparing the container forever. No storage
-    is bound in this test at all: if the write-back ran, touching it would fail loudly rather than
-    silently pass, which is exactly the point — a shared view must never reach it regardless of
-    which app_id a caller resolved for it."""
+    """A shared view's record carries the OWNER's app id, so a caller can resolve one for it and
+    pass it here. Acting on that id would write this RECIPIENT's tree over the OWNER's saved copy,
+    which a recipient may read and never write, and a write-back that could not land then REFUSES
+    the reap outright, sparing the container forever. No storage is bound in this test at all: if
+    the write-back ran, touching it would fail loudly rather than silently pass, which is exactly
+    the point — a shared view must never reach it regardless of which app_id a caller resolved
+    for it."""
     shared_name = a_shared_sandbox_name("colleague")
     await _seed(fake_redis, USER, app_name=shared_name)
     client = FakeSandboxClient()
@@ -390,7 +394,9 @@ async def test_the_scheduled_sweep_resolves_the_owning_app_id_and_the_operator_o
 
     monkeypatch.setattr(reaper, "reap_user", _spy_reap)
 
-    await reaper.sweep_all(fake_redis, FakeSandboxClient(), app_ids_by_name={SBX: app_id})
+    await reaper.sweep_all(
+        fake_redis, FakeSandboxClient(), app_ids_by_name={SBX: OwnedApp(app_id, USER)}
+    )
     await reaper.sweep_all(fake_redis, FakeSandboxClient())
 
     assert gated_with == [app_id, None]
@@ -483,7 +489,7 @@ async def test_a_normal_build_session_is_unaffected_by_the_stay_check(
 
 
 # #198 — a shared-runtime view's traffic-based stay renewal and its absolute session ceiling.
-# Both are no-ops for an ordinary build sandbox: `is_a_shared_sandbox_name` gates both, so
+# Both are no-ops for an ordinary build sandbox: `is_a_shared_view` gates both, so
 # nothing above this section could have exercised either path.
 
 
@@ -660,7 +666,7 @@ async def test_a_shared_view_within_its_ceiling_and_a_current_stay_is_spared(
 async def test_the_ceiling_never_touches_an_ordinary_build_preview(
     fake_redis: aioredis.Redis,
 ) -> None:
-    """Regression guard: `_shared_view_past_its_ceiling` gates on `is_a_shared_sandbox_name`,
+    """Regression guard: `_shared_view_past_its_ceiling` gates on `is_a_shared_view`,
     so an `sbx-` preview old enough to trip the SAME age threshold must be unaffected by it —
     its own (much longer) `RELAUNCH_PREVIEW_STAY_SECONDS` stay is what governs it."""
     from src.api.v1.build_sessions.schemas import SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS
@@ -1142,7 +1148,7 @@ async def test_a_shared_view_whose_delete_fails_is_owed_against_its_owners_app(
     the_owners_app_is_named: bool,
 ) -> None:
     """★ A FAILED DELETE NEVER FORGETS A SHARED VIEW. Giving the view up, a revoke and the
-    reconcile before a start reap it with no app id; the sweep names its owner's. Either way the
+    reconcile before a start reap it with no app id; a caller may name its owner's. Either way the
     app is the OWNER's, never the slot holder's, so the ledger reads the owner and project the
     launch stamped on the record and owes the delete against them. Without the row, the next
     container registered in this slot overwrites the only record naming the view, and it runs and
@@ -2168,3 +2174,343 @@ async def test_a_record_with_neither_a_turn_nor_a_stay_reads_no_tags(
 
     assert reaped is True
     assert client.tag_reads == 0
+
+
+# --- a container whose name says nothing about its app ---------------------------------------
+#
+# Every lookup above reads the app from the record, so a container may carry any name. These pin
+# each decision at a name no app id derives: a lookup that still derives one cannot find these
+# containers, and a classifier that still reads the prefix calls a shared view a build sandbox.
+
+
+async def _registered_unrelated(
+    redis: aioredis.Redis,
+    user: uuid.UUID,
+    *,
+    app_id: uuid.UUID,
+    view: locks.SharedViewStamp | None = None,
+    created_at: str | None = None,
+    stay: str | None = None,
+) -> str:
+    """A record as this release writes it: the app it runs, and a name unrelated to that app."""
+    name = a_name_unrelated_to_its_app()
+    await _seed(
+        redis,
+        user,
+        app_name=name,
+        with_lock=False,
+        with_heartbeat=False,
+        created_at=created_at or datetime.now(UTC).isoformat(),
+    )
+    await redis.hset(registry_key(user), REGISTRY_FIELD_APP_ID, str(app_id))
+    if view is not None:
+        await redis.hset(
+            registry_key(user),
+            mapping={
+                REGISTRY_FIELD_SHARED_OWNER_ID: str(view.owner_id),
+                REGISTRY_FIELD_SHARED_PROJECT_ID: str(view.project_id),
+            },
+        )
+    if stay is not None:
+        await redis.hset(registry_key(user), REGISTRY_FIELD_PREVIEW_STAY_UNTIL, stay)
+    return name
+
+
+async def _saved_head(store: FakeStorage, app_id: uuid.UUID) -> str | None:
+    meta = await store.head(snapshot_key(app_id))
+    return (meta.metadata or {}).get("head_sha") if meta is not None else None
+
+
+async def test_a_container_named_unrelated_to_its_app_is_reaped_with_its_tree_written_there(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ Found, attached and reaped, with the tree written to the app its record names — though
+    the map a sweep is handed knows that app only by the name derived from it.
+
+    Mutation check: resolve the app from the map by name alone and nothing is written back."""
+    app_id = uuid.uuid4()
+    name = await _registered_unrelated(fake_redis, USER, app_id=app_id)
+    client = AttachesWhatTheRecordNames()
+
+    result = await reaper.sweep_all(
+        fake_redis, client, app_ids_by_name={app_name_for(app_id): OwnedApp(app_id, USER)}
+    )
+
+    assert result.reaped == 1
+    assert client.bundled_from == [name]
+    assert client.torn_down == [name]
+    assert await _saved_head(fake_storage, app_id) == "c" * 40
+
+
+async def test_a_recorded_app_whose_row_has_gone_is_reaped_with_nothing_written(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """An app that no longer exists has nowhere for its tree to go: writing it back would put a
+    deleted project's code back in the store under its old key.
+
+    Mutation check: trust the recorded app without holding it to the map and the tree lands."""
+    app_id = uuid.uuid4()
+    name = await _registered_unrelated(fake_redis, USER, app_id=app_id)
+    client = AttachesWhatTheRecordNames()
+
+    result = await reaper.sweep_all(
+        fake_redis, client, app_ids_by_name={SBX: OwnedApp(uuid.uuid4(), USER)}
+    )
+
+    assert result.reaped == 1
+    assert client.torn_down == [name]
+    assert client.bundled_from == []
+    assert await _saved_head(fake_storage, app_id) is None
+
+
+async def test_a_record_naming_another_users_app_is_reaped_with_nothing_written_there(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ A record in one person's slot that names a colleague's app, with no shared-view stamp,
+    would have this person's tree bundled into the colleague's saved copy. Whatever wrote the
+    record, a tree goes back only to an app the slot's own user owns.
+
+    Mutation check: hold the recorded app to the map without its owner and the copy is replaced."""
+    owner, colleague, owners_app = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _preserve(fake_storage, owners_app, head="b" * 40)
+    name = await _registered_unrelated(fake_redis, colleague, app_id=owners_app)
+    client = AttachesWhatTheRecordNames()
+
+    result = await reaper.sweep_all(
+        fake_redis, client, app_ids_by_name={app_name_for(owners_app): OwnedApp(owners_app, owner)}
+    )
+
+    assert result.reaped == 1
+    assert client.torn_down == [name]
+    assert client.bundled_from == []
+    assert await _saved_head(fake_storage, owners_app) == "b" * 40
+
+
+async def test_reaping_a_shared_view_named_like_a_build_sandbox_writes_nothing_back(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ The view carries the owner's app id and a build sandbox's name shape. Written back, the
+    recipient's tree would replace the owner's saved copy.
+
+    Mutation check: classify by the name's prefix and the owner's copy is overwritten."""
+    owner_app = uuid.uuid4()
+    await _preserve(fake_storage, owner_app, head="b" * 40)
+    view = locks.SharedViewStamp(owner_id=uuid.uuid4(), project_id=uuid.uuid4())
+    name = await _registered_unrelated(fake_redis, USER, app_id=owner_app, view=view)
+    client = AttachesWhatTheRecordNames()
+
+    assert await reaper.reap_user(fake_redis, USER, client, app_id=owner_app) is True
+
+    assert client.torn_down == [name]
+    assert client.bundled_from == []
+    assert await _saved_head(fake_storage, owner_app) == "b" * 40
+
+
+async def test_of_a_build_container_and_a_view_under_one_app_only_the_build_is_written_back(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ The owner's slot and a colleague's slot both record the same app, and only the owner's
+    container holds work to save. The view's reap says nothing of a missing app row, the line an
+    operator reads as work destroyed unsaved.
+
+    Mutation check: resolve the view's app as a build sandbox's is and its reap reports one."""
+    app_id = uuid.uuid4()
+    owner, colleague = uuid.uuid4(), uuid.uuid4()
+    builds = await _registered_unrelated(fake_redis, owner, app_id=app_id)
+    views = await _registered_unrelated(
+        fake_redis,
+        colleague,
+        app_id=app_id,
+        view=locks.SharedViewStamp(owner_id=owner, project_id=uuid.uuid4()),
+    )
+    client = AttachesWhatTheRecordNames()
+
+    with structlog.testing.capture_logs() as logs:
+        result = await reaper.sweep_all(
+            fake_redis, client, app_ids_by_name={app_name_for(app_id): OwnedApp(app_id, owner)}
+        )
+
+    assert result.reaped == 2
+    assert sorted(client.torn_down) == sorted([builds, views])
+    assert client.bundled_from == [builds]
+    nothing_to_preserve = (
+        "reaping a registered container with no app row of this user's; nothing to preserve"
+    )
+    assert [e for e in logs if e["event"] == nothing_to_preserve] == []
+
+
+async def test_a_shared_view_named_like_a_build_sandbox_is_renewed_by_its_traffic(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Mutation check: decide "is this a view" from the name and the view is reaped mid-use."""
+    view = locks.SharedViewStamp(owner_id=uuid.uuid4(), project_id=uuid.uuid4())
+    name = await _registered_unrelated(fake_redis, USER, app_id=uuid.uuid4(), view=view)
+    client = _reachable_shared_view_client(name, served=3)
+
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 0
+    assert client.torn_down == []
+    reg = await locks.read_registry(fake_redis, USER)
+    assert reg is not None
+    assert reg[REGISTRY_FIELD_SHARED_SERVED_COUNT] == "3"
+
+
+async def test_a_shared_view_named_like_a_build_sandbox_is_reaped_past_its_ceiling(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Mutation check: decide "is this a view" from the name and the stay spares it forever."""
+    from src.api.v1.build_sessions.schemas import SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS
+
+    view = locks.SharedViewStamp(owner_id=uuid.uuid4(), project_id=uuid.uuid4())
+    stale = (
+        datetime.now(UTC) - timedelta(seconds=SHARED_PREVIEW_ABSOLUTE_CEILING_SECONDS + 60)
+    ).isoformat()
+    name = await _registered_unrelated(
+        fake_redis, USER, app_id=uuid.uuid4(), view=view, created_at=stale, stay=_in(600)
+    )
+    client = _reachable_shared_view_client(name, served=None)
+
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 1
+    assert name in client.torn_down
+
+
+async def test_a_failed_reap_of_a_view_named_like_a_build_sandbox_is_owed_and_never_written(
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ Owed against the owner's app, as a shared view — and the routine that later pays the
+    debt destroys it without writing the colleague's tree over the owner's saved copy.
+
+    Mutation check: classify the debt by the name and it is refused, the slot kept; classify the
+    routine's arm by the name and the owner's copy is overwritten."""
+    from src.services.build_sessions.shutdown import (
+        ShutdownOutcome,
+        ShutdownReason,
+        _owed_from,
+        run_the_shutdown,
+    )
+
+    owner = await UserFactory.create(db_session)
+    colleague = await UserFactory.create(db_session)
+    app = await AppRegistryFactory.create(db_session, user_id=owner.id)
+    await _preserve(fake_storage, app.id, head="b" * 40)
+    view = locks.SharedViewStamp(owner_id=owner.id, project_id=app.project_id)
+    name = await _registered_unrelated(fake_redis, colleague.id, app_id=app.id, view=view)
+    client = AttachesWhatTheRecordNames()
+    client.teardown_error = SandboxError("ARM said no")
+
+    async with _the_test_session(db_session, monkeypatch):
+        assert await reaper.reap_user(fake_redis, colleague.id, client, app_id=app.id) is False
+
+    row = (
+        await db_session.execute(
+            sa.select(PendingTeardown).where(PendingTeardown.user_id == colleague.id)
+        )
+    ).scalar_one()
+    assert (row.app_name, row.app_id, row.project_id) == (name, app.id, app.project_id)
+    assert row.write_back is False
+
+    client.teardown_error = None
+    client.by_name[name] = SandboxHandle(
+        fqdn=f"{name}.example", token="tok", app_name=name, preview_url="", ready=True
+    )
+
+    @contextlib.asynccontextmanager
+    async def _session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    outcome = await run_the_shutdown(
+        _owed_from(row),
+        redis=fake_redis,
+        sandbox_client=client,
+        reason=ShutdownReason.PRESENCE_LAPSED,
+        session_factory=lambda: _session(),
+    )
+
+    assert outcome is ShutdownOutcome.DESTROYED
+    assert client.torn_down == [name]
+    assert client.bundled_from == []
+    assert await _saved_head(fake_storage, app.id) == "b" * 40
+
+
+async def test_a_reap_asked_to_save_into_an_app_its_record_does_not_name_writes_nothing(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ The caller resolved the app from an earlier read. If the record now names another app,
+    saving would put one app's tree in another's saved copy, so the container is spared instead.
+
+    Mutation check: drop the agreement check in `reap_user` and the tree is bundled into the app
+    the caller named."""
+    recorded_app, asked_app = uuid.uuid4(), uuid.uuid4()
+    await _registered_unrelated(fake_redis, USER, app_id=recorded_app)
+    client = AttachesWhatTheRecordNames()
+
+    assert await reaper.reap_user(fake_redis, USER, client, app_id=asked_app) is False
+
+    assert client.bundled_from == []
+    assert client.torn_down == []
+    assert await _saved_head(fake_storage, asked_app) is None
+    assert await locks.read_registry(fake_redis, USER) is not None, "spared for a later pass"
+
+
+async def _owed_rows(db_session: AsyncSession, user_id: uuid.UUID) -> list[PendingTeardown]:
+    return list(
+        (
+            await db_session.execute(
+                sa.select(PendingTeardown).where(PendingTeardown.user_id == user_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def test_a_debt_is_owed_against_the_app_its_record_names_whatever_its_name(
+    fake_redis: aioredis.Redis, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutation check: hold the record to the name derived from the app and the debt is
+    refused, keeping the citizen's slot for a later pass."""
+    from src.services.build_sessions.shutdown import owe_a_teardown_the_reap_could_not_perform
+
+    user = await UserFactory.create(db_session)
+    app = await AppRegistryFactory.create(db_session, user_id=user.id)
+    name = await _registered_unrelated(fake_redis, user.id, app_id=app.id)
+    reg = await locks.read_registry(fake_redis, user.id)
+    assert reg is not None
+
+    async with _the_test_session(db_session, monkeypatch):
+        owed = await owe_a_teardown_the_reap_could_not_perform(
+            user_id=user.id, app_id=app.id, reg=reg, write_back=True
+        )
+
+    assert owed is not None
+    assert [
+        (row.app_name, row.app_id, row.project_id, row.write_back)
+        for row in await _owed_rows(db_session, user.id)
+    ] == [(name, app.id, app.project_id, True)]
+
+
+async def test_a_debt_whose_record_names_another_app_is_refused(
+    fake_redis: aioredis.Redis, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The record and the app id arrive from different reads; owed against a pair that
+    disagrees, the routine would bundle the wrong tree against the wrong saved head.
+
+    Mutation check: drop the agreement check on the build arm and a row is written."""
+    from src.services.build_sessions.shutdown import owe_a_teardown_the_reap_could_not_perform
+
+    user = await UserFactory.create(db_session)
+    app = await AppRegistryFactory.create(db_session, user_id=user.id)
+    other = await AppRegistryFactory.create(db_session, user_id=user.id)
+    await _registered_unrelated(fake_redis, user.id, app_id=other.id)
+    reg = await locks.read_registry(fake_redis, user.id)
+    assert reg is not None
+
+    async with _the_test_session(db_session, monkeypatch):
+        owed = await owe_a_teardown_the_reap_could_not_perform(
+            user_id=user.id, app_id=app.id, reg=reg, write_back=True
+        )
+
+    assert owed is None
+    assert await _owed_rows(db_session, user.id) == []

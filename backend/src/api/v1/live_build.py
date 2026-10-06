@@ -133,21 +133,20 @@ async def the_live_session_is_this_app(
 ) -> bool:
     """Does the live session the lock represents belong to `app_id`?
 
-    The lock carries no app axis, so identity comes from the sandbox REGISTRY hash's `app_name`
-    (a pure function of the app id). FAILS CLOSED: "lock held but registry unresolved" is
-    AMBIGUITY, not innocence — exactly how `_start_locked`'s lock-before-provision window reads —
-    so it returns True (refuse) rather than let a delete land mid-provision. Only a registry
-    naming a DIFFERENT app proceeds. (A Redis error is not this branch — `read_registry` is bare
-    and propagates to a 503.)"""
-    from src.services.build_sessions import app_name_for, read_registry
+    The lock carries no app axis, so identity comes from the sandbox REGISTRY record
+    (`record_holds`). FAILS CLOSED: "lock held but registry unresolved" is AMBIGUITY, not
+    innocence — exactly how `_start_locked`'s lock-before-provision window reads — so it returns
+    True (refuse) rather than let a delete land mid-provision. Only a registry naming a DIFFERENT
+    app proceeds. (A Redis error is not this branch — `read_registry` is bare and propagates to a
+    503.)"""
+    from src.services.build_sessions import Occupant, read_registry, record_holds
 
     registry = await read_registry(redis, user_id)
-    live_app_name = (registry or {}).get(REGISTRY_FIELD_APP_NAME, "")
-    if not live_app_name:
+    if registry is None or not registry.get(REGISTRY_FIELD_APP_NAME, ""):
         _log.info(
             "a build lock is held but names no app; refusing rather than racing it",
             user_id=str(user_id),
             app_id=str(app_id),
         )
         return True
-    return live_app_name == app_name_for(app_id)
+    return record_holds(registry, Occupant(app_id), user_id)

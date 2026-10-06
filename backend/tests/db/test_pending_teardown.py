@@ -26,7 +26,7 @@ from sqlalchemy.pool import NullPool
 from alembic import command
 from src.config import settings
 from src.db.models.pending_teardown import PendingTeardown
-from src.services.build_sessions import app_name_for
+from src.services.sandbox.base import app_name_for
 from tests.factories import AppRegistryFactory, ConversationFactory, UserFactory
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -381,6 +381,7 @@ _EXPECTED_COLUMNS = frozenset(
         "user_id",
         "app_id",
         "app_name",
+        "write_back",
         "project_id",
         "instance_ref",
         "conversation_id",

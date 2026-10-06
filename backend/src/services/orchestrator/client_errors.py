@@ -26,6 +26,7 @@ than instructions all happen at the point of use (`errors.from_client`).
 from __future__ import annotations
 
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -78,14 +79,14 @@ class ClientErrorStore:
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         # Insertion-ordered so the MAX_APPS eviction has an oldest to evict. `move_to_end` on
         # every write keeps a busy app from being evicted by a quiet one.
-        self._parked: OrderedDict[str, list[ClientErrorReport]] = OrderedDict()
+        self._parked: OrderedDict[uuid.UUID, list[ClientErrorReport]] = OrderedDict()
         # An injected clock, so the TTL can be tested by advancing time rather than by patching
         # `time.monotonic` globally — a test that reaches into the stdlib to age one report also
         # ages every timeout, sleep and event loop that happens to run while it holds the patch.
         # Production never passes one; the default IS the real clock.
         self._clock = clock
 
-    def record(self, app_name: str, *, source: str, title: str, stack: str) -> bool:
+    def record(self, app_id: uuid.UUID, *, source: str, title: str, stack: str) -> bool:
         """Park one report against an app. Returns whether it was KEPT.
 
         `False` is not an error — it means this app already has `MAX_REPORTS_PER_APP` reports
@@ -94,10 +95,10 @@ class ClientErrorStore:
         collected would have no way to know its loop is being throttled."""
         now = self._clock()
         self._expire(now)
-        parked = self._parked.get(app_name)
+        parked = self._parked.get(app_id)
         if parked is None:
             parked = []
-            self._parked[app_name] = parked
+            self._parked[app_id] = parked
             # Evict the least-recently-written app, never the one we just created — the pop must
             # happen AFTER the insert or a store already at MAX_APPS would drop the new entry.
             while len(self._parked) > MAX_APPS:
@@ -108,11 +109,11 @@ class ClientErrorStore:
             # keep renewing its lease forever, so it could never be evicted by MAX_APPS while
             # quieter apps were. Only a report we actually keep counts as activity.
             return False
-        self._parked.move_to_end(app_name)
+        self._parked.move_to_end(app_id)
         parked.append(ClientErrorReport(source=source, title=title, stack=stack, parked_at=now))
         return True
 
-    def drain(self, app_name: str) -> list[ClientErrorReport]:
+    def drain(self, app_id: uuid.UUID) -> list[ClientErrorReport]:
         """Take everything parked for this app, oldest first, and forget it.
 
         DRAINING, not peeking, and that is the contract the verify depends on: a report counts
@@ -120,9 +121,9 @@ class ClientErrorStore:
         of the same build, so one browser crash would burn the entire self-heal budget re-reporting
         itself while the agent fixed it on the first pass."""
         self._expire(self._clock())
-        return self._parked.pop(app_name, [])
+        return self._parked.pop(app_id, [])
 
-    def discard(self, app_name: str) -> int:
+    def discard(self, app_id: uuid.UUID) -> int:
         """Throw away everything parked for this app; returns how many were dropped.
 
         THE TURN FENCE. A report describes the tree the browser was rendering when it crashed,
@@ -131,7 +132,7 @@ class ClientErrorStore:
         means the gap between turns actively MANUFACTURES reports. Anything parked before the
         agent started is history. Distinct from `drain` on purpose: `drain` hands reports to a
         verdict, this is a deliberate discard — a call site should say which one it meant."""
-        dropped = self._parked.pop(app_name, [])
+        dropped = self._parked.pop(app_id, [])
         return len(dropped)
 
     def forget_everything(self) -> None:
@@ -146,18 +147,18 @@ class ClientErrorStore:
         Run on both read and write rather than on a timer: this is a small structure with no
         background owner, and the cost is proportional to what is actually parked."""
         cutoff = now - REPORT_TTL_S
-        for app_name in list(self._parked):
-            fresh = [report for report in self._parked[app_name] if report.parked_at > cutoff]
+        for app_id in list(self._parked):
+            fresh = [report for report in self._parked[app_id] if report.parked_at > cutoff]
             if fresh:
-                self._parked[app_name] = fresh
+                self._parked[app_id] = fresh
             else:
-                del self._parked[app_name]
+                del self._parked[app_id]
 
 
 _STORE = ClientErrorStore()
 
 
-def park_client_error(app_name: str, *, source: str, title: str, stack: str) -> bool:
+def park_client_error(app_id: uuid.UUID, *, source: str, title: str, stack: str) -> bool:
     """Park one browser-side crash report against an app; returns whether it was kept.
 
     A plain verb for a plain act. The evocative name for this class of failure — the dev server
@@ -166,18 +167,18 @@ def park_client_error(app_name: str, *, source: str, title: str, stack: str) -> 
     `selfheal.the_call_is_coming_from_inside_the_house`, which turns these reports into the
     diagnostic. One name, one meaning: two functions in one subsystem sharing a name is one grep
     away from a reader believing the ingest and the verdict are the same call."""
-    return _STORE.record(app_name, source=source, title=title, stack=stack)
+    return _STORE.record(app_id, source=source, title=title, stack=stack)
 
 
-def drain_client_errors(app_name: str) -> list[ClientErrorReport]:
+def drain_client_errors(app_id: uuid.UUID) -> list[ClientErrorReport]:
     """Take (and forget) every fresh report parked for this app — see `ClientErrorStore.drain`."""
-    return _STORE.drain(app_name)
+    return _STORE.drain(app_id)
 
 
-def discard_client_errors(app_name: str) -> int:
+def discard_client_errors(app_id: uuid.UUID) -> int:
     """Fence off every report parked for this app before a turn starts — see
     `ClientErrorStore.discard`."""
-    return _STORE.discard(app_name)
+    return _STORE.discard(app_id)
 
 
 def forget_all_client_errors() -> None:

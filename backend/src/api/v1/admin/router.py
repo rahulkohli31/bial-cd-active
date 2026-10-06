@@ -31,6 +31,7 @@ import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, status
 from pydantic.alias_generators import to_camel
+from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -66,6 +67,9 @@ from src.api.v1.admin.schemas import (
     RejectRequest,
     RoleReconcileCounts,
     SandboxReconcileResponse,
+    SandboxStartKindSummary,
+    SandboxStartMedians,
+    SandboxStartsResponse,
     SandboxTagBackfillResponse,
     StorageReconcileResponse,
     SuspensionResponse,
@@ -101,6 +105,11 @@ from src.db.models.feedback import Feedback
 from src.db.models.harness_counter import HarnessCount
 from src.db.models.project import Project
 from src.db.models.project_database import ProjectDatabase
+from src.db.models.sandbox_start import (
+    SANDBOX_START_RETENTION,
+    SandboxStart,
+    SandboxStartOutcome,
+)
 from src.db.models.token_usage import TokenUsage, TokenUsageKind
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
@@ -403,7 +412,7 @@ async def _publish_facts(
     newest = await db.scalars(
         sa.select(Deployment)
         .where(Deployment.app_id.in_(app_ids))
-        .distinct(Deployment.app_id)
+        .ext(distinct_on(Deployment.app_id))
         .order_by(Deployment.app_id, Deployment.id.desc())
     )
     newest_by_app = {row.app_id: row for row in newest}
@@ -1228,7 +1237,7 @@ async def reconcile_sandboxes(
         raise AppApiError(503, _SANDBOX_UNAVAILABLE)
     with build_coordination_or_503():
         try:
-            inventory = await take_sandbox_inventory(get_redis(), sandbox)
+            inventory = await take_sandbox_inventory(db, get_redis(), sandbox)
         except SandboxError as exc:
             # Never a partial inventory: a half-enumerated fleet is indistinguishable from a
             # clean one, and "clean" is the answer that gets an orphan forgotten.
@@ -1280,11 +1289,12 @@ async def backfill_sandbox_tags_endpoint(
     # a container is judgeable with Redis down — that self-stamped `created_at` is what the
     # fleet sweep's own age ceiling reads. Every container created BEFORE that carries nothing.
     #
-    # OWNERSHIP IS RECOVERED, NEVER GUESSED. `app_name_for` keeps 28 of an app_id's 32 hex
-    # characters, so a sandbox name is NOT invertible; names are matched FORWARD against the app
-    # table. A container matching no row is stamped `kind` + `backfilled_at` and nothing else — no
-    # owner, no app — and stays for an operator to find in the `unowned` count. Inventing a
-    # plausible owner for it is the one move this would need to be careful never to make.
+    # OWNERSHIP IS RECOVERED, NEVER GUESSED. A sandbox name is NOT invertible — `app_name_for`
+    # keeps 28 of an app_id's 32 hex characters, and a fresh name carries none — so names are
+    # matched FORWARD against the app table. A container matching no row is stamped `kind` +
+    # `backfilled_at` and nothing else — no owner, no app — and stays for an operator to find in
+    # the `unowned` count. Inventing a plausible owner for it is the one move this would need to
+    # be careful never to make.
     #
     # A sibling of the three reconcilers above in every operational respect: superadmin-gated,
     # operator-invoked, idempotent (an already-tagged container is skipped, so the age clock is
@@ -2045,7 +2055,7 @@ async def harness_counters(
     # MOUNTED ON THE `/admin` ROUTER, not `/admin/apps`, and the distinction is real rather than
     # cosmetic: everything under `/admin/apps` is about one app's governance, and these counters
     # are about the DEPLOYMENT. They would answer the same numbers whether any app existed or not.
-    since = datetime.now(UTC) - timedelta(days=max(1, min(days, 90)))
+    since = _window_start(days, ceiling_days=90)
     rows = (
         await db.execute(
             sa.select(
@@ -2065,6 +2075,97 @@ async def harness_counters(
                 name=name, total=int(total or 0), occurrences=occurrences, last_seen_at=last_seen
             )
             for name, total, occurrences, last_seen in rows
+        ],
+        since=since,
+    )
+
+
+def _window_start(days: int, *, ceiling_days: int) -> datetime:
+    """The start of a window of `days`, held between one day and `ceiling_days`."""
+    return datetime.now(UTC) - timedelta(days=max(1, min(days, ceiling_days)))
+
+
+def _median(column: sa.ColumnExpressionArgument[Any]) -> sa.ColumnElement[Any]:
+    return sa.func.percentile_cont(0.5).within_group(column)
+
+
+def _whole_ms(value: float | None) -> int | None:
+    return None if value is None else round(value)
+
+
+@users_router.get("/sandbox-starts", responses=error_responses(*_ADMIN_AUTH))
+async def sandbox_starts(
+    admin: CurrentSuperadmin, db: DbSession, days: int = 7
+) -> SandboxStartsResponse:
+    """How long sandbox starts take, per kind of start: how many there were, how they ended, how
+    many took a ready container and why the rest did not, and the median of each stage.
+
+    Totals and medians only: a start row names who started which app and when, so no route
+    returns one. `days` bounds the window, which cannot reach past the rows' own retention."""
+    # `CurrentSuperadmin` for the reason `harness_counters` gives, and no `user_id` predicate:
+    # an aggregate across every citizen is what this route is.
+    since = _window_start(days, ceiling_days=SANDBOX_START_RETENTION.days)
+    in_window = SandboxStart.started_at >= since
+    door_to_first_page_ms = sa.case(
+        (
+            SandboxStart.outcome == SandboxStartOutcome.SERVED,
+            sa.extract("epoch", SandboxStart.ended_at - SandboxStart.started_at) * 1000,
+        )
+    )
+    rows = (
+        (
+            await db.execute(
+                sa.select(
+                    SandboxStart.kind,
+                    sa.func.count().label("starts"),
+                    sa.func.count()
+                    .filter(SandboxStart.outcome == SandboxStartOutcome.SERVED)
+                    .label("served"),
+                    sa.func.count()
+                    .filter(SandboxStart.outcome == SandboxStartOutcome.FAILED)
+                    .label("failed"),
+                    sa.func.count().filter(SandboxStart.claimed).label("claimed"),
+                    _median(SandboxStart.admission_ms).label("admission_ms"),
+                    _median(SandboxStart.settings_ms).label("settings_ms"),
+                    _median(SandboxStart.create_ms).label("create_ms"),
+                    _median(SandboxStart.dev_start_ms).label("dev_start_ms"),
+                    _median(SandboxStart.first_page_ms).label("first_page_ms"),
+                    _median(SandboxStart.browser_visible_ms).label("browser_visible_ms"),
+                    _median(door_to_first_page_ms).label("total_ms"),
+                )
+                .where(in_window)
+                .group_by(SandboxStart.kind)
+                .order_by(SandboxStart.kind)
+            )
+        )
+        .mappings()
+        .all()
+    )
+    misses = (
+        await db.execute(
+            sa.select(SandboxStart.kind, SandboxStart.miss_reason, sa.func.count())
+            .where(in_window, SandboxStart.miss_reason.is_not(None))
+            .group_by(SandboxStart.kind, SandboxStart.miss_reason)
+        )
+    ).all()
+    return SandboxStartsResponse(
+        kinds=[
+            SandboxStartKindSummary(
+                kind=row["kind"],
+                starts=row["starts"],
+                served=row["served"],
+                failed=row["failed"],
+                claimed=row["claimed"],
+                misses={
+                    reason: count
+                    for miss_kind, reason, count in misses
+                    if miss_kind == row["kind"] and reason is not None
+                },
+                medians=SandboxStartMedians(
+                    **{stage: _whole_ms(row[stage]) for stage in SandboxStartMedians.model_fields}
+                ),
+            )
+            for row in rows
         ],
         since=since,
     )

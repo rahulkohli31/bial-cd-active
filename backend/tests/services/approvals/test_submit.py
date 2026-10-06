@@ -260,8 +260,8 @@ async def test_a_live_build_on_a_different_app_does_not_block_the_submit(
     # citizen building project A was refused when submitting project B. The service
     # narrows to the app axis (matching the deploy route), so a lock held for a
     # session that positively names a DIFFERENT app proceeds.
-    from src.services.build_sessions import app_name_for
     from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, lock_key, registry_key
+    from src.services.sandbox.base import app_name_for
 
     user, app_row = await _owned_app(db_session)
     store = _staged(app_row)
@@ -282,8 +282,8 @@ async def test_a_live_build_on_this_app_still_refuses_the_submit(db_session, fak
     # The guard survives the narrowing: the session the lock represents IS this app's, so
     # copying the snapshot would capture the previous build's bundle (valid bytes,
     # wrong tree) or torn bytes under a concurrent finalize.
-    from src.services.build_sessions import app_name_for
     from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, lock_key, registry_key
+    from src.services.sandbox.base import app_name_for
 
     user, app_row = await _owned_app(db_session)
     store = _staged(app_row)

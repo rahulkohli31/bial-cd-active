@@ -5,10 +5,10 @@ enqueues cron ticks — as two supervised asyncio tasks. A receiverless schedule
 nothing consumes behind a healthy-looking container, so the receiver is mandatory and the scheduler
 rides along.
 
-WHAT IS ON A TIMER: deploy reconciliation and the sandbox sweep every five minutes, and
-conversation retention daily. Everything else that sweeps is OPERATOR-INVOKED, run only when a
-superadmin calls it; `main.py`'s boot one-shot is neither — it settles a deploy before cron can
-run.
+WHAT IS ON A TIMER: the pool of ready sandboxes every minute, deploy reconciliation and the
+sandbox sweep every five minutes, the purge of old sandbox start rows hourly, and conversation
+retention daily. Everything else that sweeps is OPERATOR-INVOKED, run only when a superadmin calls
+it; `main.py`'s boot one-shot is neither — it settles a deploy before cron can run.
 
 WHY THIS EXISTS instead of `taskiq worker` / `taskiq scheduler`: both were tried and both are
 broken — a `WORKER_STARTUP` handler that starts the scheduler recurses without bound
@@ -57,7 +57,9 @@ _SHUTDOWN_GRACE_S: float = 25.0
 _TASK_MODULES: tuple[str, ...] = (
     "src.workers.conversation_retention",
     "src.workers.deploy_reconcile",
+    "src.workers.sandbox_pool",
     "src.workers.sandbox_reap",
+    "src.workers.sandbox_start_purge",
 )
 
 

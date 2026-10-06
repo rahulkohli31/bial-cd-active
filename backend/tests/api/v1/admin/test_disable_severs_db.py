@@ -55,7 +55,7 @@ from src.services.auth.session_jwt import mint_session_jwt
 from src.services.storage import snapshot_key
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeStorage
-from tests.services.appdb.helpers import scalar_on
+from tests.services.appdb.helpers import refused_by_postgres, scalar_on
 
 pytestmark = pytest.mark.app_db
 
@@ -152,7 +152,7 @@ async def test_disable_severs_a_live_session_and_refuses_the_next_connection(
         await live.dispose()
 
     # ...and a brand-new connection attempt is refused outright.
-    with pytest.raises(asyncpg.InvalidAuthorizationSpecificationError):
+    with refused_by_postgres(asyncpg.InvalidAuthorizationSpecificationError):
         await scalar_on(dsn, "SELECT 1")
 
 
@@ -183,7 +183,7 @@ async def test_a_reconnecting_pool_finds_the_door_already_locked(
 
         # Refused, and refused for the RIGHT reason: an auth rejection, not a stale-socket
         # error that a second attempt would sail past.
-        with pytest.raises(asyncpg.InvalidAuthorizationSpecificationError):
+        with refused_by_postgres(asyncpg.InvalidAuthorizationSpecificationError):
             async with pool.connect() as connection:
                 await connection.scalar(sa.text("SELECT 1"))
     finally:
@@ -386,7 +386,7 @@ async def test_a_refused_enable_leaves_the_database_severed(
 
     assert resp.status_code == 409
     assert await _audit_rows(db_session, "db:restore") == []
-    with pytest.raises(asyncpg.InvalidAuthorizationSpecificationError):
+    with refused_by_postgres(asyncpg.InvalidAuthorizationSpecificationError):
         await scalar_on(dsn, "SELECT 1")
 
 

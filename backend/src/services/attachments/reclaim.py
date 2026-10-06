@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import datetime
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -74,7 +76,7 @@ async def reclaim_orphaned_attachments(
     # (a) every attachmentId this user has referenced in ANY of their sent messages (native
     # payload ref markers). Scoped by `user_id` on this half too — a colliding token in
     # another user's message must not count.
-    payload_rows = (
+    payload_rows: Sequence[list[Any]] = (
         (await db.execute(sa.select(Message.payload).where(Message.user_id == user_id)))
         .scalars()
         .all()

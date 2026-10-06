@@ -1,5 +1,5 @@
 /**
- * The three marks only the browser can make.
+ * The marks only the browser can make: three named counts, and one start's wait.
  *
  * WHY THIS EXISTS — the server sees a start and a container answer, but never a citizen
  * open a project, open a chat, or first see their app; the screen reports what only it sees.
@@ -26,6 +26,12 @@
  * time-until-known-good, because a page that paints and then throws has been seen (a
  * confirmed reversion is excluded at the pane, see `LivePreview.tsx`). Every call is
  * fire-and-forget, the server's `count(...)` contract.
+ *
+ * A START'S WAIT runs from the click that began it to the same stop, and is reported against the
+ * id the server gave that start; the server attaches it to the caller's own start row, and labels
+ * come from that row, never from here. One start is timed at a time, because a person has one
+ * workspace. A click that began no start, a start nobody saw, and a start abandoned for another
+ * project or by leaving the workspace report nothing.
  */
 import { authFetch } from './api'
 
@@ -52,12 +58,19 @@ const chatOpenedProjects = new Set<string>()
  *  DELETED when the duration is sent, which is what makes the duration fire at most once. */
 const appVisibleClocks = new Map<string, number>()
 
-async function beacon(name: ObservationName, value?: number): Promise<void> {
+/**
+ * The project whose starts are being timed, and the start bound to it. REPLACED, never reassigned
+ * to another project: a click's answer lands on the timing it was made under, and once that timing
+ * has been abandoned nothing can read it.
+ */
+let timing: { projectId: string; start: { id: string; clickedAt: number } | null } | null = null
+
+async function beacon(path: string, body: Record<string, unknown>): Promise<void> {
   try {
-    await authFetch('/api/observations', {
+    await authFetch(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(value === undefined ? { name } : { name, value }),
+      body: JSON.stringify(body),
     })
   } catch {
     // Recovered by DROPPING the observation, which is the whole contract: a measurement must
@@ -67,7 +80,7 @@ async function beacon(name: ObservationName, value?: number): Promise<void> {
 }
 
 function send(name: ObservationName, value?: number): void {
-  void beacon(name, value)
+  void beacon('/api/observations', value === undefined ? { name } : { name, value })
 }
 
 /**
@@ -108,4 +121,42 @@ export function markAppVisible(projectId: string | null): void {
   if (startedAt === undefined) return
   appVisibleClocks.delete(projectId)
   send('project_to_app_visible_ms', Date.now() - startedAt)
+}
+
+/**
+ * A click that may start this project's app. Hand what this returns the server's answer: the id of
+ * the start the click began, or `null` when it began none.
+ *
+ * A click that joins a start already timed leaves it timed from the click that began it; a click
+ * whose answer names a different start times that start from this click.
+ */
+export function markStartClicked(projectId: string): (startId: string | null) => void {
+  if (timing?.projectId !== projectId) timing = { projectId, start: null }
+  const mine = timing
+  const clickedAt = Date.now()
+  return (startId) => {
+    if (!startId || mine.start?.id === startId) return
+    mine.start = { id: startId, clickedAt }
+  }
+}
+
+/**
+ * This project's app is what the person is looking at — the same stop as `markAppVisible`. Reports
+ * the start timed for it, once. A stop before the server named the start is not that start's: its
+ * container does not exist until after the answer that names it.
+ */
+export function markStartVisible(projectId: string | null): void {
+  if (timing === null || timing.projectId !== projectId || timing.start === null) return
+  const { id, clickedAt } = timing.start
+  timing.start = null
+  void beacon('/api/observations/start-visible', { startId: id, durationMs: Date.now() - clickedAt })
+}
+
+/**
+ * The person is no longer waiting on a start of any project but `onScreen` — they moved to another
+ * project, or out of the workspace (`null`). What was timed for any other project reports nothing,
+ * and an answer still in flight for it binds nothing.
+ */
+export function markStartAbandoned(onScreen: string | null = null): void {
+  if (timing !== null && timing.projectId !== onScreen) timing = null
 }

@@ -22,6 +22,7 @@ from pydantic import SecretStr
 from src.services.build_sessions.locks import stay_of_execution_is_current
 from src.services.redis import REGISTRY_STATE_ENDING, REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_STATE,
@@ -268,6 +269,8 @@ async def test_provision_new_writes_registry_and_injects_env(fake_redis: aioredi
 
     reg = await fake_redis.hgetall(registry_key(USER))
     assert reg[REGISTRY_FIELD_STATE] == REGISTRY_STATE_READY
+    # The app the env names, which is what every later lookup finds this container by.
+    assert reg[REGISTRY_FIELD_APP_ID] == str(APP_ID)
     token_ref = reg[REGISTRY_FIELD_TOKEN_REF]
     assert isinstance(token_ref, str)  # decode_responses=True — Redis hands back str
     assert token_ref and token_ref != handle.token  # a REFERENCE, never the raw token
@@ -280,20 +283,13 @@ async def test_a_fresh_registry_never_inherits_a_previous_occupants_preview_stay
     fake_redis: aioredis.Redis,
 ) -> None:
     # `_write_registry` is an `hset(mapping=…)` MERGE, so a field it does not name SURVIVES
-    # a re-registration. `preview_stay_until` surviving is a leak with teeth:
-    #
-    #   relaunch grants a 30-min stay -> the user starts a build -> reconcile's reap hits a
-    #   transient ACA error, whose arm deliberately KEEPS the registry -> a preview holds no
-    #   lock, so the build's acquire still succeeds -> the build re-registers over the
-    #   surviving hash and INHERITS the lease -> if that build's process later dies, the
-    #   sweep spares its ORPHANED container for the rest of the half hour.
-    #
-    # That inverts the protection into exactly the leak it exists to prevent, so a freshly
-    # written registry is authoritative about the lease: it carries NO stay, always.
+    # into the new record. A surviving `preview_stay_until` would have the sweep spare the new
+    # container for the rest of somebody else's stay if its own process died, so a freshly
+    # written registry is authoritative about the lease: it carries NO stay, always. The hash
+    # left here names no container; one that did would refuse the provision outright.
     await fake_redis.hset(
         registry_key(USER),
         mapping={
-            REGISTRY_FIELD_APP_NAME: "sbx-preview-that-was-never-reaped",
             REGISTRY_FIELD_PREVIEW_STAY_UNTIL: (
                 datetime.now(UTC) + timedelta(minutes=25)
             ).isoformat(),
@@ -331,6 +327,42 @@ async def test_attach_existing_reconnects_without_a_new_create(fake_redis: aiore
     assert handle.app_name == APP_NAME
     assert handle.token == provisioned.token
     assert handle.ready is True  # the ACTUAL dev-server state, never a hardcoded False
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("answer", "configured"),
+    [
+        (httpx.Response(200, json={"ok": True, "configured": False}), False),
+        (httpx.Response(200, json={"ok": True, "configured": True}), True),
+        # A supervisor built before pool containers was given its settings at creation.
+        (httpx.Response(200, json={"ok": True}), True),
+        (httpx.Response(200, json=["ok"]), True),
+        (httpx.Response(200, content=b"not json"), True),
+    ],
+)
+async def test_an_attach_carries_what_its_own_probe_heard_about_the_containers_settings(
+    fake_redis: aioredis.Redis, answer: httpx.Response, configured: bool
+) -> None:
+    """The attach already asks the supervisor's health to know it answers, so whether the
+    container holds its project's settings rides on the handle and nothing asks a second time."""
+    asked = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal asked
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
+        if request.url.path.endswith("/dev/status"):
+            return httpx.Response(200, json={"running": True, "ready": True, "port": 3000})
+        asked += 1
+        return answer
+
+    client = _client(FakeAca(), handler)
+    await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+
+    handle = await client.attach_existing(str(USER))
+
+    assert (handle.configured, asked) == (configured, 1)
     await client.aclose()
 
 

@@ -6,9 +6,11 @@ wire shape asserted against `sandbox/supervisor/app.py`.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import cast
 
 import httpx
@@ -839,3 +841,96 @@ async def test_the_serving_probe_sends_no_bearer_to_the_app() -> None:
 
     await _client(handler).what_is_it_serving(_handle())
     assert seen["auth"] is None
+
+
+# --- a pool container's settings -------------------------------------------------------------
+
+
+async def test_a_claims_health_check_is_bounded_far_under_the_create_it_saves() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["timeout"] = request.extensions["timeout"]
+        return httpx.Response(200, json={"ok": True, "configured": False})
+
+    await _client(handler)._check_health(_handle())
+
+    assert seen["path"] == "/_sup/health"
+    assert seen["timeout"] == {"connect": 2.0, "read": 2.0, "write": 2.0, "pool": 2.0}
+
+
+async def test_a_claims_health_check_refuses_anything_but_a_200() -> None:
+    answer = httpx.Response(503, json={"detail": "starting"})
+
+    with pytest.raises(SandboxError):
+        await _client(lambda _request: answer)._check_health(_handle())
+
+
+async def test_configure_sends_only_the_per_project_names_under_the_bearer() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["auth"] = request.headers.get("authorization")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    await _client(handler).configure(
+        _handle(),
+        {
+            "BIAL_APP_ID": "app-1",
+            "BIAL_DATABASE_URL": "postgresql://role:PW@db/app",
+            "BIAL_PORTAL_ORIGIN": "https://portal.example",
+            "BIAL_BASE_PATH": "/a/sbx-other",
+            "SUPERVISOR_TOKEN": "a-token-of-somebody-elses",
+        },
+    )
+
+    assert seen["path"] == "/_sup/configure"
+    assert seen["auth"] == "Bearer tok-secret"
+    assert seen["body"] == {
+        "env": {"BIAL_APP_ID": "app-1", "BIAL_DATABASE_URL": "postgresql://role:PW@db/app"}
+    }
+
+
+@pytest.mark.parametrize("status", [409, 422, 500])
+async def test_a_refused_configure_raises_without_carrying_a_value(status: int) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"detail": "refused"})
+
+    with pytest.raises(SandboxError) as refused:
+        await _client(handler).configure(
+            _handle(), {"BIAL_DATABASE_URL": "postgresql://role:SECRETPW@db/app"}
+        )
+
+    assert "SECRETPW" not in str(refused.value)
+
+
+def _supervisors_per_project_names() -> set[str]:
+    """The `_INJECTED_ENV` rows marked `per_project=True` in `sandbox/supervisor/app.py`, read by
+    parsing the file: importing it needs the container's own environment."""
+    source = Path(__file__).resolve().parents[4] / "sandbox" / "supervisor" / "app.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    return {
+        call.args[0].value
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "InjectedEnvVar"
+        and isinstance(call.args[0], ast.Constant)
+        and isinstance(call.args[0].value, str)
+        and any(
+            kw.arg == "per_project" and isinstance(kw.value, ast.Constant) and kw.value.value
+            for kw in call.keywords
+        )
+    }
+
+
+def test_configure_names_exactly_what_the_supervisor_takes() -> None:
+    """Two producers of one list. A name the supervisor does not take refuses the whole delivery,
+    so every claim would fail; one it takes that is not sent leaves a claimed app without it."""
+    theirs = _supervisors_per_project_names()
+    assert len(theirs) == 6, "the parse no longer finds the supervisor's per-project rows"
+
+    assert client_module._per_project_env_names() == theirs

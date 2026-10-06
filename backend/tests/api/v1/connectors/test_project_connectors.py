@@ -42,18 +42,20 @@ from src.services.build_sessions.locks import (
     renew_liveness_lease,
     write_starting_marker,
 )
-from src.services.build_sessions.manager import app_name_for
 from src.services.lake.config import LakeConfig
 from src.services.lake.env import connector_env_names
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_STATE,
     REGISTRY_STATE_READY,
     registry_key,
 )
+from src.services.sandbox.base import app_name_for
 from src.services.usage import ist_today
 from tests.api.v1.connectors.conftest import KEY, UNKNOWN_KEY, auth_headers
 from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
+from tests.fakes import a_name_unrelated_to_its_app
 
 _CONNECTOR = CONNECTORS[KEY]
 
@@ -455,6 +457,33 @@ async def test_a_citizen_with_no_history_switches_it_on_and_the_next_start_carri
     assert await build_connector_env(db_session, user_id=user.id, project_id=project.id) == {}
 
 
+async def test_a_switch_off_reaches_a_session_that_already_holds_the_row(
+    client, db_session, monkeypatch
+) -> None:
+    """The switch is an upsert, which a session's cached copy of the row does not see on its own.
+    A start reading through a session that loaded the row before the switch-off must not carry
+    the connector's coordinates."""
+    monkeypatch.setattr(
+        settings,
+        "connector_lake",
+        LakeConfig(
+            url="https://alakeaccount.blob.core.windows.net/acontainer/reports/",
+            identity_client_id="52b74947-0621-46e2-a523-a6b466f47c33",
+            identity_resource_id="/subscriptions/s/resourcegroups/r/providers/x/an-identity",
+        ),
+    )
+    user, project = await _owned(db_session)
+    assert (await _put(client, user, project.id, {"enabled": True})).status_code == 200
+    held = await db_session.scalar(
+        sa.select(ProjectConnector).where(ProjectConnector.project_id == project.id)
+    )
+    assert held is not None and held.enabled is True
+
+    assert (await _put(client, user, project.id, {"enabled": False})).status_code == 200
+
+    assert await build_connector_env(db_session, user_id=user.id, project_id=project.id) == {}
+
+
 async def test_a_write_without_the_csrf_header_is_refused(client, db_session) -> None:
     """The shape a cross-site form post arrives in: the cookie rides along, the header does not."""
     user, project = await _owned(db_session)
@@ -703,6 +732,35 @@ async def test_the_project_the_build_is_running_in_is_still_refused(
         project=building.name, name=_CONNECTOR.display_name
     )
     assert await _stored_rows(db_session, building.id) == []
+
+
+async def test_the_live_project_is_refused_whatever_its_container_is_called(
+    client, db_session, fake_redis
+) -> None:
+    """★ The live session is recognised by the app its record names, never by a name derived
+    from that app — and still only for that project.
+
+    Mutation check: compare the name derived from the app and the live project reads as
+    somebody else's, so a change lands on a container mid-build."""
+    user, building = await _owned(db_session)
+    elsewhere = await ProjectFactory.create(db_session, user.id)
+    building_app = await _app_of(db_session, user, building)
+    await _app_of(db_session, user, elsewhere)
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: a_name_unrelated_to_its_app(),
+            REGISTRY_FIELD_APP_ID: str(building_app.id),
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+        },
+    )
+    await acquire_lock(fake_redis, user.id)
+
+    refused = await _put(client, user, building.id, {"enabled": True})
+    allowed = await _put(client, user, elsewhere.id, {"enabled": True})
+
+    assert refused.status_code == 409, refused.text
+    assert allowed.status_code == 200, allowed.text
 
 
 async def test_the_refusal_names_the_project_whose_session_is_in_the_way(

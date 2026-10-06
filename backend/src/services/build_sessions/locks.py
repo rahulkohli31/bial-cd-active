@@ -71,6 +71,7 @@ from src.services.redis import (
 )
 from src.services.redis.keys import (
     REGISTRY_FIELD_ADOPTED_FROM_LEGACY,
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
@@ -83,6 +84,7 @@ from src.services.redis.keys import (
     start_failure_key,
     starting_key,
 )
+from src.services.sandbox.base import SHARED_SANDBOX_NAME_PREFIX, app_name_for, shr_name_for
 
 _log = structlog.get_logger()
 
@@ -939,7 +941,7 @@ def an_instant_on_the_hash(reg: Mapping[str, str] | None, field: str) -> datetim
 
 class SharedViewStamp(NamedTuple):
     """Whose project a shared view in this slot shows: stamped on the record at Launch, because
-    neither can be read back out of a `shr-` name."""
+    neither can be read back out of a container's name."""
 
     owner_id: uuid.UUID
     project_id: uuid.UUID
@@ -947,12 +949,48 @@ class SharedViewStamp(NamedTuple):
 
 def shared_view_stamp(reg: Mapping[str, str]) -> SharedViewStamp | None:
     """The owner and project a shared view's launch stamped on this record, or `None` on any other
-    record. A stamp that will not parse raises: it is not a record this platform wrote."""
+    record. The stamp is what makes a record a shared view, whatever its container is called. A
+    stamp that will not parse raises: it is not a record this platform wrote."""
     project_id = reg.get(REGISTRY_FIELD_SHARED_PROJECT_ID)
     owner_id = reg.get(REGISTRY_FIELD_SHARED_OWNER_ID)
     if not project_id or not owner_id:
         return None
     return SharedViewStamp(owner_id=uuid.UUID(owner_id), project_id=uuid.UUID(project_id))
+
+
+def is_a_shared_view(reg: Mapping[str, str]) -> bool:
+    """Is this record a colleague's shared view rather than its holder's own build sandbox? A
+    shared view is never written back: its tree would land on its owner's saved copy."""
+    # A record the previous release wrote, when a shared view's name still said so. Asked before
+    # the stamp is parsed.
+    legacy_name = "" if REGISTRY_FIELD_APP_ID in reg else reg.get(REGISTRY_FIELD_APP_NAME, "")
+    return legacy_name.startswith(SHARED_SANDBOX_NAME_PREFIX) or shared_view_stamp(reg) is not None
+
+
+class Occupant(NamedTuple):
+    """A container a caller expects to find in a user's slot: `app_id`'s own build sandbox, or,
+    given `view`, the shared view of that app whose owner and project its launch stamped."""
+
+    app_id: uuid.UUID
+    view: SharedViewStamp | None = None
+
+
+def record_holds(reg: Mapping[str, str], occupant: Occupant, user_id: uuid.UUID) -> bool:
+    """Does this record, read from `user_id`'s slot, describe `occupant`? The one comparison every
+    lookup makes, so a container may carry any name.
+
+    The recorded app AND the stamp must agree: a colleague's view of an app is never that app's
+    build sandbox, and a build sandbox is never a view."""
+    recorded_app = reg.get(REGISTRY_FIELD_APP_ID)
+    if recorded_app is None:
+        # A record the previous release wrote: no app id, and a name derived from it.
+        derived = (
+            app_name_for(occupant.app_id)
+            if occupant.view is None
+            else shr_name_for(occupant.app_id, user_id)
+        )
+        return reg.get(REGISTRY_FIELD_APP_NAME) == derived
+    return recorded_app == str(occupant.app_id) and shared_view_stamp(reg) == occupant.view
 
 
 def elapsed_ms(since: datetime | None, until: datetime) -> int | None:

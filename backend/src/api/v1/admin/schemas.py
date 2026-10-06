@@ -17,6 +17,7 @@ from pydantic import AfterValidator, Field, field_validator
 from src.api.v1.deploy.schemas import RegistryStatus
 from src.db.models.app_registry import AppStatus
 from src.db.models.deployment import DeploymentStatus
+from src.db.models.sandbox_start import SandboxStartKind, SandboxStartMiss
 from src.schemas import CamelModel, clean_stated_reason
 
 # --- governance (`/admin/apps`) ------------------------------------------------
@@ -570,4 +571,38 @@ class HarnessCountersResponse(CamelModel):
     tool boundary shows up here with no change to this file."""
 
     counters: list[HarnessCounterRow]
+    since: datetime
+
+
+class SandboxStartMedians(CamelModel):
+    """Median milliseconds of each stage over the starts that reached it, and of the whole start,
+    door to first page, over the starts that served. `None` where no start had it."""
+
+    admission_ms: int | None
+    settings_ms: int | None
+    create_ms: int | None
+    dev_start_ms: int | None
+    first_page_ms: int | None
+    browser_visible_ms: int | None
+    total_ms: int | None
+
+
+class SandboxStartKindSummary(CamelModel):
+    """The starts of one kind: how many, how they ended, how many took a ready container, why
+    the rest did not, and how long each stage took. A start neither served nor failed is still
+    under way, or one whose first page no watcher saw."""
+
+    kind: SandboxStartKind
+    starts: int
+    served: int
+    failed: int
+    claimed: int
+    misses: dict[SandboxStartMiss, int]
+    medians: SandboxStartMedians
+
+
+class SandboxStartsResponse(CamelModel):
+    """`GET /v1/admin/sandbox-starts` → 200 — sandbox start times, per kind of start."""
+
+    kinds: list[SandboxStartKindSummary]
     since: datetime

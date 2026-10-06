@@ -169,3 +169,15 @@ class CoreSettings(BaseSettings):
         redirects (308) to `/<base>`, only the unslashed form answers 200. A slash here would
         put a redirect in front of every framed preview and published link."""
         return f"{self.APPS_BASE_URL}{base_path_for(app_name)}"
+
+
+def require_an_https_portal_in_production(is_production: bool, frontend_url: str) -> None:
+    """Refuse a `FRONTEND_URL` that is not `https://` in production, for every role that holds
+    one. It feeds security surfaces — a sandbox's frame-ancestors CSP through
+    `BIAL_PORTAL_ORIGIN`, and postMessage target origins — which any other value mis-scopes."""
+    if is_production and not frontend_url.startswith("https://"):
+        raise ValueError(
+            "FRONTEND_URL must be set to the portal's real https:// origin in "
+            "production: the localhost dev default (or any non-https URL) would "
+            "mis-scope the sandbox frame-ancestors CSP and postMessage origins."
+        )

@@ -31,16 +31,17 @@
  * which blanks its reading on every re-run and can flicker "we could not check" or unframe a running app.
  *
  * A throwing read spends from the window too (`spendProbeCadence`): the bound ceilings elapsed
- * fast-polling rather than tallying answers returned, so an endpoint erroring mid-start still buys an
- * unbounded 3-second poll for the tab's life. An accelerated tick asks the preview state only —
+ * fast-polling rather than tallying answers returned, so an endpoint erroring mid-start cannot hold
+ * the accelerated poll open past it. An accelerated tick asks the preview state only —
  * `fetchSaveState` still waits for `alive`, since a seconds-old container is still booting — so the save
  * state lands within one accelerated interval of when it would have arrived unaccelerated.
  *
  * THIS READ ALSO HOLDS THE CONTAINER OPEN. Every unaccelerated tick renews the preview's stay as a side
- * effect (`SURFACE_PRESENT`, the only deadline writer a browser can reach), so a screen left framing a
- * project keeps it alive and a screen that is closed stops paying. The renewal cannot push past the
- * absolute age ceiling and never reports a failure of its own, so a stay can still lapse under someone
- * reading: the next read returns `asleep`, offering the start again with nothing lost.
+ * effect (`SURFACE_PRESENT`, the only deadline writer a browser can reach), and an accelerated one at
+ * most once a background interval (`renewsOnThisTick`), so a screen left framing a project keeps it
+ * alive and a screen that is closed stops paying. The renewal cannot push past the absolute age
+ * ceiling and never reports a failure of its own, so a stay can still lapse under someone reading:
+ * the next read returns `asleep`, offering the start again with nothing lost.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { checkWorkspace, fetchPreviewState, fetchSaveState, renewPresence, samePreviewState, sameSaveState } from '../../utils/buildSessionApi'
@@ -54,6 +55,8 @@ import {
   mayHaveStopped,
   nextProbeCadence,
   presenceToRenew,
+  readIsStillWorthWaitingFor,
+  renewsOnThisTick,
   resolveWorkspaceState,
   spendProbeCadence,
   type ProbeCadence,
@@ -197,6 +200,8 @@ export function useWorkspaceState({
     // exactly the gesture where somebody is asking to be brought up to date it would answer with
     // the reading they already had.
     let latest = 0
+    let newestReadBeganAt: number | null = null
+    let lastRenewedAt: number | null = null
     let timer: ReturnType<typeof setInterval> | null = null
     // WHAT THE ANSWERS SO FAR HAVE DECIDED ABOUT THE CADENCE, and what the running timer was
     // actually armed with. Two variables because they answer different questions: `cadence` is
@@ -227,13 +232,13 @@ export function useWorkspaceState({
       // so a tick reading it at fire time would call itself a background read on the strength of
       // a decision it had not made yet.
       const accelerated = armed === STARTING_PROBE_MS
-      timer = setInterval(() => void read(accelerated), armed)
+      timer = setInterval(() => void read(accelerated, true), armed)
     }
 
     // `accelerated` is false for the mount read and for both visibility handlers. Those are a
-    // fresh surface and a deliberate human act — neither is the 3-second timer, and neither
+    // fresh surface and a deliberate human act — neither is the accelerated timer, and neither
     // should be denied the container read a background tick makes.
-    const read = async (accelerated = false) => {
+    const read = async (accelerated = false, fromTimer = false) => {
       if (!live) return
       // A HIDDEN TAB STILL READS AND STILL RENEWS, and admits nothing else.
       //
@@ -251,11 +256,19 @@ export function useWorkspaceState({
       // NOT AWAITED. The renewal is a fact this surface reports, not one the read waits on: a
       // slow renewal must never delay the answer the screen is rendering. Its own result is
       // recorded when it lands, and a failure records nothing at all.
-      void renewPresence(projectId, presenceToRenew(hidden))
+      const now = Date.now()
+      if (renewsOnThisTick(accelerated, now, lastRenewedAt)) {
+        lastRenewedAt = now
+        void renewPresence(projectId, presenceToRenew(hidden))
+      }
+      if (fromTimer && readIsStillWorthWaitingFor(newestReadBeganAt, now)) return
       const generation = ++latest
+      newestReadBeganAt = now
       const readSettled = pressEnd.readBegins()
       try {
-        const next = await fetchPreviewState(projectId)
+        const next = await fetchPreviewState(projectId).finally(() => {
+          if (generation === latest) newestReadBeganAt = null
+        })
         // Superseded: a later read started, so its answer is newer whatever order the responses
         // arrived in. Bail before touching state OR the timer — an overtaken read calling
         // `stopAsking()` would end the poll on a verdict that has already been replaced.
@@ -289,12 +302,12 @@ export function useWorkspaceState({
           // read is `null`, which is the tri-state's "no claim", and every consumer already
           // treats that as "could not tell" rather than as "clean".
           //
-          // AND ON A BACKGROUND TICK. An accelerated read is the 3-second timer that watches a
+          // AND ON A BACKGROUND TICK. An accelerated read is the timer that watches a
           // start land, so the container it would ask has been alive for seconds and is still
           // restoring and booting — two `git` executions are the last thing it needs, and the
           // answer is the one the next background tick gives for free. The acceleration must cost
           // cheap reads and nothing else. SKIPPED, NOT RETURNED FROM: this read still owes
-          // the timer below its cadence decision, and an early exit here would leave the 3-second
+          // the timer below its cadence decision, and an early exit here would leave the accelerated
           // interval running over an app that is already up.
           if (!accelerated && !hidden) {
             const state = await fetchSaveState(projectId).catch(() => null)
@@ -343,11 +356,11 @@ export function useWorkspaceState({
         // never pulls a running app off screen or wipes an answer somebody is already reading. The
         // timer is left running so the next tick can correct it.
         //
-        // BUT IT STILL SPENDS FROM THE ACCELERATED WINDOW. Until it did, the 120-second bound was
-        // a ceiling on SUCCESSFUL reads only, so a workspace that reached `starting` and then began
-        // erroring was asked every three seconds for the life of the tab — the exact hang the bound
-        // exists to prevent, reachable by a 500. See `spendProbeCadence` for why it may spend
-        // without deciding anything.
+        // BUT IT STILL SPENDS FROM THE ACCELERATED WINDOW, or the window would bound SUCCESSFUL
+        // reads only, and a workspace that reached `starting` and then began erroring would be asked
+        // at the accelerated cadence for the life of the tab — the exact hang the bound exists to
+        // prevent, reachable by a 500. See `spendProbeCadence` for why it may spend without
+        // deciding anything.
         //
         // GUARDED THE SAME WAY THE SUCCESS PATH IS, plus one of its own. A superseded read must not
         // move the cadence a newer one already set, and `timer === null` is a poll a settled answer

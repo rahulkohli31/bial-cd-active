@@ -6,11 +6,11 @@ dodged by setting `ENVIRONMENT=development` — the cheapest thing an operator t
 container won't boot. That costs the API a broken feature; here it costs containers, so these
 fail in EVERY environment and cannot be talked out of.
 
-DELIBERATELY ABSENT: auth (nothing to authenticate), portal knobs (no browser to serve), foundry
-(runs no model), and app_db — every scheduled pass in this process reads the product DB via
-`DATABASE_URL`, never a per-project one, so a maintenance credential here is the
-union-of-everything problem this split exists to remove; a future provisioning role declares it
-in its own manifest."""
+DELIBERATELY ABSENT: auth (nothing to authenticate), portal knobs other than its address (no
+browser to serve), foundry (runs no model), and app_db — every scheduled pass in this process
+reads the product DB via `DATABASE_URL`, never a per-project one, so a maintenance credential
+here is the union-of-everything problem this split exists to remove; a future provisioning role
+declares it in its own manifest."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from src.services.deploy.config import DeployConfig
 from src.services.redis.config import RedisConfig
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage.config import StorageConfig
-from src.settings.core import CoreSettings
+from src.settings.core import CoreSettings, require_an_https_portal_in_production
 
 
 class WorkerSettings(CoreSettings):
@@ -49,6 +49,11 @@ class WorkerSettings(CoreSettings):
     # ARM access: how the fleet is enumerated and how containers are deleted. It also carries
     # `region`, which is not incidental — the ARM tag PATCH body requires `location`.
     sandbox: SandboxConfig
+
+    # The portal's own address, the API's exact value. Every ready sandbox this process makes for
+    # the pool takes from it the one origin allowed to frame it, and a guess here makes sandboxes
+    # the portal cannot show. `https://` in production, by the API's own gate.
+    FRONTEND_URL: str
 
     # ================================================ RETENTION: REQUIRED, AND A SWITCH THAT ACTS
     # A PLAIN FIELD RATHER THAN A NESTED BLOCK. The nested blocks above are subsystems with
@@ -102,4 +107,9 @@ class WorkerSettings(CoreSettings):
         # cannot drift into two opinions about one DSN.
         if self.is_production:
             self.redis.require_tls()
+        return self
+
+    @model_validator(mode="after")
+    def _require_real_frontend_url_in_production(self) -> Self:
+        require_an_https_portal_in_production(self.is_production, self.FRONTEND_URL)
         return self

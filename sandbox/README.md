@@ -17,10 +17,19 @@ directions:
 | New backend, old portal | **Broken.** Every file upload is refused — the shipped portal does not send the conversation id the backend now requires. |
 | New backend, old image | **Degraded, loudly.** Writing an attachment answers `400 … path escapes workspace`, because `/workspace/attachments` does not exist in the old image. That is *not* a control-plane path bug. |
 
-So: **image → portal → backend → worker.** Build with context `sandbox/` and
-`--platform linux/amd64`; push under an immutable tag **and** `:latest` (prod's `SANDBOX__IMAGE_REF`
-is on `:latest`). A template or supervisor change under a reused tag is silently untested — the
-preview comes up on the old image and reports healthy.
+So: **image → portal → migrations → stop the old backend → worker → new backend.** Wait until only
+the worker's new revision runs before the new backend starts, and do it outside working hours with
+the scheduled sweep on: an older backend or worker meeting a newer one's randomly named workspaces
+deletes them without saving (`documentation/deployment.md`, "The pool of ready sandboxes"). Build
+with context `sandbox/` and `--platform linux/amd64`; push under an immutable tag **and** `:latest`,
+then set `SANDBOX__IMAGE_REF` to the immutable tag in both the backend and the worker. The warm pool
+recognises an image deploy only by that reference changing, so a reference left on `:latest` hides
+it and ready containers keep the old image. A template or supervisor change under a reused tag is
+silently untested — the preview comes up on the old image and reports healthy.
+
+With a pool size above zero, a new backend on an old image also fails every claim at the `configure`
+call, which the old supervisor does not have: each claimed container is torn down, the next ready
+one fails the same way, and after two the start creates one as before, recorded as a failed claim.
 
 **It is a STARTER, not a CRUD template.** `app/page.tsx` is a placeholder screen that asks the
 framing portal whether a build is running and says so, until the agent replaces it with the app's
@@ -96,9 +105,17 @@ the `BIAL_*` ones for a reader inside the app.
 | `IDENTITY_ENDPOINT`       | Azure's own: the token endpoint for the attached managed identity      |
 | `IDENTITY_HEADER`         | Azure's own: the bearer for that endpoint (secret — redacted from output) |
 
-`BIAL_BASE_PATH` and `BIAL_APPS_HOSTNAME` are set by the control plane at the provision seam only
-(`backend/src/services/sandbox/client.py`), never in `build_app_env` — a base path added there
-would ship an `sbx-` value into a `pub-` published container.
+`BIAL_BASE_PATH` and `BIAL_APPS_HOSTNAME` are set by the control plane at the provision seam and
+by the pool's fill (`_provision_container` and `fill_one`, both in
+`backend/src/services/sandbox/client.py`), the base path from the container's own name. The fill
+sets `BIAL_PORTAL_ORIGIN` too, from `FRONTEND_URL`, since a pool member gets nothing from
+`build_app_env`. The first two are never in `build_app_env` — a base path added there would ship
+an `sbx-` value into a `pub-` published container.
+
+A pool member is created with `BIAL_POOL_MEMBER=1`, which no child sees, and without the six
+per-project names: `BIAL_APP_ID`, the two Blob values, the database URL and the two `BIAL_DICE_*`.
+`POST /_sup/configure` with `{"env": {...}}` delivers those six once; until it does,
+`/_sup/health` reports `"configured": false` and `/_sup/dev/start` answers 412.
 
 **The last four are conditional, and the condition is a security boundary.** The two `BIAL_DICE_*`
 values, the managed identity itself, and therefore Azure's `IDENTITY_*` pair are attached only

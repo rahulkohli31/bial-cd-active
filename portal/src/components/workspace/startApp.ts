@@ -18,6 +18,7 @@
 import { useRef, useState } from 'react'
 import { ApiError } from '../../utils/apiError'
 import { BuildSessionAlreadyActiveError, relaunchPreview } from '../../utils/buildSessionApi'
+import { markStartClicked } from '../../utils/observe'
 import type { StartOutcome, StartResult } from './workspaceState'
 import type { WorkspaceReport } from './workspaceChannel'
 
@@ -79,13 +80,15 @@ export async function startApp(sinks: StartSinks): Promise<StartResult> {
   const projectId = sinks.projectId
   // Nobody to ask: no request was made, so nothing failed.
   if (!projectId) return { kind: 'ok' }
+  // Timed from here: for the start an open makes, this request is the click.
+  const began = markStartClicked(projectId)
   // THE SURFACE HEARS THE PRESS IMMEDIATELY, not on the next poll tick. The server's own
   // `starting` is the authority and it arrives later; this is what stops the sentence above the
   // pane saying nothing happened for up to forty-five seconds.
   sinks.onStartPending(true)
   let admitted = false
   try {
-    await relaunchPreview({ projectId })
+    began(await relaunchPreview({ projectId }))
     // ADMITTED, NOT UP. The app comes up after this answer, and the poll is its one reader:
     // `starting` now, `alive` with the address to frame once something has watched it show a
     // page. The press stays pending: the surface asks again at once and ends it when that read
@@ -115,8 +118,9 @@ export async function startApp(sinks: StartSinks): Promise<StartResult> {
  * WHEN AN ADMITTED PRESS ENDS: on the first read BEGUN after the admission, once it settles.
  *
  * Only a read begun after the admission can end it — one already in flight carries the reading
- * from before the press. Answered or failed, that read ends it, so a press lasts no longer than
- * one read: a read that hangs is overtaken by the poll's next tick, which begins another.
+ * from before the press. Answered or failed, that read ends it. One that hangs holds the press
+ * until a newer read settles: a gesture's, or the first poll tick's once the hung read has waited
+ * `READ_PATIENCE_MS`.
  */
 export interface PressEnd {
   /** The server admitted the press. */

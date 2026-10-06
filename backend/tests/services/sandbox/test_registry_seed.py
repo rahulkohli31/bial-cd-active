@@ -21,24 +21,32 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 import redis.asyncio as aioredis
 from pydantic import SecretStr
 
+from src.services.build_sessions import locks
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_SERVING_SINCE,
+    REGISTRY_FIELD_SHARED_OWNER_ID,
+    REGISTRY_FIELD_SHARED_PROJECT_ID,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_WAITING_SINCE,
 )
+from src.services.sandbox.base import SandboxError
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
 from tests.fakes import a_sandbox_name
 
 _PREDECESSOR = a_sandbox_name("gone")
 _SUCCESSOR = a_sandbox_name("fresh")
+_PREDECESSORS_APP = uuid.UUID("0198f2c0-0000-7000-8000-0000000a0001")
+_SUCCESSORS_APP = uuid.UUID("0198f2c0-0000-7000-8000-0000000a0002")
 
 
 def _a_client() -> AcaSandboxClient:
@@ -63,17 +71,43 @@ def _a_client() -> AcaSandboxClient:
 
 
 async def _the_previous_occupant(redis: aioredis.Redis, user: uuid.UUID) -> None:
-    """A hash left behind by the container that held this user's one slot before — carrying both
-    inheritable facts: a standing serving proof and a standing stay of execution."""
+    """What the container that held this user's one slot before left behind once its name was
+    cleared — carrying both inheritable facts: a standing serving proof and a standing stay of
+    execution."""
     await redis.hset(
         registry_key(user),
         mapping={
-            REGISTRY_FIELD_APP_NAME: _PREDECESSOR,
+            REGISTRY_FIELD_APP_ID: str(_PREDECESSORS_APP),
             REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
             REGISTRY_FIELD_SERVING_SINCE: "2026-09-10T09:41:04+00:00",
             REGISTRY_FIELD_PREVIEW_STAY_UNTIL: "2026-09-10T10:41:04+00:00",
         },
     )
+
+
+async def test_a_record_that_still_names_a_container_is_never_written_over(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ The record is the only thing naming the container it describes, so a write landing on it
+    would leave that container running with nothing that finds it. A start reaching an occupied
+    slot fails, and the record stays exactly as it was.
+
+    Mutation check: drop the name guard from the script and the successor's write lands."""
+    user = uuid.uuid4()
+    await _the_previous_occupant(fake_redis, user)
+    await fake_redis.hset(registry_key(user), REGISTRY_FIELD_APP_NAME, _PREDECESSOR)
+    before = await fake_redis.hgetall(registry_key(user))
+
+    with pytest.raises(SandboxError):
+        await _a_client()._write_registry(
+            user,
+            app_name=_SUCCESSOR,
+            app_id=_SUCCESSORS_APP,
+            fqdn=f"{_SUCCESSOR}.example",
+            token_ref="ref-fresh",
+        )
+
+    assert await fake_redis.hgetall(registry_key(user)) == before
 
 
 async def test_a_new_container_says_it_has_never_served(fake_redis: aioredis.Redis) -> None:
@@ -91,7 +125,11 @@ async def test_a_new_container_says_it_has_never_served(fake_redis: aioredis.Red
     await _the_previous_occupant(fake_redis, user)
 
     await _a_client()._write_registry(
-        user, app_name=_SUCCESSOR, fqdn=f"{_SUCCESSOR}.example", token_ref="ref-fresh"
+        user,
+        app_name=_SUCCESSOR,
+        app_id=_SUCCESSORS_APP,
+        fqdn=f"{_SUCCESSOR}.example",
+        token_ref="ref-fresh",
     )
 
     assert await fake_redis.hexists(registry_key(user), REGISTRY_FIELD_SERVING_SINCE) == 1, (
@@ -114,7 +152,11 @@ async def test_a_new_container_inherits_neither_the_last_occupants_proof_nor_its
     await _the_previous_occupant(fake_redis, user)
 
     await _a_client()._write_registry(
-        user, app_name=_SUCCESSOR, fqdn=f"{_SUCCESSOR}.example", token_ref="ref-fresh"
+        user,
+        app_name=_SUCCESSOR,
+        app_id=_SUCCESSORS_APP,
+        fqdn=f"{_SUCCESSOR}.example",
+        token_ref="ref-fresh",
     )
 
     reg = await fake_redis.hgetall(registry_key(user))
@@ -139,7 +181,11 @@ async def test_the_record_is_born_ready_and_unproven_at_the_same_instant(
     user = uuid.uuid4()
 
     await _a_client()._write_registry(
-        user, app_name=_SUCCESSOR, fqdn=f"{_SUCCESSOR}.example", token_ref="ref-fresh"
+        user,
+        app_name=_SUCCESSOR,
+        app_id=_SUCCESSORS_APP,
+        fqdn=f"{_SUCCESSOR}.example",
+        token_ref="ref-fresh",
     )
 
     reg = await fake_redis.hgetall(registry_key(user))
@@ -165,8 +211,105 @@ async def test_a_new_container_waits_from_its_own_birth_not_the_last_occupants_w
     )
 
     await _a_client()._write_registry(
-        user, app_name=_SUCCESSOR, fqdn=f"{_SUCCESSOR}.example", token_ref="ref-fresh"
+        user,
+        app_name=_SUCCESSOR,
+        app_id=_SUCCESSORS_APP,
+        fqdn=f"{_SUCCESSOR}.example",
+        token_ref="ref-fresh",
     )
 
     reg = await fake_redis.hgetall(registry_key(user))
     assert reg[REGISTRY_FIELD_WAITING_SINCE] == reg[REGISTRY_FIELD_CREATED_AT]
+
+
+async def test_a_new_container_records_its_own_app_over_the_last_occupants(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Every lookup finds a container by the app its record names, so an app inherited through
+    the MERGE would hand this container to the previous occupant's project: its preview, its
+    write-back and its teardown.
+
+    Mutation-check: drop `REGISTRY_FIELD_APP_ID` from the `hset` mapping and the predecessor's
+    app survives."""
+    user = uuid.uuid4()
+    await _the_previous_occupant(fake_redis, user)
+
+    await _a_client()._write_registry(
+        user,
+        app_name=_SUCCESSOR,
+        app_id=_SUCCESSORS_APP,
+        fqdn=f"{_SUCCESSOR}.example",
+        token_ref="ref-fresh",
+    )
+
+    assert await fake_redis.hget(registry_key(user), REGISTRY_FIELD_APP_ID) == (
+        "0198f2c0-0000-7000-8000-0000000a0002"
+    )
+
+
+_OWNER = uuid.UUID("0198f2c0-0000-7000-8000-0000000a0003")
+_PROJECT = uuid.UUID("0198f2c0-0000-7000-8000-0000000a0004")
+
+
+async def test_a_build_sandbox_after_a_shared_view_is_never_read_as_the_view(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ The stamp is the only classifier, so a view's stamp inherited by the build sandbox that
+    replaces it would hold that sandbox's tree back from its own saved copy and hand the slot to
+    the colleague's project.
+
+    Mutation check: drop the `hdel` of the stamp on a build birth and every assertion below the
+    write goes red."""
+    user = uuid.uuid4()
+    await _the_previous_occupant(fake_redis, user)
+    await fake_redis.hset(
+        registry_key(user),
+        mapping={
+            REGISTRY_FIELD_SHARED_OWNER_ID: str(_OWNER),
+            REGISTRY_FIELD_SHARED_PROJECT_ID: str(_PROJECT),
+        },
+    )
+
+    await _a_client()._write_registry(
+        user,
+        app_name=_SUCCESSOR,
+        app_id=_SUCCESSORS_APP,
+        fqdn=f"{_SUCCESSOR}.example",
+        token_ref="ref-fresh",
+    )
+
+    reg = await locks.read_registry(fake_redis, user)
+    assert reg is not None
+    assert REGISTRY_FIELD_SHARED_OWNER_ID not in reg
+    assert REGISTRY_FIELD_SHARED_PROJECT_ID not in reg
+    assert reg[REGISTRY_FIELD_APP_ID] == "0198f2c0-0000-7000-8000-0000000a0002"
+    assert locks.is_a_shared_view(reg) is False
+    assert locks.record_holds(reg, locks.Occupant(_SUCCESSORS_APP), user) is True
+
+
+async def test_a_shared_view_is_born_stamped_with_its_owners_app_and_project(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Mutation check: drop the stamp's `hset` and the view reads as its holder's build sandbox."""
+    user = uuid.uuid4()
+    await _the_previous_occupant(fake_redis, user)
+
+    await _a_client()._write_registry(
+        user,
+        app_name=_SUCCESSOR,
+        app_id=_SUCCESSORS_APP,
+        fqdn=f"{_SUCCESSOR}.example",
+        token_ref="ref-fresh",
+        shared_project_id=_PROJECT,
+        shared_owner_id=_OWNER,
+    )
+
+    reg = await locks.read_registry(fake_redis, user)
+    assert reg is not None
+    assert reg[REGISTRY_FIELD_SHARED_OWNER_ID] == "0198f2c0-0000-7000-8000-0000000a0003"
+    assert reg[REGISTRY_FIELD_SHARED_PROJECT_ID] == "0198f2c0-0000-7000-8000-0000000a0004"
+    assert reg[REGISTRY_FIELD_APP_ID] == "0198f2c0-0000-7000-8000-0000000a0002"
+    assert locks.is_a_shared_view(reg) is True
+    view = locks.SharedViewStamp(owner_id=_OWNER, project_id=_PROJECT)
+    assert locks.record_holds(reg, locks.Occupant(_SUCCESSORS_APP, view), user) is True
+    assert locks.record_holds(reg, locks.Occupant(_SUCCESSORS_APP), user) is False

@@ -160,8 +160,8 @@ async def _the_live_session_is_this_project(
     THE THREE SIGNALS CARRY TWO KINDS OF IDENTITY. The starting marker holds a PROJECT id
     outright and is written under the lock, so while one stands it IS the live session's
     identity — and it is the only one that can answer during a cold start, before a registry
-    entry exists. The lock and the lease carry none: theirs comes from the registry hash's app
-    name, which `the_live_session_is_this_app` compares and fails closed on.
+    entry exists. The lock and the lease carry none: theirs comes from the registry record's app,
+    which `the_live_session_is_this_app` compares and fails closed on.
 
     A PROJECT NOTHING WAS EVER BUILT IN HAS NO APP ROW, and so no container of its own — a
     registry naming an app is naming somebody else's work. A registry naming NOTHING is
@@ -318,15 +318,11 @@ async def list_project_connectors(
     An unknown project, and a project belonging to somebody else, are the same 404."""
     await _owned_project_or_404(db, project_id, user.id)
 
-    # `populate_existing`: this router's upsert is an INSERT, so — unlike an ORM-enabled UPDATE
-    # — it does not synchronise the session's identity map. A read that follows a write in the
-    # SAME session must take the database's values, never a stale in-session copy of the row.
     rows = (
         await db.execute(
             sa.select(ProjectConnector)
             .join(Project, Project.id == ProjectConnector.project_id)
             .where(Project.user_id == user.id, ProjectConnector.project_id == project_id)
-            .execution_options(populate_existing=True)
         )
     ).scalars()
     stored_by_key = {row.connector_key: row for row in rows}
@@ -435,26 +431,16 @@ async def set_project_connector(
             "updated_at": sa.func.now(),
             **({} if body.window is None else window_columns),
         },
-    ).returning(
-        ProjectConnector.enabled,
-        ProjectConnector.window_kind,
-        ProjectConnector.window_days,
-        ProjectConnector.window_start,
-        ProjectConnector.window_end,
     )
-    written = (await db.execute(upsert)).one()
-
-    # The row as the database now holds it, carried as a TRANSIENT `ProjectConnector` because
-    # that is what the resolver reads. Never added to the session: it is a value object for one
-    # call, and the persisted row is the one the statement above already wrote.
-    stored = ProjectConnector(
-        enabled=written.enabled,
-        window_kind=written.window_kind,
-        window_days=written.window_days,
-        window_start=written.window_start,
-        window_end=written.window_end,
-    )
+    # `populate_existing` because a Core upsert does not reach the session's cached copy of the
+    # row: without it, a later read through this session hands back the switch as it was.
+    written = (
+        await db.execute(
+            upsert.returning(ProjectConnector),
+            execution_options={"populate_existing": True},
+        )
+    ).scalar_one()
     # Assembled BEFORE the commit, so nothing reads an ORM attribute across one.
-    entry = _project_entry(connector_key, connector, stored)
+    entry = _project_entry(connector_key, connector, written)
     await db.commit()
     return entry

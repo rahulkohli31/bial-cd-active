@@ -72,3 +72,20 @@ keyword-only for that row. This event is the only record that it happened.
 
 Fields: `project_id`, `reason` (the exception type — never the message, which can carry request
 content)."""
+
+SANDBOX_POOL_BELOW_SIZE_EVENT: Final = "sandbox_pool_below_size"
+"""A pass over the pool of ready sandboxes ended below the size the settings give for that time,
+and something stopped it filling: Azure refused a create, or a container sat filling or claimed
+past its deadline. That pass made no further create; the next, a minute later, tries again.
+
+A START NEVER FAILS BECAUSE OF THIS. One that finds no ready sandbox creates its own, as it would
+with no pool, only slower, and its start record names why. It never fires while the size is zero.
+
+Fields: `target` (the size for that time), `ready` (how many were ready as the pass ended),
+`refused` (whether Azure refused a create) and `overdue` (whether a row was past its deadline).
+
+WHAT TO DO: read the worker's log for that pass, where the refusal is logged beside it. An
+authorization refusal means the worker's identity lacks the create, tag-write or environment-join
+action on the sandbox resource group; rows overdue while filling mean the image reference or the
+registry credentials are wrong; a capacity refusal means the environment is full. When it cannot be
+fixed soon, set every pool size to zero."""

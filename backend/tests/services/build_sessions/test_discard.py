@@ -28,11 +28,7 @@ from src.db.models.message import Message, MessageEntryKind
 from src.db.models.user import User
 from src.services.build_sessions import manager as manager_module
 from src.services.build_sessions.alarms import SANDBOX_DEV_STARTED_EVENT
-from src.services.build_sessions.manager import (
-    BuildSessionConflictError,
-    SessionManager,
-    app_name_for,
-)
+from src.services.build_sessions.manager import BuildSessionConflictError, SessionManager
 from src.services.build_sessions.snapshot import NothingSavedToGoBackToError
 from src.services.messages.projection import UserTextItem, WorkspaceDiscardedItem, project_rows
 from src.services.messages.store import append_batch, load_history, load_rows
@@ -175,9 +171,9 @@ async def test_a_discard_puts_the_saved_version_back_in_the_running_container(
     assert client.reset_to == [a_git_bundle(SAVED)]
     assert outcome.state.dirty is False
     assert outcome.state.container_head == SAVED
-    assert client.provisioned == [app_name_for(app_id)]
+    assert len(client.provisioned) == 1
     assert client.restored == []
-    assert client.dev_started == [app_name_for(app_id)]
+    assert client.dev_started == client.provisioned
 
 
 async def test_an_idle_check_during_the_discards_start_leaves_the_app_to_the_discard(
@@ -215,7 +211,7 @@ async def test_an_idle_check_during_the_discards_start_leaves_the_app_to_the_dis
     )
 
     assert asked, "guard the premise: the idle check ran inside the Discard's start"
-    assert client.dev_started == [app_name_for(app_id)]
+    assert client.dev_started == client.provisioned
 
 
 @pytest.mark.parametrize("found_serving", [True, False])

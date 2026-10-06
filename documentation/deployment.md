@@ -14,7 +14,7 @@ value is needed, the prose names the file that owns it.
 |---|---|
 | **Container Registry** | Holds the images. It also *builds* them — the control plane asks the registry to build an approved application's image rather than building it itself. |
 | **App Service for Containers** | Runs the control plane and the portal edge. Both are long-lived, single-instance services that want a stable address and managed TLS. |
-| **Container Apps** | Runs everything disposable: one build sandbox per project, and each deployed application. Created and destroyed constantly and programmatically, which is the job App Service is wrong for. |
+| **Container Apps** | Runs everything disposable: one build sandbox per project, some of them made ahead of time and held ready, and each deployed application. Created and destroyed constantly and programmatically, which is the job App Service is wrong for. |
 | **Database for PostgreSQL** | The platform's own record, and a separate database per project for generated applications. |
 | **Cache for Redis** | Build slots, live-session state and background-job scheduling. Nothing durable. |
 | **Blob storage** | Workspace snapshots and uploaded files. |
@@ -50,7 +50,8 @@ for approval, which is what makes an approved application reproducible: the thin
 thing that was approved, not a rebuild of whatever the workspace looks like now.
 
 The sandbox image is **built and published but never deployed** by an operator. The control plane
-creates sandboxes from it at runtime.
+and the worker create sandboxes from it at runtime, and an operator's part is to point both at the
+new image by its immutable tag (see "The pool of ready sandboxes").
 
 ### The build host runs Windows, and this constrains the code
 
@@ -92,6 +93,11 @@ have, so they are the ones to start first.
   permission to create and delete container apps in the one resource group that holds them.
   `reference/` carries both role definitions with the scope left unbound; choosing the scope is
   part of the assignment.
+- **Permission for the background worker's identity to create containers**, not only to delete
+  them: the container-apps write action, which creates a container with its tags, and the
+  environment-join action, on the same resource group. The container apps role definition in
+  `reference/` holds both. It is needed before any pool size is raised; see "The pool of ready
+  sandboxes" for what its absence looks like.
 - **The tenant data source generated applications read, and the managed identity allowed to read
   it.** The control plane refuses to start in production without both: an owner switching the data
   on for a project is the only step between that project and the data, so an unconfigured source
@@ -121,6 +127,70 @@ instances mean twice the intended limit.
 
 Check it before and after every deployment. Scaling out is possible but is a piece of work, not a
 setting: it needs a shared view of liveness and a shared store for the limiters.
+
+## The pool of ready sandboxes
+
+The platform can hold sandboxes ready ahead of time, so that a start takes one instead of waiting
+for the cloud provider to create one (`architecture.md` says why it is shaped as it is, and
+`adr/0032-warm-pool-of-ready-sandboxes.md` records the decision). It ships switched off. This
+section is what it needs from its host before any size is raised. Setting names are given because
+they are the contract with the host; the values an environment runs are not recorded here.
+
+**The worker's identity can create containers.** Pool containers are made by the worker as well as
+by the control plane, so the worker's identity needs the container-apps write and environment-join
+actions on the one resource group that holds the sandboxes, on top of the read and delete it
+already has. Without them nothing breaks for a person: every create the worker makes for the pool
+is refused, the pool stays below its size, the worker raises the below-size alarm
+(`runbooks/taskiq-worker.md`), and each start that finds nothing ready creates its own sandbox as it
+always did.
+
+**The worker needs the portal's address.** Its `FRONTEND_URL` setting is required, holds the same
+value as the control plane's, and must be an `https` address in production. A worker without it
+does not start.
+
+**Both processes must be told the sandbox image by its immutable tag.** On every sandbox deploy,
+set `SANDBOX__IMAGE_REF` to the tag just published, in the control plane and in the worker, in the
+same step. The pool learns that an image was deployed only from that setting changing; a moving tag
+such as `latest` changes nothing it can see, so ready sandboxes would keep running the old image.
+While the two disagree each fills from its own image, which costs at most a few extra creates.
+
+**The settings.** Both processes read each one, and both must hold the same value.
+
+| Setting | Meaning | Default |
+|---|---|---|
+| `SANDBOX__POOL_DAY_SIZE` | How many ready sandboxes to hold during the day | 0 |
+| `SANDBOX__POOL_NIGHT_SIZE` | How many to hold at night | 0 |
+| `SANDBOX__POOL_DAY_START` | When the day begins, India time, as `HH:MM` | 09:00 |
+| `SANDBOX__POOL_DAY_END` | When the day ends, India time, as `HH:MM`; the day runs up to, not including, it | 19:00 |
+| `SANDBOX__POOL_DAY_DAYS` | The days that count as the day, as comma-separated three-letter names | Monday to Friday |
+
+Each size is capped at twenty, and a larger value stops the process from starting, so a mistyped
+size fails the deploy instead of quietly running dozens of containers; so does a day that ends
+before it begins. `backend/src/services/sandbox/config.py` owns these settings. A size of zero means
+no ready sandboxes in that period, and every size is 0 by default.
+
+**Capacity comes first.** Each ready sandbox takes addresses and cores in the container apps
+environment on top of the live ones, and an image swap briefly needs twice as many. Confirm the
+environment's limits cover twice the largest size plus the peak number of live sandboxes before
+raising a size.
+
+**Every size stays at zero until the release notes say otherwise.** A data-connector project reads
+tenant data through an identity that is attached when its container is created, and a ready
+sandbox has no project yet, so it cannot carry it. Until a release lets a connector project's claim
+obtain that identity, a connector project that claimed a ready sandbox would start its app and then
+fail to read its data.
+
+**The release that introduced this is deployed in one order.** It changed how every workspace is
+named and found, and an older backend or worker meeting the newer one's records loses citizens'
+work. Deploy it outside working hours, with the scheduled sweep on and nobody calling the manual
+reap: run the migrations, stop the old backend, deploy the worker and wait until only its new
+revision is running, then start the new backend. `runbooks/reconcile-and-reclamation.md` records
+what goes wrong in any other order.
+
+**The platform cannot be rolled back past that release.** Once a sandbox has been created under a
+random name, an older build would delete it without saving. A forced rollback first drains the
+pool, saves and ends every live workspace through the new code, and waits until no deletion is
+owed; the procedure is in `runbooks/reconcile-and-reclamation.md`.
 
 ## Proving a deployment worked
 
@@ -159,6 +229,21 @@ still have failed to become interactive, and nothing short of using it will tell
 
 **7. A deployed application reads and writes its own data**, exercised in a browser. Applications
 reach their database directly, so this path is not covered by anything above it.
+
+**8. Every kind of start is recorded once.** Open a saved project, send the first message of a new
+project, send a chat message after the workspace has gone, switch to another project, and open a
+shared application as a colleague. The superadmin report of sandbox starts (see `reference/`) shows
+a count for each kind, and each of those starts is one record: its stage times add up to within a
+second of its total, and the browser's click-to-visible time is attached once the app showed.
+Attaching to a workspace that is already running writes none. A kind that shows nothing is a path
+that never opens its record, which no other check here would find.
+
+**9. The pool, once a size is above zero.** Within a few minutes the ready sandboxes number the
+configured size, and the worker's per-minute pass logs each tick. A start made then appears in the
+report as having claimed a ready sandbox, its create stage shrunk to the time of the claim; a start
+made with none ready appears with the reason it created one. Through a working day that includes a
+sandbox image deploy, the below-size alarm is quiet, or the worker's log explains each one by a
+refused create, a new sandbox that never answered, or a create a restart interrupted.
 
 ## When previews load for you but not for the people who need them
 

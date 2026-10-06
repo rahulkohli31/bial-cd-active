@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from src.services.build_sessions.reaper import is_a_sandbox_name
 from src.services.sandbox.base import (
     DevLogs,
     DevStatus,
@@ -29,6 +30,7 @@ from src.services.sandbox.base import (
     SandboxGoneError,
     SandboxHandle,
     SandboxNotReadyError,
+    a_fresh_sandbox_name,
 )
 
 # The frozen C2 method set. A test failure here means base.py drifted from the
@@ -61,7 +63,7 @@ def test_abstractmethod_set_equals_the_pinned_contract() -> None:
     assert set(SandboxClient.__abstractmethods__) == _C2_METHODS
 
 
-def test_handle_has_the_five_expected_fields_with_correct_types() -> None:
+def test_handle_has_the_expected_fields_and_holds_its_settings_unless_told() -> None:
     handle = SandboxHandle(
         fqdn="app-xyz.westeurope.azurecontainerapps.io",
         token="tok",
@@ -75,8 +77,10 @@ def test_handle_has_the_five_expected_fields_with_correct_types() -> None:
         "app_name",
         "preview_url",
         "ready",
+        "configured",
     }
     assert handle.ready is False
+    assert handle.configured is True
 
 
 def test_handle_is_frozen() -> None:
@@ -228,3 +232,17 @@ def test_a_supervisor_that_cannot_say_keeps_todays_behaviour() -> None:
     at fleet scale, which is worse than the window it closes. It self-expires as containers turn
     over. Delete this arm one fleet turnover after deploy, against this test."""
     assert _dev(root_status=None).shows_a_page is True
+
+
+def test_every_fresh_sandbox_name_is_a_new_one_of_the_shape_a_delete_accepts() -> None:
+    """★ A name never reused is what keeps a late delete off the container that replaced its
+    target, and the shape is what every guard in front of an ARM delete accepts.
+
+    Mutation check: mint one fixed name and they stop being distinct; mint 13 random bytes and
+    the length and the guard both refuse it."""
+    names = [a_fresh_sandbox_name() for _ in range(200)]
+
+    assert {len(name) for name in names} == {32}
+    assert all(name.startswith("sbx-") for name in names)
+    assert all(is_a_sandbox_name(name) for name in names)
+    assert len(set(names)) == len(names)

@@ -16,18 +16,28 @@ import uuid
 from typing import Any
 
 import pytest
+import redis.asyncio as aioredis
+import sqlalchemy as sa
 from pydantic import SecretStr
+from redis.exceptions import RedisError
+from structlog.testing import capture_logs
 
+import src.db.base as db_base
+from src.db.models.sandbox_pool import SandboxPoolMember, SandboxPoolState
 from src.services.sandbox import client as client_module
+from src.services.sandbox import pool
 from src.services.sandbox.aca import AcaError
 from src.services.sandbox.base import SandboxError
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
+from tests.fakes import a_sandbox_name
 
 _USER = uuid.uuid4()
 _APP_ID = uuid.uuid4()
-_NEW_APP = "sbx-new"
-_OLD_APP = "sbx-old"
+_NEW_APP = a_sandbox_name("new")
+_OLD_APP = a_sandbox_name("old")
+
+pytestmark = pytest.mark.usefixtures("empty_sandbox_pool")
 
 
 def _config() -> SandboxConfig:
@@ -47,8 +57,9 @@ class _Aca:
     """Minimal ACA control-plane stub. `delete_fails` is the whole point: ARM refusing a delete
     is the state in which dropping the record manufactures a ghost."""
 
-    def __init__(self, *, delete_fails: bool) -> None:
+    def __init__(self, *, delete_fails: bool, create_fails: bool) -> None:
         self.delete_fails = delete_fails
+        self.create_fails = create_fails
         self.deleted: list[str] = []
         self.created: list[str] = []
 
@@ -69,6 +80,8 @@ class _Aca:
         # this file asserts teardown ORDERING; which identity a container was born with is
         # asserted in `test_aca.py`.
         self.created.append(name)
+        if self.create_fails:
+            raise AcaError("ARM failed the create after it began")
         return f"{name}.westeurope.azurecontainerapps.io"
 
 
@@ -78,11 +91,19 @@ class _Storage:
 
 
 @pytest.fixture
-def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
-    """A client whose Redis and object store are recorded rather than real."""
+def wired(monkeypatch: pytest.MonkeyPatch, fake_redis: aioredis.Redis) -> Any:
+    """A client whose registry and object store are recorded rather than real. The pool's ledger
+    is the test database's."""
 
-    def _make(*, delete_fails: bool, restore_fails: bool, existing_app: str | None) -> Any:
-        aca = _Aca(delete_fails=delete_fails)
+    def _make(
+        *,
+        delete_fails: bool,
+        restore_fails: bool,
+        existing_app: str | None,
+        create_fails: bool = False,
+        registry_write_fails: bool = False,
+    ) -> Any:
+        aca = _Aca(delete_fails=delete_fails, create_fails=create_fails)
         # A structural stub, not an `AcaControlPlane` subclass: the client only ever calls
         # `delete_app` / `create_app` on this path, and inheriting the real class would drag an
         # ARM credential chain into a unit test.
@@ -107,6 +128,8 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
             return True
 
         async def _write_registry(user_uuid: uuid.UUID, **kwargs: Any) -> None:
+            if registry_write_fails:
+                raise RedisError("the registry write did not land")
             calls["write_registry"].append(kwargs.get("app_name"))
 
         async def _restore_into(handle: Any, bundle: bytes) -> None:
@@ -125,6 +148,12 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 def _env() -> dict[str, str]:
     return {"BIAL_APP_ID": str(_APP_ID)}
+
+
+async def _ledger() -> dict[str, SandboxPoolState]:
+    async with db_base.async_session_factory() as db:
+        rows = await db.execute(sa.select(SandboxPoolMember.name, SandboxPoolMember.state))
+    return {name: state for name, state in rows}
 
 
 # ------------------------------------------------------------------ the failure path
@@ -173,51 +202,127 @@ async def test_a_confirmed_teardown_does_drop_the_ownership_record(wired: Any) -
     )
 
 
-# ------------------------------------------------------------------ the success path
+# ------------------------------------------------------------------ the record it would replace
 
 
-async def test_a_failed_defensive_teardown_does_not_orphan_the_old_container(
+async def test_a_restore_refuses_to_provision_over_a_container_the_registry_still_names(
     wired: Any,
 ) -> None:
-    """The SECOND ghost factory, on the success path rather than the failure path: recovery must
-    not manufacture the thing it is recovering from."""
-    client, aca, calls = wired(delete_fails=True, restore_fails=False, existing_app=_OLD_APP)
+    """★ The record is the only thing naming the container it describes. Writing the new
+    container's record over it would leave that one running with nothing that finds it, so the
+    caller has to hand it over first, and the client refuses when nobody has.
+
+    Mutation check: drop the guard in `_provision_container` and the new container is created and
+    recorded over the old one's record."""
+    client, aca, calls = wired(delete_fails=False, restore_fails=False, existing_app=_OLD_APP)
 
     with pytest.raises(SandboxError):
         await client.restore_from_snapshot(
             str(_USER), _NEW_APP, app_env=_env(), source_key="snap/key"
         )
 
-    assert _OLD_APP in aca.deleted, "the old container's teardown was never attempted"
-    assert calls["write_registry"] == [], (
-        "the registry was overwritten with the new app name while the OLD container's delete "
-        "had failed — the old container is now unrecorded and bills forever"
-    )
-    assert _NEW_APP not in aca.created, (
-        "a replacement container was provisioned even though the old one could not be torn "
-        "down, so the deployment now holds two containers and a record for one"
-    )
+    assert aca.created == []
+    assert aca.deleted == [], "the client deletes nothing a caller has not handed over"
+    assert calls["write_registry"] == []
 
 
-async def test_a_confirmed_defensive_teardown_proceeds_normally(wired: Any) -> None:
+async def test_a_fresh_provision_refuses_the_same_way(wired: Any) -> None:
     client, aca, calls = wired(delete_fails=False, restore_fails=False, existing_app=_OLD_APP)
+
+    with pytest.raises(SandboxError):
+        await client.provision_new(str(_USER), _NEW_APP, app_env=_env())
+
+    assert aca.created == []
+    assert calls["write_registry"] == []
+
+
+async def test_an_empty_slot_is_provisioned_into(
+    wired: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The create is on the pool's ledger until its record is written, and off it after.
+
+    Mutation check: keep the row once the record is written and it outlives a create that needs
+    nothing found."""
+    client, aca, calls = wired(delete_fails=False, restore_fails=False, existing_app=None)
+    on_the_ledger_as_azure_was_asked: list[dict[str, SandboxPoolState]] = []
+    create_app = aca.create_app
+
+    async def create_app_seeing_the_ledger(**kwargs: Any) -> str:
+        on_the_ledger_as_azure_was_asked.append(await _ledger())
+        return await create_app(**kwargs)
+
+    monkeypatch.setattr(aca, "create_app", create_app_seeing_the_ledger)
 
     handle = await client.restore_from_snapshot(
         str(_USER), _NEW_APP, app_env=_env(), source_key="snap/key"
     )
 
-    assert _OLD_APP in aca.deleted
-    assert _NEW_APP in aca.created
+    assert on_the_ledger_as_azure_was_asked == [{_NEW_APP: SandboxPoolState.CLAIMED}]
+    assert aca.deleted == []
+    assert aca.created == [_NEW_APP]
     assert calls["write_registry"] == [_NEW_APP]
     assert handle.app_name == _NEW_APP
+    assert await _ledger() == {}
+
+
+async def test_a_ledger_that_does_not_answer_costs_the_create_nothing(
+    wired: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, aca, calls = wired(delete_fails=False, restore_fails=False, existing_app=None)
+
+    async def unreachable(name: str, image_ref: str) -> uuid.UUID:
+        raise OSError("the database went away")
+
+    monkeypatch.setattr(pool, "hold_a_create", unreachable)
+
+    with capture_logs() as logged:
+        handle = await client.restore_from_snapshot(
+            str(_USER), _NEW_APP, app_env=_env(), source_key="snap/key"
+        )
+
+    assert handle.app_name == _NEW_APP
+    assert (aca.created, calls["write_registry"]) == ([_NEW_APP], [_NEW_APP])
+    assert [
+        e["app_name"] for e in logged if e["event"] == "sandbox_create_not_held_on_the_ledger"
+    ] == [_NEW_APP]
+
+
+# ------------------------------------------------------------------ a create left standing
+
+
+@pytest.mark.parametrize("failing_step", ["create", "registry-write"])
+@pytest.mark.parametrize("self_clean_refused", [True, False], ids=["refused", "confirmed"])
+async def test_a_failed_create_keeps_its_ledger_row_only_while_its_container_may_stand(
+    wired: Any, failing_step: str, self_clean_refused: bool
+) -> None:
+    """★ A container whose self-clean was refused carries a name nothing will create again, so
+    its ledger row is the only thing left that can find it. One confirmed gone takes its row
+    with it.
+
+    Mutation check: drop the row whatever the self-clean said and the refused cases go red; keep
+    it after a confirmed one and the confirmed cases do."""
+    client, aca, _ = wired(
+        delete_fails=self_clean_refused,
+        restore_fails=False,
+        existing_app=None,
+        create_fails=failing_step == "create",
+        registry_write_fails=failing_step == "registry-write",
+    )
+
+    with pytest.raises((SandboxError, RedisError)):
+        await client.restore_from_snapshot(
+            str(_USER), _NEW_APP, app_env=_env(), source_key="snap/key"
+        )
+
+    assert aca.deleted == [_NEW_APP], "the self-clean was never attempted"
+    assert await _ledger() == ({_NEW_APP: SandboxPoolState.CLAIMED} if self_clean_refused else {})
 
 
 async def test_a_restore_failing_before_teardown_leaves_everything_intact(
     wired: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Fetch-and-validate happens BEFORE anything is destroyed, so a missing bundle must leave
-    the original container running and attachable. This pins the ordering the file already got
-    right, so a later refactor cannot quietly undo it."""
+    """The bundle is fetched BEFORE anything is created or recorded, so a missing one leaves the
+    slot exactly as it was."""
     client, aca, calls = wired(delete_fails=False, restore_fails=False, existing_app=_OLD_APP)
 
     class _MissingStorage:

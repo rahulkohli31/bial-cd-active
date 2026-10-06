@@ -46,7 +46,7 @@ def _snapshot() -> dict[str, Any]:
             async with engine.connect() as conn:
                 records = await conn.scalar(text("SELECT to_regclass('data_records')"))
                 tokens = await conn.scalar(text("SELECT to_regclass('clear_data_tokens')"))
-                columns = set(
+                columns: set[str] = set(
                     (await conn.execute(text(_COLUMNS_SQL), {"table": "app_registry"})).scalars()
                 )
         finally:

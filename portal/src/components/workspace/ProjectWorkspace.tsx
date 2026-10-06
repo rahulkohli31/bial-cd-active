@@ -40,6 +40,7 @@ import { announceDeploymentChanged } from '../../hooks/usePublishState'
 import { useProjectDialogs } from '../../hooks/useProjectDialogs'
 import { resolvePreviewAddress } from '../../utils/previewAddress'
 import { discardUnsavedChanges, fetchCompileState, saveProject } from '../../utils/buildSessionApi'
+import { markStartVisible } from '../../utils/observe'
 import type { CompileState } from '../../utils/compileState'
 import type { Project } from '../../utils/projectApi'
 
@@ -218,6 +219,8 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
     void start()
   }, [workspace.state.name, startFailed, project.id, start])
 
+  // The stop for a start begun here. Not `markAppVisible`: that clock stops on the chat surface.
+  const handlePreviewRevealed = useCallback(() => markStartVisible(project.id), [project.id])
   const paneView = useMemo(
     () => ({
       // NO TURN RUNS ON THIS SURFACE. Every one of these describes a build in flight, and there is
@@ -250,11 +253,12 @@ export default function ProjectWorkspace(props: ProjectWorkspaceProps) {
       workspaceLost: false,
       // The pane's stalled-frame edge, into the read that decides whether to ask.
       onStallChange: workspace.reportFrameStall,
+      onRevealed: handlePreviewRevealed,
     }),
     // `project.hasRelaunchableSnapshot` LEFT THIS LIST WITH `hasSavedBuild`. It still reaches the
     // workspace map above, where the restore question actually gets answered; this view stopped
     // carrying it when the pane stopped writing sentences about the workspace.
-    [workspace.preview, compileState, workspace.reportFrameStall],
+    [workspace.preview, compileState, workspace.reportFrameStall, handlePreviewRevealed],
   )
 
   useWorkspaceProject(project.id)

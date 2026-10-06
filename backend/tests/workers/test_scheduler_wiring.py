@@ -158,3 +158,33 @@ def test_every_registered_task_module_is_importable() -> None:
 
     for module in worker_main._TASK_MODULES:
         importlib.import_module(module)
+
+
+def test_the_start_purge_is_registered_on_an_hourly_tick() -> None:
+    """A task module the worker never imports is a pass that never runs, silently."""
+    import importlib
+
+    from src.workers.sandbox_start_purge import SANDBOX_START_PURGE_TASK_NAME
+
+    assert "src.workers.sandbox_start_purge" in worker_main._TASK_MODULES
+    importlib.import_module("src.workers.sandbox_start_purge")
+    task = broker.find_task(SANDBOX_START_PURGE_TASK_NAME)
+    assert task is not None
+    [schedule] = task.labels["schedule"]
+    minute, hour, *_ = schedule["cron"].split()
+    assert minute.isdigit() and hour == "*", schedule["cron"]
+
+
+def test_the_pool_pass_is_registered_on_a_minute_tick() -> None:
+    """A task module the worker never imports is a pass that never runs, silently, and the pool
+    would then shrink by one with every claim."""
+    import importlib
+
+    from src.workers.sandbox_pool import SANDBOX_POOL_TASK_NAME
+
+    assert "src.workers.sandbox_pool" in worker_main._TASK_MODULES
+    importlib.import_module("src.workers.sandbox_pool")
+    task = broker.find_task(SANDBOX_POOL_TASK_NAME)
+    assert task is not None
+    [schedule] = task.labels["schedule"]
+    assert schedule["cron"] == "* * * * *"

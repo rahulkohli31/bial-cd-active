@@ -2,8 +2,9 @@
 
 The Taskiq worker is the platform's background process. It runs the recurring reconciliation and
 cleanup passes the control plane does not run inline — settling stalled deployments, sweeping and
-reclaiming abandoned sandboxes, and removing conversations nobody has come back to. Reach for this
-document to start the worker, confirm it is actually alive, or size and troubleshoot it.
+reclaiming abandoned sandboxes, keeping the pool of ready sandboxes at its size, deleting sandbox
+start timings past their retention, and removing conversations nobody has come back to. Reach for
+this document to start the worker, confirm it is actually alive, or size and troubleshoot it.
 
 ## 1. It will not boot from the control plane's own environment file — check this first
 
@@ -24,6 +25,13 @@ The fix is a dedicated, worker-only environment file. A template for exactly tha
 copy of it. Do not hand-carve one from the API's file by trial and error — the template already
 lists precisely what the worker needs and nothing else, and a dedicated test keeps it honest
 against the worker's actual configuration.
+
+**One setting the worker once did without is now required: the portal's public address,
+`FRONTEND_URL`.** The worker builds the environment of every ready sandbox it creates, and a
+sandbox's framing rule and error relay are tied to the portal's origin, so the worker needs the
+same address the API holds. Give it exactly the API's value. In production it must be an `https`
+address and the worker refuses to start otherwise, as the API does. A worker without it does not
+boot, so set it in the same step that moves the worker to the release that introduced the pool.
 
 ## 2. Running it
 
@@ -60,10 +68,12 @@ Only the conversation-retention pass (section 4) records a durable outcome row i
 database on every tick — success, decline, or failure alike. That row's staleness is the one
 queryable signal that the whole worker process has stopped, but it is a WEAK one: retention runs
 once a day and declines most of its own ticks by design, so its record can be up to a day stale
-before an absence is even meaningful. The other scheduled passes — deployment reconciliation and
-the routine sandbox sweep — only log their outcome; confirm those are still running from their own
-log lines, since neither leaves a queryable record behind. There is today no single signal that
-proves the worker process as a whole, rather than one of its passes, is alive.
+before an absence is even meaningful. The other scheduled passes — deployment reconciliation, the
+routine sandbox sweep, the sandbox pool pass (section 5) and the purge of old sandbox start
+timings — only log their outcome; confirm those are still running from their own log lines, since
+none leaves a queryable record behind.
+There is today no single signal that proves the worker process as a whole, rather than one of its
+passes, is alive.
 
 ## 4. The conversation-retention pass ships switched off
 
@@ -90,7 +100,70 @@ The window and the per-run ceiling are worker settings too, both with working de
 template from step 1 names all three and says what each one means. Its own history is the outcome
 rows section 3 describes, under its own task name.
 
-## 5. Redis provisioning gates
+## 5. The sandbox pool pass
+
+This pass runs every minute and keeps the number of ready sandboxes at the size the settings give
+for that time of day. Reach for this section to understand what a tick does, to tell that it is
+running, and to read the alarm it raises.
+
+**What each minute does.** It works out the target for the current time in India time — the day
+size on the configured days and hours, the night size otherwise — and then, looking only at the
+containers the pool's own ledger holds:
+
+- deletes the container of a row left filling past its deadline — a process stopped in the middle
+  of a create — and of a row left claimed past it whose container neither a registry record nor an
+  owed deletion names: a claim that never reached the registry, or a start's own create that a
+  cancelled start or a refused clean-up left behind. A claimed row whose container one of those
+  does name has become somebody's workspace, and only the row goes;
+- retries any delete that failed, which the ledger keeps as retiring;
+- retires ready containers above the target, older images first, which is what happens at the end
+  of the working day, and how ready containers on an older image give way to new ones once the new
+  ones are ready;
+- then, unless a filling row was past its deadline, fills one container at a time until the filling
+  and ready containers made from the configured image reach the target, stopping at the first
+  create Azure refuses or container that never answers. A container is ready only once its
+  supervisor answers, which can be a minute and more after Azure reports it made.
+
+It takes a database advisory lock, as the retention pass does, so the two schedulers that briefly
+coexist across a deploy never both run it. It is the only periodic pass over the pool: the backend
+runs none, not even when it starts, so after a backend start nothing but claims and their refills
+changes the pool until this pass's next tick, at most a minute later. Its creates and deletes are
+bounded to two at a time in this process so the worker's own capacity to talk to Azure is left for
+everything else. It never acts on a container a registry names, which is every sandbox a person is
+using, and it runs in every environment, not only production, because it deletes only what the
+ledger says is its own.
+
+**It ships at zero.** Every size defaults to zero, so a fresh deployment's pass finds a target of
+zero, has nothing to fill, retire or swap, and does nothing visible. Raising a size is a change to
+the settings of both the worker and the backend, taking effect when each process restarts, and
+the two must agree. The backend claims only while its own size for the hour is above zero, and
+refills after each claim while the pool is below that size; the worker fills and retires to its
+sizes every minute. A worker above zero beside a backend at zero fills containers nobody
+claims, and a worker below the backend retires what the backend adds.
+
+**What it needs.** The worker's own identity must be allowed to create containers, which writes
+their tags, and to join them to the sandbox environment, on the sandbox resource group;
+`../deployment.md` has the detail. Without that every fill the worker makes is refused and the pool
+stays below its size, which the alarm below says. It also needs the portal's address (section 1)
+and the same sandbox image reference the backend holds.
+
+**How to tell it is alive.** Like the sweep, it leaves no durable record. Each tick logs one line:
+its outcome — the target, how many were ready as it ended, and what it filled, retired and
+deleted — even when there was nothing to do; or that another process held the pool's lock, which
+is what a tick says while a long pass is still filling. The minute the worker starts in is skipped,
+so within two minutes of a fresh start there should be a line, and a minute without one after that
+means the pass is not running.
+
+**The below-size alarm.** A pass that ends below its target after Azure refused a create or a new
+container never answered, or after finding a row left filling past its deadline, logs the alarm;
+each of those stops the filling for that pass, so a refusing Azure is asked once a minute and not
+pressed. The alarm is a log event defined
+beside the platform's other alarms in `backend/src/core/alarms.py`; whether it becomes a
+notification depends on an operator-owned rule outside this repository, as for the others. It
+never fires while the target is zero. What it means and what to do about it is in
+`reconcile-and-reclamation.md`.
+
+## 6. Redis provisioning gates
 
 Confirm three things about the Redis instance directly with whoever provisions it, and record the
 answers — the worker's own logs cannot tell you any of this on their own:
@@ -107,19 +180,23 @@ Confirm which Redis product and connection port the target subscription actually
 before go-live rather than assuming a value from an earlier environment or an older copy of this
 document — managed Redis offerings and their defaults change over time.
 
-## 6. Alerting on a dead worker
+## 7. Alerting on a dead worker
 
 There is no strong primitive to alert on today (section 3). Retention's own staleness is the
 closest thing, and it is a weak signal — a whole day of silence before it means anything, and it
 says nothing about whether the sweep or deploy reconciliation are still ticking. Watch each
 pass's own log lines directly until a real liveness signal exists for the worker as a whole.
 
-## 7. Sizing
+The pool's below-size alarm is no substitute: the pass raises it, so a dead worker cannot. With a
+size above zero, the first sign of a dead worker is starts that find no ready sandbox, which each
+start's own record carries as the reason it created one instead.
+
+## 8. Sizing
 
 Run the worker as a single replica. Correctness does not rest on that number — two schedulers
 briefly coexist on every deploy, and the passes are built to tolerate it: each is idempotent, and
-the retention pass additionally takes a database advisory lock, so only one instance of it runs
-at a time. What a second replica costs is duplicated
+the retention and pool passes additionally take a database advisory lock, so only one instance of
+each runs at a time. What a second replica costs is duplicated
 work and doubled load, not a corrupted fleet. A container platform's scale-to-zero behavior is
 equally wrong here for the opposite reason — the worker has no inbound traffic to scale back up
 on, so once it scales to zero it never restarts itself. After the worker has run for a week in a
@@ -127,7 +204,7 @@ given environment, check its memory headroom and resize if it is running close t
 Under-provisioning memory here is recoverable rather than dangerous: a crash mid-pass leaves the
 fleet in a state the next pass reconciles cleanly.
 
-## 8. What this process may never do
+## 9. What this process may never do
 
 No code in the worker may assert that a build session is certainly, unrecoverably dead and act on
 that alone — that assertion is only ever true if the platform is certain it is the only replica

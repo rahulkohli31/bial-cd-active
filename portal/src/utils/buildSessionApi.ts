@@ -11,7 +11,7 @@
  * reusing `auth.ts` `getCsrfToken()`); the GETs are safe methods and carry NO token. This is
  * net-new: no prior business route in the portal enforces CSRF.
  */
-import { ApiError, extractApiCode, extractApiMessage, isRecord, readApiError } from './apiError'
+import { ApiError, extractApiCode, extractApiMessage, isRecord, optionalString, readApiError } from './apiError'
 import { authFetch } from './api'
 import { asCompileState } from './compileState'
 import type { CompileState } from './compileState'
@@ -113,7 +113,8 @@ async function postJson(url: string, body: unknown, fallback: string, deps: Auth
 /**
  * `relaunch` — start a project's saved app. Resolves once the server has ADMITTED the start (202);
  * the app comes up afterwards, and the preview-state poll is what reports it — `starting`, then
- * `alive` with the address to frame. Nothing in the answer is read, so nothing is parsed.
+ * `alive` with the address to frame. The answer's one read is the id of the start the press began,
+ * `null` when it attached to a container already running.
  * A mutating POST (carries CSRF). `postJson` already turns a `409 build_session_already_active` into
  * `BuildSessionAlreadyActiveError` (a build is running); 404 = nothing to relaunch, 503 =
  * transient/retryable.
@@ -121,8 +122,9 @@ async function postJson(url: string, body: unknown, fallback: string, deps: Auth
 export async function relaunchPreview(
   args: RelaunchPreviewRequest,
   deps: AuthFetchDeps = {},
-): Promise<void> {
-  await postJson(`${BASE}/relaunch`, { projectId: args.projectId }, 'Failed to relaunch the preview', deps)
+): Promise<string | null> {
+  const body = await postJson(`${BASE}/relaunch`, { projectId: args.projectId }, 'Failed to relaunch the preview', deps)
+  return isRecord(body) ? optionalString(body.startId) : null
 }
 
 // ─── lock operations — THERE ARE NONE LEFT ─────────────────────────────────
@@ -211,6 +213,7 @@ function toSharedPreviewResponse(value: unknown): SharedPreviewResponse {
     previewUrl: typeof value.previewUrl === 'string' ? value.previewUrl : '',
     ready: value.ready === true,
     snapshotTakenAt: typeof value.snapshotTakenAt === 'string' ? value.snapshotTakenAt : null,
+    startId: optionalString(value.startId),
   }
 }
 

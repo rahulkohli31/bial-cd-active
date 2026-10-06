@@ -229,6 +229,9 @@ class RelaunchPreviewResponse(CamelModel):
     app_id: uuid.UUID
     # For browser tabs loaded before this server: their parser refuses a body with no status.
     status: Literal["provisioning"] = "provisioning"
+    # The start this press began, which the browser reports its own clock against. `None` when
+    # the press attached to a container already running.
+    start_id: uuid.UUID | None
 
 
 class SharedPreviewResponse(CamelModel):
@@ -246,6 +249,8 @@ class SharedPreviewResponse(CamelModel):
     # entire point is moving this forward. `None` only when the store could not be asked for
     # the timestamp; the restore itself already confirmed the snapshot exists.
     snapshot_taken_at: datetime | None
+    # The start this launch began. `None` when it attached to a view already running.
+    start_id: uuid.UUID | None
 
 
 # --- the app's own client-error report ----------------

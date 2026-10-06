@@ -3,8 +3,9 @@
 Two entry points, plus `src/workers/sandbox_reap.py`, the scheduled caller of
 `sweep_all`:
 
-* `reconcile_user` reaps the caller's OWN stale lock/registry/heartbeat at the top of
-  every `start` — closes the "crashed tab -> can never start again" lockout.
+* `reconcile_user` reaps the caller's OWN stale lock/registry/heartbeat at the top of a
+  start that cannot hand its slot's holder to the background — closes the "crashed tab -> can
+  never start again" lockout.
 * `sweep_all` reconciles EVERY registered user, idempotent + concurrency-safe; runs on
   a schedule, or by hand at `POST /v1/build-sessions/internal/reap`.
 
@@ -28,7 +29,7 @@ import uuid
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Final, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 import redis.asyncio as aioredis
 import structlog
@@ -46,21 +47,23 @@ from src.services.build_sessions.drain import (
 )
 from src.services.build_sessions.locks import (
     DeadlineWriter,
+    Occupant,
     an_instant_on_the_hash,
     clear_serving,
     delete_registry_if_it_still_names,
     elapsed_ms,
     grant_stay_of_execution,
     heartbeat_is_alive,
+    is_a_shared_view,
     liveness_lease_is_held,
     lock_is_held,
     mark_registry_ending,
     read_registry,
     read_starting_marker,
     reap_lock,
+    record_holds,
     record_the_first_serve,
     release_liveness_lease,
-    shared_view_stamp,
     stamp_is_proven,
     stay_of_execution_is_current,
 )
@@ -71,12 +74,14 @@ from src.services.build_sessions.snapshot import (
 )
 from src.services.redis import REGISTRY_STATE_READY, registry_key, registry_scan_patterns
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_SERVING_SINCE,
     REGISTRY_FIELD_SHARED_SERVED_COUNT,
     REGISTRY_FIELD_STATE,
+    user_id_from_key,
 )
 from src.services.sandbox import DevStatus, SandboxClient, SandboxError, SandboxHandle
 from src.services.sandbox.base import (
@@ -87,11 +92,15 @@ from src.services.sandbox.base import (
     identity_from_tags,
 )
 
+if TYPE_CHECKING:
+    # Only for the annotation: the inventory reaches `src.db.base`, which this module must not.
+    from src.services.build_sessions.inventory import OwnedApp
+
 _log = structlog.get_logger()
 
-#: `app_name_for` mints `sbx-` + `app_id.hex[:28]`. Both halves are pinned here because the guard
-#: below is a fail-closed check on a name we are about to DELETE, and a guard that accepts more
-#: than the minter produces is a guard with a gap in it.
+#: Every sandbox name is a prefix plus 28 lowercase hex characters. Both halves are pinned here
+#: because the guard below is a fail-closed check on a name we are about to DELETE, and a guard
+#: that accepts more than the minters produce is a guard with a gap in it.
 _NAME_SLUG_LENGTH = 28
 _HEX_LOWER = frozenset("0123456789abcdef")
 
@@ -136,13 +145,6 @@ async def _scan_the_registry_namespace(redis: aioredis.Redis) -> AsyncIterator[s
             yield str(raw_key)
 
 
-def _user_from_registry_key(key: str) -> uuid.UUID | None:
-    try:
-        return uuid.UUID(key.rsplit(":", 1)[-1])
-    except ValueError:
-        return None
-
-
 def handle_named(app_name: str, *, fqdn: str = "") -> SandboxHandle:
     """The minimal teardown handle — ACA delete is keyed by `app_name` alone; `fqdn` is carried
     when known, left empty otherwise, and read by nothing on the teardown path.
@@ -168,7 +170,8 @@ def _minimal_handle(reg: dict[str, str]) -> SandboxHandle:
 
 
 def is_a_sandbox_name(app_name: str) -> bool:
-    """Could this string be a container THIS platform minted? (`manager.app_name_for`.)
+    """Could this string be a container THIS platform minted? (`a_fresh_sandbox_name`, and
+    `app_name_for` for a container still running under a name derived from its app.)
 
     THE LAST CHECK BEFORE AN ARM DELETE. The reap path rebuilds its teardown target from a
     registry record that can be corrupted or missing — `reg.get(APP_NAME, "")` turns a missing
@@ -183,17 +186,20 @@ def is_a_sandbox_name(app_name: str) -> bool:
 
 
 def is_a_shared_sandbox_name(app_name: str) -> bool:
-    """The `shr-` sibling of `is_a_sandbox_name` (#198) — same fail-closed shape check, same
-    reason: a name this platform will hand to an ARM delete has to be provably one it minted
-    (`manager.shr_name_for`), not assumed from a prefix alone.
-
-    Wired into `reap_user`'s own gate alongside its `sbx-` sibling: the one per-user slot the
-    registry describes can hold EITHER lineage — a builder's own sandbox or a colleague's
-    shared-runtime view restored into it — and `reap_user` tears down whichever is there."""
+    """The `shr-` sibling of `is_a_sandbox_name` — same fail-closed shape check, same reason: a
+    name this platform will hand to an ARM delete has to be provably one it minted
+    (`shr_name_for`), not assumed from a prefix alone. Only a shared view still running under the
+    name `shr_name_for` gave it has this shape; a new view is `sbx-`."""
     if not app_name.startswith(SHARED_SANDBOX_NAME_PREFIX):
         return False
     slug = app_name[len(SHARED_SANDBOX_NAME_PREFIX) :]
     return len(slug) == _NAME_SLUG_LENGTH and all(c in _HEX_LOWER for c in slug)
+
+
+def is_a_platform_sandbox_name(app_name: str) -> bool:
+    """A name this platform may hand to an ARM delete: a build sandbox's or a shared view's. The
+    gate every path that deletes a container by a recorded name passes."""
+    return is_a_sandbox_name(app_name) or is_a_shared_sandbox_name(app_name)
 
 
 async def _reach_the_container(
@@ -235,11 +241,11 @@ async def _reach_the_container(
 #
 # WHAT IT MAY NEVER DO IS DECIDE ANYTHING. A container that has not yet served is not therefore
 # reapable, and this section is structured so that it CANNOT become evidence in that judgement:
-# both entry points (`_observe_the_serving_proof` and `_sound_the_alarm_if_the_proof_is_absent`)
+# both entry points (`_observe_the_serving_proof` and `sound_the_alarm_if_the_proof_is_absent`)
 # return `None`, so there is no value for the reap decision to read; each is called only once
-# that decision is already taken — the sparing verdict, or a teardown that has succeeded; and
-# nothing here marks a registry `ending`, tears anything down, or touches a lock, a lease or a
-# heartbeat.
+# that decision is already taken — the sparing verdict, a teardown that has succeeded, or a
+# holder a start has handed over; and nothing here marks a registry `ending`, tears anything
+# down, or touches a lock, a lease or a heartbeat.
 
 
 @dataclass(frozen=True)
@@ -446,7 +452,9 @@ async def _make_the_stamp_agree(
         )
 
 
-def _sound_the_alarm_if_the_proof_is_absent(reg: dict[str, str], *, user_uuid: uuid.UUID) -> None:
+def sound_the_alarm_if_the_proof_is_absent(
+    reg: Mapping[str, str], *, user_uuid: uuid.UUID, reason: str
+) -> None:
     """A container is about to stop existing with no proof it ever served a page — say so, once.
 
     THE EMPTY SENTINEL PROVES NOTHING ON ITS OWN. A container that never served leaves it behind,
@@ -473,11 +481,7 @@ def _sound_the_alarm_if_the_proof_is_absent(reg: dict[str, str], *, user_uuid: u
         user_id=str(user_uuid),
         app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
         lifetime_ms=elapsed_ms(created, datetime.now(UTC)),
-        # `reap_idle` for every teardown on this path, and it is accurate rather than convenient:
-        # `reap_user` is reached only once the lock, the heartbeat, the liveness lease, the
-        # start-in-flight marker and any stay of execution have all lapsed or been certified
-        # dead. The other reasons in the vocabulary belong to teardowns the reaper does not do.
-        reason="reap_idle",
+        reason=reason,
     )
 
 
@@ -612,15 +616,8 @@ async def _hand_the_debt_over(
     from src.services.build_sessions.shutdown import owe_a_teardown_the_reap_could_not_perform
 
     try:
-        return await owe_a_teardown_the_reap_could_not_perform(
-            user_id=user_uuid,
-            app_id=app_id,
-            app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
-            # The record's OWN birthday, which is what the owed row's instance check compares
-            # against: it is re-stamped at every registration, so it can tell this container from
-            # whatever is created under the same name next. No stamp, no discriminator, no row.
-            instance_ref=an_instant_on_the_hash(reg, REGISTRY_FIELD_CREATED_AT),
-            shared_view=shared_view_stamp(reg),
+        owed = await owe_a_teardown_the_reap_could_not_perform(
+            user_id=user_uuid, app_id=app_id, reg=reg, write_back=True
         )
     except Exception:
         _log.exception(
@@ -629,6 +626,7 @@ async def _hand_the_debt_over(
             app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
         )
         return False
+    return owed is not None
 
 
 async def _let_go_unless_taken(redis: aioredis.Redis, user_uuid: uuid.UUID, app_name: str) -> None:
@@ -686,7 +684,7 @@ async def reap_user(
     # to tear down. Recognizing only `sbx-` here was the orphaning bug the shared runtime would
     # otherwise reproduce on every Revoke: the record would be deleted (below) while a `shr-`
     # container it could not vouch for kept running and billing, forever anonymous.
-    if not (is_a_sandbox_name(registered_name) or is_a_shared_sandbox_name(registered_name)):
+    if not is_a_platform_sandbox_name(registered_name):
         # FAIL CLOSED ON A NAME WE CANNOT VOUCH FOR. Everything below hands this string to an ARM
         # delete, and the record it came from is the least trustworthy input here. Refusing but
         # KEEPING the record would re-refuse every five minutes forever, so the record goes and
@@ -698,15 +696,26 @@ async def reap_user(
         )
         await _let_go_unless_taken(redis, user_uuid, registered_name)
         return False
-    # THE WRITE-BACK NEVER RUNS FOR A SHARED VIEW (#198), whatever `app_id` the caller resolved.
-    # `sweep_all`'s own `_owning_app_id` currently maps a `shr-` registry record to the OWNER's
-    # app id (`_app_names_to_owners` keys every `shr-` name off the recipient, but the value it
-    # carries is still the shared app's id) — passing that here would write this RECIPIENT's tree
-    # over the OWNER's saved copy, and a recipient's access to that storage is read-never-write.
-    # A shared view holds nothing worth preserving in the first place: the recipient never edits
-    # its tree directly, and what they own of it is a restore of the owner's own snapshot,
-    # already durable at its source.
-    if app_id is not None and not is_a_shared_sandbox_name(registered_name):
+    # THE WRITE-BACK NEVER RUNS FOR A SHARED VIEW, whatever `app_id` the caller resolved, and the
+    # record's stamp is what says it is one — never its name. A view's record carries the OWNER's
+    # app id, and a caller passing that here would write this RECIPIENT's tree over the OWNER's
+    # saved copy, and a recipient's access to that storage is read-never-write. A shared view
+    # holds nothing worth preserving in the first place: the recipient never edits its tree
+    # directly, and what they own of it is a restore of the owner's own snapshot, already durable
+    # at its source.
+    if app_id is not None and not is_a_shared_view(reg):
+        if not record_holds(reg, Occupant(app_id), user_uuid):
+            # THE APP TO SAVE INTO MUST BE THE ONE THIS RECORD NAMES. The caller resolved it from
+            # an earlier read, and saving across a slot swap since then would put one app's tree
+            # in another's saved copy. Spared; the next pass resolves the app again.
+            _log.warning(
+                "reap refused: the record names a different app from the one asked to keep its "
+                "work",
+                user_id=str(user_uuid),
+                app_id=str(app_id),
+                app_name=registered_name,
+            )
+            return False
         if not await _take_the_copy_we_promised(
             sandbox_client,
             app_id=app_id,
@@ -749,7 +758,10 @@ async def reap_user(
     # THE RECORD IS STILL IN HAND, and this is the last moment it will be: `reg` was read
     # before the mark-ending flip and the delete below is about to remove it for good. The
     # container's whole life is over, so whether it ever served anybody is now a settled fact.
-    _sound_the_alarm_if_the_proof_is_absent(reg, user_uuid=user_uuid)
+    # `reap_idle`, accurate rather than convenient: `reap_user` is reached only once the lock, the
+    # heartbeat, the liveness lease, the start-in-flight marker and any stay of execution have all
+    # lapsed or been certified dead.
+    sound_the_alarm_if_the_proof_is_absent(reg, user_uuid=user_uuid, reason="reap_idle")
     await _let_go_unless_taken(redis, user_uuid, registered_name)  # step 3: record, lease, lock
     return True
 
@@ -772,9 +784,9 @@ async def _renew_shared_view_from_traffic(
     OBSERVATION, NOT AN INPUT, same posture as `_observe_the_serving_proof` and for the same
     reason: it runs ahead of the claims the sweep reads, so a failure here must never affect the
     reap decision reading them. Recorded and swallowed; `CancelledError` still propagates."""
-    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
-    if not is_a_shared_sandbox_name(app_name):
+    if not is_a_shared_view(reg):
         return
+    app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
     try:
         handle = await sandbox_client.attach_existing(str(user_uuid))
         served = await sandbox_client.served_count(handle)
@@ -811,7 +823,7 @@ async def _renew_shared_view_from_traffic(
 
 
 def _shared_view_past_its_ceiling(
-    identity: SandboxIdentity | None, app_name: str, now: datetime
+    identity: SandboxIdentity | None, reg: Mapping[str, str], now: datetime
 ) -> bool:
     """#198's absolute session ceiling (requirement 20) — independent of the renewable traffic
     stay above, so a wedged or spoofed supervisor report can never buy a shared view
@@ -823,7 +835,7 @@ def _shared_view_past_its_ceiling(
     Measured from the CONTAINER's birthday (`_container_age_source`), because a failed teardown
     followed by a fresh registration would otherwise reset the record's `created_at` and let a
     shared view earn a new ceiling each time."""
-    if not is_a_shared_sandbox_name(app_name):
+    if not is_a_shared_view(reg):
         return False
     if identity is None or identity.created_at is None:
         return False  # cannot prove an age, so this subtracts nothing
@@ -899,7 +911,7 @@ async def reconcile_user(
     sandbox_client: SandboxClient,
     *,
     certified_dead: bool = False,
-    app_ids_by_name: Mapping[str, uuid.UUID] | None = None,
+    app_ids_by_name: Mapping[str, OwnedApp] | None = None,
 ) -> bool:
     """Reconcile the user's OWN stale state; True if it reaped.
 
@@ -970,24 +982,25 @@ async def _a_claim_still_stands(
         return False
     if identity is None and app_name:
         identity = await _container_age_source(sandbox_client, reg, app_name)
-    return not _shared_view_past_its_ceiling(identity, app_name, now) and not _past_the_ceiling(
+    return not _shared_view_past_its_ceiling(identity, reg, now) and not _past_the_ceiling(
         identity, now=now, outranks_a_turn=False
     )
 
 
 def _owning_app_id(
     reg: dict[str, str],
-    app_ids_by_name: Mapping[str, uuid.UUID] | None,
+    app_ids_by_name: Mapping[str, OwnedApp] | None,
     user_uuid: uuid.UUID,
 ) -> uuid.UUID | None:
     """The app id behind this registry record — the slot this container's tree is written back to.
+    The record's own app id, held to the map so an app whose row is gone, or that another user
+    owns, resolves to nothing.
 
     BOTH UNRESOLVED CASES END IN A DESTROYED CONTAINER WITH NOTHING WRITTEN, so neither may be
     silent. They are not the same failure. No map at all is a CALLER that did not supply one:
     every door onto this sweep is meant to, so it reads as a defect and is logged as one. An
-    unmatched name is a registry record naming a container whose app row is gone — an app that no
-    longer exists has nowhere for its tree to go, and sparing it forever is the leak this sweep
-    exists to close."""
+    unmatched record names a container whose app row is gone — an app that no longer exists has
+    nowhere for its tree to go, and sparing it forever is the leak this sweep exists to close."""
     if app_ids_by_name is None:
         _log.warning(
             "sweeping with no app map; these containers are destroyed without a write-back",
@@ -995,10 +1008,23 @@ def _owning_app_id(
             app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
         )
         return None
-    app_id = app_ids_by_name.get(reg.get(REGISTRY_FIELD_APP_NAME, ""))
+    if is_a_shared_view(reg):
+        # Never written back, so there is nothing to lose and nothing to report.
+        return None
+    recorded = reg.get(REGISTRY_FIELD_APP_ID)
+    app_id: uuid.UUID | None
+    if recorded is None:
+        # A record the previous release wrote carries no app id; its name was derived from one.
+        derived = app_ids_by_name.get(reg.get(REGISTRY_FIELD_APP_NAME, ""))
+        app_id = None if derived is None else derived.app_id
+    else:
+        app_id = uuid.UUID(recorded)
+        # Only the slot's own user's app: anyone else's would get this tree over their saved copy.
+        if (app_id, user_uuid) not in app_ids_by_name.values():
+            app_id = None
     if app_id is None:
         _log.info(
-            "reaping a registered container with no app row; nothing to preserve",
+            "reaping a registered container with no app row of this user's; nothing to preserve",
             user_id=str(user_uuid),
             app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
         )
@@ -1019,7 +1045,7 @@ async def sweep_all(
     sandbox_client: SandboxClient,
     *,
     live_users: set[uuid.UUID] | None = None,
-    app_ids_by_name: Mapping[str, uuid.UUID] | None = None,
+    app_ids_by_name: Mapping[str, OwnedApp] | None = None,
 ) -> SweepResult:
     """SCAN-iterate the registry namespace (never `KEYS`) and reconcile each user; returns what
     it reaped AND what it could not. Idempotent + concurrency-safe, safe to call on a timer.
@@ -1037,7 +1063,7 @@ async def sweep_all(
     # honest anyway.
     seen: set[uuid.UUID] = set()
     async for raw_key in _scan_the_registry_namespace(redis):
-        user_uuid = _user_from_registry_key(str(raw_key))
+        user_uuid = user_id_from_key(str(raw_key))
         if user_uuid is None or user_uuid in live or user_uuid in seen:
             continue
         seen.add(user_uuid)

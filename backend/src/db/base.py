@@ -6,13 +6,18 @@ session. `pool_pre_ping` validates a pooled connection before handing it out so 
 stale connection surfaces as a clean reconnect, not a mid-query failure.
 """
 
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import event
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
 from src.config import settings
+
+#: What a statement raises when the database did not answer it, for a caller that carries on
+#: without the database rather than failing.
+DB_UNREACHABLE: Final = (SQLAlchemyError, OSError)
 
 # Entra token audience for Azure Database for PostgreSQL (verified against MS Learn —
 # the SDK "/.default" form of `az account get-access-token --resource

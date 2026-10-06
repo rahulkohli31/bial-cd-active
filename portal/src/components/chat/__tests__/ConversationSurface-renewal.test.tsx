@@ -156,24 +156,32 @@ describe('the chat route holds its container open', () => {
     expect(h.renewPresence).toHaveBeenCalledWith(expect.any(String), 'hidden')
   })
 
-  it('★ renews throughout a watched start, exactly as the project surface does', async () => {
-    // THE SHARED DECISION, PINNED ON BOTH SIDES. `presenceToRenew` is one function precisely so a
-    // container held open on one surface cannot be quietly abandoned on the other — and the window
-    // it used to skip is the one where the marker and the lock lapse together.
+  it('★ renews throughout a watched start once a background interval, exactly as the project surface does', async () => {
+    // THE SHARED DECISION, PINNED ON BOTH SIDES. `renewsOnThisTick` is one function precisely so a
+    // container held open on one surface is neither abandoned nor rewritten every second on the other.
+    //
+    // Mutation checks: renew on every tick and the first count after the quiet stretch goes red;
+    // renew on no accelerated tick and the last one does.
     h.fetchPreviewState.mockResolvedValue({ ...LIVE, state: 'starting' as PreviewLifeState, alive: false, previewUrl: null })
     renderBuilder()
     await waitFor(() => expect(h.fetchPreviewState).toHaveBeenCalled())
     await settle()
-    h.renewPresence.mockClear()
+    const opened = h.renewPresence.mock.calls.length
+    expect(opened).toBeGreaterThan(0)
+    const reads = h.fetchPreviewState.mock.calls.length
 
-    for (let tick = 0; tick < 3; tick += 1) {
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(STARTING_PROBE_MS + 1)
-      })
-    }
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PREVIEW_PROBE_MS - 2 * STARTING_PROBE_MS)
+    })
+    // LIVENESS: the accelerated timer really was ticking through the quiet stretch.
+    expect(h.fetchPreviewState.mock.calls.length - reads).toBeGreaterThan(40)
+    expect(h.renewPresence).toHaveBeenCalledTimes(opened)
 
-    expect(h.renewPresence).toHaveBeenCalledTimes(3)
-    expect(h.renewPresence).toHaveBeenCalledWith(expect.any(String), 'visible')
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3 * STARTING_PROBE_MS + PREVIEW_PROBE_MS)
+    })
+    expect(h.renewPresence).toHaveBeenCalledTimes(opened + 2)
+    expect(h.renewPresence).toHaveBeenLastCalledWith(expect.any(String), 'visible')
   })
 
   it('sends nothing on unmount — leaving is silence', async () => {

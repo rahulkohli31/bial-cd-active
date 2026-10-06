@@ -38,6 +38,7 @@ from src.services.build_sessions.snapshot import (
 )
 from src.services.redis import registry_key
 from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_STATE,
@@ -86,10 +87,13 @@ async def _put_saved(store: FakeStorage, sha: str | None) -> None:
 
 
 async def _register(redis: aioredis.Redis) -> None:
+    """`APP`'s container as its record names it: the reap only saves into the app the record
+    names."""
     await redis.hset(
         registry_key(USER),
         mapping={
             REGISTRY_FIELD_APP_NAME: a_sandbox_name("x"),
+            REGISTRY_FIELD_APP_ID: str(APP),
             REGISTRY_FIELD_FQDN: f"{a_sandbox_name('x')}.example.io",
             REGISTRY_FIELD_STATE: "ready",
         },

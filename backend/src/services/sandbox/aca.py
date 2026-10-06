@@ -388,13 +388,13 @@ class AcaControlPlane:
                 # A CONFLICT ON A CREATE IS SOMETHING IN FLIGHT, NOT A DECISION. This call is an
                 # upsert — an existing container is UPDATED rather than refused — so a 409 here is
                 # not "that name is taken"; it is ARM saying another operation currently owns the
-                # name. The one that matters to this platform is a delete still settling: a
-                # container name is stable across teardown and recreate, so a citizen reopening a
-                # project they just left can arrive inside that window, and a terminal answer there
-                # fails a start that would have succeeded moments later.
+                # name. Every container takes a fresh name, so the one operation left to hold it
+                # is this attempt's own earlier create, still running after a timeout or a
+                # throttle, and a terminal answer there fails a start that would have succeeded
+                # moments later.
                 #
                 # CLASSIFIED BY STATUS, NOT BY A MESSAGE OR A CLAUSE ORDER. The exact ACA error
-                # code for the post-delete name hold is not verified here, and guessing one would
+                # code for that hold is not verified here, and guessing one would
                 # be a branch that reads as tested and can never fire — the failure recorded
                 # against the storage layer's own `ContainerBeingDeleted` retry. Retrying the whole
                 # 409 class costs at most the bounded ladder `_create_with_retry` already owns,
@@ -430,8 +430,7 @@ class AcaControlPlane:
 
         THE ONLY AZURE-SIDE VIEW OF THE FLEET (Redis only sees what it has a record of),
         filtered to `SANDBOX_NAME_PREFIX` so it never touches published apps or other workloads.
-        DELIBERATELY EXCLUDES `SHARED_SANDBOX_NAME_PREFIX` (#198) too, as of this writing — a
-        `shr-` container needs its own read before it can safely join this listing.
+        A shared view is `sbx-` too and is listed; one still running under a `shr-` name is not.
 
         A TRUNCATED FLEET MUST NEVER READ AS CLEAN: transient ARM failures raise
         `AcaTransientError` rather than a short list — a half-enumerated "no orphans" is

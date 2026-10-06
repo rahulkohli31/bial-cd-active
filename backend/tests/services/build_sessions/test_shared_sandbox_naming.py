@@ -11,7 +11,6 @@ from __future__ import annotations
 import re
 import uuid
 
-from src.services.build_sessions import app_name_for, shr_name_for
 from src.services.build_sessions.reaper import is_a_sandbox_name, is_a_shared_sandbox_name
 from src.services.deploy.names import published_app_name
 from src.services.sandbox.base import (
@@ -21,8 +20,10 @@ from src.services.sandbox.base import (
     TAG_CREATED_AT,
     TAG_KIND,
     TAG_USER_ID,
+    app_name_for,
     control_plane_segment,
     shared_sandbox_tags,
+    shr_name_for,
 )
 
 # ACA container-app names: 2–32 chars, lowercase alphanumeric with internal hyphens, must

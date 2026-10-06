@@ -29,7 +29,7 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import NamedTuple, Protocol, runtime_checkable
 
 import redis.asyncio as aioredis
 import sqlalchemy as sa
@@ -37,10 +37,12 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.app_registry import AppRegistry
+from src.db.models.pending_teardown import PendingTeardown
 from src.db.models.project_share import ProjectShare
+from src.db.models.sandbox_pool import SandboxPoolMember
 from src.services.build_sessions.locks import read_registry
 from src.services.redis import registry_scan_patterns
-from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
+from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, user_id_from_key
 from src.services.sandbox.base import (
     KIND_BUILD_SANDBOX,
     KIND_SHARED_SANDBOX,
@@ -52,7 +54,9 @@ from src.services.sandbox.base import (
     TAG_USER_ID,
     FleetMember,
     SandboxError,
+    app_name_for,
     control_plane_segment,
+    shr_name_for,
 )
 
 _log = structlog.get_logger()
@@ -91,8 +95,10 @@ class SandboxInventory:
     """What ARM has, what the registry claims, and the gap between them.
 
     `unregistered` is THE LEAK: containers Azure is billing for that nothing tracks, so no sweep
-    will ever reach them. `registered_missing` is the opposite and far less urgent — a registry
-    entry whose container is already gone, which the next `reconcile_user` clears on its own."""
+    will ever reach them; a container the pool's ledger or an owed teardown holds is tracked, and
+    left out. `registered_missing` is the opposite and far less urgent — a
+    registry entry whose container is already gone, which the next `reconcile_user` clears on its
+    own."""
 
     live: tuple[str, ...]
     registered: tuple[str, ...]
@@ -100,7 +106,7 @@ class SandboxInventory:
     registered_missing: tuple[str, ...]
 
 
-async def _registered_app_names(redis: aioredis.Redis) -> set[str]:
+async def registered_app_names(redis: aioredis.Redis) -> set[str]:
     """Every app name the sandbox registry currently claims is live.
 
     Scans through `registry_scan_patterns()` and reads through `read_registry`, which is how the
@@ -111,11 +117,9 @@ async def _registered_app_names(redis: aioredis.Redis) -> set[str]:
     seen: set[uuid.UUID] = set()
     for pattern in registry_scan_patterns():
         async for raw_key in redis.scan_iter(match=pattern):
-            try:
-                user_uuid = uuid.UUID(str(raw_key).rsplit(":", 1)[-1])
-            except ValueError:
-                continue  # a key we did not write; not ours to interpret
-            if user_uuid in seen:  # the same user under both prefixes — one read is enough
+            user_uuid = user_id_from_key(str(raw_key))
+            # A key we did not write, or the same user under both prefixes: one read is enough.
+            if user_uuid is None or user_uuid in seen:
                 continue
             seen.add(user_uuid)
             reg = await read_registry(redis, user_uuid)
@@ -126,7 +130,7 @@ async def _registered_app_names(redis: aioredis.Redis) -> set[str]:
 
 
 async def take_sandbox_inventory(
-    redis: aioredis.Redis, control_plane: FleetLister
+    db: AsyncSession, redis: aioredis.Redis, control_plane: FleetLister
 ) -> SandboxInventory:
     """Diff the sandbox containers ARM knows about against the ones the registry claims.
 
@@ -134,13 +138,25 @@ async def take_sandbox_inventory(
     worst possible output — it is the exact answer that gets a billing container forgotten for
     another twelve days."""
     live = {member.name for member in await control_plane.list_sandbox_fleet()}
-    registered = await _registered_app_names(redis)
+    registered = await registered_app_names(redis)
+    tracked = registered | await _held_without_a_registry(db)
     return SandboxInventory(
         live=tuple(sorted(live)),
         registered=tuple(sorted(registered)),
-        unregistered=tuple(sorted(live - registered)),
+        unregistered=tuple(sorted(live - tracked)),
         registered_missing=tuple(sorted(registered - live)),
     )
+
+
+async def _held_without_a_registry(db: AsyncSession) -> set[str]:
+    """Containers the platform still holds that no registry names: the pool's, until a claim,
+    and a start's own until its record is written, both on the pool's ledger; and the owed,
+    whose record is cleared before the container goes and which may be mid write-back. An
+    operator told any is an orphan would delete it by hand. Fleet-wide on purpose: two name
+    columns, no user data, superadmin-only."""
+    pool = await db.scalars(sa.select(SandboxPoolMember.name))
+    owed = await db.scalars(sa.select(PendingTeardown.app_name))
+    return {*pool, *owed}
 
 
 # --- the tag backfill ----------------------------------------------------------------
@@ -179,16 +195,26 @@ class _KnownContainer:
     the RECIPIENT for a shared view (`shared_sandbox_tags`' own rule, restated here rather than
     left implicit in a bare tuple, which is exactly what let this dict go a whole feature
     without a `shr-` entry: nothing about `tuple[UUID, UUID]` said which fleet a name belonged
-    to, so nobody who used it needed to answer that question)."""
+    to, so nobody who used it needed to answer that question). `owner_id` is the app's owner on
+    either kind."""
 
     app_id: uuid.UUID
     user_id: uuid.UUID
     kind: str
+    owner_id: uuid.UUID
 
 
-async def owning_app_ids(db: AsyncSession) -> dict[str, uuid.UUID]:
-    """Container name -> the app that owns it, which is what tells a sweep where to write a
-    container's tree back before it destroys it.
+class OwnedApp(NamedTuple):
+    """The app a container name was derived from, and the user who owns that app."""
+
+    app_id: uuid.UUID
+    owner_id: uuid.UUID
+
+
+async def owning_app_ids(db: AsyncSession) -> dict[str, OwnedApp]:
+    """Container name -> the app that owns it, and that app's owner. A sweep writes a container's
+    tree back to the app its record names only while that app is in this map and owned by the
+    slot's user, and finds the app by name for a record written before records named their app.
 
     A DATABASE THAT WILL NOT ANSWER FAILS THE CALLER rather than returning an empty map. Empty
     resolves every container to `None`, which a sweep cannot tell apart from "this caller has no
@@ -198,46 +224,44 @@ async def owning_app_ids(db: AsyncSession) -> dict[str, uuid.UUID]:
     EVERY DOOR ONTO A SWEEP MUST CALL THIS. The scheduled pass and the operator's by-hand
     reconciliation both destroy containers, and a door that skips it destroys their work."""
     owners = await _app_names_to_owners(db)
-    return {name: known.app_id for name, known in owners.items()}
+    return {name: OwnedApp(known.app_id, known.owner_id) for name, known in owners.items()}
 
 
 async def _app_names_to_owners(db: AsyncSession) -> dict[str, _KnownContainer]:
-    """Map every name this platform could have PRODUCED back to who it belongs to — both fleets
-    this one Redis-per-user slot can ever hold (#198): a build sandbox (`sbx-`, keyed by its
-    owner) and a colleague's shared view (`shr-`, keyed by the RECIPIENT — same rule
-    `shared_sandbox_tags` follows, since a `shr-` container's per-slot occupancy and revocable
-    access are the recipient's, not the project owner's).
+    """Map every name derived from an app back to who it belongs to — both fleets this one
+    Redis-per-user slot can ever hold: a build sandbox (`sbx-`, keyed by its owner) and a
+    colleague's shared view (`shr-`, keyed by the RECIPIENT — same rule `shared_sandbox_tags`
+    follows, since a shared view's per-slot occupancy and revocable access are the recipient's,
+    not the project owner's). Only a container still running under a derived name matches: a
+    container named by `a_fresh_sandbox_name` says nothing about its app, and is judged by its
+    registry record and its ARM tags instead.
 
     FORWARD-MATCHED, never reverse-parsed, on both arms: `app_name_for`/`shr_name_for` each keep
     only 28 of 32 hex characters, so deriving every known name and comparing is exact, while
     parsing an owner out of either is a guess that could write a future reap's tree back into the
     wrong app's slot. FLEET-WIDE ON PURPOSE — neither query here is scoped by `user_id`,
     because the question is "does ANY user (or ANY share) own this"; between them they read two
-    identifier columns plus one junction row, no user data, superadmin-only. `app_name_for`/
-    `shr_name_for` are imported in-function to keep `manager`'s heavy imports out of the worker.
+    identifier columns plus one junction row, no user data, superadmin-only.
 
-    A project shared with several colleagues produces one `shr-` entry per recipient, all keyed
-    off the SAME app id — a fan-out `_owning_app_ids` (this function's only consumer) already
-    tolerates, since it only ever reads the app id back out, never the name."""
-    from src.services.build_sessions.manager import app_name_for, shr_name_for
-
+    A project shared with several colleagues produces one `shr-` entry per recipient, each with the
+    same app id and the app's OWNER, never the recipient, as `owner_id`."""
     rows = (await db.execute(sa.select(AppRegistry.id, AppRegistry.user_id))).all()
     known: dict[str, _KnownContainer] = {
         app_name_for(app_id): _KnownContainer(
-            app_id=app_id, user_id=user_id, kind=KIND_BUILD_SANDBOX
+            app_id=app_id, user_id=user_id, kind=KIND_BUILD_SANDBOX, owner_id=user_id
         )
         for app_id, user_id in rows
     }
     share_rows = (
         await db.execute(
-            sa.select(AppRegistry.id, ProjectShare.shared_with_user_id).join(
+            sa.select(AppRegistry.id, ProjectShare.shared_with_user_id, AppRegistry.user_id).join(
                 ProjectShare, ProjectShare.project_id == AppRegistry.project_id
             )
         )
     ).all()
-    for app_id, recipient_id in share_rows:
+    for app_id, recipient_id, owner_id in share_rows:
         known[shr_name_for(app_id, recipient_id)] = _KnownContainer(
-            app_id=app_id, user_id=recipient_id, kind=KIND_SHARED_SANDBOX
+            app_id=app_id, user_id=recipient_id, kind=KIND_SHARED_SANDBOX, owner_id=owner_id
         )
     return known
 
@@ -278,6 +302,7 @@ async def backfill_sandbox_tags(db: AsyncSession, control_plane: FleetTagger) ->
     reporting "nothing left to stamp" is the exact false green the destroy flag is gated on."""
     live = {member.name: member.tags for member in await control_plane.list_sandbox_fleet()}
     owners = await _app_names_to_owners(db)
+    held = await _held_without_a_registry(db)
     # END THE READ TRANSACTION BEFORE THE ARM LOOP. `owners` is already materialised as plain
     # UUIDs, so nothing below needs the session — and what follows is an unbounded serial walk of
     # PATCHes, each pollable to `_LRO_CEILING_SECONDS`. Holding the request's connection
@@ -298,8 +323,9 @@ async def backfill_sandbox_tags(db: AsyncSession, control_plane: FleetTagger) ->
             already_tagged += 1
             # A container stamped by an EARLIER pass and still carrying no owner. Counting it
             # only when this pass did the stamping is what made the escalate-forever population
-            # vanish on every re-run.
-            if not live[name].get(TAG_USER_ID):
+            # vanish on every re-run. A ready pool container, which carries no owner until its
+            # claim, and an owed one are accounted for without one.
+            if not live[name].get(TAG_USER_ID) and name not in held:
                 unowned += 1
             continue
         owner = owners.get(name)

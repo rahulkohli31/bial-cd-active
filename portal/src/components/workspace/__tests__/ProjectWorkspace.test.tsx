@@ -27,6 +27,8 @@ import { ApiError } from '../../../utils/apiError'
 import type { ReactNode } from 'react'
 import type { Project } from '../../../utils/projectApi'
 import type { DeploymentView, PublishState } from '../../../utils/deployApi'
+import type { authFetch } from '../../../utils/api'
+import { startWaitsFrom } from '../../../pages/__tests__/_observeBeacons'
 
 const api = vi.hoisted(() => ({
   fetchPreviewState: vi.fn(),
@@ -41,7 +43,15 @@ const api = vi.hoisted(() => ({
   saveProject: vi.fn(),
   listProjectConversations: vi.fn(),
   getDeployment: vi.fn(),
+  authFetch: vi.fn<typeof authFetch>(),
 }))
+
+// The transport under the real `observe` module, recorded and passed through unchanged.
+vi.mock('../../../utils/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../utils/api')>()
+  api.authFetch.mockImplementation((...args) => actual.authFetch(...args))
+  return { ...actual, authFetch: api.authFetch }
+})
 
 vi.mock('../../../utils/buildSessionApi', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../utils/buildSessionApi')>()),
@@ -1157,5 +1167,111 @@ describe('★ an admitted press holds the pane until the next read', () => {
     await screen.findByText(REFUSED)
     expect(paneState()).toBe('not-running')
     expect(api.fetchPreviewState).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('the browser`s clock for the start an open makes', () => {
+  const T0 = new Date('2026-10-05T09:00:00Z').getTime()
+  const startWaits = () => startWaitsFrom(api.authFetch)
+  const revealed = () =>
+    document.querySelector('[data-testid="device-card"]')?.className.includes('opacity-100') === true
+  const paneSays = () => screen.queryByTestId('app-pane-empty')?.getAttribute('data-workspace-state')
+
+  const PROJECT_B: Project = { ...PROJECT, id: 'pB', name: 'Lost Baggage', appId: 'app-2', hasRelaunchableSnapshot: false }
+
+  function Headed({ project, to }: { project: Project; to: string }) {
+    usePublishHeading({ projectId: project.id, projectName: project.name, chatTitle: null, chatKind: null })
+    return (
+      <>
+        <Link to={to}>switch project</Link>
+        <Surface project={project} />
+      </>
+    )
+  }
+
+  function TwoProjects() {
+    return (
+      <MemoryRouter initialEntries={['/projects/pA']}>
+        <Routes>
+          <Route element={<WorkspaceShell />}>
+            <Route path="/projects/pA" element={<Headed project={PROJECT} to="/projects/pB" />} />
+            <Route path="/projects/pB" element={<Headed project={PROJECT_B} to="/projects/pA" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>
+    )
+  }
+
+  /** pA reads asleep until its start is admitted, then starting until the scenario says it is up;
+   *  pB has nothing built. */
+  function readsWhere(aUp: () => boolean) {
+    let admitted = false
+    api.relaunchPreview.mockImplementation(async () => {
+      admitted = true
+      return 's-a'
+    })
+    api.fetchPreviewState.mockImplementation(async (projectId: string) => {
+      if (projectId !== 'pA') return preview({ state: 'asleep', restorable: false })
+      if (aUp()) return preview({ state: 'alive', alive: true, previewUrl: APP_URL, restorable: true })
+      return admitted ? preview({ state: 'starting', restorable: true }) : preview({ state: 'asleep', restorable: true })
+    })
+  }
+
+  afterEach(() => vi.useRealTimers())
+
+  it('★ reports the wait from the start to the app`s own mounted signal, against the start the 202 named', async () => {
+    // A frame that merely loads — a 502 does — stops nothing; only the document's own word does.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(T0)
+    readsWhere(() => api.relaunchPreview.mock.calls.length > 0)
+    render(<TwoProjects />)
+
+    await waitFor(() => expect(frame()).toBeTruthy())
+    const loaded = frame()
+    if (!loaded) throw new Error('nothing framed')
+    fireEvent.load(loaded)
+    expect(startWaits()).toEqual([])
+    vi.setSystemTime(T0 + 41_250)
+    vouch()
+
+    expect(revealed()).toBe(true)
+    expect(startWaits()).toEqual([{ startId: 's-a', durationMs: 41_250 }])
+  })
+
+  it('★ reports nothing for a start left for another project before its app showed', async () => {
+    // Mutation check: drop the shell's abandon on a change of project and this goes red.
+    let up = false
+    readsWhere(() => up)
+    render(<TwoProjects />)
+    await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(paneSays()).toBe('starting'))
+
+    fireEvent.click(screen.getByText('switch project'))
+    await waitFor(() => expect(api.fetchPreviewState).toHaveBeenCalledWith('pB'))
+    up = true
+    fireEvent.click(screen.getByText('switch project'))
+    await waitFor(() => expect(frame()).toBeTruthy())
+    vouch()
+
+    expect(revealed()).toBe(true)
+    expect(api.relaunchPreview).toHaveBeenCalledTimes(1)
+    expect(startWaits()).toEqual([])
+  })
+
+  it('★ reports nothing for a start left by leaving the workspace before its app showed', async () => {
+    // Mutation check: drop the shell's abandon on unmount and this goes red.
+    let up = false
+    readsWhere(() => up)
+    render(<TwoProjects />)
+    await waitFor(() => expect(api.relaunchPreview).toHaveBeenCalledTimes(1))
+
+    cleanup()
+    up = true
+    render(<TwoProjects />)
+    await waitFor(() => expect(frame()).toBeTruthy())
+    vouch()
+
+    expect(revealed()).toBe(true)
+    expect(startWaits()).toEqual([])
   })
 })

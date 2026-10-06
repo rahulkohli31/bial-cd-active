@@ -18,8 +18,9 @@ export type BuildSessionStatus = 'provisioning' | 'building' | 'ready' | 'ended'
 
 // ─── Control operations — relaunch / shared launch ───────────────────────────
 
-/** `POST …/relaunch` body — start a project's saved app. The 202 it earns carries nothing a client
- *  reads: the preview-state poll reports the start. */
+/** `POST …/relaunch` body — start a project's saved app. Of the 202 it earns the client reads only
+ *  the start id, which the browser's clock reports against; the preview-state poll reports the
+ *  start itself. */
 export interface RelaunchPreviewRequest {
   projectId: string
 }
@@ -40,4 +41,7 @@ export interface SharedPreviewResponse {
    *  ask the store for the timestamp; the restore itself already confirmed the snapshot
    *  exists. Refresh's whole point is moving this forward. */
   snapshotTakenAt: string | null
+  /** The start this launch began, which the browser's clock reports against; `null` when it
+   *  attached to a view already running. */
+  startId: string | null
 }

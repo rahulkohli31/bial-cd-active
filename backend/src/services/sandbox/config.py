@@ -5,17 +5,41 @@
 booting without it — the single prod gate in `src.config` requires it in production.
 
 SESSION-API provisions one Azure Container App sandbox per user against these knobs and
-injects the interim app-data credential at provision and on restore. This shape is
-FROZEN — nothing should reopen this file to change it.
+injects the interim app-data credential at provision and on restore. It also sizes the
+pool of ready sandboxes by day and by night, in India time.
 
 ACA control-plane auth is managed-identity (`DefaultAzureCredential`): no static
 provisioning secret lives here; the supervisor bearer is minted at provision time."""
 
 from __future__ import annotations
 
-from typing import Literal
+from datetime import datetime, time
+from typing import Annotated, Final, Literal, Self
+from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt, SecretStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PositiveFloat,
+    PositiveInt,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
+from pydantic_settings import NoDecode
+
+#: The platform serves one organisation in one country, so the pool's day is read in this zone and
+#: the zone is not a setting.
+INDIA: Final = ZoneInfo("Asia/Kolkata")
+
+#: A size above this fails startup, so a mistyped size fails a deploy instead of running dozens of
+#: ready containers.
+POOL_SIZE_CEILING: Final = 20
+
+_WEEKDAYS: Final = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+PoolSize = Annotated[int, Field(ge=0, le=POOL_SIZE_CEILING)]
 
 
 class SandboxConfig(BaseModel):
@@ -92,3 +116,43 @@ class SandboxConfig(BaseModel):
     memory: str = "2Gi"
     # POC = public ingress; internal/VNet ingress is deferred hardening.
     ingress: Literal["external", "internal"] = "external"
+
+    # --- the pool of ready sandboxes ----------------------------------------
+    # How many to hold by day and by night. 0 holds none, and a start then creates its own.
+    pool_day_size: PoolSize = 0
+    pool_night_size: PoolSize = 0
+    # India time, `HH:MM`. The day runs from the start up to, not including, the end.
+    pool_day_start: time = time(9, 0)
+    pool_day_end: time = time(19, 0)
+    # The days that count as daytime, as comma-separated three-letter names in any case, e.g.
+    # `mon,tue,wed,thu,fri`. Held as `datetime.weekday()` numbers.
+    pool_day_days: Annotated[frozenset[int], NoDecode] = frozenset(range(5))
+
+    @field_validator("pool_day_days", mode="before")
+    @classmethod
+    def _read_day_names(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        names = [name.strip().lower() for name in value.split(",") if name.strip()]
+        unknown = [name for name in names if name not in _WEEKDAYS]
+        if not names or unknown:
+            raise ValueError(f"pool_day_days takes names from {', '.join(_WEEKDAYS)}")
+        return frozenset(_WEEKDAYS.index(name) for name in names)
+
+    @model_validator(mode="after")
+    def _the_day_is_a_span_of_india_time(self) -> Self:
+        # An offset on either end would make the comparison below raise on every start.
+        if self.pool_day_start.tzinfo is not None or self.pool_day_end.tzinfo is not None:
+            raise ValueError("pool_day_start and pool_day_end are India time, without an offset")
+        if self.pool_day_start >= self.pool_day_end:
+            raise ValueError("pool_day_start must come before pool_day_end")
+        return self
+
+    def pool_size_at(self, instant: datetime) -> int:
+        """How many ready sandboxes the pool should hold at `instant`, an aware datetime."""
+        local = instant.astimezone(INDIA)
+        daytime = (
+            local.weekday() in self.pool_day_days
+            and self.pool_day_start <= local.time() < self.pool_day_end
+        )
+        return self.pool_day_size if daytime else self.pool_night_size

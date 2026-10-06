@@ -20,7 +20,6 @@ from src.api.v1.build_sessions.deps import sandbox_or_none_dependency
 from src.config import settings
 from src.db.models.audit import AuditLog
 from src.services.auth.session_jwt import mint_session_jwt
-from src.services.build_sessions.manager import app_name_for
 from src.services.sandbox import SandboxError
 from src.services.sandbox.base import (
     KIND_BUILD_SANDBOX,
@@ -31,6 +30,7 @@ from src.services.sandbox.base import (
     TAG_KIND,
     TAG_USER_ID,
     FleetMember,
+    app_name_for,
     control_plane_segment,
     identity_from_tags,
 )
