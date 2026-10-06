@@ -136,7 +136,13 @@ if an operator-owned rule turns the log event into a notification.
      the environment-join action on the sandbox resource group. Grant them (`../deployment.md`).
    - **A row left filling past its deadline.** A process — the worker or the backend — stopped in
      the middle of a create, usually in a deploy or a restart; the pass that found it deleted the
-     container, and the next one fills again. Once after a restart is expected. If it repeats,
+     container, and the next one fills again. The alarm comes only when the row is found, a little
+     over twenty-six minutes after it began. Until then the row counts toward the size, so the
+     pool holds one ready sandbox fewer than the size and nothing is logged, and if Azure had
+     already finished the create, that sandbox is running and answers its health check but
+     nothing claims it. A count of the sandboxes in the resource group can therefore read the
+     full size while one is not ready. The pool is whole again about half an hour after the stop,
+     and nothing needs doing in between. Once after a restart is expected. If it repeats,
      confirm that the worker and the backend hold the same image reference, that the registry has
      that tag, and that the registry credentials in the worker's settings are right, then read the
      container's own log in Azure.
