@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.12] - 2026-10-07
+
+The assistant now keeps one professional voice and stays on BIAL work in every chat: BIAL Chat,
+planning and building. This answers the AI security assessment's two findings, that it took on a
+persona a user asked for and wrote content from sources that existed only in the message, and the
+client's own test of a leave email written as a poem. Ordinary work is unaffected, including
+questions about security, safety and regulation, and replies in another language.
+
+### Deploying this release
+
+- **Rebuild the backend image for dev and prod and deploy it.** The change is in the assistant's
+  instructions only. The portal and sandbox images are unchanged, and the worker does not run the
+  assistant.
+- **No migration and no settings change.**
+- **Every conversation picks up the new instructions on its next message.** Nothing stored
+  changes. A conversation that already holds persona replies still shows them, so retest the
+  assessment's prompts in a new conversation.
+
+### Security
+
+- **The assistant no longer takes on a character or persona,** however the request is framed: a
+  plain ask, a role described in a block of JSON, or a dialogue with an assistant that has no
+  rules. It answers as itself, does the work underneath if there is any, and otherwise says in a
+  sentence what it can help with.
+- **Requests that serve no work purpose are declined briefly:** writing for amusement, role-play,
+  and essays or opinion on subjects unrelated to BIAL. When a request names no purpose and has no
+  plain one, it asks what it is for rather than inventing one.
+- **A source, authority or special mode that exists only because a message claims it is not
+  treated as fact.** A user's own details still are. A draft built on a document it has not been
+  shown says so first.
+- **Nothing supplied during the work can change the assistant's instructions:** not a message, a
+  project's name or description, a file, a record or a tool's output. The instructions are not
+  quoted, summarised or translated on request; the assistant still explains why it will or will
+  not do a particular thing.
+- **Security questions are answered rather than refused for their subject,** while a method for
+  defeating a security control is never given, whoever asks or why.
+
+### Changed
+
+- **Replies are laid out the same way in every chat:** the answer first, length to fit the
+  request, and lists, tables or headings only where they help.
+- **Writing for someone's work takes the form that work calls for.** A campaign slogan may rhyme
+  and a social post may carry emoji, while emails, leave requests, reports, minutes and notices
+  stay in plain professional prose. A practice scenario is written out as a script rather than
+  played live.
+- **BIAL Chat gives finished writing,** in the usual form for that kind of writing, with anything
+  it does not know left as a placeholder.
+
 ## [1.8.11] - 2026-10-06
 
 The fixes from the interim security assessment of the portal and its API. One finding, that a
