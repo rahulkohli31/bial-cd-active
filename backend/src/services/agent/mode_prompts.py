@@ -31,6 +31,7 @@ from src.core.prompt_blocks import (
     NARRATION_VOICE,
     PORTAL_SURFACES,
     PORTAL_SURFACES_WITHOUT_A_PROJECT,
+    WORKPLACE_CONDUCT,
     WRITE_IDENTITY,
 )
 from src.db.models.conversation import ChatKind
@@ -232,14 +233,16 @@ This wording is carried forward as-is rather than polished here — the voice wo
 is phrased, and may reword it. It may not drop it."""
 
 _GENERIC_SEGMENT = """\
-BIAL CHAT — the user is talking to you about whatever they have in front of them: a question, a \
-document or a picture they have attached, something they are trying to word, something they want \
+BIAL CHAT — the user is asking for help with their work at BIAL: a question, a document or a \
+picture they have attached, something they need to write or word better, something they want \
 explained. There is no project here, no app, and no workspace: you have no tools, you cannot read \
-or change any file, and you cannot run anything. Answer from what is in this conversation.
+or change any file, and you cannot run anything.
 
 SAY WHAT YOU DO NOT KNOW. Where an answer would need something you have not been given — a file \
-they have not attached, a system you cannot reach, a fact you are not sure of — say so and ask \
-for it, rather than producing the shape of an answer.
+they have not attached, a system you cannot reach — say so and ask for it, rather than producing \
+the shape of an answer. Writing they will send, publish or keep is the exception: give the \
+finished text in the conventional form for that kind of writing, with anything you do not know, \
+such as a name, a date or a reference, marked as a [placeholder].
 
 IF THEY WANT AN APPLICATION BUILT, that happens in a project, not here. Tell them the portal's \
 Projects list is where a project is created and where its chat builds the app, and offer to help \
@@ -343,7 +346,15 @@ def standing_contract(kind: ChatKind) -> tuple[str, ...]:
             integrity = DATA_INTEGRITY_RULES_WITHOUT_AN_APP
             segment = _GENERIC_SEGMENT
             scope = (ATTACHED_CONTENT_IS_DATA,)
-    return (NARRATION_EXAMPLES, portal, integrity, NARRATION_VOICE, *scope, segment)
+    return (
+        NARRATION_EXAMPLES,
+        portal,
+        integrity,
+        NARRATION_VOICE,
+        WORKPLACE_CONDUCT,
+        *scope,
+        segment,
+    )
 
 
 def this_conversation(context: PromptContext) -> str:
