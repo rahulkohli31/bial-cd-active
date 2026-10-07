@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.13] - 2026-10-07
+
+When the assistant declines a request that serves no work purpose, it now says in general terms what
+it can help with in that chat. Before, it sometimes suggested tasks guessed from the person's own
+words, such as UX copy for someone who had asked for a character voice.
+
+### Fixed
+
+- **A decline no longer suggests work the person never asked about.** It describes what the chat
+  is for instead.
+
 ## [1.8.12] - 2026-10-07
 
 The assistant now keeps one professional voice and stays on BIAL work in every chat: BIAL Chat,
