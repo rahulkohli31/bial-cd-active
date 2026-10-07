@@ -210,6 +210,7 @@ def _api_env(*, without: str | None = None) -> dict[str, str]:
         "AUTH__REDIRECT_URI": "http://localhost:8000/api/v1/auth/callback",
         "SUPERADMIN_EMAILS": "admin@bial.com",
         "SUPPORT_CONTACT_EMAIL": "help@bial.com",
+        "INTERNAL_ROUTE_TOKEN": "test-internal-route-token-0123456789abcdef",
         # Required with no default by every role — omitting it would fail for a reason unrelated
         # to the support contact this file is about.
         "APPS_BASE_URL": "https://citizenapps.bialairport.com",

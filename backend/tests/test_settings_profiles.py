@@ -70,6 +70,8 @@ _ADMINS: dict[str, str] = {"SUPERADMIN_EMAILS": "admin@bial.com"}
 # `SUPPORT_CONTACT_EMAIL` is required of the API with no default, so every API profile built here
 # needs it or the "boots with X" tests would fail for a reason that has nothing to do with X.
 _SUPPORT: dict[str, str] = {"SUPPORT_CONTACT_EMAIL": "help@bial.com"}
+# Required of the API with no default, for the same reason.
+_EDGE: dict[str, str] = {"INTERNAL_ROUTE_TOKEN": "test-internal-route-token-0123456789abcdef"}
 _APP_DB: dict[str, str] = {
     "APP_DB__MAINTENANCE_DSN": "postgresql+asyncpg://maint:p@localhost:5432/postgres",
     # Fernet wants 32 url-safe-base64-encoded bytes; any well-formed key satisfies construction.
@@ -92,7 +94,7 @@ _RETENTION: dict[str, str] = {"CONVERSATION_RETENTION_ENABLED": "false"}
 _PORTAL: dict[str, str] = {"FRONTEND_URL": "http://localhost:5173"}
 
 _WORKER_ENV = {**_CORE, **_STORE, **_REDIS, **_SANDBOX, **_RETENTION, **_PORTAL}
-_API_ENV = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT}
+_API_ENV = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_EDGE}
 
 
 @contextmanager
@@ -359,6 +361,29 @@ def test_the_api_still_requires_its_own_superadmin_allowlist() -> None:
     assert "superadmin_emails" in str(excinfo.value).lower()
 
 
+@pytest.mark.parametrize("token", [None, "", "short-secret", "x" * 31])
+def test_the_api_refuses_to_boot_without_a_real_edge_secret(token: str | None) -> None:
+    """The route that answers with no user is guarded by this value alone, so a missing one — or
+    one too short to be a secret — stops the process rather than leaving the route open to a
+    guess. Mutation-check: give `INTERNAL_ROUTE_TOKEN` a default and the first case goes red."""
+    env = {k: v for k, v in _API_ENV.items() if k != "INTERNAL_ROUTE_TOKEN"}
+    if token is not None:
+        env["INTERNAL_ROUTE_TOKEN"] = token
+    with pytest.raises(ValidationError) as excinfo:
+        _boot(ApiSettings, env)
+    assert "INTERNAL_ROUTE_TOKEN" in str(excinfo.value)
+
+
+def test_the_edge_secret_is_the_apis_alone_and_never_prints() -> None:
+    """The worker serves no route, so it must not be made to demand the secret; and the settings
+    object, which gets logged and dumped, must not carry it in the clear."""
+    _boot(WorkerSettings, _WORKER_ENV)
+    api = _boot(ApiSettings, _API_ENV)
+    token = _API_ENV["INTERNAL_ROUTE_TOKEN"]
+    assert api.INTERNAL_ROUTE_TOKEN.get_secret_value() == token
+    assert token not in repr(api)
+
+
 # ---------------------------------------------------------------- typo catching
 
 
@@ -512,7 +537,7 @@ def test_importing_the_shim_does_not_construct_settings() -> None:
 
 def test_both_roles_refuse_to_start_without_the_apps_base_url() -> None:
     """Fail-first, in both roles. There is no deployment where a guessed value is correct."""
-    api = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_APP_DB}
+    api = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_EDGE, **_APP_DB}
     worker = {**_CORE, **_STORE, **_REDIS, **_SANDBOX}
     for env in (api, worker):
         env.pop("APPS_BASE_URL")
@@ -539,7 +564,7 @@ def test_a_shape_that_would_compose_a_wrong_address_is_refused(bad: str) -> None
     """NONE of these raises anywhere downstream. Each produces a plausible-looking URL that goes
     nowhere, so the first report comes from a colleague who could not open a shared app — which
     is exactly the class of failure this whole change exists to remove."""
-    env = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_APP_DB, "APPS_BASE_URL": bad}
+    env = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_EDGE, **_APP_DB, "APPS_BASE_URL": bad}
     with pytest.raises(ValidationError, match="APPS_BASE_URL"):
         _boot(ApiSettings, env)
 
@@ -548,18 +573,19 @@ def test_the_apps_hostname_is_stripped_of_its_scheme() -> None:
     """Next's `serverActions.allowedOrigins` wants a HOST, not an origin. A value carrying a
     scheme fails CLOSED and silently: the origin comparison never matches, so every form post in
     every generated app is aborted as a CSRF attempt with no other symptom."""
-    env = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_APP_DB}
+    env = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_EDGE, **_APP_DB}
     assert _boot(ApiSettings, env).apps_hostname == "citizenapps.bialairport.com"
 
 
-@pytest.mark.parametrize("prefix", ["sbx-", "pub-"])
-def test_an_app_url_is_composed_from_the_container_name(prefix: str) -> None:
-    """The key IS the container app's own name, which is what makes the address derivable and is
-    why the router holds no registry. Preview and published differ only by the prefix."""
-    env = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_APP_DB}
-    name = f"{prefix}1a2b3c4d5e6f70819a2b3c4d5e6f"
-    url = _boot(ApiSettings, env).app_url(name)
-    assert url == f"https://citizenapps.bialairport.com/a/{name}"
+@pytest.mark.parametrize(
+    "key", ["1a2b3c4d5e6f70819a2b3c4d5e6f7081", "pub-1a2b3c4d5e6f70819a2b3c4d5e6f"]
+)
+def test_an_app_url_is_composed_from_its_key(key: str) -> None:
+    """A preview's key is its alias and a published app's is its `pub-` name; either way the
+    address is a string composition, and the edge does the resolving."""
+    env = {**_CORE, **_AUTH, **_ADMINS, **_SUPPORT, **_EDGE, **_APP_DB}
+    url = _boot(ApiSettings, env).app_url(key)
+    assert url == f"https://citizenapps.bialairport.com/a/{key}"
     # NO TRAILING SLASH, measured against a real Next 16 dev server: `/<base>/` answers 308 and
     # redirects to `/<base>`. A slash here would put a redirect in front of every framed preview
     # and every published link somebody shares.

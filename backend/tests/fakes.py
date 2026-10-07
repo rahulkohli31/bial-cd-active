@@ -51,6 +51,7 @@ from src.services.redis import (
     registry_key,
 )
 from src.services.redis.keys import (
+    REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
@@ -80,6 +81,7 @@ from src.services.sandbox.base import (
     SandboxNotReadyError,
     ServedCount,
     ServedPage,
+    new_alias,
 )
 from src.services.storage.base import ListPage, ObjectMeta, ObjectStorage
 from src.services.storage.errors import StorageNotFoundError
@@ -317,6 +319,7 @@ async def _hydrate_registry(
         mapping={
             REGISTRY_FIELD_APP_NAME: handle.app_name,
             REGISTRY_FIELD_APP_ID: app_env["BIAL_APP_ID"],
+            REGISTRY_FIELD_ALIAS: new_alias(),
             REGISTRY_FIELD_FQDN: handle.fqdn,
             # A reference, never the raw token — mirrors the real client's contract.
             REGISTRY_FIELD_TOKEN_REF: f"ref-{handle.app_name}",

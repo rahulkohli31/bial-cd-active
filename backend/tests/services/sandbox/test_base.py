@@ -78,6 +78,7 @@ def test_handle_has_the_expected_fields_and_holds_its_settings_unless_told() -> 
         "preview_url",
         "ready",
         "configured",
+        "base_path",
     }
     assert handle.ready is False
     assert handle.configured is True

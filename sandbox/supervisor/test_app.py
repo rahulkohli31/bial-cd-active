@@ -2173,6 +2173,23 @@ def _stub_http_server(asked: list[str], *, status: int = 200, body: str = "ok") 
 # child's environment, the request target, a real connection) rather than on a constant's value.
 
 
+@pytest.mark.parametrize(
+    "accepted",
+    [
+        "/a/1a2b3c4d5e6f70819a2b3c4d5e6f7081",  # a preview's alias
+        "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f",  # a container from before aliases
+        "/a/pub-1a2b3c4d5e6f70819a2b3c4d5e6f",  # a published app
+    ],
+)
+def test_the_base_paths_the_platform_assigns_are_accepted(
+    monkeypatch: pytest.MonkeyPatch, accepted: str
+) -> None:
+    """The sandbox image and the backend deploy separately and either may land first, so the
+    supervisor takes every shape that is in use until the older ones are gone."""
+    monkeypatch.setenv("BIAL_BASE_PATH", accepted)
+    assert sup._base_path() == accepted
+
+
 def test_the_base_path_reaches_the_child(monkeypatch: pytest.MonkeyPatch) -> None:
     """MUTATION CHECK: delete BIAL_BASE_PATH's row from `_INJECTED_ENV` and this fails.
 
@@ -2198,6 +2215,10 @@ def test_the_base_path_reaches_the_child(monkeypatch: pytest.MonkeyPatch) -> Non
         "/a/dev-1a2b3c4d5e6f70819a2b3c4d5e6f",  # wrong prefix
         "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f/../etc",
         "/a/sbx-1a2b3c4d5e6f70819a2b3c4d5e6f\r\nX-Injected: 1",
+        "/a/1a2b3c4d5e6f70819a2b3c4d5e6f708",  # 31 hex alias
+        "/a/1a2b3c4d5e6f70819a2b3c4d5e6f70811",  # 33 hex alias
+        "/a/1A2B3C4D5E6F70819A2B3C4D5E6F7081",  # uppercase alias
+        "/a/1a2b3c4d5e6f70819a2b3c4d5e6f7081\r\nX-Injected: 1",
     ],
 )
 def test_a_malformed_base_path_is_treated_as_absent(

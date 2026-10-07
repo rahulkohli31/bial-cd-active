@@ -142,61 +142,81 @@ describe('nginx.conf — the two sites are told apart, and the portal is still t
   })
 })
 
-describe('nginx.conf — the apps site routes /a/<key>/ by composing the upstream', () => {
+describe('nginx.conf — the apps site routes /a/<key>/ by alias lookup or by composing the upstream', () => {
   const appsLocations = blocksOf(APPS.body, LOCATION)
-  // The keyed arm identified by what it DOES (captures the key into $app_key) rather than by its
-  // position or its literal regex — the sibling `^/a/` catch-all and the two `_sup` denials look
-  // similar enough that an index would silently retarget these assertions.
-  const keyed = appsLocations.find((l) => /set[ \t]+\$app_key[ \t]+\$1[ \t]*;/.test(l.body))!
+  // The keyed arms identified by what they DO (capture the key into $app_key), told apart by whether
+  // they ask the lookup — the sibling `^/a/` catch-all and the `_sup` denials look similar enough
+  // that an index would silently retarget these assertions.
+  const keyedArms = appsLocations.filter((l) => /set[ \t]+\$app_key[ \t]+\$1[ \t]*;/.test(l.body))
+  const aliasArm = keyedArms.find((l) => /auth_request[ \t]/.test(l.body))!
+  const pubArm = keyedArms.find((l) => !/auth_request[ \t]/.test(l.body))!
 
-  /** The keyed location's match spec, compiled. nginx matches `location ~ "…"` with PCRE; every
+  /** A keyed location's match spec, compiled. nginx matches `location ~ "…"` with PCRE; every
    *  construct used here means the same thing in JS, so the shape can be exercised directly
    *  instead of eyeballed. */
-  function keyPattern(): RegExp {
-    const source = keyed.header.match(/^~\s*"(.*)"$/)?.[1]
-    if (!source) throw new Error(`keyed arm is not a quoted regex location: ${keyed.header}`)
+  function keyPattern(arm: Block): RegExp {
+    const source = arm.header.match(/^~\s*"(.*)"$/)?.[1]
+    if (!source) throw new Error(`keyed arm is not a quoted regex location: ${arm.header}`)
     return new RegExp(source)
   }
+  const HEX32 = HEX28 + 'cdef'
 
-  it('matches the exact key shape — prefix plus 28 lowercase hex — and captures the key', () => {
-    const re = keyPattern()
-    for (const prefix of ['sbx', 'pub', 'shr']) {
-      const key = `${prefix}-${HEX28}`
+  it('matches the exact key shape — an alias of 32 lowercase hex, or `pub-` plus 28 — and captures the key', () => {
+    for (const [arm, key] of [
+      [aliasArm, HEX32],
+      [pubArm, `pub-${HEX28}`],
+    ] as const) {
+      const re = keyPattern(arm)
       expect(`/a/${key}/`.match(re)?.[1]).toBe(key)
       expect(`/a/${key}`.match(re)?.[1]).toBe(key) // no trailing slash is still the app root
       expect(`/a/${key}/api/items?q=1`.match(re)?.[1]).toBe(key)
     }
   })
 
-  it('does NOT match a key of the wrong length, the wrong case, or the wrong alphabet', () => {
+  it('does NOT match a key of the wrong length, case or alphabet — and never a preview container name', () => {
     // A looser match does not merely mis-route: it turns a mistyped key into a DNS lookup for an
-    // attacker-named host from inside the VNet. The near-misses are the whole point of the shape.
-    const re = keyPattern()
-    for (const key of [
-      `sbx-${HEX28.slice(0, 27)}`, // 27 hex
-      `sbx-${HEX28}c`, // 29 hex
-      `sbx-${HEX28.toUpperCase()}`, // uppercase hex
-      `sbx-${HEX28.slice(0, 27)}g`, // non-hex character
+    // attacker-named host from inside the VNet. A container name (`sbx-`, `shr-`) matching either arm
+    // would be the preview's identifier working in the address again.
+    const nearMisses = [
+      HEX32.slice(0, 31), // 31 hex
+      `${HEX32}c`, // 33 hex
+      HEX32.toUpperCase(), // uppercase hex
+      `${HEX32.slice(0, 31)}g`, // non-hex character
       `xyz-${HEX28}`, // unknown prefix
-      HEX28, // no prefix at all
-    ]) {
-      expect(re.test(`/a/${key}/`)).toBe(false)
-      expect(re.test(`/a/${key}`)).toBe(false)
+      `sbx-${HEX28}`, // a preview's container name
+      `shr-${HEX28}`, // a shared view's container name
+      `pub-${HEX28.slice(0, 27)}`, // 27 hex
+      `pub-${HEX28}c`, // 29 hex
+    ]
+    for (const arm of [aliasArm, pubArm]) {
+      const re = keyPattern(arm)
+      for (const key of nearMisses) {
+        expect(re.test(`/a/${key}/`)).toBe(false)
+        expect(re.test(`/a/${key}`)).toBe(false)
+      }
     }
   })
 
-  it('composes the upstream from the captured key and the apps domain — no registry, no state', () => {
-    expect(keyed.body).toMatch(/set[ \t]+\$app_host[ \t]+"\$app_key\.\$\{APPS_DOMAIN\}"[ \t]*;/)
-    expect(keyed.body).toMatch(/proxy_pass[ \t]+https:\/\/\$app_host[ \t]*;/)
+  it('composes the upstream from a validated map, never from a server-level `set` — and a published app asks no lookup', () => {
+    // A server-level `set` runs again inside the lookup subrequest and gives every alias the same
+    // value: every app routed to whichever container was looked up first.
+    expect(CODE).toMatch(/map[ \t]+"\$app_key\|\$route_container"[ \t]+\$app_host[ \t]*\{/)
+    expect(serverLevel(APPS)).not.toMatch(/(?:^|\n)[ \t]*set[ \t]/)
+    for (const arm of keyedArms) expect(arm.body).toMatch(/proxy_pass[ \t]+https:\/\/\$app_host[ \t]*;/)
+    expect(aliasArm.body).toMatch(/auth_request[ \t]+\/__bial_route[ \t]*;/)
+    expect(pubArm.body).not.toMatch(/auth_request|BACKEND_URL/)
   })
 
-  it('carries NO URI part on any proxy_pass — a stray slash collapses every request to /', () => {
+  it('carries NO URI part on any app proxy_pass — a stray slash collapses every request to /', () => {
     // Inside a regex location nginx cannot know which part of the URI the location matched, so a
     // URI on a variable `proxy_pass` REPLACES the request path outright — a total routing collapse,
-    // the same failure the BACKEND_URL boot guard exists to prevent.
+    // the same failure the BACKEND_URL boot guard exists to prevent. The lookup's own pass is the one
+    // deliberate exception: it names the backend route in full.
     const passes = [...APPS.body.matchAll(/proxy_pass[ \t]+([^;]+);/g)].map((m) => m[1]!.trim())
     expect(passes.length).toBeGreaterThan(0)
-    for (const pass of passes) expect(pass).toBe('https://$app_host')
+    for (const pass of passes.filter((p) => !p.startsWith('${BACKEND_URL}'))) {
+      expect(pass).toBe('https://$app_host')
+    }
   })
 
   it('re-declares proxy_http_version 1.1 and its OWN resolver — neither is inherited', () => {
@@ -209,10 +229,16 @@ describe('nginx.conf — the apps site routes /a/<key>/ by composing the upstrea
     expect(directiveValue(level, 'resolver_timeout')).toBe('5s')
   })
 
-  it('proxies NOTHING to the backend upstream — an app must not reach the control plane', () => {
+  it('reaches the backend only through the internal alias lookup — an app must not reach the control plane', () => {
     expect(APPS.body).not.toMatch(/backend_upstream/)
-    expect(APPS.body).not.toMatch(/BACKEND_URL/)
-    // …and the portal site is where that upstream is named, so the absence above is a boundary
+    const naming = appsLocations.filter((l) => /BACKEND_URL/.test(l.body))
+    expect(naming).toHaveLength(1)
+    // Unreachable from a browser, and the secret travels in a header the edge itself sets.
+    expect(naming[0]!.header).toBe('= /__bial_route')
+    expect(naming[0]!.body).toMatch(/(?:^|\n)[ \t]*internal[ \t]*;/)
+    expect(naming[0]!.body).toMatch(/proxy_pass_request_headers[ \t]+off[ \t]*;/)
+    expect(serverLevel(APPS)).not.toMatch(/BACKEND_URL|INTERNAL_ROUTE_TOKEN/)
+    // …and the portal site is where the backend is otherwise named, so the above is a boundary
     // rather than an accident of the backend having moved somewhere else entirely.
     expect(serverLevel(PORTAL)).toMatch(/set[ \t]+\$backend_upstream[ \t]+\$\{BACKEND_URL\}[ \t]*;/)
   })
