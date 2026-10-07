@@ -16,7 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Annotated, Self
 
-from pydantic import PositiveInt, field_validator, model_validator
+from pydantic import Field, PositiveInt, SecretStr, field_validator, model_validator
 from pydantic_settings import NoDecode
 
 from src.services.appdb.config import AppDatabaseSettings
@@ -73,6 +73,13 @@ class ApiSettings(CoreSettings):
     # who is already stuck to a mailbox nobody reads — a failure that surfaces as silence,
     # weeks later, from the one person least able to escalate it.
     SUPPORT_CONTACT_EMAIL: str
+
+    # WHAT THE PORTAL EDGE PRESENTS to the internal alias lookup, the one route that answers
+    # without a user. The portal carries the same value under the same name, so rotating it is a
+    # coordinated restart of both. No default: a backend with nothing to refuse a caller against
+    # must not start. The minimum length is the shortest value that is a real secret rather than
+    # a placeholder (`secrets.token_urlsafe(32)` is 43 characters).
+    INTERNAL_ROUTE_TOKEN: SecretStr = Field(min_length=32)
 
     # ============================================================ REQUIRED IN PRODUCTION
     # `X | None = None` plus a `_require_<field>_in_production` gate below. Dev and test boot

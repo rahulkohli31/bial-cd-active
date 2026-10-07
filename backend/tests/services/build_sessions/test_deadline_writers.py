@@ -38,18 +38,23 @@ from src.services.build_sessions.manager import BuildSession, SessionManager
 from src.services.build_sessions.reaper import reconcile_user
 from src.services.redis import registry_key
 from src.services.redis.keys import (
+    REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_STAY_WRITER,
 )
 from src.services.sandbox import SandboxHandle
+from src.services.sandbox.base import new_alias
 from tests.fakes import FakeSandboxClient, a_sandbox_name
 
 USER = uuid.uuid4()
 
 
 async def _register_as(redis: aioredis.Redis, user_id: uuid.UUID) -> None:
-    await redis.hset(registry_key(user_id), mapping={REGISTRY_FIELD_APP_NAME: "sbx-x"})
+    await redis.hset(
+        registry_key(user_id),
+        mapping={REGISTRY_FIELD_APP_NAME: "sbx-x", REGISTRY_FIELD_ALIAS: new_alias()},
+    )
 
 
 async def _register(redis: aioredis.Redis) -> None:
@@ -314,7 +319,10 @@ async def test_the_sweep_spares_a_container_inside_the_short_stay_and_reaps_thro
     second one."""
     user_id = uuid.uuid4()
     app_name = a_sandbox_name("unchanged")
-    await fake_redis.hset(registry_key(user_id), REGISTRY_FIELD_APP_NAME, app_name)
+    await fake_redis.hset(
+        registry_key(user_id),
+        mapping={REGISTRY_FIELD_APP_NAME: app_name, REGISTRY_FIELD_ALIAS: new_alias()},
+    )
     manager = SessionManager()
     session = _pardoned_session(user_id=user_id)
     sandbox = FakeSandboxClient()

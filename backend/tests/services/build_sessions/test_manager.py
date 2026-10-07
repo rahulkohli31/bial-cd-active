@@ -66,6 +66,7 @@ from src.services.redis import (
     registry_key,
 )
 from src.services.redis.keys import (
+    REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -76,6 +77,7 @@ from src.services.redis.keys import (
     start_failure_key,
 )
 from src.services.sandbox import SandboxError, SandboxHandle
+from src.services.sandbox.base import new_alias
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import (
     StorageAuthError,
@@ -138,6 +140,7 @@ async def _seed_live_sandbox_state(redis: aioredis.Redis, user_id: uuid.UUID) ->
         registry_key(user_id),
         mapping={
             REGISTRY_FIELD_APP_NAME: a_sandbox_name("someone-elses"),
+            REGISTRY_FIELD_ALIAS: new_alias(),
             REGISTRY_FIELD_FQDN: "live.example",
             REGISTRY_FIELD_TOKEN_REF: "ref",
             REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
@@ -181,6 +184,7 @@ async def test_resolve_sandbox_attaches_when_registry_is_live(
         registry_key(user.id),
         mapping={
             REGISTRY_FIELD_APP_NAME: app_name_for(app_id),
+            REGISTRY_FIELD_ALIAS: new_alias(),
             REGISTRY_FIELD_FQDN: "existing.example",
             REGISTRY_FIELD_TOKEN_REF: "ref",
             REGISTRY_FIELD_CREATED_AT: "2026-07-14T00:00:00+00:00",
@@ -206,6 +210,7 @@ async def test_resolve_sandbox_restores_when_gone_but_snapshot_exists(
         registry_key(user.id),
         mapping={
             REGISTRY_FIELD_APP_NAME: app_name_for(app_id),
+            REGISTRY_FIELD_ALIAS: new_alias(),
             REGISTRY_FIELD_FQDN: "gone.example",
             REGISTRY_FIELD_TOKEN_REF: "ref",
             REGISTRY_FIELD_CREATED_AT: "2026-07-14T00:00:00+00:00",
@@ -368,6 +373,7 @@ async def test_reconcile_on_start_unblocks_a_crashed_user(
         registry_key(user.id),
         mapping={
             REGISTRY_FIELD_APP_NAME: a_sandbox_name("stale"),
+            REGISTRY_FIELD_ALIAS: new_alias(),
             REGISTRY_FIELD_FQDN: "stale.example",
             REGISTRY_FIELD_TOKEN_REF: "ref",
             REGISTRY_FIELD_CREATED_AT: "2026-07-14T00:00:00+00:00",
@@ -1013,6 +1019,7 @@ async def test_attach_does_no_storage_work_and_forwards_no_env(
         registry_key(user.id),
         mapping={
             REGISTRY_FIELD_APP_NAME: app_name_for(app_id),
+            REGISTRY_FIELD_ALIAS: new_alias(),
             REGISTRY_FIELD_FQDN: "existing.example",
             REGISTRY_FIELD_TOKEN_REF: "ref",
             REGISTRY_FIELD_CREATED_AT: "2026-07-14T00:00:00+00:00",
@@ -1732,6 +1739,7 @@ async def _the_container_is_already_up(
         registry_key(user_id),
         mapping={
             REGISTRY_FIELD_APP_NAME: app_name,
+            REGISTRY_FIELD_ALIAS: new_alias(),
             REGISTRY_FIELD_FQDN: fqdn,
             REGISTRY_FIELD_TOKEN_REF: f"ref-{app_name}",
             REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
@@ -2164,6 +2172,7 @@ async def test_save_still_succeeds_while_the_app_is_switched_off(
         registry_key(user.id),
         mapping={
             REGISTRY_FIELD_APP_NAME: app_name_for(app_id),
+            REGISTRY_FIELD_ALIAS: new_alias(),
             REGISTRY_FIELD_FQDN: "live.example",
             REGISTRY_FIELD_TOKEN_REF: "ref",
             REGISTRY_FIELD_CREATED_AT: "2026-09-07T00:00:00+00:00",
@@ -2366,6 +2375,7 @@ async def test_attaching_to_a_live_container_does_not_re_copy_the_window(
         registry_key(user.id),
         mapping={
             REGISTRY_FIELD_APP_NAME: app_name_for(app_id),
+            REGISTRY_FIELD_ALIAS: new_alias(),
             REGISTRY_FIELD_FQDN: "existing.example",
             REGISTRY_FIELD_TOKEN_REF: "ref",
             REGISTRY_FIELD_CREATED_AT: "2026-07-14T00:00:00+00:00",

@@ -44,6 +44,7 @@ from src.services.redis import (
     registry_key,
 )
 from src.services.redis.keys import (
+    REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -51,6 +52,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_TOKEN_REF,
 )
 from src.services.sandbox import SandboxHandle
+from src.services.sandbox.base import new_alias
 from src.services.turns.engine import TurnEngine, _TurnState
 from tests.fakes import FakeSandboxClient, a_sandbox_name
 
@@ -67,6 +69,7 @@ async def _register(
         registry_key(user),
         mapping={
             REGISTRY_FIELD_APP_NAME: app_name,
+            REGISTRY_FIELD_ALIAS: new_alias(),
             REGISTRY_FIELD_FQDN: f"{app_name}.example",
             REGISTRY_FIELD_TOKEN_REF: "ref-123",
             REGISTRY_FIELD_CREATED_AT: "2026-08-11T00:00:00+00:00",

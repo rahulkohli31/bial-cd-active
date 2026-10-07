@@ -173,6 +173,7 @@ ordinary cross-origin reads the CORS layer already governs."""
 
 
 def create_app() -> FastAPI:
+    from src.api.internal.router import router as internal_router
     from src.api.v1.router import v1_router
     from src.core.errors import register_exception_handlers
     from src.services.ratelimit import install_rate_limiting
@@ -293,6 +294,7 @@ def create_app() -> FastAPI:
         app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
     app.include_router(v1_router)
+    app.include_router(internal_router)
     _mount_spa(app)
     return app
 
@@ -300,8 +302,9 @@ def create_app() -> FastAPI:
 # Path segments owned by the API — the SPA history fallback must refuse them so an
 # unmatched /v1/... stays a JSON 404, never the SPA's index.html. (The old-JSX runner
 # that mounted at bare /apps was retired — deployed apps are served from the sandbox's
-# own Caddy, not this control plane, so /apps is no longer reserved here.)
-_RESERVED_ROOTS = frozenset({"v1", "api"})
+# own Caddy, not this control plane, so /apps is no longer reserved here.) `internal` is the
+# edge's alias lookup: a mistyped path under it must not answer 200 with the SPA shell.
+_RESERVED_ROOTS = frozenset({"v1", "api", "internal"})
 
 
 def _mount_spa(app: FastAPI) -> None:

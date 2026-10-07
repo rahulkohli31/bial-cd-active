@@ -41,6 +41,7 @@ from src.services.redis import (
     registry_scan_patterns,
 )
 from src.services.redis.keys import (
+    REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -51,6 +52,7 @@ from src.services.redis.keys import (
     starting_key,
 )
 from src.services.sandbox import DevStatus, SandboxError, SandboxHandle, SandboxNotReadyError
+from src.services.sandbox.base import new_alias
 from src.services.storage import StorageError, StorageNotFoundError, snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import ProjectFactory, UserFactory
@@ -83,7 +85,13 @@ NO_SAVED_BUILD = "No saved build to relaunch. Build the app first."
 
 
 async def _register_container(
-    redis, user_id: uuid.UUID, app_name: str, *, state: str, serving_since: str
+    redis,
+    user_id: uuid.UUID,
+    app_name: str,
+    *,
+    state: str,
+    serving_since: str,
+    alias: str | None = None,
 ) -> None:
     """Write the registry hash by hand rather than through a relaunch: this route reads the
     registry and nothing else, so a provisioning path in the setup would test the path
@@ -106,6 +114,7 @@ async def _register_container(
             REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
             REGISTRY_FIELD_STATE: state,
             REGISTRY_FIELD_SERVING_SINCE: serving_since,
+            **({REGISTRY_FIELD_ALIAS: alias} if alias is not None else {}),
         },
     )
 
@@ -221,15 +230,22 @@ async def test_a_live_container_for_this_project_is_alive_with_a_framable_url(
 ) -> None:
     user, project = await _user_project(db_session, "ps-alive@rvaiglobal.com")
     app_id = await _built(db_session, user, project)
+    alias = new_alias()
     await _register_container(
-        fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY, serving_since=SERVED
+        fake_redis,
+        user.id,
+        app_name_for(app_id),
+        state=REGISTRY_STATE_READY,
+        serving_since=SERVED,
+        alias=alias,
     )
 
     body = await _probe(client, user, project)
 
     assert body["state"] == "alive"
     assert body["alive"] is True
-    assert body["previewUrl"] == (f"https://citizenapps.bialairport.com/a/{app_name_for(app_id)}")
+    assert body["previewUrl"] == f"https://citizenapps.bialairport.com/a/{alias}"
+    assert app_name_for(app_id) not in body["previewUrl"]
     assert "azurecontainerapps.io" not in body["previewUrl"]
     assert set(body) == {
         "state",
@@ -243,6 +259,22 @@ async def test_a_live_container_for_this_project_is_alive_with_a_framable_url(
     # ALIVE NOW MEANS SERVED. This container carries a real stamp, so the answer comes off the
     # proven arm rather than the pre-cutover grandfather — see the serving-proof section below.
     assert body["servingSince"] is not None
+
+
+async def test_a_container_from_before_aliases_is_framed_at_the_address_it_serves(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """A record with no alias is a container the sweep is about to retire; until then it serves
+    at its own name, and framing anything else would show a blank preview over a healthy one."""
+    user, project = await _user_project(db_session, "ps-legacy-alias@rvaiglobal.com")
+    app_id = await _built(db_session, user, project)
+    await _register_container(
+        fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY, serving_since=SERVED
+    )
+
+    body = await _probe(client, user, project)
+
+    assert body["previewUrl"] == f"https://citizenapps.bialairport.com/a/{app_name_for(app_id)}"
 
 
 async def test_whoever_holds_the_workspace_this_project_reads_asleep_and_restorable(

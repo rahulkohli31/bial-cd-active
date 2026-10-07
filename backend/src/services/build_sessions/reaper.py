@@ -71,6 +71,7 @@ from src.services.build_sessions.snapshot import (
 )
 from src.services.redis import REGISTRY_STATE_READY, registry_key, registry_scan_patterns
 from src.services.redis.keys import (
+    REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -940,6 +941,9 @@ async def _a_claim_still_stands(
 ) -> bool:
     """Does anything still claim this container? The sweep's whole sparing rule, as three claims.
 
+    A RECORD WITH NO ALIAS CLAIMS NOTHING: it is a container from before aliases, and draining it
+    (work written back first) is how the owner's next start brings it back with an alias.
+
     A START IN FLIGHT (the starting marker) covers the registry hash landing before the
     heartbeat's seed, and its mandatory TTL is its bound. A TURN (the lease, or the lock and
     heartbeat together) is bounded by the OUTER mark: one loop renews all three, so a jam holds
@@ -950,6 +954,8 @@ async def _a_claim_still_stands(
     The container's identity (`_container_age_source`, one ARM tag read) is fetched AT MOST
     ONCE, lazily, and only once something is actually about to be spared — never for a record
     neither claim reaches at all."""
+    if not reg.get(REGISTRY_FIELD_ALIAS):
+        return False
     if await read_starting_marker(redis, user_uuid) is not None:
         return True
     now = datetime.now(UTC)

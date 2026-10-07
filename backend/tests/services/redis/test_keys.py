@@ -13,6 +13,7 @@ Redis.
 
 from __future__ import annotations
 
+import fnmatch
 import uuid
 from collections.abc import Callable
 
@@ -20,10 +21,12 @@ import pytest
 
 from src.config import settings
 from src.services.redis.keys import (
+    ALIAS_TTL_SECONDS,
     LEGACY_KEY_PREFIX,
     REGISTRY_FIELDS,
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
+    alias_key,
     heartbeat_key,
     key_prefix,
     lake_file_key,
@@ -36,6 +39,7 @@ from src.services.redis.keys import (
     registry_key,
     registry_scan_patterns,
 )
+from src.services.sandbox.base import new_alias
 
 # Two DISTINCT fixed UUIDs so format + disjointness assertions are deterministic.
 _U1 = uuid.UUID("019f1c00-0000-7000-8000-000000000001")
@@ -155,6 +159,40 @@ def test_a_lake_file_key_refuses_anything_that_is_not_a_sha256_digest(not_a_dige
         lake_file_key(not_a_digest)
 
 
+def test_the_alias_key_is_byte_stable_and_outside_the_registry_scan() -> None:
+    alias = "0123456789abcdef0123456789abcdef"
+    assert alias_key(alias) == f"bial:{_ENV}:sandbox:alias:{alias}"
+    assert ALIAS_TTL_SECONDS == 24 * 60 * 60
+    for pattern in registry_scan_patterns():
+        assert not fnmatch.fnmatchcase(alias_key(alias), pattern), (
+            "the sweep reads registry keys as claims about containers; an alias key is not one"
+        )
+
+
+@pytest.mark.parametrize(
+    "not_an_alias",
+    [
+        "",
+        "sbx-" + "a" * 28,  # a container name
+        "A" * 32,  # hex, but not the spelling we write
+        "a" * 31,
+        "a" * 33,
+        "a" * 31 + ":",  # a separator smuggled in at the end
+    ],
+    ids=["empty", "container-name", "uppercase", "too-short", "too-long", "smuggled-colon"],
+)
+def test_an_alias_key_refuses_anything_that_is_not_32_lowercase_hex(not_an_alias: str) -> None:
+    with pytest.raises(ValueError, match="32 lowercase hex"):
+        alias_key(not_an_alias)
+
+
+def test_a_minted_alias_is_one_a_key_accepts_and_is_new_every_time() -> None:
+    aliases = {new_alias() for _ in range(50)}
+    assert len(aliases) == 50
+    for alias in aliases:
+        assert alias_key(alias).endswith(f":alias:{alias}")
+
+
 # --- The environment segment is the whole point -------------------------------------------
 
 
@@ -233,6 +271,7 @@ def test_registry_fields_are_the_frozen_set() -> None:
             "token_ref",
             "created_at",
             "state",
+            "alias",
             # THE ONLY FIELD ON THIS HASH THAT MEANS THE APP ANSWERED A REQUEST. `state` is a
             # reaper-lifecycle label — its two values say whether the container is being torn
             # down — and the platform reporting `state=ready` as "your app is running" is the

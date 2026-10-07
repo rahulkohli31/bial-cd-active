@@ -36,6 +36,7 @@ _BASE_ENV: dict[str, object] = {
     # superadmin_emails and SUPPORT_CONTACT_EMAIL are both required, no default.
     "superadmin_emails": ["admin@bial.com"],
     "SUPPORT_CONTACT_EMAIL": "help@bial.com",
+    "INTERNAL_ROUTE_TOKEN": "test-internal-route-token-0123456789abcdef",
 }
 
 
