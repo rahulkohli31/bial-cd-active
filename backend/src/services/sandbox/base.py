@@ -346,9 +346,8 @@ class SandboxHandle:
     fires once `next dev` is LISTENING, before the first route has compiled, and a dev server
     the agent started itself would be invisible to a child-state check forever."""
     base_path: str = ""
-    """The path the container serves under, `/a/<alias>` for every container made since aliases.
-    Empty means the container's own name, which is what a container from before aliases serves
-    at; nothing made now leaves it empty."""
+    """The path the container serves under, `/a/<alias>` for a preview or shared view. Empty means
+    the container's own name, which is all a handle built only to tear a container down knows."""
 
     @property
     def app_root_url(self) -> str:

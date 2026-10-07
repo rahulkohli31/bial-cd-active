@@ -993,10 +993,9 @@ class AcaSandboxClient(SandboxClient):
             return None
 
     async def _read_base_path(self, app_name: str) -> str:
-        """The path a container serves under, read off its own ACA env. A container whose env
-        carries none serves at its own name, the only path one made before aliases had. A failed
-        read is `SandboxNotReadyError`, never that guess: a wrong path 404s every probe of an app
-        that is running."""
+        """The path a container serves under, read off its own ACA env; its own name when the env
+        carries none. A failed read is `SandboxNotReadyError`, never a guess: a wrong path 404s
+        every probe of an app that is running."""
         try:
             raw = await self._aca.get_app_env_value(name=app_name, key=_BASE_PATH_ENV)
         except (AcaError, AcaTransientError) as exc:  # fmt: skip  # ruff py314 strips parens
@@ -1124,12 +1123,10 @@ class AcaSandboxClient(SandboxClient):
         # The supervisor bearer lives ONLY in the container env (the supervisor keeps it out of
         # the scrubbed child env) and in-process; Redis stores a token_ref, never the token.
         #
-        # WHERE THIS APP IS SERVED FROM, minted here rather than passed in. This is the one seam
-        # EVERY birth passes through — provision, restore and shared view — so each new container
-        # gets a new alias and a relaunch cannot strand the preview at an address the router will
-        # never produce. It is deliberately NOT in `build_app_env`: the publish path calls that
-        # same builder, and a preview's alias added there would ship into published containers
-        # whose images were built under their `pub-` name.
+        # WHERE THIS APP IS SERVED FROM, minted at the one seam every birth passes through. It is
+        # deliberately NOT in `build_app_env`: the publish path calls that same builder, and a
+        # preview's alias added there would ship into published containers whose images were built
+        # under their `pub-` name.
         alias = new_alias()
         base_path = base_path_for(alias)
         env = {

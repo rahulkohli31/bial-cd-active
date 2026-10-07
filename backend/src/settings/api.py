@@ -77,8 +77,7 @@ class ApiSettings(CoreSettings):
     # WHAT THE PORTAL EDGE PRESENTS to the internal alias lookup, the one route that answers
     # without a user. The portal carries the same value under the same name, so rotating it is a
     # coordinated restart of both. No default: a backend with nothing to refuse a caller against
-    # must not start. The minimum length is the shortest value that is a real secret rather than
-    # a placeholder (`secrets.token_urlsafe(32)` is 43 characters).
+    # must not start.
     INTERNAL_ROUTE_TOKEN: SecretStr = Field(min_length=32)
 
     # ============================================================ REQUIRED IN PRODUCTION

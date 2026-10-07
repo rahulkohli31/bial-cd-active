@@ -36,11 +36,9 @@ SECRET_REFUSED_EVENT: Final = "internal_route_secret_refused"
 LOOKUP_FAILED_EVENT: Final = "internal_route_lookup_failed"
 
 
-def _the_edge_is_asking(presented: str | None) -> bool:
+def _the_edge_is_asking(presented: str) -> bool:
     """Constant time over bytes: `compare_digest` raises on a non-ASCII `str`, which would turn a
-    malformed header into a 500 instead of a refusal."""
-    if not presented:
-        return False
+    malformed header into a 500 instead of a refusal. An empty one never equals the secret."""
     expected = settings.INTERNAL_ROUTE_TOKEN.get_secret_value()
     return hmac.compare_digest(presented.encode(), expected.encode())
 
@@ -49,7 +47,8 @@ async def _container_behind(alias: str) -> str | None:
     """The container name this alias stands for, or `None` for anything the registry no longer
     backs. Every Redis call is single-key: production Redis is sharded."""
     redis = get_redis()
-    raw_owner = await redis.get(alias_key(alias))
+    reverse_key = alias_key(alias)
+    raw_owner = await redis.get(reverse_key)
     if raw_owner is None:
         return None
     try:
@@ -61,14 +60,14 @@ async def _container_behind(alias: str) -> str | None:
     )
     if held_alias != alias or not app_name:
         return None
-    await redis.expire(alias_key(alias), ALIAS_TTL_SECONDS)
+    await redis.expire(reverse_key, ALIAS_TTL_SECONDS)
     return str(app_name)
 
 
 @router.get("/app-routes/{alias}")
 async def resolve_app_route(
     alias: str,
-    x_internal_route_token: Annotated[str | None, Header()] = None,
+    x_internal_route_token: Annotated[str, Header()] = "",
 ) -> Response:
     """Always 200: the container name in `X-App-Container` when the alias is current, no header
     for an unknown or retired alias, a wrong or missing secret, or a store that cannot answer.

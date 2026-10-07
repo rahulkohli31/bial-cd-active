@@ -2233,8 +2233,7 @@ class SessionManager:
                 # This site builds no `SandboxHandle`, so it is invisible to anything that
                 # follows the handle's field — and it is what the cockpit frames, so getting it
                 # wrong shows a blank preview over a perfectly healthy container. A record with
-                # no alias is a container from before aliases, which serves at its own name until
-                # the sweep retires it; that is what `attach_existing` composes for it too.
+                # no alias serves at its own name until the sweep retires it.
                 preview_url=(
                     settings.app_url(reg.get(REGISTRY_FIELD_ALIAS) or mine) if fqdn else None
                 ),
