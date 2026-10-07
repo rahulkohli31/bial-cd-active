@@ -12,16 +12,6 @@ persona a user asked for and wrote content from sources that existed only in the
 client's own test of a leave email written as a poem. Ordinary work is unaffected, including
 questions about security, safety and regulation, and replies in another language.
 
-### Deploying this release
-
-- **Rebuild the backend image for dev and prod and deploy it.** The change is in the assistant's
-  instructions only. The portal and sandbox images are unchanged, and the worker does not run the
-  assistant.
-- **No migration and no settings change.**
-- **Every conversation picks up the new instructions on its next message.** Nothing stored
-  changes. A conversation that already holds persona replies still shows them, so retest the
-  assessment's prompts in a new conversation.
-
 ### Security
 
 - **The assistant no longer takes on a character or persona,** however the request is framed: a
