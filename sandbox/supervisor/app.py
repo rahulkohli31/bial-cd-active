@@ -172,13 +172,14 @@ _SECRET_ENV_NAMES = tuple(v.name for v in _INJECTED_ENV if v.secret)
 # A shorter value can't be a real SAS/credential; redacting it would blank ordinary text.
 _MIN_SECRET_LEN = 8
 
-# The exact shape the router will actually route: `/a/` plus the container app's own name, which
-# is `sbx-`/`pub-` and 28 lowercase hex. Validated here rather than trusted because this value
-# reaches `next dev` as configuration and reaches `http.client` as a request target, and a
+# The exact shape the router will actually route: `/a/` plus either a preview's alias (32 lowercase
+# hex) or the container app's own name (`sbx-`/`pub-` and 28 lowercase hex, which a published app
+# and a container from before aliases carry). Validated here rather than trusted because this
+# value reaches `next dev` as configuration and reaches `http.client` as a request target, and a
 # malformed one would be a silent 404 in the first case and a header-injection attempt in the
 # second. Anything that does not match is treated as ABSENT, which degrades to the pre-base-path
 # behaviour — the app at `/` — rather than to a half-configured server.
-_BASE_PATH_RE = re.compile(r"^/a/(?:sbx|pub)-[0-9a-f]{28}$")
+_BASE_PATH_RE = re.compile(r"^/a/(?:[0-9a-f]{32}|(?:sbx|pub)-[0-9a-f]{28})$")
 
 
 def _base_path() -> str:
