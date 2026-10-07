@@ -4,6 +4,45 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.14] - 2026-10-07
+
+A preview's address no longer contains the name of its container. Previews and shared views now open
+at an address made of a random alias, new every time the preview is created, and the container's
+name appears in no link, redirect or cookie. A link to a published app can no longer be turned into
+its owner's live preview by editing the address. This answers the security assessment's finding on
+an exposed sandbox identifier. A preview link still opens for anyone who has it, which is how
+previews are designed to work; this change hides and renews the identifier and is not a sign-in
+gate. Published applications keep their address.
+
+### Deploying this release
+
+- **Set the same new secret on the portal and the backend before deploying.** Generate one value
+  per environment, at least 32 characters of letters, digits, `_` and `-`, and set
+  `INTERNAL_ROUTE_TOKEN` to it in both App Services. Neither starts without it. A mismatch does not
+  stop either from starting: every preview then shows "app not available". The worker does not take
+  it.
+- **Deploy in one quiet window, in this order:** the sandbox image (it accepts both address
+  shapes, so it is safe first), then the backend and the worker, then the portal, back to back.
+  Previews are unavailable from the backend restart until the portal is up. Published applications
+  are not affected.
+- **No migration.**
+- **A preview that is open when the worker starts is saved and shut down within one sweep,** a few
+  minutes, and comes back with its new address the next time its owner starts it. What it held is
+  written back first.
+- **Roll back the portal and the backend together.**
+- **After deploying, check three things:** a new preview opens at its alias, a made-up address and a
+  container's name in place of the address both show "app not available", and a published
+  application still opens.
+
+### Security
+
+- **Previews and shared views are addressed by a random alias, not by their container's name.** The
+  portal looks the alias up privately, caches the answer for about a minute, and refuses a container
+  name in the address. An alias that was never issued, or has been retired, shows "app not
+  available".
+- **The routing cookie the portal keeps for an application's own requests is no longer passed on to
+  applications,** so one application cannot read the alias of another the browser opened last.
+
 ## [1.8.13] - 2026-10-07
 
 When the assistant declines a request that serves no work purpose, it now says in general terms what

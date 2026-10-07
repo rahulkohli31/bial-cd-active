@@ -43,8 +43,10 @@ class FakeAca(AcaControlPlane):
     def __init__(self) -> None:
         self.envs: dict[str, dict[str, str]] = {}
 
-    def seed(self, name: str, *, token: str) -> None:
+    def seed(self, name: str, *, token: str, base_path: str | None = None) -> None:
         self.envs[name] = {"SUPERVISOR_TOKEN": token}
+        if base_path is not None:
+            self.envs[name]["BIAL_BASE_PATH"] = base_path
 
     def seed_without_token(self, name: str) -> None:
         """A container ARM confirms exists but whose env carries no bearer — the token-read
@@ -173,6 +175,57 @@ async def test_transient_arm_error_while_confirming_absence_is_not_ready_not_gon
 
     monkeypatch.setattr(aca, "get_app_fqdn", throttled)
     client = _client(aca)
+
+    with pytest.raises(SandboxNotReadyError):
+        await client.attach_by_name(app_name=TARGET_NAME)
+    await client.aclose()
+
+
+async def test_the_handle_serves_under_the_base_path_the_container_was_born_with() -> None:
+    """Reached by name, the outgoing container of a switch has no registry record to say which
+    alias it carries; its own env is the only place that is written down."""
+    aca = FakeAca()
+    alias_path = "/a/" + "0" * 31 + "1"
+    aca.seed(TARGET_NAME, token="tok-target", base_path=alias_path)
+    client = _client(aca, _healthy_handler)
+
+    handle = await client.attach_by_name(app_name=TARGET_NAME)
+
+    assert handle.base_path == alias_path
+    assert (
+        handle.app_root_url
+        == f"https://{TARGET_NAME}.westeurope.azurecontainerapps.io{alias_path}"
+    )
+    assert TARGET_NAME not in handle.preview_url
+    await client.aclose()
+
+
+async def test_a_container_with_no_base_path_in_its_env_serves_at_its_own_name() -> None:
+    aca = FakeAca()
+    aca.seed(TARGET_NAME, token="tok-target")
+    client = _client(aca, _healthy_handler)
+
+    handle = await client.attach_by_name(app_name=TARGET_NAME)
+
+    assert handle.base_path == f"/a/{TARGET_NAME}"
+    await client.aclose()
+
+
+async def test_an_unreadable_base_path_is_not_ready_not_a_guess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A guessed path would 404 every probe of an app that is running."""
+    aca = FakeAca()
+    aca.seed(TARGET_NAME, token="tok-target")
+    real_read = aca.get_app_env_value
+
+    async def throttled_on_the_path(*, name: str, key: str) -> str | None:
+        if key == "BIAL_BASE_PATH":
+            raise AcaTransientError("ACA get was throttled or 5xx'd")
+        return await real_read(name=name, key=key)
+
+    monkeypatch.setattr(aca, "get_app_env_value", throttled_on_the_path)
+    client = _client(aca, _healthy_handler)
 
     with pytest.raises(SandboxNotReadyError):
         await client.attach_by_name(app_name=TARGET_NAME)

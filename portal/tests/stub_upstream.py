@@ -17,6 +17,7 @@ import base64
 import datetime
 import hashlib
 import ipaddress
+import os
 import socket
 import ssl
 import tempfile
@@ -31,6 +32,11 @@ from cryptography.x509.oid import NameOID
 # RFC 6455's fixed handshake GUID. Not a secret, not configurable.
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _MAX_HEAD = 65536
+
+# As the backend's alias lookup: `alias:container` pairs, answered only to the right secret.
+_ROUTES = dict(pair.split(":") for pair in os.environ.get("STUB_ROUTES", "").split(",") if pair)
+_ROUTE_TOKEN = os.environ.get("STUB_ROUTE_TOKEN", "")
+_LOOKUP_PREFIX = "/internal/app-routes/"
 
 
 def _mint_cert() -> tuple[str, str]:
@@ -120,6 +126,29 @@ def _handle(conn: ssl.SSLSocket) -> None:
             )
             conn.recv(4096)
             return
+        if target.startswith(_LOOKUP_PREFIX):
+            alias = target.removeprefix(_LOOKUP_PREFIX)
+            name = (
+                _ROUTES.get(alias)
+                if headers.get("x-internal-route-token") == _ROUTE_TOKEN
+                else None
+            )
+            # The headers the edge must ignore to cache at all: the real backend sets no-store.
+            lines = "Cache-Control: no-store\r\nSet-Cookie: lookup=1\r\nVary: *\r\n"
+            if name:
+                lines += f"X-App-Container: {name}\r\n"
+            conn.sendall(f"HTTP/1.1 200 OK\r\n{lines}Content-Length: 0\r\n\r\n".encode())
+            return
+        status = 200
+        extra_app = ""
+        if "/__status/" in target:
+            status = int(target.split("/__status/", 1)[1].split("/")[0].split("?")[0])
+        if target.endswith("/__accel"):
+            extra_app = "X-Accel-Redirect: /__bial_route\r\n"
+        if target.endswith("/__redirect"):
+            prefix = target.removesuffix("/__redirect")
+            status = 302
+            extra_app = f"Location: https://{headers.get('host', '')}{prefix}/next\r\n"
         body = (
             f"REQ={method}|{target}|HOST={headers.get('host', '')}"
             f"|UP={headers.get('upgrade', '')}|CONN={headers.get('connection', '')}"
@@ -133,10 +162,10 @@ def _handle(conn: ssl.SSLSocket) -> None:
             "Referrer-Policy: no-referrer\r\n"
             "Strict-Transport-Security: max-age=63072000; includeSubDomains\r\n"
             if target.startswith("/v1/")
-            else "Via: 1.1 Caddy\r\nX-Powered-By: Next.js\r\n"
+            else "Via: 1.1 Caddy\r\nX-Powered-By: Next.js\r\n" + extra_app
         )
         conn.sendall(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+            f"HTTP/1.1 {status} Stub\r\nContent-Type: text/plain\r\n".encode()
             + extra.encode()
             + f"Content-Length: {len(body)}\r\n\r\n".encode()
             + body

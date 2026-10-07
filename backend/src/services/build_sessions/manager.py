@@ -125,6 +125,7 @@ from src.services.messages.store import SeqContentionError, append_batch
 from src.services.orchestrator.constants import READINESS_POLL_S
 from src.services.redis import RedisNotConfiguredError, get_redis
 from src.services.redis.keys import (
+    REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -2228,11 +2229,14 @@ class SessionManager:
             # this as "the poll did not say", exactly as it reads an unreachable store.
             return PreviewState(
                 state=PreviewLifeState.ALIVE,
-                # The PUBLIC address, composed from the app name rather than the registry
-                # FQDN. This site builds no `SandboxHandle`, so it is invisible to anything
-                # that follows the handle's field — and it is what the cockpit frames, so
-                # getting it wrong shows a blank preview over a perfectly healthy container.
-                preview_url=settings.app_url(mine) if fqdn else None,
+                # The PUBLIC address, composed from the registry's alias rather than the FQDN.
+                # This site builds no `SandboxHandle`, so it is invisible to anything that
+                # follows the handle's field — and it is what the cockpit frames, so getting it
+                # wrong shows a blank preview over a perfectly healthy container. A record with
+                # no alias serves at its own name until the sweep retires it.
+                preview_url=(
+                    settings.app_url(reg.get(REGISTRY_FIELD_ALIAS) or mine) if fqdn else None
+                ),
                 serving_since=an_instant_on_the_hash(reg, REGISTRY_FIELD_SERVING_SINCE),
             )
         if starting == project_id:

@@ -89,7 +89,7 @@ the `BIAL_*` ones for a reader inside the app.
 | `BIAL_BLOB_CONTAINER_URL` | the app's own per-app Blob container URL                               |
 | `BIAL_BLOB_SAS`           | the container-scoped SAS (secret — server-only, redacted from output)  |
 | `BIAL_DATABASE_URL`       | the project's own PostgreSQL connection string (secret, server-only)   |
-| `BIAL_BASE_PATH`          | the path this app is served under, e.g. `/a/sbx-<28 hex>` — read by `next.config.ts` |
+| `BIAL_BASE_PATH`          | the path this app is served under, e.g. `/a/<32 hex>` — read by `next.config.ts` |
 | `BIAL_APPS_HOSTNAME`      | the public hostname every generated app is served from (Server Actions origin) |
 | `BIAL_DICE_URL`           | the flight-data lake: account, container and folder in one URL — **only when the connector is approved and switched on for this project** |
 | `BIAL_DICE_CLIENT_ID`     | the managed identity's **client** id, for `ManagedIdentityCredential` — same condition |
@@ -98,7 +98,7 @@ the `BIAL_*` ones for a reader inside the app.
 
 `BIAL_BASE_PATH` and `BIAL_APPS_HOSTNAME` are set by the control plane at the provision seam only
 (`backend/src/services/sandbox/client.py`), never in `build_app_env` — a base path added there
-would ship an `sbx-` value into a `pub-` published container.
+would ship a preview's alias into a `pub-` published container.
 
 **The last four are conditional, and the condition is a security boundary.** The two `BIAL_DICE_*`
 values, the managed identity itself, and therefore Azure's `IDENTITY_*` pair are attached only

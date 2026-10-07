@@ -14,6 +14,7 @@ keyed by user except the cooperative stop, which is keyed by conversation:
     starting:{user_id}   string — start-in-flight marker (project id, TTL mandatory)
     start_failure:{user_id} string — the last failed start (JSON, TTL mandatory)
     stop:{conversation_id} string — cooperative stop ask (TTL mandatory)
+    alias:{alias}        string — public address alias → owning user id (TTL mandatory)
 
 ANOTHER DOMAIN, `bial:{environment}:lake:`, holds the connector data-plane copy — parquet
 bytes and the index that orders them. It is DELIBERATELY NOT under `sandbox:`: that segment is
@@ -44,6 +45,9 @@ from typing import Final
 # What a lake file key's discriminator must look like: exactly a sha256 hex digest.
 IS_SHA256_HEX: Final = re.compile(r"[0-9a-f]{64}")
 
+# What a public address alias must look like: exactly 32 lowercase hex (`sandbox.base.new_alias`).
+IS_ALIAS: Final = re.compile(r"[0-9a-f]{32}")
+
 # The reserved product root, shared with the taskiq families in `src/broker.py`.
 KEY_ROOT: Final = "bial:"
 
@@ -71,6 +75,7 @@ FAMILY_LEASE: Final = "lease"
 FAMILY_STARTING: Final = "starting"
 FAMILY_START_FAILURE: Final = "start_failure"
 FAMILY_COOPERATIVE_STOP: Final = "stop"
+FAMILY_ALIAS: Final = "alias"
 
 # The two lake families. `file` holds one copied parquet file's BYTES; `index` is the single
 # sorted set that orders every copied file by when it was copied, and is what the trim walks.
@@ -190,6 +195,24 @@ def cooperative_stop_key(conversation_id: uuid.UUID) -> str:
     return ns(FAMILY_COOPERATIVE_STOP, conversation_id)
 
 
+ALIAS_TTL_SECONDS: Final = 24 * 60 * 60
+"""How long an alias key outlives its last lookup. Every hit renews it, so a preview in use never
+loses its address, and an alias nobody opens expires on its own."""
+
+
+def alias_key(alias: str) -> str:
+    """`bial:{env}:sandbox:alias:{alias}` — the reverse of an alias, holding the user id whose
+    registry names the container. Looked up by the portal edge on the first request for an alias.
+
+    NEVER A CLAIM ABOUT A CONTAINER, and kept out of `registry_scan_patterns`: the lookup answers
+    only while that user's registry still holds the alias, so a key left behind after a teardown
+    can only answer no, and it expires. Nothing deletes it. A `str` alias is shape-checked for the
+    reason `ns()` checks its user id: a `:` could forge a different family."""
+    if not IS_ALIAS.fullmatch(alias):
+        raise ValueError("an alias key is built from 32 lowercase hex, nothing else")
+    return f"{key_prefix()}{FAMILY_ALIAS}:{alias}"
+
+
 def legacy_registry_key(user_id: uuid.UUID) -> str:
     """`bial:sandbox:registry:{user_id}` — the legacy registry key. **READ-ONLY.**
 
@@ -268,6 +291,11 @@ REGISTRY_FIELD_FQDN: Final = "fqdn"
 REGISTRY_FIELD_TOKEN_REF: Final = "token_ref"
 REGISTRY_FIELD_CREATED_AT: Final = "created_at"
 REGISTRY_FIELD_STATE: Final = "state"
+
+# THE CONTAINER'S PUBLIC ADDRESS KEY — what a browser's URL carries instead of `app_name`. Written
+# with the record at create and never changed for that container; the next container gets a new
+# one. Absent on a record written before aliases, which is how the sweep knows to retire it.
+REGISTRY_FIELD_ALIAS: Final = "alias"
 
 # THE SERVING PROOF: the ISO-8601 UTC instant at which something WATCHED this container's app
 # answer a request. The only field on the hash that means "the app worked" — `state` above says
@@ -366,6 +394,7 @@ REGISTRY_FIELDS: Final = frozenset(
         REGISTRY_FIELD_TOKEN_REF,
         REGISTRY_FIELD_CREATED_AT,
         REGISTRY_FIELD_STATE,
+        REGISTRY_FIELD_ALIAS,
         REGISTRY_FIELD_SERVING_SINCE,
         REGISTRY_FIELD_WAITING_SINCE,
         REGISTRY_FIELD_PREVIEW_STAY_UNTIL,

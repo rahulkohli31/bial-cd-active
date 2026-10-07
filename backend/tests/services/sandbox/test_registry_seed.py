@@ -33,6 +33,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_WAITING_SINCE,
 )
+from src.services.sandbox.base import new_alias
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
 from tests.fakes import a_sandbox_name
@@ -91,7 +92,11 @@ async def test_a_new_container_says_it_has_never_served(fake_redis: aioredis.Red
     await _the_previous_occupant(fake_redis, user)
 
     await _a_client()._write_registry(
-        user, app_name=_SUCCESSOR, fqdn=f"{_SUCCESSOR}.example", token_ref="ref-fresh"
+        user,
+        app_name=_SUCCESSOR,
+        alias=new_alias(),
+        fqdn=f"{_SUCCESSOR}.example",
+        token_ref="ref-fresh",
     )
 
     assert await fake_redis.hexists(registry_key(user), REGISTRY_FIELD_SERVING_SINCE) == 1, (
@@ -114,7 +119,11 @@ async def test_a_new_container_inherits_neither_the_last_occupants_proof_nor_its
     await _the_previous_occupant(fake_redis, user)
 
     await _a_client()._write_registry(
-        user, app_name=_SUCCESSOR, fqdn=f"{_SUCCESSOR}.example", token_ref="ref-fresh"
+        user,
+        app_name=_SUCCESSOR,
+        alias=new_alias(),
+        fqdn=f"{_SUCCESSOR}.example",
+        token_ref="ref-fresh",
     )
 
     reg = await fake_redis.hgetall(registry_key(user))
@@ -139,7 +148,11 @@ async def test_the_record_is_born_ready_and_unproven_at_the_same_instant(
     user = uuid.uuid4()
 
     await _a_client()._write_registry(
-        user, app_name=_SUCCESSOR, fqdn=f"{_SUCCESSOR}.example", token_ref="ref-fresh"
+        user,
+        app_name=_SUCCESSOR,
+        alias=new_alias(),
+        fqdn=f"{_SUCCESSOR}.example",
+        token_ref="ref-fresh",
     )
 
     reg = await fake_redis.hgetall(registry_key(user))
@@ -165,7 +178,11 @@ async def test_a_new_container_waits_from_its_own_birth_not_the_last_occupants_w
     )
 
     await _a_client()._write_registry(
-        user, app_name=_SUCCESSOR, fqdn=f"{_SUCCESSOR}.example", token_ref="ref-fresh"
+        user,
+        app_name=_SUCCESSOR,
+        alias=new_alias(),
+        fqdn=f"{_SUCCESSOR}.example",
+        token_ref="ref-fresh",
     )
 
     reg = await fake_redis.hgetall(registry_key(user))

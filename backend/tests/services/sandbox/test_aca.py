@@ -10,6 +10,7 @@ not here.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -18,14 +19,18 @@ import httpx
 import pytest
 import redis.asyncio as aioredis
 from pydantic import SecretStr
+from redis.exceptions import RedisError
 
 from src.services.build_sessions.locks import stay_of_execution_is_current
 from src.services.redis import REGISTRY_STATE_ENDING, REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import (
+    ALIAS_TTL_SECONDS,
+    REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
+    alias_key,
 )
 from src.services.sandbox import client as client_module
 from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError
@@ -825,25 +830,26 @@ async def test_a_provisioned_sandbox_is_told_where_it_is_served_from(
 ) -> None:
     """MUTATION CHECK: drop the injection from `_provision_container` and this fails.
 
-    The value is DERIVED from the container's own name, which is what makes an app's address a
-    string composition rather than a lookup — the router at the edge holds no registry.
+    The value is a minted alias, never the container's own name: the name is what the edge
+    keeps private.
     """
     aca = FakeAca()
     client = _client(aca)
     await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
     env = aca.created[APP_NAME]
-    assert env["BIAL_BASE_PATH"] == f"/a/{APP_NAME}"
+    assert re.fullmatch(r"/a/[0-9a-f]{32}", env["BIAL_BASE_PATH"])
+    assert APP_NAME not in env["BIAL_BASE_PATH"]
     assert env["BIAL_APPS_HOSTNAME"] == "citizenapps.bialairport.com"
     await client.aclose()
 
 
-async def test_a_restored_sandbox_comes_back_at_the_same_path(
+async def test_a_restored_sandbox_comes_back_under_a_new_alias(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """A relaunch that stranded the preview at a path the router will never produce would be
-    invisible: the container is healthy, the dev server is serving, and the frame is blank.
-    Deriving at the shared provision seam rather than at each call site is what makes this hold
-    for restore, relaunch and a fresh provision alike, without three places to keep in step."""
+    """A preview gets a new alias every time its container is created, so the address a
+    retired container held stops routing and is never handed out again. Minting at the shared
+    provision seam rather than at each call site is what makes that hold for provision, restore
+    and a shared view alike, without three places to keep in step."""
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -853,8 +859,62 @@ async def test_a_restored_sandbox_comes_back_at_the_same_path(
 
     client = _client(aca, handler)
     await fake_storage.put(snapshot_key(APP_ID), a_git_bundle())
-    await client.restore_from_snapshot(str(USER), APP_NAME, app_env=_app_env())
-    assert aca.created[APP_NAME]["BIAL_BASE_PATH"] == f"/a/{APP_NAME}"
+    first = await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+    second = await client.restore_from_snapshot(str(USER), APP_NAME, app_env=_app_env())
+    assert first.base_path != second.base_path
+    assert aca.created[APP_NAME]["BIAL_BASE_PATH"] == second.base_path
+    await client.aclose()
+
+
+async def test_the_alias_is_in_the_registry_and_the_reverse_key_the_edge_looks_up(
+    fake_redis: aioredis.Redis,
+) -> None:
+    aca = FakeAca()
+    client = _client(aca)
+    handle = await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+
+    alias = handle.base_path.removeprefix("/a/")
+    assert await fake_redis.hget(registry_key(USER), REGISTRY_FIELD_ALIAS) == alias
+    assert await fake_redis.get(alias_key(alias)) == str(USER)
+    assert 0 < await fake_redis.ttl(alias_key(alias)) <= ALIAS_TTL_SECONDS
+    await client.aclose()
+
+
+async def test_a_shared_view_is_given_its_own_alias_for_the_recipient(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    recipient = uuid.uuid4()
+    aca = FakeAca()
+    client = _client(aca)
+    await fake_storage.put(snapshot_key(APP_ID), a_git_bundle())
+    handle = await client.restore_from_snapshot(
+        str(recipient), "shr-abc123", app_env=_app_env(), kind="shared_sandbox"
+    )
+
+    alias = handle.base_path.removeprefix("/a/")
+    assert re.fullmatch(r"[0-9a-f]{32}", alias)
+    assert await fake_redis.get(alias_key(alias)) == str(recipient)
+    assert "shr-abc123" not in handle.preview_url
+    await client.aclose()
+
+
+async def test_a_failed_alias_write_takes_the_container_back_with_it(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reverse key is the first Redis write of the create step, so its failure leaves no
+    record and the existing undo tears the container down."""
+    aca = FakeAca()
+    client = _client(aca)
+
+    async def refuse(*args: object, **kwargs: object) -> None:
+        raise RedisError("the shard refused the write")
+
+    monkeypatch.setattr(fake_redis, "set", refuse)
+    with pytest.raises(RedisError):
+        await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+
+    assert aca.deleted == [APP_NAME]
+    assert await fake_redis.exists(registry_key(USER)) == 0
     await client.aclose()
 
 
@@ -880,7 +940,10 @@ async def test_the_handle_hands_the_browser_the_public_address(
     aca = FakeAca()
     client = _client(aca)
     handle = await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
-    assert handle.preview_url == f"https://citizenapps.bialairport.com/a/{APP_NAME}"
+    assert re.fullmatch(
+        r"https://citizenapps\.bialairport\.com/a/[0-9a-f]{32}", handle.preview_url
+    )
+    assert APP_NAME not in handle.preview_url
     assert ".azurecontainerapps.io" not in handle.preview_url
     await client.aclose()
 
@@ -900,7 +963,8 @@ async def test_the_control_plane_keeps_the_direct_private_address(
     handle = await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
 
     assert handle.fqdn.endswith(".azurecontainerapps.io")
-    assert handle.app_root_url == f"https://{handle.fqdn}/a/{APP_NAME}"
+    assert handle.app_root_url == f"https://{handle.fqdn}{handle.base_path}"
+    assert handle.base_path == aca.created[APP_NAME]["BIAL_BASE_PATH"]
     assert "citizenapps" not in handle.app_root_url
     # The two addresses reach the same app and are deliberately different hosts.
     assert handle.app_root_url.split("/a/")[0] != handle.preview_url.split("/a/")[0]
@@ -925,6 +989,32 @@ async def test_attach_agrees_with_provision_about_where_a_person_goes(
     provisioned = await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
     attached = await client.attach_existing(str(USER))
     assert attached.preview_url == provisioned.preview_url
+    await client.aclose()
+
+
+async def test_attach_to_a_container_from_before_aliases_serves_at_its_own_name(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """A record with no alias is a container made before aliases, which the sweep retires. Until
+    it does, the control plane must still reach it where it actually serves."""
+    aca = FakeAca()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/exec":
+            return _seed_reply()
+        if request.url.path.endswith("/dev/status"):
+            return httpx.Response(200, json={"running": True, "ready": True, "port": 3000})
+        return httpx.Response(200, json={"ok": True})
+
+    client = _client(aca, handler)
+    provisioned = await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+    assert (await client.attach_existing(str(USER))).base_path == provisioned.base_path
+
+    await fake_redis.hdel(registry_key(USER), REGISTRY_FIELD_ALIAS)
+    attached = await client.attach_existing(str(USER))
+
+    assert attached.base_path == f"/a/{APP_NAME}"
+    assert attached.app_root_url == f"https://{attached.fqdn}/a/{APP_NAME}"
     await client.aclose()
 
 

@@ -71,6 +71,7 @@ from src.services.build_sessions.snapshot import (
 )
 from src.services.redis import REGISTRY_STATE_READY, registry_key, registry_scan_patterns
 from src.services.redis.keys import (
+    REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -950,6 +951,10 @@ async def _a_claim_still_stands(
     The container's identity (`_container_age_source`, one ARM tag read) is fetched AT MOST
     ONCE, lazily, and only once something is actually about to be spared — never for a record
     neither claim reaches at all."""
+    # No alias means a container from before aliases: drained (work written back first), so the
+    # owner's next start brings it back with one.
+    if not reg.get(REGISTRY_FIELD_ALIAS):
+        return False
     if await read_starting_marker(redis, user_uuid) is not None:
         return True
     now = datetime.now(UTC)
