@@ -29,6 +29,9 @@ anywhere in the schema.
   object-store entries.
 - Super-admins (ADR-0005) may legitimately read across users. That access always goes
   through an explicit, audited permission check — never by omitting the scope.
+- One route is exempt from the scope: the internal lookup the portal edge uses to resolve a
+  preview's alias, whose caller holds no user (ADR-0033). It answers only while the owner's own
+  record still holds the alias.
 
 Generated apps additionally get per-project database isolation: one PostgreSQL database
 and one scoped role per project (ADR-0028), provisioned when the project is created. That
