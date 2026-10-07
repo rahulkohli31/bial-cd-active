@@ -22,6 +22,9 @@
 #   PORTAL_ORIGIN (REQUIRED)         # the portal's own origin, e.g.
 #                                    # https://blrcitizen.bialairport.com. Link target on the
 #                                    # apps site's 404 page.
+#   INTERNAL_ROUTE_TOKEN (REQUIRED)  # shared secret the edge presents to the backend's internal
+#                                    # alias lookup; the same value as the backend's setting of
+#                                    # the same name. Letters, digits, _ and -; 32+ characters.
 
 # ── Stage 1: build the SPA (Node at BUILD time only) ─────────────────────────
 FROM node:24-trixie-slim AS build
@@ -82,8 +85,8 @@ RUN sed -i 's/\r$//' /etc/nginx/templates/default.conf.template \
     && sed -i 's/\r$//' /docker-entrypoint.d/19-require-apps-domain.sh \
     && chmod +x /docker-entrypoint.d/19-require-apps-domain.sh
 
-# NOTE: APPS_DOMAIN, APPS_HOSTNAME, PORTAL_ORIGIN and DNS_RESOLVER have NO ENV defaults here
-# (fail-first) — all are deployment-specific (a Docker-correct DNS_RESOLVER default would be
+# NOTE: APPS_DOMAIN, APPS_HOSTNAME, PORTAL_ORIGIN, INTERNAL_ROUTE_TOKEN and DNS_RESOLVER have NO
+# ENV defaults here (fail-first) — all are deployment-specific (a Docker-correct DNS_RESOLVER default would be
 # silently wrong on App Service) and the guard above enforces their presence and their shape.
 # PORT/BACKEND_URL keep their container-network defaults.
 ENV PORT=8080 \

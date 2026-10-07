@@ -23,6 +23,10 @@
 #     like "the app renders the portal", not like a routing error.
 #   - PORTAL_ORIGIN is the link target on the apps site's 404 page — the way back for an
 #     employee who followed a stale link. Missing -> envsubst emits `href=""`, a dead button.
+#   - INTERNAL_ROUTE_TOKEN is the secret the edge presents to the backend's internal alias lookup.
+#     Missing -> the lookup is refused and every preview becomes "app not available". Its shape
+#     matters because it is substituted into a quoted nginx directive; a stray quote or `;` would
+#     break or inject into the config. Never echoed below: it is a secret.
 #   - DNS_RESOLVER feeds `resolver ${DNS_RESOLVER}` so nginx re-resolves upstreams at request
 #     time (App Service private endpoints; a boot-time-pinned IP caused the "Web App -
 #     Unavailable" 403 loop). It is now load-bearing for BOTH sites: without it the apps site's
@@ -116,6 +120,29 @@ case "${PORTAL_ORIGIN}" in
     exit 1
     ;;
 esac
+
+if [ -z "${INTERNAL_ROUTE_TOKEN:-}" ]; then
+  echo "FATAL: INTERNAL_ROUTE_TOKEN is unset or empty." >&2
+  echo "       Set it to the same value as the backend's INTERNAL_ROUTE_TOKEN — the edge" >&2
+  echo "       presents it to the backend's internal alias lookup, and without it every" >&2
+  echo "       preview is answered \"app not available\". Refusing to start." >&2
+  exit 1
+fi
+
+case "${INTERNAL_ROUTE_TOKEN}" in
+  *[!A-Za-z0-9_-]*)
+    echo "FATAL: INTERNAL_ROUTE_TOKEN must contain only letters, digits, '_' and '-'." >&2
+    echo "       It is substituted into a quoted nginx directive, so any other character" >&2
+    echo "       could break or inject into the config. Refusing to start." >&2
+    exit 1
+    ;;
+esac
+
+if [ "${#INTERNAL_ROUTE_TOKEN}" -lt 32 ]; then
+  echo "FATAL: INTERNAL_ROUTE_TOKEN must be at least 32 characters." >&2
+  echo "       It is a shared secret; a short one is guessable. Refusing to start." >&2
+  exit 1
+fi
 
 if [ -z "${DNS_RESOLVER:-}" ]; then
   echo "FATAL: DNS_RESOLVER is unset or empty." >&2
