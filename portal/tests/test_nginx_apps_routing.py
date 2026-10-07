@@ -136,7 +136,7 @@ def test_a_malformed_key_is_404_and_never_another_app(router: Router, bad: str) 
     for an attacker-named host — and, just as importantly, it must not fall through to the
     keyless arm, which would resolve it from a cookie and serve SOMEONE ELSE'S app under the
     address the person typed."""
-    status, _, body = router.request(f"/a/{bad}/", headers={"Cookie": f"bial_app={ALIAS}"})
+    status, _, body = router.request(f"/a/{bad}/", headers={"Cookie": f"__Host-bial_app={ALIAS}"})
     assert status == 404
     assert "REQ=" not in body
 
@@ -153,6 +153,12 @@ def test_a_path_that_names_two_aliases_is_refused_not_routed_under_one(router: R
     """The lookup reads the raw request URI and this location matches the normalized one, so a
     request whose two disagree must not be looked up as one alias and routed as another."""
     status, _, body = router.request(f"/a/{ALIAS}/../../a/{OTHER_ALIAS}/x")
+    assert status == 404
+    assert "REQ=" not in body
+    # The keyless arm has the same exposure: a raw path naming one alias that normalizes away from
+    # `/a/`, with the Referer naming another.
+    referer = {"Referer": f"https://{APPS_HOSTNAME}/a/{OTHER_ALIAS}/page"}
+    status, _, body = router.request(f"/a/{ALIAS}/../../x", headers=referer)
     assert status == 404
     assert "REQ=" not in body
 
@@ -265,7 +271,7 @@ def test_supervisor_surface_is_refused_at_the_router(router: Router, target: str
     rather than depend on a check designed for a different threat. The `shr-` case (#198) is
     the one the issue names explicitly: a shared-runtime container's supervisor must be exactly
     as unreachable as a build sandbox's or a published app's."""
-    status, _, body = router.request(target, headers={"Cookie": f"bial_app={ALIAS}"})
+    status, _, body = router.request(target, headers={"Cookie": f"__Host-bial_app={ALIAS}"})
     assert status == 404
     assert "REQ=" not in body
 
@@ -395,7 +401,7 @@ def test_referer_beats_cookie_so_two_open_tabs_stay_correct(router: Router) -> N
         "/api/items",
         headers={
             "Referer": f"https://{APPS_HOSTNAME}/a/{ALIAS}/page",
-            "Cookie": f"bial_app={OTHER_ALIAS}",
+            "Cookie": f"__Host-bial_app={OTHER_ALIAS}",
         },
     )
     assert _target(body) == f"/a/{ALIAS}/api/items"
@@ -405,7 +411,7 @@ def test_referer_beats_cookie_so_two_open_tabs_stay_correct(router: Router) -> N
 def test_cookie_answers_a_top_level_navigation_with_no_referer(router: Router) -> None:
     _, _, body = router.request(
         "/reports",
-        headers={"Cookie": f"bial_app={PUB_KEY}", "Sec-Fetch-Mode": "navigate"},
+        headers={"Cookie": f"__Host-bial_app={PUB_KEY}", "Sec-Fetch-Mode": "navigate"},
     )
     assert _target(body) == f"/a/{PUB_KEY}/reports"
 
@@ -424,7 +430,7 @@ def test_plain_html_and_browser_originated_requests_arrive_prefixed(
     """`basePath` rewrites what the FRAMEWORK generates. It does not touch a plain `<img src>`,
     a CSS `url()`, or `/favicon.ico`, so this arm carries steady traffic rather than the
     occasional hand-written call."""
-    _, _, body = router.request(target, headers={"Cookie": f"bial_app={ALIAS}", **headers})
+    _, _, body = router.request(target, headers={"Cookie": f"__Host-bial_app={ALIAS}", **headers})
     assert _target(body) == f"/a/{ALIAS}{target}"
 
 
@@ -462,11 +468,11 @@ def test_no_signal_at_all_is_404_never_a_fallthrough(router: Router) -> None:
 @pytest.mark.parametrize(
     "headers",
     [
-        {"Cookie": "bial_app=nothex"},
-        {"Cookie": "bial_app=" + ALIAS + "extra"},
-        {"Cookie": "bial_app=../../etc/passwd"},
+        {"Cookie": "__Host-bial_app=nothex"},
+        {"Cookie": "__Host-bial_app=" + ALIAS + "extra"},
+        {"Cookie": "__Host-bial_app=../../etc/passwd"},
         # A container name was never a key a browser may hold.
-        {"Cookie": f"bial_app={SBX_KEY}"},
+        {"Cookie": f"__Host-bial_app={SBX_KEY}"},
         {"Referer": f"https://{APPS_HOSTNAME}/a/{SBX_KEY}/"},
         {"Referer": "https://evil.example/a/" + ALIAS + "/"},
         {"Referer": f"https://{APPS_HOSTNAME}/a/NOTHEX/"},
@@ -485,7 +491,9 @@ def test_a_signal_that_is_not_the_exact_key_shape_is_refused(
 
 
 def test_a_signal_naming_a_vanished_app_is_404_not_502(router: Router) -> None:
-    status, _, body = router.request("/api/items", headers={"Cookie": f"bial_app={GHOST_ALIAS}"})
+    status, _, body = router.request(
+        "/api/items", headers={"Cookie": f"__Host-bial_app={GHOST_ALIAS}"}
+    )
     assert status == 404
     assert UNKNOWN_ALIAS not in body
 
@@ -514,7 +522,7 @@ def test_top_level_navigation_sets_exactly_one_correctly_attributed_cookie(
     )
     assert headers["__set_cookie_count"] == "1"
     cookie = headers["set-cookie"]
-    assert cookie.startswith(f"bial_app={ALIAS};")
+    assert cookie.startswith(f"__Host-bial_app={ALIAS};")
     assert "Path=/" in cookie
     assert "Secure" in cookie
     assert "HttpOnly" in cookie
@@ -539,7 +547,7 @@ def test_cookie_is_also_set_when_the_app_loads_inside_the_portal_iframe(
         },
     )
     assert headers["__set_cookie_count"] == "1"
-    assert headers["set-cookie"].startswith(f"bial_app={ALIAS};")
+    assert headers["set-cookie"].startswith(f"__Host-bial_app={ALIAS};")
 
 
 @pytest.mark.parametrize(
@@ -577,7 +585,7 @@ def test_the_keyless_arm_never_writes_the_cookie(router: Router) -> None:
     write one would let a resolved-from-cookie request re-affirm its own guess forever."""
     _, got, _ = router.request(
         "/page",
-        headers={"Cookie": f"bial_app={ALIAS}", "Sec-Fetch-Mode": "navigate"},
+        headers={"Cookie": f"__Host-bial_app={ALIAS}", "Sec-Fetch-Mode": "navigate"},
     )
     assert got["__set_cookie_count"] == "0"
 
@@ -847,7 +855,9 @@ def test_two_aliases_each_reach_their_own_container_keyed_and_keyless(router: Ro
                 f"{container}.{APPS_DOMAIN}",
                 f"/a/{alias}/api/items",
             )
-            _, _, by_cookie = router.request("/api/items", headers={"Cookie": f"bial_app={alias}"})
+            _, _, by_cookie = router.request(
+                "/api/items", headers={"Cookie": f"__Host-bial_app={alias}"}
+            )
             assert _host(by_cookie) == f"{container}.{APPS_DOMAIN}"
 
 
@@ -901,15 +911,19 @@ def test_the_internal_lookup_is_unreachable_from_a_browser_and_from_an_app(route
 
 def test_an_app_is_never_sent_the_routing_cookie_and_keeps_its_own(router: Router) -> None:
     for cookie in [
-        f"bial_app={ALIAS}; theme=dark",
-        f"theme=dark; bial_app={ALIAS}; lang=en",
-        f"theme=dark; bial_app={ALIAS}",
+        f"__Host-bial_app={ALIAS}; theme=dark",
+        f"theme=dark; __Host-bial_app={ALIAS}; lang=en",
+        f"theme=dark; __Host-bial_app={ALIAS}",
+        # The name this cookie used to carry, holding a container's name, until browsers drop it.
+        f"bial_app={SBX_KEY}; theme=dark",
     ]:
         _, _, body = router.request(f"/a/{OTHER_ALIAS}/", headers={"Cookie": cookie})
         sent = _fields(body)["CK"]
-        assert "bial_app" not in sent and ALIAS not in sent
+        assert "bial_app" not in sent and ALIAS not in sent and SBX_KEY not in sent
         assert "theme=dark" in sent
-    _, _, body = router.request(f"/a/{OTHER_ALIAS}/", headers={"Cookie": f"bial_app={ALIAS}"})
+    _, _, body = router.request(
+        f"/a/{OTHER_ALIAS}/", headers={"Cookie": f"__Host-bial_app={ALIAS}"}
+    )
     assert _fields(body)["CK"] == ""
 
 
@@ -921,3 +935,15 @@ def test_an_apps_redirect_carries_the_prefix_once_and_never_the_container(router
     location = headers["location"]
     assert location.endswith(f"/a/{ALIAS}/next") and location.count("/a/") == 1
     assert APPS_DOMAIN not in location and SBX_KEY not in location
+
+
+def test_a_backend_that_cannot_answer_reads_as_app_not_available_and_spares_published_apps(
+    router_without_backend: Router,
+) -> None:
+    status, _, body = router_without_backend.request(f"/a/{ALIAS}/")
+    assert (status, "not available" in body.lower()) == (404, True)
+    status, _, body = router_without_backend.request(
+        "/api/items", headers={"Referer": f"https://{APPS_HOSTNAME}/a/{ALIAS}/"}
+    )
+    assert (status, "REQ=" in body) == (404, False)
+    assert router_without_backend.request(f"/a/{PUB_KEY}/")[0] == 200
