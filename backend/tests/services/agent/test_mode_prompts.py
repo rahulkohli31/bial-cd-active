@@ -42,6 +42,7 @@ from src.core.prompt_blocks import (
     NARRATION_VOICE,
     PORTAL_SURFACES,
     PORTAL_SURFACES_WITHOUT_A_PROJECT,
+    WORKPLACE_CONDUCT,
     WRITE_IDENTITY,
 )
 from src.db.models.conversation import ChatKind
@@ -454,6 +455,17 @@ def test_the_audience_block_is_emitted_exactly_once() -> None:
         assert composed.count("TALKING TO THE USER") == 1
         # No length bar drifts back in beside the contract it used to ride with.
         assert "HOW LONG —" not in composed
+
+
+@pytest.mark.parametrize("kind", list(ChatKind))
+def test_every_kind_carries_the_conduct_block_once_in_its_cached_contract(kind: ChatKind) -> None:
+    """A guard on the wiring against deletion and duplication; whether the model follows the block
+    is checked against the live model, not here."""
+    # Mutation check: drop the block from `standing_contract` and every kind goes red. The first
+    # count proves it rides the cached static parts; the second, that no segment or tail repeats
+    # it.
+    assert standing_contract(kind).count(WORKPLACE_CONDUCT) == 1
+    assert compose_kind_prompt(kind, _CONTEXTS[kind]).count(WORKPLACE_CONDUCT) == 1
 
 
 def test_the_name_the_files_instruction_went_with_the_segment_that_carried_it() -> None:
