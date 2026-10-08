@@ -835,6 +835,43 @@ async def test_another_owners_file_is_not_reachable_by_naming_its_id(db_session)
     assert found == []
 
 
+async def test_a_chat_scoped_read_reaches_no_file_linked_elsewhere_even_when_named(
+    db_session,
+) -> None:
+    """A BIAL Chat session is named by its chat, so a file of the same owner linked to another
+    chat, or to none, must never be placed in it. The message's own file still counts as sent.
+
+    Mutation receipt: keep the id arm under `this_chat_only` and all three come back."""
+    storage = FakeStorage()
+    user = await UserFactory.create(db_session)
+    here = await ConversationFactory.create(db_session, user.id, kind=ChatKind.GENERIC)
+    elsewhere = await ConversationFactory.create(db_session, user.id, kind=ChatKind.GENERIC)
+    for attachment_id, conversation_id in [
+        ("mine", here.id),
+        ("other_chat", elsewhere.id),
+        ("unlinked", None),
+    ]:
+        await _stored(
+            db_session,
+            storage,
+            user_id=user.id,
+            attachment_id=attachment_id,
+            media_type=EXCEL_MEDIA_TYPE,
+            name=f"{attachment_id}.xlsx",
+            conversation_id=conversation_id,
+        )
+
+    found = await code_lane_attachments(
+        db_session,
+        user_id=user.id,
+        conversation_id=here.id,
+        attachment_ids=["mine", "other_chat", "unlinked"],
+        this_chat_only=True,
+    )
+
+    assert [f.attachment_id for f in found] == ["mine"]
+
+
 async def test_the_delivery_round_trips_a_stored_file_into_the_container(db_session) -> None:
     """The whole path in one test: a stored row becomes a placed file at the path the note names,
     which is what makes the agent's first read succeed."""

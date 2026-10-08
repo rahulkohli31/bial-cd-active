@@ -167,8 +167,12 @@ async def code_lane_attachments(
     user_id: uuid.UUID,
     conversation_id: uuid.UUID,
     attachment_ids: Sequence[str] = (),
+    this_chat_only: bool = False,
 ) -> list[CodeLaneAttachment]:
     """Every code-lane file this turn can see, oldest first.
+
+    `this_chat_only` drops the id arm, so only rows linked to this conversation qualify: a file
+    linked to another chat must never be placed in this chat's own session.
 
     OWNER-SCOPED FIRST, AND THAT IS NOT IMPLIED BY ANYTHING BELOW IT. `user_id` is the ownership
     axis (ADR-0004) and is ANDed with every other predicate, so a row is reachable here only if it
@@ -198,7 +202,7 @@ async def code_lane_attachments(
     """
     wanted = list(dict.fromkeys(attachment_ids))
     reachable = Attachment.conversation_id == conversation_id
-    if wanted:
+    if wanted and not this_chat_only:
         reachable = sa.or_(reachable, Attachment.attachment_id.in_(wanted))
     rows = list(
         (

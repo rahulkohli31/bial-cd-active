@@ -90,8 +90,8 @@ def test_the_builder_lane_sentence_is_the_portal_s_word_for_word() -> None:
 
 
 def test_the_generic_lane_sentence_is_the_portal_s_word_for_word() -> None:
-    """The generic chat promises less because it can do less, and the browser refuses the
-    file before the server ever sees it — so the two sides are each other's only witness."""
+    """BIAL Chat with no analysis runtime promises less because it can do less, so the two
+    sides are each other's only witness."""
     assert _sentence("GENERIC_ATTACHMENT_LANES_SENTENCE") == GENERIC_ATTACHMENT_LANES_SENTENCE
 
 
