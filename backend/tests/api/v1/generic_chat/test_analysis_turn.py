@@ -543,10 +543,13 @@ async def test_a_session_delete_that_never_returns_still_frees_the_chat(
     turn = (await _send(client, user, chat, attachment_ids=["att_q3"])).json()["turnId"]
     await _until_code_runs(reads)
 
-    await client.post(f"/v1/conversations/{chat.id}/turns/{turn}/stop", headers=_headers(user))
-    await _settle(_fresh_engine, chat.id)
+    with structlog.testing.capture_logs() as logs:
+        await client.post(f"/v1/conversations/{chat.id}/turns/{turn}/stop", headers=_headers(user))
+        await _settle(_fresh_engine, chat.id)
 
     assert not conversation_is_mid_reply(chat.id)
+    failed = [log for log in logs if log["event"] == "analysis_session_end_failed"]
+    assert [(log["log_level"], log["error"]) for log in failed] == [("warning", "TimeoutError")]
 
 
 # --- what is recorded --------------------------------------------------------------------
