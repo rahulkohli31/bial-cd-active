@@ -325,6 +325,15 @@ coming from an application's page count apart from the portal's own, so an appli
 merely opens cannot lock them out of the portal; signing in and out, and the portal asking who is
 signed in, are never refused by it.
 
+**BIAL Chat's file analysis runs in a managed session, not in the platform's sandboxes.** A
+spreadsheet, document or deck attached to BIAL Chat is opened by code the model writes while
+reading it, so whoever wrote the document can steer that code. It runs in a session the cloud
+provider isolates in its own virtual machine, with no internet access and no credential, named by
+the chat alone and called only by the control plane's own identity. The session holds working
+copies; the stored attachment is the truth, and the control plane refills a session the provider
+has quietly replaced. The platform's own sandboxes would not do: each belongs to a person's one
+app-building workspace, and their internet access is open (ADR-0034).
+
 **The control plane reads the organisation's directory, and only as its own identity.** Sharing
 looks people up there, so an owner can share with a colleague who has never signed in. The call
 uses the control plane's own identity, never the one generated applications receive, and it only
