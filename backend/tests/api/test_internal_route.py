@@ -1,9 +1,10 @@
-"""The edge's alias lookup: alias in, container name out, and only for the edge.
+"""The edge's alias lookup: alias and pass in, container name out, only for the edge and only for
+the person whose workspace runs the preview.
 
-The answer is a header, never a body, and EVERY refusal is a 200 with no header: the edge reads
-a 200 from its subrequest as data and anything else as an error it cannot place. So each
-refusal below is paired with a successful lookup for the same alias, because a route that
-answered nothing at all would satisfy "no header" for every case.
+The answer is a header, never a body, and EVERY refusal is a 200: the edge reads a 200 from its
+subrequest as data and anything else as an error it cannot place. So each refusal below is paired
+with a successful lookup for the same alias, because a route that answered nothing at all would
+satisfy "no header" for every case.
 """
 
 from __future__ import annotations
@@ -19,9 +20,16 @@ from fastapi import FastAPI
 from pydantic import SecretStr
 from redis.exceptions import RedisError
 
-from src.api.internal.router import CONTAINER_HEADER, LOOKUP_FAILED_EVENT, SECRET_REFUSED_EVENT
+from src.api.internal.router import (
+    CONTAINER_HEADER,
+    DENIED_HEADER,
+    LOOKUP_FAILED_EVENT,
+    SECRET_REFUSED_EVENT,
+)
 from src.config import settings
 from src.main import create_app
+from src.services.auth.preview_pass import mint_pass
+from src.services.auth.refresh import revoke_all_sessions
 from src.services.redis import registry_key
 from src.services.redis.keys import (
     ALIAS_TTL_SECONDS,
@@ -31,6 +39,7 @@ from src.services.redis.keys import (
 from src.services.sandbox.base import new_alias
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
+from tests.factories import UserFactory
 from tests.fakes import a_sandbox_name
 
 USER = uuid.uuid4()
@@ -42,7 +51,12 @@ def _path(alias: str) -> str:
     return f"/internal/app-routes/{alias}"
 
 
-async def _a_live_alias(redis: aioredis.Redis) -> str:
+async def _a_live_alias(
+    redis: aioredis.Redis,
+    holder: uuid.UUID = USER,
+    *,
+    shared_owner_id: uuid.UUID | None = None,
+) -> str:
     """An alias exactly as the create step leaves it, written through the real client rather than
     typed key by key, so a drift between what is written and what is read is caught here."""
 
@@ -64,21 +78,104 @@ async def _a_live_alias(redis: aioredis.Redis) -> str:
     )
     alias = new_alias()
     await client._write_registry(
-        USER, app_name=CONTAINER, alias=alias, fqdn=f"{CONTAINER}.example", token_ref="ref"
+        holder,
+        app_name=CONTAINER,
+        alias=alias,
+        fqdn=f"{CONTAINER}.example",
+        token_ref="ref",
+        shared_project_id=None if shared_owner_id is None else uuid.uuid4(),
+        shared_owner_id=shared_owner_id,
     )
     return alias
 
 
-async def test_the_edge_is_told_which_container_a_current_alias_stands_for(
-    client: httpx.AsyncClient, fake_redis: aioredis.Redis
-) -> None:
-    alias = await _a_live_alias(fake_redis)
+async def _holding(db_session, redis: aioredis.Redis) -> tuple[str, dict[str, str]]:
+    """A live alias and the edge headers its holder's browser produces."""
+    holder = await UserFactory.create(db_session)
+    alias = await _a_live_alias(redis, holder.id)
+    pass_ = await mint_pass(user_id=holder.id, token_version=holder.token_version)
+    return alias, {**EDGE, "X-Preview-Pass": pass_}
 
-    resp = await client.get(_path(alias), headers=EDGE)
+
+async def test_the_edge_is_told_which_container_a_current_alias_stands_for(
+    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session
+) -> None:
+    alias, holders_browser = await _holding(db_session, fake_redis)
+
+    resp = await client.get(_path(alias), headers=holders_browser)
 
     assert resp.status_code == 200
     assert resp.headers[CONTAINER_HEADER] == CONTAINER
+    assert DENIED_HEADER not in resp.headers
     assert CONTAINER not in resp.text
+
+
+async def test_a_browser_without_the_holders_pass_is_denied_with_a_fresh_value(
+    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session
+) -> None:
+    alias, holders_browser = await _holding(db_session, fake_redis)
+    stranger = await UserFactory.create(db_session)
+    strangers_pass = await mint_pass(user_id=stranger.id, token_version=stranger.token_version)
+
+    no_pass = await client.get(_path(alias), headers=EDGE)
+    again = await client.get(_path(alias), headers=EDGE)
+    someone_else = await client.get(
+        _path(alias), headers={**EDGE, "X-Preview-Pass": strangers_pass}
+    )
+    holder = await client.get(_path(alias), headers=holders_browser)
+
+    for refused in (no_pass, again, someone_else):
+        assert CONTAINER_HEADER not in refused.headers
+        assert len(refused.headers[DENIED_HEADER]) == 32
+    assert no_pass.headers[DENIED_HEADER] != again.headers[DENIED_HEADER]
+    assert holder.headers[CONTAINER_HEADER] == CONTAINER
+
+
+async def test_a_pass_from_before_a_sign_out_is_denied(
+    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session
+) -> None:
+    holder = await UserFactory.create(db_session)
+    alias = await _a_live_alias(fake_redis, holder.id)
+    pass_ = await mint_pass(user_id=holder.id, token_version=holder.token_version)
+    before = await client.get(_path(alias), headers={**EDGE, "X-Preview-Pass": pass_})
+
+    await revoke_all_sessions(db_session, holder.id)
+    await db_session.refresh(holder)
+    after = await client.get(_path(alias), headers={**EDGE, "X-Preview-Pass": pass_})
+
+    assert before.headers[CONTAINER_HEADER] == CONTAINER
+    assert CONTAINER_HEADER not in after.headers
+    assert DENIED_HEADER in after.headers
+
+
+async def test_a_shared_view_opens_for_the_colleague_and_not_the_projects_owner(
+    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session
+) -> None:
+    owner = await UserFactory.create(db_session)
+    colleague = await UserFactory.create(db_session)
+    alias = await _a_live_alias(fake_redis, colleague.id, shared_owner_id=owner.id)
+    colleagues = await mint_pass(user_id=colleague.id, token_version=colleague.token_version)
+    owners = await mint_pass(user_id=owner.id, token_version=owner.token_version)
+
+    as_colleague = await client.get(_path(alias), headers={**EDGE, "X-Preview-Pass": colleagues})
+    as_owner = await client.get(_path(alias), headers={**EDGE, "X-Preview-Pass": owners})
+
+    assert as_colleague.headers[CONTAINER_HEADER] == CONTAINER
+    assert CONTAINER_HEADER not in as_owner.headers
+    assert DENIED_HEADER in as_owner.headers
+
+
+async def test_a_dead_alias_is_never_a_denial_even_with_a_good_pass(
+    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session
+) -> None:
+    """Only a live alias may send a browser to the hand-over; a dead one answers nothing."""
+    alias, holders_browser = await _holding(db_session, fake_redis)
+    live = await client.get(_path(alias), headers=holders_browser)
+    dead = await client.get(_path(new_alias()), headers=holders_browser)
+
+    assert live.headers[CONTAINER_HEADER] == CONTAINER
+    assert CONTAINER_HEADER not in dead.headers
+    assert DENIED_HEADER not in dead.headers
 
 
 async def test_a_hit_renews_the_aliass_lifetime(
@@ -144,13 +241,15 @@ async def test_every_refusal_is_a_200_that_names_nothing(
 
 
 async def test_the_refusals_are_not_a_route_that_never_answers(
-    client: httpx.AsyncClient, fake_redis: aioredis.Redis
+    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session
 ) -> None:
     """Liveness for the cases above: the alias that every one of them was refused for answers
     when asked properly."""
-    alias = await _a_live_alias(fake_redis)
-    refused = await client.get(_path(alias), headers={"X-Internal-Route-Token": "x" * 40})
-    answered = await client.get(_path(alias), headers=EDGE)
+    alias, holders_browser = await _holding(db_session, fake_redis)
+    refused = await client.get(
+        _path(alias), headers={**holders_browser, "X-Internal-Route-Token": "x" * 40}
+    )
+    answered = await client.get(_path(alias), headers=holders_browser)
     assert CONTAINER_HEADER not in refused.headers
     assert answered.headers[CONTAINER_HEADER] == CONTAINER
 

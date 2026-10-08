@@ -113,7 +113,7 @@ account, the registry, the container apps environment, and the build host.
 
 **One shared secret, generated per environment.** The portal edge and the control plane carry the
 same value: the edge presents it when it asks the control plane which container a preview's address
-stands for. Each refuses to start without a well-formed one. A mismatch is not a startup failure —
+stands for, and when it hands the control plane a ticket to turn into a preview pass. Each refuses to start without a well-formed one. A mismatch is not a startup failure —
 every preview answers "app not available" — so set both from one source. Rotating it is a restart
 of both together. The portal image's Dockerfile and `backend/.env.example` name the input.
 
@@ -130,13 +130,15 @@ setting: it needs a shared view of liveness and a shared store for the limiters.
 
 ### The portal and the control plane change together
 
-The edge resolves a preview's address by asking the control plane, so the two are deployed as a
-pair in one quiet window. The order is the sandbox image first, which accepts both address shapes
-and is safe on its own, then the control plane and the worker, then the portal, back to back.
-Previews are unavailable from the control plane's restart until the portal is up. Within one sweep
-of the worker starting, previews from before the change are written back and retired, and their
-owners get them back, at a new address, on their next start. A rollback takes the portal and the
-control plane back together.
+The edge resolves a preview's address, and who may open it, by asking the control plane, so the two
+are deployed as a pair in one quiet window. The order is the sandbox image first, which accepts both
+address shapes and is safe on its own, then the portal, then the control plane and the worker, back
+to back. A newer edge works against an older control plane, which never refuses a preview pass, so
+previews stay open to anyone holding a link until the control plane restarts; an older edge against
+a newer control plane would show every preview as unavailable. Within one sweep of the worker
+starting, previews from before addresses carried an alias are written back and retired, and their
+owners get them back, at a new address, on their next start. A rollback takes the control plane
+back first, then the portal.
 
 ## Proving a deployment worked
 
@@ -173,9 +175,11 @@ application. When inside is also unhealthy, the application did not start.
 Then open it in a real browser and interact with it. A page that returns a successful status can
 still have failed to become interactive, and nothing short of using it will tell you.
 
-Three more checks cover the edge's address lookup: a new preview opens at its own address; a made-up
-address, and a container's own name in place of the address, both show the "app not available"
-page; and a deployed application still opens.
+More checks cover the edge's address lookup: a new preview opens at its own address, inside the
+workspace and in a new tab; the same address in a private window goes to the portal's sign-in, not
+the preview, and another signed-in person gets the "app not available" page; a made-up address, and
+a container's own name in place of the address, both show that page; and a deployed application
+still opens, signed in or not.
 
 **7. A deployed application reads and writes its own data**, exercised in a browser. Applications
 reach their database directly, so this path is not covered by anything above it.
