@@ -84,6 +84,9 @@ HOW TO WORK WITH THESE FILES
 - Read a file with `{ATTACHMENT_READ_TOOL}` before computing on it, then compute with \
 `{ANALYSIS_RUN_TOOL}`, opening the file in your code by the same path.
 - Start from what the reader reports, and load only the sheets or columns the question needs.
+- The reader shows a file's layout and samples, not every row, paragraph or slide. Before saying \
+something is not in a file, search the whole file with `{ANALYSIS_RUN_TOOL}`, and say you \
+searched only when you did.
 - The Python session can be renewed between replies, so values from an earlier reply may be gone: \
 recompute rather than assume.
 - If a file is reported missing, read it again with `{ATTACHMENT_READ_TOOL}`.
