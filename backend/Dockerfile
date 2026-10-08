@@ -51,7 +51,9 @@ FROM python:3.14-alpine@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d75060
 # during a CVE remediation pass. That trade is deliberate — a live production defect outranks a
 # count — and it is recorded as such in the remediation register rather than left to surprise
 # the reviewer.
-RUN apk add --no-cache git ca-certificates
+#
+# `apk upgrade` takes the Alpine security fixes published since the digest-pinned base was built.
+RUN apk upgrade --no-cache && apk add --no-cache git ca-certificates
 
 # Pinned by tag AND index digest: the tag says which version, the digest fixes the bytes. The
 # floating `:latest` it replaces meant two builds on different days were not the same build.
@@ -104,7 +106,7 @@ ENV UV_NO_SYNC=1
 
 EXPOSE 8000
 
-# Health: FastAPI's unauthenticated /v1/health (probes Postgres, fails closed 503).
+# Health: FastAPI's unauthenticated /v1/health (probes Postgres and Redis, fails closed 503).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD ["python", "-c", "import os,sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:'+os.environ.get('PORT','8000')+'/v1/health', timeout=4).status==200 else 1)"]
 
