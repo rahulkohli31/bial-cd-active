@@ -222,7 +222,9 @@ async def test_a_timeout_whose_delete_fails_still_answers(storage) -> None:
     assert out.startswith("error: timeout")
     assert session.running is True
     failed = [log for log in logs if log["event"] == "analysis_session_end_failed"]
-    assert [log["error"] for log in failed] == ["AnalysisUnavailableError"]
+    assert [(log["log_level"], log["error"]) for log in failed] == [
+        ("warning", "AnalysisUnavailableError")
+    ]
 
 
 async def test_a_placement_that_outlives_its_deadline_is_unavailable_not_a_timeout(
