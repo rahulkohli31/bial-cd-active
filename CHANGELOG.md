@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.15] - 2026-10-08
+
+The backend and portal images take the security updates from BIAL's container scan of 8 October,
+and two findings from the security assessment are closed. The health check no longer describes the
+platform's internals. A request to delete someone else's attachment no longer answers as if it had
+worked. Once rebuilt, each backend image should drop from 10 findings to 6 and each portal image
+from 5 to 3. None of the remaining ones has a released fix. busybox has no patched build for the
+images' Alpine release. The four Python findings are fixed only in Python 3.15, and the code they
+sit in is not used in production.
+
+### Security
+
+- **Deleting an attachment you do not own now answers "not found".** It never deleted another
+  person's file, because each person reaches only their own. But it answered with success, which
+  read as if the delete had worked. It now gets the same answer as an id that does not exist, so it
+  neither claims a delete nor confirms the file exists. Your own attachment is deleted as before; a
+  second request for it answers "not found", because it no longer exists.
+- **The health check says only whether the service is up.** It used to report the state of the
+  database and the cache to anyone who asked. It now answers `ok`, or `unavailable` with a 503 when
+  either one does not respond. Which one failed is written to the server log.
+- **urllib3 moves to its patched release,** which clears its three findings in the backend image.
+  Azure's sign-in and storage libraries use it to make their web requests.
+- **Both images install Alpine's patched zlib and pcre2 when they are built.** The official base
+  images do not include them yet. This clears the zlib finding in every image and the pcre2
+  finding in the portal.
+
+### Changed
+
+- **A cache outage now makes the health check answer 503.** Before, only a database outage did.
+  Builds, chats and previews all depend on the cache, so the service is not usable without it.
+
 ## [1.8.14] - 2026-10-07
 
 A preview's address no longer contains the name of its container. Previews and shared views now open
