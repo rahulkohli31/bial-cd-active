@@ -212,10 +212,10 @@ owed; the procedure is in `runbooks/reconcile-and-reclamation.md`.
 
 Work outward, and do not stop at the first green result.
 
-**1. The control plane is up and can reach its dependencies.** The health endpoint reports on the
-database and the cache. Read the HTTP status rather than the wording: a cache outage is reported as
-degraded *at a successful status code*, because builds cannot start but every other route is fine.
-Automation keyed on the word rather than the code will miss it.
+**1. The control plane is up and can reach its dependencies.** The health endpoint answers `ok`
+when the database and the cache both respond, and `unavailable` with a 503 when either does not.
+It does not say which one, because anyone can call it; the control plane's log names the failed
+dependency.
 
 **2. The schema is current.** The health check cannot detect a missing migration. Confirm the
 database is at the revision this image expects.

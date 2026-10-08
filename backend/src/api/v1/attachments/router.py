@@ -526,13 +526,18 @@ async def upload_attachment(
     return JSONResponse(status_code=201, content={"attachment": {**ref, "kind": kind}})
 
 
-async def _load_owned(db: DbSession, user_id: uuid.UUID, attachment_id: str) -> Attachment | None:
-    result: Attachment | None = await db.scalar(
+async def _load_owned(db: DbSession, user_id: uuid.UUID, attachment_id: str) -> Attachment:
+    att: Attachment | None = await db.scalar(
         sa.select(Attachment).where(
             Attachment.user_id == user_id, Attachment.attachment_id == attachment_id
         )
     )
-    return result
+    # Another user's id gets the same 404 as an unknown one: the answer must neither claim an
+    # action on it nor confirm that it exists.
+    if att is None:
+        raise AppApiError(404, "Attachment not found.")
+    assert_owned(att.storage_key, user_id)
+    return att
 
 
 @router.get(
@@ -550,9 +555,6 @@ async def download_attachment(
     if not _ID_RE.match(attachment_id):
         raise AppApiError(400, "Invalid attachment id.")
     att = await _load_owned(db, user.id, attachment_id)
-    if att is None:
-        raise AppApiError(404, "Attachment not found.")
-    assert_owned(att.storage_key, user.id)
     try:
         data = await storage.get(att.storage_key)
     except StorageNotFoundError:
@@ -570,6 +572,7 @@ async def download_attachment(
     dependencies=[Depends(_attachment_limiter)],
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid attachment id"),
+        (404, ErrorEnvelope, "Attachment not found"),
         (429, ErrorEnvelope, "Too many attachment requests"),
         AUTH_401,
     ),
@@ -580,33 +583,19 @@ async def delete_attachment(
     if not _ID_RE.match(attachment_id):
         raise AppApiError(400, "Invalid attachment id.")
     att = await _load_owned(db, user.id, attachment_id)
-    if att is not None:
-        assert_owned(att.storage_key, user.id)
-        key = att.storage_key
-        # ★ ROW FIRST, BLOB SECOND — the same rollback discipline every other delete here follows.
-        #
-        # The old order deleted the object and then the row, so a commit that failed afterwards
-        # left a row pointing at a blob that was already gone: the chip stays in the composer, the
-        # file opens to nothing, and the only way out is another delete. That is the one
-        # composer-reachable path to a dead row, and it is what this closes.
-        #
-        # THE TRADE IS REAL AND IS NOT FREE. Once the row is committed-deleted the blob is
-        # invisible to every cleanup path we have — `reclaim_orphaned_attachments` is row-driven
-        # and nothing anywhere lists the object store — so a failed sweep leaks the object for
-        # good. `sweep_blobs` never raises and returns what survived, so the leak is at least
-        # written down with the id it belonged to, which is the most a post-commit sweep can owe.
-        #
-        # NO DERIVED SIBLING TO SWEEP ANY MORE. A deck used to be rendered to PDF and the
-        # `{key}.pdf` stored beside the original, so a delete had to remove both or leak one.
-        # Nothing derives anything from an attachment now.
-        await db.delete(att)
-        await db.commit()
-        survived = await sweep_blobs(storage, [key])
-        if survived:
-            logger.warning(
-                "attachment_blob_sweep_survived",
-                attachment_id=attachment_id,
-                key_count=len(survived),
-            )
-    # Delete is always idempotent and 200, even when the id is unknown (Express behavior).
+    key = att.storage_key
+    # Row first, blob second, so a failed commit cannot leave a row pointing at a missing blob.
+    # The trade: once the row is gone no cleanup path can find the blob, because
+    # `reclaim_orphaned_attachments` is row-driven and nothing lists the object store. A failed
+    # sweep therefore leaks it for good; `sweep_blobs` never raises and returns what survived,
+    # and the log below records that leak against its id.
+    await db.delete(att)
+    await db.commit()
+    survived = await sweep_blobs(storage, [key])
+    if survived:
+        logger.warning(
+            "attachment_blob_sweep_survived",
+            attachment_id=attachment_id,
+            key_count=len(survived),
+        )
     return JSONResponse(content={"ok": True})
