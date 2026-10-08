@@ -127,6 +127,25 @@ def test_a_bound_that_fired_is_reported_as_itself_not_as_a_damaged_file(
 
 
 @pytest.mark.parametrize("suffix", [".csv", ".docx", ".pptx"])
+def test_too_large_lets_go_of_what_filled_the_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    """`too_large` carries no context. Raised while the `MemoryError` is still being handled, it
+    would keep that error's traceback, and whatever filled the ceiling, alive while `main` builds
+    the answer, which then runs out of memory itself and prints nothing.
+
+    Mutation check: raise the failure inside `describe`'s `except MemoryError` arm and this goes
+    red."""
+    _raise_from_the_library(monkeypatch, suffix, MemoryError())
+
+    with pytest.raises(ReadFailure) as caught:
+        reader_module.describe(_a_file(tmp_path, suffix))
+
+    assert caught.value.code == "too_large"
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("suffix", [".csv", ".docx", ".pptx"])
 def test_a_genuinely_damaged_file_still_gets_its_format_specific_remedy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
 ) -> None:

@@ -608,16 +608,16 @@ def describe(path: Path) -> dict[str, Any]:
             f"{path.suffix or 'This file type'} is not one this reader handles.",
             "Attach a spreadsheet (.xlsx), document (.docx), deck (.pptx), .csv or .tsv.",
         )
+    body: dict[str, Any] | None = None
     try:
         body = reader(path)
     except ReadFailure:
         raise
     except MemoryError:
-        raise ReadFailure(
-            "too_large",
-            "This file needs more memory to read than the workspace allows.",
-            "Attach a smaller file, or split it.",
-        ) from None
+        # NOTHING IS BUILT IN THIS HANDLER. The error's traceback still holds whatever filled the
+        # memory ceiling, so a failure raised here runs out of memory itself, carrying the error
+        # along as its context, and the reader prints nothing. It is raised once this lets go.
+        pass
     except Exception as exc:
         # ENCRYPTION LANDS HERE, among other things. Every library refuses a password-protected
         # file in its own way, so the shape is named rather than the exception type guessed at.
@@ -633,6 +633,12 @@ def describe(path: Path) -> dict[str, Any]:
             if hint == "encrypted"
             else "Re-save the file in its own application and attach it again.",
         ) from None
+    if body is None:
+        raise ReadFailure(
+            "too_large",
+            "This file needs more memory to read than the workspace allows.",
+            "Attach a smaller file, or split it.",
+        )
     return {"ok": True, "file": path.name, "kind": path.suffix.lower().lstrip("."), **body}
 
 
