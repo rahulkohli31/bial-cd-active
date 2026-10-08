@@ -36,7 +36,11 @@ import sqlalchemy as sa
 from pydantic import Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.prompt_blocks import APPLY_SCHEMA_CHANGE_TOOL, ATTACHMENT_READ_TOOL
+from src.core.prompt_blocks import (
+    ANALYSIS_RUN_TOOL,
+    APPLY_SCHEMA_CHANGE_TOOL,
+    ATTACHMENT_READ_TOOL,
+)
 from src.core.redaction import redact_secrets
 from src.db.models.attachment import Attachment
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
@@ -590,6 +594,8 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
     if tool_name == ATTACHMENT_READ_TOOL:
         file = args.get("file")
         return _attachment_step_label(file if isinstance(file, str) else None)
+    if tool_name == ANALYSIS_RUN_TOOL:
+        return ("Running the analysis", False)
     if tool_name in _FILE_MUTATORS:
         return _file_step_label(tool_name, path)
     if tool_name == "read_file":
