@@ -277,6 +277,10 @@ function genericEnding(status: BuildOutcomeStatus): string {
   }
 }
 
+/** The reply reached one of the run's own bounds. */
+export const isCeilingReason = (reason: string | null): boolean =>
+  reason === 'request_limit' || reason === 'wall_clock_deadline_exceeded'
+
 /**
  * The same endings for a chat with no workspace. Only the handful of reasons a buildless chat can
  * actually reach are named; every workspace-shaped one (`workspace_restored`, `idle_teardown`,
@@ -289,7 +293,7 @@ function buildlessEnding(status: BuildOutcomeStatus, reason: string | null): str
   if (reason === 'model_unavailable') {
     return 'The assistant could not get an answer from its service, so this reply stopped.'
   }
-  if (reason === 'request_limit' || reason === 'wall_clock_deadline_exceeded') {
+  if (isCeilingReason(reason)) {
     return 'This question needed more steps than one reply allows. Try asking about one part at a time.'
   }
   switch (status) {

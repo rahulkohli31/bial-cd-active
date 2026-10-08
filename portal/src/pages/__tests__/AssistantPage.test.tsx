@@ -1003,14 +1003,22 @@ const stepFrame = (
   item: { type: 'step', seq: 0, tool, label, state, hidden },
 })
 
-/** A turn whose frames the test hands over one at a time, ending when the test says so. */
+/** A turn whose frames the test hands over one at a time, ending when the test says so — or, as
+ *  the real reader does, the moment its signal aborts, after which no frame reaches the page. */
 function scriptTurn() {
   let push: (frame: unknown) => void = () => {}
   let finish: (outcome: string) => void = () => {}
-  h.readTurnStream.mockImplementation(({ onFrame }: { onFrame: (f: unknown) => void }) => {
-    push = onFrame
-    return new Promise((resolve) => (finish = resolve))
-  })
+  h.readTurnStream.mockImplementation(
+    ({ onFrame, signal }: { onFrame: (f: unknown) => void; signal: AbortSignal }) => {
+      push = (frame) => {
+        if (!signal.aborted) onFrame(frame)
+      }
+      return new Promise((resolve) => {
+        finish = resolve
+        signal.addEventListener('abort', () => resolve('aborted'), { once: true })
+      })
+    },
+  )
   return {
     opened: () => waitFor(() => expect(h.readTurnStream).toHaveBeenCalled()),
     frame: (frame: unknown) => act(() => push(frame)),
@@ -1154,7 +1162,10 @@ describe('a reply that works through the citizen files', () => {
     expect(screen.getByText('Half an answer')).toBeTruthy()
   })
 
-  it('★ a step still running at Stop stops spinning and reads as stopped', async () => {
+  it.each([
+    ['the Stop control', async () => fireEvent.click(await screen.findByTestId('stop-turn'))],
+    ['Escape in the box', async () => fireEvent.keyDown(box(), { key: 'Escape' })],
+  ])('★ a step still running at %s stops spinning and reads as stopped', async (_how, stop) => {
     // The engine never resolves the tool call a Stop cut short, so the step arrives at the end of
     // the reply still pending.
     const turn = scriptTurn()
@@ -1164,8 +1175,11 @@ describe('a reply that works through the citizen files', () => {
     await turn.frame(stepFrame('call-1', 'Running the analysis'))
     expect(screen.getByTestId('activity-group-now')).toBeTruthy()
 
-    fireEvent.click(await screen.findByTestId('stop-turn'))
-    await waitFor(() => expect(h.stopTurn).toHaveBeenCalled())
+    await stop()
+    await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith(expect.any(String), 't1'))
+    // The server answers the stop before its stream carries `turn_ended`, so the page acts on that
+    // answer first.
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)))
     await turn.frame({
       type: 'turn_ended',
       seq: 2,
@@ -1224,7 +1238,11 @@ describe('a reply that works through the citizen files', () => {
 
       expect(screen.getByText('So far column C totals 4,210.')).toBeTruthy()
       expect(screen.getByTestId('turn-banner').textContent).toBe(CEILING_SENTENCE)
-      expect(screen.getByTestId('activity-announcer').textContent).toBe(CEILING_SENTENCE)
+      const announcing = [...document.querySelectorAll('[aria-live]')].filter((region) =>
+        region.textContent?.includes(CEILING_SENTENCE),
+      )
+      expect(announcing).toHaveLength(1)
+      expect(screen.getByTestId('activity-announcer').textContent).toBe('Reply finished.')
       expect(screen.queryByTestId('assistant-turn-retry')).toBeNull()
     },
   )

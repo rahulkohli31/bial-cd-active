@@ -59,7 +59,7 @@ import {
 } from '../utils/conversationApi'
 import { contextState } from '../utils/contextLimits'
 import type { ComposerSubmission } from '../components/chat/Composer'
-import type { ChatMessage, EndReason } from '../utils/messageTypes'
+import { isCeilingReason, type ChatMessage } from '../utils/messageTypes'
 import {
   isKnownFrame,
   readTurnStream,
@@ -100,12 +100,6 @@ const ANNOUNCE = {
   loadFailed: 'This conversation could not be loaded. A retry is available.',
 } as const
 
-/** The run's own bounds. The same question meets the same bound again, so neither offers a retry. */
-const CEILINGS: ReadonlySet<string> = new Set<EndReason>([
-  'request_limit',
-  'wall_clock_deadline_exceeded',
-])
-
 /** The tool the platform's opening "Getting started" row rides under. */
 const ACKNOWLEDGEMENT_TOOL = '__ack__'
 
@@ -116,11 +110,10 @@ interface LiveReply extends LiveTurn {
   shown: boolean
   status: TurnEndedFrame['status'] | null
   reason: string | null
-  error: string | null
 }
 
 function newReply(id: string): LiveReply {
-  return { id, parts: [], working: false, shown: false, status: null, reason: null, error: null }
+  return { id, parts: [], working: false, shown: false, status: null, reason: null }
 }
 
 function putReplyStep(reply: LiveReply, toolCallId: string, step: StepItem): void {
@@ -128,11 +121,8 @@ function putReplyStep(reply: LiveReply, toolCallId: string, step: StepItem): voi
   if (step.tool !== ACKNOWLEDGEMENT_TOOL) putStep(reply, toolCallId, step)
 }
 
-const endedAtCeiling = (reply: LiveReply) => reply.reason !== null && CEILINGS.has(reply.reason)
-
-/** A ceiling is announced in its own words; every other ending only as finished. */
-const endingAnnouncement = (reply: LiveReply) =>
-  (endedAtCeiling(reply) && reply.error) || ANNOUNCE.finished
+/** The same question meets the same bound again, so neither offers a retry. */
+const endedAtCeiling = (reply: LiveReply) => isCeilingReason(reply.reason)
 
 export default function AssistantPage() {
   const { chatId: routedId } = useParams()
@@ -266,7 +256,6 @@ export default function AssistantPage() {
         return
       }
       if (frame.type === 'error') {
-        reply.error = frame.message
         setBanner(frame.message)
         return
       }
@@ -288,10 +277,7 @@ export default function AssistantPage() {
         if (frame.turnStatus !== 'idle' && frame.turnStatus !== 'running') {
           reply.status = frame.turnStatus
         }
-        if (frame.errorMessage) {
-          reply.error = frame.errorMessage
-          setBanner(frame.errorMessage)
-        }
+        if (frame.errorMessage) setBanner(frame.errorMessage)
         paint(reply)
         return
       }
@@ -332,7 +318,7 @@ export default function AssistantPage() {
           onFrame: (frame) => pushFrame(frame, reply),
         })
         if (!aliveRef.current) return
-        setAnnouncement(endingAnnouncement(reply))
+        setAnnouncement(ANNOUNCE.finished)
       } catch {
         if (!aliveRef.current) return
         setBanner(TURN_LOST_TEXT)
@@ -462,7 +448,7 @@ export default function AssistantPage() {
         })
         if (!aliveRef.current) return
         if (endedAtCeiling(reply)) setLastSend(null)
-        setAnnouncement(endingAnnouncement(reply))
+        setAnnouncement(ANNOUNCE.finished)
       } catch (err) {
         // BEFORE THE LIVENESS GUARD, because taking back what a refusal orphaned is not a paint
         // decision: the uploads are on the server whether or not this screen is still here.
@@ -572,9 +558,9 @@ export default function AssistantPage() {
     void runTurn(chatId, lastSend.text, lastSend.attachmentIds)
   }, [chatId, lastSend, runTurn])
 
+  // No abort: the server closes the stream after `turn_ended`, the frame that marks a reply stopped.
   const handleCancel = useCallback(async () => {
     if (turnId) await stopTurn(chatId, turnId)
-    abortRef.current?.abort()
   }, [chatId, turnId])
 
   // WHAT A NEW CONVERSATION STARTS FROM: a fresh id, an empty transcript, nothing carried over.

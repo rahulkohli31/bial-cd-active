@@ -21,7 +21,7 @@ import { useState, useEffect, useRef, useCallback, useMemo, type FC } from 'reac
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
 import Announcer, { useActivityAnnouncement } from './Announcer'
 import ChatThread from './ChatThread'
-import { appendText, putStep, streamingParts, type LivePart } from './liveTurnParts'
+import { appendText, putStep, streamingParts, type LivePart, type LiveTurn } from './liveTurnParts'
 import ChatRuntimeProvider from './runtime/ChatRuntimeProvider'
 import Composer, { type ComposerSubmission } from './Composer'
 import { SendRefusal } from './sendRefusal'
@@ -166,31 +166,13 @@ export interface ConversationSurfaceProps {
  *  spent when it is still pressable. */
 type PlanOverrideValue = 'build' | 'refine'
 
-/** The turn-frame reducer's mutable accumulator, carried back out to the caller once the
- * stream settles (`streamAssistant`/`reattachToTurn`/`fireRelayTurn`'s shared shape). */
-interface TurnSink {
-  /**
-   * THE LIVE TURN, PROSE AND STEPS, IN THE ORDER IT PRODUCED THEM. Was a flat `text` string
-   * beside a step map (every step, then one text block); a reload interleaves them in part
-   * order — the two only agreed because prose beside a tool call was thrown away. Steps live
-   * HERE, not only in `turnSteps` state, because the TRANSCRIPT renders them now and the frame
-   * handler (empty dep list) can't read state changing under it; `turnSteps` still exists
-   * alongside for a different question (the pane phase).
-   */
-  parts: LivePart[]
-  /** Does the model HAVE THE FLOOR right now (the server's `working` flag)?
-   *
-   *  NOT "is it reasoning", which is what this said while the server narrowed it to that. The
-   *  server raises it whenever the model is being ASKED and nothing readable has arrived — which
-   *  now includes the gap after the last tool returns, the window a hung-looking transcript was
-   *  actually sitting in. Reading it as a reasoning signal here would under-render it.
-   *
-   *  IT IS NOT A PART, because the server never sends one and never will: reasoning text is
-   *  stored for the provider's next turn and is never framed. The flag is turned INTO a
-   *  content-free reasoning part at the TAIL of the streaming message by `streamingParts`,
-   *  because the library's status renderer is reached only when a message actually carries a
-   *  part of that kind — a boolean riding the turn renders nothing at all on its own. */
-  working: boolean
+/**
+ * The turn-frame reducer's mutable accumulator, carried back out to the caller once the stream
+ * settles (`streamAssistant`/`reattachToTurn`/`fireRelayTurn`'s shared shape). Steps live here as
+ * well as in `turnSteps` state, because the frame handler (empty dependency list) cannot read
+ * state that changes under it.
+ */
+interface TurnSink extends LiveTurn {
   terminal: 'completed' | 'failed' | 'stopped' | null
   reason: string | null
   snapshotCommitted: boolean | null
