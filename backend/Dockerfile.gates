@@ -56,11 +56,12 @@ RUN test -d tests && test -d alembic || (echo "gate context is missing tests/ or
 # modules reach across: into `sandbox/` (the supervisor's allowlist, the golden template, the
 # workspace git scripts run under the image's exclude file, the analysis reader's copy), into
 # `portal/` (copy and fixtures the backend must match word for word), or over the whole
-# repository (the guards that a retired name stays gone). They therefore CANNOT pass here — not because anything is broken, but because the tree
-# they inspect was never copied in. They are deselected BY NAME rather than left to fail: a lane
-# that is expected to be red teaches people to ignore red. One reads a portal fixture while it is
-# collected, so it is ignored rather than deselected. They still run in the host lane, which has
-# the whole repo, and that is where they belong.
+# repository (the guards that a retired name stays gone). They therefore CANNOT pass here — not
+# because anything is broken, but because the tree they inspect was never copied in. They are
+# deselected BY NAME rather than left to fail: a lane that is expected to be red teaches people to
+# ignore red. One reads a portal fixture while it is collected, so it is ignored rather than
+# deselected. They still run in the host lane, which has the whole repo, and that is where they
+# belong.
 #
 # Widening the context to the repo root to "fix" this would pull the sandbox tree, the portal
 # tree and every node_modules into an image whose entire purpose is to be the shipped base plus

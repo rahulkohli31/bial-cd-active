@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 import time
 import uuid
 
@@ -18,10 +20,10 @@ from src.services.analysis.placement import (
     AnalysisSession,
     FileGoneError,
 )
+from src.services.analysis.runtime import SESSION_FILES_DIR
 from src.services.attachments.materialize import CodeLaneAttachment, _named_without_collisions
+from src.services.media.lanes import EXCEL_MEDIA_TYPE
 from tests.fakes import FakeAnalysisRuntime, FakeStorage
-
-_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +50,7 @@ def _file(storage: FakeStorage, name: str, data: bytes = b"cells") -> CodeLaneAt
         attachment_id=attachment_id,
         display_name=name,
         file_name=name,
-        media_type=_XLSX,
+        media_type=EXCEL_MEDIA_TYPE,
         size=len(data),
         storage_key=f"att/{attachment_id}",
     )
@@ -149,6 +151,19 @@ async def test_a_copy_changed_in_the_session_is_replaced(runtime, storage) -> No
     assert "q3.xlsx" in _names_uploaded(runtime)
 
 
+async def test_a_copy_rewritten_at_the_same_size_is_replaced(runtime, storage) -> None:
+    chat = uuid.uuid4()
+    q3 = _file(storage, "q3.xlsx", b"the stored rows")
+    await _reply(runtime, storage, [q3], chat).ensure_placed()
+    await runtime.upload_file(chat.hex, "q3.xlsx", b"the forged rows")
+
+    later = _reply(runtime, storage, [q3], chat)
+    await later.ensure_placed()
+
+    assert later.fresh is True
+    assert runtime.files[chat.hex]["q3.xlsx"] == b"the stored rows"
+
+
 async def test_a_copy_resized_in_the_session_is_replaced_even_with_no_stamp(
     runtime, storage
 ) -> None:
@@ -218,7 +233,7 @@ def test_two_files_with_one_name_get_distinct_names_with_no_spaces() -> None:
         Attachment(
             user_id=user,
             attachment_id=f"att_{index}",
-            media_type=_XLSX,
+            media_type=EXCEL_MEDIA_TYPE,
             name=name,
             size=1,
             storage_key=f"att/{index}",
@@ -312,6 +327,26 @@ async def test_an_expired_record_is_treated_as_no_record(runtime, storage) -> No
     assert _names_uploaded(runtime) == ["q3.xlsx", READER_NAME]
 
 
+async def test_the_record_ages_from_the_sessions_last_call_not_from_placement(
+    runtime, storage
+) -> None:
+    """The pool's cool-down restarts on every call, so a session placed long ago but used since is
+    alive, and what code wrote in it stays."""
+    chat = uuid.uuid4()
+    files = [_file(storage, "q3.xlsx")]
+    reply = _reply(runtime, storage, files, chat)
+    await reply.ensure_placed()
+    placement._records[chat].touched = time.monotonic() - placement.RECORD_TTL_S - 1
+    await reply.run("print(1)", timeout_s=5, output_limit=20_000)
+    await runtime.upload_file(chat.hex, "totals.csv", b"written by code")
+
+    later = _reply(runtime, storage, files, chat)
+    await later.ensure_placed()
+
+    assert later.fresh is False
+    assert "totals.csv" in _held(runtime, chat)
+
+
 async def test_ending_deletes_the_session_and_the_next_access_refills_it(runtime, storage) -> None:
     chat = uuid.uuid4()
     files = [_file(storage, "q3.xlsx")]
@@ -332,7 +367,7 @@ async def test_running_marks_the_reply_busy_only_while_code_runs(runtime, storag
     await reply.ensure_placed()
     runtime.hold_runs = asyncio.Event()
 
-    running = asyncio.create_task(reply.run("print(1)", timeout_s=5))
+    running = asyncio.create_task(reply.run("print(1)", timeout_s=5, output_limit=20_000))
     while not runtime.runs:
         await asyncio.sleep(0)
     assert reply.running is True
@@ -349,7 +384,7 @@ async def test_a_run_cut_off_mid_flight_stays_marked_until_the_session_is_ended(
     reply = _reply(runtime, storage, [_file(storage, "q3.xlsx")], uuid.uuid4())
     await reply.ensure_placed()
     runtime.hold_runs = asyncio.Event()
-    running = asyncio.create_task(reply.run("while True: pass", timeout_s=5))
+    running = asyncio.create_task(reply.run("while True: pass", timeout_s=5, output_limit=20_000))
     while not runtime.runs:
         await asyncio.sleep(0)
 
@@ -362,6 +397,22 @@ async def test_a_run_cut_off_mid_flight_stays_marked_until_the_session_is_ended(
     assert reply.running is False
 
 
+async def test_a_delete_that_fails_leaves_the_reply_marked_running(runtime, storage) -> None:
+    """So the reply's teardown tries once more to stop what may still run."""
+    reply = _reply(runtime, storage, [_file(storage, "q3.xlsx")], uuid.uuid4())
+    await reply.ensure_placed()
+    reply.running = True
+    runtime.unavailable = True
+
+    with pytest.raises(AnalysisUnavailableError):
+        await reply.end()
+    assert reply.running is True
+
+    runtime.unavailable = False
+    await reply.end()
+    assert reply.running is False
+
+
 async def test_placement_links_the_attachments_path_to_where_files_land(runtime, storage) -> None:
     chat = uuid.uuid4()
 
@@ -369,10 +420,16 @@ async def test_placement_links_the_attachments_path_to_where_files_land(runtime,
 
     assert runtime.links == [chat.hex]
     assert runtime.runs == []
-    assert LINK_CODE == (
-        "import os\nos.chdir('/mnt/data')\n"
-        "os.path.islink('.attachments') or os.symlink('.', '.attachments')\n"
-    )
+
+
+def test_the_link_code_resolves_the_attachments_path_and_can_run_again(tmp_path) -> None:
+    (tmp_path / "q3.xlsx").write_bytes(b"cells")
+    code = LINK_CODE.replace(repr(SESSION_FILES_DIR), repr(str(tmp_path)))
+
+    for _ in range(2):
+        subprocess.run([sys.executable, "-I", "-c", code], check=True)
+
+    assert (tmp_path / ".attachments" / "q3.xlsx").read_bytes() == b"cells"
 
 
 async def test_a_link_that_cannot_be_made_is_unavailable_and_records_nothing(
@@ -380,7 +437,9 @@ async def test_a_link_that_cannot_be_made_is_unavailable_and_records_nothing(
 ) -> None:
     chat = uuid.uuid4()
 
-    async def _refused(_session_id: str, _code: str, *, timeout_s: float) -> Execution:
+    async def _refused(
+        _session_id: str, _code: str, *, timeout_s: float, output_limit: int
+    ) -> Execution:
         return Execution(succeeded=False, stdout="", stderr="denied")
 
     monkeypatch.setattr(runtime, "run", _refused)

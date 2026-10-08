@@ -33,11 +33,12 @@ from src.services.analysis.runtime import (
     SessionFile,
 )
 from src.services.attachments.materialize import CodeLaneAttachment
+from src.services.media.lanes import EXCEL_MEDIA_TYPE
 from src.services.messages.projection import classify_tool_call
+from src.services.orchestrator.constants import ANALYSIS_READ_STREAM_LIMIT
 from tests.fakes import FakeAnalysisRuntime, FakeStorage
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
-_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _MANIFEST = '{"ok": true, "file": "q3.xlsx", "rows": 5}'
 _MISSING = '{"ok": false, "error": {"code": "missing"}}'
 
@@ -59,7 +60,7 @@ def _file(storage: FakeStorage, name: str = "q3.xlsx") -> CodeLaneAttachment:
         attachment_id=attachment_id,
         display_name=name,
         file_name=name,
-        media_type=_XLSX,
+        media_type=EXCEL_MEDIA_TYPE,
         size=5,
         storage_key=f"att/{attachment_id}",
     )
@@ -156,13 +157,13 @@ async def test_code_that_raises_ends_with_the_tracebacks_tail(runtime, storage) 
 async def test_a_traceback_survives_output_too_long_to_keep(runtime, storage) -> None:
     """A program that prints a whole table and then raises is the common mistake; cutting the
     traceback would leave the model guessing at why it failed."""
-    runtime.handle_run = _printing("row\n" * 10_000, "KeyError: 'Region'\n", succeeded=False)
+    runtime.handle_run = _printing("row\n" * 4_500, "KeyError: 'Region'\n", succeeded=False)
 
     out = await _call(_session(runtime, storage), "run_python", code="print(df); df['Region']")
 
     lines = out.splitlines()
     assert lines[0] == "exit 1"
-    assert lines[-2] == "[24,019 characters omitted]"
+    assert lines[-2] == "[2,019 characters omitted]"
     assert lines[-1] == "KeyError: 'Region'"
 
 
@@ -213,10 +214,15 @@ async def test_a_timeout_whose_delete_fails_still_answers(storage) -> None:
             raise AnalysisUnavailableError("delete_session refused")
 
     runtime = _RefusesDelete(run_times_out=True)
+    session = _session(runtime, storage)
 
-    out = await _call(_session(runtime, storage), "run_python", code="while True: pass")
+    with capture_logs() as logs:
+        out = await _call(session, "run_python", code="while True: pass")
 
     assert out.startswith("error: timeout")
+    assert session.running is True
+    failed = [log for log in logs if log["event"] == "analysis_session_end_failed"]
+    assert [log["error"] for log in failed] == ["AnalysisUnavailableError"]
 
 
 async def test_a_placement_that_outlives_its_deadline_is_unavailable_not_a_timeout(
@@ -225,7 +231,8 @@ async def test_a_placement_that_outlives_its_deadline_is_unavailable_not_a_timeo
     """No code is running yet, so nothing needs stopping: the session is simply unreachable, and
     deleting it would cost the next reply a full copy for nothing.
 
-    Mutation check: let `_place` pass the timeout through and this reads `error: timeout`."""
+    Mutation check: let `ensure_placed` pass the timeout through and this reads
+    `error: timeout`."""
 
     class _SlowToList(FakeAnalysisRuntime):
         async def list_files(self, session_id: str) -> list[SessionFile]:
@@ -398,6 +405,42 @@ async def test_a_path_outside_the_attachments_gets_plans_correction(
         await _call(_session(runtime, storage), "read_attachment", file=file)
 
     assert runtime.calls == []
+
+
+@pytest.mark.parametrize("file", [".attachments/q2.xlsx", ".attachments/receipt.pdf"], ids=str)
+async def test_a_file_the_session_does_not_hold_is_named_and_never_reaches_it(
+    runtime, storage, file: str
+) -> None:
+    """A name the chat no longer has, or a PDF that reaches the model directly. Placing again
+    cannot produce it, so retrying would end in the sentence about an outage."""
+    session = _session(runtime, storage)
+
+    out = await _call(session, "read_attachment", file=file)
+
+    assert json.loads(out)["error"]["code"] == "not_attached"
+    assert runtime.calls == []
+    assert session.tool_calls == 1
+
+
+async def test_a_long_description_comes_back_whole(runtime, storage) -> None:
+    """A workbook of a dozen ordinary sheets describes itself in well over 20,000 characters."""
+    manifest = json.dumps({"ok": True, "file": "q3.xlsx", "sheets": ["x" * 60] * 1_000})
+    runtime.handle_run = _printing(manifest)
+
+    out = await _call(_session(runtime, storage), "read_attachment", file=".attachments/q3.xlsx")
+
+    assert out == manifest
+
+
+async def test_a_description_the_service_cut_is_too_large_not_broken_json(
+    runtime, storage
+) -> None:
+    """The service cuts output at the limit without a marker, and a cut description is not JSON."""
+    runtime.handle_run = _printing('{"ok": true, "sheets": ["' + "x" * ANALYSIS_READ_STREAM_LIMIT)
+
+    out = await _call(_session(runtime, storage), "read_attachment", file=".attachments/q3.xlsx")
+
+    assert json.loads(out) == {"ok": False, "error": {"code": "too_large"}}
 
 
 async def test_a_file_lost_mid_reply_is_placed_again_and_read(runtime, storage) -> None:

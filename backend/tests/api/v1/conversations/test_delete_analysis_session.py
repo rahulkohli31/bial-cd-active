@@ -81,9 +81,7 @@ async def test_a_failed_session_delete_still_deletes_the_chat_and_warns(
 async def test_a_session_delete_that_never_answers_is_abandoned_at_its_deadline(
     client, db_session, fake_analysis: FakeAnalysisRuntime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.api.v1.conversations import router
-
-    monkeypatch.setattr(router, "ANALYSIS_DELETE_DEADLINE_S", 0.05)
+    monkeypatch.setattr(placement, "ANALYSIS_DELETE_DEADLINE_S", 0.05)
     user = await UserFactory.create(db_session)
     conv = await ConversationFactory.create(db_session, user.id, kind=ChatKind.GENERIC)
 

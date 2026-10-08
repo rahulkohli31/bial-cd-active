@@ -8,10 +8,8 @@ carry the conversation id, a file's suffix and an error class, never a name, cod
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Final
@@ -28,15 +26,15 @@ from src.services.analysis.runtime import (
     READER_NAME,
     SESSION_FILES_DIR,
     AnalysisTimedOutError,
-    AnalysisUnavailableError,
     Execution,
 )
 from src.services.orchestrator.constants import (
     ANALYSIS_CODE_LIMIT,
-    ANALYSIS_DELETE_DEADLINE_S,
     ANALYSIS_EXECUTION_TIMEOUT_S,
     ANALYSIS_OUTPUT_CAP,
+    ANALYSIS_READ_STREAM_LIMIT,
     ANALYSIS_READ_TIMEOUT_S,
+    ANALYSIS_RUN_STREAM_LIMIT,
 )
 
 if TYPE_CHECKING:
@@ -94,28 +92,41 @@ def _code_of(output: str) -> object:
     return error.get("code") if isinstance(error, dict) else None
 
 
-async def _place(session: AnalysisSession, *, again: bool = False) -> None:
-    """Placement, where a deadline means the session cannot be reached: no code is running yet,
-    so it is `unavailable` rather than a timeout that ends the session."""
-    try:
-        await session.ensure_placed(again=again)
-    except AnalysisTimedOutError:
-        raise AnalysisUnavailableError("placement outlived its deadline") from None
+def _not_attached(path: str) -> str:
+    return json.dumps(
+        {
+            "ok": False,
+            "file": PurePosixPath(path).name,
+            "error": {
+                "code": "not_attached",
+                "message": "That is not one of the files listed for this chat's analysis.",
+                "next": "Use a path from that list. A PDF or picture reaches you directly; a file "
+                "that is no longer attached has to be attached again.",
+            },
+        }
+    )
 
 
 async def _end_quietly(session: AnalysisSession) -> None:
-    """Delete the session to stop what runs in it. The pool's cool-down is the backstop."""
-    with suppress(Exception):
-        async with asyncio.timeout(ANALYSIS_DELETE_DEADLINE_S):
-            await session.end()
+    """Delete the session to stop what runs in it. A failure is logged and left to the reply's
+    teardown, then to the pool's cool-down."""
+    try:
+        await session.end()
+    except Exception as exc:
+        logger.warning(
+            "analysis_session_end_failed",
+            conversation_id=str(session.conversation_id),
+            error=type(exc).__name__,
+        )
 
 
 @dataclass
 class SessionAttachmentReader:
     """Runs the shipped reader over one attached file in the chat's session.
 
-    Answers in the reader's own JSON whatever happens. A `missing` file is placed once more and
-    read again; a second miss, like any failure to reach the session, is `unavailable`."""
+    Answers in the reader's own JSON whatever happens. A path that names none of the chat's files
+    never reaches the session. A listed file reported `missing` is placed once more and read
+    again; a second miss, like any failure to reach the session, is `unavailable`."""
 
     session: AnalysisSession
 
@@ -125,10 +136,13 @@ class SessionAttachmentReader:
 
     async def read(self, path: str) -> str:
         self.session.tool_calls += 1
+        attached = {file.file_name for file in self.session.files}
+        if path.removeprefix(ATTACHMENTS_PREFIX) not in attached:
+            return _not_attached(path)
         try:
             output = await self._read(path)
             if _code_of(output) == "missing":
-                await _place(self.session, again=True)
+                await self.session.ensure_placed(again=True)
                 output = await self._read(path)
             return _failure("unavailable") if _code_of(output) == "missing" else output
         except AnalysisTimedOutError:
@@ -144,14 +158,20 @@ class SessionAttachmentReader:
             return _failure("unavailable")
 
     async def _read(self, path: str) -> str:
-        await _place(self.session)
         code = _READ.format(
             reader=json.dumps(f"{SESSION_FILES_DIR}/{READER_NAME}"),
             path=json.dumps(f"{SESSION_FILES_DIR}/{path.removeprefix(ATTACHMENTS_PREFIX)}"),
             timeout=_PROCESS_TIMEOUT_S,
         )
-        execution = await self.session.run(code, timeout_s=ANALYSIS_READ_TIMEOUT_S)
-        return execution.stdout if execution.succeeded else _failure("unavailable")
+        execution = await self.session.run(
+            code, timeout_s=ANALYSIS_READ_TIMEOUT_S, output_limit=ANALYSIS_READ_STREAM_LIMIT
+        )
+        if not execution.succeeded:
+            return _failure("unavailable")
+        # A cut stream keeps one character fewer than the limit, and a cut description is not JSON.
+        if len(execution.stdout) >= ANALYSIS_READ_STREAM_LIMIT - 1:
+            return _failure("too_large")
+        return execution.stdout
 
 
 def _capped(stdout: str, stderr: str) -> str:
@@ -209,8 +229,11 @@ def analysis_toolset[DepsT](
                 "Send a shorter program."
             )
         try:
-            await _place(session)
-            execution = await session.run(code, timeout_s=ANALYSIS_EXECUTION_TIMEOUT_S)
+            execution = await session.run(
+                code,
+                timeout_s=ANALYSIS_EXECUTION_TIMEOUT_S,
+                output_limit=ANALYSIS_RUN_STREAM_LIMIT,
+            )
         except AnalysisTimedOutError:
             logger.warning("analysis_run_timed_out", conversation_id=str(session.conversation_id))
             await _end_quietly(session)

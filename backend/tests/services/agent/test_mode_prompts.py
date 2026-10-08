@@ -983,8 +983,8 @@ def test_the_rules_text_is_byte_identical_across_two_compositions() -> None:
 
 # --- BIAL Chat's analysis tools: what the model is told ------------------------------------
 
-# sha256 of each composed Plan and Build prompt. A deliberate edit to one of their blocks moves
-# its digests; re-pin them in the same change.
+# sha256 of each composed Plan and Build prompt, and of BIAL Chat's without the analysis tools.
+# A deliberate edit to one of their blocks moves its digests; re-pin them in the same change.
 _PROJECT_SHAPES = {
     "bare": _CONTEXT,
     "rich": replace(
@@ -999,10 +999,7 @@ _PINNED_PROJECT_DIGESTS = {
     (ChatKind.BUILD, "bare"): "44c1530d76917a82c105f9a427e572c588fe80183740848e282ed6d09e124fad",
     (ChatKind.BUILD, "rich"): "c4bea3b8383411da2ca466b060bf5b137363d13f8f10b7786ed618daae93f336",
 }
-_GENERIC_DIGEST_BEFORE = "a494fc113b555a60fe29eca25c8eb99077c4bffd9e68b6d1212844bdfc37a996"
-_CLAUSE_BEFORE = (
-    "you have no tools, you cannot read or change any file, and you cannot run anything."
-)
+_PINNED_GENERIC_DIGEST = "de5de801ddf51de4b7c18fabd73cde105f64db1f40f6e0fa5073da882d404d7c"
 _CLAUSE = (
     "you cannot change their files, and you can open a file or run code only through a tool "
     "you have been given."
@@ -1048,14 +1045,14 @@ def test_plan_and_build_prompts_keep_their_pinned_bytes(
     assert _digest(compose_kind_prompt(kind, context)) == _PINNED_PROJECT_DIGESTS[(kind, shape)]
 
 
-def test_without_the_tools_bial_chat_differs_from_before_only_in_the_reworded_clause() -> None:
+def test_without_the_tools_bial_chat_keeps_its_pinned_bytes() -> None:
     """The standing contract is one text for every BIAL Chat, so its clause about tools has to
     be true whether or not this reply has any."""
     composed = compose_kind_prompt(ChatKind.GENERIC, _GENERIC_CONTEXT)
     assert ANALYSIS_RULES not in composed
     assert ANALYSIS_RUN_TOOL not in composed
     assert composed.count(_CLAUSE) == 1
-    assert _digest(composed.replace(_CLAUSE, _CLAUSE_BEFORE)) == _GENERIC_DIGEST_BEFORE
+    assert _digest(composed) == _PINNED_GENERIC_DIGEST
 
 
 def test_with_the_tools_the_listing_rules_and_sentences_appear_once_each() -> None:

@@ -30,12 +30,17 @@ from src.services.analysis.runtime import READER_NAME as READER_NAME
 from src.services.analysis.runtime import (
     SESSION_FILES_DIR,
     AnalysisRuntime,
+    AnalysisTimedOutError,
     AnalysisUnavailableError,
     Execution,
     SessionFile,
     session_identifier,
 )
 from src.services.attachments.materialize import CodeLaneAttachment
+from src.services.orchestrator.constants import (
+    ANALYSIS_DELETE_DEADLINE_S,
+    ANALYSIS_RUN_STREAM_LIMIT,
+)
 from src.services.storage.base import ObjectStorage
 from src.services.storage.errors import StorageError, StorageNotFoundError
 
@@ -45,7 +50,8 @@ READER: Final = (Path(__file__).parent / "assets" / "read_attachment.py.txt").re
 """Byte-identical to `sandbox/scripts/read_attachment.py`; a test holds the two equal."""
 
 RECORD_TTL_S: Final = 20 * 60.0
-"""The pool's idle cool-down. A record older than this describes a session Azure has deleted."""
+"""The pool's idle cool-down. A record untouched for longer describes a session Azure has
+deleted."""
 
 _LINK: Final = ATTACHMENTS_PREFIX.rstrip("/")
 # Files land in the working directory, and the service refuses a folder named with a dot, so
@@ -86,9 +92,23 @@ def _live_record(conversation_id: uuid.UUID) -> _Record | None:
     return record
 
 
+def _touch(conversation_id: uuid.UUID) -> None:
+    """Age the record from the session's last call, as the pool ages the session."""
+    record = _records.get(conversation_id)
+    if record is not None:
+        record.touched = time.monotonic()
+
+
 def forget(conversation_id: uuid.UUID) -> None:
     """Drop the chat's record, after its session was deleted."""
     _records.pop(conversation_id, None)
+
+
+async def end_session(runtime: AnalysisRuntime, conversation_id: uuid.UUID) -> None:
+    """Forget the chat's record, then delete its session within the delete deadline."""
+    forget(conversation_id)
+    async with asyncio.timeout(ANALYSIS_DELETE_DEADLINE_S):
+        await runtime.delete_session(session_identifier(conversation_id))
 
 
 def _matches(record: _Record, listed: dict[str, SessionFile]) -> bool:
@@ -137,7 +157,9 @@ async def place(
         await runtime.upload_file(session_id, file.file_name, data)
         copied_bytes += len(data)
     await runtime.upload_file(session_id, READER_NAME, READER)
-    linked = await runtime.run(session_id, LINK_CODE, timeout_s=_LINK_TIMEOUT_S)
+    linked = await runtime.run(
+        session_id, LINK_CODE, timeout_s=_LINK_TIMEOUT_S, output_limit=ANALYSIS_RUN_STREAM_LIMIT
+    )
     if not linked.succeeded:
         raise AnalysisUnavailableError("the attachments link could not be made")
 
@@ -185,8 +207,8 @@ class AnalysisSession:
 
     Placement runs on the reply's first file access and not again unless asked; the lock makes
     two tool calls issued together place once. `running` is set while code executes and stays set
-    if the run never came back (cancelled, timed out, unreachable): that is what tells a Stop or a
-    timeout that the session must be deleted to end it."""
+    if the run never came back (cancelled, timed out, unreachable) or the delete meant to end it
+    did not answer: that is what tells a Stop or a timeout that the session must be deleted."""
 
     conversation_id: uuid.UUID
     files: tuple[CodeLaneAttachment, ...]
@@ -213,28 +235,35 @@ class AnalysisSession:
         async with self._lock:
             if self.placed and not again:
                 return runtime
-            fresh = await place(
-                runtime,
-                conversation_id=self.conversation_id,
-                files=self.files,
-                storage=self.storage,
-            )
+            try:
+                fresh = await place(
+                    runtime,
+                    conversation_id=self.conversation_id,
+                    files=self.files,
+                    storage=self.storage,
+                )
+            except AnalysisTimedOutError:
+                # No code of the model's is running yet, so this is not a timeout that ends the
+                # session.
+                raise AnalysisUnavailableError("placement outlived its deadline") from None
             self.fresh = self.fresh or fresh
             self.placed = True
         return runtime
 
-    async def run(self, code: str, *, timeout_s: float) -> Execution:
+    async def run(self, code: str, *, timeout_s: float, output_limit: int) -> Execution:
         """Run `code` in the chat's session, after placement."""
         runtime = await self.ensure_placed()
         self.running = True
-        result = await runtime.run(self.session_id, code, timeout_s=timeout_s)
+        result = await runtime.run(
+            self.session_id, code, timeout_s=timeout_s, output_limit=output_limit
+        )
         self.running = False
+        _touch(self.conversation_id)
         return result
 
     async def end(self) -> None:
         """Delete the chat's session and its record: the only way to stop code that is running.
         The next file access re-creates it and copies everything back in."""
-        forget(self.conversation_id)
         self.placed = False
+        await end_session(self._runtime(), self.conversation_id)
         self.running = False
-        await self._runtime().delete_session(self.session_id)

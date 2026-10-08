@@ -290,9 +290,10 @@ class FakeAnalysisRuntime:
     A call on an unknown identifier opens an empty session, as the service does. `remove` is
     Azure deleting an idle session. `unavailable` fails every call; `run_times_out` fails every
     run with the deadline; `hold_runs` parks each run until it is cleared. `handle_run` decides
-    what a run prints. `calls` records `(operation, session_id)` in order, `uploads` and
-    `deletions` the `(session_id, name)` of each file call, and `runs` the code. Placement's own
-    link run lands in `links` instead and always succeeds: the knobs above are for model code."""
+    what a run prints, and its streams are cut at the run's `output_limit` as the service cuts
+    them. `calls` records `(operation, session_id)` in order, `uploads` and `deletions` the
+    `(session_id, name)` of each file call, and `runs` the code. Placement's own link run lands in
+    `links` instead and always succeeds: the knobs above are for model code."""
 
     files: dict[str, dict[str, bytes]] = field(default_factory=dict)
     stamps: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -307,7 +308,6 @@ class FakeAnalysisRuntime:
     handle_run: Callable[[str, str], Execution] = field(
         default=lambda _session_id, _code: Execution(succeeded=True, stdout="", stderr="")
     )
-    closed: bool = False
     _uploads: int = 0
 
     def _enter(self, operation: str, session_id: str) -> dict[str, bytes]:
@@ -345,7 +345,9 @@ class FakeAnalysisRuntime:
         self.deletions.append((session_id, name))
         self.stamps[session_id].pop(name, None)
 
-    async def run(self, session_id: str, code: str, *, timeout_s: float) -> Execution:
+    async def run(
+        self, session_id: str, code: str, *, timeout_s: float, output_limit: int
+    ) -> Execution:
         self._enter("run", session_id)
         if code == LINK_CODE:
             self.links.append(session_id)
@@ -355,7 +357,12 @@ class FakeAnalysisRuntime:
             await self.hold_runs.wait()
         if self.run_times_out:
             raise AnalysisTimedOutError(f"run outlived {timeout_s}s")
-        return self.handle_run(session_id, code)
+        execution = self.handle_run(session_id, code)
+        return replace(
+            execution,
+            stdout=execution.stdout[: output_limit - 1],
+            stderr=execution.stderr[: output_limit - 1],
+        )
 
     async def delete_session(self, session_id: str) -> None:
         self.calls.append(("delete_session", session_id))
@@ -364,7 +371,7 @@ class FakeAnalysisRuntime:
         self.remove(session_id)
 
     async def aclose(self) -> None:
-        self.closed = True
+        return None
 
 
 def _fake_handle(app_name: str) -> SandboxHandle:

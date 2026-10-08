@@ -61,7 +61,12 @@ class AnalysisRuntime(Protocol):
 
     async def delete_file(self, session_id: str, name: str) -> None: ...
 
-    async def run(self, session_id: str, code: str, *, timeout_s: float) -> Execution: ...
+    async def run(
+        self, session_id: str, code: str, *, timeout_s: float, output_limit: int
+    ) -> Execution:
+        """Past `output_limit` characters the service cuts each stream without a marker,
+        keeping one character fewer than the limit."""
+        ...
 
     async def delete_session(self, session_id: str) -> None: ...
 

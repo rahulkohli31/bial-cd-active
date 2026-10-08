@@ -106,7 +106,7 @@ async def test_a_run_sends_the_code_and_reads_what_it_printed() -> None:
     answer = {"status": "Succeeded", "result": {"stdout": "42\n", "stderr": ""}}
     runtime, seen = _client(lambda _r: httpx.Response(200, json=answer))
 
-    result = await runtime.run(_SESSION, "print(6 * 7)", timeout_s=120)
+    result = await runtime.run(_SESSION, "print(6 * 7)", timeout_s=120, output_limit=123_456)
 
     assert (result.succeeded, result.stdout, result.stderr) == (True, "42\n", "")
     assert seen[0].url.path.endswith("/executions")
@@ -116,7 +116,7 @@ async def test_a_run_sends_the_code_and_reads_what_it_printed() -> None:
         "executionType": "Synchronous",
         "code": "print(6 * 7)",
         "timeoutInSeconds": 120,
-        "outputStreamsMaxLength": 20_000,
+        "outputStreamsMaxLength": 123_456,
     }
 
 
@@ -124,7 +124,7 @@ async def test_code_that_raised_is_a_run_that_did_not_succeed() -> None:
     answer = {"status": "Failed", "result": {"stdout": "", "stderr": "ZeroDivisionError"}}
     runtime, _ = _client(lambda _r: httpx.Response(200, json=answer))
 
-    result = await runtime.run(_SESSION, "1/0", timeout_s=5)
+    result = await runtime.run(_SESSION, "1/0", timeout_s=5, output_limit=20_000)
 
     assert (result.succeeded, result.stderr, result.out_of_memory) == (
         False,
@@ -157,7 +157,7 @@ async def test_a_transport_failure_is_unavailable() -> None:
     runtime, _ = _client(_refuse)
 
     with pytest.raises(AnalysisUnavailableError):
-        await runtime.run(_SESSION, "print(1)", timeout_s=5)
+        await runtime.run(_SESSION, "print(1)", timeout_s=5, output_limit=20_000)
 
 
 async def test_a_call_past_its_deadline_is_timed_out() -> None:
@@ -167,7 +167,7 @@ async def test_a_call_past_its_deadline_is_timed_out() -> None:
     runtime, _ = _client(_slow)
 
     with pytest.raises(AnalysisTimedOutError):
-        await runtime.run(_SESSION, "while True: pass", timeout_s=5)
+        await runtime.run(_SESSION, "while True: pass", timeout_s=5, output_limit=20_000)
 
 
 async def test_an_answer_that_is_not_the_expected_shape_is_unavailable() -> None:
@@ -199,7 +199,9 @@ async def test_what_code_printed_never_reaches_a_log() -> None:
     runtime, _ = _client(lambda _r: httpx.Response(200, json=answer))
 
     with structlog.testing.capture_logs() as logs:
-        await runtime.run(_SESSION, f"open('q3.xlsx')  # {printed}", timeout_s=5)
+        await runtime.run(
+            _SESSION, f"open('q3.xlsx')  # {printed}", timeout_s=5, output_limit=20_000
+        )
 
     assert logs
     assert "SALARY" not in repr(logs)
@@ -228,14 +230,16 @@ async def test_the_services_own_deadline_is_timed_out() -> None:
     )
 
     with pytest.raises(AnalysisTimedOutError):
-        await runtime.run(_SESSION, "import time; time.sleep(999)", timeout_s=120)
+        await runtime.run(
+            _SESSION, "import time; time.sleep(999)", timeout_s=120, output_limit=20_000
+        )
 
 
 async def test_a_run_aborted_behind_a_timeout_is_unavailable() -> None:
     runtime, _ = _client(_failed("Execution aborted"))
 
     with pytest.raises(AnalysisUnavailableError):
-        await runtime.run(_SESSION, "print(1)", timeout_s=5)
+        await runtime.run(_SESSION, "print(1)", timeout_s=5, output_limit=20_000)
 
 
 @pytest.mark.parametrize(
@@ -244,7 +248,7 @@ async def test_a_run_aborted_behind_a_timeout_is_unavailable() -> None:
 async def test_running_out_of_memory_is_named(stderr: str) -> None:
     runtime, _ = _client(_failed(stderr))
 
-    result = await runtime.run(_SESSION, "x = bytearray(2**33)", timeout_s=5)
+    result = await runtime.run(_SESSION, "x = bytearray(2**33)", timeout_s=5, output_limit=20_000)
 
     assert (result.succeeded, result.out_of_memory) == (False, True)
 

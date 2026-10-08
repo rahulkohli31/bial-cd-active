@@ -13,7 +13,6 @@ creates a SECOND chat (`transition.py`) rather than mutating the plan chat.
 
 from __future__ import annotations
 
-import asyncio
 import datetime
 import re
 import unicodedata
@@ -43,13 +42,11 @@ from src.services.analysis import (
     AnalysisRuntime,
     AnalysisTimedOutError,
     AnalysisUnavailableError,
-    session_identifier,
 )
-from src.services.analysis.placement import forget
+from src.services.analysis.placement import end_session
 from src.services.conversations import gather_and_delete_conversation
 from src.services.messages.projection import measured_context_tokens, project_conversation
 from src.services.messages.store import load_rows
-from src.services.orchestrator.constants import ANALYSIS_DELETE_DEADLINE_S
 from src.services.projects import owned_project_or_404
 from src.services.storage import ObjectStorage, sweep_blobs
 from src.services.turns.engine import get_turn_engine
@@ -409,10 +406,8 @@ async def delete_conversation(
 async def _delete_analysis_session(runtime: AnalysisRuntime, conversation_id: uuid.UUID) -> None:
     """Take the chat's working copies out of Azure now rather than at the pool's cool-down,
     which stays the backstop: a failure here is logged and never fails the delete."""
-    forget(conversation_id)
     try:
-        async with asyncio.timeout(ANALYSIS_DELETE_DEADLINE_S):
-            await runtime.delete_session(session_identifier(conversation_id))
+        await end_session(runtime, conversation_id)
     except (AnalysisUnavailableError, AnalysisTimedOutError, TimeoutError) as exc:
         _log.warning(
             "analysis_session_delete_failed",

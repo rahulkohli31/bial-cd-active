@@ -29,7 +29,7 @@ import asyncio
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncIterable, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterable, Awaitable, Callable, Collection, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -170,7 +170,6 @@ from src.services.messages.store import append_batch
 from src.services.orchestrator.client_errors import discard_client_errors
 from src.services.orchestrator.constants import (
     ADAPTIVE_THINKING,
-    ANALYSIS_DELETE_DEADLINE_S,
     ANALYSIS_REQUEST_LIMIT,
     ANALYSIS_WALL_CLOCK_S,
     BUILD_EFFORT,
@@ -574,8 +573,10 @@ def plan_from_call(part: ToolCallPart) -> str | None:
     return plan
 
 
-def _without_the_call(messages: list[ModelMessage], tool_call_id: str) -> list[ModelMessage]:
-    """The run's persistable slice with one tool call removed, and any response it emptied.
+def _without_the_calls(
+    messages: list[ModelMessage], tool_call_ids: Collection[str]
+) -> list[ModelMessage]:
+    """The run's persistable slice with these tool calls removed, and any response they emptied.
 
     Removed rather than stored-and-skipped: "no offer is recorded" has to be true at two
     independent readers, `plan_options._scan` (row meta) and the projection (the stored call
@@ -591,7 +592,7 @@ def _without_the_call(messages: list[ModelMessage], tool_call_id: str) -> list[M
         parts = [
             part
             for part in message.parts
-            if not (isinstance(part, ToolCallPart) and part.tool_call_id == tool_call_id)
+            if not (isinstance(part, ToolCallPart) and part.tool_call_id in tool_call_ids)
         ]
         if len(parts) == len(message.parts):
             kept.append(message)
@@ -1207,31 +1208,42 @@ def _has_called_analysis(history: list[ModelMessage]) -> bool:
     )
 
 
-def _without_dangling_calls(messages: list[ModelMessage]) -> list[ModelMessage]:
-    """`messages` with every tool call that no later part answers taken out, and any response it
-    emptied: a run cut off mid-tool leaves calls the stored transcript must not carry."""
+def _steps_of_the_cut_run(captured: list[ModelMessage]) -> list[ModelMessage]:
+    """What a run ended at a ceiling leaves to store: the messages after its own prompt, without
+    the calls nobody answered, and without a request or response that is left carrying nothing
+    but thinking.
+
+    The run begins at the last request carrying a prompt, never at the history's length:
+    pydantic-ai merges adjacent requests in the history it captures, so that length can land past
+    the run's first steps."""
+    prompts = [
+        index
+        for index, message in enumerate(captured)
+        if isinstance(message, ModelRequest)
+        and any(isinstance(part, UserPromptPart) for part in message.parts)
+    ]
+    if not prompts:
+        return []
+    steps = _persistable_messages(captured[prompts[-1] + 1 :])
     answered = {
         part.tool_call_id
-        for message in messages
+        for message in steps
         if isinstance(message, ModelRequest)
         for part in message.parts
         if isinstance(part, ToolReturnPart | RetryPromptPart)
     }
-    kept: list[ModelMessage] = []
-    for message in messages:
-        if not isinstance(message, ModelResponse):
-            kept.append(message)
-            continue
-        parts = [
-            part
-            for part in message.parts
-            if not (isinstance(part, ToolCallPart) and part.tool_call_id not in answered)
-        ]
-        if parts:
-            kept.append(
-                message if len(parts) == len(message.parts) else replace(message, parts=parts)
-            )
-    return kept
+    called = {
+        part.tool_call_id
+        for message in steps
+        if isinstance(message, ModelResponse)
+        for part in message.parts
+        if isinstance(part, ToolCallPart)
+    }
+    return [
+        message
+        for message in _without_the_calls(steps, called - answered)
+        if any(not isinstance(part, ThinkingPart) for part in message.parts)
+    ]
 
 
 def _effort_for(kind: ChatKind) -> AnthropicEffort:
@@ -1815,7 +1827,7 @@ class TurnEngine:
                             else None
                         ),
                     )
-                    result = await self._within_the_analysis_bounds(state, db, history, run)
+                    result = await self._within_the_analysis_bounds(state, db, run)
                     # PER CALL, not per run: a Plan turn that used tools made several requests,
                     # and a total cannot say which of them read the cache.
                     for message in result.new_messages():
@@ -1847,7 +1859,7 @@ class TurnEngine:
                             conversation_id=str(state.conversation_id),
                             turn_id=str(state.turn_id),
                         )
-                        persistable = _without_the_call(persistable, deferred.tool_call_id)
+                        persistable = _without_the_calls(persistable, {deferred.tool_call_id})
                         deferred = None
                         self._push_text(state, PLAN_NOT_KEPT_TEXT)
                         platform_text = PLAN_NOT_KEPT_TEXT
@@ -2068,9 +2080,13 @@ class TurnEngine:
                 # Deleting the session is the only way to stop code still running in it; a reply
                 # that finished leaves it for the next one.
                 if state.analysis is not None and state.analysis.running:
-                    with suppress(Exception):
-                        await asyncio.shield(
-                            asyncio.wait_for(state.analysis.end(), ANALYSIS_DELETE_DEADLINE_S)
+                    try:
+                        await asyncio.shield(state.analysis.end())
+                    except Exception as exc:
+                        _log.warning(
+                            "analysis_session_end_failed",
+                            conversation_id=str(state.conversation_id),
+                            error=type(exc).__name__,
                         )
             finally:
                 # AFTER the sandbox work, not before: releasing early would let the next turn in
@@ -2100,7 +2116,6 @@ class TurnEngine:
         self,
         state: _TurnState,
         db: AsyncSession,
-        history: list[ModelMessage],
         run: Awaitable[T],
     ) -> T:
         """Await `run`, held to the wall clock when this reply works on files.
@@ -2115,31 +2130,27 @@ class TurnEngine:
             try:
                 async with deadline:
                     return await run
-            except (UsageLimitExceeded, TimeoutError) as exc:
-                if isinstance(exc, TimeoutError) and not deadline.expired():
+            except UsageLimitExceeded:
+                reason = REQUEST_LIMIT_REASON
+            except TimeoutError:
+                if not deadline.expired():
                     raise
-                persistable = _without_dangling_calls(
-                    _persistable_messages(captured[len(history) :])
-                )
-                try:
-                    if persistable:
-                        await append_batch(
-                            db,
-                            user_id=state.user_id,
-                            conversation_id=state.conversation_id,
-                            messages=persistable,
-                            entry_kind=MessageEntryKind.TURN,
-                            kind=state.kind,
-                        )
-                        await db.commit()
-                except Exception as persist_exc:
-                    raise _PersistFailedError from persist_exc
-                raise _WriteEndedError(
-                    REQUEST_LIMIT_REASON
-                    if isinstance(exc, UsageLimitExceeded)
-                    else WALL_CLOCK_DEADLINE_EXCEEDED_REASON,
-                    ANALYSIS_CEILING_TEXT,
-                ) from None
+                reason = WALL_CLOCK_DEADLINE_EXCEEDED_REASON
+            persistable = _steps_of_the_cut_run(captured)
+            try:
+                if persistable:
+                    await append_batch(
+                        db,
+                        user_id=state.user_id,
+                        conversation_id=state.conversation_id,
+                        messages=persistable,
+                        entry_kind=MessageEntryKind.TURN,
+                        kind=state.kind,
+                    )
+                    await db.commit()
+            except Exception as persist_exc:
+                raise _PersistFailedError from persist_exc
+            raise _WriteEndedError(reason, ANALYSIS_CEILING_TEXT)
 
     async def _pin_workspace(
         self,

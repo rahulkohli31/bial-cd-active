@@ -156,9 +156,12 @@ def container_store_dependency() -> AppContainerStore | None:
 ContainerStore = Annotated[AppContainerStore | None, Depends(container_store_dependency)]
 
 
-def analysis_runtime_dependency() -> AnalysisRuntime | None:
+async def analysis_runtime_dependency() -> AnalysisRuntime | None:
     """BIAL Chat's analysis runtime, or **`None` when it is not configured** — a supported posture
-    in every environment, in which BIAL Chat refuses Office and CSV files at its doors."""
+    in every environment, in which BIAL Chat refuses Office and CSV files at its doors.
+
+    `async` so it runs on the event loop: in the threadpool, two first requests could each build
+    a runtime, and one would never be closed."""
     return get_analysis_runtime()
 
 

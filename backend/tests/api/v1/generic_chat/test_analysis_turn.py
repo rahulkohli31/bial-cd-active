@@ -35,7 +35,7 @@ from src.services.analysis import Execution, placement
 from src.services.analysis import runtime as analysis_runtime
 from src.services.analysis.placement import READER_NAME
 from src.services.media.lanes import EXCEL_MEDIA_TYPE
-from src.services.messages.store import load_history
+from src.services.messages.store import load_history, load_rows
 from src.services.orchestrator.constants import GENERIC_EFFORT
 from src.services.turns import engine as engine_module
 from src.services.turns.copy import ANALYSIS_CEILING_TEXT
@@ -204,6 +204,32 @@ def _script(
     return FunctionModel(stream_function=_stream)
 
 
+def _failing() -> FunctionModel:
+    """A model that fails before it answers anything."""
+
+    async def _stream(_messages: list[ModelMessage], _info: AgentInfo):
+        raise RuntimeError("the model is unreachable")
+        yield _ANSWER
+
+    return FunctionModel(stream_function=_stream)
+
+
+async def _stored(db_session, user, chat) -> list[dict[str, Any]]:
+    """Every message the chat's rows hold, as written: no load-time repair."""
+    rows = await load_rows(db_session, user_id=user.id, conversation_id=chat.id)
+    return [message for row in rows for message in row.payload]
+
+
+def _stored_calls(messages: list[dict[str, Any]]) -> list[str]:
+    return [
+        part["tool_name"]
+        for message in messages
+        if message["kind"] == "response"
+        for part in message["parts"]
+        if part["part_kind"] == "tool-call"
+    ]
+
+
 _READ = (ATTACHMENT_READ_TOOL, {"file": ".attachments/q3.xlsx"})
 _RUN = (ANALYSIS_RUN_TOOL, {"code": "print(6 * 7)"})
 
@@ -260,11 +286,15 @@ async def test_a_reply_that_calls_no_tool_makes_no_runtime_call(
 ) -> None:
     user, chat = await _chat(db_session)
     await _upload(client, user, chat, "att_q3")
-    set_chat_model(_script([]))
+    seen: dict[str, Any] = {}
+    set_chat_model(_script([], seen=seen))
 
-    await _send(client, user, chat, attachment_ids=["att_q3"])
+    resp = await _send(client, user, chat, attachment_ids=["att_q3"])
     await _settle(_fresh_engine, chat.id)
 
+    assert resp.status_code == 202, resp.text
+    assert _fresh_engine.peek(chat.id).status == "completed"
+    assert seen["tools"] == sorted([ATTACHMENT_READ_TOOL, ANALYSIS_RUN_TOOL])
     assert reads.calls == []
 
 
@@ -423,6 +453,29 @@ async def test_the_request_ceiling_keeps_the_steps_shows_the_sentence_and_bills(
     assert reads.operations("delete_session") == []
 
 
+async def test_the_request_ceiling_keeps_only_this_replys_steps_after_earlier_failed_replies(
+    client, db_session, set_chat_model, _fresh_engine, stored, reads, monkeypatch
+) -> None:
+    """Replies that failed before answering leave adjacent requests, which pydantic-ai merges in
+    the history it hands back, so the history's length overshoots where this reply begins."""
+    monkeypatch.setattr(engine_module, "ANALYSIS_REQUEST_LIMIT", 2)
+    user, chat = await _chat(db_session)
+    await _upload(client, user, chat, "att_q3")
+    for text in ("First try", "Second try", "Third try"):
+        set_chat_model(_failing())
+        await _send(client, user, chat, text=text)
+        await _settle(_fresh_engine, chat.id)
+        assert _fresh_engine.peek(chat.id).status == "failed"
+    set_chat_model(_script([_READ, _RUN, _RUN, _RUN]))
+
+    await _send(client, user, chat, attachment_ids=["att_q3"])
+    await _settle(_fresh_engine, chat.id)
+
+    assert _fresh_engine.peek(chat.id).end_reason == "request_limit"
+    stored_calls = _stored_calls(await _stored(db_session, user, chat))
+    assert stored_calls == [ATTACHMENT_READ_TOOL, ANALYSIS_RUN_TOOL]
+
+
 async def test_the_wall_clock_ends_the_reply_and_deletes_a_session_still_running_code(
     client, db_session, set_chat_model, _fresh_engine, stored, reads, monkeypatch
 ) -> None:
@@ -439,6 +492,13 @@ async def test_the_wall_clock_ends_the_reply_and_deletes_a_session_still_running
     assert (state.status, state.end_reason) == ("failed", "wall_clock_deadline_exceeded")
     assert state.error_message == ANALYSIS_CEILING_TEXT
     assert reads.operations("delete_session") == [chat.id.hex]
+    stored_messages = await _stored(db_session, user, chat)
+    assert all(message["parts"] for message in stored_messages)
+    assert _stored_calls(stored_messages) == []
+    billed = await db_session.scalar(
+        sa.select(sa.func.sum(TokenUsage.input_tokens)).where(TokenUsage.user_id == user.id)
+    )
+    assert billed and billed > 0
 
 
 async def test_stop_while_code_runs_deletes_the_session_once_and_the_next_reply_refills_it(
@@ -470,7 +530,7 @@ async def test_stop_while_code_runs_deletes_the_session_once_and_the_next_reply_
 async def test_a_session_delete_that_never_returns_still_frees_the_chat(
     client, db_session, set_chat_model, _fresh_engine, stored, reads, monkeypatch
 ) -> None:
-    monkeypatch.setattr(engine_module, "ANALYSIS_DELETE_DEADLINE_S", 0.05)
+    monkeypatch.setattr(placement, "ANALYSIS_DELETE_DEADLINE_S", 0.05)
     user, chat = await _chat(db_session)
     await _upload(client, user, chat, "att_q3")
     reads.hold_runs = asyncio.Event()

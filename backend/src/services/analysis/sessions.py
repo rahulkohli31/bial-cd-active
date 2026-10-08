@@ -41,8 +41,6 @@ _OP_TIMEOUT_S: Final = 30.0
 _UPLOAD_TIMEOUT_S: Final = 120.0
 # Past the execution's own deadline, so the service answers before the transport gives up.
 _RUN_TIMEOUT_BUFFER_S: Final = 15.0
-# The service cuts each stream here without a marker; above the cap the caller applies itself.
-_OUTPUT_STREAM_LIMIT: Final = 20_000
 
 # The service's own words in a failed execution's stderr.
 _SERVER_TIMED_OUT: Final = "Request timed out waiting for code execution to complete"
@@ -182,7 +180,9 @@ class DynamicSessionsRuntime:
             absent_is_done=True,
         )
 
-    async def run(self, session_id: str, code: str, *, timeout_s: float) -> Execution:
+    async def run(
+        self, session_id: str, code: str, *, timeout_s: float, output_limit: int
+    ) -> Execution:
         response = await self._call(
             "run",
             "POST",
@@ -194,16 +194,12 @@ class DynamicSessionsRuntime:
                 "executionType": "Synchronous",
                 "code": code,
                 "timeoutInSeconds": round(timeout_s),
-                "outputStreamsMaxLength": _OUTPUT_STREAM_LIMIT,
+                "outputStreamsMaxLength": output_limit,
             },
         )
         try:
-            body = response.json()
-        except ValueError:
-            raise AnalysisUnavailableError("run: unreadable answer") from None
-        try:
-            return _execution(body)
-        except KeyError, TypeError, AttributeError:
+            return _execution(response.json())
+        except ValueError, KeyError, TypeError, AttributeError:
             raise AnalysisUnavailableError("run: unreadable answer") from None
 
     async def delete_session(self, session_id: str) -> None:

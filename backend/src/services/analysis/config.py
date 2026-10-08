@@ -11,10 +11,9 @@ that identity's role on the pool is the whole of the access control.
 
 from __future__ import annotations
 
-from typing import Self
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 # Static: pydantic echoes validator messages into the startup `ValidationError`.
 _ENDPOINT_SHAPE = (
@@ -30,9 +29,10 @@ class AnalysisConfig(BaseModel):
 
     pool_endpoint: str
 
-    @model_validator(mode="after")
-    def _the_endpoint_must_be_https(self) -> Self:
-        parts = urlsplit(self.pool_endpoint)
+    @field_validator("pool_endpoint")
+    @classmethod
+    def _the_endpoint_must_be_https(cls, v: str) -> str:
+        parts = urlsplit(v)
         if parts.scheme != "https" or not parts.hostname or not parts.path.strip("/"):
             raise ValueError(_ENDPOINT_SHAPE)
-        return self
+        return v

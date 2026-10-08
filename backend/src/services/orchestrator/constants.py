@@ -321,6 +321,14 @@ ANALYSIS_DELETE_DEADLINE_S: Final = 5.0
 ANALYSIS_OUTPUT_CAP: Final = 16_000
 """Characters of one execution's output handed back to the model."""
 
+ANALYSIS_RUN_STREAM_LIMIT: Final = 20_000
+"""Characters the service returns of each stream of a `run_python` execution, above the cap the
+tool applies itself."""
+
+ANALYSIS_READ_STREAM_LIMIT: Final = 200_000
+"""Characters the service returns of the reader's description. One that reaches it is too large
+to hand the model, and the read answers `too_large`."""
+
 ANALYSIS_CODE_LIMIT: Final = 100_000
 """Characters of code one `run_python` call may send."""
 
