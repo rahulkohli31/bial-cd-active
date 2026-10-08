@@ -339,6 +339,14 @@ IT SAYS THE APP IS WORKING, because that is what the piece-at-a-time ordering bu
 fact that makes this ending survivable."""
 
 
+ANALYSIS_CEILING_TEXT: Final = (
+    "This question needed more steps than one reply allows. Try asking about one part at a time."
+)
+"""How a BIAL Chat reply that works on files ends at either of its bounds, requests or wall
+clock. One sentence for both, for the reason `SPENT_ENOUGH_TEXT` gives. Its reload twin is in the
+portal's `buildlessEnding`, under the same two reasons."""
+
+
 MODEL_UNAVAILABLE_TEXT: Final = (
     "The assistant's service stopped responding partway through. "
     "Send your message again in a minute and it will carry on from here."
