@@ -64,6 +64,9 @@ FROM nginx:alpine-slim
 COPY nginx.conf /etc/nginx/templates/default.conf.template
 COPY --from=build /app/dist /usr/share/nginx/html
 
+# Takes the Alpine branch's security fixes that the nginx base image predates.
+RUN apk upgrade --no-cache
+
 # Fail-first guard: APPS_DOMAIN, APPS_HOSTNAME, PORTAL_ORIGIN and DNS_RESOLVER are
 # REQUIRED deploy inputs with no sensible defaults — this runs at start, before nginx's
 # envsubst, and exits non-zero if any is unset, empty, or SHAPED WRONG (a scheme, a `*.`
