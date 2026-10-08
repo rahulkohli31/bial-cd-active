@@ -17,10 +17,10 @@ be derived from anything else, is new for every container, and does not name the
 ## Decision
 
 **A preview's address carries a random alias.** The alias comes from a secure random generator
-(ADR-0006), is minted at the one step that creates a container, is new for every container and is
-never reused. Previews and shared views are served at `/a/<alias>/`. A ready container made ahead of
-any project (ADR-0032) gets its alias when it is made, because a claim cannot change the path a
-container serves under; the claim records that alias for the person who takes it.
+(ADR-0006), is minted when its container is created, is new for every container and is never
+reused. Previews and shared views are served at `/a/<alias>/`. A claim cannot change the path a
+container serves under, so a ready container made ahead of any project (ADR-0032) keeps the alias
+it was made with, and the claim records it for the person who takes it.
 
 **The alias lives in the owner's registry record, with a reverse key that names the owner.** The
 reverse key expires after a stretch without use, and each lookup renews it. A lookup trusts the

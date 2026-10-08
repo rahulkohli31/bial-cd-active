@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -35,7 +36,6 @@ from src.services.build_sessions import pool_pass
 from src.services.lake.env import connector_env_names
 from src.services.redis import registry_key
 from src.services.redis.keys import (
-    IS_ALIAS,
     REGISTRY_FIELD_ALIAS,
     REGISTRY_FIELD_APP_ID,
     REGISTRY_FIELD_APP_NAME,
@@ -560,6 +560,10 @@ def _made_before_aliases(world: SimpleNamespace, name: str) -> None:
     world.aca.envs[name]["BIAL_BASE_PATH"] = f"/a/{name}"
 
 
+def _alias_outside_its_path(world: SimpleNamespace, name: str) -> None:
+    world.aca.envs[name]["BIAL_BASE_PATH"] = new_alias()
+
+
 _FAILURES = [
     pytest.param(_bearer_unreadable, "claim_failed", id="bearer-unreadable"),
     pytest.param(_container_absent, "claim_failed", id="container-absent"),
@@ -569,6 +573,7 @@ _FAILURES = [
     pytest.param(_configure_refused, "claim_failed", id="configure-500"),
     pytest.param(_configure_hangs, "claim_failed", id="configure-hangs"),
     pytest.param(_made_before_aliases, "claim_failed", id="made-before-aliases"),
+    pytest.param(_alias_outside_its_path, "claim_failed", id="alias-outside-its-path"),
 ]
 
 
@@ -936,8 +941,7 @@ async def test_a_fill_makes_a_container_that_holds_nothing_of_any_project(world)
         "BIAL_PORTAL_ORIGIN",
         "BIAL_POOL_MEMBER",
     }
-    assert IS_ALIAS.fullmatch(env["BIAL_BASE_PATH"].removeprefix("/a/"))
-    assert name not in env["BIAL_BASE_PATH"]
+    assert re.fullmatch(r"/a/[0-9a-f]{32}", env["BIAL_BASE_PATH"])
     assert env["BIAL_APPS_HOSTNAME"] == "citizenapps.bialairport.com"
     assert env["BIAL_PORTAL_ORIGIN"] == "http://localhost:5173"
     assert env["BIAL_POOL_MEMBER"] == "1"
@@ -958,12 +962,14 @@ async def test_a_fill_makes_a_container_that_holds_nothing_of_any_project(world)
     )
 
 
-async def test_each_fill_gets_a_bearer_of_its_own(world) -> None:
+async def test_each_fill_gets_a_bearer_and_an_alias_of_its_own(world) -> None:
+    """A shared alias would route one person's preview to the other's workspace."""
     await world.client.fill_one(5)
     await world.client.fill_one(5)
 
     first, second = world.aca.filled
     assert world.aca.envs[first]["SUPERVISOR_TOKEN"] != world.aca.envs[second]["SUPERVISOR_TOKEN"]
+    assert world.aca.envs[first]["BIAL_BASE_PATH"] != world.aca.envs[second]["BIAL_BASE_PATH"]
 
 
 async def test_a_fill_is_on_the_ledger_before_azure_is_asked(world) -> None:

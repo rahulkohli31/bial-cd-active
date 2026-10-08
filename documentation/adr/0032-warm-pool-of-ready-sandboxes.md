@@ -207,8 +207,8 @@ shipped.
 - **Parking each app's own container and restarting it.** A restart still pulls the image and
   boots, and new projects and shared views gain nothing from it.
 - **Keeping the name derived from the app and looking it up at the web edge.** Every preview
-  request would pay a lookup, to preserve an address nothing hands out. ADR-0033 later added a
-  cached lookup for a different reason: an address that does not name its container.
+  request would pay a lookup, to preserve an address nothing hands out. ADR-0033's cached lookup
+  exists for a different reason: an address that does not name its container.
 - **A full ledger of every container, beside the registry.** Two records of one fact. The registry
   gains the app id and the ledger covers the pool alone.
 - **A reconciler that lists Azure and deletes what the ledger does not hold.** A container the

@@ -25,6 +25,7 @@ import pytest
 import redis.asyncio as aioredis
 from pydantic import SecretStr
 
+from src.api.internal.router import _container_behind
 from src.services.build_sessions import locks
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import (
@@ -97,18 +98,21 @@ async def test_a_record_that_still_names_a_container_is_never_written_over(
     await _the_previous_occupant(fake_redis, user)
     await fake_redis.hset(registry_key(user), REGISTRY_FIELD_APP_NAME, _PREDECESSOR)
     before = await fake_redis.hgetall(registry_key(user))
+    refused = new_alias()
 
     with pytest.raises(SandboxError):
         await _a_client()._write_registry(
             user,
             app_name=_SUCCESSOR,
             app_id=_SUCCESSORS_APP,
-            alias=new_alias(),
+            alias=refused,
             fqdn=f"{_SUCCESSOR}.example",
             token_ref="ref-fresh",
         )
 
     assert await fake_redis.hgetall(registry_key(user)) == before
+    # Its reverse key was written first; no record holds the alias, so the edge is told nothing.
+    assert await _container_behind(refused) is None
 
 
 async def test_a_new_container_says_it_has_never_served(fake_redis: aioredis.Redis) -> None:

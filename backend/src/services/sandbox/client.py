@@ -1326,14 +1326,12 @@ class AcaSandboxClient(SandboxClient):
         container is the caller's to let go."""
         stopwatch = running_stopwatch()
         with stopwatch.lap("bearer_read"):
-            token = await self._read_a_claimed_bearer(member.name)
-            alias = await self._read_a_claimed_alias(member.name)
+            token, alias = await self._read_a_claimed_env(member.name)
         base_path = base_path_for(alias)
         handle = SandboxHandle(
             fqdn=member.fqdn,
             token=token,
             app_name=member.name,
-            # Its base path, apps hostname and portal origin were set when it was made.
             preview_url=_public_app_url(base_path),
             ready=False,
             base_path=base_path,
@@ -1367,40 +1365,28 @@ class AcaSandboxClient(SandboxClient):
             raise
         return handle
 
-    async def _read_a_claimed_bearer(self, name: str) -> str:
-        """A claimed container's supervisor bearer, off its Azure environment. A transient ARM
-        error is asked again once, and a second keeps the container: nothing was learnt of it. A
-        container Azure does not have, or one with no bearer, falls through to be let go."""
+    async def _read_a_claimed_env(self, name: str) -> tuple[str, str]:
+        """A claimed container's supervisor bearer and alias, off its Azure environment. A
+        transient ARM error is asked again once, and a second keeps the container: nothing was
+        learnt of it. A container Azure does not have, one with no bearer, or one made before
+        aliases, which serves at its own name, falls through to be let go."""
         transient: AcaTransientError | None = None
         for attempt in range(_BEARER_READS):
             if attempt:
                 await _asleep(_ACA_RETRY_START_SECONDS)
             try:
                 token = await self._aca.get_app_env_value(name=name, key=_SUPERVISOR_TOKEN_ENV)
+                base_path = await self._aca.get_app_env_value(name=name, key=_BASE_PATH_ENV)
             except AcaTransientError as exc:
                 transient = exc
                 continue
             except AcaError as exc:
                 raise _ClaimFellThroughError("claim_failed") from exc
-            if token is None:
+            alias = (base_path or "").removeprefix("/a/")
+            if token is None or base_path != base_path_for(alias) or not IS_ALIAS.fullmatch(alias):
                 raise _ClaimFellThroughError("claim_failed")
-            return token
+            return token, alias
         raise _ClaimFellThroughError("claim_failed", keep=True) from transient
-
-    async def _read_a_claimed_alias(self, name: str) -> str:
-        """A claimed container's alias, off the base path in its Azure environment. One made
-        before aliases serves at its own name and falls through to be let go; a transient ARM
-        error keeps it, as nothing was learnt of it."""
-        try:
-            base_path = await self._aca.get_app_env_value(name=name, key=_BASE_PATH_ENV)
-        except AcaTransientError as exc:
-            raise _ClaimFellThroughError("claim_failed", keep=True) from exc
-        except AcaError as exc:
-            raise _ClaimFellThroughError("claim_failed") from exc
-        alias = (base_path or "").removeprefix("/a/")
-        if not IS_ALIAS.fullmatch(alias) or base_path != base_path_for(alias):
-            raise _ClaimFellThroughError("claim_failed")
-        return alias
 
     async def _put_it_back(self, member: ClaimedMember) -> None:
         """Return a claimed container to the pool, behind the start. A row left claimed is
