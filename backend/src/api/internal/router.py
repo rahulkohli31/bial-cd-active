@@ -14,7 +14,6 @@ from typing import Annotated, Final
 
 import structlog
 from fastapi import APIRouter, Header, Response
-from fastapi.responses import RedirectResponse
 from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -25,6 +24,7 @@ from src.services.auth.preview_pass import (
     GONE_PATH,
     HANDOFF_COOKIE,
     PASS_COOKIE,
+    apps_site_redirect,
     mint_pass,
     new_binding,
     pass_ttl_seconds,
@@ -128,12 +128,6 @@ async def resolve_app_route(
     return Response(headers={DENIED_HEADER: new_binding()})
 
 
-def _to_apps_site(path: str) -> RedirectResponse:
-    response = RedirectResponse(f"{settings.APPS_BASE_URL}{path}", status_code=302)
-    response.headers["Cache-Control"] = "no-store"
-    return response
-
-
 @router.get("/preview-pass")
 async def enter_preview(
     x_internal_route_token: Annotated[str, Header()] = "",
@@ -145,17 +139,17 @@ async def enter_preview(
     control plane's frame refusal and blank the preview pane."""
     if not _the_edge_is_asking(x_internal_route_token):
         _log.warning(SECRET_REFUSED_EVENT, route="preview-pass")
-        return _to_apps_site(GONE_PATH)
+        return apps_site_redirect(GONE_PATH)
     try:
         ticket = await redeem_ticket(x_preview_ticket, x_preview_binding)
         if ticket is None:
             _log.info(TICKET_REFUSED_EVENT)
-            return _to_apps_site(GONE_PATH)
+            return apps_site_redirect(GONE_PATH)
         raw_pass = await mint_pass(user_id=ticket.user_id, token_version=ticket.token_version)
     except RedisError, RedisNotConfiguredError:
         _log.error(ENTRY_FAILED_EVENT, exc_info=True)
-        return _to_apps_site(GONE_PATH)
-    response = _to_apps_site(ticket.return_path)
+        return apps_site_redirect(GONE_PATH)
+    response = apps_site_redirect(ticket.return_path)
     response.set_cookie(
         PASS_COOKIE,
         raw_pass,

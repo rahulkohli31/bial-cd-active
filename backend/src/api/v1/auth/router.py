@@ -66,7 +66,13 @@ from src.services.auth.oidc import (
     identity_from_browser,
     pending_redemption,
 )
-from src.services.auth.preview_pass import ENTRY_PATH, GONE_PATH, IS_BINDING, mint_ticket
+from src.services.auth.preview_pass import (
+    ENTRY_PATH,
+    GONE_PATH,
+    IS_BINDING,
+    apps_site_redirect,
+    mint_ticket,
+)
 from src.services.auth.refresh import (
     hash_refresh_token,
     issue_new_family,
@@ -639,12 +645,6 @@ _RETURN_PATH_CEILING: Final = 2048
 _LEAVES_THE_PREVIEW: Final = re.compile(r"//|\\|[\x00-\x1f\x7f]")
 
 
-def _to_apps_site(path: str) -> RedirectResponse:
-    response = RedirectResponse(f"{settings.APPS_BASE_URL}{path}", status_code=302)
-    response.headers["Cache-Control"] = "no-store"
-    return response
-
-
 def _preview_return_path(request: Request, binding: str, alias: str) -> str | None:
     """Where the browser goes back to: always under `/a/<alias>/`, read from the raw request so
     nothing is decoded on the way, or `None` for anything that could leave the preview. A keyless
@@ -671,23 +671,21 @@ async def preview_handoff(request: Request, db: DbSession, binding: str, alias: 
     if fetch_mode is not None and fetch_mode != "navigate":
         return Response(status_code=400)
     if not IS_BINDING.fullmatch(binding) or not IS_ALIAS.fullmatch(alias):
-        return _to_apps_site(GONE_PATH)
+        return apps_site_redirect(GONE_PATH)
     return_path = _preview_return_path(request, binding, alias)
     if return_path is None:
-        return _to_apps_site(GONE_PATH)
+        return apps_site_redirect(GONE_PATH)
     user = await _user_from_session_cookie(request, db)
     if user is None:
         if request.headers.get("sec-fetch-dest") in _FRAMED_DESTINATIONS:
-            return _to_apps_site(GONE_PATH)
-        to_portal = RedirectResponse(settings.FRONTEND_URL, status_code=302)
-        to_portal.headers["Cache-Control"] = "no-store"
-        return to_portal
+            return apps_site_redirect(GONE_PATH)
+        return RedirectResponse(settings.FRONTEND_URL, status_code=302)
     if user.suspended_at is not None:
-        return _to_apps_site(GONE_PATH)
+        return apps_site_redirect(GONE_PATH)
     try:
         held_alias = await get_redis().hget(registry_key(user.id), REGISTRY_FIELD_ALIAS)
         if held_alias != alias:
-            return _to_apps_site(GONE_PATH)
+            return apps_site_redirect(GONE_PATH)
         ticket = await mint_ticket(
             user_id=user.id,
             token_version=user.token_version,
@@ -696,5 +694,5 @@ async def preview_handoff(request: Request, db: DbSession, binding: str, alias: 
         )
     except RedisError, RedisNotConfiguredError:
         logger.error("preview_handoff_failed", exc_info=True)
-        return _to_apps_site(GONE_PATH)
-    return _to_apps_site(f"{ENTRY_PATH}?ticket={ticket}")
+        return apps_site_redirect(GONE_PATH)
+    return apps_site_redirect(f"{ENTRY_PATH}?ticket={ticket}")
