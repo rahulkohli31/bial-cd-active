@@ -1068,7 +1068,8 @@ describe('a reply that works through the citizen files', () => {
     await turn.frame({ type: 'working', seq: 3, working: true })
     // The finished frame replaces the started one in place rather than stacking a second row.
     expect(groupLabel()).toContain('1 step')
-    expect(screen.getByTestId('working-status').textContent).toContain('Working on your app')
+    expect(screen.getByTestId('working-status').textContent).toContain('Working on it')
+    expect(screen.getByTestId('working-status').textContent).not.toContain('app')
     await turn.end()
   })
 

@@ -753,7 +753,11 @@ export default function AssistantPage() {
                 <div className="h-full">
                   {/* The turn's own start, so the working line's count measures the reply rather
                       than the row drawing it — the row is rebuilt on every burst. */}
-                  <ChatThread turnStartedAt={turnStartedAt} interruptedMessageIds={interruptedIds} />
+                  <ChatThread
+                    turnStartedAt={turnStartedAt}
+                    interruptedMessageIds={interruptedIds}
+                    workingLabel="Working on it"
+                  />
                 </div>
               )}
             </div>
