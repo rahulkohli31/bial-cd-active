@@ -16,7 +16,7 @@ from collections.abc import Callable
 from typing import Final
 
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from src.config import settings
 from src.services.redis import get_redis
@@ -25,7 +25,8 @@ from src.services.redis.keys import preview_pass_key, preview_ticket_key
 PASS_COOKIE: Final = "__Host-bial_pass"
 HANDOFF_COOKIE: Final = "__Host-bial_handoff"
 
-# The apps site's own pages for these hops (`portal/nginx.conf`): neither ever redirects.
+# The apps site's own routes for these hops (`portal/nginx.conf`): the entry, and the page every
+# refusal ends on, which never sends the browser back to the hand-over.
 ENTRY_PATH: Final = "/__bial_enter"
 GONE_PATH: Final = "/__bial_gone"
 
@@ -90,7 +91,10 @@ async def redeem_ticket(raw: str, binding: str) -> TicketRecord | None:
     stored = await get_redis().getdel(preview_ticket_key(_digest(raw)))
     if stored is None:
         return None
-    record = TicketRecord.model_validate_json(stored)
+    try:
+        record = TicketRecord.model_validate_json(stored)
+    except ValidationError:
+        return None
     if not hmac.compare_digest(record.binding.encode(), binding.encode()):
         return None
     return record
@@ -102,7 +106,14 @@ async def mint_pass(*, user_id: uuid.UUID, token_version: int) -> str:
 
 
 async def read_pass(raw: str) -> PassRecord | None:
+    """`None` for a pass with no record or one this code can no longer read, so the browser is sent
+    through the hand-over for a fresh one rather than refused for good."""
     if not IS_TOKEN.fullmatch(raw):
         return None
     stored = await get_redis().get(preview_pass_key(_digest(raw)))
-    return None if stored is None else PassRecord.model_validate_json(stored)
+    if stored is None:
+        return None
+    try:
+        return PassRecord.model_validate_json(stored)
+    except ValidationError:
+        return None

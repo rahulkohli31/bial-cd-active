@@ -30,6 +30,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from redis.exceptions import RedisError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DbSession
@@ -642,7 +643,10 @@ async def logout(request: Request, db: DbSession) -> Response:
 
 _FRAMED_DESTINATIONS: Final = frozenset({"iframe", "frame"})
 _RETURN_PATH_CEILING: Final = 2048
-_LEAVES_THE_PREVIEW: Final = re.compile(r"//|\\|[\x00-\x1f\x7f]")
+# A path that could leave the preview, and any control character anywhere in the address. A
+# query may carry `//` (a return link of the app's own); the redirect is absolute on the apps site.
+_LEAVES_THE_PREVIEW: Final = re.compile(r"//|\\")
+_CONTROL_CHARACTER: Final = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _preview_return_path(request: Request, binding: str, alias: str) -> str | None:
@@ -656,7 +660,11 @@ def _preview_return_path(request: Request, binding: str, alias: str) -> str | No
     path = rest if rest == base or rest.startswith(f"{base}/") else f"{base}{rest or '/'}"
     query = request.scope.get("query_string", b"").decode("latin-1")
     target = f"{path}?{query}" if query else path
-    if len(target) > _RETURN_PATH_CEILING or _LEAVES_THE_PREVIEW.search(target):
+    if (
+        len(target) > _RETURN_PATH_CEILING
+        or _LEAVES_THE_PREVIEW.search(path)
+        or _CONTROL_CHARACTER.search(target)
+    ):
         return None
     return target
 
@@ -675,14 +683,14 @@ async def preview_handoff(request: Request, db: DbSession, binding: str, alias: 
     return_path = _preview_return_path(request, binding, alias)
     if return_path is None:
         return apps_site_redirect(GONE_PATH)
-    user = await _user_from_session_cookie(request, db)
-    if user is None:
-        if request.headers.get("sec-fetch-dest") in _FRAMED_DESTINATIONS:
-            return apps_site_redirect(GONE_PATH)
-        return RedirectResponse(settings.FRONTEND_URL, status_code=302)
-    if user.suspended_at is not None:
-        return apps_site_redirect(GONE_PATH)
     try:
+        user = await _user_from_session_cookie(request, db)
+        if user is None:
+            if request.headers.get("sec-fetch-dest") in _FRAMED_DESTINATIONS:
+                return apps_site_redirect(GONE_PATH)
+            return RedirectResponse(settings.FRONTEND_URL, status_code=302)
+        if user.suspended_at is not None:
+            return apps_site_redirect(GONE_PATH)
         held_alias = await get_redis().hget(registry_key(user.id), REGISTRY_FIELD_ALIAS)
         if held_alias != alias:
             return apps_site_redirect(GONE_PATH)
@@ -692,7 +700,7 @@ async def preview_handoff(request: Request, db: DbSession, binding: str, alias: 
             binding=binding,
             return_path=return_path,
         )
-    except RedisError, RedisNotConfiguredError:
+    except RedisError, RedisNotConfiguredError, SQLAlchemyError:
         logger.error("preview_handoff_failed", exc_info=True)
         return apps_site_redirect(GONE_PATH)
     return apps_site_redirect(f"{ENTRY_PATH}?ticket={ticket}")

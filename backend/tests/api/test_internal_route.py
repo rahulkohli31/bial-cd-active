@@ -10,6 +10,7 @@ satisfy "no header" for every case.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -148,6 +149,23 @@ async def test_a_pass_from_before_a_sign_out_is_denied(
     assert DENIED_HEADER in after.headers
 
 
+async def test_a_suspended_holders_pass_is_denied(
+    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session
+) -> None:
+    holder = await UserFactory.create(db_session)
+    alias = await _a_live_alias(fake_redis, holder.id)
+    pass_ = await mint_pass(user_id=holder.id, token_version=holder.token_version)
+    before = await client.get(_path(alias), headers={**EDGE, "X-Preview-Pass": pass_})
+
+    holder.suspended_at = datetime.now(UTC)
+    await db_session.flush()
+    after = await client.get(_path(alias), headers={**EDGE, "X-Preview-Pass": pass_})
+
+    assert before.headers[CONTAINER_HEADER] == CONTAINER
+    assert CONTAINER_HEADER not in after.headers
+    assert DENIED_HEADER in after.headers
+
+
 async def test_a_shared_view_opens_for_the_colleague_and_not_the_projects_owner(
     client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session
 ) -> None:
@@ -189,13 +207,13 @@ async def test_a_hit_renews_the_aliass_lifetime(
     assert await fake_redis.ttl(alias_key(alias)) > ALIAS_TTL_SECONDS - 60
 
 
-async def _retire(redis: aioredis.Redis, alias: str) -> None:
+async def _retire(redis: aioredis.Redis, holder: uuid.UUID) -> None:
     """The container is replaced: the user's registry now holds a newer alias."""
-    await redis.hset(registry_key(USER), REGISTRY_FIELD_ALIAS, new_alias())
+    await redis.hset(registry_key(holder), REGISTRY_FIELD_ALIAS, new_alias())
 
 
-async def _forget_the_container(redis: aioredis.Redis, alias: str) -> None:
-    await redis.delete(registry_key(USER))
+async def _forget_the_container(redis: aioredis.Redis, holder: uuid.UUID) -> None:
+    await redis.delete(registry_key(holder))
 
 
 @pytest.mark.parametrize(
@@ -211,25 +229,28 @@ async def _forget_the_container(redis: aioredis.Redis, alias: str) -> None:
     ],
 )
 async def test_every_refusal_is_a_200_that_names_nothing(
-    client: httpx.AsyncClient, fake_redis: aioredis.Redis, case: str
+    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session, case: str
 ) -> None:
-    alias = await _a_live_alias(fake_redis)
-    headers: dict[str, str] | dict[bytes, bytes] = dict(EDGE)
+    """Every case carries the holder's own pass, so only the case itself can be what refuses."""
+    holder = await UserFactory.create(db_session)
+    alias = await _a_live_alias(fake_redis, holder.id)
+    pass_ = await mint_pass(user_id=holder.id, token_version=holder.token_version)
+    headers: dict[str, str] | dict[bytes, bytes] = {**EDGE, "X-Preview-Pass": pass_}
     asked = alias
     if case == "no_secret":
-        headers = {}
+        headers = {"X-Preview-Pass": pass_}
     elif case == "wrong_secret":
-        headers = {"X-Internal-Route-Token": "x" * 40}
+        headers = {"X-Internal-Route-Token": "x" * 40, "X-Preview-Pass": pass_}
     elif case == "a_secret_that_is_not_ascii":
         # Bytes, because httpx will not put a non-ASCII `str` on the wire; a client that is not
         # httpx can.
-        headers = {b"X-Internal-Route-Token": "é".encode() * 40}
+        headers = {b"X-Internal-Route-Token": "é".encode() * 40, b"X-Preview-Pass": pass_.encode()}
     elif case == "an_alias_nobody_minted":
         asked = new_alias()
     elif case == "an_alias_the_registry_no_longer_holds":
-        await _retire(fake_redis, alias)
+        await _retire(fake_redis, holder.id)
     elif case == "an_alias_whose_registry_is_gone":
-        await _forget_the_container(fake_redis, alias)
+        await _forget_the_container(fake_redis, holder.id)
     elif case == "a_container_name_in_the_alias_place":
         asked = CONTAINER
 
@@ -237,6 +258,7 @@ async def test_every_refusal_is_a_200_that_names_nothing(
 
     assert resp.status_code == 200
     assert CONTAINER_HEADER not in resp.headers
+    assert DENIED_HEADER not in resp.headers
     assert CONTAINER not in resp.text
 
 

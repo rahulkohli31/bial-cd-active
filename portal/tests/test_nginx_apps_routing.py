@@ -1021,6 +1021,10 @@ def test_a_websocket_without_the_pass_is_refused_and_never_bounced(router: Route
         f"__Host-bial_app={ALIAS}",
         f"__Host-bial_app={ALIAS}; theme=dark; __Host-bial_handoff={_BINDING}; lang=en; "
         f"__Host-bial_pass={PASS}",
+        # A second, partitioned copy of each beside the ordinary one.
+        f"__Host-bial_pass={PASS}; __Host-bial_app={ALIAS}; theme=dark; "
+        f"__Host-bial_handoff={_BINDING}; __Host-bial_pass={OTHER_PASS}; lang=en; "
+        f"__Host-bial_handoff={_BINDING}; __Host-bial_app={ALIAS}",
     ],
 )
 @pytest.mark.parametrize(
@@ -1092,7 +1096,11 @@ def test_the_entry_route_forwards_only_the_ticket_and_binding_and_never_logs_the
 
 @pytest.mark.parametrize(
     ("target", "headers"),
-    [("/sw.js", {"Referer": f"https://{APPS_HOSTNAME}/a/{ALIAS}/"}), (f"/a/{ALIAS}", {})],
+    [
+        ("/sw.js", {"Referer": f"https://{APPS_HOSTNAME}/a/{ALIAS}/"}),
+        (f"/a/{ALIAS}", {}),
+        (f"/a%2F{PUB_KEY}%2Fsw.js", {}),
+    ],
 )
 def test_a_worker_script_outside_an_apps_own_address_is_refused(
     router: Router, target: str, headers: dict[str, str]

@@ -74,3 +74,23 @@ async def test_a_ticket_opened_in_another_browser_plants_no_pass(
         assert resp.status_code == 302
         assert resp.headers["location"] == f"{settings.APPS_BASE_URL}/__bial_gone"
         assert PASS_COOKIE not in _set_cookies(resp)
+
+
+async def test_a_caller_without_the_edges_secret_spends_nothing_and_sets_nothing(
+    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session
+) -> None:
+    user = await UserFactory.create(db_session)
+    binding = new_binding()
+    ticket = await mint_ticket(
+        user_id=user.id, token_version=user.token_version, binding=binding, return_path=RETURN_PATH
+    )
+    browser = {"X-Preview-Ticket": ticket, "X-Preview-Binding": binding}
+
+    refused = await client.get(
+        "/internal/preview-pass", headers={**browser, "X-Internal-Route-Token": "x" * 40}
+    )
+    answered = await client.get("/internal/preview-pass", headers={**EDGE, **browser})
+
+    assert refused.headers["location"] == f"{settings.APPS_BASE_URL}/__bial_gone"
+    assert PASS_COOKIE not in _set_cookies(refused)
+    assert PASS_COOKIE in _set_cookies(answered)

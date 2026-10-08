@@ -3,9 +3,11 @@ destination that never loops and never puts a sign-in page in a frame."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
+import pytest
 import redis.asyncio as aioredis
 
 from src.config import settings
@@ -36,13 +38,22 @@ async def _holding(db_session, redis: aioredis.Redis):
     return user, alias
 
 
+@pytest.mark.parametrize(
+    ("asked", "returned"),
+    [
+        ("/a/{alias}/dashboard?tab=2", "/a/{alias}/dashboard?tab=2"),
+        ("/dashboard?tab=2", "/a/{alias}/dashboard?tab=2"),
+        ("/a/{alias}/?next=https://example.com/x", "/a/{alias}/?next=https://example.com/x"),
+    ],
+    ids=["a-preview-address", "a-keyless-address", "a-link-in-the-query"],
+)
 async def test_the_holder_gets_a_ticket_back_to_the_page_they_asked_for(
-    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session
+    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session, asked: str, returned: str
 ) -> None:
     user, alias = await _holding(db_session, fake_redis)
 
     resp = await client.get(
-        _handoff(alias, "/dashboard?tab=2"),
+        _handoff(alias, asked.format(alias=alias)),
         headers={**_session(user), "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"},
     )
 
@@ -54,7 +65,20 @@ async def test_the_holder_gets_a_ticket_back_to_the_page_they_asked_for(
     record = await redeem_ticket(ticket, BINDING)
     assert record is not None
     assert record.user_id == user.id
-    assert record.return_path == f"/a/{alias}/dashboard?tab=2"
+    assert record.return_path == returned.format(alias=alias)
+
+
+async def test_a_suspended_holder_gets_no_ticket(
+    client: httpx.AsyncClient, fake_redis: aioredis.Redis, db_session
+) -> None:
+    user, alias = await _holding(db_session, fake_redis)
+    session = _session(user)
+    user.suspended_at = datetime.now(UTC)
+    await db_session.flush()
+
+    resp = await client.get(_handoff(alias), headers=session)
+
+    assert resp.headers["location"] == GONE
 
 
 async def test_someone_elses_preview_gets_no_ticket(
