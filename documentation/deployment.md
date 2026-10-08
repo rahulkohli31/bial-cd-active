@@ -113,9 +113,14 @@ account, the registry, the container apps environment, and the build host.
 
 **One shared secret, generated per environment.** The portal edge and the control plane carry the
 same value: the edge presents it when it asks the control plane which container a preview's address
-stands for, and when it hands the control plane a ticket to turn into a preview pass. Each refuses to start without a well-formed one. A mismatch is not a startup failure —
-every preview answers "app not available" — so set both from one source. Rotating it is a restart
-of both together. The portal image's Dockerfile and `backend/.env.example` name the input.
+stands for, and when it hands the control plane a ticket to turn into a preview pass. Each refuses
+to start without a well-formed one. A mismatch is not a startup failure — every preview answers
+"app not available" — so set both from one source. Rotating it is a restart of both together. The
+portal image's Dockerfile and `backend/.env.example` name the input.
+
+The edge also carries the portal's own address, and sends a browser there to collect its preview
+pass. It must be exactly the address people sign in at, the one the control plane is configured
+with; on any other address the session is absent and no preview opens for anyone.
 
 ### The control plane runs as exactly one instance
 
@@ -169,7 +174,8 @@ lands at once at the end, something in the path is buffering the stream.
 This is the check most worth doing properly, because **a green result from outside can sit in front
 of a dead container.** A request that never reaches the application can still be answered by
 something on the path between you and it. So ask the container about itself: execute a request
-inside it against its own port, and compare that with what the public address returns. When inside
+inside it against its own port, and compare that with what the public address returns in the
+owner's signed-in browser; any other request to a live preview is sent to the portal instead. When inside
 is healthy and outside is not, the fault is in the path — ingress, routing, DNS — and not in the
 application. When inside is also unhealthy, the application did not start.
 

@@ -22,7 +22,10 @@
 #     served from, so the preview pane goes blank with only a console message. That failure looks
 #     like "the app renders the portal", not like a routing error.
 #   - PORTAL_ORIGIN is the link target on the apps site's 404 page — the way back for an
-#     employee who followed a stale link. Missing -> envsubst emits `href=""`, a dead button.
+#     employee who followed a stale link — and where the edge sends a browser to collect its
+#     preview pass. It must be exactly the address people sign in at (the backend's FRONTEND_URL):
+#     anywhere else the session cookie is absent and no preview opens for anyone. Missing ->
+#     envsubst emits `href=""`, a dead button.
 #   - INTERNAL_ROUTE_TOKEN is the secret the edge presents to the backend's internal alias lookup
 #     and preview entry route. Missing -> both refuse it and every preview becomes "app not
 #     available". Its shape matters because it is substituted into a quoted nginx directive; a
