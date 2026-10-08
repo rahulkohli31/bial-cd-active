@@ -17,6 +17,7 @@ from _router import (
     APPS_HOSTNAME,
     BACKEND_ALIAS,
     OTHER_SBX_KEY,
+    PASS,
     PORTAL_ORIGIN,
     PUB_KEY,
     ROUTE_TOKEN,
@@ -65,6 +66,7 @@ def stub_apps(images: None, docker_network: str) -> Iterator[None]:
         args += ["--network-alias", f"{key}.{APPS_DOMAIN}"]
     args += ["--network-alias", BACKEND_ALIAS]
     args += ["-e", f"STUB_ROUTES={STUB_ROUTES}", "-e", f"STUB_ROUTE_TOKEN={ROUTE_TOKEN}"]
+    args += ["-e", f"STUB_PASS={PASS}"]
     args += [STUB_IMAGE]
     proc = _run(args, timeout=120)
     if proc.returncode != 0:
