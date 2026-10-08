@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.1] - 2026-10-08
+
+Opening an app saved under an older sandbox image no longer reinstalls its libraries every time.
+An app keeps the library versions it was saved with, so every app saved before the 6 October image
+put an older Next.js back over the image's own copy on each open, which took 20 to 90 seconds on
+development even when a ready workspace came from the pool. Now the template's own libraries move
+up to the image's versions when an app opens, never down and never across a major version, and
+libraries the app added itself keep their saved versions. An older app with no libraries of its own
+opens with nothing to install; one with its own installs only those, in a few seconds. Older apps
+also move onto the patched Next.js.
+
+An upgraded app shows unsaved changes until its next save. The move is a change in the workspace,
+kept by the next save the person makes or by the one the platform makes when the workspace shuts
+down.
+
+### Fixed
+
+- **Old apps open on the image's libraries instead of reinstalling their own.** An app with no
+  libraries of its own now installs nothing; one with its own installs only those, in about 3
+  seconds.
+- **An app whose saved manifest cannot be read, or whose install refuses the newer versions, opens
+  on its saved libraries,** as it did before.
+- **Discard keeps the image's libraries** instead of putting the older ones back.
+
 ## [1.9.0] - 2026-10-06
 
 Workspaces can now be made ahead of time, so a start no longer has to wait for Azure to create
